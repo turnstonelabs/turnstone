@@ -99,8 +99,8 @@ class TestMigration060:
         cfg = _alembic_cfg(db_path)
         command.upgrade(cfg, "059")
 
-        # escape_wrapper_tags(``see <tool_output> & <system-reminder>``) →
-        # ``&amp;`` first, then the tag escapes.
+        # The old wrapper-tag escaping of ``see <tool_output> & <system-reminder>``
+        # encoded ``&amp;`` first, then the tags.
         inner_escaped = "see &lt;tool_output&gt; &amp; &lt;system-reminder&gt;"
         wrapped = (
             f"<tool_output>\n{inner_escaped}\n</tool_output>\n\n"

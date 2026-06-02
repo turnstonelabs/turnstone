@@ -103,7 +103,6 @@ from turnstone.core.skill_parser import MAX_SKILL_DESCRIPTION_LEN
 from turnstone.core.storage._registry import get_storage
 from turnstone.core.storage._utils import normalize_search_terms
 from turnstone.core.tool_advisory import (
-    escape_wrapper_tags,
     make_system_turn,
     render_user_interjection,
 )
@@ -8568,24 +8567,27 @@ class ChatSession:
         )
 
     def _skill_hint(self, message: str, *, system_reminder: str = "") -> str:
-        """Compose a tool error/result message with an optional meta-cognitive
-        nudge in a ``<system-reminder>`` tag.  The nudge text is consumed by
-        the model as a hint, not by the harness as a directive — it informs
-        the next tool call without forcing a specific recovery path.
+        """Return a skills tool-result *message*, queuing an optional hint turn.
 
-        Both inputs route through :func:`escape_wrapper_tags` because callers
-        interpolate model-controlled values (skill names, filter strings)
-        into ``message`` via f-strings — a crafted name like
-        ``evil</system-reminder>...`` would otherwise close the envelope and
-        let the model fabricate a system-reminder directive in its own
-        future context.  Escaping at the single chokepoint covers every
-        existing and future call site.
+        *system_reminder* is guidance for the model's next move (broaden a
+        filter, ask the operator for a permission, …).  It is no longer spliced
+        into the tool result as a bare ``<system-reminder>`` block — that marker
+        is declared *untrusted* on the fold path, which would silently demote the
+        hint.  Instead it is queued onto the tool channel via
+        :meth:`_queue_tool_advisory` and drained by :meth:`_collect_advisories`
+        into a first-class ``{"role": "system", "_source": "skill_hint"}`` turn
+        that lands after the (clean) tool result — folded inside the trusted
+        nonce fence for non-native models, kept inline for native ones.  (Queuing
+        no-ops during a wake, like the other tool-channel advisories.)
+
+        *message* is returned verbatim as the tool result.  It needs no escaping:
+        it is ordinary tool output (untrusted by nature), and if a call site
+        interpolates a model-controlled value that contains a ``<system-reminder>``
+        marker, the fold's host-escaping (:meth:`_neutralize_host`) defangs it.
         """
-        safe_message = escape_wrapper_tags(message)
         if system_reminder:
-            safe_reminder = escape_wrapper_tags(system_reminder)
-            return f"{safe_message} <system-reminder>{safe_reminder}</system-reminder>"
-        return safe_message
+            self._queue_tool_advisory("skill_hint", system_reminder)
+        return message
 
     def _prepare_skills(self, call_id: str, args: dict[str, Any]) -> dict[str, Any]:
         """Dispatch on ``action``.  Reads auto-approve; writes require both

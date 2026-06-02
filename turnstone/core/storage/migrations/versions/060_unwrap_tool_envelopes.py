@@ -53,7 +53,7 @@ _BATCH = 500
 
 
 def _decode_ampersand(text: str) -> str:
-    """Reverse only the ``&`` → ``&amp;`` half of ``escape_wrapper_tags``.
+    """Reverse only the ``&`` → ``&amp;`` half of the old wrapper-tag escaping.
 
     The original escape encoded ``&`` first, then the wrapper tags.  We
     deliberately do NOT reverse the wrapper-tag half: a stored

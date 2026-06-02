@@ -115,9 +115,9 @@ class TestEnqueueShape:
 
 class TestSanitisation:
     """``sanitize_payload`` runs producer-side over the formatted message
-    before it ever reaches the queue.  The wire-boundary
-    ``escape_wrapper_tags`` only protects ``<system-reminder>`` /
-    ``<tool_output>`` envelopes; this layer covers everything else.
+    before it ever reaches the queue.  The wire-boundary fence escaping
+    (``fence.neutralize`` at fold time) only defangs ``<system-reminder>``
+    markers; this producer layer covers everything else.
     """
 
     def test_dispatch_sanitizes_payload_before_enqueue(self, tmp_db):

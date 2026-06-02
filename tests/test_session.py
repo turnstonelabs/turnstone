@@ -2969,6 +2969,20 @@ class TestMetacognitiveBuffers:
         assert specs == []
         assert session._queued_messages == {}
 
+    def test_skill_hint_drains_into_system_turn_spec(self, tmp_db):
+        """A skill hint queued by ``_skill_hint`` onto the tool channel drains in
+        ``_collect_advisories`` into a ``skill_hint`` spec — which the caller
+        appends as a first-class ``{"role":"system","_source":"skill_hint"}``
+        turn after the (clean) tool result (folded with the trusted fence on the
+        non-native path), instead of the old bare ``<system-reminder>`` splice."""
+        session = _make_session()
+        result = session._skill_hint("0 results", system_reminder="broaden the query")
+        assert result == "0 results"  # clean tool result, no embedded marker
+        specs = session._collect_advisories(
+            assessment=None, func_name="skills", is_last_in_batch=True
+        )
+        assert ("skill_hint", "broaden the query", {}) in specs
+
     def test_collect_advisories_does_not_drain_queued_when_not_last(self, tmp_db):
         """Mid-batch results must NOT drain the queued message — the
         drain is bound to the last result so a parallel fan-out doesn't

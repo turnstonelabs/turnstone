@@ -1,19 +1,19 @@
-"""Operator-context helpers — first-class system turns + envelope escaping.
+"""Operator-context helpers — first-class system turns.
 
 Operator-level context injected mid-session (output-guard findings, user
-interjections, metacognitive nudges) lives in the conversation trajectory as
-first-class ``{"role": "system", "_source": <kind>, "content": ...}`` turns
-(see :func:`make_system_turn`).  At the wire boundary each turn is either kept
-inline (native mid-conversation system messages — claude-opus-4-8) or folded
-into the preceding turn as a nonce-delimited ``<system-reminder_{nonce}>`` fence
-for every other model.  The fence mechanism (mint / neutralise / wrap) lives in
-:mod:`turnstone.core.fence`, shared with the output-guard judge so the two
-trust boundaries cannot drift; ``ChatSession._fold_system_turns`` applies it.
+interjections, metacognitive nudges, skill hints) lives in the conversation
+trajectory as first-class ``{"role": "system", "_source": <kind>, "content":
+...}`` turns (see :func:`make_system_turn`).  At the wire boundary each turn is
+either kept inline (native mid-conversation system messages — claude-opus-4-8)
+or folded into the preceding turn as a nonce-delimited ``<system-reminder_
+{nonce}>`` fence for every other model.  The fence mechanism (mint / neutralise
+/ wrap) lives in :mod:`turnstone.core.fence`, shared with the output-guard judge
+so the two trust boundaries cannot drift; ``ChatSession._fold_system_turns``
+applies it.
 
-This module also hosts :func:`escape_wrapper_tags` (defence for the few call
-sites that interpolate model-controlled text next to a *bare* (un-nonced)
-``<system-reminder>`` tag — e.g. ``ChatSession._skill_hint``) and
-:func:`parse_priority` (the ``!!!`` priority prefix on queued user messages).
+This module also hosts :func:`parse_priority` (the ``!!!`` priority prefix on
+queued user messages) and :func:`render_user_interjection` (the user-authored
+framing for a drained queued message).
 """
 
 from __future__ import annotations
@@ -23,33 +23,6 @@ from typing import Any, Final
 # Priority constants
 PRIORITY_IMPORTANT: Final = "important"
 PRIORITY_NOTICE: Final = "notice"
-
-
-def escape_wrapper_tags(text: str) -> str:
-    """Neutralise sequences that would break a ``<system-reminder>`` envelope.
-
-    Replaces ``<tool_output>`` and ``<system-reminder>`` (open and close)
-    with their HTML-entity-encoded forms so adjacent untrusted text
-    cannot fabricate or close one of the wrapper blocks.  Use this on any
-    untrusted content that is glued next to a bare wrapper tag — e.g.
-    ``ChatSession._skill_hint`` interpolates model-controlled skill names
-    into a message that ends with a ``<system-reminder>`` block.
-
-    Encodes ``&`` first so a pre-existing literal like ``&lt;tool_output&gt;``
-    in the source text becomes ``&amp;lt;tool_output&amp;gt;`` and cannot
-    collide with our wrapper-tag escape strings.  The short-circuit on
-    ``"<" not in text and "&" not in text`` covers the common case where
-    neither a wrapper tag nor any pre-existing entity is present.
-    """
-    if "<" not in text and "&" not in text:
-        return text
-    return (
-        text.replace("&", "&amp;")
-        .replace("</tool_output>", "&lt;/tool_output&gt;")
-        .replace("<tool_output>", "&lt;tool_output&gt;")
-        .replace("<system-reminder>", "&lt;system-reminder&gt;")
-        .replace("</system-reminder>", "&lt;/system-reminder&gt;")
-    )
 
 
 def parse_priority(text: str) -> tuple[str, str]:
@@ -109,14 +82,16 @@ def render_user_interjection(message: str, priority: str) -> str:
 # the LLM wire by ``sanitize_messages``.  See ``ChatSession`` for the producers
 # and the fold-or-keep pass.
 
-# Canonical ``_source`` values.  ``output_guard`` / ``user_interjection`` come
-# from the advisory producers above; the rest mirror the metacognition nudge
-# types (``turnstone.core.metacognition._NUDGE_MAP``) — kept in sync by
-# ``tests/test_tool_advisory.py::TestMakeSystemTurn``.
+# Canonical ``_source`` values.  ``output_guard`` / ``user_interjection`` /
+# ``skill_hint`` come from the advisory producers above (skill_hint via
+# ``ChatSession._skill_hint`` queuing onto the tool channel); the rest mirror the
+# metacognition nudge types (``turnstone.core.metacognition._NUDGE_MAP``) — kept
+# in sync by ``tests/test_tool_advisory.py::TestMakeSystemTurn``.
 SYSTEM_TURN_SOURCES: Final = frozenset(
     {
         "output_guard",
         "user_interjection",
+        "skill_hint",
         "correction",
         "denial",
         "resume",
