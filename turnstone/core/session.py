@@ -8757,27 +8757,20 @@ class ChatSession:
             except Exception:
                 unfiltered = []
             if unfiltered:
-                applied: list[str] = []
-                if item.get("query"):
-                    applied.append(f"query={item['query']!r}")
-                if item.get("category"):
-                    applied.append(f"category={item['category']!r}")
-                if item.get("tag"):
-                    applied.append(f"tag={item['tag']!r}")
-                if item.get("risk_level"):
-                    applied.append(f"risk_level={item['risk_level']!r}")
-                if item.get("kind"):
-                    applied.append(f"kind={item['kind']!r}")
-                if item.get("enabled_only"):
-                    applied.append("enabled_only=true")
+                # The hint must NOT echo the model-supplied filter values: it
+                # now rides into a TRUSTED operator system turn (the fold fence
+                # / native system role), and the filter args are model-
+                # controlled — under an indirect injection they could carry an
+                # attacker directive, which echoing here would launder into
+                # operator authority.  The count is harness-derived, and the
+                # model already knows the filters it just sent, so fixed
+                # guidance suffices.
                 output_msg = self._skill_hint(
                     "0 skills matched the supplied filters.",
                     system_reminder=(
-                        f"Without these filters ({', '.join(applied)}) "
-                        f"there are at least {len(unfiltered)} skill(s) "
-                        "available in the catalog. Try omitting "
-                        "the most-restrictive filter or use a broader "
-                        "query."
+                        f"The applied filters matched nothing, but the catalog "
+                        f"has at least {len(unfiltered)} skill(s). Omit the "
+                        "most-restrictive filter or use a broader query."
                     ),
                 )
                 summary = "0 skills (hint included)"

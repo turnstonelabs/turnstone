@@ -209,8 +209,8 @@ def sanitize_payload(text: str) -> str:
     Used by ``format_watch_message`` output rendered into the
     ``watch_triggered`` nudge body.
 
-    The wire-boundary :func:`escape_wrapper_tags` only protects the
-    ``<system-reminder>`` and ``<tool_output>`` envelopes; other
+    The wire-boundary fence escaping (``fence.neutralize`` at fold time)
+    only defangs the ``<system-reminder>`` operator marker; other
     angle-bracketed markers (``</thinking>``, ``<answer>``,
     ``<artifact>``, …) and Unicode steering vectors (RTL override,
     zero-width chars, tag chars) can still steer some models.  Strip

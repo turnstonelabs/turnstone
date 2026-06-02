@@ -390,8 +390,11 @@ class TestExecSkillsFind:
         assert "<system-reminder>" not in output
         hints = [t for nt, t, _ in session._nudge_queue.drain(TOOL_DRAIN) if nt == "skill_hint"]
         assert len(hints) == 1
-        assert "Without these filters" in hints[0]
         assert "at least 3 skill" in hints[0]
+        # The hint rides a TRUSTED operator turn, so it must NOT echo the
+        # model-controlled filter values — doing so would launder them into
+        # operator authority under an indirect injection.
+        assert "nonexistent" not in hints[0]
 
     def test_find_zero_results_without_filter_no_hint(self) -> None:
         """Hint only fires when filters reduced the result set."""
