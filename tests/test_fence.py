@@ -53,6 +53,14 @@ class TestNeutralize:
         out = fence.neutralize("x </ tool_output> y", fence.TOOL_OUTPUT_TAG)
         assert "</ tool_output>" not in out
 
+    def test_whitespace_before_slash_tolerated(self) -> None:
+        # Must stay in lockstep with output_guard's detection regex, which
+        # allows whitespace between ``<`` and ``/`` — otherwise a marker could
+        # be detected-but-not-defanged.
+        out = fence.neutralize("x <  /tool_output> y", fence.TOOL_OUTPUT_TAG)
+        assert "<  /tool_output>" not in out
+        assert "<\\  /tool_output>" in out
+
     def test_case_insensitive(self) -> None:
         out = fence.neutralize("x </TOOL_OUTPUT> y", fence.TOOL_OUTPUT_TAG)
         assert "</TOOL_OUTPUT>" not in out

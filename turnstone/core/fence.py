@@ -61,12 +61,18 @@ def _marker_pattern(tag: str, *, opening: bool) -> re.Pattern[str]:
     ``</tag`` (closing) is always matched — that is how content breaks *out* of
     a fence wrapping it.  ``<tag`` (opening) is matched too when *opening* is
     set — that is how surrounding text forges a fake fence to break *in*.
-    ``\\s*`` tolerates ``</ tag`` whitespace tricks.  Only the tag *prefix* is
-    anchored, so a nonce suffix (``<system-reminder_abcd>``) is matched and
-    defanged regardless of whether the hex matches the real nonce.
+
+    The single capture spans the whole run between ``<`` and the tag — optional
+    whitespace, the slash, more optional whitespace — rather than anchoring the
+    slash right after ``<``.  That defangs whitespace tricks on *both* sides of
+    the slash (``< /tag``, ``<  /tag``, ``</ tag``) and keeps this in lockstep
+    with ``output_guard._RE_FENCE_MARKER`` (``<\\s*/?\\s*tag``) so a marker can
+    never be detected-but-not-defanged.  Only the tag *prefix* is anchored, so a
+    nonce suffix (``<system-reminder_abcd>``) is matched and defanged regardless
+    of whether the hex matches the real nonce.
     """
-    slash = "/?" if opening else "/"
-    return re.compile(rf"<({slash})(\s*){re.escape(tag)}", re.IGNORECASE)
+    mid = r"\s*/?\s*" if opening else r"\s*/\s*"
+    return re.compile(rf"<({mid}){re.escape(tag)}", re.IGNORECASE)
 
 
 def neutralize(text: str, tag: str, *, opening: bool = False) -> str:
@@ -85,7 +91,7 @@ def neutralize(text: str, tag: str, *, opening: bool = False) -> str:
     if "<" not in text:
         return text
     pattern = _marker_pattern(tag, opening=opening)
-    return pattern.sub(lambda m: f"<\\{m.group(1)}{m.group(2)}{tag}", text)
+    return pattern.sub(lambda m: f"<\\{m.group(1)}{tag}", text)
 
 
 def wrap(content: str, nonce: str, tag: str) -> str:
