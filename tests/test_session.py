@@ -2741,6 +2741,51 @@ class TestPerKindToolVariants:
             assert coord_t is union_t, f"{name} should pass through unchanged"
 
 
+class TestMemoryCompositionDeferral:
+    """The memory block is selected from the recent-user-message query, so a
+    fresh session (no messages at __init__) must NOT freeze a recency-only,
+    un-reranked block — the memory-bearing compose defers to the first real
+    user turn, where the query is non-empty.
+    """
+
+    def test_flag_false_until_real_user_query(self, tmp_db):
+        session = _make_session()
+        # __init__ composed against an empty history -> no query yet.
+        assert session._system_composed_with_context is False
+        # A whitespace-only "turn" (e.g. a wake send("")) is not a real query.
+        session.messages.append({"role": "user", "content": "   "})
+        session._init_system_messages()
+        assert session._system_composed_with_context is False
+        # A real user message flips it (one-shot).
+        session.messages.append({"role": "user", "content": "what is the weather"})
+        session._init_system_messages()
+        assert session._system_composed_with_context is True
+
+    def test_send_recomposes_memory_block_on_first_user_turn(self, tmp_db):
+        from turnstone.core.memory_relevance import extract_recent_context
+
+        session = _make_session()
+        session._title_generated = True  # suppress the auto-title daemon thread
+        assert session._system_composed_with_context is False
+        seen_queries: list[str] = []
+        real_init = session._init_system_messages
+
+        def spy_init():
+            seen_queries.append(extract_recent_context(session.messages))
+            real_init()
+
+        responses = [{"role": "assistant", "content": "ok"}]
+        with _send_with_mocks(
+            session, responses, lambda _tc: ([], None), _init_system_messages=spy_init
+        ):
+            session.send("debug my kubernetes pods")
+
+        # send() ran the deferred recompose AFTER appending the user turn, so the
+        # memory query saw the real message instead of the empty __init__ history.
+        assert any("kubernetes" in q for q in seen_queries)
+        assert session._system_composed_with_context is True
+
+
 class TestMetacognitiveBuffers:
     """Nudges drain through advisory channels, not the system message."""
 

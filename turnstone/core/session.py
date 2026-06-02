@@ -1193,6 +1193,12 @@ class ChatSession:
         self._skill_resources: dict[str, str] = {}
         self._skill_resources_dir: str | None = None
         self._load_skills()
+        # Memory selection keys off the recent-user-message query, but a fresh
+        # session has no messages yet here -> the first compose would inject
+        # recency-only memories with no relevance/rerank. Track whether we've
+        # composed against a real query so send() can defer the memory-bearing
+        # recompose to the first user turn (keeps the cached prefix stable).
+        self._system_composed_with_context: bool = False
         self._init_system_messages()
         # Skip on rehydrate — ``_save_config`` is ``INSERT OR
         # REPLACE`` per-key, and the persisted row is what
@@ -2806,6 +2812,10 @@ class ChatSession:
             dev_parts.append("")
             dev_parts.append(self.instructions)
         context = extract_recent_context(self.messages)
+        if context.strip():
+            # Composed against a real user-message query at least once; send()
+            # uses this to know the deferred first-turn recompose is done.
+            self._system_composed_with_context = True
         visible_mems, candidate_source = self._select_memory_candidates(context)
         if visible_mems:
             thr = self._bm25_rerank_threshold()
@@ -3776,6 +3786,15 @@ class ChatSession:
             self._queue_user_advisory(*nudge)
 
         self._append_user_turn(user_input, attachments or (), send_id=send_id, from_wake=from_wake)
+
+        # A fresh session composed its system prefix at __init__ with an empty
+        # history, so memory selection fell back to recency (no query, no rerank).
+        # Now that the first real user message exists, recompose so the opening
+        # turn gets a query-relevant memory set. The flag flips True once composed
+        # against real context, so this fires once and the prefix stays cache-
+        # stable after -- per-turn refresh is the larger redesign on another branch.
+        if not self._system_composed_with_context:
+            self._init_system_messages()
 
         try:
             while True:
