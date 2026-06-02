@@ -314,12 +314,9 @@ Search the web using a text query.
 
 `web_search` can use an external **reranker** to re-order the backend's result pool by relevance to the query before returning the top hits. Turnstone runs no reranker model itself; it POSTs to a Cohere/Jina-compatible `/rerank` endpoint (self-hosted [vLLM](https://docs.vllm.ai) / [TEI](https://github.com/huggingface/text-embeddings-inference) / llama.cpp, or hosted Cohere/Jina/Voyage).
 
-**Disabled by default.** Two ways to point at an endpoint:
+**Disabled by default.** In the console **Models** tab, add a model definition whose `base_url` is a Cohere/Jina-compatible `/rerank` endpoint and whose capabilities include `{"supports_rerank": true}`, then select it under **Models → Roles → Reranker**. It's managed like every other model (write-only key, enable/disable, calibration). The reranker is purely this per-model definition — there is no global `rerank_url`-style endpoint setting.
 
-- **A reranker model (recommended, admin UI):** in the console **Models** tab, add a model definition whose `base_url` is a Cohere/Jina-compatible `/rerank` endpoint and whose capabilities include `{"supports_rerank": true}`, then select it under **Models → Roles → Reranker**. Managed like every other model (write-only key, enable/disable).
-- **Config settings:** set `rerank_url` (full endpoint URL including path) in `config.toml` `[tools]`, the admin Settings tab, or `$TURNSTONE_RERANK_URL`; optionally `rerank_model` and `rerank_api_key` (write-only). The reranker model role, if set, takes precedence over these.
-
-The `rerank_web_search` toggle defaults on once an endpoint is configured. If the endpoint is unreachable or errors, web_search falls back silently to the backend's native result order — reranking never makes a search fail.
+The `rerank_web_search` toggle defaults on once a reranker is selected. If the endpoint is unreachable or errors, web_search falls back silently to the backend's native result order — reranking never makes a search fail.
 
 When `rerank_bm25` is enabled, the candidate text for memory, tool, and skill retrieval (memory name/description/content and tool/skill names + descriptions) is also sent to the rerank endpoint — a self-hosted endpoint (vLLM/TEI/llama.cpp) keeps it on your infrastructure, a hosted provider (Cohere/Jina/Voyage) sends it off-box.
 
@@ -333,11 +330,7 @@ vllm serve /models/Qwen3-Reranker-0.6B \
   --served-model-name qwen3-reranker --port 8000
 ```
 
-```toml
-[tools]
-rerank_url = "http://vllm:8000/rerank"
-rerank_model = "qwen3-reranker"
-```
+Then add a reranker model in the **Models** tab with `base_url` `http://vllm:8000/rerank` (model name `qwen3-reranker`) and select it under **Models → Roles → Reranker**.
 
 For an endpoint that does *not* apply the model's template, set `rerank_instruction` instead — Turnstone then wraps each query as `<Instruct>: {instruction}` / `<Query>: {query}` (Qwen3's own default is `Given a web search query, retrieve relevant passages that answer the query`). Use the chat template **or** the instruction, not both (they double-wrap).
 

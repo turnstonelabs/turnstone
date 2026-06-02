@@ -1,9 +1,10 @@
 """Resolve a rerank client from configuration.
 
-Shared by ``ChatSession`` and the ``turnstone-admin rerank-calibrate`` CLI (and,
-later, an admin "Calibrate" endpoint) so the precedence — a Reranker model role
-(``tools.reranker_alias`` -> a model with ``supports_rerank``) over the
-``tools.rerank_url`` settings (storage -> config.toml/env) — lives in one place.
+Shared by ``ChatSession`` and the ``turnstone-admin rerank-calibrate`` CLI (and
+the admin "Calibrate" endpoint) so the resolution lives in one place: the
+reranker is the model definition (capability ``supports_rerank``) selected via
+the Reranker role (``tools.reranker_alias``). There is no global endpoint
+fallback — the reranker is a per-model definition, nothing else.
 """
 
 from __future__ import annotations
@@ -20,60 +21,46 @@ def resolve_rerank_client_from(
     *,
     timeout: float,
 ) -> RerankClient | None:
-    """Return a rerank client from settings, or ``None`` when unconfigured.
+    """Return a rerank client from the selected Reranker model, or ``None``.
 
-    A reranker model definition selected via the Reranker role
-    (``tools.reranker_alias`` -> a model with ``supports_rerank``) takes
-    precedence; otherwise the ``tools.rerank_url`` settings (explicit stored
-    value -> config.toml/env -> registry default). There is no bundled rerank
-    endpoint, so this returns ``None`` until one is configured.
+    The reranker is the model definition (capability ``supports_rerank``) picked
+    via the Reranker role (``tools.reranker_alias``) — managed like every other
+    model, its ``base_url`` the full Cohere/Jina-compatible /rerank endpoint.
+    Returns ``None`` until such a model is selected (there is no bundled rerank
+    endpoint and no global URL fallback).
     """
-    from turnstone.core.config import (
-        get_rerank_api_key,
-        get_rerank_instruction,
-        get_rerank_model,
-        get_rerank_url,
-    )
-    from turnstone.core.rerank import resolve_rerank_client
+    if config_store is None or registry is None:
+        return None
 
     cs = config_store
-    stored = cs.stored_keys() if cs is not None else frozenset()
+    alias = str(cs.get("tools.reranker_alias") or "").strip()
+    if not alias:
+        return None
+    try:
+        cfg = registry.get_config(alias)
+    except Exception:
+        cfg = None
+    if cfg is None or not cfg.base_url or not cfg.capabilities.get("supports_rerank"):
+        return None
 
-    def _setting(key: str, env_value: str) -> str:
-        if cs is not None and key in stored:  # explicit admin value wins
-            return str(cs.get(key) or "").strip()
-        if env_value:  # config.toml / env var
-            return env_value
-        if cs is not None:  # registry default, surfaced by the store
-            return str(cs.get(key) or "").strip()
-        return ""
+    from turnstone.core.config import get_rerank_instruction
+    from turnstone.core.rerank import resolve_rerank_client
 
-    # The query instruction is global — it applies to whichever endpoint resolves.
-    instruction = _setting("tools.rerank_instruction", get_rerank_instruction())
-
-    # A reranker model definition (capability ``supports_rerank``), picked via
-    # the Reranker role, wins — managed like every other model; its base_url is
-    # the full Cohere/Jina-compatible rerank endpoint.
-    if cs is not None and registry is not None:
-        alias = str(cs.get("tools.reranker_alias") or "").strip()
-        if alias:
-            try:
-                cfg = registry.get_config(alias)
-            except Exception:
-                cfg = None
-            if cfg is not None and cfg.base_url and cfg.capabilities.get("supports_rerank"):
-                return resolve_rerank_client(
-                    url=cfg.base_url,
-                    model=cfg.model or "",
-                    api_key=cfg.api_key,
-                    timeout=timeout,
-                    instruction=instruction,
-                )
+    # The query instruction is a global task knob (instruction-aware rerankers
+    # like Qwen3); it applies to whichever reranker model is active. Explicit
+    # stored value wins, then config.toml/env, then the registry default.
+    stored = cs.stored_keys()
+    if "tools.rerank_instruction" in stored:
+        instruction = str(cs.get("tools.rerank_instruction") or "").strip()
+    else:
+        instruction = (
+            get_rerank_instruction() or str(cs.get("tools.rerank_instruction") or "").strip()
+        )
 
     return resolve_rerank_client(
-        url=_setting("tools.rerank_url", get_rerank_url()),
-        model=_setting("tools.rerank_model", get_rerank_model()),
-        api_key=_setting("tools.rerank_api_key", get_rerank_api_key()),
+        url=cfg.base_url,
+        model=cfg.model or "",
+        api_key=cfg.api_key,
         timeout=timeout,
         instruction=instruction,
     )

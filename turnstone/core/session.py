@@ -1312,11 +1312,11 @@ class ChatSession:
     def _resolve_rerank_client(self) -> RerankClient | None:
         """Return a rerank client, or None when reranking is unconfigured.
 
-        Precedence: a reranker **model definition** selected via the Reranker
-        role (``tools.reranker_alias`` → a model with ``supports_rerank``) wins;
-        otherwise the ``tools.rerank_url`` settings (storage → config.toml/env).
-        There is no bundled rerank endpoint, so reranking stays disabled until
-        one is configured.
+        The reranker is a **model definition** (capability ``supports_rerank``)
+        selected via the Reranker role (``tools.reranker_alias``); its base_url
+        is the full /rerank endpoint. There is no bundled rerank endpoint and no
+        global URL fallback, so reranking stays disabled until such a model is
+        selected.
         """
         from turnstone.core.rerank_config import resolve_rerank_client_from
 
