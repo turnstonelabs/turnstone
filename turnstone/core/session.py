@@ -3789,11 +3789,14 @@ class ChatSession:
 
         # A fresh session composed its system prefix at __init__ with an empty
         # history, so memory selection fell back to recency (no query, no rerank).
-        # Now that the first real user message exists, recompose so the opening
-        # turn gets a query-relevant memory set. The flag flips True once composed
-        # against real context, so this fires once and the prefix stays cache-
-        # stable after -- per-turn refresh is the larger redesign on another branch.
-        if not self._system_composed_with_context:
+        # Recompose once the first real user message exists so the opening turn
+        # gets a query-relevant memory set. Gate on a non-empty query (not just
+        # the flag) so synthetic wake sends -- which carry no user content and
+        # leave the flag False -- don't re-pay the compose every wake; the flag
+        # flips True inside the recompose, so this fires once and the prefix
+        # stays cache-stable after. Per-turn refresh is the larger redesign on
+        # another branch.
+        if not self._system_composed_with_context and extract_recent_context(self.messages).strip():
             self._init_system_messages()
 
         try:

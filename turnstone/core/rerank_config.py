@@ -1,10 +1,11 @@
-"""Resolve a rerank client from configuration.
+"""Resolve the runtime rerank client from configuration.
 
-Shared by ``ChatSession`` and the ``turnstone-admin rerank-calibrate`` CLI (and
-the admin "Calibrate" endpoint) so the resolution lives in one place: the
-reranker is the model definition (capability ``supports_rerank``) selected via
-the Reranker role (``tools.reranker_alias``). There is no global endpoint
-fallback — the reranker is a per-model definition, nothing else.
+Sole caller is ``ChatSession._resolve_rerank_client``: the reranker is the model
+definition (capability ``supports_rerank``) selected via the Reranker role
+(``tools.reranker_alias``); there is no global endpoint fallback. The calibrate
+CLI (``admin.py``) and the calibrate endpoint (``_global_rerank_instruction`` in
+console/server.py) resolve the endpoint themselves via ``calibrate_model`` and
+only share the instruction precedence below, not this function.
 """
 
 from __future__ import annotations
@@ -47,15 +48,11 @@ def resolve_rerank_client_from(
     from turnstone.core.rerank import resolve_rerank_client
 
     # The query instruction is a global task knob (instruction-aware rerankers
-    # like Qwen3); it applies to whichever reranker model is active. Explicit
-    # stored value wins, then config.toml/env, then the registry default.
-    stored = cs.stored_keys()
-    if "tools.rerank_instruction" in stored:
-        instruction = str(cs.get("tools.rerank_instruction") or "").strip()
-    else:
-        instruction = (
-            get_rerank_instruction() or str(cs.get("tools.rerank_instruction") or "").strip()
-        )
+    # like Qwen3); it applies to whichever reranker model is active. Stored admin
+    # value wins, else config.toml/env -- the same precedence the calibrate CLI
+    # (admin.py) and the calibrate endpoint (_global_rerank_instruction) use, so
+    # the instruction used at calibration time matches the one used at runtime.
+    instruction = str(cs.get("tools.rerank_instruction") or "").strip() or get_rerank_instruction()
 
     return resolve_rerank_client(
         url=cfg.base_url,

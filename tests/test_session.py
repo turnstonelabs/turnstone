@@ -2785,6 +2785,26 @@ class TestMemoryCompositionDeferral:
         assert any("kubernetes" in q for q in seen_queries)
         assert session._system_composed_with_context is True
 
+    def test_whitespace_send_does_not_recompose(self, tmp_db):
+        """A whitespace-only / wake send carries no query, so the deferred
+        recompose must NOT fire -- and the flag stays False so a later real
+        turn still triggers it."""
+        session = _make_session()
+        session._title_generated = True
+        init_calls = 0
+
+        def spy_init():
+            nonlocal init_calls
+            init_calls += 1
+
+        responses = [{"role": "assistant", "content": "ok"}]
+        with _send_with_mocks(
+            session, responses, lambda _tc: ([], None), _init_system_messages=spy_init
+        ):
+            session.send("   ")
+        assert init_calls == 0
+        assert session._system_composed_with_context is False
+
 
 class TestMetacognitiveBuffers:
     """Nudges drain through advisory channels, not the system message."""
