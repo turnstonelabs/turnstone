@@ -112,18 +112,11 @@
 #
 # Reranking (optional, disabled by default). Turnstone runs no reranker itself —
 # it POSTs to an external Cohere/Jina-compatible /rerank endpoint (self-hosted
-# vLLM/TEI/llama.cpp, or hosted Cohere/Jina/Voyage) to reorder web_search results
-# by query relevance. Set rerank_url to enable; leave empty to disable. (Alternatively,
-# add a reranker model in the admin Models tab and pick it under Models -> Roles
-# -> Reranker; that selection takes precedence over rerank_url.)
-# rerank_url = ""              # full endpoint URL incl. path, e.g.
-                               # "http://vllm:8000/rerank" or
-                               # "https://api.cohere.com/v2/rerank";
-                               # env: TURNSTONE_RERANK_URL
-# rerank_model = ""            # model name sent in the request; empty = the
-                               # endpoint's default; env: TURNSTONE_RERANK_MODEL
-# rerank_api_key = ""          # bearer token for hosted providers; usually empty
-                               # for self-hosted. config.toml only (never env)
+# vLLM/TEI/llama.cpp, or hosted Cohere/Jina/Voyage) to reorder results by query
+# relevance. The endpoint is a per-model definition: add a model in the admin
+# Models tab with capability {"supports_rerank": true} and base_url set to the
+# full /rerank endpoint, then pick it under Models -> Roles -> Reranker. The
+# settings below are global knobs — there is no rerank_url-style endpoint setting.
 # rerank_web_search = true     # rerank web_search results (when an endpoint is set)
 # rerank_bm25 = true           # rerank BM25 retrieval: tool search, skill search, memory
 # rerank_bm25_threshold = 0.0  # 0-1 relevance floor for proactive memory; 0 = off (reorder

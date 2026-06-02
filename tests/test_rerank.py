@@ -215,41 +215,20 @@ class _FakeConfigStore:
         return self._values.get(key)
 
 
-def _patch_getters_empty(monkeypatch):
-    for name in ("get_rerank_url", "get_rerank_model", "get_rerank_api_key"):
-        monkeypatch.setattr(f"turnstone.core.config.{name}", lambda: "")
-
-
 class TestSessionRerankWiring:
-    def test_disabled_by_default_when_no_endpoint(self, monkeypatch):
-        _patch_getters_empty(monkeypatch)
-        stub = SimpleNamespace(_config_store=None, tool_timeout=30)
+    def test_disabled_when_no_config_store(self):
+        stub = SimpleNamespace(_config_store=None, _registry=None, tool_timeout=30)
         assert ChatSession._resolve_rerank_client(stub) is None
 
-    def test_resolves_client_from_config_store(self, monkeypatch):
-        _patch_getters_empty(monkeypatch)
-        cs = _FakeConfigStore(
-            {
-                "tools.rerank_url": "http://h/rerank",
-                "tools.rerank_model": "m",
-                "tools.rerank_api_key": "k",
-            }
+    def test_disabled_when_no_reranker_alias(self):
+        # No Reranker role selected -> reranking off. There is no global endpoint
+        # fallback: the reranker is purely a per-model definition.
+        cs = _FakeConfigStore({"tools.reranker_alias": ""})
+        stub = SimpleNamespace(
+            _config_store=cs,
+            tool_timeout=30,
+            _registry=SimpleNamespace(get_config=lambda a: None),
         )
-        stub = SimpleNamespace(_config_store=cs, tool_timeout=15)
-        client = ChatSession._resolve_rerank_client(stub)
-        assert isinstance(client, CohereJinaRerankClient)
-        assert client._url == "http://h/rerank"
-        assert client._model == "m"
-        assert client._api_key == "k"
-
-    def test_explicit_empty_url_stays_disabled(self, monkeypatch):
-        # An admin who clears the URL (explicit "") must NOT fall back to a
-        # config.toml/env value — explicit-empty means "off".
-        monkeypatch.setattr("turnstone.core.config.get_rerank_url", lambda: "http://env/rerank")
-        monkeypatch.setattr("turnstone.core.config.get_rerank_model", lambda: "")
-        monkeypatch.setattr("turnstone.core.config.get_rerank_api_key", lambda: "")
-        cs = _FakeConfigStore({"tools.rerank_url": ""}, stored={"tools.rerank_url"})
-        stub = SimpleNamespace(_config_store=cs, tool_timeout=30)
         assert ChatSession._resolve_rerank_client(stub) is None
 
     def test_enabled_for_defaults_true_without_store(self):
@@ -261,10 +240,9 @@ class TestSessionRerankWiring:
         stub = SimpleNamespace(_config_store=cs)
         assert ChatSession._rerank_enabled_for(stub, "web_search") is False
 
-    def test_prefers_reranker_model_definition(self, monkeypatch):
-        # A model definition with supports_rerank, selected via the Reranker
-        # role, wins over the raw tools.rerank_url settings.
-        _patch_getters_empty(monkeypatch)
+    def test_resolves_reranker_model_definition(self):
+        # The reranker is a model definition (supports_rerank) selected via the
+        # Reranker role; its base_url is the full /rerank endpoint.
         from turnstone.core.model_registry import ModelConfig
 
         cfg = ModelConfig(
@@ -286,10 +264,9 @@ class TestSessionRerankWiring:
         assert client._model == "bge"
         assert client._api_key == "k"
 
-    def test_ignores_alias_without_rerank_capability(self, monkeypatch):
+    def test_ignores_alias_without_rerank_capability(self):
         # A non-reranker model (no supports_rerank) must NOT be used as a reranker,
-        # even if the alias is set — guards against a stale/wrong alias misrouting.
-        _patch_getters_empty(monkeypatch)
+        # even if the alias is set -> reranking off (no fallback).
         from turnstone.core.model_registry import ModelConfig
 
         cfg = ModelConfig(
@@ -301,7 +278,7 @@ class TestSessionRerankWiring:
             tool_timeout=30,
             _registry=SimpleNamespace(get_config=lambda a: cfg),
         )
-        assert ChatSession._resolve_rerank_client(stub) is None  # falls through, no rerank_url
+        assert ChatSession._resolve_rerank_client(stub) is None
 
 
 # ---------------------------------------------------------------------------
