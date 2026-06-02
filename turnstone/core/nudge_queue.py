@@ -57,8 +57,8 @@ class _Entry(NamedTuple):
     # Producer-supplied optional fields that ride alongside ``text`` when
     # drained — used by ``watch_triggered`` to carry ``watch_name`` /
     # ``command`` / ``poll_count`` / ``max_polls`` / ``is_final`` into the
-    # rendered reminder dict so the frontend can render a structured
-    # ``.msg.watch-result`` card instead of a plain advisory bubble.
+    # rendered reminder dict; they ride as sibling keys on the
+    # ``watch_triggered`` system turn, surfaced in the operator bubble.
     # Other producers leave it ``None`` and consumers see only
     # ``{type, text}``.  Atomicity guarantee: text + metadata land on the
     # same enqueue call, so a concurrent drain can't observe text without

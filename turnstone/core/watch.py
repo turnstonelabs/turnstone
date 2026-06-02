@@ -328,8 +328,8 @@ class WatchRunner:
         The fn signature is ``(reminder, watch_id)``.  ``reminder`` is
         the structured dict returned by :func:`build_watch_reminder` —
         ``text`` carries the formatted body, the remaining fields ride
-        as queue-entry metadata so the frontend can render a
-        ``.msg.watch-result`` card.  ``watch_id`` is passed for
+        as queue-entry metadata → sibling keys on the ``watch_triggered``
+        system turn, surfaced in the operator bubble.  ``watch_id`` is passed for
         closures that need per-watch metadata in their queue plumbing
         (e.g. correlating a fire back to the originating row in logs);
         do NOT use it to gate delivery against

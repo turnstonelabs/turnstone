@@ -190,3 +190,65 @@ class TestFoldSystemTurns:
         assert any(f"<system-reminder_{nonce}>" in p["text"] for p in text_parts)
         # Original list/text part untouched.
         assert msgs[0]["content"][0]["text"] == "look"
+
+
+class TestEmptyUserTurnDrop:
+    """Empty-content user turns are dropped at the wire boundary (known #3)."""
+
+    def test_drop_empty_user_turns_unit(self) -> None:
+        s = make_session()
+        msgs = [
+            {"role": "user", "content": "real"},
+            {"role": "user", "content": "", "_source": "system_nudge"},
+            {"role": "user", "content": "   "},  # whitespace-only
+            {"role": "assistant", "content": "ok"},
+            {"role": "user", "content": []},  # empty list
+            {"role": "user", "content": [{"type": "text", "text": "look"}]},  # kept
+        ]
+        out = s._drop_empty_user_turns(msgs)
+        user_contents = [m["content"] for m in out if m["role"] == "user"]
+        assert "real" in user_contents
+        assert [{"type": "text", "text": "look"}] in user_contents
+        assert "" not in user_contents
+        assert "   " not in user_contents
+        assert [] not in user_contents
+        # Non-user turns untouched.
+        assert any(m["role"] == "assistant" for m in out)
+
+    def test_identity_preserving_when_no_empty(self) -> None:
+        s = make_session()
+        msgs = [{"role": "user", "content": "hi"}, {"role": "assistant", "content": "yo"}]
+        assert s._drop_empty_user_turns(msgs) is msgs
+
+    def test_native_empty_wake_user_turn_dropped(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # Native path: the synthetic empty wake user turn stays empty (the nudge
+        # is delivered inline, not folded into it), so it must be dropped — an
+        # empty user message is invalid on the wire.
+        s = make_session()
+        native = ModelCapabilities(supports_mid_conversation_system=True)
+        monkeypatch.setattr(s, "_get_capabilities", lambda *a, **k: native)
+        msgs = [
+            {"role": "assistant", "content": "ok"},
+            {"role": "user", "content": "", "_source": "system_nudge"},
+            {"role": "system", "_source": "idle_children", "content": "child done"},
+        ]
+        out = s._prepare_wire_messages(msgs)
+        assert not any(m.get("role") == "user" and m.get("content") == "" for m in out)
+        # The nudge survives inline as a real system turn.
+        assert any(m.get("role") == "system" and m.get("_source") == "idle_children" for m in out)
+
+    def test_fold_path_wake_turn_survives(self) -> None:
+        # Fold path: the nudge folds INTO the empty wake user turn, filling it,
+        # so it is NOT dropped (the drop runs after the fold).
+        s = make_session()  # default test model → fold path
+        nonce = s._envelope_nonce
+        msgs = [
+            {"role": "assistant", "content": "ok"},
+            {"role": "user", "content": "", "_source": "system_nudge"},
+            {"role": "system", "_source": "idle_children", "content": "child done"},
+        ]
+        out = s._prepare_wire_messages(msgs)
+        user_turns = [m for m in out if m.get("role") == "user"]
+        assert len(user_turns) == 1
+        assert f"<system-reminder_{nonce}>" in user_turns[0]["content"]
+        assert "child done" in user_turns[0]["content"]

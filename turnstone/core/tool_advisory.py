@@ -64,6 +64,39 @@ def parse_priority(text: str) -> tuple[str, str]:
     return text, PRIORITY_NOTICE
 
 
+# User-interjection framing.  A queued user message that drains mid-turn becomes
+# a ``user_interjection`` system turn; this preamble keeps it framed as the
+# *user's* words, not an operator directive.  That matters most on the native
+# mid-conversation-system path, where the turn enters as a real ``role=system``
+# message: without the "the user sent…" framing the user's text would inherit
+# system/operator authority (an authority inversion).  The priority controls
+# urgency wording; the body marker separates the framing from the verbatim body.
+_USER_INTERJECTION_NOTICE_PREAMBLE: Final = (
+    "The user sent additional context while you were working. "
+    "Incorporate if relevant, otherwise continue."
+)
+_USER_INTERJECTION_IMPORTANT_PREAMBLE: Final = (
+    "The user sent a message while you were working. You MUST address this before continuing."
+)
+_USER_INTERJECTION_BODY_MARKER: Final = "\n\nUser message: "
+
+
+def render_user_interjection(message: str, priority: str) -> str:
+    """Frame a queued user *message* as user-authored operator context.
+
+    Returns ``"{preamble}\\n\\nUser message: {message}"`` — the preamble varies
+    by *priority* (``important`` → must-address; otherwise → incorporate-if-
+    relevant).  Used by ``ChatSession._collect_advisories`` when turning a
+    drained queued message into a ``user_interjection`` system turn.
+    """
+    preamble = (
+        _USER_INTERJECTION_IMPORTANT_PREAMBLE
+        if priority == PRIORITY_IMPORTANT
+        else _USER_INTERJECTION_NOTICE_PREAMBLE
+    )
+    return f"{preamble}{_USER_INTERJECTION_BODY_MARKER}{message}"
+
+
 # -- First-class system turns -------------------------------------------------
 # Operator-context (output-guard findings, user interjections, metacognitive
 # nudges) lives in the conversation trajectory as real
