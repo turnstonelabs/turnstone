@@ -6,9 +6,12 @@ Covers the two server paths added in Phase 3:
   reranker, persists the three calibration fields onto its capabilities, and
   returns a verdict; a calibration failure is graceful (no 500, nothing
   persisted).
-- ``POST /api/admin/model-definitions/detect`` with ``supports_rerank`` — merges
-  the calibration fields into the returned capabilities so the client
-  autopopulates them; a non-rerank detect takes no calibration path.
+- ``POST /api/admin/model-definitions/detect`` with ``supports_rerank`` —
+  calibrates the /rerank endpoint *directly* (a reranker's base_url is its full
+  /rerank path, which the ``/v1/models`` probe can't reach), so the probe is
+  skipped and the calibration round-trip IS the reachability check: success
+  autopopulates the three fields, failure reports ``reachable: False``. A
+  non-rerank detect still probes ``/v1/models`` and takes no calibration path.
 
 ``calibrate_model`` is monkeypatched (it needs a live /rerank endpoint).
 Mirrors the TestClient wiring in test_admin_model_registry_refresh.py.
@@ -238,12 +241,15 @@ def _stub_probe(monkeypatch: pytest.MonkeyPatch, result: dict[str, Any]) -> None
     )
 
 
-def test_detect_autopopulates_calibration_for_reranker(
+def test_detect_reranker_calibrates_directly_skipping_probe(
     storage: SQLiteBackend, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    _stub_probe(
-        monkeypatch,
-        {"reachable": True, "available_models": ["bge-reranker"], "error": None},
+    """A reranker detect must NOT touch /v1/models (its base_url is the full
+    /rerank path) — it calibrates directly and autopopulates the three fields."""
+    probe_called: list[Any] = []
+    monkeypatch.setattr(
+        "turnstone.core.model_registry.probe_model_endpoint",
+        lambda *a, **kw: probe_called.append(a) or {"reachable": True},
     )
     _stub_calibrate(monkeypatch, _result(separated=True, threshold=0.33))
     client = _make_client(storage, None)
@@ -258,19 +264,48 @@ def test_detect_autopopulates_calibration_for_reranker(
         },
     )
     assert resp.status_code == 200, resp.text
-    caps = resp.json().get("capabilities", {})
+    assert probe_called == []  # /v1/models never probed for a reranker
+    body = resp.json()
+    assert body["reachable"] is True
+    assert body["available_models"] == []
+    caps = body.get("capabilities", {})
+    assert caps["supports_rerank"] is True
     assert caps["rerank_threshold"] == 0.33
     assert caps["rerank_scale"] == "logit (sigmoid-normalised)"
     assert caps["rerank_separated"] is True
 
 
-def test_detect_reranker_calibration_failure_is_noted(
+def test_detect_reranker_no_separation_notes_but_reachable(
     storage: SQLiteBackend, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    _stub_probe(
-        monkeypatch,
-        {"reachable": True, "available_models": ["bge-reranker"], "error": None},
+    """Reachable reranker with no clean split: fields still populate (scale
+    marker + separated=False, threshold 0) and a note warns; still reachable."""
+    _stub_calibrate(monkeypatch, _result(separated=False, threshold=None))
+    client = _make_client(storage, None)
+
+    resp = client.post(
+        "/v1/api/admin/model-definitions/detect",
+        json={
+            "provider": "openai-compatible",
+            "base_url": "http://localhost:9999/rerank",
+            "model": "bge-reranker",
+            "supports_rerank": True,
+        },
     )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["reachable"] is True
+    caps = body["capabilities"]
+    assert caps["rerank_separated"] is False
+    assert caps["rerank_threshold"] == 0.0
+    assert "no clean separation" in body["rerank_calibration_note"]
+
+
+def test_detect_reranker_calibration_failure_is_unreachable(
+    storage: SQLiteBackend, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Can't calibrate -> it isn't a working reranker: reachable False + error,
+    no capabilities (there is no independent /v1/models reachability signal)."""
 
     def _boom(base_url, model, api_key, *, instruction="", timeout=60.0):
         raise RuntimeError("not a reranker")
@@ -289,8 +324,35 @@ def test_detect_reranker_calibration_failure_is_noted(
     )
     assert resp.status_code == 200, resp.text
     body = resp.json()
-    assert not body.get("capabilities")  # fields omitted on failure
-    assert "not a reranker" in body["rerank_calibration_note"]
+    assert body["reachable"] is False
+    assert not body.get("capabilities")
+    assert "not a reranker" in body["error"]
+
+
+def test_detect_reranker_requires_base_url(
+    storage: SQLiteBackend, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A reranker has no provider-default URL — an empty base_url is a clear 400
+    (not a probe against some default host) and never attempts calibration."""
+    called: list[Any] = []
+    monkeypatch.setattr(
+        "turnstone.core.rerank_calibrate.calibrate_model",
+        lambda *a, **kw: called.append(a) or _result(separated=True, threshold=0.5),
+    )
+    client = _make_client(storage, None)
+
+    resp = client.post(
+        "/v1/api/admin/model-definitions/detect",
+        json={
+            "provider": "openai-compatible",
+            "base_url": "",
+            "model": "bge-reranker",
+            "supports_rerank": True,
+        },
+    )
+    assert resp.status_code == 400, resp.text
+    assert "/rerank" in resp.json()["error"]
+    assert called == []  # never attempted calibration with an empty url
 
 
 def test_detect_non_reranker_skips_calibration(

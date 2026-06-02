@@ -10943,6 +10943,64 @@ async def admin_detect_model(request: Request) -> JSONResponse:
             if not base_url:
                 base_url = row.get("base_url", "")
 
+    # Reranker endpoints speak the Cohere/Jina ``POST <url>`` protocol, not
+    # ``/v1/models`` — their base_url is the full rerank path, which the OpenAI
+    # probe below can't reach (that mismatch is why adding a reranker failed:
+    # ``$host/v1`` made the probe pass but calibration POST to the wrong path,
+    # ``$host/rerank`` made the probe fail outright). Calibrate directly instead
+    # and let that round-trip be the reachability check; the three calibration
+    # fields then autopopulate the way context_window does for a chat model.
+    if bool(body.get("supports_rerank")):
+        if not base_url:
+            return JSONResponse(
+                {
+                    "reachable": False,
+                    "error": "A reranker's base_url must be its full /rerank "
+                    "endpoint (e.g. http://host:8000/rerank).",
+                },
+                status_code=400,
+            )
+        from turnstone.core.rerank_calibrate import calibration_caps_fields
+
+        loop = asyncio.get_running_loop()
+        instruction = _global_rerank_instruction(request.app.state)
+        try:
+            async with asyncio.timeout(90):
+                cal, cal_err = await loop.run_in_executor(
+                    None, _run_rerank_calibration, base_url, model, api_key, instruction
+                )
+        except TimeoutError:
+            cal, cal_err = None, "calibration timed out"
+        if cal is None:
+            # Can't calibrate it -> it isn't a working reranker endpoint. There
+            # is no independent /v1/models reachability signal to fall back on.
+            return JSONResponse(
+                {
+                    "reachable": False,
+                    "model_found": None,
+                    "available_models": [],
+                    "context_window": None,
+                    "server_type": None,
+                    "error": cal_err,
+                }
+            )
+        payload: dict[str, Any] = {
+            "reachable": True,
+            "model_found": None,
+            "available_models": [],
+            "context_window": None,
+            "server_type": None,
+            "error": None,
+            "capabilities": {"supports_rerank": True, **calibration_caps_fields(cal)},
+        }
+        if not cal.separated:
+            payload["rerank_calibration_note"] = (
+                "Calibrated, but no clean separation between relevant and "
+                "irrelevant probes — check the model name and that this endpoint "
+                "is a real reranker."
+            )
+        return JSONResponse(payload)
+
     # Apply provider default URL if still empty
     if not base_url:
         base_url = _PROVIDER_DEFAULT_URLS.get(provider, "")
@@ -10964,33 +11022,6 @@ async def admin_detect_model(request: Request) -> JSONResponse:
     result = await loop.run_in_executor(
         None, probe_model_endpoint, provider, base_url, api_key, model
     )
-
-    # Calibrate-on-detect: when the target is a reranker (the UI flags it from
-    # the capabilities being edited), ALSO probe the /rerank endpoint with the
-    # labelled set and merge the calibration fields so the client autopopulates
-    # them like context_window. Best-effort — a failure adds a non-fatal note
-    # and omits the fields ("not calibrated"); non-rerank detect is untouched
-    # (no extra round-trip, no slowdown).
-    if bool(body.get("supports_rerank")) and result.get("reachable") and base_url:
-        from turnstone.core.rerank_calibrate import calibration_caps_fields
-
-        instruction = _global_rerank_instruction(request.app.state)
-        try:
-            async with asyncio.timeout(90):
-                cal, cal_err = await loop.run_in_executor(
-                    None, _run_rerank_calibration, base_url, model, api_key, instruction
-                )
-        except TimeoutError:
-            cal, cal_err = None, "calibration timed out"
-        if cal is not None:
-            caps_out = result.get("capabilities")
-            if not isinstance(caps_out, dict):
-                caps_out = {}
-            caps_out.update(calibration_caps_fields(cal))
-            result["capabilities"] = caps_out
-        else:
-            result["rerank_calibration_note"] = f"Reranker not calibrated: {cal_err}"
-
     return JSONResponse(result)
 
 
