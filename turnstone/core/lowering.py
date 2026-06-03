@@ -6,9 +6,20 @@ trajectory) and the per-provider translators (which own format only — the
 *valid* for an LLM round-trip, so every translator can assume a well-formed
 input and stay a pure format mapping.
 
-Today this module owns **repair** (validity): synthesizing cancellation
-results for orphaned client tool calls.  The fold (representation) moves here
-in a later step; the two together are the "lowering" stage.
+This module owns the two provider-neutral lowering passes:
+
+* **fold** (representation) — operator-context ``system`` turns are folded into
+  the preceding turn as nonce-fenced ``<system-reminder>`` blocks for models
+  without native mid-conversation system support (native models keep them
+  inline).  See :func:`fold_system_turns`.
+* **repair** (validity) — synthesizing cancellation results for orphaned client
+  tool calls.  See :func:`repair_wire_messages`.
+
+The nonce the fold borrows stays **session-minted and session-owned**
+(``ChatSession._envelope_nonce``): it binds three consumers — the fold here, the
+cached-prefix trust declaration in the system prompt, and the output-guard
+forgery check — which must agree on the exact marker, so lowering takes it as a
+parameter and never mints its own.
 
 Orphan repair has **one detector** (:func:`_find_orphaned_tool_calls`) feeding
 **three policies**, only one of which lives here:
@@ -35,6 +46,8 @@ their own.
 from __future__ import annotations
 
 from typing import Any
+
+from turnstone.core import fence
 
 # The synthetic result body for a tool call that never produced output.  The
 # neutral turn carries ``is_error=True``; each translator renders that per its
@@ -113,3 +126,152 @@ def repair_wire_messages(
         ]
         out[insert_at:insert_at] = synthetic
     return out
+
+
+# --------------------------------------------------------------------------- #
+# Fold — operator-context representation (A); runs BEFORE repair on the wire.
+# --------------------------------------------------------------------------- #
+def fold_system_turns(
+    messages: list[dict[str, Any]],
+    *,
+    supports_mid_conversation_system: bool,
+    nonce: str,
+) -> list[dict[str, Any]]:
+    """Fold first-class operator-context system turns into the preceding turn.
+
+    First-class ``{"role": "system", "_source": ...}`` turns carry operator
+    context (advisories / nudges / interjections — see
+    ``tool_advisory.make_system_turn``).  Models WITHOUT native mid-conversation
+    system support can't take a ``system`` message mid-array, so each such turn
+    is wrapped in a nonce-delimited ``<system-reminder_{nonce}>`` fence
+    (:func:`turnstone.core.fence.wrap`) — the system prompt declares the exact
+    *nonce* as the sole trusted marker via
+    ``build_operator_instruction_declaration`` — and appended to the preceding
+    wire turn's content, then dropped from the list.
+
+    Forgery defence is two-layer: ``fence.wrap`` neutralises the operator body's
+    closing marker (break-out), and before the first fold onto a host we
+    neutralise that (untrusted) host turn's ``<system-reminder>`` markers via
+    :func:`_neutralize_host` (forge-in).  The host pass runs once per host —
+    re-running it would defang the real fences we append afterwards — so a leaked
+    or guessed nonce still cannot fabricate a trusted block.
+
+    Native models (*supports_mid_conversation_system*) keep the turns inline —
+    the Anthropic converter emits them as real ``system`` messages.  Base-prompt
+    system messages (no ``_source``) pass through.  Consecutive operator turns
+    fold onto the shared predecessor in order, so the wire never carries two
+    adjacent ``system`` messages.  An operator turn with no predecessor (should
+    not occur — they follow the turn they relate to) is kept standalone so
+    nothing is silently dropped.
+
+    Returns a transient copy; the input list/dicts are untouched.
+    """
+    if supports_mid_conversation_system:
+        return messages
+    out: list[dict[str, Any]] = []
+    host_escaped = False  # has out[-1] had its untrusted markers defanged?
+    for msg in messages:
+        if msg.get("role") == "system" and msg.get("_source"):
+            raw = msg.get("content")
+            text = raw if isinstance(raw, str) else str(raw or "")
+            wrapped = fence.wrap(text, nonce, fence.SYSTEM_REMINDER_TAG)
+            if out:
+                if not host_escaped:
+                    out[-1] = _neutralize_host(out[-1])
+                    host_escaped = True
+                out[-1] = _append_text_block(out[-1], wrapped)
+            else:
+                out.append(msg)
+            continue
+        out.append(msg)
+        host_escaped = False
+    return out
+
+
+def _neutralize_host(msg: dict[str, Any]) -> dict[str, Any]:
+    """Return a copy of *msg* with operator-fence markers defanged in its text.
+
+    Defence-in-depth for the fold path: before a real ``<system-reminder_{nonce}>``
+    block is appended to this (untrusted) host turn, any literal
+    ``<system-reminder>`` marker already in its content is neutralised via
+    :func:`turnstone.core.fence.neutralize` (opening + closing) so a leaked or
+    guessed nonce cannot be used to forge a trusted block here.  Never mutates
+    *msg* — the fold holds the read-only contract.
+    """
+    copy = dict(msg)
+    content = copy.get("content")
+    if isinstance(content, str):
+        copy["content"] = fence.neutralize(content, fence.SYSTEM_REMINDER_TAG, opening=True)
+    elif isinstance(content, list):
+        copy["content"] = [
+            (
+                {
+                    **p,
+                    "text": fence.neutralize(p["text"], fence.SYSTEM_REMINDER_TAG, opening=True),
+                }
+                if isinstance(p, dict)
+                and p.get("type") == "text"
+                and isinstance(p.get("text"), str)
+                else p
+            )
+            for p in content
+        ]
+    return copy
+
+
+def _append_text_block(msg: dict[str, Any], block: str) -> dict[str, Any]:
+    """Return a copy of *msg* with *block* appended to its content as text.
+
+    String content gets a tail block; list content appends to the trailing text
+    part (or a new text part).  Never mutates *msg* — the fold holds the
+    read-only contract on the entries it threads through.
+    """
+    copy = dict(msg)
+    content = copy.get("content")
+    if isinstance(content, str):
+        copy["content"] = f"{content}\n\n{block}" if content else block
+    elif isinstance(content, list):
+        new_parts = [
+            dict(p) if isinstance(p, dict) and p.get("type") == "text" else p for p in content
+        ]
+        text_parts = [p for p in new_parts if isinstance(p, dict) and p.get("type") == "text"]
+        if text_parts:
+            text_parts[-1]["text"] = f"{text_parts[-1]['text']}\n\n{block}"
+        else:
+            new_parts.append({"type": "text", "text": block})
+        copy["content"] = new_parts
+    else:
+        copy["content"] = block
+    return copy
+
+
+def _is_empty_wire_content(content: Any) -> bool:
+    """True when *content* carries nothing the wire can send.
+
+    ``None`` / blank string / empty list count as empty; a list with any parts
+    (text, image, document) does not.
+    """
+    if content is None:
+        return True
+    if isinstance(content, str):
+        return not content.strip()
+    if isinstance(content, list):
+        return len(content) == 0
+    return False
+
+
+def drop_empty_user_turns(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Drop user turns with empty content.
+
+    Runs AFTER the fold so a fold-path wake turn (which a nudge folds into and
+    thereby fills) is kept, while a still-empty synthetic user turn — invalid on
+    every provider wire — is removed.  Identity-preserving: returns *messages*
+    unchanged when no user turn is empty, so the common path is allocation-free.
+    """
+
+    def _drop(m: dict[str, Any]) -> bool:
+        return m.get("role") == "user" and _is_empty_wire_content(m.get("content"))
+
+    if not any(_drop(m) for m in messages):
+        return messages
+    return [m for m in messages if not _drop(m)]

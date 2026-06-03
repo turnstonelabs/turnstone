@@ -52,7 +52,11 @@ from turnstone.core.history_decoration import (
     attach_vllm_chat_reasoning_field,
 )
 from turnstone.core.log import get_logger
-from turnstone.core.lowering import repair_wire_messages
+from turnstone.core.lowering import (
+    drop_empty_user_turns,
+    fold_system_turns,
+    repair_wire_messages,
+)
 from turnstone.core.memory import (
     count_structured_memories,
     delete_messages_after,
@@ -1193,7 +1197,8 @@ class ChatSession:
         # judge fence can rotate per-call but this one cannot).  Transient/
         # wire-only (not persisted): the fold re-wraps each build, so a fresh
         # nonce per session-load is fine.  64-bit + per-fold host escaping (see
-        # ``_fold_system_turns``) keep a mid-session leak from forging a block.
+        # ``lowering.fold_system_turns``) keep a mid-session leak from forging a
+        # block.  Owned here; ``lowering`` borrows it as a parameter.
         self._envelope_nonce = fence.mint_nonce()
         self._load_skills()
         # Memory selection keys off the recent-user-message query, but a fresh
@@ -2879,7 +2884,8 @@ class ChatSession:
         "_source": ...}`` turns in the conversation trajectory (output-guard
         findings, user interjections, metacognitive nudges — see
         :func:`turnstone.core.tool_advisory.make_system_turn`).  This pass
-        folds them for the wire via :meth:`_fold_system_turns`: non-native
+        folds them for the wire via
+        :func:`turnstone.core.lowering.fold_system_turns`: non-native
         models get each turn wrapped as a nonce-delimited
         ``<system-reminder>`` block on the preceding turn; native
         mid-conversation-system models (claude-opus-4-8) keep them inline
@@ -2902,154 +2908,17 @@ class ChatSession:
         tool call — this is the sole send-time orphan repair; the translators
         carry none.  Identity-preserving when nothing is orphaned.
         """
-        folded = self._fold_system_turns(messages)
-        dropped = self._drop_empty_user_turns(folded)
+        folded = messages
+        if self._provider is not None:
+            folded = fold_system_turns(
+                messages,
+                supports_mid_conversation_system=(
+                    self._get_capabilities().supports_mid_conversation_system
+                ),
+                nonce=self._envelope_nonce,
+            )
+        dropped = drop_empty_user_turns(folded)
         return repair_wire_messages(dropped)
-
-    @staticmethod
-    def _is_empty_wire_content(content: Any) -> bool:
-        """True when *content* carries nothing the wire can send.
-
-        ``None`` / blank string / empty list count as empty; a list with any
-        parts (text, image, document) does not.
-        """
-        if content is None:
-            return True
-        if isinstance(content, str):
-            return not content.strip()
-        if isinstance(content, list):
-            return len(content) == 0
-        return False
-
-    @classmethod
-    def _drop_empty_user_turns(cls, messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
-        """Drop user turns with empty content (see :meth:`_prepare_wire_messages`).
-
-        Identity-preserving: returns *messages* unchanged when no user turn is
-        empty, so the common path stays allocation-free.
-        """
-
-        def _drop(m: dict[str, Any]) -> bool:
-            return m.get("role") == "user" and cls._is_empty_wire_content(m.get("content"))
-
-        if not any(_drop(m) for m in messages):
-            return messages
-        return [m for m in messages if not _drop(m)]
-
-    def _fold_system_turns(self, messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
-        """Fold first-class operator-context system turns into the preceding turn.
-
-        First-class ``{"role": "system", "_source": ...}`` turns carry operator
-        context (advisories / nudges / interjections — see
-        ``tool_advisory.make_system_turn``).  Models WITHOUT native
-        mid-conversation system support can't take a ``system`` message
-        mid-array, so each such turn is wrapped in a nonce-delimited
-        ``<system-reminder_{nonce}>`` fence (:func:`turnstone.core.fence.wrap`)
-        — the system prompt declares the exact nonce as the sole trusted marker
-        via ``build_operator_instruction_declaration`` — and appended to the
-        preceding wire turn's content, then dropped from the list.
-
-        Forgery defence is two-layer: ``fence.wrap`` neutralises the operator
-        body's closing marker (break-out), and before the first fold onto a host
-        we neutralise that (untrusted) host turn's ``<system-reminder>`` markers
-        via :meth:`_neutralize_host` (forge-in).  The host pass runs once per
-        host — re-running it would defang the real fences we append afterwards —
-        so a leaked or guessed nonce still cannot fabricate a trusted block.
-
-        Native models (``supports_mid_conversation_system``) keep the turns
-        inline — the Anthropic converter emits them as real ``system`` messages.
-        Base-prompt system messages (no ``_source``) pass through.  Consecutive
-        operator turns fold onto the shared predecessor in order, so the wire
-        never carries two adjacent ``system`` messages.  An operator turn with no
-        predecessor (should not occur — they follow the turn they relate to) is
-        kept standalone so nothing is silently dropped.
-
-        Returns a transient copy; ``self.messages`` is untouched.
-        """
-        if self._provider is None:
-            return messages
-        if self._get_capabilities().supports_mid_conversation_system:
-            return messages
-        nonce = self._envelope_nonce
-        out: list[dict[str, Any]] = []
-        host_escaped = False  # has out[-1] had its untrusted markers defanged?
-        for msg in messages:
-            if msg.get("role") == "system" and msg.get("_source"):
-                raw = msg.get("content")
-                text = raw if isinstance(raw, str) else str(raw or "")
-                wrapped = fence.wrap(text, nonce, fence.SYSTEM_REMINDER_TAG)
-                if out:
-                    if not host_escaped:
-                        out[-1] = self._neutralize_host(out[-1])
-                        host_escaped = True
-                    out[-1] = self._append_text_block(out[-1], wrapped)
-                else:
-                    out.append(msg)
-                continue
-            out.append(msg)
-            host_escaped = False
-        return out
-
-    @staticmethod
-    def _neutralize_host(msg: dict[str, Any]) -> dict[str, Any]:
-        """Return a copy of *msg* with operator-fence markers defanged in its text.
-
-        Defence-in-depth for the fold path: before a real
-        ``<system-reminder_{nonce}>`` block is appended to this (untrusted) host
-        turn, any literal ``<system-reminder>`` marker already in its content is
-        neutralised via :func:`turnstone.core.fence.neutralize` (opening +
-        closing) so a leaked or guessed nonce cannot be used to forge a trusted
-        block here.  Never mutates *msg* — the fold pass holds the read-only
-        contract (see :meth:`_prepare_wire_messages`).
-        """
-        copy = dict(msg)
-        content = copy.get("content")
-        if isinstance(content, str):
-            copy["content"] = fence.neutralize(content, fence.SYSTEM_REMINDER_TAG, opening=True)
-        elif isinstance(content, list):
-            copy["content"] = [
-                (
-                    {
-                        **p,
-                        "text": fence.neutralize(
-                            p["text"], fence.SYSTEM_REMINDER_TAG, opening=True
-                        ),
-                    }
-                    if isinstance(p, dict)
-                    and p.get("type") == "text"
-                    and isinstance(p.get("text"), str)
-                    else p
-                )
-                for p in content
-            ]
-        return copy
-
-    @staticmethod
-    def _append_text_block(msg: dict[str, Any], block: str) -> dict[str, Any]:
-        """Return a copy of *msg* with *block* appended to its content as text.
-
-        String content gets a tail block; list content appends to the trailing
-        text part (or a new text part).  Never mutates *msg* — the fold pass
-        holds the read-only contract on the entries it threads through (see
-        :meth:`_prepare_wire_messages`).
-        """
-        copy = dict(msg)
-        content = copy.get("content")
-        if isinstance(content, str):
-            copy["content"] = f"{content}\n\n{block}" if content else block
-        elif isinstance(content, list):
-            new_parts = [
-                dict(p) if isinstance(p, dict) and p.get("type") == "text" else p for p in content
-            ]
-            text_parts = [p for p in new_parts if isinstance(p, dict) and p.get("type") == "text"]
-            if text_parts:
-                text_parts[-1]["text"] = f"{text_parts[-1]['text']}\n\n{block}"
-            else:
-                new_parts.append({"type": "text", "text": block})
-            copy["content"] = new_parts
-        else:
-            copy["content"] = block
-        return copy
 
     def _emit_state(self, state: str) -> None:
         """Notify UI of a workstream state transition.
@@ -8698,7 +8567,8 @@ class ChatSession:
         *message* is returned verbatim as the tool result.  It needs no escaping:
         it is ordinary tool output (untrusted by nature), and if a call site
         interpolates a model-controlled value that contains a ``<system-reminder>``
-        marker, the fold's host-escaping (:meth:`_neutralize_host`) defangs it.
+        marker, the fold's host-escaping
+        (:func:`turnstone.core.lowering._neutralize_host`) defangs it.
         """
         if system_reminder:
             self._queue_tool_advisory("skill_hint", system_reminder)
