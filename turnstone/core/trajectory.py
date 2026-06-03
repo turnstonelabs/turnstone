@@ -9,15 +9,17 @@ canonical would break cross-provider resume.
 
 Field set and rationale: ``docs/design/canonical-trajectory-ideal-target.md`` §2.
 
-NOTE: ``AttachmentRef`` references a content-addressed blob in ``workstream_attachments``
-(the by-reference attachment model).  Wiring attachment content through ``Turn`` lands
-with that storage cut; until then the model is defined here but the dict↔Turn adapters
-cover text / tool_calls / native / tool turns.
+NOTE: non-text content rides as ``AttachmentRef`` — a reference to a content-addressed
+blob in ``workstream_attachments``.  ``Turn``s never carry bytes; each output boundary
+(the provider wire, the ``/history`` display, export) materializes the reference to an
+inline part by point-lookup against the blob store.  ``RawContentBlock`` is the transient
+carrier for an already-resolved inline part as it rides the dict↔Turn bridge — never a
+persisted or canonical form.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from enum import StrEnum
 from typing import Any
 
@@ -55,15 +57,15 @@ class AttachmentRef:
 
 @dataclass(slots=True)
 class RawContentBlock:
-    """Transitional carrier for a verbatim wire content-part dict (``image_url`` /
-    ``document``).
+    """Transient carrier for an already-resolved wire content-part dict (``image_url``
+    / ``document``).
 
-    The by-reference model (§2/§6) is :class:`AttachmentRef` — id + kind, with the
-    translator resolving bytes at wire time.  Until that wiring lands (it relocates
-    byte-resolution out of ``reconstruct``'s inline data-URL path), the dict↔Turn
-    adapters carry an attachment part *verbatim* here so multipart turns round-trip
-    byte-identically.  Contributes nothing to :attr:`Turn.text` (you cannot
-    full-text-search an image).  Removed when :class:`AttachmentRef` is wired through.
+    The canonical non-text content form is :class:`AttachmentRef` (by reference);
+    at an output boundary the reference is materialized to an inline part, and that
+    inline part rides the dict↔Turn bridge here so multipart turns round-trip
+    byte-identically.  Never persisted, never in ``session.messages`` — only
+    transiently between :func:`resolve_attachment_refs` and the translator.
+    Contributes nothing to :attr:`Turn.text` (you cannot full-text-search an image).
     """
 
     part: dict[str, Any]
@@ -188,9 +190,19 @@ def _content_from_raw(raw: Any) -> tuple[ContentBlock, ...]:
     if isinstance(raw, list):
         blocks: list[ContentBlock] = []
         for part in raw:
-            if isinstance(part, dict) and part.get("type") == "text":
+            if not isinstance(part, dict):
+                blocks.append(RawContentBlock(part))
+            elif part.get("type") == "text":
                 blocks.append(TextBlock(part.get("text", "")))
+            elif part.get("attachment_id"):
+                # The by-reference placeholder ``{type: kind, attachment_id}`` —
+                # the canonical form for non-text content (bytes resolve at send).
+                blocks.append(
+                    AttachmentRef(attachment_id=part["attachment_id"], kind=part.get("type", ""))
+                )
             else:
+                # A resolved inline part (image_url / document, carrying bytes) —
+                # transient wire-prep form that rides the dict↔Turn bridge.
                 blocks.append(RawContentBlock(part))
         return tuple(blocks)
     return (RawContentBlock(raw),)  # defensive — unexpected scalar
@@ -215,7 +227,7 @@ def _content_to_raw(content: tuple[ContentBlock, ...]) -> str | list[dict[str, A
             parts.append({"type": "text", "text": b.text})
         elif isinstance(b, RawContentBlock):
             parts.append(b.part)
-        elif isinstance(b, AttachmentRef):  # not produced pre-by-ref-wiring; defensive
+        elif isinstance(b, AttachmentRef):  # by-reference placeholder (unresolved)
             parts.append({"type": b.kind, "attachment_id": b.attachment_id})
     return parts
 
@@ -294,3 +306,33 @@ def turns_from_dicts(msgs: list[dict[str, Any]]) -> list[Turn]:
 
 def dicts_from_turns(turns: list[Turn]) -> list[dict[str, Any]]:
     return [turn_to_dict(t) for t in turns]
+
+
+def resolve_attachment_refs(
+    turns: list[Turn], parts_by_id: dict[str, dict[str, Any]]
+) -> list[Turn]:
+    """Replace each :class:`AttachmentRef` with its resolved inline content part.
+
+    *parts_by_id* maps an ``attachment_id`` to the wire content part (image_url /
+    document) built from the content-addressed blob — the bytes a translator
+    needs.  This is the send-time materialization of the by-reference content
+    lane; a ref whose blob is missing (pruned) is dropped, so the wire never
+    carries an unresolved reference.  Identity-preserving for turns that hold no
+    ``AttachmentRef``; never mutates the input turns.
+    """
+    out: list[Turn] = []
+    for t in turns:
+        if not any(isinstance(b, AttachmentRef) for b in t.content):
+            out.append(t)
+            continue
+        new_content: list[ContentBlock] = []
+        for b in t.content:
+            if isinstance(b, AttachmentRef):
+                part = parts_by_id.get(b.attachment_id)
+                if part is not None:
+                    new_content.append(RawContentBlock(part))
+                # else: the blob is gone (pruned) — drop the ref.
+            else:
+                new_content.append(b)
+        out.append(replace(t, content=tuple(new_content)))
+    return out

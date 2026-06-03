@@ -76,7 +76,7 @@ class TestMultipartBuild:
             content=PNG_1x1,
         )
         _run_send(s, "what is this?", attachments=[att])
-        msg = turn_to_dict(s.messages[-1])
+        msg = s._lower_messages_to_wire(s.messages)[-1]
         assert msg["role"] == "user"
         assert isinstance(msg["content"], list)
         assert msg["content"][0] == {"type": "text", "text": "what is this?"}
@@ -94,7 +94,7 @@ class TestMultipartBuild:
             content=b"# hi\n",
         )
         _run_send(s, "summarize", attachments=[att])
-        msg = turn_to_dict(s.messages[-1])
+        msg = s._lower_messages_to_wire(s.messages)[-1]
         doc = msg["content"][1]
         assert doc == {
             "type": "document",
@@ -113,7 +113,7 @@ class TestMultipartBuild:
             Attachment("a3", "second.md", "text/markdown", "text", b"B"),
         ]
         _run_send(s, "look", attachments=atts)
-        msg = turn_to_dict(s.messages[-1])
+        msg = s._lower_messages_to_wire(s.messages)[-1]
         types = [p["type"] for p in msg["content"]]
         assert types == ["text", "image_url", "document", "document"]
         docs = [p for p in msg["content"] if p["type"] == "document"]
@@ -124,7 +124,7 @@ class TestMultipartBuild:
         s = _make_session(mock_openai_client)
         att = Attachment("a1", "bad.bin", "text/plain", "text", b"\xff\xfe")
         _run_send(s, "read this", attachments=[att])
-        parts = turn_to_dict(s.messages[-1])["content"]
+        parts = s._lower_messages_to_wire(s.messages)[-1]["content"]
         assert any(
             p.get("type") == "text" and p.get("text") == "[unreadable attachment: bad.bin]"
             for p in parts
@@ -227,7 +227,9 @@ class TestProviderIntegration:
         ]
         _run_send(s, "look at both", attachments=atts)
 
-        _, converted = AnthropicProvider()._convert_messages(dicts_from_turns([s.messages[-1]]))
+        _, converted = AnthropicProvider()._convert_messages(
+            s._lower_messages_to_wire([s.messages[-1]])
+        )
         assert len(converted) == 1
         content = converted[0]["content"]
         types = [p["type"] for p in content]
@@ -279,7 +281,7 @@ class TestProviderIntegration:
         ]
         _run_send(s, "review", attachments=atts)
 
-        out = sanitize_messages(dicts_from_turns([s.messages[-1]]))
+        out = sanitize_messages(s._lower_messages_to_wire([s.messages[-1]]))
         parts = out[0]["content"]
         types = [p["type"] for p in parts]
         assert types == ["text", "text"]
@@ -333,13 +335,18 @@ class TestTokenAccounting:
     def test_text_doc_adds_text_char_budget(self, tmp_db, mock_openai_client):
         baseline = _make_session(mock_openai_client)
         _run_send(baseline, "hi")
-        plain_tokens = baseline._msg_tokens[-1]
+        plain_chars = baseline._msg_char_count(
+            baseline._lower_messages_to_wire(baseline.messages)[-1]
+        )
 
         big = "x" * 4000
         with_doc = _make_session(mock_openai_client)
         att = Attachment("a1", "big.md", "text/markdown", "text", big.encode())
         _run_send(with_doc, "hi", attachments=[att])
-        doc_tokens = with_doc._msg_tokens[-1]
+        doc_chars = with_doc._msg_char_count(
+            with_doc._lower_messages_to_wire(with_doc.messages)[-1]
+        )
 
-        # ~4000 chars / 4 chars_per_token ≈ ~1000 tokens added
-        assert doc_tokens - plain_tokens >= 900
+        # The ~4000-char doc lands at the resolved boundary (the per-turn
+        # placeholder no longer carries the bytes), well above the budget floor.
+        assert doc_chars - plain_chars >= 900

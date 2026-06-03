@@ -47,6 +47,15 @@ _ROUNDTRIP: list[dict[str, Any]] = [
             {"type": "text", "text": "[unreadable attachment: bad.bin]"},
         ],
     },
+    {
+        # By-reference attachments: the canonical content form (id, never bytes).
+        "role": "user",
+        "content": [
+            {"type": "text", "text": "what's this?"},
+            {"type": "image", "attachment_id": "sha256:abc"},
+            {"type": "document", "attachment_id": "sha256:def"},
+        ],
+    },
     {"role": "assistant", "content": "hi there"},
     {"role": "assistant", "content": ""},  # empty assistant (no text, no tools)
     {
@@ -179,7 +188,44 @@ def test_empty_content_roundtrips_to_empty_string() -> None:
     assert turn_to_dict(Turn(Role.ASSISTANT)) == {"role": "assistant", "content": ""}
 
 
-def test_attachment_ref_emits_defensive_part() -> None:
-    # AttachmentRef isn't produced pre-by-ref-wiring, but the emit path is defined.
+def test_attachment_ref_is_the_canonical_non_text_form() -> None:
+    # By-reference placeholders ``{type: image|document, attachment_id}`` are the
+    # canonical content; a real inline ``image_url`` (no id) stays a RawContentBlock.
+    t = turn_from_dict(
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "q"},
+                {"type": "image", "attachment_id": "sha256:abc"},
+                {"type": "document", "attachment_id": "sha256:def"},
+                {"type": "image_url", "image_url": {"url": "data:..."}},
+            ],
+        }
+    )
+    assert isinstance(t.content[1], AttachmentRef) and t.content[1].attachment_id == "sha256:abc"
+    assert isinstance(t.content[2], AttachmentRef) and t.content[2].kind == "document"
+    assert isinstance(t.content[3], RawContentBlock)  # resolved inline part, no id
+
+
+def test_attachment_ref_emits_placeholder() -> None:
     t = Turn(Role.USER, (AttachmentRef(attachment_id="abc", kind="image"),))
     assert turn_to_dict(t)["content"] == [{"type": "image", "attachment_id": "abc"}]
+
+
+def test_resolve_attachment_refs_materializes_and_drops_missing() -> None:
+    from turnstone.core.trajectory import resolve_attachment_refs
+
+    turns = [
+        Turn(
+            Role.USER,
+            (
+                TextBlock("look"),
+                AttachmentRef(attachment_id="a1", kind="image"),
+                AttachmentRef(attachment_id="gone", kind="image"),
+            ),
+        )
+    ]
+    part = {"type": "image_url", "image_url": {"url": "data:img"}}
+    out = turn_to_dict(resolve_attachment_refs(turns, {"a1": part})[0])
+    # a1 → inline part; the pruned ref is dropped; text kept.
+    assert out["content"] == [{"type": "text", "text": "look"}, part]

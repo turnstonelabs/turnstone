@@ -22,6 +22,8 @@ from turnstone.core.workstream import WorkstreamKind
 if TYPE_CHECKING:
     from collections.abc import Callable
 
+    from turnstone.core.trajectory import Turn
+
 log = get_logger(__name__)
 
 
@@ -93,6 +95,19 @@ def load_messages(ws_id: str, *, repair: bool = True) -> list[dict[str, Any]]:
         return get_storage().load_messages(ws_id, repair=repair)
     except Exception:
         log.warning("Failed to load messages for ws=%s", ws_id, exc_info=True)
+        return []
+
+
+def load_message_turns(ws_id: str) -> list[Turn]:
+    """Load a workstream's history as canonical ``Turn``s (by-reference content).
+
+    The resume path — see :meth:`StorageBackend.load_message_turns`.  Returns an
+    empty list on any storage error (a failed resume must not crash the session).
+    """
+    try:
+        return get_storage().load_message_turns(ws_id)
+    except Exception:
+        log.warning("Failed to load message turns for ws=%s", ws_id, exc_info=True)
         return []
 
 

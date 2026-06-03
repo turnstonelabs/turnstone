@@ -10,15 +10,16 @@ from typing import Any
 from turnstone.core.attachments import unreadable_placeholder
 from turnstone.core.log import get_logger
 from turnstone.core.trajectory import (
+    AttachmentRef,
     ContentBlock,
     ProviderNative,
-    RawContentBlock,
     Role,
     TextBlock,
     ToolCall,
     Turn,
     TurnMeta,
     dicts_from_turns,
+    resolve_attachment_refs,
 )
 
 log = get_logger(__name__)
@@ -131,7 +132,7 @@ def prepare_provider_data_for_save(
     )
 
 
-def _attachment_to_content_part(att: dict[str, Any]) -> dict[str, Any] | None:
+def attachment_to_content_part(att: dict[str, Any]) -> dict[str, Any] | None:
     """Convert a stored attachment row into an OpenAI-style content part.
 
     Returns ``None`` if the attachment's ``kind`` / ``content`` cannot be
@@ -206,30 +207,36 @@ def build_attachments_by_msg(
     return grouped
 
 
-def _reconstruct_attachment_parts(
+def _reconstruct_attachment_refs(
     attachments_by_msg: dict[int, list[dict[str, Any]]] | None,
     row_id: int | None,
-) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
-    """Build ``(content_parts, attachments_meta)`` for a row from its ref-list.
+) -> tuple[list[AttachmentRef], list[dict[str, Any]]]:
+    """Build ``(attachment_refs, attachments_meta)`` for a row from its ref-list.
 
     ``attachments_by_msg`` maps a conversations row id to the ordered list of
-    content-addressed attachment rows referenced by that row's
-    ``attachments`` column (resolved to include ``content`` bytes).  Returns
-    the OpenAI-style content parts (image_url / document, in ref-list order)
+    content-addressed attachment rows referenced by that row's ``attachments``
+    column.  Returns the by-reference content blocks (:class:`AttachmentRef`, in
+    ref-list order — bytes resolve at the consumer, never carried in the Turn)
     and the display-oriented ``_attachments_meta`` siblings (kind / filename /
-    mime_type) — the latter is tracked even when a part can't be reconstructed
-    so history replay keeps filenames available (e.g. image pills).  Shared by
-    the user- and tool-row reconstruction so both surfaces stay byte-identical
-    in part shape.
+    mime_type) so history replay keeps filenames available (e.g. image pills).
+    Shared by the user- and tool-row reconstruction.
     """
-    parts: list[dict[str, Any]] = []
+    refs: list[AttachmentRef] = []
     meta: list[dict[str, Any]] = []
     if not attachments_by_msg or row_id is None:
-        return parts, meta
+        return refs, meta
     for att in attachments_by_msg.get(row_id, []):
-        part = _attachment_to_content_part(att)
-        if part is not None:
-            parts.append(part)
+        # AttachmentRef.kind is the by-reference content kind ('image' |
+        # 'document'); the stored blob kind ('image' | 'text') drives the actual
+        # resolution.  'document' (not 'text') keeps the placeholder type from
+        # colliding with a real text content part on the dict round-trip.
+        ref_kind = "image" if str(att.get("kind") or "") == "image" else "document"
+        refs.append(
+            AttachmentRef(
+                attachment_id=str(att.get("attachment_id") or ""),
+                kind=ref_kind,
+            )
+        )
         meta.append(
             {
                 "kind": str(att.get("kind") or ""),
@@ -237,7 +244,7 @@ def _reconstruct_attachment_parts(
                 "mime_type": str(att.get("mime_type") or ""),
             }
         )
-    return parts, meta
+    return refs, meta
 
 
 # ---------------------------------------------------------------------------
@@ -562,18 +569,31 @@ def reconstruct_messages(
     turns = reconstruct_turns(rows, ws_id, attachments_by_msg)
     if repair:
         turns = recover_trajectory(turns)
+    # Dict consumers (display, export) want materialized content, so resolve the
+    # by-reference attachments to inline parts using the blob rows already in
+    # hand.  ``load_message_turns`` is the unresolved canonical path for resume.
+    if attachments_by_msg:
+        parts_by_id = {
+            str(att.get("attachment_id") or ""): part
+            for atts in attachments_by_msg.values()
+            for att in atts
+            if (part := attachment_to_content_part(att)) is not None
+        }
+        if parts_by_id:
+            turns = resolve_attachment_refs(turns, parts_by_id)
     return dicts_from_turns(turns)
 
 
-def _content_blocks(text: str | None, parts: list[dict[str, Any]]) -> tuple[ContentBlock, ...]:
-    """Build typed content blocks from a row's text column + attachment parts.
+def _content_blocks(text: str | None, refs: list[AttachmentRef]) -> tuple[ContentBlock, ...]:
+    """Build typed content blocks from a row's text column + attachment refs.
 
-    A row with attachment parts becomes a leading text block plus one raw part
-    per attachment (``read_file`` vision output, user uploads); a text-only row
-    is a single text block, or empty.
+    A row with attachments becomes a leading text block plus one
+    :class:`AttachmentRef` per attachment (``read_file`` vision output, user
+    uploads — bytes resolve at the consumer); a text-only row is a single text
+    block, or empty.
     """
-    if parts:
-        return (TextBlock(text or ""), *(RawContentBlock(p) for p in parts))
+    if refs:
+        return (TextBlock(text or ""), *refs)
     if text:
         return (TextBlock(text),)
     return ()
@@ -646,10 +666,10 @@ def reconstruct_turns(
         src = str(source) if source else None
 
         if role == "user":
-            parts, am = _reconstruct_attachment_parts(attachments_by_msg, row_id)
+            refs, am = _reconstruct_attachment_refs(attachments_by_msg, row_id)
             if am:
                 meta.extra["attachments_meta"] = am
-            turns.append(Turn(Role.USER, _content_blocks(content, parts), source=src, meta=meta))
+            turns.append(Turn(Role.USER, _content_blocks(content, refs), source=src, meta=meta))
         elif role == "assistant":
             turns.append(
                 Turn(
@@ -661,11 +681,11 @@ def reconstruct_turns(
                 )
             )
         elif role == "tool":
-            tparts, _tmeta = _reconstruct_attachment_parts(attachments_by_msg, row_id)
+            trefs, _tmeta = _reconstruct_attachment_refs(attachments_by_msg, row_id)
             turns.append(
                 Turn(
                     Role.TOOL,
-                    _content_blocks(content, tparts),
+                    _content_blocks(content, trefs),
                     tool_call_id=tc_id or "",
                     is_error=is_error,
                     meta=meta,

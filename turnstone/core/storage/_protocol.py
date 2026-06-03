@@ -9,6 +9,7 @@ if TYPE_CHECKING:
     from contextlib import AbstractContextManager
 
     from turnstone.core.storage._notify import NotifyStream
+    from turnstone.core.trajectory import Turn
     from turnstone.core.workstream import WorkstreamKind
 
 
@@ -212,6 +213,21 @@ class StorageBackend(Protocol):
         ``repair=False`` so the user sees the actual partial state
         instead of having the trailing turn silently stripped during
         live tool execution.
+
+        Attachments are resolved to inline content parts (the materialized
+        bytes a display/export consumer needs); :meth:`load_message_turns` is
+        the unresolved, by-reference counterpart for resume.
+        """
+        ...
+
+    def load_message_turns(self, ws_id: str) -> list[Turn]:
+        """Load a workstream's full history as canonical ``Turn``s for resume.
+
+        Unlike :meth:`load_messages` this keeps attachments *by reference*
+        (:class:`AttachmentRef`) — ``session.messages`` is the canonical Turn
+        trajectory and materializes bytes only at each output (wire / display).
+        The trailing-incomplete-tool-call strip (``recover_trajectory``) is
+        applied; mid-conversation orphans are left for the send-time repair.
         """
         ...
 

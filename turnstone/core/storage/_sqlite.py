@@ -17,6 +17,7 @@ if TYPE_CHECKING:
     from collections.abc import Iterable, Iterator, Sequence
 
     from turnstone.core.storage._notify import Notify, NotifyStream
+    from turnstone.core.trajectory import Turn
 
 from turnstone.core.log import get_logger
 from turnstone.core.storage._protocol import (
@@ -123,6 +124,12 @@ from turnstone.core.storage._utils import (
 from turnstone.core.storage._utils import prepare_provider_data_for_save, sanitize_text
 from turnstone.core.storage._utils import (
     reconstruct_messages as _reconstruct_messages,
+)
+from turnstone.core.storage._utils import (
+    reconstruct_turns as _reconstruct_turns,
+)
+from turnstone.core.storage._utils import (
+    recover_trajectory as _recover_trajectory,
 )
 from turnstone.core.storage._utils import (
     row_to_dict as _row_to_dict,
@@ -427,13 +434,16 @@ class SQLiteBackend:
                     self._fts5_available = False
             conn.commit()
 
-    def load_messages(
-        self, ws_id: str, *, limit: int | None = None, repair: bool = True
-    ) -> list[dict[str, Any]]:
-        # The trailing ``attachments`` column carries the per-row
-        # content-addressed ref-list; it is split off below to resolve blobs
-        # and is NOT part of the positional tuple ``reconstruct_messages``
-        # unpacks (id..is_error).
+    def _conversation_rows(
+        self, ws_id: str, limit: int | None
+    ) -> tuple[list[tuple[Any, ...]], dict[int, list[dict[str, Any]]] | None]:
+        """Fetch a ws's conversation rows + resolved attachment map.
+
+        Shared by :meth:`load_messages` (→ dicts, resolved for display) and
+        :meth:`load_message_turns` (→ canonical Turns for resume).  The trailing
+        ``attachments`` ref-list column is split off to resolve blobs and is NOT
+        part of the positional tuple ``reconstruct_*`` unpacks (id..is_error).
+        """
         _cols = (
             conversations.c.id,
             conversations.c.role,
@@ -467,10 +477,23 @@ class SQLiteBackend:
                 ).fetchall()
 
         attachments = self._resolve_row_attachments(rows)
-        # Strip the trailing ref-list column so the tuple shape stays exactly
-        # what ``reconstruct_messages`` expects (id..is_error).
         msg_rows = [tuple(r)[:10] for r in rows]
-        return _reconstruct_messages(msg_rows, ws_id, attachments or None, repair=repair)
+        return msg_rows, (attachments or None)
+
+    def load_messages(
+        self, ws_id: str, *, limit: int | None = None, repair: bool = True
+    ) -> list[dict[str, Any]]:
+        msg_rows, attachments = self._conversation_rows(ws_id, limit)
+        return _reconstruct_messages(msg_rows, ws_id, attachments, repair=repair)
+
+    def load_message_turns(self, ws_id: str) -> list[Turn]:
+        """Load the conversation as canonical ``Turn``s (unresolved AttachmentRef).
+
+        The resume path: ``session.messages`` holds the by-reference content;
+        bytes are materialized at each output (wire / display), never here.
+        """
+        msg_rows, attachments = self._conversation_rows(ws_id, None)
+        return _recover_trajectory(_reconstruct_turns(msg_rows, ws_id, attachments))
 
     def _resolve_row_attachments(self, rows: Sequence[Any]) -> dict[int, list[dict[str, Any]]]:
         """Build the ``reconstruct_messages`` attachment map from row ref-lists.

@@ -62,6 +62,7 @@ from turnstone.core.memory import (
     delete_messages_after,
     delete_structured_memory_by_id,
     delete_workstream,
+    get_attachments,
     get_skill_by_name,
     get_structured_memory_by_name,
     get_workstream_display_name,
@@ -70,7 +71,7 @@ from turnstone.core.memory import (
     list_structured_memories,
     list_visible_structured_memories,
     list_workstreams_with_history,
-    load_messages,
+    load_message_turns,
     load_workstream_config,
     normalize_key,
     resolve_workstream,
@@ -108,7 +109,11 @@ from turnstone.core.safety import is_command_blocked, sanitize_command
 from turnstone.core.skill_field_validation import SKILL_RUNTIME_CONFIG_FIELDS
 from turnstone.core.skill_parser import MAX_SKILL_DESCRIPTION_LEN
 from turnstone.core.storage._registry import get_storage
-from turnstone.core.storage._utils import normalize_search_terms, strip_orphan_client_tool_blocks
+from turnstone.core.storage._utils import (
+    attachment_to_content_part,
+    normalize_search_terms,
+    strip_orphan_client_tool_blocks,
+)
 from turnstone.core.tool_advisory import (
     make_system_turn,
     render_user_interjection,
@@ -124,9 +129,11 @@ from turnstone.core.tools import (
     merge_mcp_tools,
 )
 from turnstone.core.trajectory import (
+    AttachmentRef,
     Role,
     Turn,
     dicts_from_turns,
+    resolve_attachment_refs,
     turn_from_dict,
     turn_to_dict,
     turns_from_dicts,
@@ -2482,7 +2489,7 @@ class ChatSession:
         so the resumed/forked workstream behaves identically to the
         original.  Returns True on success.
         """
-        turns = turns_from_dicts(load_messages(ws_id))
+        turns = load_message_turns(ws_id)
         if not turns:
             return False
         if not fork:
@@ -2884,8 +2891,30 @@ class ChatSession:
 
         ``self.messages`` is the canonical ``Turn`` trajectory; the wire-prep and
         provider layers still consume dicts, so the Turns are lowered here (this
-        boundary moves inward when those layers migrate)."""
-        return self.system_messages + dicts_from_turns(self.messages)
+        boundary moves inward when those layers migrate).  By-reference
+        attachments are materialized to inline parts at this output boundary."""
+        return self.system_messages + self._lower_messages_to_wire(self.messages)
+
+    def _lower_messages_to_wire(self, turns: list[Turn]) -> list[dict[str, Any]]:
+        """Lower canonical Turns to wire dicts, resolving AttachmentRef → bytes.
+
+        Attachment content lives by reference in ``self.messages`` (ids, not
+        bytes); at this output boundary the referenced blobs are batch-fetched
+        from the content-addressed store and expanded to inline content parts —
+        the same ``data:…``/document parts the providers have always received.
+        Allocation-free when no turn carries an attachment.
+        """
+        ids = sorted(
+            {b.attachment_id for t in turns for b in t.content if isinstance(b, AttachmentRef)}
+        )
+        if not ids:
+            return dicts_from_turns(turns)
+        parts_by_id = {
+            str(att["attachment_id"]): part
+            for att in get_attachments(ids)
+            if (part := attachment_to_content_part(att)) is not None
+        }
+        return dicts_from_turns(resolve_attachment_refs(turns, parts_by_id))
 
     def _prepare_wire_messages(
         self,
@@ -3512,37 +3541,16 @@ class ChatSession:
         self._invalidate_memory_cache()
         user_content: str | list[dict[str, Any]]
         if attachments:
+            # Attachments ride by reference (``{type: kind, attachment_id}`` →
+            # AttachmentRef); the bytes — already committed content-addressed
+            # below — materialize at each output (wire / display), where the
+            # bad-UTF-8 / unrenderable handling now lives.
             parts: list[dict[str, Any]] = [{"type": "text", "text": user_input}]
             for att in attachments:
                 if att.is_image:
-                    parts.append(
-                        {
-                            "type": "image_url",
-                            "image_url": {
-                                "url": _encode_image_data_uri(att.content, att.mime_type),
-                            },
-                        }
-                    )
+                    parts.append({"type": "image", "attachment_id": att.attachment_id})
                 elif att.is_text:
-                    try:
-                        text = att.content.decode("utf-8")
-                    except UnicodeDecodeError:
-                        log.warning(
-                            "attachment id=%s is not valid UTF-8; injecting placeholder",
-                            att.attachment_id,
-                        )
-                        parts.append(unreadable_placeholder(att.filename))
-                        continue
-                    parts.append(
-                        {
-                            "type": "document",
-                            "document": {
-                                "name": att.filename,
-                                "media_type": att.mime_type,
-                                "data": text,
-                            },
-                        }
-                    )
+                    parts.append({"type": "document", "attachment_id": att.attachment_id})
                 else:
                     log.warning(
                         "attachment id=%s has unknown kind=%r; injecting placeholder",
@@ -4792,9 +4800,13 @@ class ChatSession:
                 ptype = p.get("type")
                 if ptype == "text":
                     n += len(p.get("text", ""))
-                elif ptype == "image_url":
+                elif ptype == "image_url" or (ptype == "image" and p.get("attachment_id")):
+                    # Resolved inline image, or the by-reference image placeholder
+                    # — both cost one fixed image budget.
                     images += 1
-                elif ptype == "document":
+                elif ptype == "document" and not p.get("attachment_id"):
+                    # Resolved inline document; the by-reference placeholder carries
+                    # no bytes, so its char budget lands at send-time calibration.
                     d = p.get("document", {})
                     doc_chars += len(d.get("data", ""))
                     doc_chars += len(d.get("name", ""))
