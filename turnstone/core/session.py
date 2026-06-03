@@ -2590,6 +2590,7 @@ class ChatSession:
                         "tool_calls": tc_json,
                         "provider_data": pd_str,
                         "source": src if isinstance(src, str) and src else None,
+                        "is_error": bool(msg.get("is_error", False)),
                     }
                 )
             save_messages_bulk(bulk_rows)
@@ -4097,7 +4098,8 @@ class ChatSession:
                         "tool_call_id": tc_id,
                         "content": output,
                     }
-                    if self._tool_error_flags.pop(tc_id, False):
+                    tool_is_error = self._tool_error_flags.pop(tc_id, False)
+                    if tool_is_error:
                         tool_msg["is_error"] = True
                     self.messages.append(tool_msg)
 
@@ -4137,6 +4139,7 @@ class ChatSession:
                         _tname,
                         tool_call_id=tc_id,
                         event_id=self._ui_event_id(),
+                        is_error=tool_is_error,
                     )
 
                     # Accumulate this result's operator context (guard
@@ -4305,6 +4308,7 @@ class ChatSession:
                     func_name,
                     tool_call_id=tc_id,
                     event_id=self._ui_event_id(),
+                    is_error=True,
                 )
                 # Emit synthetic tool_result so live SSE listeners can
                 # complete the in-DOM tool batch — without this the

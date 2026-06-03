@@ -325,6 +325,7 @@ class SQLiteBackend:
         tool_calls: str | None = None,
         source: str | None = None,
         event_id: int | None = None,
+        is_error: bool = False,
     ) -> int:
         now = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S")
         content = sanitize_text(content)
@@ -344,6 +345,7 @@ class SQLiteBackend:
                     "tool_calls": tool_calls,
                     "_source": source,
                     "event_id": event_id,
+                    "is_error": is_error,
                 },
             )
             if result.lastrowid is None:
@@ -390,6 +392,7 @@ class SQLiteBackend:
                     ),
                     "tool_calls": row.get("tool_calls"),
                     "_source": sanitize_text(row.get("source")),
+                    "is_error": bool(row.get("is_error", False)),
                 }
             )
         with self._conn() as conn:
@@ -429,6 +432,7 @@ class SQLiteBackend:
                         conversations.c.tool_calls,
                         conversations.c._source,
                         conversations.c.event_id,
+                        conversations.c.is_error,
                     )
                     .where(conversations.c.ws_id == ws_id)
                     .order_by(conversations.c.id.desc())
@@ -447,6 +451,7 @@ class SQLiteBackend:
                         conversations.c.tool_calls,
                         conversations.c._source,
                         conversations.c.event_id,
+                        conversations.c.is_error,
                     )
                     .where(conversations.c.ws_id == ws_id)
                     .order_by(conversations.c.id)

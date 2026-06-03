@@ -451,6 +451,9 @@ def reconstruct_messages(
         # compute the resume cursor + locate the in-flight-turn boundary.
         # Defensive length check keeps pre-event_id 8-tuple fixtures valid.
         event_id = row[8] if len(row) > 8 else None
+        # ``is_error`` (10th column, migration 060) rides last so the tuple
+        # positions above stay stable; legacy fixtures (≤9-tuples) default False.
+        is_error = bool(row[9]) if len(row) > 9 else False
 
         if role == "user":
             parts: list[dict[str, Any]] = []
@@ -502,6 +505,8 @@ def reconstruct_messages(
                 "tool_call_id": tc_id or "",
                 "content": content or "",
             }
+            if is_error:
+                tmsg["is_error"] = True
             if event_id is not None:
                 tmsg["_event_id"] = int(event_id)
             messages.append(tmsg)

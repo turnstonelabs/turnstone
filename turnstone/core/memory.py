@@ -43,6 +43,7 @@ def save_message(
     tool_calls: str | None = None,
     source: str | None = None,
     event_id: int | None = None,
+    is_error: bool = False,
 ) -> int:
     """Log a message to the conversations table.
 
@@ -69,6 +70,7 @@ def save_message(
             tool_calls=tool_calls,
             source=source,
             event_id=event_id,
+            is_error=is_error,
         )
     except Exception:
         log.warning("Failed to save message for ws=%s role=%s", ws_id, role, exc_info=True)

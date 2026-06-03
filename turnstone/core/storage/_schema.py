@@ -56,6 +56,11 @@ conversations = sa.Table(
     # stay NULL → cursor logic falls back to the snapshot floor.  See
     # migration 059.
     sa.Column("event_id", sa.BigInteger),
+    # Tool-result error flag (persisted; migration 060).  Set on ``tool`` rows
+    # whose tool raised or was cancelled, so a reload preserves the error state
+    # (history rendering + the Anthropic ``is_error`` result block) instead of
+    # re-deriving it from a text heuristic.  Non-tool rows are always False.
+    sa.Column("is_error", sa.Boolean, nullable=False, server_default=sa.false()),
 )
 
 sa.Index("idx_conversations_timestamp", conversations.c.timestamp)

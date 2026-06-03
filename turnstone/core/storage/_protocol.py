@@ -159,6 +159,7 @@ class StorageBackend(Protocol):
         tool_calls: str | None = None,
         source: str | None = None,
         event_id: int | None = None,
+        is_error: bool = False,
     ) -> int:
         """Log a message to the conversations table.
 
