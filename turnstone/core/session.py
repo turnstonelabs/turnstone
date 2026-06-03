@@ -123,6 +123,14 @@ from turnstone.core.tools import (
     TASK_AUTO_TOOLS,
     merge_mcp_tools,
 )
+from turnstone.core.trajectory import (
+    Role,
+    Turn,
+    dicts_from_turns,
+    turn_from_dict,
+    turn_to_dict,
+    turns_from_dicts,
+)
 from turnstone.core.watch import WATCH_REMINDER_OPTIONAL_KEYS
 from turnstone.core.web import check_ssrf, strip_html
 from turnstone.core.workstream import WorkstreamKind
@@ -1018,7 +1026,10 @@ class ChatSession:
         self._ws_id = ws_id or uuid.uuid4().hex
         self._title_generated = False
         self._read_files: set[str] = set()
-        self.messages: list[dict[str, Any]] = []
+        # The canonical in-memory trajectory.  Wire prep (fold/repair) + the
+        # provider translators still consume dicts, so ``_full_messages`` lowers
+        # Turns→dicts at that boundary until those layers migrate.
+        self.messages: list[Turn] = []
         self._last_usage: dict[str, int] | None = None
         self._msg_tokens: list[int] = []  # parallel to self.messages
         self._system_tokens = 0  # tokens for system_messages
@@ -2375,13 +2386,10 @@ class ChatSession:
             user_msg = ""
             asst_msg = ""
             for m in self.messages:
-                content = m.get("content") or ""
-                # Handle multi-part content (vision messages)
-                if isinstance(content, list):
-                    content = " ".join(p.get("text", "") for p in content if isinstance(p, dict))
-                if m["role"] == "user" and not user_msg:
+                content = m.text  # joins text blocks; multipart attachments contribute none
+                if m.role is Role.USER and not user_msg:
                     user_msg = content[:300]
-                elif m["role"] == "assistant" and not asst_msg:
+                elif m.role is Role.ASSISTANT and not asst_msg:
                     asst_msg = content[:200]
                 if user_msg and asst_msg:
                     break
@@ -2474,12 +2482,12 @@ class ChatSession:
         so the resumed/forked workstream behaves identically to the
         original.  Returns True on success.
         """
-        messages = load_messages(ws_id)
-        if not messages:
+        turns = turns_from_dicts(load_messages(ws_id))
+        if not turns:
             return False
         if not fork:
             self._ws_id = ws_id
-        self.messages = messages
+        self.messages = turns
         self._read_files.clear()
         self._repeat_detector.clear()
         self._last_usage = None
@@ -2491,7 +2499,7 @@ class ChatSession:
         log.info(
             "Resuming ws=%s: %d messages, provider=%s, model=%s",
             ws_id,
-            len(messages),
+            len(self.messages),
             type(self._provider).__name__,
             self.model,
         )
@@ -2574,7 +2582,8 @@ class ChatSession:
         if fork:
             # Bulk-insert all messages in a single transaction for performance.
             bulk_rows: list[dict[str, Any]] = []
-            for msg in self.messages:
+            for turn in self.messages:
+                msg = turn_to_dict(turn)
                 tc = msg.get("tool_calls")
                 tc_json = json.dumps(tc) if tc else None
                 # Provider-fidelity blocks ride the in-memory
@@ -2828,7 +2837,7 @@ class ChatSession:
         if self.instructions:
             dev_parts.append("")
             dev_parts.append(self.instructions)
-        context = extract_recent_context(self.messages)
+        context = extract_recent_context(dicts_from_turns(self.messages))
         if context.strip():
             # Composed against a real user-message query at least once; send()
             # uses this to know the deferred first-turn recompose is done.
@@ -2871,8 +2880,12 @@ class ChatSession:
         self._agent_system_messages = list(new_system_messages)
 
     def _full_messages(self) -> list[dict[str, Any]]:
-        """System messages + conversation history."""
-        return self.system_messages + self.messages
+        """System messages + conversation history, lowered to wire dicts.
+
+        ``self.messages`` is the canonical ``Turn`` trajectory; the wire-prep and
+        provider layers still consume dicts, so the Turns are lowered here (this
+        boundary moves inward when those layers migrate)."""
+        return self.system_messages + dicts_from_turns(self.messages)
 
     def _prepare_wire_messages(
         self,
@@ -3563,7 +3576,7 @@ class ChatSession:
                 }
                 for a in attachments
             ]
-        self.messages.append(user_msg)
+        self.messages.append(turn_from_dict(user_msg))
         self._msg_tokens.append(max(1, int(self._msg_char_count(user_msg) / self._chars_per_token)))
         # DB row stores the raw text only; attachment bytes are written
         # content-addressed into workstream_attachments and the ordered id-list
@@ -3696,7 +3709,7 @@ class ChatSession:
         before the wire by ``sanitize_messages``).
         """
         turn = make_system_turn(source, content, **meta)
-        self.messages.append(turn)
+        self.messages.append(turn_from_dict(turn))
         self._msg_tokens.append(max(1, int(self._msg_char_count(turn) / self._chars_per_token)))
         save_message(
             self._ws_id,
@@ -3784,7 +3797,10 @@ class ChatSession:
         # flips True inside the recompose, so this fires once and the prefix
         # stays cache-stable after. Per-turn refresh is the larger redesign on
         # another branch.
-        if not self._system_composed_with_context and extract_recent_context(self.messages).strip():
+        if (
+            not self._system_composed_with_context
+            and extract_recent_context(dicts_from_turns(self.messages)).strip()
+        ):
             self._init_system_messages()
 
         try:
@@ -3863,7 +3879,7 @@ class ChatSession:
                 # actually counted.
                 self._update_token_table(assistant_msg, msgs=msgs)
                 self._print_status_line()  # Report usage for EVERY API call
-                self.messages.append(assistant_msg)
+                self.messages.append(turn_from_dict(assistant_msg))
                 # Clear per-turn inflight buffers — the assistant
                 # message is now in the history list a refresh would
                 # replay, so the in_progress_snapshot shouldn't re-
@@ -4063,7 +4079,7 @@ class ChatSession:
                     tool_is_error = self._tool_error_flags.pop(tc_id, False)
                     if tool_is_error:
                         tool_msg["is_error"] = True
-                    self.messages.append(tool_msg)
+                    self.messages.append(turn_from_dict(tool_msg))
 
                     # Token estimation — image content uses a fixed heuristic
                     if isinstance(output, list):
@@ -4188,7 +4204,7 @@ class ChatSession:
                 else:
                     msg["content"] = "[generation cancelled before completion]"
                 save_message(self._ws_id, "assistant", msg["content"], event_id=self._ui_event_id())
-                self.messages.append(msg)
+                self.messages.append(turn_from_dict(msg))
                 tok_est = max(
                     1,
                     int(self._msg_char_count(msg) / self._chars_per_token),
@@ -4248,7 +4264,7 @@ class ChatSession:
         assistant_idx = None
         for i in range(len(self.messages) - 1, -1, -1):
             msg = self.messages[i]
-            if msg.get("role") == "assistant" and msg.get("tool_calls"):
+            if msg.role is Role.ASSISTANT and msg.tool_calls:
                 assistant_idx = i
                 break
         if assistant_idx is None:
@@ -4257,22 +4273,15 @@ class ChatSession:
         # Collect tool_call IDs that already have results
         answered_ids: set[str] = set()
         for msg in self.messages[assistant_idx + 1 :]:
-            if msg.get("role") == "tool":
-                answered_ids.add(msg.get("tool_call_id", ""))
+            if msg.role is Role.TOOL:
+                answered_ids.add(msg.tool_call_id or "")
 
         # Synthesize results for unanswered tool_calls
-        for tc in self.messages[assistant_idx].get("tool_calls", []):
-            tc_id = tc.get("id", "")
-            func_name = tc.get("function", {}).get("name", "")
+        for tc in self.messages[assistant_idx].tool_calls:
+            tc_id = tc.id
+            func_name = tc.name
             if tc_id and tc_id not in answered_ids:
-                self.messages.append(
-                    {
-                        "role": "tool",
-                        "tool_call_id": tc_id,
-                        "content": reason,
-                        "is_error": True,
-                    }
-                )
+                self.messages.append(Turn.tool(tc_id, reason, is_error=True))
                 self._msg_tokens.append(1)
                 save_message(
                     self._ws_id,
@@ -4302,7 +4311,7 @@ class ChatSession:
 
     def _find_turn_boundaries(self) -> list[int]:
         """Return indices of user messages in self.messages (turn start positions)."""
-        return [i for i, m in enumerate(self.messages) if m["role"] == "user"]
+        return [i for i, m in enumerate(self.messages) if m.role is Role.USER]
 
     def rewind(self, n: int) -> int:
         """Drop the last *n* complete turns from the conversation.
@@ -4334,7 +4343,7 @@ class ChatSession:
         if not boundaries:
             return None
         last_user_idx = boundaries[-1]
-        content = self.messages[last_user_idx].get("content")
+        content = turn_to_dict(self.messages[last_user_idx]).get("content")
         # Multipart messages (vision/images) have list-type content;
         # retry only supports plain text.
         if not isinstance(content, str) or not content:
@@ -4751,7 +4760,7 @@ class ChatSession:
     _IMAGE_TOKENS = 1000
 
     @staticmethod
-    def _msg_text_chars(msg: dict[str, Any]) -> tuple[int, int, int]:
+    def _msg_text_chars(msg: dict[str, Any] | Turn) -> tuple[int, int, int]:
         """Return ``(text_chars, image_count, doc_chars)`` for a message.
 
         Counts textual content + structural overhead (role, tool_call
@@ -4763,7 +4772,12 @@ class ChatSession:
         calibration — provider-native document blocks (Anthropic) and
         inlined text (OpenAI/Google) tokenize differently, so it's
         safer to exclude them from the text calibration.
+
+        Accepts a wire dict or a canonical ``Turn`` (the latter is lowered to
+        its dict form so the char accounting matches what the provider sees).
         """
+        if isinstance(msg, Turn):
+            msg = turn_to_dict(msg)
         content = msg.get("content")
         n = 0
         images = 0
@@ -4791,12 +4805,12 @@ class ChatSession:
         n += len(msg.get("tool_call_id", ""))
         return n, images, doc_chars
 
-    def _msg_char_count(self, msg: dict[str, Any]) -> int:
+    def _msg_char_count(self, msg: dict[str, Any] | Turn) -> int:
         """Count characters in a message, including structural overhead.
 
         Includes role markers, tool_call IDs, image placeholders, and
         document-part characters so that the budget estimate reflects
-        the full payload the provider sees.
+        the full payload the provider sees.  Accepts a wire dict or a ``Turn``.
         """
         text_chars, images, doc_chars = self._msg_text_chars(msg)
         return text_chars + doc_chars + int(images * self._IMAGE_TOKENS * self._chars_per_token)
@@ -4949,8 +4963,8 @@ class ChatSession:
         last_user_content = None
         if auto:
             for m in reversed(self.messages):
-                if m["role"] == "user":
-                    last_user_content = m.get("content") or ""
+                if m.role is Role.USER:
+                    last_user_content = m.text or ""
                     break
 
         to_summarize = self.messages
@@ -4980,7 +4994,7 @@ class ChatSession:
             return
 
         # Build summary prompt and call model
-        formatted = self._format_messages_for_summary(selected)
+        formatted = self._format_messages_for_summary(dicts_from_turns(selected))
         summary_msgs = [
             {
                 "role": "system",
@@ -5070,7 +5084,7 @@ class ChatSession:
         before_tokens = self._system_tokens + sum(self._msg_tokens)
         summary_user = {"role": "user", "content": "[Conversation summary]"}
         summary_asst = {"role": "assistant", "content": summary}
-        self.messages = [summary_user, summary_asst]
+        self.messages = turns_from_dicts([summary_user, summary_asst])
         # File contents are gone after compaction — force re-read before edit_file
         self._read_files.clear()
         self._repeat_detector.clear()
@@ -5363,7 +5377,7 @@ class ChatSession:
 
         heuristic_verdicts = judge.evaluate(
             pending,
-            list(self.messages),  # snapshot — daemon thread must not see mutations
+            dicts_from_turns(self.messages),  # snapshot — daemon thread must not see mutations
             callback=_on_verdict,
             cancel_event=cancel_event,
         )
@@ -12437,7 +12451,7 @@ class ChatSession:
             # Clear history when toggling ON if it contains tool messages,
             # because the API rejects tool-call history without tool definitions
             if self.creative_mode and any(
-                m.get("tool_calls") or m.get("role") == "tool" for m in self.messages
+                m.tool_calls or m.role is Role.TOOL for m in self.messages
             ):
                 self.messages.clear()
                 self._read_files.clear()

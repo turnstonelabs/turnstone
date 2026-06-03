@@ -9,6 +9,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from turnstone.core.session import ChatSession, GenerationCancelled, _CancelRef
+from turnstone.core.trajectory import dicts_from_turns, turn_from_dict
 
 
 class NullUI:
@@ -191,7 +192,7 @@ class TestCancelDuringStreaming:
         # raw "Hello world" without a marker would look like the
         # final assistant answer to a coord LLM reading the child's
         # transcript.
-        assistant_msgs = [m for m in session.messages if m["role"] == "assistant"]
+        assistant_msgs = [m for m in dicts_from_turns(session.messages) if m["role"] == "assistant"]
         assert len(assistant_msgs) == 1
         content = assistant_msgs[0]["content"]
         assert content.startswith("Hello world")
@@ -261,13 +262,14 @@ class TestCancelDuringToolExecution:
         # Session should be idle
         assert ui.states[-1] == "idle"
         # Cancelled tool calls should have synthesized results
-        tool_msgs = [m for m in session.messages if m["role"] == "tool"]
+        msgs = dicts_from_turns(session.messages)
+        tool_msgs = [m for m in msgs if m["role"] == "tool"]
         assert len(tool_msgs) == 1
         assert tool_msgs[0]["tool_call_id"] == "tc_1"
         assert "Cancelled by user" in tool_msgs[0]["content"]
         assert tool_msgs[0].get("is_error") is True
         # The assistant message with tool_calls should still be present
-        assistant_msgs = [m for m in session.messages if m.get("tool_calls")]
+        assistant_msgs = [m for m in msgs if m.get("tool_calls")]
         assert len(assistant_msgs) == 1
 
 
@@ -297,7 +299,7 @@ class TestCancelWhenIdle:
             session.send("hello")
 
         # Should complete normally
-        assistant_msgs = [m for m in session.messages if m["role"] == "assistant"]
+        assistant_msgs = [m for m in dicts_from_turns(session.messages) if m["role"] == "assistant"]
         assert len(assistant_msgs) == 1
         assert assistant_msgs[0]["content"] == "ok"
 
@@ -537,7 +539,7 @@ class TestStreamAbort:
         assert any("cancelled" in i.lower() for i in ui.infos)
         # Partial content preserved AND annotated with the
         # cancelled-before-completion marker.
-        assistant_msgs = [m for m in session.messages if m["role"] == "assistant"]
+        assistant_msgs = [m for m in dicts_from_turns(session.messages) if m["role"] == "assistant"]
         assert len(assistant_msgs) == 1
         content = assistant_msgs[0]["content"]
         assert content.startswith("Hello")
@@ -783,7 +785,7 @@ class TestForceCancelThreaded:
         assert old_done.wait(timeout=10), "orphaned thread did not exit"
 
         # The orphaned thread should NOT have appended its content
-        assistant_msgs = [m for m in session.messages if m["role"] == "assistant"]
+        assistant_msgs = [m for m in dicts_from_turns(session.messages) if m["role"] == "assistant"]
         # May have partial content from before cancel, but NOT the full
         # "Old content more" that would appear without the generation guard
         for msg in assistant_msgs:
@@ -834,7 +836,7 @@ class TestForceCancelThreaded:
 
         # The new generation should have completed successfully
         assert "idle" in ui.states
-        assistant_msgs = [m for m in session.messages if m["role"] == "assistant"]
+        assistant_msgs = [m for m in dicts_from_turns(session.messages) if m["role"] == "assistant"]
         assert any("Fresh response" in m.get("content", "") for m in assistant_msgs)
 
 
@@ -864,14 +866,16 @@ class TestSynthesizeCancelledResults:
         ui = self._ui_with_tool_result_tracking()
         session = _make_session(ui=ui)
         session.messages.append(
-            {
-                "role": "assistant",
-                "content": "calling tools",
-                "tool_calls": [
-                    {"id": "call_a", "function": {"name": "search", "arguments": "{}"}},
-                    {"id": "call_b", "function": {"name": "compute", "arguments": "{}"}},
-                ],
-            },
+            turn_from_dict(
+                {
+                    "role": "assistant",
+                    "content": "calling tools",
+                    "tool_calls": [
+                        {"id": "call_a", "function": {"name": "search", "arguments": "{}"}},
+                        {"id": "call_b", "function": {"name": "compute", "arguments": "{}"}},
+                    ],
+                },
+            )
         )
         session._msg_tokens.append(1)
 
@@ -888,25 +892,29 @@ class TestSynthesizeCancelledResults:
         assert all(tr[2] == "Cancelled by user." for tr in ui.tool_results)
         # And the message list has the synthesized tool entries
         # (preserves the prior contract).
-        tool_msgs = [m for m in session.messages if m.get("role") == "tool"]
+        tool_msgs = [m for m in dicts_from_turns(session.messages) if m.get("role") == "tool"]
         assert len(tool_msgs) == 2
 
     def test_skips_calls_already_answered(self, tmp_db):
         ui = self._ui_with_tool_result_tracking()
         session = _make_session(ui=ui)
         session.messages.append(
-            {
-                "role": "assistant",
-                "tool_calls": [
-                    {"id": "call_a", "function": {"name": "search", "arguments": "{}"}},
-                    {"id": "call_b", "function": {"name": "compute", "arguments": "{}"}},
-                ],
-            },
+            turn_from_dict(
+                {
+                    "role": "assistant",
+                    "tool_calls": [
+                        {"id": "call_a", "function": {"name": "search", "arguments": "{}"}},
+                        {"id": "call_b", "function": {"name": "compute", "arguments": "{}"}},
+                    ],
+                },
+            )
         )
         session._msg_tokens.append(1)
         # call_a already answered.
         session.messages.append(
-            {"role": "tool", "tool_call_id": "call_a", "content": "result"},
+            turn_from_dict(
+                {"role": "tool", "tool_call_id": "call_a", "content": "result"},
+            )
         )
         session._msg_tokens.append(1)
 
@@ -928,17 +936,19 @@ class TestSynthesizeCancelledResults:
         ui = _ExplodingUI()
         session = _make_session(ui=ui)
         session.messages.append(
-            {
-                "role": "assistant",
-                "tool_calls": [
-                    {"id": "call_a", "function": {"name": "search", "arguments": "{}"}},
-                ],
-            },
+            turn_from_dict(
+                {
+                    "role": "assistant",
+                    "tool_calls": [
+                        {"id": "call_a", "function": {"name": "search", "arguments": "{}"}},
+                    ],
+                },
+            )
         )
         session._msg_tokens.append(1)
 
         # Must not raise.
         session._synthesize_cancelled_results("Cancelled by user.")
 
-        tool_msgs = [m for m in session.messages if m.get("role") == "tool"]
+        tool_msgs = [m for m in dicts_from_turns(session.messages) if m.get("role") == "tool"]
         assert len(tool_msgs) == 1

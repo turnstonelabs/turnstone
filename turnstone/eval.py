@@ -36,6 +36,7 @@ from turnstone.core.providers import LLMProvider, create_client, create_provider
 from turnstone.core.session import ChatSession
 from turnstone.core.storage import init_storage, reset_storage
 from turnstone.core.tools import INTERACTIVE_TOOLS, PRIMARY_KEY_MAP
+from turnstone.core.trajectory import Role, turn_from_dict
 
 # Eval evaluates interactive-session agent behaviour — coordinator tools
 # require a console-hosted session and aren't exercised by the harness.
@@ -280,7 +281,7 @@ class HeadlessSession(ChatSession):
             tool: str, args: dict, result: str (truncated), turn: int
         """
         self.tool_call_log = []
-        self.messages.append({"role": "user", "content": user_input})
+        self.messages.append(turn_from_dict({"role": "user", "content": user_input}))
         self._msg_tokens.append(max(1, int(len(user_input) / self._chars_per_token)))
 
         for turn in range(max_turns):
@@ -321,7 +322,7 @@ class HeadlessSession(ChatSession):
                 # Cap parallel tool calls to prevent degenerate repetition
                 assistant_msg["tool_calls"] = result.tool_calls[:10]
 
-            self.messages.append(assistant_msg)
+            self.messages.append(turn_from_dict(assistant_msg))
             msg_len = len(assistant_msg.get("content") or "")
             self._msg_tokens.append(max(1, int(msg_len / self._chars_per_token)))
 
@@ -401,7 +402,7 @@ class HeadlessSession(ChatSession):
                     "tool_call_id": tc_id,
                     "content": raw_output,
                 }
-                self.messages.append(tool_msg)
+                self.messages.append(turn_from_dict(tool_msg))
                 self._msg_tokens.append(max(1, int(len(output) / self._chars_per_token)))
 
         return self.tool_call_log
@@ -507,8 +508,8 @@ def _run_single_test(
 
                 # Extract results before releasing session
                 for msg in reversed(session.messages):
-                    if msg["role"] == "assistant" and msg.get("content"):
-                        final_content = msg["content"]
+                    if msg.role is Role.ASSISTANT and msg.text:
+                        final_content = msg.text
                         break
                 message_count = len(session.messages)
                 total_usage = session.total_usage

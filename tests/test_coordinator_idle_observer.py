@@ -16,6 +16,7 @@ import pytest
 
 from turnstone.console.coordinator_idle_observer import CoordinatorIdleObserver
 from turnstone.core.nudge_queue import NudgeQueue
+from turnstone.core.trajectory import Turn, turns_from_dicts
 from turnstone.core.workstream import WorkstreamKind, WorkstreamState
 
 
@@ -73,7 +74,7 @@ class _FakeStorage:
 class _FakeSession:
     def __init__(self) -> None:
         self._nudge_queue = NudgeQueue()
-        self.messages: list[dict[str, Any]] = []
+        self.messages: list[Turn] = []
         self._wake_source_tag: str = ""
         self._metacog_state: dict[str, float] = {}
         self._mem_cfg = MagicMock(nudge_cooldown=300)
@@ -150,10 +151,12 @@ class TestEnqueueOnIdle:
         mgr, storage, ws = coord_setup
         _add_active_child(storage, ws_id="child-a", state="running")
         _add_active_child(storage, ws_id="child-b", state="thinking")
-        ws.session.messages = [
-            {"role": "user", "content": "go"},
-            {"role": "assistant", "content": "ok"},
-        ]
+        ws.session.messages = turns_from_dicts(
+            [
+                {"role": "user", "content": "go"},
+                {"role": "assistant", "content": "ok"},
+            ]
+        )
 
         observer = CoordinatorIdleObserver(mgr, storage)
         observer.start()
@@ -181,10 +184,12 @@ class TestEnqueueOnIdle:
         _add_active_child(storage, state="closed")
         _add_active_child(storage, state="error")
         # ≥2 messages so should_nudge's message_count > 1 gate clears.
-        ws.session.messages = [
-            {"role": "user", "content": "go"},
-            {"role": "assistant", "content": "ok"},
-        ]
+        ws.session.messages = turns_from_dicts(
+            [
+                {"role": "user", "content": "go"},
+                {"role": "assistant", "content": "ok"},
+            ]
+        )
         observer = CoordinatorIdleObserver(mgr, storage)
         observer.start()
         mgr.fire_state(ws.id, WorkstreamState.IDLE)
@@ -225,19 +230,21 @@ class TestWaitForWorkstreamSkip:
     def test_skips_when_last_assistant_used_wait(self, coord_setup):
         mgr, storage, ws = coord_setup
         _add_active_child(storage)
-        ws.session.messages = [
-            {"role": "user", "content": "kick off"},
-            {
-                "role": "assistant",
-                "content": None,
-                "tool_calls": [
-                    {
-                        "id": "call-1",
-                        "function": {"name": "wait_for_workstream", "arguments": "{}"},
-                    }
-                ],
-            },
-        ]
+        ws.session.messages = turns_from_dicts(
+            [
+                {"role": "user", "content": "kick off"},
+                {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [
+                        {
+                            "id": "call-1",
+                            "function": {"name": "wait_for_workstream", "arguments": "{}"},
+                        }
+                    ],
+                },
+            ]
+        )
         observer = CoordinatorIdleObserver(mgr, storage)
         observer.start()
         mgr.fire_state(ws.id, WorkstreamState.IDLE)
@@ -247,16 +254,21 @@ class TestWaitForWorkstreamSkip:
     def test_fires_when_last_assistant_used_different_tool(self, coord_setup):
         mgr, storage, ws = coord_setup
         _add_active_child(storage)
-        ws.session.messages = [
-            {"role": "user", "content": "go"},
-            {
-                "role": "assistant",
-                "content": None,
-                "tool_calls": [
-                    {"id": "call-1", "function": {"name": "spawn_workstream", "arguments": "{}"}}
-                ],
-            },
-        ]
+        ws.session.messages = turns_from_dicts(
+            [
+                {"role": "user", "content": "go"},
+                {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [
+                        {
+                            "id": "call-1",
+                            "function": {"name": "spawn_workstream", "arguments": "{}"},
+                        }
+                    ],
+                },
+            ]
+        )
         observer = CoordinatorIdleObserver(mgr, storage)
         observer.start()
         mgr.fire_state(ws.id, WorkstreamState.IDLE)
@@ -268,10 +280,12 @@ class TestHardCap:
         mgr, storage, ws = coord_setup
         _add_active_child(storage)
         # ≥2 messages so should_nudge's message_count > 1 gate clears.
-        ws.session.messages = [
-            {"role": "user", "content": "go"},
-            {"role": "assistant", "content": "ok"},
-        ]
+        ws.session.messages = turns_from_dicts(
+            [
+                {"role": "user", "content": "go"},
+                {"role": "assistant", "content": "ok"},
+            ]
+        )
         observer = CoordinatorIdleObserver(mgr, storage)
         observer.start()
 
@@ -292,10 +306,12 @@ class TestHardCap:
         mgr, storage, ws = coord_setup
         _add_active_child(storage)
         # ≥2 messages so should_nudge's message_count > 1 gate clears.
-        ws.session.messages = [
-            {"role": "user", "content": "go"},
-            {"role": "assistant", "content": "ok"},
-        ]
+        ws.session.messages = turns_from_dicts(
+            [
+                {"role": "user", "content": "go"},
+                {"role": "assistant", "content": "ok"},
+            ]
+        )
         observer = CoordinatorIdleObserver(mgr, storage)
         observer.start()
 
@@ -321,10 +337,12 @@ class TestHardCap:
         mgr, storage, ws = coord_setup
         _add_active_child(storage)
         # ≥2 messages so should_nudge's message_count > 1 gate clears.
-        ws.session.messages = [
-            {"role": "user", "content": "go"},
-            {"role": "assistant", "content": "ok"},
-        ]
+        ws.session.messages = turns_from_dicts(
+            [
+                {"role": "user", "content": "go"},
+                {"role": "assistant", "content": "ok"},
+            ]
+        )
         observer = CoordinatorIdleObserver(mgr, storage)
         observer.start()
 
@@ -350,10 +368,12 @@ class TestCooldown:
         mgr, storage, ws = coord_setup
         _add_active_child(storage)
         # ≥2 messages so should_nudge's message_count > 1 gate clears.
-        ws.session.messages = [
-            {"role": "user", "content": "go"},
-            {"role": "assistant", "content": "ok"},
-        ]
+        ws.session.messages = turns_from_dicts(
+            [
+                {"role": "user", "content": "go"},
+                {"role": "assistant", "content": "ok"},
+            ]
+        )
         observer = CoordinatorIdleObserver(mgr, storage)
         observer.start()
 
@@ -372,10 +392,12 @@ class TestStorageFailure:
     def test_storage_exception_is_swallowed(self, coord_setup):
         mgr, storage, ws = coord_setup
         # ≥2 messages so should_nudge's message_count > 1 gate clears.
-        ws.session.messages = [
-            {"role": "user", "content": "go"},
-            {"role": "assistant", "content": "ok"},
-        ]
+        ws.session.messages = turns_from_dicts(
+            [
+                {"role": "user", "content": "go"},
+                {"role": "assistant", "content": "ok"},
+            ]
+        )
         storage.list_raises = True
         observer = CoordinatorIdleObserver(mgr, storage)
         observer.start()
@@ -389,10 +411,12 @@ class TestValidUntilPredicate:
         mgr, storage, ws = coord_setup
         _add_active_child(storage, ws_id="child-a", state="running")
         # ≥2 messages so should_nudge's message_count > 1 gate clears.
-        ws.session.messages = [
-            {"role": "user", "content": "go"},
-            {"role": "assistant", "content": "ok"},
-        ]
+        ws.session.messages = turns_from_dicts(
+            [
+                {"role": "user", "content": "go"},
+                {"role": "assistant", "content": "ok"},
+            ]
+        )
         observer = CoordinatorIdleObserver(mgr, storage)
         observer.start()
         mgr.fire_state(ws.id, WorkstreamState.IDLE)
@@ -413,10 +437,12 @@ class TestValidUntilPredicate:
         mgr, storage, ws = coord_setup
         _add_active_child(storage, ws_id="child-a", state="running")
         # ≥2 messages so should_nudge's message_count > 1 gate clears.
-        ws.session.messages = [
-            {"role": "user", "content": "go"},
-            {"role": "assistant", "content": "ok"},
-        ]
+        ws.session.messages = turns_from_dicts(
+            [
+                {"role": "user", "content": "go"},
+                {"role": "assistant", "content": "ok"},
+            ]
+        )
         observer = CoordinatorIdleObserver(mgr, storage)
         observer.start()
         mgr.fire_state(ws.id, WorkstreamState.IDLE)
@@ -432,10 +458,12 @@ class TestValidUntilPredicate:
         mgr, storage, ws = coord_setup
         _add_active_child(storage)
         # ≥2 messages so should_nudge's message_count > 1 gate clears.
-        ws.session.messages = [
-            {"role": "user", "content": "go"},
-            {"role": "assistant", "content": "ok"},
-        ]
+        ws.session.messages = turns_from_dicts(
+            [
+                {"role": "user", "content": "go"},
+                {"role": "assistant", "content": "ok"},
+            ]
+        )
         observer = CoordinatorIdleObserver(mgr, storage)
         observer.start()
         mgr.fire_state(ws.id, WorkstreamState.IDLE)
@@ -456,10 +484,12 @@ class TestLifecycle:
         mgr, storage, ws = coord_setup
         _add_active_child(storage)
         # ≥2 messages so should_nudge's message_count > 1 gate clears.
-        ws.session.messages = [
-            {"role": "user", "content": "go"},
-            {"role": "assistant", "content": "ok"},
-        ]
+        ws.session.messages = turns_from_dicts(
+            [
+                {"role": "user", "content": "go"},
+                {"role": "assistant", "content": "ok"},
+            ]
+        )
         observer = CoordinatorIdleObserver(mgr, storage)
         observer.start()
         observer.start()  # no-op
@@ -471,10 +501,12 @@ class TestLifecycle:
         mgr, storage, ws = coord_setup
         _add_active_child(storage)
         # ≥2 messages so should_nudge's message_count > 1 gate clears.
-        ws.session.messages = [
-            {"role": "user", "content": "go"},
-            {"role": "assistant", "content": "ok"},
-        ]
+        ws.session.messages = turns_from_dicts(
+            [
+                {"role": "user", "content": "go"},
+                {"role": "assistant", "content": "ok"},
+            ]
+        )
         observer = CoordinatorIdleObserver(mgr, storage)
         observer.start()
         observer.shutdown()

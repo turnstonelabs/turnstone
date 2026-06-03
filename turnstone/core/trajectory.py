@@ -199,13 +199,16 @@ def _content_from_raw(raw: Any) -> tuple[ContentBlock, ...]:
 def _content_to_raw(content: tuple[ContentBlock, ...]) -> str | list[dict[str, Any]]:
     """Inverse of :func:`_content_from_raw`.
 
-    All-text content collapses to a plain string (the 95% case, and what an empty
-    turn round-trips to); any non-text block forces the multipart list form.
+    A single text block collapses to a plain string (the 95% case, and what an
+    empty turn round-trips to); multiple blocks — or any non-text block — take
+    the multipart list form.  The multiple-block rule preserves an all-*text*
+    multipart list (the unreadable-attachment placeholder path emits one) instead
+    of collapsing it to a joined string.
     """
     if not content:
         return ""
-    if all(isinstance(b, TextBlock) for b in content):
-        return "".join(b.text for b in content if isinstance(b, TextBlock))
+    if len(content) == 1 and isinstance(content[0], TextBlock):
+        return content[0].text
     parts: list[dict[str, Any]] = []
     for b in content:
         if isinstance(b, TextBlock):

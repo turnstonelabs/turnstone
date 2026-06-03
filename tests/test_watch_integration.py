@@ -31,6 +31,7 @@ import pytest
 from tests._helpers import patch_session_storage
 from turnstone.core.session import ChatSession
 from turnstone.core.storage import get_storage
+from turnstone.core.trajectory import dicts_from_turns
 from turnstone.core.watch import WatchRunner
 
 
@@ -120,10 +121,11 @@ def test_watch_fires_then_user_send_drains_envelope(tmp_db, monkeypatch):
     # The watch text lands as a first-class operator-context ``system``
     # turn following the user turn (the production drain seam now emits
     # ``make_system_turn`` rather than the legacy ``_reminders`` splice).
-    user_msgs = [m for m in session.messages if m.get("role") == "user"]
+    msgs = dicts_from_turns(session.messages)
+    user_msgs = [m for m in msgs if m.get("role") == "user"]
     assert user_msgs, "expected a user message in history"
     assert "_reminders" not in user_msgs[-1]
-    sys_turns = [m for m in session.messages if m.get("role") == "system"]
+    sys_turns = [m for m in msgs if m.get("role") == "system"]
     assert any(
         m["_source"] == "watch_triggered" and "watch payload body" in m["content"]
         for m in sys_turns
@@ -176,10 +178,9 @@ def test_three_back_to_back_watch_fires_drain_into_one_turn(tmp_db, monkeypatch)
 
     # All three drained into three operator-context system turns after
     # the single user turn.
+    msgs = dicts_from_turns(session.messages)
     watch_turns = [
-        m
-        for m in session.messages
-        if m.get("role") == "system" and m.get("_source") == "watch_triggered"
+        m for m in msgs if m.get("role") == "system" and m.get("_source") == "watch_triggered"
     ]
     assert len(watch_turns) == 3
     bodies = [m["content"] for m in watch_turns]
@@ -187,7 +188,7 @@ def test_three_back_to_back_watch_fires_drain_into_one_turn(tmp_db, monkeypatch)
     assert any("fire two" in b for b in bodies)
     assert any("fire three" in b for b in bodies)
     # And there's exactly ONE assistant turn (not three).
-    assistant_turns = [m for m in session.messages if m.get("role") == "assistant"]
+    assistant_turns = [m for m in msgs if m.get("role") == "assistant"]
     assert len(assistant_turns) == 1
 
 

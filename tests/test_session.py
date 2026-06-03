@@ -11,6 +11,12 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from turnstone.core.session import _IMAGE_EXTENSIONS, _IMAGE_SIZE_CAP, ChatSession
+from turnstone.core.trajectory import (
+    dicts_from_turns,
+    turn_from_dict,
+    turn_to_dict,
+    turns_from_dicts,
+)
 
 
 class NullUI:
@@ -198,7 +204,7 @@ class TestChatSessionConstruction:
         assert len(full) == len(session.system_messages)
 
         # Add a user message
-        session.messages.append({"role": "user", "content": "hello"})
+        session.messages.append(turn_from_dict({"role": "user", "content": "hello"}))
         full = session._full_messages()
         assert len(full) == len(session.system_messages) + 1
         assert full[-1]["role"] == "user"
@@ -834,10 +840,12 @@ class TestTitleRetry:
 
         session = _make_session()
         session._title_generated = True
-        session.messages = [
-            {"role": "user", "content": "Hello"},
-            {"role": "assistant", "content": "Hi there"},
-        ]
+        session.messages = turns_from_dicts(
+            [
+                {"role": "user", "content": "Hello"},
+                {"role": "assistant", "content": "Hi there"},
+            ]
+        )
         # Mock provider to raise
         session._provider = MagicMock()
         session._provider.get_capabilities.return_value = ModelCapabilities()
@@ -852,10 +860,12 @@ class TestTitleRetry:
 
         session = _make_session()
         session._title_generated = True
-        session.messages = [
-            {"role": "user", "content": "Hello"},
-            {"role": "assistant", "content": "Hi there"},
-        ]
+        session.messages = turns_from_dicts(
+            [
+                {"role": "user", "content": "Hello"},
+                {"role": "assistant", "content": "Hi there"},
+            ]
+        )
         result = MagicMock()
         result.content = "Test Title"
         session._provider = MagicMock()
@@ -874,10 +884,12 @@ class TestTitleRetry:
 
         session = _make_session()
         session._title_generated = True
-        session.messages = [
-            {"role": "user", "content": "Hello"},
-            {"role": "assistant", "content": "Hi there"},
-        ]
+        session.messages = turns_from_dicts(
+            [
+                {"role": "user", "content": "Hello"},
+                {"role": "assistant", "content": "Hi there"},
+            ]
+        )
         original_ws_id = session._ws_id
         result = MagicMock()
         result.content = "Test Title"
@@ -2750,11 +2762,11 @@ class TestMemoryCompositionDeferral:
         # __init__ composed against an empty history -> no query yet.
         assert session._system_composed_with_context is False
         # A whitespace-only "turn" (e.g. a wake send("")) is not a real query.
-        session.messages.append({"role": "user", "content": "   "})
+        session.messages.append(turn_from_dict({"role": "user", "content": "   "}))
         session._init_system_messages()
         assert session._system_composed_with_context is False
         # A real user message flips it (one-shot).
-        session.messages.append({"role": "user", "content": "what is the weather"})
+        session.messages.append(turn_from_dict({"role": "user", "content": "what is the weather"}))
         session._init_system_messages()
         assert session._system_composed_with_context is True
 
@@ -2768,7 +2780,7 @@ class TestMemoryCompositionDeferral:
         real_init = session._init_system_messages
 
         def spy_init():
-            seen_queries.append(extract_recent_context(session.messages))
+            seen_queries.append(extract_recent_context(dicts_from_turns(session.messages)))
             real_init()
 
         responses = [{"role": "assistant", "content": "ok"}]
@@ -2827,14 +2839,14 @@ class TestMetacognitiveBuffers:
         legacy ``_reminders`` side-channel splice.  The user turn content
         stays clean — the nudge is its own role=system trajectory turn."""
         session = _make_session()
-        session.messages.append({"role": "user", "content": "hello there"})
+        session.messages.append(turn_from_dict({"role": "user", "content": "hello there"}))
         session._msg_tokens.append(1)
         session._queue_user_advisory("correction", "ALERT_TEXT")
         with patch("turnstone.core.session.save_message"):
             session._emit_pending_user_nudges()
         # User turn untouched; a system turn now follows it.
-        assert session.messages[-2] == {"role": "user", "content": "hello there"}
-        assert session.messages[-1] == {
+        assert turn_to_dict(session.messages[-2]) == {"role": "user", "content": "hello there"}
+        assert turn_to_dict(session.messages[-1]) == {
             "role": "system",
             "_source": "correction",
             "content": "ALERT_TEXT",
@@ -2845,24 +2857,24 @@ class TestMetacognitiveBuffers:
 
     def test_emit_user_nudges_noop_when_buffer_empty(self, tmp_db):
         session = _make_session()
-        session.messages.append({"role": "user", "content": "untouched"})
+        session.messages.append(turn_from_dict({"role": "user", "content": "untouched"}))
         session._msg_tokens.append(1)
         pre_len = len(session.messages)
         with patch("turnstone.core.session.save_message"):
             session._emit_pending_user_nudges()
         # No nudges → no system turn appended.
         assert len(session.messages) == pre_len
-        assert session.messages[-1]["role"] == "user"
+        assert turn_to_dict(session.messages[-1])["role"] == "user"
 
     def test_emit_user_nudges_appends_one_system_turn_per_nudge(self, tmp_db):
         session = _make_session()
-        session.messages.append({"role": "user", "content": "user text"})
+        session.messages.append(turn_from_dict({"role": "user", "content": "user text"}))
         session._msg_tokens.append(1)
         session._queue_user_advisory("denial", "FIRST")
         session._queue_user_advisory("correction", "SECOND")
         with patch("turnstone.core.session.save_message"):
             session._emit_pending_user_nudges()
-        sys_turns = [m for m in session.messages if m.get("role") == "system"]
+        sys_turns = [m for m in dicts_from_turns(session.messages) if m.get("role") == "system"]
         assert sys_turns == [
             {"role": "system", "_source": "denial", "content": "FIRST"},
             {"role": "system", "_source": "correction", "content": "SECOND"},
@@ -3031,12 +3043,13 @@ class TestMetacognitiveBuffers:
             session.send("first")
 
         # Role sequence: the nudge follows the clean tool message.
-        roles = [m.get("role") for m in session.messages]
+        msgs = dicts_from_turns(session.messages)
+        roles = [m.get("role") for m in msgs]
         assert roles == ["user", "assistant", "tool", "system", "assistant"], (
             f"expected the tool_error nudge as a system turn after the tool, got {roles!r}"
         )
-        assert session.messages[2]["content"] == "boom"  # clean tool output
-        sys_turn = session.messages[3]
+        assert msgs[2]["content"] == "boom"  # clean tool output
+        sys_turn = msgs[3]
         assert sys_turn["_source"] == "tool_error"
         assert sys_turn["content"] == "you hit an error; check memory"
 
@@ -3085,16 +3098,17 @@ class TestMetacognitiveBuffers:
         # Role sequence: user -> assistant(tool_calls) -> tool ->
         # system(user_interjection) -> assistant(ack).  No trailing user
         # row — the interjection is operator-context, not user input.
-        roles = [m.get("role") for m in session.messages]
+        msgs = dicts_from_turns(session.messages)
+        roles = [m.get("role") for m in msgs]
         assert roles == ["user", "assistant", "tool", "system", "assistant"], (
             f"expected user->assistant->tool->system->assistant, got {roles!r}"
         )
         # Tool message content is the bare output — no envelope.
-        tool_msg = session.messages[2]
+        tool_msg = msgs[2]
         assert tool_msg["content"] == "ok"
         assert "<tool_output>" not in tool_msg["content"]
         # The system turn carries the queued interjection.
-        sys_turn = session.messages[3]
+        sys_turn = msgs[3]
         assert sys_turn["_source"] == "user_interjection"
         assert sys_turn["content"].endswith("User message: typed during tool")
         # The tool row was saved clean; a system row carries the interjection.
@@ -3139,13 +3153,14 @@ class TestMetacognitiveBuffers:
             session._title_generated = True
             session.send("first")
 
-        roles = [m.get("role") for m in session.messages]
+        msgs = dicts_from_turns(session.messages)
+        roles = [m.get("role") for m in msgs]
         # Single trailing user row carrying the feedback before the
         # final assistant ack.
         assert roles == ["user", "assistant", "tool", "user", "assistant"], (
             f"expected feedback-as-user-row sequence, got {roles!r}"
         )
-        assert session.messages[3]["content"] == "y, use full path"
+        assert msgs[3]["content"] == "y, use full path"
         # Persisted via _append_user_turn -> save_message("user", ...).
         user_saves = [
             c for c in save_msg.call_args_list if len(c.args) >= 3 and c.args[1] == "user"
@@ -3213,7 +3228,8 @@ class TestMetacognitiveBuffers:
             session._title_generated = True
             session.send("first")
 
-        roles = [m.get("role") for m in session.messages]
+        msgs = dicts_from_turns(session.messages)
+        roles = [m.get("role") for m in msgs]
         # NO back-to-back user rows.  Pre-fix the user_feedback
         # appended a separate user row and the queue drained another:
         # roles == [..., "user", "user", ...] which broke strict
@@ -3226,7 +3242,7 @@ class TestMetacognitiveBuffers:
         assert roles == ["user", "assistant", "tool", "user", "assistant"], (
             f"expected single-trailing-user shape, got {roles!r}"
         )
-        flushed_content = session.messages[3]["content"]
+        flushed_content = msgs[3]["content"]
         # The two pieces are joined by the canonical separator.
         assert flushed_content == "y, use full path\n\nlate arrival"
         # Queue cleared.
@@ -3241,7 +3257,7 @@ class TestMetacognitiveBuffers:
         appended = session._flush_queued_messages(prefix="hello")
         assert appended is True
         assert len(session.messages) == pre_count + 1
-        last = session.messages[-1]
+        last = turn_to_dict(session.messages[-1])
         assert last["role"] == "user"
         assert last["content"] == "hello"
 
@@ -3254,7 +3270,7 @@ class TestMetacognitiveBuffers:
         session.queue_message("b", queue_msg_id="q-b")
         appended = session._flush_queued_messages(prefix="approve")
         assert appended is True
-        last = session.messages[-1]
+        last = turn_to_dict(session.messages[-1])
         assert last["role"] == "user"
         assert last["content"] == "approve\n\na\n\nb"
         assert session._queued_messages == {}
@@ -3422,14 +3438,15 @@ class TestMetacognitiveBuffers:
             session.send("first")
 
         # In-memory: tool row keeps the list content; a system turn follows.
-        tool_msg = next(m for m in session.messages if m.get("role") == "tool")
+        msgs = dicts_from_turns(session.messages)
+        tool_msg = next(m for m in msgs if m.get("role") == "tool")
         text_parts = [
             p["text"]
             for p in tool_msg["content"]
             if isinstance(p, dict) and p.get("type") == "text"
         ]
         assert text_parts == ["the chart shows X"]
-        sys_turn = next(m for m in session.messages if m.get("role") == "system")
+        sys_turn = next(m for m in msgs if m.get("role") == "system")
         assert sys_turn["_source"] == "user_interjection"
         assert sys_turn["content"].endswith("User message: inspect the histogram")
 
@@ -3459,10 +3476,11 @@ class TestMetacognitiveBuffers:
 
         # User turn landed clean; the start nudge follows it as a system turn.
         assert session.messages, "user message should have been appended"
-        user_turns = [m for m in session.messages if m.get("role") == "user"]
+        msgs = dicts_from_turns(session.messages)
+        user_turns = [m for m in msgs if m.get("role") == "user"]
         assert user_turns[-1]["content"] == "first user message"
         assert "_reminders" not in user_turns[-1]
-        sys_turns = [m for m in session.messages if m.get("role") == "system"]
+        sys_turns = [m for m in msgs if m.get("role") == "system"]
         assert any(m["_source"] == "start" for m in sys_turns), (
             f"expected a start system turn, got {sys_turns!r}"
         )
@@ -3478,7 +3496,7 @@ class TestMetacognitiveBuffers:
         line is gone.  No ``on_info`` should fire from the drain."""
         session = _make_session()
         session.ui = MagicMock()
-        session.messages.append({"role": "user", "content": "noted"})
+        session.messages.append(turn_from_dict({"role": "user", "content": "noted"}))
         session._msg_tokens.append(1)
         session._queue_user_advisory("correction", "watch out")
         with patch("turnstone.core.session.save_message"):
@@ -3494,7 +3512,7 @@ class TestMetacognitiveBuffers:
         operator bubble in lockstep with the originating tab."""
         session = _make_session()
         session.ui = MagicMock()
-        session.messages.append({"role": "user", "content": "noted"})
+        session.messages.append(turn_from_dict({"role": "user", "content": "noted"}))
         session._msg_tokens.append(1)
         session._queue_user_advisory("correction", "watch out")
         with patch("turnstone.core.session.save_message"):
@@ -3511,13 +3529,13 @@ class TestMetacognitiveBuffers:
         session = _make_session()
         session.ui = MagicMock()
         session.ui.on_system_turn.side_effect = RuntimeError("queue full")
-        session.messages.append({"role": "user", "content": "noted"})
+        session.messages.append(turn_from_dict({"role": "user", "content": "noted"}))
         session._msg_tokens.append(1)
         session._queue_user_advisory("correction", "watch out")
         with patch("turnstone.core.session.save_message"):
             session._emit_pending_user_nudges()
         # The system turn was appended despite the hook raising.
-        assert session.messages[-1] == {
+        assert turn_to_dict(session.messages[-1]) == {
             "role": "system",
             "_source": "correction",
             "content": "watch out",
@@ -3566,8 +3584,8 @@ class TestApplyPostExecuteAdvisories:
         so seed two messages to mirror that.
         """
         session._mem_cfg.nudges = True
-        session.messages.append({"role": "user", "content": "hi"})
-        session.messages.append({"role": "assistant", "content": "ok"})
+        session.messages.append(turn_from_dict({"role": "user", "content": "hi"}))
+        session.messages.append(turn_from_dict({"role": "assistant", "content": "ok"}))
 
     def test_three_identical_calls_fire_warning_and_advisory(self, tmp_db):
         session = _make_session()
@@ -3774,7 +3792,7 @@ class TestUpdateTokenTableMsgsParam:
     def test_uses_provided_msgs_skips_re_application(self, tmp_db):
         session = _make_session()
         session._last_usage = {"prompt_tokens": 100, "completion_tokens": 50}
-        session.messages.append({"role": "user", "content": "hi"})
+        session.messages.append(turn_from_dict({"role": "user", "content": "hi"}))
         # Patch _prepare_wire_messages to detect a redundant re-fold.
         with patch.object(
             session,
@@ -3792,7 +3810,7 @@ class TestUpdateTokenTableMsgsParam:
         can't) pre-build the wire copy still get a sane calibration."""
         session = _make_session()
         session._last_usage = {"prompt_tokens": 100, "completion_tokens": 50}
-        session.messages.append({"role": "user", "content": "hi"})
+        session.messages.append(turn_from_dict({"role": "user", "content": "hi"}))
         with patch.object(
             session,
             "_prepare_wire_messages",
@@ -3911,7 +3929,7 @@ class TestUserAdvisoryCancelClear:
         )
         # The queued message landed in history before the second turn.
         user_texts: list[str] = []
-        for m in session.messages:
+        for m in dicts_from_turns(session.messages):
             if m.get("role") != "user":
                 continue
             content = m.get("content")
@@ -3986,12 +4004,13 @@ class TestDeliverWakeNudge:
         assert _user_pending(session) == []
         # Empty-content user message was appended; the nudge follows it as
         # a first-class system turn (no _reminders side-channel).
-        user_msgs = [m for m in session.messages if m.get("role") == "user"]
+        msgs = dicts_from_turns(session.messages)
+        user_msgs = [m for m in msgs if m.get("role") == "user"]
         assert user_msgs, "wake should append a synthetic user message"
         wake_msg = user_msgs[-1]
         assert wake_msg["content"] == ""
         assert "_reminders" not in wake_msg
-        sys_turns = [m for m in session.messages if m.get("role") == "system"]
+        sys_turns = [m for m in msgs if m.get("role") == "system"]
         assert {"role": "system", "_source": "idle_children", "content": "your kids"} in sys_turns
 
     def test_marks_source_tag_on_synthesized_user_msg(self, tmp_db):
@@ -4013,7 +4032,7 @@ class TestDeliverWakeNudge:
             patch("turnstone.core.session.save_message"),
         ):
             session.deliver_wake_nudge_from_queue()
-        user_msgs = [m for m in session.messages if m.get("role") == "user"]
+        user_msgs = [m for m in dicts_from_turns(session.messages) if m.get("role") == "user"]
         wake_msg = user_msgs[-1]
         assert wake_msg.get("_source") == "system_nudge"
 
@@ -4056,7 +4075,7 @@ class TestDeliverWakeNudge:
         session._queue_user_advisory("denial", "don't do that next time")
         # Force enough memory + message context that should_nudge would
         # otherwise fire a fresh correction nudge.
-        session.messages.append({"role": "user", "content": "earlier"})
+        session.messages.append(turn_from_dict({"role": "user", "content": "earlier"}))
         with (
             patch.object(session, "_create_stream_with_retry", return_value=iter([])),
             patch.object(
@@ -4116,7 +4135,7 @@ class TestDeliverWakeNudge:
         ):
             session.deliver_wake_nudge_from_queue()
 
-        user_msgs = [m for m in session.messages if m.get("role") == "user"]
+        user_msgs = [m for m in dicts_from_turns(session.messages) if m.get("role") == "user"]
         # Two user messages: the wake's synthetic empty turn (with
         # _source) AND the flushed real user input (without _source).
         wake_msg = next(m for m in user_msgs if m.get("content") == "")
@@ -4145,10 +4164,11 @@ class TestDeliverWakeNudge:
         ):
             session.deliver_wake_nudge_from_queue()
         # The nudge system turn landed and stays (persistent history).
-        sys_turns = [m for m in session.messages if m.get("role") == "system"]
+        msgs = dicts_from_turns(session.messages)
+        sys_turns = [m for m in msgs if m.get("role") == "system"]
         assert any(m["_source"] == "denial" and m["content"] == "leftover" for m in sys_turns)
         # No legacy delivered flag anywhere.
-        assert all("_reminders_delivered" not in m for m in session.messages)
+        assert all("_reminders_delivered" not in m for m in msgs)
         # Wake tag cleared even on exception (finally block).
         assert session._wake_source_tag == ""
 
@@ -4230,14 +4250,16 @@ class TestReminderSidechannelIsolation:
         the summary text and outlive the turn it advised."""
         session = _make_session()
         session.messages.append(
-            {
-                "role": "user",
-                "content": "user said this",
-                "_reminders": [{"type": "correction", "text": "SECRET_NUDGE_TEXT"}],
-            }
+            turn_from_dict(
+                {
+                    "role": "user",
+                    "content": "user said this",
+                    "_reminders": [{"type": "correction", "text": "SECRET_NUDGE_TEXT"}],
+                }
+            )
         )
-        session.messages.append({"role": "assistant", "content": "ok"})
-        summary = session._format_messages_for_summary(session.messages)
+        session.messages.append(turn_from_dict({"role": "assistant", "content": "ok"}))
+        summary = session._format_messages_for_summary(dicts_from_turns(session.messages))
         assert "SECRET_NUDGE_TEXT" not in summary
         assert "<system-reminder>" not in summary
         assert "user said this" in summary
@@ -4249,16 +4271,18 @@ class TestReminderSidechannelIsolation:
         clean even when ``_reminders`` is populated."""
         session = _make_session()
         session.messages.append(
-            {
-                "role": "user",
-                "content": "first message body",
-                "_reminders": [{"type": "start", "text": "SECRET_NUDGE_TEXT"}],
-            }
+            turn_from_dict(
+                {
+                    "role": "user",
+                    "content": "first message body",
+                    "_reminders": [{"type": "start", "text": "SECRET_NUDGE_TEXT"}],
+                }
+            )
         )
         # Mirror the loop at session.py:_generate_title that pulls the
         # first user message into the title prompt.
         extracted_user = ""
-        for m in session.messages:
+        for m in dicts_from_turns(session.messages):
             content = m.get("content") or ""
             if isinstance(content, list):
                 content = " ".join(p.get("text", "") for p in content if isinstance(p, dict))
@@ -4290,7 +4314,7 @@ class TestReminderSidechannelIsolation:
 
         wake_msgs = [
             m
-            for m in resumed_fork.messages
+            for m in dicts_from_turns(resumed_fork.messages)
             if m.get("role") == "user" and m.get("_source") == "system_nudge"
         ]
         assert len(wake_msgs) == 1

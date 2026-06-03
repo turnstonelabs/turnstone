@@ -29,6 +29,7 @@ from turnstone.console.server import (
 )
 from turnstone.core.auth import AuthResult
 from turnstone.core.storage._sqlite import SQLiteBackend
+from turnstone.core.trajectory import turns_from_dicts
 from turnstone.server import (
     _deliver_notification,
     _extract_last_assistant_content,
@@ -210,23 +211,27 @@ class TestValidateNotifyTargets:
 class TestExtractLastAssistantContent:
     def test_string_content(self):
         session = MagicMock()
-        session.messages = [
-            {"role": "user", "content": "hello"},
-            {"role": "assistant", "content": "world"},
-        ]
+        session.messages = turns_from_dicts(
+            [
+                {"role": "user", "content": "hello"},
+                {"role": "assistant", "content": "world"},
+            ]
+        )
         assert _extract_last_assistant_content(session) == "world"
 
     def test_structured_content(self):
         session = MagicMock()
-        session.messages = [
-            {
-                "role": "assistant",
-                "content": [
-                    {"type": "text", "text": "part one"},
-                    {"type": "text", "text": "part two"},
-                ],
-            },
-        ]
+        session.messages = turns_from_dicts(
+            [
+                {
+                    "role": "assistant",
+                    "content": [
+                        {"type": "text", "text": "part one"},
+                        {"type": "text", "text": "part two"},
+                    ],
+                },
+            ]
+        )
         assert _extract_last_assistant_content(session) == "part one\npart two"
 
     def test_empty_messages(self):
@@ -236,29 +241,33 @@ class TestExtractLastAssistantContent:
 
     def test_no_assistant_messages(self):
         session = MagicMock()
-        session.messages = [{"role": "user", "content": "hello"}]
+        session.messages = turns_from_dicts([{"role": "user", "content": "hello"}])
         assert _extract_last_assistant_content(session) == ""
 
     def test_picks_last_assistant(self):
         session = MagicMock()
-        session.messages = [
-            {"role": "assistant", "content": "first"},
-            {"role": "user", "content": "question"},
-            {"role": "assistant", "content": "second"},
-        ]
+        session.messages = turns_from_dicts(
+            [
+                {"role": "assistant", "content": "first"},
+                {"role": "user", "content": "question"},
+                {"role": "assistant", "content": "second"},
+            ]
+        )
         assert _extract_last_assistant_content(session) == "second"
 
     def test_skips_non_text_blocks(self):
         session = MagicMock()
-        session.messages = [
-            {
-                "role": "assistant",
-                "content": [
-                    {"type": "tool_use", "id": "123"},
-                    {"type": "text", "text": "result"},
-                ],
-            },
-        ]
+        session.messages = turns_from_dicts(
+            [
+                {
+                    "role": "assistant",
+                    "content": [
+                        {"type": "tool_use", "id": "123"},
+                        {"type": "text", "text": "result"},
+                    ],
+                },
+            ]
+        )
         assert _extract_last_assistant_content(session) == "result"
 
 
