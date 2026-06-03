@@ -535,18 +535,19 @@ def reconstruct_messages(
     (``read_file`` on an image) this way — they would otherwise reload as the
     flattened text alone.
 
-    When ``repair`` is True (default) the result is post-processed to
-    produce a wire-shape valid for an LLM round-trip: the trailing
-    ``assistant(tool_calls)`` turn is dropped if not all tool_call ids
-    have a matching tool result (trailing operator-context ``system``
-    turns are looked through and stripped with it), and any
-    mid-conversation orphaned tool_calls are filled with synthetic
-    cancellation results.  Callers
-    that consume the messages as LLM context (e.g. ``session.resume``)
-    must keep this on.  Callers reading for *display* (the ``/history``
-    REST endpoint) should pass ``repair=False`` so the user sees the
-    actual partial state — refreshing during tool execution otherwise
-    silently drops the trailing turn from the UI.
+    When ``repair`` is True (default) the trailing ``assistant(tool_calls)``
+    turn is dropped if not all tool_call ids have a matching tool result
+    (trailing operator-context ``system`` turns are looked through and stripped
+    with it) — boot-crash recovery so a half-finished turn never replays.
+    Mid-conversation orphaned tool_calls are *not* filled here; that is the
+    send-time repair (:func:`turnstone.core.lowering.repair_wire_messages`), the
+    single place the wire path synthesizes cancellation results.  Callers that
+    consume the messages as LLM context via the session send path
+    (``session.resume``) get that repair for free; a consumer that bypasses it
+    (``export``) runs ``repair_wire_messages`` itself.  Callers reading for
+    *display* (the ``/history`` REST endpoint) should pass ``repair=False`` so
+    the user sees the actual partial state — refreshing during tool execution
+    otherwise silently drops the trailing turn from the UI.
     """
     messages: list[dict[str, Any]] = []
     for row in rows:
@@ -686,59 +687,10 @@ def reconstruct_messages(
             break
         del messages[asst_idx:]
 
-    # Repair: synthesize tool results for mid-conversation orphaned tool calls.
-    # This happens when a cancel interrupts tool execution — the assistant
-    # message with tool_calls is saved to DB but GenerationCancelled prevents
-    # tool results from being created.  Both Anthropic (strict) and OpenAI
-    # (lenient today, may tighten) benefit from well-formed histories.
-    i = 0
-    while i < len(messages):
-        msg = messages[i]
-        if msg.get("role") == "assistant" and msg.get("tool_calls"):
-            expected_ids = [tc.get("id", "") for tc in msg["tool_calls"] if tc.get("id")]
-            # Collect the tool-result ids that follow, looking *through* any
-            # operator-context system/developer turns interspersed in the block
-            # (they follow the turn they relate to and must not be mistaken for
-            # the end of the tool-result run — the same skip pass 1 applies).
-            # ``insert_at`` tracks the slot right after the last real tool
-            # result so synthesized results stay contiguous with the real ones
-            # (Anthropic requires every tool_result adjacent to its tool_use);
-            # without this, a synthetic spliced after a trailing system turn
-            # would split the block.
-            j = i + 1
-            result_ids: set[str] = set()
-            insert_at = i + 1
-            while j < len(messages) and messages[j].get("role") in (
-                "tool",
-                "system",
-                "developer",
-            ):
-                if messages[j].get("role") == "tool":
-                    tc_id = messages[j].get("tool_call_id", "")
-                    if tc_id:
-                        result_ids.add(tc_id)
-                    insert_at = j + 1
-                j += 1
-            # Synthesize results for any missing IDs
-            orphaned = [uid for uid in expected_ids if uid not in result_ids]
-            if orphaned:
-                synthetic = [
-                    {
-                        "role": "tool",
-                        "tool_call_id": uid,
-                        "content": "Tool execution was cancelled.",
-                        "is_error": True,
-                    }
-                    for uid in orphaned
-                ]
-                messages[insert_at:insert_at] = synthetic
-            if orphaned:
-                i = j + len(orphaned)  # skip past the (now longer) block
-            elif j > i + 1:
-                i = j  # skip past existing tool block
-            else:
-                i += 1  # no tools followed; just advance
-        else:
-            i += 1
-
+    # Mid-conversation orphaned tool_calls are NOT synthesized here — that is the
+    # send-time repair (``lowering.repair_wire_messages``), the single place the
+    # wire path fills them.  Load stays trailing-strip-only: the bare orphan is
+    # harmless between load and send (token-count is additive, ``/history`` reads
+    # ``repair=False``, compaction summarizes to text), and the send pass repairs
+    # it.  Non-session consumers (``export``) run ``repair_wire_messages`` too.
     return messages

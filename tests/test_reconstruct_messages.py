@@ -249,10 +249,12 @@ class TestEdgeCases:
 
 
 class TestMidConversationOrphanRepair:
-    """Mid-conversation orphaned tool_calls get synthetic tool results."""
+    """Mid-conversation orphaned tool_calls are LEFT bare at load — the
+    send-time repair (``lowering.repair_wire_messages``, covered in
+    ``test_lowering.py``) fills them.  Load is trailing-strip only."""
 
-    def test_all_orphaned_mid_conversation(self):
-        """Assistant has 2 tool_calls, no tool results, then user message."""
+    def test_all_orphaned_not_synthesized_at_load(self):
+        """Assistant has 2 unanswered tool_calls then a user turn: left bare."""
         tc = json.dumps(
             [
                 {"id": "c1", "function": {"name": "bash", "arguments": "{}"}},
@@ -265,17 +267,13 @@ class TestMidConversationOrphanRepair:
             _row("user", "never mind"),
         ]
         msgs = reconstruct_messages(rows, "ws1")
-        # Should have: user, assistant, tool(c1), tool(c2), user
-        assert len(msgs) == 5
-        assert msgs[2]["role"] == "tool"
-        assert msgs[2]["tool_call_id"] == "c1"
-        assert msgs[2]["is_error"] is True
-        assert msgs[3]["role"] == "tool"
-        assert msgs[3]["tool_call_id"] == "c2"
-        assert msgs[4]["role"] == "user"
+        # No synthesis at load — the orphan is mid-conversation (not trailing),
+        # so the strip leaves it; the send pass synthesizes it.
+        assert [m["role"] for m in msgs] == ["user", "assistant", "user"]
+        assert not any(m["role"] == "tool" for m in msgs)
 
-    def test_partial_results_mid_conversation(self):
-        """2 tool_calls, 1 result present, 1 missing — synthesize only the missing one."""
+    def test_partial_results_not_synthesized_at_load(self):
+        """A present result is kept; the missing sibling is NOT filled at load."""
         tc = json.dumps(
             [
                 {"id": "c1", "function": {"name": "bash", "arguments": "{}"}},
@@ -289,16 +287,12 @@ class TestMidConversationOrphanRepair:
             _row("user", "skip the write"),
         ]
         msgs = reconstruct_messages(rows, "ws1")
-        # Should have: user, assistant, tool(c1 real), tool(c2 synthetic), user
-        assert len(msgs) == 5
-        assert msgs[2]["role"] == "tool"
-        assert msgs[2]["tool_call_id"] == "c1"
-        assert msgs[2]["content"] == "file1.txt"
-        assert msgs[2].get("is_error") is not True
-        assert msgs[3]["role"] == "tool"
-        assert msgs[3]["tool_call_id"] == "c2"
-        assert msgs[3]["is_error"] is True
-        assert msgs[4]["role"] == "user"
+        # Real c1 result kept; c2 left orphaned (synthesized at send, not here).
+        assert [m["role"] for m in msgs] == ["user", "assistant", "tool", "user"]
+        tool_msgs = [m for m in msgs if m["role"] == "tool"]
+        assert len(tool_msgs) == 1
+        assert tool_msgs[0]["tool_call_id"] == "c1"
+        assert tool_msgs[0]["content"] == "file1.txt"
 
     def test_complete_results_no_synthesis(self):
         """All tool_calls have results — no synthesis needed."""
@@ -429,10 +423,10 @@ class TestSystemTurns:
         assert tool_msgs[0].get("is_error") is not True
         assert [m["role"] for m in msgs] == ["user", "assistant", "system", "tool", "user"]
 
-    def test_synthetic_result_stays_adjacent_to_real_results_past_system(self):
-        """When a call IS orphaned and a system turn follows the real results,
-        the synthetic is inserted adjacent to the real block (before the system
-        turn), keeping the tool-result block contiguous."""
+    def test_orphan_past_system_left_bare_at_load(self):
+        """When a call IS orphaned with a system turn after the real results,
+        load leaves it bare (no splice).  The send-time repair's contiguous
+        insertion past system turns is covered in ``test_lowering.py``."""
         tc = json.dumps(
             [
                 {"id": "c1", "function": {"name": "bash", "arguments": "{}"}},
@@ -447,16 +441,9 @@ class TestSystemTurns:
             _row("user", "skip c2"),  # c2 never resulted
         ]
         msgs = reconstruct_messages(rows, "ws1")
-        assert [m["role"] for m in msgs] == [
-            "user",
-            "assistant",
-            "tool",
-            "tool",
-            "system",
-            "user",
-        ]
+        # No synthetic c2 at load — only the real c1 result.
+        assert [m["role"] for m in msgs] == ["user", "assistant", "tool", "system", "user"]
         assert msgs[2]["tool_call_id"] == "c1" and msgs[2].get("is_error") is not True
-        assert msgs[3]["tool_call_id"] == "c2" and msgs[3]["is_error"] is True
 
 
 _PNG = (

@@ -194,3 +194,21 @@ def test_attach_reasoning_runs_before_sanitize(backend):
     leaked = [k for m in messages for k in m if isinstance(k, str) and k.startswith("_")]
     assert leaked == []
     assert _assistants(messages)[0].get("reasoning_content") == "R1"
+
+
+def test_mid_orphan_tool_call_exports_with_cancellation(backend):
+    """A mid-conversation orphaned tool_call (no result) exports with a
+    synthesized cancellation: export bypasses the session send path, so it runs
+    the send-time orphan repair itself (load is trailing-strip only)."""
+    tc = [{"id": "call_x", "type": "function", "function": {"name": "run", "arguments": "{}"}}]
+    backend.register_workstream("ws1", user_id=USER, title="T", kind="interactive")
+    backend.save_message("ws1", "user", "go")
+    backend.save_message("ws1", "assistant", "working", tool_calls=json.dumps(tc))
+    # A user turn after the orphan keeps it mid-conversation (not stripped).
+    backend.save_message("ws1", "user", "never mind")
+
+    messages = _parse_messages(_build_openai_json(backend, "ws1"))
+    tool_msgs = [m for m in messages if m.get("role") == "tool"]
+    assert len(tool_msgs) == 1
+    assert tool_msgs[0]["tool_call_id"] == "call_x"
+    assert "cancelled" in tool_msgs[0]["content"].lower()

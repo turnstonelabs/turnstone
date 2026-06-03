@@ -32,6 +32,7 @@ from typing import TYPE_CHECKING, Any
 from turnstone.core.history_decoration import (
     extract_reasoning_text_from_provider_content,
 )
+from turnstone.core.lowering import repair_wire_messages
 from turnstone.core.providers._openai_common import sanitize_messages
 
 if TYPE_CHECKING:
@@ -79,9 +80,11 @@ def _attach_reasoning_content(messages: list[dict[str, Any]]) -> list[dict[str, 
 
 def _build_openai_json(storage: StorageBackend, ws_id: str) -> bytes:
     """Serialize one workstream's history as an OpenAI envelope (JSON bytes)."""
-    messages = sanitize_messages(
-        _attach_reasoning_content(storage.load_messages(ws_id, repair=True))
-    )
+    # Export bypasses the session send path, so it runs the send-time orphan
+    # repair itself (``load`` only strips the trailing turn) — otherwise a
+    # mid-conversation orphaned tool_call would serialize as an unanswered call.
+    loaded = _attach_reasoning_content(storage.load_messages(ws_id, repair=True))
+    messages = sanitize_messages(repair_wire_messages(loaded))
     return json.dumps({"messages": messages}, ensure_ascii=False, indent=2).encode("utf-8")
 
 
