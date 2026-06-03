@@ -907,8 +907,6 @@ class PostgreSQLBackend:
     def save_attachment(
         self,
         attachment_id: str,
-        ws_id: str,
-        user_id: str,
         filename: str,
         mime_type: str,
         size_bytes: int,
@@ -929,8 +927,6 @@ class PostgreSQLBackend:
         with self._conn() as conn:
             stmt = pg_insert(workstream_attachments).values(
                 attachment_id=attachment_id,
-                ws_id=ws_id,
-                user_id=user_id,
                 filename=filename,
                 mime_type=mime_type,
                 size_bytes=size_bytes,

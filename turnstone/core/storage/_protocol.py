@@ -257,8 +257,6 @@ class StorageBackend(Protocol):
     def save_attachment(
         self,
         attachment_id: str,
-        ws_id: str,
-        user_id: str,
         filename: str,
         mime_type: str,
         size_bytes: int,

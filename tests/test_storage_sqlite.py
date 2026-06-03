@@ -230,7 +230,7 @@ class TestLoadMessagesLimit:
         # Oldest row carries the attachment; then 20 plain rows after it.
         aid = "a" * 64
         att_msg_id = backend.save_message("s1", "user", "see attachment")
-        backend.save_attachment(aid, "s1", "u", "x.txt", "text/plain", 1, "text", b"x")
+        backend.save_attachment(aid, "x.txt", "text/plain", 1, "text", b"x")
         backend.set_message_attachments("s1", att_msg_id, [aid])
         for i in range(20):
             backend.save_message("s1", "user", f"msg-{i:02d}")

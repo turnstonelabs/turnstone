@@ -245,8 +245,6 @@ class _FakeSession:
                 for a in attachments:
                     save_attachment(
                         a.attachment_id,
-                        self.ws_id,
-                        self.user_id,
                         a.filename,
                         a.mime_type,
                         len(a.content),

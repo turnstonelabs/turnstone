@@ -116,8 +116,6 @@ def load_message_turns(ws_id: str) -> list[Turn]:
 
 def save_attachment(
     attachment_id: str,
-    ws_id: str,
-    user_id: str,
     filename: str,
     mime_type: str,
     size_bytes: int,
@@ -134,8 +132,6 @@ def save_attachment(
     try:
         get_storage().save_attachment(
             attachment_id,
-            ws_id,
-            user_id,
             filename,
             mime_type,
             size_bytes,
@@ -144,7 +140,7 @@ def save_attachment(
             origin,
         )
     except Exception:
-        log.warning("Failed to save attachment ws=%s", ws_id, exc_info=True)
+        log.warning("Failed to save attachment id=%s", attachment_id, exc_info=True)
 
 
 def set_message_attachments(ws_id: str, message_id: int, attachment_ids: list[str]) -> None:

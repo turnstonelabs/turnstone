@@ -535,8 +535,12 @@ sa.Index(
 #
 # In the content-addressed model the primary key IS the content hash
 # (sha256 hex): identical bytes dedupe to one row regardless of how many
-# messages reference them.  A blob is written only at send-commit (or when a
-# tool produces an image), so every stored row is born referenced
+# messages reference them.  The store is GLOBAL — identical bytes dedupe
+# across workstreams and users, so there are no ``ws_id`` / ``user_id`` scope
+# columns; a committed blob is authorised by proving the (already ws-gated)
+# requester has a turn in that workstream whose ref-list names the id (see
+# ``attachment_referenced_in_ws``).  A blob is written only at send-commit (or
+# when a tool produces an image), so every stored row is born referenced
 # (``refcount >= 1``); GC decrements ``refcount`` as referencing messages are
 # deleted and prunes the row at 0.  Pending (uploaded-but-unsent) bytes live
 # in the per-node in-memory buffer (``attachment_buffer``), NOT here — the
@@ -550,8 +554,6 @@ workstream_attachments = sa.Table(
     metadata,
     # PK is the content hash (sha256 hex) — content-addressed dedup.
     sa.Column("attachment_id", sa.Text, primary_key=True),
-    sa.Column("ws_id", sa.Text, nullable=False),
-    sa.Column("user_id", sa.Text, nullable=False),
     sa.Column("filename", sa.Text, nullable=False),
     sa.Column("mime_type", sa.Text, nullable=False),
     sa.Column("size_bytes", sa.Integer, nullable=False),
@@ -564,8 +566,6 @@ workstream_attachments = sa.Table(
     sa.Column("refcount", sa.Integer, nullable=False, server_default=sa.text("0")),
     sa.Column("origin", sa.Text, nullable=False, server_default=sa.text("'upload'")),
 )
-
-sa.Index("idx_ws_attachments_ws_id", workstream_attachments.c.ws_id)
 
 # ---------------------------------------------------------------------------
 # Skill versions — version history for skills

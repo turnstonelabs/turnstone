@@ -105,8 +105,8 @@ def test_no_underscore_keys_leak(backend):
 def test_image_url_kept_document_inlined(backend):
     backend.register_workstream("ws1", user_id=USER, kind="interactive")
     msg_id = backend.save_message("ws1", "user", "see attached")
-    backend.save_attachment("att_img", "ws1", USER, "pic.png", "image/png", 4, "image", b"\x89PNG")
-    backend.save_attachment("att_doc", "ws1", USER, "notes.txt", "text/plain", 5, "text", b"hello")
+    backend.save_attachment("att_img", "pic.png", "image/png", 4, "image", b"\x89PNG")
+    backend.save_attachment("att_doc", "notes.txt", "text/plain", 5, "text", b"hello")
     backend.set_message_attachments("ws1", msg_id, ["att_img", "att_doc"])
     backend.save_message("ws1", "assistant", "got it")
 

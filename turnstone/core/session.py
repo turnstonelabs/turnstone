@@ -3636,8 +3636,6 @@ class ChatSession:
         for att in attachments:
             save_attachment(
                 att.attachment_id,
-                self._ws_id,
-                self._user_id,
                 att.filename,
                 att.mime_type,
                 len(att.content),

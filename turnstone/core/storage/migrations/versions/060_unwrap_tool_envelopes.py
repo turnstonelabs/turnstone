@@ -39,7 +39,11 @@ Finally it performs the **attachment content-addressing cutover**: after adding
 (``sha256(content)``), dedups identical bytes into one refcounted blob, builds each
 message's ``attachments`` ref-list from the old ``message_id`` link, and then drops the
 retired upload-lifecycle columns ``message_id`` / ``reserved_for_msg_id`` /
-``reserved_at`` (and their indexes).  Pending (un-consumed) legacy rows are dropped —
+``reserved_at`` together with the now-global blob's dead scope columns ``ws_id`` /
+``user_id`` (and all their indexes).  The blob store is content-addressed and global —
+identical bytes dedupe across workstreams/users, so per-tenant scoping is gone;
+authorisation is by the ``conversations.attachments`` ref-list (see
+``attachment_referenced_in_ws``).  Pending (un-consumed) legacy rows are dropped —
 pending uploads now live in the per-node in-memory buffer, not in storage.
 
 ``downgrade()`` re-adds the (empty) ``_reminders`` column so the schema matches
@@ -281,10 +285,14 @@ def upgrade() -> None:
     #     drop below (it reads message_id).
     _backfill_content_addressed_attachments(bind)
 
-    # (4) Drop the retired upload-lifecycle columns + their indexes.  The
-    #     content-addressed model keys blobs by content hash and links them via
-    #     the conversations.attachments ref-list, so message_id /
-    #     reserved_for_msg_id / reserved_at (and the indexes over them) are dead.
+    # (4) Drop the retired upload-lifecycle columns + the now-dead scope columns
+    #     + their indexes.  The content-addressed model keys blobs by content
+    #     hash and links them via the conversations.attachments ref-list, so
+    #     message_id / reserved_for_msg_id / reserved_at are dead; and the blob
+    #     store is global (identical bytes dedupe across workstreams/users), so
+    #     the per-tenant scope columns ws_id / user_id are dead too — along with
+    #     every index over them (idx_ws_attachments_ws_id, and the composite
+    #     pending / reserved indexes that led with ws_id/user_id).
     #     Drop the dependent indexes FIRST on both dialects: SQLite's
     #     ``batch_alter_table`` rebuilds the table from the reflected schema and
     #     would otherwise try to re-create these indexes against the
@@ -294,12 +302,15 @@ def upgrade() -> None:
         "idx_ws_attachments_message",
         "idx_ws_attachments_reserved",
         "idx_ws_attachments_reserved_at",
+        "idx_ws_attachments_ws_id",
     ):
         op.execute(sa.text(f"DROP INDEX IF EXISTS {idx}"))
     with op.batch_alter_table("workstream_attachments") as batch_op:
         batch_op.drop_column("message_id")
         batch_op.drop_column("reserved_for_msg_id")
         batch_op.drop_column("reserved_at")
+        batch_op.drop_column("ws_id")
+        batch_op.drop_column("user_id")
 
 
 def _backfill_content_addressed_attachments(bind: sa.engine.Connection) -> None:
@@ -404,7 +415,10 @@ def downgrade() -> None:
     # re-added column is therefore always NULL.  The content-addressing
     # backfill (step 3) is likewise NOT reversed: the retired columns are
     # re-added empty (the old message_id links / reservation tokens cannot be
-    # reconstructed from the content-addressed ref-list).
+    # reconstructed from the content-addressed ref-list), and the dropped scope
+    # columns ws_id / user_id are re-added NOT NULL with an empty server_default
+    # (their original values were discarded at the cutover — the blob is global
+    # content-addressed now — so existing rows backfill to the empty sentinel).
     with op.batch_alter_table("conversations") as batch_op:
         batch_op.add_column(sa.Column("_reminders", sa.Text, nullable=True))
         batch_op.drop_column("is_error")
@@ -413,6 +427,8 @@ def downgrade() -> None:
         batch_op.add_column(sa.Column("message_id", sa.Integer, nullable=True))
         batch_op.add_column(sa.Column("reserved_for_msg_id", sa.Text, nullable=True))
         batch_op.add_column(sa.Column("reserved_at", sa.Text, nullable=True))
+        batch_op.add_column(sa.Column("ws_id", sa.Text, nullable=False, server_default=""))
+        batch_op.add_column(sa.Column("user_id", sa.Text, nullable=False, server_default=""))
         batch_op.drop_column("refcount")
         batch_op.drop_column("origin")
     # Re-create the indexes over the re-added columns to match the 059 schema.
@@ -430,4 +446,18 @@ def downgrade() -> None:
         "idx_ws_attachments_reserved",
         "workstream_attachments",
         ["ws_id", "user_id", "reserved_for_msg_id"],
+    )
+    op.create_index(
+        "idx_ws_attachments_ws_id",
+        "workstream_attachments",
+        ["ws_id"],
+    )
+    # Partial index (migration 038) — replicate the ``reserved_at IS NOT NULL``
+    # predicate so the restored 059 schema matches exactly, not a full index.
+    op.create_index(
+        "idx_ws_attachments_reserved_at",
+        "workstream_attachments",
+        ["reserved_at"],
+        postgresql_where=sa.text("reserved_at IS NOT NULL"),
+        sqlite_where=sa.text("reserved_at IS NOT NULL"),
     )

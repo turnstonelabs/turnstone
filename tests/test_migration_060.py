@@ -212,12 +212,17 @@ class TestMigration060:
             assert "message_id" not in att_cols
             assert "reserved_for_msg_id" not in att_cols
             assert "reserved_at" not in att_cols
+            # Dropped: the now-dead per-tenant scope columns (the blob store is
+            # global content-addressed; ownership is via the ref-list).
+            assert "ws_id" not in att_cols
+            assert "user_id" not in att_cols
             # Dropped: their indexes.
             idx_names = {i["name"] for i in insp.get_indexes("workstream_attachments")}
             assert "idx_ws_attachments_message" not in idx_names
             assert "idx_ws_attachments_pending" not in idx_names
             assert "idx_ws_attachments_reserved" not in idx_names
             assert "idx_ws_attachments_reserved_at" not in idx_names
+            assert "idx_ws_attachments_ws_id" not in idx_names
         finally:
             engine.dispose()
 

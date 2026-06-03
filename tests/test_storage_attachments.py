@@ -41,7 +41,7 @@ class TestContentAddressedWrite:
     def test_save_writes_blob_at_refcount_one(self, backend):
         backend.register_workstream("ws-ca")
         aid = _hash(b"hello")
-        backend.save_attachment(aid, "ws-ca", "u", "hello.txt", "text/plain", 5, "text", b"hello")
+        backend.save_attachment(aid, "hello.txt", "text/plain", 5, "text", b"hello")
         row = backend.get_attachment(aid)
         assert row is not None
         assert row["attachment_id"] == aid
@@ -53,7 +53,7 @@ class TestContentAddressedWrite:
         backend.register_workstream("ws-origin")
         aid = _hash(PNG_1x1)
         backend.save_attachment(
-            aid, "ws-origin", "u", "t.png", "image/png", len(PNG_1x1), "image", PNG_1x1, "tool"
+            aid, "t.png", "image/png", len(PNG_1x1), "image", PNG_1x1, "tool"
         )
         row = backend.get_attachment(aid)
         assert row is not None
@@ -63,10 +63,10 @@ class TestContentAddressedWrite:
     def test_identical_bytes_dedup_and_bump_refcount(self, backend):
         backend.register_workstream("ws-dedup")
         aid = _hash(b"same")
-        backend.save_attachment(aid, "ws-dedup", "u", "a.txt", "text/plain", 4, "text", b"same")
+        backend.save_attachment(aid, "a.txt", "text/plain", 4, "text", b"same")
         # A second reference to identical bytes does not duplicate the row —
         # it bumps the refcount (e.g. two messages reference the same blob).
-        backend.save_attachment(aid, "ws-dedup", "u", "b.txt", "text/plain", 4, "text", b"same")
+        backend.save_attachment(aid, "b.txt", "text/plain", 4, "text", b"same")
         rows = backend.get_attachments([aid])
         assert len(rows) == 1
         assert rows[0]["refcount"] == 2
@@ -77,8 +77,8 @@ class TestContentAddressedWrite:
         backend.register_workstream("ws-distinct")
         a1 = _hash(b"one")
         a2 = _hash(b"two")
-        backend.save_attachment(a1, "ws-distinct", "u", "1.txt", "text/plain", 3, "text", b"one")
-        backend.save_attachment(a2, "ws-distinct", "u", "2.txt", "text/plain", 3, "text", b"two")
+        backend.save_attachment(a1, "1.txt", "text/plain", 3, "text", b"one")
+        backend.save_attachment(a2, "2.txt", "text/plain", 3, "text", b"two")
         assert a1 != a2
         rows = {r["attachment_id"]: r for r in backend.get_attachments([a1, a2])}
         assert rows[a1]["content"] == b"one"
@@ -90,9 +90,9 @@ class TestGetAttachments:
         backend.register_workstream("ws-b")
         a1 = _hash(b"one")
         a2 = _hash(PNG_1x1)
-        backend.save_attachment(a1, "ws-b", "u", "one.txt", "text/plain", 3, "text", b"one")
+        backend.save_attachment(a1, "one.txt", "text/plain", 3, "text", b"one")
         backend.save_attachment(
-            a2, "ws-b", "u", "img.png", "image/png", len(PNG_1x1), "image", PNG_1x1
+            a2, "img.png", "image/png", len(PNG_1x1), "image", PNG_1x1
         )
         by_id = {r["attachment_id"]: r for r in backend.get_attachments([a1, a2])}
         assert by_id[a1]["content"] == b"one"
@@ -105,7 +105,7 @@ class TestGetAttachments:
     def test_mixed_known_and_unknown_ids(self, backend):
         backend.register_workstream("ws-mix")
         known = _hash(b"k")
-        backend.save_attachment(known, "ws-mix", "u", "k.txt", "text/plain", 1, "text", b"k")
+        backend.save_attachment(known, "k.txt", "text/plain", 1, "text", b"k")
         rows = backend.get_attachments([known, _hash(b"nope"), "definitely-not-an-id"])
         assert len(rows) == 1
         assert rows[0]["attachment_id"] == known
@@ -125,8 +125,8 @@ class TestSetMessageAttachments:
         backend.register_workstream("ws-ref")
         mid = backend.save_message("ws-ref", "user", "hi")
         a1, a2 = _hash(b"x"), _hash(b"y")
-        backend.save_attachment(a1, "ws-ref", "u", "x.txt", "text/plain", 1, "text", b"x")
-        backend.save_attachment(a2, "ws-ref", "u", "y.txt", "text/plain", 1, "text", b"y")
+        backend.save_attachment(a1, "x.txt", "text/plain", 1, "text", b"x")
+        backend.save_attachment(a2, "y.txt", "text/plain", 1, "text", b"y")
         backend.set_message_attachments("ws-ref", mid, [a2, a1])  # order matters
         with backend._conn() as conn:
             raw = conn.execute(
@@ -151,7 +151,7 @@ class TestSetMessageAttachments:
         backend.register_workstream("ws-b")
         mid = backend.save_message("ws-a", "user", "hi")
         aid = _hash(b"x")
-        backend.save_attachment(aid, "ws-a", "u", "x.txt", "text/plain", 1, "text", b"x")
+        backend.save_attachment(aid, "x.txt", "text/plain", 1, "text", b"x")
         backend.set_message_attachments("ws-b", mid, [aid])  # wrong ws
         with backend._conn() as conn:
             raw = conn.execute(
@@ -167,10 +167,10 @@ class TestLoadMessagesReconstructsMultipart:
         img_id = _hash(PNG_1x1)
         doc_id = _hash(b"# hi\n")
         backend.save_attachment(
-            img_id, "ws-multi", "u", "tiny.png", "image/png", len(PNG_1x1), "image", PNG_1x1
+            img_id, "tiny.png", "image/png", len(PNG_1x1), "image", PNG_1x1
         )
         backend.save_attachment(
-            doc_id, "ws-multi", "u", "notes.md", "text/markdown", 5, "text", b"# hi\n"
+            doc_id, "notes.md", "text/markdown", 5, "text", b"# hi\n"
         )
         backend.set_message_attachments("ws-multi", msg_id, [img_id, doc_id])
 
@@ -195,8 +195,8 @@ class TestLoadMessagesReconstructsMultipart:
         backend.register_workstream("ws-order")
         mid = backend.save_message("ws-order", "user", "ordered")
         a, b = _hash(b"AAA"), _hash(b"BBB")
-        backend.save_attachment(a, "ws-order", "u", "a.md", "text/markdown", 3, "text", b"AAA")
-        backend.save_attachment(b, "ws-order", "u", "b.md", "text/markdown", 3, "text", b"BBB")
+        backend.save_attachment(a, "a.md", "text/markdown", 3, "text", b"AAA")
+        backend.save_attachment(b, "b.md", "text/markdown", 3, "text", b"BBB")
         # Record b before a — reconstruction must follow the ref-list order.
         backend.set_message_attachments("ws-order", mid, [b, a])
         docs = [
@@ -213,7 +213,7 @@ class TestLoadMessagesReconstructsMultipart:
         backend.register_workstream("ws-bad")
         msg_id = backend.save_message("ws-bad", "user", "oops")
         aid = _hash(b"\xff\xfe")
-        backend.save_attachment(aid, "ws-bad", "u", "bad.txt", "text/plain", 2, "text", b"\xff\xfe")
+        backend.save_attachment(aid, "bad.txt", "text/plain", 2, "text", b"\xff\xfe")
         backend.set_message_attachments("ws-bad", msg_id, [aid])
         content = backend.load_messages("ws-bad")[0]["content"]
         assert isinstance(content, list)
@@ -258,8 +258,6 @@ class TestToolImageReconstruction:
         img_id = _hash(PNG_1x1)
         backend.save_attachment(
             img_id,
-            "ws-tool",
-            "u",
             "read_file-image.png",
             "image/png",
             len(PNG_1x1),
@@ -289,7 +287,7 @@ class TestReconstructMetaSibling:
     def test_reconstructed_user_msg_carries_attachments_meta(self, backend):
         backend.register_workstream("ws-meta")
         aid = _hash(b"hi")
-        backend.save_attachment(aid, "ws-meta", "u", "doc.md", "text/markdown", 2, "text", b"hi")
+        backend.save_attachment(aid, "doc.md", "text/markdown", 2, "text", b"hi")
         mid = backend.save_message("ws-meta", "user", "see this")
         backend.set_message_attachments("ws-meta", mid, [aid])
         meta = backend.load_messages("ws-meta")[0].get("_attachments_meta")
@@ -305,11 +303,11 @@ class TestRefcountGC:
         # keep the first's.
         a1, a2 = _hash(b"keep"), _hash(b"drop")
         m1 = backend.save_message("ws-rewind", "user", "turn1")
-        backend.save_attachment(a1, "ws-rewind", "u", "keep.md", "text/plain", 4, "text", b"keep")
+        backend.save_attachment(a1, "keep.md", "text/plain", 4, "text", b"keep")
         backend.set_message_attachments("ws-rewind", m1, [a1])
 
         m2 = backend.save_message("ws-rewind", "user", "turn2")
-        backend.save_attachment(a2, "ws-rewind", "u", "drop.md", "text/plain", 4, "text", b"drop")
+        backend.save_attachment(a2, "drop.md", "text/plain", 4, "text", b"drop")
         backend.set_message_attachments("ws-rewind", m2, [a2])
 
         backend.delete_messages_after("ws-rewind", 1)  # keep only turn1's row
@@ -324,12 +322,12 @@ class TestRefcountGC:
         shared = _hash(b"shared-bytes")
         m1 = backend.save_message("ws-shared", "user", "first")
         backend.save_attachment(
-            shared, "ws-shared", "u", "s.txt", "text/plain", 12, "text", b"shared-bytes"
+            shared, "s.txt", "text/plain", 12, "text", b"shared-bytes"
         )
         backend.set_message_attachments("ws-shared", m1, [shared])
         m2 = backend.save_message("ws-shared", "user", "second")
         backend.save_attachment(
-            shared, "ws-shared", "u", "s.txt", "text/plain", 12, "text", b"shared-bytes"
+            shared, "s.txt", "text/plain", 12, "text", b"shared-bytes"
         )
         backend.set_message_attachments("ws-shared", m2, [shared])
 
@@ -343,7 +341,7 @@ class TestRefcountGC:
         backend.register_workstream("ws-cas")
         aid = _hash(b"a")
         m = backend.save_message("ws-cas", "user", "hi")
-        backend.save_attachment(aid, "ws-cas", "u", "a.txt", "text/plain", 1, "text", b"a")
+        backend.save_attachment(aid, "a.txt", "text/plain", 1, "text", b"a")
         backend.set_message_attachments("ws-cas", m, [aid])
 
         assert backend.delete_workstream("ws-cas") is True
@@ -358,12 +356,12 @@ class TestRefcountGC:
         shared = _hash(b"cross-ws")
         m1 = backend.save_message("ws-one", "user", "a")
         backend.save_attachment(
-            shared, "ws-one", "u", "s.txt", "text/plain", 8, "text", b"cross-ws"
+            shared, "s.txt", "text/plain", 8, "text", b"cross-ws"
         )
         backend.set_message_attachments("ws-one", m1, [shared])
         m2 = backend.save_message("ws-two", "user", "b")
         backend.save_attachment(
-            shared, "ws-two", "u", "s.txt", "text/plain", 8, "text", b"cross-ws"
+            shared, "s.txt", "text/plain", 8, "text", b"cross-ws"
         )
         backend.set_message_attachments("ws-two", m2, [shared])
         assert backend.get_attachment(shared)["refcount"] == 2
@@ -381,7 +379,7 @@ class TestOwnershipGate:
         backend.register_workstream("ws-own")
         aid = _hash(b"owned")
         m = backend.save_message("ws-own", "user", "hi")
-        backend.save_attachment(aid, "ws-own", "u", "o.txt", "text/plain", 5, "text", b"owned")
+        backend.save_attachment(aid, "o.txt", "text/plain", 5, "text", b"owned")
         backend.set_message_attachments("ws-own", m, [aid])
         assert backend.attachment_referenced_in_ws(aid, "ws-own") is True
 
@@ -392,7 +390,7 @@ class TestOwnershipGate:
         backend.register_workstream("ws-stranger")
         aid = _hash(b"owned2")
         m = backend.save_message("ws-own2", "user", "hi")
-        backend.save_attachment(aid, "ws-own2", "u", "o.txt", "text/plain", 6, "text", b"owned2")
+        backend.save_attachment(aid, "o.txt", "text/plain", 6, "text", b"owned2")
         backend.set_message_attachments("ws-own2", m, [aid])
         assert backend.attachment_referenced_in_ws(aid, "ws-stranger") is False
 
@@ -401,7 +399,7 @@ class TestOwnershipGate:
         # the live flow, but the gate must be closed-by-default).
         backend.register_workstream("ws-own3")
         aid = _hash(b"orphan")
-        backend.save_attachment(aid, "ws-own3", "u", "o.txt", "text/plain", 6, "text", b"orphan")
+        backend.save_attachment(aid, "o.txt", "text/plain", 6, "text", b"orphan")
         assert backend.attachment_referenced_in_ws(aid, "ws-own3") is False
 
 
@@ -413,7 +411,7 @@ class TestParametrizedKind:
         mime = "image/png" if kind == "image" else "text/plain"
         aid = _hash(payload)
         backend.save_attachment(
-            aid, f"ws-p-{kind}", "u", f"f.{kind}", mime, len(payload), kind, payload
+            aid, f"f.{kind}", mime, len(payload), kind, payload
         )
         rows = backend.get_attachments([aid])
         assert len(rows) == 1
