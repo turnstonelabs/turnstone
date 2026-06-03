@@ -30,6 +30,7 @@ from typing import TYPE_CHECKING, Any, cast
 
 import pytest
 
+from turnstone.core.lowering import repair_wire_messages
 from turnstone.core.providers._anthropic import AnthropicProvider
 from turnstone.core.providers._google import GoogleProvider
 from turnstone.core.providers._openai_chat import OpenAIChatCompletionsProvider
@@ -109,6 +110,10 @@ def _capture(
     """Drive ``create_streaming`` against a recording client; return the SDK kwargs."""
     client = RecordingClient()
     caps = provider.get_capabilities(model)
+    # Mirror the session's wire prep: orphan repair runs once, neutrally, before
+    # the provider translator (``ChatSession._prepare_wire_messages``).  Fixtures
+    # arrive folded/empty-dropped; repair is the remaining send-side pass.
+    messages = repair_wire_messages(messages)
     gen = provider.create_streaming(
         client=client, model=model, messages=messages, capabilities=caps, **opts
     )
@@ -141,7 +146,8 @@ def _assert_golden(name: str, payload: dict[str, Any]) -> None:
 
 
 # --------------------------------------------------------------------------- #
-# Fixtures — trajectories as a provider receives them (already folded/empty-dropped).
+# Fixtures — trajectories post-fold/empty-drop; _capture applies the remaining
+# send-side wire prep (orphan repair) before handing them to the provider.
 # --------------------------------------------------------------------------- #
 _TOOLS = [
     {

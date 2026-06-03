@@ -8,6 +8,7 @@ from unittest.mock import MagicMock, PropertyMock, patch
 
 import pytest
 
+from turnstone.core.lowering import repair_wire_messages
 from turnstone.core.providers._openai import OpenAIProvider
 from turnstone.core.providers._openai_chat import OpenAIChatCompletionsProvider
 from turnstone.core.providers._openai_common import (
@@ -261,7 +262,7 @@ class TestOpenAIProvider:
             },
             {"role": "user", "content": "next"},
         ]
-        result = sanitize_messages(msgs)
+        result = sanitize_messages(repair_wire_messages(msgs))
         assert len(result) == 3
         assert result[1]["role"] == "tool"
         assert result[1]["tool_call_id"] == "call_1"
@@ -289,7 +290,7 @@ class TestOpenAIProvider:
             },
             {"role": "tool", "tool_call_id": "call_1", "content": "ok"},
         ]
-        result = sanitize_messages(msgs)
+        result = sanitize_messages(repair_wire_messages(msgs))
         assert len(result) == 3
         assert result[1]["tool_call_id"] == "call_1"
         assert result[1]["content"] == "ok"
@@ -335,7 +336,7 @@ class TestOpenAIProvider:
                 ],
             },
         ]
-        result = sanitize_messages(msgs)
+        result = sanitize_messages(repair_wire_messages(msgs))
         assert len(result) == 2
         assert result[1]["role"] == "tool"
         assert result[1]["tool_call_id"] == "call_1"
@@ -382,6 +383,28 @@ class TestOpenAIProvider:
         # No synthetic result needed — the pairing is complete
         assert len(result) == 2
 
+    def test_sanitize_empty_tool_call_id_orphan_synthesized(self) -> None:
+        """An empty-id tool_call with no result: sanitize back-fills the id AND
+        synthesizes its cancellation (the upstream repair can't see an id-less
+        call, so this lane owns it)."""
+        msgs = [
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [
+                    {"id": "", "type": "function", "function": {"name": "a", "arguments": "{}"}},
+                ],
+            },
+            {"role": "user", "content": "never mind"},
+        ]
+        result = sanitize_messages(msgs)
+        new_id = result[0]["tool_calls"][0]["id"]
+        assert new_id.startswith("call_")
+        tool_msgs = [m for m in result if m.get("role") == "tool"]
+        assert len(tool_msgs) == 1
+        assert tool_msgs[0]["tool_call_id"] == new_id  # paired to the back-filled id
+        assert "cancelled" in tool_msgs[0]["content"].lower()
+
     def test_sanitize_stale_result_with_orphan(self) -> None:
         """Stale tool results are dropped even when orphaned calls are present."""
         msgs = [
@@ -404,7 +427,7 @@ class TestOpenAIProvider:
             {"role": "tool", "tool_call_id": "call_1", "content": "ok"},
             {"role": "tool", "tool_call_id": "call_STALE", "content": "stale"},
         ]
-        result = sanitize_messages(msgs)
+        result = sanitize_messages(repair_wire_messages(msgs))
         result_tc_ids = [m["tool_call_id"] for m in result if m.get("role") == "tool"]
         assert "call_STALE" not in result_tc_ids
         assert "call_1" in result_tc_ids
@@ -449,10 +472,28 @@ class TestOpenAIProvider:
                 ],
             },
         ]
-        result = sanitize_messages(msgs)
+        result = sanitize_messages(repair_wire_messages(msgs))
         # Turn 2's orphaned call_1 should get a synthetic result
         tool_msgs = [m for m in result if m.get("role") == "tool"]
         assert len(tool_msgs) == 2  # one real from turn 1, one synthetic from turn 2
+
+    def test_sanitize_drops_is_error_from_tool_messages(self) -> None:
+        """``is_error`` is the neutral error flag (Anthropic renders it); the
+        OpenAI-compatible tool message has no such field, so it is dropped."""
+        msgs = [
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [
+                    {"id": "c1", "type": "function", "function": {"name": "a", "arguments": "{}"}},
+                ],
+            },
+            {"role": "tool", "tool_call_id": "c1", "content": "boom", "is_error": True},
+        ]
+        result = sanitize_messages(msgs)
+        tool_msg = next(m for m in result if m.get("role") == "tool")
+        assert "is_error" not in tool_msg
+        assert tool_msg["content"] == "boom"  # payload otherwise intact
 
     # -- convert_tools --------------------------------------------------------
 
@@ -2060,7 +2101,7 @@ class TestAnthropicOrphanedToolUse:
             },
             {"role": "user", "content": "never mind, do something else"},
         ]
-        _, converted = self.provider._convert_messages(messages)
+        _, converted = self.provider._convert_messages(repair_wire_messages(messages))
         # Should have: user, assistant(tool_use), user(synthetic tool_result), user
         # After _merge_consecutive, the two user messages may merge.
         # Find the synthetic tool_result
@@ -2090,7 +2131,7 @@ class TestAnthropicOrphanedToolUse:
             },
             {"role": "user", "content": "skip all that"},
         ]
-        _, converted = self.provider._convert_messages(messages)
+        _, converted = self.provider._convert_messages(repair_wire_messages(messages))
         tool_results = []
         for msg in converted:
             if msg["role"] == "user" and isinstance(msg["content"], list):
@@ -2116,7 +2157,7 @@ class TestAnthropicOrphanedToolUse:
             {"role": "tool", "tool_call_id": "c1", "content": "file1.txt"},
             {"role": "user", "content": "skip the write"},
         ]
-        _, converted = self.provider._convert_messages(messages)
+        _, converted = self.provider._convert_messages(repair_wire_messages(messages))
         # c1 should have a real result, c2 should have a synthetic one
         tool_results = []
         for msg in converted:
@@ -2170,7 +2211,7 @@ class TestAnthropicOrphanedToolUse:
                 ],
             },
         ]
-        _, converted = self.provider._convert_messages(messages)
+        _, converted = self.provider._convert_messages(repair_wire_messages(messages))
         tool_results = []
         for msg in converted:
             if msg["role"] == "user" and isinstance(msg["content"], list):
@@ -2206,7 +2247,7 @@ class TestAnthropicOrphanedToolUse:
             },
             {"role": "user", "content": "never mind"},
         ]
-        _, converted = self.provider._convert_messages(messages)
+        _, converted = self.provider._convert_messages(repair_wire_messages(messages))
         # Should synthesize a tool_result for the orphaned tool_use in provider_content
         tool_results = []
         for msg in converted:
@@ -3928,8 +3969,8 @@ class TestResponsesMessageConversion:
                 ],
             },
         ]
-        _, items = self.provider._convert_messages(messages)
-        # sanitize_messages synthesizes a missing tool result for the orphaned call
+        _, items = self.provider._convert_messages(repair_wire_messages(messages))
+        # repair_wire_messages synthesizes the missing tool result; the translator renders it
         assert len(items) == 2
         assert items[0]["type"] == "function_call"
         assert items[0]["call_id"] == "call_1"
@@ -3986,8 +4027,8 @@ class TestResponsesMessageConversion:
                 ],
             },
         ]
-        _, items = self.provider._convert_messages(messages)
-        # sanitize_messages synthesizes a missing tool result for the orphaned call
+        _, items = self.provider._convert_messages(repair_wire_messages(messages))
+        # repair_wire_messages synthesizes the missing tool result; the translator renders it
         assert len(items) == 3
         assert items[0]["type"] == "message"
         assert items[0]["content"] == "I'll read that file"

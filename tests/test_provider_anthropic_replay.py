@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import pytest
 
+from turnstone.core.lowering import repair_wire_messages
 from turnstone.core.providers._anthropic import (
     ANTHROPIC_REASONING_BLOCK_TYPES,
     ANTHROPIC_VALID_BLOCK_TYPES,
@@ -182,18 +183,16 @@ class TestWebSearchBlocksSurviveStrip:
         assert "tool_use" in types_present
 
     def test_orphan_tool_use_synthesized_after_strip(self, provider: AnthropicProvider) -> None:
-        """Pin the post-strip orphan-tool branch at _anthropic.py:397-433.
+        """Verbatim-replay orphan: repair synthesizes, the converter renders.
 
-        The implementation comment specifically calls out reading
-        ``provider_content`` (not ``wire_blocks``) for the orphan-tool
-        ID walk after the strip — keeping the read on the source-of-
-        truth list so a future refactor that swapped them would still
-        get the same set of tool_use IDs.  This test exercises that
-        branch end-to-end: replay=False strips the thinking block,
-        AND the message has a tool_use whose result is missing.  The
-        converter must synthesize a 'cancelled' tool_result for the
-        orphaned tool_use ID (matching the existing pre-Phase-2
-        behaviour for the verbatim path).
+        ``lowering.repair_wire_messages`` synthesizes the cancellation result
+        by reading the mirrored top-level ``tool_calls`` (sound via the
+        native/tool_calls save invariant), so it catches the orphan even when
+        the tool_use only lives in the native ``_provider_content`` lane.  This
+        exercises the path end-to-end: replay=False strips the thinking block
+        but keeps the tool_use, and the synthesized ``cancelled`` tool_result
+        for the orphaned id converts via the tool branch into a following
+        user-role message.
         """
         msg = {
             "role": "assistant",
@@ -210,11 +209,12 @@ class TestWebSearchBlocksSurviveStrip:
                 }
             ],
         }
-        # NO tool result follows — orphan branch must synthesize one.
-        _, converted = provider._convert_messages([msg], replay_reasoning_to_model=False)
+        # NO tool result follows — repair (reading tool_calls) synthesizes one.
+        _, converted = provider._convert_messages(
+            repair_wire_messages([msg]), replay_reasoning_to_model=False
+        )
         # Synthetic tool_result lands as a user-role message immediately
-        # after the assistant turn (per existing behaviour at
-        # _anthropic.py:421-430).
+        # after the assistant turn.
         assistant = next(m for m in converted if m["role"] == "assistant")
         # Stripped: thinking gone, tool_use survives.
         a_types = [b["type"] for b in assistant["content"]]

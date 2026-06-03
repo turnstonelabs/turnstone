@@ -52,6 +52,7 @@ from turnstone.core.history_decoration import (
     attach_vllm_chat_reasoning_field,
 )
 from turnstone.core.log import get_logger
+from turnstone.core.lowering import repair_wire_messages
 from turnstone.core.memory import (
     count_structured_memories,
     delete_messages_after,
@@ -2894,9 +2895,16 @@ class ChatSession:
         an empty user message is invalid on every provider wire.  The drop runs
         *after* the fold so the fold-path wake turn, which the nudge folds into
         and thereby fills, is kept.
+
+        Finally, :func:`turnstone.core.lowering.repair_wire_messages`
+        synthesizes cancellation results for any orphaned client tool calls so
+        the provider translator (the ``C`` layer) never sees an unanswered
+        tool call — this is the sole send-time orphan repair; the translators
+        carry none.  Identity-preserving when nothing is orphaned.
         """
         folded = self._fold_system_turns(messages)
-        return self._drop_empty_user_turns(folded)
+        dropped = self._drop_empty_user_turns(folded)
+        return repair_wire_messages(dropped)
 
     @staticmethod
     def _is_empty_wire_content(content: Any) -> bool:

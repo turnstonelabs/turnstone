@@ -12,6 +12,7 @@ from typing import Any
 
 import structlog
 
+from turnstone.core.lowering import CANCELLED_TOOL_RESULT
 from turnstone.core.providers._protocol import (
     ModelCapabilities,
     UsageInfo,
@@ -451,28 +452,40 @@ def sanitize_messages(
 ) -> list[dict[str, Any]]:
     """Sanitize messages for OpenAI-compatible APIs.
 
-    Performs three repairs:
+    Mostly format translation (the ``C`` layer): orphaned *real-id* tool_calls
+    are synthesized upstream by
+    :func:`turnstone.core.lowering.repair_wire_messages`, so by here every
+    real-id tool_call already has a result.  This pass:
 
-    1. Ensures assistant messages always have ``content`` or ``tool_calls``
+    1. Drops internal sibling keys (``_*``) and the neutral ``is_error`` flag
+       (no equivalent on the OpenAI-compatible tool message).
+    2. Ensures assistant messages always have ``content`` or ``tool_calls``
        (APIs reject messages with neither).
-    2. Fills empty tool_call IDs with synthetic ``call_{uuid}`` values
-       (local servers sometimes omit them).
-    3. Detects and repairs orphaned tool_call / tool_result pairs:
-
-       - Synthesizes error tool messages for tool_calls with no matching
-         tool result.
-       - Drops tool messages whose ``tool_call_id`` has no matching
-         tool_call in the preceding assistant message.
+    3. Fills empty tool_call IDs with synthetic ``call_{uuid}`` values,
+       positionally remaps the matching empty-ID results, and synthesizes
+       cancellation results for back-filled calls left unanswered (local
+       servers sometimes omit IDs entirely — these calls are id-less when the
+       upstream repair runs, so this lane owns their orphan synthesis).
+    4. Drops tool messages whose ``tool_call_id`` has no matching tool_call in
+       the preceding assistant message (stale / orphaned results).
 
     Returns a new list; the original messages are not mutated.
     """
+
     # Drop internal sibling keys (``_provider_content``,
     # ``_attachments_meta``, etc.) that the OpenAI / Google-compat APIs
-    # don't understand before they reach the wire.
-    messages = [
-        {k: v for k, v in m.items() if not (isinstance(k, str) and k.startswith("_"))}
-        for m in messages
-    ]
+    # don't understand before they reach the wire.  ``is_error`` is the
+    # neutral tool-result error flag — Anthropic renders it natively, but the
+    # OpenAI-compatible tool message has no such field, so it is dropped here
+    # (this is the ``C``-layer translation of the flag) rather than riding to
+    # the wire as an unknown key.
+    def _clean(m: dict[str, Any]) -> dict[str, Any]:
+        cleaned = {k: v for k, v in m.items() if not (isinstance(k, str) and k.startswith("_"))}
+        if cleaned.get("role") == "tool":
+            cleaned.pop("is_error", None)
+        return cleaned
+
+    messages = [_clean(m) for m in messages]
     # Inline any internal ``document`` content parts — OpenAI Chat
     # Completions does not accept a native document block type.
     messages = [_inline_documents_in_message(m) for m in messages]
@@ -489,7 +502,7 @@ def sanitize_messages(
             i += 1
             continue
 
-        # (2+3) Assistant with tool_calls: fix IDs and detect orphans
+        # (3) Assistant with tool_calls: fix empty IDs, copy through results
         if role == "assistant" and msg.get("tool_calls"):
             tool_calls = msg["tool_calls"]
 
@@ -521,7 +534,11 @@ def sanitize_messages(
 
             # Copy through existing tool messages, applying ID remap and
             # filtering out stale results that don't match any tool_call.
-            local_answered: set[str] = set()
+            # Orphans with a real id are synthesized upstream by
+            # ``lowering.repair_wire_messages``; the back-filled empty-id calls
+            # below are invisible to it (it can't pair an id-less call), so this
+            # pass owns their orphan synthesis.
+            answered_backfilled: set[str] = set()
             empty_result_idx = 0
             while i < len(messages) and messages[i].get("role") == "tool":
                 tool_msg = messages[i]
@@ -530,7 +547,7 @@ def sanitize_messages(
                     # Positional remap: empty result → matching new ID
                     new_id = id_remap[empty_result_idx]
                     tool_msg = {**tool_msg, "tool_call_id": new_id}
-                    local_answered.add(new_id)
+                    answered_backfilled.add(new_id)
                     empty_result_idx += 1
                     out.append(tool_msg)
                 elif not result_tc_id:
@@ -538,7 +555,6 @@ def sanitize_messages(
                     log.debug("sanitize_messages: dropping tool result with empty ID")
                     empty_result_idx += 1
                 elif result_tc_id in tc_id_set:
-                    local_answered.add(result_tc_id)
                     out.append(tool_msg)
                 else:
                     log.debug(
@@ -547,22 +563,14 @@ def sanitize_messages(
                     )
                 i += 1
 
-            # Synthesize error results for tool_calls not answered in
-            # THIS turn (not all of `out`, to avoid false matches from
-            # reused IDs across turns).
-            still_orphaned = [uid for uid in tc_ids if uid not in local_answered]
-            if still_orphaned:
-                log.debug(
-                    "sanitize_messages: synthesizing %d tool result(s) for orphaned tool_calls",
-                    len(still_orphaned),
-                )
-                for uid in still_orphaned:
+            # Synthesize cancellation results for back-filled (empty-id)
+            # tool_calls left unanswered — the upstream repair could not see
+            # them before sanitize assigned their ids.  Real-id orphans are
+            # already handled upstream, so this is scoped to ``id_remap`` only.
+            for uid in id_remap.values():
+                if uid not in answered_backfilled:
                     out.append(
-                        {
-                            "role": "tool",
-                            "tool_call_id": uid,
-                            "content": "Tool execution was cancelled.",
-                        }
+                        {"role": "tool", "tool_call_id": uid, "content": CANCELLED_TOOL_RESULT}
                     )
             continue
 
