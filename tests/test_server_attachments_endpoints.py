@@ -10,7 +10,6 @@ from __future__ import annotations
 
 import queue
 import threading
-import uuid
 from unittest.mock import MagicMock
 
 import pytest
@@ -84,11 +83,18 @@ def app_client(tmp_path):
         skip_permissions=False,
         jwt_secret=_TEST_JWT_SECRET,
     )
+    # Pending uploads live in the process-global per-node buffer now; clear it
+    # so staged uploads can't leak across tests.
+    from turnstone.core.attachment_buffer import get_attachment_buffer
+
+    get_attachment_buffer()._entries.clear()
+
     client = TestClient(app, raise_server_exceptions=False)
     try:
         yield client, mock_mgr
     finally:
         client.close()
+        get_attachment_buffer()._entries.clear()
         reset_storage()
 
 
@@ -224,52 +230,10 @@ class TestUploadRejections:
         assert resp.status_code == 200
 
 
-class TestPendingCap:
-    def test_tenth_attachment_accepted_eleventh_rejected(self, app_client):
-        client, _ = app_client
-        for i in range(10):
-            resp = client.post(
-                "/v1/api/workstreams/ws-A/attachments",
-                files={"file": (f"n{i}.md", b"x", "text/markdown")},
-                headers=_auth("userA"),
-            )
-            assert resp.status_code == 200, resp.text
-        resp = client.post(
-            "/v1/api/workstreams/ws-A/attachments",
-            files={"file": ("overflow.md", b"x", "text/markdown")},
-            headers=_auth("userA"),
-        )
-        assert resp.status_code == 409
-        assert resp.json().get("code") == "too_many"
-
-    def test_cap_is_serialized_under_concurrent_uploads(self, app_client):
-        # Pre-fill to cap-1, then fire two concurrent uploads.  Exactly
-        # one must succeed; the other must be rejected with 409.
-        client, _ = app_client
-        for i in range(9):
-            assert (
-                client.post(
-                    "/v1/api/workstreams/ws-A/attachments",
-                    files={"file": (f"pre{i}.md", b"x", "text/markdown")},
-                    headers=_auth("userA"),
-                ).status_code
-                == 200
-            )
-
-        import concurrent.futures
-
-        def attempt(idx: int) -> int:
-            return client.post(
-                "/v1/api/workstreams/ws-A/attachments",
-                files={"file": (f"race{idx}.md", b"x", "text/markdown")},
-                headers=_auth("userA"),
-            ).status_code
-
-        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as ex:
-            futures = [ex.submit(attempt, i) for i in range(2)]
-            results = sorted(f.result() for f in futures)
-        # One success (200) + one cap-exceeded (409); never 200+200.
-        assert results == [200, 409]
+# (The per-user pending-upload cap was removed with the content-addressing
+# cutover — pending uploads live in the per-node buffer, bounded by its own
+# size/TTL ceilings rather than a per-(ws,user) count.  The cap tests that
+# lived here are gone.)
 
 
 # ---------------------------------------------------------------------------
@@ -552,21 +516,28 @@ class TestSendMessageAttachments:
         atts = captured["attachments"]
         assert [x.attachment_id for x in atts] == [c, a, b]
 
-    def test_send_oversized_attachment_ids_list_rejected(self, app_client):
-        # Hostile / buggy clients should not be able to push an
-        # arbitrarily long IN (...) clause through reservation.
+    def test_send_unknown_ids_resolve_to_nothing(self, app_client):
+        # The old oversized-IN-clause / cap rejection is gone (no DB
+        # reservation, no per-user cap).  Unknown ids simply don't resolve
+        # from the buffer — the send proceeds with no attachments rather
+        # than 400-ing.
         client, mgr = app_client
-        self._wire_ws(mgr, "ws-A", "userA")
-        from turnstone.core.attachments import MAX_PENDING_ATTACHMENTS_PER_USER_WS
-
-        too_many = [f"id-{i}" for i in range(MAX_PENDING_ATTACHMENTS_PER_USER_WS + 1)]
+        captured, _ = self._wire_ws(mgr, "ws-A", "userA")
+        many = [f"id-{i}" for i in range(50)]
         resp = client.post(
             "/v1/api/workstreams/ws-A/send",
-            json={"message": "x", "attachment_ids": too_many},
+            json={"message": "x", "attachment_ids": many},
             headers=_auth("userA"),
         )
-        assert resp.status_code == 400
-        assert resp.json().get("code") == "too_many"
+        assert resp.status_code == 200
+
+        import time
+
+        for _ in range(50):
+            if "attachments" in captured:
+                break
+            time.sleep(0.01)
+        assert captured["attachments"] is None
 
     def test_send_forged_id_from_other_user_ignored(self, app_client):
         client, mgr = app_client
@@ -666,13 +637,13 @@ class TestQueuedSendWithAttachments:
         assert captured["attachment_ids"] == [b, a]
 
 
-class TestQueuedAttachmentReservation:
-    """Once a queued send reserves its attachments, concurrent operations
-    (delete, auto-consume, explicit reuse) must not disturb them."""
+class TestBusyWorkerAttachments:
+    """An attachment-bearing send to a busy worker can't ride the text-only
+    queue seam — it returns ``attachments_busy`` and the staged bytes stay in
+    the buffer (a peek, not a drain) so the client can retry once idle."""
 
     def _wire_busy_ws(self, mgr, ws_id: str):
-        """Mock ws whose worker is always alive (forces queue path).
-        Uses the real ChatSession's queue_message so reservation runs."""
+        """Mock ws whose worker is always alive (forces the queue path)."""
         from turnstone.core.session import ChatSession
         from turnstone.core.workstream import WorkstreamState
 
@@ -686,8 +657,6 @@ class TestQueuedAttachmentReservation:
             tool_timeout=10,
             user_id="userA",
         )
-        # Pin the session to ws-A so queue_message / dequeue_message
-        # operate on the expected storage rows.
         session._ws_id = ws_id
 
         ui = MagicMock()
@@ -708,119 +677,7 @@ class TestQueuedAttachmentReservation:
         mgr.get.return_value = ws
         return ws, session
 
-    def _reserve_attachment(self, client, mgr, ws_id: str, filename: str = "q.md"):
-        """Set up a reserved attachment for the busy-worker tests below.
-
-        The queue-with-attachments path was removed (queued user turns
-        can't carry attachments — see ``AttachmentsNotQueueableError``),
-        so the tests reserve directly via ``reserve_attachments`` to
-        produce the same on-disk state without going through the
-        rejected route path.
-        """
-        from turnstone.core.memory import reserve_attachments
-
-        aid = _upload(client, ws_id, "userA", filename, b"Q", "text/markdown")
-        ws, session = self._wire_busy_ws(mgr, ws_id)
-        msg_id = uuid.uuid4().hex
-        reserve_attachments([aid], msg_id, ws_id, "userA")
-        return aid, msg_id, session
-
-    def test_reserved_attachment_hidden_from_pending_listing(self, app_client):
-        client, mgr = app_client
-        aid, _mid, _session = self._reserve_attachment(client, mgr, "ws-A")
-        resp = client.get("/v1/api/workstreams/ws-A/attachments", headers=_auth("userA"))
-        # Reserved attachment is not in the pending listing
-        ids = [a["attachment_id"] for a in resp.json()["attachments"]]
-        assert aid not in ids
-
-    def test_reserved_attachment_cannot_be_deleted(self, app_client):
-        client, mgr = app_client
-        aid, _mid, _session = self._reserve_attachment(client, mgr, "ws-A")
-        resp = client.delete(
-            f"/v1/api/workstreams/ws-A/attachments/{aid}",
-            headers=_auth("userA"),
-        )
-        # Delete silently masks reserved ones as not-found (can't delete
-        # while tied to a queued message).
-        assert resp.status_code == 404
-        # Still exists on the backend
-        from turnstone.core.memory import get_attachment
-
-        assert get_attachment(aid) is not None
-
-    def test_reserved_attachment_not_auto_consumed_by_later_send(self, app_client):
-        client, mgr = app_client
-        aid, _mid, session = self._reserve_attachment(client, mgr, "ws-A")
-
-        # Swap the busy worker for an idle one and capture the next
-        # session.send call so we can assert on its attachment list.
-        captured: dict = {}
-
-        def fake_send(message, attachments=None, send_id=None):
-            captured["message"] = message
-            captured["attachments"] = attachments
-            captured["send_id"] = send_id
-
-        session.send = fake_send  # type: ignore[method-assign]
-        ws = mgr.get.return_value
-        ws.worker_thread = None  # idle → non-queue path
-        ws._worker_running = False
-
-        # Auto-consume on a follow-up send: reserved attachment must not
-        # be picked up (another turn isn't entitled to it).
-        resp = client.post(
-            "/v1/api/workstreams/ws-A/send",
-            json={"message": "follow up"},
-            headers=_auth("userA"),
-        )
-        assert resp.status_code == 200
-        import time
-
-        for _ in range(50):
-            if "attachments" in captured:
-                break
-            time.sleep(0.01)
-        atts = captured.get("attachments")
-        if atts is not None:
-            assert aid not in [a.attachment_id for a in atts]
-
-    def test_reserved_attachment_rejected_in_explicit_ids(self, app_client):
-        client, mgr = app_client
-        aid, _mid, session = self._reserve_attachment(client, mgr, "ws-A")
-
-        captured: dict = {}
-
-        def fake_send(message, attachments=None, send_id=None):
-            captured["attachments"] = attachments
-
-        session.send = fake_send  # type: ignore[method-assign]
-        ws = mgr.get.return_value
-        ws.worker_thread = None
-        ws._worker_running = False
-
-        # A second send explicitly naming the reserved id: scope check
-        # rejects it, so the attachment list is empty.
-        resp = client.post(
-            "/v1/api/workstreams/ws-A/send",
-            json={"message": "take mine", "attachment_ids": [aid]},
-            headers=_auth("userA"),
-        )
-        assert resp.status_code == 200
-        import time
-
-        for _ in range(50):
-            if "attachments" in captured:
-                break
-            time.sleep(0.01)
-        atts = captured.get("attachments")
-        # Either None (all scope-rejected → empty list collapses to None)
-        # or an empty list — never contains the reserved id.
-        if atts is not None:
-            assert aid not in [a.attachment_id for a in atts]
-
     def test_send_with_attachments_to_busy_worker_returns_attachments_busy(self, app_client):
-        """An attempt to attach mid-tool-call returns ``attachments_busy``;
-        attachments stay pending so the client can retry once idle."""
         client, mgr = app_client
         aid = _upload(client, "ws-A", "userA", "x.md", b"X", "text/markdown")
         self._wire_busy_ws(mgr, "ws-A")
@@ -834,192 +691,11 @@ class TestQueuedAttachmentReservation:
         assert body["status"] == "attachments_busy"
         assert body["attached_ids"] == []
         assert body["dropped_attachment_ids"] == [aid]
-        # Reservation released — attachment is still pending and visible.
+        # The staged upload was peeked (not drained), so it's still pending
+        # and visible for a retry once the worker idles.
         resp = client.get("/v1/api/workstreams/ws-A/attachments", headers=_auth("userA"))
         ids = [a["attachment_id"] for a in resp.json()["attachments"]]
         assert aid in ids
-
-
-class TestReserveThenDispatchRace:
-    """Reservation happens BEFORE queue_message / worker start, so an
-    overlapping request can't select the same row."""
-
-    def test_overlapping_idle_send_cannot_resteal(self, app_client):
-        # Kick off an idle send that reserves attachment A but blocks
-        # inside session.send — then a second send with the same
-        # explicit id must NOT receive A.
-        client, mgr = app_client
-        from turnstone.core.session import ChatSession
-        from turnstone.core.workstream import WorkstreamState
-
-        aid = _upload(client, "ws-A", "userA", "hold.md", b"hold", "text/markdown")
-
-        # Real ChatSession for the idle path (reservation must be real)
-        session = ChatSession(
-            client=MagicMock(),
-            model="test-model",
-            ui=MagicMock(),
-            instructions=None,
-            temperature=0.3,
-            max_tokens=1024,
-            tool_timeout=10,
-            user_id="userA",
-        )
-        session._ws_id = "ws-A"
-
-        first_captured: dict = {}
-        gate = threading.Event()
-
-        def first_send(message, attachments=None, send_id=None):
-            first_captured["attachments"] = attachments
-            first_captured["send_id"] = send_id
-            gate.wait(timeout=5.0)  # Hold the worker so #2 races against us
-
-        session.send = first_send  # type: ignore[method-assign]
-
-        ui = MagicMock()
-        ui._ws_lock = threading.Lock()
-        ui._ws_messages = 0
-        ui._ws_turn_tool_calls = 0
-
-        ws = MagicMock()
-        ws.id = "ws-A"
-        ws.state = WorkstreamState.IDLE
-        ws.ui = ui
-        ws.session = session
-        ws.worker_thread = None
-        ws._worker_running = False
-        ws._lock = threading.RLock()
-        mgr.get.return_value = ws
-
-        # First send — reserves A under its send_id, worker blocks
-        resp1 = client.post(
-            "/v1/api/workstreams/ws-A/send",
-            json={"message": "one", "attachment_ids": [aid]},
-            headers=_auth("userA"),
-        )
-        assert resp1.status_code == 200
-
-        import time
-
-        for _ in range(50):
-            if first_captured.get("attachments") is not None:
-                break
-            time.sleep(0.01)
-        assert first_captured["attachments"] is not None
-        assert [a.attachment_id for a in first_captured["attachments"]] == [aid]
-        first_send_id = first_captured["send_id"]
-        assert first_send_id
-
-        # Second send — idle path busy-check still sees the mock's
-        # worker as "not alive" (we didn't update it) so this enters
-        # the idle branch.  Reservation must skip the already-reserved
-        # row, so send sees no attachments.
-        second_captured: dict = {}
-
-        def second_send(message, attachments=None, send_id=None):
-            second_captured["attachments"] = attachments
-
-        session.send = second_send  # type: ignore[method-assign]
-
-        resp2 = client.post(
-            "/v1/api/workstreams/ws-A/send",
-            json={"message": "two", "attachment_ids": [aid]},
-            headers=_auth("userA"),
-        )
-        assert resp2.status_code == 200
-
-        for _ in range(50):
-            if "attachments" in second_captured:
-                break
-            time.sleep(0.01)
-        # The second send either got no attachments or an empty list —
-        # it never saw the row that the first send reserved.
-        seen = second_captured.get("attachments")
-        assert not seen or aid not in [a.attachment_id for a in (seen or [])]
-
-        # Release the first worker so the fixture can tear down cleanly
-        gate.set()
-
-    def test_worker_exception_releases_reservation(self, app_client):
-        # If session.send raises inside the worker thread, the
-        # reservation must be released so the attachment isn't
-        # permanently soft-locked.
-        client, mgr = app_client
-        from turnstone.core.memory import get_attachment
-
-        aid = _upload(client, "ws-A", "userA", "boom.md", b"x", "text/markdown")
-
-        captured, session = TestSendMessageAttachments._wire_ws(
-            TestSendMessageAttachments, mgr, "ws-A", "userA"
-        )
-
-        def exploding_send(message, attachments=None, send_id=None):
-            raise RuntimeError("worker blew up")
-
-        session.send = exploding_send  # type: ignore[method-assign]
-
-        resp = client.post(
-            "/v1/api/workstreams/ws-A/send",
-            json={"message": "boom", "attachment_ids": [aid]},
-            headers=_auth("userA"),
-        )
-        assert resp.status_code == 200
-
-        # Wait for the worker thread to finish (crash + cleanup).
-        import time
-
-        for _ in range(100):
-            row = get_attachment(aid)
-            if row and row.get("reserved_for_msg_id") is None:
-                break
-            time.sleep(0.01)
-
-        row = get_attachment(aid)
-        # Reservation must be released so the attachment is usable again.
-        assert row is not None
-        assert row["reserved_for_msg_id"] is None
-        assert row["message_id"] is None
-
-    def test_partial_reservation_proceeds_with_reserved_subset(self, app_client):
-        # Pre-reserve one id; a send listing two explicit ids should
-        # proceed with only the non-reserved one.
-        client, mgr = app_client
-        from turnstone.core.memory import reserve_attachments
-
-        a = _upload(client, "ws-A", "userA", "a.md", b"A", "text/markdown")
-        b = _upload(client, "ws-A", "userA", "b.md", b"B", "text/markdown")
-        # Pre-reserve 'a' under a fake prior send
-        reserve_attachments([a], "prior-send", "ws-A", "userA")
-
-        captured: dict = {}
-
-        def fake_send(message, attachments=None, send_id=None):
-            captured["attachments"] = attachments
-
-        ws_tuple = TestSendMessageAttachments._wire_ws(
-            TestSendMessageAttachments, mgr, "ws-A", "userA"
-        )
-        captured = ws_tuple[0]  # _wire_ws returns (captured, session)
-        ws_tuple[1].send = fake_send  # type: ignore[method-assign]
-
-        resp = client.post(
-            "/v1/api/workstreams/ws-A/send",
-            json={"message": "both", "attachment_ids": [a, b]},
-            headers=_auth("userA"),
-        )
-        assert resp.status_code == 200
-
-        import time
-
-        for _ in range(50):
-            if "attachments" in captured:
-                break
-            time.sleep(0.01)
-        atts = captured.get("attachments") or []
-        ids = [x.attachment_id for x in atts]
-        # Only the un-pre-reserved id survives
-        assert ids == [b]
 
 
 class TestServiceScopedActorFlow:
@@ -1042,8 +718,9 @@ class TestServiceScopedActorFlow:
         )
         svc_headers = {"Authorization": f"Bearer {service_token}"}
 
-        # Upload to ws-A (owned by userA) as service — file should land
-        # under owner "userA", not "svc-bot"
+        # Upload to ws-A (owned by userA) as service — the staged upload is
+        # filed under the owner "userA" (the resolver's uid), not "svc-bot",
+        # so the later owner-resolved send can find it in the buffer.
         resp = client.post(
             "/v1/api/workstreams/ws-A/attachments",
             files={"file": ("svc.md", b"svc", "text/markdown")},
@@ -1052,10 +729,11 @@ class TestServiceScopedActorFlow:
         assert resp.status_code == 200
         aid = resp.json()["attachment_id"]
 
-        from turnstone.core.memory import get_attachment
+        from turnstone.core.attachment_buffer import get_attachment_buffer
 
-        row = get_attachment(aid)
-        assert row["user_id"] == "userA"  # filed under the owner
+        # Staged under the owner uid (userA), not the service caller (svc-bot).
+        assert get_attachment_buffer().get(aid, ws_id="ws-A", user_id="userA") is not None
+        assert get_attachment_buffer().get(aid, ws_id="ws-A", user_id="svc-bot") is None
 
         # Now drive /api/send as the service token — the resolver uses
         # the ws owner (userA) to look up attachments, so the upload is

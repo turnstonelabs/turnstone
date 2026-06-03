@@ -118,14 +118,6 @@ _VALID_WS_ID = re.compile(r"^[0-9a-f]{32}$")
 # WebUI — implements SessionUI for browser-based interaction
 # ---------------------------------------------------------------------------
 
-# Orphan-attachment-reservation sweep cadence.  Threshold is measured
-# against the storage layer's `reserved_at` column (time the row last
-# transitioned into reserved state, NOT upload time), so a 1-hour cap
-# is safely longer than any realistic single send without risking the
-# unreservation of attachments uploaded long ago but reserved fresh.
-_ORPHAN_SWEEP_INTERVAL_S = 30 * 60
-_ORPHAN_SWEEP_THRESHOLD_S = 1 * 3600
-
 
 class WebUI(SessionUIBase):
     """Browser-based UI using SSE for streaming and HTTP POST for actions.
@@ -2050,14 +2042,16 @@ async def _interactive_create_post_install(
     initial_message = body.get("initial_message", "").strip()
     if initial_message and ws.session is not None:
         from turnstone.core.attachments import (
-            reserve_and_resolve_attachments as _reserve_and_resolve,
+            resolve_staged_attachments as _resolve_staged,
         )
 
         session = ws.session
         send_id = uuid.uuid4().hex
         resolved_atts: list[Any] = []
         if attachment_ids:
-            resolved_atts, _ord, _drop = _reserve_and_resolve(attachment_ids, send_id, ws.id, uid)
+            # Resolve (peek) the staged uploads; the committing send drains
+            # them from the buffer.  No reservation to release on failure.
+            resolved_atts, _ord, _drop = _resolve_staged(attachment_ids, ws.id, uid)
 
         def _run_initial() -> None:
             try:
@@ -2067,13 +2061,6 @@ async def _interactive_create_post_install(
                     send_id=send_id if resolved_atts else None,
                 )
             except (Exception, GenerationCancelled):
-                if attachment_ids:
-                    from turnstone.core.memory import (
-                        unreserve_attachments as _unreserve,
-                    )
-
-                    with contextlib.suppress(Exception):
-                        _unreserve(send_id, ws.id, uid)
                 if isinstance(ws.ui, WebUI):
                     ws.ui.on_stream_end()
                     ws.ui.on_state_change("idle")
@@ -3472,36 +3459,9 @@ async def _lifespan(app: Starlette) -> AsyncGenerator[None, None]:
     if state_writer is not None:
         state_writer.start()
 
-    # Sweep stale attachment reservations left over from process crashes
-    # between reserve_attachments and consume/unreserve.  Run once at
-    # startup (catches anything orphaned by the previous process), then
-    # periodically as defense-in-depth.
-    from turnstone.core.memory import sweep_orphan_reservations as _sweep_orphans
-
-    try:
-        n = await asyncio.to_thread(_sweep_orphans, _ORPHAN_SWEEP_THRESHOLD_S)
-        if n:
-            log.info("attachments.orphan_sweep.startup", swept=n)
-    except Exception:
-        log.warning("attachments.orphan_sweep.startup_failed", exc_info=True)
-
-    _orphan_sweep_stop = asyncio.Event()
-
-    async def _orphan_sweep_loop() -> None:
-        while not _orphan_sweep_stop.is_set():
-            try:
-                await asyncio.wait_for(_orphan_sweep_stop.wait(), timeout=_ORPHAN_SWEEP_INTERVAL_S)
-                return  # stop event fired
-            except TimeoutError:
-                pass
-            try:
-                n = await asyncio.to_thread(_sweep_orphans, _ORPHAN_SWEEP_THRESHOLD_S)
-                if n:
-                    log.info("attachments.orphan_sweep.periodic", swept=n)
-            except Exception:
-                log.warning("attachments.orphan_sweep.periodic_failed", exc_info=True)
-
-    _orphan_sweep_task = asyncio.create_task(_orphan_sweep_loop())
+    # (The attachment orphan-reservation sweep is gone — pending uploads now
+    # live in the per-node in-memory buffer with its own TTL eviction, so
+    # there are no persisted reservations to reclaim.)
 
     from turnstone.core.oidc import initialize_oidc_state
 
@@ -3660,10 +3620,6 @@ async def _lifespan(app: Starlette) -> AsyncGenerator[None, None]:
     state_writer = getattr(app.state, "state_writer", None)
     if state_writer is not None:
         await asyncio.to_thread(state_writer.shutdown)
-    # Stop the orphan-reservation sweep loop
-    _orphan_sweep_stop.set()
-    with contextlib.suppress(asyncio.CancelledError, Exception):
-        await _orphan_sweep_task
     # health_registry is stateless (no background threads) — nothing to stop
     if app.state.mcp_client:
         app.state.mcp_client.shutdown()
@@ -3782,14 +3738,10 @@ def create_app(
     from turnstone.core.attachments import (
         sniff_image_mime as _sniff_image_mime,
     )
-    from turnstone.core.attachments import (
-        upload_lock as _attachment_upload_lock,
-    )
 
     interactive_attachment_helpers = AttachmentUploadHelpers(
         sniff_image_mime=_sniff_image_mime,
         classify_text_attachment=_classify_text_attachment,
-        upload_lock=_attachment_upload_lock,
     )
     from turnstone.core.memory import (
         get_workstream_display_names as _get_ws_display_names,

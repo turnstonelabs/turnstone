@@ -3383,7 +3383,7 @@ async def _coord_create_post_install(
     """
     import uuid as _uuid
 
-    from turnstone.core.attachments import reserve_and_resolve_attachments
+    from turnstone.core.attachments import resolve_staged_attachments
 
     initial_message = (body.get("initial_message") or "").strip()
     if not initial_message:
@@ -3392,18 +3392,14 @@ async def _coord_create_post_install(
     if coord_adapter is None:
         return {}
 
-    # Mirror interactive's reservation pattern: same send_id token
-    # scopes the soft-lock and the eventual consume. Coord's
-    # ``CoordinatorAdapter.send`` worker passes both through to
-    # ``ChatSession.send(..., send_id=...)``; on worker failure the
-    # adapter's exception path unreserves so the rows return to
-    # pending.
+    # Resolve (peek) the staged uploads for the dispatched first turn; the
+    # committing ``ChatSession.send`` drains them from the per-node buffer and
+    # persists them content-addressed.  ``send_id`` is a tracking token only —
+    # no DB reservation to release on worker failure.
     send_id = _uuid.uuid4().hex
     resolved_atts: list[Any] = []
     if attachment_ids:
-        resolved_atts, _ord, _drop = reserve_and_resolve_attachments(
-            attachment_ids, send_id, ws.id, uid
-        )
+        resolved_atts, _ord, _drop = resolve_staged_attachments(attachment_ids, ws.id, uid)
     coord_adapter.send(
         ws.id,
         initial_message,
@@ -12775,14 +12771,10 @@ def create_app(
     from turnstone.core.attachments import (
         sniff_image_mime as _coord_sniff_image,
     )
-    from turnstone.core.attachments import (
-        upload_lock as _coord_upload_lock,
-    )
 
     coord_attachment_helpers = AttachmentUploadHelpers(
         sniff_image_mime=_coord_sniff_image,
         classify_text_attachment=_coord_classify_text,
-        upload_lock=_coord_upload_lock,
     )
     coord_endpoint_config = SessionEndpointConfig(
         permission_gate=_require_admin_coordinator,

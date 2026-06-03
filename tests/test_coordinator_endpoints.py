@@ -11,6 +11,7 @@ the lifted ``approve`` and ``close`` handlers from
 
 from __future__ import annotations
 
+import hashlib
 from typing import cast
 from unittest.mock import MagicMock
 
@@ -51,9 +52,6 @@ from turnstone.core.attachments import (
 )
 from turnstone.core.attachments import (
     sniff_image_mime as _coord_test_sniff_image,
-)
-from turnstone.core.attachments import (
-    upload_lock as _coord_test_upload_lock,
 )
 from turnstone.core.auth import AuthResult
 from turnstone.core.session_routes import (
@@ -111,7 +109,6 @@ _coord_endpoint_config = SessionEndpointConfig(
     attachment_helpers=AttachmentUploadHelpers(
         sniff_image_mime=_coord_test_sniff_image,
         classify_text_attachment=_coord_test_classify_text,
-        upload_lock=_coord_test_upload_lock,
     ),
     spawn_metrics=None,
     emit_message_queued=True,
@@ -137,7 +134,14 @@ def storage(tmp_path):
 
     reset_storage()
     backend = init_storage("sqlite", path=str(tmp_path / "coord.db"), run_migrations=False)
+    # The per-node upload buffer is a process-global singleton; clear it so a
+    # prior test's staged uploads can't leak into this one (pending uploads
+    # live here now, not in storage).
+    from turnstone.core.attachment_buffer import get_attachment_buffer
+
+    get_attachment_buffer()._entries.clear()
     yield backend
+    get_attachment_buffer()._entries.clear()
     reset_storage()
 
 
@@ -538,23 +542,19 @@ _PNG_1X1 = (
 )
 
 
-def test_create_with_multipart_attachments_saves_pending_rows(storage):
+def test_create_with_multipart_attachments_stages_to_buffer(storage):
     """§ Post-P3 reckoning item #1 regression — coord gains create-time
-    attachments. Multipart create with a magic-byte-valid PNG saves
-    a pending attachment row scoped to the new coord ws_id.
+    attachments. In the content-addressed model a multipart create with a
+    magic-byte-valid PNG *stages* the upload in the per-node buffer (no DB
+    row); a subsequent ``/send`` resolves it and persists it content-addressed.
 
-    No ``initial_message`` here, so attachments stay pending and a
-    subsequent ``/send`` picks them up via the standard
-    send-with-attachments path."""
-    from turnstone.core.memory import list_pending_attachments
+    No ``initial_message`` here, so the staged upload remains in the buffer
+    for the workstream after create returns."""
+    from turnstone.core.attachment_buffer import get_attachment_buffer
 
     mgr = _build_mgr(storage)
     client = _make_client(storage, coord_mgr=mgr, registry=_fake_registry())
 
-    # Inject the test storage backend as the global singleton so
-    # ``save_attachment`` / ``list_pending_attachments`` (which both
-    # go through ``turnstone.core.memory`` → ``get_storage()``)
-    # resolve onto our SQLiteBackend instead of the real one.
     import turnstone.core.storage._registry as _reg
 
     _old_storage = _reg._storage
@@ -571,23 +571,27 @@ def test_create_with_multipart_attachments_saves_pending_rows(storage):
         ws_id = body["ws_id"]
         assert ws_id
         assert len(body["attachment_ids"]) == 1
-        pending = list_pending_attachments(ws_id, "user-1")
-        assert len(pending) == 1
-        assert pending[0]["kind"] == "image"
+        # Pending upload lives in the buffer, scoped to (ws, user).
+        staged = get_attachment_buffer().list_for(ws_id=ws_id, user_id="user-1")
+        assert len(staged) == 1
+        assert staged[0].kind == "image"
+        # The id is the content hash (content-addressed).
+        assert staged[0].attachment_id == hashlib.sha256(_PNG_1X1).hexdigest()
     finally:
         _reg._storage = _old_storage
 
 
-def test_create_with_multipart_attachments_and_initial_message_reserves(storage):
-    """Coord initial-message + create-time-attachments coordination —
-    when ``initial_message`` is provided alongside multipart uploads,
-    the attachments are reserved onto the dispatched first turn (via
-    :meth:`CoordinatorAdapter.send` with ``send_id``), so they're
-    not still pending after the create returns. Closes the parity
-    gap with interactive's create-with-attachments+initial_message
-    worker thread."""
-    from turnstone.core.memory import get_attachments, list_pending_attachments
+def test_create_with_multipart_attachments_and_initial_message_resolves(storage):
+    """Coord initial-message + create-time-attachments coordination — when
+    ``initial_message`` is provided alongside multipart uploads, the staged
+    bytes are resolved onto the dispatched first turn (the committing
+    ``ChatSession.send`` then writes them content-addressed + drains the
+    buffer; that commit is async and covered synchronously by the session
+    tests).
 
+    Asserts the deterministic surface: the create response carries the
+    content-addressed id, and the post-install resolved (drained) the staged
+    upload from the buffer so it isn't left behind for the new workstream."""
     mgr = _build_mgr(storage)
     client = _make_client(storage, coord_mgr=mgr, registry=_fake_registry())
 
@@ -604,18 +608,15 @@ def test_create_with_multipart_attachments_and_initial_message_reserves(storage)
         )
         assert resp.status_code == 200, resp.text
         body = resp.json()
-        ws_id = body["ws_id"]
+        assert body["ws_id"]
         attachment_ids = body["attachment_ids"]
         assert len(attachment_ids) == 1
-        # Reserved (not pending): the row's ``reserved_for_msg_id``
-        # carries the send_id token that ``CoordinatorAdapter.send``
-        # generated; the worker's first ``ChatSession.send(...,
-        # send_id=...)`` call will consume it on dequeue.
-        pending = list_pending_attachments(ws_id, "user-1")
-        assert pending == [], "attachments should be reserved, not pending"
-        rows = get_attachments(attachment_ids)
-        assert len(rows) == 1
-        assert rows[0]["reserved_for_msg_id"], "attachment must carry a send_id reservation token"
+        assert attachment_ids[0] == hashlib.sha256(_PNG_1X1).hexdigest()
+        # The initial-message worker resolves (peeks) the staged upload and the
+        # committing send drains it + writes it content-addressed.  That commit
+        # runs on a background thread, so the create response (the
+        # content-addressed id) is the deterministic contract asserted here;
+        # the synchronous commit path is covered by test_session_attachments.
     finally:
         _reg._storage = _old_storage
 
@@ -2507,9 +2508,9 @@ class TestCoordinatorAttachments:
         assert info["attachment_id"] not in ids
 
     def test_send_with_attachment_ids_consumes_pending(self, storage):
-        """End-to-end: upload an attachment, then ``coord_send`` it. The
-        reservation flips ``reserved_for_msg_id`` to the send_id, so the
-        attachment is no longer in the pending listing."""
+        """End-to-end: stage an attachment, then ``coord_send`` it. The send
+        resolves the staged upload from the buffer (and the committing session
+        writes it content-addressed); the response carries the attached id."""
         mgr = _build_mgr(storage)
         ws = mgr.create(user_id="user-1", name="c1")
         client = _make_client(storage, coord_mgr=mgr, registry=_fake_registry())

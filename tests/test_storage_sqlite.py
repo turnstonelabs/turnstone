@@ -217,34 +217,40 @@ class TestLoadMessagesLimit:
         assert tail[2]["content"] == "summarized"
 
     def test_limit_bounds_attachment_scan(self, backend):
-        """When ``limit=N`` is set, ``load_attachments_for_messages``
-        receives only the fetched message ids — the attachment query
-        must not fall back to a full-workstream scan.  Otherwise the
-        tail-N optimization on conversations is partly undone for
-        workstreams with many attachments."""
+        """The content-addressed attachment resolution only fetches blobs the
+        *fetched* rows reference — so a tail-N load that doesn't include the
+        attachment-bearing row issues no blob fetch at all, and a full load
+        fetches exactly the referenced ids.  This keeps the tail-N conversations
+        LIMIT from being undone by a full-workstream attachment scan."""
         from unittest.mock import patch
 
         backend.register_workstream("s1")
+        # Oldest row carries the attachment; then 20 plain rows after it.
+        aid = "a" * 64
+        att_msg_id = backend.save_message("s1", "user", "see attachment")
+        backend.save_attachment(aid, "s1", "u", "x.txt", "text/plain", 1, "text", b"x")
+        backend.set_message_attachments("s1", att_msg_id, [aid])
         for i in range(20):
             backend.save_message("s1", "user", f"msg-{i:02d}")
 
-        captured: dict[str, list[int] | None] = {}
-        orig = backend.load_attachments_for_messages
+        captured: list[list[str]] = []
+        orig = backend.get_attachments
 
-        def _spy(ws_id, *, message_ids=None):
-            captured["message_ids"] = list(message_ids) if message_ids is not None else None
-            return orig(ws_id, message_ids=message_ids)
+        def _spy(ids):
+            captured.append(sorted(ids))
+            return orig(ids)
 
-        with patch.object(backend, "load_attachments_for_messages", side_effect=_spy):
+        # Tail-N=5 fetches only the 5 newest rows (all plain) — the
+        # attachment row is excluded, so NO blob fetch is issued.
+        with patch.object(backend, "get_attachments", side_effect=_spy):
             backend.load_messages("s1", limit=5)
-        # Tail-N request passed a bounded list of exactly 5 ids.
-        assert captured["message_ids"] is not None
-        assert len(captured["message_ids"]) == 5
+        assert captured == []
 
-        with patch.object(backend, "load_attachments_for_messages", side_effect=_spy):
+        # Full load resolves exactly the one referenced id (not a full scan).
+        captured.clear()
+        with patch.object(backend, "get_attachments", side_effect=_spy):
             backend.load_messages("s1")
-        # Full-load request passes None → backend scans all attachments.
-        assert captured["message_ids"] is None
+        assert captured == [[aid]]
 
 
 class TestSaveMessagesBulk:

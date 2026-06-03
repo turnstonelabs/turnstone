@@ -531,13 +531,24 @@ sa.Index(
 )
 
 # ---------------------------------------------------------------------------
-# Workstream attachments — user-uploaded images and text documents bound to
-# a specific user turn (one-shot, consumed when linked to a conversations row).
+# Workstream attachments — content-addressed, refcounted blob store.
+#
+# In the content-addressed model the primary key IS the content hash
+# (sha256 hex): identical bytes dedupe to one row regardless of how many
+# messages reference them.  A blob is written only at send-commit (or when a
+# tool produces an image), so every stored row is born referenced
+# (``refcount >= 1``); GC decrements ``refcount`` as referencing messages are
+# deleted and prunes the row at 0.  Pending (uploaded-but-unsent) bytes live
+# in the per-node in-memory buffer (``attachment_buffer``), NOT here — the
+# persisted pending/reserved/consumed lifecycle (message_id / reserved_* and
+# its orphan-sweep) was retired by the content-addressing cutover.  The
+# message->blob link is the ordered ``conversations.attachments`` ref-list.
 # ---------------------------------------------------------------------------
 
 workstream_attachments = sa.Table(
     "workstream_attachments",
     metadata,
+    # PK is the content hash (sha256 hex) — content-addressed dedup.
     sa.Column("attachment_id", sa.Text, primary_key=True),
     sa.Column("ws_id", sa.Text, nullable=False),
     sa.Column("user_id", sa.Text, nullable=False),
@@ -546,48 +557,15 @@ workstream_attachments = sa.Table(
     sa.Column("size_bytes", sa.Integer, nullable=False),
     sa.Column("kind", sa.Text, nullable=False),  # 'image' | 'text'
     sa.Column("content", sa.LargeBinary, nullable=False),
-    sa.Column("message_id", sa.Integer, nullable=True),  # conversations.id once consumed
-    # Soft lock tying an attachment to a queued user message.  Lifecycle:
-    #   pending  : message_id IS NULL  AND  reserved_for_msg_id IS NULL
-    #   reserved : message_id IS NULL  AND  reserved_for_msg_id = <queue-msg-id>
-    #   consumed : message_id IS NOT NULL  (reservation cleared on transition)
-    sa.Column("reserved_for_msg_id", sa.Text, nullable=True),
-    # When the row last transitioned into reserved state.  Cleared on
-    # consume / unreserve.  Set independently of `created` (upload time)
-    # so the orphan-reservation sweep can target only reservations that
-    # have actually been held longer than the threshold.
-    sa.Column("reserved_at", sa.Text, nullable=True),
     sa.Column("created", sa.Text, nullable=False),
-    # Content-addressed blob store (canonical-trajectory cut): a deduped blob's
-    # live-reference count (pruned at 0) and its origin ('upload' | 'tool').  The
-    # cutover retires the message_id / reserved_* upload-lifecycle columns above in
-    # favour of refcount + the conversations.attachments ref-list.
+    # A deduped blob's live-reference count (pruned at 0) and its origin
+    # ('upload' | 'tool').  The sole message->blob link is the ordered
+    # ``conversations.attachments`` ref-list, not a column here.
     sa.Column("refcount", sa.Integer, nullable=False, server_default=sa.text("0")),
     sa.Column("origin", sa.Text, nullable=False, server_default=sa.text("'upload'")),
 )
 
 sa.Index("idx_ws_attachments_ws_id", workstream_attachments.c.ws_id)
-sa.Index(
-    "idx_ws_attachments_pending",
-    workstream_attachments.c.ws_id,
-    workstream_attachments.c.user_id,
-    workstream_attachments.c.message_id,
-)
-sa.Index("idx_ws_attachments_message", workstream_attachments.c.message_id)
-sa.Index(
-    "idx_ws_attachments_reserved",
-    workstream_attachments.c.ws_id,
-    workstream_attachments.c.user_id,
-    workstream_attachments.c.reserved_for_msg_id,
-)
-# Partial index — only reserved rows participate, so the sweep scan
-# stays cheap as the consumed-history grows.
-sa.Index(
-    "idx_ws_attachments_reserved_at",
-    workstream_attachments.c.reserved_at,
-    sqlite_where=workstream_attachments.c.reserved_at.is_not(None),
-    postgresql_where=workstream_attachments.c.reserved_at.is_not(None),
-)
 
 # ---------------------------------------------------------------------------
 # Skill versions — version history for skills

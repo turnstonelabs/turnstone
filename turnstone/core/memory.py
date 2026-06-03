@@ -108,8 +108,14 @@ def save_attachment(
     size_bytes: int,
     kind: str,
     content: bytes,
+    origin: str = "upload",
 ) -> None:
-    """Persist an uploaded attachment in pending state."""
+    """Write a content-addressed blob (INSERT-OR-IGNORE) and bump its refcount.
+
+    ``attachment_id`` is the content hash; ``origin`` is ``'upload'`` (user
+    attachment) or ``'tool'`` (e.g. a ``read_file`` image).  A blob is only
+    ever written referenced (refcount ≥ 1).
+    """
     try:
         get_storage().save_attachment(
             attachment_id,
@@ -120,18 +126,20 @@ def save_attachment(
             size_bytes,
             kind,
             content,
+            origin,
         )
     except Exception:
         log.warning("Failed to save attachment ws=%s", ws_id, exc_info=True)
 
 
-def list_pending_attachments(ws_id: str, user_id: str) -> list[dict[str, Any]]:
-    """List un-consumed attachments for ``(ws_id, user_id)``."""
+def set_message_attachments(ws_id: str, message_id: int, attachment_ids: list[str]) -> None:
+    """Record a turn's ordered content-addressed ref-list on its conversations row."""
+    if not attachment_ids or not message_id:
+        return
     try:
-        return get_storage().list_pending_attachments(ws_id, user_id)
+        get_storage().set_message_attachments(ws_id, message_id, attachment_ids)
     except Exception:
-        log.warning("Failed to list pending attachments ws=%s", ws_id, exc_info=True)
-        return []
+        log.warning("Failed to set message attachments ws=%s", ws_id, exc_info=True)
 
 
 def get_attachments(attachment_ids: list[str]) -> list[dict[str, Any]]:
@@ -145,22 +153,6 @@ def get_attachments(attachment_ids: list[str]) -> list[dict[str, Any]]:
         return []
 
 
-def get_pending_attachments_with_content(ws_id: str, user_id: str) -> list[dict[str, Any]]:
-    """Single-query fetch of pending attachments + their bytes for the
-    auto-consume path on send.  Never expose this to user-facing listing
-    endpoints — use ``list_pending_attachments`` there instead.
-    """
-    try:
-        return get_storage().get_pending_attachments_with_content(ws_id, user_id)
-    except Exception:
-        log.warning(
-            "Failed to fetch pending attachments with content ws=%s",
-            ws_id,
-            exc_info=True,
-        )
-        return []
-
-
 def get_attachment(attachment_id: str) -> dict[str, Any] | None:
     """Return a single attachment row (with content) or None."""
     try:
@@ -170,95 +162,18 @@ def get_attachment(attachment_id: str) -> dict[str, Any] | None:
         return None
 
 
-def delete_attachment(attachment_id: str, ws_id: str, user_id: str) -> bool:
-    """Delete a pending attachment. Returns True if deleted."""
+def attachment_referenced_in_ws(attachment_id: str, ws_id: str) -> bool:
+    """True iff some conversations row in ``ws_id`` references ``attachment_id``.
+
+    The committed-attachment ownership gate for ``get_content`` (the per-row
+    ws/user scope columns are gone — scope rebases onto referencing-row
+    ownership).
+    """
     try:
-        return get_storage().delete_attachment(attachment_id, ws_id, user_id)
+        return get_storage().attachment_referenced_in_ws(attachment_id, ws_id)
     except Exception:
-        log.warning("Failed to delete attachment id=%s", attachment_id, exc_info=True)
+        log.warning("Failed to check attachment reference id=%s", attachment_id, exc_info=True)
         return False
-
-
-def mark_attachments_consumed(
-    attachment_ids: list[str],
-    message_id: int,
-    ws_id: str,
-    user_id: str,
-    reserved_for_msg_id: str | None = None,
-) -> None:
-    """Link attachments to a saved user message (scoped to ws_id+user_id).
-
-    When ``reserved_for_msg_id`` is set, the UPDATE also requires the
-    attachment's reservation token to match — prevents a stale send from
-    consuming rows reserved for a different one.
-    """
-    if not attachment_ids:
-        return
-    try:
-        get_storage().mark_attachments_consumed(
-            attachment_ids,
-            message_id,
-            ws_id,
-            user_id,
-            reserved_for_msg_id=reserved_for_msg_id,
-        )
-    except Exception:
-        log.warning("Failed to mark attachments consumed", exc_info=True)
-
-
-def reserve_attachments(
-    attachment_ids: list[str],
-    queue_msg_id: str,
-    ws_id: str,
-    user_id: str,
-) -> list[str]:
-    """Soft-lock pending attachments to a queued user message.
-
-    Returns the list of ids that were actually reserved for ``queue_msg_id``
-    (others silently skipped — e.g. already consumed or reserved).
-    """
-    if not attachment_ids or not queue_msg_id:
-        return []
-    try:
-        return get_storage().reserve_attachments(attachment_ids, queue_msg_id, ws_id, user_id)
-    except Exception:
-        log.warning("Failed to reserve attachments", exc_info=True)
-        return []
-
-
-def unreserve_attachments(queue_msg_id: str, ws_id: str, user_id: str) -> None:
-    """Release the reservation held by ``queue_msg_id`` on this (ws, user)."""
-    if not queue_msg_id:
-        return
-    try:
-        get_storage().unreserve_attachments(queue_msg_id, ws_id, user_id)
-    except Exception:
-        log.warning("Failed to unreserve attachments", exc_info=True)
-
-
-def sweep_orphan_reservations(older_than_seconds: int) -> int:
-    """Clear ``reserved_for_msg_id`` on stale attachment rows.
-
-    Defensive cleanup for reservations leaked by process crashes between
-    ``reserve_attachments`` and ``mark_attachments_consumed`` /
-    ``unreserve_attachments``.  Returns count of rows swept.
-    """
-    if older_than_seconds <= 0:
-        return 0
-    try:
-        return get_storage().sweep_orphan_reservations(older_than_seconds)
-    except Exception:
-        log.warning("Failed to sweep orphan reservations", exc_info=True)
-        return 0
-
-
-def load_attachments_for_messages(ws_id: str) -> dict[int, list[dict[str, Any]]]:
-    """Return attachments grouped by ``message_id`` for history replay."""
-    try:
-        return get_storage().load_attachments_for_messages(ws_id)
-    except Exception:
-        log.warning("Failed to load attachments for ws=%s", ws_id, exc_info=True)
-        return {}
 
 
 def delete_messages_after(ws_id: str, keep_count: int) -> int:

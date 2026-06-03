@@ -38,6 +38,7 @@ from typing import TYPE_CHECKING, Any, ClassVar, Protocol
 import httpx
 
 from turnstone.core import fence
+from turnstone.core.attachment_buffer import get_attachment_buffer
 from turnstone.core.attachments import (
     IMAGE_SIZE_CAP as _ATTACH_IMAGE_SIZE_CAP,
 )
@@ -66,9 +67,9 @@ from turnstone.core.memory import (
     list_workstreams_with_history,
     load_messages,
     load_workstream_config,
-    mark_attachments_consumed,
     normalize_key,
     resolve_workstream,
+    save_attachment,
     save_message,
     save_messages_bulk,
     save_structured_memory,
@@ -77,6 +78,7 @@ from turnstone.core.memory import (
     search_history_recent,
     search_structured_memories,
     search_visible_structured_memories,
+    set_message_attachments,
     set_workstream_alias,
     update_workstream_title,
 )
@@ -3598,14 +3600,17 @@ class ChatSession:
 
         When ``attachments`` is non-empty the in-memory message carries
         list content (text + image_url + document parts); the DB
-        conversations row stores only the text — attachments link back
-        via ``workstream_attachments.message_id``.  Returns the saved
-        conversations row id (0 on save failure, per the storage
-        wrapper's no-raise contract).
+        conversations row stores only the text.  At commit each attachment's
+        bytes are written content-addressed + reference-counted into
+        ``workstream_attachments`` (``attachment_id`` = the content hash) and
+        the ordered id-list is recorded on the row's ``attachments`` ref-list
+        column — the sole message->blob link.  Returns the saved conversations
+        row id (0 on save failure, per the storage wrapper's no-raise
+        contract).
 
-        ``send_id`` (when provided) is the reservation token; the
-        consume step adds it to the WHERE clause so a stale send can't
-        steal rows reserved to a different one.
+        ``send_id`` (when provided) is the end-to-end send token; it no longer
+        gates a DB reservation (the upload buffer is the pending store — the
+        bytes were already drained from it before this call).
         """
         # New user content invalidates the per-turn memory-search cache
         # (composition will see a different recent-context string).
@@ -3683,11 +3688,12 @@ class ChatSession:
             ]
         self.messages.append(user_msg)
         self._msg_tokens.append(max(1, int(self._msg_char_count(user_msg) / self._chars_per_token)))
-        # DB row stores the raw text only; attachments are joined back in
-        # from workstream_attachments on load via message_id.  Save →
-        # consume are two separate transactions; a crash between them
-        # leaves pending rows that the UI's chip rehydration can still
-        # surface so the user can clear or resend them.
+        # DB row stores the raw text only; attachment bytes are written
+        # content-addressed into workstream_attachments and the ordered id-list
+        # is recorded on this row's ``attachments`` ref-list column (the sole
+        # message->blob link), joined back in on load.  ``send_id`` no longer
+        # gates a reservation — the bytes were drained from the upload buffer
+        # before this call.
         #
         # The wake's synthesised empty turn carries ``_source`` onto the
         # row so reconnecting tabs render the marker instead of an
@@ -3703,14 +3709,90 @@ class ChatSession:
             event_id=self._ui_event_id(),
         )
         if attachments and message_id:
-            mark_attachments_consumed(
-                [a.attachment_id for a in attachments],
-                message_id,
+            self._persist_attachment_refs(message_id, attachments)
+            # Drain the now-committed handles from the per-node upload buffer
+            # (content-addressed: the bytes are persisted + referenced).  A
+            # peek-then-commit split (resolve in the route, drain here) lets an
+            # uncommitted send — e.g. one the queue rejected — keep the staged
+            # bytes for a retry; anything not drained expires on the buffer TTL.
+            buffer = get_attachment_buffer()
+            for att in attachments:
+                buffer.discard(att.attachment_id, ws_id=self._ws_id, user_id=self._user_id)
+        return message_id
+
+    def _persist_attachment_refs(
+        self,
+        message_id: int,
+        attachments: list[Attachment] | tuple[Attachment, ...],
+        *,
+        origin: str = "upload",
+    ) -> None:
+        """Write each attachment's bytes content-addressed and record the ref-list.
+
+        ``attachment_id`` is the content hash, so identical bytes dedupe to one
+        blob and each reference bumps its refcount; the ordered id-list is
+        recorded on the conversations row's ``attachments`` column.  Used by
+        the user-turn commit (``origin='upload'``) and the tool-image persist
+        (``origin='tool'``).
+        """
+        ref_ids: list[str] = []
+        for att in attachments:
+            save_attachment(
+                att.attachment_id,
                 self._ws_id,
                 self._user_id,
-                reserved_for_msg_id=send_id,
+                att.filename,
+                att.mime_type,
+                len(att.content),
+                att.kind,
+                att.content,
+                origin,
             )
-        return message_id
+            ref_ids.append(att.attachment_id)
+        set_message_attachments(self._ws_id, message_id, ref_ids)
+
+    @staticmethod
+    def _image_parts_to_attachments(
+        output: list[dict[str, Any]], tool_name: str
+    ) -> list[Attachment]:
+        """Decode ``image_url`` data-URI parts in tool output into Attachments.
+
+        Tool vision output (e.g. ``read_file`` on an image) carries inline
+        ``data:<mime>;base64,<...>`` image parts.  Decode them back to bytes,
+        derive the content hash as the ``attachment_id``, and return one
+        ``Attachment`` per image so the caller can persist them
+        content-addressed.  Non-image / non-data-URI parts and undecodable
+        payloads are skipped (the inline part still rides the live wire).
+        """
+        atts: list[Attachment] = []
+        for part in output:
+            if not (isinstance(part, dict) and part.get("type") == "image_url"):
+                continue
+            url = (part.get("image_url") or {}).get("url") or ""
+            if not url.startswith("data:") or ";base64," not in url:
+                continue
+            header, _, b64 = url.partition(";base64,")
+            mime = header[len("data:") :] or "image/png"
+            try:
+                # ``binascii.Error`` (raised on a malformed payload) subclasses
+                # ``ValueError``, so a single except covers both.
+                raw = base64.b64decode(b64, validate=True)
+            except ValueError:
+                log.warning(
+                    "tool %s emitted an undecodable image data URI; not persisting", tool_name
+                )
+                continue
+            ext = (mimetypes.guess_extension(mime) or ".png").lstrip(".")
+            atts.append(
+                Attachment(
+                    attachment_id=hashlib.sha256(raw).hexdigest(),
+                    filename=f"{tool_name or 'tool'}-image.{ext}",
+                    mime_type=mime,
+                    kind="image",
+                    content=raw,
+                )
+            )
+        return atts
 
     def _append_system_turn(self, source: str, content: str, **meta: Any) -> None:
         """Append a first-class operator-context system turn and persist it.
@@ -3764,14 +3846,15 @@ class ChatSession:
         """Send user input and handle the response loop (including tool calls).
 
         When ``attachments`` is provided the in-memory user message carries
-        multipart list content (text + image_url + document parts) while
-        the DB conversations row stores only the text — attachments are
-        linked via ``message_id`` in the workstream_attachments table.
+        multipart list content (text + image_url + document parts) while the
+        DB conversations row stores only the text — the attachment bytes are
+        written content-addressed into ``workstream_attachments`` and the
+        ordered id-list is recorded on the row's ``attachments`` ref-list
+        column.
 
-        ``send_id`` is the server-side reservation token for the
-        attachments; on consume, the storage layer matches it against
-        ``reserved_for_msg_id`` so a stale send can't steal rows
-        reserved to a different one.
+        ``send_id`` is an end-to-end tracking token only; it no longer gates a
+        DB reservation (the upload buffer is the pending store, and the bytes
+        in ``attachments`` were already drained/peeked from it by the caller).
         """
         self._refresh_model_from_registry()
         # Token budget approval gate
@@ -4126,15 +4209,22 @@ class ChatSession:
                     # already bounded by ``_truncate_output`` above (per-turn
                     # context budget); no second cap needed.
                     _tname = _tc_names.get(tc_id, "")
+                    tool_image_atts: list[Attachment] = []
                     if isinstance(output, list):
                         store_text: str = " ".join(
                             p.get("text", "")
                             for p in output
                             if isinstance(p, dict) and p.get("type") == "text"
                         )
+                        # Persist any image parts content-addressed so vision
+                        # tool output (e.g. read_file on an image) survives a
+                        # reload — the flattened text alone would drop it.  The
+                        # in-memory ``output`` keeps its inline image_url for
+                        # the live wire; only the ref is persisted.
+                        tool_image_atts = self._image_parts_to_attachments(output, _tname)
                     else:
                         store_text = output
-                    save_message(
+                    tool_message_id = save_message(
                         self._ws_id,
                         "tool",
                         store_text,
@@ -4143,6 +4233,10 @@ class ChatSession:
                         event_id=self._ui_event_id(),
                         is_error=tool_is_error,
                     )
+                    if tool_image_atts and tool_message_id:
+                        self._persist_attachment_refs(
+                            tool_message_id, tool_image_atts, origin="tool"
+                        )
 
                     # Accumulate this result's operator context (guard
                     # findings per-result; queued interjections + metacog

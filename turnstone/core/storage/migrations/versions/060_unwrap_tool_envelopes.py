@@ -33,6 +33,15 @@ generating provider as the ``{producer, blocks}`` envelope (producer inferred fr
 types — see ``_infer_producer``, which must match the live save's ``provider_name``
 values), so the lowering layer can replay the native lane verbatim only to its producer.
 
+Finally it performs the **attachment content-addressing cutover**: after adding
+``conversations.attachments`` (the ref-list) and ``workstream_attachments.refcount`` /
+``origin``, it re-keys every legacy *consumed* attachment row to its content hash
+(``sha256(content)``), dedups identical bytes into one refcounted blob, builds each
+message's ``attachments`` ref-list from the old ``message_id`` link, and then drops the
+retired upload-lifecycle columns ``message_id`` / ``reserved_for_msg_id`` /
+``reserved_at`` (and their indexes).  Pending (un-consumed) legacy rows are dropped —
+pending uploads now live in the per-node in-memory buffer, not in storage.
+
 ``downgrade()`` re-adds the (empty) ``_reminders`` column so the schema matches
 the 059 state, but does NOT reverse the envelope un-wrap — that is lossy (the
 advisory blocks are discarded), so the original wrapped rows cannot be
@@ -45,6 +54,7 @@ Create Date: 2026-06-01
 
 from __future__ import annotations
 
+import hashlib
 import json
 from typing import Any
 
@@ -253,8 +263,9 @@ def upgrade() -> None:
         batch_op.add_column(
             sa.Column("is_error", sa.Boolean, nullable=False, server_default=sa.false())
         )
-        # Content-addressed attachment ref-list (canonical-trajectory cut); the cutover
-        # fills it and retires the message_id/reserved_* link.
+        # Content-addressed attachment ref-list (canonical-trajectory cut); the
+        # backfill below (step 3) fills it from the legacy message_id link and
+        # then drops message_id/reserved_* (step 4).
         batch_op.add_column(sa.Column("attachments", sa.Text, nullable=True))
     with op.batch_alter_table("workstream_attachments") as batch_op:
         batch_op.add_column(
@@ -264,16 +275,159 @@ def upgrade() -> None:
             sa.Column("origin", sa.Text, nullable=False, server_default=sa.text("'upload'"))
         )
 
+    # (3) Backfill the content-addressed model from the legacy message_id link,
+    #     then drop the retired lifecycle columns.  Must run AFTER the additive
+    #     columns above exist (refcount / origin / attachments) and BEFORE the
+    #     drop below (it reads message_id).
+    _backfill_content_addressed_attachments(bind)
+
+    # (4) Drop the retired upload-lifecycle columns + their indexes.  The
+    #     content-addressed model keys blobs by content hash and links them via
+    #     the conversations.attachments ref-list, so message_id /
+    #     reserved_for_msg_id / reserved_at (and the indexes over them) are dead.
+    #     Drop the dependent indexes FIRST on both dialects: SQLite's
+    #     ``batch_alter_table`` rebuilds the table from the reflected schema and
+    #     would otherwise try to re-create these indexes against the
+    #     now-missing columns; PostgreSQL needs them gone before the columns.
+    for idx in (
+        "idx_ws_attachments_pending",
+        "idx_ws_attachments_message",
+        "idx_ws_attachments_reserved",
+        "idx_ws_attachments_reserved_at",
+    ):
+        op.execute(sa.text(f"DROP INDEX IF EXISTS {idx}"))
+    with op.batch_alter_table("workstream_attachments") as batch_op:
+        batch_op.drop_column("message_id")
+        batch_op.drop_column("reserved_for_msg_id")
+        batch_op.drop_column("reserved_at")
+
+
+def _backfill_content_addressed_attachments(bind: sa.engine.Connection) -> None:
+    """Re-key legacy consumed attachments to their content hash + build ref-lists.
+
+    Legacy rows linked an attachment to a message via
+    ``workstream_attachments.message_id``.  The content-addressed model keys a
+    blob by ``sha256(content)`` and links it via the ordered
+    ``conversations.attachments`` ref-list.  For every *consumed* legacy row
+    (``message_id IS NOT NULL``):
+
+    * compute the content hash and dedup — identical bytes collapse to one row
+      whose PK is re-keyed to the hash; duplicate legacy rows are deleted;
+    * set ``refcount`` = the number of distinct messages referencing that
+      content, and ``origin = 'upload'``;
+    * build each referencing message's ``conversations.attachments`` as the
+      ordered list of content hashes (legacy per-message order preserved by the
+      attachment row's ``created`` then ``attachment_id``).
+
+    Pending (un-consumed) legacy rows (``message_id IS NULL``) are dropped: they
+    were transient upload state and the content-addressed model holds no pending
+    blobs in storage (they live in the per-node buffer now).
+    """
+    wa = sa.table(
+        "workstream_attachments",
+        sa.column("attachment_id", sa.Text),
+        sa.column("message_id", sa.Integer),
+        sa.column("content", sa.LargeBinary),
+        sa.column("created", sa.Text),
+        sa.column("refcount", sa.Integer),
+        sa.column("origin", sa.Text),
+    )
+    conversations = sa.table(
+        "conversations",
+        sa.column("id", sa.Integer),
+        sa.column("attachments", sa.Text),
+    )
+
+    # Read every consumed legacy row in (message_id, created, attachment_id)
+    # order so each message's ref-list preserves the original attachment order.
+    rows = bind.execute(
+        sa.select(wa.c.attachment_id, wa.c.message_id, wa.c.content)
+        .where(wa.c.message_id.is_not(None))
+        .order_by(wa.c.message_id, wa.c.created, wa.c.attachment_id)
+    ).fetchall()
+
+    # new_id (content hash) -> canonical old id kept as that blob's row.
+    canonical_old_id: dict[str, str] = {}
+    # new_id -> set of distinct message ids referencing it (refcount source).
+    refcounting: dict[str, set[int]] = {}
+    # message_id -> ordered list of new_ids (de-duped within the message).
+    per_message: dict[int, list[str]] = {}
+    # old ids to delete (duplicates that collapsed into a canonical row).
+    drop_old_ids: list[str] = []
+
+    for old_id, message_id, content in rows:
+        raw = content if isinstance(content, (bytes, bytearray)) else b""
+        new_id = hashlib.sha256(bytes(raw)).hexdigest()
+        if new_id not in canonical_old_id:
+            canonical_old_id[new_id] = old_id
+            refcounting[new_id] = set()
+        elif old_id != canonical_old_id[new_id]:
+            # A distinct legacy row carrying identical bytes — collapse it.
+            drop_old_ids.append(old_id)
+        refcounting[new_id].add(int(message_id))
+        bucket = per_message.setdefault(int(message_id), [])
+        if new_id not in bucket:
+            bucket.append(new_id)
+
+    # Re-key each canonical row's PK to its content hash and set refcount/origin.
+    # Re-key first (while the duplicates still hold their old PKs), then delete
+    # the duplicates, so a re-key can't collide with a not-yet-deleted dup.
+    for new_id, old_id in canonical_old_id.items():
+        bind.execute(
+            sa.update(wa)
+            .where(wa.c.attachment_id == old_id)
+            .values(
+                attachment_id=new_id,
+                refcount=len(refcounting[new_id]),
+                origin="upload",
+            )
+        )
+    for old_id in drop_old_ids:
+        bind.execute(sa.delete(wa).where(wa.c.attachment_id == old_id))
+
+    # Drop any remaining pending (un-consumed) legacy rows — no storage home.
+    bind.execute(sa.delete(wa).where(wa.c.message_id.is_(None)))
+
+    # Write each message's content-addressed ref-list.
+    for message_id, new_ids in per_message.items():
+        bind.execute(
+            sa.update(conversations)
+            .where(conversations.c.id == message_id)
+            .values(attachments=json.dumps(new_ids))
+        )
+
 
 def downgrade() -> None:
     # Re-add the (empty) column so the schema matches the 059 state.  The
     # envelope un-wrap (step 1) is NOT reversed — it discards the advisory
     # blocks, so the original wrapped rows cannot be reconstructed; the
-    # re-added column is therefore always NULL.
+    # re-added column is therefore always NULL.  The content-addressing
+    # backfill (step 3) is likewise NOT reversed: the retired columns are
+    # re-added empty (the old message_id links / reservation tokens cannot be
+    # reconstructed from the content-addressed ref-list).
     with op.batch_alter_table("conversations") as batch_op:
         batch_op.add_column(sa.Column("_reminders", sa.Text, nullable=True))
         batch_op.drop_column("is_error")
         batch_op.drop_column("attachments")
     with op.batch_alter_table("workstream_attachments") as batch_op:
+        batch_op.add_column(sa.Column("message_id", sa.Integer, nullable=True))
+        batch_op.add_column(sa.Column("reserved_for_msg_id", sa.Text, nullable=True))
+        batch_op.add_column(sa.Column("reserved_at", sa.Text, nullable=True))
         batch_op.drop_column("refcount")
         batch_op.drop_column("origin")
+    # Re-create the indexes over the re-added columns to match the 059 schema.
+    op.create_index(
+        "idx_ws_attachments_pending",
+        "workstream_attachments",
+        ["ws_id", "user_id", "message_id"],
+    )
+    op.create_index(
+        "idx_ws_attachments_message",
+        "workstream_attachments",
+        ["message_id"],
+    )
+    op.create_index(
+        "idx_ws_attachments_reserved",
+        "workstream_attachments",
+        ["ws_id", "user_id", "reserved_for_msg_id"],
+    )

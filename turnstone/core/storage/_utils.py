@@ -156,6 +156,80 @@ def _attachment_to_content_part(att: dict[str, Any]) -> dict[str, Any] | None:
     return None
 
 
+def parse_attachment_refs(raw: str | None) -> list[str]:
+    """Decode a ``conversations.attachments`` ref-list column into id strings.
+
+    The column stores a JSON array of content-addressed ``attachment_id``s in
+    turn order (NULL / empty for turns with no attachments).  Malformed or
+    non-list JSON decodes to an empty list (defensive — a corrupt column must
+    never crash a history load); non-string elements are dropped.
+    """
+    if not raw:
+        return []
+    try:
+        parsed = json.loads(raw)
+    except (json.JSONDecodeError, TypeError):
+        return []
+    if not isinstance(parsed, list):
+        return []
+    return [str(x) for x in parsed if isinstance(x, str) and x]
+
+
+def build_attachments_by_msg(
+    attachment_refs: dict[int, list[str]],
+    rows_by_id: dict[str, dict[str, Any]],
+) -> dict[int, list[dict[str, Any]]]:
+    """Assemble the ``reconstruct_messages`` attachment map from ref-lists.
+
+    ``attachment_refs`` maps a conversations row id to its ordered list of
+    content-addressed ids (from :func:`parse_attachment_refs`); ``rows_by_id``
+    maps an attachment id to its resolved blob row (incl. ``content`` bytes).
+    Returns ``{row_id: [att_row, ...]}`` preserving ref-list order, skipping
+    ids whose blob is missing (pruned / never written).  Empty lists are
+    omitted so the caller can pass ``result or None`` unchanged.
+    """
+    grouped: dict[int, list[dict[str, Any]]] = {}
+    for mid, ids in attachment_refs.items():
+        resolved = [rows_by_id[aid] for aid in ids if aid in rows_by_id]
+        if resolved:
+            grouped[mid] = resolved
+    return grouped
+
+
+def _reconstruct_attachment_parts(
+    attachments_by_msg: dict[int, list[dict[str, Any]]] | None,
+    row_id: int | None,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Build ``(content_parts, attachments_meta)`` for a row from its ref-list.
+
+    ``attachments_by_msg`` maps a conversations row id to the ordered list of
+    content-addressed attachment rows referenced by that row's
+    ``attachments`` column (resolved to include ``content`` bytes).  Returns
+    the OpenAI-style content parts (image_url / document, in ref-list order)
+    and the display-oriented ``_attachments_meta`` siblings (kind / filename /
+    mime_type) — the latter is tracked even when a part can't be reconstructed
+    so history replay keeps filenames available (e.g. image pills).  Shared by
+    the user- and tool-row reconstruction so both surfaces stay byte-identical
+    in part shape.
+    """
+    parts: list[dict[str, Any]] = []
+    meta: list[dict[str, Any]] = []
+    if not attachments_by_msg or row_id is None:
+        return parts, meta
+    for att in attachments_by_msg.get(row_id, []):
+        part = _attachment_to_content_part(att)
+        if part is not None:
+            parts.append(part)
+        meta.append(
+            {
+                "kind": str(att.get("kind") or ""),
+                "filename": str(att.get("filename") or ""),
+                "mime_type": str(att.get("mime_type") or ""),
+            }
+        )
+    return parts, meta
+
+
 # ---------------------------------------------------------------------------
 # Search-term normalization
 # ---------------------------------------------------------------------------
@@ -453,9 +527,13 @@ def reconstruct_messages(
     cursor) is surfaced as the ``_event_id`` side-channel; legacy 9-tuple
     fixtures omit it (handled by the defensive unpack below).
 
-    When ``attachments_by_msg`` is provided, any user row whose id has
-    attachments is rebuilt with multipart list content (text +
-    image_url/document parts).
+    When ``attachments_by_msg`` is provided (keyed by row id, each value an
+    ordered list of content-addressed attachment rows resolved from the
+    ``conversations.attachments`` ref-list), any ``user`` *or* ``tool`` row
+    whose id has attachments is rebuilt with multipart list content (text +
+    image_url/document parts).  Tool rows carry persisted vision output
+    (``read_file`` on an image) this way — they would otherwise reload as the
+    flattened text alone.
 
     When ``repair`` is True (default) the result is post-processed to
     produce a wire-shape valid for an LLM round-trip: the trailing
@@ -494,23 +572,7 @@ def reconstruct_messages(
         is_error = bool(row[9]) if len(row) > 9 else False
 
         if role == "user":
-            parts: list[dict[str, Any]] = []
-            meta: list[dict[str, Any]] = []
-            if attachments_by_msg and row_id is not None:
-                for att in attachments_by_msg.get(row_id, []):
-                    part = _attachment_to_content_part(att)
-                    if part is not None:
-                        parts.append(part)
-                    # Track display-oriented metadata even when a part
-                    # itself can't be reconstructed — keeps filenames
-                    # available for history replay (e.g. image pills).
-                    meta.append(
-                        {
-                            "kind": str(att.get("kind") or ""),
-                            "filename": str(att.get("filename") or ""),
-                            "mime_type": str(att.get("mime_type") or ""),
-                        }
-                    )
+            parts, meta = _reconstruct_attachment_parts(attachments_by_msg, row_id)
             if parts:
                 user_content: list[dict[str, Any]] = [{"type": "text", "text": content or ""}]
                 user_content.extend(parts)
@@ -547,10 +609,22 @@ def reconstruct_messages(
             messages.append(msg)
 
         elif role == "tool":
+            # Tool rows can carry persisted vision output (``read_file`` on an
+            # image): the live tool message's content was a multipart list and
+            # the image bytes were written content-addressed + referenced on
+            # this row, while the row's text column holds only the flattened
+            # text.  Rebuild the multipart list on reload so the image survives;
+            # text-only tool rows stay plain strings (the common case).
+            tparts, _tmeta = _reconstruct_attachment_parts(attachments_by_msg, row_id)
+            tool_content: str | list[dict[str, Any]]
+            if tparts:
+                tool_content = [{"type": "text", "text": content or ""}, *tparts]
+            else:
+                tool_content = content or ""
             tmsg: dict[str, Any] = {
                 "role": "tool",
                 "tool_call_id": tc_id or "",
-                "content": content or "",
+                "content": tool_content,
             }
             if is_error:
                 tmsg["is_error"] = True

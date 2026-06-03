@@ -3,16 +3,18 @@
 from __future__ import annotations
 
 import contextlib
+import json
 import queue
 import threading
 import time
+from collections import Counter
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Any
 
 import sqlalchemy as sa
 
 if TYPE_CHECKING:
-    from collections.abc import Iterable, Iterator
+    from collections.abc import Iterable, Iterator, Sequence
 
     from turnstone.core.storage._notify import Notify, NotifyStream
 
@@ -107,10 +109,16 @@ from turnstone.core.storage._utils import (
     VERDICT_MUTABLE as _VERDICT_MUTABLE,
 )
 from turnstone.core.storage._utils import (
+    build_attachments_by_msg as _build_attachments_by_msg,
+)
+from turnstone.core.storage._utils import (
     escape_like as _escape_like,
 )
 from turnstone.core.storage._utils import (
     normalize_search_terms as _normalize_search_terms,
+)
+from turnstone.core.storage._utils import (
+    parse_attachment_refs as _parse_attachment_refs,
 )
 from turnstone.core.storage._utils import prepare_provider_data_for_save, sanitize_text
 from turnstone.core.storage._utils import (
@@ -422,24 +430,30 @@ class SQLiteBackend:
     def load_messages(
         self, ws_id: str, *, limit: int | None = None, repair: bool = True
     ) -> list[dict[str, Any]]:
+        # The trailing ``attachments`` column carries the per-row
+        # content-addressed ref-list; it is split off below to resolve blobs
+        # and is NOT part of the positional tuple ``reconstruct_messages``
+        # unpacks (id..is_error).
+        _cols = (
+            conversations.c.id,
+            conversations.c.role,
+            conversations.c.content,
+            conversations.c.tool_name,
+            conversations.c.tool_call_id,
+            conversations.c.provider_data,
+            conversations.c.tool_calls,
+            conversations.c._source,
+            conversations.c.event_id,
+            conversations.c.is_error,
+            conversations.c.attachments,
+        )
         with self._conn() as conn:
             if limit is not None and limit > 0:
                 # Tail-N: fetch the last `limit` rows via DESC + LIMIT
                 # then reverse so the reconstructed output stays in
                 # chronological order.  Bounds memory on long histories.
                 rows = conn.execute(
-                    sa.select(
-                        conversations.c.id,
-                        conversations.c.role,
-                        conversations.c.content,
-                        conversations.c.tool_name,
-                        conversations.c.tool_call_id,
-                        conversations.c.provider_data,
-                        conversations.c.tool_calls,
-                        conversations.c._source,
-                        conversations.c.event_id,
-                        conversations.c.is_error,
-                    )
+                    sa.select(*_cols)
                     .where(conversations.c.ws_id == ws_id)
                     .order_by(conversations.c.id.desc())
                     .limit(limit)
@@ -447,31 +461,37 @@ class SQLiteBackend:
                 rows = list(reversed(rows))
             else:
                 rows = conn.execute(
-                    sa.select(
-                        conversations.c.id,
-                        conversations.c.role,
-                        conversations.c.content,
-                        conversations.c.tool_name,
-                        conversations.c.tool_call_id,
-                        conversations.c.provider_data,
-                        conversations.c.tool_calls,
-                        conversations.c._source,
-                        conversations.c.event_id,
-                        conversations.c.is_error,
-                    )
+                    sa.select(*_cols)
                     .where(conversations.c.ws_id == ws_id)
                     .order_by(conversations.c.id)
                 ).fetchall()
 
-        # Bound the attachment scan to the fetched message ids when
-        # tail-N was requested — otherwise the attachments query
-        # still scans every row for the workstream and partially
-        # defeats the conversations-table LIMIT.
-        message_ids: list[int] | None = None
-        if limit is not None and limit > 0:
-            message_ids = [r[0] for r in rows]
-        attachments = self.load_attachments_for_messages(ws_id, message_ids=message_ids)
-        return _reconstruct_messages(list(rows), ws_id, attachments or None, repair=repair)
+        attachments = self._resolve_row_attachments(rows)
+        # Strip the trailing ref-list column so the tuple shape stays exactly
+        # what ``reconstruct_messages`` expects (id..is_error).
+        msg_rows = [tuple(r)[:10] for r in rows]
+        return _reconstruct_messages(msg_rows, ws_id, attachments or None, repair=repair)
+
+    def _resolve_row_attachments(self, rows: Sequence[Any]) -> dict[int, list[dict[str, Any]]]:
+        """Build the ``reconstruct_messages`` attachment map from row ref-lists.
+
+        Each row's trailing ``attachments`` column (last element) is the
+        content-addressed ref-list; collect every referenced id, bulk-fetch
+        the blobs in one query, and group them back per row id in ref-list
+        order.  No referenced ids → no query.
+        """
+        attachment_refs: dict[int, list[str]] = {}
+        all_ids: set[str] = set()
+        for r in rows:
+            ids = _parse_attachment_refs(r[10])
+            if ids:
+                attachment_refs[r[0]] = ids
+                all_ids.update(ids)
+        if not all_ids:
+            return {}
+        blobs = self.get_attachments(list(all_ids))
+        rows_by_id = {str(b["attachment_id"]): b for b in blobs}
+        return _build_attachments_by_msg(attachment_refs, rows_by_id)
 
     def get_max_event_id(self, ws_id: str) -> int | None:
         with self._conn() as conn:
@@ -495,16 +515,23 @@ class SQLiteBackend:
             if cutoff_row is None:
                 return 0  # nothing to delete
             cutoff_id = cutoff_row[0]
-            # Cascade-delete attachments linked to doomed messages so
-            # rewind/retry flows don't leak orphan BLOBs.
-            conn.execute(
-                sa.delete(workstream_attachments).where(
+            # Refcount GC: read the doomed rows' content-addressed ref-lists,
+            # decrement each blob's refcount once per reference, and prune
+            # blobs that hit 0 — so a deduped blob still referenced by a kept
+            # turn survives.  Replaces the old message_id-cascade delete.
+            doomed = conn.execute(
+                sa.select(conversations.c.attachments).where(
                     sa.and_(
-                        workstream_attachments.c.ws_id == ws_id,
-                        workstream_attachments.c.message_id >= cutoff_id,
+                        conversations.c.ws_id == ws_id,
+                        conversations.c.id >= cutoff_id,
+                        conversations.c.attachments.is_not(None),
                     )
                 )
-            )
+            ).fetchall()
+            doomed_ids: list[str] = []
+            for (refs,) in doomed:
+                doomed_ids.extend(_parse_attachment_refs(refs))
+            self._release_attachment_refs(conn, doomed_ids)
             # Remove FTS5 entries first (external content table doesn't auto-sync)
             if self._fts5_available:
                 try:
@@ -962,9 +989,22 @@ class SQLiteBackend:
 
     def delete_workstream(self, ws_id: str) -> bool:
         with self._conn() as conn:
-            conn.execute(
-                sa.delete(workstream_attachments).where(workstream_attachments.c.ws_id == ws_id)
-            )
+            # Refcount GC over every referenced blob (content-addressed ids are
+            # global, so a deduped blob may be shared with another workstream —
+            # decrement, don't blanket-delete by ws_id).  Blobs that hit 0 are
+            # pruned; any still referenced elsewhere survive.
+            referenced = conn.execute(
+                sa.select(conversations.c.attachments).where(
+                    sa.and_(
+                        conversations.c.ws_id == ws_id,
+                        conversations.c.attachments.is_not(None),
+                    )
+                )
+            ).fetchall()
+            ref_ids: list[str] = []
+            for (refs,) in referenced:
+                ref_ids.extend(_parse_attachment_refs(refs))
+            self._release_attachment_refs(conn, ref_ids)
             conn.execute(sa.delete(conversations).where(conversations.c.ws_id == ws_id))
             conn.execute(sa.delete(workstream_config).where(workstream_config.c.ws_id == ws_id))
             conn.execute(
@@ -985,7 +1025,7 @@ class SQLiteBackend:
             conn.commit()
             return result.rowcount > 0
 
-    # -- Workstream attachments ------------------------------------------------
+    # -- Workstream attachments (content-addressed, refcounted) ----------------
 
     def save_attachment(
         self,
@@ -997,48 +1037,70 @@ class SQLiteBackend:
         size_bytes: int,
         kind: str,
         content: bytes,
+        origin: str = "upload",
     ) -> None:
+        """Write a content-addressed blob (INSERT-OR-IGNORE) and ``refcount += 1``.
+
+        ``attachment_id`` is the content hash (the caller computes it).  The
+        first reference writes the row at ``refcount = 1``; every subsequent
+        reference (a re-upload of identical bytes, or a second message
+        referencing the same blob) finds the PK present and only bumps the
+        count — so a stored blob is always referenced (born at ≥ 1) and dedupes
+        across messages / workstreams.  Idempotent on the bytes, never on the
+        count.
+        """
+        from sqlalchemy.dialects.sqlite import insert as sqlite_insert
+
         now = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S")
         with self._conn() as conn:
+            # INSERT-OR-IGNORE the blob, then unconditionally bump the count.
+            # Splitting insert (ignore-on-conflict) from the increment keeps
+            # the +1 correct whether or not the row already existed.
+            stmt = sqlite_insert(workstream_attachments).values(
+                attachment_id=attachment_id,
+                ws_id=ws_id,
+                user_id=user_id,
+                filename=filename,
+                mime_type=mime_type,
+                size_bytes=size_bytes,
+                kind=kind,
+                content=content,
+                created=now,
+                refcount=0,
+                origin=origin,
+            )
+            conn.execute(stmt.on_conflict_do_nothing(index_elements=["attachment_id"]))
             conn.execute(
-                sa.insert(workstream_attachments),
-                {
-                    "attachment_id": attachment_id,
-                    "ws_id": ws_id,
-                    "user_id": user_id,
-                    "filename": filename,
-                    "mime_type": mime_type,
-                    "size_bytes": size_bytes,
-                    "kind": kind,
-                    "content": content,
-                    "message_id": None,
-                    "created": now,
-                },
+                sa.update(workstream_attachments)
+                .where(workstream_attachments.c.attachment_id == attachment_id)
+                .values(refcount=workstream_attachments.c.refcount + 1)
             )
             conn.commit()
 
-    def list_pending_attachments(self, ws_id: str, user_id: str) -> list[dict[str, Any]]:
+    def set_message_attachments(
+        self, ws_id: str, message_id: int, attachment_ids: list[str]
+    ) -> None:
+        """Record a turn's ordered content-addressed ref-list on its row.
+
+        Writes the JSON id-list onto ``conversations.attachments`` for the
+        ``(ws_id, message_id)`` row — the sole message->blob link.  Empty
+        input is a no-op (the column stays NULL).  Scoped to ``ws_id`` as
+        defense-in-depth against a cross-ws message id.
+        """
+        if not attachment_ids or not message_id:
+            return
         with self._conn() as conn:
-            rows = conn.execute(
-                sa.select(
-                    workstream_attachments.c.attachment_id,
-                    workstream_attachments.c.filename,
-                    workstream_attachments.c.mime_type,
-                    workstream_attachments.c.size_bytes,
-                    workstream_attachments.c.kind,
-                    workstream_attachments.c.created,
-                )
+            conn.execute(
+                sa.update(conversations)
                 .where(
                     sa.and_(
-                        workstream_attachments.c.ws_id == ws_id,
-                        workstream_attachments.c.user_id == user_id,
-                        workstream_attachments.c.message_id.is_(None),
-                        workstream_attachments.c.reserved_for_msg_id.is_(None),
+                        conversations.c.id == message_id,
+                        conversations.c.ws_id == ws_id,
                     )
                 )
-                .order_by(workstream_attachments.c.created)
-            ).fetchall()
-            return [dict(r._mapping) for r in rows]
+                .values(attachments=json.dumps(list(attachment_ids)))
+            )
+            conn.commit()
 
     def get_attachments(self, attachment_ids: list[str]) -> list[dict[str, Any]]:
         if not attachment_ids:
@@ -1051,24 +1113,6 @@ class SQLiteBackend:
             ).fetchall()
             return [dict(r._mapping) for r in rows]
 
-    def get_pending_attachments_with_content(
-        self, ws_id: str, user_id: str
-    ) -> list[dict[str, Any]]:
-        with self._conn() as conn:
-            rows = conn.execute(
-                sa.select(workstream_attachments)
-                .where(
-                    sa.and_(
-                        workstream_attachments.c.ws_id == ws_id,
-                        workstream_attachments.c.user_id == user_id,
-                        workstream_attachments.c.message_id.is_(None),
-                        workstream_attachments.c.reserved_for_msg_id.is_(None),
-                    )
-                )
-                .order_by(workstream_attachments.c.created)
-            ).fetchall()
-            return [dict(r._mapping) for r in rows]
-
     def get_attachment(self, attachment_id: str) -> dict[str, Any] | None:
         with self._conn() as conn:
             row = conn.execute(
@@ -1078,163 +1122,59 @@ class SQLiteBackend:
             ).fetchone()
             return dict(row._mapping) if row else None
 
-    def delete_attachment(self, attachment_id: str, ws_id: str, user_id: str) -> bool:
+    def attachment_referenced_in_ws(self, attachment_id: str, ws_id: str) -> bool:
+        """True iff some conversations row in ``ws_id`` references ``attachment_id``.
+
+        The committed-attachment ownership gate: the ``ws_id``/``user_id``
+        scope columns are gone, so a ``get_content`` for a committed blob is
+        authorised by proving the requester (already gated to own ``ws_id``)
+        has a turn in that workstream whose ref-list names the id.  Uses a
+        JSON-array substring match on the ``attachments`` column —
+        content-addressed ids are 64-char sha256 hex, so a quoted-id substring
+        cannot collide with another id.
+        """
+        needle = f'%"{attachment_id}"%'
         with self._conn() as conn:
-            # Only pending (unreserved, unconsumed) attachments may be
-            # deleted.  Reserved ones are soft-locked to a queued send.
-            result = conn.execute(
-                sa.delete(workstream_attachments).where(
+            row = conn.execute(
+                sa.select(conversations.c.id)
+                .where(
                     sa.and_(
-                        workstream_attachments.c.attachment_id == attachment_id,
-                        workstream_attachments.c.ws_id == ws_id,
-                        workstream_attachments.c.user_id == user_id,
-                        workstream_attachments.c.message_id.is_(None),
-                        workstream_attachments.c.reserved_for_msg_id.is_(None),
+                        conversations.c.ws_id == ws_id,
+                        conversations.c.attachments.is_not(None),
+                        conversations.c.attachments.like(needle),
                     )
                 )
-            )
-            conn.commit()
-            return result.rowcount > 0
+                .limit(1)
+            ).fetchone()
+            return row is not None
 
-    def mark_attachments_consumed(
-        self,
-        attachment_ids: list[str],
-        message_id: int,
-        ws_id: str,
-        user_id: str,
-        reserved_for_msg_id: str | None = None,
-    ) -> None:
+    @staticmethod
+    def _release_attachment_refs(conn: Any, attachment_ids: list[str]) -> None:
+        """Decrement refcount once per id and prune blobs that reach 0.
+
+        Caller holds the connection / transaction.  Counts duplicate ids in
+        the input (a turn references an id once, but a batch may span several
+        turns that each reference the same deduped blob), so the decrement
+        matches the number of references actually being removed.
+        """
         if not attachment_ids:
             return
-        predicate = sa.and_(
-            workstream_attachments.c.attachment_id.in_(attachment_ids),
-            workstream_attachments.c.ws_id == ws_id,
-            workstream_attachments.c.user_id == user_id,
-            workstream_attachments.c.message_id.is_(None),
+        counts = Counter(attachment_ids)
+        for aid, n in counts.items():
+            conn.execute(
+                sa.update(workstream_attachments)
+                .where(workstream_attachments.c.attachment_id == aid)
+                .values(refcount=workstream_attachments.c.refcount - n)
+            )
+        # Prune any blob whose count fell to (or below) 0.
+        conn.execute(
+            sa.delete(workstream_attachments).where(
+                sa.and_(
+                    workstream_attachments.c.attachment_id.in_(list(counts)),
+                    workstream_attachments.c.refcount <= 0,
+                )
+            )
         )
-        if reserved_for_msg_id is not None:
-            predicate = sa.and_(
-                predicate,
-                workstream_attachments.c.reserved_for_msg_id == reserved_for_msg_id,
-            )
-        with self._conn() as conn:
-            conn.execute(
-                sa.update(workstream_attachments)
-                .where(predicate)
-                .values(
-                    message_id=message_id,
-                    reserved_for_msg_id=None,
-                    reserved_at=None,
-                )
-            )
-            conn.commit()
-
-    def reserve_attachments(
-        self,
-        attachment_ids: list[str],
-        queue_msg_id: str,
-        ws_id: str,
-        user_id: str,
-    ) -> list[str]:
-        if not attachment_ids or not queue_msg_id:
-            return []
-        now = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S")
-        with self._conn() as conn:
-            conn.execute(
-                sa.update(workstream_attachments)
-                .where(
-                    sa.and_(
-                        workstream_attachments.c.attachment_id.in_(attachment_ids),
-                        workstream_attachments.c.ws_id == ws_id,
-                        workstream_attachments.c.user_id == user_id,
-                        workstream_attachments.c.message_id.is_(None),
-                        workstream_attachments.c.reserved_for_msg_id.is_(None),
-                    )
-                )
-                .values(reserved_for_msg_id=queue_msg_id, reserved_at=now)
-            )
-            # Echo back which ids are now reserved for this msg id (race-
-            # safe confirmation for the caller).
-            rows = conn.execute(
-                sa.select(workstream_attachments.c.attachment_id).where(
-                    sa.and_(
-                        workstream_attachments.c.attachment_id.in_(attachment_ids),
-                        workstream_attachments.c.ws_id == ws_id,
-                        workstream_attachments.c.user_id == user_id,
-                        workstream_attachments.c.reserved_for_msg_id == queue_msg_id,
-                    )
-                )
-            ).fetchall()
-            conn.commit()
-            return [r[0] for r in rows]
-
-    def unreserve_attachments(self, queue_msg_id: str, ws_id: str, user_id: str) -> None:
-        if not queue_msg_id:
-            return
-        with self._conn() as conn:
-            conn.execute(
-                sa.update(workstream_attachments)
-                .where(
-                    sa.and_(
-                        workstream_attachments.c.ws_id == ws_id,
-                        workstream_attachments.c.user_id == user_id,
-                        workstream_attachments.c.reserved_for_msg_id == queue_msg_id,
-                    )
-                )
-                .values(reserved_for_msg_id=None, reserved_at=None)
-            )
-            conn.commit()
-
-    def sweep_orphan_reservations(self, older_than_seconds: int) -> int:
-        if older_than_seconds <= 0:
-            return 0
-        cutoff = (datetime.now(UTC) - timedelta(seconds=older_than_seconds)).strftime(
-            "%Y-%m-%dT%H:%M:%S"
-        )
-        with self._conn() as conn:
-            result = conn.execute(
-                sa.update(workstream_attachments)
-                .where(
-                    sa.and_(
-                        workstream_attachments.c.reserved_for_msg_id.is_not(None),
-                        workstream_attachments.c.message_id.is_(None),
-                        workstream_attachments.c.reserved_at.is_not(None),
-                        workstream_attachments.c.reserved_at < cutoff,
-                    )
-                )
-                .values(reserved_for_msg_id=None, reserved_at=None)
-            )
-            conn.commit()
-            return int(result.rowcount or 0)
-
-    def load_attachments_for_messages(
-        self,
-        ws_id: str,
-        *,
-        message_ids: list[int] | None = None,
-    ) -> dict[int, list[dict[str, Any]]]:
-        with self._conn() as conn:
-            where_clauses = [
-                workstream_attachments.c.ws_id == ws_id,
-                workstream_attachments.c.message_id.is_not(None),
-            ]
-            if message_ids is not None:
-                # Empty list → no matches; guard against an implicit
-                # all-rows scan from a would-be empty IN clause.
-                if not message_ids:
-                    return {}
-                where_clauses.append(workstream_attachments.c.message_id.in_(message_ids))
-            rows = conn.execute(
-                sa.select(workstream_attachments)
-                .where(sa.and_(*where_clauses))
-                .order_by(workstream_attachments.c.created)
-            ).fetchall()
-        grouped: dict[int, list[dict[str, Any]]] = {}
-        for r in rows:
-            row = dict(r._mapping)
-            mid = row["message_id"]
-            grouped.setdefault(mid, []).append(row)
-        return grouped
 
     def list_workstreams(
         self,

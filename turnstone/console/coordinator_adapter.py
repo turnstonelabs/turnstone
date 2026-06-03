@@ -23,7 +23,6 @@ from turnstone.core.child_event_bus import ChildEventBus
 from turnstone.core.child_source import ClusterChildSource
 from turnstone.core.children_registry import ChildrenRegistry
 from turnstone.core.log import get_logger
-from turnstone.core.session import AttachmentsNotQueueableError
 from turnstone.core.workstream import Workstream, WorkstreamKind, WorkstreamState
 
 if TYPE_CHECKING:
@@ -274,13 +273,13 @@ class CoordinatorAdapter:
         Optional ``attachments`` + ``send_id`` carry create-time
         attachments onto the first turn dispatched by the lifted
         ``create`` handler's ``_coord_create_post_install``. The
-        send_id token must match the reservation already taken
-        against the attachment rows (see
-        :func:`turnstone.core.attachments.reserve_and_resolve_attachments`);
-        the worker's failure path unreserves so a worker crash
-        doesn't leave the rows soft-locked. Both kwargs default to
-        ``None`` so the steady-state ``coord_adapter.send`` call
-        sites (no attachments) keep working unchanged.
+        attachments were resolved (peeked) from the per-node upload buffer by
+        :func:`turnstone.core.attachments.resolve_staged_attachments`; the
+        committing ``ChatSession.send`` drains them and persists them
+        content-addressed.  ``send_id`` is a tracking token only — no
+        reservation to release on a worker crash.  Both kwargs default to
+        ``None`` so the steady-state ``coord_adapter.send`` call sites (no
+        attachments) keep working unchanged.
         """
         mgr = self._manager
         if mgr is None:
@@ -297,29 +296,16 @@ class CoordinatorAdapter:
         # mutable kwargs through the call-site frame after return.
         _attachments = attachments or None
         _send_id = send_id if _attachments else None
-        _user_id = ws.user_id
 
         def _run() -> None:
             try:
                 session.send(message, attachments=_attachments, send_id=_send_id)
             except Exception:
-                # Unreserve any attachments we soft-locked for this
-                # send_id so the rows return to pending and don't stay
-                # locked forever after a worker crash. Mirrors the
-                # interactive create-with-attachments worker pattern.
-                if _attachments and _send_id:
-                    from turnstone.core.memory import (
-                        unreserve_attachments as _unreserve,
-                    )
-
-                    try:
-                        _unreserve(_send_id, ws_ref.id, _user_id)
-                    except Exception:
-                        log.debug(
-                            "coord_adapter.attachment_unreserve_failed ws=%s",
-                            ws_ref.id[:8],
-                            exc_info=True,
-                        )
+                # Attachments were resolved (peeked) from the per-node upload
+                # buffer, not soft-locked — there is no reservation to release
+                # on a worker crash.  Undrained staged bytes expire on the
+                # buffer TTL; the bytes for a turn that DID commit are already
+                # persisted content-addressed.
                 log.exception("coord_adapter.worker_failed ws=%s", ws_ref.id[:8])
                 # ``session.send()`` already surfaced the failure to the
                 # SSE stream (``ui.on_error``), persisted the sanitized
@@ -335,30 +321,14 @@ class CoordinatorAdapter:
             # ``AttachmentsNotQueueableError``). The route handler's
             # _enqueue catches the rejection and surfaces an
             # ``attachments_busy`` status to the caller; the coord
-            # adapter's caller has no equivalent return channel, so
-            # we mirror the cleanup (release the reservation taken
-            # for ``_send_id``) and let session_worker.send return
-            # False — the only call site today
-            # (``_coord_create_post_install``) hits the spawn branch
-            # on a fresh workstream so the catch is defense-in-depth.
+            # adapter's caller has no equivalent return channel, so we let
+            # session_worker.send return False — the only call site today
+            # (``_coord_create_post_install``) hits the spawn branch on a
+            # fresh workstream so the catch is defense-in-depth.  Nothing to
+            # release: the staged bytes were peeked, not soft-locked, and a
+            # rejected enqueue never drained them.
             att_ids = [a.attachment_id for a in _attachments] if _attachments else None
-            try:
-                session.queue_message(message, attachment_ids=att_ids, queue_msg_id=_send_id)
-            except AttachmentsNotQueueableError:
-                if _attachments and _send_id:
-                    from turnstone.core.memory import (
-                        unreserve_attachments as _unreserve,
-                    )
-
-                    try:
-                        _unreserve(_send_id, ws_ref.id, _user_id)
-                    except Exception:
-                        log.debug(
-                            "coord_adapter.attachment_unreserve_failed ws=%s",
-                            ws_ref.id[:8],
-                            exc_info=True,
-                        )
-                raise
+            session.queue_message(message, attachment_ids=att_ids, queue_msg_id=_send_id)
 
         return session_worker.send(
             ws,

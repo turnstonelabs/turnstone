@@ -457,3 +457,63 @@ class TestSystemTurns:
         ]
         assert msgs[2]["tool_call_id"] == "c1" and msgs[2].get("is_error") is not True
         assert msgs[3]["tool_call_id"] == "c2" and msgs[3]["is_error"] is True
+
+
+_PNG = (
+    b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00\x01"
+    b"\x08\x06\x00\x00\x00\x1f\x15\xc4\x89\x00\x00\x00\rIDATx\x9cc\xfc\xcf"
+    b"\xc0\xc0\xc0\x00\x00\x00\x05\x00\x01\xa5\xf6E@\x00\x00\x00\x00IEND\xaeB`\x82"
+)
+
+
+class TestRoleAgnosticAttachments:
+    """``attachments_by_msg`` (keyed by row id) rebuilds multipart content for
+    BOTH user and tool rows — the latter is how persisted tool vision output
+    (read_file on an image) survives reload."""
+
+    def test_user_row_multipart(self):
+        urow = _row("user", "look")
+        atts = {
+            urow[0]: [
+                {
+                    "attachment_id": "i1",
+                    "kind": "image",
+                    "mime_type": "image/png",
+                    "filename": "x.png",
+                    "content": _PNG,
+                }
+            ]
+        }
+        msgs = reconstruct_messages([urow], "ws1", atts)
+        assert msgs[0]["role"] == "user"
+        assert msgs[0]["content"][0] == {"type": "text", "text": "look"}
+        assert msgs[0]["content"][1]["type"] == "image_url"
+        assert msgs[0]["_attachments_meta"][0]["filename"] == "x.png"
+
+    def test_tool_row_multipart_image(self):
+        tc = json.dumps([{"id": "c1", "function": {"name": "read_file", "arguments": "{}"}}])
+        arow = _row("assistant", None, tool_calls=tc)
+        trow = _row("tool", "Image file: dog.png", tc_id="c1")
+        atts = {
+            trow[0]: [
+                {
+                    "attachment_id": "i1",
+                    "kind": "image",
+                    "mime_type": "image/png",
+                    "filename": "dog.png",
+                    "content": _PNG,
+                }
+            ]
+        }
+        msgs = reconstruct_messages([arow, trow], "ws1", atts)
+        tool_msg = next(m for m in msgs if m["role"] == "tool")
+        assert isinstance(tool_msg["content"], list)
+        assert tool_msg["content"][0] == {"type": "text", "text": "Image file: dog.png"}
+        assert tool_msg["content"][1]["type"] == "image_url"
+        # Tool rows do NOT carry _attachments_meta (that's a user-display sibling).
+        assert "_attachments_meta" not in tool_msg
+
+    def test_tool_row_without_attachments_stays_string(self):
+        trow = _row("tool", "plain", tc_id="c1")
+        msgs = reconstruct_messages([trow], "ws1", None, repair=False)
+        assert msgs[0]["content"] == "plain"

@@ -1,21 +1,29 @@
-"""Tests for workstream_attachments storage layer."""
+"""Tests for the content-addressed, refcounted workstream_attachments store.
+
+The pre-cutover persisted pending/reserved/consumed lifecycle (message_id /
+reserved_* + the per-user upload cap) is gone — pending uploads now live in the
+per-node in-memory buffer (see ``test_attachment_buffer.py``), and storage holds
+only committed blobs: written content-addressed at send-commit, deduped by
+content hash, and reference-counted via the ``conversations.attachments``
+ref-list.  These tests pin that model at the storage boundary.
+"""
 
 from __future__ import annotations
 
-import uuid
+import hashlib
 
 import pytest
-
-
-def _aid() -> str:
-    return uuid.uuid4().hex
-
 
 PNG_1x1 = (
     b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00\x01"
     b"\x08\x06\x00\x00\x00\x1f\x15\xc4\x89\x00\x00\x00\rIDATx\x9cc\xfc\xcf"
     b"\xc0\xc0\xc0\x00\x00\x00\x05\x00\x01\xa5\xf6E@\x00\x00\x00\x00IEND\xaeB`\x82"
 )
+
+
+def _hash(content: bytes) -> str:
+    """The content-addressed id: bytes' sha256 hex (what the buffer computes)."""
+    return hashlib.sha256(content).hexdigest()
 
 
 class TestSaveMessageReturnsId:
@@ -29,153 +37,142 @@ class TestSaveMessageReturnsId:
         assert m2 > m1
 
 
-class TestAttachmentCRUD:
-    def test_save_then_list_pending(self, backend):
-        backend.register_workstream("ws-a")
-        aid = _aid()
-        backend.save_attachment(
-            aid, "ws-a", "user-1", "hello.txt", "text/plain", 5, "text", b"hello"
-        )
-        pending = backend.list_pending_attachments("ws-a", "user-1")
-        assert len(pending) == 1
-        row = pending[0]
+class TestContentAddressedWrite:
+    def test_save_writes_blob_at_refcount_one(self, backend):
+        backend.register_workstream("ws-ca")
+        aid = _hash(b"hello")
+        backend.save_attachment(aid, "ws-ca", "u", "hello.txt", "text/plain", 5, "text", b"hello")
+        row = backend.get_attachment(aid)
+        assert row is not None
         assert row["attachment_id"] == aid
-        assert row["filename"] == "hello.txt"
-        assert row["mime_type"] == "text/plain"
-        assert row["size_bytes"] == 5
-        assert row["kind"] == "text"
-        # bytes must not leak into the pending-listing payload
-        assert "content" not in row
+        assert row["content"] == b"hello"
+        assert row["refcount"] == 1
+        assert row["origin"] == "upload"
 
-    def test_list_pending_isolates_users(self, backend):
-        backend.register_workstream("ws-iso")
-        a1 = _aid()
-        a2 = _aid()
-        backend.save_attachment(a1, "ws-iso", "user-A", "a.txt", "text/plain", 1, "text", b"A")
-        backend.save_attachment(a2, "ws-iso", "user-B", "b.txt", "text/plain", 1, "text", b"B")
-        a_pending = backend.list_pending_attachments("ws-iso", "user-A")
-        b_pending = backend.list_pending_attachments("ws-iso", "user-B")
-        assert [r["attachment_id"] for r in a_pending] == [a1]
-        assert [r["attachment_id"] for r in b_pending] == [a2]
+    def test_origin_tool_recorded(self, backend):
+        backend.register_workstream("ws-origin")
+        aid = _hash(PNG_1x1)
+        backend.save_attachment(
+            aid, "ws-origin", "u", "t.png", "image/png", len(PNG_1x1), "image", PNG_1x1, "tool"
+        )
+        row = backend.get_attachment(aid)
+        assert row is not None
+        assert row["origin"] == "tool"
+        assert row["refcount"] == 1
 
-    def test_get_attachments_bulk_returns_bytes(self, backend):
+    def test_identical_bytes_dedup_and_bump_refcount(self, backend):
+        backend.register_workstream("ws-dedup")
+        aid = _hash(b"same")
+        backend.save_attachment(aid, "ws-dedup", "u", "a.txt", "text/plain", 4, "text", b"same")
+        # A second reference to identical bytes does not duplicate the row —
+        # it bumps the refcount (e.g. two messages reference the same blob).
+        backend.save_attachment(aid, "ws-dedup", "u", "b.txt", "text/plain", 4, "text", b"same")
+        rows = backend.get_attachments([aid])
+        assert len(rows) == 1
+        assert rows[0]["refcount"] == 2
+        # First-writer metadata wins (INSERT-OR-IGNORE on the blob).
+        assert rows[0]["filename"] == "a.txt"
+
+    def test_distinct_bytes_are_distinct_blobs(self, backend):
+        backend.register_workstream("ws-distinct")
+        a1 = _hash(b"one")
+        a2 = _hash(b"two")
+        backend.save_attachment(a1, "ws-distinct", "u", "1.txt", "text/plain", 3, "text", b"one")
+        backend.save_attachment(a2, "ws-distinct", "u", "2.txt", "text/plain", 3, "text", b"two")
+        assert a1 != a2
+        rows = {r["attachment_id"]: r for r in backend.get_attachments([a1, a2])}
+        assert rows[a1]["content"] == b"one"
+        assert rows[a2]["content"] == b"two"
+
+
+class TestGetAttachments:
+    def test_bulk_returns_bytes(self, backend):
         backend.register_workstream("ws-b")
-        a1 = _aid()
-        a2 = _aid()
+        a1 = _hash(b"one")
+        a2 = _hash(PNG_1x1)
         backend.save_attachment(a1, "ws-b", "u", "one.txt", "text/plain", 3, "text", b"one")
         backend.save_attachment(
             a2, "ws-b", "u", "img.png", "image/png", len(PNG_1x1), "image", PNG_1x1
         )
-        rows = backend.get_attachments([a1, a2])
-        by_id = {r["attachment_id"]: r for r in rows}
+        by_id = {r["attachment_id"]: r for r in backend.get_attachments([a1, a2])}
         assert by_id[a1]["content"] == b"one"
         assert by_id[a2]["content"] == PNG_1x1
         assert by_id[a2]["kind"] == "image"
 
-    def test_get_attachments_empty_input(self, backend):
+    def test_empty_input(self, backend):
         assert backend.get_attachments([]) == []
+
+    def test_mixed_known_and_unknown_ids(self, backend):
+        backend.register_workstream("ws-mix")
+        known = _hash(b"k")
+        backend.save_attachment(known, "ws-mix", "u", "k.txt", "text/plain", 1, "text", b"k")
+        rows = backend.get_attachments([known, _hash(b"nope"), "definitely-not-an-id"])
+        assert len(rows) == 1
+        assert rows[0]["attachment_id"] == known
 
     def test_get_attachment_missing_returns_none(self, backend):
         assert backend.get_attachment("no-such-id") is None
 
-    def test_delete_pending(self, backend):
-        backend.register_workstream("ws-d")
-        aid = _aid()
-        backend.save_attachment(aid, "ws-d", "u", "x.txt", "text/plain", 1, "text", b"x")
-        assert backend.delete_attachment(aid, "ws-d", "u") is True
-        assert backend.list_pending_attachments("ws-d", "u") == []
 
-    def test_delete_wrong_user_is_noop(self, backend):
-        backend.register_workstream("ws-perm")
-        aid = _aid()
-        backend.save_attachment(aid, "ws-perm", "owner", "o.txt", "text/plain", 1, "text", b"o")
-        assert backend.delete_attachment(aid, "ws-perm", "intruder") is False
-        assert len(backend.list_pending_attachments("ws-perm", "owner")) == 1
+class TestSetMessageAttachments:
+    def test_records_ordered_ref_list(self, backend):
+        import json
 
-    def test_delete_after_consumed_is_noop(self, backend):
-        backend.register_workstream("ws-con")
-        aid = _aid()
-        backend.save_attachment(aid, "ws-con", "u", "c.txt", "text/plain", 1, "text", b"c")
-        msg_id = backend.save_message("ws-con", "user", "hi")
-        backend.mark_attachments_consumed([aid], msg_id, "ws-con", "u")
-        assert backend.delete_attachment(aid, "ws-con", "u") is False
-        row = backend.get_attachment(aid)
-        assert row is not None
-        assert row["message_id"] == msg_id
+        import sqlalchemy as sa
 
+        from turnstone.core.storage._schema import conversations
 
-class TestConsumptionLinkage:
-    def test_mark_consumed_links_message(self, backend):
-        backend.register_workstream("ws-link")
-        aid = _aid()
-        backend.save_attachment(aid, "ws-link", "u", "f.txt", "text/plain", 1, "text", b"f")
-        msg_id = backend.save_message("ws-link", "user", "with attach")
-        backend.mark_attachments_consumed([aid], msg_id, "ws-link", "u")
+        backend.register_workstream("ws-ref")
+        mid = backend.save_message("ws-ref", "user", "hi")
+        a1, a2 = _hash(b"x"), _hash(b"y")
+        backend.save_attachment(a1, "ws-ref", "u", "x.txt", "text/plain", 1, "text", b"x")
+        backend.save_attachment(a2, "ws-ref", "u", "y.txt", "text/plain", 1, "text", b"y")
+        backend.set_message_attachments("ws-ref", mid, [a2, a1])  # order matters
+        with backend._conn() as conn:
+            raw = conn.execute(
+                sa.select(conversations.c.attachments).where(conversations.c.id == mid)
+            ).scalar_one()
+        assert json.loads(raw) == [a2, a1]
 
-        # No longer listed as pending
-        assert backend.list_pending_attachments("ws-link", "u") == []
-        # Second mark is a no-op (won't re-link to a different message)
-        other_msg_id = backend.save_message("ws-link", "user", "another")
-        backend.mark_attachments_consumed([aid], other_msg_id, "ws-link", "u")
-        row = backend.get_attachment(aid)
-        assert row is not None
-        assert row["message_id"] == msg_id
+    def test_empty_input_is_noop(self, backend):
+        backend.register_workstream("ws-ref2")
+        mid = backend.save_message("ws-ref2", "user", "hi")
+        backend.set_message_attachments("ws-ref2", mid, [])  # must not raise
+        # Column stays NULL → load yields a plain string message.
+        assert backend.load_messages("ws-ref2")[0]["content"] == "hi"
 
-    def test_mark_consumed_empty_input(self, backend):
-        backend.mark_attachments_consumed([], 0, "ws", "u")  # must not raise
+    def test_scoped_to_ws(self, backend):
+        # A cross-ws message id is not written (defense-in-depth).
+        import sqlalchemy as sa
 
-    def test_mark_consumed_wrong_user_is_noop(self, backend):
-        backend.register_workstream("ws-scope")
-        aid = _aid()
-        backend.save_attachment(aid, "ws-scope", "owner", "o.txt", "text/plain", 1, "text", b"o")
-        msg_id = backend.save_message("ws-scope", "user", "hi")
-        # Different user tries to consume — must not link
-        backend.mark_attachments_consumed([aid], msg_id, "ws-scope", "intruder")
-        row = backend.get_attachment(aid)
-        assert row is not None
-        assert row["message_id"] is None
+        from turnstone.core.storage._schema import conversations
 
-    def test_mark_consumed_wrong_ws_is_noop(self, backend):
-        backend.register_workstream("ws-scope2")
-        backend.register_workstream("ws-other")
-        aid = _aid()
-        backend.save_attachment(aid, "ws-scope2", "u", "x.txt", "text/plain", 1, "text", b"x")
-        msg_id = backend.save_message("ws-other", "user", "hi")
-        # Try to link to a message in a different ws — must not succeed
-        backend.mark_attachments_consumed([aid], msg_id, "ws-other", "u")
-        row = backend.get_attachment(aid)
-        assert row is not None
-        assert row["message_id"] is None
+        backend.register_workstream("ws-a")
+        backend.register_workstream("ws-b")
+        mid = backend.save_message("ws-a", "user", "hi")
+        aid = _hash(b"x")
+        backend.save_attachment(aid, "ws-a", "u", "x.txt", "text/plain", 1, "text", b"x")
+        backend.set_message_attachments("ws-b", mid, [aid])  # wrong ws
+        with backend._conn() as conn:
+            raw = conn.execute(
+                sa.select(conversations.c.attachments).where(conversations.c.id == mid)
+            ).scalar_one()
+        assert raw is None
 
 
 class TestLoadMessagesReconstructsMultipart:
     def test_user_message_with_image_and_text_doc(self, backend):
         backend.register_workstream("ws-multi")
         msg_id = backend.save_message("ws-multi", "user", "look at these")
-
-        img_id = _aid()
-        doc_id = _aid()
+        img_id = _hash(PNG_1x1)
+        doc_id = _hash(b"# hi\n")
         backend.save_attachment(
-            img_id,
-            "ws-multi",
-            "u",
-            "tiny.png",
-            "image/png",
-            len(PNG_1x1),
-            "image",
-            PNG_1x1,
+            img_id, "ws-multi", "u", "tiny.png", "image/png", len(PNG_1x1), "image", PNG_1x1
         )
         backend.save_attachment(
-            doc_id,
-            "ws-multi",
-            "u",
-            "notes.md",
-            "text/markdown",
-            5,
-            "text",
-            b"# hi\n",
+            doc_id, "ws-multi", "u", "notes.md", "text/markdown", 5, "text", b"# hi\n"
         )
-        backend.mark_attachments_consumed([img_id, doc_id], msg_id, "ws-multi", "u")
+        backend.set_message_attachments("ws-multi", msg_id, [img_id, doc_id])
 
         msgs = backend.load_messages("ws-multi")
         assert len(msgs) == 1
@@ -184,7 +181,6 @@ class TestLoadMessagesReconstructsMultipart:
         content = user_msg["content"]
         assert isinstance(content, list)
         assert content[0] == {"type": "text", "text": "look at these"}
-        # Image part: base64 data URI
         kinds = [p["type"] for p in content[1:]]
         assert "image_url" in kinds
         assert "document" in kinds
@@ -195,198 +191,227 @@ class TestLoadMessagesReconstructsMultipart:
         assert doc_part["document"]["media_type"] == "text/markdown"
         assert doc_part["document"]["data"] == "# hi\n"
 
+    def test_ref_list_order_preserved(self, backend):
+        backend.register_workstream("ws-order")
+        mid = backend.save_message("ws-order", "user", "ordered")
+        a, b = _hash(b"AAA"), _hash(b"BBB")
+        backend.save_attachment(a, "ws-order", "u", "a.md", "text/markdown", 3, "text", b"AAA")
+        backend.save_attachment(b, "ws-order", "u", "b.md", "text/markdown", 3, "text", b"BBB")
+        # Record b before a — reconstruction must follow the ref-list order.
+        backend.set_message_attachments("ws-order", mid, [b, a])
+        docs = [
+            p for p in backend.load_messages("ws-order")[0]["content"] if p["type"] == "document"
+        ]
+        assert [d["document"]["data"] for d in docs] == ["BBB", "AAA"]
+
     def test_user_message_without_attachments_stays_string(self, backend):
         backend.register_workstream("ws-plain")
         backend.save_message("ws-plain", "user", "plain text")
-        msgs = backend.load_messages("ws-plain")
-        assert msgs[0]["content"] == "plain text"
+        assert backend.load_messages("ws-plain")[0]["content"] == "plain text"
 
     def test_invalid_utf8_text_attachment_shows_placeholder(self, backend):
         backend.register_workstream("ws-bad")
         msg_id = backend.save_message("ws-bad", "user", "oops")
-        aid = _aid()
+        aid = _hash(b"\xff\xfe")
         backend.save_attachment(aid, "ws-bad", "u", "bad.txt", "text/plain", 2, "text", b"\xff\xfe")
-        backend.mark_attachments_consumed([aid], msg_id, "ws-bad", "u")
-        msgs = backend.load_messages("ws-bad")
-        # Undecodable text → placeholder so the user sees the attachment existed
-        content = msgs[0]["content"]
+        backend.set_message_attachments("ws-bad", msg_id, [aid])
+        content = backend.load_messages("ws-bad")[0]["content"]
         assert isinstance(content, list)
         assert content[0] == {"type": "text", "text": "oops"}
         assert content[1] == {"type": "text", "text": "[unreadable attachment: bad.txt]"}
 
+    def test_missing_blob_is_skipped(self, backend):
+        # A ref-list id whose blob was pruned (refcount hit 0 via another
+        # message's GC) reconstructs as plain text, not a crash.
+        backend.register_workstream("ws-missing")
+        mid = backend.save_message("ws-missing", "user", "gone")
+        backend.set_message_attachments("ws-missing", mid, [_hash(b"never-written")])
+        assert backend.load_messages("ws-missing")[0]["content"] == "gone"
 
-class TestDeleteWorkstreamCascade:
-    def test_attachments_removed_on_workstream_delete(self, backend):
-        backend.register_workstream("ws-cas")
-        aid = _aid()
-        backend.save_attachment(aid, "ws-cas", "u", "a.txt", "text/plain", 1, "text", b"a")
-        msg_id = backend.save_message("ws-cas", "user", "hi")
-        backend.mark_attachments_consumed([aid], msg_id, "ws-cas", "u")
 
-        assert backend.delete_workstream("ws-cas") is True
-        assert backend.get_attachment(aid) is None
+class TestToolImageReconstruction:
+    def test_tool_row_with_image_rebuilds_multipart(self, backend):
+        """Tool vision output is persisted content-addressed + referenced on the
+        tool row, so a reload rebuilds the multipart [text, image_url] content
+        (role-agnostic reconstruction) rather than the flattened text alone."""
+        backend.register_workstream("ws-tool")
+        # assistant(tool_calls) → tool row, mirroring a real read_image turn.
+        import json
 
-    def test_pending_attachments_also_cascade(self, backend):
-        backend.register_workstream("ws-cas2")
-        pending = _aid()
-        consumed = _aid()
-        backend.save_attachment(pending, "ws-cas2", "u", "p.txt", "text/plain", 1, "text", b"p")
-        backend.save_attachment(consumed, "ws-cas2", "u", "c.txt", "text/plain", 1, "text", b"c")
-        msg_id = backend.save_message("ws-cas2", "user", "hi")
-        backend.mark_attachments_consumed([consumed], msg_id, "ws-cas2", "u")
+        backend.save_message(
+            "ws-tool",
+            "assistant",
+            None,
+            tool_calls=json.dumps(
+                [
+                    {
+                        "id": "c1",
+                        "type": "function",
+                        "function": {"name": "read_file", "arguments": "{}"},
+                    }
+                ]
+            ),
+        )
+        tool_mid = backend.save_message(
+            "ws-tool", "tool", "Image file: dog.png", "read_file", tool_call_id="c1"
+        )
+        img_id = _hash(PNG_1x1)
+        backend.save_attachment(
+            img_id,
+            "ws-tool",
+            "u",
+            "read_file-image.png",
+            "image/png",
+            len(PNG_1x1),
+            "image",
+            PNG_1x1,
+            "tool",
+        )
+        backend.set_message_attachments("ws-tool", tool_mid, [img_id])
 
-        assert backend.delete_workstream("ws-cas2") is True
-        assert backend.get_attachment(pending) is None
-        assert backend.get_attachment(consumed) is None
+        msgs = backend.load_messages("ws-tool")
+        tool_msg = next(m for m in msgs if m["role"] == "tool")
+        assert tool_msg["tool_call_id"] == "c1"
+        content = tool_msg["content"]
+        assert isinstance(content, list)
+        assert content[0] == {"type": "text", "text": "Image file: dog.png"}
+        assert content[1]["type"] == "image_url"
+        assert content[1]["image_url"]["url"].startswith("data:image/png;base64,")
+
+    def test_tool_row_without_attachments_stays_string(self, backend):
+        backend.register_workstream("ws-tool2")
+        backend.save_message("ws-tool2", "tool", "plain output", "bash", tool_call_id="c9")
+        tool_msg = backend.load_messages("ws-tool2", repair=False)[0]
+        assert tool_msg["content"] == "plain output"
 
 
 class TestReconstructMetaSibling:
     def test_reconstructed_user_msg_carries_attachments_meta(self, backend):
         backend.register_workstream("ws-meta")
-        aid = _aid()
+        aid = _hash(b"hi")
         backend.save_attachment(aid, "ws-meta", "u", "doc.md", "text/markdown", 2, "text", b"hi")
         mid = backend.save_message("ws-meta", "user", "see this")
-        backend.mark_attachments_consumed([aid], mid, "ws-meta", "u")
-
-        msgs = backend.load_messages("ws-meta")
-        assert len(msgs) == 1
-        meta = msgs[0].get("_attachments_meta")
+        backend.set_message_attachments("ws-meta", mid, [aid])
+        meta = backend.load_messages("ws-meta")[0].get("_attachments_meta")
         assert isinstance(meta, list) and len(meta) == 1
-        assert meta[0] == {
-            "kind": "text",
-            "filename": "doc.md",
-            "mime_type": "text/markdown",
-        }
+        assert meta[0] == {"kind": "text", "filename": "doc.md", "mime_type": "text/markdown"}
 
 
-class TestReservation:
-    def test_reserve_excludes_from_pending_listing(self, backend):
-        backend.register_workstream("ws-res1")
-        aid = _aid()
-        backend.save_attachment(aid, "ws-res1", "u", "a.md", "text/plain", 1, "text", b"a")
-        assert len(backend.list_pending_attachments("ws-res1", "u")) == 1
-        reserved = backend.reserve_attachments([aid], "q-1", "ws-res1", "u")
-        assert reserved == [aid]
-        # Reserved row must be hidden from the pending list
-        assert backend.list_pending_attachments("ws-res1", "u") == []
-        # And from the with-content variant used by auto-consume
-        assert backend.get_pending_attachments_with_content("ws-res1", "u") == []
-
-    def test_reserve_blocks_delete(self, backend):
-        backend.register_workstream("ws-res2")
-        aid = _aid()
-        backend.save_attachment(aid, "ws-res2", "u", "a.md", "text/plain", 1, "text", b"a")
-        backend.reserve_attachments([aid], "q-1", "ws-res2", "u")
-        # Reserved attachment cannot be deleted — the user must dequeue
-        # the queued message first.
-        assert backend.delete_attachment(aid, "ws-res2", "u") is False
-        assert backend.get_attachment(aid) is not None
-
-    def test_reserve_twice_is_idempotent_first_wins(self, backend):
-        backend.register_workstream("ws-res3")
-        aid = _aid()
-        backend.save_attachment(aid, "ws-res3", "u", "a.md", "text/plain", 1, "text", b"a")
-        assert backend.reserve_attachments([aid], "q-1", "ws-res3", "u") == [aid]
-        # Second reservation for a different queue msg must not steal
-        assert backend.reserve_attachments([aid], "q-2", "ws-res3", "u") == []
-        row = backend.get_attachment(aid)
-        assert row["reserved_for_msg_id"] == "q-1"
-
-    def test_unreserve_returns_to_pending(self, backend):
-        backend.register_workstream("ws-res4")
-        aid = _aid()
-        backend.save_attachment(aid, "ws-res4", "u", "a.md", "text/plain", 1, "text", b"a")
-        backend.reserve_attachments([aid], "q-1", "ws-res4", "u")
-        backend.unreserve_attachments("q-1", "ws-res4", "u")
-        # Back to pending — delete and listing work again
-        assert len(backend.list_pending_attachments("ws-res4", "u")) == 1
-        row = backend.get_attachment(aid)
-        assert row["reserved_for_msg_id"] is None
-
-    def test_consume_clears_reservation(self, backend):
-        backend.register_workstream("ws-res5")
-        aid = _aid()
-        backend.save_attachment(aid, "ws-res5", "u", "a.md", "text/plain", 1, "text", b"a")
-        backend.reserve_attachments([aid], "q-1", "ws-res5", "u")
-        mid = backend.save_message("ws-res5", "user", "go")
-        backend.mark_attachments_consumed([aid], mid, "ws-res5", "u")
-        row = backend.get_attachment(aid)
-        # Transition reserved → consumed clears the reservation
-        assert row["message_id"] == mid
-        assert row["reserved_for_msg_id"] is None
-
-    def test_reserve_scoped_to_owner(self, backend):
-        backend.register_workstream("ws-res6")
-        aid = _aid()
-        backend.save_attachment(aid, "ws-res6", "owner", "a.md", "text/plain", 1, "text", b"a")
-        # An intruder user_id cannot reserve someone else's attachment
-        assert backend.reserve_attachments([aid], "q-x", "ws-res6", "intruder") == []
-        row = backend.get_attachment(aid)
-        assert row["reserved_for_msg_id"] is None
-
-
-class TestGetAttachmentsRobustness:
-    def test_mixed_known_and_unknown_ids(self, backend):
-        backend.register_workstream("ws-mix")
-        known = _aid()
-        unknown = _aid()
-        backend.save_attachment(known, "ws-mix", "u", "k.txt", "text/plain", 1, "text", b"k")
-        rows = backend.get_attachments([known, unknown, "definitely-not-an-id"])
-        assert len(rows) == 1
-        assert rows[0]["attachment_id"] == known
-
-
-class TestRewindTruncationCascadesAttachments:
-    def test_delete_messages_after_removes_linked_attachments(self, backend):
+class TestRefcountGC:
+    def test_delete_messages_after_decrements_and_prunes(self, backend):
         backend.register_workstream("ws-rewind")
-        # Two user turns, each with an attachment.  A rewind that keeps
-        # only the first turn's messages must also drop the second
-        # turn's attachment rather than leak the BLOB.
-        a1 = _aid()
-        a2 = _aid()
-        backend.save_attachment(a1, "ws-rewind", "u", "keep.md", "text/plain", 1, "text", b"k")
+        # Two turns, each referencing a distinct blob.  A rewind that keeps
+        # only the first turn must prune the second's blob (refcount → 0) and
+        # keep the first's.
+        a1, a2 = _hash(b"keep"), _hash(b"drop")
         m1 = backend.save_message("ws-rewind", "user", "turn1")
-        backend.mark_attachments_consumed([a1], m1, "ws-rewind", "u")
+        backend.save_attachment(a1, "ws-rewind", "u", "keep.md", "text/plain", 4, "text", b"keep")
+        backend.set_message_attachments("ws-rewind", m1, [a1])
 
-        backend.save_attachment(a2, "ws-rewind", "u", "drop.md", "text/plain", 1, "text", b"d")
         m2 = backend.save_message("ws-rewind", "user", "turn2")
-        backend.mark_attachments_consumed([a2], m2, "ws-rewind", "u")
+        backend.save_attachment(a2, "ws-rewind", "u", "drop.md", "text/plain", 4, "text", b"drop")
+        backend.set_message_attachments("ws-rewind", m2, [a2])
 
-        # Keep only the first conversation row
-        backend.delete_messages_after("ws-rewind", 1)
+        backend.delete_messages_after("ws-rewind", 1)  # keep only turn1's row
 
-        # Kept attachment survives
-        assert backend.get_attachment(a1) is not None
-        # Doomed attachment is gone — no orphan BLOB
-        assert backend.get_attachment(a2) is None
+        assert backend.get_attachment(a1) is not None  # still referenced
+        assert backend.get_attachment(a2) is None  # pruned at refcount 0
 
-    def test_delete_messages_after_preserves_pending(self, backend):
-        # Pending (un-consumed) attachments must not be touched by a
-        # truncation — they have no message_id and shouldn't be swept
-        # up by the cascade.
-        backend.register_workstream("ws-rewind2")
-        pending = _aid()
-        consumed = _aid()
-        backend.save_attachment(pending, "ws-rewind2", "u", "p.md", "text/plain", 1, "text", b"p")
-        backend.save_attachment(consumed, "ws-rewind2", "u", "c.md", "text/plain", 1, "text", b"c")
-        m1 = backend.save_message("ws-rewind2", "user", "turn1")
-        backend.mark_attachments_consumed([consumed], m1, "ws-rewind2", "u")
+    def test_deduped_blob_survives_partial_delete(self, backend):
+        """A blob referenced by two messages survives deleting one of them —
+        refcount drops 2 → 1, the blob stays until the last reference goes."""
+        backend.register_workstream("ws-shared")
+        shared = _hash(b"shared-bytes")
+        m1 = backend.save_message("ws-shared", "user", "first")
+        backend.save_attachment(
+            shared, "ws-shared", "u", "s.txt", "text/plain", 12, "text", b"shared-bytes"
+        )
+        backend.set_message_attachments("ws-shared", m1, [shared])
+        m2 = backend.save_message("ws-shared", "user", "second")
+        backend.save_attachment(
+            shared, "ws-shared", "u", "s.txt", "text/plain", 12, "text", b"shared-bytes"
+        )
+        backend.set_message_attachments("ws-shared", m2, [shared])
 
-        backend.delete_messages_after("ws-rewind2", 0)  # drop everything
+        assert backend.get_attachment(shared)["refcount"] == 2
+        backend.delete_messages_after("ws-shared", 1)  # drop the 2nd turn
+        row = backend.get_attachment(shared)
+        assert row is not None
+        assert row["refcount"] == 1
 
-        # Pending survives (no message_id → no cascade match)
-        assert backend.get_attachment(pending) is not None
-        # Consumed is dropped with its parent message
-        assert backend.get_attachment(consumed) is None
+    def test_delete_workstream_prunes_referenced_blobs(self, backend):
+        backend.register_workstream("ws-cas")
+        aid = _hash(b"a")
+        m = backend.save_message("ws-cas", "user", "hi")
+        backend.save_attachment(aid, "ws-cas", "u", "a.txt", "text/plain", 1, "text", b"a")
+        backend.set_message_attachments("ws-cas", m, [aid])
+
+        assert backend.delete_workstream("ws-cas") is True
+        assert backend.get_attachment(aid) is None
+
+    def test_delete_workstream_keeps_blob_shared_with_other_ws(self, backend):
+        """Content-addressed ids are global: a blob referenced from two
+        workstreams must only be decremented (not blanket-deleted) when one
+        workstream is removed."""
+        backend.register_workstream("ws-one")
+        backend.register_workstream("ws-two")
+        shared = _hash(b"cross-ws")
+        m1 = backend.save_message("ws-one", "user", "a")
+        backend.save_attachment(
+            shared, "ws-one", "u", "s.txt", "text/plain", 8, "text", b"cross-ws"
+        )
+        backend.set_message_attachments("ws-one", m1, [shared])
+        m2 = backend.save_message("ws-two", "user", "b")
+        backend.save_attachment(
+            shared, "ws-two", "u", "s.txt", "text/plain", 8, "text", b"cross-ws"
+        )
+        backend.set_message_attachments("ws-two", m2, [shared])
+        assert backend.get_attachment(shared)["refcount"] == 2
+
+        backend.delete_workstream("ws-one")
+        row = backend.get_attachment(shared)
+        assert row is not None, "blob still referenced by ws-two must survive"
+        assert row["refcount"] == 1
+        backend.delete_workstream("ws-two")
+        assert backend.get_attachment(shared) is None
+
+
+class TestOwnershipGate:
+    def test_referenced_in_ws_true_for_referencing_row(self, backend):
+        backend.register_workstream("ws-own")
+        aid = _hash(b"owned")
+        m = backend.save_message("ws-own", "user", "hi")
+        backend.save_attachment(aid, "ws-own", "u", "o.txt", "text/plain", 5, "text", b"owned")
+        backend.set_message_attachments("ws-own", m, [aid])
+        assert backend.attachment_referenced_in_ws(aid, "ws-own") is True
+
+    def test_referenced_in_ws_false_for_other_ws(self, backend):
+        # The blob is global, but the OTHER workstream has no row referencing
+        # it → the get_content ownership gate denies it there.
+        backend.register_workstream("ws-own2")
+        backend.register_workstream("ws-stranger")
+        aid = _hash(b"owned2")
+        m = backend.save_message("ws-own2", "user", "hi")
+        backend.save_attachment(aid, "ws-own2", "u", "o.txt", "text/plain", 6, "text", b"owned2")
+        backend.set_message_attachments("ws-own2", m, [aid])
+        assert backend.attachment_referenced_in_ws(aid, "ws-stranger") is False
+
+    def test_referenced_in_ws_false_when_unreferenced(self, backend):
+        # A blob written but not yet recorded on any row (shouldn't happen in
+        # the live flow, but the gate must be closed-by-default).
+        backend.register_workstream("ws-own3")
+        aid = _hash(b"orphan")
+        backend.save_attachment(aid, "ws-own3", "u", "o.txt", "text/plain", 6, "text", b"orphan")
+        assert backend.attachment_referenced_in_ws(aid, "ws-own3") is False
 
 
 @pytest.mark.parametrize("kind", ["image", "text"])
 class TestParametrizedKind:
     def test_roundtrip_content_bytes(self, backend, kind):
         backend.register_workstream(f"ws-p-{kind}")
-        aid = _aid()
         payload = PNG_1x1 if kind == "image" else b"x" * 42
         mime = "image/png" if kind == "image" else "text/plain"
+        aid = _hash(payload)
         backend.save_attachment(
             aid, f"ws-p-{kind}", "u", f"f.{kind}", mime, len(payload), kind, payload
         )
@@ -394,148 +419,3 @@ class TestParametrizedKind:
         assert len(rows) == 1
         assert rows[0]["content"] == payload
         assert rows[0]["kind"] == kind
-
-
-class TestSweepOrphanReservations:
-    """Defensive sweep for reservations leaked by process crashes between
-    reserve_attachments and consume/unreserve."""
-
-    def _backdate(self, backend, attachment_id, *, created_ago=None, reserved_ago=None):
-        """Rewrite the row's `created` and/or `reserved_at` columns so the
-        sweep sees them as older than they really are.
-
-        Works against the same string format the storage layer writes
-        (ISO-8601 truncated to seconds).
-        """
-        from datetime import UTC, datetime, timedelta
-
-        import sqlalchemy as sa
-
-        from turnstone.core.storage._schema import workstream_attachments
-
-        values: dict[str, str] = {}
-        if created_ago is not None:
-            values["created"] = (datetime.now(UTC) - timedelta(seconds=created_ago)).strftime(
-                "%Y-%m-%dT%H:%M:%S"
-            )
-        if reserved_ago is not None:
-            values["reserved_at"] = (datetime.now(UTC) - timedelta(seconds=reserved_ago)).strftime(
-                "%Y-%m-%dT%H:%M:%S"
-            )
-        if not values:
-            return
-        with backend._conn() as conn:
-            conn.execute(
-                sa.update(workstream_attachments)
-                .where(workstream_attachments.c.attachment_id == attachment_id)
-                .values(**values)
-            )
-            conn.commit()
-
-    def test_clears_old_reserved_rows(self, backend):
-        backend.register_workstream("ws-sw")
-        aid = _aid()
-        backend.save_attachment(aid, "ws-sw", "u", "a.txt", "text/plain", 5, "text", b"hello")
-        reserved = backend.reserve_attachments([aid], "send-old", "ws-sw", "u")
-        assert reserved == [aid]
-        # Backdate the reservation timestamp so the sweep considers it stale
-        self._backdate(backend, aid, reserved_ago=7200)
-
-        n = backend.sweep_orphan_reservations(older_than_seconds=3600)
-        assert n == 1
-
-        # The row is back in pending — list_pending_attachments will surface it
-        pending = backend.list_pending_attachments("ws-sw", "u")
-        assert any(p["attachment_id"] == aid for p in pending)
-
-    def test_leaves_fresh_reservations_alone(self, backend):
-        backend.register_workstream("ws-sw2")
-        aid = _aid()
-        backend.save_attachment(aid, "ws-sw2", "u", "a.txt", "text/plain", 5, "text", b"hello")
-        backend.reserve_attachments([aid], "send-fresh", "ws-sw2", "u")
-        # No backdating — reservation was just created
-
-        n = backend.sweep_orphan_reservations(older_than_seconds=3600)
-        assert n == 0
-
-        # Reservation still held
-        pending = backend.list_pending_attachments("ws-sw2", "u")
-        assert pending == []
-
-    def test_old_upload_with_fresh_reservation_is_preserved(self, backend):
-        """Regression: an attachment uploaded long ago but reserved just
-        now must NOT be swept.  ``reserved_at`` (set on reserve) is the
-        staleness signal — not ``created`` (upload time)."""
-        backend.register_workstream("ws-sw-mix")
-        aid = _aid()
-        backend.save_attachment(aid, "ws-sw-mix", "u", "a.txt", "text/plain", 5, "text", b"hello")
-        # Backdate the upload by a day, but reserve fresh.
-        self._backdate(backend, aid, created_ago=86_400)
-        reserved = backend.reserve_attachments([aid], "send-fresh", "ws-sw-mix", "u")
-        assert reserved == [aid]
-
-        n = backend.sweep_orphan_reservations(older_than_seconds=3600)
-        assert n == 0
-
-        # Reservation still held — pending list is empty
-        assert backend.list_pending_attachments("ws-sw-mix", "u") == []
-        # And consume against the original send_id still succeeds
-        msg_id = backend.save_message("ws-sw-mix", "user", "after fresh reserve")
-        backend.mark_attachments_consumed(
-            [aid], msg_id, "ws-sw-mix", "u", reserved_for_msg_id="send-fresh"
-        )
-        row = backend.get_attachment(aid)
-        assert row is not None
-        assert row["message_id"] == msg_id
-
-    def test_consume_clears_reserved_at(self, backend):
-        """Once consumed, the row's reservation metadata must be wiped so
-        a follow-up sweep can't accidentally match on it."""
-        backend.register_workstream("ws-sw-consume")
-        aid = _aid()
-        backend.save_attachment(
-            aid, "ws-sw-consume", "u", "a.txt", "text/plain", 5, "text", b"hello"
-        )
-        backend.reserve_attachments([aid], "send-c", "ws-sw-consume", "u")
-        msg_id = backend.save_message("ws-sw-consume", "user", "consumed")
-        backend.mark_attachments_consumed(
-            [aid], msg_id, "ws-sw-consume", "u", reserved_for_msg_id="send-c"
-        )
-        row = backend.get_attachment(aid)
-        assert row is not None
-        assert row["reserved_at"] is None
-        assert row["reserved_for_msg_id"] is None
-
-    def test_unreserve_clears_reserved_at(self, backend):
-        backend.register_workstream("ws-sw-unres")
-        aid = _aid()
-        backend.save_attachment(aid, "ws-sw-unres", "u", "a.txt", "text/plain", 5, "text", b"hello")
-        backend.reserve_attachments([aid], "send-u", "ws-sw-unres", "u")
-        backend.unreserve_attachments("send-u", "ws-sw-unres", "u")
-        row = backend.get_attachment(aid)
-        assert row is not None
-        assert row["reserved_at"] is None
-        assert row["reserved_for_msg_id"] is None
-
-    def test_skips_consumed_rows(self, backend):
-        backend.register_workstream("ws-sw3")
-        aid = _aid()
-        backend.save_attachment(aid, "ws-sw3", "u", "a.txt", "text/plain", 5, "text", b"hello")
-        backend.reserve_attachments([aid], "send-c", "ws-sw3", "u")
-        msg_id = backend.save_message("ws-sw3", "user", "consumed turn")
-        backend.mark_attachments_consumed(
-            [aid], msg_id, "ws-sw3", "u", reserved_for_msg_id="send-c"
-        )
-        # Even backdating both timestamps shouldn't matter — the sweep
-        # excludes consumed rows.
-        self._backdate(backend, aid, created_ago=7200, reserved_ago=7200)
-
-        n = backend.sweep_orphan_reservations(older_than_seconds=3600)
-        assert n == 0
-
-    def test_zero_threshold_is_noop(self, backend):
-        # Defensive guard against accidental "sweep everything" calls
-        n = backend.sweep_orphan_reservations(older_than_seconds=0)
-        assert n == 0
-        n = backend.sweep_orphan_reservations(older_than_seconds=-5)
-        assert n == 0

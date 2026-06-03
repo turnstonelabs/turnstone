@@ -228,7 +228,15 @@ class StorageBackend(Protocol):
         """
         ...
 
-    # -- Workstream attachments -----------------------------------------------
+    # -- Workstream attachments (content-addressed, refcounted) ---------------
+    #
+    # Pending (uploaded-but-unsent) bytes live in the per-node in-memory
+    # ``attachment_buffer``, NOT in storage — the persisted pending/reserved/
+    # consumed lifecycle (and its orphan-sweep) was retired by the
+    # content-addressing cutover.  Storage holds only committed blobs: written
+    # content-addressed at send-commit (or when a tool produces an image),
+    # deduped by content hash, and reference-counted via the ordered
+    # ``conversations.attachments`` ref-list.
 
     def save_attachment(
         self,
@@ -240,15 +248,29 @@ class StorageBackend(Protocol):
         size_bytes: int,
         kind: str,
         content: bytes,
+        origin: str = "upload",
     ) -> None:
-        """Persist an uploaded attachment in pending (unconsumed) state."""
+        """Write a content-addressed blob (INSERT-OR-IGNORE) and ``refcount += 1``.
+
+        ``attachment_id`` is the content hash (sha256 hex); the caller computes
+        it.  The first reference inserts the row at ``refcount = 1``; every
+        later reference (a re-upload of identical bytes, or a second message
+        referencing the same blob) only bumps the count.  A stored blob is thus
+        always referenced (born at ≥ 1) and identical bytes dedupe to one row
+        across messages and workstreams.  ``origin`` is ``'upload'`` (user
+        attachment) or ``'tool'`` (e.g. a ``read_file`` image).
+        """
         ...
 
-    def list_pending_attachments(self, ws_id: str, user_id: str) -> list[dict[str, Any]]:
-        """Return un-consumed attachments for ``(ws_id, user_id)``.
+    def set_message_attachments(
+        self, ws_id: str, message_id: int, attachment_ids: list[str]
+    ) -> None:
+        """Record a turn's ordered content-addressed ref-list on its row.
 
-        Each dict contains: ``attachment_id``, ``filename``, ``mime_type``,
-        ``size_bytes``, ``kind``, ``created``.  Content bytes are NOT returned.
+        Writes the JSON id-list onto ``conversations.attachments`` for the
+        ``(ws_id, message_id)`` conversations row — the sole message->blob
+        link.  Empty input is a no-op (the column stays NULL).  Scoped to
+        ``ws_id`` as defense-in-depth against a cross-ws message id.
         """
         ...
 
@@ -259,108 +281,18 @@ class StorageBackend(Protocol):
         """
         ...
 
-    def get_pending_attachments_with_content(
-        self, ws_id: str, user_id: str
-    ) -> list[dict[str, Any]]:
-        """Fetch all pending attachments for ``(ws_id, user_id)`` in a single
-        query, including ``content`` bytes.
-
-        Used by the auto-consume path on send — saves the two-roundtrip
-        list-then-get dance.  Excluded by design from the user-facing
-        listing API (which must never expose bytes).
-        """
-        ...
-
     def get_attachment(self, attachment_id: str) -> dict[str, Any] | None:
         """Return a single attachment row (with content bytes) or None."""
         ...
 
-    def delete_attachment(self, attachment_id: str, ws_id: str, user_id: str) -> bool:
-        """Delete a pending attachment.
+    def attachment_referenced_in_ws(self, attachment_id: str, ws_id: str) -> bool:
+        """True iff some conversations row in ``ws_id`` references ``attachment_id``.
 
-        Only succeeds when the row matches ``ws_id``, ``user_id``, AND
-        ``message_id IS NULL`` (i.e. not yet consumed).  Returns True if
-        a row was deleted.
-        """
-        ...
-
-    def mark_attachments_consumed(
-        self,
-        attachment_ids: list[str],
-        message_id: int,
-        ws_id: str,
-        user_id: str,
-        reserved_for_msg_id: str | None = None,
-    ) -> None:
-        """Link a set of attachments to a freshly-saved user message.
-
-        The UPDATE is scoped to ``(ws_id, user_id)`` and
-        ``message_id IS NULL`` as defense-in-depth: even if a caller
-        passes attachment ids that don't belong to them, nothing will be
-        consumed.  When ``reserved_for_msg_id`` is set, also requires
-        the reservation to match — prevents a stale send from consuming
-        rows reserved to a different one.  Clears ``reserved_for_msg_id``
-        on transition.
-        """
-        ...
-
-    def reserve_attachments(
-        self,
-        attachment_ids: list[str],
-        queue_msg_id: str,
-        ws_id: str,
-        user_id: str,
-    ) -> list[str]:
-        """Soft-lock pending attachments to a queued user message.
-
-        Only rows where ``(ws_id, user_id)`` match and both
-        ``message_id`` and ``reserved_for_msg_id`` are NULL are updated.
-        Returns the list of ids that were actually reserved (others
-        silently skipped — caller should not assume completeness).
-        """
-        ...
-
-    def unreserve_attachments(self, queue_msg_id: str, ws_id: str, user_id: str) -> None:
-        """Release any reservation for ``queue_msg_id``.
-
-        Used when a queued message is dequeued (cancelled) before
-        dispatch — the attachments return to ``pending``.
-        """
-        ...
-
-    def sweep_orphan_reservations(self, older_than_seconds: int) -> int:
-        """Clear ``reserved_for_msg_id`` on stale reservations.
-
-        Targets rows with ``reserved_for_msg_id IS NOT NULL`` AND
-        ``message_id IS NULL`` AND ``reserved_at`` older than the cutoff.
-        Self-heals reservations leaked by process crashes between
-        ``reserve_attachments`` and ``mark_attachments_consumed`` /
-        ``unreserve_attachments``.
-
-        Uses ``reserved_at`` (set on reserve, cleared on consume /
-        unreserve) rather than ``created`` (upload time) so an attachment
-        that sat pending for hours before being reserved is not
-        mistakenly unreserved mid-send.  Returns the row count swept.
-        """
-        ...
-
-    def load_attachments_for_messages(
-        self,
-        ws_id: str,
-        *,
-        message_ids: list[int] | None = None,
-    ) -> dict[int, list[dict[str, Any]]]:
-        """Return attachments grouped by ``message_id`` for history replay.
-
-        Each attachment dict includes ``attachment_id``, ``filename``,
-        ``mime_type``, ``size_bytes``, ``kind``, and ``content`` (bytes).
-        Pending (un-consumed) rows are excluded.
-
-        ``message_ids`` narrows the scan to attachments tied to the
-        given message rows — used by the tail-N path in
-        :func:`load_messages` so the attachment read doesn't defeat
-        the conversations-table LIMIT.  Default ``None`` returns every
-        attachment for the workstream.
+        The committed-attachment ownership gate: the per-row ``ws_id`` /
+        ``user_id`` scope columns are gone, so ``get_content`` for a committed
+        blob is authorised by proving the requester (already gated to own
+        ``ws_id``) has a turn in that workstream whose ``attachments`` ref-list
+        names the id.
         """
         ...
 

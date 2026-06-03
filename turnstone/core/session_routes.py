@@ -266,14 +266,14 @@ SavedLoadedLookup = Callable[["Request"], Awaitable[set[str]]]
 class AttachmentUploadHelpers:
     """Process-local hooks the lifted attachment factories call into.
 
-    The classification + per-(ws,user) lock are stateful concerns that
-    don't belong on the (frozen) :class:`SessionEndpointConfig`
-    directly: ``sniff_image_mime`` and ``classify_text_attachment``
-    are pure but defined in the kind's owning module;
-    ``upload_lock`` returns a process-local cached lock. Bundling
-    them on a separate dataclass keeps the cfg declarative and lets
-    callers share one helper instance across kinds if the policies
-    converge later.
+    The classification helpers are pure but defined in the kind's owning
+    module, so they don't belong on the (frozen)
+    :class:`SessionEndpointConfig` directly.  Bundling them on a separate
+    dataclass keeps the cfg declarative and lets callers share one helper
+    instance across kinds if the policies converge later.  (The old
+    ``upload_lock`` hook is gone — uploads now stage into the thread-safe,
+    content-addressed per-node buffer, so there's no DB count-check to
+    serialize.)
     """
 
     sniff_image_mime: Callable[[bytes], str | None]
@@ -281,7 +281,6 @@ class AttachmentUploadHelpers:
         [str, str, bytes],
         tuple[str | None, str | None],
     ]
-    upload_lock: Callable[[str, str], Any]
 
 
 @dataclass(frozen=True)
@@ -2163,7 +2162,7 @@ def make_create_handler(
         uploaded_files: list[tuple[str, str, bytes]] = []
         body: dict[str, Any]
         if cfg.create_supports_attachments and content_type.startswith("multipart/form-data"):
-            # Multipart cap: up to MAX_PENDING × image cap, plus slack
+            # Multipart cap: up to 10 files × the image cap, plus slack
             # for JSON meta + multipart framing. Per-file size is
             # enforced inside :func:`validate_and_save_uploaded_files`
             # against the kind-specific cap.
@@ -3285,12 +3284,12 @@ def make_detail_handler(cfg: SessionEndpointConfig) -> Handler:
 def make_send_handler(cfg: SessionEndpointConfig) -> Handler:
     """Lifted body for ``POST {prefix}/{ws_id}/send`` — message dispatch.
 
-    Reserves any attachment ids the request carries, captures a
-    ``send_id`` token for end-to-end tracking, then dispatches via
-    :func:`turnstone.core.session_worker.send` (atomic
-    spawn-or-enqueue under ``ws._lock``). Both queue-reuse and
-    spawn paths reserve so the eventual ``mark_attachments_consumed``
-    can match on ``reserved_for_msg_id``.
+    Resolves any attachment ids the request carries from the per-node upload
+    buffer (a peek — the bytes stay buffered for a retry if the queue rejects
+    the turn), captures a ``send_id`` tracking token, then dispatches via
+    :func:`turnstone.core.session_worker.send` (atomic spawn-or-enqueue under
+    ``ws._lock``). The committing ``send`` drains the buffer and writes the
+    bytes content-addressed; no reservation is taken or released.
 
     Capability flags on ``cfg`` toggle the kind-specific behaviour:
 
@@ -3366,29 +3365,17 @@ def make_send_handler(cfg: SessionEndpointConfig) -> Handler:
         if ui is None:
             return JSONResponse({"error": "session UI not available"}, status_code=409)
 
-        # ----- Attachment reservation (atomic reserve-then-dispatch) -----
+        # ----- Attachment resolution (from the per-node upload buffer) -----
         send_id = ""
         requested_ids: list[str] = []
         ordered_reserved: list[str] = []
         reserved_set: set[str] = set()
-        reserved_ids: list[str] = []
         resolved_atts: list[Any] = []
         attach_user_id = ""
 
         if cfg.supports_attachments:
-            from turnstone.core.attachments import (
-                MAX_PENDING_ATTACHMENTS_PER_USER_WS,
-                Attachment,
-            )
-            from turnstone.core.memory import (
-                get_attachments as _get_attachments,
-            )
-            from turnstone.core.memory import (
-                get_pending_attachments_with_content as _get_pending_with_content,
-            )
-            from turnstone.core.memory import (
-                reserve_attachments as _reserve,
-            )
+            from turnstone.core.attachment_buffer import get_attachment_buffer
+            from turnstone.core.attachments import resolve_staged_attachments
 
             if cfg.attachment_owner_resolver is None:
                 # Mis-wired config — the resolver is mandatory when
@@ -3401,79 +3388,32 @@ def make_send_handler(cfg: SessionEndpointConfig) -> Handler:
 
             send_id = uuid.uuid4().hex
             raw_ids = body.get("attachment_ids")
-            auto_consume_rows: list[dict[str, Any]] = []
             if raw_ids is None:
-                # Auto-consume: pull the caller's pending (unreserved)
-                # rows in creation order — bytes included so we skip
-                # a second fetch below.
-                auto_consume_rows = _get_pending_with_content(ws_id, attach_user_id)
-                requested_ids = [str(r["attachment_id"]) for r in auto_consume_rows]
+                # Auto-consume: every pending (staged) upload for this caller,
+                # in stage order.
+                buffer = get_attachment_buffer()
+                requested_ids = [
+                    s.attachment_id for s in buffer.list_for(ws_id=ws_id, user_id=attach_user_id)
+                ]
             elif isinstance(raw_ids, list) and raw_ids:
-                if len(raw_ids) > MAX_PENDING_ATTACHMENTS_PER_USER_WS:
-                    return JSONResponse(
-                        {
-                            "error": (
-                                f"Too many attachment_ids "
-                                f"(max {MAX_PENDING_ATTACHMENTS_PER_USER_WS})"
-                            ),
-                            "code": "too_many",
-                        },
-                        status_code=400,
-                    )
                 requested_ids = [str(x) for x in raw_ids if x]
 
-            reserved_ids = (
-                _reserve(requested_ids, send_id, ws_id, attach_user_id) if requested_ids else []
+            # Peek (not drain): the bytes stay buffered so an attachment-bearing
+            # turn the queue rejects can still be retried; the committing
+            # ``send`` drains them at write time.  ``resolved`` carries the
+            # bytes the session persists content-addressed.
+            resolved_atts, ordered_reserved, _dropped_resolve = resolve_staged_attachments(
+                requested_ids, ws_id, attach_user_id
             )
-            reserved_set = set(reserved_ids)
-            ordered_reserved = [aid for aid in requested_ids if aid in reserved_set]
-
-            if ordered_reserved:
-                if auto_consume_rows and all(
-                    str(r["attachment_id"]) in reserved_set for r in auto_consume_rows
-                ):
-                    rows_by_id = {str(r["attachment_id"]): r for r in auto_consume_rows}
-                    # reserved_for_msg_id was None at pre-fetch; patch
-                    # in the token so the scope check below admits the
-                    # rows we just reserved.
-                    for r in rows_by_id.values():
-                        r["reserved_for_msg_id"] = send_id
-                else:
-                    rows = _get_attachments(ordered_reserved)
-                    rows_by_id = {str(r["attachment_id"]): r for r in rows}
-                for aid in ordered_reserved:
-                    row = rows_by_id.get(aid)
-                    if not row:
-                        continue
-                    # Belt-and-braces scope check on top of the reservation.
-                    if (
-                        row.get("ws_id") != ws_id
-                        or row.get("user_id") != attach_user_id
-                        or row.get("message_id") is not None
-                        or row.get("reserved_for_msg_id") != send_id
-                    ):
-                        continue
-                    content = row.get("content")
-                    if not isinstance(content, bytes):
-                        continue
-                    resolved_atts.append(
-                        Attachment(
-                            attachment_id=str(row["attachment_id"]),
-                            filename=str(row.get("filename") or ""),
-                            mime_type=str(row.get("mime_type") or "application/octet-stream"),
-                            kind=str(row.get("kind") or ""),
-                            content=content,
-                        )
-                    )
+            reserved_set = set(ordered_reserved)
 
         def _release_reservation_on_fail() -> None:
-            """Unreserve if we bail before the dispatcher takes ownership."""
-            if reserved_ids:
-                from turnstone.core.memory import (
-                    unreserve_attachments as _unreserve,
-                )
+            """No-op: the upload buffer is a peek, not a lock.
 
-                _unreserve(send_id, ws_id, attach_user_id)
+            Retained as the worker-failure hook so the call sites below read
+            the same as the pre-cutover reservation flow; there is nothing to
+            release — undrained staged bytes simply expire on the buffer TTL.
+            """
 
         # If a cancel was just issued, briefly poll for the worker to
         # exit before dispatching — avoids spawning into a stale
@@ -3658,7 +3598,6 @@ def make_attachment_handlers(cfg: SessionEndpointConfig) -> AttachmentHandlers:
     otherwise; they'll just no-op-with-500 when
     ``attachment_owner_resolver`` is unset.
     """
-    import uuid
 
     async def _gate(request: Request) -> JSONResponse | None:
         if cfg.permission_gate is not None:
@@ -3677,12 +3616,8 @@ def make_attachment_handlers(cfg: SessionEndpointConfig) -> AttachmentHandlers:
         return cfg.attachment_owner_resolver(request, ws_id, mgr)
 
     async def upload(request: Request) -> Response:
-        from turnstone.core.attachments import (
-            IMAGE_SIZE_CAP,
-            MAX_PENDING_ATTACHMENTS_PER_USER_WS,
-            TEXT_DOC_SIZE_CAP,
-        )
-        from turnstone.core.memory import list_pending_attachments, save_attachment
+        from turnstone.core.attachment_buffer import get_attachment_buffer
+        from turnstone.core.attachments import IMAGE_SIZE_CAP, TEXT_DOC_SIZE_CAP
         from turnstone.core.web_helpers import read_multipart_file_or_400
 
         # Sniffing helpers stay kind-specific because they're tied to
@@ -3692,7 +3627,6 @@ def make_attachment_handlers(cfg: SessionEndpointConfig) -> AttachmentHandlers:
             return JSONResponse({"error": "attachment_helpers missing"}, status_code=500)
         sniff_image = cfg.attachment_helpers.sniff_image_mime
         classify_text = cfg.attachment_helpers.classify_text_attachment
-        upload_lock = cfg.attachment_helpers.upload_lock
 
         err_gate = await _gate(request)
         if err_gate is not None:
@@ -3748,35 +3682,30 @@ def make_attachment_handlers(cfg: SessionEndpointConfig) -> AttachmentHandlers:
             kind = "text"
             mime = mime_or_err[0]
 
-        # Serialize count-check + save per (ws, user) so concurrent
-        # uploads can't both pass a check that sees count == cap-1.
-        lock = upload_lock(ws_id, user_id)
-        with lock:
-            if len(list_pending_attachments(ws_id, user_id)) >= MAX_PENDING_ATTACHMENTS_PER_USER_WS:
-                return JSONResponse(
-                    {
-                        "error": (
-                            f"Too many pending attachments "
-                            f"(max {MAX_PENDING_ATTACHMENTS_PER_USER_WS} pending per workstream)"
-                        ),
-                        "code": "too_many",
-                    },
-                    status_code=409,
-                )
-            attachment_id = uuid.uuid4().hex
-            save_attachment(attachment_id, ws_id, user_id, filename, mime, len(data), kind, data)
+        # Stage in the per-node upload buffer (content-addressed: the id is the
+        # content hash, so re-uploading identical bytes is idempotent).  The
+        # bytes are written to storage only at send-commit.  No DB write, no
+        # per-user cap — the buffer's size/TTL ceilings bound a flood.
+        staged = get_attachment_buffer().stage(
+            ws_id=ws_id,
+            user_id=user_id,
+            filename=filename,
+            mime_type=mime,
+            kind=kind,
+            content=data,
+        )
         return JSONResponse(
             {
-                "attachment_id": attachment_id,
-                "filename": filename,
-                "mime_type": mime,
-                "size_bytes": len(data),
-                "kind": kind,
+                "attachment_id": staged.attachment_id,
+                "filename": staged.filename,
+                "mime_type": staged.mime_type,
+                "size_bytes": staged.size_bytes,
+                "kind": staged.kind,
             }
         )
 
     async def list_pending(request: Request) -> Response:
-        from turnstone.core.memory import list_pending_attachments
+        from turnstone.core.attachment_buffer import get_attachment_buffer
 
         err_gate = await _gate(request)
         if err_gate is not None:
@@ -3787,13 +3716,25 @@ def make_attachment_handlers(cfg: SessionEndpointConfig) -> AttachmentHandlers:
         user_id, err = await _resolve_owner(request, ws_id)
         if err:
             return err
-        rows = list_pending_attachments(ws_id, user_id)
+        # Pending uploads live in the buffer; project to the same wire shape
+        # the DB-backed listing used (no content bytes).
+        rows = [
+            {
+                "attachment_id": s.attachment_id,
+                "filename": s.filename,
+                "mime_type": s.mime_type,
+                "size_bytes": s.size_bytes,
+                "kind": s.kind,
+            }
+            for s in get_attachment_buffer().list_for(ws_id=ws_id, user_id=user_id)
+        ]
         return JSONResponse({"attachments": rows})
 
     async def get_content(request: Request) -> Response:
         from starlette.responses import Response as _Response
 
-        from turnstone.core.memory import get_attachment
+        from turnstone.core.attachment_buffer import get_attachment_buffer
+        from turnstone.core.memory import attachment_referenced_in_ws, get_attachment
 
         err_gate = await _gate(request)
         if err_gate is not None:
@@ -3805,16 +3746,29 @@ def make_attachment_handlers(cfg: SessionEndpointConfig) -> AttachmentHandlers:
         user_id, err = await _resolve_owner(request, ws_id)
         if err:
             return err
-        row = get_attachment(attachment_id)
-        # Scope on user_id too — id-guessing across users in an
-        # unowned workstream would otherwise leak blobs. Mask
-        # cross-user / cross-ws as 404 to avoid leaking existence.
-        if not row or row.get("ws_id") != ws_id or row.get("user_id") != user_id:
-            return JSONResponse({"error": "Not found"}, status_code=404)
-        body = row.get("content") or b""
-        kind = row.get("kind") or ""
-        stored_mime = row.get("mime_type") or "application/octet-stream"
-        filename = str(row.get("filename") or "attachment")
+
+        # Pending (staged) blobs serve straight from the buffer, scoped to the
+        # uploader.  Committed blobs serve from the store, gated by ownership:
+        # the requester (already gated to own ``ws_id``) must have a turn whose
+        # ref-list names the id.  Cross-user / cross-ws / unreferenced → 404 so
+        # existence doesn't leak.
+        kind: str
+        stored_mime: str
+        filename: str
+        staged = get_attachment_buffer().get(attachment_id, ws_id=ws_id, user_id=user_id)
+        if staged is not None:
+            body: bytes = staged.content
+            kind = staged.kind
+            stored_mime = staged.mime_type or "application/octet-stream"
+            filename = staged.filename or "attachment"
+        else:
+            row = get_attachment(attachment_id)
+            if not row or not attachment_referenced_in_ws(attachment_id, ws_id):
+                return JSONResponse({"error": "Not found"}, status_code=404)
+            body = row.get("content") or b""
+            kind = row.get("kind") or ""
+            stored_mime = row.get("mime_type") or "application/octet-stream"
+            filename = str(row.get("filename") or "attachment")
         # Force text/plain for text kinds — avoids same-origin HTML/SVG
         # rendering if a user uploaded an HTML-ish text file. Images
         # keep their sniffed MIME (allowlist is strict: png/jpeg/gif/webp).
@@ -3829,7 +3783,7 @@ def make_attachment_handlers(cfg: SessionEndpointConfig) -> AttachmentHandlers:
         return _Response(body, media_type=response_mime, headers=headers)
 
     async def delete_(request: Request) -> Response:
-        from turnstone.core.memory import delete_attachment as _delete
+        from turnstone.core.attachment_buffer import get_attachment_buffer
 
         err_gate = await _gate(request)
         if err_gate is not None:
@@ -3841,7 +3795,9 @@ def make_attachment_handlers(cfg: SessionEndpointConfig) -> AttachmentHandlers:
         user_id, err = await _resolve_owner(request, ws_id)
         if err:
             return err
-        deleted = _delete(attachment_id, ws_id, user_id)
+        # Only pending (staged) uploads are deletable — a committed blob is
+        # owned by the turn that references it and is GC'd by refcount.
+        deleted = get_attachment_buffer().discard(attachment_id, ws_id=ws_id, user_id=user_id)
         if not deleted:
             return JSONResponse({"error": "Not found"}, status_code=404)
         return JSONResponse({"status": "deleted"})

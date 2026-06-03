@@ -9,9 +9,7 @@ import pytest
 from turnstone.core.attachments import Attachment
 from turnstone.core.memory import (
     get_attachment,
-    list_pending_attachments,
     register_workstream,
-    save_attachment,
 )
 from turnstone.core.session import ChatSession
 
@@ -132,23 +130,19 @@ class TestMultipartBuild:
 
 
 class TestPersistenceAndConsumption:
-    def test_db_row_stores_text_only(self, tmp_db, mock_openai_client):
+    def test_db_row_stores_text_only_and_records_ref_list(self, tmp_db, mock_openai_client):
+        import hashlib
+
         s = _make_session(mock_openai_client)
-        save_attachment(
-            "att-persist",
-            s._ws_id,
-            "u1",
-            "note.md",
-            "text/markdown",
-            5,
-            "text",
-            b"hello",
-        )
-        att = Attachment("att-persist", "note.md", "text/markdown", "text", b"hello")
+        content = b"hello"
+        aid = hashlib.sha256(content).hexdigest()  # the content hash is the id
+        att = Attachment(aid, "note.md", "text/markdown", "text", content)
         _run_send(s, "user text", attachments=[att])
 
-        # The conversations row's text content is just the user input —
-        # the attachment is linked separately via message_id.
+        # The conversations row's text content is just the user input; the
+        # attachment is linked via the ``attachments`` ref-list column.
+        import json
+
         import sqlalchemy as sa
 
         from turnstone.core.storage._registry import get_storage
@@ -156,41 +150,60 @@ class TestPersistenceAndConsumption:
 
         with get_storage()._conn() as conn:
             rows = conn.execute(
-                sa.select(conversations.c.content, conversations.c.id)
+                sa.select(conversations.c.content, conversations.c.id, conversations.c.attachments)
                 .where(conversations.c.ws_id == s._ws_id)
                 .order_by(conversations.c.id)
             ).fetchall()
         assert len(rows) == 1
         assert rows[0][0] == "user text"
-        msg_id = rows[0][1]
+        assert json.loads(rows[0][2]) == [aid]
 
-        # Attachment should be consumed and linked to the message
-        assert list_pending_attachments(s._ws_id, "u1") == []
-        att_row = get_attachment("att-persist")
+        # The blob was written content-addressed at refcount 1, origin upload.
+        att_row = get_attachment(aid)
         assert att_row is not None
-        assert att_row["message_id"] == msg_id
+        assert att_row["content"] == content
+        assert att_row["refcount"] == 1
+        assert att_row["origin"] == "upload"
 
-    def test_consumption_scoped_to_user(self, tmp_db, mock_openai_client):
-        # A session running as user B must not consume user A's attachments
-        # even if the id is in the list passed to send().
-        s = _make_session(mock_openai_client, user_id="userB")
-        save_attachment(
-            "att-other",
-            s._ws_id,
-            "userA",
-            "a.md",
-            "text/plain",
-            1,
-            "text",
-            b"A",
+    def test_send_drains_the_upload_buffer(self, tmp_db, mock_openai_client):
+        # Bytes staged in the per-node buffer are drained (discarded) once the
+        # send commits them content-addressed — they don't linger as pending.
+        from turnstone.core.attachment_buffer import get_attachment_buffer
+
+        s = _make_session(mock_openai_client)
+        buf = get_attachment_buffer()
+        staged = buf.stage(
+            ws_id=s._ws_id,
+            user_id=s._user_id,
+            filename="note.md",
+            mime_type="text/markdown",
+            kind="text",
+            content=b"buffered",
         )
-        # Session constructs multipart content regardless (trust-but-verify),
-        # but the DB-level mark is scoped — attachment stays pending for A.
-        att = Attachment("att-other", "a.md", "text/plain", "text", b"A")
-        _run_send(s, "hi", attachments=[att])
-        att_row = get_attachment("att-other")
-        assert att_row is not None
-        assert att_row["message_id"] is None
+        assert buf.get(staged.attachment_id, ws_id=s._ws_id, user_id=s._user_id) is not None
+        att = Attachment(staged.attachment_id, "note.md", "text/markdown", "text", b"buffered")
+        _run_send(s, "user text", attachments=[att])
+        # Drained from the buffer post-commit.
+        assert buf.get(staged.attachment_id, ws_id=s._ws_id, user_id=s._user_id) is None
+
+    def test_reload_reconstructs_multipart(self, tmp_db, mock_openai_client):
+        import hashlib
+
+        from turnstone.core.memory import load_messages
+
+        s = _make_session(mock_openai_client)
+        content = b"# doc\n"
+        aid = hashlib.sha256(content).hexdigest()
+        att = Attachment(aid, "d.md", "text/markdown", "text", content)
+        _run_send(s, "see doc", attachments=[att])
+
+        msgs = load_messages(s._ws_id, repair=False)
+        assert msgs[0]["role"] == "user"
+        parts = msgs[0]["content"]
+        assert isinstance(parts, list)
+        assert parts[0] == {"type": "text", "text": "see doc"}
+        assert parts[1]["type"] == "document"
+        assert parts[1]["document"]["data"] == "# doc\n"
 
 
 class TestProviderIntegration:
@@ -286,7 +299,8 @@ class TestQueuedAttachmentsRejected:
         from turnstone.core.session import AttachmentsNotQueueableError
 
         s = _make_session(mock_openai_client)
-        save_attachment("a-q1", s._ws_id, "u1", "q.md", "text/markdown", 1, "text", b"q")
+        # Rejection is on the ``attachment_ids`` argument alone — no row need
+        # exist (the buffer is the pending store; queueing never touches it).
         with pytest.raises(AttachmentsNotQueueableError):
             s.queue_message("queued text", attachment_ids=["a-q1"])
         # Queue stayed empty — nothing partially committed.

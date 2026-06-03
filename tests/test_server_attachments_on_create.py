@@ -1,8 +1,8 @@
 """Tests for the multipart variant of POST /v1/api/workstreams/new.
 
 Exercises:
-- The pure helpers `_validate_and_save_uploaded_files` and
-  `_reserve_and_resolve_attachments` (added alongside the multipart path).
+- The pure helpers ``validate_and_save_uploaded_files`` (stages to the
+  per-node buffer) and ``resolve_staged_attachments`` (peeks them back).
 - The full create endpoint via TestClient with a FakeSession factory so
   the initial-message dispatch thread runs end-to-end without an LLM.
 """
@@ -54,15 +54,16 @@ def _auth(user: str) -> dict[str, str]:
 
 
 class TestValidateAndSaveUploadedFiles:
-    def test_saves_image_and_text(self, tmp_path):
+    def test_stages_image_and_text_to_buffer(self, tmp_path):
+        import hashlib
+
+        from turnstone.core.attachment_buffer import get_attachment_buffer
         from turnstone.core.attachments import (
             validate_and_save_uploaded_files as _validate_and_save_uploaded_files,
         )
-        from turnstone.core.memory import list_pending_attachments
-        from turnstone.core.storage import init_storage, reset_storage
 
-        reset_storage()
-        init_storage("sqlite", path=str(tmp_path / "t.db"), run_migrations=False)
+        buf = get_attachment_buffer()
+        buf._entries.clear()
         try:
             files = [
                 ("hi.png", "image/png", PNG_1x1),
@@ -71,12 +72,13 @@ class TestValidateAndSaveUploadedFiles:
             ids, err = _validate_and_save_uploaded_files(files, "ws-X", "userA")
             assert err is None
             assert len(ids) == 2
-            pending = list_pending_attachments("ws-X", "userA")
-            assert len(pending) == 2
-            kinds = {p["kind"] for p in pending}
-            assert kinds == {"image", "text"}
+            # Ids are content hashes (content-addressed staging).
+            assert ids[0] == hashlib.sha256(PNG_1x1).hexdigest()
+            staged = buf.list_for(ws_id="ws-X", user_id="userA")
+            assert len(staged) == 2
+            assert {s.kind for s in staged} == {"image", "text"}
         finally:
-            reset_storage()
+            buf._entries.clear()
 
     def test_rejects_oversized_image(self, tmp_path):
         from turnstone.core.attachments import IMAGE_SIZE_CAP
@@ -116,76 +118,85 @@ class TestValidateAndSaveUploadedFiles:
         finally:
             reset_storage()
 
-    def test_pending_cap_returns_409(self, tmp_path):
-        from turnstone.core.attachments import MAX_PENDING_ATTACHMENTS_PER_USER_WS
-        from turnstone.core.attachments import (
-            validate_and_save_uploaded_files as _validate_and_save_uploaded_files,
+
+# (The per-user pending-upload cap was removed with the content-addressing
+# cutover; ``validate_and_save_uploaded_files`` no longer 409s — the buffer's
+# own size/TTL ceilings bound a flood.)
+
+
+class TestResolveStagedAttachments:
+    def _stage(self, ws_id, user_id, filename, mime, kind, content):
+        from turnstone.core.attachment_buffer import get_attachment_buffer
+
+        return get_attachment_buffer().stage(
+            ws_id=ws_id,
+            user_id=user_id,
+            filename=filename,
+            mime_type=mime,
+            kind=kind,
+            content=content,
         )
-        from turnstone.core.memory import save_attachment
-        from turnstone.core.storage import init_storage, reset_storage
 
-        reset_storage()
-        init_storage("sqlite", path=str(tmp_path / "t.db"), run_migrations=False)
-        try:
-            # Saturate the pending cap
-            for i in range(MAX_PENDING_ATTACHMENTS_PER_USER_WS):
-                save_attachment(
-                    f"pre-{i}", "ws-X", "userA", f"f{i}.txt", "text/plain", 1, "text", b"x"
-                )
-            files = [("notes.md", "text/markdown", b"hello")]
-            ids, err = _validate_and_save_uploaded_files(files, "ws-X", "userA")
-            assert err is not None
-            assert err.status_code == 409
-            assert ids == []
-        finally:
-            reset_storage()
-
-
-class TestReserveAndResolveAttachments:
-    def test_reserves_and_returns_attachments(self, tmp_path):
+    def test_resolves_staged_to_attachments(self):
+        from turnstone.core.attachment_buffer import get_attachment_buffer
         from turnstone.core.attachments import Attachment
         from turnstone.core.attachments import (
-            reserve_and_resolve_attachments as _reserve_and_resolve_attachments,
+            resolve_staged_attachments as _resolve_staged_attachments,
         )
-        from turnstone.core.memory import save_attachment
-        from turnstone.core.storage import init_storage, reset_storage
 
-        reset_storage()
-        init_storage("sqlite", path=str(tmp_path / "t.db"), run_migrations=False)
+        buf = get_attachment_buffer()
+        buf._entries.clear()
         try:
-            save_attachment("a1", "ws-X", "userA", "a.txt", "text/plain", 5, "text", b"hello")
-            save_attachment("a2", "ws-X", "userA", "b.png", "image/png", 91, "image", PNG_1x1)
-            resolved, ordered, dropped = _reserve_and_resolve_attachments(
-                ["a1", "a2"], "send-1", "ws-X", "userA"
+            a1 = self._stage("ws-X", "userA", "a.txt", "text/plain", "text", b"hello")
+            a2 = self._stage("ws-X", "userA", "b.png", "image/png", "image", PNG_1x1)
+            resolved, taken, dropped = _resolve_staged_attachments(
+                [a1.attachment_id, a2.attachment_id], "ws-X", "userA"
             )
-            assert ordered == ["a1", "a2"]
+            assert taken == [a1.attachment_id, a2.attachment_id]
             assert dropped == []
             assert len(resolved) == 2
             assert all(isinstance(a, Attachment) for a in resolved)
-            kinds = [a.kind for a in resolved]
-            assert kinds == ["text", "image"]
+            assert [a.kind for a in resolved] == ["text", "image"]
         finally:
-            reset_storage()
+            buf._entries.clear()
 
-    def test_double_reserve_drops_second(self, tmp_path):
+    def test_unknown_id_is_dropped(self):
+        from turnstone.core.attachment_buffer import get_attachment_buffer
         from turnstone.core.attachments import (
-            reserve_and_resolve_attachments as _reserve_and_resolve_attachments,
+            resolve_staged_attachments as _resolve_staged_attachments,
         )
-        from turnstone.core.memory import save_attachment
-        from turnstone.core.storage import init_storage, reset_storage
 
-        reset_storage()
-        init_storage("sqlite", path=str(tmp_path / "t.db"), run_migrations=False)
+        buf = get_attachment_buffer()
+        buf._entries.clear()
         try:
-            save_attachment("a1", "ws-X", "userA", "a.txt", "text/plain", 5, "text", b"hello")
-            r1, ord1, _ = _reserve_and_resolve_attachments(["a1"], "send-A", "ws-X", "userA")
-            assert len(r1) == 1
-            r2, ord2, drop2 = _reserve_and_resolve_attachments(["a1"], "send-B", "ws-X", "userA")
-            assert r2 == []
-            assert ord2 == []
-            assert drop2 == ["a1"]
+            a1 = self._stage("ws-X", "userA", "a.txt", "text/plain", "text", b"hello")
+            resolved, taken, dropped = _resolve_staged_attachments(
+                [a1.attachment_id, "never-staged"], "ws-X", "userA"
+            )
+            assert taken == [a1.attachment_id]
+            assert dropped == ["never-staged"]
+            assert len(resolved) == 1
         finally:
-            reset_storage()
+            buf._entries.clear()
+
+    def test_cross_user_id_not_resolved(self):
+        # A staged id scoped to another user (same ws) must not resolve.
+        from turnstone.core.attachment_buffer import get_attachment_buffer
+        from turnstone.core.attachments import (
+            resolve_staged_attachments as _resolve_staged_attachments,
+        )
+
+        buf = get_attachment_buffer()
+        buf._entries.clear()
+        try:
+            other = self._stage("ws-X", "userB", "a.txt", "text/plain", "text", b"hello")
+            resolved, taken, dropped = _resolve_staged_attachments(
+                [other.attachment_id], "ws-X", "userA"
+            )
+            assert resolved == []
+            assert dropped == [other.attachment_id]
+        finally:
+            buf._entries.clear()
 
 
 # ---------------------------------------------------------------------------
@@ -216,21 +227,35 @@ class _FakeSession:
     def send(self, text, attachments=None, send_id=None):
         with self._lock:
             self.sends.append((text, list(attachments or []), send_id))
-            # Simulate the real ChatSession's consume step against storage
-            # so callers can assert the lifecycle landed.
-            if attachments and send_id and self.ws_id and self.user_id:
-                import uuid as _uuid
-
-                from turnstone.core.memory import mark_attachments_consumed
-
-                ids = [a.attachment_id for a in attachments]
-                mark_attachments_consumed(
-                    ids,
-                    _uuid.uuid4().hex,  # synthetic conversation message id
-                    self.ws_id,
-                    self.user_id,
-                    reserved_for_msg_id=send_id,
+            # Simulate the real ChatSession commit: write each attachment
+            # content-addressed, record the ref-list on a (synthetic) message
+            # row, and drain the staged handles from the buffer — so callers
+            # can assert the lifecycle landed.
+            if attachments and self.ws_id and self.user_id:
+                from turnstone.core.attachment_buffer import get_attachment_buffer
+                from turnstone.core.memory import (
+                    save_attachment,
+                    save_message,
+                    set_message_attachments,
                 )
+
+                mid = save_message(self.ws_id, "user", text)
+                buf = get_attachment_buffer()
+                ref_ids = []
+                for a in attachments:
+                    save_attachment(
+                        a.attachment_id,
+                        self.ws_id,
+                        self.user_id,
+                        a.filename,
+                        a.mime_type,
+                        len(a.content),
+                        a.kind,
+                        a.content,
+                    )
+                    ref_ids.append(a.attachment_id)
+                    buf.discard(a.attachment_id, ws_id=self.ws_id, user_id=self.user_id)
+                set_message_attachments(self.ws_id, mid, ref_ids)
 
     # Methods the create handler may call but we don't care about
     def set_watch_runner(self, *_a, **_kw):
@@ -318,17 +343,27 @@ def app_client(tmp_path, monkeypatch):
         skip_permissions=False,
         jwt_secret=_TEST_JWT_SECRET,
     )
+    # Pending uploads live in the process-global per-node buffer; clear it so
+    # staged uploads can't leak across tests.
+    from turnstone.core.attachment_buffer import get_attachment_buffer
+
+    get_attachment_buffer()._entries.clear()
+
     client = TestClient(app, raise_server_exceptions=False)
     try:
         yield client, fake_sessions, gq
     finally:
         client.close()
+        get_attachment_buffer()._entries.clear()
         reset_storage()
 
 
 class TestCreateMultipart:
     def test_create_with_image_and_initial_message(self, app_client):
-        from turnstone.core.memory import list_pending_attachments
+        import hashlib
+
+        from turnstone.core.attachment_buffer import get_attachment_buffer
+        from turnstone.core.memory import attachment_referenced_in_ws, get_attachment
 
         client, sessions, _gq = app_client
         meta = {"name": "demo", "initial_message": "describe this image"}
@@ -343,6 +378,8 @@ class TestCreateMultipart:
         ws_id = data["ws_id"]
         assert ws_id
         assert len(data["attachment_ids"]) == 1
+        aid = data["attachment_ids"][0]
+        assert aid == hashlib.sha256(PNG_1x1).hexdigest()  # content-addressed id
 
         # Wait briefly for the dispatch thread
         deadline = time.time() + 2.0
@@ -355,16 +392,27 @@ class TestCreateMultipart:
         assert sessions[0].sends, "session.send was not invoked"
         text, atts, send_id = sessions[0].sends[0]
         assert text == "describe this image"
-        assert send_id  # reservation token threaded through
+        assert send_id  # tracking token threaded through
         assert len(atts) == 1
         assert atts[0].kind == "image"
 
-        # Lifecycle: the FakeSession marks them consumed via storage —
-        # so the pending-list for this ws should be empty after dispatch.
-        assert list_pending_attachments(ws_id, "userA") == []
+        # Lifecycle: the FakeSession commit wrote the blob content-addressed +
+        # recorded the ref-list + drained the buffer.  Poll for the worker.
+        deadline = time.time() + 2.0
+        while time.time() < deadline:
+            if get_attachment(aid) is not None and attachment_referenced_in_ws(aid, ws_id):
+                break
+            time.sleep(0.02)
+        row = get_attachment(aid)
+        assert row is not None and row["refcount"] >= 1
+        assert attachment_referenced_in_ws(aid, ws_id) is True
+        # Drained from the buffer post-commit.
+        assert get_attachment_buffer().get(aid, ws_id=ws_id, user_id="userA") is None
 
-    def test_create_with_attachments_no_initial_message_keeps_pending(self, app_client):
-        from turnstone.core.memory import list_pending_attachments
+    def test_create_with_attachments_no_initial_message_keeps_staged(self, app_client):
+        import hashlib
+
+        from turnstone.core.attachment_buffer import get_attachment_buffer
 
         client, _, _gq = app_client
         meta = {"name": "stash"}
@@ -377,9 +425,11 @@ class TestCreateMultipart:
         assert resp.status_code == 200, resp.text
         data = resp.json()
         ws_id = data["ws_id"]
-        pending = list_pending_attachments(ws_id, "userA")
-        assert len(pending) == 1
-        assert pending[0]["filename"] == "notes.md"
+        assert data["attachment_ids"] == [hashlib.sha256(b"# hello\n").hexdigest()]
+        # No initial_message → no send → the upload stays staged in the buffer.
+        staged = get_attachment_buffer().list_for(ws_id=ws_id, user_id="userA")
+        assert len(staged) == 1
+        assert staged[0].filename == "notes.md"
 
     def test_create_rejects_oversized_image_and_rolls_back(self, app_client):
         from turnstone.core.attachments import IMAGE_SIZE_CAP
