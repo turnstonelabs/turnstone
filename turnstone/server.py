@@ -88,6 +88,7 @@ from turnstone.core.session_ui_base import (
     fire_judge_verdict_metric,
 )
 from turnstone.core.tools import TOOLS  # noqa: F401 — available for introspection
+from turnstone.core.trajectory import turn_to_dict
 from turnstone.core.web_helpers import version_html as _version_html
 from turnstone.core.workstream import (
     Workstream,
@@ -1627,7 +1628,8 @@ def _validate_notify_targets(raw: Any) -> tuple[str, str]:
 
 def _extract_last_assistant_content(session: Any) -> str:
     """Return the text content of the last assistant message."""
-    for msg in reversed(session.messages):
+    for turn in reversed(session.messages):
+        msg = turn_to_dict(turn)
         if msg.get("role") == "assistant":
             content = msg.get("content", "")
             if isinstance(content, str):

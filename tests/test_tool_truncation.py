@@ -7,6 +7,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from turnstone.core.session import ChatSession
+from turnstone.core.trajectory import turns_from_dicts
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -144,7 +145,7 @@ class TestContextOverflowRecovery:
     """Test that context-length errors trigger compact-and-retry."""
 
     def test_openai_context_length_error_triggers_compact(self, session):
-        session.messages = [{"role": "user", "content": "hi"}]
+        session.messages = turns_from_dicts([{"role": "user", "content": "hi"}])
         session._msg_tokens = [1]
 
         call_count = 0
@@ -175,7 +176,7 @@ class TestContextOverflowRecovery:
         assert call_count == 2
 
     def test_anthropic_prompt_too_long_triggers_compact(self, session):
-        session.messages = [{"role": "user", "content": "hi"}]
+        session.messages = turns_from_dicts([{"role": "user", "content": "hi"}])
         session._msg_tokens = [1]
 
         call_count = 0
@@ -205,7 +206,7 @@ class TestContextOverflowRecovery:
         compact_mock.assert_called_once_with(auto=True)
 
     def test_non_context_error_propagates(self, session):
-        session.messages = [{"role": "user", "content": "hi"}]
+        session.messages = turns_from_dicts([{"role": "user", "content": "hi"}])
         session._msg_tokens = [1]
 
         with (
@@ -222,7 +223,7 @@ class TestContextOverflowRecovery:
             session.send("hello")
 
     def test_compact_failure_raises_original_error(self, session):
-        session.messages = [{"role": "user", "content": "hi"}]
+        session.messages = turns_from_dicts([{"role": "user", "content": "hi"}])
         session._msg_tokens = [1]
 
         with (

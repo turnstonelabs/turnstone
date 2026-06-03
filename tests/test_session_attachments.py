@@ -12,6 +12,7 @@ from turnstone.core.memory import (
     register_workstream,
 )
 from turnstone.core.session import ChatSession
+from turnstone.core.trajectory import dicts_from_turns, turn_to_dict
 
 PNG_1x1 = (
     b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00\x01"
@@ -56,12 +57,12 @@ class TestPlainTextUnchanged:
     def test_no_attachments_stores_string_content(self, tmp_db, mock_openai_client):
         s = _make_session(mock_openai_client)
         _run_send(s, "hello")
-        assert s.messages[-1] == {"role": "user", "content": "hello"}
+        assert turn_to_dict(s.messages[-1]) == {"role": "user", "content": "hello"}
 
     def test_empty_attachments_list_stores_string_content(self, tmp_db, mock_openai_client):
         s = _make_session(mock_openai_client)
         _run_send(s, "hello", attachments=[])
-        assert s.messages[-1] == {"role": "user", "content": "hello"}
+        assert turn_to_dict(s.messages[-1]) == {"role": "user", "content": "hello"}
 
 
 class TestMultipartBuild:
@@ -75,7 +76,7 @@ class TestMultipartBuild:
             content=PNG_1x1,
         )
         _run_send(s, "what is this?", attachments=[att])
-        msg = s.messages[-1]
+        msg = turn_to_dict(s.messages[-1])
         assert msg["role"] == "user"
         assert isinstance(msg["content"], list)
         assert msg["content"][0] == {"type": "text", "text": "what is this?"}
@@ -93,7 +94,7 @@ class TestMultipartBuild:
             content=b"# hi\n",
         )
         _run_send(s, "summarize", attachments=[att])
-        msg = s.messages[-1]
+        msg = turn_to_dict(s.messages[-1])
         doc = msg["content"][1]
         assert doc == {
             "type": "document",
@@ -112,9 +113,10 @@ class TestMultipartBuild:
             Attachment("a3", "second.md", "text/markdown", "text", b"B"),
         ]
         _run_send(s, "look", attachments=atts)
-        types = [p["type"] for p in s.messages[-1]["content"]]
+        msg = turn_to_dict(s.messages[-1])
+        types = [p["type"] for p in msg["content"]]
         assert types == ["text", "image_url", "document", "document"]
-        docs = [p for p in s.messages[-1]["content"] if p["type"] == "document"]
+        docs = [p for p in msg["content"] if p["type"] == "document"]
         assert docs[0]["document"]["data"] == "A"
         assert docs[1]["document"]["data"] == "B"
 
@@ -122,7 +124,7 @@ class TestMultipartBuild:
         s = _make_session(mock_openai_client)
         att = Attachment("a1", "bad.bin", "text/plain", "text", b"\xff\xfe")
         _run_send(s, "read this", attachments=[att])
-        parts = s.messages[-1]["content"]
+        parts = turn_to_dict(s.messages[-1])["content"]
         assert any(
             p.get("type") == "text" and p.get("text") == "[unreadable attachment: bad.bin]"
             for p in parts
@@ -225,7 +227,7 @@ class TestProviderIntegration:
         ]
         _run_send(s, "look at both", attachments=atts)
 
-        _, converted = AnthropicProvider()._convert_messages([s.messages[-1]])
+        _, converted = AnthropicProvider()._convert_messages(dicts_from_turns([s.messages[-1]]))
         assert len(converted) == 1
         content = converted[0]["content"]
         types = [p["type"] for p in content]
@@ -250,7 +252,7 @@ class TestProviderIntegration:
             Attachment("a2", "notes.md", "text/markdown", "text", b"hi"),
         ]
         _run_send(s, "desc", attachments=atts)
-        meta = s.messages[-1].get("_attachments_meta")
+        meta = turn_to_dict(s.messages[-1]).get("_attachments_meta")
         assert meta == [
             {"kind": "image", "filename": "dog.png", "mime_type": "image/png"},
             {"kind": "text", "filename": "notes.md", "mime_type": "text/markdown"},
@@ -264,7 +266,7 @@ class TestProviderIntegration:
         s = _make_session(mock_openai_client)
         atts = [Attachment("a1", "x.md", "text/markdown", "text", b"x")]
         _run_send(s, "hi", attachments=atts)
-        out = sanitize_messages([s.messages[-1]])
+        out = sanitize_messages(dicts_from_turns([s.messages[-1]]))
         for k in out[0]:
             assert not k.startswith("_"), f"{k!r} leaked to wire"
 
@@ -277,7 +279,7 @@ class TestProviderIntegration:
         ]
         _run_send(s, "review", attachments=atts)
 
-        out = sanitize_messages([s.messages[-1]])
+        out = sanitize_messages(dicts_from_turns([s.messages[-1]]))
         parts = out[0]["content"]
         types = [p["type"] for p in parts]
         assert types == ["text", "text"]

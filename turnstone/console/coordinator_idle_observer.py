@@ -41,6 +41,7 @@ from turnstone.core.metacognition import (
     format_idle_children_nudge,
     should_nudge,
 )
+from turnstone.core.trajectory import Role
 from turnstone.core.workstream import WorkstreamKind, WorkstreamState
 
 if TYPE_CHECKING:
@@ -250,13 +251,10 @@ class CoordinatorIdleObserver:
         ``wait_for_workstream`` tool call, return ``True``.
         """
         for msg in reversed(session.messages):
-            if msg.get("role") != "assistant":
+            if msg.role is not Role.ASSISTANT:
                 continue
-            for tc in msg.get("tool_calls") or []:
-                fn = tc.get("function", {}) or {}
-                if fn.get("name") == "wait_for_workstream":
-                    return True
-            return False  # found the most recent assistant turn — done
+            # The most recent assistant turn — done after this one.
+            return any(tc.name == "wait_for_workstream" for tc in msg.tool_calls)
         return False
 
     def _active_children(self, ws: Workstream) -> list[dict[str, str]]:

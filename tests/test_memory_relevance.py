@@ -8,6 +8,7 @@ from turnstone.core.memory_relevance import (
     extract_recent_context,
     score_memories,
 )
+from turnstone.core.trajectory import turns_from_dicts
 
 # ---------------------------------------------------------------------------
 # score_memories
@@ -303,7 +304,9 @@ class TestCompositionCandidateSelection:
     def test_recency_ceiling_regression(self, tmp_db):
         """Old relevant memory not in recency top-N still injected via search path."""
         session = _make_session(fetch_limit=5, relevance_k=3)
-        session.messages = [{"role": "user", "content": "postgres database configuration"}]
+        session.messages = turns_from_dicts(
+            [{"role": "user", "content": "postgres database configuration"}]
+        )
 
         old_mem = _make_mem(
             "ancient_db_config",
@@ -343,7 +346,7 @@ class TestCompositionCandidateSelection:
     def test_sparse_match_union_fills_candidate_pool(self, tmp_db):
         """Search returning < fetch_limit results unions with recency fillers."""
         session = _make_session(fetch_limit=5, relevance_k=4)
-        session.messages = [{"role": "user", "content": "unique_term xyzzy"}]
+        session.messages = turns_from_dicts([{"role": "user", "content": "unique_term xyzzy"}])
 
         hit_a = _make_mem("hit_alpha", content="unique_term xyzzy alpha", memory_id="m_ha")
         hit_b = _make_mem("hit_beta", content="unique_term xyzzy beta", memory_id="m_hb")
@@ -374,7 +377,7 @@ class TestCompositionCandidateSelection:
         evict the recency-only memory the bug had been surfacing.
         """
         session = _make_session(fetch_limit=10, relevance_k=3)
-        session.messages = [{"role": "user", "content": "configure host"}]
+        session.messages = turns_from_dicts([{"role": "user", "content": "configure host"}])
 
         # Search returns relevance_k=3 noise hits — enough to skip recency
         # under the OLD threshold, not enough to fill fetch_limit=10.
@@ -409,7 +412,7 @@ class TestCompositionCandidateSelection:
         sets out to improve.
         """
         session = _make_session(fetch_limit=10, relevance_k=3)
-        session.messages = [{"role": "user", "content": "alpha"}]
+        session.messages = turns_from_dicts([{"role": "user", "content": "alpha"}])
 
         # 5 search hits, none of which appear in recency.
         search_hits = [
@@ -451,7 +454,7 @@ class TestCompositionCandidateSelection:
         scopes = coord._visible_scopes()
         assert scopes == [("coordinator", "coord-1")]
         # And: search uses those same scopes (no global/user fan-in)
-        coord.messages = [{"role": "user", "content": "anything"}]
+        coord.messages = turns_from_dicts([{"role": "user", "content": "anything"}])
         with patch(
             "turnstone.core.session.search_visible_structured_memories",
             return_value=[],
@@ -492,13 +495,13 @@ class TestCompositionRerankFiltersWiring:
 
     def test_threshold_zero_uses_reorder_mode(self, tmp_db):
         session = _make_session()
-        session.messages = [{"role": "user", "content": "alpha"}]
+        session.messages = turns_from_dicts([{"role": "user", "content": "alpha"}])
         # threshold 0 (disabled floor) -> reorder mode -> no suppression.
         assert self._capture_rerank_filters(session, 0.0) is False
 
     def test_positive_threshold_uses_filter_mode(self, tmp_db):
         session = _make_session()
-        session.messages = [{"role": "user", "content": "alpha"}]
+        session.messages = turns_from_dicts([{"role": "user", "content": "alpha"}])
         # An active floor -> filter mode -> the reranker may empty the injection.
         assert self._capture_rerank_filters(session, 0.5) is True
 

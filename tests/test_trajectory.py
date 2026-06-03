@@ -38,6 +38,15 @@ _ROUNDTRIP: list[dict[str, Any]] = [
         ],
         "_attachments_meta": [{"kind": "image", "filename": "x.png", "mime_type": "image/png"}],
     },
+    {
+        # All-text multipart list (the unreadable-attachment placeholder path)
+        # stays a list — must not collapse to a joined string.
+        "role": "user",
+        "content": [
+            {"type": "text", "text": "read this"},
+            {"type": "text", "text": "[unreadable attachment: bad.bin]"},
+        ],
+    },
     {"role": "assistant", "content": "hi there"},
     {"role": "assistant", "content": ""},  # empty assistant (no text, no tools)
     {

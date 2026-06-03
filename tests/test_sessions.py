@@ -19,6 +19,7 @@ from turnstone.core.memory import (
 )
 from turnstone.core.session import ChatSession
 from turnstone.core.storage import get_storage
+from turnstone.core.trajectory import turn_to_dict
 
 # ── Workstream registration ───────────────────────────────────────────
 
@@ -298,7 +299,7 @@ class TestResumeWorkstream:
         assert result is True
         assert session._ws_id == "old_ws_123"
         assert len(session.messages) == 2
-        assert session.messages[0]["content"] == "hello world"
+        assert turn_to_dict(session.messages[0])["content"] == "hello world"
         assert session._title_generated is True
 
     def test_resume_nonexistent_returns_false(self, tmp_db, mock_openai_client):

@@ -5,6 +5,7 @@ from __future__ import annotations
 from unittest.mock import MagicMock
 
 from turnstone.core.session import ChatSession
+from turnstone.core.trajectory import turn_to_dict, turns_from_dicts
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -90,31 +91,35 @@ def _make_session(tmp_db) -> ChatSession:
 
 def _populate_simple(session: ChatSession) -> None:
     """Populate with 2 simple turns (no tool calls)."""
-    session.messages = [
-        {"role": "user", "content": "Hello"},
-        {"role": "assistant", "content": "Hi there!"},
-        {"role": "user", "content": "How are you?"},
-        {"role": "assistant", "content": "I'm fine."},
-    ]
+    session.messages = turns_from_dicts(
+        [
+            {"role": "user", "content": "Hello"},
+            {"role": "assistant", "content": "Hi there!"},
+            {"role": "user", "content": "How are you?"},
+            {"role": "assistant", "content": "I'm fine."},
+        ]
+    )
     session._msg_tokens = [10, 20, 10, 20]
 
 
 def _populate_with_tools(session: ChatSession) -> None:
     """Populate with 2 turns, first has tool calls."""
-    session.messages = [
-        {"role": "user", "content": "Write a test"},
-        {
-            "role": "assistant",
-            "content": "",
-            "tool_calls": [
-                {"id": "tc1", "function": {"name": "bash", "arguments": '{"cmd":"echo hi"}'}}
-            ],
-        },
-        {"role": "tool", "tool_call_id": "tc1", "content": "hi"},
-        {"role": "assistant", "content": "Done."},
-        {"role": "user", "content": "Fix the import"},
-        {"role": "assistant", "content": "Fixed."},
-    ]
+    session.messages = turns_from_dicts(
+        [
+            {"role": "user", "content": "Write a test"},
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {"id": "tc1", "function": {"name": "bash", "arguments": '{"cmd":"echo hi"}'}}
+                ],
+            },
+            {"role": "tool", "tool_call_id": "tc1", "content": "hi"},
+            {"role": "assistant", "content": "Done."},
+            {"role": "user", "content": "Fix the import"},
+            {"role": "assistant", "content": "Fixed."},
+        ]
+    )
     session._msg_tokens = [10, 20, 10, 20, 10, 20]
 
 
@@ -130,10 +135,12 @@ class TestFindTurnBoundaries:
 
     def test_single_turn(self, tmp_db):
         session = _make_session(tmp_db)
-        session.messages = [
-            {"role": "user", "content": "Hello"},
-            {"role": "assistant", "content": "Hi!"},
-        ]
+        session.messages = turns_from_dicts(
+            [
+                {"role": "user", "content": "Hello"},
+                {"role": "assistant", "content": "Hi!"},
+            ]
+        )
         assert session._find_turn_boundaries() == [0]
 
     def test_multi_turn(self, tmp_db):
@@ -165,8 +172,8 @@ class TestRewind:
         removed = session.rewind(1)
         assert removed == 2  # user + assistant
         assert len(session.messages) == 2
-        assert session.messages[0]["content"] == "Hello"
-        assert session.messages[1]["content"] == "Hi there!"
+        assert turn_to_dict(session.messages[0])["content"] == "Hello"
+        assert turn_to_dict(session.messages[1])["content"] == "Hi there!"
         assert len(session._msg_tokens) == 2
 
     def test_rewind_all_turns(self, tmp_db):
@@ -196,7 +203,7 @@ class TestRewind:
         removed = session.rewind(1)
         assert removed == 2  # user "Fix the import" + assistant "Fixed."
         assert len(session.messages) == 4
-        assert session.messages[-1]["content"] == "Done."
+        assert turn_to_dict(session.messages[-1])["content"] == "Done."
 
     def test_rewind_tokens_sync(self, tmp_db):
         """_msg_tokens stays in sync with messages."""
@@ -219,7 +226,7 @@ class TestRetry:
         assert msg == "How are you?"
         # Only Turn 1 remains, without the second user message
         assert len(session.messages) == 2
-        assert session.messages[-1]["content"] == "Hi there!"
+        assert turn_to_dict(session.messages[-1])["content"] == "Hi there!"
 
     def test_retry_empty(self, tmp_db):
         session = _make_session(tmp_db)
@@ -249,10 +256,18 @@ class TestRetry:
     def test_retry_multipart_content_returns_none(self, tmp_db):
         """retry() should refuse multipart (vision/image) messages."""
         session = _make_session(tmp_db)
-        session.messages = [
-            {"role": "user", "content": [{"type": "text", "text": "describe this"}]},
-            {"role": "assistant", "content": "It's an image."},
-        ]
+        session.messages = turns_from_dicts(
+            [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "describe this"},
+                        {"type": "image_url", "image_url": {"url": "data:image/png;base64,AA=="}},
+                    ],
+                },
+                {"role": "assistant", "content": "It's an image."},
+            ]
+        )
         session._msg_tokens = [10, 20]
         assert session.retry() is None
         # Messages should be unchanged
@@ -261,10 +276,12 @@ class TestRetry:
     def test_retry_none_content_returns_none(self, tmp_db):
         """retry() should handle content=None gracefully."""
         session = _make_session(tmp_db)
-        session.messages = [
-            {"role": "user", "content": None},
-            {"role": "assistant", "content": "Ok."},
-        ]
+        session.messages = turns_from_dicts(
+            [
+                {"role": "user", "content": None},
+                {"role": "assistant", "content": "Ok."},
+            ]
+        )
         session._msg_tokens = [10, 20]
         assert session.retry() is None
 
@@ -386,12 +403,14 @@ class TestRewindDBSync:
         save_message(ws_id, "user", "Bye")
         save_message(ws_id, "assistant", "Goodbye!")
 
-        session.messages = [
-            {"role": "user", "content": "Hello"},
-            {"role": "assistant", "content": "Hi!"},
-            {"role": "user", "content": "Bye"},
-            {"role": "assistant", "content": "Goodbye!"},
-        ]
+        session.messages = turns_from_dicts(
+            [
+                {"role": "user", "content": "Hello"},
+                {"role": "assistant", "content": "Hi!"},
+                {"role": "user", "content": "Bye"},
+                {"role": "assistant", "content": "Goodbye!"},
+            ]
+        )
         session._msg_tokens = [5, 5, 5, 5]
 
         session.rewind(1)

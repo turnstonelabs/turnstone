@@ -32,6 +32,7 @@ from tests.test_session_manager import FakeStorage
 from turnstone.core.idle_nudge_watcher import IdleNudgeWatcher
 from turnstone.core.session import ChatSession
 from turnstone.core.session_manager import SessionManager
+from turnstone.core.trajectory import dicts_from_turns, turn_from_dict
 from turnstone.core.workstream import Workstream, WorkstreamKind, WorkstreamState
 
 # ---------------------------------------------------------------------------
@@ -254,13 +255,14 @@ def test_idle_event_through_real_session_manager_drives_wake_send(real_mgr, tmp_
         # The synthesized empty user message landed in history with the
         # ``_source`` audit tag; the nudge follows it as a first-class
         # ``system`` turn (no _reminders side-channel).
-        user_msgs = [m for m in ws.session.messages if m.get("role") == "user"]
+        msgs = dicts_from_turns(ws.session.messages)
+        user_msgs = [m for m in msgs if m.get("role") == "user"]
         assert user_msgs, "expected a synthesized user message from the wake"
         wake_msg = user_msgs[-1]
         assert wake_msg["content"] == ""
         assert wake_msg.get("_source") == "system_nudge"
         assert "_reminders" not in wake_msg
-        sys_turns = [m for m in ws.session.messages if m.get("role") == "system"]
+        sys_turns = [m for m in msgs if m.get("role") == "system"]
         assert {
             "role": "system",
             "_source": "idle_children",
@@ -367,8 +369,8 @@ def test_coord_idle_with_active_children_emits_envelope_via_real_managers(coord_
 
         # Pretend the coord has already had a real conversation so
         # ``should_nudge``'s message_count > 1 gate passes.
-        coord.session.messages.append({"role": "user", "content": "spawn 2"})
-        coord.session.messages.append({"role": "assistant", "content": "ok"})
+        coord.session.messages.append(turn_from_dict({"role": "user", "content": "spawn 2"}))
+        coord.session.messages.append(turn_from_dict({"role": "assistant", "content": "ok"}))
 
         with (
             patch.object(coord.session, "_create_stream_with_retry", return_value=iter([])),
@@ -392,11 +394,12 @@ def test_coord_idle_with_active_children_emits_envelope_via_real_managers(coord_
         # The synthetic empty-user turn landed; the idle_children nudge
         # follows it as a first-class ``system`` turn containing both
         # children.
-        user_msgs = [m for m in coord.session.messages if m.get("role") == "user"]
+        msgs = dicts_from_turns(coord.session.messages)
+        user_msgs = [m for m in msgs if m.get("role") == "user"]
         wake_msg = user_msgs[-1]
         assert wake_msg["content"] == ""
         assert wake_msg.get("_source") == "system_nudge"
-        sys_turns = [m for m in coord.session.messages if m.get("role") == "system"]
+        sys_turns = [m for m in msgs if m.get("role") == "system"]
         idle_turns = [m for m in sys_turns if m["_source"] == "idle_children"]
         assert len(idle_turns) == 1
         text = idle_turns[0]["content"]
