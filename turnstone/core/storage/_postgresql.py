@@ -109,10 +109,10 @@ from turnstone.core.storage._utils import (
 from turnstone.core.storage._utils import (
     escape_like as _escape_like,
 )
-from turnstone.core.storage._utils import normalize_native_for_save, sanitize_text
 from turnstone.core.storage._utils import (
     normalize_search_terms as _normalize_search_terms,
 )
+from turnstone.core.storage._utils import prepare_provider_data_for_save, sanitize_text
 from turnstone.core.storage._utils import (
     reconstruct_messages as _reconstruct_messages,
 )
@@ -292,10 +292,13 @@ class PostgreSQLBackend:
         source: str | None = None,
         event_id: int | None = None,
         is_error: bool = False,
+        producer: str | None = None,
     ) -> int:
         now = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S")
         content = sanitize_text(content)
-        provider_data = normalize_native_for_save(role, sanitize_text(provider_data), tool_calls)
+        provider_data = prepare_provider_data_for_save(
+            role, sanitize_text(provider_data), tool_calls, producer
+        )
         source = sanitize_text(source)
         with self._conn() as conn:
             result = conn.execute(
@@ -339,8 +342,11 @@ class PostgreSQLBackend:
                     "content": sanitize_text(row["content"]),
                     "tool_name": row.get("tool_name"),
                     "tool_call_id": row.get("tool_call_id"),
-                    "provider_data": normalize_native_for_save(
-                        row["role"], sanitize_text(row.get("provider_data")), row.get("tool_calls")
+                    "provider_data": prepare_provider_data_for_save(
+                        row["role"],
+                        sanitize_text(row.get("provider_data")),
+                        row.get("tool_calls"),
+                        row.get("producer"),
                     ),
                     "tool_calls": row.get("tool_calls"),
                     "_source": sanitize_text(row.get("source")),

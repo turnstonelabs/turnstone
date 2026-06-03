@@ -83,6 +83,44 @@ def normalize_native_for_save(
     return json.dumps(kept) if kept else None
 
 
+def wrap_provider_data(provider_data: str | None, producer: str | None) -> str | None:
+    """Wrap a bare native-block list in the storage envelope ``{producer, blocks}``.
+
+    ``producer`` (the provider that generated the turn) lets the lowering layer replay the
+    native lane verbatim only to its producing provider.  Storage-only: the envelope is
+    unwrapped back to a bare block list by :func:`reconstruct_messages`, so every
+    ``_provider_content`` consumer still sees a plain list.  Input that is empty, already
+    wrapped, unparseable, or has no ``producer`` is returned unchanged (the last keeps the
+    legacy bare-list shape, which reconstruct dual-reads).
+    """
+    if not provider_data or not producer:
+        return provider_data
+    try:
+        blocks = json.loads(provider_data)
+    except (json.JSONDecodeError, TypeError):
+        return provider_data
+    if isinstance(blocks, dict) and "blocks" in blocks:
+        return provider_data
+    return json.dumps({"producer": producer, "blocks": blocks})
+
+
+def prepare_provider_data_for_save(
+    role: str | None,
+    provider_data: str | None,
+    tool_calls_json: str | None,
+    producer: str | None,
+) -> str | None:
+    """Save-boundary preparation of the native lane: enforce the mirror, then wrap.
+
+    The single entry point both backends' save paths call:
+    :func:`normalize_native_for_save` (the native↔tool_calls mirror, on the bare block
+    list) followed by :func:`wrap_provider_data` (the ``{producer, blocks}`` envelope).
+    """
+    return wrap_provider_data(
+        normalize_native_for_save(role, provider_data, tool_calls_json), producer
+    )
+
+
 def _attachment_to_content_part(att: dict[str, Any]) -> dict[str, Any] | None:
     """Convert a stored attachment row into an OpenAI-style content part.
 
@@ -491,7 +529,16 @@ def reconstruct_messages(
             msg: dict[str, Any] = {"role": "assistant", "content": content or ""}
             if provider_data:
                 with contextlib.suppress(json.JSONDecodeError, TypeError):
-                    msg["_provider_content"] = json.loads(provider_data)
+                    parsed = json.loads(provider_data)
+                    # Storage envelope ``{producer, blocks}`` (new) vs bare list (legacy):
+                    # surface bare blocks as ``_provider_content`` (every consumer expects a
+                    # plain list) and carry the producer on a stripped-before-wire side channel.
+                    if isinstance(parsed, dict) and "blocks" in parsed:
+                        msg["_provider_content"] = parsed["blocks"]
+                        if parsed.get("producer"):
+                            msg["_producer"] = parsed["producer"]
+                    else:
+                        msg["_provider_content"] = parsed
             if tool_calls_json:
                 with contextlib.suppress(json.JSONDecodeError, TypeError):
                     msg["tool_calls"] = json.loads(tool_calls_json)

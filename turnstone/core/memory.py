@@ -44,6 +44,7 @@ def save_message(
     source: str | None = None,
     event_id: int | None = None,
     is_error: bool = False,
+    producer: str | None = None,
 ) -> int:
     """Log a message to the conversations table.
 
@@ -71,6 +72,7 @@ def save_message(
             source=source,
             event_id=event_id,
             is_error=is_error,
+            producer=producer,
         )
     except Exception:
         log.warning("Failed to save message for ws=%s role=%s", ws_id, role, exc_info=True)

@@ -2591,6 +2591,7 @@ class ChatSession:
                         "provider_data": pd_str,
                         "source": src if isinstance(src, str) and src else None,
                         "is_error": bool(msg.get("is_error", False)),
+                        "producer": msg.get("_producer"),
                     }
                 )
             save_messages_bulk(bulk_rows)
@@ -3935,6 +3936,7 @@ class ChatSession:
                         provider_data=provider_data,
                         tool_calls=tool_calls_json,
                         event_id=self._ui_event_id(),
+                        producer=self._provider.provider_name if self._provider else None,
                     )
 
                 tool_calls = assistant_msg.get("tool_calls")
