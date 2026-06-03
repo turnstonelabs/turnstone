@@ -1,0 +1,62 @@
+{
+  "max_completion_tokens": 4096,
+  "messages": [
+    {
+      "content": "Run the deploy.",
+      "role": "user"
+    },
+    {
+      "content": "",
+      "role": "assistant",
+      "tool_calls": [
+        {
+          "function": {
+            "arguments": "{}",
+            "name": "deploy"
+          },
+          "id": "call_1",
+          "type": "function"
+        }
+      ]
+    },
+    {
+      "content": "deployed",
+      "role": "tool",
+      "tool_call_id": "call_1"
+    },
+    {
+      "content": "Output-guard: deploy output looked clean.",
+      "role": "system"
+    },
+    {
+      "content": "Great, what's next?",
+      "role": "user"
+    }
+  ],
+  "model": "gpt-4o-mini",
+  "stream": true,
+  "stream_options": {
+    "include_usage": true
+  },
+  "temperature": 0.5,
+  "tools": [
+    {
+      "function": {
+        "description": "Look up the weather for a city.",
+        "name": "get_weather",
+        "parameters": {
+          "properties": {
+            "city": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "city"
+          ],
+          "type": "object"
+        }
+      },
+      "type": "function"
+    }
+  ]
+}

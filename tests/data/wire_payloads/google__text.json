@@ -1,0 +1,23 @@
+{
+  "max_tokens": 4096,
+  "messages": [
+    {
+      "content": "Hi there.",
+      "role": "user"
+    },
+    {
+      "content": "Hello! How can I help?",
+      "role": "assistant"
+    },
+    {
+      "content": "What's the weather in Paris?",
+      "role": "user"
+    }
+  ],
+  "model": "gemini-2.5-pro",
+  "stream": true,
+  "stream_options": {
+    "include_usage": true
+  },
+  "temperature": 0.5
+}

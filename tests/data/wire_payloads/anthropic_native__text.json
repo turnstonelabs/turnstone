@@ -1,0 +1,33 @@
+{
+  "cache_control": {
+    "type": "ephemeral"
+  },
+  "max_tokens": 4096,
+  "messages": [
+    {
+      "content": "Hi there.",
+      "role": "user"
+    },
+    {
+      "content": [
+        {
+          "text": "Hello! How can I help?",
+          "type": "text"
+        }
+      ],
+      "role": "assistant"
+    },
+    {
+      "content": "What's the weather in Paris?",
+      "role": "user"
+    }
+  ],
+  "model": "claude-opus-4-8",
+  "output_config": {
+    "effort": "medium"
+  },
+  "thinking": {
+    "display": "summarized",
+    "type": "adaptive"
+  }
+}

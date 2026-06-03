@@ -1,0 +1,30 @@
+{
+  "include": [
+    "reasoning.encrypted_content"
+  ],
+  "input": [
+    {
+      "content": "Hi there.",
+      "role": "user",
+      "type": "message"
+    },
+    {
+      "content": "Hello! How can I help?",
+      "role": "assistant",
+      "type": "message"
+    },
+    {
+      "content": "What's the weather in Paris?",
+      "role": "user",
+      "type": "message"
+    }
+  ],
+  "max_output_tokens": 4096,
+  "model": "gpt-5",
+  "prompt_cache_retention": "24h",
+  "reasoning": {
+    "effort": "medium"
+  },
+  "store": false,
+  "stream": true
+}
