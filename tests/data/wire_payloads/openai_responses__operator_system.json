@@ -1,0 +1,56 @@
+{
+  "include": [
+    "reasoning.encrypted_content"
+  ],
+  "input": [
+    {
+      "content": "Run the deploy.",
+      "role": "user",
+      "type": "message"
+    },
+    {
+      "arguments": "{}",
+      "call_id": "call_1",
+      "name": "deploy",
+      "type": "function_call"
+    },
+    {
+      "call_id": "call_1",
+      "output": "deployed",
+      "type": "function_call_output"
+    },
+    {
+      "content": "Great, what's next?",
+      "role": "user",
+      "type": "message"
+    }
+  ],
+  "instructions": "Output-guard: deploy output looked clean.",
+  "max_output_tokens": 4096,
+  "model": "gpt-5",
+  "prompt_cache_retention": "24h",
+  "reasoning": {
+    "effort": "medium"
+  },
+  "store": false,
+  "stream": true,
+  "tools": [
+    {
+      "description": "Look up the weather for a city.",
+      "name": "get_weather",
+      "parameters": {
+        "properties": {
+          "city": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "city"
+        ],
+        "type": "object"
+      },
+      "strict": false,
+      "type": "function"
+    }
+  ]
+}
