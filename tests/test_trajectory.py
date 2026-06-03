@@ -15,11 +15,12 @@ import pytest
 from turnstone.core.trajectory import (
     AttachmentRef,
     ProviderNative,
-    RawContentBlock,
     Role,
     TextBlock,
     ToolCall,
     Turn,
+    materialize_attachments,
+    resolve_attachment_parts,
     turn_from_dict,
     turn_to_dict,
     turns_from_dicts,
@@ -34,7 +35,7 @@ _ROUNDTRIP: list[dict[str, Any]] = [
         "role": "user",
         "content": [
             {"type": "text", "text": "what's this?"},
-            {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}},
+            {"type": "image", "attachment_id": "sha256:aaaa"},
         ],
         "_attachments_meta": [{"kind": "image", "filename": "x.png", "mime_type": "image/png"}],
     },
@@ -84,7 +85,7 @@ _ROUNDTRIP: list[dict[str, Any]] = [
         "tool_call_id": "c3",
         "content": [
             {"type": "text", "text": "saw an image"},
-            {"type": "image_url", "image_url": {"url": "data:image/png;base64,BBBB"}},
+            {"type": "image", "attachment_id": "sha256:bbbb"},
         ],
     },
     {"role": "system", "content": "guard note", "_source": "output_guard"},
@@ -162,18 +163,18 @@ def test_tool_calls_map_to_typed_toolcalls() -> None:
     assert t.tool_calls == (ToolCall(id="c1", name="f", arguments="{}"),)
 
 
-def test_multipart_text_part_stays_textblock_image_is_raw() -> None:
+def test_multipart_text_textblock_placeholder_attachmentref() -> None:
     t = turn_from_dict(
         {
             "role": "user",
             "content": [
                 {"type": "text", "text": "q"},
-                {"type": "image_url", "image_url": {"url": "data:..."}},
+                {"type": "image", "attachment_id": "sha256:abc"},
             ],
         }
     )
     assert isinstance(t.content[0], TextBlock) and t.content[0].text == "q"
-    assert isinstance(t.content[1], RawContentBlock)
+    assert isinstance(t.content[1], AttachmentRef)
     assert t.text == "q"  # only the text part contributes to FTS
 
 
@@ -190,7 +191,8 @@ def test_empty_content_roundtrips_to_empty_string() -> None:
 
 def test_attachment_ref_is_the_canonical_non_text_form() -> None:
     # By-reference placeholders ``{type: image|document, attachment_id}`` are the
-    # canonical content; a real inline ``image_url`` (no id) stays a RawContentBlock.
+    # canonical non-text content; a resolved inline ``image_url`` (no id) never
+    # reaches turn_from_dict on the canonical path and is dropped if it does.
     t = turn_from_dict(
         {
             "role": "user",
@@ -202,9 +204,9 @@ def test_attachment_ref_is_the_canonical_non_text_form() -> None:
             ],
         }
     )
-    assert isinstance(t.content[1], AttachmentRef) and t.content[1].attachment_id == "sha256:abc"
-    assert isinstance(t.content[2], AttachmentRef) and t.content[2].kind == "document"
-    assert isinstance(t.content[3], RawContentBlock)  # resolved inline part, no id
+    assert [type(b).__name__ for b in t.content] == ["TextBlock", "AttachmentRef", "AttachmentRef"]
+    assert t.content[1].attachment_id == "sha256:abc"  # type: ignore[union-attr]
+    assert t.content[2].kind == "document"  # type: ignore[union-attr]
 
 
 def test_attachment_ref_emits_placeholder() -> None:
@@ -212,20 +214,45 @@ def test_attachment_ref_emits_placeholder() -> None:
     assert turn_to_dict(t)["content"] == [{"type": "image", "attachment_id": "abc"}]
 
 
-def test_resolve_attachment_refs_materializes_and_drops_missing() -> None:
-    from turnstone.core.trajectory import resolve_attachment_refs
-
-    turns = [
-        Turn(
-            Role.USER,
-            (
-                TextBlock("look"),
-                AttachmentRef(attachment_id="a1", kind="image"),
-                AttachmentRef(attachment_id="gone", kind="image"),
-            ),
-        )
-    ]
+def test_resolve_attachment_parts_materializes_and_drops_missing() -> None:
+    # The dict-side resolver: placeholders → inline parts; a pruned id is dropped.
     part = {"type": "image_url", "image_url": {"url": "data:img"}}
-    out = turn_to_dict(resolve_attachment_refs(turns, {"a1": part})[0])
-    # a1 → inline part; the pruned ref is dropped; text kept.
-    assert out["content"] == [{"type": "text", "text": "look"}, part]
+    messages = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "look"},
+                {"type": "image", "attachment_id": "a1"},
+                {"type": "image", "attachment_id": "gone"},
+            ],
+        }
+    ]
+    out = resolve_attachment_parts(messages, {"a1": part})
+    assert out[0]["content"] == [{"type": "text", "text": "look"}, part]
+
+
+def test_resolve_attachment_parts_identity_when_no_placeholders() -> None:
+    messages = [{"role": "user", "content": "hi"}]
+    assert resolve_attachment_parts(messages, {}) is messages
+
+
+def test_materialize_attachments_collects_ids_and_substitutes() -> None:
+    part = {"type": "image_url", "image_url": {"url": "data:img"}}
+    seen_ids: list[list[str]] = []
+
+    def _resolve(ids: list[str]) -> dict[str, dict[str, object]]:
+        seen_ids.append(ids)
+        return {"a1": part}
+
+    messages = [
+        {"role": "user", "content": [{"type": "image", "attachment_id": "a1"}]},
+    ]
+    out = materialize_attachments(messages, _resolve)
+    assert seen_ids == [["a1"]]  # collected the placeholder id
+    assert out[0]["content"] == [part]
+
+
+def test_materialize_attachments_noop_without_resolver_or_placeholders() -> None:
+    messages = [{"role": "user", "content": "hi"}]
+    assert materialize_attachments(messages, None) is messages
+    assert materialize_attachments(messages, lambda ids: {}) is messages

@@ -20,9 +20,10 @@ from turnstone.core.providers._protocol import (
     _join_reasoning_with_cap,
     _lookup_capabilities,
 )
+from turnstone.core.trajectory import materialize_attachments
 
 if TYPE_CHECKING:
-    from collections.abc import Iterator
+    from collections.abc import Callable, Iterator
 
 log = logging.getLogger(__name__)
 
@@ -696,7 +697,9 @@ class AnthropicProvider:
         capabilities: ModelCapabilities | None = None,
         replay_reasoning_to_model: bool = True,
         extra_headers: dict[str, str] | None = None,
+        resolve_attachments: Callable[[list[str]], dict[str, dict[str, Any]]] | None = None,
     ) -> Iterator[StreamChunk]:
+        messages = materialize_attachments(messages, resolve_attachments)
         _ensure_anthropic()
         caps = capabilities or self.get_capabilities(model)
         system_prompt, converted_msgs = self._convert_messages(
@@ -908,7 +911,9 @@ class AnthropicProvider:
         capabilities: ModelCapabilities | None = None,
         replay_reasoning_to_model: bool = True,
         extra_headers: dict[str, str] | None = None,
+        resolve_attachments: Callable[[list[str]], dict[str, dict[str, Any]]] | None = None,
     ) -> CompletionResult:
+        messages = materialize_attachments(messages, resolve_attachments)
         _ensure_anthropic()
         caps = capabilities or self.get_capabilities(model)
         system_prompt, converted_msgs = self._convert_messages(

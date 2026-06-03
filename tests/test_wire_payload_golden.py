@@ -117,7 +117,12 @@ def _capture(
     # folded/empty-dropped; repair is the remaining send-side pass.
     messages = dicts_from_turns(repair_wire_messages(turns_from_dicts(messages)))
     gen = provider.create_streaming(
-        client=client, model=model, messages=messages, capabilities=caps, **opts
+        client=client,
+        model=model,
+        messages=messages,
+        capabilities=caps,
+        resolve_attachments=_capture_resolver,
+        **opts,
     )
     # kwargs are recorded eagerly during the call above; close the (unconsumed)
     # iterator so any stream-manager cleanup runs against the empty stub.
@@ -239,20 +244,33 @@ FIX_NATIVE_ORPHAN: list[dict[str, Any]] = [
 ]
 
 # Multipart user content (image attachment as the provider receives it today).
+# By-reference image: the trajectory carries a {type:image, attachment_id}
+# placeholder; the translator materializes it to the inline part below via the
+# resolver _capture passes (mirroring ChatSession._resolve_attachments).
+_MULTIPART_IMG_ID = "mp-image-hash"
+_MULTIPART_IMAGE_PART: dict[str, Any] = {
+    "type": "image_url",
+    "image_url": {
+        "url": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg=="
+    },
+}
+
 FIX_MULTIPART: list[dict[str, Any]] = [
     {
         "role": "user",
         "content": [
             {"type": "text", "text": "What's in this image?"},
-            {
-                "type": "image_url",
-                "image_url": {
-                    "url": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg=="
-                },
-            },
+            {"type": "image", "attachment_id": _MULTIPART_IMG_ID},
         ],
     },
 ]
+
+
+def _capture_resolver(ids: list[str]) -> dict[str, dict[str, Any]]:
+    """Stand-in for ``ChatSession._resolve_attachments`` — maps the fixture's
+    by-reference image id to its inline content part."""
+    return {_MULTIPART_IMG_ID: _MULTIPART_IMAGE_PART} if _MULTIPART_IMG_ID in ids else {}
+
 
 # Operator-context system turn left inline (the native mid-conversation-system path).
 FIX_OPERATOR_SYSTEM: list[dict[str, Any]] = [

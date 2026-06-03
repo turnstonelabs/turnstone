@@ -129,11 +129,9 @@ from turnstone.core.tools import (
     merge_mcp_tools,
 )
 from turnstone.core.trajectory import (
-    AttachmentRef,
     Role,
     Turn,
     dicts_from_turns,
-    resolve_attachment_refs,
     turn_from_dict,
     turn_to_dict,
     turns_from_dicts,
@@ -2887,34 +2885,29 @@ class ChatSession:
         self._agent_system_messages = list(new_system_messages)
 
     def _full_messages(self) -> list[dict[str, Any]]:
-        """System messages + conversation history, lowered to wire dicts.
+        """System messages + conversation history as wire dicts.
 
-        ``self.messages`` is the canonical ``Turn`` trajectory; the wire-prep and
-        provider layers still consume dicts, so the Turns are lowered here (this
-        boundary moves inward when those layers migrate).  By-reference
-        attachments are materialized to inline parts at this output boundary."""
-        return self.system_messages + self._lower_messages_to_wire(self.messages)
+        ``self.messages`` is the canonical ``Turn`` trajectory; lowering it here
+        emits by-reference attachments as ``{type: kind, attachment_id}``
+        placeholders.  The provider translator materializes them to inline bytes
+        via :meth:`_resolve_attachments` — resolution lives at the C layer."""
+        return self.system_messages + dicts_from_turns(self.messages)
 
-    def _lower_messages_to_wire(self, turns: list[Turn]) -> list[dict[str, Any]]:
-        """Lower canonical Turns to wire dicts, resolving AttachmentRef → bytes.
+    def _resolve_attachments(self, ids: list[str]) -> dict[str, dict[str, Any]]:
+        """Resolve content-addressed attachment ids to inline wire content parts.
 
-        Attachment content lives by reference in ``self.messages`` (ids, not
-        bytes); at this output boundary the referenced blobs are batch-fetched
-        from the content-addressed store and expanded to inline content parts —
-        the same ``data:…``/document parts the providers have always received.
-        Allocation-free when no turn carries an attachment.
-        """
-        ids = sorted(
-            {b.attachment_id for t in turns for b in t.content if isinstance(b, AttachmentRef)}
-        )
+        The send-time materialization of the by-reference content lane: handed to
+        the provider translator, which calls it with the placeholder ids it finds
+        and expands each to the inline ``data:…`` / document part the wire needs.
+        Blobs are batch-fetched from the content-addressed store; a pruned id
+        resolves to nothing and the translator drops its placeholder."""
         if not ids:
-            return dicts_from_turns(turns)
-        parts_by_id = {
+            return {}
+        return {
             str(att["attachment_id"]): part
             for att in get_attachments(ids)
             if (part := attachment_to_content_part(att)) is not None
         }
-        return dicts_from_turns(resolve_attachment_refs(turns, parts_by_id))
 
     def _prepare_wire_messages(
         self,
@@ -3437,6 +3430,7 @@ class ChatSession:
                     replay_reasoning_to_model=self._resolve_replay_reasoning_to_model(
                         model_alias, caps=resolved_caps
                     ),
+                    resolve_attachments=self._resolve_attachments,
                 )
             except Exception as e:
                 ename = type(e).__name__
@@ -3655,47 +3649,62 @@ class ChatSession:
         set_message_attachments(self._ws_id, message_id, ref_ids)
 
     @staticmethod
-    def _image_parts_to_attachments(
-        output: list[dict[str, Any]], tool_name: str
-    ) -> list[Attachment]:
-        """Decode ``image_url`` data-URI parts in tool output into Attachments.
+    def _decode_image_part(part: Any, tool_name: str) -> Attachment | None:
+        """Decode one ``image_url`` data-URI content part into an Attachment.
 
-        Tool vision output (e.g. ``read_file`` on an image) carries inline
-        ``data:<mime>;base64,<...>`` image parts.  Decode them back to bytes,
-        derive the content hash as the ``attachment_id``, and return one
-        ``Attachment`` per image so the caller can persist them
-        content-addressed.  Non-image / non-data-URI parts and undecodable
-        payloads are skipped (the inline part still rides the live wire).
+        Returns ``None`` for non-image / non-data-URI / undecodable parts.  The
+        ``attachment_id`` is the content hash, so persisting is idempotent and
+        the same bytes dedupe across turns/conversations.
         """
+        if not (isinstance(part, dict) and part.get("type") == "image_url"):
+            return None
+        url = (part.get("image_url") or {}).get("url") or ""
+        if not url.startswith("data:") or ";base64," not in url:
+            return None
+        header, _, b64 = url.partition(";base64,")
+        mime = header[len("data:") :] or "image/png"
+        try:
+            # ``binascii.Error`` (malformed payload) subclasses ``ValueError``.
+            raw = base64.b64decode(b64, validate=True)
+        except ValueError:
+            log.warning("tool %s emitted an undecodable image data URI; not persisting", tool_name)
+            return None
+        ext = (mimetypes.guess_extension(mime) or ".png").lstrip(".")
+        return Attachment(
+            attachment_id=hashlib.sha256(raw).hexdigest(),
+            filename=f"{tool_name or 'tool'}-image.{ext}",
+            mime_type=mime,
+            kind="image",
+            content=raw,
+        )
+
+    @classmethod
+    def _tool_content_by_reference(
+        cls, output: Any, tool_name: str
+    ) -> tuple[Any, list[Attachment]]:
+        """Build the tool turn's content with image parts BY REFERENCE.
+
+        For list output (vision tool results), each decodable ``image_url`` part
+        becomes a ``{type: "image", attachment_id}`` placeholder and its bytes
+        are returned for content-addressed persistence; text parts pass through;
+        an undecodable image part is dropped (it was never persistable, and a
+        by-reference trajectory carries no inline bytes).  Non-list output is
+        returned unchanged with no attachments.
+        """
+        if not isinstance(output, list):
+            return output, []
+        content: list[Any] = []
         atts: list[Attachment] = []
         for part in output:
-            if not (isinstance(part, dict) and part.get("type") == "image_url"):
-                continue
-            url = (part.get("image_url") or {}).get("url") or ""
-            if not url.startswith("data:") or ";base64," not in url:
-                continue
-            header, _, b64 = url.partition(";base64,")
-            mime = header[len("data:") :] or "image/png"
-            try:
-                # ``binascii.Error`` (raised on a malformed payload) subclasses
-                # ``ValueError``, so a single except covers both.
-                raw = base64.b64decode(b64, validate=True)
-            except ValueError:
-                log.warning(
-                    "tool %s emitted an undecodable image data URI; not persisting", tool_name
-                )
-                continue
-            ext = (mimetypes.guess_extension(mime) or ".png").lstrip(".")
-            atts.append(
-                Attachment(
-                    attachment_id=hashlib.sha256(raw).hexdigest(),
-                    filename=f"{tool_name or 'tool'}-image.{ext}",
-                    mime_type=mime,
-                    kind="image",
-                    content=raw,
-                )
-            )
-        return atts
+            att = cls._decode_image_part(part, tool_name)
+            if att is not None:
+                content.append({"type": "image", "attachment_id": att.attachment_id})
+                atts.append(att)
+            elif isinstance(part, dict) and part.get("type") == "image_url":
+                continue  # undecodable image — unpersistable, drop from the by-ref turn
+            else:
+                content.append(part)
+        return content, atts
 
     def _append_system_turn(self, source: str, content: str, **meta: Any) -> None:
         """Append a first-class operator-context system turn and persist it.
@@ -4084,10 +4093,16 @@ class ChatSession:
                         assessment, _tc_names.get(tc_id, ""), _ri == _last_idx
                     )
 
+                    _tname = _tc_names.get(tc_id, "")
+                    # Image output rides the canonical turn BY REFERENCE: the
+                    # inline bytes stay on ``output`` (token est + store_text +
+                    # persist below) while the turn carries ``{type:image,
+                    # attachment_id}`` placeholders the wire resolves at send.
+                    tool_content, tool_image_atts = self._tool_content_by_reference(output, _tname)
                     tool_msg: dict[str, Any] = {
                         "role": "tool",
                         "tool_call_id": tc_id,
-                        "content": output,
+                        "content": tool_content,
                     }
                     tool_is_error = self._tool_error_flags.pop(tc_id, False)
                     if tool_is_error:
@@ -4114,20 +4129,15 @@ class ChatSession:
                     # ``self.messages[i]['content']`` (no envelope).  Size is
                     # already bounded by ``_truncate_output`` above (per-turn
                     # context budget); no second cap needed.
-                    _tname = _tc_names.get(tc_id, "")
-                    tool_image_atts: list[Attachment] = []
+                    # ``tool_content``/``tool_image_atts`` were computed above
+                    # (the turn carries the refs); persist the same bytes
+                    # content-addressed so the vision output survives a reload.
                     if isinstance(output, list):
                         store_text: str = " ".join(
                             p.get("text", "")
                             for p in output
                             if isinstance(p, dict) and p.get("type") == "text"
                         )
-                        # Persist any image parts content-addressed so vision
-                        # tool output (e.g. read_file on an image) survives a
-                        # reload — the flattened text alone would drop it.  The
-                        # in-memory ``output`` keeps its inline image_url for
-                        # the live wire; only the ref is persisted.
-                        tool_image_atts = self._image_parts_to_attachments(output, _tname)
                     else:
                         store_text = output
                     tool_message_id = save_message(

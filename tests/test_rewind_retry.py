@@ -262,7 +262,9 @@ class TestRetry:
                     "role": "user",
                     "content": [
                         {"type": "text", "text": "describe this"},
-                        {"type": "image_url", "image_url": {"url": "data:image/png;base64,AA=="}},
+                        # Canonical non-text content is a by-reference placeholder;
+                        # the turn stays multipart, so retry refuses it.
+                        {"type": "image", "attachment_id": "sha256:abc"},
                     ],
                 },
                 {"role": "assistant", "content": "It's an image."},

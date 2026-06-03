@@ -10,18 +10,20 @@ canonical would break cross-provider resume.
 Field set and rationale: ``docs/design/canonical-trajectory-ideal-target.md`` §2.
 
 NOTE: non-text content rides as ``AttachmentRef`` — a reference to a content-addressed
-blob in ``workstream_attachments``.  ``Turn``s never carry bytes; each output boundary
-(the provider wire, the ``/history`` display, export) materializes the reference to an
-inline part by point-lookup against the blob store.  ``RawContentBlock`` is the transient
-carrier for an already-resolved inline part as it rides the dict↔Turn bridge — never a
-persisted or canonical form.
+blob in ``workstream_attachments``.  ``Turn``s never carry bytes, and the dict bridge
+carries only the ``{type: kind, attachment_id}`` placeholder.  Each output boundary (the
+provider translator, the ``/history`` display, export) materializes the placeholder to an
+inline part by point-lookup against the blob store, via :func:`resolve_attachment_parts`.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field
 from enum import StrEnum
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
 
 
 class Role(StrEnum):
@@ -55,23 +57,7 @@ class AttachmentRef:
     kind: str
 
 
-@dataclass(slots=True)
-class RawContentBlock:
-    """Transient carrier for an already-resolved wire content-part dict (``image_url``
-    / ``document``).
-
-    The canonical non-text content form is :class:`AttachmentRef` (by reference);
-    at an output boundary the reference is materialized to an inline part, and that
-    inline part rides the dict↔Turn bridge here so multipart turns round-trip
-    byte-identically.  Never persisted, never in ``session.messages`` — only
-    transiently between :func:`resolve_attachment_refs` and the translator.
-    Contributes nothing to :attr:`Turn.text` (you cannot full-text-search an image).
-    """
-
-    part: dict[str, Any]
-
-
-ContentBlock = TextBlock | AttachmentRef | RawContentBlock
+ContentBlock = TextBlock | AttachmentRef
 
 
 @dataclass(slots=True)
@@ -190,22 +176,19 @@ def _content_from_raw(raw: Any) -> tuple[ContentBlock, ...]:
     if isinstance(raw, list):
         blocks: list[ContentBlock] = []
         for part in raw:
-            if not isinstance(part, dict):
-                blocks.append(RawContentBlock(part))
-            elif part.get("type") == "text":
+            if isinstance(part, dict) and part.get("type") == "text":
                 blocks.append(TextBlock(part.get("text", "")))
-            elif part.get("attachment_id"):
+            elif isinstance(part, dict) and part.get("attachment_id"):
                 # The by-reference placeholder ``{type: kind, attachment_id}`` —
-                # the canonical form for non-text content (bytes resolve at send).
+                # the canonical form for non-text content (bytes resolve at the
+                # translator).  A *resolved* inline part never reaches here:
+                # resolution is terminal (the wire payload / display output), so
+                # such a part is dropped rather than carried as bytes.
                 blocks.append(
                     AttachmentRef(attachment_id=part["attachment_id"], kind=part.get("type", ""))
                 )
-            else:
-                # A resolved inline part (image_url / document, carrying bytes) —
-                # transient wire-prep form that rides the dict↔Turn bridge.
-                blocks.append(RawContentBlock(part))
         return tuple(blocks)
-    return (RawContentBlock(raw),)  # defensive — unexpected scalar
+    return ()  # unexpected scalar — drop
 
 
 def _content_to_raw(content: tuple[ContentBlock, ...]) -> str | list[dict[str, Any]]:
@@ -225,9 +208,9 @@ def _content_to_raw(content: tuple[ContentBlock, ...]) -> str | list[dict[str, A
     for b in content:
         if isinstance(b, TextBlock):
             parts.append({"type": "text", "text": b.text})
-        elif isinstance(b, RawContentBlock):
-            parts.append(b.part)
-        elif isinstance(b, AttachmentRef):  # by-reference placeholder (unresolved)
+        elif isinstance(b, AttachmentRef):
+            # By-reference placeholder; the translator (or reconstruct) resolves
+            # it to an inline part via :func:`resolve_attachment_parts`.
             parts.append({"type": b.kind, "attachment_id": b.attachment_id})
     return parts
 
@@ -308,31 +291,71 @@ def dicts_from_turns(turns: list[Turn]) -> list[dict[str, Any]]:
     return [turn_to_dict(t) for t in turns]
 
 
-def resolve_attachment_refs(
-    turns: list[Turn], parts_by_id: dict[str, dict[str, Any]]
-) -> list[Turn]:
-    """Replace each :class:`AttachmentRef` with its resolved inline content part.
+def resolve_attachment_parts(
+    messages: list[dict[str, Any]], parts_by_id: dict[str, dict[str, Any]]
+) -> list[dict[str, Any]]:
+    """Replace by-reference attachment placeholders with resolved inline parts.
 
-    *parts_by_id* maps an ``attachment_id`` to the wire content part (image_url /
-    document) built from the content-addressed blob — the bytes a translator
-    needs.  This is the send-time materialization of the by-reference content
-    lane; a ref whose blob is missing (pruned) is dropped, so the wire never
-    carries an unresolved reference.  Identity-preserving for turns that hold no
-    ``AttachmentRef``; never mutates the input turns.
+    The by-reference content lane reaches the wire (and ``/history`` display) as
+    ``{type: kind, attachment_id}`` placeholders in a message's list content;
+    *parts_by_id* maps an id to the inline content part (image_url / document)
+    built from the content-addressed blob.  This is the materialization the
+    translator — and reconstruct, for display — runs at its output boundary: a
+    placeholder whose blob is missing (pruned) is dropped, so a consumer never
+    sees an unresolved reference.  Identity-preserving when no message carries a
+    placeholder; never mutates the input.
     """
-    out: list[Turn] = []
-    for t in turns:
-        if not any(isinstance(b, AttachmentRef) for b in t.content):
-            out.append(t)
+
+    def _refs(content: Any) -> bool:
+        return isinstance(content, list) and any(
+            isinstance(p, dict) and p.get("attachment_id") for p in content
+        )
+
+    if not any(_refs(m.get("content")) for m in messages):
+        return messages
+    out: list[dict[str, Any]] = []
+    for m in messages:
+        content = m.get("content")
+        if not isinstance(content, list) or not _refs(content):
+            out.append(m)
             continue
-        new_content: list[ContentBlock] = []
-        for b in t.content:
-            if isinstance(b, AttachmentRef):
-                part = parts_by_id.get(b.attachment_id)
-                if part is not None:
-                    new_content.append(RawContentBlock(part))
-                # else: the blob is gone (pruned) — drop the ref.
+        new_parts: list[Any] = []
+        for p in content:
+            if isinstance(p, dict) and p.get("attachment_id"):
+                resolved = parts_by_id.get(str(p["attachment_id"]))
+                if resolved is not None:
+                    new_parts.append(resolved)
+                # else: pruned blob — drop the placeholder.
             else:
-                new_content.append(b)
-        out.append(replace(t, content=tuple(new_content)))
+                new_parts.append(p)
+        out.append({**m, "content": new_parts})
     return out
+
+
+def materialize_attachments(
+    messages: list[dict[str, Any]],
+    resolve: Callable[[list[str]], dict[str, dict[str, Any]]] | None,
+) -> list[dict[str, Any]]:
+    """Expand by-reference attachment placeholders to inline parts at the wire.
+
+    The translator's entry point for the by-reference content lane: collect the
+    placeholder ids across *messages*, ask *resolve* (a storage point-lookup the
+    session hands down) for their inline content parts, and substitute via
+    :func:`resolve_attachment_parts`.  A ``None`` resolver (no storage — e.g. a
+    unit test or an in-memory sub-agent whose media is already inline) or a
+    placeholder-free trajectory is a no-op, so the common path is allocation-free.
+    """
+    if resolve is None:
+        return messages
+    ids = sorted(
+        {
+            str(p["attachment_id"])
+            for m in messages
+            if isinstance(m.get("content"), list)
+            for p in m["content"]
+            if isinstance(p, dict) and p.get("attachment_id")
+        }
+    )
+    if not ids:
+        return messages
+    return resolve_attachment_parts(messages, resolve(ids))

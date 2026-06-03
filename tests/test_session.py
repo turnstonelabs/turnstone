@@ -3428,7 +3428,12 @@ class TestMetacognitiveBuffers:
                     "call_x",
                     [
                         {"type": "text", "text": "the chart shows X"},
-                        {"type": "image_url", "image_url": {"url": "data:image/png;base64,xxx"}},
+                        {
+                            "type": "image_url",
+                            "image_url": {
+                                "url": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg=="
+                            },
+                        },
                     ],
                 )
             ], None

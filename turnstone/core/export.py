@@ -34,7 +34,8 @@ from turnstone.core.history_decoration import (
 )
 from turnstone.core.lowering import repair_wire_messages
 from turnstone.core.providers._openai_common import sanitize_messages
-from turnstone.core.trajectory import dicts_from_turns, turns_from_dicts
+from turnstone.core.storage._utils import attachment_to_content_part
+from turnstone.core.trajectory import dicts_from_turns, materialize_attachments
 
 if TYPE_CHECKING:
     from turnstone.core.storage import StorageBackend
@@ -80,17 +81,27 @@ def _attach_reasoning_content(messages: list[dict[str, Any]]) -> list[dict[str, 
 
 
 def _build_openai_json(storage: StorageBackend, ws_id: str) -> bytes:
-    """Serialize one workstream's history as an OpenAI envelope (JSON bytes)."""
-    # Export bypasses the session send path, so it runs the send-time orphan
-    # repair itself (``load`` only strips the trailing turn) — otherwise a
-    # mid-conversation orphaned tool_call would serialize as an unanswered call.
-    # Repair (the canonical Turn round-trip) runs BEFORE reasoning attach: the
-    # latter stamps a non-canonical ``reasoning_content`` key that the Turn model
-    # does not carry, and the two passes are independent (tool turns vs assistant
-    # reasoning).
-    loaded = storage.load_messages(ws_id, repair=True)
-    repaired = dicts_from_turns(repair_wire_messages(turns_from_dicts(loaded)))
-    messages = sanitize_messages(_attach_reasoning_content(repaired))
+    """Serialize one workstream's history as an OpenAI envelope (JSON bytes).
+
+    Export bypasses the session send path, so it lowers the canonical ``Turn``
+    trajectory itself: ``load_message_turns`` strips a trailing incomplete
+    tool-call turn, ``repair_wire_messages`` synthesizes mid-conversation
+    cancellations, and ``materialize_attachments`` (with a storage resolver)
+    expands by-reference content to inline parts — the C-layer step the provider
+    translators run for the wire.  Reasoning attach runs last (its non-canonical
+    ``reasoning_content`` key is not carried by the Turn model).
+    """
+
+    def _resolve(ids: list[str]) -> dict[str, dict[str, Any]]:
+        return {
+            str(att["attachment_id"]): part
+            for att in storage.get_attachments(ids)
+            if (part := attachment_to_content_part(att)) is not None
+        }
+
+    turns = repair_wire_messages(storage.load_message_turns(ws_id))
+    dicts = materialize_attachments(dicts_from_turns(turns), _resolve)
+    messages = sanitize_messages(_attach_reasoning_content(dicts))
     return json.dumps({"messages": messages}, ensure_ascii=False, indent=2).encode("utf-8")
 
 

@@ -19,7 +19,7 @@ from turnstone.core.trajectory import (
     Turn,
     TurnMeta,
     dicts_from_turns,
-    resolve_attachment_refs,
+    resolve_attachment_parts,
 )
 
 log = get_logger(__name__)
@@ -572,6 +572,7 @@ def reconstruct_messages(
     # Dict consumers (display, export) want materialized content, so resolve the
     # by-reference attachments to inline parts using the blob rows already in
     # hand.  ``load_message_turns`` is the unresolved canonical path for resume.
+    dicts = dicts_from_turns(turns)
     if attachments_by_msg:
         parts_by_id = {
             str(att.get("attachment_id") or ""): part
@@ -580,8 +581,8 @@ def reconstruct_messages(
             if (part := attachment_to_content_part(att)) is not None
         }
         if parts_by_id:
-            turns = resolve_attachment_refs(turns, parts_by_id)
-    return dicts_from_turns(turns)
+            dicts = resolve_attachment_parts(dicts, parts_by_id)
+    return dicts
 
 
 def _content_blocks(text: str | None, refs: list[AttachmentRef]) -> tuple[ContentBlock, ...]:

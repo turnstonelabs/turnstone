@@ -9,7 +9,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
-    from collections.abc import Iterator
+    from collections.abc import Callable, Iterator
 
 import structlog
 
@@ -30,6 +30,7 @@ from turnstone.core.providers._protocol import (
     ToolCallDelta,
     _join_reasoning_with_cap,
 )
+from turnstone.core.trajectory import materialize_attachments
 
 log = structlog.get_logger(__name__)
 
@@ -179,7 +180,9 @@ class OpenAIChatCompletionsProvider:
         capabilities: ModelCapabilities | None = None,
         replay_reasoning_to_model: bool = True,
         extra_headers: dict[str, str] | None = None,
+        resolve_attachments: Callable[[list[str]], dict[str, dict[str, Any]]] | None = None,
     ) -> Iterator[StreamChunk]:
+        messages = materialize_attachments(messages, resolve_attachments)
         caps = capabilities or self.get_capabilities(model)
         messages = self._prepare_messages(messages)
         kwargs: dict[str, Any] = {
@@ -313,7 +316,9 @@ class OpenAIChatCompletionsProvider:
         # See create_streaming above for the Phase 2 reasoning-persistence rationale.
         replay_reasoning_to_model: bool = True,
         extra_headers: dict[str, str] | None = None,
+        resolve_attachments: Callable[[list[str]], dict[str, dict[str, Any]]] | None = None,
     ) -> CompletionResult:
+        messages = materialize_attachments(messages, resolve_attachments)
         caps = capabilities or self.get_capabilities(model)
         messages = self._prepare_messages(messages)
         kwargs: dict[str, Any] = {
