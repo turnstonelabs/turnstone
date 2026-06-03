@@ -14,6 +14,75 @@ from turnstone.core.log import get_logger
 log = get_logger(__name__)
 
 
+# Client tool-call block types across providers, used to enforce the
+# native↔tool_calls mirror (see ``normalize_native_for_save``).  Anthropic emits
+# ``tool_use``; OpenAI Responses ``function_call``; Google's OpenAI-compat lane
+# ``function``.  Server-side tool blocks (``server_tool_use`` /
+# ``web_search_tool_result`` / ``web_search_call`` / ``*_call`` results) and
+# reasoning blocks are deliberately absent: they carry no client ``tool_result`` to
+# orphan and must round-trip verbatim.
+_CLIENT_TOOL_CALL_BLOCK_TYPES: frozenset[str] = frozenset({"tool_use", "function_call", "function"})
+
+
+def strip_orphan_client_tool_blocks(blocks: list[Any]) -> list[Any]:
+    """Drop client tool-call blocks from a provider-native block list.
+
+    Used when an assistant turn carries no ``tool_calls``: a client tool-call block
+    left in the native lane would replay as an orphan ``tool_use`` / ``function_call``
+    with no matching ``tool_result`` and be rejected by the API on a same-provider
+    resume.  Reasoning / server-tool / web-search blocks are preserved.  Returns a new
+    list; the input is not mutated.
+    """
+    return [
+        b
+        for b in blocks
+        if not (isinstance(b, dict) and b.get("type") in _CLIENT_TOOL_CALL_BLOCK_TYPES)
+    ]
+
+
+def _has_tool_calls(tool_calls_json: str | None) -> bool:
+    """True when the stored ``tool_calls`` JSON encodes a non-empty list."""
+    if not tool_calls_json:
+        return False
+    try:
+        parsed = json.loads(tool_calls_json)
+    except (json.JSONDecodeError, TypeError):
+        return False
+    return isinstance(parsed, list) and len(parsed) > 0
+
+
+def normalize_native_for_save(
+    role: str | None, provider_data: str | None, tool_calls_json: str | None
+) -> str | None:
+    """Enforce the native↔tool_calls mirror at the persistence boundary.
+
+    A persisted ``assistant`` row must never carry a *client* tool-call block in its
+    verbatim native lane (``provider_data``) without a matching entry in ``tool_calls``;
+    otherwise a same-provider resume replays an orphan ``tool_use`` / ``function_call``
+    with no ``tool_result`` and the provider API rejects the turn (the
+    truncated-mid-tool_use hole).  Enforcing the mirror here — once, for every save path
+    and both backends — is what lets the orphan-repair pass read ``tool_calls`` alone
+    (and lets the Anthropic ``pc_tool_ids`` fallback be retired).
+
+    When ``tool_calls`` is empty, client tool-call blocks in ``provider_data`` are
+    orphaned and dropped (reasoning / server-tool / web-search blocks kept).  Returns the
+    (possibly rewritten) ``provider_data`` JSON, ``None`` if nothing survives, or the input
+    unchanged for non-assistant / well-formed rows.
+    """
+    if role != "assistant" or not provider_data or _has_tool_calls(tool_calls_json):
+        return provider_data
+    try:
+        blocks = json.loads(provider_data)
+    except (json.JSONDecodeError, TypeError):
+        return provider_data
+    if not isinstance(blocks, list):
+        return provider_data
+    kept = strip_orphan_client_tool_blocks(blocks)
+    if len(kept) == len(blocks):
+        return provider_data
+    return json.dumps(kept) if kept else None
+
+
 def _attachment_to_content_part(att: dict[str, Any]) -> dict[str, Any] | None:
     """Convert a stored attachment row into an OpenAI-style content part.
 

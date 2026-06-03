@@ -109,6 +109,7 @@ from turnstone.core.storage._utils import (
 from turnstone.core.storage._utils import (
     escape_like as _escape_like,
 )
+from turnstone.core.storage._utils import normalize_native_for_save, sanitize_text
 from turnstone.core.storage._utils import (
     normalize_search_terms as _normalize_search_terms,
 )
@@ -118,7 +119,6 @@ from turnstone.core.storage._utils import (
 from turnstone.core.storage._utils import (
     row_to_dict as _row_to_dict,
 )
-from turnstone.core.storage._utils import sanitize_text
 from turnstone.core.storage._utils import (
     scan_skill_content as _scan_skill_content,
 )
@@ -328,7 +328,7 @@ class SQLiteBackend:
     ) -> int:
         now = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S")
         content = sanitize_text(content)
-        provider_data = sanitize_text(provider_data)
+        provider_data = normalize_native_for_save(role, sanitize_text(provider_data), tool_calls)
         source = sanitize_text(source)
         with self._conn() as conn:
             result = conn.execute(
@@ -385,7 +385,9 @@ class SQLiteBackend:
                     "content": sanitize_text(row["content"]),
                     "tool_name": row.get("tool_name"),
                     "tool_call_id": row.get("tool_call_id"),
-                    "provider_data": sanitize_text(row.get("provider_data")),
+                    "provider_data": normalize_native_for_save(
+                        row["role"], sanitize_text(row.get("provider_data")), row.get("tool_calls")
+                    ),
                     "tool_calls": row.get("tool_calls"),
                     "_source": sanitize_text(row.get("source")),
                 }

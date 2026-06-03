@@ -101,7 +101,7 @@ from turnstone.core.safety import is_command_blocked, sanitize_command
 from turnstone.core.skill_field_validation import SKILL_RUNTIME_CONFIG_FIELDS
 from turnstone.core.skill_parser import MAX_SKILL_DESCRIPTION_LEN
 from turnstone.core.storage._registry import get_storage
-from turnstone.core.storage._utils import normalize_search_terms
+from turnstone.core.storage._utils import normalize_search_terms, strip_orphan_client_tool_blocks
 from turnstone.core.tool_advisory import (
     make_system_turn,
     render_user_interjection,
@@ -4699,6 +4699,13 @@ class ChatSession:
         # ``reasoning_text`` block so the captured reasoning survives
         # past the live stream and surfaces on history reload.
         provider_blocks = self._maybe_synth_reasoning_block(provider_blocks, reasoning_parts)
+        # Enforce the native↔tool_calls mirror in memory too.  A truncation that cleared
+        # tool_calls (finish_reason="length") can leave an orphan tool_use in the captured
+        # blocks; the save-time chokepoint fixes the persisted row, but a same-session
+        # continuation reads this in-memory copy, so strip the orphan here as well.
+        # See storage._utils.normalize_native_for_save.
+        if provider_blocks and not msg.get("tool_calls"):
+            provider_blocks = strip_orphan_client_tool_blocks(provider_blocks)
         if provider_blocks:
             msg["_provider_content"] = provider_blocks
 
