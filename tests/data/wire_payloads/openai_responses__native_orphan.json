@@ -1,0 +1,55 @@
+{
+  "include": [
+    "reasoning.encrypted_content"
+  ],
+  "input": [
+    {
+      "content": "Think about the weather.",
+      "role": "user",
+      "type": "message"
+    },
+    {
+      "content": "Let me check.",
+      "role": "assistant",
+      "type": "message"
+    },
+    {
+      "arguments": "{\"city\": \"Paris\"}",
+      "call_id": "call_1",
+      "name": "get_weather",
+      "type": "function_call"
+    },
+    {
+      "call_id": "call_1",
+      "output": "Tool execution was cancelled.",
+      "type": "function_call_output"
+    }
+  ],
+  "max_output_tokens": 4096,
+  "model": "gpt-5",
+  "prompt_cache_retention": "24h",
+  "reasoning": {
+    "effort": "medium"
+  },
+  "store": false,
+  "stream": true,
+  "tools": [
+    {
+      "description": "Look up the weather for a city.",
+      "name": "get_weather",
+      "parameters": {
+        "properties": {
+          "city": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "city"
+        ],
+        "type": "object"
+      },
+      "strict": false,
+      "type": "function"
+    }
+  ]
+}

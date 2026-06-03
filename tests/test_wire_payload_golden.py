@@ -211,6 +211,25 @@ FIX_NATIVE_REASONING: list[dict[str, Any]] = [
     {"role": "tool", "tool_call_id": "call_1", "content": "18C, clear."},
 ]
 
+# Native reasoning lane with an UNANSWERED tool_use — the verbatim-replay orphan.
+# The native ``tool_use`` is mirrored top-level in ``tool_calls`` (the P1 invariant),
+# so the send-time repair can synthesize its cancellation result by reading
+# ``tool_calls`` alone.  Exercises the Anthropic verbatim-replay branch that the old
+# per-provider ``pc_tool_ids`` synthesis covered.
+FIX_NATIVE_ORPHAN: list[dict[str, Any]] = [
+    {"role": "user", "content": "Think about the weather."},
+    {
+        "role": "assistant",
+        "content": "Let me check.",
+        "_provider_content": [
+            {"type": "thinking", "thinking": "The user wants weather.", "signature": "sig-abc"},
+            {"type": "text", "text": "Let me check."},
+            {"type": "tool_use", "id": "call_1", "name": "get_weather", "input": {"city": "Paris"}},
+        ],
+        "tool_calls": [_tc("call_1")],
+    },
+]
+
 # Multipart user content (image attachment as the provider receives it today).
 FIX_MULTIPART: list[dict[str, Any]] = [
     {
@@ -247,6 +266,10 @@ _FIXTURES: dict[str, tuple[list[dict[str, Any]], dict[str, Any]]] = {
     "trailing_orphan": (FIX_TRAILING_ORPHAN, {"tools": _TOOLS}),
     "native_reasoning": (
         FIX_NATIVE_REASONING,
+        {"tools": _TOOLS, "replay_reasoning_to_model": True},
+    ),
+    "native_orphan": (
+        FIX_NATIVE_ORPHAN,
         {"tools": _TOOLS, "replay_reasoning_to_model": True},
     ),
     "multipart": (FIX_MULTIPART, {}),
