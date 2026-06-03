@@ -2921,17 +2921,22 @@ class ChatSession:
         tool call — this is the sole send-time orphan repair; the translators
         carry none.  Identity-preserving when nothing is orphaned.
         """
-        folded = messages
+        # The lowering passes (fold / drop / repair) operate on canonical Turns;
+        # the provider translators consume the dict projection, so bridge in here
+        # and back out.  ``_full_messages`` hands dicts (system prompt + the
+        # Turn trajectory lowered), so the round-trip is local to this boundary.
+        turns = turns_from_dicts(messages)
+        folded = turns
         if self._provider is not None:
             folded = fold_system_turns(
-                messages,
+                turns,
                 supports_mid_conversation_system=(
                     self._get_capabilities().supports_mid_conversation_system
                 ),
                 nonce=self._envelope_nonce,
             )
         dropped = drop_empty_user_turns(folded)
-        return repair_wire_messages(dropped)
+        return dicts_from_turns(repair_wire_messages(dropped))
 
     def _emit_state(self, state: str) -> None:
         """Notify UI of a workstream state transition.

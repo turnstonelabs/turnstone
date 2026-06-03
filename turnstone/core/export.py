@@ -34,6 +34,7 @@ from turnstone.core.history_decoration import (
 )
 from turnstone.core.lowering import repair_wire_messages
 from turnstone.core.providers._openai_common import sanitize_messages
+from turnstone.core.trajectory import dicts_from_turns, turns_from_dicts
 
 if TYPE_CHECKING:
     from turnstone.core.storage import StorageBackend
@@ -83,8 +84,13 @@ def _build_openai_json(storage: StorageBackend, ws_id: str) -> bytes:
     # Export bypasses the session send path, so it runs the send-time orphan
     # repair itself (``load`` only strips the trailing turn) — otherwise a
     # mid-conversation orphaned tool_call would serialize as an unanswered call.
-    loaded = _attach_reasoning_content(storage.load_messages(ws_id, repair=True))
-    messages = sanitize_messages(repair_wire_messages(loaded))
+    # Repair (the canonical Turn round-trip) runs BEFORE reasoning attach: the
+    # latter stamps a non-canonical ``reasoning_content`` key that the Turn model
+    # does not carry, and the two passes are independent (tool turns vs assistant
+    # reasoning).
+    loaded = storage.load_messages(ws_id, repair=True)
+    repaired = dicts_from_turns(repair_wire_messages(turns_from_dicts(loaded)))
+    messages = sanitize_messages(_attach_reasoning_content(repaired))
     return json.dumps({"messages": messages}, ensure_ascii=False, indent=2).encode("utf-8")
 
 

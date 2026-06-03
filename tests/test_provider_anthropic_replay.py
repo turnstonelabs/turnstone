@@ -32,6 +32,7 @@ from turnstone.core.providers._anthropic import (
     ANTHROPIC_VALID_BLOCK_TYPES,
     AnthropicProvider,
 )
+from turnstone.core.trajectory import dicts_from_turns, turns_from_dicts
 
 
 @pytest.fixture
@@ -211,7 +212,8 @@ class TestWebSearchBlocksSurviveStrip:
         }
         # NO tool result follows — repair (reading tool_calls) synthesizes one.
         _, converted = provider._convert_messages(
-            repair_wire_messages([msg]), replay_reasoning_to_model=False
+            dicts_from_turns(repair_wire_messages(turns_from_dicts([msg]))),
+            replay_reasoning_to_model=False,
         )
         # Synthetic tool_result lands as a user-role message immediately
         # after the assistant turn.
