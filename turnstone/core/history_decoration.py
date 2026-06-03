@@ -560,6 +560,17 @@ def project_history_messages(
         if msg.get("_source"):
             entry["source"] = str(msg["_source"])
 
+        # (3b) ``_source_meta`` side-channel → top-level ``meta``.  The
+        #      operator turn's structured per-kind fields (``watch_triggered``'s
+        #      ``watch_name`` / command / poll counters) — the FE branches on
+        #      ``source`` and uses these to rebuild per-kind rendering (the
+        #      watch-result card) instead of a plain operator bubble.  Mirrors
+        #      the live ``on_system_turn`` SSE event's ``meta`` field so a
+        #      reconnecting tab renders identically.
+        source_meta = msg.get("_source_meta")
+        if isinstance(source_meta, dict) and source_meta:
+            entry["meta"] = source_meta
+
         # (4) Reasoning is already stamped by ``extract_reasoning_for_history``
         #     (gated on the active model's surface_persisted_reasoning flag) —
         #     pass it through.  This projection never re-extracts from

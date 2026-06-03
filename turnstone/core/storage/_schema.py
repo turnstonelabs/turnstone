@@ -65,6 +65,16 @@ conversations = sa.Table(
     # (JSON; NULL for turns with no attachments) — the sole message->blob link in
     # the content-addressed model; bytes resolve from workstream_attachments by id.
     sa.Column("attachments", sa.Text, nullable=True),
+    # Structured per-kind operator-context metadata for a first-class ``system``
+    # turn (JSON object; NULL for ordinary turns and for operator turns with no
+    # extra fields).  The persisted twin of the in-memory
+    # ``Turn.meta.extra["source_meta"]`` / the ``_source_meta`` side channel:
+    # ``watch_triggered`` carries ``{watch_name, command, poll_count, max_polls,
+    # is_final}`` so ``/history`` can rebuild the structured watch-result card;
+    # other kinds (``user_interjection`` → ``{priority}``) ride generically.
+    # Stripped before the LLM wire (it is a ``_``-prefixed key by the time it
+    # reaches a provider).  Added in migration 060.
+    sa.Column("meta", sa.Text, nullable=True),
 )
 
 sa.Index("idx_conversations_timestamp", conversations.c.timestamp)

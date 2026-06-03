@@ -308,6 +308,7 @@ class PostgreSQLBackend:
         event_id: int | None = None,
         is_error: bool = False,
         producer: str | None = None,
+        meta: str | None = None,
     ) -> int:
         now = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S")
         content = sanitize_text(content)
@@ -330,6 +331,7 @@ class PostgreSQLBackend:
                     _source=source,
                     event_id=event_id,
                     is_error=is_error,
+                    meta=meta,
                 )
                 .returning(conversations.c.id)
             )
@@ -366,6 +368,7 @@ class PostgreSQLBackend:
                     "tool_calls": row.get("tool_calls"),
                     "_source": sanitize_text(row.get("source")),
                     "is_error": bool(row.get("is_error", False)),
+                    "meta": row.get("meta"),
                 }
             )
         with self._conn() as conn:
@@ -382,7 +385,7 @@ class PostgreSQLBackend:
         """Fetch a ws's conversation rows + resolved attachment map (shared by
         :meth:`load_messages` and :meth:`load_message_turns`).  The trailing
         ``attachments`` ref-list column is split off and is NOT part of the
-        positional tuple ``reconstruct_*`` unpacks (id..is_error)."""
+        positional tuple ``reconstruct_*`` unpacks (id..meta)."""
         _cols = (
             conversations.c.id,
             conversations.c.role,
@@ -394,6 +397,7 @@ class PostgreSQLBackend:
             conversations.c._source,
             conversations.c.event_id,
             conversations.c.is_error,
+            conversations.c.meta,
             conversations.c.attachments,
         )
         with self._conn() as conn:
@@ -412,7 +416,7 @@ class PostgreSQLBackend:
                     .order_by(conversations.c.id)
                 ).fetchall()
         attachments = self._resolve_row_attachments(rows)
-        msg_rows = [tuple(r)[:10] for r in rows]
+        msg_rows = [tuple(r)[:11] for r in rows]
         return msg_rows, (attachments or None)
 
     def load_messages(
@@ -438,7 +442,7 @@ class PostgreSQLBackend:
         attachment_refs: dict[int, list[str]] = {}
         all_ids: set[str] = set()
         for r in rows:
-            ids = _parse_attachment_refs(r[10])
+            ids = _parse_attachment_refs(r[11])
             if ids:
                 attachment_refs[r[0]] = ids
                 all_ids.update(ids)

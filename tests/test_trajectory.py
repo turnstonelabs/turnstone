@@ -90,6 +90,13 @@ _ROUNDTRIP: list[dict[str, Any]] = [
     },
     {"role": "system", "content": "guard note", "_source": "output_guard"},
     {"role": "system", "content": "you are an assistant"},  # base prompt, no _source
+    # Operator turn with structured per-kind meta (the watch-result card source).
+    {
+        "role": "system",
+        "content": "ci failed",
+        "_source": "watch_triggered",
+        "_source_meta": {"watch_name": "ci", "command": "make test", "poll_count": 3},
+    },
 ]
 
 
@@ -109,6 +116,30 @@ def test_turns_from_dicts_preserves_order_and_count() -> None:
 # --------------------------------------------------------------------------- #
 # Field mapping — the side channels become typed Turn fields.
 # --------------------------------------------------------------------------- #
+def test_source_meta_maps_to_meta_extra() -> None:
+    # The per-kind operator meta rides a single ``_source_meta`` dict and lands
+    # in ``Turn.meta.extra["source_meta"]`` (and round-trips back out).
+    t = turn_from_dict(
+        {
+            "role": "system",
+            "content": "ci failed",
+            "_source": "watch_triggered",
+            "_source_meta": {"watch_name": "ci", "poll_count": 3},
+        }
+    )
+    assert t.meta.extra["source_meta"] == {"watch_name": "ci", "poll_count": 3}
+    assert turn_to_dict(t)["_source_meta"] == {"watch_name": "ci", "poll_count": 3}
+
+
+def test_empty_source_meta_omitted() -> None:
+    # An empty meta dict is not carried (no key on the Turn, none re-emitted).
+    t = turn_from_dict(
+        {"role": "system", "content": "n", "_source": "correction", "_source_meta": {}}
+    )
+    assert "source_meta" not in t.meta.extra
+    assert "_source_meta" not in turn_to_dict(t)
+
+
 def test_source_maps_to_source_field() -> None:
     t = turn_from_dict({"role": "system", "content": "n", "_source": "tool_error"})
     assert t.role is Role.SYSTEM

@@ -301,12 +301,14 @@ class TerminalUI(SessionUI):
         sys.stdout.write(f"{RED}{message}{RESET}\n")
         sys.stdout.flush()
 
-    def on_system_turn(self, content: str, source: str) -> None:
+    def on_system_turn(self, content: str, source: str, meta: dict[str, Any] | None = None) -> None:
         """Render a first-class operator-context system turn as an
         ``[operator · source] text`` line in the terminal — the CLI's
         equivalent of the web UI's operator bubble.  Terminal output is
         anchored by flow (the line lands directly after the turn it
-        relates to), so no DOM anchoring is needed.
+        relates to), so no DOM anchoring is needed.  ``meta`` (the structured
+        per-kind fields the web card uses) is unused here: the formatted body
+        in ``content`` already reads well in a terminal.
         """
         label = "operator" + (f" · {source}" if source else "")
         sys.stdout.write(f"{YELLOW}[{label}]{RESET} {content}\n")

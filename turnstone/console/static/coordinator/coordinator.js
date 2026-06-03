@@ -391,6 +391,180 @@
     return appendMsg(role, esc(text), opts);
   }
 
+  // Structured ``.msg.watch-result`` card for a ``watch_triggered``
+  // operator-context system turn — command-preview header + shell-output body
+  // + poll-counter footer.  ``content`` is the formatted watch body (the system
+  // turn's content); ``meta`` carries the structured fields (``watch_name`` /
+  // ``command`` / ``poll_count`` / ``max_polls`` / ``is_final``) delivered live
+  // on the ``system_turn`` SSE event and on the ``/history`` projection.  All
+  // text goes through ``textContent`` so shell output containing angle brackets
+  // / scripts / steering bytes renders inertly.  Mirrors the interactive pane's
+  // _buildWatchResultBubble.
+  function appendWatchResult(meta, content) {
+    const el = document.createElement("div");
+    el.className = "msg watch-result";
+    el.setAttribute("role", "article");
+    el.setAttribute("data-ts-role", "watch");
+    el.setAttribute("aria-label", "watch");
+    const header = document.createElement("div");
+    header.className = "msg-watch-header";
+    header.textContent =
+      "watch" + (meta.watch_name ? " · " + String(meta.watch_name) : "");
+    el.appendChild(header);
+    if (meta.command) {
+      const cmd = document.createElement("div");
+      cmd.className = "msg-watch-cmd";
+      cmd.textContent = "$ " + String(meta.command);
+      el.appendChild(cmd);
+    }
+    const body = document.createElement("pre");
+    body.className = "msg-watch-body";
+    // Prefer the structured ``output`` (raw shell output alone) so the body
+    // doesn't re-print the header / ``$ command`` lines the chrome already
+    // shows; fall back to the full turn ``content`` for legacy turns that
+    // predate the ``output`` meta field (migration 060 is additive).
+    body.textContent =
+      meta.output != null ? String(meta.output) : content || "";
+    el.appendChild(body);
+    if (meta.poll_count != null && meta.max_polls != null) {
+      const footer = document.createElement("div");
+      footer.className = "msg-watch-footer";
+      const finalSuffix = meta.is_final ? " · final" : "";
+      footer.textContent =
+        "poll " +
+        String(meta.poll_count) +
+        "/" +
+        String(meta.max_polls) +
+        finalSuffix;
+      el.appendChild(footer);
+    }
+    messagesEl.appendChild(el);
+    _scheduleScroll();
+    return el;
+  }
+
+  // Structured ``.msg.guard-finding`` card for an ``output_guard``
+  // operator-context system turn.  ``meta`` carries ``{flags, risk_level,
+  // annotations, redacted}``.  Reuses the tool-row warning chip's risk / flags
+  // / redaction vocabulary (``.coord-tool-row-warning``) so guard findings read
+  // identically wherever they surface, then appends the annotations the inline
+  // tool chip omits.  All text via textContent.  Mirrors the interactive pane's
+  // _buildGuardFindingBubble.
+  function appendGuardFinding(meta) {
+    const el = document.createElement("div");
+    el.className = "msg guard-finding";
+    el.setAttribute("role", "article");
+    el.setAttribute("data-ts-role", "output_guard");
+    el.setAttribute("aria-label", "output guard");
+    const risk = String(meta.risk_level || "medium");
+    const warn = document.createElement("div");
+    warn.className = "coord-tool-row-warning coord-tool-row-warning--" + risk;
+    warn.setAttribute("role", "status");
+    const label = document.createElement("span");
+    label.className = "coord-tool-row-warning-label";
+    label.textContent = "⚠ " + risk.toUpperCase();
+    warn.appendChild(label);
+    const flags = Array.isArray(meta.flags) ? meta.flags : [];
+    if (flags.length) {
+      warn.appendChild(document.createTextNode(" " + flags.join(", ")));
+    }
+    if (meta.redacted) {
+      const redacted = document.createElement("span");
+      redacted.className = "coord-tool-row-warning-redacted";
+      redacted.textContent = " (credentials redacted)";
+      warn.appendChild(redacted);
+    }
+    el.appendChild(warn);
+    const anns = Array.isArray(meta.annotations) ? meta.annotations : [];
+    for (let i = 0; i < anns.length; i++) {
+      const a = document.createElement("div");
+      a.className = "msg-guard-annotation";
+      a.textContent = String(anns[i]);
+      el.appendChild(a);
+    }
+    messagesEl.appendChild(el);
+    _scheduleScroll();
+    return el;
+  }
+
+  // Structured ``.msg.idle-children`` card for the coordinator-only
+  // ``idle_children`` operator-context system turn — lists the child
+  // workstreams still running while the coordinator went idle.  ``meta.children``
+  // is ``[{ws_id, name, state}]`` (names already ``sanitize_name``-cleaned at the
+  // producer); rendered via textContent so a hostile workstream name is inert.
+  function appendIdleChildren(meta) {
+    const el = document.createElement("div");
+    el.className = "msg idle-children";
+    el.setAttribute("role", "article");
+    el.setAttribute("data-ts-role", "idle_children");
+    el.setAttribute("aria-label", "idle children");
+    const children = Array.isArray(meta.children) ? meta.children : [];
+    const header = document.createElement("div");
+    header.className = "msg-idle-header";
+    header.textContent =
+      "idle · " +
+      children.length +
+      (children.length === 1
+        ? " child still running"
+        : " children still running");
+    el.appendChild(header);
+    const list = document.createElement("ul");
+    list.className = "msg-idle-list";
+    for (let i = 0; i < children.length; i++) {
+      const c = children[i] || {};
+      const li = document.createElement("li");
+      li.className = "msg-idle-child";
+      const name = document.createElement("span");
+      name.className = "msg-idle-child-name";
+      name.textContent = String(c.name || c.ws_id || "child");
+      li.appendChild(name);
+      if (c.state) {
+        const state = document.createElement("span");
+        state.className = "msg-idle-child-state";
+        state.textContent = String(c.state);
+        li.appendChild(state);
+      }
+      list.appendChild(li);
+    }
+    el.appendChild(list);
+    messagesEl.appendChild(el);
+    _scheduleScroll();
+    return el;
+  }
+
+  // "queued message" bubble for a ``user_interjection`` system turn — shows the
+  // user's raw words (``meta.message``) rather than the model-directed framing
+  // baked into ``content``, with brighter emphasis for ``!!!``-important
+  // interjections.  Reuses ``appendText`` (→ ``.msg.system-context``) + a class.
+  function appendInterjection(meta, content) {
+    const important = meta && meta.priority === "important";
+    const text =
+      meta && meta.message != null ? String(meta.message) : content || "";
+    const el = appendText("system", text, {
+      label: important ? "queued message · important" : "queued message",
+    });
+    el.classList.add("interjection");
+    if (important) el.classList.add("important");
+    return el;
+  }
+
+  // Dispatch a first-class operator-context system turn to the right renderer.
+  // Shared by the live ``system_turn`` SSE handler and history replay so the
+  // two can't drift on which kinds get structured cards.  ``watch_triggered`` /
+  // ``output_guard`` / ``idle_children`` carry structured ``meta`` → cards;
+  // ``user_interjection`` → a "queued message" bubble; everything else → the
+  // labeled operator bubble.
+  function renderSystemTurn(source, content, meta) {
+    const m = meta && typeof meta === "object" ? meta : null;
+    if (source === "watch_triggered" && m)
+      return appendWatchResult(m, content || "");
+    if (source === "output_guard" && m) return appendGuardFinding(m);
+    if (source === "idle_children" && m) return appendIdleChildren(m);
+    if (source === "user_interjection")
+      return appendInterjection(m, content || "");
+    return appendText("system", content || "", { label: source || "system" });
+  }
+
   // User-message bubble with attachment-pill cluster appended below
   // the text.  Mirrors Pane.addUserMessage in the interactive UI so
   // live-send and history-replay both render the same chip strip the
@@ -2251,14 +2425,12 @@
         break;
       case "system_turn":
         // First-class operator-context system turn (output-guard finding,
-        // user interjection, metacognitive nudge — see make_system_turn).
-        // Consolidates the legacy user_reminder / tool_reminder events into
-        // one operator bubble rendered in trajectory sequence (it FOLLOWS
-        // the turn it advises).  ``ev.source`` carries the kind; the
-        // ``system`` _MSG_VARIANTS entry gives it the operator styling.
-        appendText("system", ev.content || "", {
-          label: ev.source || "system",
-        });
+        // user interjection, metacognitive nudge, watch result — see
+        // make_system_turn).  Rendered in trajectory sequence (it FOLLOWS the
+        // turn it advises).  ``renderSystemTurn`` routes by ``ev.source`` to the
+        // structured card (watch / guard / idle-children) or the operator bubble
+        // (carrying ``ev.meta`` so cards rebuild identically live and on replay).
+        renderSystemTurn(ev.source || "", ev.content || "", ev.meta);
         break;
       case "connected":
         // First yield from _coord_events_replay — populates the
@@ -4626,11 +4798,12 @@
             label: role,
           });
         } else if (role === "system") {
-          // First-class operator-context system turn — label with the
-          // ``source`` kind (output_guard / user_interjection / ...);
-          // the ``system`` _MSG_VARIANTS entry gives it operator styling.
+          // First-class operator-context system turn — ``renderSystemTurn``
+          // routes by ``m.source`` to the structured card (watch / guard /
+          // idle-children) or the operator bubble, reading ``m.meta`` from the
+          // ``/history`` projection so replay matches the live render exactly.
           if (!content) return;
-          appendText(role, content, { label: m.source || "system" });
+          renderSystemTurn(m.source || "", content, m.meta);
         } else {
           if (!content) return;
           appendText(role, content, { label: role });

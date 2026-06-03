@@ -39,6 +39,7 @@ from turnstone.core.log import get_logger
 from turnstone.core.metacognition import (
     _cooldown_allows,
     format_idle_children_nudge,
+    sanitize_name,
     should_nudge,
 )
 from turnstone.core.trajectory import Role
@@ -205,6 +206,21 @@ class CoordinatorIdleObserver:
         if not text:  # belt-and-braces: formatter empty-input guard
             return
 
+        # Structured ``_source_meta`` for the FE idle-children card — the same
+        # child list ``format_idle_children_nudge`` rendered into ``text`` above,
+        # so the card and the model-facing prose derive from one source.  Names
+        # are sanitized identically (``sanitize_name``) so a steering-vector /
+        # angle-bracket name can't reach the operator card any more than the
+        # text; the FE additionally renders every field via ``textContent``.
+        children_meta = [
+            {
+                "ws_id": str(c.get("ws_id", "")),
+                "name": sanitize_name(str(c.get("name", ""))),
+                "state": str(c.get("state", "")),
+            }
+            for c in active
+        ]
+
         # Bind ws.id + user_id by closure so the predicate captures the
         # workstream identity (not the live ``ws`` reference, which
         # could mutate).  The predicate runs at drain time outside the
@@ -235,6 +251,7 @@ class CoordinatorIdleObserver:
             text,
             "any",
             valid_until=_still_has_active_children,
+            metadata={"children": children_meta},
         )
         with self._fire_counts_lock:
             ws_caps = self._fire_counts.setdefault(ws_id, {})

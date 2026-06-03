@@ -8,6 +8,7 @@ from turnstone.core.tool_advisory import (
     SYSTEM_TURN_SOURCES,
     make_system_turn,
     parse_priority,
+    render_output_guard_text,
     render_user_interjection,
 )
 
@@ -23,31 +24,40 @@ class TestMakeSystemTurn:
             "content": "check auth too",
         }
 
-    def test_meta_keys_underscore_prefixed(self) -> None:
-        turn = make_system_turn(
-            "watch_triggered", "ci failed", watch_name="ci", priority="important"
-        )
-        assert turn["_watch_name"] == "ci"
-        assert turn["_priority"] == "important"
-        assert turn["role"] == "system"
-        assert turn["_source"] == "watch_triggered"
-        assert turn["content"] == "ci failed"
+    def test_meta_carried_as_source_meta_dict(self) -> None:
+        # Meta rides as ONE ``_source_meta`` dict (not scattered ``_``-prefixed
+        # siblings) — one carrier mapping to one storage column / one FE field.
+        turn = make_system_turn("watch_triggered", "ci failed", watch_name="ci", poll_count=3)
+        assert turn == {
+            "role": "system",
+            "_source": "watch_triggered",
+            "content": "ci failed",
+            "_source_meta": {"watch_name": "ci", "poll_count": 3},
+        }
 
-    def test_already_underscored_meta_kept(self) -> None:
-        turn = make_system_turn("repeat", "stop repeating", _event_id=7)
-        assert turn["_event_id"] == 7
+    def test_no_meta_omits_source_meta(self) -> None:
+        # A kind with no structured fields carries no ``_source_meta`` key.
+        turn = make_system_turn("output_guard", "flag (HIGH)")
+        assert turn == {
+            "role": "system",
+            "_source": "output_guard",
+            "content": "flag (HIGH)",
+        }
+        assert "_source_meta" not in turn
 
     def test_unknown_source_rejected(self) -> None:
         with pytest.raises(ValueError, match="unknown system-turn source"):
             make_system_turn("bogus", "x")
 
-    def test_meta_key_colliding_with_source_rejected(self) -> None:
-        # `source=` can't even reach **meta — it's a named parameter, so Python
-        # raises TypeError first.  The only reachable collision is an explicit
-        # ``_source=`` meta key, which the builder rejects rather than letting it
-        # silently clobber the validated source.
-        with pytest.raises(ValueError, match="collides with reserved"):
-            make_system_turn("repeat", "x", _source="evil")
+    def test_meta_namespaced_cannot_clobber_reserved_keys(self) -> None:
+        # Because meta rides namespaced inside ``_source_meta``, a meta key that
+        # mirrors a reserved top-level key (``role`` / ``_source``) lands inside
+        # the dict and cannot overwrite the validated turn fields — so the old
+        # collision guard is no longer needed (the shape makes it impossible).
+        turn = make_system_turn("repeat", "x", role="evil", _source="spoof")
+        assert turn["role"] == "system"
+        assert turn["_source"] == "repeat"
+        assert turn["_source_meta"] == {"role": "evil", "_source": "spoof"}
 
     def test_vocabulary_mirrors_nudge_map_both_directions(self) -> None:
         # The nudge-derived sources must equal _NUDGE_MAP exactly: a new nudge
@@ -58,6 +68,58 @@ class TestMakeSystemTurn:
 
         nudge_sources = SYSTEM_TURN_SOURCES - {"output_guard", "user_interjection", "skill_hint"}
         assert nudge_sources == set(_NUDGE_MAP)
+
+
+class TestRenderOutputGuardText:
+    """render_output_guard_text() projects the structured guard meta to prose."""
+
+    def test_full_finding(self) -> None:
+        text = render_output_guard_text(
+            {
+                "flags": ["aws_key", "private_key"],
+                "risk_level": "high",
+                "annotations": ["matched AKIA…", "PEM header"],
+                "redacted": True,
+            }
+        )
+        assert text == (
+            "Output guard: aws_key, private_key (HIGH)\n"
+            "  matched AKIA…\n"
+            "  PEM header\n"
+            "Credentials have been redacted. Do not attempt to reconstruct redacted values."
+        )
+
+    def test_no_annotations_no_redaction(self) -> None:
+        text = render_output_guard_text(
+            {"flags": ["pii"], "risk_level": "low", "annotations": [], "redacted": False}
+        )
+        assert text == "Output guard: pii (LOW)"
+
+    def test_missing_keys_default_gracefully(self) -> None:
+        # Defensive: a partial meta dict never raises.
+        assert render_output_guard_text({}) == "Output guard:  (NONE)"
+
+
+class TestMetaIsWireStripped:
+    """The structured operator meta must never reach the LLM wire."""
+
+    def test_source_meta_stripped_by_sanitize(self) -> None:
+        from turnstone.core.providers._openai_common import sanitize_messages
+
+        out = sanitize_messages(
+            [
+                {"role": "user", "content": "hi"},
+                {
+                    "role": "system",
+                    "_source": "watch_triggered",
+                    "content": "ci failed",
+                    "_source_meta": {"command": "rm -rf /", "watch_name": "ci"},
+                },
+            ]
+        )
+        # No leading-underscore side channel survives to the wire.
+        assert all(not k.startswith("_") for m in out for k in m)
+        assert out[1] == {"role": "system", "content": "ci failed"}
 
 
 class TestParsePriority:

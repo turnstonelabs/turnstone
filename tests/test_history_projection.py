@@ -56,6 +56,28 @@ class TestSystemTurnProjection:
         assert history[0]["source"] == "user_interjection"
         assert history[0]["content"] == "check the logs"
 
+    def test_system_turn_source_meta_projects(self) -> None:
+        # ``_source_meta`` → ``meta`` so a reconnecting tab rebuilds the same
+        # per-kind card (the watch-result card etc.) the live SSE event drives.
+        history = project_history_messages(
+            [
+                {
+                    "role": "system",
+                    "_source": "watch_triggered",
+                    "content": "ci failed",
+                    "_source_meta": {"watch_name": "ci", "poll_count": 3},
+                }
+            ]
+        )
+        assert history[0]["source"] == "watch_triggered"
+        assert history[0]["meta"] == {"watch_name": "ci", "poll_count": 3}
+
+    def test_system_turn_without_meta_omits_meta_field(self) -> None:
+        history = project_history_messages(
+            [{"role": "system", "_source": "correction", "content": "watch out"}]
+        )
+        assert "meta" not in history[0]
+
     def test_legacy_reminders_column_not_projected(self) -> None:
         """A pre-migration row that still carries ``_reminders`` must NOT
         surface a ``reminders`` field — the projection dropped that lane."""

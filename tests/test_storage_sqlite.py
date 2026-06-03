@@ -36,6 +36,36 @@ class TestSaveAndLoadMessages:
         assert msgs[1]["role"] == "assistant"
         assert msgs[1]["content"] == "world"
 
+    def test_system_turn_meta_roundtrip(self, backend):
+        # The structured per-kind operator meta saved on a ``system`` row
+        # round-trips back as ``_source_meta`` through the real insert + SELECT
+        # (the ``conversations.meta`` column, migration 060).
+        import json
+
+        backend.register_workstream("s1")
+        backend.save_message("s1", "user", "go")
+        backend.save_message(
+            "s1",
+            "system",
+            "ci failed",
+            source="watch_triggered",
+            meta=json.dumps({"watch_name": "ci", "command": "make test", "poll_count": 3}),
+        )
+        msgs = backend.load_messages("s1")
+        assert msgs[1] == {
+            "role": "system",
+            "content": "ci failed",
+            "_source": "watch_triggered",
+            "_source_meta": {"watch_name": "ci", "command": "make test", "poll_count": 3},
+        }
+
+    def test_ordinary_row_has_null_meta(self, backend):
+        # A non-operator row carries no meta — no ``_source_meta`` on reload.
+        backend.register_workstream("s1")
+        backend.save_message("s1", "user", "hello")
+        msgs = backend.load_messages("s1")
+        assert "_source_meta" not in msgs[0]
+
     def test_tool_call_grouping(self, backend):
         import json
 

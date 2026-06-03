@@ -244,24 +244,49 @@ class Pane {
     return el;
   }
 
-  addSystemContext(content, source) {
+  addSystemContext(content, source, meta) {
     // First-class operator-context system turn — the consolidation of the
     // legacy metacognition reminders / user interjections / output-guard
     // notes into one role="system" trajectory turn.  Rendered as a distinct
     // operator bubble in sequence (it FOLLOWS the turn it advises);
     // `source` carries the kind (user_interjection / output_guard /
-    // tool_error / ...) for the bubble label.
+    // tool_error / ...) for the bubble label.  `watch_triggered` additionally
+    // carries structured `meta` (watch_name / command / poll counters) → the
+    // richer `.msg.watch-result` card instead of the plain operator bubble.
     this.removeEmptyState();
+    if (source === "watch_triggered" && meta && typeof meta === "object") {
+      const card = _buildWatchResultBubble(meta, content || "");
+      this.messagesEl.appendChild(card);
+      this.scrollToBottom(true);
+      return card;
+    }
+    if (source === "output_guard" && meta && typeof meta === "object") {
+      const card = _buildGuardFindingBubble(meta);
+      this.messagesEl.appendChild(card);
+      this.scrollToBottom(true);
+      return card;
+    }
+    // user_interjection renders as a "queued message" bubble showing the user's
+    // RAW words (`meta.message`) rather than the model-directed framing in
+    // `content`, with brighter emphasis for `!!!`-important interjections.
+    const isInterjection =
+      source === "user_interjection" && meta && typeof meta === "object";
+    const important = isInterjection && meta.priority === "important";
     const el = document.createElement("div");
-    el.className = "msg system-context";
+    el.className = "msg system-context" + (important ? " important" : "");
     const body = document.createElement("div");
     body.className = "msg-body";
     const labelEl = document.createElement("span");
     labelEl.className = "msg-system-context-label";
-    labelEl.textContent = "operator" + (source ? " · " + String(source) : "");
+    labelEl.textContent = isInterjection
+      ? "queued message" + (important ? " · important" : "")
+      : "operator" + (source ? " · " + String(source) : "");
     const textEl = document.createElement("span");
     textEl.className = "msg-system-context-text";
-    textEl.textContent = content || "";
+    textEl.textContent =
+      isInterjection && meta.message != null
+        ? String(meta.message)
+        : content || "";
     body.appendChild(labelEl);
     body.appendChild(textEl);
     el.appendChild(body);
@@ -1181,8 +1206,13 @@ class Pane {
         // user_reminder / tool_reminder events into one operator bubble
         // rendered in trajectory sequence (it FOLLOWS the turn it advises,
         // so by the time this SSE event arrives the related turn already
-        // rendered).  ``evt.source`` carries the kind for the bubble label.
-        this.addSystemContext(evt.content || "", evt.source || "");
+        // rendered).  ``evt.source`` carries the kind for the bubble label;
+        // ``evt.meta`` the structured per-kind fields (watch-result card).
+        this.addSystemContext(
+          evt.content || "",
+          evt.source || "",
+          evt.meta || null,
+        );
         break;
 
       case "message_queued":
@@ -2124,8 +2154,13 @@ class Pane {
         // interjection, metacognitive nudge — see make_system_turn).  These
         // now FOLLOW the turn they advise as their own rows; tool-channel
         // nudges and queued interjections that used to splice into the tool
-        // result render here in sequence.  `source` is the kind.
-        this.addSystemContext(msg.content || "", msg.source || "");
+        // result render here in sequence.  `source` is the kind; `meta` the
+        // structured per-kind fields (watch-result card) from /history.
+        this.addSystemContext(
+          msg.content || "",
+          msg.source || "",
+          msg.meta || null,
+        );
         lastToolBlock = null;
       }
     }
@@ -2710,6 +2745,79 @@ class Pane {
         this.stopBtn.disabled = false;
       });
   }
+}
+
+// Build a structured ``.msg.watch-result`` card for a ``watch_triggered``
+// operator-context system turn — command-preview header + shell-output body +
+// poll-counter footer.  ``content`` is the formatted watch body (the system
+// turn's content); ``meta`` carries the structured fields (``watch_name`` /
+// ``command`` / ``poll_count`` / ``max_polls`` / ``is_final``) delivered live on
+// the ``system_turn`` SSE event and on the ``/history`` projection.  All text
+// goes through ``textContent`` so shell output containing angle brackets /
+// scripts / steering bytes renders inertly.  Mirrors the coordinator pane's
+// buildWatchResultBubble.
+function _buildWatchResultBubble(meta, content) {
+  const el = document.createElement("div");
+  el.className = "msg watch-result";
+  el.setAttribute("role", "article");
+  el.setAttribute("data-ts-role", "watch");
+  el.setAttribute("aria-label", "watch");
+  const header = document.createElement("div");
+  header.className = "msg-watch-header";
+  header.textContent =
+    "watch" + (meta.watch_name ? " · " + String(meta.watch_name) : "");
+  el.appendChild(header);
+  if (meta.command) {
+    const cmd = document.createElement("div");
+    cmd.className = "msg-watch-cmd";
+    cmd.textContent = "$ " + String(meta.command);
+    el.appendChild(cmd);
+  }
+  const body = document.createElement("pre");
+  body.className = "msg-watch-body";
+  // Prefer the structured ``output`` (raw shell output alone) so the body
+  // doesn't re-print the header / ``$ command`` lines the chrome already shows;
+  // fall back to the full turn ``content`` for legacy turns that predate the
+  // ``output`` meta field (migration 060 is additive — no backfill).
+  body.textContent = meta.output != null ? String(meta.output) : content || "";
+  el.appendChild(body);
+  if (meta.poll_count != null && meta.max_polls != null) {
+    const footer = document.createElement("div");
+    footer.className = "msg-watch-footer";
+    const finalSuffix = meta.is_final ? " · final" : "";
+    footer.textContent =
+      "poll " +
+      String(meta.poll_count) +
+      "/" +
+      String(meta.max_polls) +
+      finalSuffix;
+    el.appendChild(footer);
+  }
+  return el;
+}
+
+// Build a structured ``.msg.guard-finding`` card for an ``output_guard``
+// operator-context system turn.  ``meta`` carries the structured finding
+// ``{flags, risk_level, annotations, redacted}``.  Reuses the tool-result
+// warning chip (``_buildOutputWarningEl``) for the risk / flags / redaction
+// header so the operator-context finding speaks the same visual vocabulary,
+// then appends the annotations (matched-pattern detail) — which the inline
+// tool chip omits to stay terse.  All text via textContent.
+function _buildGuardFindingBubble(meta) {
+  const el = document.createElement("div");
+  el.className = "msg guard-finding";
+  el.setAttribute("role", "article");
+  el.setAttribute("data-ts-role", "output_guard");
+  el.setAttribute("aria-label", "output guard");
+  el.appendChild(_buildOutputWarningEl(meta));
+  const anns = Array.isArray(meta.annotations) ? meta.annotations : [];
+  for (let i = 0; i < anns.length; i++) {
+    const a = document.createElement("div");
+    a.className = "msg-guard-annotation";
+    a.textContent = String(anns[i]);
+    el.appendChild(a);
+  }
+  return el;
 }
 
 // Shared output-warning DOM builder — used by both replayHistory

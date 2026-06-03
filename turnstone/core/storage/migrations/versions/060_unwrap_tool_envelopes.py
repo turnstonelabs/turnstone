@@ -28,7 +28,10 @@ This migration retires both carriers:
 
 This migration also carries the additive front of the canonical-trajectory storage cut:
 it adds the ``is_error`` column (persisting the tool-result error flag, previously an
-in-memory-only message key) and tags legacy bare-list ``provider_data`` rows with their
+in-memory-only message key), the ``meta`` column (a first-class ``system`` turn's
+structured per-kind operator-context fields — ``watch_triggered``'s ``watch_name`` /
+``command`` / poll counters etc. — so ``/history`` rebuilds the structured watch-result
+card; additive, no backfill), and tags legacy bare-list ``provider_data`` rows with their
 generating provider as the ``{producer, blocks}`` envelope (producer inferred from block
 types — see ``_infer_producer``, which must match the live save's ``provider_name``
 values), so the lowering layer can replay the native lane verbatim only to its producer.
@@ -271,6 +274,15 @@ def upgrade() -> None:
         # backfill below (step 3) fills it from the legacy message_id link and
         # then drops message_id/reserved_* (step 4).
         batch_op.add_column(sa.Column("attachments", sa.Text, nullable=True))
+        # Structured per-kind operator-context metadata for a first-class
+        # ``system`` turn (JSON object; NULL otherwise) — ``watch_triggered``'s
+        # ``{watch_name, command, poll_count, max_polls, is_final}`` etc., the
+        # persisted twin of the in-memory ``_source_meta`` side channel — so
+        # ``/history`` and the live SSE replay rebuild the structured
+        # watch-result card.  Additive, no backfill (operator turns predating
+        # this stay plain text bubbles; their structured fields are unrecoverable
+        # from the flattened ``content``).
+        batch_op.add_column(sa.Column("meta", sa.Text, nullable=True))
     with op.batch_alter_table("workstream_attachments") as batch_op:
         batch_op.add_column(
             sa.Column("refcount", sa.Integer, nullable=False, server_default=sa.text("0"))
@@ -423,6 +435,7 @@ def downgrade() -> None:
         batch_op.add_column(sa.Column("_reminders", sa.Text, nullable=True))
         batch_op.drop_column("is_error")
         batch_op.drop_column("attachments")
+        batch_op.drop_column("meta")
     with op.batch_alter_table("workstream_attachments") as batch_op:
         batch_op.add_column(sa.Column("message_id", sa.Integer, nullable=True))
         batch_op.add_column(sa.Column("reserved_for_msg_id", sa.Text, nullable=True))

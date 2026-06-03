@@ -47,6 +47,7 @@ def save_message(
     event_id: int | None = None,
     is_error: bool = False,
     producer: str | None = None,
+    meta: str | None = None,
 ) -> int:
     """Log a message to the conversations table.
 
@@ -61,6 +62,13 @@ def save_message(
     time (``SessionUIBase._event_id``); the caller in ``session.py``
     passes ``self.ui._event_id`` so ``/history`` can return it as the
     ``Last-Event-ID`` resume cursor.  ``None`` for offline / bulk saves.
+
+    ``meta`` is the pre-serialized JSON of a first-class ``system`` turn's
+    structured per-kind operator-context fields (e.g. ``watch_triggered``'s
+    ``watch_name`` / ``command`` / poll counters) — the persisted twin of the
+    in-memory ``Turn.meta.extra["source_meta"]`` / ``_source_meta`` side
+    channel.  ``None`` for ordinary rows and operator turns with no extra
+    fields.  Opaque to storage (like ``tool_calls`` / ``provider_data``).
     """
     try:
         return get_storage().save_message(
@@ -75,6 +83,7 @@ def save_message(
             event_id=event_id,
             is_error=is_error,
             producer=producer,
+            meta=meta,
         )
     except Exception:
         log.warning("Failed to save message for ws=%s role=%s", ws_id, role, exc_info=True)

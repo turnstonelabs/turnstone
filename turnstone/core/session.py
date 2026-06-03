@@ -116,6 +116,7 @@ from turnstone.core.storage._utils import (
 )
 from turnstone.core.tool_advisory import (
     make_system_turn,
+    render_output_guard_text,
     render_user_interjection,
 )
 from turnstone.core.tool_search import ToolSearchManager
@@ -800,7 +801,9 @@ class SessionUI(Protocol):
     def on_status(self, usage: dict[str, Any], context_window: int, effort: str) -> None: ...
     def on_info(self, message: str) -> None: ...
     def on_error(self, message: str) -> None: ...
-    def on_system_turn(self, content: str, source: str) -> None: ...
+    def on_system_turn(
+        self, content: str, source: str, meta: dict[str, Any] | None = None
+    ) -> None: ...
     def on_state_change(self, state: str) -> None: ...
     def on_rename(self, name: str) -> None: ...
     def on_intent_verdict(self, verdict: dict[str, Any]) -> None:
@@ -2602,6 +2605,11 @@ class ChatSession:
                 except (TypeError, ValueError):
                     pd_str = None
                 src = msg.get("_source")
+                # Operator-context per-kind meta (``_source_meta`` dict) rides
+                # the fork too, so a forked watch-result keeps its structured
+                # card.  Serialized to JSON for the ``conversations.meta`` column.
+                sm = msg.get("_source_meta")
+                meta_json = json.dumps(sm) if isinstance(sm, dict) and sm else None
                 bulk_rows.append(
                     {
                         "ws_id": self._ws_id,
@@ -2614,6 +2622,7 @@ class ChatSession:
                         "source": src if isinstance(src, str) and src else None,
                         "is_error": bool(msg.get("is_error", False)),
                         "producer": msg.get("_producer"),
+                        "meta": meta_json,
                     }
                 )
             save_messages_bulk(bulk_rows)
@@ -3728,21 +3737,29 @@ class ChatSession:
         throwing here must not abort the turn.
 
         *source* must be one of :data:`tool_advisory.SYSTEM_TURN_SOURCES`;
-        extra *meta* rides as leading-underscore sibling keys (stripped
-        before the wire by ``sanitize_messages``).
+        extra *meta* is the turn's structured per-kind data (e.g.
+        ``watch_triggered``'s ``watch_name`` / command / poll counters).  It
+        rides three boundaries in lockstep: the in-memory ``Turn`` (as
+        ``meta.extra["source_meta"]`` via :func:`make_system_turn` →
+        ``turn_from_dict``), the persisted ``conversations.meta`` column (JSON),
+        and the live ``on_system_turn`` SSE hook — so a reconnecting tab and a
+        live mirror both rebuild the same per-kind bubble.  It is stripped before
+        the LLM wire (``_source_meta`` is a ``_``-prefixed key).
         """
         turn = make_system_turn(source, content, **meta)
         self.messages.append(turn_from_dict(turn))
         self._msg_tokens.append(max(1, int(self._msg_char_count(turn) / self._chars_per_token)))
+        meta_json = json.dumps(meta) if meta else None
         save_message(
             self._ws_id,
             "system",
             content,
             source=source,
             event_id=self._ui_event_id(),
+            meta=meta_json,
         )
         try:
-            self.ui.on_system_turn(content, source)
+            self.ui.on_system_turn(content, source, meta or None)
         except Exception:
             log.warning("ui.on_system_turn failed; system turn still appended", exc_info=True)
 
@@ -5887,19 +5904,19 @@ class ChatSession:
         """
         specs: list[tuple[str, str, dict[str, Any]]] = []
 
-        # Output guard advisory — rendered inline (the wire/UI content the
-        # model and operator see).  Mirrors the legacy GuardAdvisory.render.
+        # Output guard advisory.  The structured finding is the source of
+        # truth: build ``meta`` (flags / risk / annotations / redaction), then
+        # derive the wire/UI text ``content`` from it via
+        # ``render_output_guard_text`` so the prose the model reads and the FE
+        # guard-finding card cannot drift.  Mirrors the legacy GuardAdvisory.
         if assessment is not None:
-            lines = [
-                f"Output guard: {', '.join(assessment.flags)} ({assessment.risk_level.upper()})"
-            ]
-            for ann in assessment.annotations:
-                lines.append(f"  {ann}")
-            if assessment.sanitized is not None:
-                lines.append(
-                    "Credentials have been redacted. Do not attempt to reconstruct redacted values."
-                )
-            specs.append(("output_guard", "\n".join(lines), {}))
+            guard_meta: dict[str, Any] = {
+                "flags": list(assessment.flags),
+                "risk_level": assessment.risk_level,
+                "annotations": list(assessment.annotations),
+                "redacted": assessment.sanitized is not None,
+            }
+            specs.append(("output_guard", render_output_guard_text(guard_meta), guard_meta))
 
         # Last-result-in-batch drain seams: queued user messages (Seam 1)
         # and tool/any-channel metacog nudges.  Both fire once per batch so a
@@ -5917,8 +5934,14 @@ class ChatSession:
                 # where it enters as a real role=system message.
                 if not text.strip():
                     continue
+                # ``framed`` (preamble + "User message: …") is the model-facing
+                # content — it keeps the user's authority framing on the wire.
+                # The structured meta carries the user's RAW words + priority so
+                # the FE renders a clean "queued message" bubble (the operator
+                # reads the message, not the model-directed preamble) with
+                # priority emphasis.  Both derive from ``(text, priority)``.
                 framed = render_user_interjection(text, priority)
-                specs.append(("user_interjection", framed, {"priority": priority}))
+                specs.append(("user_interjection", framed, {"priority": priority, "message": text}))
 
             # Metacognitive tool-channel drain.  Queued by
             # ``_queue_tool_advisory`` from the tool_error / repeat

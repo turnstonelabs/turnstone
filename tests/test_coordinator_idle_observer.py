@@ -169,6 +169,34 @@ class TestEnqueueOnIdle:
         assert "child-a" in text
         assert "child-b" in text
 
+    def test_idle_children_carries_structured_meta(self, coord_setup):
+        # The nudge rides the structured child list as ``metadata`` so the FE
+        # rebuilds the idle-children card; the same list ``format_idle_children
+        # _nudge`` rendered into ``text`` (one source, no drift).
+        mgr, storage, ws = coord_setup
+        _add_active_child(storage, ws_id="child-a", name="research", state="running")
+        _add_active_child(storage, ws_id="child-b", name="deploy", state="thinking")
+        ws.session.messages = turns_from_dicts(
+            [
+                {"role": "user", "content": "go"},
+                {"role": "assistant", "content": "ok"},
+            ]
+        )
+
+        observer = CoordinatorIdleObserver(mgr, storage)
+        observer.start()
+        mgr.fire_state(ws.id, WorkstreamState.IDLE)
+
+        snap = ws.session._nudge_queue.pending_with_metadata(channel="any")
+        assert len(snap) == 1
+        meta = snap[0][2]
+        assert meta == {
+            "children": [
+                {"ws_id": "child-a", "name": "research", "state": "running"},
+                {"ws_id": "child-b", "name": "deploy", "state": "thinking"},
+            ]
+        }
+
     def test_idle_with_no_active_children_no_enqueue(self, coord_setup):
         mgr, storage, ws = coord_setup
         # storage.children is empty

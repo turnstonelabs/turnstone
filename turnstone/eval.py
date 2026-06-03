@@ -143,7 +143,7 @@ class NullUI:
     def on_error(self, message: str) -> None:
         pass
 
-    def on_system_turn(self, content: str, source: str) -> None:
+    def on_system_turn(self, content: str, source: str, meta: dict[str, Any] | None = None) -> None:
         pass
 
     def on_state_change(self, state: str) -> None:

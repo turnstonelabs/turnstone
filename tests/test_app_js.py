@@ -270,7 +270,10 @@ def test_replay_renders_system_turn_via_add_system_context() -> None:
     assert 'msg.role === "system"' in fn, (
         "replayHistory must have a system-role branch for first-class operator-context turns."
     )
-    assert "addSystemContext(msg.content" in fn, (
+    # Whitespace-tolerant: the call carries a 3rd ``meta`` arg now, so the
+    # formatter wraps it across lines — match the call + first arg, not a
+    # brittle contiguous substring.
+    assert re.search(r"addSystemContext\(\s*msg\.content", fn), (
         "the system-role branch must route the turn through addSystemContext "
         "so it renders as an operator bubble."
     )

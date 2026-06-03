@@ -195,9 +195,15 @@ def format_watch_message(
     return "\n".join(lines)
 
 
+# The structured fields that ride the ``watch_triggered`` system turn's
+# ``_source_meta`` (delivered to the FE for the watch-result card).  ``output``
+# is the raw (sanitized) shell output so the card body renders it alone, without
+# re-showing the header / command lines that ``format_watch_message`` bakes into
+# the turn's text ``content`` (which is what the model reads on the wire).
 WATCH_REMINDER_OPTIONAL_KEYS = (
     "watch_name",
     "command",
+    "output",
     "poll_count",
     "max_polls",
     "is_final",
@@ -217,13 +223,18 @@ def build_watch_reminder(
 ) -> dict[str, Any]:
     """Build a structured ``watch_triggered`` reminder dict.
 
-    Returns a dict with ``{type, text, watch_name, command, poll_count,
-    max_polls, is_final}``.  The ``text`` field is the formatted body
+    Returns a dict with ``{type, text, watch_name, command, output,
+    poll_count, max_polls, is_final}``.  The ``text`` field is the formatted body
     (same content :func:`format_watch_message` produces) and becomes the
-    content of the first-class ``{"role": "system", "_source":
-    "watch_triggered"}`` turn the drain seam emits; the remaining fields
-    ride as sibling metadata.  Compaction / channel adapters keep seeing
-    the human-readable shell output via the ``text`` field.
+    ``content`` of the first-class ``{"role": "system", "_source":
+    "watch_triggered"}`` turn the drain seam emits — the model-facing prose, with
+    the watch header / ``$ command`` / output all baked in.  The remaining fields
+    ride as the turn's structured ``_source_meta`` so the FE rebuilds the
+    watch-result card from them; ``output`` is carried separately so the card
+    body shows the raw shell output alone (without re-printing the header /
+    command the chrome already renders).  Both ``text`` and the structured fields
+    derive from the same inputs, so they cannot drift.  Compaction / channel
+    adapters keep seeing the human-readable shell output via the ``text`` field.
     """
     return {
         "type": "watch_triggered",
@@ -240,6 +251,7 @@ def build_watch_reminder(
         ),
         "watch_name": name,
         "command": command,
+        "output": output,
         "poll_count": poll_count,
         "max_polls": max_polls,
         "is_final": is_final,

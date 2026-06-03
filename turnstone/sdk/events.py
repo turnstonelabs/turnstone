@@ -62,6 +62,11 @@ class HistoryEvent(ServerEvent):
     * ``source`` — the operator-context kind on a ``system`` turn
       (``output_guard`` / ``user_interjection`` / ``tool_error`` / ...),
       or ``"system_nudge"`` on a wake-driven empty user turn
+    * ``meta`` — structured per-kind fields on an operator-context
+      ``system`` turn (e.g. ``watch_triggered``'s ``{watch_name, command,
+      poll_count, max_polls, is_final}``) so the renderer can rebuild
+      per-kind UI (the watch-result card); absent when the kind carries no
+      structured data
     * ``reasoning`` — concatenated reasoning text for assistant turns
       that round-tripped a thinking-block lane (Anthropic-with-thinking
       today; OpenAI Responses + Gemini in later phases). Present only

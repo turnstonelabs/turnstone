@@ -1003,11 +1003,13 @@
 }
 /* First-class operator-context system turn (role="system" in the
    trajectory) — the consolidation of the metacognition reminder /
-   user-interjection / output-guard / watch-result bubbles into one turn
-   type that FOLLOWS the turn it advises.  Shared so the interactive UI and
-   the console coord viewer render it identically.  Yellow accent reads as
-   "operator metadata" against the amber user colour and the cyan tool
-   cards; deliberately quieter so it doesn't compete for attention. */
+   user-interjection / output-guard bubbles into one turn type that FOLLOWS
+   the turn it advises.  Shared so the interactive UI and the console coord
+   viewer render it identically.  Yellow accent reads as "operator metadata"
+   against the amber user colour and the cyan tool cards; deliberately quieter
+   so it doesn't compete for attention.  The ``watch_triggered`` kind carries
+   structured per-kind meta and branches into the richer ``.msg.watch-result``
+   card below instead of this plain bubble. */
 .msg.system-context {
   border-left-color: var(--yellow);
   color: var(--fg-dim);
@@ -1023,6 +1025,107 @@
 }
 .msg.system-context .msg-body {
   white-space: pre-wrap;
+}
+
+/* Structured watch-result card — the ``watch_triggered`` operator-context
+   system turn renders here (command-preview header / shell-output body / poll
+   counter footer) rather than as the plain ``.msg.system-context`` bubble,
+   because it carries structured per-kind meta.  Cyan accent ties it to the
+   tool-surface vocabulary (it IS shell output).  Built by
+   ``_buildWatchResultBubble`` (interactive) / ``appendWatchResult`` (coord). */
+.msg.watch-result {
+  border-left-color: var(--cyan);
+  background: var(--panel);
+  padding: 8px 12px;
+  margin: 6px 0;
+  width: 100%;
+}
+.msg.watch-result .msg-watch-header {
+  color: var(--cyan);
+  font-family: var(--font-mono);
+  font-size: 11px;
+  font-weight: 600;
+  margin-bottom: 4px;
+  text-transform: lowercase;
+}
+.msg.watch-result .msg-watch-cmd {
+  color: var(--ink-3);
+  font-family: var(--font-mono);
+  font-size: 12px;
+  margin-bottom: 6px;
+}
+.msg.watch-result .msg-watch-body {
+  font-family: var(--font-mono);
+  font-size: 12px;
+  margin: 0;
+  white-space: pre-wrap;
+  /* Shell output can be wide (URLs, JSON, file lists) — break inside
+     long words so the off-canvas mobile drawer doesn't blow horizontal
+     layout. */
+  word-break: break-word;
+}
+.msg.watch-result .msg-watch-footer {
+  color: var(--ink-3);
+  font-size: 11px;
+  margin-top: 6px;
+}
+
+/* Guard-finding card — the ``output_guard`` operator-context system turn.  The
+   inner warning element (``.output-warning`` interactive / ``.coord-tool-row-
+   warning`` coord) carries the risk colour + flags + redaction; this wrapper
+   hosts it as a standalone message row and styles the annotation detail lines
+   the terse inline tool chip omits.  Built by ``_buildGuardFindingBubble``
+   (interactive) / ``appendGuardFinding`` (coord). */
+.msg.guard-finding {
+  border-left-color: var(--yellow);
+  padding: 6px 10px;
+}
+.msg.guard-finding .msg-guard-annotation {
+  color: var(--ink-3);
+  font-size: 11px;
+  margin-top: 4px;
+  margin-left: 8px;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+/* Idle-children card — the coordinator-only ``idle_children`` operator-context
+   system turn lists the child workstreams still running while the coordinator
+   went idle.  Built by ``appendIdleChildren`` (coord). */
+.msg.idle-children {
+  border-left-color: var(--yellow);
+  padding: 6px 10px;
+}
+.msg.idle-children .msg-idle-header {
+  color: var(--yellow);
+  font-weight: 600;
+  font-size: 11px;
+  text-transform: lowercase;
+  margin-bottom: 4px;
+}
+.msg.idle-children .msg-idle-list {
+  margin: 0;
+  padding-left: 16px;
+}
+.msg.idle-children .msg-idle-child {
+  font-size: 12px;
+  color: var(--ink-3);
+}
+.msg.idle-children .msg-idle-child-state {
+  color: var(--ink-4);
+  margin-left: 6px;
+  font-size: 11px;
+}
+
+/* Important user interjection — a ``!!!``-prefixed queued message that drained
+   mid-turn.  Brighter accent + heavier weight so an urgent operator interjection
+   doesn't read as a quiet metadata note.  ``notice`` interjections keep the
+   default ``.system-context`` styling. */
+.msg.system-context.important {
+  border-left-color: var(--accent);
+}
+.msg.system-context.important .msg-system-context-label {
+  color: var(--accent);
 }
 
 /* System-nudge marker — visible-but-thin replacement for the wake's

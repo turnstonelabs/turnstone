@@ -372,6 +372,61 @@ class TestSystemTurns:
         assert msgs[2]["role"] == "system"
         assert "_source" not in msgs[2]
 
+    def test_system_row_with_meta_column_reconstructed(self):
+        # A system row carrying the JSON ``meta`` column (migration 060) rehydrates
+        # the structured operator meta onto the dict as ``_source_meta`` — the
+        # source the FE watch-result card derives from.  Full 11-tuple:
+        # (id, role, content, tool_name, tc_id, pdata, tool_calls, source,
+        #  event_id, is_error, meta).
+        meta_json = json.dumps({"watch_name": "ci", "command": "make test", "poll_count": 3})
+        row = (
+            1,
+            "system",
+            "ci failed",
+            None,
+            None,
+            None,
+            None,
+            "watch_triggered",
+            None,
+            False,
+            meta_json,
+        )
+        msgs = reconstruct_messages([row], "ws1")
+        assert msgs[0] == {
+            "role": "system",
+            "content": "ci failed",
+            "_source": "watch_triggered",
+            "_source_meta": {"watch_name": "ci", "command": "make test", "poll_count": 3},
+        }
+
+    def test_legacy_short_row_without_meta_column_valid(self):
+        # A pre-meta 8-tuple row reconstructs fine (defensive length check) and
+        # carries no ``_source_meta`` key.
+        rows = [_row("system", "old note", source="output_guard")]
+        msgs = reconstruct_messages(rows, "ws1")
+        assert msgs[0]["_source"] == "output_guard"
+        assert "_source_meta" not in msgs[0]
+
+    def test_malformed_meta_column_dropped_not_crashed(self):
+        # A non-JSON / non-object meta column is dropped (the human-readable body
+        # still rides ``content``), never raised.
+        row = (
+            1,
+            "system",
+            "note",
+            None,
+            None,
+            None,
+            None,
+            "output_guard",
+            None,
+            False,
+            "{bad json",
+        )
+        msgs = reconstruct_messages([row], "ws1")
+        assert "_source_meta" not in msgs[0]
+
     def test_trailing_system_after_incomplete_assistant_strips_both(self):
         """A nudge appended after an interrupted tool-call turn must not leave
         the orphaned assistant — the strip walks through the trailing system

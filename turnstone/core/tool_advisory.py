@@ -54,6 +54,29 @@ _USER_INTERJECTION_IMPORTANT_PREAMBLE: Final = (
 _USER_INTERJECTION_BODY_MARKER: Final = "\n\nUser message: "
 
 
+def render_output_guard_text(meta: dict[str, Any]) -> str:
+    """Render an ``output_guard`` system turn's text from its structured *meta*.
+
+    *meta* carries ``{flags, risk_level, annotations, redacted}``.  Returns the
+    operator/model-facing prose — the flag list + risk level, one indented line
+    per annotation, and (when credentials were redacted) the do-not-reconstruct
+    notice.  This is the text projection of the structured guard finding: the
+    producer (``ChatSession._collect_advisories``) builds *meta* and derives the
+    turn ``content`` from it via this function, so the wire text and the FE
+    guard-finding card cannot drift (both read the same *meta*).
+    """
+    flags = meta.get("flags") or []
+    risk_level = str(meta.get("risk_level") or "none")
+    lines = [f"Output guard: {', '.join(flags)} ({risk_level.upper()})"]
+    for ann in meta.get("annotations") or []:
+        lines.append(f"  {ann}")
+    if meta.get("redacted"):
+        lines.append(
+            "Credentials have been redacted. Do not attempt to reconstruct redacted values."
+        )
+    return "\n".join(lines)
+
+
 def render_user_interjection(message: str, priority: str) -> str:
     """Frame a queued user *message* as user-authored operator context.
 
@@ -108,14 +131,22 @@ SYSTEM_TURN_SOURCES: Final = frozenset(
 def make_system_turn(source: str, content: str, **meta: Any) -> dict[str, Any]:
     """Build a first-class operator-context system turn for ``self.messages``.
 
-    Returns ``{"role": "system", "_source": source, "content": content}``.
-    *source* must be one of :data:`SYSTEM_TURN_SOURCES`.  Extra keyword *meta*
-    fields are attached as leading-underscore sibling keys (e.g.
-    ``watch_name="ci"`` → ``_watch_name``) so they ride the persisted record
-    and the UI projection but are stripped before the LLM wire by
-    ``sanitize_messages``.  Keys already underscore-prefixed are kept as-is; a
-    meta key that normalises onto a reserved field (``_source``) is rejected so
-    the validated source can't be silently clobbered.
+    Returns ``{"role": "system", "_source": source, "content": content}``, plus a
+    ``_source_meta`` dict of the *meta* keyword fields when any are supplied.
+    *source* must be one of :data:`SYSTEM_TURN_SOURCES`.
+
+    The *meta* fields are the turn's structured per-kind data (e.g.
+    ``watch_triggered``'s ``watch_name`` / ``command`` / ``poll_count`` /
+    ``max_polls`` / ``is_final``; ``user_interjection``'s ``priority``).  They
+    ride as ONE ``_source_meta`` dict — a single carrier that maps cleanly to the
+    one ``conversations.meta`` storage column, the one ``Turn.meta.extra
+    ["source_meta"]`` field (via :func:`turnstone.core.trajectory.turn_from_dict`),
+    and the one ``meta`` field the live ``on_system_turn`` SSE event / the
+    ``/history`` projection hand the frontend so it can rebuild per-kind rendering
+    (the ``watch_triggered`` card).  Being a ``_``-prefixed key, ``_source_meta``
+    is stripped before the LLM wire by ``sanitize_messages`` (and the Anthropic
+    native mid-conversation path copies only ``role`` + ``content``), so the
+    structured fields never reach the model.
 
     ``content`` is stored and — on the native mid-conversation-system path
     (claude-opus-4-8) — sent to the model verbatim, so fence-escaping is NOT
@@ -128,9 +159,6 @@ def make_system_turn(source: str, content: str, **meta: Any) -> dict[str, Any]:
     if source not in SYSTEM_TURN_SOURCES:
         raise ValueError(f"unknown system-turn source: {source!r}")
     turn: dict[str, Any] = {"role": "system", "_source": source, "content": content}
-    for key, value in meta.items():
-        norm = key if key.startswith("_") else f"_{key}"
-        if norm in turn:
-            raise ValueError(f"system-turn meta key {key!r} collides with reserved {norm!r}")
-        turn[norm] = value
+    if meta:
+        turn["_source_meta"] = dict(meta)
     return turn

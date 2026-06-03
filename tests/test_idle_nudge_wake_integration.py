@@ -70,7 +70,7 @@ class _FakeUI:
     def on_state_change(self, state: str) -> None:
         self.events.append(("state", state))
 
-    def on_system_turn(self, content: str, source: str) -> None:
+    def on_system_turn(self, content: str, source: str, meta: dict | None = None) -> None:
         self.events.append(("system_turn", content, source))
 
     def on_error(self, message: str) -> None:

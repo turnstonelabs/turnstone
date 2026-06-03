@@ -336,6 +336,10 @@ class TestBuildWatchReminder:
         assert reminder["type"] == "watch_triggered"
         assert reminder["watch_name"] == "pr-review"
         assert reminder["command"] == "gh pr view --json state"
+        # The raw shell output rides as its own field so the FE card body shows
+        # it alone (no header / command repeat); the wire ``text`` keeps the
+        # full prose for the model.
+        assert reminder["output"] == '{"state": "MERGED"}'
         assert reminder["poll_count"] == 5
         assert reminder["max_polls"] == 100
         assert reminder["is_final"] is True

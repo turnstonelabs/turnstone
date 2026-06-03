@@ -2363,23 +2363,29 @@ class SessionUIBase:
     def on_error(self, message: str) -> None:
         self._enqueue({"type": "error", "message": message})
 
-    def on_system_turn(self, content: str, source: str) -> None:
+    def on_system_turn(self, content: str, source: str, meta: dict[str, Any] | None = None) -> None:
         """Surface a first-class operator-context system turn as its own
         UI element.
 
         Operator context (output-guard findings, user interjections,
-        metacognitive nudges) lives in the conversation trajectory as a
-        real ``{"role": "system", "_source": <kind>, ...}`` turn (see
-        ``tool_advisory.make_system_turn``).  This event lets every
+        metacognitive nudges, watch results) lives in the conversation
+        trajectory as a real ``{"role": "system", "_source": <kind>, ...}``
+        turn (see ``tool_advisory.make_system_turn``).  This event lets every
         connected SSE consumer (other browser tabs, CLI mirrors, future
         channel adapters) render the operator bubble in lockstep with the
         originating tab's optimistic render.  The history-replay path
         surfaces the same shape via ``project_history_messages`` (the REST
         ``/history`` projection) so a tab reconnecting later renders the
         same bubble.  ``source`` carries the turn's ``_source`` kind so
-        the frontend can label / style the bubble.
+        the frontend can label / style the bubble; ``meta`` carries the
+        turn's structured per-kind fields (``watch_triggered``'s
+        ``watch_name`` / command / poll counters) so the frontend can rebuild
+        per-kind rendering (the watch-result card).  ``None`` for kinds with
+        no structured data.
         """
-        self._enqueue({"type": "system_turn", "content": content, "source": source})
+        self._enqueue(
+            {"type": "system_turn", "content": content, "source": source, "meta": meta or None}
+        )
 
     # ------------------------------------------------------------------
     # Broadcast hooks — kind-specific transport.

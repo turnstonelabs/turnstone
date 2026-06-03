@@ -162,6 +162,7 @@ class StorageBackend(Protocol):
         event_id: int | None = None,
         is_error: bool = False,
         producer: str | None = None,
+        meta: str | None = None,
     ) -> int:
         """Log a message to the conversations table.
 
@@ -178,6 +179,10 @@ class StorageBackend(Protocol):
         time (``SessionUIBase._event_id``) — the ``Last-Event-ID`` resume
         cursor space, distinct from the returned ``id`` PK.  NULL when the
         caller has no live UI counter (offline / bulk / fork re-saves).
+
+        ``meta`` is the pre-serialized JSON of an operator-context ``system``
+        turn's structured per-kind fields (the ``_source_meta`` side channel);
+        opaque to storage and NULL for ordinary rows.
         """
         ...
 
@@ -187,8 +192,8 @@ class StorageBackend(Protocol):
         Each dict must include ``ws_id``, ``role``, and ``content``
         (which may be ``None`` for assistant messages with only tool_calls).
         Optional keys: ``tool_name``, ``tool_call_id``, ``provider_data``,
-        ``tool_calls``, ``source``.  Timestamp and workstream updated-at
-        are handled internally.
+        ``tool_calls``, ``source``, ``meta``.  Timestamp and workstream
+        updated-at are handled internally.
         """
         ...
 

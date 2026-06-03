@@ -61,7 +61,7 @@ class NullUI:
     def on_error(self, message):
         pass
 
-    def on_system_turn(self, content, source):
+    def on_system_turn(self, content, source, meta=None):
         pass
 
     def on_state_change(self, state):
@@ -2942,7 +2942,15 @@ class TestMetacognitiveBuffers:
         assert "HIGH" in content
         assert "API key detected" in content
         assert "redacted" in content.lower()
-        assert meta == {}
+        # The structured finding rides as meta (the source the FE card and the
+        # rendered ``content`` both derive from); ``redacted`` is the boolean
+        # projection of ``sanitized is not None``.
+        assert meta == {
+            "flags": ["credential_leak"],
+            "risk_level": "high",
+            "annotations": ["API key detected"],
+            "redacted": True,
+        }
 
     def test_collect_advisories_drains_queued_messages_on_last_result(self, tmp_db):
         """Queued user messages drain into a ``user_interjection`` spec on
@@ -2958,7 +2966,10 @@ class TestMetacognitiveBuffers:
         assert len(specs) == 1
         source, content, meta = specs[0]
         assert source == "user_interjection"
-        assert meta == {"priority": "notice"}
+        # Meta carries the priority AND the user's raw words, so the FE renders
+        # a clean "queued message" bubble while ``content`` keeps the framed,
+        # model-facing wording.
+        assert meta == {"priority": "notice", "message": "hows it going?"}
         # Framed as the user's words (known #2 — keeps user, not operator,
         # authority, especially on the native path), not the raw text.
         assert content.endswith("User message: hows it going?")
@@ -3523,9 +3534,11 @@ class TestMetacognitiveBuffers:
         with patch("turnstone.core.session.save_message"):
             session._emit_pending_user_nudges()
         assert session.ui.on_system_turn.call_count == 1
-        content, source = session.ui.on_system_turn.call_args.args
+        content, source, meta = session.ui.on_system_turn.call_args.args
         assert content == "watch out"
         assert source == "correction"
+        # ``correction`` is a static nudge — no structured per-kind meta.
+        assert meta is None
 
     def test_emit_user_nudges_swallows_on_system_turn_failure(self, tmp_db):
         """A UI hook that raises (queue full, unexpected bug) must not abort
@@ -4388,9 +4401,24 @@ class TestSessionUIBaseSystemTurnHook:
 
         ui = _RecordingUI()
         ui.on_system_turn("watch out", "correction")
+        # A static-text kind carries no structured meta → ``meta`` is None.
         assert ui.events == [
-            {"type": "system_turn", "content": "watch out", "source": "correction"}
+            {
+                "type": "system_turn",
+                "content": "watch out",
+                "source": "correction",
+                "meta": None,
+            }
         ]
+        # A structured kind rides its per-kind meta on the event so the FE
+        # rebuilds the card live, in lockstep with /history replay.
+        ui.on_system_turn("ci failed", "watch_triggered", {"watch_name": "ci", "poll_count": 3})
+        assert ui.events[-1] == {
+            "type": "system_turn",
+            "content": "ci failed",
+            "source": "watch_triggered",
+            "meta": {"watch_name": "ci", "poll_count": 3},
+        }
 
     def test_on_system_turn_carries_each_source_kind(self):
         from turnstone.core.session_ui_base import SessionUIBase

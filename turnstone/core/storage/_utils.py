@@ -538,15 +538,17 @@ def reconstruct_messages(
 ) -> list[dict[str, Any]]:
     """Reconstruct OpenAI message format from stored conversation rows.
 
-    Each *row* is an 8- or 9-tuple ``(id, role, content, tool_name,
-    tool_call_id, provider_data, tool_calls_json, source [, event_id])``,
-    ordered chronologically by row id.  ``source`` is rehydrated as the
-    ``_source`` side channel.  (The legacy ``_reminders`` column that used to
-    ride here was dropped in migration 060 — operator context lives in
-    first-class ``system`` turns now.)  The optional 9th element
-    ``event_id`` (migration 059, the per-ws SSE ``Last-Event-ID`` resume
-    cursor) is surfaced as the ``_event_id`` side-channel; legacy 9-tuple
-    fixtures omit it (handled by the defensive unpack below).
+    Each *row* is an 8-to-11-tuple ``(id, role, content, tool_name,
+    tool_call_id, provider_data, tool_calls_json, source [, event_id [, is_error
+    [, meta]]])``, ordered chronologically by row id.  ``source`` is rehydrated
+    as the ``_source`` side channel.  (The legacy ``_reminders`` column that used
+    to ride here was dropped in migration 060 — operator context lives in
+    first-class ``system`` turns now.)  The trailing optional elements —
+    ``event_id`` (migration 059, the per-ws SSE ``Last-Event-ID`` resume cursor →
+    ``_event_id``), ``is_error`` (migration 060, the persisted tool-result error
+    flag), and ``meta`` (migration 060, an operator-context turn's structured
+    ``_source_meta``) — are handled by the defensive unpack so shorter legacy
+    fixtures stay valid.
 
     When ``attachments_by_msg`` is provided (keyed by row id, each value an
     ordered list of content-addressed attachment rows resolved from the
@@ -624,6 +626,24 @@ def _native_from_provider_data(provider_data: str | None) -> ProviderNative | No
     return None
 
 
+def _source_meta_from_json(meta_json: str | None) -> dict[str, Any] | None:
+    """Decode the stored ``meta`` column into an operator-context meta dict.
+
+    The persisted twin of ``Turn.meta.extra["source_meta"]`` — a first-class
+    ``system`` turn's structured per-kind fields (e.g. ``watch_triggered``'s
+    ``watch_name`` / ``command`` / poll counters).  A decode failure or a
+    non-object payload yields ``None`` (the meta is dropped — the human-readable
+    body still lives in ``content``).
+    """
+    if not meta_json:
+        return None
+    try:
+        parsed = json.loads(meta_json)
+    except (json.JSONDecodeError, TypeError):
+        return None
+    return parsed if isinstance(parsed, dict) and parsed else None
+
+
 def _tool_calls_from_json(tool_calls_json: str | None) -> tuple[ToolCall, ...]:
     """Decode the stored ``tool_calls`` column into typed :class:`ToolCall`s."""
     if not tool_calls_json:
@@ -663,11 +683,15 @@ def reconstruct_turns(
     for row in rows:
         (row_id, role, content, _tool_name, tc_id, provider_data, tool_calls_json, source) = row[:8]
         # event_id (col 9, migration 059) — the per-ws SSE Last-Event-ID cursor;
-        # is_error (col 10, migration 060) rides last.  Defensive length checks
-        # keep pre-event_id / pre-is_error fixtures valid.
+        # is_error (col 10, migration 060); meta (col 11, also migration 060 — the
+        # operator-context per-kind ``source_meta``) rides last.  Defensive
+        # length checks keep pre-event_id / pre-is_error / pre-meta fixtures valid.
         event_id = int(row[8]) if len(row) > 8 and row[8] is not None else None
         is_error = bool(row[9]) if len(row) > 9 else False
         meta = TurnMeta(event_id=event_id)
+        source_meta = _source_meta_from_json(row[10]) if len(row) > 10 else None
+        if source_meta is not None:
+            meta.extra["source_meta"] = source_meta
         src = str(source) if source else None
 
         if role == "user":

@@ -89,7 +89,11 @@ class TurnMeta:
     """Sidecar metadata: never reaches the wire, never read by the lowering layer.
 
     ``event_id`` is the per-ws SSE ``Last-Event-ID`` resume cursor; ``extra`` holds
-    open operator-turn metadata (e.g. ``watch_name``)."""
+    open metadata under well-known keys — ``"source_meta"`` (an operator-context
+    ``system`` turn's structured per-kind fields, e.g. ``watch_triggered``'s
+    ``watch_name`` / ``command`` / poll counters; persisted in the
+    ``conversations.meta`` column, surfaced to the FE for per-kind rendering) and
+    ``"attachments_meta"`` (display metadata for by-reference attachments)."""
 
     event_id: int | None = None
     extra: dict[str, Any] = field(default_factory=dict)
@@ -240,6 +244,12 @@ def turn_from_dict(msg: dict[str, Any]) -> Turn:
     am = msg.get("_attachments_meta")
     if am is not None:
         meta.extra["attachments_meta"] = am
+    # Operator-context per-kind structured fields (``watch_triggered`` etc.).
+    # Carried as ONE dict so it maps to one ``conversations.meta`` column / one
+    # FE ``meta`` field, rather than scattered ``_``-prefixed siblings.
+    sm = msg.get("_source_meta")
+    if sm:
+        meta.extra["source_meta"] = sm
 
     return Turn(
         role=role,
@@ -280,6 +290,9 @@ def turn_to_dict(turn: Turn) -> dict[str, Any]:
     am = turn.meta.extra.get("attachments_meta")
     if am is not None:
         msg["_attachments_meta"] = am
+    sm = turn.meta.extra.get("source_meta")
+    if sm:
+        msg["_source_meta"] = sm
     return msg
 
 
