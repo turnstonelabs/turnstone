@@ -26,6 +26,13 @@ This migration retires both carriers:
   path no longer reads it, so carrying it forward would only leave a writable
   dead column as a foot-gun.
 
+This migration also carries the additive front of the canonical-trajectory storage cut:
+it adds the ``is_error`` column (persisting the tool-result error flag, previously an
+in-memory-only message key) and tags legacy bare-list ``provider_data`` rows with their
+generating provider as the ``{producer, blocks}`` envelope (producer inferred from block
+types — see ``_infer_producer``, which must match the live save's ``provider_name``
+values), so the lowering layer can replay the native lane verbatim only to its producer.
+
 ``downgrade()`` re-adds the (empty) ``_reminders`` column so the schema matches
 the 059 state, but does NOT reverse the envelope un-wrap — that is lossy (the
 advisory blocks are discarded), so the original wrapped rows cannot be
@@ -37,6 +44,9 @@ Create Date: 2026-06-01
 """
 
 from __future__ import annotations
+
+import json
+from typing import Any
 
 import sqlalchemy as sa
 from alembic import op
@@ -111,12 +121,53 @@ def _unwrap_envelope(content: str) -> str | None:
     return _decode_ampersand(inner)
 
 
+# Block-type → producer inference for the legacy provider_data backfill.  Must yield the
+# same provider_name strings the live save writes (anthropic / google / openai /
+# openai-compatible) so a backfilled row and a freshly-saved row compare equal under the
+# lowering layer's ``producer == active_provider`` rule.  xAI is byte-identical to
+# OpenAI-Responses in the stored blocks, so legacy xAI rows are deliberately (and
+# self-healingly) tagged ``openai``.
+_ANTHROPIC_BLOCK_TYPES = frozenset(
+    {"thinking", "redacted_thinking", "tool_use", "server_tool_use", "web_search_tool_result"}
+)
+_OPENAI_RESPONSES_BLOCK_TYPES = frozenset(
+    {
+        "reasoning",
+        "function_call",
+        "web_search_call",
+        "file_search_call",
+        "code_interpreter_call",
+        "message",
+    }
+)
+
+
+def _infer_producer(blocks: list[Any]) -> str | None:
+    """Infer the generating provider from a legacy bare ``provider_data`` block list."""
+    # Google's fidelity shape: a client tool-call block carrying ``thought_signature``
+    # (generic ``function`` type, so the signature field is the distinguishing signal).
+    if any(
+        isinstance(b, dict) and b.get("type") == "function" and "thought_signature" in b
+        for b in blocks
+    ):
+        return "google"
+    types = {b.get("type") for b in blocks if isinstance(b, dict)}
+    if types & _ANTHROPIC_BLOCK_TYPES:
+        return "anthropic"
+    if types & _OPENAI_RESPONSES_BLOCK_TYPES:
+        return "openai"
+    if "reasoning_text" in types:
+        return "openai-compatible"
+    return None
+
+
 def upgrade() -> None:
     bind = op.get_bind()
     conversations = sa.table(
         "conversations",
         sa.column("id", sa.Integer),
         sa.column("content", sa.Text),
+        sa.column("provider_data", sa.Text),
     )
 
     # (1) Un-wrap legacy ``<tool_output>`` envelopes in place.  Only rows whose
@@ -149,6 +200,44 @@ def upgrade() -> None:
                 sa.update(conversations)
                 .where(conversations.c.id == row_id)
                 .values(content=unwrapped)
+            )
+
+    # (1b) Tag legacy bare-list ``provider_data`` with its producer → the
+    #      ``{producer, blocks}`` envelope.  Only bare-list rows (``[%``) are
+    #      candidates; already-wrapped or un-inferable rows are left as-is
+    #      (reconstruct dual-reads the legacy bare-list shape).  Paged like (1).
+    last_id = 0
+    while True:
+        rows = bind.execute(
+            sa.select(conversations.c.id, conversations.c.provider_data)
+            .where(
+                sa.and_(
+                    conversations.c.provider_data.like("[%"),
+                    conversations.c.id > last_id,
+                )
+            )
+            .order_by(conversations.c.id)
+            .limit(_BATCH)
+        ).fetchall()
+        if not rows:
+            break
+        for row_id, pdata in rows:
+            last_id = row_id
+            if not isinstance(pdata, str):
+                continue
+            try:
+                blocks = json.loads(pdata)
+            except (json.JSONDecodeError, ValueError):
+                continue
+            if not isinstance(blocks, list):
+                continue
+            producer = _infer_producer(blocks)
+            if producer is None:
+                continue
+            bind.execute(
+                sa.update(conversations)
+                .where(conversations.c.id == row_id)
+                .values(provider_data=json.dumps({"producer": producer, "blocks": blocks}))
             )
 
     # (2) Drop the dead ``_reminders`` column outright.  Operator context now
