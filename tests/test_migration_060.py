@@ -19,6 +19,7 @@ isolated SQLite database per test, then asserts:
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import sqlalchemy as sa
@@ -88,6 +89,80 @@ class TestMigration060:
             assert content == "clean tool output"
             assert "<tool_output>" not in content
             assert "<system-reminder>" not in content
+        finally:
+            engine.dispose()
+
+    def test_provider_data_producer_backfill(self, tmp_path: Path) -> None:
+        """Legacy bare-list provider_data is tagged {producer, blocks} by inferred provider.
+
+        The inferred producer strings must match the live save's provider_name values
+        (anthropic / google / openai / openai-compatible); un-inferable rows stay bare.
+        """
+        db_path = tmp_path / "060-producer.db"
+        cfg = _alembic_cfg(db_path)
+        command.upgrade(cfg, "059")
+        cases = {
+            "a-anthropic": ([{"type": "thinking", "thinking": "t"}], "anthropic"),
+            "a-google": (
+                [{"type": "function", "function": {"name": "x"}, "thought_signature": "ts"}],
+                "google",
+            ),
+            "a-openai": ([{"type": "reasoning", "summary": []}], "openai"),
+            "a-chat": ([{"type": "reasoning_text", "text": "r"}], "openai-compatible"),
+        }
+        engine = sa.create_engine(f"sqlite:///{db_path}")
+        try:
+            with engine.begin() as conn:
+                for tcid, (blocks, _) in cases.items():
+                    _seed_row(
+                        conn,
+                        role="assistant",
+                        content="x",
+                        tool_call_id=tcid,
+                        provider_data=json.dumps(blocks),
+                    )
+                _seed_row(
+                    conn,
+                    role="assistant",
+                    content="x",
+                    tool_call_id="a-unknown",
+                    provider_data=json.dumps([{"type": "mystery"}]),
+                )
+
+            command.upgrade(cfg, "060")
+
+            with engine.connect() as conn:
+                for tcid, (blocks, producer) in cases.items():
+                    pd = conn.execute(
+                        sa.text("SELECT provider_data FROM conversations WHERE tool_call_id = :t"),
+                        {"t": tcid},
+                    ).scalar_one()
+                    assert json.loads(pd) == {"producer": producer, "blocks": blocks}
+                # Un-inferable blocks are left bare (reconstruct dual-reads the legacy shape).
+                unknown = conn.execute(
+                    sa.text(
+                        "SELECT provider_data FROM conversations WHERE tool_call_id = 'a-unknown'"
+                    )
+                ).scalar_one()
+                assert json.loads(unknown) == [{"type": "mystery"}]
+        finally:
+            engine.dispose()
+
+    def test_is_error_column_added_and_backfilled_false(self, tmp_path: Path) -> None:
+        db_path = tmp_path / "060-iserr.db"
+        cfg = _alembic_cfg(db_path)
+        command.upgrade(cfg, "059")
+        engine = sa.create_engine(f"sqlite:///{db_path}")
+        try:
+            with engine.begin() as conn:
+                _seed_row(conn, role="tool", content="boom", tool_call_id="e1")
+            command.upgrade(cfg, "060")
+            with engine.connect() as conn:
+                # Existing rows backfill to False via the server_default.
+                val = conn.execute(
+                    sa.text("SELECT is_error FROM conversations WHERE tool_call_id = 'e1'")
+                ).scalar_one()
+            assert not val
         finally:
             engine.dispose()
 
