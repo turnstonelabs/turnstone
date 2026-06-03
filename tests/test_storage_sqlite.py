@@ -91,10 +91,12 @@ class TestSaveAndLoadMessages:
         import json
 
         backend.register_workstream("s1")
-        pd = json.dumps({"encrypted": True})
-        backend.save_message("s1", "assistant", "hi", provider_data=pd)
+        # The native lane is a block list (or the {producer, blocks} envelope);
+        # it round-trips verbatim through _provider_content.
+        blocks = [{"type": "thinking", "thinking": "secret", "signature": "s"}]
+        backend.save_message("s1", "assistant", "hi", provider_data=json.dumps(blocks))
         msgs = backend.load_messages("s1")
-        assert msgs[0].get("_provider_content") == {"encrypted": True}
+        assert msgs[0].get("_provider_content") == blocks
 
     def test_empty_workstream_returns_empty(self, backend):
         assert backend.load_messages("nonexistent") == []

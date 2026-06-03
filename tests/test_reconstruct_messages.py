@@ -351,14 +351,17 @@ class TestSystemTurns:
             "_source": "user_interjection",
         }
 
-    def test_developer_row_reconstructed(self):
+    def test_developer_row_reconstructed_as_system(self):
+        # A developer row is kept (not dropped) but collapses into role=system
+        # (zero writers; providers treat system/developer identically, so the
+        # wire is unaffected).
         rows = [
             _row("user", "hi"),
             _row("assistant", "x"),
             _row("developer", "be terse", source="output_guard"),
         ]
         msgs = reconstruct_messages(rows, "ws1")
-        assert msgs[2]["role"] == "developer"
+        assert msgs[2]["role"] == "system"
         assert msgs[2]["content"] == "be terse"
         assert msgs[2]["_source"] == "output_guard"
 

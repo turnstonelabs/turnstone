@@ -3,13 +3,23 @@
 from __future__ import annotations
 
 import base64
-import contextlib
 import json
 import re
 from typing import Any
 
 from turnstone.core.attachments import unreadable_placeholder
 from turnstone.core.log import get_logger
+from turnstone.core.trajectory import (
+    ContentBlock,
+    ProviderNative,
+    RawContentBlock,
+    Role,
+    TextBlock,
+    ToolCall,
+    Turn,
+    TurnMeta,
+    dicts_from_turns,
+)
 
 log = get_logger(__name__)
 
@@ -549,148 +559,153 @@ def reconstruct_messages(
     the user sees the actual partial state — refreshing during tool execution
     otherwise silently drops the trailing turn from the UI.
     """
-    messages: list[dict[str, Any]] = []
+    turns = reconstruct_turns(rows, ws_id, attachments_by_msg)
+    if repair:
+        turns = recover_trajectory(turns)
+    return dicts_from_turns(turns)
+
+
+def _content_blocks(text: str | None, parts: list[dict[str, Any]]) -> tuple[ContentBlock, ...]:
+    """Build typed content blocks from a row's text column + attachment parts.
+
+    A row with attachment parts becomes a leading text block plus one raw part
+    per attachment (``read_file`` vision output, user uploads); a text-only row
+    is a single text block, or empty.
+    """
+    if parts:
+        return (TextBlock(text or ""), *(RawContentBlock(p) for p in parts))
+    if text:
+        return (TextBlock(text),)
+    return ()
+
+
+def _native_from_provider_data(provider_data: str | None) -> ProviderNative | None:
+    """Decode the stored ``provider_data`` lane into a :class:`ProviderNative`.
+
+    The storage envelope is ``{producer, blocks}`` (new) or a bare block list
+    (legacy, no producer).  A decode failure or non-list/non-envelope payload
+    yields ``None`` (the lane is dropped — matching the prior best-effort decode).
+    """
+    if not provider_data:
+        return None
+    try:
+        parsed = json.loads(provider_data)
+    except (json.JSONDecodeError, TypeError):
+        return None
+    if isinstance(parsed, dict) and "blocks" in parsed:
+        return ProviderNative(producer=parsed.get("producer") or "", blocks=tuple(parsed["blocks"]))
+    if isinstance(parsed, list):
+        return ProviderNative(producer="", blocks=tuple(parsed))
+    return None
+
+
+def _tool_calls_from_json(tool_calls_json: str | None) -> tuple[ToolCall, ...]:
+    """Decode the stored ``tool_calls`` column into typed :class:`ToolCall`s."""
+    if not tool_calls_json:
+        return ()
+    try:
+        parsed = json.loads(tool_calls_json)
+    except (json.JSONDecodeError, TypeError):
+        return ()
+    if not isinstance(parsed, list):
+        return ()
+    return tuple(
+        ToolCall(
+            id=tc.get("id", ""),
+            name=tc.get("function", {}).get("name", ""),
+            arguments=tc.get("function", {}).get("arguments", ""),
+        )
+        for tc in parsed
+        if isinstance(tc, dict)
+    )
+
+
+def reconstruct_turns(
+    rows: list[Any],
+    ws_id: str,
+    attachments_by_msg: dict[int, list[dict[str, Any]]] | None = None,
+) -> list[Turn]:
+    """Deserialize stored conversation rows into canonical ``Turn``s (pure).
+
+    The ``row → Turn`` boundary: one positional unpack of the row tuple, one
+    ``Turn`` per row, no wire-validity correction (the lowering layer owns that
+    — see :func:`recover_trajectory` for the load-time strip).  The legacy
+    ``tool_name`` column (position 3) is unpacked but never used.  Unknown roles
+    are dropped (the roles below are exhaustive for stored conversations);
+    ``developer`` collapses into ``Role.SYSTEM``.
+    """
+    turns: list[Turn] = []
     for row in rows:
-        (
-            row_id,
-            role,
-            content,
-            _tool_name,
-            tc_id,
-            provider_data,
-            tool_calls_json,
-            source,
-        ) = row[:8]
-        # ``event_id`` (9th column, migration 059) is the per-ws SSE
-        # ring-buffer high-water mark stamped at save time — the
-        # ``Last-Event-ID`` resume cursor space.  Surfaced as the
-        # ``_event_id`` side-channel so ``make_history_handler`` can
-        # compute the resume cursor + locate the in-flight-turn boundary.
-        # Defensive length check keeps pre-event_id 8-tuple fixtures valid.
-        event_id = row[8] if len(row) > 8 else None
-        # ``is_error`` (10th column, migration 060) rides last so the tuple
-        # positions above stay stable; legacy fixtures (≤9-tuples) default False.
+        (row_id, role, content, _tool_name, tc_id, provider_data, tool_calls_json, source) = row[:8]
+        # event_id (col 9, migration 059) — the per-ws SSE Last-Event-ID cursor;
+        # is_error (col 10, migration 060) rides last.  Defensive length checks
+        # keep pre-event_id / pre-is_error fixtures valid.
+        event_id = int(row[8]) if len(row) > 8 and row[8] is not None else None
         is_error = bool(row[9]) if len(row) > 9 else False
+        meta = TurnMeta(event_id=event_id)
+        src = str(source) if source else None
 
         if role == "user":
-            parts, meta = _reconstruct_attachment_parts(attachments_by_msg, row_id)
-            if parts:
-                user_content: list[dict[str, Any]] = [{"type": "text", "text": content or ""}]
-                user_content.extend(parts)
-                umsg: dict[str, Any] = {"role": "user", "content": user_content}
-                if meta:
-                    umsg["_attachments_meta"] = meta
-            else:
-                umsg = {"role": "user", "content": content or ""}
-            if source:
-                umsg["_source"] = str(source)
-            if event_id is not None:
-                umsg["_event_id"] = int(event_id)
-            messages.append(umsg)
-
+            parts, am = _reconstruct_attachment_parts(attachments_by_msg, row_id)
+            if am:
+                meta.extra["attachments_meta"] = am
+            turns.append(Turn(Role.USER, _content_blocks(content, parts), source=src, meta=meta))
         elif role == "assistant":
-            msg: dict[str, Any] = {"role": "assistant", "content": content or ""}
-            if provider_data:
-                with contextlib.suppress(json.JSONDecodeError, TypeError):
-                    parsed = json.loads(provider_data)
-                    # Storage envelope ``{producer, blocks}`` (new) vs bare list (legacy):
-                    # surface bare blocks as ``_provider_content`` (every consumer expects a
-                    # plain list) and carry the producer on a stripped-before-wire side channel.
-                    if isinstance(parsed, dict) and "blocks" in parsed:
-                        msg["_provider_content"] = parsed["blocks"]
-                        if parsed.get("producer"):
-                            msg["_producer"] = parsed["producer"]
-                    else:
-                        msg["_provider_content"] = parsed
-            if tool_calls_json:
-                with contextlib.suppress(json.JSONDecodeError, TypeError):
-                    msg["tool_calls"] = json.loads(tool_calls_json)
-            if event_id is not None:
-                msg["_event_id"] = int(event_id)
-            messages.append(msg)
-
+            turns.append(
+                Turn(
+                    Role.ASSISTANT,
+                    _content_blocks(content, []),
+                    tool_calls=_tool_calls_from_json(tool_calls_json),
+                    native=_native_from_provider_data(provider_data),
+                    meta=meta,
+                )
+            )
         elif role == "tool":
-            # Tool rows can carry persisted vision output (``read_file`` on an
-            # image): the live tool message's content was a multipart list and
-            # the image bytes were written content-addressed + referenced on
-            # this row, while the row's text column holds only the flattened
-            # text.  Rebuild the multipart list on reload so the image survives;
-            # text-only tool rows stay plain strings (the common case).
             tparts, _tmeta = _reconstruct_attachment_parts(attachments_by_msg, row_id)
-            tool_content: str | list[dict[str, Any]]
-            if tparts:
-                tool_content = [{"type": "text", "text": content or ""}, *tparts]
-            else:
-                tool_content = content or ""
-            tmsg: dict[str, Any] = {
-                "role": "tool",
-                "tool_call_id": tc_id or "",
-                "content": tool_content,
-            }
-            if is_error:
-                tmsg["is_error"] = True
-            if event_id is not None:
-                tmsg["_event_id"] = int(event_id)
-            messages.append(tmsg)
-
+            turns.append(
+                Turn(
+                    Role.TOOL,
+                    _content_blocks(content, tparts),
+                    tool_call_id=tc_id or "",
+                    is_error=is_error,
+                    meta=meta,
+                )
+            )
         elif role in ("system", "developer"):
-            # First-class operator-context turn (advisory / nudge /
-            # interjection — see tool_advisory.make_system_turn), persisted
-            # mid-history.  The base system prompt is never stored (it is
-            # recomposed by _init_system_messages), so any system/developer
-            # row here is operator context; ``_source`` classifies it for the
-            # fold-or-keep wire pass and UI replay.
-            smsg: dict[str, Any] = {"role": role, "content": content or ""}
-            if source:
-                smsg["_source"] = str(source)
-            if event_id is not None:
-                smsg["_event_id"] = int(event_id)
-            messages.append(smsg)
-        # Genuinely unknown roles are intentionally dropped (no ``else``): the
-        # roles above are exhaustive for stored conversations, so an
-        # unrecognised role is anomalous and must not be forwarded to a
-        # provider.  ``system``/``developer`` are handled above precisely so
-        # they are NOT dropped — that silent drop was the bug this fixes.
+            turns.append(Turn(Role.SYSTEM, _content_blocks(content, []), source=src, meta=meta))
+    return turns
 
-    if not repair:
-        # Both passes below are LLM-context corrections — trailing-turn
-        # strip and orphan synthesis.  Display callers want neither; see
-        # the reconstruct_messages docstring.
-        return messages
 
-    # Repair: strip trailing incomplete tool call turns.  Walk back past
-    # trailing tool results AND operator-context system turns (which follow
-    # the turn they relate to) to locate the turn's assistant head; if its
-    # tool calls are incomplete, strip from the assistant onward — dropping
-    # the trailing tools and system turns with it.  Skipping system turns keeps
-    # the strip working when a nudge/interjection was appended after an
-    # interrupted tool-call turn (otherwise the orphaned assistant survives).
-    while messages:
+def recover_trajectory(turns: list[Turn]) -> list[Turn]:
+    """Strip a trailing incomplete tool-call turn (boot-crash recovery).
+
+    The load-time orphan policy: walk back past trailing tool results AND
+    operator-context system turns (which follow the turn they relate to) to the
+    turn's assistant head; if its tool_calls are not all answered, drop from the
+    assistant onward.  Mid-conversation orphans are left for the send-time
+    repair (``lowering.repair_wire_messages``).  Returns a new list; the input is
+    not mutated.
+    """
+    turns = list(turns)
+    while turns:
         tail_tools = 0
-        idx = len(messages) - 1
+        idx = len(turns) - 1
         while idx >= 0:
-            tail_role = messages[idx].get("role")
-            if tail_role == "tool":
+            tail_role = turns[idx].role
+            if tail_role is Role.TOOL:
                 tail_tools += 1
                 idx -= 1
-            elif tail_role in ("system", "developer"):
+            elif tail_role is Role.SYSTEM:
                 idx -= 1
             else:
                 break
         asst_idx = idx
         if asst_idx < 0:
             break
-        asst = messages[asst_idx]
-        if asst.get("role") != "assistant" or not asst.get("tool_calls"):
+        asst = turns[asst_idx]
+        if asst.role is not Role.ASSISTANT or not asst.tool_calls:
             break
-        if tail_tools >= len(asst["tool_calls"]):
+        if tail_tools >= len(asst.tool_calls):
             break
-        del messages[asst_idx:]
-
-    # Mid-conversation orphaned tool_calls are NOT synthesized here — that is the
-    # send-time repair (``lowering.repair_wire_messages``), the single place the
-    # wire path fills them.  Load stays trailing-strip-only: the bare orphan is
-    # harmless between load and send (token-count is additive, ``/history`` reads
-    # ``repair=False``, compaction summarizes to text), and the send pass repairs
-    # it.  Non-session consumers (``export``) run ``repair_wire_messages`` too.
-    return messages
+        del turns[asst_idx:]
+    return turns
