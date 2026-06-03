@@ -11,7 +11,7 @@ forge or break the boundary.  One mechanism, two trust polarities:
   declares the fence *form* (``<tool_output_NONCE>``) as untrusted data, so a
   fresh per-call nonce is enough.
 
-* **Operator fold** (``ChatSession._fold_system_turns``) wraps TRUSTED operator
+* **Operator fold** (``lowering.fold_system_turns``) wraps TRUSTED operator
   instructions folded into a neighbouring turn for models without native
   mid-conversation system messages.  The nonce stops untrusted host text from
   forging a *fake* trusted block; the system prompt

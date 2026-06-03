@@ -3580,6 +3580,9 @@ class ChatSession:
                     "kind": a.kind,
                     "filename": a.filename,
                     "mime_type": a.mime_type,
+                    # Doc-budget proxy mirrored from the reconstruct path so the
+                    # live and reloaded shapes count identically (``_msg_text_chars``).
+                    "size_bytes": len(a.content),
                 }
                 for a in attachments
             ]
@@ -4803,6 +4806,7 @@ class ChatSession:
         n = 0
         images = 0
         doc_chars = 0
+        inline_doc = False
         if isinstance(content, list):
             for p in content:
                 ptype = p.get("type")
@@ -4813,14 +4817,29 @@ class ChatSession:
                     # — both cost one fixed image budget.
                     images += 1
                 elif ptype == "document" and not p.get("attachment_id"):
-                    # Resolved inline document; the by-reference placeholder carries
-                    # no bytes, so its char budget lands at send-time calibration.
+                    # Resolved inline document (the transient materialized form):
+                    # count its data chars directly.
+                    inline_doc = True
                     d = p.get("document", {})
                     doc_chars += len(d.get("data", ""))
                     doc_chars += len(d.get("name", ""))
                     doc_chars += len(d.get("media_type", ""))
         else:
             n += len(content or "")
+        # A by-reference document placeholder (``{type:document, attachment_id}``)
+        # carries no inline bytes, so its budget comes from the sibling
+        # ``_attachments_meta`` (``size_bytes`` per text-kind attachment).  Skip
+        # when an inline document was already counted: canonical messages are
+        # by-reference + meta and the materialized wire form is inline-without-meta,
+        # so the two are mutually exclusive — the guard makes that robust either way.
+        if not inline_doc:
+            meta = msg.get("_attachments_meta")
+            if isinstance(meta, list):
+                doc_chars += sum(
+                    int(e.get("size_bytes") or 0)
+                    for e in meta
+                    if isinstance(e, dict) and e.get("kind") == "text"
+                )
         for tc in msg.get("tool_calls", []):
             n += len(tc.get("id", ""))
             n += len(tc.get("function", {}).get("name", ""))

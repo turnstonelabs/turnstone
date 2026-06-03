@@ -52,9 +52,7 @@ class TestContentAddressedWrite:
     def test_origin_tool_recorded(self, backend):
         backend.register_workstream("ws-origin")
         aid = _hash(PNG_1x1)
-        backend.save_attachment(
-            aid, "t.png", "image/png", len(PNG_1x1), "image", PNG_1x1, "tool"
-        )
+        backend.save_attachment(aid, "t.png", "image/png", len(PNG_1x1), "image", PNG_1x1, "tool")
         row = backend.get_attachment(aid)
         assert row is not None
         assert row["origin"] == "tool"
@@ -91,9 +89,7 @@ class TestGetAttachments:
         a1 = _hash(b"one")
         a2 = _hash(PNG_1x1)
         backend.save_attachment(a1, "one.txt", "text/plain", 3, "text", b"one")
-        backend.save_attachment(
-            a2, "img.png", "image/png", len(PNG_1x1), "image", PNG_1x1
-        )
+        backend.save_attachment(a2, "img.png", "image/png", len(PNG_1x1), "image", PNG_1x1)
         by_id = {r["attachment_id"]: r for r in backend.get_attachments([a1, a2])}
         assert by_id[a1]["content"] == b"one"
         assert by_id[a2]["content"] == PNG_1x1
@@ -166,12 +162,8 @@ class TestLoadMessagesReconstructsMultipart:
         msg_id = backend.save_message("ws-multi", "user", "look at these")
         img_id = _hash(PNG_1x1)
         doc_id = _hash(b"# hi\n")
-        backend.save_attachment(
-            img_id, "tiny.png", "image/png", len(PNG_1x1), "image", PNG_1x1
-        )
-        backend.save_attachment(
-            doc_id, "notes.md", "text/markdown", 5, "text", b"# hi\n"
-        )
+        backend.save_attachment(img_id, "tiny.png", "image/png", len(PNG_1x1), "image", PNG_1x1)
+        backend.save_attachment(doc_id, "notes.md", "text/markdown", 5, "text", b"# hi\n")
         backend.set_message_attachments("ws-multi", msg_id, [img_id, doc_id])
 
         msgs = backend.load_messages("ws-multi")
@@ -292,7 +284,12 @@ class TestReconstructMetaSibling:
         backend.set_message_attachments("ws-meta", mid, [aid])
         meta = backend.load_messages("ws-meta")[0].get("_attachments_meta")
         assert isinstance(meta, list) and len(meta) == 1
-        assert meta[0] == {"kind": "text", "filename": "doc.md", "mime_type": "text/markdown"}
+        assert meta[0] == {
+            "kind": "text",
+            "filename": "doc.md",
+            "mime_type": "text/markdown",
+            "size_bytes": 2,
+        }
 
 
 class TestRefcountGC:
@@ -321,14 +318,10 @@ class TestRefcountGC:
         backend.register_workstream("ws-shared")
         shared = _hash(b"shared-bytes")
         m1 = backend.save_message("ws-shared", "user", "first")
-        backend.save_attachment(
-            shared, "s.txt", "text/plain", 12, "text", b"shared-bytes"
-        )
+        backend.save_attachment(shared, "s.txt", "text/plain", 12, "text", b"shared-bytes")
         backend.set_message_attachments("ws-shared", m1, [shared])
         m2 = backend.save_message("ws-shared", "user", "second")
-        backend.save_attachment(
-            shared, "s.txt", "text/plain", 12, "text", b"shared-bytes"
-        )
+        backend.save_attachment(shared, "s.txt", "text/plain", 12, "text", b"shared-bytes")
         backend.set_message_attachments("ws-shared", m2, [shared])
 
         assert backend.get_attachment(shared)["refcount"] == 2
@@ -355,14 +348,10 @@ class TestRefcountGC:
         backend.register_workstream("ws-two")
         shared = _hash(b"cross-ws")
         m1 = backend.save_message("ws-one", "user", "a")
-        backend.save_attachment(
-            shared, "s.txt", "text/plain", 8, "text", b"cross-ws"
-        )
+        backend.save_attachment(shared, "s.txt", "text/plain", 8, "text", b"cross-ws")
         backend.set_message_attachments("ws-one", m1, [shared])
         m2 = backend.save_message("ws-two", "user", "b")
-        backend.save_attachment(
-            shared, "s.txt", "text/plain", 8, "text", b"cross-ws"
-        )
+        backend.save_attachment(shared, "s.txt", "text/plain", 8, "text", b"cross-ws")
         backend.set_message_attachments("ws-two", m2, [shared])
         assert backend.get_attachment(shared)["refcount"] == 2
 
@@ -410,9 +399,7 @@ class TestParametrizedKind:
         payload = PNG_1x1 if kind == "image" else b"x" * 42
         mime = "image/png" if kind == "image" else "text/plain"
         aid = _hash(payload)
-        backend.save_attachment(
-            aid, f"f.{kind}", mime, len(payload), kind, payload
-        )
+        backend.save_attachment(aid, f"f.{kind}", mime, len(payload), kind, payload)
         rows = backend.get_attachments([aid])
         assert len(rows) == 1
         assert rows[0]["content"] == payload

@@ -242,6 +242,10 @@ def _reconstruct_attachment_refs(
                 "kind": str(att.get("kind") or ""),
                 "filename": str(att.get("filename") or ""),
                 "mime_type": str(att.get("mime_type") or ""),
+                # Doc-budget proxy for the by-reference placeholder (which carries
+                # no inline bytes): the token estimator reads this so a reloaded
+                # document turn isn't counted as ~free.  See ``_msg_text_chars``.
+                "size_bytes": int(att.get("size_bytes") or 0),
             }
         )
     return refs, meta

@@ -262,8 +262,13 @@ class TestProviderIntegration:
         _run_send(s, "desc", attachments=atts)
         meta = turn_to_dict(s.messages[-1]).get("_attachments_meta")
         assert meta == [
-            {"kind": "image", "filename": "dog.png", "mime_type": "image/png"},
-            {"kind": "text", "filename": "notes.md", "mime_type": "text/markdown"},
+            {
+                "kind": "image",
+                "filename": "dog.png",
+                "mime_type": "image/png",
+                "size_bytes": len(PNG_1x1),
+            },
+            {"kind": "text", "filename": "notes.md", "mime_type": "text/markdown", "size_bytes": 2},
         ]
 
     def test_attachments_meta_stripped_before_openai_wire(self, tmp_db, mock_openai_client):
@@ -362,3 +367,35 @@ class TestTokenAccounting:
         # The ~4000-char doc lands at the resolved boundary (the per-turn
         # placeholder no longer carries the bytes), well above the budget floor.
         assert doc_chars - plain_chars >= 900
+
+    def test_by_reference_doc_counted_without_materialization(self):
+        """R1: a canonical by-reference document turn (NOT yet materialized) must
+        count its size in the char budget via ``_attachments_meta``.  Before the
+        fix the placeholder carried no bytes, so ``doc_chars`` was 0 and a reloaded
+        document conversation under-counted its context (the budget feeds
+        compaction / trim decisions)."""
+        meta = [
+            {"kind": "text", "filename": "big.md", "mime_type": "text/markdown", "size_bytes": 4000}
+        ]
+        by_ref = {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "see doc"},
+                {"type": "document", "attachment_id": "x"},
+            ],
+            "_attachments_meta": meta,
+        }
+        _t, _i, doc_chars = ChatSession._msg_text_chars(by_ref)
+        assert doc_chars == 4000  # was 0 before the fix
+
+        # A materialized inline document that still carries meta must count ONCE,
+        # not twice — the inline_doc guard suppresses the meta term.
+        inline_plus_meta = {
+            "role": "user",
+            "content": [
+                {"type": "document", "document": {"data": "x" * 4000, "name": "", "media_type": ""}}
+            ],
+            "_attachments_meta": meta,
+        }
+        _t2, _i2, doc2 = ChatSession._msg_text_chars(inline_plus_meta)
+        assert doc2 == 4000

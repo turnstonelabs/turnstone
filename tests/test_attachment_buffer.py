@@ -66,16 +66,6 @@ def test_discard_is_scope_checked() -> None:
     assert buf.get(entry.attachment_id, ws_id="ws1", user_id="u1") is None
 
 
-def test_take_pops_in_scope_and_skips_others() -> None:
-    buf = AttachmentBuffer()
-    a = _stage(buf, content=b"a")
-    b = _stage(buf, content=b"b", ws="ws2")
-    taken = buf.take([a.attachment_id, b.attachment_id, "missing"], ws_id="ws1")
-    assert [t.attachment_id for t in taken] == [a.attachment_id]  # only ws1's, missing skipped
-    assert buf.get(a.attachment_id, ws_id="ws1", user_id="u1") is None  # popped
-    assert buf.get(b.attachment_id, ws_id="ws2", user_id="u1") is not None  # other ws untouched
-
-
 def test_ttl_eviction_on_access() -> None:
     clock = [0.0]
     buf = AttachmentBuffer(ttl_seconds=10.0, clock=lambda: clock[0])

@@ -14,17 +14,18 @@ export interface ConnectedEvent {
 export interface HistoryEvent {
   type: "history";
   /**
-   * Per-message dicts the frontend consumes directly. Common optional keys:
-   * - `role`: "user" | "assistant" | "tool"
-   * - `content`: string or list (image/document parts)
+   * Per-message dicts the frontend consumes directly. Notable optional keys:
+   * - `role`: "user" | "assistant" | "tool" | "system"
+   * - `content`: string for text turns, list for image/document parts
    * - `tool_calls`: assistant turns — list of `{id, name, arguments, verdict?, output_assessment?}`
    * - `tool_call_id`: tool turns — id of the originating call
-   * - `reminders`: metacognitive nudge bubbles (user/tool channels)
-   * - `advisories`: extracted `UserInterjection` payloads on tool turns
-   * - `reasoning`: concatenated reasoning text for assistant turns whose
-   *   `provider_data` carried reasoning-bearing blocks (Anthropic
-   *   `thinking`, OpenAI Responses `reasoning`, or synthetic
-   *   `reasoning_text` from path-3 servers). Present only when the
+   * - `source`: the operator-context kind on a `system` turn (`output_guard` /
+   *   `user_interjection` / `tool_error` / ...), or `system_nudge` on a
+   *   wake-driven empty user turn
+   * - `attachments`: per-attachment metadata `{kind, filename, mime_type, size_bytes}`
+   * - `reasoning`: concatenated reasoning text for assistant turns that
+   *   round-tripped a thinking-block lane (Anthropic-with-thinking today;
+   *   OpenAI Responses + Gemini in later phases). Present only when the
    *   active model's `surface_persisted_reasoning` flag is true.
    */
   messages: Array<Record<string, unknown>>;

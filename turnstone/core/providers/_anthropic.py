@@ -368,7 +368,7 @@ class AnthropicProvider:
         messages (the base prompt) still hoist into the top-level
         ``system`` param, but a system message appearing AFTER a
         non-system turn is a mid-conversation operator turn (see
-        ``ChatSession._fold_system_turns``) and is emitted inline as a
+        ``lowering.fold_system_turns``) and is emitted inline as a
         ``{"role": "system"}`` message so it keeps its trajectory
         position.  When False (every other model) all system messages
         hoist, as before — the fold pass has already removed any

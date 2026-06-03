@@ -8,7 +8,7 @@ either kept inline (native mid-conversation system messages — claude-opus-4-8)
 or folded into the preceding turn as a nonce-delimited ``<system-reminder_
 {nonce}>`` fence for every other model.  The fence mechanism (mint / neutralise
 / wrap) lives in :mod:`turnstone.core.fence`, shared with the output-guard judge
-so the two trust boundaries cannot drift; ``ChatSession._fold_system_turns``
+so the two trust boundaries cannot drift; ``lowering.fold_system_turns``
 applies it.
 
 This module also hosts :func:`parse_priority` (the ``!!!`` priority prefix on
@@ -122,7 +122,7 @@ def make_system_turn(source: str, content: str, **meta: Any) -> dict[str, Any]:
     done here.  It belongs to the fallback fold step, which wraps the content
     in a nonce-delimited ``<system-reminder_{nonce}>`` fence via
     :func:`turnstone.core.fence.wrap` (applied in
-    ``ChatSession._fold_system_turns``).  Escaping in this builder would corrupt
+    ``lowering.fold_system_turns``).  Escaping in this builder would corrupt
     the native path, where there is no fence to break out of.
     """
     if source not in SYSTEM_TURN_SOURCES:

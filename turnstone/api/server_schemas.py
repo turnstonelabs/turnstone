@@ -491,9 +491,10 @@ class WorkstreamHistoryResponse(BaseModel):
         default_factory=list,
         description=(
             "Tail of the workstream's message history, projected to the "
-            "canonical render shape (flat tool_calls with verdict / "
-            "output_assessment, top-level source / reminders / "
-            "attachments, derived denied / is_error / pending). Bounded "
+            "canonical render shape (``role`` may be ``system`` for "
+            "operator-context turns; flat tool_calls with verdict / "
+            "output_assessment; top-level source / attachments / reasoning; "
+            "derived denied / is_error / pending). Bounded "
             "by the ``limit`` query parameter (default 100, max 500)."
         ),
     )

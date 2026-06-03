@@ -23,7 +23,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Iterable
+    from collections.abc import Callable
 
 # OOM-safety backstops (per node), not a product policy — the per-user upload cap was
 # removed.  Generous: the goal is only to bound a pathological flood of unsent uploads.
@@ -112,21 +112,6 @@ class AttachmentBuffer:
                 return False
             del self._entries[handle]
             return True
-
-    def take(self, handles: Iterable[str], *, ws_id: str) -> list[StagedAttachment]:
-        """Pop the staged entries for *handles* at send-commit (ws-scoped).
-
-        Missing / out-of-scope handles are skipped — the send proceeds with whatever
-        committed (a buffer eviction or crash between upload and send drops the upload).
-        """
-        with self._lock:
-            taken: list[StagedAttachment] = []
-            for handle in handles:
-                entry = self._entries.get(handle)
-                if entry is not None and entry.ws_id == ws_id:
-                    taken.append(entry)
-                    del self._entries[handle]
-            return taken
 
     # -- eviction (caller holds the lock) ------------------------------------
     def _evict_expired_locked(self) -> None:
