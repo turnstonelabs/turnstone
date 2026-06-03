@@ -18,6 +18,7 @@ from turnstone.core.lowering import (
     _find_orphaned_tool_calls,
     repair_wire_messages,
 )
+from turnstone.core.trajectory import dicts_from_turns, turns_from_dicts
 
 
 def _tc(call_id: str, name: str = "f") -> dict[str, Any]:
@@ -109,17 +110,19 @@ def test_detector_ignores_empty_ids() -> None:
 def test_repair_identity_when_complete() -> None:
     msgs = [_assistant("c1"), _tool("c1")]
     # No orphan → same object returned (allocation-free common path).
-    assert repair_wire_messages(msgs) is msgs
+    turns = turns_from_dicts(msgs)
+    assert repair_wire_messages(turns) is turns
 
 
 def test_repair_no_tool_calls_identity() -> None:
     msgs = [{"role": "user", "content": "hi"}, {"role": "assistant", "content": "yo"}]
-    assert repair_wire_messages(msgs) is msgs
+    turns = turns_from_dicts(msgs)
+    assert repair_wire_messages(turns) is turns
 
 
 def test_repair_synthesizes_trailing_orphan() -> None:
     msgs = [{"role": "user", "content": "go"}, _assistant("c1")]
-    out = repair_wire_messages(msgs)
+    out = dicts_from_turns(repair_wire_messages(turns_from_dicts(msgs)))
     assert len(out) == 3
     assert out[2] == {
         "role": "tool",
@@ -131,7 +134,7 @@ def test_repair_synthesizes_trailing_orphan() -> None:
 
 def test_repair_synthesizes_only_missing() -> None:
     msgs = [_assistant("c1", "c2"), _tool("c1"), {"role": "user", "content": "stop"}]
-    out = repair_wire_messages(msgs)
+    out = dicts_from_turns(repair_wire_messages(turns_from_dicts(msgs)))
     # Real c1 result stays first; synthetic c2 spliced right after, before the user.
     assert [m["role"] for m in out] == ["assistant", "tool", "tool", "user"]
     assert out[1]["tool_call_id"] == "c1" and out[1]["content"] == "ok"
@@ -140,7 +143,7 @@ def test_repair_synthesizes_only_missing() -> None:
 
 def test_repair_multiple_orphans_in_declaration_order() -> None:
     msgs = [_assistant("c1", "c2", "c3"), {"role": "user", "content": "skip"}]
-    out = repair_wire_messages(msgs)
+    out = dicts_from_turns(repair_wire_messages(turns_from_dicts(msgs)))
     synth_ids = [m["tool_call_id"] for m in _synth_results(out)]
     assert synth_ids == ["c1", "c2", "c3"]
 
@@ -151,7 +154,7 @@ def test_repair_two_assistant_turns() -> None:
         {"role": "user", "content": "and"},
         _assistant("c2"),
     ]
-    out = repair_wire_messages(msgs)
+    out = dicts_from_turns(repair_wire_messages(turns_from_dicts(msgs)))
     # Each orphaned turn gets its own synthetic result, positioned after it.
     assert [m["role"] for m in out] == ["assistant", "tool", "user", "assistant", "tool"]
     assert out[1]["tool_call_id"] == "c1"
@@ -165,7 +168,7 @@ def test_repair_synth_inserts_before_interspersed_system() -> None:
         {"role": "system", "_source": "output_guard", "content": "note"},
         {"role": "user", "content": "next"},
     ]
-    out = repair_wire_messages(msgs)
+    out = dicts_from_turns(repair_wire_messages(turns_from_dicts(msgs)))
     # Synthetic c2 stays contiguous with the real result, before the system turn.
     assert [m["role"] for m in out] == ["assistant", "tool", "tool", "system", "user"]
     assert out[2]["tool_call_id"] == "c2" and out[2]["is_error"] is True
@@ -173,7 +176,8 @@ def test_repair_synth_inserts_before_interspersed_system() -> None:
 
 def test_repair_does_not_mutate_input() -> None:
     msgs = [_assistant("c1")]
-    original_len = len(msgs)
-    repair_wire_messages(msgs)
-    assert len(msgs) == original_len  # caller's list untouched
-    assert "tool_calls" in msgs[0]
+    turns = turns_from_dicts(msgs)
+    original_len = len(turns)
+    repair_wire_messages(turns)
+    assert len(turns) == original_len  # caller's list untouched
+    assert "tool_calls" in dicts_from_turns(turns)[0]

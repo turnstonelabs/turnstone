@@ -48,6 +48,7 @@ from __future__ import annotations
 from typing import Any
 
 from turnstone.core import fence
+from turnstone.core.trajectory import Turn, dicts_from_turns, turns_from_dicts
 
 # The synthetic result body for a tool call that never produced output.  The
 # neutral turn carries ``is_error=True``; each translator renders that per its
@@ -99,31 +100,25 @@ def _find_orphaned_tool_calls(
     return found
 
 
-def repair_wire_messages(
-    messages: list[dict[str, Any]],
-) -> list[dict[str, Any]]:
-    """Return *messages* with cancellation results for any orphaned tool calls.
+def repair_wire_messages(turns: list[Turn]) -> list[Turn]:
+    """Return *turns* with cancellation results for any orphaned tool calls.
 
     The synth-transient-@-send repair policy (see the module docstring).
     Identity-preserving: when nothing is orphaned the input is returned
-    unchanged, so the common path is allocation-free.  Never mutates *messages*.
+    unchanged, so the common path is allocation-free.  Never mutates *turns*.
+
+    The orphan detector runs over the dict projection (the ``tool_calls`` /
+    ``tool_call_id`` shape it keys on); the synthesized cancellations are spliced
+    back in as canonical ``Turn``s, so the result stays a ``list[Turn]``.
     """
-    orphans = _find_orphaned_tool_calls(messages)
+    orphans = _find_orphaned_tool_calls(dicts_from_turns(turns))
     if not orphans:
-        return messages
-    out = list(messages)
+        return turns
+    out = list(turns)
     # The detector yields insert positions in ascending order; splice from the
     # highest down so each splice can't shift an as-yet-unused lower position.
     for insert_at, ids in sorted(orphans, key=lambda pair: pair[0], reverse=True):
-        synthetic = [
-            {
-                "role": "tool",
-                "tool_call_id": uid,
-                "content": CANCELLED_TOOL_RESULT,
-                "is_error": True,
-            }
-            for uid in ids
-        ]
+        synthetic = [Turn.tool(uid, CANCELLED_TOOL_RESULT, is_error=True) for uid in ids]
         out[insert_at:insert_at] = synthetic
     return out
 
@@ -132,11 +127,11 @@ def repair_wire_messages(
 # Fold — operator-context representation (A); runs BEFORE repair on the wire.
 # --------------------------------------------------------------------------- #
 def fold_system_turns(
-    messages: list[dict[str, Any]],
+    turns: list[Turn],
     *,
     supports_mid_conversation_system: bool,
     nonce: str,
-) -> list[dict[str, Any]]:
+) -> list[Turn]:
     """Fold first-class operator-context system turns into the preceding turn.
 
     First-class ``{"role": "system", "_source": ...}`` turns carry operator
@@ -164,10 +159,13 @@ def fold_system_turns(
     not occur — they follow the turn they relate to) is kept standalone so
     nothing is silently dropped.
 
-    Returns a transient copy; the input list/dicts are untouched.
+    Returns a transient copy as canonical Turns; the input is untouched.  The
+    fold operates on the dict projection (its content-merge / host-escape logic
+    keys on the wire content shape) and bridges the result back to Turns.
     """
     if supports_mid_conversation_system:
-        return messages
+        return turns
+    messages = dicts_from_turns(turns)
     out: list[dict[str, Any]] = []
     host_escaped = False  # has out[-1] had its untrusted markers defanged?
     for msg in messages:
@@ -185,7 +183,7 @@ def fold_system_turns(
             continue
         out.append(msg)
         host_escaped = False
-    return out
+    return turns_from_dicts(out)
 
 
 def _neutralize_host(msg: dict[str, Any]) -> dict[str, Any]:
@@ -260,18 +258,23 @@ def _is_empty_wire_content(content: Any) -> bool:
     return False
 
 
-def drop_empty_user_turns(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+def drop_empty_user_turns(turns: list[Turn]) -> list[Turn]:
     """Drop user turns with empty content.
 
     Runs AFTER the fold so a fold-path wake turn (which a nudge folds into and
     thereby fills) is kept, while a still-empty synthetic user turn — invalid on
-    every provider wire — is removed.  Identity-preserving: returns *messages*
+    every provider wire — is removed.  Identity-preserving: returns *turns*
     unchanged when no user turn is empty, so the common path is allocation-free.
+
+    The empty check runs over the dict projection (it keys on the wire content
+    shape); the kept turns are the originals, unchanged.
     """
 
     def _drop(m: dict[str, Any]) -> bool:
         return m.get("role") == "user" and _is_empty_wire_content(m.get("content"))
 
-    if not any(_drop(m) for m in messages):
-        return messages
-    return [m for m in messages if not _drop(m)]
+    messages = dicts_from_turns(turns)
+    drop_idx = {i for i, m in enumerate(messages) if _drop(m)}
+    if not drop_idx:
+        return turns
+    return [t for i, t in enumerate(turns) if i not in drop_idx]
