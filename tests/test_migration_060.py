@@ -166,6 +166,20 @@ class TestMigration060:
         finally:
             engine.dispose()
 
+    def test_content_addressed_attachment_columns_added(self, tmp_path: Path) -> None:
+        db_path = tmp_path / "060-ca-cols.db"
+        cfg = _alembic_cfg(db_path)
+        command.upgrade(cfg, "060")
+        engine = sa.create_engine(f"sqlite:///{db_path}")
+        try:
+            insp = sa.inspect(engine)
+            conv_cols = {c["name"] for c in insp.get_columns("conversations")}
+            att_cols = {c["name"] for c in insp.get_columns("workstream_attachments")}
+            assert "attachments" in conv_cols
+            assert {"refcount", "origin"} <= att_cols
+        finally:
+            engine.dispose()
+
     def test_ampersand_decoded_but_wrapper_tags_left_escaped(self, tmp_path: Path) -> None:
         """The un-wrap reverses only ``&amp;`` → ``&``.  Wrapper-tag entities are
         left escaped on purpose: re-activating ``&lt;system-reminder&gt;`` into a

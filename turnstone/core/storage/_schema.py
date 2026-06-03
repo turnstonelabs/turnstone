@@ -61,6 +61,10 @@ conversations = sa.Table(
     # (history rendering + the Anthropic ``is_error`` result block) instead of
     # re-deriving it from a text heuristic.  Non-tool rows are always False.
     sa.Column("is_error", sa.Boolean, nullable=False, server_default=sa.false()),
+    # Ordered list of content-addressed attachment_id references for this turn
+    # (JSON; NULL for turns with no attachments) — the sole message->blob link in
+    # the content-addressed model; bytes resolve from workstream_attachments by id.
+    sa.Column("attachments", sa.Text, nullable=True),
 )
 
 sa.Index("idx_conversations_timestamp", conversations.c.timestamp)
@@ -554,6 +558,12 @@ workstream_attachments = sa.Table(
     # have actually been held longer than the threshold.
     sa.Column("reserved_at", sa.Text, nullable=True),
     sa.Column("created", sa.Text, nullable=False),
+    # Content-addressed blob store (canonical-trajectory cut): a deduped blob's
+    # live-reference count (pruned at 0) and its origin ('upload' | 'tool').  The
+    # cutover retires the message_id / reserved_* upload-lifecycle columns above in
+    # favour of refcount + the conversations.attachments ref-list.
+    sa.Column("refcount", sa.Integer, nullable=False, server_default=sa.text("0")),
+    sa.Column("origin", sa.Text, nullable=False, server_default=sa.text("'upload'")),
 )
 
 sa.Index("idx_ws_attachments_ws_id", workstream_attachments.c.ws_id)

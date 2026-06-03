@@ -253,6 +253,16 @@ def upgrade() -> None:
         batch_op.add_column(
             sa.Column("is_error", sa.Boolean, nullable=False, server_default=sa.false())
         )
+        # Content-addressed attachment ref-list (canonical-trajectory cut); the cutover
+        # fills it and retires the message_id/reserved_* link.
+        batch_op.add_column(sa.Column("attachments", sa.Text, nullable=True))
+    with op.batch_alter_table("workstream_attachments") as batch_op:
+        batch_op.add_column(
+            sa.Column("refcount", sa.Integer, nullable=False, server_default=sa.text("0"))
+        )
+        batch_op.add_column(
+            sa.Column("origin", sa.Text, nullable=False, server_default=sa.text("'upload'"))
+        )
 
 
 def downgrade() -> None:
@@ -263,3 +273,7 @@ def downgrade() -> None:
     with op.batch_alter_table("conversations") as batch_op:
         batch_op.add_column(sa.Column("_reminders", sa.Text, nullable=True))
         batch_op.drop_column("is_error")
+        batch_op.drop_column("attachments")
+    with op.batch_alter_table("workstream_attachments") as batch_op:
+        batch_op.drop_column("refcount")
+        batch_op.drop_column("origin")

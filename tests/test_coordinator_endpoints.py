@@ -73,7 +73,6 @@ from turnstone.core.session_routes import (
     make_saved_handler,
     make_send_handler,
 )
-from turnstone.core.storage._sqlite import SQLiteBackend
 from turnstone.core.workstream import WorkstreamKind
 
 # ---------------------------------------------------------------------------
@@ -130,7 +129,16 @@ _coord_endpoint_config = SessionEndpointConfig(
 
 @pytest.fixture
 def storage(tmp_path):
-    return SQLiteBackend(str(tmp_path / "coord.db"))
+    # The attachment handlers resolve storage via ``memory.get_storage()`` (the
+    # registry singleton), not the instance passed to ``_make_client``/``_build_mgr``.
+    # Register the test backend so ``get_attachment`` & co. hit this fresh db rather
+    # than a stale default — otherwise schema drift (e.g. a new column) surfaces here.
+    from turnstone.core.storage import init_storage, reset_storage
+
+    reset_storage()
+    backend = init_storage("sqlite", path=str(tmp_path / "coord.db"), run_migrations=False)
+    yield backend
+    reset_storage()
 
 
 def _make_client(
