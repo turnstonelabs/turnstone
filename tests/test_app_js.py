@@ -307,6 +307,27 @@ def test_retry_walk_skips_operator_context_cards() -> None:
         )
 
 
+def test_operator_nudge_labels_use_shared_helper() -> None:
+    """Operator-context nudge bubbles collapse the metacognition nudge types
+    (start / resume / correction / denial / completion / repeat) to one
+    'metacognition' category via the shared ``utils.js`` ``operatorSourceLabel``
+    helper rather than leaking the raw ``_source`` (the 'operator · start'
+    regression).  Both panes call the one helper so they can't drift."""
+    root = Path(__file__).resolve().parent.parent
+    utils = (root / "turnstone/shared_static/utils.js").read_text(encoding="utf-8")
+    assert "function operatorSourceLabel(" in utils
+    for t in ("start", "resume", "correction", "denial", "completion", "repeat"):
+        assert f'{t}: "metacognition"' in utils, f"nudge type {t!r} must label as metacognition"
+    assert 'tool_error: "tool error"' in utils
+    assert 'skill_hint: "skill hint"' in utils
+    app = (root / "turnstone/ui/static/app.js").read_text(encoding="utf-8")
+    coord = (root / "turnstone/console/static/coordinator/coordinator.js").read_text(
+        encoding="utf-8"
+    )
+    assert "operatorSourceLabel(source)" in app, "interactive pane must use the shared label helper"
+    assert "operatorSourceLabel(source)" in coord, "coord pane must use the shared label helper"
+
+
 # ---------------------------------------------------------------------------
 # Phase 8 — Chunk D: MCP error embed + settings panel UX
 # ---------------------------------------------------------------------------

@@ -35,6 +35,26 @@ function formatCount(n) {
   return String(n);
 }
 
+// Friendly display label for an operator-context system turn's `_source`.
+// The metacognition nudge types (metacognition._NUDGE_MAP, mirrored in
+// tool_advisory.SYSTEM_TURN_SOURCES) collapse to one "metacognition" category;
+// the other generic-bubble sources are humanized.  Carded kinds (watch_triggered
+// / output_guard / idle_children / user_interjection) render via their own
+// builders and never reach this label.
+const OPERATOR_SOURCE_LABELS = {
+  correction: "metacognition",
+  denial: "metacognition",
+  resume: "metacognition",
+  completion: "metacognition",
+  start: "metacognition",
+  repeat: "metacognition",
+  tool_error: "tool error",
+  skill_hint: "skill hint",
+};
+function operatorSourceLabel(source) {
+  return OPERATOR_SOURCE_LABELS[source] || source || "operator";
+}
+
 // Naive ISO-8601 → "Nm ago" / "Nh ago" / "Nd ago" / locale date.
 // Tolerates space-as-separator (SQLite default) and missing TZ marker
 // (assumes UTC, matching the storage layer's stamp).

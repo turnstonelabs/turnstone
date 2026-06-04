@@ -281,7 +281,7 @@ class Pane {
     labelEl.className = "msg-system-context-label";
     labelEl.textContent = isInterjection
       ? "queued message" + (important ? " · important" : "")
-      : "operator" + (source ? " · " + String(source) : "");
+      : operatorSourceLabel(source);
     const textEl = document.createElement("span");
     textEl.className = "msg-system-context-text";
     textEl.textContent =

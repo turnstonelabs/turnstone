@@ -564,7 +564,9 @@
     if (source === "idle_children" && m) return appendIdleChildren(m);
     if (source === "user_interjection")
       return appendInterjection(m, content || "");
-    return appendText("system", content || "", { label: source || "system" });
+    return appendText("system", content || "", {
+      label: operatorSourceLabel(source),
+    });
   }
 
   // User-message bubble with attachment-pill cluster appended below
