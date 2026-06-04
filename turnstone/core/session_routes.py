@@ -2690,8 +2690,9 @@ def _resume_cursor_and_trim(
 
     Pure + defensive — reads only ``role`` / ``tool_calls`` /
     ``tool_call_id`` / ``_event_id``.  The ``_event_id`` side-channel
-    survives reconstruct → decorate → extract_reasoning and is dropped by
-    ``project_history_messages`` (which runs on the returned list).
+    survives reconstruct → decorate → extract_reasoning; this runs on the
+    pre-projection list, and ``project_history_messages`` then surfaces it
+    as the top-level ``event_id`` for the frontend.
     """
     if awaiting_approval or not messages:
         return messages, None

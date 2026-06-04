@@ -78,6 +78,19 @@ class TestSystemTurnProjection:
         )
         assert "meta" not in history[0]
 
+    def test_event_id_surfaces_when_set(self) -> None:
+        """``_event_id`` → top-level ``event_id`` so the frontend can dedup a
+        ``/history``-painted system turn against an SSE replay that redelivers
+        it (the resume-cursor seam)."""
+        history = project_history_messages(
+            [{"role": "system", "_source": "start", "content": "x", "_event_id": 7}]
+        )
+        assert history[0]["event_id"] == 7
+
+    def test_event_id_absent_when_unset(self) -> None:
+        history = project_history_messages([{"role": "user", "content": "hello"}])
+        assert "event_id" not in history[0]
+
     def test_legacy_reminders_column_not_projected(self) -> None:
         """A pre-migration row that still carries ``_reminders`` must NOT
         surface a ``reminders`` field — the projection dropped that lane."""

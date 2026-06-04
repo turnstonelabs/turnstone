@@ -803,7 +803,7 @@ class SessionUI(Protocol):
     def on_error(self, message: str) -> None: ...
     def on_system_turn(
         self, content: str, source: str, meta: dict[str, Any] | None = None
-    ) -> None: ...
+    ) -> int | None: ...
     def on_state_change(self, state: str) -> None: ...
     def on_rename(self, name: str) -> None: ...
     def on_intent_verdict(self, verdict: dict[str, Any]) -> None:
@@ -3728,13 +3728,15 @@ class ChatSession:
         it after the user / tool / assistant turn it advises.
 
         Mirrors :meth:`_append_user_turn`'s bookkeeping: pushes a
-        ``_msg_tokens`` estimate (parallel to ``self.messages``), persists
-        the row via ``save_message(ws, "system", content, source=source)``
-        so reconnecting tabs replay the same bubble, and fires the live
-        ``on_system_turn`` SSE hook so multi-tab mirrors render it in
-        lockstep.  Hook failures are logged and swallowed — the in-memory
-        append + persist are the load-bearing ops; a UI implementation
-        throwing here must not abort the turn.
+        ``_msg_tokens`` estimate (parallel to ``self.messages``), fires the
+        live ``on_system_turn`` SSE hook so multi-tab mirrors render it in
+        lockstep, then persists the row via
+        ``save_message(ws, "system", content, source=source)`` so
+        reconnecting tabs replay the same bubble.  The hook runs *before* the
+        persist so the row can be stamped with its own SSE event id (see the
+        inline note for why the ordering matters).  Hook failures are logged
+        and swallowed — the in-memory append + persist are the load-bearing
+        ops; a UI implementation throwing here must not abort the turn.
 
         *source* must be one of :data:`tool_advisory.SYSTEM_TURN_SOURCES`;
         extra *meta* is the turn's structured per-kind data (e.g.
@@ -3750,18 +3752,25 @@ class ChatSession:
         self.messages.append(turn_from_dict(turn))
         self._msg_tokens.append(max(1, int(self._msg_char_count(turn) / self._chars_per_token)))
         meta_json = json.dumps(meta) if meta else None
+        # Fire the live SSE hook BEFORE persisting so the row carries the SAME
+        # event_id its ``system_turn`` event carries.  ``on_system_turn``
+        # returns the id ``_enqueue`` assigned (``None`` for non-SSE UIs / test
+        # doubles).  The hook stays best-effort: on failure the persist below
+        # still runs and the row falls back to the current cursor (no live
+        # event was delivered to double anyway).
+        emitted_event_id: int | None = None
+        try:
+            emitted_event_id = self.ui.on_system_turn(content, source, meta or None)
+        except Exception:
+            log.warning("ui.on_system_turn failed; system turn still appended", exc_info=True)
         save_message(
             self._ws_id,
             "system",
             content,
             source=source,
-            event_id=self._ui_event_id(),
+            event_id=emitted_event_id if isinstance(emitted_event_id, int) else self._ui_event_id(),
             meta=meta_json,
         )
-        try:
-            self.ui.on_system_turn(content, source, meta or None)
-        except Exception:
-            log.warning("ui.on_system_turn failed; system turn still appended", exc_info=True)
 
     # -- Main generation loop ------------------------------------------------
 

@@ -279,6 +279,20 @@ def test_replay_renders_system_turn_via_add_system_context() -> None:
     )
 
 
+def test_system_turn_dedups_against_history_by_event_id() -> None:
+    """The live ``system_turn`` handler skips an event already painted from
+    ``/history`` (matched by ``_event_id``), so an SSE replay that redelivers
+    it past the resume cursor doesn't double-render the operator bubble —
+    belt-and-braces for the row-vs-event id-alignment fix."""
+    body = _APP_JS.read_text(encoding="utf-8")
+    assert re.search(r"_renderedSystemEventIds\s*\.\s*has\(", body), (
+        "the system_turn handler must skip an event whose id was already rendered from /history."
+    )
+    assert re.search(r"_renderedSystemEventIds\s*\.\s*add\(", body), (
+        "replayHistory (and the live handler) must record system-turn ids for the dedup set."
+    )
+
+
 def test_retry_walk_skips_operator_context_cards() -> None:
     """Interactive twin of the coord retry-skip guard.
     ``_attachRetryToLastAssistant`` walks back past ``.operator-context`` rows
