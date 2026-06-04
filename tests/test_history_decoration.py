@@ -327,6 +327,7 @@ class TestDecorateHistoryMessages:
         assert "verdict" not in tc
         assert "output_assessment" not in tc
 
+
 class TestExtractReasoningForHistory:
     """``extract_reasoning_for_history`` — Phase 1 surfaces stored
     Anthropic thinking blocks on assistant messages and strips

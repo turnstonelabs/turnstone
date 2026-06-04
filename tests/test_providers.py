@@ -2101,9 +2101,7 @@ class TestAnthropicOrphanedToolUse:
             },
             {"role": "user", "content": "never mind, do something else"},
         ]
-        _, converted = self.provider._convert_messages(
-            repair_wire_messages(messages)
-        )
+        _, converted = self.provider._convert_messages(repair_wire_messages(messages))
         # Should have: user, assistant(tool_use), user(synthetic tool_result), user
         # After _merge_consecutive, the two user messages may merge.
         # Find the synthetic tool_result
@@ -2133,9 +2131,7 @@ class TestAnthropicOrphanedToolUse:
             },
             {"role": "user", "content": "skip all that"},
         ]
-        _, converted = self.provider._convert_messages(
-            repair_wire_messages(messages)
-        )
+        _, converted = self.provider._convert_messages(repair_wire_messages(messages))
         tool_results = []
         for msg in converted:
             if msg["role"] == "user" and isinstance(msg["content"], list):
@@ -2161,9 +2157,7 @@ class TestAnthropicOrphanedToolUse:
             {"role": "tool", "tool_call_id": "c1", "content": "file1.txt"},
             {"role": "user", "content": "skip the write"},
         ]
-        _, converted = self.provider._convert_messages(
-            repair_wire_messages(messages)
-        )
+        _, converted = self.provider._convert_messages(repair_wire_messages(messages))
         # c1 should have a real result, c2 should have a synthetic one
         tool_results = []
         for msg in converted:
@@ -2217,9 +2211,7 @@ class TestAnthropicOrphanedToolUse:
                 ],
             },
         ]
-        _, converted = self.provider._convert_messages(
-            repair_wire_messages(messages)
-        )
+        _, converted = self.provider._convert_messages(repair_wire_messages(messages))
         tool_results = []
         for msg in converted:
             if msg["role"] == "user" and isinstance(msg["content"], list):
@@ -2255,9 +2247,7 @@ class TestAnthropicOrphanedToolUse:
             },
             {"role": "user", "content": "never mind"},
         ]
-        _, converted = self.provider._convert_messages(
-            repair_wire_messages(messages)
-        )
+        _, converted = self.provider._convert_messages(repair_wire_messages(messages))
         # Should synthesize a tool_result for the orphaned tool_use in provider_content
         tool_results = []
         for msg in converted:
@@ -3979,9 +3969,7 @@ class TestResponsesMessageConversion:
                 ],
             },
         ]
-        _, items = self.provider._convert_messages(
-            repair_wire_messages(messages)
-        )
+        _, items = self.provider._convert_messages(repair_wire_messages(messages))
         # repair_wire_messages synthesizes the missing tool result; the translator renders it
         assert len(items) == 2
         assert items[0]["type"] == "function_call"
@@ -4039,9 +4027,7 @@ class TestResponsesMessageConversion:
                 ],
             },
         ]
-        _, items = self.provider._convert_messages(
-            repair_wire_messages(messages)
-        )
+        _, items = self.provider._convert_messages(repair_wire_messages(messages))
         # repair_wire_messages synthesizes the missing tool result; the translator renders it
         assert len(items) == 3
         assert items[0]["type"] == "message"

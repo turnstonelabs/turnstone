@@ -61,8 +61,10 @@ def test_list_for_scopes_by_ws_and_user() -> None:
 def test_discard_is_scope_checked() -> None:
     buf = AttachmentBuffer()
     entry = _stage(buf)
-    assert buf.discard(entry.attachment_id, ws_id="ws2", user_id="u1") is False
-    assert buf.discard(entry.attachment_id, ws_id="ws1", user_id="u1") is True
+    wrong_scope = buf.discard(entry.attachment_id, ws_id="ws2", user_id="u1")
+    assert wrong_scope is False
+    right_scope = buf.discard(entry.attachment_id, ws_id="ws1", user_id="u1")
+    assert right_scope is True
     assert buf.get(entry.attachment_id, ws_id="ws1", user_id="u1") is None
 
 
@@ -112,10 +114,12 @@ def test_discard_one_scope_keeps_other_and_evicts_on_last() -> None:
     buf = AttachmentBuffer()
     h = _stage(buf, content=b"dup", ws="wsA", user="u1").attachment_id
     _stage(buf, content=b"dup", ws="wsB", user="u1")
-    assert buf.discard(h, ws_id="wsA", user_id="u1") is True
+    discarded_a = buf.discard(h, ws_id="wsA", user_id="u1")
+    assert discarded_a is True
     assert buf.get(h, ws_id="wsA", user_id="u1") is None  # wsA's ref gone
     assert buf.get(h, ws_id="wsB", user_id="u1") is not None  # wsB's survives
-    assert buf.discard(h, ws_id="wsB", user_id="u1") is True
+    discarded_b = buf.discard(h, ws_id="wsB", user_id="u1")
+    assert discarded_b is True
     assert buf.get(h, ws_id="wsB", user_id="u1") is None  # last ref → blob evicted
 
 
