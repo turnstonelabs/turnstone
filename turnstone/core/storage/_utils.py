@@ -5,10 +5,14 @@ from __future__ import annotations
 import base64
 import json
 import re
+from collections import Counter
 from typing import Any
+
+import sqlalchemy as sa
 
 from turnstone.core.attachments import unreadable_placeholder
 from turnstone.core.log import get_logger
+from turnstone.core.storage._schema import workstream_attachments
 from turnstone.core.trajectory import (
     AttachmentRef,
     ContentBlock,
@@ -129,6 +133,43 @@ def prepare_provider_data_for_save(
     """
     return wrap_provider_data(
         normalize_native_for_save(role, provider_data, tool_calls_json), producer
+    )
+
+
+def release_attachment_refs(conn: Any, attachment_ids: list[str]) -> None:
+    """Decrement each referenced blob's refcount, prune any that reach 0.
+
+    The single dialect-agnostic owner of the content-addressed GC decrement —
+    both backends call this on rewind/retry (``delete_messages_after``) and on
+    workstream delete; the increment twin is each backend's ``save_attachment``
+    (INSERT-OR-IGNORE + unconditional ``+1``).  Counts duplicate ids in the
+    input — a turn references an id once, but a batch may span several turns that
+    each reference the same deduped blob — so the decrement matches the
+    references actually removed.  One UPDATE (a searched CASE maps each id to its
+    decrement; portable across SQLite/Postgres, unlike a VALUES join) plus one
+    prune DELETE, rather than a query per distinct id.  Caller holds the
+    connection / transaction.
+    """
+    if not attachment_ids:
+        return
+    counts = Counter(attachment_ids)
+    ids = list(counts)
+    decrement = sa.case(
+        *((workstream_attachments.c.attachment_id == aid, n) for aid, n in counts.items()),
+        else_=0,
+    )
+    conn.execute(
+        sa.update(workstream_attachments)
+        .where(workstream_attachments.c.attachment_id.in_(ids))
+        .values(refcount=workstream_attachments.c.refcount - decrement)
+    )
+    conn.execute(
+        sa.delete(workstream_attachments).where(
+            sa.and_(
+                workstream_attachments.c.attachment_id.in_(ids),
+                workstream_attachments.c.refcount <= 0,
+            )
+        )
     )
 
 

@@ -139,9 +139,9 @@ def storage(tmp_path):
     # live here now, not in storage).
     from turnstone.core.attachment_buffer import get_attachment_buffer
 
-    get_attachment_buffer()._entries.clear()
+    get_attachment_buffer().clear()
     yield backend
-    get_attachment_buffer()._entries.clear()
+    get_attachment_buffer().clear()
     reset_storage()
 
 

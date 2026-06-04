@@ -7,7 +7,6 @@ import json
 import queue
 import threading
 import time
-from collections import Counter
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Any
 
@@ -121,7 +120,11 @@ from turnstone.core.storage._utils import (
 from turnstone.core.storage._utils import (
     parse_attachment_refs as _parse_attachment_refs,
 )
-from turnstone.core.storage._utils import prepare_provider_data_for_save, sanitize_text
+from turnstone.core.storage._utils import (
+    prepare_provider_data_for_save,
+    release_attachment_refs,
+    sanitize_text,
+)
 from turnstone.core.storage._utils import (
     reconstruct_messages as _reconstruct_messages,
 )
@@ -558,7 +561,7 @@ class SQLiteBackend:
             doomed_ids: list[str] = []
             for (refs,) in doomed:
                 doomed_ids.extend(_parse_attachment_refs(refs))
-            self._release_attachment_refs(conn, doomed_ids)
+            release_attachment_refs(conn, doomed_ids)
             # Remove FTS5 entries first (external content table doesn't auto-sync)
             if self._fts5_available:
                 try:
@@ -1031,7 +1034,7 @@ class SQLiteBackend:
             ref_ids: list[str] = []
             for (refs,) in referenced:
                 ref_ids.extend(_parse_attachment_refs(refs))
-            self._release_attachment_refs(conn, ref_ids)
+            release_attachment_refs(conn, ref_ids)
             conn.execute(sa.delete(conversations).where(conversations.c.ws_id == ws_id))
             conn.execute(sa.delete(workstream_config).where(workstream_config.c.ws_id == ws_id))
             conn.execute(
@@ -1156,7 +1159,7 @@ class SQLiteBackend:
         content-addressed ids are 64-char sha256 hex, so a quoted-id substring
         cannot collide with another id.
         """
-        needle = f'%"{attachment_id}"%'
+        needle = f'%"{_escape_like(attachment_id)}"%'
         with self._conn() as conn:
             row = conn.execute(
                 sa.select(conversations.c.id)
@@ -1164,40 +1167,12 @@ class SQLiteBackend:
                     sa.and_(
                         conversations.c.ws_id == ws_id,
                         conversations.c.attachments.is_not(None),
-                        conversations.c.attachments.like(needle),
+                        conversations.c.attachments.like(needle, escape=_LIKE_ESCAPE),
                     )
                 )
                 .limit(1)
             ).fetchone()
             return row is not None
-
-    @staticmethod
-    def _release_attachment_refs(conn: Any, attachment_ids: list[str]) -> None:
-        """Decrement refcount once per id and prune blobs that reach 0.
-
-        Caller holds the connection / transaction.  Counts duplicate ids in
-        the input (a turn references an id once, but a batch may span several
-        turns that each reference the same deduped blob), so the decrement
-        matches the number of references actually being removed.
-        """
-        if not attachment_ids:
-            return
-        counts = Counter(attachment_ids)
-        for aid, n in counts.items():
-            conn.execute(
-                sa.update(workstream_attachments)
-                .where(workstream_attachments.c.attachment_id == aid)
-                .values(refcount=workstream_attachments.c.refcount - n)
-            )
-        # Prune any blob whose count fell to (or below) 0.
-        conn.execute(
-            sa.delete(workstream_attachments).where(
-                sa.and_(
-                    workstream_attachments.c.attachment_id.in_(list(counts)),
-                    workstream_attachments.c.refcount <= 0,
-                )
-            )
-        )
 
     def list_workstreams(
         self,

@@ -4766,7 +4766,10 @@ class ChatSession:
                 for p in content:
                     if p.get("type") == "text":
                         parts.append(p.get("text", ""))
-                    elif p.get("type") == "image_url":
+                    elif p.get("type") in ("image_url", "image"):
+                        # ``image`` is the by-reference vision placeholder
+                        # ({type, attachment_id}); ``image_url`` the resolved
+                        # inline form — both flatten to the same marker.
                         parts.append("[image]")
                 content = " ".join(parts)
 
@@ -4983,7 +4986,8 @@ class ChatSession:
                 for p in content:
                     if p.get("type") == "text":
                         text_parts.append(p["text"])
-                    elif p.get("type") == "image_url":
+                    elif p.get("type") in ("image_url", "image"):
+                        # by-reference vision placeholder OR resolved inline image
                         text_parts.append("[image]")
                 content = " ".join(text_parts)
 

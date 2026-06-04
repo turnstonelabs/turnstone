@@ -63,7 +63,7 @@ class TestValidateAndSaveUploadedFiles:
         )
 
         buf = get_attachment_buffer()
-        buf._entries.clear()
+        buf.clear()
         try:
             files = [
                 ("hi.png", "image/png", PNG_1x1),
@@ -78,7 +78,7 @@ class TestValidateAndSaveUploadedFiles:
             assert len(staged) == 2
             assert {s.kind for s in staged} == {"image", "text"}
         finally:
-            buf._entries.clear()
+            buf.clear()
 
     def test_rejects_oversized_image(self, tmp_path):
         from turnstone.core.attachments import IMAGE_SIZE_CAP
@@ -145,7 +145,7 @@ class TestResolveStagedAttachments:
         )
 
         buf = get_attachment_buffer()
-        buf._entries.clear()
+        buf.clear()
         try:
             a1 = self._stage("ws-X", "userA", "a.txt", "text/plain", "text", b"hello")
             a2 = self._stage("ws-X", "userA", "b.png", "image/png", "image", PNG_1x1)
@@ -158,7 +158,7 @@ class TestResolveStagedAttachments:
             assert all(isinstance(a, Attachment) for a in resolved)
             assert [a.kind for a in resolved] == ["text", "image"]
         finally:
-            buf._entries.clear()
+            buf.clear()
 
     def test_unknown_id_is_dropped(self):
         from turnstone.core.attachment_buffer import get_attachment_buffer
@@ -167,7 +167,7 @@ class TestResolveStagedAttachments:
         )
 
         buf = get_attachment_buffer()
-        buf._entries.clear()
+        buf.clear()
         try:
             a1 = self._stage("ws-X", "userA", "a.txt", "text/plain", "text", b"hello")
             resolved, taken, dropped = _resolve_staged_attachments(
@@ -177,7 +177,7 @@ class TestResolveStagedAttachments:
             assert dropped == ["never-staged"]
             assert len(resolved) == 1
         finally:
-            buf._entries.clear()
+            buf.clear()
 
     def test_cross_user_id_not_resolved(self):
         # A staged id scoped to another user (same ws) must not resolve.
@@ -187,7 +187,7 @@ class TestResolveStagedAttachments:
         )
 
         buf = get_attachment_buffer()
-        buf._entries.clear()
+        buf.clear()
         try:
             other = self._stage("ws-X", "userB", "a.txt", "text/plain", "text", b"hello")
             resolved, taken, dropped = _resolve_staged_attachments(
@@ -196,7 +196,7 @@ class TestResolveStagedAttachments:
             assert resolved == []
             assert dropped == [other.attachment_id]
         finally:
-            buf._entries.clear()
+            buf.clear()
 
 
 # ---------------------------------------------------------------------------
@@ -345,14 +345,14 @@ def app_client(tmp_path, monkeypatch):
     # staged uploads can't leak across tests.
     from turnstone.core.attachment_buffer import get_attachment_buffer
 
-    get_attachment_buffer()._entries.clear()
+    get_attachment_buffer().clear()
 
     client = TestClient(app, raise_server_exceptions=False)
     try:
         yield client, fake_sessions, gq
     finally:
         client.close()
-        get_attachment_buffer()._entries.clear()
+        get_attachment_buffer().clear()
         reset_storage()
 
 

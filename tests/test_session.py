@@ -4282,6 +4282,30 @@ class TestReminderSidechannelIsolation:
         assert "<system-reminder>" not in summary
         assert "user said this" in summary
 
+    def test_format_messages_for_summary_marks_by_reference_vision_image(self, tmp_db):
+        """A by-reference vision result (a tool image lowered to
+        ``{type:"image", attachment_id}``) must still flatten to the ``[image]``
+        marker in the compaction summary.  Keying on ``image_url`` alone dropped
+        it after the AttachmentRef migration changed the part shape — so a
+        compacted vision turn lost its only trace of having returned an image."""
+        session = _make_session()
+        session.messages.append(turn_from_dict({"role": "user", "content": "look at this"}))
+        session.messages.append(
+            turn_from_dict(
+                {
+                    "role": "tool",
+                    "tool_call_id": "call_1",
+                    "content": [
+                        {"type": "text", "text": "screenshot:"},
+                        {"type": "image", "attachment_id": "a" * 64},
+                    ],
+                }
+            )
+        )
+        summary = session._format_messages_for_summary(dicts_from_turns(session.messages))
+        assert "[image]" in summary
+        assert "screenshot:" in summary
+
     def test_first_user_message_extraction_does_not_see_reminders(self, tmp_db):
         """Title generation pulls the first user message's ``content`` for
         the title prompt.  Replicates the inner extraction loop and pins

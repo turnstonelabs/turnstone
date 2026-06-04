@@ -87,14 +87,14 @@ def app_client(tmp_path):
     # so staged uploads can't leak across tests.
     from turnstone.core.attachment_buffer import get_attachment_buffer
 
-    get_attachment_buffer()._entries.clear()
+    get_attachment_buffer().clear()
 
     client = TestClient(app, raise_server_exceptions=False)
     try:
         yield client, mock_mgr
     finally:
         client.close()
-        get_attachment_buffer()._entries.clear()
+        get_attachment_buffer().clear()
         reset_storage()
 
 

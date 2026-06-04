@@ -18,6 +18,7 @@ tune via ``judge.output_guard_budget_seconds``.  Dependencies: stdlib only.
 from __future__ import annotations
 
 import re
+import secrets
 import time
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
@@ -741,7 +742,11 @@ def _check_marker_forgery(
     forged = False
     for m in _RE_FENCE_MARKER.finditer(text):
         suffix = (m.group(1) or "").lower()
-        if want is not None and suffix == want:
+        # Constant-time vs the session nonce (project standard for nonce
+        # comparison).  Bytes form so a non-ASCII forged suffix can't raise.
+        if want is not None and secrets.compare_digest(
+            suffix.encode("utf-8"), want.encode("utf-8")
+        ):
             leaked = True
         else:
             forged = True

@@ -88,5 +88,48 @@ def test_size_cap_evicts_oldest_first() -> None:
     assert {b.attachment_id, c.attachment_id} <= ids
 
 
+def test_cross_scope_identical_bytes_resolve_independently() -> None:
+    """Identical bytes staged from two scopes dedupe to one blob but keep
+    independent references — so neither scope's send drops the other's upload
+    (the bug: a hash-only key let the second stage overwrite + rescope the
+    first, and resolve has no committed-store fallback)."""
+    buf = AttachmentBuffer()
+    a = _stage(buf, content=b"shared", ws="wsA", user="u1", filename="a.txt")
+    b = _stage(buf, content=b"shared", ws="wsB", user="u1", filename="b.txt")
+    assert a.attachment_id == b.attachment_id  # same content hash → one blob
+    # Both scopes resolve their own staged upload — neither was overwritten —
+    # and each keeps its own per-scope metadata (filename).
+    ra = buf.get(a.attachment_id, ws_id="wsA", user_id="u1")
+    rb = buf.get(b.attachment_id, ws_id="wsB", user_id="u1")
+    assert ra is not None and ra.content == b"shared" and ra.filename == "a.txt"
+    assert rb is not None and rb.content == b"shared" and rb.filename == "b.txt"
+
+
+def test_discard_one_scope_keeps_other_and_evicts_on_last() -> None:
+    """Discarding one scope's reference (a committing send draining its own
+    upload) leaves another scope's pending upload of the same bytes intact; the
+    shared blob is evicted only when the last reference goes."""
+    buf = AttachmentBuffer()
+    h = _stage(buf, content=b"dup", ws="wsA", user="u1").attachment_id
+    _stage(buf, content=b"dup", ws="wsB", user="u1")
+    assert buf.discard(h, ws_id="wsA", user_id="u1") is True
+    assert buf.get(h, ws_id="wsA", user_id="u1") is None  # wsA's ref gone
+    assert buf.get(h, ws_id="wsB", user_id="u1") is not None  # wsB's survives
+    assert buf.discard(h, ws_id="wsB", user_id="u1") is True
+    assert buf.get(h, ws_id="wsB", user_id="u1") is None  # last ref → blob evicted
+
+
+def test_size_cap_counts_deduped_bytes_once() -> None:
+    """The size ceiling bounds bytes actually resident: identical bytes staged
+    from many scopes count once (not once-per-scope as re-keying would), so
+    dedup-heavy staging isn't falsely evicted."""
+    buf = AttachmentBuffer(max_total_bytes=8)  # fits exactly one 8-byte blob
+    for ws in ("wsA", "wsB", "wsC"):
+        _stage(buf, content=b"eightyte", ws=ws, user="u1")  # 8 bytes, same blob
+    handle = hashlib.sha256(b"eightyte").hexdigest()
+    for ws in ("wsA", "wsB", "wsC"):
+        assert buf.get(handle, ws_id=ws, user_id="u1") is not None
+
+
 def test_singleton_getter_is_stable() -> None:
     assert get_attachment_buffer() is get_attachment_buffer()
