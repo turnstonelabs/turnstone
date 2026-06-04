@@ -51,14 +51,12 @@ turnstone --base-url http://localhost:8000/v1
 turnstone-server --port 8080 --base-url http://localhost:8000/v1
 
 # Cluster dashboard
-pip install turnstone[console]
 turnstone-console --port 8090
 ```
 
 For PostgreSQL (recommended for production):
 
 ```bash
-pip install turnstone[postgres]
 export TURNSTONE_DB_BACKEND=postgresql
 export TURNSTONE_DB_URL="postgresql+psycopg://user:pass@localhost:5432/turnstone"
 turnstone-server --port 8080 --base-url http://localhost:8000/v1
@@ -161,7 +159,7 @@ UML diagrams in [`docs/diagrams/`](docs/diagrams/):
 
 - Python 3.11+
 - An OpenAI-compatible API endpoint, Anthropic API key, or Google Gemini API key
-- Optional: PostgreSQL (`pip install turnstone[postgres]`), Anthropic (`pip install turnstone[anthropic]`)
+- Optional: Discord / Slack channel integrations (`pip install turnstone[discord,slack]`)
 - [Git LFS](https://git-lfs.com/) for cloning (diagram PNGs)
 
 ## Community

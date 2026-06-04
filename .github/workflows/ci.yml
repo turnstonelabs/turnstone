@@ -82,7 +82,7 @@ jobs:
       - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6
         with:
           node-version: "24"
-      - run: pip install -e ".[test,postgres]"
+      - run: pip install -e ".[test]"
       - run: pytest tests/ -m "not live" --storage-backend=postgresql -q
         env:
           TURNSTONE_TEST_PG_URL: postgresql+psycopg://postgres:postgres@localhost:5432/turnstone_test

@@ -976,12 +976,7 @@ def _setup_openai() -> tuple[str, Any, str]:
 
 
 def _setup_anthropic() -> tuple[str, Any, str]:
-    try:
-        import anthropic
-    except ImportError:
-        print(f"\n {RED}The 'anthropic' package is not installed.{RESET}")
-        print(f" Install it with: {CYAN}pip install turnstone[anthropic]{RESET}")
-        sys.exit(1)
+    import anthropic
 
     api_key = _prompt_api_key("ANTHROPIC_API_KEY", "Enter your Anthropic API key:")
     model = _prompt_model("anthropic")

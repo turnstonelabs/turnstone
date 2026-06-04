@@ -23,6 +23,7 @@ classifiers = [
 ]
 dependencies = [
     "openai>=2.37",
+    "anthropic>=0.39",
     "httpx>=0.28",
     "mcp>=1.27",
     "starlette>=1.0.1",  # PYSEC-2026-161: host-header path-injection in URL reconstruction (auth-bypass on apps comparing reconstructed URL paths)
@@ -32,10 +33,13 @@ dependencies = [
     "pydantic>=2.0",
     "sqlalchemy>=2.0",
     "alembic>=1.14",
+    "psycopg[binary]>=3.2",
+    "croniter>=3.0",
     "structlog>=24.1",
     "PyJWT>=2.8",
     "bcrypt>=4.0",
     "cryptography>=42",
+    "lacme>=1.0.5",
     "python-frontmatter>=1.0",
 ]
 
@@ -45,15 +49,11 @@ Repository = "https://github.com/turnstonelabs/turnstone"
 Issues = "https://github.com/turnstonelabs/turnstone/issues"
 
 [project.optional-dependencies]
-test = ["pytest>=9.0", "pytest-cov>=6.0", "croniter>=3.0", "slack-bolt>=1.18", "aiohttp>=3.9"]
+test = ["pytest>=9.0", "pytest-cov>=6.0", "slack-bolt>=1.18", "aiohttp>=3.9"]
 dev = ["ruff>=0.9", "mypy>=1.14"]
-console = ["croniter>=3.0"]
-anthropic = ["anthropic>=0.39"]
-postgres = ["psycopg[binary]>=3.2"]
 discord = ["discord.py>=2.4"]
-tls = ["lacme>=1.0.5"]
 slack = ["slack-bolt>=1.18", "aiohttp>=3.9"]
-all = ["turnstone[console,anthropic,postgres,discord,tls,slack]"]
+all = ["turnstone[discord,slack]"]
 
 [project.scripts]
 turnstone = "turnstone.cli:main"

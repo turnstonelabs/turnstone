@@ -29,16 +29,14 @@ log = logging.getLogger(__name__)
 
 
 def _ensure_anthropic() -> Any:
-    """Lazy import anthropic SDK, raising helpful error if not installed."""
-    try:
-        import anthropic  # noqa: PLC0415
+    """Return the ``anthropic`` SDK module (a core dependency).
 
-        return anthropic
-    except ImportError:
-        raise ImportError(
-            "The 'anthropic' package is required for Anthropic provider. "
-            "Install it with: pip install 'turnstone[anthropic]'"
-        ) from None
+    Kept as a thin accessor so ``create_client`` (and tests) can obtain the
+    SDK via a single seam without a module-top import.
+    """
+    import anthropic  # noqa: PLC0415
+
+    return anthropic
 
 
 # -- message format helpers --------------------------------------------------
@@ -700,7 +698,6 @@ class AnthropicProvider:
         resolve_attachments: Callable[[list[str]], dict[str, dict[str, Any]]] | None = None,
     ) -> Iterator[StreamChunk]:
         messages = materialize_attachments(messages, resolve_attachments)
-        _ensure_anthropic()
         caps = capabilities or self.get_capabilities(model)
         system_prompt, converted_msgs = self._convert_messages(
             messages,
@@ -914,7 +911,6 @@ class AnthropicProvider:
         resolve_attachments: Callable[[list[str]], dict[str, dict[str, Any]]] | None = None,
     ) -> CompletionResult:
         messages = materialize_attachments(messages, resolve_attachments)
-        _ensure_anthropic()
         caps = capabilities or self.get_capabilities(model)
         system_prompt, converted_msgs = self._convert_messages(
             messages,

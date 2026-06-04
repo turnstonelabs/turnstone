@@ -26,8 +26,6 @@ from types import SimpleNamespace
 from typing import Any
 from unittest.mock import MagicMock, patch
 
-import pytest
-
 from tests._session_helpers import make_session as _make_session
 
 
@@ -300,7 +298,6 @@ class TestSessionToWireBoundaryIntegration:
         the resolver pre-set to *replay_flag*.  Returns the kwargs
         dict that reached the (mocked) Anthropic SDK boundary.
         """
-        pytest.importorskip("anthropic")
         from turnstone.core.providers._anthropic import AnthropicProvider
 
         session = _make_session()
@@ -322,7 +319,7 @@ class TestSessionToWireBoundaryIntegration:
                 model_alias="claude-opus-4-7",
             )
             # Iterate the stream to drain the (empty) generator and ensure
-            # _ensure_anthropic / convert / build_kwargs all ran.
+            # convert / build_kwargs all ran.
             list(stream)
         return captured
 
@@ -386,7 +383,6 @@ class TestSessionToWireBoundaryIntegration:
         # supports_reasoning_replay=False.  AND-gate at the resolver
         # blocks replay, so the strip predicate fires at the wire and
         # the thinking block does NOT reach the SDK boundary.
-        pytest.importorskip("anthropic")
         from turnstone.core.providers._anthropic import AnthropicProvider
         from turnstone.core.providers._protocol import ModelCapabilities
 

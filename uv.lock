@@ -2311,12 +2311,16 @@ version = "1.6.0a10"
 source = { editable = "." }
 dependencies = [
     { name = "alembic" },
+    { name = "anthropic" },
     { name = "bcrypt" },
+    { name = "croniter" },
     { name = "cryptography" },
     { name = "httpx" },
     { name = "httpx-sse" },
+    { name = "lacme" },
     { name = "mcp" },
     { name = "openai" },
+    { name = "psycopg", extra = ["binary"] },
     { name = "pydantic" },
     { name = "pyjwt" },
     { name = "python-frontmatter" },
@@ -2330,18 +2334,8 @@ dependencies = [
 [package.optional-dependencies]
 all = [
     { name = "aiohttp" },
-    { name = "anthropic" },
-    { name = "croniter" },
     { name = "discord-py" },
-    { name = "lacme" },
-    { name = "psycopg", extra = ["binary"] },
     { name = "slack-bolt" },
-]
-anthropic = [
-    { name = "anthropic" },
-]
-console = [
-    { name = "croniter" },
 ]
 dev = [
     { name = "mypy" },
@@ -2350,22 +2344,15 @@ dev = [
 discord = [
     { name = "discord-py" },
 ]
-postgres = [
-    { name = "psycopg", extra = ["binary"] },
-]
 slack = [
     { name = "aiohttp" },
     { name = "slack-bolt" },
 ]
 test = [
     { name = "aiohttp" },
-    { name = "croniter" },
     { name = "pytest" },
     { name = "pytest-cov" },
     { name = "slack-bolt" },
-]
-tls = [
-    { name = "lacme" },
 ]
 
 [package.metadata]
@@ -2373,19 +2360,18 @@ requires-dist = [
     { name = "aiohttp", marker = "extra == 'slack'", specifier = ">=3.9" },
     { name = "aiohttp", marker = "extra == 'test'", specifier = ">=3.9" },
     { name = "alembic", specifier = ">=1.14" },
-    { name = "anthropic", marker = "extra == 'anthropic'", specifier = ">=0.39" },
+    { name = "anthropic", specifier = ">=0.39" },
     { name = "bcrypt", specifier = ">=4.0" },
-    { name = "croniter", marker = "extra == 'console'", specifier = ">=3.0" },
-    { name = "croniter", marker = "extra == 'test'", specifier = ">=3.0" },
+    { name = "croniter", specifier = ">=3.0" },
     { name = "cryptography", specifier = ">=42" },
     { name = "discord-py", marker = "extra == 'discord'", specifier = ">=2.4" },
     { name = "httpx", specifier = ">=0.28" },
     { name = "httpx-sse", specifier = ">=0.4" },
-    { name = "lacme", marker = "extra == 'tls'", specifier = ">=1.0.5" },
+    { name = "lacme", specifier = ">=1.0.5" },
     { name = "mcp", specifier = ">=1.27" },
     { name = "mypy", marker = "extra == 'dev'", specifier = ">=1.14" },
     { name = "openai", specifier = ">=2.37" },
-    { name = "psycopg", extras = ["binary"], marker = "extra == 'postgres'", specifier = ">=3.2" },
+    { name = "psycopg", extras = ["binary"], specifier = ">=3.2" },
     { name = "pydantic", specifier = ">=2.0" },
     { name = "pyjwt", specifier = ">=2.8" },
     { name = "pytest", marker = "extra == 'test'", specifier = ">=9.0" },
@@ -2398,10 +2384,10 @@ requires-dist = [
     { name = "sse-starlette", specifier = ">=2.0" },
     { name = "starlette", specifier = ">=1.0.1" },
     { name = "structlog", specifier = ">=24.1" },
-    { name = "turnstone", extras = ["console", "anthropic", "postgres", "discord", "tls", "slack"], marker = "extra == 'all'" },
+    { name = "turnstone", extras = ["discord", "slack"], marker = "extra == 'all'" },
     { name = "uvicorn", specifier = ">=0.34" },
 ]
-provides-extras = ["test", "dev", "console", "anthropic", "postgres", "discord", "tls", "slack", "all"]
+provides-extras = ["test", "dev", "discord", "slack", "all"]
 
 [[package]]
 name = "typing-extensions"

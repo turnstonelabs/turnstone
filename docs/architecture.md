@@ -652,9 +652,8 @@ display). Automatic prompt caching is enabled via top-level `cache_control:
 cacheable block and advances it as conversations grow (90% input cost
 reduction on cache hits, 1.25x write on first turn). Cache metrics
 (`cache_creation_input_tokens`, `cache_read_input_tokens`) are extracted from
-both streaming and non-streaming responses. The `anthropic` SDK is imported
-lazily so it remains an optional dependency (`pip install
-turnstone[anthropic]`).
+both streaming and non-streaming responses. The `anthropic` SDK is a core
+dependency — the Anthropic provider is first-class alongside OpenAI.
 
 **GoogleProvider** (`_google.py`): extends `OpenAIChatCompletionsProvider` for
 the Gemini `/v1beta/openai/` endpoint. Uses a single default
