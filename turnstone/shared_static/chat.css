@@ -1005,7 +1005,9 @@
    trajectory) — the consolidation of the metacognition reminder /
    user-interjection / output-guard bubbles into one turn type that FOLLOWS
    the turn it advises.  Shared so the interactive UI and the console coord
-   viewer render it identically.  Yellow accent reads as "operator metadata"
+   viewer render the bubble identically (the visible kind label is
+   interactive-only — see ``.msg-system-context-label`` below).  Yellow accent
+   reads as "operator metadata"
    against the amber user colour and the cyan tool cards; deliberately quieter
    so it doesn't compete for attention.  The ``watch_triggered`` kind carries
    structured per-kind meta and branches into the richer ``.msg.watch-result``
@@ -1017,6 +1019,12 @@
   padding: 6px 10px;
   white-space: pre-wrap;
 }
+/* The visible kind label is built ONLY by the interactive pane
+   (app.js ``addSystemContext`` → a ``.msg-system-context-label`` span).  The
+   coord viewer (coordinator.js ``appendMsg``) renders the kind via
+   border-colour + ``data-ts-role``/``aria-label`` with no visible label for
+   ANY role, so this rule (and its ``.important`` variant below) is inert on the
+   coord pane by design — not dead CSS. */
 .msg.system-context .msg-system-context-label {
   color: var(--yellow);
   font-weight: 600;

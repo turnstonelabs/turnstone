@@ -67,6 +67,8 @@ class HistoryEvent(ServerEvent):
       poll_count, max_polls, is_final}``) so the renderer can rebuild
       per-kind UI (the watch-result card); absent when the kind carries no
       structured data
+    * ``attachments`` — per-attachment metadata ``{kind, filename,
+      mime_type}`` (turns that carried image / document refs)
     * ``reasoning`` — concatenated reasoning text for assistant turns
       that round-tripped a thinking-block lane (Anthropic-with-thinking
       today; OpenAI Responses + Gemini in later phases). Present only
