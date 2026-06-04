@@ -26,7 +26,6 @@ from turnstone.core.providers._protocol import (
     ToolCallDelta,
     UsageInfo,
 )
-from turnstone.core.trajectory import dicts_from_turns, turns_from_dicts
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -263,7 +262,7 @@ class TestOpenAIProvider:
             },
             {"role": "user", "content": "next"},
         ]
-        result = sanitize_messages(dicts_from_turns(repair_wire_messages(turns_from_dicts(msgs))))
+        result = sanitize_messages(repair_wire_messages(msgs))
         assert len(result) == 3
         assert result[1]["role"] == "tool"
         assert result[1]["tool_call_id"] == "call_1"
@@ -291,7 +290,7 @@ class TestOpenAIProvider:
             },
             {"role": "tool", "tool_call_id": "call_1", "content": "ok"},
         ]
-        result = sanitize_messages(dicts_from_turns(repair_wire_messages(turns_from_dicts(msgs))))
+        result = sanitize_messages(repair_wire_messages(msgs))
         assert len(result) == 3
         assert result[1]["tool_call_id"] == "call_1"
         assert result[1]["content"] == "ok"
@@ -337,7 +336,7 @@ class TestOpenAIProvider:
                 ],
             },
         ]
-        result = sanitize_messages(dicts_from_turns(repair_wire_messages(turns_from_dicts(msgs))))
+        result = sanitize_messages(repair_wire_messages(msgs))
         assert len(result) == 2
         assert result[1]["role"] == "tool"
         assert result[1]["tool_call_id"] == "call_1"
@@ -428,7 +427,7 @@ class TestOpenAIProvider:
             {"role": "tool", "tool_call_id": "call_1", "content": "ok"},
             {"role": "tool", "tool_call_id": "call_STALE", "content": "stale"},
         ]
-        result = sanitize_messages(dicts_from_turns(repair_wire_messages(turns_from_dicts(msgs))))
+        result = sanitize_messages(repair_wire_messages(msgs))
         result_tc_ids = [m["tool_call_id"] for m in result if m.get("role") == "tool"]
         assert "call_STALE" not in result_tc_ids
         assert "call_1" in result_tc_ids
@@ -473,7 +472,7 @@ class TestOpenAIProvider:
                 ],
             },
         ]
-        result = sanitize_messages(dicts_from_turns(repair_wire_messages(turns_from_dicts(msgs))))
+        result = sanitize_messages(repair_wire_messages(msgs))
         # Turn 2's orphaned call_1 should get a synthetic result
         tool_msgs = [m for m in result if m.get("role") == "tool"]
         assert len(tool_msgs) == 2  # one real from turn 1, one synthetic from turn 2
@@ -2103,7 +2102,7 @@ class TestAnthropicOrphanedToolUse:
             {"role": "user", "content": "never mind, do something else"},
         ]
         _, converted = self.provider._convert_messages(
-            dicts_from_turns(repair_wire_messages(turns_from_dicts(messages)))
+            repair_wire_messages(messages)
         )
         # Should have: user, assistant(tool_use), user(synthetic tool_result), user
         # After _merge_consecutive, the two user messages may merge.
@@ -2135,7 +2134,7 @@ class TestAnthropicOrphanedToolUse:
             {"role": "user", "content": "skip all that"},
         ]
         _, converted = self.provider._convert_messages(
-            dicts_from_turns(repair_wire_messages(turns_from_dicts(messages)))
+            repair_wire_messages(messages)
         )
         tool_results = []
         for msg in converted:
@@ -2163,7 +2162,7 @@ class TestAnthropicOrphanedToolUse:
             {"role": "user", "content": "skip the write"},
         ]
         _, converted = self.provider._convert_messages(
-            dicts_from_turns(repair_wire_messages(turns_from_dicts(messages)))
+            repair_wire_messages(messages)
         )
         # c1 should have a real result, c2 should have a synthetic one
         tool_results = []
@@ -2219,7 +2218,7 @@ class TestAnthropicOrphanedToolUse:
             },
         ]
         _, converted = self.provider._convert_messages(
-            dicts_from_turns(repair_wire_messages(turns_from_dicts(messages)))
+            repair_wire_messages(messages)
         )
         tool_results = []
         for msg in converted:
@@ -2257,7 +2256,7 @@ class TestAnthropicOrphanedToolUse:
             {"role": "user", "content": "never mind"},
         ]
         _, converted = self.provider._convert_messages(
-            dicts_from_turns(repair_wire_messages(turns_from_dicts(messages)))
+            repair_wire_messages(messages)
         )
         # Should synthesize a tool_result for the orphaned tool_use in provider_content
         tool_results = []
@@ -3981,7 +3980,7 @@ class TestResponsesMessageConversion:
             },
         ]
         _, items = self.provider._convert_messages(
-            dicts_from_turns(repair_wire_messages(turns_from_dicts(messages)))
+            repair_wire_messages(messages)
         )
         # repair_wire_messages synthesizes the missing tool result; the translator renders it
         assert len(items) == 2
@@ -4041,7 +4040,7 @@ class TestResponsesMessageConversion:
             },
         ]
         _, items = self.provider._convert_messages(
-            dicts_from_turns(repair_wire_messages(turns_from_dicts(messages)))
+            repair_wire_messages(messages)
         )
         # repair_wire_messages synthesizes the missing tool result; the translator renders it
         assert len(items) == 3

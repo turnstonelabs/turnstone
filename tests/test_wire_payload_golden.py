@@ -35,7 +35,6 @@ from turnstone.core.providers._anthropic import AnthropicProvider
 from turnstone.core.providers._google import GoogleProvider
 from turnstone.core.providers._openai_chat import OpenAIChatCompletionsProvider
 from turnstone.core.providers._openai_responses import OpenAIResponsesProvider
-from turnstone.core.trajectory import dicts_from_turns, turns_from_dicts
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
@@ -115,7 +114,7 @@ def _capture(
     # Turns (``ChatSession._prepare_wire_messages``), then the result is lowered
     # to the dict projection the translator consumes.  Fixtures arrive
     # folded/empty-dropped; repair is the remaining send-side pass.
-    messages = dicts_from_turns(repair_wire_messages(turns_from_dicts(messages)))
+    messages = repair_wire_messages(messages)
     gen = provider.create_streaming(
         client=client,
         model=model,
