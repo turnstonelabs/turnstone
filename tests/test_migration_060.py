@@ -596,3 +596,89 @@ class TestMigration060AttachmentBackfill:
             assert json.loads(refs) == [h1, h2]
         finally:
             engine.dispose()
+
+    def test_backfill_pages_across_batch_boundary(self, tmp_path: Path) -> None:
+        """The backfill reads consumed rows PAGED (keyset on (message_id,
+        created, attachment_id)) so a large blob corpus never materialises at
+        once.  Seed more than one page of attachments and assert the
+        accumulators span the boundary: a single message's ref-list keeps its
+        order across the page split, and a duplicate that lands on a LATER page
+        than its canonical still dedups + bumps the refcount.  Runs against the
+        real ``_BATCH`` so a regression to an un-paged ``.fetchall()`` (or a
+        cursor that stalls/skips at the boundary) is caught."""
+        import importlib.util
+
+        mig_path = (
+            Path(__file__).resolve().parent.parent
+            / "turnstone/core/storage/migrations/versions/060_unwrap_tool_envelopes.py"
+        )
+        spec = importlib.util.spec_from_file_location("_mig_060_batch", mig_path)
+        assert spec is not None and spec.loader is not None
+        mig = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mig)
+        batch: int = mig._BATCH
+
+        # m1 carries one full page + 2 → its ref-list straddles the boundary.
+        # m2 carries a single attachment whose bytes duplicate m1's first blob
+        # but sorts onto page 2 (canonical seen on page 1, dup found on page 2).
+        n = batch + 2
+        contents = [f"blob-{i}".encode() for i in range(n)]
+        hashes = [hashlib.sha256(c).hexdigest() for c in contents]
+
+        db_path = tmp_path / "060-att-paging.db"
+        cfg = _alembic_cfg(db_path)
+        command.upgrade(cfg, "059")
+        engine = sa.create_engine(f"sqlite:///{db_path}")
+        try:
+            with engine.begin() as conn:
+                _seed_row(conn, role="user", content="m1", tool_call_id="p1")
+                _seed_row(conn, role="user", content="m2", tool_call_id="p2")
+                m1 = conn.execute(
+                    sa.text("SELECT id FROM conversations WHERE tool_call_id = 'p1'")
+                ).scalar_one()
+                m2 = conn.execute(
+                    sa.text("SELECT id FROM conversations WHERE tool_call_id = 'p2'")
+                ).scalar_one()
+                # Zero-padded ids so lexicographic order == insertion order
+                # (created is constant → attachment_id is the sort tiebreaker).
+                for i, c in enumerate(contents):
+                    _seed_attachment(
+                        conn,
+                        attachment_id=f"a{i:05d}",
+                        content=c,
+                        size_bytes=len(c),
+                        message_id=m1,
+                    )
+                _seed_attachment(
+                    conn,
+                    attachment_id="b00000",
+                    content=contents[0],
+                    size_bytes=len(contents[0]),
+                    message_id=m2,
+                )
+
+            command.upgrade(cfg, "060")
+
+            with engine.connect() as conn:
+                # m2's dup of blob-0 collapses → n distinct blobs (not n + 1).
+                blob_rows = conn.execute(
+                    sa.text("SELECT attachment_id, refcount FROM workstream_attachments")
+                ).fetchall()
+                assert len(blob_rows) == n
+                by_id = {r[0]: r[1] for r in blob_rows}
+                # The cross-page duplicate (blob-0) is referenced by m1 + m2.
+                assert by_id[hashes[0]] == 2
+                # A blob unique to the second page keeps refcount 1.
+                assert by_id[hashes[-1]] == 1
+                # m1's ref-list preserves order ACROSS the page boundary.
+                refs1 = conn.execute(
+                    sa.text("SELECT attachments FROM conversations WHERE id = :i"), {"i": m1}
+                ).scalar_one()
+                assert json.loads(refs1) == hashes
+                # m2 references the shared (cross-page-deduped) blob.
+                refs2 = conn.execute(
+                    sa.text("SELECT attachments FROM conversations WHERE id = :i"), {"i": m2}
+                ).scalar_one()
+                assert json.loads(refs2) == [hashes[0]]
+        finally:
+            engine.dispose()

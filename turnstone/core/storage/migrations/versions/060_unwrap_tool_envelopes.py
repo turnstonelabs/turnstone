@@ -361,14 +361,6 @@ def _backfill_content_addressed_attachments(bind: sa.engine.Connection) -> None:
         sa.column("attachments", sa.Text),
     )
 
-    # Read every consumed legacy row in (message_id, created, attachment_id)
-    # order so each message's ref-list preserves the original attachment order.
-    rows = bind.execute(
-        sa.select(wa.c.attachment_id, wa.c.message_id, wa.c.content)
-        .where(wa.c.message_id.is_not(None))
-        .order_by(wa.c.message_id, wa.c.created, wa.c.attachment_id)
-    ).fetchall()
-
     # new_id (content hash) -> canonical old id kept as that blob's row.
     canonical_old_id: dict[str, str] = {}
     # new_id -> set of distinct message ids referencing it (refcount source).
@@ -378,19 +370,54 @@ def _backfill_content_addressed_attachments(bind: sa.engine.Connection) -> None:
     # old ids to delete (duplicates that collapsed into a canonical row).
     drop_old_ids: list[str] = []
 
-    for old_id, message_id, content in rows:
-        raw = content if isinstance(content, (bytes, bytearray)) else b""
-        new_id = hashlib.sha256(bytes(raw)).hexdigest()
-        if new_id not in canonical_old_id:
-            canonical_old_id[new_id] = old_id
-            refcounting[new_id] = set()
-        elif old_id != canonical_old_id[new_id]:
-            # A distinct legacy row carrying identical bytes — collapse it.
-            drop_old_ids.append(old_id)
-        refcounting[new_id].add(int(message_id))
-        bucket = per_message.setdefault(int(message_id), [])
-        if new_id not in bucket:
-            bucket.append(new_id)
+    # Read every consumed legacy row in (message_id, created, attachment_id)
+    # order so each message's ref-list preserves the original attachment order.
+    # PAGED via a composite keyset cursor (like steps 1/1b) so the LargeBinary
+    # ``content`` of the whole corpus is never materialised at once — only one
+    # _BATCH of blobs is resident per iteration (each is hashed then dropped),
+    # bounding peak memory regardless of total stored blob volume.  The
+    # accumulators above span the full scan and flush after it, and the keyset
+    # order matches the ORDER BY exactly, so paging is byte-equivalent to a
+    # single ordered fetch.  ``created`` is NOT NULL and ``attachment_id`` is the
+    # PK, so the (message_id, created, attachment_id) tuple is unique and the
+    # cursor never stalls or skips at a page boundary.
+    last_key: tuple[int, str, str] | None = None
+    while True:
+        page = sa.select(wa.c.attachment_id, wa.c.message_id, wa.c.content, wa.c.created).where(
+            wa.c.message_id.is_not(None)
+        )
+        if last_key is not None:
+            last_msg, last_created, last_aid = last_key
+            page = page.where(
+                sa.or_(
+                    wa.c.message_id > last_msg,
+                    sa.and_(wa.c.message_id == last_msg, wa.c.created > last_created),
+                    sa.and_(
+                        wa.c.message_id == last_msg,
+                        wa.c.created == last_created,
+                        wa.c.attachment_id > last_aid,
+                    ),
+                )
+            )
+        rows = bind.execute(
+            page.order_by(wa.c.message_id, wa.c.created, wa.c.attachment_id).limit(_BATCH)
+        ).fetchall()
+        if not rows:
+            break
+        for old_id, message_id, content, created in rows:
+            last_key = (int(message_id), created, old_id)
+            raw = content if isinstance(content, (bytes, bytearray)) else b""
+            new_id = hashlib.sha256(bytes(raw)).hexdigest()
+            if new_id not in canonical_old_id:
+                canonical_old_id[new_id] = old_id
+                refcounting[new_id] = set()
+            elif old_id != canonical_old_id[new_id]:
+                # A distinct legacy row carrying identical bytes — collapse it.
+                drop_old_ids.append(old_id)
+            refcounting[new_id].add(int(message_id))
+            bucket = per_message.setdefault(int(message_id), [])
+            if new_id not in bucket:
+                bucket.append(new_id)
 
     # Re-key each canonical row's PK to its content hash and set refcount/origin.
     # Re-key first (while the duplicates still hold their old PKs), then delete

@@ -16,10 +16,15 @@ from __future__ import annotations
 import json
 from typing import Any
 
+from turnstone.core.providers._anthropic import AnthropicProvider
+from turnstone.core.providers._google import GoogleProvider
 from turnstone.core.storage._utils import (
     normalize_native_for_save,
+    reconstruct_messages,
+    reconstruct_turns,
     strip_orphan_client_tool_blocks,
 )
+from turnstone.core.trajectory import dicts_from_turns
 
 _THINKING = {"type": "thinking", "thinking": "reasoning text", "signature": "sig-1"}
 _TOOL_USE = {"type": "tool_use", "id": "call_1", "name": "get_weather", "input": {"city": "Paris"}}
@@ -158,3 +163,117 @@ def test_save_messages_bulk_drops_orphan_native_tool_use(backend: Any) -> None:
     asst = next(m for m in backend.load_messages(ws, repair=False) if m["role"] == "assistant")
     types = [b["type"] for b in asst.get("_provider_content", [])]
     assert types == ["thinking"]
+
+
+# --------------------------------------------------------------------------- #
+# Load-side self-heal: ``reconstruct_turns`` re-enforces the mirror for LEGACY
+# rows that predate the save chokepoint — an orphan client tool-call in the
+# native lane with an empty ``tool_calls`` column.  Without this, an Anthropic
+# resume replays the orphan ``tool_use`` (400) and Google resurrects the
+# ``function`` block into ``tool_calls`` (an unanswered call).  Both heal once
+# the block is stripped at load.
+# --------------------------------------------------------------------------- #
+def _assistant_row(provider_data: str, tool_calls: str | None) -> list[Any]:
+    """A legacy-shaped assistant conversation row for ``reconstruct_turns``.
+
+    Positional tuple: (id, role, content, tool_name, tool_call_id,
+    provider_data, tool_calls, source) — the 8-col prefix; event_id / is_error /
+    meta are absent (older fixture), exercising the length-guarded unpack.
+    """
+    return [1, "assistant", "truncated mid tool_use", None, None, provider_data, tool_calls, None]
+
+
+def _native_types(turns: list[Any]) -> list[str]:
+    native = turns[0].native
+    if native is None:
+        return []
+    return [b["type"] for b in native.blocks if isinstance(b, dict)]
+
+
+def test_reconstruct_strips_orphan_tool_use_bare_list() -> None:
+    row = _assistant_row(json.dumps([_THINKING, _TOOL_USE]), None)
+    assert _native_types(reconstruct_turns([row], "ws")) == ["thinking"]
+
+
+def test_reconstruct_strips_orphan_in_producer_envelope() -> None:
+    # The {producer, blocks} storage envelope (a 060-tagged legacy row), not
+    # just the bare-list shape, also heals.
+    row = _assistant_row(
+        json.dumps({"producer": "anthropic", "blocks": [_THINKING, _TOOL_USE]}), None
+    )
+    assert _native_types(reconstruct_turns([row], "ws")) == ["thinking"]
+
+
+def test_reconstruct_drops_native_when_only_orphan() -> None:
+    # All-orphan native lane collapses to None (mirrors normalize_native_for_save's
+    # ``None``), not an empty ProviderNative.
+    row = _assistant_row(json.dumps([_TOOL_USE]), None)
+    assert reconstruct_turns([row], "ws")[0].native is None
+
+
+def test_reconstruct_keeps_native_when_mirror_holds() -> None:
+    # Healthy case (matching tool_calls) is untouched — no over-stripping.
+    row = _assistant_row(json.dumps([_THINKING, _TOOL_USE]), _TOOL_CALLS_JSON)
+    assert _native_types(reconstruct_turns([row], "ws")) == ["thinking", "tool_use"]
+
+
+def test_healed_row_yields_no_orphan_on_anthropic_wire() -> None:
+    # End-to-end: the healed Turn projects to an Anthropic payload with NO orphan
+    # ``tool_use`` block in any assistant content (the resume 400 is gone).
+    row = _assistant_row(json.dumps([_THINKING, _TOOL_USE]), None)
+    msgs = dicts_from_turns(reconstruct_turns([row], "ws"))
+    _system, converted = AnthropicProvider()._convert_messages(msgs)
+    for m in converted:
+        if m.get("role") != "assistant":
+            continue
+        content = m.get("content")
+        blocks = content if isinstance(content, list) else []
+        assert all(b.get("type") != "tool_use" for b in blocks if isinstance(b, dict))
+
+
+def test_healed_row_yields_no_resurrected_call_on_google_wire() -> None:
+    # End-to-end (the path the brief MISSED): Google's _prepare_messages
+    # resurrects ``function`` blocks from ``_provider_content`` into
+    # ``tool_calls``.  With the orphan stripped at load there is nothing to
+    # resurrect, so the assistant turn carries no unanswered ``tool_calls``.
+    row = _assistant_row(json.dumps([_GOOGLE_FN]), None)
+    msgs = dicts_from_turns(reconstruct_turns([row], "ws"))
+    prepared = GoogleProvider()._prepare_messages(msgs)
+    assert all(not m.get("tool_calls") for m in prepared if m.get("role") == "assistant")
+
+
+def test_inflight_toolcall_preserved_on_history_load() -> None:
+    """An IN-FLIGHT tool call (the assistant issued it; the tool result hasn't
+    landed yet) must survive a ``/history`` load untouched.
+
+    The self-heal is gated on an EMPTY ``tool_calls`` column — which a
+    legitimately-issued call never has: the save-time mirror
+    (``normalize_native_for_save``, applied to every assistant row by both save
+    paths on both backends) keeps the native lane and ``tool_calls`` in lockstep.
+    So /history (``reconstruct_messages(repair=False)``, which deliberately
+    preserves the trailing partial turn during tool execution) shows the call,
+    and a later resume replays it intact.  Only the broken truncated-mid-tool_use
+    legacy shape (native ``tool_use`` with empty ``tool_calls``) is stripped.
+    Guards against the heal ever being widened to misfire on live tool calls."""
+    rows = [
+        [1, "user", "do a thing", None, None, None, None, None],
+        # In-flight assistant turn: tool_use in native AND a matching tool_calls
+        # entry (mirror holds); no following tool-result row yet.
+        [
+            2,
+            "assistant",
+            "",
+            None,
+            None,
+            json.dumps([_THINKING, _TOOL_USE]),
+            _TOOL_CALLS_JSON,
+            None,
+        ],
+    ]
+    msgs = reconstruct_messages(rows, "ws", repair=False)
+    assert len(msgs) == 2  # repair=False keeps the trailing in-flight turn
+    asst = msgs[-1]
+    assert asst["role"] == "assistant"
+    assert asst.get("tool_calls")  # the issued call survives the load
+    pc_types = [b["type"] for b in asst.get("_provider_content", []) if isinstance(b, dict)]
+    assert "tool_use" in pc_types  # native lane intact — the heal did NOT strip it

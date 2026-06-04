@@ -606,12 +606,25 @@ def _content_blocks(text: str | None, refs: list[AttachmentRef]) -> tuple[Conten
     return ()
 
 
-def _native_from_provider_data(provider_data: str | None) -> ProviderNative | None:
+def _native_from_provider_data(
+    provider_data: str | None, tool_calls_json: str | None
+) -> ProviderNative | None:
     """Decode the stored ``provider_data`` lane into a :class:`ProviderNative`.
 
     The storage envelope is ``{producer, blocks}`` (new) or a bare block list
     (legacy, no producer).  A decode failure or non-list/non-envelope payload
     yields ``None`` (the lane is dropped — matching the prior best-effort decode).
+
+    Load-side mirror self-heal: when the row carries no ``tool_calls`` (empty or
+    absent column), any *client* tool-call block in the native lane is an orphan —
+    a legacy truncated-mid-``tool_use`` row predating the save-time
+    ``normalize_native_for_save`` chokepoint — that would replay on a same-provider
+    resume with no matching ``tool_result`` (Anthropic 400; Google resurrects it
+    into ``tool_calls`` via its fidelity lane).  Strip those blocks here so every
+    legacy row heals on read regardless of whether migration 060 tagged it
+    (reasoning / server-tool / web-search blocks kept).  Mirrors
+    ``normalize_native_for_save``'s gate, including its ``None`` when nothing
+    survives.  The healthy (mirror-holds) path is byte-identical to a plain decode.
     """
     if not provider_data:
         return None
@@ -620,10 +633,18 @@ def _native_from_provider_data(provider_data: str | None) -> ProviderNative | No
     except (json.JSONDecodeError, TypeError):
         return None
     if isinstance(parsed, dict) and "blocks" in parsed:
-        return ProviderNative(producer=parsed.get("producer") or "", blocks=tuple(parsed["blocks"]))
-    if isinstance(parsed, list):
-        return ProviderNative(producer="", blocks=tuple(parsed))
-    return None
+        producer = parsed.get("producer") or ""
+        blocks = list(parsed["blocks"])
+    elif isinstance(parsed, list):
+        producer = ""
+        blocks = parsed
+    else:
+        return None
+    if not _has_tool_calls(tool_calls_json):
+        blocks = strip_orphan_client_tool_blocks(blocks)
+        if not blocks:
+            return None
+    return ProviderNative(producer=producer, blocks=tuple(blocks))
 
 
 def _source_meta_from_json(meta_json: str | None) -> dict[str, Any] | None:
@@ -705,7 +726,7 @@ def reconstruct_turns(
                     Role.ASSISTANT,
                     _content_blocks(content, []),
                     tool_calls=_tool_calls_from_json(tool_calls_json),
-                    native=_native_from_provider_data(provider_data),
+                    native=_native_from_provider_data(provider_data, tool_calls_json),
                     meta=meta,
                 )
             )
