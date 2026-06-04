@@ -552,6 +552,19 @@ def project_history_messages(
         if attachments_meta:
             entry["attachments"] = attachments_meta
 
+        # Expose the row's SSE event id — the monotonic per-ws Last-Event-ID
+        # cursor (migration 059), NOT a ring-buffer index: ``_enqueue`` only
+        # ever increments it and it's re-seeded from the persisted max on UI
+        # rebuild, so it never wraps or repeats (the deque ring buffer evicts
+        # old *entries*, bounding replay reach, but ids keep climbing).  Lets
+        # the frontend dedup a turn it already painted from ``/history``
+        # against the same turn redelivered by an SSE replay — belt-and-braces
+        # alongside the resume-cursor fix (a system turn's row id now matches
+        # its own live ``system_turn`` event id, so the cursor no longer
+        # re-replays it).
+        if isinstance(msg.get("_event_id"), int):
+            entry["event_id"] = msg["_event_id"]
+
         # (3) ``_source`` side-channel → top-level ``source``.  On a user
         #     row it drives the ``.msg.user.system-nudge`` marker
         #     (wake-driven empty turns); on a first-class operator-context

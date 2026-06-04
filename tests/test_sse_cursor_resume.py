@@ -21,13 +21,17 @@ from __future__ import annotations
 import collections
 import os
 import tempfile
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 os.environ.setdefault("TURNSTONE_JWT_SECRET", "x" * 32)
 
+from tests._session_helpers import make_session
 from turnstone.core.session_routes import _resume_cursor_and_trim
 from turnstone.core.session_ui_base import SessionUIBase
 from turnstone.core.storage._sqlite import SQLiteBackend
+
+if TYPE_CHECKING:
+    import pytest
 
 
 class _ConcreteUI(SessionUIBase):
@@ -192,6 +196,44 @@ def test_can_replay_from_truncated_false() -> None:
     for _ in range(20):
         ui._enqueue({"type": "t"})  # buffer holds ids 18,19,20
     assert ui.can_replay_from(2) is False  # cursor evicted → would be truncated
+
+
+# ---------------------------------------------------------------------------
+# Operator-context system turn — row event_id == its own SSE event id
+# (the metacognition-nudge double-render regression)
+# ---------------------------------------------------------------------------
+
+
+def test_on_system_turn_returns_buffered_event_id() -> None:
+    """``on_system_turn`` returns the SSE ``_event_id`` it assigned — the same
+    id stamped on the buffered event — so ``_append_system_turn`` persists the
+    row with the id matching its own live event."""
+    ui = _ConcreteUI(ws_id="ws", user_id="u")
+    ui._enqueue({"type": "content"})  # advance the counter
+    eid = ui.on_system_turn("ground yourself", "start", None)
+    assert eid == ui._event_buffer[-1][0]
+    assert ui._event_buffer[-1][1]["type"] == "system_turn"
+
+
+def test_append_system_turn_stamps_row_with_its_sse_event_id(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Regression: a system turn's persisted row carries the SAME ``event_id``
+    as its live ``on_system_turn`` event.  Stamping the row with the pre-emit
+    counter left it one below its own event, so an in-flight-orphan
+    ``/history`` resume cursor derived from the row re-replayed the live event
+    and the operator bubble rendered twice (the metacognition-nudge double)."""
+    session = make_session()
+    ui = session.ui  # NullUI is a real SessionUIBase → increments _event_id
+    captured: dict[str, Any] = {}
+    monkeypatch.setattr(
+        "turnstone.core.session.save_message",
+        lambda *a, **k: captured.update(event_id=k.get("event_id")),
+    )
+    ui._enqueue({"type": "content"})  # advance past the prior turn
+    session._append_system_turn("start", "ground yourself")
+    assert captured["event_id"] == ui._event_buffer[-1][0]
+    assert ui._event_buffer[-1][1]["type"] == "system_turn"
 
 
 # ---------------------------------------------------------------------------

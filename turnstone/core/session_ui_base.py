@@ -406,7 +406,7 @@ class SessionUIBase:
     # Listener plumbing (SSE)
     # ------------------------------------------------------------------
 
-    def _enqueue(self, data: dict[str, Any]) -> None:
+    def _enqueue(self, data: dict[str, Any]) -> int:
         """Fan ``data`` out to every registered listener queue.
 
         Stamps ``ws_id`` on the payload if not already present so the
@@ -426,6 +426,12 @@ class SessionUIBase:
         ``(event_id, listeners, buffer)`` tuple — no event is
         fanned out to a not-yet-registered listener AND missing from
         the replay buffer.
+
+        Returns the monotonic ``_event_id`` assigned to this event so a
+        caller that also persists the same turn (e.g.
+        ``ChatSession._append_system_turn``) can stamp the row with the
+        matching id, keeping the ``/history`` resume cursor and the live
+        event stream aligned.
         """
         if "ws_id" not in data:
             data = {**data, "ws_id": self.ws_id}
@@ -444,6 +450,7 @@ class SessionUIBase:
         for lq in snapshot:
             with contextlib.suppress(queue.Full):
                 lq.put_nowait(data)
+        return event_id
 
     def _register_listener(
         self, maxsize: int = _DEFAULT_LISTENER_QUEUE_MAX
@@ -2363,7 +2370,9 @@ class SessionUIBase:
     def on_error(self, message: str) -> None:
         self._enqueue({"type": "error", "message": message})
 
-    def on_system_turn(self, content: str, source: str, meta: dict[str, Any] | None = None) -> None:
+    def on_system_turn(
+        self, content: str, source: str, meta: dict[str, Any] | None = None
+    ) -> int | None:
         """Surface a first-class operator-context system turn as its own
         UI element.
 
@@ -2382,8 +2391,12 @@ class SessionUIBase:
         ``watch_name`` / command / poll counters) so the frontend can rebuild
         per-kind rendering (the watch-result card).  ``None`` for kinds with
         no structured data.
+
+        Returns the SSE ``_event_id`` assigned to the emitted event so the
+        caller persists the row with the matching id (``None`` for UIs
+        without an event stream).
         """
-        self._enqueue(
+        return self._enqueue(
             {"type": "system_turn", "content": content, "source": source, "meta": meta or None}
         )
 

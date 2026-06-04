@@ -802,6 +802,11 @@ class Pane {
         this._lastEventId = this.evtSource.lastEventId;
       }
       const data = JSON.parse(e.data);
+      // Tag the event with its own SSE id so the system_turn handler can
+      // dedup a turn already painted from /history against the same turn
+      // redelivered by an SSE replay.  e.lastEventId is this event's id;
+      // buffered events (system_turn included) always carry one.
+      if (e.lastEventId) data._event_id = e.lastEventId;
       this.handleEvent(data);
     };
 
@@ -1200,7 +1205,7 @@ class Pane {
         this.addErrorMessage(evt.message);
         break;
 
-      case "system_turn":
+      case "system_turn": {
         // First-class operator-context system turn (output-guard finding,
         // user interjection, metacognitive nudge — see
         // tool_advisory.make_system_turn).  Consolidates the legacy
@@ -1209,12 +1214,30 @@ class Pane {
         // so by the time this SSE event arrives the related turn already
         // rendered).  ``evt.source`` carries the kind for the bubble label;
         // ``evt.meta`` the structured per-kind fields (watch-result card).
+        // Dedup: if this turn was already painted from /history (its row id
+        // matches this event's id) an SSE replay redelivered it — skip.  With
+        // the resume-cursor fix this shouldn't recur, but the guard keeps the
+        // /history+replay seam idempotent for system turns regardless.
+        const sysEid = evt._event_id != null ? String(evt._event_id) : null;
+        if (
+          sysEid &&
+          this._renderedSystemEventIds &&
+          this._renderedSystemEventIds.has(sysEid)
+        ) {
+          break;
+        }
         this.addSystemContext(
           evt.content || "",
           evt.source || "",
           evt.meta || null,
         );
+        if (sysEid) {
+          if (!this._renderedSystemEventIds)
+            this._renderedSystemEventIds = new Set();
+          this._renderedSystemEventIds.add(sysEid);
+        }
         break;
+      }
 
       case "message_queued":
         // Confirmation from server that a queued message was accepted.
@@ -1923,6 +1946,10 @@ class Pane {
 
   replayHistory(messages) {
     this.messagesEl.replaceChildren();
+    // Reset the per-pane dedup set: ids of operator-context system turns
+    // already painted from /history.  A later SSE replay that redelivers one
+    // (resume-cursor overlap) is skipped by the system_turn handler.
+    this._renderedSystemEventIds = new Set();
     if (!messages.length) {
       this.showEmptyState();
       return;
@@ -2162,6 +2189,9 @@ class Pane {
           msg.source || "",
           msg.meta || null,
         );
+        if (msg.event_id != null) {
+          this._renderedSystemEventIds.add(String(msg.event_id));
+        }
         lastToolBlock = null;
       }
     }
