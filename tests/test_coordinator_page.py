@@ -345,6 +345,32 @@ def test_coord_history_renders_system_turn_via_msg_variants():
     )
 
 
+def test_coord_dedups_system_turn_against_history_by_event_id():
+    """The coord live ``system_turn`` handler skips an event already painted
+    from ``/history`` (matched by ``_event_id``) so an SSE replay redelivering
+    it past the resume cursor doesn't double-render the operator bubble.
+    Symmetric with ``test_app_js.py``'s interactive dedup and the row/event
+    id-alignment backend fix — both panes share the seam."""
+    from pathlib import Path
+
+    coord_js = Path(__file__).resolve().parent.parent / (
+        "turnstone/console/static/coordinator/coordinator.js"
+    )
+    body = coord_js.read_text(encoding="utf-8")
+
+    assert "renderedSystemEventIds.has(" in body, (
+        "the coord system_turn handler must skip an event whose id was already "
+        "rendered from /history."
+    )
+    assert "renderedSystemEventIds.add(" in body, (
+        "the coord history loop (and live handler) must record system-turn ids."
+    )
+    assert "renderedSystemEventIds.clear(" in body, (
+        "refetchHistory must reset the dedup set so a re-render doesn't "
+        "false-skip after clear_ui / replay_truncated."
+    )
+
+
 def test_coord_retry_walk_skips_operator_context_cards():
     """Retry must NOT regenerate a stale assistant turn when the last DOM row is
     a tool batch trailed by an operator-context row.  ``_refreshRetryButton``

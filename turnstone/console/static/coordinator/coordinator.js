@@ -190,6 +190,11 @@
   // close).
   let lastEventId = null;
   let reconnectTimer = null;
+  // Ids of operator-context system turns already painted from /history.  A
+  // later SSE replay that redelivers one (resume-cursor overlap) is skipped
+  // by the system_turn handler — reset per refetchHistory.  Mirrors
+  // ui/static/app.js's per-pane _renderedSystemEventIds.
+  const renderedSystemEventIds = new Set();
 
   // Cache of judge verdicts keyed by call_id.  intent_verdict and
   // approve_request are async and may arrive in either order; the
@@ -2219,6 +2224,9 @@
       } catch (_) {
         return;
       }
+      // Tag the event with its own SSE id so the system_turn handler can dedup
+      // a turn already painted from /history (mirrors ui/static/app.js).
+      if (event.lastEventId) data._event_id = event.lastEventId;
       handleEvent(data);
     };
   }
@@ -2427,15 +2435,23 @@
         // styling which mis-categorised them as tool calls.
         appendText("info", ev.message || "", { label: "info" });
         break;
-      case "system_turn":
+      case "system_turn": {
         // First-class operator-context system turn (output-guard finding,
         // user interjection, metacognitive nudge, watch result — see
         // make_system_turn).  Rendered in trajectory sequence (it FOLLOWS the
         // turn it advises).  ``renderSystemTurn`` routes by ``ev.source`` to the
         // structured card (watch / guard / idle-children) or the operator bubble
         // (carrying ``ev.meta`` so cards rebuild identically live and on replay).
+        // Dedup: skip a turn already painted from /history (matched by id) and
+        // redelivered by an SSE replay past the resume cursor.  With the
+        // row/event id-alignment fix this shouldn't recur, but keeps the
+        // /history+replay seam idempotent.  Mirrors ui/static/app.js.
+        const sysEid = ev._event_id != null ? String(ev._event_id) : null;
+        if (sysEid && renderedSystemEventIds.has(sysEid)) break;
         renderSystemTurn(ev.source || "", ev.content || "", ev.meta);
+        if (sysEid) renderedSystemEventIds.add(sysEid);
         break;
+      }
       case "connected":
         // First yield from _coord_events_replay — populates the
         // status bar's model cell before any history arrives.  Also
@@ -4533,6 +4549,7 @@
     messagesEl.replaceChildren();
     toolRows.clear();
     activeBatch = null;
+    renderedSystemEventIds.clear();
     if (!hist) return;
     // Fresh-connect fast-forward: when the trailing turn is an executing
     // in-flight tool batch the server can replay, /history returns a
@@ -4811,6 +4828,8 @@
           // ``/history`` projection so replay matches the live render exactly.
           if (!content) return;
           renderSystemTurn(m.source || "", content, m.meta);
+          if (m.event_id != null)
+            renderedSystemEventIds.add(String(m.event_id));
         } else {
           if (!content) return;
           appendText(role, content, { label: role });
