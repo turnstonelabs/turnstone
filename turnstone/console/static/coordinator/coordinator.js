@@ -356,7 +356,10 @@
     // `.msg.system-context` rule (turnstone/shared_static/chat.css).  The
     // generic history-replay branch already renders unknown roles via
     // appendText("system", …); this variant gives it the operator styling.
-    system: "system-context",
+    // The `operator-context` marker is shared by every operator row (this
+    // bubble + the watch-result / guard-finding / idle-children cards) so the
+    // retry-skip walk in _refreshRetryButton can skip them all uniformly.
+    system: "system-context operator-context",
   };
 
   function appendMsg(role, html, opts) {
@@ -402,7 +405,7 @@
   // _buildWatchResultBubble.
   function appendWatchResult(meta, content) {
     const el = document.createElement("div");
-    el.className = "msg watch-result";
+    el.className = "msg watch-result operator-context";
     el.setAttribute("role", "article");
     el.setAttribute("data-ts-role", "watch");
     el.setAttribute("aria-label", "watch");
@@ -452,7 +455,7 @@
   // _buildGuardFindingBubble.
   function appendGuardFinding(meta) {
     const el = document.createElement("div");
-    el.className = "msg guard-finding";
+    el.className = "msg guard-finding operator-context";
     el.setAttribute("role", "article");
     el.setAttribute("data-ts-role", "output_guard");
     el.setAttribute("aria-label", "output guard");
@@ -494,7 +497,7 @@
   // producer); rendered via textContent so a hostile workstream name is inert.
   function appendIdleChildren(meta) {
     const el = document.createElement("div");
-    el.className = "msg idle-children";
+    el.className = "msg idle-children operator-context";
     el.setAttribute("role", "article");
     el.setAttribute("data-ts-role", "idle_children");
     el.setAttribute("aria-label", "idle children");
@@ -535,7 +538,7 @@
   // "queued message" bubble for a ``user_interjection`` system turn — shows the
   // user's raw words (``meta.message``) rather than the model-directed framing
   // baked into ``content``, with brighter emphasis for ``!!!``-important
-  // interjections.  Reuses ``appendText`` (→ ``.msg.system-context``) + a class.
+  // interjections.  Reuses ``appendText`` and adds ``.important`` for ``!!!`` ones.
   function appendInterjection(meta, content) {
     const important = meta && meta.priority === "important";
     const text =
@@ -543,7 +546,6 @@
     const el = appendText("system", text, {
       label: important ? "queued message · important" : "queued message",
     });
-    el.classList.add("interjection");
     if (important) el.classList.add("important");
     return el;
   }
@@ -4439,13 +4441,16 @@
     const old = messagesEl.querySelectorAll(".msg.assistant .msg-actions");
     for (let i = 0; i < old.length; i++) old[i].parentNode.removeChild(old[i]);
     // Skip retry when the most recent semantic turn is tool-only (last DOM
-    // child is a .coord-tool-batch construct); walk back past .system-context
-    // operator bubbles first so the guard still fires when the tool turn
-    // carried a nudge / guard finding. (Coord's batch class is
+    // child is a .coord-tool-batch construct); walk back past operator-context
+    // rows first — the plain system bubble AND the structured watch-result /
+    // guard-finding / idle-children cards all carry .operator-context — so the
+    // guard still fires when the tool turn carried a nudge / guard finding.
+    // Keying on the shared marker (not any single card class) keeps the skip
+    // correct as new card kinds are added. (Coord's batch class is
     // .coord-tool-batch — the interactive pane uses .ts-approval, which does
     // not exist in coord's DOM.)
     let lastChild = messagesEl.lastElementChild;
-    while (lastChild && lastChild.classList.contains("system-context")) {
+    while (lastChild && lastChild.classList.contains("operator-context")) {
       lastChild = lastChild.previousElementSibling;
     }
     if (lastChild && lastChild.classList.contains("coord-tool-batch")) {

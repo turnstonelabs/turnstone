@@ -335,11 +335,44 @@ def test_coord_history_renders_system_turn_via_msg_variants():
     assert 'role === "system"' in body, (
         "coord history loop must have a system-role branch for first-class operator-context turns."
     )
-    # The ``system`` _MSG_VARIANTS entry gives the bubble operator styling.
-    assert 'system: "system-context"' in body, (
-        "coordinator.js must map the system role to the .msg.system-context "
-        "variant so operator-context turns get the operator styling."
+    # The ``system`` _MSG_VARIANTS entry gives the bubble operator styling and
+    # tags it with the shared ``operator-context`` marker (so the retry-skip
+    # walk steps over it — see test_coord_retry_walk_skips_operator_context_cards).
+    assert 'system: "system-context operator-context"' in body, (
+        "coordinator.js must map the system role to the "
+        "'system-context operator-context' variant so operator-context turns "
+        "get the operator styling AND carry the retry-skip marker."
     )
+
+
+def test_coord_retry_walk_skips_operator_context_cards():
+    """Retry must NOT regenerate a stale assistant turn when the last DOM row is
+    a tool batch trailed by an operator-context row.  ``_refreshRetryButton``
+    walks back past ``.operator-context`` rows before testing for
+    ``.coord-tool-batch`` — which only works if EVERY operator row carries the
+    shared marker.  Pin the walk predicate AND the marker on each structured
+    card so a new card kind (or a walk keyed on a single class) can't silently
+    re-introduce the wrong-turn retry regression."""
+    from pathlib import Path
+
+    coord_js = Path(__file__).resolve().parent.parent / (
+        "turnstone/console/static/coordinator/coordinator.js"
+    )
+    body = coord_js.read_text(encoding="utf-8")
+
+    assert 'classList.contains("operator-context")' in body, (
+        "_refreshRetryButton must walk back past .operator-context rows so the "
+        "tool-only retry skip fires even when a card trails the tool batch."
+    )
+    for builder, cls in (
+        ("appendWatchResult", '"msg watch-result operator-context"'),
+        ("appendGuardFinding", '"msg guard-finding operator-context"'),
+        ("appendIdleChildren", '"msg idle-children operator-context"'),
+    ):
+        assert cls in body, (
+            f"{builder} must tag its card with the shared operator-context "
+            f"marker ({cls}) or the retry walk won't skip it."
+        )
 
 
 def test_coordinator_js_seeds_resume_cursor_only_on_initial_connect():

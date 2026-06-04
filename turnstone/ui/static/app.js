@@ -273,7 +273,8 @@ class Pane {
       source === "user_interjection" && meta && typeof meta === "object";
     const important = isInterjection && meta.priority === "important";
     const el = document.createElement("div");
-    el.className = "msg system-context" + (important ? " important" : "");
+    el.className =
+      "msg system-context operator-context" + (important ? " important" : "");
     const body = document.createElement("div");
     body.className = "msg-body";
     const labelEl = document.createElement("span");
@@ -2211,14 +2212,16 @@ class Pane {
     // .msg.assistant selector already excludes them — no extra guard needed.
     //
     // Skip retry attachment when the most recent semantic turn is
-    // tool-only — last DOM child is a .ts-approval block.  Walk back
-    // past .system-context bubbles (operator-context system turns that
-    // FOLLOW the tool batch they advise) so the guard fires correctly
-    // even when the tool turn carried a nudge / guard finding.  Without
-    // this skip, retry lands on a stale prior assistant content bubble
-    // belonging to an earlier turn.
+    // tool-only — last DOM child is a .ts-approval block.  Walk back past
+    // operator-context rows (the plain system bubble AND the structured
+    // watch-result / guard-finding cards — every operator row carries
+    // .operator-context) which FOLLOW the tool batch they advise, so the
+    // guard fires even when the tool turn carried a nudge / guard finding.
+    // Keying on the shared marker (not any single card class) keeps the skip
+    // correct as new card kinds are added.  Without it, retry lands on a
+    // stale prior assistant content bubble belonging to an earlier turn.
     let lastChild = this.messagesEl.lastElementChild;
-    while (lastChild && lastChild.classList.contains("system-context")) {
+    while (lastChild && lastChild.classList.contains("operator-context")) {
       lastChild = lastChild.previousElementSibling;
     }
     if (lastChild && lastChild.classList.contains("ts-approval")) {
@@ -2758,7 +2761,7 @@ class Pane {
 // buildWatchResultBubble.
 function _buildWatchResultBubble(meta, content) {
   const el = document.createElement("div");
-  el.className = "msg watch-result";
+  el.className = "msg watch-result operator-context";
   el.setAttribute("role", "article");
   el.setAttribute("data-ts-role", "watch");
   el.setAttribute("aria-label", "watch");
@@ -2805,7 +2808,7 @@ function _buildWatchResultBubble(meta, content) {
 // tool chip omits to stay terse.  All text via textContent.
 function _buildGuardFindingBubble(meta) {
   const el = document.createElement("div");
-  el.className = "msg guard-finding";
+  el.className = "msg guard-finding operator-context";
   el.setAttribute("role", "article");
   el.setAttribute("data-ts-role", "output_guard");
   el.setAttribute("aria-label", "output guard");

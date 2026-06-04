@@ -26,7 +26,7 @@ export interface HistoryEvent {
    *   (e.g. `watch_triggered`'s `{watch_name, command, poll_count, max_polls,
    *   is_final}`) so the renderer can rebuild per-kind UI (the watch-result
    *   card); absent for kinds with no structured data
-   * - `attachments`: per-attachment metadata `{kind, filename, mime_type, size_bytes}`
+   * - `attachments`: per-attachment metadata `{kind, filename, mime_type}`
    * - `reasoning`: concatenated reasoning text for assistant turns that
    *   round-tripped a thinking-block lane (Anthropic-with-thinking today;
    *   OpenAI Responses + Gemini in later phases). Present only when the

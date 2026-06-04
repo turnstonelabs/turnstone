@@ -3731,6 +3731,8 @@ def make_attachment_handlers(cfg: SessionEndpointConfig) -> AttachmentHandlers:
         return JSONResponse({"attachments": rows})
 
     async def get_content(request: Request) -> Response:
+        import asyncio
+
         from starlette.responses import Response as _Response
 
         from turnstone.core.attachment_buffer import get_attachment_buffer
@@ -3762,8 +3764,14 @@ def make_attachment_handlers(cfg: SessionEndpointConfig) -> AttachmentHandlers:
             stored_mime = staged.mime_type or "application/octet-stream"
             filename = staged.filename or "attachment"
         else:
-            row = get_attachment(attachment_id)
-            if not row or not attachment_referenced_in_ws(attachment_id, ws_id):
+            # Both committed-blob gates are sync DB I/O — the ref check is an
+            # unbounded ws-scoped LIKE scan (O(turns-in-ws)) run on every
+            # committed-image request, so keep it off the event loop.  Matches
+            # the asyncio.to_thread convention used throughout this module.
+            row = await asyncio.to_thread(get_attachment, attachment_id)
+            if not row or not await asyncio.to_thread(
+                attachment_referenced_in_ws, attachment_id, ws_id
+            ):
                 return JSONResponse({"error": "Not found"}, status_code=404)
             body = row.get("content") or b""
             kind = row.get("kind") or ""

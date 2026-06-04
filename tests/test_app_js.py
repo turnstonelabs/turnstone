@@ -279,6 +279,34 @@ def test_replay_renders_system_turn_via_add_system_context() -> None:
     )
 
 
+def test_retry_walk_skips_operator_context_cards() -> None:
+    """Interactive twin of the coord retry-skip guard.
+    ``_attachRetryToLastAssistant`` walks back past ``.operator-context`` rows
+    before testing for ``.ts-approval`` — so a watch-result / guard-finding
+    card (or a plain system bubble) trailing a tool-only turn doesn't make retry
+    attach to a stale earlier assistant turn.  Pin the walk predicate (scoped to
+    the method) AND the shared marker on every operator row that can trail a
+    tool batch, so adding a card kind without the marker fails loudly here."""
+    body = _APP_JS.read_text(encoding="utf-8")
+    start = _pane_method_offset(body, "_attachRetryToLastAssistant")
+    end = _pane_method_offset(body, "announceToolBlock")
+    fn = body[start:end]
+    assert 'classList.contains("operator-context")' in fn, (
+        "_attachRetryToLastAssistant must walk back past .operator-context "
+        "rows so the tool-only retry skip fires even when a card trails."
+    )
+    # Every operator row that can trail a tool batch carries the shared marker.
+    for cls in (
+        '"msg system-context operator-context"',
+        '"msg watch-result operator-context"',
+        '"msg guard-finding operator-context"',
+    ):
+        assert cls in body, (
+            f"operator row className {cls} must carry the operator-context "
+            "marker or the retry walk won't skip it."
+        )
+
+
 # ---------------------------------------------------------------------------
 # Phase 8 — Chunk D: MCP error embed + settings panel UX
 # ---------------------------------------------------------------------------
