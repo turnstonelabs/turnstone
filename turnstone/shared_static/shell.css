@@ -553,3 +553,15 @@
   color: var(--cyan);
   border-color: color-mix(in srgb, var(--cyan) 35%, var(--hair-2));
 }
+
+/* Inset focus ring for the rail's interactive rows + the persona toggle — the
+   global :focus-visible (base.css) uses outline-offset:2px, which clips against
+   the 266px rail edge; inset it like .dash-row:focus-visible (base.css). */
+.cpill:focus-visible,
+.node-row:focus-visible,
+.row:focus-visible,
+.persona-btn:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: -2px;
+  border-radius: var(--r-sm);
+}

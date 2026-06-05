@@ -1006,7 +1006,7 @@ function _hasInteractivePermission() {
 // submit endpoint + redirect differ.
 let _launcherKind = "coordinator";
 
-function _setLauncherKind(kind) {
+function _setLauncherKind(kind, focus) {
   _launcherKind = kind;
   const map = {
     "persona-coordinator": "coordinator",
@@ -1018,10 +1018,13 @@ function _setLauncherKind(kind) {
     const on = map[id] === kind;
     btn.classList.toggle("active", on);
     btn.setAttribute("aria-checked", on ? "true" : "false");
+    btn.tabIndex = on ? 0 : -1; // roving tabindex — the radiogroup is one tab stop
+    if (on && focus) btn.focus();
   });
 }
 
 function _wireLauncherToggle() {
+  const group = document.getElementById("launcher-personas");
   const coordBtn = document.getElementById("persona-coordinator");
   const intBtn = document.getElementById("persona-interactive");
   if (coordBtn) {
@@ -1034,6 +1037,28 @@ function _wireLauncherToggle() {
       _setLauncherKind("interactive");
     });
   }
+  if (group) {
+    // WAI-ARIA radiogroup contract: arrow keys move the selection (+ focus).
+    group.addEventListener("keydown", function (e) {
+      if (
+        ["ArrowLeft", "ArrowUp", "ArrowRight", "ArrowDown"].indexOf(e.key) ===
+        -1
+      ) {
+        return;
+      }
+      e.preventDefault();
+      const back = e.key === "ArrowLeft" || e.key === "ArrowUp";
+      const next = back
+        ? _launcherKind === "interactive"
+          ? "coordinator"
+          : "interactive"
+        : _launcherKind === "coordinator"
+          ? "interactive"
+          : "coordinator";
+      _setLauncherKind(next, true);
+    });
+  }
+  _setLauncherKind(_launcherKind); // seed the initial roving-tabindex state
 }
 
 // POST /v1/api/cluster/workstreams/new — the console picks a node and PROXIES

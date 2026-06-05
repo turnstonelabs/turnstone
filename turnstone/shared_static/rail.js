@@ -97,6 +97,15 @@ function renderCluster(root, cs, TS) {
     : [];
   if (nodeIds.length) {
     const nodes = nodeIds.map((n) => TS.buildNodeInfo(cs.nodes[n]));
+    // The cluster's most-common version — only nodes that DIFFER from it get the
+    // amber drift treatment, so the highlight marks the outlier, not every row.
+    const verCounts = {};
+    for (const n of nodes) {
+      if (n.version) verCounts[n.version] = (verCounts[n.version] || 0) + 1;
+    }
+    const majorityVer = Object.keys(verCounts).sort(
+      (a, b) => verCounts[b] - verCounts[a],
+    )[0];
     const wrap = document.createElement("div");
     wrap.className = "cluster-nodes";
 
@@ -126,12 +135,11 @@ function renderCluster(root, cs, TS) {
       const nn = document.createElement("span");
       nn.className = "nn";
       nn.textContent = info.node_id;
+      const drifted =
+        overview.version_drift && info.version && info.version !== majorityVer;
       const ver = document.createElement("span");
-      ver.className =
-        "ver" +
-        (overview.version_drift && (overview.versions || []).length > 1
-          ? " drift"
-          : "");
+      ver.className = "ver" + (drifted ? " drift" : "");
+      if (drifted) ver.title = "drift: cluster majority is " + majorityVer;
       ver.textContent = info.version || "—";
       const nws = document.createElement("span");
       nws.className = "nws";
