@@ -2507,6 +2507,108 @@ def make_list_handler(cfg: SessionEndpointConfig) -> Handler:
     return list_workstreams_handler
 
 
+async def _collect_saved_rows(
+    cfg: SessionEndpointConfig,
+    request: Request,
+) -> list[dict[str, Any]]:
+    """Query + exclude-loaded + row-build for one kind's saved list.
+
+    The shared inner body of :func:`make_saved_handler` (and one of the
+    N bodies :func:`make_unified_saved_handler` fans over): runs the
+    storage query filtered by ``cfg.list_kind`` / ``cfg.saved_state_filter``,
+    drops any ws_id reported by ``cfg.saved_loaded_lookup`` (coord-only
+    warm-pool exclusion), and serialises each surviving row to the
+    saved-card dict shape.
+
+    Caller-owned (NOT done here): ``cfg.permission_gate`` and the
+    ``cfg.list_kind is None`` misconfig guard — both belong to the
+    handler wrapper so the unified handler can gate once and 500 per
+    cfg before fanning out. ``cfg.list_kind`` is therefore assumed
+    non-``None`` on entry.
+    """
+    import asyncio
+
+    from turnstone.core.memory import list_workstreams_with_history
+
+    rows = await asyncio.to_thread(
+        list_workstreams_with_history,
+        limit=50,
+        kind=cfg.list_kind,
+        user_id=None,
+        state=cfg.saved_state_filter,
+    )
+
+    # Coord-only: exclude ws_ids currently in the warm pool.
+    loaded: set[str] = set()
+    if cfg.saved_loaded_lookup is not None:
+        try:
+            loaded = await cfg.saved_loaded_lookup(request)
+        except Exception:
+            # Defence-in-depth filter — never let a lookup error
+            # block the saved list. Log + continue with empty
+            # set (worst case: a duplicate row in the saved list
+            # for a few seconds during a close-emit race).
+            log.debug(
+                "ws.saved.loaded_lookup_failed",
+                exc_info=True,
+            )
+
+    # Column order from list_workstreams_with_history (keep in sync with
+    # the storage SELECT): ws_id, alias, title, name, created, updated,
+    # message_count, node_id, state, kind, model_alias, launch_skill,
+    # child_count, context_tokens, context_window.  The occupancy ratio
+    # is derived here (Python float division) rather than in SQL so the
+    # NULL / zero-window cases stay obvious and identical across backends.
+    # context_window is NULL for model aliases absent from
+    # model_definitions (e.g. config.toml-only models), so context_ratio
+    # degrades to 0.0 there rather than reporting a bogus occupancy.
+    result: list[dict[str, Any]] = []
+    for row in rows:
+        (
+            wid,
+            alias,
+            title,
+            name,
+            created,
+            updated,
+            count,
+            node_id,
+            state,
+            kind,
+            model_alias,
+            launch_skill,
+            child_count,
+            context_tokens,
+            context_window,
+        ) = row
+        if wid in loaded:
+            continue
+        ctx_tokens = context_tokens or 0
+        context_ratio = (
+            round(ctx_tokens / context_window, 3) if ctx_tokens and context_window else 0.0
+        )
+        result.append(
+            {
+                "ws_id": wid,
+                "alias": alias,
+                "title": title,
+                "name": name,
+                "created": created,
+                "updated": updated,
+                "message_count": count,
+                "node_id": node_id or "",
+                "state": state,
+                "kind": kind,
+                "model_alias": model_alias or None,
+                "launch_skill": launch_skill or None,
+                "child_count": child_count or 0,
+                "context_tokens": ctx_tokens,
+                "context_ratio": context_ratio,
+            }
+        )
+    return result
+
+
 def make_saved_handler(cfg: SessionEndpointConfig) -> Handler:
     """Lifted body for ``GET {prefix}/saved`` — list persisted workstreams.
 
@@ -2556,10 +2658,6 @@ def make_saved_handler(cfg: SessionEndpointConfig) -> Handler:
     """
 
     async def saved_workstreams_handler(request: Request) -> Response:
-        import asyncio
-
-        from turnstone.core.memory import list_workstreams_with_history
-
         if cfg.permission_gate is not None:
             err = cfg.permission_gate(request)
             if err is not None:
@@ -2579,85 +2677,97 @@ def make_saved_handler(cfg: SessionEndpointConfig) -> Handler:
                 status_code=500,
             )
 
-        rows = await asyncio.to_thread(
-            list_workstreams_with_history,
-            limit=50,
-            kind=cfg.list_kind,
-            user_id=None,
-            state=cfg.saved_state_filter,
-        )
-
-        # Coord-only: exclude ws_ids currently in the warm pool.
-        loaded: set[str] = set()
-        if cfg.saved_loaded_lookup is not None:
-            try:
-                loaded = await cfg.saved_loaded_lookup(request)
-            except Exception:
-                # Defence-in-depth filter — never let a lookup error
-                # block the saved list. Log + continue with empty
-                # set (worst case: a duplicate row in the saved list
-                # for a few seconds during a close-emit race).
-                log.debug(
-                    "ws.saved.loaded_lookup_failed",
-                    exc_info=True,
-                )
-
-        # Column order from list_workstreams_with_history (keep in sync with
-        # the storage SELECT): ws_id, alias, title, name, created, updated,
-        # message_count, node_id, state, kind, model_alias, launch_skill,
-        # child_count, context_tokens, context_window.  The occupancy ratio
-        # is derived here (Python float division) rather than in SQL so the
-        # NULL / zero-window cases stay obvious and identical across backends.
-        # context_window is NULL for model aliases absent from
-        # model_definitions (e.g. config.toml-only models), so context_ratio
-        # degrades to 0.0 there rather than reporting a bogus occupancy.
-        result = []
-        for row in rows:
-            (
-                wid,
-                alias,
-                title,
-                name,
-                created,
-                updated,
-                count,
-                node_id,
-                state,
-                kind,
-                model_alias,
-                launch_skill,
-                child_count,
-                context_tokens,
-                context_window,
-            ) = row
-            if wid in loaded:
-                continue
-            ctx_tokens = context_tokens or 0
-            context_ratio = (
-                round(ctx_tokens / context_window, 3) if ctx_tokens and context_window else 0.0
-            )
-            result.append(
-                {
-                    "ws_id": wid,
-                    "alias": alias,
-                    "title": title,
-                    "name": name,
-                    "created": created,
-                    "updated": updated,
-                    "message_count": count,
-                    "node_id": node_id or "",
-                    "state": state,
-                    "kind": kind,
-                    "model_alias": model_alias or None,
-                    "launch_skill": launch_skill or None,
-                    "child_count": child_count or 0,
-                    "context_tokens": ctx_tokens,
-                    "context_ratio": context_ratio,
-                }
-            )
+        result = await _collect_saved_rows(cfg, request)
         return JSONResponse({"workstreams": result})
 
     return saved_workstreams_handler
+
+
+def _saved_updated_sort_key(row: dict[str, Any]) -> tuple[int, str]:
+    """Descending-``updated`` sort key for the merged saved list.
+
+    Used with ``sorted(..., reverse=True)``. Returns ``(1, str(updated))``
+    for rows carrying an ``updated`` value and ``(0, "")`` for rows
+    missing it — so under ``reverse=True`` real rows sort newest-first
+    and ``updated``-less rows fall to the tail (the presence flag differs
+    so the string element of a present row is never compared against the
+    absent placeholder). ``updated`` is coerced to ``str`` purely as a
+    crash-proof comparator: each storage backend yields a single
+    homogeneous timestamp type (ISO string on sqlite, ``datetime`` on
+    postgres) whose lexical order matches chronological order, and
+    ``list_workstreams_with_history`` already returns each kind
+    ``ORDER BY updated DESC``, so this only re-interleaves two
+    already-sorted same-type runs — never an int-vs-string compare.
+    """
+    updated = row.get("updated")
+    if updated is None:
+        return (0, "")
+    return (1, str(updated))
+
+
+def make_unified_saved_handler(
+    cfgs: list[SessionEndpointConfig],
+    permission_gate: PermissionGate | None = None,
+) -> Handler:
+    """Saved-list handler that spans multiple kinds in one response.
+
+    The console's L-shell dashboard wants ONE saved list covering both
+    coordinator and interactive sessions. Storage is shared across kinds,
+    so this fans :func:`_collect_saved_rows` over each ``cfg`` (preserving
+    every kind's own ``list_kind`` / ``saved_state_filter`` /
+    ``saved_loaded_lookup`` semantics — coord keeps its ``state='closed'``
+    + warm-pool exclusion, interactive keeps its all-non-deleted listing),
+    concatenates the rows, and re-sorts the union by ``updated`` descending
+    (``updated``-less rows last).
+
+    Permission: a SINGLE ``permission_gate`` runs once up front (the
+    operator gate the console already applies to its coordinator saved
+    list). Per-``cfg`` ``permission_gate`` values are deliberately NOT
+    consulted here — the union is operator-gated as a whole, and the
+    operator already has cluster-wide visibility into every kind, so the
+    merge exposes nothing the per-kind lists didn't.
+
+    Each ``cfg`` must wire ``list_kind`` (a missing value is a mount-time
+    misconfiguration); the handler 500s loud rather than silently
+    filtering for the wrong kind, matching :func:`make_saved_handler`.
+
+    Args:
+        cfgs: per-kind policy bundles to merge, in any order (the response
+            is re-sorted by ``updated`` regardless of cfg order).
+        permission_gate: single gate applied to the whole list. ``None``
+            relies on upstream auth middleware only.
+    """
+
+    async def unified_saved_handler(request: Request) -> Response:
+        if permission_gate is not None:
+            err = permission_gate(request)
+            if err is not None:
+                return err
+
+        # Fail loud BEFORE any query (same contract as the single-kind
+        # handler): a cfg mounted into the union without a kind would
+        # otherwise filter for the wrong (or all) kinds.
+        for cfg in cfgs:
+            if cfg.list_kind is None:
+                log.error("ws.saved.unified.misconfigured_no_list_kind")
+                return JSONResponse(
+                    {"error": "saved handler misconfigured"},
+                    status_code=500,
+                )
+
+        # The per-kind collections are independent (shared store, no data
+        # dependency), so overlap their DB round-trips instead of summing them.
+        import asyncio
+
+        parts = await asyncio.gather(*(_collect_saved_rows(cfg, request) for cfg in cfgs))
+        merged: list[dict[str, Any]] = []
+        for part in parts:
+            merged.extend(part)
+
+        merged.sort(key=_saved_updated_sort_key, reverse=True)
+        return JSONResponse({"workstreams": merged})
+
+    return unified_saved_handler
 
 
 def _resume_cursor_and_trim(

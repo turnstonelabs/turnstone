@@ -95,8 +95,36 @@
           id="coord-composer-panel"
           class="home-panel"
           style="display: none"
-          aria-label="Start a new orchestration task"
+          aria-label="Start a new session"
         >
+          <!-- Persona toggle — start a coordinator (console-local) or an
+           interactive session (proxied to a node).  app.js gates each option
+           by scope and hides the toggle when only one is available. -->
+          <div
+            id="launcher-personas"
+            class="launcher-personas"
+            role="radiogroup"
+            aria-label="Session kind"
+          >
+            <button
+              type="button"
+              id="persona-coordinator"
+              class="persona-btn active"
+              role="radio"
+              aria-checked="true"
+            >
+              Coordinator
+            </button>
+            <button
+              type="button"
+              id="persona-interactive"
+              class="persona-btn"
+              role="radio"
+              aria-checked="false"
+            >
+              Interactive
+            </button>
+          </div>
           <!-- Composer DOM is built by shared_static/composer.js into this
            mount — stacked layout (textarea above, options toggle +
            Start button below) with Name + Skill in an Options
@@ -110,49 +138,6 @@
           ></div>
         </section>
 
-        <!-- Active coordinators — SSE-driven, contiguous card matching the
-             server's Workstreams block: a dash-header bar (title +
-             active/total summary), the column-header band, the rows
-             (rendered via the shared _renderWsRow tree helper so glyphs /
-             child-count badges / last-activity match the dashboard), and a
-             dash-footer count line.  The band + footer are static siblings of
-             the rows container so renderWsTable's replaceChildren leaves them
-             intact; the renderer reveals them with rows, hides them empty. -->
-        <section id="active-coordinators" aria-label="Coordinators">
-          <div class="dash-header">
-            <span class="dash-header-title">COORDINATORS</span>
-            <span class="dash-header-summary" id="active-coord-summary"></span>
-          </div>
-          <div
-            class="dash-colheaders"
-            id="active-coord-colheaders"
-            aria-hidden="true"
-            style="display: none"
-          >
-            <span class="dash-col dash-col-state">STATE</span>
-            <span class="dash-col dash-col-name">NAME</span>
-            <span class="dash-col dash-col-model">MODEL</span>
-            <span class="dash-col dash-col-node">NODE</span>
-            <span class="dash-col dash-col-task">TASK</span>
-            <span class="dash-col dash-col-tokens">TOKENS</span>
-            <span class="dash-col dash-col-ctx">CTX</span>
-          </div>
-          <div
-            id="active-coord-rows"
-            class="dash-table"
-            role="list"
-            aria-live="polite"
-          >
-            <div class="dashboard-empty">Loading…</div>
-          </div>
-          <div
-            class="dash-footer"
-            id="active-coord-footer"
-            style="display: none"
-          >
-            <span class="dash-footer-count" id="active-coord-footer-count"></span>
-          </div>
-        </section>
 
         <!-- Saved coordinators — closed sessions that persist on disk.
          Mirrors the interactive UI's "Saved Workstreams" card grid
@@ -163,10 +148,10 @@
         <section
           id="saved-coordinators"
           style="display: none"
-          aria-label="Saved coordinators"
+          aria-label="Saved sessions"
         >
           <div class="dash-header">
-            <span class="dash-header-title">SAVED COORDINATORS</span>
+            <span class="dash-header-title">SAVED SESSIONS</span>
             <div class="saved-toolbar">
               <input
                 id="coord-filter"
@@ -191,7 +176,7 @@
             class="dash-table"
             id="saved-coord-cards"
             role="group"
-            aria-label="Saved coordinators"
+            aria-label="Saved sessions"
           ></div>
           <div class="saved-pager-row">
             <div
