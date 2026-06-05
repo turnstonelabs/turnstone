@@ -75,8 +75,8 @@ from turnstone.core.session_routes import (
     make_open_handler,
     make_retry_handler,
     make_rewind_handler,
-    make_saved_handler,
     make_send_handler,
+    make_unified_saved_handler,
     register_coord_verbs,
     register_session_routes,
 )
@@ -12823,13 +12823,44 @@ def create_app(
         # in ``turnstone/server.py``.
         sse_executor_lookup=lambda request: request.app.state.coord_sse_executor,
     )
+    # Minimal interactive cfg used ONLY by the unified saved-list handler
+    # so the console's L-shell dashboard can show a single saved list
+    # spanning both kinds. Storage is shared across kinds, so this drives
+    # ``list_workstreams_with_history(kind=INTERACTIVE, ...)`` with
+    # interactive's own saved semantics: ``state=None`` (every persisted
+    # interactive row except the tombstoned ``deleted`` ones storage
+    # already filters) and no warm-pool exclusion. The verb fields
+    # (manager_lookup / tenant_check / labels) are required by the
+    # dataclass but never consulted on the read-only saved path — the
+    # console mounts no interactive verb handlers, only the merged saved
+    # list. ``permission_gate=None`` because the unified handler gates
+    # once with the operator's ``admin.coordinator`` check.
+    interactive_saved_cfg = SessionEndpointConfig(
+        permission_gate=None,
+        manager_lookup=lambda request: (None, None),
+        tenant_check=None,
+        not_found_label="Workstream not found",
+        audit_action_prefix="workstream",
+        list_kind=WorkstreamKind.INTERACTIVE,
+        saved_state_filter=None,
+        saved_loaded_lookup=None,
+    )
     coord_workstream_routes: list[Any] = []
     register_session_routes(
         coord_workstream_routes,
         prefix="/api/workstreams",
         handlers=SharedSessionVerbHandlers(
             list_workstreams=make_list_handler(coord_endpoint_config),  # lifted: shared body
-            list_saved=make_saved_handler(coord_endpoint_config),  # lifted: shared body
+            # Unified saved list: coordinator + interactive in one
+            # response for the L-shell dashboard. Gated once by coord's
+            # existing operator check (``admin.coordinator``) — the
+            # operator already sees every kind, so the merge exposes
+            # nothing new. Each cfg keeps its own per-kind state filter
+            # / warm-pool exclusion.
+            list_saved=make_unified_saved_handler(
+                [coord_endpoint_config, interactive_saved_cfg],
+                permission_gate=coord_endpoint_config.permission_gate,
+            ),
             create=make_create_handler(  # lifted: shared body
                 coord_endpoint_config,
                 audit_emit=_audit_coordinator_create,

@@ -771,8 +771,8 @@ class ClusterCollector:
 
         Excludes the ``"console"`` pseudo-node — coordinators are not
         compute-node workstreams and counting them would inflate the
-        cluster summary.  The home view surfaces coordinators via the
-        active-coordinators list instead.
+        cluster summary.  The rail's Workspaces tree + the saved-sessions
+        list surface coordinators instead.
         """
         states = {"running": 0, "thinking": 0, "attention": 0, "idle": 0, "error": 0}
         total_tokens = 0

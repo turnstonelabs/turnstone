@@ -150,3 +150,31 @@ def test_rail_conveys_state_and_persona() -> None:
     assert "ui-glyph-" in body, "rail must use ui-base .ui-glyph-* for state (shape+colour)"
     assert "bucketByParent" in body, "rail must nest children via the shared bucket helper"
     assert "COORD" in body and "INT" in body, "rail must tag sessions by persona"
+
+
+def test_console_launcher_routes_by_persona() -> None:
+    """Step 2b: the dashboard launcher carries a persona kind, scope-gates the
+    interactive option, branches submit + create by kind (coordinator =
+    console-local, interactive = node-proxy), routes saved activation to the
+    node for interactive rows, and the active-coordinators home table is gone
+    (the rail covers it).  Pins the console-JS convention for the new logic."""
+    app = _CONSOLE_APP.read_text(encoding="utf-8")
+    assert "function _setLauncherKind" in app and "_launcherKind" in app
+    assert "function _hasInteractivePermission" in app, (
+        "launcher must scope-gate the interactive persona"
+    )
+    assert 'kind === "interactive"' in app, "submitHomeCoord must branch by persona kind"
+    assert "function _createInteractive" in app, "the interactive create path must exist"
+    assert '"/v1/api/cluster/workstreams/new"' in app, (
+        "interactive create must use the node-proxy endpoint"
+    )
+    assert 's.kind !== "coordinator"' in app, (
+        "saved activation must route interactive sessions to their node"
+    )
+    for gone in ("function _renderHomeView", "_activeCoordsFromClusterState"):
+        assert gone not in app, f"removed home-view symbol {gone!r} must stay gone from app.js"
+    index = _CONSOLE_INDEX.read_text(encoding="utf-8")
+    assert 'id="active-coordinators"' not in index, (
+        "the active-coordinators table must be removed (the rail covers it)"
+    )
+    assert 'id="launcher-personas"' in index, "the persona toggle must be in the launcher panel"

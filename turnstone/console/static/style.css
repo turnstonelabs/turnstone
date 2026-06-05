@@ -90,7 +90,7 @@
 
 .home-composer-error {
   /* Always rendered (no display toggle in JS) so toggling validation
-     messages doesn't reflow the active-coordinators list below.  The
+     messages doesn't reflow the saved-sessions list below.  The
      min-height holds a single 12px line + padding so an empty state
      reserves the same space the rendered error will occupy. */
   min-height: 20px;

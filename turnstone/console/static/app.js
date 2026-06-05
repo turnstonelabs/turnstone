@@ -136,28 +136,16 @@ function patchClusterState(data) {
       });
     }
   } else if (t === "ws_closed") {
-    // Peek BEFORE the filter so we can tell whether the closed ws was a
-    // coordinator (lives on the console pseudo-node, kind="coordinator")
-    // and only then refetch the saved list.  ws_closed payloads from
-    // real-node interactive closes don't carry kind on the wire, but
-    // they're already typed in clusterState from the matching ws_created
-    // event.  Skipping interactive closes avoids per-close fan-out into
-    // /v1/api/workstreams/saved on busy clusters.
-    let wasCoordinator = false;
-    Object.keys(clusterState.nodes).forEach(function (nid) {
-      (clusterState.nodes[nid].workstreams || []).forEach(function (ws) {
-        if (ws.id === data.ws_id && ws.kind === "coordinator") {
-          wasCoordinator = true;
-        }
-      });
-    });
     Object.keys(clusterState.nodes).forEach(function (nid) {
       const n = clusterState.nodes[nid];
       n.workstreams = (n.workstreams || []).filter(function (ws) {
         return ws.id !== data.ws_id;
       });
     });
-    if (wasCoordinator && typeof loadSavedCoordinators === "function") {
+    // The saved list spans BOTH kinds now, so refresh on any close — the
+    // in-flight coalescing guard in loadSavedCoordinators (single fetch +
+    // one catch-up) prevents per-close fan-out into the saved endpoint.
+    if (typeof loadSavedCoordinators === "function") {
       loadSavedCoordinators();
     }
   } else if (t === "ws_rename") {
@@ -290,9 +278,7 @@ function buildNodeInfoFromSnapshot(node) {
 
 function renderFromState() {
   if (!clusterState) return;
-  if (currentView === "home") {
-    _renderHomeView();
-  } else if (currentView === "filtered") {
+  if (currentView === "filtered") {
     let allWs = [];
     Object.keys(clusterState.nodes).forEach(function (nid) {
       (clusterState.nodes[nid].workstreams || []).forEach(function (ws) {
@@ -1010,8 +996,105 @@ function _createCoordinator(opts) {
     });
 }
 
+function _hasInteractivePermission() {
+  const perms = sessionStorage.getItem("turnstone_permissions") || "";
+  return perms.split(",").indexOf("workstreams.create") !== -1;
+}
+
+// Which persona the launcher creates: "coordinator" (console-local) or
+// "interactive" (proxied to a compute node).  The composer is shared; only the
+// submit endpoint + redirect differ.
+let _launcherKind = "coordinator";
+
+function _setLauncherKind(kind) {
+  _launcherKind = kind;
+  const map = {
+    "persona-coordinator": "coordinator",
+    "persona-interactive": "interactive",
+  };
+  Object.keys(map).forEach(function (id) {
+    const btn = document.getElementById(id);
+    if (!btn) return;
+    const on = map[id] === kind;
+    btn.classList.toggle("active", on);
+    btn.setAttribute("aria-checked", on ? "true" : "false");
+  });
+}
+
+function _wireLauncherToggle() {
+  const coordBtn = document.getElementById("persona-coordinator");
+  const intBtn = document.getElementById("persona-interactive");
+  if (coordBtn) {
+    coordBtn.addEventListener("click", function () {
+      _setLauncherKind("coordinator");
+    });
+  }
+  if (intBtn) {
+    intBtn.addEventListener("click", function () {
+      _setLauncherKind("interactive");
+    });
+  }
+}
+
+// POST /v1/api/cluster/workstreams/new — the console picks a node and PROXIES
+// the create; interactive sessions run on compute nodes (only coordinators
+// live in the console).  On success redirects to the node's session view.
+function _createInteractive(opts) {
+  const name = (opts.name || "").trim();
+  const skill = opts.skill || "";
+  const model = (opts.model || "").trim();
+  const judgeModel = (opts.judge_model || "").trim();
+  const task = (opts.task || "").trim();
+  const errEl = opts.errEl;
+  const setBusy = opts.setBusy || function () {};
+  const onSuccess = opts.onSuccess || function () {};
+
+  errEl.textContent = "";
+  setBusy(true);
+
+  const body = { node_id: "auto" };
+  if (name) body.name = name;
+  if (skill) body.skill = skill;
+  if (model) body.model = model;
+  if (judgeModel) body.judge_model = judgeModel;
+  if (task) body.initial_message = task;
+
+  authFetch("/v1/api/cluster/workstreams/new", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  })
+    .then(function (r) {
+      return r.json().then(function (data) {
+        return { ok: r.ok, status: r.status, data: data };
+      });
+    })
+    .then(function (res) {
+      setBusy(false);
+      const data = res.data || {};
+      const wsId = data.correlation_id || data.ws_id;
+      const node = data.target_node;
+      if (!res.ok || !wsId) {
+        errEl.textContent = data.error || "HTTP " + res.status;
+        return;
+      }
+      onSuccess(res);
+      if (node) {
+        window.location.href =
+          "/node/" +
+          encodeURIComponent(node) +
+          "/?ws_id=" +
+          encodeURIComponent(wsId);
+      }
+    })
+    .catch(function () {
+      setBusy(false);
+      errEl.textContent = "Request failed";
+    });
+}
+
 // ---------------------------------------------------------------------------
-// Home-landing composer + active-coordinators list + cluster summary.
+// Home-landing session launcher (coordinator or interactive) + saved sessions.
 // The composer renders as a persistent panel on the home view.  The
 // active list and
 // cluster summary render from clusterState, so every SSE-driven patch
@@ -1190,6 +1273,7 @@ function _ensureHomeComposerInit() {
   if (_homeComposerInit) return;
   _homeComposerInit = true;
   _mountHomeCoordComposer();
+  _wireLauncherToggle();
   _populateHomeSkillDropdown();
   _populateHomeModelDropdowns();
   _refreshHomeComposerVisibility();
@@ -1353,12 +1437,32 @@ function _populateHomeModelDropdowns() {
 function _refreshHomeComposerVisibility() {
   const panel = document.getElementById("coord-composer-panel");
   if (!panel) return;
-  panel.style.display = _hasCoordPermission() ? "" : "none";
+  const canCoord = _hasCoordPermission();
+  const canInt = _hasInteractivePermission();
+  panel.style.display = canCoord || canInt ? "" : "none";
+  const coordBtn = document.getElementById("persona-coordinator");
+  const intBtn = document.getElementById("persona-interactive");
+  if (coordBtn) coordBtn.style.display = canCoord ? "" : "none";
+  if (intBtn) intBtn.style.display = canInt ? "" : "none";
+  // Hide the toggle when only one persona is available.
+  const personas = document.getElementById("launcher-personas");
+  if (personas) personas.style.display = canCoord && canInt ? "" : "none";
+  // Default to a persona the user can actually create.
+  if (_launcherKind === "coordinator" && !canCoord && canInt) {
+    _setLauncherKind("interactive");
+  } else if (_launcherKind === "interactive" && !canInt && canCoord) {
+    _setLauncherKind("coordinator");
+  }
 }
 
 function submitHomeCoord(textFromComposer) {
-  if (!_hasCoordPermission()) {
+  const kind = _launcherKind;
+  if (kind === "coordinator" && !_hasCoordPermission()) {
     showToast("admin.coordinator permission required");
+    return;
+  }
+  if (kind === "interactive" && !_hasInteractivePermission()) {
+    showToast("workstreams.create permission required");
     return;
   }
   if (!_homeCoordComposer) return;
@@ -1383,13 +1487,12 @@ function submitHomeCoord(textFromComposer) {
     );
     return;
   }
-  _createCoordinator({
+  const shared = {
     name: opts.name || "",
     skill: opts.skill || "",
     model: opts.model || "",
     judge_model: opts.judge_model || "",
     task: task,
-    files: files,
     errEl: document.getElementById("home-coord-error"),
     setBusy: function (b) {
       _homeCoordBusy = b;
@@ -1399,7 +1502,20 @@ function submitHomeCoord(textFromComposer) {
     onSuccess: function () {
       _homeClearStagedFiles();
     },
-  });
+  };
+  if (kind === "interactive") {
+    // The cluster create proxy is JSON-only; attachments stay coordinator-only.
+    if (files.length > 0) {
+      _homeShowError(
+        "Attachments aren't supported for interactive sessions yet.",
+      );
+      return;
+    }
+    _createInteractive(shared);
+  } else {
+    shared.files = files;
+    _createCoordinator(shared);
+  }
 }
 
 // Ctrl/Cmd+Enter anywhere on the home page submits the coordinator
@@ -1415,126 +1531,6 @@ document.addEventListener("keydown", function (e) {
   e.preventDefault();
   if (!_homeCoordComposer.sendBtn.disabled) submitHomeCoord();
 });
-
-// Fingerprint of the last active-coordinators render — skip the
-// replaceChildren + tree-group rebuild when nothing visible in the
-// coord list has changed.  renderFromState fires on every SSE patch
-// (state_change, ws_created, ws_closed, ...) and most of those don't
-// affect the coord list.
-let _homeCoordsFingerprint = "";
-
-// Active-coordinators list is SSE-driven — the console collector
-// registers a "console" pseudo-node and the coordinator manager fans
-// out ws_created / ws_closed / cluster_state / ws_rename events when
-// coordinators come, go, or change state.  The browser's
-// patchClusterState handler routes those events into
-// clusterState.nodes["console"].workstreams, so every home-view render
-// reads a live mirror without polling.
-
-function _activeCoordsFromClusterState() {
-  if (!clusterState) return [];
-  const node = clusterState.nodes && clusterState.nodes["console"];
-  if (!node) return [];
-  return (node.workstreams || []).filter(function (ws) {
-    return ws && ws.kind === "coordinator";
-  });
-}
-
-function _renderHomeView() {
-  // Active coordinators are sourced live from clusterState.nodes["console"]
-  // — the coordinator manager fans out ws_created / ws_closed /
-  // cluster_state via the collector's pseudo-node so the home view
-  // stays in sync without polling.
-  const coords = _activeCoordsFromClusterState();
-  coords.sort(function (a, b) {
-    // Most-recently-active first.  updated is absent on freshly-created
-    // rows; fall back to id so the ordering is stable either way.
-    const au = a.updated || 0,
-      bu = b.updated || 0;
-    if (au !== bu) return bu - au;
-    return (a.id || "").localeCompare(b.id || "");
-  });
-
-  // Fingerprint: every field _renderWsRow actually consumes, so a
-  // cluster_state tick that only bumps tokens / context_ratio /
-  // activity (patchClusterState mutates those without touching
-  // ws.updated) doesn't leave the TOKENS / CTX / activity cells
-  // frozen.  Bucketing tokens by hundreds keeps the fingerprint
-  // stable enough that unrelated sub-hundred drift doesn't trigger
-  // a full rebuild on every SSE tick; the rendered value still
-  // re-renders when the bucket changes.
-  let coordsFp = coords.length + "|";
-  for (let i = 0; i < coords.length; i++) {
-    const c = coords[i];
-    coordsFp +=
-      (c.id || "") +
-      ":" +
-      (c.state || "") +
-      ":" +
-      (c.updated || 0) +
-      ":" +
-      (c.name || "") +
-      ":" +
-      Math.floor((c.tokens || 0) / 100) +
-      ":" +
-      Math.round((c.context_ratio || 0) * 100) +
-      ":" +
-      (c.activity_state || "") +
-      ":" +
-      (c.model_alias || c.model || "") +
-      ":" +
-      (c.node || "") +
-      ":" +
-      (c.title || "") +
-      ";";
-  }
-  if (coordsFp !== _homeCoordsFingerprint) {
-    _homeCoordsFingerprint = coordsFp;
-    // Header summary mirrors the server dashboard's wording exactly
-    // ("N active · M total"; active = non-idle) so the two surfaces read
-    // the same.
-    const total = coords.length;
-    let active = 0;
-    for (let i = 0; i < coords.length; i++) {
-      if ((coords[i].state || "idle") !== "idle") active++;
-    }
-    const summaryEl = document.getElementById("active-coord-summary");
-    if (summaryEl) {
-      summaryEl.textContent = active + " active · " + total + " total";
-    }
-    const rowsEl = document.getElementById("active-coord-rows");
-    const colHeadersEl = document.getElementById("active-coord-colheaders");
-    const footerEl = document.getElementById("active-coord-footer");
-    const footerCountEl = document.getElementById("active-coord-footer-count");
-    if (rowsEl) {
-      if (!total) {
-        // Empty: hide the column-header band (no columns to label) but keep
-        // the footer so the card retains its rounded, bordered bottom edge
-        // rather than an open-bottomed header over the empty-state copy.
-        if (colHeadersEl) colHeadersEl.style.display = "none";
-        if (footerEl) footerEl.style.display = "";
-        if (footerCountEl) footerCountEl.textContent = "0 coordinators";
-        const empty = document.createElement("div");
-        empty.className = "dashboard-empty";
-        empty.textContent = "No active coordinator sessions. Start one above.";
-        rowsEl.replaceChildren(empty);
-      } else {
-        // Reveal the column-header band + footer (static siblings of the
-        // rows container, so renderWsTable's replaceChildren leaves them
-        // intact), then reuse the shared tree-grouped renderer so the rows
-        // get the same labelled columns, glyphs, child-count badges, and
-        // treatment as the Nodes table and the server's Workstreams card.
-        if (colHeadersEl) colHeadersEl.style.display = "";
-        if (footerEl) footerEl.style.display = "";
-        if (footerCountEl) {
-          footerCountEl.textContent =
-            total + (total === 1 ? " coordinator" : " coordinators");
-        }
-        renderWsTable(rowsEl, coords);
-      }
-    }
-  }
-}
 
 // ---------------------------------------------------------------------------
 // Saved coordinators — closed sessions persisted on disk.  Mirrors the
@@ -1555,6 +1551,10 @@ let _savedCoordsInFlight = false;
 let _savedCoordsRetry = false;
 
 function loadSavedCoordinators() {
+  // Saved sessions is an operator surface (admin.coordinator) — the unified
+  // list spans BOTH kinds for operators (who already have cluster-wide reach).
+  // Interactive-only users use the launcher, not this list, so the gate stays
+  // admin.coordinator (matching the server gate; a looser gate here would 403).
   if (!_hasCoordPermission()) return;
   // Freeze the list while the user is multi-selecting — re-rendering
   // mid-mode would shuffle the visible page out from under them.  The
@@ -1609,6 +1609,21 @@ function loadSavedCoordinators() {
 // navigating so capacity limits surface as a toast, not a broken page.
 const COORD_COLUMNS = [
   SavedColumns.name(),
+  {
+    key: "kind",
+    label: "KIND",
+    width: "62px",
+    cell: function (s) {
+      const tag = document.createElement("span");
+      const coord = s.kind === "coordinator";
+      tag.className = "persona-tag" + (coord ? " coord" : " int");
+      tag.textContent = coord ? "COORD" : "INT";
+      return tag;
+    },
+    sort: function (s) {
+      return s.kind || "";
+    },
+  },
   SavedColumns.model(),
   SavedColumns.count("child_count", "CHILDREN", "92px"),
   SavedColumns.ctx(),
@@ -1622,12 +1637,31 @@ const _coordTable = createSavedTable({
   footerEl: document.getElementById("coord-saved-footer"),
   paginationEl: document.getElementById("coord-pagination"),
   columns: COORD_COLUMNS,
-  noun: "coordinator",
-  emptyText: "No saved coordinators",
+  noun: "session",
+  emptyText: "No saved sessions",
   activateLabel: function (s) {
-    return "Resume coordinator: " + (s.alias || s.title || s.name || s.ws_id);
+    return (
+      "Resume " +
+      (s.kind === "coordinator" ? "coordinator" : "session") +
+      ": " +
+      (s.alias || s.title || s.name || s.ws_id)
+    );
   },
   onActivate: function (s, rowEl) {
+    // Interactive sessions live on a compute node — open the node's session
+    // view directly (no warm-pool /open; that is a coordinator concern).
+    if (s.kind !== "coordinator") {
+      if (s.node_id) {
+        window.location.href =
+          "/node/" +
+          encodeURIComponent(s.node_id) +
+          "/?ws_id=" +
+          encodeURIComponent(s.ws_id);
+      } else {
+        showToast("Session node unknown");
+      }
+      return;
+    }
     // POST /open BEFORE navigating so capacity issues surface as a toast
     // instead of a broken-looking detail page.
     if (rowEl) rowEl.classList.add("is-busy");
