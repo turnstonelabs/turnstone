@@ -219,3 +219,16 @@ def test_step3_admin_seam_and_thin_show_admin() -> None:
     assert 'pm.openPane("admin")' in body, "showAdmin must open the singleton Admin pane"
     for gone in ('currentView = "admin"', 'history.pushState({ view: "admin" }'):
         assert gone not in body, f"legacy admin view-model bit {gone!r} must be gone"
+    # 3b — the in-pane sidebar's mobile-drawer machinery + dead nav refs are deleted.
+    for gone in (
+        "_mobileSidebarOpen",
+        "_injectMobileToggle",
+        "_toggleMobileSidebar",
+        ".admin-nav",
+    ):
+        assert gone not in body, f"retired admin sidebar/mobile symbol {gone!r} must be gone"
+    index = _CONSOLE_INDEX.read_text(encoding="utf-8")
+    assert 'id="admin-sidebar"' not in index, (
+        "the in-pane admin sidebar markup must be deleted — the rail Manage groups navigate"
+    )
+    assert 'id="admin-content"' in index, "the admin content host must remain (the pane adopts it)"

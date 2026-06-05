@@ -13,7 +13,6 @@ let _cfTrapHandler = null;
 let _adminWatches = [];
 let _confirmCallbackFn = null;
 let _confirmTriggerEl = null;
-let _mobileSidebarOpen = false;
 
 // Settings whose choices are populated dynamically from the live model
 // alias list, and whose empty-string option renders as "(server default)".
@@ -184,68 +183,11 @@ function showAdmin(tab) {
   else _showAdminNoPermissions();
 }
 
-function _injectMobileToggle(tab) {
-  let toggle = document.getElementById("admin-mobile-toggle");
-  if (!toggle) {
-    toggle = document.createElement("button");
-    toggle.id = "admin-mobile-toggle";
-    toggle.className = "admin-mobile-toggle";
-    toggle.setAttribute("aria-label", "Open navigation");
-    toggle.setAttribute("aria-expanded", "false");
-    toggle.onclick = function () {
-      _toggleMobileSidebar();
-    };
-  }
-  const panel = document.getElementById("admin-" + tab);
-  if (!panel) return;
-  const toolbar = panel.querySelector(".admin-toolbar");
-  if (toolbar) {
-    if (!toolbar.contains(toggle))
-      toolbar.insertBefore(toggle, toolbar.firstChild);
-  } else {
-    // Panel has no toolbar — prepend toggle directly so it remains accessible
-    if (!panel.contains(toggle)) panel.insertBefore(toggle, panel.firstChild);
-  }
-}
-
-function _toggleMobileSidebar() {
-  _mobileSidebarOpen = !_mobileSidebarOpen;
-  const sidebar = document.getElementById("admin-sidebar");
-  sidebar.classList.toggle("open", _mobileSidebarOpen);
-  sidebar.classList.toggle("collapsed", !_mobileSidebarOpen);
-  sidebar.setAttribute("aria-hidden", _mobileSidebarOpen ? "false" : "true");
-  if (_mobileSidebarOpen) sidebar.removeAttribute("inert");
-  else sidebar.setAttribute("inert", "");
-  const backdrop = document.getElementById("admin-sidebar-backdrop");
-  if (backdrop) backdrop.classList.toggle("visible", _mobileSidebarOpen);
-  // Update hamburger aria-label to reflect current state
-  const mt = document.getElementById("admin-mobile-toggle");
-  if (mt) {
-    mt.setAttribute(
-      "aria-label",
-      _mobileSidebarOpen ? "Close navigation" : "Open navigation",
-    );
-    mt.setAttribute("aria-expanded", _mobileSidebarOpen ? "true" : "false");
-  }
-  // Move focus into drawer on open; callers handle focus-return on close
-  if (_mobileSidebarOpen) {
-    const closeBtn = sidebar.querySelector(".admin-sidebar-close button");
-    if (closeBtn) closeBtn.focus();
-  }
-}
-
 function switchAdminTab(tab) {
   _adminTab = tab;
   // Hide no-permissions empty state if it was showing
   const noPerms = document.getElementById("admin-no-permissions");
   if (noPerms) noPerms.style.display = "none";
-  const navItems = document.querySelectorAll(".admin-nav");
-  for (let i = 0; i < navItems.length; i++) {
-    const isActive = navItems[i].getAttribute("data-tab") === tab;
-    navItems[i].classList.toggle("active", isActive);
-    navItems[i].setAttribute("aria-selected", isActive ? "true" : "false");
-    navItems[i].setAttribute("tabindex", isActive ? "0" : "-1");
-  }
   const panels = [
     "users",
     "tokens",
@@ -292,14 +234,6 @@ function switchAdminTab(tab) {
   if (tab === "mcp") loadAdminMcp();
   if (tab === "prompt-policies") loadPromptPolicies();
   if (tab === "judge") loadJudgeTab();
-
-  // Update breadcrumb with active tab label
-  const activeNav = document.querySelector(
-    '.admin-nav[data-tab="' + tab + '"]',
-  );
-  const label = activeNav ? activeNav.textContent : tab;
-  const bcLabel = document.getElementById("breadcrumb-label");
-  if (bcLabel) bcLabel.textContent = "Admin / " + label;
 
   // Mirror the active tab into the rail's Manage groups (the in-pane sidebar
   // that used to carry the active state is retired — the rail navigates now).
@@ -2600,71 +2534,7 @@ document.addEventListener("keydown", function (e) {
       return;
     }
   }
-  // Close mobile sidebar drawer on Escape
-  if (_mobileSidebarOpen && window.innerWidth <= 700) {
-    e.preventDefault();
-    _toggleMobileSidebar();
-    const mt = document.getElementById("admin-mobile-toggle");
-    if (mt) mt.focus();
-    return;
-  }
 });
-
-// Sidebar arrow key navigation (vertical)
-(function () {
-  const sidebar = document.getElementById("admin-sidebar");
-  if (!sidebar) return;
-  sidebar.addEventListener("keydown", function (e) {
-    if (e.key !== "ArrowUp" && e.key !== "ArrowDown") return;
-    e.preventDefault();
-    const allNavs = document.querySelectorAll(
-      '.admin-nav:not([style*="display: none"])',
-    );
-    const navOrder = [];
-    for (let ni = 0; ni < allNavs.length; ni++) {
-      navOrder.push(allNavs[ni].getAttribute("data-tab"));
-    }
-    if (navOrder.length === 0) return;
-    let idx = navOrder.indexOf(_adminTab);
-    if (e.key === "ArrowDown") idx = (idx + 1) % navOrder.length;
-    else idx = (idx - 1 + navOrder.length) % navOrder.length;
-    switchAdminTab(navOrder[idx]);
-    const btn = document.querySelector(
-      '.admin-nav[data-tab="' + navOrder[idx] + '"]',
-    );
-    if (btn) btn.focus();
-  });
-})();
-
-// Sync sidebar aria-hidden/inert when crossing mobile/desktop breakpoint
-(function () {
-  let resizeTimer;
-  window.addEventListener("resize", function () {
-    clearTimeout(resizeTimer);
-    resizeTimer = setTimeout(function () {
-      if (typeof currentView === "undefined" || currentView !== "admin") return;
-      const sidebar = document.getElementById("admin-sidebar");
-      if (!sidebar) return;
-      const isMobile = window.innerWidth <= 700;
-      const backdrop = document.getElementById("admin-sidebar-backdrop");
-      if (!isMobile) {
-        // Crossed into desktop: close drawer cleanly if it was open
-        if (_mobileSidebarOpen) _toggleMobileSidebar();
-        sidebar.removeAttribute("aria-hidden");
-        sidebar.removeAttribute("inert");
-        sidebar.classList.remove("collapsed", "open");
-        if (backdrop) backdrop.classList.remove("visible");
-      } else if (!_mobileSidebarOpen) {
-        // Mobile with drawer closed: ensure collapsed state
-        sidebar.setAttribute("aria-hidden", "true");
-        sidebar.setAttribute("inert", "");
-        sidebar.classList.add("collapsed");
-        sidebar.classList.remove("open");
-        if (backdrop) backdrop.classList.remove("visible");
-      }
-    }, 150);
-  });
-})();
 
 // ---------------------------------------------------------------------------
 // Confirm Modal (reusable styled replacement for confirm())

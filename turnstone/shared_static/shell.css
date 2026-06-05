@@ -628,15 +628,11 @@
 }
 
 /* ===== Admin pane — adopts #view-admin (the 18 tabpanels).  The in-pane
-   sidebar + its mobile backdrop are retired (the rail's Manage groups are the
-   navigation now), so #view-admin fills the pane body and content is full-width. */
+   sidebar is retired (the rail's Manage groups navigate), so #view-admin fills
+   the pane body and the content host renders full-width. ===== */
 .pane-body > #view-admin {
   flex: 1;
   min-height: 0;
   display: flex;
   flex-direction: column;
-}
-.pane-body .admin-sidebar,
-.pane-body .admin-sidebar-backdrop {
-  display: none;
 }
