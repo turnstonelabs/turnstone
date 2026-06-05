@@ -15,6 +15,7 @@
     <link rel="stylesheet" href="/shared/chat.css" />
     <link rel="stylesheet" href="/shared/cards.css" />
     <link rel="stylesheet" href="/static/style.css" />
+    <link rel="stylesheet" href="/shared/shell.css" />
   </head>
   <body>
     <div id="header">
@@ -2249,6 +2250,13 @@
     <script>
       window.TURNSTONE_AUTH_TITLE = "turnstone console";
       window.TURNSTONE_TOAST_TIMEOUT = 4000;
+      // L-shell capability flags — console is the cluster front-door (rail
+      // Cluster section on); a standalone turnstone-server would flip these.
+      window.TURNSTONE_SHELL_CAPS = {
+        cluster: true,
+        orchestration: true,
+        brandSub: "console",
+      };
       window.TURNSTONE_KB_SHORTCUTS = [
         {
           title: "Navigation",
@@ -4634,5 +4642,8 @@
     <script src="/static/admin.js"></script>
     <script src="/static/governance.js"></script>
     <script src="/static/app.js"></script>
+    <!-- L-shell (ES module) — deferred, so it runs after the classic scripts
+         above and drives window.TS_APP.boot(). -->
+    <script type="module" src="/shared/shell.js"></script>
   </body>
 </html>

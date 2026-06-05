@@ -2025,37 +2025,46 @@ function _ensureSSE() {
     connectSSE();
   }
 }
-history.replaceState({ view: "home" }, "");
-initLogin();
-// loadOverview fetches the cluster snapshot — both the node list AND
-// the active-coordinators list come from the same snapshot + SSE patch
-// pipeline (#9); the console pseudo-node carries coordinator
-// ws_created / ws_closed / cluster_state events.
-loadOverview();
-(function () {
-  const npTrigger = document.getElementById("csb-np-trigger");
-  if (npTrigger) npTrigger.onclick = toggleNodePicker;
-})();
-_ensureHomeComposerInit();
-// Refresh the coord button visibility once auth.js has populated
-// sessionStorage from the initial whoami.  window.permissionsReady
-// resolves after that completes (success or failure); fall back to a
-// short timeout if the promise isn't available (older auth.js).
-//
-// NOTE: permissionsReady is one-shot — it fires exactly once per page
-// load (see auth.js).  Subsequent re-logins are caught by the
-// onLoginSuccess hook above which calls loadSavedCoordinators() again.
-if (
-  window.permissionsReady &&
-  typeof window.permissionsReady.then === "function"
-) {
-  window.permissionsReady.then(function () {
-    _refreshHomeComposerVisibility();
-    loadSavedCoordinators();
-  });
-} else {
-  setTimeout(function () {
-    _refreshHomeComposerVisibility();
-    loadSavedCoordinators();
-  }, 500);
-}
+// --- Boot ---
+// The L-shell (shared_static/shell.js, an ES module) is deferred and runs after
+// this classic script, so it drives boot() once the rail + status DOM exist —
+// init no longer auto-runs at parse time.  window.onLoginSuccess (top of file)
+// still starts the Tier-1 stream on both fresh login and refresh-with-cookie,
+// so that path is unchanged.
+window.TS_APP = window.TS_APP || {};
+window.TS_APP.boot = function () {
+  history.replaceState({ view: "home" }, "");
+  initLogin();
+  // loadOverview fetches the cluster snapshot — both the node list AND
+  // the active-coordinators list come from the same snapshot + SSE patch
+  // pipeline (#9); the console pseudo-node carries coordinator
+  // ws_created / ws_closed / cluster_state events.
+  loadOverview();
+  (function () {
+    const npTrigger = document.getElementById("csb-np-trigger");
+    if (npTrigger) npTrigger.onclick = toggleNodePicker;
+  })();
+  _ensureHomeComposerInit();
+  // Refresh the coord button visibility once auth.js has populated
+  // sessionStorage from the initial whoami.  window.permissionsReady
+  // resolves after that completes (success or failure); fall back to a
+  // short timeout if the promise isn't available (older auth.js).
+  //
+  // NOTE: permissionsReady is one-shot — it fires exactly once per page
+  // load (see auth.js).  Subsequent re-logins are caught by the
+  // onLoginSuccess hook above which calls loadSavedCoordinators() again.
+  if (
+    window.permissionsReady &&
+    typeof window.permissionsReady.then === "function"
+  ) {
+    window.permissionsReady.then(function () {
+      _refreshHomeComposerVisibility();
+      loadSavedCoordinators();
+    });
+  } else {
+    setTimeout(function () {
+      _refreshHomeComposerVisibility();
+      loadSavedCoordinators();
+    }, 500);
+  }
+};

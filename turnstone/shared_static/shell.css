@@ -1,0 +1,323 @@
+/* ==========================================================================
+   L-shell chrome — the unified rail + tab-bar + pane-host frame.
+
+   Scope (step 1): structural shell only — the rail shell, the tab bar, and the
+   pane frame.  Rail *content* (Cluster health, Workspaces tree, Manage groups)
+   and pane *content* (chat turns, approval card, composer) are NOT here:
+     - state glyphs reuse ui-base.css `.ui-glyph-*` (the canonical shape+colour
+       vocabulary), not a private glyph class;
+     - chat / approval / composer styling lives in chat.css + coordinator.css;
+     - rail IA rows (.cluster/.nav/.grp) land alongside their markup in steps 2-3.
+
+   Tokens are the real base.css names (mock drafted against `--elevated`/`--r`/
+   `--accent-glow` which map to `--bg-elevated`/`--r-md`/`--accent-glow-strong`).
+   ========================================================================== */
+
+/* ===== The L: rail (|) + content (—) ===== */
+.app {
+  display: grid;
+  grid-template-columns: 266px 1fr;
+  height: 100vh;
+  overflow: hidden;
+}
+
+/* ===== Rail (the | of the L) ===== */
+.rail {
+  background: var(--panel);
+  border-right: 1px solid var(--hair);
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+}
+.rail-brand {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 13px 14px 11px;
+  border-bottom: 1px solid var(--hair);
+}
+.brand-mark {
+  width: 18px;
+  height: 18px;
+  border-radius: 5px;
+  background: linear-gradient(135deg, var(--accent), #b9762a);
+  box-shadow: 0 0 10px var(--accent-glow-strong);
+  flex: none;
+}
+.brand-name {
+  font-weight: 600;
+  color: var(--ink);
+  letter-spacing: 0.2px;
+  font-size: 14px;
+}
+.brand-sub {
+  color: var(--ink-4);
+  font-size: 11px;
+  margin-left: -3px;
+}
+/* the brand is a real button (keyboard "home") styled to look like plain text */
+.brand-home {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  background: none;
+  border: 0;
+  margin: 0;
+  padding: 0;
+  font: inherit;
+  color: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+.brand-home:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+  border-radius: var(--r-sm);
+}
+.rail-scroll {
+  flex: 1;
+  overflow: auto;
+  padding: 10px 8px 6px;
+}
+.sec-label {
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.13em;
+  color: var(--ink-4);
+  font-weight: 600;
+  padding: 12px 8px 6px;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+.sec-label .count {
+  margin-left: auto;
+  color: var(--ink-4);
+  font-weight: 500;
+  letter-spacing: 0;
+}
+
+/* connection indicator — relocated #status-bar (was the header text bar).
+   `disconnected` is toggled by app.js connectSSE on stream loss. */
+.rail-conn {
+  padding: 4px 10px 2px;
+  font-size: 11px;
+  color: var(--ink-4);
+  min-height: 18px;
+}
+.rail-conn.disconnected {
+  color: var(--yellow);
+}
+
+/* rail footer — relocated header controls + user chip */
+.rail-foot {
+  border-top: 1px solid var(--hair);
+  padding: 9px 12px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+/* relocated header controls.  Text buttons (admin / logout) keep a text shape;
+   only glyph-only buttons (the ☾ theme toggle, future .ico-btn) collapse to a
+   square — otherwise multi-char labels overflow a 28px box and overlap. */
+.rail-foot .header-btn {
+  height: 28px;
+  padding: 0 10px;
+  border-radius: var(--r-sm);
+  border: 1px solid var(--hair);
+  background: var(--panel-2);
+  color: var(--ink-3);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  font-size: 12px;
+  line-height: 1;
+  white-space: nowrap;
+}
+.rail-foot .header-btn:hover {
+  border-color: var(--accent-dim);
+  color: var(--ink);
+}
+.rail-foot #theme-toggle {
+  width: 28px;
+  padding: 0;
+  font-size: 13px;
+}
+.ico-btn {
+  width: 28px;
+  height: 28px;
+  padding: 0;
+  border-radius: var(--r-sm);
+  border: 1px solid var(--hair);
+  background: var(--panel-2);
+  color: var(--ink-3);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  font-size: 13px;
+}
+.ico-btn:hover {
+  border-color: var(--accent-dim);
+  color: var(--ink);
+}
+/* logout starts hidden (app.js toggles it on auth) — keep that behaviour */
+.user-chip {
+  margin-left: auto;
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  color: var(--ink-3);
+  font-size: 12px;
+}
+.avatar {
+  width: 24px;
+  height: 24px;
+  border-radius: 50%;
+  background: var(--bg-elevated);
+  border: 1px solid var(--hair-2);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 10px;
+  font-weight: 600;
+  color: var(--ink-2);
+}
+
+/* ===== Content (the — of the L): tab bar + pane host ===== */
+.content {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  min-height: 0;
+}
+.tabbar {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 8px 12px;
+  border-bottom: 1px solid var(--hair);
+  background: var(--panel);
+  position: relative;
+  z-index: 20;
+}
+.tab {
+  position: relative;
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  white-space: nowrap;
+  padding: 6px 11px;
+  border-radius: var(--r-md);
+  font-size: 12.5px;
+  line-height: 1.2;
+  color: var(--ink-3);
+  cursor: pointer;
+  border: 1px solid transparent;
+  background: none;
+  font-family: var(--font-ui);
+}
+.tab .glyph {
+  margin-right: 6px;
+  color: var(--ink-4);
+  font-size: 11px;
+}
+.tab:hover {
+  background: var(--panel-2);
+}
+.tab.active {
+  background: var(--panel-2);
+  border-color: var(--hair-2);
+  color: var(--ink);
+}
+.tab-add {
+  width: 28px;
+  height: 28px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--ink-4);
+  border-radius: var(--r-sm);
+  cursor: pointer;
+  font-size: 16px;
+  border: none;
+  background: none;
+}
+.tab-add:hover {
+  background: var(--panel-2);
+  color: var(--ink-2);
+}
+.tabbar-right {
+  margin-left: auto;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  color: var(--ink-4);
+}
+
+/* pane host — ONE pane visible per tab (no split; the mock's 2-up was a
+   display device only, so this is a single column, not `1fr 1fr`). */
+.panes {
+  flex: 1;
+  display: grid;
+  grid-template-columns: 1fr;
+  min-height: 0;
+}
+.pane {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  min-height: 0;
+}
+.pane[hidden] {
+  display: none;
+}
+.pane-head {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  padding: 9px 13px;
+  border-bottom: 1px solid var(--hair);
+  background: color-mix(in srgb, var(--panel) 60%, var(--bg));
+}
+.pane-head .nm {
+  font-weight: 600;
+  color: var(--ink);
+  font-size: 13.5px;
+}
+.ptag {
+  font-size: 9px;
+  letter-spacing: 0.09em;
+  font-weight: 600;
+  padding: 1px 6px;
+  border-radius: 9px;
+  border: 1px solid var(--hair-2);
+  color: var(--ink-4);
+}
+.ptag.coord {
+  color: var(--accent);
+  border-color: color-mix(in srgb, var(--accent) 40%, var(--hair-2));
+}
+.ptag.int {
+  color: var(--cyan);
+  border-color: color-mix(in srgb, var(--cyan) 35%, var(--hair-2));
+}
+
+/* the pane body fills + scrolls; the step-1 dashboard pane hosts the legacy
+   #main here unchanged, so it keeps its own internal layout. */
+.pane-body {
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+  display: flex;
+  flex-direction: column;
+}
+.pane-body > #main,
+.pane-body > #breadcrumb {
+  flex: none;
+}
+.pane-body > #main {
+  flex: 1 1 auto;
+  min-height: 0;
+}
