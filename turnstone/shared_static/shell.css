@@ -97,6 +97,197 @@
   letter-spacing: 0;
 }
 
+/* ===== Rail live sections (Cluster + Workspaces) — fed by Tier-1 (rail.js).
+   State = shape + colour via ui-base.css .ui-glyph-*; rows are <button>s so
+   they're keyboard-operable (button resets below). ===== */
+.rail-section {
+  margin-bottom: 2px;
+}
+
+/* cluster strip + node list */
+.cluster {
+  margin: 2px 4px 4px;
+  padding: 9px 10px;
+  background: var(--panel-2);
+  border: 1px solid var(--hair);
+  border-radius: var(--r-md);
+}
+.cluster-row {
+  display: flex;
+  align-items: center;
+  gap: 11px;
+  flex-wrap: wrap;
+}
+.cpill {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  color: var(--ink-3);
+  font-variant-numeric: tabular-nums;
+  background: none;
+  border: 0;
+  padding: 0;
+  font-family: var(--font-ui);
+  cursor: pointer;
+}
+.cpill b {
+  color: var(--ink-2);
+  font-weight: 600;
+}
+.cpill:hover {
+  color: var(--ink);
+}
+.cluster-nodes {
+  margin-top: 8px;
+  padding-top: 8px;
+  border-top: 1px solid var(--hair);
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+}
+.nlabel {
+  display: flex;
+  align-items: center;
+  font-size: 9.5px;
+  text-transform: uppercase;
+  letter-spacing: 0.12em;
+  color: var(--ink-4);
+  font-weight: 600;
+  margin-bottom: 4px;
+  padding: 0 2px;
+}
+.nlabel .drift {
+  margin-left: auto;
+  color: var(--yellow);
+  letter-spacing: 0;
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+}
+.node-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 3px 4px;
+  border-radius: var(--r-sm);
+  cursor: pointer;
+  background: none;
+  border: 0;
+  width: 100%;
+  text-align: left;
+  font-family: var(--font-ui);
+}
+.node-row:hover {
+  background: var(--panel);
+}
+.node-row .nn {
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+  color: var(--ink-2);
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.node-row .ver {
+  font-family: var(--font-mono);
+  font-size: 10px;
+  color: var(--ink-4);
+}
+.node-row .ver.drift {
+  color: var(--yellow);
+}
+.node-row .nws {
+  font-variant-numeric: tabular-nums;
+  color: var(--ink-3);
+  font-size: 11px;
+  min-width: 42px;
+  text-align: right;
+}
+
+/* workspaces — session nav tree */
+.nav {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+.nav li {
+  list-style: none;
+}
+.row {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  padding: 6px 9px;
+  border-radius: var(--r-sm);
+  cursor: pointer;
+  color: var(--ink-2);
+  position: relative;
+  font-size: 13px;
+  width: 100%;
+  background: none;
+  border: 0;
+  text-align: left;
+  font-family: var(--font-ui);
+}
+.row:hover {
+  background: var(--panel-2);
+}
+.row .glyph {
+  width: 16px;
+  text-align: center;
+  color: var(--ink-4);
+  font-size: 12px;
+  flex: none;
+}
+.row .nm {
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.row .rcount {
+  font-size: 10px;
+  color: var(--ink-4);
+  font-variant-numeric: tabular-nums;
+}
+.row .tag {
+  font-size: 9px;
+  letter-spacing: 0.08em;
+  font-weight: 600;
+  padding: 1px 5px;
+  border-radius: 9px;
+  border: 1px solid var(--hair-2);
+  color: var(--ink-4);
+}
+.row .tag.coord {
+  color: var(--accent);
+  border-color: color-mix(in srgb, var(--accent) 40%, var(--hair-2));
+}
+.row.open {
+  background: color-mix(in srgb, var(--accent) 8%, var(--panel-2));
+}
+.row.open::before {
+  content: "";
+  position: absolute;
+  left: -8px;
+  top: 5px;
+  bottom: 5px;
+  width: 2px;
+  border-radius: 2px;
+  background: var(--accent);
+}
+.row.open .nm {
+  color: var(--ink);
+}
+.children {
+  list-style: none;
+  margin: 1px 0 3px 13px;
+  padding-left: 14px;
+  border-left: 1px solid var(--hair);
+}
+
 /* connection indicator — relocated #status-bar (was the header text bar).
    `disconnected` is toggled by app.js connectSSE on stream loss. */
 .rail-conn {

@@ -9,9 +9,10 @@
    shell and reparents the existing DOM → it calls `TS_APP.boot()` to start
    login + the Tier-1 cluster stream under the shell.
 
-   Re-point without rewiring: the cluster stream writes status via
-   getElementById("status-bar" / "cluster-status-bar"); we MOVE those elements
-   (ids preserved) into the rail / hide them, so app.js needs zero edits.
+   Re-point without rewiring: the cluster stream writes its connection status via
+   getElementById("status-bar"); we MOVE that element (id preserved) into the
+   rail, so connectSSE keeps writing to it.  Cluster health itself renders in the
+   rail (rail.js) from the Tier-1 seam app.js exposes on window.TS_APP.
 
    This is the one module that legitimately reaches the existing document by id —
    it is the orchestrator wiring the shell onto the page, not pane-internal code
@@ -19,6 +20,7 @@
    ========================================================================== */
 
 import { PaneManager, ShellPane } from "./pane.js";
+import { mountRail } from "./rail.js";
 
 function make(tag, className, text) {
   const node = document.createElement(tag);
@@ -52,10 +54,17 @@ function buildShell(caps) {
   // connection indicator — the relocated #status-bar is inserted here at wire time.
   const connSlot = make("div", "rail-conn-slot");
   scroll.append(connSlot);
-  // IA section labels (content fed by Tier-1 / admin in steps 2-3).  Cluster is
-  // capability-gated — hidden on a single-node standalone deployment.
-  if (caps.cluster) scroll.append(make("div", "sec-label", "Cluster"));
-  scroll.append(make("div", "sec-label", "Workspaces"));
+  // IA sections — each a label + a render target.  Cluster is capability-gated
+  // (hidden on a single-node standalone deployment); rail.js fills Cluster +
+  // Workspaces from Tier-1.  Manage stays a stub label until step 3.
+  function section(title) {
+    scroll.append(make("div", "sec-label", title));
+    const body = make("div", "rail-section");
+    scroll.append(body);
+    return body;
+  }
+  const clusterSec = caps.cluster ? section("Cluster") : null;
+  const workspacesSec = section("Workspaces");
   scroll.append(make("div", "sec-label", "Manage"));
   rail.append(scroll);
 
@@ -71,7 +80,18 @@ function buildShell(caps) {
   content.append(tabbar, panes);
 
   app.append(rail, content);
-  return { app, rail, scroll, connSlot, foot, tabbar, tail, panes };
+  return {
+    app,
+    rail,
+    scroll,
+    connSlot,
+    foot,
+    tabbar,
+    tail,
+    panes,
+    clusterSec,
+    workspacesSec,
+  };
 }
 
 function mountShell() {
@@ -82,7 +102,6 @@ function mountShell() {
   const statusBarEl = document.getElementById("status-bar");
   const breadcrumbEl = document.getElementById("breadcrumb");
   const mainEl = document.getElementById("main");
-  const clusterBarEl = document.getElementById("cluster-status-bar");
 
   const shell = buildShell(caps);
   // Insert the shell as the first body child so it owns the viewport; portals
@@ -108,11 +127,6 @@ function mountShell() {
   userChip.append(nameEl);
   shell.foot.append(userChip);
   if (headerEl) headerEl.style.display = "none";
-
-  // Hide the legacy bottom cluster bar but keep it in the DOM — connectSSE
-  // toggles its `.stale` class via getElementById; step 2 retires it for the
-  // rail-native Cluster section.
-  if (clusterBarEl) clusterBarEl.style.display = "none";
 
   // ----- PaneManager: one new spine -----
   const pm = new PaneManager({
@@ -143,6 +157,17 @@ function mountShell() {
   if (!pm.rehydrate()) pm.openPane("dashboard");
 
   window.TS_SHELL = { panes: pm, caps };
+
+  // Wire the rail's live Cluster + Workspaces sections to the Tier-1 render
+  // signal (subscribe before boot so the first snapshot render is caught).
+  mountRail(
+    {
+      cluster: shell.clusterSec,
+      workspaces: shell.workspacesSec,
+      paneManager: pm,
+    },
+    caps,
+  );
 
   // Hand off to the legacy boot (login + Tier-1 stream) now that the shell and
   // its status DOM exist.

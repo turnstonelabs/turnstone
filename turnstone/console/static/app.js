@@ -80,7 +80,6 @@ const STATE_DISPLAY = {
   idle: { symbol: "\u00b7", label: "idle" },
   error: { symbol: "\u2716", label: "err" },
 };
-const STATE_ORDER = ["running", "thinking", "attention", "error", "idle"];
 
 // --- Cluster State Model ---
 function applySnapshot(data) {
@@ -291,8 +290,6 @@ function buildNodeInfoFromSnapshot(node) {
 
 function renderFromState() {
   if (!clusterState) return;
-  renderStatusBar(clusterState.overview);
-  renderNodePicker();
   if (currentView === "home") {
     _renderHomeView();
   } else if (currentView === "filtered") {
@@ -337,6 +334,19 @@ function renderFromState() {
       pages,
     );
   }
+  _fireRenderSubs();
+}
+
+// Notify the L-shell rail (rail.js) that cluster state was (re)rendered.
+function _fireRenderSubs() {
+  const subs = (window.TS_APP && window.TS_APP._renderSubs) || [];
+  for (const cb of subs) {
+    try {
+      cb(clusterState);
+    } catch (e) {
+      console.error("onRender subscriber failed", e);
+    }
+  }
 }
 
 // --- SSE Connection ---
@@ -351,8 +361,6 @@ function connectSSE() {
     retryDelay = 1000;
     statusBar.classList.remove("disconnected");
     statusBar.textContent = "";
-    const csb = document.getElementById("cluster-status-bar");
-    if (csb) csb.classList.remove("stale");
   };
   evtSource.onmessage = function (e) {
     try {
@@ -370,8 +378,6 @@ function connectSSE() {
     if (loginOverlay && loginOverlay.style.display !== "none") return;
     statusBar.textContent = "Reconnecting\u2026";
     statusBar.classList.add("disconnected");
-    const csb = document.getElementById("cluster-status-bar");
-    if (csb) csb.classList.add("stale");
     // Raw fetch (not authFetch) — need to inspect status before throwing
     fetch("/v1/api/cluster/overview")
       .then(function (r) {
@@ -473,317 +479,6 @@ function loadOverview() {
     .catch(function () {
       showToast("Failed to load cluster data");
     });
-}
-
-// --- Status Bar ---
-function renderStatusBar(overview) {
-  const cacheKey =
-    JSON.stringify(overview) +
-    "|" +
-    currentView +
-    "|" +
-    (currentFilter.state || "");
-  if (cacheKey === _lastOverviewJson) return;
-  _lastOverviewJson = cacheKey;
-
-  const states = overview.states || {};
-  const agg = overview.aggregate || {};
-
-  const statesContainer = document.getElementById("csb-states");
-  statesContainer.replaceChildren();
-  STATE_ORDER.forEach(function (state) {
-    const count = states[state] || 0;
-    const sd = STATE_DISPLAY[state] || STATE_DISPLAY.idle;
-    const pill = document.createElement("button");
-    pill.className = "csb-state";
-    if (currentView === "filtered" && currentFilter.state === state) {
-      pill.classList.add("active");
-    }
-    pill.setAttribute("aria-label", sd.label + ": " + count + " workstreams");
-    const stateDot = document.createElement("span");
-    stateDot.className = "csb-state-dot";
-    stateDot.setAttribute("data-state", state);
-    stateDot.setAttribute("aria-hidden", "true");
-    const stateCount = document.createElement("span");
-    stateCount.className = "csb-state-count" + (count === 0 ? " zero" : "");
-    stateCount.textContent = formatCount(count);
-    const stateLabel = document.createElement("span");
-    stateLabel.className = "csb-state-label";
-    stateLabel.textContent = sd.label;
-    pill.append(stateDot, stateCount, stateLabel);
-    pill.onclick = function () {
-      drillDownByState(state);
-    };
-    statesContainer.appendChild(pill);
-  });
-
-  const metricsContainer = document.getElementById("csb-metrics");
-  metricsContainer.replaceChildren();
-  const metrics = [
-    { value: overview.workstreams || 0, label: "ws", format: formatCount },
-    { value: agg.total_tokens || 0, label: "tokens", format: formatTokens },
-    { value: agg.total_tool_calls || 0, label: "calls", format: formatCount },
-  ];
-  metrics.forEach(function (m) {
-    if (m.value === 0 && m.label !== "ws") return;
-    const el = document.createElement("span");
-    el.className = "csb-metric";
-    const valSpan = document.createElement("span");
-    valSpan.className = "csb-metric-value";
-    valSpan.textContent = m.format(m.value);
-    const labelSpan = document.createElement("span");
-    labelSpan.className = "csb-metric-label";
-    labelSpan.textContent = m.label;
-    el.appendChild(valSpan);
-    el.appendChild(labelSpan);
-    metricsContainer.appendChild(el);
-  });
-  // MCP aggregate metrics
-  if (overview.mcp_servers && overview.mcp_servers > 0) {
-    const mcpDivider = document.createElement("span");
-    mcpDivider.className = "csb-divider";
-    mcpDivider.setAttribute("aria-hidden", "true");
-    metricsContainer.appendChild(mcpDivider);
-    const mcpTitles = {
-      mcp: "MCP servers",
-      rsrc: "MCP resources",
-      pmpt: "MCP prompts",
-    };
-    const mcpMetrics = [
-      { value: overview.mcp_servers, label: "mcp" },
-      { value: overview.mcp_resources, label: "rsrc" },
-      { value: overview.mcp_prompts, label: "pmpt" },
-    ];
-    mcpMetrics.forEach(function (m) {
-      const el = document.createElement("span");
-      el.className = "csb-metric";
-      el.title = mcpTitles[m.label] || "";
-      if (m.label === "mcp") {
-        const dot = document.createElement("span");
-        dot.className = "csb-mcp-dot";
-        dot.setAttribute("aria-hidden", "true");
-        el.appendChild(dot);
-      }
-      const valSpan = document.createElement("span");
-      valSpan.className = "csb-metric-value";
-      valSpan.textContent = formatCount(m.value);
-      const labelSpan = document.createElement("span");
-      labelSpan.className = "csb-metric-label";
-      labelSpan.textContent = m.label;
-      el.appendChild(valSpan);
-      el.appendChild(labelSpan);
-      metricsContainer.appendChild(el);
-    });
-  }
-}
-
-// --- Node Picker ---
-//
-// Replaces the old NODES table.  The bottom status bar carries a compact
-// trigger ("N NODES · <version>", or a DRIFT badge when the cluster runs
-// mixed versions); clicking it opens a popup list of every compute node
-// with its live workstream count.  Selecting a node navigates to that
-// node's own dashboard (/node/<id>/) — the same destination the table
-// rows used to link to.
-function _nodePickerList() {
-  // Real compute nodes only — the "console" pseudo-node is a synthetic
-  // carrier for coordinators, not a node you can open.
-  const list = Object.keys(clusterState.nodes)
-    .filter(function (nid) {
-      return nid !== "console";
-    })
-    .map(function (nid) {
-      return buildNodeInfoFromSnapshot(clusterState.nodes[nid]);
-    });
-  list.sort(function (a, b) {
-    const d = b.ws_running + b.ws_attention - (a.ws_running + a.ws_attention);
-    return d !== 0 ? d : a.node_id.localeCompare(b.node_id);
-  });
-  return list;
-}
-
-function _nodeDotClass(node) {
-  if (!node.reachable) return "csb-np-dot unreachable";
-  if (node.health && node.health.status === "degraded")
-    return "csb-np-dot degraded";
-  return "csb-np-dot";
-}
-
-function renderNodePicker() {
-  if (!clusterState) return;
-  const overview = clusterState.overview || {};
-  const nodes = _nodePickerList();
-  const versions = overview.versions || [];
-  const drift = !!(overview.version_drift && versions.length > 1);
-
-  // Skip the rebuild when nothing the picker shows has changed — node
-  // count, per-node ws count/reachability/health, and the version set.
-  const sig = JSON.stringify({
-    n: nodes.map(function (x) {
-      return [x.node_id, x.ws_total, x.reachable, (x.health || {}).status];
-    }),
-    v: versions,
-    d: drift,
-  });
-  if (sig === _lastNodePickerJson) return;
-  _lastNodePickerJson = sig;
-
-  // --- Trigger ---
-  const trigger = document.getElementById("csb-np-trigger");
-  if (!trigger) return;
-  trigger.onclick = toggleNodePicker;
-  trigger.replaceChildren();
-  const caret = document.createElement("span");
-  caret.className = "csb-np-caret";
-  caret.setAttribute("aria-hidden", "true");
-  caret.textContent = "▾";
-  const countVal = document.createElement("span");
-  countVal.className = "csb-metric-value";
-  countVal.textContent = formatCount(nodes.length);
-  const countLbl = document.createElement("span");
-  countLbl.className = "csb-metric-label";
-  countLbl.textContent = nodes.length === 1 ? "node" : "nodes";
-  trigger.append(caret, countVal, countLbl);
-
-  if (drift) {
-    const driftBadge = document.createElement("span");
-    driftBadge.className = "csb-np-drift";
-    driftBadge.textContent = "DRIFT";
-    driftBadge.title = "Versions detected: " + versions.join(", ");
-    trigger.appendChild(driftBadge);
-    trigger.setAttribute(
-      "aria-label",
-      nodes.length + " nodes, version drift: " + versions.join(", "),
-    );
-  } else if (versions.length === 1) {
-    const verVal = document.createElement("span");
-    verVal.className = "csb-np-ver";
-    verVal.textContent = versions[0];
-    trigger.appendChild(verVal);
-    trigger.setAttribute(
-      "aria-label",
-      nodes.length + " nodes, version " + versions[0],
-    );
-  } else {
-    trigger.setAttribute("aria-label", nodes.length + " nodes");
-  }
-
-  // --- Menu ---
-  const menu = document.getElementById("csb-np-menu");
-  if (!menu) return;
-  menu.replaceChildren();
-  if (!nodes.length) {
-    const empty = document.createElement("div");
-    empty.className = "csb-np-empty";
-    empty.textContent = "No nodes discovered";
-    menu.appendChild(empty);
-    return;
-  }
-  nodes.forEach(function (node) {
-    // Navigation popup, not a selection control — menuitem, not option.
-    const item = document.createElement("button");
-    item.type = "button";
-    item.className = "csb-np-item";
-    item.setAttribute("role", "menuitem");
-    const dot = document.createElement("span");
-    dot.className = _nodeDotClass(node);
-    dot.setAttribute("aria-hidden", "true");
-    const name = document.createElement("span");
-    name.className = "csb-np-name";
-    name.textContent = node.node_id;
-    // Full id on hover for when the name ellipsizes.
-    name.title = node.node_id;
-    const ws = document.createElement("span");
-    ws.className = "csb-np-ws" + (node.ws_total > 0 ? " has-value" : "");
-    ws.textContent = formatCount(node.ws_total) + " ws";
-    // Status is dot colour + shape, but colour/shape alone fails for
-    // color-blind users at 7px — spell out the non-healthy states.
-    const degraded = !!(node.health && node.health.status === "degraded");
-    let stateSuffix = "";
-    if (!node.reachable) stateSuffix = " (unreachable)";
-    else if (degraded) stateSuffix = " (degraded)";
-    if (stateSuffix) {
-      const tag = document.createElement("span");
-      tag.className = "csb-np-state" + (node.reachable ? "" : " down");
-      tag.textContent = node.reachable ? "degraded" : "down";
-      item.append(dot, name, tag, ws);
-    } else {
-      item.append(dot, name, ws);
-    }
-    item.setAttribute(
-      "aria-label",
-      node.node_id + ", " + node.ws_total + " workstreams" + stateSuffix,
-    );
-    const nodeUrl = "/node/" + encodeURIComponent(node.node_id) + "/";
-    item.onclick = function () {
-      window.location.href = nodeUrl;
-    };
-    menu.appendChild(item);
-  });
-}
-
-function _closeNodePicker() {
-  const menu = document.getElementById("csb-np-menu");
-  const trigger = document.getElementById("csb-np-trigger");
-  if (menu) menu.hidden = true;
-  if (trigger) trigger.setAttribute("aria-expanded", "false");
-  document.removeEventListener("click", _onNodePickerOutside, true);
-  document.removeEventListener("keydown", _onNodePickerKeydown, true);
-}
-
-function _onNodePickerOutside(e) {
-  const wrap = document.getElementById("csb-node-picker");
-  if (wrap && !wrap.contains(e.target)) _closeNodePicker();
-}
-
-function _onNodePickerKeydown(e) {
-  if (e.key === "Escape") {
-    e.preventDefault();
-    _closeNodePicker();
-    const trigger = document.getElementById("csb-np-trigger");
-    if (trigger) trigger.focus();
-    return;
-  }
-  const menu = document.getElementById("csb-np-menu");
-  if (!menu || menu.hidden) return;
-  const items = Array.prototype.slice.call(
-    menu.querySelectorAll(".csb-np-item"),
-  );
-  if (!items.length) return;
-  const idx = items.indexOf(document.activeElement);
-  if (e.key === "ArrowDown") {
-    e.preventDefault();
-    items[idx < 0 ? 0 : Math.min(idx + 1, items.length - 1)].focus();
-  } else if (e.key === "ArrowUp") {
-    e.preventDefault();
-    items[idx <= 0 ? 0 : idx - 1].focus();
-  } else if (e.key === "Home") {
-    e.preventDefault();
-    items[0].focus();
-  } else if (e.key === "End") {
-    e.preventDefault();
-    items[items.length - 1].focus();
-  }
-}
-
-function toggleNodePicker() {
-  const menu = document.getElementById("csb-np-menu");
-  const trigger = document.getElementById("csb-np-trigger");
-  if (!menu || !trigger) return;
-  if (menu.hidden) {
-    menu.hidden = false;
-    trigger.setAttribute("aria-expanded", "true");
-    // Capture-phase listeners so a click/keypress is caught before it
-    // bubbles back up.  Registering them here (during the trigger's own
-    // bubble-phase click) means this same click won't re-trigger them.
-    document.addEventListener("click", _onNodePickerOutside, true);
-    document.addEventListener("keydown", _onNodePickerKeydown, true);
-    const first = menu.querySelector(".csb-np-item");
-    if (first) first.focus();
-    else trigger.focus();
-  } else {
-    _closeNodePicker();
-  }
 }
 
 // --- Drill-down: Filtered ---
@@ -2032,6 +1727,26 @@ function _ensureSSE() {
 // still starts the Tier-1 stream on both fresh login and refresh-with-cookie,
 // so that path is unchanged.
 window.TS_APP = window.TS_APP || {};
+// --- Rail seam (Tier-1) ---
+// The shell's rail.js reads cluster state + nav actions through this surface and
+// re-renders whenever renderFromState fires onRender.  app.js keeps owning
+// clusterState (no physical extraction); these closures see the live binding.
+window.TS_APP._renderSubs = window.TS_APP._renderSubs || [];
+window.TS_APP.getClusterState = function () {
+  return clusterState;
+};
+window.TS_APP.onRender = function (cb) {
+  window.TS_APP._renderSubs.push(cb);
+};
+window.TS_APP.drillDownByState = function (s) {
+  drillDownByState(s);
+};
+window.TS_APP.bucketByParent = function (list) {
+  return _bucketByParent(list);
+};
+window.TS_APP.buildNodeInfo = function (node) {
+  return buildNodeInfoFromSnapshot(node);
+};
 window.TS_APP.boot = function () {
   history.replaceState({ view: "home" }, "");
   initLogin();
@@ -2040,10 +1755,6 @@ window.TS_APP.boot = function () {
   // pipeline (#9); the console pseudo-node carries coordinator
   // ws_created / ws_closed / cluster_state events.
   loadOverview();
-  (function () {
-    const npTrigger = document.getElementById("csb-np-trigger");
-    if (npTrigger) npTrigger.onclick = toggleNodePicker;
-  })();
   _ensureHomeComposerInit();
   // Refresh the coord button visibility once auth.js has populated
   // sessionStorage from the initial whoami.  window.permissionsReady

@@ -26,7 +26,8 @@ _PANE_JS = _SHARED / "pane.js"
 _CONSOLE_INDEX = _ROOT / "turnstone/console/static/index.html"
 _CONSOLE_APP = _ROOT / "turnstone/console/static/app.js"
 
-_ESM_BUNDLES = [_SHELL_JS, _PANE_JS]
+_RAIL_JS = _SHARED / "rail.js"
+_ESM_BUNDLES = [_SHELL_JS, _PANE_JS, _RAIL_JS]
 
 # The same unsafe DOM-write / dynamic-code sink set that ``test_app_js.py``
 # pins for the classic bundles — kept local so the two test files stay
@@ -101,9 +102,8 @@ def test_shell_drives_legacy_boot_and_registers_dashboard() -> None:
     assert 'getElementById("status-bar")' in body, (
         "shell must relocate the connectSSE status target"
     )
-    assert 'getElementById("cluster-status-bar")' in body, (
-        "shell must handle the legacy cluster bar"
-    )
+    assert 'from "./rail.js"' in body, "shell must import the rail module"
+    assert "mountRail(" in body, "shell must mount the live rail (Cluster + Workspaces)"
 
 
 def test_console_index_loads_shell_module_and_caps() -> None:
@@ -126,3 +126,27 @@ def test_console_app_exposes_boot_for_shell() -> None:
         "app.js must expose TS_APP.boot for the shell to drive"
     )
     assert "window.onLoginSuccess" in body, "the SSE-start hook must remain intact"
+
+
+def test_rail_seam_exposed_and_bottom_bar_retired() -> None:
+    """Step 2: app.js exposes the Tier-1 rail seam (getClusterState + onRender,
+    fired from renderFromState), and the legacy bottom #cluster-status-bar + its
+    renderers are GONE (the rail replaces it — single writer per region)."""
+    app = _CONSOLE_APP.read_text(encoding="utf-8")
+    assert "window.TS_APP.getClusterState" in app, "app.js must expose getClusterState for the rail"
+    assert "window.TS_APP.onRender" in app, "app.js must expose the onRender subscribe hook"
+    assert "_fireRenderSubs()" in app, "renderFromState must fire rail subscribers"
+    for gone in ("renderStatusBar", "renderNodePicker", "cluster-status-bar", "csb-"):
+        assert gone not in app, f"retired bottom-bar symbol {gone!r} must be gone from app.js"
+    index = _CONSOLE_INDEX.read_text(encoding="utf-8")
+    assert "cluster-status-bar" not in index, "the #cluster-status-bar markup must be deleted"
+
+
+def test_rail_conveys_state_and_persona() -> None:
+    """rail.js conveys state by shape+colour via the shared ui-base .ui-glyph-*
+    vocabulary (not a private glyph class), nests children via the shared bucket
+    helper, and tags sessions by persona (COORD/INT)."""
+    body = _RAIL_JS.read_text(encoding="utf-8")
+    assert "ui-glyph-" in body, "rail must use ui-base .ui-glyph-* for state (shape+colour)"
+    assert "bucketByParent" in body, "rail must nest children via the shared bucket helper"
+    assert "COORD" in body and "INT" in body, "rail must tag sessions by persona"
