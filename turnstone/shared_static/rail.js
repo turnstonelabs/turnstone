@@ -281,33 +281,44 @@ export function mountRail(sections, caps) {
  * House style: programmatic DOM, NO innerHTML; reuses the mock's
  * `.grp`/`.grp-head`/`.grp-items` vocabulary (shell.css).
  */
-export function mountManage(root) {
+export function mountManage(root, paneManager) {
   if (!root) return;
   const TS = window.TS_ADMIN || {};
   const ia = TS.ia || [];
   const allowed = TS.isTabAllowed || (() => true);
   root.replaceChildren();
 
+  // If the Admin pane is already open (e.g. restored by PaneManager.rehydrate),
+  // seed the rail to its current tab + expand the owning group; otherwise the
+  // first group expands (mock) and nothing is marked until the user clicks.
+  const adminOpen =
+    paneManager && paneManager.hasPane && paneManager.hasPane("admin");
+  const activeTab = adminOpen && TS.getActiveTab ? TS.getActiveTab() : null;
+
   const rowByTab = new Map(); // tab -> its row <button>, for active-state sync
 
   ia.forEach((group, gi) => {
     const tabs = group.tabs.filter((t) => allowed(t.tab));
-    if (!tabs.length) return; // every tab in the group is gated away → drop it
+    if (!tabs.length) return; // every tab in the group is gated away, drop it
+
+    const expanded = activeTab
+      ? group.tabs.some((t) => t.tab === activeTab) // group owning the active tab
+      : gi === 0; // default: first group open (mock)
 
     const grp = document.createElement("div");
     grp.className = "grp";
-    if (gi === 0) grp.classList.add("open"); // first group expanded (mock)
+    if (expanded) grp.classList.add("open");
 
     const itemsId = "manage-grp-" + group.group.toLowerCase();
     const head = document.createElement("button");
     head.type = "button";
     head.className = "grp-head";
-    head.setAttribute("aria-expanded", gi === 0 ? "true" : "false");
+    head.setAttribute("aria-expanded", expanded ? "true" : "false");
     head.setAttribute("aria-controls", itemsId);
     const chev = document.createElement("span");
     chev.className = "chev";
     chev.setAttribute("aria-hidden", "true");
-    chev.textContent = gi === 0 ? "▾" : "▸";
+    chev.textContent = expanded ? "▾" : "▸";
     const name = document.createElement("span");
     name.className = "gname";
     name.textContent = group.group;
@@ -346,10 +357,11 @@ export function mountManage(root) {
   });
 
   // Single writer for the Manage active-row: the row for the current admin tab
-  // carries `.active`.  admin.js notifies on every switchAdminTab; nothing is
-  // marked until the user actually navigates the admin pane.
+  // carries `.active`.  admin.js notifies on every switchAdminTab; seed it here
+  // for an already-open (restored) Admin pane.
   function markActive(tab) {
     for (const [t, row] of rowByTab) row.classList.toggle("active", t === tab);
   }
+  if (activeTab) markActive(activeTab);
   if (TS.onTabChange) TS.onTabChange(markActive);
 }

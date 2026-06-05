@@ -188,7 +188,8 @@ function mountShell() {
 
   // Manage section — the admin IA as collapsible discovery groups; a row click
   // routes through the TS_ADMIN seam (opens/focuses the singleton Admin pane).
-  mountManage(shell.manageSec);
+  // `pm` lets the rail seed its active marker when a restored Admin pane is open.
+  mountManage(shell.manageSec, pm);
 
   // Hand off to the legacy boot (login + Tier-1 stream) now that the shell and
   // its status DOM exist.

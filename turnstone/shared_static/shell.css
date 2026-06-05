@@ -605,6 +605,7 @@
   white-space: nowrap;
 }
 .grp-head .gcount {
+  margin-left: auto;
   color: var(--ink-4);
   font-size: 11px;
   font-variant-numeric: tabular-nums;
@@ -624,7 +625,8 @@
    the Admin pane is showing; distinct from the amber `.open` of live sessions) */
 .grp-items .row.active {
   color: var(--ink);
-  background: color-mix(in srgb, var(--accent) 8%, var(--panel-2));
+  background: var(--panel-2);
+  box-shadow: inset 2px 0 0 var(--hair-2);
 }
 
 /* ===== Admin pane — adopts #view-admin (the 18 tabpanels).  The in-pane
@@ -635,4 +637,6 @@
   min-height: 0;
   display: flex;
   flex-direction: column;
+  /* inset off the tab-bar hairline + rail edge; .admin-content keeps its right pad */
+  padding: 16px 0 0 16px;
 }
