@@ -25,6 +25,7 @@ _SHELL_JS = _SHARED / "shell.js"
 _PANE_JS = _SHARED / "pane.js"
 _CONSOLE_INDEX = _ROOT / "turnstone/console/static/index.html"
 _CONSOLE_APP = _ROOT / "turnstone/console/static/app.js"
+_CONSOLE_ADMIN = _ROOT / "turnstone/console/static/admin.js"
 
 _RAIL_JS = _SHARED / "rail.js"
 _ESM_BUNDLES = [_SHELL_JS, _PANE_JS, _RAIL_JS]
@@ -178,3 +179,43 @@ def test_console_launcher_routes_by_persona() -> None:
         "the active-coordinators table must be removed (the rail covers it)"
     )
     assert 'id="launcher-personas"' in index, "the persona toggle must be in the launcher panel"
+
+
+def test_step3_admin_pane_registered_and_manage_mounted() -> None:
+    """Step 3: the shell registers the singleton Admin pane (which adopts
+    #view-admin) and mounts the rail's Manage groups from the admin IA seam."""
+    body = _SHELL_JS.read_text(encoding="utf-8")
+    assert 'registerType("admin"' in body, "shell must register the admin pane type"
+    assert 'getElementById("view-admin")' in body, "the admin pane must adopt #view-admin"
+    assert "mountManage(" in body, "shell must mount the rail Manage groups"
+    assert "mountManage" in body and 'from "./rail.js"' in body, (
+        "shell must import mountManage from rail.js"
+    )
+
+
+def test_step3_rail_manage_builds_from_admin_seam() -> None:
+    """rail.js builds the Manage groups from the TS_ADMIN seam — perm-filtered,
+    collapsible .grp vocabulary, programmatic DOM — and routes a row click
+    through the seam's openTab rather than reaching into admin DOM."""
+    body = _RAIL_JS.read_text(encoding="utf-8")
+    assert "export function mountManage" in body, "rail must export mountManage"
+    assert "window.TS_ADMIN" in body, "Manage must read the admin IA seam"
+    assert "isTabAllowed" in body, "Manage must permission-filter its tabs"
+    assert "openTab" in body, "a Manage row click must route through the seam's openTab"
+    assert '"grp"' in body and '"grp-items"' in body, "Manage reuses the .grp vocabulary"
+    # collapse + active state ride a class + aria, never colour alone
+    assert "aria-expanded" in body, "collapsible group heads must expose aria-expanded"
+
+
+def test_step3_admin_seam_and_thin_show_admin() -> None:
+    """admin.js exposes the TS_ADMIN seam (IA + shared perm gate + active-tab +
+    openTab) and showAdmin is now a thin delegator that opens the singleton
+    Admin pane — the legacy in-#main view toggle + history push are gone."""
+    body = _CONSOLE_ADMIN.read_text(encoding="utf-8")
+    assert "const ADMIN_IA = [" in body, "admin must define the IA data"
+    assert "window.TS_ADMIN.ia = ADMIN_IA" in body, "admin must expose the IA seam"
+    assert "window.TS_ADMIN.isTabAllowed" in body and "window.TS_ADMIN.openTab" in body
+    assert "function adminTabAllowed(tab)" in body, "the shared permission gate must exist"
+    assert 'pm.openPane("admin")' in body, "showAdmin must open the singleton Admin pane"
+    for gone in ('currentView = "admin"', 'history.pushState({ view: "admin" }'):
+        assert gone not in body, f"legacy admin view-model bit {gone!r} must be gone"

@@ -20,7 +20,7 @@
    ========================================================================== */
 
 import { PaneManager, ShellPane } from "./pane.js";
-import { mountRail } from "./rail.js";
+import { mountRail, mountManage } from "./rail.js";
 
 function make(tag, className, text) {
   const node = document.createElement(tag);
@@ -56,7 +56,7 @@ function buildShell(caps) {
   scroll.append(connSlot);
   // IA sections — each a label + a render target.  Cluster is capability-gated
   // (hidden on a single-node standalone deployment); rail.js fills Cluster +
-  // Workspaces from Tier-1.  Manage stays a stub label until step 3.
+  // Workspaces from Tier-1 and the Manage groups from the admin IA (step 3).
   function section(title) {
     scroll.append(make("div", "sec-label", title));
     const body = make("div", "rail-section");
@@ -65,7 +65,7 @@ function buildShell(caps) {
   }
   const clusterSec = caps.cluster ? section("Cluster") : null;
   const workspacesSec = section("Workspaces");
-  scroll.append(make("div", "sec-label", "Manage"));
+  const manageSec = section("Manage");
   rail.append(scroll);
 
   const foot = make("div", "rail-foot");
@@ -91,6 +91,7 @@ function buildShell(caps) {
     panes,
     clusterSec,
     workspacesSec,
+    manageSec,
   };
 }
 
@@ -102,6 +103,7 @@ function mountShell() {
   const statusBarEl = document.getElementById("status-bar");
   const breadcrumbEl = document.getElementById("breadcrumb");
   const mainEl = document.getElementById("main");
+  const viewAdminEl = document.getElementById("view-admin");
 
   const shell = buildShell(caps);
   // Insert the shell as the first body child so it owns the viewport; portals
@@ -153,6 +155,21 @@ function mountShell() {
     return pane;
   });
 
+  // Admin pane (step 3): a singleton that ADOPTS #view-admin (the 18 admin
+  // tabpanels).  The rail's Manage groups are its navigation — the in-pane
+  // sidebar is retired.  Lazy-mounts on first openPane('admin'); by then the
+  // dashboard pane already hosts #main, so #view-admin moves out of it here.
+  pm.registerType("admin", () => {
+    const pane = new ShellPane({ type: "admin", title: "Admin", glyph: "⚙" });
+    pane.onMount = function () {
+      if (viewAdminEl) {
+        viewAdminEl.style.display = ""; // clear the inline display:none guard
+        this.bodyEl.append(viewAdminEl);
+      }
+    };
+    return pane;
+  });
+
   // Restore the persisted working set, else open the default Dashboard pane.
   if (!pm.rehydrate()) pm.openPane("dashboard");
 
@@ -168,6 +185,10 @@ function mountShell() {
     },
     caps,
   );
+
+  // Manage section — the admin IA as collapsible discovery groups; a row click
+  // routes through the TS_ADMIN seam (opens/focuses the singleton Admin pane).
+  mountManage(shell.manageSec);
 
   // Hand off to the legacy boot (login + Tier-1 stream) now that the shell and
   // its status DOM exist.

@@ -32,152 +32,156 @@ const ALIAS_SETTING_KEYS = [
 const INHERIT_EMPTY_LABEL_KEYS = ["model.task_effort"];
 
 // ---------------------------------------------------------------------------
-// View switching (called from app.js showHome/drillDown pattern)
+// Admin information architecture — the single source of truth for the rail's
+// Manage groups (rail.js builds from this) AND in-pane tab activation.  Each
+// tab carries the permission scope that gates it, so the rail can filter
+// without reaching into admin internals.  `perm: null` = ungated (always
+// shown — mirrors the legacy gate, which left node-metadata uncovered).
+// ---------------------------------------------------------------------------
+const ADMIN_IA = [
+  {
+    group: "Identity",
+    tabs: [
+      { tab: "users", label: "Users", perm: "admin.users" },
+      { tab: "tokens", label: "API Tokens", perm: "admin.users" },
+      { tab: "channels", label: "Channels", perm: "admin.users" },
+    ],
+  },
+  {
+    group: "Automation",
+    tabs: [
+      { tab: "schedules", label: "Schedules", perm: "admin.schedules" },
+      { tab: "watches", label: "Watches", perm: "admin.watches" },
+    ],
+  },
+  {
+    group: "Governance",
+    tabs: [
+      { tab: "roles", label: "Roles", perm: "admin.roles" },
+      { tab: "policies", label: "Policies", perm: "admin.policies" },
+      {
+        tab: "prompt-policies",
+        label: "Prompts",
+        perm: "admin.prompt_policies",
+      },
+      { tab: "judge", label: "Judge", perm: "admin.judge" },
+    ],
+  },
+  {
+    group: "Extensions",
+    tabs: [
+      { tab: "skills", label: "Skills", perm: "admin.skills" },
+      { tab: "mcp", label: "MCP Servers", perm: "admin.mcp" },
+    ],
+  },
+  {
+    group: "Observe",
+    tabs: [
+      { tab: "usage", label: "Usage", perm: "admin.usage" },
+      { tab: "audit", label: "Audit", perm: "admin.audit" },
+      { tab: "memories", label: "Memories", perm: "admin.memories" },
+    ],
+  },
+  {
+    group: "System",
+    tabs: [
+      { tab: "models", label: "Models", perm: "admin.models" },
+      { tab: "node-metadata", label: "Nodes", perm: null },
+      { tab: "settings", label: "Settings", perm: "admin.settings" },
+      { tab: "tls", label: "TLS", perm: "admin.settings" },
+    ],
+  },
+];
+
+function _adminTabMeta(tab) {
+  for (const grp of ADMIN_IA) {
+    for (const t of grp.tabs) if (t.tab === tab) return t;
+  }
+  return null;
+}
+
+// Mirror the legacy showAdmin gate exactly: only gate when a permission string
+// is present (unknown perms → show everything); ungated tabs (perm: null) and
+// tabs whose scope the user holds are allowed.
+function adminTabAllowed(tab) {
+  const raw = sessionStorage.getItem("turnstone_permissions");
+  if (!raw) return true;
+  const meta = _adminTabMeta(tab);
+  const needed = meta && meta.perm;
+  if (!needed) return true;
+  return raw.split(",").indexOf(needed) >= 0;
+}
+
+function _firstAllowedAdminTab() {
+  for (const grp of ADMIN_IA) {
+    for (const t of grp.tabs) if (adminTabAllowed(t.tab)) return t.tab;
+  }
+  return null;
+}
+
+// No-permissions empty state in the admin content host (ported from the legacy
+// sidebar gate — still reachable when a user holds no admin scope at all).
+function _showAdminNoPermissions() {
+  const panels = document.querySelectorAll(".admin-panel");
+  for (let j = 0; j < panels.length; j++) panels[j].style.display = "none";
+  let empty = document.getElementById("admin-no-permissions");
+  if (!empty) {
+    empty = document.createElement("div");
+    empty.id = "admin-no-permissions";
+    empty.className = "dashboard-empty";
+    empty.textContent = "You do not have permissions to view any admin tabs.";
+    const content = document.getElementById("admin-content");
+    if (content) content.appendChild(empty);
+  }
+  empty.style.display = "";
+}
+
+// The rail's Manage groups subscribe here to mirror the active admin tab.
+const _adminTabSubs = [];
+function _notifyAdminTab(tab) {
+  for (const cb of _adminTabSubs) {
+    try {
+      cb(tab);
+    } catch (e) {
+      /* a faulty subscriber must not break tab switching */
+    }
+  }
+}
+
+// Seam consumed by rail.js (the Manage section): the admin IA, its permission
+// gate, the active-tab subscription, the current tab, and the open-on-tab entry
+// point (a row click opens/focuses the Admin pane on that tab).
+window.TS_ADMIN = window.TS_ADMIN || {};
+window.TS_ADMIN.ia = ADMIN_IA;
+window.TS_ADMIN.isTabAllowed = adminTabAllowed;
+window.TS_ADMIN.onTabChange = function (cb) {
+  if (typeof cb === "function") _adminTabSubs.push(cb);
+};
+window.TS_ADMIN.getActiveTab = function () {
+  return _adminTab;
+};
+window.TS_ADMIN.openTab = function (tab) {
+  showAdmin(tab);
+};
+
+// ---------------------------------------------------------------------------
+// View switching (called from app.js showHome/drillDown pattern + the rail)
 // ---------------------------------------------------------------------------
 
-function showAdmin() {
-  /* global currentView, showHome */
-  // Toggle: if already in admin view, go back to the home landing
-  if (currentView === "admin") {
-    const adminBtn = document.getElementById("admin-btn");
-    if (adminBtn) {
-      adminBtn.classList.remove("active");
-      adminBtn.setAttribute("aria-expanded", "false");
-    }
-    showHome();
-    return;
-  }
+function showAdmin(tab) {
+  // The admin surface is a singleton pane now — the L-shell PaneManager owns
+  // show/hide and the rail's Manage groups are its navigation.  Open/focus the
+  // pane (its onMount adopts #view-admin), then activate a tab the user may see.
+  const pm = window.TS_SHELL && window.TS_SHELL.panes;
+  if (pm && pm.hasType("admin")) pm.openPane("admin");
 
-  currentView = "admin";
-  const homeView = document.getElementById("view-home");
-  if (homeView) homeView.style.display = "none";
-  document.getElementById("view-filtered").style.display = "none";
-  document.getElementById("view-admin").style.display = "";
-  document.getElementById("breadcrumb").style.display = "";
-  document.getElementById("breadcrumb-label").textContent = "Admin";
-  document.getElementById("main").scrollTop = 0;
-
-  // Highlight admin button as active
-  const adminBtn = document.getElementById("admin-btn");
-  if (adminBtn) {
-    adminBtn.classList.add("active");
-    adminBtn.setAttribute("aria-expanded", "true");
-  }
-  history.pushState({ view: "admin" }, "");
-
-  // Permission gating: hide nav items the user cannot access
-  const perms = sessionStorage.getItem("turnstone_permissions") || "";
-  const tabPerms = {
-    users: "admin.users",
-    tokens: "admin.users",
-    channels: "admin.users",
-    schedules: "admin.schedules",
-    watches: "admin.watches",
-    roles: "admin.roles",
-    policies: "admin.policies",
-    "prompt-policies": "admin.prompt_policies",
-    judge: "admin.judge",
-    skills: "admin.skills",
-    usage: "admin.usage",
-    audit: "admin.audit",
-    memories: "admin.memories",
-    settings: "admin.settings",
-    tls: "admin.settings",
-    mcp: "admin.mcp",
-    models: "admin.models",
-  };
-  if (perms) {
-    const permSet = perms.split(",");
-    const navItems = document.querySelectorAll(".admin-nav");
-    for (let i = 0; i < navItems.length; i++) {
-      const tabName = navItems[i].getAttribute("data-tab");
-      const needed = tabPerms[tabName];
-      if (needed && permSet.indexOf(needed) < 0) {
-        navItems[i].style.display = "none";
-      } else {
-        navItems[i].style.display = "";
-      }
-    }
-  }
-
-  // Hide groups where all children are permission-hidden
-  const groups = document.querySelectorAll(".admin-sidebar-group");
-  for (let g = 0; g < groups.length; g++) {
-    const visibleInGroup = groups[g].querySelectorAll(
-      '.admin-nav:not([style*="display: none"])',
-    );
-    groups[g].style.display = visibleInGroup.length > 0 ? "" : "none";
-  }
-
-  // Mobile: ensure sidebar starts hidden + inert; desktop: ensure it's accessible
-  const sidebar = document.getElementById("admin-sidebar");
-
-  // Inject close header for mobile drawer (once)
-  if (!document.getElementById("admin-sidebar-close")) {
-    const closeHeader = document.createElement("div");
-    closeHeader.id = "admin-sidebar-close";
-    closeHeader.className = "admin-sidebar-close";
-    const label = document.createElement("span");
-    label.textContent = "Navigation";
-    const closeBtn = document.createElement("button");
-    closeBtn.setAttribute("aria-label", "Close navigation");
-    closeBtn.textContent = "\u00d7";
-    closeBtn.addEventListener("click", function () {
-      if (_mobileSidebarOpen) {
-        _toggleMobileSidebar();
-        const mt = document.getElementById("admin-mobile-toggle");
-        if (mt) mt.focus();
-      }
-    });
-    closeHeader.appendChild(label);
-    closeHeader.appendChild(closeBtn);
-    sidebar.insertBefore(closeHeader, sidebar.firstChild);
-  }
-
-  if (window.innerWidth <= 700) {
-    _mobileSidebarOpen = false;
-    sidebar.classList.add("collapsed");
-    sidebar.classList.remove("open");
-    sidebar.setAttribute("aria-hidden", "true");
-    sidebar.setAttribute("inert", "");
-  } else {
-    sidebar.removeAttribute("aria-hidden");
-    sidebar.removeAttribute("inert");
-  }
-
-  // Mobile backdrop listener (idempotent)
-  const backdrop = document.getElementById("admin-sidebar-backdrop");
-  if (backdrop && !backdrop._listenerAttached) {
-    backdrop.addEventListener("click", function () {
-      if (_mobileSidebarOpen) {
-        _toggleMobileSidebar();
-        const mt = document.getElementById("admin-mobile-toggle");
-        if (mt) mt.focus();
-      }
-    });
-    backdrop._listenerAttached = true;
-  }
-
-  // Switch to the first visible nav item
-  const visibleNavs = document.querySelectorAll(
-    '.admin-nav:not([style*="display: none"])',
-  );
-  if (visibleNavs.length > 0) {
-    switchAdminTab(visibleNavs[0].getAttribute("data-tab"));
-  } else {
-    // No tabs visible — show empty state
-    const panels = document.querySelectorAll(".admin-panel");
-    for (let j = 0; j < panels.length; j++) panels[j].style.display = "none";
-    let empty = document.getElementById("admin-no-permissions");
-    if (!empty) {
-      empty = document.createElement("div");
-      empty.id = "admin-no-permissions";
-      empty.className = "dashboard-empty";
-      empty.textContent = "You do not have permissions to view any admin tabs.";
-      document.getElementById("admin-content").appendChild(empty);
-    }
-    empty.style.display = "";
-  }
+  const target =
+    tab ||
+    (_adminTab && adminTabAllowed(_adminTab)
+      ? _adminTab
+      : _firstAllowedAdminTab());
+  if (target) switchAdminTab(target);
+  else _showAdminNoPermissions();
 }
 
 function _injectMobileToggle(tab) {
@@ -297,22 +301,9 @@ function switchAdminTab(tab) {
   const bcLabel = document.getElementById("breadcrumb-label");
   if (bcLabel) bcLabel.textContent = "Admin / " + label;
 
-  // Inject mobile hamburger toggle into active panel's toolbar
-  _injectMobileToggle(tab);
-
-  // On mobile, auto-close sidebar after tab selection
-  if (window.innerWidth <= 700 && _mobileSidebarOpen) {
-    _toggleMobileSidebar();
-    // Move focus to the newly active panel instead of leaving it in the inert sidebar
-    const panel = document.getElementById("admin-" + tab);
-    const focusTarget =
-      panel &&
-      panel.querySelector("h2, .section-header, button:not([disabled])");
-    if (focusTarget) {
-      focusTarget.setAttribute("tabindex", "-1");
-      focusTarget.focus();
-    }
-  }
+  // Mirror the active tab into the rail's Manage groups (the in-pane sidebar
+  // that used to carry the active state is retired — the rail navigates now).
+  _notifyAdminTab(tab);
 }
 
 // ---------------------------------------------------------------------------

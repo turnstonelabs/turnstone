@@ -427,8 +427,10 @@ function showHome() {
   currentView = "home";
   currentFilter = { state: null, node: null, page: 1, per_page: 50 };
   _setLandingView("home");
-  const adminView = document.getElementById("view-admin");
-  if (adminView) adminView.style.display = "none";
+  // #view-admin is its own pane now; re-focus the Dashboard pane (home/filtered
+  // sub-views live inside it) instead of toggling the old in-#main admin view.
+  const pm = window.TS_SHELL && window.TS_SHELL.panes;
+  if (pm) pm.openPane("dashboard");
   const adminBtn = document.getElementById("admin-btn");
   if (adminBtn) {
     adminBtn.classList.remove("active");
@@ -472,8 +474,10 @@ function drillDownByState(state) {
   currentView = "filtered";
   currentFilter = { state: state, node: null, page: 1, per_page: 50 };
   _setLandingView("filtered");
-  const adminView = document.getElementById("view-admin");
-  if (adminView) adminView.style.display = "none";
+  // #view-admin is its own pane now; re-focus the Dashboard pane (home/filtered
+  // sub-views live inside it) instead of toggling the old in-#main admin view.
+  const pm = window.TS_SHELL && window.TS_SHELL.panes;
+  if (pm) pm.openPane("dashboard");
   const adminBtn = document.getElementById("admin-btn");
   if (adminBtn) {
     adminBtn.classList.remove("active");
@@ -497,8 +501,10 @@ function drillDownByNode(nodeId) {
   currentView = "filtered";
   currentFilter = { state: null, node: nodeId, page: 1, per_page: 50 };
   _setLandingView("filtered");
-  const adminView = document.getElementById("view-admin");
-  if (adminView) adminView.style.display = "none";
+  // #view-admin is its own pane now; re-focus the Dashboard pane (home/filtered
+  // sub-views live inside it) instead of toggling the old in-#main admin view.
+  const pm = window.TS_SHELL && window.TS_SHELL.panes;
+  if (pm) pm.openPane("dashboard");
   const adminBtn = document.getElementById("admin-btn");
   if (adminBtn) {
     adminBtn.classList.remove("active");

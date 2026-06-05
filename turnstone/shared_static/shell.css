@@ -560,8 +560,83 @@
 .cpill:focus-visible,
 .node-row:focus-visible,
 .row:focus-visible,
+.grp-head:focus-visible,
 .persona-btn:focus-visible {
   outline: 2px solid var(--accent);
   outline-offset: -2px;
   border-radius: var(--r-sm);
+}
+
+/* ===== Rail Manage section — the admin IA as collapsible discovery groups
+   (rail.js mountManage).  Reuses the mock's .grp / .grp-head / .grp-items
+   vocabulary; heads + rows are <button>s so they're keyboard-operable, and
+   collapse state rides the chevron + aria-expanded (no colour-only cue). ===== */
+.grp {
+  margin-top: 1px;
+}
+.grp-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 9px;
+  border-radius: var(--r-sm);
+  cursor: pointer;
+  color: var(--ink-3);
+  font-size: 13px;
+  width: 100%;
+  background: none;
+  border: 0;
+  text-align: left;
+  font-family: var(--font-ui);
+}
+.grp-head:hover {
+  background: var(--panel-2);
+}
+.grp-head .chev {
+  width: 12px;
+  color: var(--ink-4);
+  font-size: 10px;
+  flex: none;
+}
+.grp-head .gname {
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.grp-head .gcount {
+  color: var(--ink-4);
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+}
+.grp:not(.open) .grp-items {
+  display: none;
+}
+.grp-items {
+  padding-left: 20px;
+}
+.grp-items .row {
+  color: var(--ink-3);
+  font-size: 12.5px;
+  padding: 5px 9px;
+}
+/* the current admin tab — a subtle single marker (the rail mirrors which tab
+   the Admin pane is showing; distinct from the amber `.open` of live sessions) */
+.grp-items .row.active {
+  color: var(--ink);
+  background: color-mix(in srgb, var(--accent) 8%, var(--panel-2));
+}
+
+/* ===== Admin pane — adopts #view-admin (the 18 tabpanels).  The in-pane
+   sidebar + its mobile backdrop are retired (the rail's Manage groups are the
+   navigation now), so #view-admin fills the pane body and content is full-width. */
+.pane-body > #view-admin {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+.pane-body .admin-sidebar,
+.pane-body .admin-sidebar-backdrop {
+  display: none;
 }

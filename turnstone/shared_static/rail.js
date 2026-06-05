@@ -267,3 +267,89 @@ export function mountRail(sections, caps) {
   if (TS.onRender) TS.onRender(render);
   render(); // initial paint (empty until the first snapshot arrives)
 }
+
+// ---- Manage section (admin IA → collapsible discovery groups) --------------
+
+/**
+ * Build the rail's Manage groups from the admin IA seam (admin.js exposes
+ * `window.TS_ADMIN`).  Each group is a collapsible `.grp` whose head toggles
+ * its `.grp-items`; items are the admin tabs the user is permitted to see.  A
+ * row click opens/focuses the singleton Admin pane on that tab via the seam's
+ * `openTab`.  The IA is static, so this builds once; only the active-row marker
+ * re-renders, driven by the admin tab-change subscription (single writer).
+ *
+ * House style: programmatic DOM, NO innerHTML; reuses the mock's
+ * `.grp`/`.grp-head`/`.grp-items` vocabulary (shell.css).
+ */
+export function mountManage(root) {
+  if (!root) return;
+  const TS = window.TS_ADMIN || {};
+  const ia = TS.ia || [];
+  const allowed = TS.isTabAllowed || (() => true);
+  root.replaceChildren();
+
+  const rowByTab = new Map(); // tab -> its row <button>, for active-state sync
+
+  ia.forEach((group, gi) => {
+    const tabs = group.tabs.filter((t) => allowed(t.tab));
+    if (!tabs.length) return; // every tab in the group is gated away → drop it
+
+    const grp = document.createElement("div");
+    grp.className = "grp";
+    if (gi === 0) grp.classList.add("open"); // first group expanded (mock)
+
+    const itemsId = "manage-grp-" + group.group.toLowerCase();
+    const head = document.createElement("button");
+    head.type = "button";
+    head.className = "grp-head";
+    head.setAttribute("aria-expanded", gi === 0 ? "true" : "false");
+    head.setAttribute("aria-controls", itemsId);
+    const chev = document.createElement("span");
+    chev.className = "chev";
+    chev.setAttribute("aria-hidden", "true");
+    chev.textContent = gi === 0 ? "▾" : "▸";
+    const name = document.createElement("span");
+    name.className = "gname";
+    name.textContent = group.group;
+    const count = document.createElement("span");
+    count.className = "gcount";
+    count.textContent = String(tabs.length);
+    head.append(chev, name, count);
+
+    const items = document.createElement("div");
+    items.className = "grp-items";
+    items.id = itemsId;
+    for (const t of tabs) {
+      const row = document.createElement("button");
+      row.type = "button";
+      row.className = "row";
+      row.dataset.tab = t.tab;
+      const nm = document.createElement("span");
+      nm.className = "nm";
+      nm.textContent = t.label;
+      row.append(nm);
+      row.addEventListener("click", () => {
+        if (TS.openTab) TS.openTab(t.tab);
+      });
+      rowByTab.set(t.tab, row);
+      items.append(row);
+    }
+
+    head.addEventListener("click", () => {
+      const open = grp.classList.toggle("open");
+      head.setAttribute("aria-expanded", open ? "true" : "false");
+      chev.textContent = open ? "▾" : "▸";
+    });
+
+    grp.append(head, items);
+    root.append(grp);
+  });
+
+  // Single writer for the Manage active-row: the row for the current admin tab
+  // carries `.active`.  admin.js notifies on every switchAdminTab; nothing is
+  // marked until the user actually navigates the admin pane.
+  function markActive(tab) {
+    for (const [t, row] of rowByTab) row.classList.toggle("active", t === tab);
+  }
+  if (TS.onTabChange) TS.onTabChange(markActive);
+}
