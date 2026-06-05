@@ -232,3 +232,7 @@ def test_step3_admin_seam_and_thin_show_admin() -> None:
         "the in-pane admin sidebar markup must be deleted — the rail Manage groups navigate"
     )
     assert 'id="admin-content"' in index, "the admin content host must remain (the pane adopts it)"
+    assert 'aria-labelledby="tab-' not in index, (
+        "the adopted admin panels' dangling tab-* aria-labelledby (pointing at the deleted "
+        "sidebar buttons) must be stripped"
+    )

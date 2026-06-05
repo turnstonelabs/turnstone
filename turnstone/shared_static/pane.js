@@ -88,6 +88,12 @@ export class PaneManager {
     return this._types.has(type);
   }
 
+  /** Is a pane currently open (mounted)?  Omit id for a singleton (keyed by type). */
+  hasPane(type, id) {
+    const paneId = id == null ? type : type + ":" + id;
+    return this._panes.has(paneId);
+  }
+
   /** Create the pane if absent, then focus it.  Auth/cap gating is the caller's. */
   openPane(type, id) {
     if (!this._types.has(type)) {
