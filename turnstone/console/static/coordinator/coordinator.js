@@ -58,6 +58,7 @@ function buildCoordChrome(root, opts) {
     el("button", {
       id: "coord-close-btn",
       class: "btn",
+      "aria-label": "End coordinator session",
       title: "End this coordinator session (terminates it on the server)",
       text: "end",
     }),
@@ -2243,7 +2244,10 @@ function createCoordinatorPane(root, wsId, opts) {
       resumeSse();
       return;
     }
-    window.location.href = "/";
+    // Pane-hosted (console): close the tab + tear the controller down via the
+    // PaneManager.  The standalone page passes no onClose → console redirect.
+    if (opts && opts.onClose) opts.onClose();
+    else window.location.href = "/";
   }
 
   // ------------------------------------------------------------------
