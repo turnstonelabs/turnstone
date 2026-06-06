@@ -16,6 +16,10 @@ from pathlib import Path
 import pytest
 
 _APP_JS = Path(__file__).resolve().parent.parent / "turnstone/ui/static/app.js"
+_INTERACTIVE_JS = (
+    Path(__file__).resolve().parent.parent
+    / "turnstone/shared_static/interactive.js"
+)
 
 
 def _pane_method_offset(body: str, name: str) -> int:
@@ -30,7 +34,7 @@ def _pane_method_offset(body: str, name: str) -> int:
     """
     pattern = re.compile(r"^\s{2,}" + re.escape(name) + r"\(", re.MULTILINE)
     m = pattern.search(body)
-    assert m is not None, f"class method {name!r} not found in app.js"
+    assert m is not None, f"class method {name!r} not found in interactive.js"
     return m.start()
 
 
@@ -68,7 +72,7 @@ def test_tool_error_does_not_overwrite_approval_badge() -> None:
     and overwrote its className + textContent with the ``--error``
     state, so the user lost the record that they had approved the
     call. This test pins the new append-sibling behaviour."""
-    body = _APP_JS.read_text(encoding="utf-8")
+    body = _INTERACTIVE_JS.read_text(encoding="utf-8")
     # Affirmatively check that an idempotency guard exists somewhere:
     # a ``querySelector(".ts-approval-badge--error")`` lookup is the
     # structural marker of the fix. Pre-fix the modifier never appeared
@@ -133,7 +137,7 @@ def test_replay_history_renders_content_before_tool_block() -> None:
 
     The test pins the order via the offsets of the ``msg.content`` and
     ``msg.tool_calls`` branch headers inside the function body."""
-    body = _APP_JS.read_text(encoding="utf-8")
+    body = _INTERACTIVE_JS.read_text(encoding="utf-8")
     start = _pane_method_offset(body, "replayHistory")
     end = _pane_method_offset(body, "_attachRetryToLastAssistant")
     fn = body[start:end]
@@ -170,7 +174,7 @@ def test_replay_history_renders_persisted_verdict_badge() -> None:
     couldn't see what the heuristic / LLM judge thought of any tool
     call. This test pins the call site so a refactor that drops the
     decoration regresses the audit surface."""
-    body = _APP_JS.read_text(encoding="utf-8")
+    body = _INTERACTIVE_JS.read_text(encoding="utf-8")
     start = _pane_method_offset(body, "replayHistory")
     end = _pane_method_offset(body, "_attachRetryToLastAssistant")
     fn = body[start:end]
@@ -205,12 +209,12 @@ def test_refetch_history_seeds_resume_cursor_only_on_initial_connect() -> None:
        ``!= null`` (not truthiness) so a valid cursor of 0 — a brand-new
        ws's first-turn boundary — isn't silently dropped to the fresh
        snapshot path."""
-    body = _APP_JS.read_text(encoding="utf-8")
+    body = _INTERACTIVE_JS.read_text(encoding="utf-8")
     # ``_refetchHistory`` is an ``async`` method, which the shared
     # ``_pane_method_offset`` header regex doesn't match — anchor on the
     # definition directly and bound at the next method.
     start = body.index("async _refetchHistory(")
-    end = body.index("_refetchWorkstreamsAndReassign(", start)
+    end = body.index("handleEvent(", start)
     fn = body[start:end]
     # (1a) seed is gated on BOTH seedCursor AND a non-null cursor.
     seed_re = re.compile(
@@ -263,7 +267,7 @@ def test_replay_renders_system_turn_via_add_system_context() -> None:
     branch of ``replayHistory``, rendering an operator bubble via
     ``addSystemContext``.  Pins the call site so a refactor that drops the
     branch regresses the operator-context replay shape silently."""
-    body = _APP_JS.read_text(encoding="utf-8")
+    body = _INTERACTIVE_JS.read_text(encoding="utf-8")
     start = _pane_method_offset(body, "replayHistory")
     end = _pane_method_offset(body, "_attachRetryToLastAssistant")
     fn = body[start:end]
@@ -284,7 +288,7 @@ def test_system_turn_dedups_against_history_by_event_id() -> None:
     ``/history`` (matched by ``_event_id``), so an SSE replay that redelivers
     it past the resume cursor doesn't double-render the operator bubble —
     belt-and-braces for the row-vs-event id-alignment fix."""
-    body = _APP_JS.read_text(encoding="utf-8")
+    body = _INTERACTIVE_JS.read_text(encoding="utf-8")
     assert re.search(r"_renderedSystemEventIds\s*\.\s*has\(", body), (
         "the system_turn handler must skip an event whose id was already rendered from /history."
     )
@@ -301,7 +305,7 @@ def test_retry_walk_skips_operator_context_cards() -> None:
     attach to a stale earlier assistant turn.  Pin the walk predicate (scoped to
     the method) AND the shared marker on every operator row that can trail a
     tool batch, so adding a card kind without the marker fails loudly here."""
-    body = _APP_JS.read_text(encoding="utf-8")
+    body = _INTERACTIVE_JS.read_text(encoding="utf-8")
     start = _pane_method_offset(body, "_attachRetryToLastAssistant")
     end = _pane_method_offset(body, "announceToolBlock")
     fn = body[start:end]
@@ -334,7 +338,7 @@ def test_operator_nudge_labels_use_shared_helper() -> None:
         assert f'{t}: "metacognition"' in utils, f"nudge type {t!r} must label as metacognition"
     assert 'tool_error: "tool error"' in utils
     assert 'skill_hint: "skill hint"' in utils
-    app = (root / "turnstone/ui/static/app.js").read_text(encoding="utf-8")
+    app = (root / "turnstone/shared_static/interactive.js").read_text(encoding="utf-8")
     coord = (root / "turnstone/console/static/coordinator/coordinator.js").read_text(
         encoding="utf-8"
     )
@@ -393,36 +397,29 @@ _UNSAFE_CODE_SINK_RE = re.compile(
 )
 
 
-def test_phase8_mcp_error_helpers_defined_in_app_js() -> None:
-    """The Phase 8 dashboard renderer adds three load-bearing helpers
-    next to the existing media-embed pattern: ``tryParseMcpError``
-    (envelope detector), ``buildMcpErrorEmbed`` (interactive card),
-    and the ``_pendingConsentServers`` set that drives the gear-icon
-    badge. A regression that drops any of them silently degrades the
-    OAuth consent UX to a plain JSON dump, so guard their existence
-    here."""
-    body = _APP_JS.read_text(encoding="utf-8")
-    assert "function tryParseMcpError" in body, (
-        "tryParseMcpError must remain defined — appendToolOutput's "
-        "error branch depends on it to detect the MCP error envelope."
+def test_phase8_mcp_error_helpers_defined() -> None:
+    """``tryParseMcpError`` (envelope detector) + ``buildMcpErrorEmbed``
+    (interactive consent / forbidden / operator card) moved into the shared
+    interactive module with the Pane.  The consent-badge state
+    (``_pendingConsentServers`` / ``_onConsentDetected``) stays in the
+    standalone shell — it drives the settings-gear badge — and the pane reaches
+    it through the ``host.onConsentDetected`` seam (a no-op in the console,
+    which has no gear badge).  Pin both halves and the seam."""
+    inter = _INTERACTIVE_JS.read_text(encoding="utf-8")
+    assert "function tryParseMcpError" in inter
+    assert "function buildMcpErrorEmbed" in inter
+    # The actionable branch surfaces consent via the THREADED callback, not a
+    # direct shell call — that decoupling is what lets the console no-op it.
+    assert "if (onConsent) onConsent(err.server)" in inter
+    assert "onConsentDetected(s)" in inter, (
+        "the pane must notify consent through host.onConsentDetected"
     )
-    assert "function buildMcpErrorEmbed" in body, (
-        "buildMcpErrorEmbed must remain defined — it renders the "
-        "interactive consent / forbidden / operator card."
+    app = _APP_JS.read_text(encoding="utf-8")
+    assert "_pendingConsentServers" in app
+    assert "function _onConsentDetected" in app
+    assert "onConsentDetected(server)" in app, (
+        "STANDALONE_HOST must wire host.onConsentDetected -> _onConsentDetected"
     )
-    assert "_pendingConsentServers" in body, (
-        "_pendingConsentServers state must remain — it backs the "
-        "gear-icon badge so a user who scrolls past a consent prompt "
-        "still has a stable signal that consent is pending."
-    )
-    # The buildMcpErrorEmbed pattern must also wire the "actionable"
-    # branch (consent_required / insufficient_scope) into the badge
-    # via _onConsentDetected; pin the helper name.
-    assert "_onConsentDetected" in body, (
-        "_onConsentDetected must remain — buildMcpErrorEmbed calls it "
-        "for the actionable category to surface the gear-icon badge."
-    )
-
 
 def test_phase8_settings_panel_handlers_defined() -> None:
     """The settings modal exposes four entry points that the inline
@@ -451,7 +448,7 @@ def test_phase8_appendtooloutput_dispatches_mcp_error_before_renderer() -> None:
     ``renderToolOutput`` path. The ordering is what makes the
     interactive consent card replace the JSON dump; reverse the calls
     and the user sees the raw error envelope as text again."""
-    body = _APP_JS.read_text(encoding="utf-8")
+    body = _INTERACTIVE_JS.read_text(encoding="utf-8")
     start = _pane_method_offset(body, "appendToolOutput")
     end = _pane_method_offset(body, "sendMessage")
     fn = body[start:end]
@@ -479,18 +476,18 @@ _CONSOLE_ADMIN_JS = Path(__file__).resolve().parent.parent / "turnstone/console/
 _CONSOLE_GOVERNANCE_JS = (
     Path(__file__).resolve().parent.parent / "turnstone/console/static/governance.js"
 )
-_CONSOLE_APP_JS = Path(__file__).resolve().parent.parent / "turnstone/console/static/app.js"
+_CONSOLE_INTERACTIVE_JS = Path(__file__).resolve().parent.parent / "turnstone/console/static/app.js"
 
 
 _UNSAFE_CODE_SINK_LINT_TARGETS = [
-    ("turnstone/ui/static/app.js", _APP_JS),
+    ("turnstone/ui/static/app.js", _INTERACTIVE_JS),
     ("turnstone/shared_static/utils.js", _UTILS_JS),
     ("turnstone/shared_static/auth.js", _AUTH_JS),
     ("turnstone/shared_static/kb.js", _KB_JS),
     ("turnstone/console/static/coordinator/coordinator.js", _COORD_JS),
     ("turnstone/console/static/admin.js", _CONSOLE_ADMIN_JS),
     ("turnstone/console/static/governance.js", _CONSOLE_GOVERNANCE_JS),
-    ("turnstone/console/static/app.js", _CONSOLE_APP_JS),
+    ("turnstone/console/static/app.js", _CONSOLE_INTERACTIVE_JS),
 ]
 
 
@@ -727,7 +724,7 @@ def test_phase8_xss_safe_render_in_build_mcp_error_embed() -> None:
     scopes list. The card builder uses createElement + textContent
     throughout so a script-tag server name renders harmlessly. Pin
     the absence of the unsafe-write inside ``buildMcpErrorEmbed``."""
-    body = _APP_JS.read_text(encoding="utf-8")
+    body = _INTERACTIVE_JS.read_text(encoding="utf-8")
     start = body.index("function buildMcpErrorEmbed(")
     # Bound to the function body — find its closing brace at column 0.
     rest = body[start:]
@@ -775,7 +772,7 @@ def test_phase8_consent_url_prefix_check_in_click_handler() -> None:
     string and the ``startsWith`` form so a future refactor can't
     silently weaken the guard.
     """
-    body = _APP_JS.read_text(encoding="utf-8")
+    body = _INTERACTIVE_JS.read_text(encoding="utf-8")
     # Bound the search to the click handler region (between the
     # ``buildMcpErrorEmbed`` function and the next top-level helper) to
     # avoid false positives from unrelated string occurrences.
@@ -1203,7 +1200,7 @@ def test_redact_api_keys_runtime_smoke() -> None:
     the original ``const redacted`` bug (which ``node --check`` and a
     pure-static keyword scan both miss; the ``TypeError`` only fires
     at call-time)."""
-    body = _APP_JS.read_text(encoding="utf-8")
+    body = _INTERACTIVE_JS.read_text(encoding="utf-8")
     m = re.search(
         r"function _redactApiKeys\(text\) \{.*?\n\}\n",
         body,
@@ -1455,7 +1452,7 @@ def test_pane_connectsse_onerror_preserves_native_reconnect() -> None:
     """``Pane.connectSSE``'s onerror must not close evtSource on
     transient errors — PR-D's reconnect-with-replay depends on native
     EventSource auto-reconnect firing with the ``Last-Event-ID`` header."""
-    body = _strip_js_comments(_APP_JS.read_text(encoding="utf-8"))
+    body = _strip_js_comments(_INTERACTIVE_JS.read_text(encoding="utf-8"))
     # Slice the Pane.connectSSE method body, then the onerror handler
     # inside it.  Reuse the indent-agnostic class-method finder.
     method_start = _pane_method_offset(body, "connectSSE")
@@ -1500,7 +1497,7 @@ def test_interactive_history_is_rest_first_not_sse() -> None:
     the client must no longer consume a ``history`` SSE event. Guards
     against a regression that re-couples first paint to the removed
     inline-history replay."""
-    body = _APP_JS.read_text(encoding="utf-8")
+    body = _INTERACTIVE_JS.read_text(encoding="utf-8")
     assert "_loadHistoryThenConnect" in body, (
         "REST-first first-paint helper missing — interactive must fetch "
         "history via GET /history before connecting SSE (coord's model)."
@@ -1545,7 +1542,7 @@ def test_early_paint_tool_pending_wiring() -> None:
     ``approve_request`` rather than appending a duplicate.  Pre-fix (PR #621)
     the card waited on the verdict; this guards the early-paint wiring against
     a rename/deletion that would silently revert to post-verdict rendering."""
-    body = _APP_JS.read_text(encoding="utf-8")
+    body = _INTERACTIVE_JS.read_text(encoding="utf-8")
     # Dispatch routes the early event to the announce painter.
     assert 'case "tool_pending":' in body
     assert "announceToolBlock(evt.items)" in body
@@ -1566,7 +1563,7 @@ def test_risk_level_normalized_before_dom_interpolation() -> None:
     fallback would pass whitespace or a future relaxed-validation value
     straight into the class string and silently break selector targeting —
     guard that the chokepoint exists and no site skips it."""
-    body = _APP_JS.read_text(encoding="utf-8")
+    body = _INTERACTIVE_JS.read_text(encoding="utf-8")
     assert "function normalizeRiskLevel(" in body
     assert "VALID_RISK_LEVELS" in body
     for level in ("low", "medium", "high", "critical"):
@@ -1608,7 +1605,7 @@ def test_early_paint_screen_reader_announce() -> None:
     the appended shell alone is inaudible), and the announced shell must carry
     aria-busy until the gate resolves.  All silent failures — no JS error, just
     a blind operator who never hears the call land — so pin the wiring."""
-    body = _APP_JS.read_text(encoding="utf-8")
+    body = _INTERACTIVE_JS.read_text(encoding="utf-8")
     # Dedicated polite SR region (separate from the voice one) + summary builder.
     assert "function toolAnnounce(" in body
     assert "function _toolAnnounceText(" in body
