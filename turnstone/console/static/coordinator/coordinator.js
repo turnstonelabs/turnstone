@@ -19,17 +19,249 @@
  * mermaid / KaTeX) once on stream_end.  Reasoning bubbles stay
  * text-only because they're transient and styled dim/italic.
  */
-function createCoordinatorPane(root, wsId) {
+// ---------------------------------------------------------------------------
+// Coordinator chrome — built programmatically (createElement, no innerHTML) so
+// the SAME markup serves the standalone page (root = document.body) and a
+// console pane (root = the pane body).  `opts.standalone` adds the page-level
+// bits a pane doesn't want: the "Console" back-link, the theme toggle, and the
+// shared #toast (the console shell already provides theme + toast).
+// ---------------------------------------------------------------------------
+function buildCoordChrome(root, opts) {
+  opts = opts || {};
+  root.classList.add("coord-chrome-root");
+  function el(tag, props, kids) {
+    const n = document.createElement(tag);
+    if (props) {
+      for (const k in props) {
+        if (k === "class") n.className = props[k];
+        else if (k === "text") n.textContent = props[k];
+        else n.setAttribute(k, props[k]);
+      }
+    }
+    if (kids)
+      for (let i = 0; i < kids.length; i++) if (kids[i]) n.append(kids[i]);
+    return n;
+  }
+  const SR =
+    "position:absolute;left:-10000px;width:1px;height:1px;overflow:hidden";
+
+  // ----- appbar header -----
+  const actions = [
+    el("button", {
+      id: "coord-export-btn",
+      class: "btn",
+      type: "button",
+      "aria-label": "Export conversation",
+      title: "Export conversation (OpenAI JSON)",
+      text: "⤓",
+    }),
+    el("button", {
+      id: "coord-close-btn",
+      class: "btn",
+      title: "End this coordinator session (terminates it on the server)",
+      text: "end",
+    }),
+  ];
+  if (opts.standalone) {
+    const theme = el("button", {
+      id: "theme-toggle",
+      class: "btn",
+      "aria-label": "Toggle light/dark theme",
+      text: "☾",
+    });
+    theme.addEventListener("click", function () {
+      if (typeof toggleTheme === "function") toggleTheme();
+    });
+    actions.push(theme);
+  }
+  const headerKids = [];
+  if (opts.standalone) {
+    headerKids.push(
+      el(
+        "a",
+        { href: "/", class: "appbar-back", "aria-label": "Back to console" },
+        [
+          el("span", {
+            class: "appbar-back-arrow",
+            "aria-hidden": "true",
+            text: "←",
+          }),
+          el("span", { text: "Console" }),
+        ],
+      ),
+    );
+  }
+  headerKids.push(
+    el("h1", { class: "appbar-title" }, [
+      document.createTextNode("turnstone "),
+      el("span", { id: "coord-name", class: "dim" }),
+    ]),
+    el("span", { id: "coord-status", class: "appbar-status" }),
+    el("span", { class: "appbar-spacer" }),
+    el("span", {
+      id: "coord-sse-status",
+      class: "appbar-status",
+      "aria-live": "polite",
+      text: "connecting…",
+    }),
+    el("span", { class: "appbar-actions" }, actions),
+  );
+  const header = el("div", { id: "coord-header", class: "appbar" }, headerKids);
+
+  // ----- main column (messages + off-screen announcers + status bar + composer) -----
+  const statusBar = el(
+    "div",
+    {
+      id: "coord-status-bar",
+      class: "ws-status-bar",
+      role: "status",
+      "aria-live": "polite",
+      "aria-atomic": "true",
+      "aria-label": "Coordinator status",
+    },
+    [
+      el("span", {
+        id: "coord-sb-model",
+        class: "ws-sb-model",
+        "aria-label": "Model",
+        text: "—",
+      }),
+      el("span", {
+        id: "coord-sb-tokens",
+        class: "ws-sb-tokens",
+        "aria-label": "Token usage",
+        text: "0 / —",
+      }),
+      el("span", {
+        id: "coord-sb-tools",
+        class: "ws-sb-tools",
+        "aria-label": "Tool calls this turn",
+        text: "0 tools",
+      }),
+      el("span", {
+        id: "coord-sb-turns",
+        class: "ws-sb-turns",
+        "aria-label": "Conversation turn",
+        text: "turn 0",
+      }),
+    ],
+  );
+  const main = el("div", { id: "coord-main" }, [
+    el("div", { id: "coord-messages", role: "log", "aria-live": "polite" }),
+    el("div", {
+      id: "coord-sr-announcer",
+      role: "status",
+      "aria-live": "assertive",
+      "aria-atomic": "true",
+      style: SR,
+    }),
+    el("div", {
+      id: "coord-sr-announcer-polite",
+      role: "status",
+      "aria-live": "polite",
+      "aria-atomic": "true",
+      style: SR,
+    }),
+    statusBar,
+    el("div", { id: "coord-composer-mount" }),
+  ]);
+
+  // ----- sidebar (children + tasks) -----
+  function sideSection(
+    wrapId,
+    headingId,
+    heading,
+    countId,
+    refreshId,
+    refreshLabel,
+    bodyId,
+  ) {
+    return el("div", { id: wrapId, class: "side-section" }, [
+      el("div", { class: "coord-sidebar-head" }, [
+        el("h2", { id: headingId, class: "side-label", text: heading }),
+        el("span", { id: countId, class: "side-count" }),
+        el("button", {
+          type: "button",
+          class: "ghost",
+          id: refreshId,
+          "aria-label": refreshLabel,
+          title: refreshLabel,
+          text: "↻",
+        }),
+      ]),
+      el("div", {
+        id: bodyId,
+        class: "coord-sidebar-body",
+        role: "list",
+        "aria-labelledby": headingId,
+      }),
+    ]);
+  }
+  const sidebar = el(
+    "aside",
+    {
+      id: "coord-sidebar",
+      class: "sidebar",
+      "aria-expanded": "true",
+      "aria-label": "Coordinator children and tasks",
+    },
+    [
+      el(
+        "button",
+        {
+          id: "coord-sidebar-toggle",
+          type: "button",
+          "aria-controls": "coord-children-wrap coord-tasks-wrap",
+          "aria-expanded": "true",
+        },
+        [
+          el("span", {
+            id: "coord-sidebar-toggle-glyph",
+            "aria-hidden": "true",
+            text: "▾",
+          }),
+          el("span", { text: "Children & tasks" }),
+        ],
+      ),
+      sideSection(
+        "coord-children-wrap",
+        "coord-children-heading",
+        "Children",
+        "coord-children-count",
+        "coord-children-refresh",
+        "Refresh children",
+        "coord-children-tree",
+      ),
+      sideSection(
+        "coord-tasks-wrap",
+        "coord-tasks-heading",
+        "Tasks",
+        "coord-tasks-count",
+        "coord-tasks-refresh",
+        "Refresh tasks",
+        "coord-tasks",
+      ),
+    ],
+  );
+
+  root.append(header, el("div", { id: "coord-body" }, [main, sidebar]));
+  if (opts.standalone) {
+    root.append(
+      el("div", { id: "toast", role: "status", "aria-live": "polite" }),
+    );
+  }
+}
+
+function createCoordinatorPane(root, wsId, opts) {
   "use strict";
   if (!wsId) {
-    // Static literal — class-name migration only; no XSS surface.
     const missing = document.createElement("div");
     missing.className = "msg error";
-    missing.textContent = "Missing ws_id on <html> tag.";
-    const host = root.querySelector("#coord-messages");
-    if (host) host.replaceChildren(missing);
-    return;
+    missing.textContent = "Missing ws_id.";
+    root.replaceChildren(missing);
+    return null;
   }
+  buildCoordChrome(root, opts);
 
   const messagesEl = root.querySelector("#coord-messages");
   const coordMain = root.querySelector("#coord-main");

@@ -236,3 +236,28 @@ def test_step3_admin_seam_and_thin_show_admin() -> None:
         "the adopted admin panels' dangling tab-* aria-labelledby (pointing at the deleted "
         "sidebar buttons) must be stripped"
     )
+
+
+def test_step4_coordinator_pane_registered_and_wired() -> None:
+    """Step 4b: the shell registers a ws_id-keyed coordinator pane (build chrome +
+    controller on mount, connect on activate, destroy on close), installs the login
+    fan-out registry, the rail opens coordinators as panes (not full-page nav), and
+    the console loads the coordinator controller + its migrated chrome CSS."""
+    shell = _SHELL_JS.read_text(encoding="utf-8")
+    assert 'registerType("coordinator"' in shell, "shell must register the coordinator pane type"
+    assert "window.createCoordinatorPane(this.bodyEl, id)" in shell, (
+        "onMount must build the controller into the pane body"
+    )
+    assert "this._ctl.connect()" in shell and "this._ctl.destroy()" in shell, (
+        "per-pane Tier-2 connect on activate, destroy on close"
+    )
+    assert "window.TS_LOGIN" in shell, "shell must install the login fan-out registry"
+    rail = _RAIL_JS.read_text(encoding="utf-8")
+    assert 'paneManager.openPane("coordinator", ws.id)' in rail, (
+        "rail coordinator clicks must open a pane, not full-page nav"
+    )
+    index = _CONSOLE_INDEX.read_text(encoding="utf-8")
+    assert "/static/coordinator/coordinator.js" in index, (
+        "console must load the coordinator controller"
+    )
+    assert "coord-chrome.css" in index, "console must load the coordinator chrome CSS"

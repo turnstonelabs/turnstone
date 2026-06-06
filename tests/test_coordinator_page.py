@@ -475,12 +475,12 @@ def test_coordinator_js_early_paint_screen_reader_announce():
 
     base = Path(__file__).resolve().parent.parent / "turnstone/console/static/coordinator"
     coord_js = (base / "coordinator.js").read_text(encoding="utf-8")
-    index_html = (base / "index.html").read_text(encoding="utf-8")
 
-    # Dedicated polite announcer element + helper, distinct from the assertive one.
-    assert 'id="coord-sr-announcer-polite"' in index_html
-    pos = index_html.index('id="coord-sr-announcer-polite"')
-    assert 'aria-live="polite"' in index_html[pos : pos + 200]
+    # Dedicated polite announcer + helper, distinct from the assertive one.  The
+    # markup is built by buildCoordChrome now (the standalone page went thin).
+    assert '"coord-sr-announcer-polite"' in coord_js
+    pos = coord_js.index('"coord-sr-announcer-polite"')
+    assert '"aria-live": "polite"' in coord_js[pos : pos + 200]
     assert "function _announcePolite(" in coord_js
     # Root-scoped now (de-globalized pane factory): the polite announcer is
     # resolved off the pane root, not document.getElementById.
@@ -502,7 +502,7 @@ def test_coordinator_de_globalized_to_pane_factory():
     coord_js = (base / "coordinator.js").read_text(encoding="utf-8")
     index_html = (base / "index.html").read_text(encoding="utf-8")
 
-    assert "function createCoordinatorPane(root, wsId) {" in coord_js
+    assert "function createCoordinatorPane(root, wsId, opts) {" in coord_js
     assert "window.createCoordinatorPane = createCoordinatorPane;" in coord_js
     assert "function destroy() {" in coord_js, "a pane must have a teardown path"
     # ws_id is a constructor arg now, not read off <html>; lookups are root-scoped.
@@ -516,3 +516,27 @@ def test_coordinator_de_globalized_to_pane_factory():
     # Standalone page = one pane filling the body; the inline close onclick is gone.
     assert "createCoordinatorPane(document.body" in index_html
     assert 'onclick="coordCloseSession()"' not in index_html
+
+
+def test_coordinator_chrome_builder_and_thin_page():
+    """Step 4b: the coordinator chrome is built programmatically (createElement,
+    no innerHTML) by buildCoordChrome, so the SAME factory serves the standalone
+    page and a console pane.  The standalone page is now a thin bootstrap passing
+    {standalone:true}; its static chrome + inline <style> are gone (CSS migrated)."""
+    from pathlib import Path
+
+    base = Path(__file__).resolve().parent.parent / "turnstone/console/static/coordinator"
+    coord_js = (base / "coordinator.js").read_text(encoding="utf-8")
+    index_html = (base / "index.html").read_text(encoding="utf-8")
+
+    assert "function buildCoordChrome(root, opts)" in coord_js
+    assert "buildCoordChrome(root, opts);" in coord_js, "the factory must build its own chrome"
+    assert ".innerHTML" not in coord_js, "the chrome builder must stay innerHTML-free"
+    # Standalone page is thin: static chrome gone, links the migrated stylesheet,
+    # bootstraps with the standalone flag (adds back-link / theme / toast).
+    assert 'id="coord-header"' not in index_html, (
+        "static chrome must be gone (the factory builds it)"
+    )
+    assert "coord-chrome.css" in index_html, "standalone must link the migrated chrome CSS"
+    assert "standalone: true" in index_html
+    assert (base / "coord-chrome.css").exists(), "the migrated chrome stylesheet must exist"

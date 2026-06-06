@@ -95,6 +95,28 @@ function buildShell(caps) {
   };
 }
 
+// Tab title for a coordinator pane — the ws name from the Tier-1 snapshot, else
+// a short ws_id (a restored pane may open before the first snapshot arrives).
+function coordTitle(wsId) {
+  try {
+    const cs =
+      window.TS_APP &&
+      window.TS_APP.getClusterState &&
+      window.TS_APP.getClusterState();
+    if (cs && cs.nodes) {
+      for (const nid in cs.nodes) {
+        for (const ws of cs.nodes[nid].workstreams || []) {
+          if (ws.id === wsId)
+            return ws.name || ws.title || String(wsId).slice(0, 8);
+        }
+      }
+    }
+  } catch (e) {
+    /* clusterState not ready — fall through to the id */
+  }
+  return wsId ? String(wsId).slice(0, 8) : "coordinator";
+}
+
 function mountShell() {
   const caps = window.TURNSTONE_SHELL_CAPS || {};
 
@@ -170,10 +192,63 @@ function mountShell() {
     return pane;
   });
 
+  // Coordinator pane (step 4): a ws_id-keyed conversational pane.  onMount builds
+  // the coordinator chrome + controller into the pane body (createCoordinatorPane,
+  // a console-local persona so no node-proxy transport); onActivate opens its
+  // per-pane Tier-2 SSE once and subscribes to login re-arm; onClose tears the
+  // controller (stream + timers + observer) down.
+  pm.registerType("coordinator", (id) => {
+    const pane = new ShellPane({
+      type: "coordinator",
+      title: coordTitle(id),
+      glyph: "●",
+    });
+    pane.onMount = function () {
+      if (typeof window.createCoordinatorPane === "function") {
+        this._ctl = window.createCoordinatorPane(this.bodyEl, id);
+      }
+    };
+    pane.onActivate = function () {
+      if (this._ctl && !this._connected) {
+        this._connected = true;
+        this._ctl.connect();
+        if (window.TS_LOGIN && this._ctl.onLogin) {
+          window.TS_LOGIN.subscribe(this._ctl.onLogin);
+        }
+      }
+    };
+    pane.onClose = function () {
+      if (this._ctl) this._ctl.destroy();
+    };
+    return pane;
+  });
+
   // Restore the persisted working set, else open the default Dashboard pane.
   if (!pm.rehydrate()) pm.openPane("dashboard");
 
   window.TS_SHELL = { panes: pm, caps };
+
+  // Login fan-out: app.js owns the single window.onLoginSuccess (the Tier-1
+  // reconnect, set at load).  Wrap it in a tiny registry so EVERY conversational
+  // pane can re-arm its own Tier-2 stream on re-auth, not just the last writer.
+  const _loginSubs = [];
+  if (typeof window.onLoginSuccess === "function")
+    _loginSubs.push(window.onLoginSuccess);
+  window.TS_LOGIN = {
+    subscribe(cb) {
+      if (typeof cb === "function" && _loginSubs.indexOf(cb) < 0)
+        _loginSubs.push(cb);
+    },
+  };
+  window.onLoginSuccess = function () {
+    for (const cb of _loginSubs) {
+      try {
+        cb();
+      } catch (e) {
+        console.error("L-shell: onLogin subscriber failed", e);
+      }
+    }
+  };
 
   // Wire the rail's live Cluster + Workspaces sections to the Tier-1 render
   // signal (subscribe before boot so the first snapshot render is caught).

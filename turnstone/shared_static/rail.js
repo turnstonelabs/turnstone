@@ -159,7 +159,7 @@ function renderCluster(root, cs, TS) {
 
 // ---- Workspaces section ----------------------------------------------------
 
-function sessionRow(ws, childCount, isChild, TS) {
+function sessionRow(ws, childCount, isChild, TS, paneManager) {
   const li = document.createElement("li");
   const btn = document.createElement("button");
   btn.type = "button";
@@ -181,11 +181,11 @@ function sessionRow(ws, childCount, isChild, TS) {
     btn.append(c);
   }
   btn.append(tagFor(kind));
-  // Interim navigation until the coordinator/interactive panes exist (steps 4-5):
-  // keep today's full-page behaviour.
+  // Coordinator sessions are console-local → open as a pane (step 4); interactive
+  // sessions stay interim full-page until the interactive pane lands (step 5).
   btn.addEventListener("click", () => {
     if (kind === "coordinator") {
-      window.location.href = "/coordinator/" + encodeURIComponent(ws.id) + "/";
+      if (paneManager) paneManager.openPane("coordinator", ws.id);
     } else if (ws.node && ws.node !== "console") {
       window.location.href =
         "/node/" +
@@ -235,16 +235,18 @@ function renderWorkspaces(root, cs, TS, paneManager) {
   const groups = TS.bucketByParent(all);
   for (const ws of groups.roots) {
     const kids = groups.childrenMap[ws.id] || [];
-    const li = sessionRow(ws, kids.length, false, TS);
+    const li = sessionRow(ws, kids.length, false, TS, paneManager);
     if (kids.length) {
       const childUl = document.createElement("ul");
       childUl.className = "children";
-      for (const k of kids) childUl.append(sessionRow(k, 0, true, TS));
+      for (const k of kids)
+        childUl.append(sessionRow(k, 0, true, TS, paneManager));
       li.append(childUl);
     }
     nav.append(li);
   }
-  for (const ws of groups.orphans) nav.append(sessionRow(ws, 0, false, TS));
+  for (const ws of groups.orphans)
+    nav.append(sessionRow(ws, 0, false, TS, paneManager));
 
   root.append(nav);
 }
