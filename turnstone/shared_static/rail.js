@@ -159,11 +159,15 @@ function renderCluster(root, cs, TS) {
 
 // ---- Workspaces section ----------------------------------------------------
 
-function sessionRow(ws, childCount, isChild, TS, paneManager) {
+function sessionRow(ws, childCount, isChild, TS, paneManager, active) {
   const li = document.createElement("li");
   const btn = document.createElement("button");
   btn.type = "button";
-  btn.className = "row" + (isChild ? " row-child" : "");
+  // `.open` (amber left-accent) marks the row whose pane is the active tab, so
+  // the rail map and the tab bar agree on what is focused.
+  const isOpen = !!(active && active.rawId === ws.id);
+  btn.className =
+    "row" + (isChild ? " row-child" : "") + (isOpen ? " open" : "");
   const kind = ws.kind || (ws.parent_ws_id ? "interactive" : "interactive");
   btn.setAttribute(
     "aria-label",
@@ -207,11 +211,17 @@ function renderWorkspaces(root, cs, TS, paneManager) {
   const nav = document.createElement("ul");
   nav.className = "nav";
 
+  // The active pane drives the `.open` marker so the rail map mirrors the tab
+  // bar (re-rendered on every activate via paneManager.onActiveChange).
+  const active =
+    paneManager && paneManager.getActive ? paneManager.getActive() : null;
+
   // Dashboard entry — activates the Dashboard pane (the one pane in step 2).
   const dashLi = document.createElement("li");
   const dash = document.createElement("button");
   dash.type = "button";
-  dash.className = "row open";
+  dash.className =
+    "row" + (active && active.type === "dashboard" ? " open" : "");
   const g = document.createElement("span");
   g.className = "glyph";
   g.setAttribute("aria-hidden", "true");
@@ -239,18 +249,18 @@ function renderWorkspaces(root, cs, TS, paneManager) {
   const groups = TS.bucketByParent(all);
   for (const ws of groups.roots) {
     const kids = groups.childrenMap[ws.id] || [];
-    const li = sessionRow(ws, kids.length, false, TS, paneManager);
+    const li = sessionRow(ws, kids.length, false, TS, paneManager, active);
     if (kids.length) {
       const childUl = document.createElement("ul");
       childUl.className = "children";
       for (const k of kids)
-        childUl.append(sessionRow(k, 0, true, TS, paneManager));
+        childUl.append(sessionRow(k, 0, true, TS, paneManager, active));
       li.append(childUl);
     }
     nav.append(li);
   }
   for (const ws of groups.orphans)
-    nav.append(sessionRow(ws, 0, false, TS, paneManager));
+    nav.append(sessionRow(ws, 0, false, TS, paneManager, active));
 
   root.append(nav);
 }
@@ -271,6 +281,10 @@ export function mountRail(sections, caps) {
       renderWorkspaces(sections.workspaces, cs, TS, sections.paneManager);
   }
   if (TS.onRender) TS.onRender(render);
+  // Re-render when the active pane changes so the Workspaces `.open` marker
+  // tracks the active tab (not just on the next Tier-1 snapshot).
+  if (sections.paneManager && sections.paneManager.onActiveChange)
+    sections.paneManager.onActiveChange(render);
   render(); // initial paint (empty until the first snapshot arrives)
 }
 

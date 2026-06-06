@@ -298,3 +298,19 @@ def test_step5_interactive_pane_registered_and_wired() -> None:
     )
     index = _CONSOLE_INDEX.read_text(encoding="utf-8")
     assert "/shared/interactive.css" in index, "console must load the interactive stylesheet"
+
+
+def test_step5d_rail_open_marker_tracks_active_pane() -> None:
+    """Step 5d (designer fix): the rail's Workspaces `.open` marker tracks the
+    active pane instead of being hardcoded to Dashboard, so the rail map and the
+    tab bar agree on what is focused.  PaneManager exposes getActive/onActiveChange
+    and fires on activate/close; the rail keys `.open` off it and re-renders."""
+    pane = _PANE_JS.read_text(encoding="utf-8")
+    assert "getActive()" in pane and "onActiveChange(cb)" in pane
+    assert "_notifyActive()" in pane, "active-change must fan out to subscribers"
+    rail = _RAIL_JS.read_text(encoding="utf-8")
+    assert "paneManager.getActive()" in rail
+    assert "onActiveChange(render)" in rail, "rail must re-render on pane activation"
+    # The Dashboard row is no longer unconditionally open; a session row gets it.
+    assert 'dash.className = "row open"' not in rail
+    assert "active && active.rawId === ws.id" in rail

@@ -68,6 +68,7 @@ export class PaneManager {
     this._panes = new Map(); // paneId -> ShellPane
     this._order = []; // paneId[] — tab order
     this._activeId = null;
+    this._activeSubs = []; // active-pane-change listeners (e.g. the rail marker)
     // The tab bar is a WAI-ARIA tablist; arrow keys rove focus across the open
     // tabs (delegated, so it survives tab reconciliation).
     if (this.tabbarEl) {
@@ -92,6 +93,19 @@ export class PaneManager {
   hasPane(type, id) {
     const paneId = id == null ? type : type + ":" + id;
     return this._panes.has(paneId);
+  }
+
+  /** The active pane's identity ({type, rawId}), or null — lets the rail mark
+   *  the workspace row that mirrors the active tab. */
+  getActive() {
+    const p = this._activeId ? this._panes.get(this._activeId) : null;
+    return p ? { type: p.type, rawId: p.rawId } : null;
+  }
+
+  /** Subscribe to active-pane changes (the rail re-renders its open-marker). */
+  onActiveChange(cb) {
+    if (typeof cb === "function" && this._activeSubs.indexOf(cb) < 0)
+      this._activeSubs.push(cb);
   }
 
   /** Create the pane if absent, then focus it.  Auth/cap gating is the caller's.
@@ -169,6 +183,17 @@ export class PaneManager {
     }
     this._renderTabs();
     this._persist();
+    this._notifyActive();
+  }
+
+  _notifyActive() {
+    for (const cb of this._activeSubs) {
+      try {
+        cb();
+      } catch (e) {
+        console.error("PaneManager: active-change subscriber failed", e);
+      }
+    }
   }
 
   /** Drop a pane (tab + content), release it, focus a neighbour. */
@@ -186,7 +211,9 @@ export class PaneManager {
     if (this._activeId === paneId) {
       this._activeId = null;
       const fallback = this._order[this._order.length - 1];
-      if (fallback) this.activate(fallback);
+      if (fallback)
+        this.activate(fallback); // fires _notifyActive itself
+      else this._notifyActive(); // last pane closed — clear the marker
     }
     this._renderTabs();
     this._persist();

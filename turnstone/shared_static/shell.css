@@ -424,6 +424,12 @@
   border-color: var(--hair-2);
   color: var(--ink);
 }
+/* Active tab's glyph brightens so an open session's `○` placeholder doesn't read
+   permanently "idle" beside its live (e.g. running ●) rail row.  Step 7 makes
+   tab glyphs live state; this is the interim hint. */
+.tab.active .glyph {
+  color: var(--ink-2);
+}
 .tab-add {
   width: 28px;
   height: 28px;
