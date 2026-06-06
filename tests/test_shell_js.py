@@ -264,3 +264,37 @@ def test_step4_coordinator_pane_registered_and_wired() -> None:
         "console must load the coordinator controller"
     )
     assert "coord-chrome.css" in index, "console must load the coordinator chrome CSS"
+
+
+def test_step5_interactive_pane_registered_and_wired() -> None:
+    """Step 5b: the shell registers a ws_id-keyed interactive pane over the
+    NODE-PROXIED transport.  Unlike the classic coordinator (read off window),
+    the interactive pane is a real ES module the shell IMPORTS; its node is
+    derived from the Tier-1 snapshot (nodeForWs) or an open-time hint; the rail
+    opens it as a pane passing the owning node; and the console loads the shared
+    interactive stylesheet."""
+    shell = _SHELL_JS.read_text(encoding="utf-8")
+    assert 'import { createInteractivePane } from "./interactive.js"' in shell, (
+        "interactive is ESM — the shell imports it (coordinator stays window.*)"
+    )
+    assert 'registerType("interactive"' in shell, "shell must register the interactive pane type"
+    assert "createInteractivePane(this.bodyEl, id, {" in shell, (
+        "onMount must build the controller into the pane body"
+    )
+    assert "nodeForWs(id)" in shell, (
+        "the node-proxy target must be derived from Tier-1 (rehydrate-safe)"
+    )
+    assert "function nodeForWs(" in shell, "shell must define the node resolver"
+    # Focus-tracking lifecycle: connect/deactivate/destroy + login re-arm.
+    for hook in ("this._ctl.connect()", "this._ctl.deactivate()", "this._ctl.destroy()"):
+        assert hook in shell, f"interactive pane missing lifecycle {hook!r}"
+    pane = _PANE_JS.read_text(encoding="utf-8")
+    assert "this._types.get(type)(id, extra)" in pane, (
+        "openPane must thread the open-time hint to the factory"
+    )
+    rail = _RAIL_JS.read_text(encoding="utf-8")
+    assert 'openPane("interactive", ws.id, { nodeId: ws.node })' in rail, (
+        "rail interactive clicks must open a node-proxied pane, not full-page nav"
+    )
+    index = _CONSOLE_INDEX.read_text(encoding="utf-8")
+    assert "/shared/interactive.css" in index, "console must load the interactive stylesheet"

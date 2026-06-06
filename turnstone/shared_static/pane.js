@@ -94,8 +94,11 @@ export class PaneManager {
     return this._panes.has(paneId);
   }
 
-  /** Create the pane if absent, then focus it.  Auth/cap gating is the caller's. */
-  openPane(type, id) {
+  /** Create the pane if absent, then focus it.  Auth/cap gating is the caller's.
+   *  `extra` is an optional open-time hint passed straight to the factory (e.g.
+   *  the interactive pane's `{nodeId}` from a rail click); it is NOT persisted,
+   *  so a factory must be able to re-derive it on rehydrate. */
+  openPane(type, id, extra) {
     if (!this._types.has(type)) {
       console.warn("PaneManager: unknown pane type", type);
       return null;
@@ -103,7 +106,7 @@ export class PaneManager {
     const paneId = id == null ? type : type + ":" + id;
     let pane = this._panes.get(paneId);
     if (!pane) {
-      pane = this._types.get(type)(id);
+      pane = this._types.get(type)(id, extra);
       // normalise identity in case the factory left it unset
       pane.type = type;
       pane.rawId = id != null ? id : null;

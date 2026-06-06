@@ -181,11 +181,15 @@ function sessionRow(ws, childCount, isChild, TS, paneManager) {
     btn.append(c);
   }
   btn.append(tagFor(kind));
-  // Coordinator sessions are console-local → open as a pane (step 4); interactive
-  // sessions stay interim full-page until the interactive pane lands (step 5).
+  // Both personas open as console panes (step 5): a coordinator is console-local;
+  // an interactive session lives on a node, so its pane is node-PROXIED — pass
+  // the owning node as a hint (the shell re-derives it from Tier-1 on rehydrate).
+  // Fall back to the legacy full-page node UI only when no pane host is present.
   btn.addEventListener("click", () => {
     if (kind === "coordinator") {
       if (paneManager) paneManager.openPane("coordinator", ws.id);
+    } else if (paneManager) {
+      paneManager.openPane("interactive", ws.id, { nodeId: ws.node });
     } else if (ws.node && ws.node !== "console") {
       window.location.href =
         "/node/" +

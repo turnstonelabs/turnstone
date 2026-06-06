@@ -21,6 +21,10 @@
 
 import { PaneManager, ShellPane } from "./pane.js";
 import { mountRail, mountManage } from "./rail.js";
+// The interactive pane is a real ES module (step 5a) — import it directly.  The
+// coordinator pane stays a classic legacy script read off `window.*` below; this
+// asymmetry is the incremental "pulled by the adopting pane" modernization.
+import { createInteractivePane } from "./interactive.js";
 
 function make(tag, className, text) {
   const node = document.createElement(tag);
@@ -95,9 +99,9 @@ function buildShell(caps) {
   };
 }
 
-// Tab title for a coordinator pane — the ws name from the Tier-1 snapshot, else
-// a short ws_id (a restored pane may open before the first snapshot arrives).
-function coordTitle(wsId) {
+// Tab title for a session pane — the ws name from the Tier-1 snapshot, else a
+// short ws_id (a restored pane may open before the first snapshot arrives).
+function wsTitle(wsId) {
   try {
     const cs =
       window.TS_APP &&
@@ -114,7 +118,31 @@ function coordTitle(wsId) {
   } catch (e) {
     /* clusterState not ready — fall through to the id */
   }
-  return wsId ? String(wsId).slice(0, 8) : "coordinator";
+  return wsId ? String(wsId).slice(0, 8) : "session";
+}
+
+// The cluster node hosting an interactive ws — the node-proxy transport target
+// for its pane (Tier-1 carries every ws under its owning node).  Derived from
+// the live snapshot so a rehydrated pane needs no persisted node_id; an
+// explicit open-time hint (rail click / coordinator child link) skips the scan.
+function nodeForWs(wsId) {
+  try {
+    const cs =
+      window.TS_APP &&
+      window.TS_APP.getClusterState &&
+      window.TS_APP.getClusterState();
+    if (cs && cs.nodes) {
+      for (const nid in cs.nodes) {
+        if (nid === "console") continue; // coordinators live here, not interactives
+        for (const ws of cs.nodes[nid].workstreams || []) {
+          if (ws.id === wsId) return nid;
+        }
+      }
+    }
+  } catch (e) {
+    /* snapshot not ready */
+  }
+  return null;
 }
 
 function mountShell() {
@@ -200,7 +228,7 @@ function mountShell() {
   pm.registerType("coordinator", (id) => {
     const pane = new ShellPane({
       type: "coordinator",
-      title: coordTitle(id),
+      title: wsTitle(id),
       glyph: "◆",
     });
     pane.onMount = function () {
@@ -218,6 +246,44 @@ function mountShell() {
           window.TS_LOGIN.subscribe(this._ctl.onLogin);
         }
       }
+    };
+    pane.onClose = function () {
+      if (this._ctl) this._ctl.destroy();
+    };
+    return pane;
+  });
+
+  // Interactive pane (step 5): a ws_id-keyed conversational pane whose session
+  // lives on a cluster NODE, so its Tier-2 SSE is node-PROXIED (the LOCALITY
+  // invariant).  The owning node is resolved from the Tier-1 snapshot (or a
+  // `{nodeId}` open-time hint from a rail click / coordinator child link), so a
+  // rehydrated pane needs no persisted node_id.  No children/tasks sidebar —
+  // an interactive persona has no spawn affordance.  onActivate connects once +
+  // re-marks focus; onDeactivate stops focus-stealing while the stream stays
+  // live; onClose tears down the stream + timers and detaches the DOM.
+  pm.registerType("interactive", (id, extra) => {
+    const pane = new ShellPane({
+      type: "interactive",
+      title: wsTitle(id),
+      glyph: "○",
+    });
+    pane.onMount = function () {
+      const nodeId = (extra && extra.nodeId) || nodeForWs(id);
+      this._ctl = createInteractivePane(this.bodyEl, id, {
+        nodeId,
+        onClose: () => pm.close(pane.id),
+      });
+    };
+    pane.onActivate = function () {
+      if (!this._ctl) return;
+      this._ctl.connect(); // idempotent — opens the stream once, re-marks focus
+      if (!this._loginArmed && window.TS_LOGIN && this._ctl.onLogin) {
+        this._loginArmed = true;
+        window.TS_LOGIN.subscribe(this._ctl.onLogin);
+      }
+    };
+    pane.onDeactivate = function () {
+      if (this._ctl && this._ctl.deactivate) this._ctl.deactivate();
     };
     pane.onClose = function () {
       if (this._ctl) this._ctl.destroy();
