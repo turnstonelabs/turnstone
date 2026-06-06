@@ -4296,9 +4296,9 @@
     <script src="/static/admin.js"></script>
     <script src="/static/governance.js"></script>
     <script src="/static/app.js"></script>
-    <script src="/static/coordinator/coordinator.js"></script>
     <!-- L-shell (ES module) — deferred, so it runs after the classic scripts
-         above and drives window.TS_APP.boot(). -->
+         above and drives window.TS_APP.boot().  It imports the coordinator +
+         interactive panes (both ES modules), so neither is <script>-tagged here. -->
     <script type="module" src="/shared/shell.js"></script>
   </body>
 </html>

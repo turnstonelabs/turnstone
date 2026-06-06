@@ -245,7 +245,7 @@ def test_step4_coordinator_pane_registered_and_wired() -> None:
     the console loads the coordinator controller + its migrated chrome CSS."""
     shell = _SHELL_JS.read_text(encoding="utf-8")
     assert 'registerType("coordinator"' in shell, "shell must register the coordinator pane type"
-    assert "window.createCoordinatorPane(this.bodyEl, id" in shell, (
+    assert "createCoordinatorPane(this.bodyEl, id" in shell, (
         "onMount must build the controller into the pane body"
     )
     assert "this._ctl.connect()" in shell and "this._ctl.destroy()" in shell, (
@@ -259,23 +259,26 @@ def test_step4_coordinator_pane_registered_and_wired() -> None:
     assert 'paneManager.openPane("coordinator", ws.id)' in rail, (
         "rail coordinator clicks must open a pane, not full-page nav"
     )
+    assert 'from "/static/coordinator/coordinator.js"' in shell, (
+        "step 5e.0: the shell IMPORTS the coordinator controller (ESM), not a <script> tag"
+    )
     index = _CONSOLE_INDEX.read_text(encoding="utf-8")
-    assert "/static/coordinator/coordinator.js" in index, (
-        "console must load the coordinator controller"
+    assert "/static/coordinator/coordinator.js" not in index, (
+        "coordinator.js is imported by shell.js now, not <script>-tagged in the console"
     )
     assert "coord-chrome.css" in index, "console must load the coordinator chrome CSS"
 
 
 def test_step5_interactive_pane_registered_and_wired() -> None:
     """Step 5b: the shell registers a ws_id-keyed interactive pane over the
-    NODE-PROXIED transport.  Unlike the classic coordinator (read off window),
-    the interactive pane is a real ES module the shell IMPORTS; its node is
+    NODE-PROXIED transport.  Both panes are ES modules the shell IMPORTS (step
+    5e.0 lifted the coordinator off window too); its node is
     derived from the Tier-1 snapshot (nodeForWs) or an open-time hint; the rail
     opens it as a pane passing the owning node; and the console loads the shared
     interactive stylesheet."""
     shell = _SHELL_JS.read_text(encoding="utf-8")
     assert 'import { createInteractivePane } from "./interactive.js"' in shell, (
-        "interactive is ESM — the shell imports it (coordinator stays window.*)"
+        "interactive is ESM — the shell imports it (as it now does the coordinator)"
     )
     assert 'registerType("interactive"' in shell, "shell must register the interactive pane type"
     assert "createInteractivePane(this.bodyEl, id, {" in shell, (

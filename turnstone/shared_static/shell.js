@@ -21,10 +21,12 @@
 
 import { PaneManager, ShellPane } from "./pane.js";
 import { mountRail, mountManage } from "./rail.js";
-// The interactive pane is a real ES module (step 5a) — import it directly.  The
-// coordinator pane stays a classic legacy script read off `window.*` below; this
-// asymmetry is the incremental "pulled by the adopting pane" modernization.
+// Both conversational panes are real ES modules the shell imports directly.  The
+// interactive pane lives beside us in /shared (step 5a); the coordinator pane is
+// at an absolute /static path (step 5e.0 lifted it off `window.*`), so it imports
+// by URL.
 import { createInteractivePane } from "./interactive.js";
+import { createCoordinatorPane } from "/static/coordinator/coordinator.js";
 
 function make(tag, className, text) {
   const node = document.createElement(tag);
@@ -232,11 +234,9 @@ function mountShell() {
       glyph: "◆",
     });
     pane.onMount = function () {
-      if (typeof window.createCoordinatorPane === "function") {
-        this._ctl = window.createCoordinatorPane(this.bodyEl, id, {
-          onClose: () => pm.close(pane.id),
-        });
-      }
+      this._ctl = createCoordinatorPane(this.bodyEl, id, {
+        onClose: () => pm.close(pane.id),
+      });
     };
     pane.onActivate = function () {
       if (this._ctl && !this._connected) {
