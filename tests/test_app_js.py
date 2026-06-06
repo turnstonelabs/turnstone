@@ -16,10 +16,7 @@ from pathlib import Path
 import pytest
 
 _APP_JS = Path(__file__).resolve().parent.parent / "turnstone/ui/static/app.js"
-_INTERACTIVE_JS = (
-    Path(__file__).resolve().parent.parent
-    / "turnstone/shared_static/interactive.js"
-)
+_INTERACTIVE_JS = Path(__file__).resolve().parent.parent / "turnstone/shared_static/interactive.js"
 
 
 def _pane_method_offset(body: str, name: str) -> int:
@@ -314,9 +311,14 @@ def test_retry_walk_skips_operator_context_cards() -> None:
         "rows so the tool-only retry skip fires even when a card trails."
     )
     # Every operator row that can trail a tool batch carries the shared marker.
+    # The watch-result card moved to the shared conversation.js (step 5e.1); the
+    # plain system-context + guard-finding cards stay in the pane.
+    shared = (_INTERACTIVE_JS.parent / "conversation.js").read_text(encoding="utf-8")
+    assert '"msg watch-result operator-context"' in shared, (
+        "buildWatchResultCard must carry the operator-context marker."
+    )
     for cls in (
         '"msg system-context operator-context"',
-        '"msg watch-result operator-context"',
         '"msg guard-finding operator-context"',
     ):
         assert cls in body, (
@@ -420,6 +422,7 @@ def test_phase8_mcp_error_helpers_defined() -> None:
     assert "onConsentDetected(server)" in app, (
         "STANDALONE_HOST must wire host.onConsentDetected -> _onConsentDetected"
     )
+
 
 def test_phase8_settings_panel_handlers_defined() -> None:
     """The settings modal exposes four entry points that the inline

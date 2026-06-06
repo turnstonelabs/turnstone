@@ -10,10 +10,10 @@
 //  `opts.base` URL prefix: "" locally, "/node/{id}" when the console proxies a
 //  session living on a cluster node (the LOCALITY invariant).
 //
-//  ES module — the first legacy pane lifted into a real module (coordinator.js
-//  stays classic; the shared substrate it leans on — composer/renderer/etc. —
-//  does too, as those still have classic consumers).  The console shell.js
-//  imports the factory directly; the standalone loads it as
+//  ES module — the first legacy pane lifted into a real module (step 5a; the
+//  coordinator pane followed in 5e.0).  The shared substrate it leans on —
+//  composer/renderer/etc. — is still classic, consumed as globals.  The console
+//  shell.js imports the factory directly; the standalone loads it as
 //  `<script type="module">`.  It also publishes `window.InteractivePane` /
 //  `window.createInteractivePane` so the still-classic standalone `app.js`
 //  shell can read the class — safe because app.js builds panes only AFTER the
@@ -22,6 +22,12 @@
 //  House style: programmatic DOM, NO innerHTML (the renderer is the sole
 //  sanctioned exception); pane code root-scopes to its own element.
 // ===========================================================================
+
+import {
+  stripAnsi,
+  buildWatchResultCard,
+  buildSystemNudgeMarker,
+} from "./conversation.js";
 
 let _paneCounter = 0;
 
@@ -288,17 +294,10 @@ class Pane {
   }
 
   addSystemNudgeMarker() {
-    // Thin .msg.user.system-nudge marker rendered as the anchor for
-    // wake-driven reminder bubbles.  Replaces the previously-invisible
-    // synthetic empty user turn with a visible-but-subtle DOM element so
-    // the bubble below it lands in the right place even when the wake
-    // fires long after the user's last real message.
+    // The marker DOM is shared (conversation.buildSystemNudgeMarker); the Pane
+    // owns empty-state removal + placement.
     this.removeEmptyState();
-    const el = document.createElement("div");
-    el.className = "msg user system-nudge";
-    el.setAttribute("data-source", "system_nudge");
-    el.setAttribute("aria-label", "system nudge");
-    el.textContent = "system nudge";
+    const el = buildSystemNudgeMarker();
     this.messagesEl.appendChild(el);
     return el;
   }
@@ -314,7 +313,7 @@ class Pane {
     // richer `.msg.watch-result` card instead of the plain operator bubble.
     this.removeEmptyState();
     if (source === "watch_triggered" && meta && typeof meta === "object") {
-      const card = _buildWatchResultBubble(meta, content || "");
+      const card = buildWatchResultCard(meta, content || "");
       this.messagesEl.appendChild(card);
       this.scrollToBottom(true);
       return card;
@@ -2787,55 +2786,6 @@ class Pane {
   }
 }
 
-// Build a structured ``.msg.watch-result`` card for a ``watch_triggered``
-// operator-context system turn — command-preview header + shell-output body +
-// poll-counter footer.  ``content`` is the formatted watch body (the system
-// turn's content); ``meta`` carries the structured fields (``watch_name`` /
-// ``command`` / ``poll_count`` / ``max_polls`` / ``is_final``) delivered live on
-// the ``system_turn`` SSE event and on the ``/history`` projection.  All text
-// goes through ``textContent`` so shell output containing angle brackets /
-// scripts / steering bytes renders inertly.  Mirrors the coordinator pane's
-// buildWatchResultBubble.
-function _buildWatchResultBubble(meta, content) {
-  const el = document.createElement("div");
-  el.className = "msg watch-result operator-context";
-  el.setAttribute("role", "article");
-  el.setAttribute("data-ts-role", "watch");
-  el.setAttribute("aria-label", "watch");
-  const header = document.createElement("div");
-  header.className = "msg-watch-header";
-  header.textContent =
-    "watch" + (meta.watch_name ? " · " + String(meta.watch_name) : "");
-  el.appendChild(header);
-  if (meta.command) {
-    const cmd = document.createElement("div");
-    cmd.className = "msg-watch-cmd";
-    cmd.textContent = "$ " + String(meta.command);
-    el.appendChild(cmd);
-  }
-  const body = document.createElement("pre");
-  body.className = "msg-watch-body";
-  // Prefer the structured ``output`` (raw shell output alone) so the body
-  // doesn't re-print the header / ``$ command`` lines the chrome already shows;
-  // fall back to the full turn ``content`` for legacy turns that predate the
-  // ``output`` meta field (migration 060 is additive — no backfill).
-  body.textContent = meta.output != null ? String(meta.output) : content || "";
-  el.appendChild(body);
-  if (meta.poll_count != null && meta.max_polls != null) {
-    const footer = document.createElement("div");
-    footer.className = "msg-watch-footer";
-    const finalSuffix = meta.is_final ? " · final" : "";
-    footer.textContent =
-      "poll " +
-      String(meta.poll_count) +
-      "/" +
-      String(meta.max_polls) +
-      finalSuffix;
-    el.appendChild(footer);
-  }
-  return el;
-}
-
 // Build a structured ``.msg.guard-finding`` card for an ``output_guard``
 // operator-context system turn.  ``meta`` carries the structured finding
 // ``{flags, risk_level, annotations, redacted}``.  Reuses the tool-result
@@ -3159,16 +3109,11 @@ function _mcpErrorTitle(err) {
 
 // ---------------------------------------------------------------------------
 // Conversational rendering helpers — tool output, media embeds, MCP-error
-// cards, verdict badges, ANSI stripping.  Moved here with the Pane (they are
-// used only by it); the coordinator pane carries its own copies, which the
-// step-5e base lift will reconcile.
+// cards, verdict badges.  Used only by the Pane.  stripAnsi + the watch-result
+// card + the system-nudge marker were lifted to the shared conversation.js
+// (step 5e.1, imported at the top); the rest reconciles with the CSS-vocabulary
+// unify (5e.2), since the coordinator carries .coord-tool-* variants of them.
 // ---------------------------------------------------------------------------
-function stripAnsi(s) {
-  return s.replace(
-    /\x1b(?:\[[0-9;?]*[@-~]|\][^\x07\x1b]*(?:\x07|\x1b\\)?|[()#][A-Za-z0-9]|.)/g,
-    "",
-  );
-}
 
 function buildToolDiv(item) {
   const div = document.createElement("div");
