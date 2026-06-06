@@ -390,8 +390,15 @@ def test_coord_retry_walk_skips_operator_context_cards():
         "_refreshRetryButton must walk back past .operator-context rows so the "
         "tool-only retry skip fires even when a card trails the tool batch."
     )
+    # The watch-result card moved to the shared conversation.js (step 5e.1); the
+    # guard-finding + idle-children cards stay in the coordinator pane.
+    shared = (
+        Path(__file__).resolve().parent.parent / "turnstone/shared_static/conversation.js"
+    ).read_text(encoding="utf-8")
+    assert '"msg watch-result operator-context"' in shared, (
+        "buildWatchResultCard must tag its card with the operator-context marker."
+    )
     for builder, cls in (
-        ("appendWatchResult", '"msg watch-result operator-context"'),
         ("appendGuardFinding", '"msg guard-finding operator-context"'),
         ("appendIdleChildren", '"msg idle-children operator-context"'),
     ):

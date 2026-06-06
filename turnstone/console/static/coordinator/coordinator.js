@@ -26,6 +26,12 @@
 // bits a pane doesn't want: the "Console" back-link, the theme toggle, and the
 // shared #toast (the console shell already provides theme + toast).
 // ---------------------------------------------------------------------------
+import {
+  stripAnsi,
+  buildWatchResultCard,
+  buildSystemNudgeMarker,
+} from "/shared/conversation.js";
+
 function buildCoordChrome(root, opts) {
   opts = opts || {};
   root.classList.add("coord-chrome-root");
@@ -484,18 +490,6 @@ function createCoordinatorPane(root, wsId, opts) {
       .replace(/'/g, "&#39;");
   }
 
-  // ANSI-escape stripper — mirrors ui/static/app.js so a tool that
-  // emits CSI sequences (rare on the coord tool surface, but bash
-  // through MCP / the underlying child node still can) lands as
-  // readable text inside the tool-batch result block.
-  function stripAnsi(s) {
-    return String(s == null ? "" : s).replace(
-      // eslint-disable-next-line no-control-regex
-      /\x1b(?:\[[0-9;?]*[@-~]|\][^\x07\x1b]*(?:\x07|\x1b\\)?|[()#][A-Za-z0-9]|.)/g,
-      "",
-    );
-  }
-
   // Post-process tool-output JSON: wrap known ws_id + node_id pairs in a
   // link pointing at /node/{node_id}/?ws_id={child_ws_id}.  Only applies
   // when BOTH keys are present and look like valid hex ids.
@@ -660,46 +654,10 @@ function createCoordinatorPane(root, wsId, opts) {
   // ``command`` / ``poll_count`` / ``max_polls`` / ``is_final``) delivered live
   // on the ``system_turn`` SSE event and on the ``/history`` projection.  All
   // text goes through ``textContent`` so shell output containing angle brackets
-  // / scripts / steering bytes renders inertly.  Mirrors the interactive pane's
-  // _buildWatchResultBubble.
+  // / scripts / steering bytes renders inertly.  Delegates to the shared
+  // conversation.buildWatchResultCard; this wrapper appends + scrolls.
   function appendWatchResult(meta, content) {
-    const el = document.createElement("div");
-    el.className = "msg watch-result operator-context";
-    el.setAttribute("role", "article");
-    el.setAttribute("data-ts-role", "watch");
-    el.setAttribute("aria-label", "watch");
-    const header = document.createElement("div");
-    header.className = "msg-watch-header";
-    header.textContent =
-      "watch" + (meta.watch_name ? " · " + String(meta.watch_name) : "");
-    el.appendChild(header);
-    if (meta.command) {
-      const cmd = document.createElement("div");
-      cmd.className = "msg-watch-cmd";
-      cmd.textContent = "$ " + String(meta.command);
-      el.appendChild(cmd);
-    }
-    const body = document.createElement("pre");
-    body.className = "msg-watch-body";
-    // Prefer the structured ``output`` (raw shell output alone) so the body
-    // doesn't re-print the header / ``$ command`` lines the chrome already
-    // shows; fall back to the full turn ``content`` for legacy turns that
-    // predate the ``output`` meta field (migration 060 is additive).
-    body.textContent =
-      meta.output != null ? String(meta.output) : content || "";
-    el.appendChild(body);
-    if (meta.poll_count != null && meta.max_polls != null) {
-      const footer = document.createElement("div");
-      footer.className = "msg-watch-footer";
-      const finalSuffix = meta.is_final ? " · final" : "";
-      footer.textContent =
-        "poll " +
-        String(meta.poll_count) +
-        "/" +
-        String(meta.max_polls) +
-        finalSuffix;
-      el.appendChild(footer);
-    }
+    const el = buildWatchResultCard(meta, content);
     messagesEl.appendChild(el);
     _scheduleScroll();
     return el;
@@ -871,11 +829,7 @@ function createCoordinatorPane(root, wsId, opts) {
   // carried are now first-class operator-context ``system`` turns that
   // follow it and render via the ``system`` ``_MSG_VARIANTS`` styling.
   function appendSystemNudgeMarker() {
-    const el = document.createElement("div");
-    el.className = "msg user system-nudge";
-    el.setAttribute("data-source", "system_nudge");
-    el.setAttribute("aria-label", "system nudge");
-    el.textContent = "system nudge";
+    const el = buildSystemNudgeMarker();
     messagesEl.appendChild(el);
     return el;
   }
