@@ -503,7 +503,14 @@ def test_coordinator_de_globalized_to_pane_factory():
     index_html = (base / "index.html").read_text(encoding="utf-8")
 
     assert "function createCoordinatorPane(root, wsId, opts) {" in coord_js
-    assert "window.createCoordinatorPane = createCoordinatorPane;" in coord_js
+    # Step 5e.0: coordinator.js is a real ES module the shell imports — the bare
+    # `export` is its only seam.  No `window.*` bridge (unlike interactive.js,
+    # whose classic ui/static/app.js still needs the global): both the console
+    # shell and the standalone bootstrap import the factory.
+    assert "export { createCoordinatorPane };" in coord_js
+    assert "window.createCoordinatorPane" not in coord_js, (
+        "no dead window bridge — both consumers import the factory"
+    )
     assert "function destroy() {" in coord_js, "a pane must have a teardown path"
     # ws_id is a constructor arg now, not read off <html>; lookups are root-scoped.
     assert "document.documentElement.dataset.wsId" not in coord_js
@@ -513,7 +520,13 @@ def test_coordinator_de_globalized_to_pane_factory():
     # No page-global collision points (multi-instance safe).
     for gone in ("window.coordSend", "window.coordCloseSession", "window.onLoginSuccess"):
         assert gone not in coord_js, f"de-globalized: {gone} must be gone"
-    # Standalone page = one pane filling the body; the inline close onclick is gone.
+    # Standalone page = one pane filling the body, bootstrapped by a MODULE that
+    # imports the factory (a classic eager IIFE would run before the deferred
+    # coordinator module loaded it); the inline close onclick is gone.
+    assert '<script type="module">' in index_html
+    assert (
+        'import { createCoordinatorPane } from "/static/coordinator/coordinator.js"' in index_html
+    )
     assert "createCoordinatorPane(document.body" in index_html
     assert 'onclick="coordCloseSession()"' not in index_html
 

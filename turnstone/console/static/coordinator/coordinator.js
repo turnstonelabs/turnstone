@@ -5150,4 +5150,9 @@ function createCoordinatorPane(root, wsId, opts) {
   };
 }
 
-window.createCoordinatorPane = createCoordinatorPane;
+// Imported by the console shell (shell.js) and the standalone coordinator page's
+// bootstrap (coordinator/index.html), the same way shell.js imports the
+// interactive pane.  No `window.*` bridge here: unlike interactive.js — whose
+// classic standalone ui/static/app.js still consumes the global — the
+// coordinator has no classic consumer, so the bare ESM export is the only seam.
+export { createCoordinatorPane };
