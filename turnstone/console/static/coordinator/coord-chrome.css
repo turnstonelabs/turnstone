@@ -17,6 +17,13 @@
   flex-direction: column;
   min-height: 0;
 }
+/* The coord chrome owns its own scroll regions (#coord-messages, the sidebar
+   bodies); when it IS the pane body, the generic `.pane-body { overflow:auto }`
+   scroller is redundant and would wrap the sticky appbar in a second scroll
+   parent.  Neutralise it for this pane type only (dashboard/admin keep theirs). */
+.pane-body.coord-chrome-root {
+  overflow: hidden;
+}
 
 /* Main layout — chat pane (2fr) + sidebar (1fr) with shared
    #coord-main and #coord-body flex wiring. */

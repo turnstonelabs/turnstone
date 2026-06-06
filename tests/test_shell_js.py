@@ -245,11 +245,14 @@ def test_step4_coordinator_pane_registered_and_wired() -> None:
     the console loads the coordinator controller + its migrated chrome CSS."""
     shell = _SHELL_JS.read_text(encoding="utf-8")
     assert 'registerType("coordinator"' in shell, "shell must register the coordinator pane type"
-    assert "window.createCoordinatorPane(this.bodyEl, id)" in shell, (
+    assert "window.createCoordinatorPane(this.bodyEl, id" in shell, (
         "onMount must build the controller into the pane body"
     )
     assert "this._ctl.connect()" in shell and "this._ctl.destroy()" in shell, (
         "per-pane Tier-2 connect on activate, destroy on close"
+    )
+    assert "pm.close(pane.id)" in shell, (
+        "the coordinator's `end` must close the pane (not reload the whole console)"
     )
     assert "window.TS_LOGIN" in shell, "shell must install the login fan-out registry"
     rail = _RAIL_JS.read_text(encoding="utf-8")

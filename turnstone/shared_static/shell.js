@@ -201,11 +201,13 @@ function mountShell() {
     const pane = new ShellPane({
       type: "coordinator",
       title: coordTitle(id),
-      glyph: "●",
+      glyph: "◆",
     });
     pane.onMount = function () {
       if (typeof window.createCoordinatorPane === "function") {
-        this._ctl = window.createCoordinatorPane(this.bodyEl, id);
+        this._ctl = window.createCoordinatorPane(this.bodyEl, id, {
+          onClose: () => pm.close(pane.id),
+        });
       }
     };
     pane.onActivate = function () {

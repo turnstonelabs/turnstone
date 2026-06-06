@@ -532,6 +532,8 @@ def test_coordinator_chrome_builder_and_thin_page():
     assert "function buildCoordChrome(root, opts)" in coord_js
     assert "buildCoordChrome(root, opts);" in coord_js, "the factory must build its own chrome"
     assert ".innerHTML" not in coord_js, "the chrome builder must stay innerHTML-free"
+    # Pane-hosted close routes through opts.onClose (close the pane), not a redirect.
+    assert "opts.onClose" in coord_js, "coordCloseSession must close the pane when pane-hosted"
     # Standalone page is thin: static chrome gone, links the migrated stylesheet,
     # bootstraps with the standalone flag (adds back-link / theme / toast).
     assert 'id="coord-header"' not in index_html, (
