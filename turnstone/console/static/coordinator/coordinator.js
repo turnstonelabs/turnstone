@@ -19,23 +19,21 @@
  * mermaid / KaTeX) once on stream_end.  Reasoning bubbles stay
  * text-only because they're transient and styled dim/italic.
  */
-(function () {
+function createCoordinatorPane(root, wsId) {
   "use strict";
-
-  const wsId = document.documentElement.dataset.wsId || "";
   if (!wsId) {
     // Static literal — class-name migration only; no XSS surface.
     const missing = document.createElement("div");
     missing.className = "msg error";
     missing.textContent = "Missing ws_id on <html> tag.";
-    const host = document.getElementById("coord-messages");
+    const host = root.querySelector("#coord-messages");
     if (host) host.replaceChildren(missing);
     return;
   }
 
-  const messagesEl = document.getElementById("coord-messages");
-  const coordMain = document.getElementById("coord-main");
-  const composerMount = document.getElementById("coord-composer-mount");
+  const messagesEl = root.querySelector("#coord-messages");
+  const coordMain = root.querySelector("#coord-main");
+  const composerMount = root.querySelector("#coord-composer-mount");
   const composer = new Composer(composerMount, {
     placeholder: "Message the coordinator\u2026",
     ariaLabel: "Coordinator input",
@@ -102,21 +100,21 @@
   let _pendingEditSend = null;
   let cancelTimeoutId = null;
   let forceTimeoutId = null;
-  const statusEl = document.getElementById("coord-status");
-  const sseEl = document.getElementById("coord-sse-status");
-  const nameEl = document.getElementById("coord-name");
-  const childrenTreeEl = document.getElementById("coord-children-tree");
-  const childrenCountEl = document.getElementById("coord-children-count");
-  const childrenRefreshBtn = document.getElementById("coord-children-refresh");
-  const tasksEl = document.getElementById("coord-tasks");
-  const tasksCountEl = document.getElementById("coord-tasks-count");
-  const tasksRefreshBtn = document.getElementById("coord-tasks-refresh");
+  const statusEl = root.querySelector("#coord-status");
+  const sseEl = root.querySelector("#coord-sse-status");
+  const nameEl = root.querySelector("#coord-name");
+  const childrenTreeEl = root.querySelector("#coord-children-tree");
+  const childrenCountEl = root.querySelector("#coord-children-count");
+  const childrenRefreshBtn = root.querySelector("#coord-children-refresh");
+  const tasksEl = root.querySelector("#coord-tasks");
+  const tasksCountEl = root.querySelector("#coord-tasks-count");
+  const tasksRefreshBtn = root.querySelector("#coord-tasks-refresh");
   // Off-screen aria-live="assertive" region — pending tool-batches
   // append into the polite messages log, which gets flipped to
   // aria-live="off" during streaming.  Routing the action-required
   // announcement through this dedicated region ensures SR users hear
   // the gate land regardless of streaming state.
-  const srAnnouncerEl = document.getElementById("coord-sr-announcer");
+  const srAnnouncerEl = root.querySelector("#coord-sr-announcer");
   function _announceAssertive(text) {
     if (!srAnnouncerEl) return;
     // Briefly clearing then setting forces SR reading even if the
@@ -131,7 +129,7 @@
   // Off-screen aria-live="polite" sibling — the tool-call early paint
   // (tool_pending) routes here so SR users hear a committed call land (and
   // that they can Stop it) without the interrupt the assertive gate uses.
-  const srPoliteEl = document.getElementById("coord-sr-announcer-polite");
+  const srPoliteEl = root.querySelector("#coord-sr-announcer-polite");
   function _announcePolite(text) {
     if (!srPoliteEl || !text) return;
     srPoliteEl.textContent = "";
@@ -160,11 +158,11 @@
   // Status bar — model alias, token / context-window usage, tool calls
   // this turn, conversation turn.  Driven by the connected + status
   // SSE events; mirrors the interactive pane (ui/static/app.js).
-  const statusBarEl = document.getElementById("coord-status-bar");
-  const sbModelEl = document.getElementById("coord-sb-model");
-  const sbTokensEl = document.getElementById("coord-sb-tokens");
-  const sbToolsEl = document.getElementById("coord-sb-tools");
-  const sbTurnsEl = document.getElementById("coord-sb-turns");
+  const statusBarEl = root.querySelector("#coord-status-bar");
+  const sbModelEl = root.querySelector("#coord-sb-model");
+  const sbTokensEl = root.querySelector("#coord-sb-tokens");
+  const sbToolsEl = root.querySelector("#coord-sb-tools");
+  const sbTurnsEl = root.querySelector("#coord-sb-turns");
   let coordModel = "";
   let coordModelAlias = "";
   let lastStatusEvt = null;
@@ -1819,7 +1817,7 @@
     lastStatusEvt = evt;
   }
 
-  window.coordSend = function () {
+  function coordSend() {
     const text = composer.value;
     const trimmed = (text || "").trim();
     if (!trimmed) return false;
@@ -1911,7 +1909,7 @@
         if (!queuedEl) setBusy(false);
       });
     return false;
-  };
+  }
 
   function cancelGeneration() {
     if (!busy || stopBtn.disabled) return;
@@ -1950,7 +1948,7 @@
       });
   }
 
-  window.coordCloseSession = async function () {
+  async function coordCloseSession() {
     if (
       !window.confirm(
         "End this coordinator session? The server will terminate it.",
@@ -2014,7 +2012,7 @@
       return;
     }
     window.location.href = "/";
-  };
+  }
 
   // ------------------------------------------------------------------
   // HTTP helpers
@@ -2671,7 +2669,7 @@
   const activeWaits = new Map();
 
   function _waitIndicatorEl() {
-    let el = document.getElementById("coord-wait-indicator");
+    let el = root.querySelector("#coord-wait-indicator");
     if (el) return el;
     // Only attach to the coord header vocabulary — don't fall back to
     // document.body, which would plant a floating badge at the page
@@ -2682,7 +2680,7 @@
     // state_change event clobbers all children of #coord-status, which
     // would delete the wait indicator on the next state tick.  As a
     // sibling inside the appbar it stays alive across state updates.
-    const host = document.getElementById("coord-header");
+    const host = root.querySelector("#coord-header");
     if (!host) return null;
     el = document.createElement("span");
     el.id = "coord-wait-indicator";
@@ -3688,7 +3686,7 @@
       a.textContent = "\u2192 child " + task.child_ws_id.slice(0, 8);
       a.addEventListener("click", (e) => {
         e.preventDefault();
-        const target = document.querySelector(
+        const target = childrenTreeEl.querySelector(
           '.ch-row[data-ws-id="' + cssEscape(task.child_ws_id) + '"]',
         );
         if (target && target.scrollIntoView) {
@@ -4194,7 +4192,7 @@
       renderChildren();
     }
   }
-  setInterval(_pruneChildren, CHILDREN_PRUNE_INTERVAL_MS);
+  const pruneTimer = setInterval(_pruneChildren, CHILDREN_PRUNE_INTERVAL_MS);
 
   if (childrenRefreshBtn) {
     childrenRefreshBtn.addEventListener("click", () => {
@@ -4214,20 +4212,22 @@
   // OpenAI-shaped JSON via the shared helper in utils.js.  Wired here
   // (rather than via an inline onclick like coord-close-btn) because the
   // helper needs the IIFE-scoped ``wsId`` const captured at load time.
-  const exportBtn = document.getElementById("coord-export-btn");
+  const exportBtn = root.querySelector("#coord-export-btn");
   if (exportBtn) {
     exportBtn.addEventListener("click", () => {
       exportWorkstreamDownload(wsId, exportBtn);
     });
   }
 
+  // "end" button — was inline onclick="coordCloseSession()"; bind per-instance.
+  const closeBtn = root.querySelector("#coord-close-btn");
+  if (closeBtn) closeBtn.addEventListener("click", coordCloseSession);
+
   // Mobile-only sidebar toggle — wires the accordion collapse below 700px.
   // On desktop the button is display:none so the handler is a no-op.
-  const sidebarEl = document.getElementById("coord-sidebar");
-  const sidebarToggle = document.getElementById("coord-sidebar-toggle");
-  const sidebarToggleGlyph = document.getElementById(
-    "coord-sidebar-toggle-glyph",
-  );
+  const sidebarEl = root.querySelector("#coord-sidebar");
+  const sidebarToggle = root.querySelector("#coord-sidebar-toggle");
+  const sidebarToggleGlyph = root.querySelector("#coord-sidebar-toggle-glyph");
   if (sidebarEl && sidebarToggle) {
     sidebarToggle.addEventListener("click", () => {
       const expanded = sidebarEl.getAttribute("aria-expanded") !== "false";
@@ -4844,20 +4844,49 @@
     _refreshRetryButton();
   }
 
-  init();
-
-  // When the user re-authenticates after a 401 (see SSE onerror above),
-  // reset the backoff and force an immediate reconnect so the stream
-  // resumes without waiting out the current Math.pow backoff window.
-  window.onLoginSuccess = function () {
+  // Re-arm the stream after a 401 re-auth: reset backoff + reconnect now.
+  // (Standalone wires this to the page login hook; the console shell fans
+  //  login out to every open pane.)
+  function onLogin() {
     reconnectAttempts = 0;
     if (reconnectTimer) {
       clearTimeout(reconnectTimer);
       reconnectTimer = null;
     }
     connectSSE();
-  };
+  }
+
+  // Symmetric teardown for a pane close — the IIFE had no close path; a
+  // per-instance pane must release the stream + every timer/observer or a
+  // backgrounded pane keeps an SSE open and fires renders into detached DOM.
+  function destroy() {
+    if (evtSource) {
+      evtSource.close();
+      evtSource = null;
+    }
+    [
+      reconnectTimer,
+      cancelTimeoutId,
+      forceTimeoutId,
+      tasksRefreshTimer,
+      liveBadgeFlushTimer,
+    ].forEach((t) => t && clearTimeout(t));
+    reconnectTimer = cancelTimeoutId = forceTimeoutId = null;
+    tasksRefreshTimer = liveBadgeFlushTimer = null;
+    if (pruneTimer) clearInterval(pruneTimer);
+    if (_childObserver && _childObserver.disconnect)
+      _childObserver.disconnect();
+  }
 
   // Enter-to-send / Shift-Enter newline / IME-safe handling lives in
   // shared/composer.js; no duplicate listener here.
-})();
+  return {
+    wsId: wsId,
+    connect: init,
+    destroy: destroy,
+    onLogin: onLogin,
+    closeSession: coordCloseSession,
+  };
+}
+
+window.createCoordinatorPane = createCoordinatorPane;

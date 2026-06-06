@@ -482,7 +482,37 @@ def test_coordinator_js_early_paint_screen_reader_announce():
     pos = index_html.index('id="coord-sr-announcer-polite"')
     assert 'aria-live="polite"' in index_html[pos : pos + 200]
     assert "function _announcePolite(" in coord_js
-    assert 'getElementById("coord-sr-announcer-polite")' in coord_js
+    # Root-scoped now (de-globalized pane factory): the polite announcer is
+    # resolved off the pane root, not document.getElementById.
+    assert 'querySelector("#coord-sr-announcer-polite")' in coord_js
     # tool_pending announces politely; the announce shell is marked busy.
     assert "_announcePolite(_toolAnnounceText(ev.items" in coord_js
     assert 'if (opts.announce) batch.setAttribute("aria-busy", "true")' in coord_js
+
+
+def test_coordinator_de_globalized_to_pane_factory():
+    """Step 4a: coordinator.js is a multi-instantiable pane factory, not a
+    page-global IIFE.  ``createCoordinatorPane(root, wsId)`` root-scopes every
+    lookup, owns its lifecycle (connect / destroy / onLogin), and exposes no
+    page-global ``window.coord*`` / ``onLoginSuccess`` collision point; the
+    standalone page bootstraps one pane filling the body."""
+    from pathlib import Path
+
+    base = Path(__file__).resolve().parent.parent / "turnstone/console/static/coordinator"
+    coord_js = (base / "coordinator.js").read_text(encoding="utf-8")
+    index_html = (base / "index.html").read_text(encoding="utf-8")
+
+    assert "function createCoordinatorPane(root, wsId) {" in coord_js
+    assert "window.createCoordinatorPane = createCoordinatorPane;" in coord_js
+    assert "function destroy() {" in coord_js, "a pane must have a teardown path"
+    # ws_id is a constructor arg now, not read off <html>; lookups are root-scoped.
+    assert "document.documentElement.dataset.wsId" not in coord_js
+    assert "document.getElementById(" not in coord_js, (
+        "pane code must root-scope, not getElementById"
+    )
+    # No page-global collision points (multi-instance safe).
+    for gone in ("window.coordSend", "window.coordCloseSession", "window.onLoginSuccess"):
+        assert gone not in coord_js, f"de-globalized: {gone} must be gone"
+    # Standalone page = one pane filling the body; the inline close onclick is gone.
+    assert "createCoordinatorPane(document.body" in index_html
+    assert 'onclick="coordCloseSession()"' not in index_html

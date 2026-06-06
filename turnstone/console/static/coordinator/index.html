@@ -533,7 +533,7 @@
   <span id="coord-sse-status" class="appbar-status" aria-live="polite">connecting…</span>
   <span class="appbar-actions">
     <button id="coord-export-btn" class="btn" type="button" aria-label="Export conversation" title="Export conversation (OpenAI JSON)">&#10515;</button>
-    <button id="coord-close-btn" class="btn" onclick="coordCloseSession()" title="End this coordinator session (terminates it on the server)">end</button>
+    <button id="coord-close-btn" class="btn" title="End this coordinator session (terminates it on the server)">end</button>
     <button id="theme-toggle" class="btn" onclick="toggleTheme()" aria-label="Toggle light/dark theme">&#9790;</button>
   </span>
 </div>
@@ -653,5 +653,20 @@
 <script src="/shared/hljs-11.11.1/highlight.min.js"></script>
 <script src="/shared/renderer.js"></script>
 <script src="/static/coordinator/coordinator.js"></script>
+<script>
+  // Standalone coordinator page = one coordinator pane filling the body.
+  // (The console shell instead creates panes on demand via the same
+  //  window.createCoordinatorPane factory — one per ws_id.)
+  (function () {
+    var wsId = document.documentElement.dataset.wsId || "";
+    var pane = window.createCoordinatorPane(document.body, wsId);
+    if (pane) {
+      pane.connect();
+      window.onLoginSuccess = function () {
+        pane.onLogin();
+      };
+    }
+  })();
+</script>
 </body>
 </html>
