@@ -342,6 +342,25 @@ function createCoordinatorPane(root, wsId, opts) {
   const tasksEl = root.querySelector("#coord-tasks");
   const tasksCountEl = root.querySelector("#coord-tasks-count");
   const tasksRefreshBtn = root.querySelector("#coord-tasks-refresh");
+
+  // Child ws links — rendered into the children tree (renderChildRow) and into
+  // linkified tool output (renderToolOutput) — open the child as a node-proxied
+  // interactive pane in the console L-shell.  Delegated on the pane root so it
+  // survives every re-render; the link's href is the standalone fallback (the
+  // standalone coordinator page has no PaneManager, so the new-tab nav stands).
+  root.addEventListener("click", function (e) {
+    const link =
+      e.target.closest && e.target.closest(".ws-link, .coord-ws-link");
+    if (!link) return;
+    const childWs = link.dataset.wsId;
+    const childNode = link.dataset.nodeId;
+    if (!childWs || !childNode) return;
+    const pm = window.TS_SHELL && window.TS_SHELL.panes;
+    if (pm && pm.openPane) {
+      e.preventDefault();
+      pm.openPane("interactive", childWs, { nodeId: childNode });
+    }
+  });
   // Off-screen aria-live="assertive" region — pending tool-batches
   // append into the polite messages log, which gets flipped to
   // aria-live="off" during streaming.  Routing the action-required
@@ -538,7 +557,11 @@ function createCoordinatorPane(root, wsId, opts) {
       if (safeWs && safeNode) {
         link =
           '<a class="coord-ws-link" target="_blank" rel="noopener"' +
-          ' href="/node/' +
+          ' data-ws-id="' +
+          esc(safeWs) +
+          '" data-node-id="' +
+          esc(safeNode) +
+          '" href="/node/' +
           encodeURIComponent(safeNode) +
           "/?ws_id=" +
           encodeURIComponent(safeWs) +
@@ -3109,6 +3132,8 @@ function createCoordinatorPane(root, wsId, opts) {
         encodeURIComponent(safeWs);
       a.target = "_blank";
       a.rel = "noopener";
+      a.dataset.wsId = safeWs;
+      a.dataset.nodeId = safeNode;
     } else {
       a.href = "#";
     }

@@ -542,3 +542,29 @@ def test_coordinator_chrome_builder_and_thin_page():
     assert "coord-chrome.css" in index_html, "standalone must link the migrated chrome CSS"
     assert "standalone: true" in index_html
     assert (base / "coord-chrome.css").exists(), "the migrated chrome stylesheet must exist"
+
+
+def test_coord_child_links_open_interactive_pane():
+    """Step 5c: a coordinator child ws link (children tree + linkified tool
+    output) opens the child as a node-proxied interactive pane in the console
+    L-shell.  A delegated handler on the pane root reads data-ws-id/data-node-id
+    and calls openPane('interactive', ...) with the CHILD's node; the link's
+    href stays the standalone fallback (the standalone coordinator page has no
+    PaneManager, so the new-tab nav stands)."""
+    from pathlib import Path
+
+    coord_js = (
+        Path(__file__).resolve().parent.parent
+        / "turnstone/console/static/coordinator/coordinator.js"
+    ).read_text(encoding="utf-8")
+    # Delegated handler, gated on the pane host so standalone keeps the href nav.
+    assert '.closest(".ws-link, .coord-ws-link")' in coord_js
+    assert "window.TS_SHELL && window.TS_SHELL.panes" in coord_js
+    assert 'pm.openPane("interactive", childWs, { nodeId: childNode })' in coord_js
+    # Both link sites carry the ids the handler reads.
+    assert "a.dataset.wsId = safeWs;" in coord_js  # renderChildRow (DOM)
+    assert "a.dataset.nodeId = safeNode;" in coord_js
+    assert 'data-ws-id="' in coord_js  # renderToolOutput (string)
+    assert 'data-node-id="' in coord_js
+    # The /node/{id}/?ws_id= href fallback must remain for the standalone page.
+    assert '"/node/"' in coord_js
