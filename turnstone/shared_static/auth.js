@@ -572,7 +572,9 @@ function _handleSubmit() {
 }
 
 function _submitLogin() {
-  const username = (document.getElementById("login-username").value || "").trim();
+  const username = (
+    document.getElementById("login-username").value || ""
+  ).trim();
   const password = document.getElementById("login-password").value || "";
 
   if (!username) {
@@ -644,7 +646,9 @@ function _submitToken() {
 }
 
 function _submitSetup() {
-  const username = (document.getElementById("setup-username").value || "").trim();
+  const username = (
+    document.getElementById("setup-username").value || ""
+  ).trim();
   const displayName = (
     document.getElementById("setup-displayname").value || ""
   ).trim();

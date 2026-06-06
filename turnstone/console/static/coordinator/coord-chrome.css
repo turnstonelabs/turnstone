@@ -1,6 +1,6 @@
 /* Coordinator chrome layout (extracted from the standalone page's inline
    <style> so the console can load it for coordinator panes too).  Every
-   rule is #coord-*/coordinator-class scoped; the lone page-level body rule
+   rule is #coord- or coordinator-class scoped; the lone page-level body rule
    became `.coord-chrome-root` (added by buildCoordChrome to the pane root). */
 
 /* Coordinator-specific layout glue.  Messages, header, and sidebar
@@ -80,7 +80,10 @@
   gap: 6px;
   margin: 8px 0 6px;
 }
-.coord-sidebar-head .side-label { flex: 1; padding: 0; }
+.coord-sidebar-head .side-label {
+  flex: 1;
+  padding: 0;
+}
 .coord-sidebar-head .side-count {
   font-family: var(--font-mono);
   font-size: 11px;
@@ -121,12 +124,16 @@
   border: 1px solid transparent;
 }
 .ch-row + .ch-row,
-.task-row + .task-row { margin-top: 2px; }
+.task-row + .task-row {
+  margin-top: 2px;
+}
 .ch-row:hover,
 .task-row:hover {
   background: var(--hair-2);
 }
-.ch-row.closed { opacity: 0.55; }
+.ch-row.closed {
+  opacity: 0.55;
+}
 .ch-row a.ws-link {
   color: inherit;
   text-decoration: none;
@@ -134,7 +141,9 @@
   gap: 6px;
   align-items: baseline;
 }
-.ch-row a.ws-link:hover { color: var(--accent); }
+.ch-row a.ws-link:hover {
+  color: var(--accent);
+}
 /* Keyboard-focus indicators — accent ring matches the .side-item and
    .btn focus-visible treatment so tab-nav stays visible across both
    themes. */
@@ -210,7 +219,9 @@
   margin-top: 4px;
 }
 @media (prefers-reduced-motion: reduce) {
-  .ch-row .approval-loading-spin { animation: none; }
+  .ch-row .approval-loading-spin {
+    animation: none;
+  }
 }
 /* Auto-approved pill — same 22px indent as .approval-block / .meta
    so a child row showing both stacks cleanly.  Lower visual weight
@@ -360,7 +371,10 @@
   border: 1.5px solid var(--hair-2);
   border-radius: var(--r-md);
   cursor: pointer;
-  transition: background 120ms ease, border-color 120ms ease, color 120ms ease;
+  transition:
+    background 120ms ease,
+    border-color 120ms ease,
+    color 120ms ease;
 }
 .ch-row .approval-actions .act:hover {
   color: var(--ink);
@@ -461,16 +475,24 @@
 .ch-row.highlight {
   background: var(--accent-soft);
   border-color: color-mix(in srgb, var(--accent) 50%, var(--hair));
-  transition: background 0.6s ease-out, border-color 0.6s ease-out;
+  transition:
+    background 0.6s ease-out,
+    border-color 0.6s ease-out;
 }
 @media (prefers-reduced-motion: reduce) {
-  .ch-row.highlight { transition: none; }
+  .ch-row.highlight {
+    transition: none;
+  }
 }
 
 /* @keyframes ts-spin — drives the .coord-tool-row-verdict
    code.judging spinner.  Defined here because this page doesn't
    link feed.css (no .feed-item usage). */
-@keyframes ts-spin { to { transform: rotate(360deg); } }
+@keyframes ts-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
 
 /* Sidebar mobile toggle (desktop hides; mobile shows via media query
    below). */
@@ -488,7 +510,9 @@
   outline: 2px solid var(--accent);
   outline-offset: 2px;
 }
-[aria-busy="true"].coord-sidebar-body { opacity: 0.55; }
+[aria-busy="true"].coord-sidebar-body {
+  opacity: 0.55;
+}
 
 /* Wait indicator — appbar-hosted polite status badge. */
 .coord-wait-indicator {
@@ -499,19 +523,31 @@
 /* Sub-700px: sidebar collapses to an accordion above the chat;
    appbar wraps its right cluster; composer tightens. */
 @media (max-width: 700px) {
-  .appbar { flex-wrap: wrap; height: auto; padding: 8px 12px; }
-  #coord-messages { padding: 12px 14px; }
-  #coord-body { flex-direction: column; }
+  .appbar {
+    flex-wrap: wrap;
+    height: auto;
+    padding: 8px 12px;
+  }
+  #coord-messages {
+    padding: 12px 14px;
+  }
+  #coord-body {
+    flex-direction: column;
+  }
   #coord-sidebar.sidebar {
     max-height: 50vh;
     flex: 0 0 auto;
     border-left: none;
     border-top: 1px solid var(--hair);
   }
-  #coord-sidebar-toggle { display: inline-flex; }
+  #coord-sidebar-toggle {
+    display: inline-flex;
+  }
   #coord-sidebar[aria-expanded="false"] #coord-children-wrap,
   #coord-sidebar[aria-expanded="false"] #coord-tasks-wrap {
     display: none;
   }
-  #coord-sidebar[aria-expanded="false"] { max-height: none; }
+  #coord-sidebar[aria-expanded="false"] {
+    max-height: none;
+  }
 }

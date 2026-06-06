@@ -32,10 +32,15 @@
   border: 1px solid var(--border);
   border-radius: var(--radius-sm);
   padding: 6px 10px;
-  transition: border-color 0.15s, box-shadow 0.15s;
+  transition:
+    border-color 0.15s,
+    box-shadow 0.15s;
 }
 .ui-input::placeholder,
-.ui-textarea::placeholder { color: var(--fg-dim); opacity: 0.7; }
+.ui-textarea::placeholder {
+  color: var(--fg-dim);
+  opacity: 0.7;
+}
 .ui-input:focus-visible,
 .ui-textarea:focus-visible,
 .ui-select:focus-visible {
@@ -45,9 +50,15 @@
 }
 .ui-input:disabled,
 .ui-textarea:disabled,
-.ui-select:disabled { opacity: 0.55; cursor: not-allowed; }
+.ui-select:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
 
-.ui-textarea { resize: vertical; min-height: 32px; }
+.ui-textarea {
+  resize: vertical;
+  min-height: 32px;
+}
 
 /* ==========================================================================
    Buttons — flat 1px border; accent-filled "primary" variant
@@ -62,12 +73,25 @@
   border-radius: var(--radius-sm);
   padding: 4px 10px;
   cursor: pointer;
-  transition: background 0.15s, border-color 0.15s, color 0.15s;
+  transition:
+    background 0.15s,
+    border-color 0.15s,
+    color 0.15s;
   letter-spacing: 0.01em;
 }
-.ui-btn:hover { background: var(--bg-highlight); border-color: var(--accent-dim); color: var(--fg-bright); }
-.ui-btn:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
-.ui-btn:disabled { opacity: 0.5; cursor: not-allowed; }
+.ui-btn:hover {
+  background: var(--bg-highlight);
+  border-color: var(--accent-dim);
+  color: var(--fg-bright);
+}
+.ui-btn:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+.ui-btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
 
 .ui-btn--primary {
   background: var(--accent);
@@ -75,10 +99,21 @@
   border-color: var(--accent);
   font-weight: 600;
 }
-.ui-btn--primary:hover { filter: brightness(1.08); background: var(--accent); color: var(--on-color); }
+.ui-btn--primary:hover {
+  filter: brightness(1.08);
+  background: var(--accent);
+  color: var(--on-color);
+}
 
-.ui-btn--danger { border-color: var(--red); color: var(--red); }
-.ui-btn--danger:hover { background: var(--red-glow); color: var(--red); border-color: var(--red); }
+.ui-btn--danger {
+  border-color: var(--red);
+  color: var(--red);
+}
+.ui-btn--danger:hover {
+  background: var(--red-glow);
+  color: var(--red);
+  border-color: var(--red);
+}
 
 /* Compact "refresh" / icon button — inline affordance in sidebars and
    section headings. */
@@ -90,12 +125,17 @@
   border-radius: 2px;
   color: var(--fg);
 }
-.ui-btn--icon:hover { background: var(--bg-elevated); }
+.ui-btn--icon:hover {
+  background: var(--bg-elevated);
+}
 /* Match .ui-btn's focus-visible pattern so the compact variant gets
    the same accent-ring treatment instead of falling back to the
    browser-default outline (phase-4 designer review: focus-ring
    consistency). */
-.ui-btn--icon:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+.ui-btn--icon:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
 
 /* ==========================================================================
    State glyphs — unified vocabulary (● running / ◐ thinking / ⚠ attention /
@@ -108,11 +148,22 @@
   flex-shrink: 0;
   font-family: var(--font-mono);
 }
-.ui-glyph-running   { color: var(--green); }
-.ui-glyph-thinking  { color: var(--cyan); }
-.ui-glyph-attention { color: var(--yellow); font-weight: 700; }
-.ui-glyph-error     { color: var(--red); }
-.ui-glyph-idle      { color: var(--fg-dim); }
+.ui-glyph-running {
+  color: var(--green);
+}
+.ui-glyph-thinking {
+  color: var(--cyan);
+}
+.ui-glyph-attention {
+  color: var(--yellow);
+  font-weight: 700;
+}
+.ui-glyph-error {
+  color: var(--red);
+}
+.ui-glyph-idle {
+  color: var(--fg-dim);
+}
 
 /* ==========================================================================
    Status pills — reusable chip for enum states (task status, run state)
@@ -128,14 +179,37 @@
   color: var(--fg-dim);
   font-family: var(--font-mono);
 }
-.ui-pill--pending     { color: var(--fg-dim); }
-.ui-pill--in-progress { color: var(--yellow); border-color: var(--yellow); }
-.ui-pill--done        { color: var(--green); border-color: var(--green); }
-.ui-pill--blocked     { color: var(--red); border-color: var(--red); }
-.ui-pill--running     { color: var(--green); border-color: var(--green); }
-.ui-pill--thinking    { color: var(--cyan); border-color: var(--cyan); }
-.ui-pill--attention   { color: var(--yellow); border-color: var(--yellow); }
-.ui-pill--error       { color: var(--red); border-color: var(--red); }
+.ui-pill--pending {
+  color: var(--fg-dim);
+}
+.ui-pill--in-progress {
+  color: var(--yellow);
+  border-color: var(--yellow);
+}
+.ui-pill--done {
+  color: var(--green);
+  border-color: var(--green);
+}
+.ui-pill--blocked {
+  color: var(--red);
+  border-color: var(--red);
+}
+.ui-pill--running {
+  color: var(--green);
+  border-color: var(--green);
+}
+.ui-pill--thinking {
+  color: var(--cyan);
+  border-color: var(--cyan);
+}
+.ui-pill--attention {
+  color: var(--yellow);
+  border-color: var(--yellow);
+}
+.ui-pill--error {
+  color: var(--red);
+  border-color: var(--red);
+}
 
 /* ==========================================================================
    Section heading — used on tree/list sidebars.
@@ -164,25 +238,48 @@
   border: 1px solid var(--border);
   border-radius: var(--radius);
 }
-.ui-panel--flush { border-radius: 0; border-left: none; border-right: none; }
+.ui-panel--flush {
+  border-radius: 0;
+  border-left: none;
+  border-right: none;
+}
 
 /* ==========================================================================
    Typography helpers — explicit tiers so the utility actually conveys size.
    Opt-in overrides for headings / captions; do not redefine the shared
    body typography defaults from base.css (var(--font-ui), 14px / 1.45).
    ========================================================================== */
-.ui-heading { font-family: var(--font-ui); font-weight: 600; color: var(--fg-bright); }
-.ui-heading--sm { font-size: 11px; text-transform: uppercase; letter-spacing: 0.06em; color: var(--fg-dim); }
-.ui-heading--md { font-size: 13px; }
-.ui-heading--lg { font-size: 15px; }
-.ui-dim { color: var(--fg-dim); }
+.ui-heading {
+  font-family: var(--font-ui);
+  font-weight: 600;
+  color: var(--fg-bright);
+}
+.ui-heading--sm {
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--fg-dim);
+}
+.ui-heading--md {
+  font-size: 13px;
+}
+.ui-heading--lg {
+  font-size: 15px;
+}
+.ui-dim {
+  color: var(--fg-dim);
+}
 
 /* ==========================================================================
    Reduced-motion — any animation declared in this file stays disabled.
    ========================================================================== */
 @media (prefers-reduced-motion: reduce) {
-  .ui-input, .ui-textarea, .ui-select,
-  .ui-btn { transition: none; }
+  .ui-input,
+  .ui-textarea,
+  .ui-select,
+  .ui-btn {
+    transition: none;
+  }
 }
 
 /* ==========================================================================
@@ -266,7 +363,9 @@
 
 /* Spacer pushes the right cluster to the edge. Use as a flex filler
    between the title and the action row. */
-.appbar-spacer { flex: 1; }
+.appbar-spacer {
+  flex: 1;
+}
 
 /* Status text (SSE connection state, streaming indicator). Polite
    aria-live lives on this span; the typography here intentionally
@@ -350,7 +449,10 @@
   border: 1px solid var(--hair);
   border-radius: 999px;
   cursor: pointer;
-  transition: background 120ms ease, border-color 120ms ease, color 120ms ease;
+  transition:
+    background 120ms ease,
+    border-color 120ms ease,
+    color 120ms ease;
 }
 
 .btn:hover {
@@ -422,8 +524,13 @@
    spinner.
    ========================================================================== */
 @keyframes ts-pulse {
-  0%, 100% { opacity: 1; }
-  50%      { opacity: 0.35; }
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.35;
+  }
 }
 
 .risk {
@@ -438,10 +545,21 @@
   border-radius: 3px;
 }
 
-.risk.low  { background: var(--ok-soft);   color: var(--ok); }
-.risk.med  { background: var(--warn-soft); color: var(--warn); }
-.risk.high { background: var(--err-soft);  color: var(--err); }
+.risk.low {
+  background: var(--ok-soft);
+  color: var(--ok);
+}
+.risk.med {
+  background: var(--warn-soft);
+  color: var(--warn);
+}
+.risk.high {
+  background: var(--err-soft);
+  color: var(--err);
+}
 /* .risk.crit — darker filled red via --err-fill (bright --err as a fill
    reads as alarm-loud). White text in both themes for max contrast. */
-.risk.crit { background: var(--err-fill);  color: #fff; }
-
+.risk.crit {
+  background: var(--err-fill);
+  color: #fff;
+}

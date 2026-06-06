@@ -2139,7 +2139,9 @@ textarea.skill-content-area {
      that don't support font-variant-emoji fall back gracefully. */
   font-variant-emoji: text;
   cursor: pointer;
-  transition: background 0.15s, border-color 0.15s;
+  transition:
+    background 0.15s,
+    border-color 0.15s;
   z-index: 2;
 }
 .skill-lock-btn:hover {
@@ -4342,4 +4344,3 @@ textarea.skill-content-area {
     transition: none;
   }
 }
-

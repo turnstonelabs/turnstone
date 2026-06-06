@@ -1383,7 +1383,9 @@
   border: none;
   border-radius: var(--r-sm);
   cursor: pointer;
-  transition: color 120ms ease, background 120ms ease;
+  transition:
+    color 120ms ease,
+    background 120ms ease;
 }
 
 .msg-action-btn:hover {

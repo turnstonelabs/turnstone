@@ -331,7 +331,9 @@
   animation: ts-spin 0.9s linear infinite;
 }
 @media (prefers-reduced-motion: reduce) {
-  .coord-tool-row-verdict code.judging .spin { animation: none; }
+  .coord-tool-row-verdict code.judging .spin {
+    animation: none;
+  }
 }
 
 /* Rationale disclosure — collapsible block under a row.  Renders the
@@ -512,7 +514,9 @@
   background: var(--panel-2);
   border-top: 1px solid var(--hair);
 }
-.coord-tool-actions .spacer { flex: 1; }
+.coord-tool-actions .spacer {
+  flex: 1;
+}
 .coord-tool-actions button.act {
   padding: 6px 14px;
   font: inherit;
@@ -523,7 +527,10 @@
   border: 1.5px solid var(--hair-2);
   border-radius: var(--r-md);
   cursor: pointer;
-  transition: background 120ms ease, border-color 120ms ease, color 120ms ease;
+  transition:
+    background 120ms ease,
+    border-color 120ms ease,
+    color 120ms ease;
 }
 .coord-tool-actions button.act:hover {
   color: var(--ink);
