@@ -83,3 +83,47 @@ export function buildSystemNudgeMarker() {
   el.textContent = "system nudge";
   return el;
 }
+
+// Canonical risk-level vocabulary shared by both panes.  RISK_LEVELS is ordinal
+// (index == severity rank); the aliases cover emitters that abbreviate.  An
+// unknown / unrecognized level normalizes to "medium": not "low" (an unlabelled
+// risk must not render benign) and not "high" (medium is the neutral default
+// both panes already displayed; the coordinator's old rank used "high", which
+// step 5e.1b brings to "medium" per the unify decision).
+const RISK_LEVELS = ["low", "medium", "high", "critical"];
+const RISK_ALIASES = { med: "medium", crit: "critical" };
+
+export function normalizeRiskLevel(raw) {
+  let s = String(raw == null ? "" : raw)
+    .trim()
+    .toLowerCase();
+  s = RISK_ALIASES[s] || s;
+  return RISK_LEVELS.indexOf(s) >= 0 ? s : "medium";
+}
+
+// Ordinal rank (low=0 .. critical=3) via the canonical normalize, so an alias or
+// unknown value ranks consistently with how it displays.  Unknown -> medium (1).
+export function riskRank(raw) {
+  return RISK_LEVELS.indexOf(normalizeRiskLevel(raw));
+}
+
+// Pick the item carrying the highest risk_level (judge verdict preferred over
+// heuristic) so a low-risk item[0] can't visually mask a higher-risk item[2].
+// An item with NO verdict ranks below "low" (-1) so it never wins; a verdict
+// with an unknown level ranks "medium" via riskRank.
+export function maxSeverityItem(items) {
+  function rank(it) {
+    const v = it && (it.judge_verdict || it.heuristic_verdict);
+    return v ? riskRank(v.risk_level) : -1;
+  }
+  let best = items[0];
+  let bestRank = rank(best);
+  for (let i = 1; i < items.length; i += 1) {
+    const r = rank(items[i]);
+    if (r > bestRank) {
+      best = items[i];
+      bestRank = r;
+    }
+  }
+  return best;
+}

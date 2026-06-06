@@ -65,3 +65,24 @@ def test_no_inner_html() -> None:
     """House style: programmatic DOM only — no innerHTML *usage* in the shared
     module (the header comment names it; guard the access pattern)."""
     assert ".innerHTML" not in _body()
+
+
+def test_normalize_risk_level_unknown_to_medium() -> None:
+    """Unified canonical fallback (step 5e.1b): an unknown / unrecognized risk
+    normalizes to "medium" (the user's decision; the coordinator's old rank used
+    "high").  The crit/med abbreviations alias to critical/medium so a 'crit'
+    verdict no longer renders as medium (the latent interactive bug)."""
+    body = _body()
+    assert 'return RISK_LEVELS.indexOf(s) >= 0 ? s : "medium";' in body
+    assert 'crit: "critical"' in body and 'med: "medium"' in body
+
+
+def test_risk_rank_and_max_severity_exported() -> None:
+    """riskRank + maxSeverityItem (lifted from the coordinator's _riskRank /
+    _maxSeverityItem) are exported and build on the canonical normalize, so the
+    rank and the display can't disagree on the fallback.  An item with no verdict
+    ranks below low so it never wins the max-severity pick."""
+    body = _body()
+    assert "export function riskRank(" in body
+    assert "export function maxSeverityItem(" in body
+    assert "? riskRank(v.risk_level) : -1;" in body

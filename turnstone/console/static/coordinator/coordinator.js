@@ -30,6 +30,7 @@ import {
   stripAnsi,
   buildWatchResultCard,
   buildSystemNudgeMarker,
+  maxSeverityItem,
 } from "/shared/conversation.js";
 
 function buildCoordChrome(root, opts) {
@@ -3222,50 +3223,10 @@ function createCoordinatorPane(root, wsId, opts) {
   // null if the detail is unusable (defensive \u2014 server is supposed to
   // emit None when no items).  Stays DOM-method-only to match the
   // zero-innerHTML XSS posture of the rest of the row template.
-  // Risk-level → numeric severity for max-across-items computation.
-  // Values are ordinal: higher integer = higher severity. Both "crit"
-  // and "critical" map to 3 because production emitters disagree:
-  // turnstone/core/judge.py validates against ('low','medium','high',
-  // 'critical') and the heuristic seeds emit the full word, but
-  // earlier dock UI history used the abbreviation. Accept both.
-  // Unknown / malformed risk_level falls back to "high" rank so a
-  // schema drift fails *safe* (over-alert) rather than silently
-  // downgrading to a green pill — fixes the failure mode where
-  // "critical" was treated as unknown and rendered as low.
-  const RISK_SEVERITY = {
-    low: 0,
-    medium: 1,
-    med: 1,
-    high: 2,
-    crit: 3,
-    critical: 3,
-  };
-  const UNKNOWN_RISK_RANK = 2; // fail-safe: treat unknown as "high"
-
-  function _riskRank(verdict) {
-    if (!verdict) return -1;
-    const risk = (verdict.risk_level || "").toLowerCase();
-    return RISK_SEVERITY[risk] != null
-      ? RISK_SEVERITY[risk]
-      : UNKNOWN_RISK_RANK;
-  }
-
-  // Pick the item carrying the highest risk_level — pill colour and
-  // body display follow the worst tool in the envelope so a low-risk
-  // item[0] can't visually mask a crit item[2].
-  function _maxSeverityItem(items) {
-    let best = items[0];
-    let bestRank = _riskRank(best.judge_verdict || best.heuristic_verdict);
-    for (let i = 1; i < items.length; i += 1) {
-      const v = items[i].judge_verdict || items[i].heuristic_verdict;
-      const r = _riskRank(v);
-      if (r > bestRank) {
-        best = items[i];
-        bestRank = r;
-      }
-    }
-    return best;
-  }
+  // Risk-level severity ranking moved to the shared conversation.js
+  // (maxSeverityItem / riskRank, imported above) so the coordinator and
+  // interactive panes can't drift on the fallback.  Unknown / malformed
+  // risk_level ranks "medium" (step 5e.1b: this pane's old rank used "high").
 
   function _evidenceLineText(line) {
     if (typeof line === "string") return line;
@@ -3350,7 +3311,7 @@ function createCoordinatorPane(root, wsId, opts) {
     // them all so leading with [0] keeps the operator's mental model
     // anchored on "what the LLM dispatched first").
     const primary = items[0];
-    const severityItem = _maxSeverityItem(items);
+    const severityItem = maxSeverityItem(items);
     const judge = severityItem.judge_verdict || null;
     const heuristic = severityItem.heuristic_verdict || null;
     const verdict = judge || heuristic;

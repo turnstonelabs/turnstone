@@ -27,6 +27,7 @@ import {
   stripAnsi,
   buildWatchResultCard,
   buildSystemNudgeMarker,
+  normalizeRiskLevel,
 } from "./conversation.js";
 
 let _paneCounter = 0;
@@ -3180,21 +3181,6 @@ function buildToolDiv(item) {
   }
 
   return div;
-}
-
-// Server-supplied ``risk_level`` is constrained to this enum, but it lands
-// in ``className`` / ``data-risk`` strings that the verdict + output-warning
-// CSS and the ``badge.nextElementSibling`` / ``data-risk`` selectors rely on.
-// Funnel every interpolation through one chokepoint so whitespace, a stray
-// case, or a future relaxed-validation server value can't break selector
-// targeting silently (issue #562) — unknown / blank → the neutral default.
-const VALID_RISK_LEVELS = new Set(["low", "medium", "high", "critical"]);
-
-function normalizeRiskLevel(raw) {
-  const s = String(raw || "")
-    .trim()
-    .toLowerCase();
-  return VALID_RISK_LEVELS.has(s) ? s : "medium";
 }
 
 function renderVerdictBadge(verdict, judgePending) {

@@ -1567,16 +1567,19 @@ def test_risk_level_normalized_before_dom_interpolation() -> None:
     straight into the class string and silently break selector targeting —
     guard that the chokepoint exists and no site skips it."""
     body = _INTERACTIVE_JS.read_text(encoding="utf-8")
-    assert "function normalizeRiskLevel(" in body
-    assert "VALID_RISK_LEVELS" in body
-    for level in ("low", "medium", "high", "critical"):
-        assert f'"{level}"' in body
+    # The canonical normalizer + its enum moved to the shared conversation.js
+    # (step 5e.1b); the pane imports it and routes all three sites through it.
+    assert "normalizeRiskLevel," in body and 'from "./conversation.js"' in body
     # The raw fallback antipattern must be gone from every interpolation site.
     assert 'risk_level || "medium"' not in body
     assert 'risk_level) || "medium"' not in body
-    # The three known sites (updateVerdictBadge / _buildOutputWarningEl /
+    # The three sites (updateVerdictBadge / _buildOutputWarningEl /
     # renderVerdictBadge) all route through the chokepoint.
-    assert body.count("normalizeRiskLevel(") >= 4  # 1 def + 3 call sites
+    assert body.count("normalizeRiskLevel(") >= 3  # 3 call sites (def is shared)
+    shared = (_INTERACTIVE_JS.parent / "conversation.js").read_text(encoding="utf-8")
+    assert "export function normalizeRiskLevel(" in shared
+    for level in ("low", "medium", "high", "critical"):
+        assert f'"{level}"' in shared
 
 
 def test_announced_rail_outspecifies_inline_cyan_hold() -> None:

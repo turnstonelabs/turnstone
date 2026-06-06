@@ -73,7 +73,7 @@ def test_coordinator_js_exposes_inline_approval_helpers():
     body = coord_js.read_text(encoding="utf-8")
     # Approval-block rendering helpers
     assert "function renderApprovalBlock" in body
-    assert "function _maxSeverityItem" in body
+    assert "maxSeverityItem," in body  # imported from conversation.js (5e.1b)
     assert "function _renderSubItem" in body
     # The submit + 409 race-handling path
     assert "function submitChildApproval" in body or "submitChildApproval(" in body
@@ -103,11 +103,14 @@ def test_coordinator_js_exposes_inline_approval_helpers():
     # regress to a buttoned approve UI on the wrong state.
     assert "POLICY-BLOCKED" in body
     assert "judge unavailable" in body
-    # Critical-risk handling — bug-1 was that risk_level='critical'
-    # rendered as low because RISK_SEVERITY only mapped 'crit'.
-    # Both aliases must remain in the table so a 'critical' verdict
-    # ranks at 3 and renders with the .risk.crit pill.
-    assert "critical: 3" in body
+    # Critical-risk handling: bug-1 was that risk_level='critical' rendered as
+    # low because the old severity table only mapped 'crit'.  The crit/critical
+    # alias moved to the shared conversation.js (step 5e.1b); verify it there so
+    # a 'critical' verdict still ranks like 'crit'.
+    shared = Path(__file__).resolve().parent.parent / (
+        "turnstone/shared_static/conversation.js"
+    )
+    assert 'crit: "critical"' in shared.read_text(encoding="utf-8")
     # Child approves must round-trip through the routing proxy at
     # /v1/api/route/workstreams/{ws_id}/approve — the bare
     # /v1/api/workstreams/.../approve path only works for the
