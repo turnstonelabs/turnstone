@@ -81,16 +81,19 @@ def test_transport_urls_are_base_prefixed() -> None:
 
 def test_embedded_chrome_is_gated() -> None:
     """The standalone split-pane affordances (focus tracking, context menu,
-    split/close buttons) are gated behind ``!this._embedded`` so the console
-    pane gets the L-shell's tab + slim header instead; the embedded path adds
-    the INTERACTIVE persona tag."""
+    split/close buttons) AND the pane header are gated behind ``!this._embedded``:
+    the console (embedded) pane has NO header — name / persona / state live in
+    the tab + rail, and the conversation reclaims the full pane height."""
     body = _INTERACTIVE.read_text(encoding="utf-8")
     assert "if (!this._embedded) {" in body, "standalone chrome must be gated"
     assert 'this.el.classList.add("pane--embedded")' in body
-    assert '"pane-persona-tag"' in body
-    assert '"INTERACTIVE"' in body
-    # The split/close buttons must NOT be built unconditionally any more.
-    assert "if (this._embedded) {" in body
+    # The embedded pane builds NO header — the persona tag is gone (the rail's
+    # INT/COORD vocabulary shows it instead).
+    assert '"pane-persona-tag"' not in body
+    assert '"INTERACTIVE"' not in body
+    # The header (workstream name + split/close actions) builds for standalone
+    # only — gated, not unconditional.
+    assert 'this.headerEl = document.createElement("div")' in body
 
 
 def test_factory_returns_lifecycle_over_node_proxy() -> None:

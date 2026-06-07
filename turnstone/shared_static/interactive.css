@@ -26,37 +26,11 @@
   overflow: hidden;
 }
 
-/* Slim header — visible here (standalone hides .pane-header outside multi-pane);
-   matches the coordinator appbar's surface so adjacent panes read alike. */
-.pane--embedded .pane-header {
-  display: flex;
-  align-items: center;
-  gap: 9px;
-  padding: 7px 13px;
-  flex-shrink: 0;
-  background: color-mix(in srgb, var(--panel) 60%, var(--bg));
-  border-bottom: 1px solid var(--hair);
-}
-.pane--embedded .pane-ws-name {
-  font-size: 13px;
-  font-weight: 500;
-  color: var(--ink);
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-/* Persona tag — mirrors the rail's INT/COORD vocabulary (uppercase mono pill). */
-.pane-persona-tag {
-  font-family: var(--font-mono);
-  font-size: 9px;
-  letter-spacing: 0.08em;
-  color: var(--ink-3);
-  border: 1px solid var(--hair);
-  border-radius: var(--radius-sm);
-  padding: 1px 5px;
-  flex-shrink: 0;
-}
+/* No embedded pane header — name / persona / state are shown by the tab + rail
+   (Workspaces), so the conversation reclaims the full pane height.  The slim
+   header + persona-tag rules were removed here when the embedded header was
+   dropped; the standalone split-pane header (retired in step 6) styles itself
+   from ui/static. */
 
 /* Messages scroll; the per-ws status bar + composer stay pinned. */
 .pane--embedded .pane-messages {

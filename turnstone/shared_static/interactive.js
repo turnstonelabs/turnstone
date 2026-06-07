@@ -222,6 +222,7 @@ class Pane {
   }
 
   updateWsName() {
+    if (!this.headerEl) return; // no header in the embedded L-shell pane
     const nameEl = this.headerEl.querySelector(".pane-ws-name");
     if (nameEl) {
       nameEl.textContent = this.wsId
@@ -626,28 +627,22 @@ class Pane {
       });
     }
 
-    // Slim pane header — the workstream name plus either the INTERACTIVE persona
-    // tag (embedded, in the L-shell) or the split/close actions (standalone).
-    this.headerEl = document.createElement("div");
-    this.headerEl.className = "pane-header";
+    // No pane header in the L-shell (embedded): the workstream name, persona,
+    // and state are shown by the tab and the rail (Workspaces).  The standalone
+    // split-pane (retired in step 6) still builds a header for its split/close
+    // actions.  The --skip-permissions banner lands in messagesEl now (see the
+    // host warningTarget), not the header.
+    if (!this._embedded) {
+      this.headerEl = document.createElement("div");
+      this.headerEl.className = "pane-header";
 
-    const wsName = document.createElement("span");
-    wsName.className = "pane-ws-name";
-    wsName.textContent = this.wsId
-      ? this._host.getWsName(this.wsId) || this.wsId.substring(0, 8)
-      : "";
-    this.headerEl.appendChild(wsName);
+      const wsName = document.createElement("span");
+      wsName.className = "pane-ws-name";
+      wsName.textContent = this.wsId
+        ? this._host.getWsName(this.wsId) || this.wsId.substring(0, 8)
+        : "";
+      this.headerEl.appendChild(wsName);
 
-    if (this._embedded) {
-      // Persona tag mirrors the rail's INT/COORD vocabulary so the pane reads
-      // as an interactive session at a glance.  No children/tasks tree — an
-      // interactive persona has no spawn affordance (that is the coordinator
-      // pane's sidebar).
-      const personaTag = document.createElement("span");
-      personaTag.className = "pane-persona-tag";
-      personaTag.textContent = "INTERACTIVE";
-      this.headerEl.appendChild(personaTag);
-    } else {
       const actions = document.createElement("div");
       actions.className = "pane-actions";
 
@@ -685,8 +680,8 @@ class Pane {
       actions.appendChild(closeBtn);
 
       this.headerEl.appendChild(actions);
+      this.el.appendChild(this.headerEl);
     }
-    this.el.appendChild(this.headerEl);
 
     // Messages area
     this.messagesEl = document.createElement("div");
@@ -3251,7 +3246,7 @@ function createInteractivePane(root, wsId, opts) {
     },
     // The --skip-permissions banner lands in the pane's own slim header.
     warningTarget(pane) {
-      return pane.headerEl;
+      return pane.messagesEl;
     },
     // MCP re-consent surfaces inline in the pane card; the console has no
     // settings-gear badge to drive (a future console consent surface can hook
