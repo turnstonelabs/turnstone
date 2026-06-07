@@ -65,8 +65,6 @@ window.onThemeChange = function (next) {
 // --- State ---
 let currentView = "home"; // "home" | "overview" | "filtered" | "admin"
 let currentFilter = { state: null, node: null, page: 1, per_page: 50 };
-let _lastOverviewJson = "";
-let _lastNodePickerJson = "";
 let evtSource = null;
 let retryDelay = 1000;
 let clusterState = null;
@@ -904,8 +902,6 @@ window.addEventListener("popstate", function (e) {
       return;
     }
     if (e.state.view === "home" || e.state.view === "overview") showHome();
-    else if (e.state.view === "admin" && typeof showAdmin === "function")
-      showAdmin();
     else if (e.state.view === "filtered" && e.state.filter) {
       currentFilter = e.state.filter;
       if (currentFilter.state) drillDownByState(currentFilter.state);
@@ -1116,6 +1112,10 @@ function _createInteractive(opts) {
           encodeURIComponent(node) +
           "/?ws_id=" +
           encodeURIComponent(wsId);
+      } else {
+        // Defensive: a 200 without target_node (a server-contract drift, e.g. an
+        // async-dispatch response) would otherwise strand the user silently.
+        errEl.textContent = "Session created but no target node was reported";
       }
     })
     .catch(function () {
