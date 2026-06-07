@@ -277,6 +277,23 @@ async function mountShell() {
     caps,
   });
 
+  // [+] new-tab (step 7): a shortcut to the persona launcher.  The Dashboard pane
+  // hosts the unified coordinator/interactive launcher (a new session needs a task
+  // prompt, so it composes there) — "new session" focuses it.  showHome is exposed
+  // by both deployments; openPane is the fallback.  Lives in the right-floated tail
+  // slot per the brief.  (Auth is the launcher's own concern — it gates each
+  // persona option; focusing it is always safe.)
+  const addTab = make("button", "tab-add");
+  addTab.type = "button";
+  addTab.setAttribute("aria-label", "New session");
+  addTab.title = "New session";
+  addTab.textContent = "+";
+  addTab.addEventListener("click", () => {
+    if (typeof window.showHome === "function") window.showHome();
+    else pm.openPane("dashboard");
+  });
+  shell.tail.append(addTab);
+
   // Dashboard pane (step 1): a singleton that ADOPTS the legacy #main so the
   // console renders unchanged inside the new shell.  Real pane types (admin,
   // coordinator, interactive) register in steps 2-5.

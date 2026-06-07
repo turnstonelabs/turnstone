@@ -421,3 +421,16 @@ def test_step7_live_tab_state_glyphs() -> None:
     )
     css = _SHELL_CSS.read_text(encoding="utf-8")
     assert ".tab .tab-glyph" in css, "the tab-glyph spacing rule must apply to static + live glyphs"
+
+
+def test_step7_new_tab_launcher_button() -> None:
+    """Step 7 #3: the tab bar's right tail carries a [+] new-session button that
+    focuses the persona launcher (the Dashboard pane hosts it; a new session needs
+    a task prompt so it composes there).  Cross-deployment via showHome with an
+    openPane fallback; reuses the scaffold's .tab-add styling."""
+    shell = _SHELL_JS.read_text(encoding="utf-8")
+    assert 'make("button", "tab-add")' in shell, "the [+] new-tab button must exist"
+    assert "shell.tail.append(addTab)" in shell, "the [+] lives in the right-floated tail slot"
+    assert "window.showHome()" in shell, "[+] must focus the persona launcher (showHome)"
+    css = _SHELL_CSS.read_text(encoding="utf-8")
+    assert ".tab-add" in css, "the .tab-add button style must exist (from the scaffold)"
