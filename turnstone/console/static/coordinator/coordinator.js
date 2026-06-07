@@ -317,6 +317,35 @@ function createCoordinatorPane(root, wsId, opts) {
       pm.openPane("interactive", childWs, { nodeId: childNode });
     }
   });
+  // Approval keyboard shortcuts (designer P2 — the console twin of the
+  // interactive.js fix): when a tool-batch is awaiting approval, route the
+  // card's kbd hints (Enter approve / D deny / Shift+A approve-all) to the
+  // resolve path.  Pane-owned on `root`, no global handler.  A focus guard lets
+  // the composer / any input keep its own keys; _currentPendingBatch skips a
+  // batch whose actions are already disabled (the in-flight double-fire guard).
+  // No feedback field here (unlike interactive), so no feedback special-case.
+  root.addEventListener("keydown", function (e) {
+    const ae = document.activeElement;
+    if (
+      ae &&
+      (ae.tagName === "TEXTAREA" ||
+        ae.tagName === "INPUT" ||
+        ae.isContentEditable)
+    )
+      return;
+    const batch = _currentPendingBatch();
+    if (!batch) return;
+    if (e.key === "Enter") {
+      e.preventDefault();
+      _resolveBatchAction(batch, true, false);
+    } else if (e.key === "Escape" || e.key.toLowerCase() === "d") {
+      e.preventDefault();
+      _resolveBatchAction(batch, false, false);
+    } else if (e.shiftKey && e.key.toLowerCase() === "a") {
+      e.preventDefault();
+      _resolveBatchAction(batch, true, true);
+    }
+  });
   // Off-screen aria-live="assertive" region — pending tool-batches
   // append into the polite messages log, which gets flipped to
   // aria-live="off" during streaming.  Routing the action-required
@@ -1247,6 +1276,22 @@ function createCoordinatorPane(root, wsId, opts) {
     batch.querySelectorAll(".conv-actions button").forEach((b) => {
       b.disabled = !!disabled;
     });
+  }
+
+  // The tool-batch currently awaiting an approval decision (for the keyboard
+  // shortcuts): the last .conv-batch with a still-pending row whose actions
+  // aren't already disabled — i.e. not mid-resolve, so a key never double-fires.
+  function _currentPendingBatch() {
+    const batches = messagesEl.querySelectorAll(".conv-batch");
+    for (let i = batches.length - 1; i >= 0; i--) {
+      const b = batches[i];
+      if (!b.querySelector('.conv-row[data-needs-approval="1"][data-call-id]'))
+        continue;
+      const btn = b.querySelector(".conv-actions button");
+      if (btn && btn.disabled) continue; // mid-resolve — don't double-fire
+      return b;
+    }
+    return null;
   }
 
   // Build the resolved-state status pill.  Shared between the live
