@@ -21,12 +21,13 @@
 
 import { PaneManager, ShellPane } from "./pane.js";
 import { mountRail, mountManage } from "./rail.js";
-// Both conversational panes are real ES modules the shell imports directly.  The
-// interactive pane lives beside us in /shared (step 5a); the coordinator pane is
-// at an absolute /static path (step 5e.0 lifted it off `window.*`), so it imports
-// by URL.
+// The interactive pane is a real ES module beside us in /shared (step 5a) — the
+// shell imports it directly, and it exists in every deployment.  The coordinator
+// pane lives at an absolute /static path that only the CONSOLE serves, so it is
+// imported LAZILY in mountShell, gated on the orchestration capability: a
+// standalone turnstone-server has no /static/coordinator/* and a static import
+// would 404 and abort the whole shell module.
 import { createInteractivePane } from "./interactive.js";
-import { createCoordinatorPane } from "/static/coordinator/coordinator.js";
 
 function make(tag, className, text) {
   const node = document.createElement(tag);
@@ -147,7 +148,7 @@ function nodeForWs(wsId) {
   return null;
 }
 
-function mountShell() {
+async function mountShell() {
   const caps = window.TURNSTONE_SHELL_CAPS || {};
 
   // Capture the existing page structure before we reorganise it.
@@ -222,37 +223,6 @@ function mountShell() {
     return pane;
   });
 
-  // Coordinator pane (step 4): a ws_id-keyed conversational pane.  onMount builds
-  // the coordinator chrome + controller into the pane body (createCoordinatorPane,
-  // a console-local persona so no node-proxy transport); onActivate opens its
-  // per-pane Tier-2 SSE once and subscribes to login re-arm; onClose tears the
-  // controller (stream + timers + observer) down.
-  pm.registerType("coordinator", (id) => {
-    const pane = new ShellPane({
-      type: "coordinator",
-      title: wsTitle(id),
-      glyph: "◆",
-    });
-    pane.onMount = function () {
-      this._ctl = createCoordinatorPane(this.bodyEl, id, {
-        onClose: () => pm.close(pane.id),
-      });
-    };
-    pane.onActivate = function () {
-      if (this._ctl && !this._connected) {
-        this._connected = true;
-        this._ctl.connect();
-        if (window.TS_LOGIN && this._ctl.onLogin) {
-          window.TS_LOGIN.subscribe(this._ctl.onLogin);
-        }
-      }
-    };
-    pane.onClose = function () {
-      if (this._ctl) this._ctl.destroy();
-    };
-    return pane;
-  });
-
   // Interactive pane (step 5): a ws_id-keyed conversational pane whose session
   // lives on a cluster NODE, so its Tier-2 SSE is node-PROXIED (the LOCALITY
   // invariant).  The owning node is resolved from the Tier-1 snapshot (or a
@@ -268,7 +238,13 @@ function mountShell() {
       glyph: "○",
     });
     pane.onMount = function () {
-      const nodeId = (extra && extra.nodeId) || nodeForWs(id);
+      // Node-proxy transport only exists in a cluster deployment (the console).
+      // On a single-node standalone (caps.cluster=false) every session is LOCAL,
+      // so nodeId stays null → the pane uses base="" (no /node/<id> hop), even
+      // though the synthesized one-node clusterState would otherwise name a node.
+      const nodeId = caps.cluster
+        ? (extra && extra.nodeId) || nodeForWs(id)
+        : null;
       this._ctl = createInteractivePane(this.bodyEl, id, {
         nodeId,
         onClose: () => pm.close(pane.id),
@@ -290,6 +266,49 @@ function mountShell() {
     };
     return pane;
   });
+
+  // Coordinator pane (step 4): a ws_id-keyed conversational pane — but ONLY where
+  // the deployment has the orchestration capability (the console).  The factory
+  // lives at an absolute /static path the standalone server does not serve, so it
+  // is imported lazily here, before rehydrate, and skipped entirely otherwise (a
+  // persisted coordinator pane then degrades to a skip — rehydrate only re-opens
+  // registered types).  onMount builds the coordinator chrome + controller (a
+  // console-local persona, no node-proxy transport); onActivate opens its per-pane
+  // Tier-2 SSE once + subscribes to login re-arm; onClose tears the controller
+  // (stream + timers + observer) down.
+  if (caps.orchestration) {
+    try {
+      const { createCoordinatorPane } =
+        await import("/static/coordinator/coordinator.js");
+      pm.registerType("coordinator", (id) => {
+        const pane = new ShellPane({
+          type: "coordinator",
+          title: wsTitle(id),
+          glyph: "◆",
+        });
+        pane.onMount = function () {
+          this._ctl = createCoordinatorPane(this.bodyEl, id, {
+            onClose: () => pm.close(pane.id),
+          });
+        };
+        pane.onActivate = function () {
+          if (this._ctl && !this._connected) {
+            this._connected = true;
+            this._ctl.connect();
+            if (window.TS_LOGIN && this._ctl.onLogin) {
+              window.TS_LOGIN.subscribe(this._ctl.onLogin);
+            }
+          }
+        };
+        pane.onClose = function () {
+          if (this._ctl) this._ctl.destroy();
+        };
+        return pane;
+      });
+    } catch (e) {
+      console.error("L-shell: coordinator pane unavailable", e);
+    }
+  }
 
   // Restore the persisted working set, else open the default Dashboard pane.
   if (!pm.rehydrate()) pm.openPane("dashboard");

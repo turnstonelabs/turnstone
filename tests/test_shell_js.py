@@ -259,8 +259,13 @@ def test_step4_coordinator_pane_registered_and_wired() -> None:
     assert 'paneManager.openPane("coordinator", ws.id)' in rail, (
         "rail coordinator clicks must open a pane, not full-page nav"
     )
-    assert 'from "/static/coordinator/coordinator.js"' in shell, (
-        "step 5e.0: the shell IMPORTS the coordinator controller (ESM), not a <script> tag"
+    assert "if (caps.orchestration)" in shell, (
+        "step 6.0: the coordinator import is gated on the orchestration capability "
+        "(a standalone turnstone-server has no /static/coordinator/*)"
+    )
+    assert "await import(" in shell and '"/static/coordinator/coordinator.js"' in shell, (
+        "step 6.0: the shell imports the coordinator controller LAZILY (dynamic import) "
+        "so a static import can't 404 the whole module on a standalone deployment"
     )
     index = _CONSOLE_INDEX.read_text(encoding="utf-8")
     assert "/static/coordinator/coordinator.js" not in index, (
