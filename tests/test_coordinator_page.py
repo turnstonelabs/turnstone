@@ -109,6 +109,35 @@ def test_coordinator_js_exposes_inline_approval_helpers():
     # a 'critical' verdict still ranks like 'crit'.
     shared = Path(__file__).resolve().parent.parent / ("turnstone/shared_static/conversation.js")
     assert 'crit: "critical"' in shared.read_text(encoding="utf-8")
+
+
+def test_coordinator_js_approval_keyboard_shortcuts():
+    """Step 7 designer P2 (the console twin of the interactive.js fix): a pending
+    tool-batch's kbd hints (Enter approve / D deny / Shift+A approve-all) must
+    actually fire.  Pane-owned keydown on `root` routing to _resolveBatchAction
+    via _currentPendingBatch (the last un-resolved pending batch), with a focus
+    guard (don't hijack composer typing) and the disabled-button double-fire guard.
+    Asserts string presence only (no JS framework for coord.js)."""
+    from pathlib import Path
+
+    body = (
+        Path(__file__).resolve().parent.parent
+        / "turnstone/console/static/coordinator/coordinator.js"
+    ).read_text(encoding="utf-8")
+    assert 'root.addEventListener("keydown"' in body, (
+        "the approval shortcuts must be a pane-owned keydown on root"
+    )
+    assert "function _currentPendingBatch()" in body, (
+        "the keydown must resolve the current pending batch (not a stale/resolved one)"
+    )
+    # The double-fire guard: skip a batch whose actions are already disabled.
+    assert "btn.disabled) continue" in body
+    # Routes the three verbs to the existing resolve path.
+    assert "_resolveBatchAction(batch, true, false)" in body  # Enter -> approve
+    assert "_resolveBatchAction(batch, false, false)" in body  # D/Esc -> deny
+    assert "_resolveBatchAction(batch, true, true)" in body  # Shift+A -> approve-all
+    # Focus guard so the keys never hijack composer/input typing.
+    assert 'ae.tagName === "TEXTAREA"' in body and "ae.isContentEditable" in body
     # Child approves must round-trip through the routing proxy at
     # /v1/api/route/workstreams/{ws_id}/approve — the bare
     # /v1/api/workstreams/.../approve path only works for the
