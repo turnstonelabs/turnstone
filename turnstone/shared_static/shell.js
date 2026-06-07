@@ -102,9 +102,11 @@ function buildShell(caps) {
   };
 }
 
-// Tab title for a session pane — the ws name from the Tier-1 snapshot, else a
-// short ws_id (a restored pane may open before the first snapshot arrives).
-function wsTitle(wsId) {
+// Scan the Tier-1 snapshot for a workstream — the shared spine of the three thin
+// wrappers below.  `skipConsole` excludes the `console` pseudo-node (coordinators
+// live there and must NOT be node-proxied — only nodeForWs wants that).  Returns
+// { nodeId, ws } or null (snapshot not ready / no match).
+function findWs(wsId, skipConsole) {
   try {
     const cs =
       window.TS_APP &&
@@ -112,33 +114,9 @@ function wsTitle(wsId) {
       window.TS_APP.getClusterState();
     if (cs && cs.nodes) {
       for (const nid in cs.nodes) {
+        if (skipConsole && nid === "console") continue;
         for (const ws of cs.nodes[nid].workstreams || []) {
-          if (ws.id === wsId)
-            return ws.name || ws.title || String(wsId).slice(0, 8);
-        }
-      }
-    }
-  } catch (e) {
-    /* clusterState not ready — fall through to the id */
-  }
-  return wsId ? String(wsId).slice(0, 8) : "session";
-}
-
-// The cluster node hosting an interactive ws — the node-proxy transport target
-// for its pane (Tier-1 carries every ws under its owning node).  Derived from
-// the live snapshot so a rehydrated pane needs no persisted node_id; an
-// explicit open-time hint (rail click / coordinator child link) skips the scan.
-function nodeForWs(wsId) {
-  try {
-    const cs =
-      window.TS_APP &&
-      window.TS_APP.getClusterState &&
-      window.TS_APP.getClusterState();
-    if (cs && cs.nodes) {
-      for (const nid in cs.nodes) {
-        if (nid === "console") continue; // coordinators live here, not interactives
-        for (const ws of cs.nodes[nid].workstreams || []) {
-          if (ws.id === wsId) return nid;
+          if (ws.id === wsId) return { nodeId: nid, ws: ws };
         }
       }
     }
@@ -148,33 +126,29 @@ function nodeForWs(wsId) {
   return null;
 }
 
-// Tab-action menu items for a conversational pane — the three-verb close plus
-// the per-persona verbs.  Pane-type-derived AND deployment-aware: a verb appears
-// only when its handler exists here, so the SAME shell yields the full menu in
-// the standalone (whose interactive verbs are classic globals in ui/static's
-// app.js) and a reduced menu in the console — the capability-derived-affordances
-// thesis applied to the tab menu.  `opts`: titleVerbs (Refresh/Edit/Fork title),
-// deleteVerb (the destructive Delete), closeSession (stop the workstream itself).
+// Tab title for a session pane — the ws name from the Tier-1 snapshot, else a
+// short ws_id (a restored pane may open before the first snapshot arrives).
+function wsTitle(wsId) {
+  const f = findWs(wsId, false);
+  if (f) return f.ws.name || f.ws.title || String(wsId).slice(0, 8);
+  return wsId ? String(wsId).slice(0, 8) : "session";
+}
+
+// The cluster node hosting an interactive ws — the node-proxy transport target
+// for its pane (Tier-1 carries every ws under its owning node).  Derived from
+// the live snapshot so a rehydrated pane needs no persisted node_id; an
+// explicit open-time hint (rail click / coordinator child link) skips the scan.
+function nodeForWs(wsId) {
+  const f = findWs(wsId, true);
+  return f ? f.nodeId : null;
+}
+
 // The live state of a workstream from the Tier-1 snapshot (the SAME source the
 // rail reads) — so a conversational tab's state glyph stays consistent with its
 // rail row and updates live rather than sitting at an open-time placeholder.
 function stateForWs(wsId) {
-  try {
-    const cs =
-      window.TS_APP &&
-      window.TS_APP.getClusterState &&
-      window.TS_APP.getClusterState();
-    if (cs && cs.nodes) {
-      for (const nid in cs.nodes) {
-        for (const ws of cs.nodes[nid].workstreams || []) {
-          if (ws.id === wsId) return ws.state || "idle";
-        }
-      }
-    }
-  } catch (e) {
-    /* snapshot not ready */
-  }
-  return "idle";
+  const f = findWs(wsId, false);
+  return f ? f.ws.state || "idle" : "idle";
 }
 
 // Repaint every stateful tab's glyph from Tier-1.  Subscribed to the render
@@ -185,6 +159,13 @@ function paintConvTabGlyphs(pm) {
     pm.setTabGlyph(t.id, glyph(stateForWs(t.rawId)));
 }
 
+// Tab-action menu items for a conversational pane — the three-verb close plus
+// the per-persona verbs.  Pane-type-derived AND deployment-aware: a verb appears
+// only when its handler exists here, so the SAME shell yields the full menu in
+// the standalone (whose interactive verbs are classic globals in ui/static's
+// app.js) and a reduced menu in the console — the capability-derived-affordances
+// thesis applied to the tab menu.  `opts`: titleVerbs (Refresh/Edit/Fork title),
+// deleteVerb (the destructive Delete), closeSession (stop the workstream itself).
 function convTabMenu(pane, pm, wsId, opts) {
   opts = opts || {};
   const G = window;

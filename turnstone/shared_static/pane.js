@@ -202,9 +202,9 @@ export class PaneManager {
 
   /** Show one pane, hide the rest, fire deactivate/activate hooks. */
   activate(paneId) {
-    if (this._activeId === paneId || !this._panes.has(paneId)) {
-      if (!this._panes.has(paneId)) return;
-    }
+    // Re-activating the already-active pane is a cheap no-op (it still re-renders
+    // tabs / re-persists / re-notifies below, just no onDeactivate/onActivate).
+    if (!this._panes.has(paneId)) return;
     const prev = this._activeId ? this._panes.get(this._activeId) : null;
     if (prev && prev.id !== paneId) {
       prev.el.hidden = true;
@@ -525,8 +525,10 @@ export class PaneManager {
     let restored = false;
     for (const item of state.order) {
       if (item && this._types.has(item.type)) {
-        this.openPane(item.type, item.id);
-        restored = true;
+        // Only count it restored if the pane was actually created — an auth-gated
+        // type (a coordinator pane without scope) returns null, and must not
+        // suppress the Dashboard fallback into a blank shell.
+        if (this.openPane(item.type, item.id)) restored = true;
       }
     }
     if (state.active && this._panes.has(state.active)) {
