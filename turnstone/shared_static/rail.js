@@ -27,8 +27,10 @@ const STATE_LABEL = {
 };
 
 /** A decorative shape+colour state glyph (the row/pill also carries the state
- *  in text/aria, so the glyph itself is aria-hidden). */
-function glyph(state) {
+ *  in text/aria, so the glyph itself is aria-hidden).  Exported so the shell can
+ *  paint the SAME glyph onto a conversational tab from the SAME Tier-1 source —
+ *  rail row and tab stay consistent, one writer (no Tier-2 tab-glyph race). */
+export function glyph(state) {
   const s = GLYPH[state] ? state : "idle";
   const el = document.createElement("span");
   el.className = "ui-glyph ui-glyph-" + s;

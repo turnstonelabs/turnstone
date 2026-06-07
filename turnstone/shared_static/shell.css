@@ -411,10 +411,16 @@
   background: none;
   font-family: var(--font-ui);
 }
-.tab .glyph {
+/* Tab glyph spacing — applies to BOTH the static decorative char (Dashboard /
+   Admin, via .glyph) and the live state glyph (.ui-glyph-* on conversational
+   tabs).  The static glyph is dim --ink-4; the live glyph keeps its own
+   .ui-glyph-* state colour, so it is NOT given a colour here. */
+.tab .tab-glyph {
   margin-right: 6px;
-  color: var(--ink-4);
   font-size: 11px;
+}
+.tab .glyph {
+  color: var(--ink-4);
 }
 .tab:hover {
   background: var(--panel-2);
@@ -424,9 +430,8 @@
   border-color: var(--hair-2);
   color: var(--ink);
 }
-/* Active tab's glyph brightens so an open session's `○` placeholder doesn't read
-   permanently "idle" beside its live (e.g. running ●) rail row.  Step 7 makes
-   tab glyphs live state; this is the interim hint. */
+/* Active tab's STATIC glyph (Dashboard / Admin) brightens a touch; live state
+   glyphs on conversational tabs keep their .ui-glyph-* state colour instead. */
 .tab.active .glyph {
   color: var(--ink-2);
 }

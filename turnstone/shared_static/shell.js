@@ -20,7 +20,7 @@
    ========================================================================== */
 
 import { PaneManager, ShellPane } from "./pane.js";
-import { mountRail, mountManage } from "./rail.js";
+import { mountRail, mountManage, glyph } from "./rail.js";
 // The interactive pane is a real ES module beside us in /shared (step 5a) — the
 // shell imports it directly, and it exists in every deployment.  The coordinator
 // pane lives at an absolute /static path that only the CONSOLE serves, so it is
@@ -155,6 +155,36 @@ function nodeForWs(wsId) {
 // app.js) and a reduced menu in the console — the capability-derived-affordances
 // thesis applied to the tab menu.  `opts`: titleVerbs (Refresh/Edit/Fork title),
 // deleteVerb (the destructive Delete), closeSession (stop the workstream itself).
+// The live state of a workstream from the Tier-1 snapshot (the SAME source the
+// rail reads) — so a conversational tab's state glyph stays consistent with its
+// rail row and updates live rather than sitting at an open-time placeholder.
+function stateForWs(wsId) {
+  try {
+    const cs =
+      window.TS_APP &&
+      window.TS_APP.getClusterState &&
+      window.TS_APP.getClusterState();
+    if (cs && cs.nodes) {
+      for (const nid in cs.nodes) {
+        for (const ws of cs.nodes[nid].workstreams || []) {
+          if (ws.id === wsId) return ws.state || "idle";
+        }
+      }
+    }
+  } catch (e) {
+    /* snapshot not ready */
+  }
+  return "idle";
+}
+
+// Repaint every stateful tab's glyph from Tier-1.  Subscribed to the render
+// signal (one Tier-1 writer for the tab glyph; the pane's Tier-2 stream drives
+// its body, not the tab) and called on activate for the initial paint.
+function paintConvTabGlyphs(pm) {
+  for (const t of pm.statefulTabs())
+    pm.setTabGlyph(t.id, glyph(stateForWs(t.rawId)));
+}
+
 function convTabMenu(pane, pm, wsId, opts) {
   opts = opts || {};
   const G = window;
@@ -294,7 +324,7 @@ async function mountShell() {
     const pane = new ShellPane({
       type: "interactive",
       title: wsTitle(id),
-      glyph: "○",
+      stateful: true, // tab shows live Tier-1 state (no static placeholder)
     });
     pane.tabMenu = () =>
       convTabMenu(pane, pm, id, {
@@ -319,6 +349,7 @@ async function mountShell() {
       });
     };
     pane.onActivate = function () {
+      pm.setTabGlyph(pane.id, glyph(stateForWs(id))); // live Tier-1 state glyph
       if (!this._ctl) return;
       this._ctl.connect(); // idempotent — opens the stream once, re-marks focus
       if (!this._loginArmed && window.TS_LOGIN && this._ctl.onLogin) {
@@ -352,7 +383,7 @@ async function mountShell() {
         const pane = new ShellPane({
           type: "coordinator",
           title: wsTitle(id),
-          glyph: "◆",
+          stateful: true, // tab shows live Tier-1 state (no static placeholder)
         });
         pane.tabMenu = () =>
           convTabMenu(pane, pm, id, {
@@ -366,6 +397,7 @@ async function mountShell() {
           });
         };
         pane.onActivate = function () {
+          pm.setTabGlyph(pane.id, glyph(stateForWs(id))); // live Tier-1 state glyph
           if (this._ctl && !this._connected) {
             this._connected = true;
             this._ctl.connect();
@@ -426,6 +458,14 @@ async function mountShell() {
   // routes through the TS_ADMIN seam (opens/focuses the singleton Admin pane).
   // `pm` lets the rail seed its active marker when a restored Admin pane is open.
   mountManage(shell.manageSec, pm);
+
+  // Live tab state-glyphs (step 7): repaint conversational tabs' state glyphs on
+  // every Tier-1 render — the SAME source + builder the rail uses, so tab and
+  // rail agree and the glyph never sits stale at an open-time placeholder.  One
+  // Tier-1 writer for the tab glyph; the pane's Tier-2 stream drives its body.
+  if (window.TS_APP && typeof window.TS_APP.onRender === "function") {
+    window.TS_APP.onRender(() => paintConvTabGlyphs(pm));
+  }
 
   // Hand off to the legacy boot (login + Tier-1 stream) now that the shell and
   // its status DOM exist.
