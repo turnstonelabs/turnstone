@@ -78,12 +78,14 @@ def test_tool_error_does_not_overwrite_approval_badge() -> None:
     # site, or a positive ``if (q) return;`` early-exit inside an
     # extracted helper) so a later refactor doesn't trip CI on
     # cosmetics.
+    # 5e.2c: the resolved/error pills converged onto the shared .conv-status
+    # vocabulary; the error variant is .conv-status--error.
     error_guard_re = re.compile(
-        r"""querySelector\(\s*['"]\.ts-approval-badge--error['"]\s*\)""",
+        r"""querySelector\(\s*['"]\.conv-status--error['"]\s*\)""",
     )
     assert error_guard_re.search(body), (
         "The error-badge code path must guard creation with a "
-        "querySelector for .ts-approval-badge--error so duplicate fires "
+        "querySelector for .conv-status--error so duplicate fires "
         "(live + history re-render) do not stack badges."
     )
     # Forbid the mutate-existing-badge sequence: a generic
@@ -96,18 +98,18 @@ def test_tool_error_does_not_overwrite_approval_badge() -> None:
     # either quote style and catch both ``className = "..."`` and
     # ``classList.add("ts-approval-badge--error")`` forms.
     overwrite_re = re.compile(
-        r"""(\w+)\s*=\s*\w+\.querySelector\(\s*(["'])\.ts-approval-badge\2\s*\)\s*;"""
+        r"""(\w+)\s*=\s*\w+\.querySelector\(\s*(["'])\.conv-status\2\s*\)\s*;"""
         r""".{0,200}?"""
         r"""(?:"""
-        r"""\1\.className\s*=\s*(["'])[^"']*\bts-approval-badge--error\b[^"']*\3"""
+        r"""\1\.className\s*=\s*(["'])[^"']*\bconv-status--error\b[^"']*\3"""
         r"""|"""
-        r"""\1\.classList\.add\([^)]*(["'])ts-approval-badge--error\4[^)]*\)"""
+        r"""\1\.classList\.add\([^)]*(["'])conv-status--error\4[^)]*\)"""
         r""")""",
         re.DOTALL,
     )
     assert not overwrite_re.search(body), (
         "Found the badge-overwrite anti-pattern: a queried "
-        ".ts-approval-badge handle is mutated into the --error variant "
+        ".conv-status handle is mutated into the --error variant "
         "(via className overwrite or classList.add). Append a sibling "
         "badge instead so the approval verdict stays visible alongside "
         "the error."
@@ -179,10 +181,10 @@ def test_replay_history_renders_persisted_verdict_badge() -> None:
     # the replay loop.  Loose on whitespace + identifier so a future
     # rename of the iteration variable doesn't trip CI.
     badge_call_re = re.compile(
-        r"renderVerdictBadge\(\s*\w+\.verdict\b",
+        r"buildConvVerdict\(\s*\w+\.verdict\b",
     )
     assert badge_call_re.search(fn), (
-        "replayHistory must call renderVerdictBadge(tc.verdict, ...) "
+        "replayHistory must call buildConvVerdict(tc.verdict, ...) "
         "when a persisted verdict is attached to a tool_call entry — "
         "otherwise the audit-trail data persisted to intent_verdicts "
         "doesn't surface on saved-workstream replays."
@@ -1559,25 +1561,26 @@ def test_early_paint_tool_pending_wiring() -> None:
 
 
 def test_risk_level_normalized_before_dom_interpolation() -> None:
-    """Server-supplied ``risk_level`` lands in className / data-risk strings
-    the verdict + output-warning CSS and the ``data-risk`` / nextElementSibling
-    selectors depend on, so every interpolation must funnel through
-    ``normalizeRiskLevel`` (issue #562).  A raw ``risk_level || "medium"``
-    fallback would pass whitespace or a future relaxed-validation value
-    straight into the class string and silently break selector targeting —
-    guard that the chokepoint exists and no site skips it."""
+    """Server-supplied ``risk_level`` lands in className / data-risk strings the
+    verdict + warning CSS depend on, so every interpolation must funnel through
+    ``normalizeRiskLevel`` (issue #562).  Post-5e.2c the pane DELEGATES the card
+    DOM to the shared builders (conversation.js), which OWN the normalization —
+    so the pane must (a) carry no raw ``risk_level || "medium"`` fallback and
+    (b) build verdict/warning DOM only via the shared builders, never inline."""
     body = _INTERACTIVE_JS.read_text(encoding="utf-8")
-    # The canonical normalizer + its enum moved to the shared conversation.js
-    # (step 5e.1b); the pane imports it and routes all three sites through it.
-    assert "normalizeRiskLevel," in body and 'from "./conversation.js"' in body
-    # The raw fallback antipattern must be gone from every interpolation site.
+    # No raw fallback antipattern anywhere in the pane.
     assert 'risk_level || "medium"' not in body
     assert 'risk_level) || "medium"' not in body
-    # The three sites (updateVerdictBadge / _buildOutputWarningEl /
-    # renderVerdictBadge) all route through the chokepoint.
-    assert body.count("normalizeRiskLevel(") >= 3  # 3 call sites (def is shared)
+    # Verdict + warning DOM is built by the shared builders (which normalize),
+    # not by an inline className / data-risk interpolation in the pane.
+    assert "buildConvVerdict(" in body
+    assert "buildConvWarning(" in body
+    # The chokepoint + its enum live in the shared module, and the builders there
+    # route the server risk through it.
     shared = (_INTERACTIVE_JS.parent / "conversation.js").read_text(encoding="utf-8")
     assert "export function normalizeRiskLevel(" in shared
+    assert "normalizeRiskLevel(verdict.risk_level)" in shared  # buildConvVerdict
+    assert "normalizeRiskLevel(a.risk_level)" in shared  # buildConvWarning
     for level in ("low", "medium", "high", "critical"):
         assert f'"{level}"' in shared
 
