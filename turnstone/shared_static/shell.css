@@ -430,6 +430,33 @@
 .tab.active .glyph {
   color: var(--ink-2);
 }
+/* Tab-action caret — opens the pane's action dropdown (step 7).  A decorative
+   span inside the tab <button> (a nested <button> is invalid markup); the menu
+   it triggers is keyboard-reachable via ContextMenu / Shift+F10 on the focused
+   tab.  Dim by default, brightening on tab hover / active / open. */
+.tab-caret {
+  margin-left: 6px;
+  margin-right: -3px;
+  padding: 2px 3px;
+  color: var(--ink-4);
+  font-size: 10px;
+  line-height: 1;
+  border-radius: var(--r-sm);
+  transition:
+    color 0.1s,
+    background 0.1s;
+}
+.tab:hover .tab-caret,
+.tab.active .tab-caret {
+  color: var(--ink-2);
+}
+.tab-caret:hover,
+.tab[aria-expanded="true"] .tab-caret {
+  color: var(--ink);
+}
+.tab-caret:hover {
+  background: var(--hair-2);
+}
 .tab-add {
   width: 28px;
   height: 28px;
@@ -453,6 +480,109 @@
   align-items: center;
   gap: 8px;
   color: var(--ink-4);
+}
+
+/* Tab-action dropdown — promoted to the shared shell sheet so the console and
+   the standalone server both render it.  Recovers the retired `.ws-tab-dropdown`
+   design (git 92ad5bd4) translated onto the DS token vocabulary (the old sheet
+   used --bg-surface/--border/--fg-*; the shell speaks --panel/--hair/--ink-*). */
+.tab-menu {
+  position: fixed;
+  z-index: 300;
+  min-width: 184px;
+  max-height: calc(
+    100vh - 16px
+  ); /* never taller than the viewport — scroll instead */
+  overflow-y: auto;
+  padding: 4px 0;
+  /* --panel-2 (a step up from the page/tabbar --panel) reads as an elevated
+     popup; the shadow + --hair-2 border carry the rest. */
+  background: var(--panel-2);
+  border: 1px solid var(--hair-2);
+  border-radius: var(--r-md);
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.4);
+  animation: tab-menu-in 0.1s ease-out;
+}
+[data-theme="light"] .tab-menu {
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.12);
+}
+.tab-menu-item {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  width: 100%;
+  padding: 7px 14px;
+  border: none;
+  background: none;
+  color: var(--ink);
+  font-family: var(--font-ui);
+  font-size: 13px;
+  text-align: left;
+  white-space: nowrap;
+  cursor: pointer;
+  transition: background 0.1s;
+}
+.tab-menu-item:hover,
+.tab-menu-item:focus-visible {
+  /* a visible delta from the --panel-2 surface on BOTH themes; reuses the rail
+     .row.open accent wash so the highlight reads as one vocabulary. */
+  background: color-mix(in srgb, var(--accent) 8%, var(--panel-2));
+}
+.tab-menu-item:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: -2px;
+}
+/* Delete carries a RESTING danger cue (red-tinted label + key), not colour-on-
+   hover-only — the brief's "never colour alone" rule.  ("Delete" is itself the
+   non-colour cue; the tint is the at-a-glance scan affordance.) ~7:1 at rest. */
+.tab-menu-item.destructive {
+  color: color-mix(in srgb, var(--err) 80%, var(--ink-2));
+}
+.tab-menu-item.destructive .tab-menu-key {
+  color: color-mix(in srgb, var(--err) 55%, var(--ink-4));
+}
+.tab-menu-item.destructive:hover,
+.tab-menu-item.destructive:focus-visible {
+  color: var(--err);
+  background: color-mix(in oklab, var(--err) 14%, transparent);
+}
+.tab-menu-item.destructive:focus-visible {
+  outline-color: var(--err);
+}
+.tab-menu-label {
+  flex: 1;
+}
+.tab-menu-key {
+  flex-shrink: 0;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--ink-4);
+}
+/* light --ink-4 on the menu surface is ~4:1 (sub-AA for this 11px text) — one
+   step up; dark --ink-4 already clears AA so it keeps the dimmer hint. */
+[data-theme="light"] .tab-menu-key {
+  color: var(--ink-3);
+}
+.tab-menu-sep {
+  height: 1px;
+  margin: 6px 0;
+  background: var(--hair-2);
+}
+@keyframes tab-menu-in {
+  from {
+    opacity: 0;
+    transform: translateY(-4px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .tab-menu {
+    animation: none;
+  }
 }
 
 /* pane host — ONE pane visible per tab (no split; the mock's 2-up was a

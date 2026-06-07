@@ -23,6 +23,7 @@ _ROOT = Path(__file__).resolve().parent.parent
 _SHARED = _ROOT / "turnstone/shared_static"
 _SHELL_JS = _SHARED / "shell.js"
 _PANE_JS = _SHARED / "pane.js"
+_SHELL_CSS = _SHARED / "shell.css"
 _CONSOLE_INDEX = _ROOT / "turnstone/console/static/index.html"
 _CONSOLE_APP = _ROOT / "turnstone/console/static/app.js"
 _CONSOLE_ADMIN = _ROOT / "turnstone/console/static/admin.js"
@@ -322,3 +323,71 @@ def test_step5d_rail_open_marker_tracks_active_pane() -> None:
     # The Dashboard row is no longer unconditionally open; a session row gets it.
     assert 'dash.className = "row open"' not in rail
     assert "active && active.rawId === ws.id" in rail
+
+
+def test_step7_tab_dropdown_mechanism() -> None:
+    """Step 7: PaneManager owns the GENERIC tab-action dropdown — a caret on any
+    pane that exposes ``tabMenu()`` (the Dashboard home exposes none, so no
+    caret), opening a keyboard-navigable ``.tab-menu``.  The caret is a <span>,
+    NOT a nested <button> inside the tab <button> (invalid markup); the menu is
+    reachable by keyboard via ContextMenu / Shift+F10, and a single menu is open
+    at a time (Escape / outside-click close it)."""
+    body = _PANE_JS.read_text(encoding="utf-8")
+    assert "_openTabMenu(" in body and "_closeTabMenu(" in body, (
+        "PaneManager must own the dropdown open/close mechanism"
+    )
+    assert 'typeof pane.tabMenu === "function"' in body, (
+        "the caret is gated on the pane exposing a tabMenu() descriptor"
+    )
+    assert '"tab-caret"' in body, "the tab must get a caret affordance"
+    for cls in ('"tab-menu"', '"tab-menu-item"', '"tab-menu-sep"'):
+        assert cls in body, f"the dropdown must build the namespaced {cls} chrome"
+    assert "ContextMenu" in body and "F10" in body, (
+        "the menu must be keyboard-openable (ContextMenu / Shift+F10)"
+    )
+    assert 'e.key === "Escape"' in body, "Escape must close the open menu"
+
+
+def test_step7_tab_menu_wired_per_persona() -> None:
+    """Step 7: the shell wires each pane type's tab menu via convTabMenu —
+    pane-type AND deployment derived.  The load-bearing recovery: the coordinator
+    header's removed Export + end (5e.2e) return here as Export + Close workstream
+    (its controller's closeSession).  The three-verb close (Close pane = pm.close
+    != Close workstream != Delete) is the spine; the standalone interactive verbs
+    are feature-detected globals, so the console degrades to a reduced menu."""
+    shell = _SHELL_JS.read_text(encoding="utf-8")
+    assert "function convTabMenu(" in shell, "the shared tab-menu builder must exist"
+    assert shell.count("pane.tabMenu =") >= 3, (
+        "coordinator, interactive, and admin panes must each expose a tabMenu"
+    )
+    # The three-verb close — the BRIEFING's load-bearing distinction.
+    assert '"Close pane"' in shell and "pm.close(pane.id)" in shell
+    assert '"Close workstream"' in shell, "Close workstream must be distinct from Close pane"
+    assert '"Delete"' in shell
+    # Coordinator recovery: Close workstream routes to the controller's server-close.
+    assert "pane._ctl.closeSession()" in shell, (
+        "the coordinator's Close workstream must call the controller's closeSession "
+        "(the end button removed from its header in 5e.2e)"
+    )
+    assert "exportWorkstreamDownload" in shell, "Export conversation must wire the shared util"
+    # Deployment-aware: the standalone interactive verbs are feature-detected globals.
+    assert 'typeof window.closeWorkstream === "function"' in shell, (
+        "the interactive Close workstream is a standalone-only global (feature-detected)"
+    )
+    assert "refreshWorkstreamTitle" in shell and "confirmDeleteWorkstream" in shell, (
+        "the interactive title/delete verbs are feature-detected standalone globals"
+    )
+
+
+def test_step7_tab_menu_css_promoted_shared() -> None:
+    """Step 7: the dropdown chrome is promoted to the SHARED shell sheet (so both
+    deployments render it), recovered from the retired .ws-tab-dropdown design but
+    translated onto the DS token vocabulary (--panel/--hair/--ink-*/--err, not the
+    retired ui/static --bg-surface/--border/--fg-*)."""
+    css = _SHELL_CSS.read_text(encoding="utf-8")
+    for sel in (".tab-caret", ".tab-menu", ".tab-menu-item", ".tab-menu-sep", ".tab-menu-key"):
+        assert sel in css, f"shell.css must carry the {sel} chrome"
+    assert "@keyframes tab-menu-in" in css, "the dropdown entrance keyframe must be defined"
+    assert "color-mix(in oklab, var(--err)" in css, (
+        "the destructive item must use the DS --err token (the translation happened)"
+    )

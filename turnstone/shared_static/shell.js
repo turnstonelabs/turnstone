@@ -148,6 +148,62 @@ function nodeForWs(wsId) {
   return null;
 }
 
+// Tab-action menu items for a conversational pane — the three-verb close plus
+// the per-persona verbs.  Pane-type-derived AND deployment-aware: a verb appears
+// only when its handler exists here, so the SAME shell yields the full menu in
+// the standalone (whose interactive verbs are classic globals in ui/static's
+// app.js) and a reduced menu in the console — the capability-derived-affordances
+// thesis applied to the tab menu.  `opts`: titleVerbs (Refresh/Edit/Fork title),
+// deleteVerb (the destructive Delete), closeSession (stop the workstream itself).
+function convTabMenu(pane, pm, wsId, opts) {
+  opts = opts || {};
+  const G = window;
+  const items = [];
+  if (opts.titleVerbs) {
+    if (typeof G.refreshWorkstreamTitle === "function")
+      items.push({
+        label: "Refresh title",
+        action: () => G.refreshWorkstreamTitle(wsId),
+      });
+    if (typeof G.editWorkstreamTitle === "function")
+      items.push({
+        label: "Edit title",
+        key: "Ctrl+Shift+E",
+        action: () => G.editWorkstreamTitle(wsId),
+      });
+    if (typeof G.forkWorkstream === "function")
+      items.push({
+        label: "Fork",
+        key: "Ctrl+Shift+F",
+        action: () => G.forkWorkstream(wsId),
+      });
+  }
+  if (typeof G.exportWorkstreamDownload === "function")
+    items.push({
+      label: "Export conversation",
+      action: () => G.exportWorkstreamDownload(wsId),
+    });
+  items.push({ separator: true });
+  // Close pane — drop the tab, leave the session running (PaneManager-level).
+  items.push({
+    label: "Close pane",
+    key: "Ctrl+W",
+    action: () => pm.close(pane.id),
+  });
+  // Close workstream — stop the session itself (distinct from closing the tab).
+  if (opts.closeSession)
+    items.push({ label: "Close workstream", action: opts.closeSession });
+  // Delete — destroy + unsave (interactive standalone only; confirms itself).
+  if (opts.deleteVerb && typeof G.confirmDeleteWorkstream === "function")
+    items.push({
+      label: "Delete",
+      key: "Ctrl+Shift+X",
+      cls: "destructive",
+      action: () => G.confirmDeleteWorkstream(wsId),
+    });
+  return items;
+}
+
 async function mountShell() {
   const caps = window.TURNSTONE_SHELL_CAPS || {};
 
@@ -214,6 +270,9 @@ async function mountShell() {
   // dashboard pane already hosts #main, so #view-admin moves out of it here.
   pm.registerType("admin", () => {
     const pane = new ShellPane({ type: "admin", title: "Admin", glyph: "⚙" });
+    pane.tabMenu = () => [
+      { label: "Close pane", key: "Ctrl+W", action: () => pm.close(pane.id) },
+    ];
     pane.onMount = function () {
       if (viewAdminEl) {
         viewAdminEl.style.display = ""; // clear the inline display:none guard
@@ -237,6 +296,15 @@ async function mountShell() {
       title: wsTitle(id),
       glyph: "○",
     });
+    pane.tabMenu = () =>
+      convTabMenu(pane, pm, id, {
+        titleVerbs: true,
+        deleteVerb: true,
+        closeSession:
+          typeof window.closeWorkstream === "function"
+            ? () => window.closeWorkstream(id)
+            : null,
+      });
     pane.onMount = function () {
       // Node-proxy transport only exists in a cluster deployment (the console).
       // On a single-node standalone (caps.cluster=false) every session is LOCAL,
@@ -286,6 +354,12 @@ async function mountShell() {
           title: wsTitle(id),
           glyph: "◆",
         });
+        pane.tabMenu = () =>
+          convTabMenu(pane, pm, id, {
+            closeSession: () => {
+              if (pane._ctl && pane._ctl.closeSession) pane._ctl.closeSession();
+            },
+          });
         pane.onMount = function () {
           this._ctl = createCoordinatorPane(this.bodyEl, id, {
             onClose: () => pm.close(pane.id),
