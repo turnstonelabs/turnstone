@@ -454,11 +454,14 @@ class SessionEndpointConfig:
     list_kind: WorkstreamKind | None = None
     # Storage-side state filter for the saved-list endpoint. Interactive
     # wires ``None`` — saved sidebar shows every persisted interactive
-    # workstream regardless of state (the storage layer already
-    # excludes ``state='deleted'`` tombstones). Coord wires
-    # ``"closed"`` so only explicitly-closed coordinators surface in
-    # the saved-card grid; active / in-flight rows live in the active
-    # list.
+    # workstream regardless of state. This is safe because delete is a
+    # HARD delete (``session_manager.delete`` -> ``sa.delete(workstreams)``)
+    # and no ``state='deleted'`` tombstone is ever written (WorkstreamState
+    # has no DELETED member); there is NO storage-side state filter to lean
+    # on, so if a soft-delete tombstone is ever introduced this list must
+    # add an explicit ``state != 'deleted'`` guard. Coord wires ``"closed"``
+    # so only explicitly-closed coordinators surface in the saved-card grid;
+    # active / in-flight rows live in the active list.
     saved_state_filter: str | None = None
     # (request) -> set of ws_ids in the kind's in-memory pool. Coord
     # wires a coroutine that returns ``{ws.id for ws in

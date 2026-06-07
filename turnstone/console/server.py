@@ -12828,8 +12828,9 @@ def create_app(
     # spanning both kinds. Storage is shared across kinds, so this drives
     # ``list_workstreams_with_history(kind=INTERACTIVE, ...)`` with
     # interactive's own saved semantics: ``state=None`` (every persisted
-    # interactive row except the tombstoned ``deleted`` ones storage
-    # already filters) and no warm-pool exclusion. The verb fields
+    # interactive row — safe because delete is a HARD delete, so no
+    # ``deleted`` tombstone is ever written; there is no storage-side
+    # filter) and no warm-pool exclusion. The verb fields
     # (manager_lookup / tenant_check / labels) are required by the
     # dataclass but never consulted on the read-only saved path — the
     # console mounts no interactive verb handlers, only the merged saved
