@@ -1908,8 +1908,6 @@ function closeSettingsPanel() {
   if (inner && inner.style.display !== "none") {
     cancelRevokeMcp();
   }
-  const overlay = document.getElementById("settings-overlay");
-  if (overlay) overlay.style.display = "none";
   if (_settingsTrap) {
     document.removeEventListener("keydown", _settingsTrap);
     _settingsTrap = null;
@@ -2153,7 +2151,6 @@ document.addEventListener("keydown", function (e) {
     "edit-title-overlay",
     "delete-ws-overlay",
     "ws-delete-overlay",
-    "settings-overlay",
     "revoke-mcp-overlay",
   ];
   for (let mi = 0; mi < modalIds.length; mi++) {

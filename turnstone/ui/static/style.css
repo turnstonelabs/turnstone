@@ -2146,15 +2146,9 @@ audio.media-player {
 /* ==========================================================================
    Settings: MCP server connections
    ========================================================================== */
-#settings-overlay {
-  position: fixed;
-  inset: 0;
-  background: rgba(0, 0, 0, 0.6);
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  z-index: 1000;
-}
+/* (#settings-overlay — the old settings MODAL backdrop — retired: MCP connections
+   moved to the Manage > Connections pane, which provides its own container; the
+   #settings-mcp-* content rules below are reused live in that pane.) */
 #settings-mcp-loading,
 #settings-mcp-empty {
   color: var(--fg-dim);
