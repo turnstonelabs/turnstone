@@ -31,6 +31,13 @@ import {
   buildWatchResultCard,
   buildSystemNudgeMarker,
   maxSeverityItem,
+  buildConvBatchShell,
+  buildConvRow,
+  buildConvVerdict,
+  buildConvWarning,
+  buildConvActions,
+  buildConvStatus,
+  buildConvResult,
 } from "/shared/conversation.js";
 
 function buildCoordChrome(root, opts) {
@@ -667,7 +674,7 @@ function createCoordinatorPane(root, wsId, opts) {
   // Structured ``.msg.guard-finding`` card for an ``output_guard``
   // operator-context system turn.  ``meta`` carries ``{flags, risk_level,
   // annotations, redacted}``.  Reuses the tool-row warning chip's risk / flags
-  // / redaction vocabulary (``.coord-tool-row-warning``) so guard findings read
+  // / redaction vocabulary (``.conv-warning``) so guard findings read
   // identically wherever they surface, then appends the annotations the inline
   // tool chip omits.  All text via textContent.  Mirrors the interactive pane's
   // _buildGuardFindingBubble.
@@ -677,24 +684,7 @@ function createCoordinatorPane(root, wsId, opts) {
     el.setAttribute("role", "article");
     el.setAttribute("data-ts-role", "output_guard");
     el.setAttribute("aria-label", "output guard");
-    const risk = String(meta.risk_level || "medium");
-    const warn = document.createElement("div");
-    warn.className = "coord-tool-row-warning coord-tool-row-warning--" + risk;
-    warn.setAttribute("role", "status");
-    const label = document.createElement("span");
-    label.className = "coord-tool-row-warning-label";
-    label.textContent = "⚠ " + risk.toUpperCase();
-    warn.appendChild(label);
-    const flags = Array.isArray(meta.flags) ? meta.flags : [];
-    if (flags.length) {
-      warn.appendChild(document.createTextNode(" " + flags.join(", ")));
-    }
-    if (meta.redacted) {
-      const redacted = document.createElement("span");
-      redacted.className = "coord-tool-row-warning-redacted";
-      redacted.textContent = " (credentials redacted)";
-      warn.appendChild(redacted);
-    }
+    const warn = buildConvWarning(meta);
     el.appendChild(warn);
     const anns = Array.isArray(meta.annotations) ? meta.annotations : [];
     for (let i = 0; i < anns.length; i++) {
@@ -923,8 +913,8 @@ function createCoordinatorPane(root, wsId, opts) {
   //
   // Replaces the prior pinned approval dock + duplicate .msg.tool
   // bubble pattern.  One construct per dispatch turn:
-  //   - solo (1 call, serial):  .coord-tool-batch--solo
-  //   - parallel (≥2 calls):    .coord-tool-batch--parallel
+  //   - solo (1 call, serial):  .conv-batch--solo
+  //   - parallel (≥2 calls):    .conv-batch--parallel
   // The approval gate, judge verdicts, and tool results all render
   // inside the construct so the operator reads call → verdict → result
   // as one cohesive unit.
@@ -1013,7 +1003,7 @@ function createCoordinatorPane(root, wsId, opts) {
     if (!batch || !batch.isConnected) return;
     let llmModel = null;
     let hasHeuristic = false;
-    batch.querySelectorAll(".coord-tool-row").forEach((r) => {
+    batch.querySelectorAll(".conv-row").forEach((r) => {
       const t = r.dataset.verdictTier;
       if (t === "llm" && llmModel === null) {
         llmModel = r.dataset.verdictModel || "";
@@ -1021,14 +1011,14 @@ function createCoordinatorPane(root, wsId, opts) {
         hasHeuristic = true;
       }
     });
-    const head = batch.querySelector(".coord-tool-batch-head");
+    const head = batch.querySelector(".conv-batch-head");
     if (!head) return;
-    let tierEl = head.querySelector(".coord-tool-batch-tier");
+    let tierEl = head.querySelector(".conv-batch-tier");
     const label = _formatTierLabel(llmModel, hasHeuristic);
     if (label) {
       if (!tierEl) {
         tierEl = document.createElement("span");
-        tierEl.className = "coord-tool-batch-tier";
+        tierEl.className = "conv-batch-tier";
         head.appendChild(tierEl);
       }
       if (tierEl.textContent !== label) tierEl.textContent = label;
@@ -1039,8 +1029,8 @@ function createCoordinatorPane(root, wsId, opts) {
 
   // Apply / refresh per-row status state from an item payload:
   //  - data-needs-approval="1" when item.needs_approval && !item.error
-  //  - .coord-tool-row-status--auto pill when item.auto_approved
-  //  - .coord-tool-row-status--error pill + .error class when policy-
+  //  - .conv-row-status--auto pill when item.auto_approved
+  //  - .conv-row-status--error pill + .error class when policy-
   //    blocked (item.error && !needs_approval)
   // Idempotent: clears any prior status pills + the data attribute
   // before re-applying so an upgrade-in-place (e.g. SSE folding tool
@@ -1051,11 +1041,9 @@ function createCoordinatorPane(root, wsId, opts) {
   // reflect execution outcome, not the static item payload.
   function _refreshRowStatus(row, item) {
     if (!row || !item) return;
-    const callLine = row.querySelector(".coord-tool-row-call");
+    const callLine = row.querySelector(".conv-row-call");
     if (callLine) {
-      callLine
-        .querySelectorAll(".coord-tool-row-status")
-        .forEach((p) => p.remove());
+      callLine.querySelectorAll(".conv-row-status").forEach((p) => p.remove());
     }
     delete row.dataset.needsApproval;
     // Don't clear .error here when it came from a result (no
@@ -1065,17 +1053,29 @@ function createCoordinatorPane(root, wsId, opts) {
     if (item.needs_approval && !item.error) {
       row.dataset.needsApproval = "1";
     }
-    if (callLine && item.auto_approved && !item.needs_approval) {
-      const pill = document.createElement("span");
-      pill.className = "coord-tool-row-status coord-tool-row-status--auto";
-      const reason = _normaliseAutoApproveReason(item.auto_approve_reason);
-      pill.textContent = "✓ " + reason;
-      pill.title = "auto-approved (no operator prompt) — reason: " + reason;
-      callLine.appendChild(pill);
+    // Auto-approve indicator: reconcile the inline name tag
+    // (.conv-row-auto) from item.auto_approved so an upgrade-in-place (SSE
+    // folding auto state into an already-rendered row) adds it; buildConvRow
+    // adds it at initial render, so this just keeps the two in sync.
+    const nameEl = callLine && callLine.querySelector(".conv-row-name");
+    if (nameEl) {
+      const existingAuto = nameEl.querySelector(".conv-row-auto");
+      if (item.auto_approved && !item.needs_approval) {
+        if (!existingAuto) {
+          const auto = document.createElement("span");
+          auto.className = "conv-row-auto";
+          const reason = _normaliseAutoApproveReason(item.auto_approve_reason);
+          auto.textContent = " auto: " + reason;
+          auto.title = "auto-approved (no operator prompt) — reason: " + reason;
+          nameEl.appendChild(auto);
+        }
+      } else if (existingAuto) {
+        existingAuto.remove();
+      }
     }
     if (callLine && item.error && !item.needs_approval) {
       const errPill = document.createElement("span");
-      errPill.className = "coord-tool-row-status coord-tool-row-status--error";
+      errPill.className = "conv-row-status conv-row-status--error";
       errPill.textContent = "✗ " + (item.error || "blocked");
       callLine.appendChild(errPill);
       row.classList.add("error");
@@ -1084,115 +1084,36 @@ function createCoordinatorPane(root, wsId, opts) {
     // re-derive it from the result block's presence so we don't
     // accidentally drop the cue when refreshing from a non-error
     // item shape.
-    if (
-      row.querySelector(".coord-tool-row-result.coord-tool-row-result--error")
-    ) {
+    if (row.querySelector(".conv-row-result.conv-row-result--error")) {
       row.classList.add("error");
     }
   }
 
   function _renderBatchRow(item, indexLabel) {
-    const row = document.createElement("div");
-    row.className = "coord-tool-row";
-    if (item.call_id) row.dataset.callId = item.call_id;
-    // Stamp the function name so the metacog dim rule for memory /
-    // recall (coordinator.css `.coord-tool-row[data-tool-name=...]`)
-    // has something to match.  Cheap; lets long workstreams with
-    // heavy memory usage stay readable without per-call JS work.
-    if (item.func_name) row.dataset.toolName = item.func_name;
-
-    const callLine = document.createElement("div");
-    callLine.className = "coord-tool-row-call";
-
-    if (indexLabel) {
-      const idx = document.createElement("span");
-      idx.className = "coord-tool-row-idx";
-      idx.textContent = indexLabel;
-      callLine.appendChild(idx);
-    }
-
-    const name = document.createElement("span");
-    name.className = "coord-tool-row-name";
-    name.textContent = item.func_name || "(unknown tool)";
-    callLine.appendChild(name);
-
-    const args = document.createElement("span");
-    args.className = "coord-tool-row-args";
-    args.textContent = _formatBatchArgs(item);
-    callLine.appendChild(args);
-
-    row.appendChild(callLine);
-    // Apply status pills + data-needs-approval through the shared
-    // helper so initial render and upgrade-in-place can't drift.
+    const row = buildConvRow(item, {
+      indexLabel: indexLabel || "",
+      argsText: _formatBatchArgs(item),
+    });
+    // Apply status pills + data-needs-approval through the shared helper so
+    // initial render and upgrade-in-place can't drift.
     _refreshRowStatus(row, item);
     return row;
   }
 
-  // Attach an output-guard finding chip to a specific .coord-tool-row.
+  // Attach an output-guard finding chip to a specific .conv-row.
   // Idempotent — replacing an existing chip in place lets the live
   // SSE handler upgrade severity without stacking duplicates when a
   // late event arrives after replay seeded an initial chip.
   function _attachOutputWarningChip(row, oa) {
+    // Idempotent: replace any existing chip in place so a late SSE upgrade
+    // (severity escalation) doesn't stack duplicates next to the replay seed.
+    // The chip's risk / flags / redaction / tier / reasoning are all built by
+    // the shared buildConvWarning (reasoning is now inline, not a <details>).
     if (!row || !oa) return;
-    const risk = String(oa.risk_level || "medium");
-    const flags = oa.flags || [];
-    const existing = row.querySelector(".coord-tool-row-warning");
-    const chip = existing || document.createElement("div");
-    chip.className = "coord-tool-row-warning coord-tool-row-warning--" + risk;
-    chip.setAttribute("role", "status");
-    chip.textContent = "";
-    const label = document.createElement("span");
-    label.className = "coord-tool-row-warning-label";
-    label.textContent = "⚠ " + risk.toUpperCase();
-    chip.appendChild(label);
-    if (flags.length) {
-      chip.appendChild(document.createTextNode(" " + flags.join(", ")));
-    }
-    if (oa.redacted) {
-      const redacted = document.createElement("span");
-      redacted.className = "coord-tool-row-warning-redacted";
-      redacted.textContent = " (credentials redacted)";
-      chip.appendChild(redacted);
-    }
-    // LLM-judge attribution — mirrors the intent-verdict chip's tier
-    // badge so the operator can tell a regex match from a model
-    // judgement and read the model's confidence inline.
-    if (oa.tier === "llm") {
-      const tier = document.createElement("span");
-      tier.className = "coord-tool-row-warning-tier";
-      let t = "⚖ LLM";
-      // Surface the judge's own verdict when it differs from the displayed
-      // (merged) risk — e.g. regex MEDIUM but the judge cleared it as none.
-      if (oa.judge_risk && oa.judge_risk !== risk) t += ": " + oa.judge_risk;
-      if (oa.confidence > 0) {
-        t += " · " + Math.round(oa.confidence * 100) + "%";
-      }
-      if (oa.judge_model) t += " · " + oa.judge_model;
-      tier.textContent = t;
-      chip.appendChild(tier);
-    }
-    if (!existing) row.appendChild(chip);
-
-    // Rationale — collapsible disclosure mirroring the verdict rationale
-    // (reuses .coord-tool-row-rationale styling) so the judge's reasoning
-    // is inspectable without bloating the tree. Idempotent: drop any prior
-    // warning rationale before re-adding so a late SSE upgrade doesn't
-    // stack duplicates next to the one seeded on replay.
-    const oldRationale = row.querySelector(".coord-tool-row-warning-rationale");
-    if (oldRationale) oldRationale.remove();
-    if (oa.reasoning) {
-      const det = document.createElement("details");
-      det.className =
-        "coord-tool-row-rationale coord-tool-row-warning-rationale";
-      const sum = document.createElement("summary");
-      sum.textContent = "guard rationale";
-      det.appendChild(sum);
-      const body = document.createElement("div");
-      body.className = "coord-tool-row-rationale-body";
-      body.textContent = oa.reasoning;
-      det.appendChild(body);
-      chip.insertAdjacentElement("afterend", det);
-    }
+    const existing = row.querySelector(".conv-warning");
+    const chip = buildConvWarning(oa);
+    if (existing) existing.replaceWith(chip);
+    else row.appendChild(chip);
   }
 
   // Stable signature for a verdict — used to skip the DOM rebuild when
@@ -1224,56 +1145,27 @@ function createCoordinatorPane(root, wsId, opts) {
     // path explicitly bypasses the dedupe (sig of null is "").
     const sig = _verdictSig(verdict);
     if (verdict && row.dataset.verdictSig === sig) {
-      return row.querySelector(".coord-tool-row-verdict");
+      return row.querySelector(".conv-verdict");
     }
     row.dataset.verdictSig = sig;
 
-    let line = row.querySelector(".coord-tool-row-verdict");
-    if (!line) {
-      line = document.createElement("div");
-      line.className = "coord-tool-row-verdict";
-      const callEl = row.querySelector(".coord-tool-row-call");
-      if (callEl && callEl.nextSibling) {
-        row.insertBefore(line, callEl.nextSibling);
-      } else {
-        row.appendChild(line);
+    // Drop any prior verdict badge + its detail sibling before rebuilding.
+    const prevBadge = row.querySelector(".conv-verdict");
+    if (prevBadge) {
+      const prevDetail = prevBadge.nextElementSibling;
+      if (prevDetail && prevDetail.classList.contains("conv-verdict-detail")) {
+        prevDetail.remove();
       }
+      prevBadge.remove();
     }
-    line.replaceChildren();
     if (verdict) {
-      const chip = document.createElement("code");
-      const rec = verdict.recommendation || "?";
-      const risk = verdict.risk_level || "?";
-      chip.textContent = "judge: " + rec + " · risk: " + risk;
-      if (rec === "approve") chip.classList.add("rec-approve");
-      else if (rec === "review") chip.classList.add("rec-review");
-      else if (rec === "deny") chip.classList.add("rec-deny");
-      line.appendChild(chip);
-      if (verdict.confidence != null) {
-        const conf = document.createElement("code");
-        const v = verdict.confidence;
-        conf.textContent = typeof v === "number" ? v.toFixed(2) : String(v);
-        line.appendChild(conf);
+      const frag = buildConvVerdict(verdict);
+      const callEl = row.querySelector(".conv-row-call");
+      if (callEl && callEl.nextSibling) {
+        row.insertBefore(frag, callEl.nextSibling);
+      } else {
+        row.appendChild(frag);
       }
-    }
-    const oldRationale = row.querySelector(".coord-tool-row-rationale");
-    if (oldRationale) oldRationale.remove();
-    if (verdict && verdict.reasoning) {
-      const det = document.createElement("details");
-      det.className = "coord-tool-row-rationale";
-      const sum = document.createElement("summary");
-      sum.textContent = "rationale";
-      det.appendChild(sum);
-      const body = document.createElement("div");
-      body.className = "coord-tool-row-rationale-body";
-      body.textContent = verdict.reasoning;
-      det.appendChild(body);
-      // Insert immediately after the verdict line so the rationale
-      // stays adjacent to the chip even when a result block has
-      // already landed below — DOM order otherwise reads as
-      // [call, verdict, result, rationale], which visually disconnects
-      // the rationale from the chip it explains.
-      line.insertAdjacentElement("afterend", det);
     }
     // Persist the verdict's tier on the row so the batch's header
     // tier badge can escalate from ⚙ heuristic → ⚖ llm when a later
@@ -1291,102 +1183,44 @@ function createCoordinatorPane(root, wsId, opts) {
       delete row.dataset.verdictTier;
       delete row.dataset.verdictModel;
     }
-    _refreshBatchTier(row.closest(".coord-tool-batch"));
-    return line;
+    _refreshBatchTier(row.closest(".conv-batch"));
+    return row.querySelector(".conv-verdict");
   }
 
   function _appendJudgePendingLineTo(row) {
-    const line = _appendVerdictLineTo(row, null);
-    const chip = document.createElement("code");
-    chip.className = "judging";
-    const spin = document.createElement("span");
-    spin.className = "spin";
-    spin.setAttribute("aria-hidden", "true");
-    chip.appendChild(spin);
-    chip.appendChild(document.createTextNode("judge evaluating…"));
-    line.appendChild(chip);
+    // Clear any prior verdict, then render the spinner-only badge (neutral
+    // stripe -- risk isn't known until the judge lands).
+    _appendVerdictLineTo(row, null);
+    const frag = buildConvVerdict(null, { judgePending: true });
+    const callEl = row.querySelector(".conv-row-call");
+    if (callEl && callEl.nextSibling) {
+      row.insertBefore(frag, callEl.nextSibling);
+    } else {
+      row.appendChild(frag);
+    }
   }
 
   function _appendResultToRow(row, output, isError, opts) {
     if (!row) return;
-    const existing = row.querySelector(".coord-tool-row-result");
+    const existing = row.querySelector(".conv-row-result");
     if (existing) existing.remove();
     if (isError) {
       row.classList.add("error");
       // Lift the row's error onto the enclosing batch so the left
       // stripe + status pill (--error) cue the operator at the batch
       // level too.  Idempotent — re-fires don't stack.
-      const batch = row.closest(".coord-tool-batch");
-      if (batch) batch.classList.add("coord-tool-batch--error");
+      const batch = row.closest(".conv-batch");
+      if (batch) batch.classList.add("conv-batch--error");
     }
-    const block = document.createElement("div");
-    block.className = "coord-tool-row-result";
-    // Marker class so _refreshRowStatus can preserve the row's
-    // .error state across upgrade-in-place when the error came from
-    // a tool_result (not a static item.error).
-    if (isError) block.classList.add("coord-tool-row-result--error");
-    const lead = document.createElement("span");
-    lead.className = "coord-tool-row-result-lead";
-    lead.textContent = isError ? "✗ error: " : "↳ result: ";
-    block.appendChild(lead);
-    // Pretty-print JSON when the output parses; coord tool surfaces
-    // (list_nodes, tasks, spawn_workstream, ...) emit JSON by default,
-    // and a single-line dump is unreadable for a multi-key result.
-    // The parent .coord-tool-row-result has white-space: pre-wrap, so
-    // a textContent assignment with embedded \n preserves the
-    // formatting without needing a nested <pre>.
-    const cleaned = stripAnsi(output || "");
-    const body = document.createElement("span");
-    let pretty = cleaned;
-    // Pretty-print JSON only when:
-    //  - the payload looks like JSON (first non-space char is { or [),
-    //    so we don't waste a parse on plain text or HTML, AND
-    //  - it's small enough that the parse + restringify is cheap
-    //    (cap at 32 KiB).  A 100 KiB tool output can deepen into a
-    //    multi-MB object graph and stall the main thread for hundreds
-    //    of ms; the parent CSS is white-space: pre-wrap so raw text
-    //    still wraps and stays readable past the cap.
-    const PRETTY_PRINT_CAP = 32 * 1024;
-    if (cleaned && cleaned.length <= PRETTY_PRINT_CAP) {
-      const head = cleaned.charCodeAt(0);
-      // 0x7B = '{', 0x5B = '['  — leading whitespace would also fail
-      // the cheap heuristic; that's intentional, the pretty-print is
-      // a UX nice-to-have not a contract.
-      if (head === 0x7b || head === 0x5b) {
-        try {
-          const parsed = JSON.parse(cleaned);
-          if (parsed && typeof parsed === "object") {
-            pretty = JSON.stringify(parsed, null, 2);
-          }
-        } catch (_) {
-          /* not JSON — fall through to raw text */
-        }
-      }
-    }
-    body.textContent = pretty;
-    block.appendChild(body);
+    const block = buildConvResult(output, { isError });
+    // Marker class so _refreshRowStatus can preserve the row's .error state
+    // across upgrade-in-place when the error came from a tool_result.
+    if (isError) block.classList.add("conv-row-result--error");
     row.appendChild(block);
   }
 
-  function _makeActionButton(label, role, kbdHint, ariaLabel) {
-    const btn = document.createElement("button");
-    btn.type = "button";
-    btn.className = "act";
-    btn.dataset.role = role;
-    btn.appendChild(document.createTextNode(label));
-    if (kbdHint) {
-      const kbd = document.createElement("span");
-      kbd.className = "kbd";
-      kbd.setAttribute("aria-hidden", "true");
-      kbd.textContent = kbdHint;
-      btn.appendChild(kbd);
-    }
-    if (ariaLabel) btn.setAttribute("aria-label", ariaLabel);
-    return btn;
-  }
-
   // Concise, screen-reader friendly summary of a pending batch — used
-  // both as the .coord-tool-batch[role=region] aria-label and as the
+  // both as the .conv-batch[role=region] aria-label and as the
   // text fed to the off-screen assertive announcer when the gate
   // appears.  "Approval required: spawn_workstream + 9 more" reads
   // cleanly through a SR without revealing every nested arg.
@@ -1409,19 +1243,6 @@ function createCoordinatorPane(root, wsId, opts) {
   }
 
   function _buildBatchActions(batch, items) {
-    const actions = document.createElement("div");
-    actions.className = "coord-tool-actions";
-    const spacer = document.createElement("div");
-    spacer.className = "spacer";
-    actions.appendChild(spacer);
-
-    const denyBtn = _makeActionButton("Deny", "deny", "D", "Deny (D)");
-    denyBtn.classList.add("danger");
-    denyBtn.addEventListener("click", () =>
-      _resolveBatchAction(batch, false, false),
-    );
-    actions.appendChild(denyBtn);
-
     const alwaysNames = items
       .filter(
         (it) =>
@@ -1431,30 +1252,16 @@ function createCoordinatorPane(root, wsId, opts) {
           !it.error,
       )
       .map((it) => it.approval_label || it.func_name);
-    if (alwaysNames.length > 0) {
-      const ariaAlways = "Always approve " + alwaysNames.join(", ");
-      const alwaysBtn = _makeActionButton("Always", "always", "⇧A", ariaAlways);
-      alwaysBtn.classList.add("always");
-      alwaysBtn.title = ariaAlways;
-      alwaysBtn.addEventListener("click", () =>
-        _resolveBatchAction(batch, true, true),
-      );
-      actions.appendChild(alwaysBtn);
-    }
-
-    const approveBtn = _makeActionButton(
-      "Approve",
-      "approve",
-      "⏎",
-      "Approve (Enter)",
-    );
-    approveBtn.classList.add("primary");
-    approveBtn.addEventListener("click", () =>
-      _resolveBatchAction(batch, true, false),
-    );
-    actions.appendChild(approveBtn);
-
-    return actions;
+    const alwaysLabel = alwaysNames.length
+      ? "Always approve " + alwaysNames.join(", ")
+      : "";
+    return buildConvActions({
+      kbd: { approve: "⏎", deny: "D", always: "⇧A" },
+      alwaysLabel,
+      onApprove: () => _resolveBatchAction(batch, true, false),
+      onDeny: () => _resolveBatchAction(batch, false, false),
+      onAlways: () => _resolveBatchAction(batch, true, true),
+    });
   }
 
   async function _resolveBatchAction(batch, approved, always) {
@@ -1464,7 +1271,7 @@ function createCoordinatorPane(root, wsId, opts) {
     // policy-blocked siblings; resolving against one of those would
     // 409 since the server's pending_items wouldn't recognise it.
     const pendingRow = batch.querySelector(
-      '.coord-tool-row[data-needs-approval="1"][data-call-id]',
+      '.conv-row[data-needs-approval="1"][data-call-id]',
     );
     const callId = pendingRow && pendingRow.dataset.callId;
     if (!callId) return;
@@ -1495,7 +1302,7 @@ function createCoordinatorPane(root, wsId, opts) {
   }
 
   function _setBatchActionsDisabled(batch, disabled) {
-    batch.querySelectorAll(".coord-tool-actions button").forEach((b) => {
+    batch.querySelectorAll(".conv-actions button").forEach((b) => {
       b.disabled = !!disabled;
     });
   }
@@ -1505,35 +1312,15 @@ function createCoordinatorPane(root, wsId, opts) {
   // history-replay path inside appendToolBatch (renders resolved
   // batches without ever showing actions).
   function _buildStatusPill(opts) {
-    const status = document.createElement("div");
-    status.className = "coord-tool-status";
-    status.classList.add(
-      opts.approved
-        ? "coord-tool-status--approved"
-        : "coord-tool-status--denied",
-    );
-    const label = document.createElement("span");
-    if (opts.approved) {
-      label.textContent = opts.always ? "✓ approved · always" : "✓ approved";
-    } else {
-      label.textContent = "✗ denied";
-    }
-    status.appendChild(label);
-    if (opts.feedback) {
-      const fb = document.createElement("span");
-      fb.className = "coord-tool-status-feedback";
-      fb.textContent = "— " + opts.feedback;
-      status.appendChild(fb);
-    }
-    return status;
+    return buildConvStatus(opts);
   }
 
   function _setBatchRunning(batch) {
     if (!batch) return;
-    batch.classList.add("coord-tool-batch--running");
-    const kicker = batch.querySelector(".coord-tool-batch-kicker");
+    batch.classList.add("conv-batch--running");
+    const kicker = batch.querySelector(".conv-batch-kicker");
     if (kicker) {
-      const rowCount = batch.querySelectorAll(".coord-tool-row").length;
+      const rowCount = batch.querySelectorAll(".conv-row").length;
       kicker.textContent =
         rowCount >= 2 ? "Running · Parallel " + rowCount : "Running";
     }
@@ -1545,14 +1332,14 @@ function createCoordinatorPane(root, wsId, opts) {
     // is "did THIS result complete the batch?" — cheap DOM walk over
     // the same handful of rows we already track.
     if (!batch) return;
-    if (!batch.classList.contains("coord-tool-batch--running")) return;
-    const rows = batch.querySelectorAll(".coord-tool-row");
+    if (!batch.classList.contains("conv-batch--running")) return;
+    const rows = batch.querySelectorAll(".conv-row");
     for (const row of rows) {
-      if (!row.querySelector(".coord-tool-row-result")) return;
+      if (!row.querySelector(".conv-row-result")) return;
     }
-    batch.classList.remove("coord-tool-batch--running");
-    const kicker = batch.querySelector(".coord-tool-batch-kicker");
-    if (kicker && !batch.classList.contains("coord-tool-batch--pending")) {
+    batch.classList.remove("conv-batch--running");
+    const kicker = batch.querySelector(".conv-batch-kicker");
+    if (kicker && !batch.classList.contains("conv-batch--pending")) {
       const rowCount = rows.length;
       kicker.textContent =
         rowCount >= 2 ? "Parallel · " + rowCount + " tools" : "Tool";
@@ -1561,15 +1348,15 @@ function createCoordinatorPane(root, wsId, opts) {
 
   function _morphBatchResolved(batch, opts) {
     if (!batch) return;
-    batch.classList.remove("coord-tool-batch--pending");
+    batch.classList.remove("conv-batch--pending");
     batch.classList.add(
-      opts.approved ? "coord-tool-batch--approved" : "coord-tool-batch--denied",
+      opts.approved ? "conv-batch--approved" : "conv-batch--denied",
     );
     // Drop the [role=region] approval landmark so the resolved batch
     // stops claiming "Approval required" in SR landmark navigation.
     batch.removeAttribute("role");
     batch.removeAttribute("aria-label");
-    const actions = batch.querySelector(".coord-tool-actions");
+    const actions = batch.querySelector(".conv-actions");
     if (actions) actions.replaceWith(_buildStatusPill(opts));
     if (activeBatch === batch) activeBatch = null;
   }
@@ -1578,7 +1365,7 @@ function createCoordinatorPane(root, wsId, opts) {
     if (!batch) return;
     const role = prefer === "deny" ? "deny" : "approve";
     const btn = batch.querySelector(
-      '.coord-tool-actions button[data-role="' + role + '"]',
+      '.conv-actions button[data-role="' + role + '"]',
     );
     if (btn) {
       try {
@@ -1648,27 +1435,24 @@ function createCoordinatorPane(root, wsId, opts) {
       //   --running → --auto     (SSE tool_info fires for an orphan
       //                            turn that was actually auto-
       //                            approved + in-flight at reload)
-      if (
-        opts.pending &&
-        !existing.classList.contains("coord-tool-batch--pending")
-      ) {
+      if (opts.pending && !existing.classList.contains("conv-batch--pending")) {
         existing.classList.remove(
-          "coord-tool-batch--approved",
-          "coord-tool-batch--denied",
-          "coord-tool-batch--auto",
-          "coord-tool-batch--running",
-          "coord-tool-batch--error",
+          "conv-batch--approved",
+          "conv-batch--denied",
+          "conv-batch--auto",
+          "conv-batch--running",
+          "conv-batch--error",
         );
-        existing.classList.add("coord-tool-batch--pending");
+        existing.classList.add("conv-batch--pending");
         existing.removeAttribute("aria-busy"); // announce resolved → human gate
         existing.setAttribute("role", "region");
         existing.setAttribute("aria-label", _approvalAriaLabel(items));
-        const kicker = existing.querySelector(".coord-tool-batch-kicker");
+        const kicker = existing.querySelector(".conv-batch-kicker");
         if (kicker) {
           kicker.textContent = _pendingKickerText(items);
         }
-        const statusEl = existing.querySelector(".coord-tool-status");
-        const actionsEl = existing.querySelector(".coord-tool-actions");
+        const statusEl = existing.querySelector(".conv-status");
+        const actionsEl = existing.querySelector(".conv-actions");
         const newActions = _buildBatchActions(existing, items);
         if (statusEl) statusEl.replaceWith(newActions);
         else if (actionsEl) actionsEl.replaceWith(newActions);
@@ -1677,8 +1461,8 @@ function createCoordinatorPane(root, wsId, opts) {
         _announceAssertive(_approvalAriaLabel(items));
       } else if (
         opts.auto &&
-        existing.classList.contains("coord-tool-batch--running") &&
-        !existing.classList.contains("coord-tool-batch--auto")
+        existing.classList.contains("conv-batch--running") &&
+        !existing.classList.contains("conv-batch--auto")
       ) {
         // SSE tool_info clarifies an existing --running batch as
         // auto-approved.  Keep --running (the tool is still in
@@ -1686,13 +1470,13 @@ function createCoordinatorPane(root, wsId, opts) {
         // batch reflects BOTH "auto-approved" + "running" — historical
         // behaviour swapped --running out, which lost the running
         // indicator the moment tool_info clarified the approval state.
-        existing.classList.add("coord-tool-batch--auto");
+        existing.classList.add("conv-batch--auto");
         existing.removeAttribute("aria-busy"); // announce resolved → auto-running
         // An early-paint (announce) batch's kicker reads "Evaluating";
         // the tool is now actually in flight, so swap it to the running
         // indicator.  No-op for a true replay orphan whose placeholder
         // kicker already read "Running".
-        const runKicker = existing.querySelector(".coord-tool-batch-kicker");
+        const runKicker = existing.querySelector(".conv-batch-kicker");
         if (runKicker) {
           runKicker.textContent =
             items.length >= 2
@@ -1714,7 +1498,7 @@ function createCoordinatorPane(root, wsId, opts) {
         // earlier shell rendered (e.g. replay-time orphan rows had
         // no auto/error info; SSE tool_info / approve_request items
         // do).  Preserves runtime tool_result errors via the
-        // .coord-tool-row-result--error marker.
+        // .conv-row-result--error marker.
         _refreshRowStatus(entry.row, it);
         const cached = judgeVerdicts.get(it.call_id);
         const v = it.judge_verdict || it.heuristic_verdict || cached;
@@ -1723,7 +1507,7 @@ function createCoordinatorPane(root, wsId, opts) {
         } else if (
           it.needs_approval &&
           opts.judgePending &&
-          !entry.row.querySelector(".coord-tool-row-verdict")
+          !entry.row.querySelector(".conv-verdict")
         ) {
           _appendJudgePendingLineTo(entry.row);
         }
@@ -1731,77 +1515,49 @@ function createCoordinatorPane(root, wsId, opts) {
       return existing;
     }
 
-    const batch = document.createElement("div");
-    batch.className = "coord-tool-batch";
-    batch.classList.add(
-      items.length >= 2
-        ? "coord-tool-batch--parallel"
-        : "coord-tool-batch--solo",
-    );
-    if (opts.pending) batch.classList.add("coord-tool-batch--pending");
-    else if (opts.auto) batch.classList.add("coord-tool-batch--auto");
-    else if (opts.resolved) {
-      batch.classList.add(
-        opts.resolved.approved
-          ? "coord-tool-batch--approved"
-          : "coord-tool-batch--denied",
-      );
-    }
-    // ``running`` is additive — coexists with ``auto`` (auto-approved
-    // and currently in flight) or stands alone (replay-time orphan
-    // before SSE clarifies the approval state).  Removed by
-    // :func:`_unsetBatchRunningIfAllResults` when every row in the
-    // batch has a tool_result.
-    if (opts.running) batch.classList.add("coord-tool-batch--running");
-    // Early-paint shell is an indeterminate region until the judge/gate
-    // resolves; the --pending / --auto upgrade clears it below.
-    if (opts.announce) batch.setAttribute("aria-busy", "true");
-
-    const head = document.createElement("div");
-    head.className = "coord-tool-batch-head";
-    const kicker = document.createElement("span");
-    kicker.className = "coord-tool-batch-kicker";
+    let kickerText;
     if (opts.pending) {
-      kicker.textContent = _pendingKickerText(items);
+      kickerText = _pendingKickerText(items);
     } else if (opts.announce) {
-      // Early-paint placeholder: the call is committed but the judge
-      // verdict + approval state aren't in yet.  "Evaluating" reads
-      // truer than "Running" here (nothing is in flight); the auto /
-      // pending upgrade swaps it for the real state's kicker.
-      kicker.textContent =
+      kickerText =
         items.length >= 2
           ? "Evaluating · Parallel " + items.length
           : "Evaluating";
     } else if (opts.running) {
-      kicker.textContent =
+      kickerText =
         items.length >= 2 ? "Running · Parallel " + items.length : "Running";
     } else if (items.length >= 2) {
-      kicker.textContent = "Parallel · " + items.length + " tools";
+      kickerText = "Parallel · " + items.length + " tools";
     } else {
-      kicker.textContent = "Tool";
+      kickerText = "Tool";
     }
-    head.appendChild(kicker);
-
-    const summary = document.createElement("span");
-    summary.className = "coord-tool-batch-summary";
     const firstName =
       items[0] && (items[0].func_name || items[0].approval_label)
         ? items[0].func_name || items[0].approval_label
         : "tool";
-    summary.textContent =
+    const summaryText =
       items.length >= 2
         ? firstName + " + " + (items.length - 1) + " more"
         : firstName;
-    head.appendChild(summary);
-
-    const tier = _pickBatchTier(items);
-    if (tier) {
-      const tierEl = document.createElement("span");
-      tierEl.className = "coord-tool-batch-tier";
-      tierEl.textContent = tier;
-      head.appendChild(tierEl);
+    const batch = buildConvBatchShell({
+      parallel: items.length >= 2,
+      kickerText,
+      summaryText,
+      tierText: _pickBatchTier(items),
+    });
+    if (opts.pending) batch.classList.add("conv-batch--pending");
+    else if (opts.auto) batch.classList.add("conv-batch--auto");
+    else if (opts.resolved) {
+      batch.classList.add(
+        opts.resolved.approved ? "conv-batch--approved" : "conv-batch--denied",
+      );
     }
-    batch.appendChild(head);
+    // ``running`` is additive -- coexists with ``auto`` or stands alone
+    // (replay-time orphan before SSE clarifies the approval state).
+    if (opts.running) batch.classList.add("conv-batch--running");
+    // Early-paint shell is an indeterminate region until the judge/gate
+    // resolves; the --pending / --auto upgrade clears it below.
+    if (opts.announce) batch.setAttribute("aria-busy", "true");
 
     let anyRowError = false;
     const renderedRows = [];
@@ -1827,16 +1583,14 @@ function createCoordinatorPane(root, wsId, opts) {
     // miss because the batch has other div siblings — head + actions
     // — coming before/after the row group).
     if (renderedRows.length > 0) {
-      renderedRows[0].classList.add("coord-tool-row--first");
-      renderedRows[renderedRows.length - 1].classList.add(
-        "coord-tool-row--last",
-      );
+      renderedRows[0].classList.add("conv-row--first");
+      renderedRows[renderedRows.length - 1].classList.add("conv-row--last");
     }
     // Lift any policy-blocked row's error onto the enclosing batch so
     // the left stripe + status pill cue the operator at the batch
     // level too.  _appendResultToRow does the same for runtime errors
     // arriving via tool_result.
-    if (anyRowError) batch.classList.add("coord-tool-batch--error");
+    if (anyRowError) batch.classList.add("conv-batch--error");
 
     if (opts.pending) {
       batch.appendChild(_buildBatchActions(batch, items));
@@ -2543,9 +2297,7 @@ function createCoordinatorPane(root, wsId, opts) {
         // the approval gate before the resolved event landed).
         const target =
           activeBatch ||
-          messagesEl.querySelector(
-            ".coord-tool-batch.coord-tool-batch--pending",
-          );
+          messagesEl.querySelector(".conv-batch.conv-batch--pending");
         if (target) {
           const wasAlways =
             ev.always === true ||
@@ -2589,7 +2341,7 @@ function createCoordinatorPane(root, wsId, opts) {
             // Focus the construct's primary action once the verdict
             // gives the reviewer context to act on — judge=deny defaults
             // focus to Deny, otherwise Approve.
-            if (entry.batch.classList.contains("coord-tool-batch--pending")) {
+            if (entry.batch.classList.contains("conv-batch--pending")) {
               _focusBatchPrimary(entry.batch, ev.recommendation);
             }
             break;
@@ -2609,7 +2361,7 @@ function createCoordinatorPane(root, wsId, opts) {
         );
         break;
       case "output_warning":
-        // Anchor the finding to the specific .coord-tool-row that
+        // Anchor the finding to the specific .conv-row that
         // tripped the guard so the operator reads call → finding
         // adjacency on both live and replay surfaces.  Falls back
         // to a chat line only when the call_id no longer maps to a
@@ -4635,19 +4387,18 @@ function createCoordinatorPane(root, wsId, opts) {
     const old = messagesEl.querySelectorAll(".msg.assistant .msg-actions");
     for (let i = 0; i < old.length; i++) old[i].parentNode.removeChild(old[i]);
     // Skip retry when the most recent semantic turn is tool-only (last DOM
-    // child is a .coord-tool-batch construct); walk back past operator-context
+    // child is a .conv-batch construct); walk back past operator-context
     // rows first — the plain system bubble AND the structured watch-result /
     // guard-finding / idle-children cards all carry .operator-context — so the
     // guard still fires when the tool turn carried a nudge / guard finding.
     // Keying on the shared marker (not any single card class) keeps the skip
-    // correct as new card kinds are added. (Coord's batch class is
-    // .coord-tool-batch — the interactive pane uses .ts-approval, which does
-    // not exist in coord's DOM.)
+    // correct as new card kinds are added. (Both personas now render the
+    // shared .conv-batch construct; this pane's DOM only holds its own.)
     let lastChild = messagesEl.lastElementChild;
     while (lastChild && lastChild.classList.contains("operator-context")) {
       lastChild = lastChild.previousElementSibling;
     }
-    if (lastChild && lastChild.classList.contains("coord-tool-batch")) {
+    if (lastChild && lastChild.classList.contains("conv-batch")) {
       return;
     }
     const assistants = messagesEl.querySelectorAll(".msg.assistant");
@@ -4864,7 +4615,7 @@ function createCoordinatorPane(root, wsId, opts) {
         appendToolBatch(items, { resolved: { approved: true } });
       }
       // Output-guard findings — render each one as a chip
-      // anchored to the .coord-tool-row that tripped the guard
+      // anchored to the .conv-row that tripped the guard
       // rather than a generic "[output guard]" chat line.
       // Anchored placement preserves per-call adjacency on
       // multi-tool batches (live + replay) and the chip's
