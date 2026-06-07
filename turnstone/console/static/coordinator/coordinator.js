@@ -3116,8 +3116,9 @@ function createCoordinatorPane(root, wsId, opts) {
       const risk = (verdict.risk_level || "").toLowerCase();
       // Map verdict.risk_level → CSS class. Production emitters use
       // both "crit" and "critical"; pills.css only defines .risk.crit
-      // so collapse the alias here. Unknown risk falls back to .high
-      // (matching UNKNOWN_RISK_RANK) — fail-safe over-alert.
+      // so collapse the alias here. Unknown / unrecognized risk folds to
+      // .med — the canonical unknown->medium (5e.1b decision); the
+      // separate "(judge unavailable)" pill already covers no-verdict.
       const riskCls =
         risk === "crit" || risk === "critical"
           ? "crit"
@@ -3127,7 +3128,7 @@ function createCoordinatorPane(root, wsId, opts) {
               ? "med"
               : risk === "low"
                 ? "low"
-                : "high";
+                : "med";
       pill.classList.add("risk", riskCls);
       const conf = verdict.confidence;
       const confStr = typeof conf === "number" ? " " + conf.toFixed(2) : "";
