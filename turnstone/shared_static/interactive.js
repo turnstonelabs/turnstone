@@ -28,6 +28,13 @@ import {
   buildWatchResultCard,
   buildSystemNudgeMarker,
   normalizeRiskLevel,
+  buildConvBatchShell,
+  buildConvRow,
+  buildConvCmd,
+  buildConvVerdict,
+  buildConvWarning,
+  buildConvActions,
+  buildConvStatus,
 } from "./conversation.js";
 
 let _paneCounter = 0;
@@ -391,7 +398,7 @@ class Pane {
 
   getFeedback() {
     if (!this.approvalBlockEl) return null;
-    const inp = this.approvalBlockEl.querySelector(".ts-approval-feedback");
+    const inp = this.approvalBlockEl.querySelector(".conv-feedback");
     return inp && inp.value.trim() ? inp.value.trim() : null;
   }
 
@@ -409,19 +416,19 @@ class Pane {
     if (!el) {
       let target = escapedId
         ? this.messagesEl.querySelector(
-            '.ts-approval-tool[data-call-id="' + escapedId + '"]',
+            '.conv-row[data-call-id="' + escapedId + '"]',
           )
         : null;
       if (!target) {
-        const blocks = this.messagesEl.querySelectorAll(".ts-approval");
+        const blocks = this.messagesEl.querySelectorAll(".conv-batch");
         if (!blocks.length) return;
         const block = blocks[blocks.length - 1];
         const tools = block.querySelectorAll(
-          '.ts-approval-tool[data-func-name="bash"]',
+          '.conv-row[data-func-name="bash"]',
         );
         target = tools.length ? tools[tools.length - 1] : null;
         if (!target) {
-          const allTools = block.querySelectorAll(".ts-approval-tool");
+          const allTools = block.querySelectorAll(".conv-row");
           target = allTools.length ? allTools[allTools.length - 1] : null;
         }
       }
@@ -445,7 +452,7 @@ class Pane {
     if (!evt.call_id || evt.risk_level === "none") return;
     const escapedId = CSS.escape(evt.call_id);
     const toolDiv = this.messagesEl.querySelector(
-      '.ts-approval-tool[data-call-id="' + escapedId + '"]',
+      '.conv-row[data-call-id="' + escapedId + '"]',
     );
     if (!toolDiv) return;
     // Shared DOM-builder with replayHistory \u2014 single source of truth for
@@ -476,11 +483,11 @@ class Pane {
     if (!verdict || !verdict.call_id) return;
     const escapedId = CSS.escape(verdict.call_id);
     const badge = this.messagesEl.querySelector(
-      '.verdict-badge[data-call-id="' + escapedId + '"]',
+      '.conv-verdict[data-call-id="' + escapedId + '"]',
     );
     if (!badge) {
-      // Badge no longer in DOM (tool block replaced by output) — show
-      // a toast so the user still sees the late-arriving verdict.
+      // Badge no longer in DOM (tool block replaced by output) — toast the
+      // late-arriving verdict so the user still sees it.
       const conf = Math.round((verdict.confidence || 0) * 100);
       const rec = verdict.recommendation || "review";
       const func = verdict.func_name || "";
@@ -490,68 +497,26 @@ class Pane {
       );
       return;
     }
-
-    const risk = normalizeRiskLevel(verdict.risk_level);
-    badge.className = "verdict-badge verdict-" + risk + " ts-verdict-badge";
-    badge.setAttribute("data-risk", risk);
-
-    const riskEl = badge.querySelector(".verdict-risk");
-    const recEl = badge.querySelector(".verdict-rec");
-    const confEl = badge.querySelector(".verdict-conf");
-    if (riskEl) riskEl.textContent = risk.toUpperCase();
-    if (recEl) recEl.textContent = verdict.recommendation || "review";
-    if (confEl)
-      confEl.textContent = Math.round((verdict.confidence || 0) * 100) + "%";
-
-    const spinner = badge.querySelector(".verdict-judge-spinner");
-    if (spinner) spinner.remove();
-
+    // Replace the badge (+ its detail sibling) with a freshly-built one so the
+    // landed LLM verdict, its risk stripe, and the detail all refresh at once.
     const detail = badge.nextElementSibling;
-    if (detail && detail.classList.contains("verdict-detail")) {
-      const summaryEl = detail.querySelector(".verdict-summary");
-      const reasonEl = detail.querySelector(".verdict-reasoning");
-      const tierEl = detail.querySelector(".verdict-tier");
-      if (summaryEl) summaryEl.textContent = verdict.intent_summary || "";
-      if (reasonEl) reasonEl.textContent = verdict.reasoning || "";
-      if (tierEl)
-        tierEl.textContent =
-          (verdict.tier || "llm") +
-          " tier" +
-          (verdict.judge_model ? " | " + verdict.judge_model : "");
-      let evidenceEl = detail.querySelector(".verdict-evidence");
-      if (verdict.evidence && verdict.evidence.length) {
-        if (!evidenceEl) {
-          evidenceEl = document.createElement("div");
-          evidenceEl.className = "verdict-evidence";
-          const tierDiv = detail.querySelector(".verdict-tier");
-          if (tierDiv) detail.insertBefore(evidenceEl, tierDiv);
-          else detail.appendChild(evidenceEl);
-        }
-        evidenceEl.replaceChildren(
-          ...verdict.evidence.map(function (e) {
-            const div = document.createElement("div");
-            div.textContent = "\u2022 " + e;
-            return div;
-          }),
-        );
-      } else if (evidenceEl) {
-        evidenceEl.remove();
-      }
+    if (detail && detail.classList.contains("conv-verdict-detail")) {
+      detail.remove();
     }
+    badge.replaceWith(buildConvVerdict(verdict, { judgePending: false }));
 
     this.updateVerdictGlow(verdict.recommendation);
   }
 
   updateVerdictGlow(recommendation) {
     if (!this.approvalBlockEl) return;
-    const prompt = this.approvalBlockEl.querySelector(".ts-approval-body");
-    if (!prompt) return;
-
-    // Collect all verdict badges currently visible in this approval block
-    const badges = this.approvalBlockEl.querySelectorAll(".verdict-badge");
+    const actions = this.approvalBlockEl.querySelector(".conv-actions");
+    if (!actions) return;
+    // Collect all verdict badges currently visible in this approval block.
+    const badges = this.approvalBlockEl.querySelectorAll(".conv-verdict");
     let worst = recommendation;
     for (let i = 0; i < badges.length; i++) {
-      const recEl = badges[i].querySelector(".verdict-rec");
+      const recEl = badges[i].querySelector(".conv-verdict-rec");
       if (recEl) {
         const r = recEl.textContent;
         if (r === "deny") {
@@ -561,15 +526,15 @@ class Pane {
         if (r === "review" && worst !== "deny") worst = "review";
       }
     }
-
-    prompt.classList.remove(
-      "ts-verdict-glow--approve",
-      "ts-verdict-glow--deny",
-      "ts-verdict-glow--review",
+    actions.classList.remove(
+      "conv-verdict-glow--approve",
+      "conv-verdict-glow--deny",
+      "conv-verdict-glow--review",
     );
-    if (worst === "approve") prompt.classList.add("ts-verdict-glow--approve");
-    else if (worst === "deny") prompt.classList.add("ts-verdict-glow--deny");
-    else prompt.classList.add("ts-verdict-glow--review");
+    if (worst === "approve")
+      actions.classList.add("conv-verdict-glow--approve");
+    else if (worst === "deny") actions.classList.add("conv-verdict-glow--deny");
+    else actions.classList.add("conv-verdict-glow--review");
   }
 
   addInfoMessage(text) {
@@ -2022,27 +1987,22 @@ class Pane {
             const wasDenied = !!msg.denied;
             const block = document.createElement("div");
             block.className =
-              "msg ts-approval ts-approval--inline " +
-              (wasDenied ? "denied" : "approved");
+              "conv-batch conv-batch--solo " +
+              (wasDenied ? "conv-batch--denied" : "conv-batch--approved");
+            block.appendChild(
+              _convApprovalHead(
+                "Tool",
+                msg.tool_calls.map((tc) => ({ func_name: tc.name })),
+              ),
+            );
             msg.tool_calls.forEach((tc) => {
-              const div = document.createElement("div");
-              div.className = "ts-approval-tool";
-              div.dataset.funcName = tc.name;
-              div.dataset.callId = tc.id || "";
-              const nameEl = document.createElement("div");
-              nameEl.className = "tool-name";
-              nameEl.textContent = tc.name;
-              div.appendChild(nameEl);
-              const cmd = document.createElement("div");
-              cmd.className = "tool-cmd";
+              // Synthesize the live `item` shape from the stored tool_call so
+              // replay renders the SAME .conv-row as the live path.
+              let header = "";
               try {
                 const args = JSON.parse(tc.arguments);
                 if (tc.name === "bash") {
-                  const preview = Object.values(args)[0] || "";
-                  const dollar = document.createElement("span");
-                  dollar.className = "dollar";
-                  dollar.textContent = "$ ";
-                  cmd.append(dollar, String(preview));
+                  header = String(Object.values(args)[0] || "");
                 } else {
                   const parts = [];
                   const keys = Object.keys(args);
@@ -2054,30 +2014,22 @@ class Pane {
                       valStr = valStr.substring(0, 77) + "...";
                     parts.push(keys[k] + ": " + valStr);
                   }
-                  cmd.textContent = parts.join("\n");
+                  header = parts.join("\n");
                 }
               } catch (e) {
-                // Defensive: never let a non-string `arguments` (or a
-                // parse failure) escalate into a render-aborting throw.
-                cmd.textContent = String(tc.arguments || "").substring(0, 100);
+                header = String(tc.arguments || "").substring(0, 100);
               }
-              div.appendChild(cmd);
-              // Verdict badge — anchor to THIS tool's row (div) rather
-              // than the whole block, so a multi-tool batch with one
-              // flagged call doesn't drift the badge above unrelated
-              // calls.  Same renderVerdictBadge helper as live; pass
-              // judgePending=false because any verdict on replay is
-              // final — no spinner.
+              const item = { func_name: tc.name, call_id: tc.id || "", header };
+              const row = buildToolDiv(item);
+              // Verdict anchored to THIS row; replay verdicts are final.
               if (tc.verdict) {
-                div.appendChild(renderVerdictBadge(tc.verdict, false));
+                row.appendChild(
+                  buildConvVerdict(tc.verdict, { judgePending: false }),
+                );
               }
-              block.appendChild(div);
-              // Output-guard finding — defer insertion until the tool
-              // result lands so the warning anchors under the output
-              // (mirrors live showOutputWarning placement).  Stash in
-              // a function-local map keyed by call_id so the
-              // role==="tool" branch below can pick it up; legacy rows
-              // missing tool_call_id are flushed at end-of-replay.
+              block.appendChild(row);
+              // Output-guard finding — deferred until the tool result lands so
+              // it anchors under the output (mirrors live showOutputWarning).
               if (
                 tc.output_assessment &&
                 tc.output_assessment.risk_level &&
@@ -2085,20 +2037,15 @@ class Pane {
               ) {
                 pendingAssessments[tc.id || ""] = {
                   assessment: tc.output_assessment,
-                  toolDiv: div,
+                  toolDiv: row,
                 };
               }
             });
-            const badge = document.createElement("div");
-            badge.setAttribute("role", "status");
-            if (wasDenied) {
-              badge.className = "ts-approval-badge ts-approval-badge--denied";
-              badge.textContent = "\u2717 denied";
-            } else {
-              badge.className = "ts-approval-badge ts-approval-badge--approved";
-              badge.textContent = "\u2713 approved";
-            }
-            block.appendChild(badge);
+            block.appendChild(
+              buildConvStatus(
+                wasDenied ? { approved: false } : { approved: true },
+              ),
+            );
             this.messagesEl.appendChild(block);
             lastToolBlock = block;
           }
@@ -2111,7 +2058,7 @@ class Pane {
             /^Denied by user/.test(stripped) ||
             /^Blocked/.test(stripped);
           const isToolError = !!msg.is_error;
-          // Anchor the rendered output to the specific .ts-approval-tool
+          // Anchor the rendered output to the specific .conv-row
           // element matching this result's tool_call_id — mirrors the
           // live appendToolOutput path so multi-tool batches show
           // [hdr A][out A][hdr B][out B] rather than [A][B][out A][out B].
@@ -2120,9 +2067,7 @@ class Pane {
           let resultTarget = null;
           if (msg.tool_call_id) {
             resultTarget = lastToolBlock.querySelector(
-              '.ts-approval-tool[data-call-id="' +
-                CSS.escape(msg.tool_call_id) +
-                '"]',
+              '.conv-row[data-call-id="' + CSS.escape(msg.tool_call_id) + '"]',
             );
           }
           // Cursor-style append: cursor advances after each insert so
@@ -2138,7 +2083,7 @@ class Pane {
               insertCursor.after(node);
               insertCursor = node;
             } else {
-              const bdg = lastToolBlock.querySelector(".ts-approval-badge");
+              const bdg = lastToolBlock.querySelector(".conv-status");
               if (bdg) lastToolBlock.insertBefore(node, bdg);
               else lastToolBlock.appendChild(node);
             }
@@ -2155,8 +2100,11 @@ class Pane {
               insertChained(out);
             }
           }
-          if (isToolError && !lastToolBlock.classList.contains("denied")) {
-            lastToolBlock.classList.add("error");
+          if (
+            isToolError &&
+            !lastToolBlock.classList.contains("conv-batch--denied")
+          ) {
+            lastToolBlock.classList.add("conv-batch--error");
             appendToolErrorBadge(lastToolBlock);
           }
           // Output-guard warning — pull the assessment out of the
@@ -2236,7 +2184,7 @@ class Pane {
     // .msg.assistant selector already excludes them — no extra guard needed.
     //
     // Skip retry attachment when the most recent semantic turn is
-    // tool-only — last DOM child is a .ts-approval block.  Walk back past
+    // tool-only — last DOM child is a .conv-batch block.  Walk back past
     // operator-context rows (the plain system bubble AND the structured
     // watch-result / guard-finding cards — every operator row carries
     // .operator-context) which FOLLOW the tool batch they advise, so the
@@ -2248,7 +2196,7 @@ class Pane {
     while (lastChild && lastChild.classList.contains("operator-context")) {
       lastChild = lastChild.previousElementSibling;
     }
-    if (lastChild && lastChild.classList.contains("ts-approval")) {
+    if (lastChild && lastChild.classList.contains("conv-batch")) {
       return;
     }
     const assistants = this.messagesEl.querySelectorAll(".msg.assistant");
@@ -2264,39 +2212,31 @@ class Pane {
   announceToolBlock(items) {
     const list = (items || []).filter(Boolean);
     if (!list.length) return;
-    // Drop a previous un-consumed announce (e.g. a turn that errored before
-    // its approve_request / tool_info ever arrived) so shells don't pile up.
+    // Drop a previous un-consumed announce so shells don't pile up.
     if (this.announcedBlockEl) {
       this.announcedBlockEl.remove();
       this.announcedBlockEl = null;
     }
     const block = document.createElement("div");
-    block.className =
-      "msg ts-approval ts-approval--inline ts-approval--announced";
-    // Indeterminate region until the judge/gate resolves; the tool_info /
-    // approve_request upgrade clears it (showInlineToolBlock), so AT treats
-    // the shell as loading rather than a finished card.
+    block.className = "conv-batch conv-batch--solo";
+    // Indeterminate region until the judge/gate resolves; the upgrade in
+    // showInlineToolBlock clears aria-busy.
     block.setAttribute("aria-busy", "true");
     block.dataset.callIds = JSON.stringify(
       list.map((it) => it.call_id).filter(Boolean),
     );
+    block.appendChild(_convApprovalHead("Evaluating", list));
     list.forEach((item) => {
       block.appendChild(buildToolDiv(item));
-      // The heuristic verdict is attached synchronously before the gate, so
-      // the badge (carrying its data-call-id) exists from the first frame;
-      // the async LLM ``intent_verdict`` updates it in place via
-      // updateVerdictBadge.  judgePending=true shows the "judge analysing"
-      // spinner until that lands.
       const verdict =
         item.judge_verdict || item.heuristic_verdict || item.verdict;
-      if (verdict) block.appendChild(renderVerdictBadge(verdict, true));
+      if (verdict) {
+        block.appendChild(buildConvVerdict(verdict, { judgePending: true }));
+      }
     });
     this.announcedBlockEl = block;
     this.messagesEl.appendChild(block);
     this.scrollToBottom();
-    // Polite SR announcement (messagesEl is aria-live="off" mid-stream, so the
-    // appended shell alone wouldn't be heard) — names the call + that it can
-    // be stopped, the whole point of painting it early.
     toolAnnounce(_toolAnnounceText(list));
   }
 
@@ -2331,40 +2271,36 @@ class Pane {
   }
 
   showInlineToolBlock(items, autoApproved, judgePending) {
-    // Reuse the early-paint shell (tool_pending) if it's for this batch so
-    // the card upgrades in place instead of duplicating; else build fresh.
-    // replaceChildren() rebuilds the rows from the now-complete items (which
-    // carry the auto-approve tag + completed LLM verdict), so the auto badge
-    // and llm-tier verdict render without per-node patching.
+    // Reuse the early-paint announce shell if it's for this batch (upgrade in
+    // place); else build fresh.
     const announced = this._takeAnnouncedBlock(items);
     const block = announced || document.createElement("div");
     if (announced) announced.replaceChildren();
-    // The judge/gate has resolved — clear the announced shell's busy state
-    // (no-op on a freshly built block, which never had it).
     block.removeAttribute("aria-busy");
     block.className =
-      "msg ts-approval ts-approval--inline" + (autoApproved ? " approved" : "");
+      "conv-batch conv-batch--solo" + (autoApproved ? " conv-batch--auto" : "");
     if (!autoApproved) {
       block.setAttribute("role", "alertdialog");
       block.setAttribute("aria-label", "Tool approval required");
     }
+    block.appendChild(
+      _convApprovalHead(
+        autoApproved
+          ? "Tool"
+          : items.length >= 2
+            ? "⚠ Approval · " + items.length + " tools"
+            : "⚠ Approval",
+        items,
+      ),
+    );
 
-    // Track the highest-priority recommendation for glow
     let glowRec = null;
-
     items.forEach((item) => {
       block.appendChild(buildToolDiv(item));
-      // Render verdict badge if present.  Prefer the completed LLM verdict
-      // (``judge_verdict``, set by the server on a Smart-Approved item) so an
-      // auto-approved row shows the llm/approve verdict that cleared it rather
-      // than the cautious heuristic carry-over.  Otherwise the heuristic
-      // verdict (``heuristic_verdict``, matching the api/server_schemas
-      // PendingApprovalItem shape); ``verdict`` is the legacy fallback for a
-      // stale mid-deploy SSE payload.
       const verdict =
         item.judge_verdict || item.heuristic_verdict || item.verdict;
       if (verdict) {
-        block.appendChild(renderVerdictBadge(verdict, judgePending));
+        block.appendChild(buildConvVerdict(verdict, { judgePending }));
         const rec = verdict.recommendation || "review";
         if (
           !glowRec ||
@@ -2377,92 +2313,40 @@ class Pane {
     });
 
     if (autoApproved) {
-      const badge = document.createElement("div");
-      badge.setAttribute("role", "status");
-      badge.className = "ts-approval-badge ts-approval-badge--approved";
-      badge.textContent = "\u2713 auto-approved";
-      block.appendChild(badge);
+      block.appendChild(buildConvStatus({ auto: true }));
     } else {
-      const prompt = document.createElement("div");
-      prompt.className = "ts-approval-body";
-
-      // Apply verdict glow on initial heuristic verdict
-      if (glowRec) {
-        if (glowRec === "approve")
-          prompt.classList.add("ts-verdict-glow--approve");
-        else if (glowRec === "deny")
-          prompt.classList.add("ts-verdict-glow--deny");
-        else prompt.classList.add("ts-verdict-glow--review");
-      }
-
       const alwaysNames = items
-        .filter((it) => {
-          return (
+        .filter(
+          (it) =>
             it.needs_approval &&
             it.func_name &&
             it.func_name !== "__budget_override__" &&
-            !it.error
-          );
-        })
-        .map((it) => {
-          return it.approval_label || it.func_name;
-        });
+            !it.error,
+        )
+        .map((it) => it.approval_label || it.func_name);
       block.dataset.alwaysNames = JSON.stringify(alwaysNames);
-      const alwaysTitle = alwaysNames.length
-        ? "Always approve " + alwaysNames.join(", ")
-        : "Always approve this tool type";
-
-      const actionsDiv = document.createElement("div");
-      actionsDiv.className = "ts-approval-actions";
-
-      const approveBtn = document.createElement("button");
-      approveBtn.className = "ts-approval-btn ts-approval-btn--approve";
-      approveBtn.append(makeKeyLabel("y", "Approve"));
-      approveBtn.onclick = () => {
-        this.resolveApproval(true, false, this.getFeedback());
-      };
-      actionsDiv.appendChild(approveBtn);
-
-      const denyBtn = document.createElement("button");
-      denyBtn.className = "ts-approval-btn ts-approval-btn--deny";
-      denyBtn.append(makeKeyLabel("n", "Deny"));
-      denyBtn.onclick = () => {
-        this.resolveApproval(false, false, this.getFeedback());
-      };
-      actionsDiv.appendChild(denyBtn);
-
-      if (alwaysNames.length) {
-        const alwaysBtn = document.createElement("button");
-        alwaysBtn.className = "ts-approval-btn ts-approval-btn--always";
-        alwaysBtn.title = alwaysTitle;
-        alwaysBtn.setAttribute("aria-label", alwaysTitle);
-        alwaysBtn.append(makeKeyLabel("a", "Always"));
-        alwaysBtn.onclick = () => {
-          this.resolveApproval(true, true, this.getFeedback());
-        };
-        actionsDiv.appendChild(alwaysBtn);
-      }
-
-      prompt.appendChild(actionsDiv);
-
-      const fbInput = document.createElement("input");
-      fbInput.type = "text";
-      fbInput.className = "ts-approval-feedback";
-      fbInput.placeholder = "feedback (optional)";
-      prompt.appendChild(fbInput);
-
-      block.appendChild(prompt);
+      const actions = buildConvActions({
+        kbd: { approve: "y", deny: "n", always: "a" },
+        alwaysLabel: alwaysNames.length
+          ? "Always approve " + alwaysNames.join(", ")
+          : "",
+        glowRec,
+        withFeedback: true,
+        onApprove: () => this.resolveApproval(true, false, this.getFeedback()),
+        onDeny: () => this.resolveApproval(false, false, this.getFeedback()),
+        onAlways: () => this.resolveApproval(true, true, this.getFeedback()),
+      });
+      block.appendChild(actions);
       this.pendingApproval = true;
       this.approvalBlockEl = block;
       this.inputEl.disabled = true;
       this.sendBtn.disabled = true;
+      const fb = actions.querySelector(".conv-feedback");
       requestAnimationFrame(() => {
-        fbInput.focus();
+        if (fb) fb.focus();
       });
     }
 
-    // A reused announce shell is already in the DOM — only append a freshly
-    // built block.
     if (!announced) this.messagesEl.appendChild(block);
     this.scrollToBottom();
   }
@@ -2471,39 +2355,22 @@ class Pane {
     if (!this.approvalBlockEl) return;
     this.pendingApproval = false;
 
-    // Remove prompt
-    const prompt = this.approvalBlockEl.querySelector(".ts-approval-body");
-    if (prompt) prompt.remove();
+    const actions = this.approvalBlockEl.querySelector(".conv-actions");
+    if (actions) actions.remove();
 
-    // Add badge
-    const badge = document.createElement("div");
-    badge.setAttribute("role", "status");
-    if (approved) {
-      badge.className = "ts-approval-badge ts-approval-badge--approved";
-      let label = "\u2713 approved";
-      if (always) {
-        const raw = this.approvalBlockEl.dataset.alwaysNames;
-        const names = raw ? JSON.parse(raw) : [];
-        label = names.length
-          ? "\u2713 always approve " + names.join(", ")
-          : "\u2713 always approve";
-      }
-      badge.textContent = feedback ? label + ": " + feedback : label;
-      this.approvalBlockEl.classList.add("approved");
-    } else {
-      badge.className = "ts-approval-badge ts-approval-badge--denied";
-      badge.textContent = "\u2717 denied" + (feedback ? ": " + feedback : "");
-      this.approvalBlockEl.classList.add("denied");
-    }
-    this.approvalBlockEl.appendChild(badge);
+    this.approvalBlockEl.appendChild(
+      buildConvStatus({ approved, always, feedback: feedback || "" }),
+    );
+    this.approvalBlockEl.classList.add(
+      approved ? "conv-batch--approved" : "conv-batch--denied",
+    );
     this.approvalBlockEl = null;
 
-    // Re-enable input
     this.inputEl.disabled = false;
     this.sendBtn.disabled = this.busy;
     this.inputEl.focus();
 
-    // POST to server (skip when server already resolved, e.g. timeout)
+    // POST to server (skip when server already resolved, e.g. timeout).
     if (!skipPost) {
       authFetch(
         this._base +
@@ -2531,14 +2398,14 @@ class Pane {
     const escapedId = callId ? CSS.escape(callId) : "";
     let target = escapedId
       ? this.messagesEl.querySelector(
-          '.ts-approval-tool[data-call-id="' + escapedId + '"]',
+          '.conv-row[data-call-id="' + escapedId + '"]',
         )
       : null;
     if (!target) {
-      const blocks = this.messagesEl.querySelectorAll(".ts-approval");
+      const blocks = this.messagesEl.querySelectorAll(".conv-batch");
       if (!blocks.length) return;
       const block = blocks[blocks.length - 1];
-      const tools = block.querySelectorAll(".ts-approval-tool");
+      const tools = block.querySelectorAll(".conv-row");
       for (let i = tools.length - 1; i >= 0; i--) {
         if (tools[i].dataset.funcName === name) {
           target = tools[i];
@@ -2572,9 +2439,9 @@ class Pane {
     // the guard in the history-replay path (the live path used to be
     // safe because no tool_result event was ever emitted for denied
     // items, but we now emit one so _tool_error_flags gets set).
-    const parentBlock = target.closest(".ts-approval");
+    const parentBlock = target.closest(".conv-batch");
     const isDenied =
-      (parentBlock && parentBlock.classList.contains("denied")) ||
+      (parentBlock && parentBlock.classList.contains("conv-batch--denied")) ||
       /^Denied by user/.test(stripped) ||
       /^Blocked/.test(stripped);
     if (isDenied) return;
@@ -2596,8 +2463,11 @@ class Pane {
     if (isError) {
       const mcpErr = tryParseMcpError(stripped);
       if (mcpErr) {
-        if (parentBlock && !parentBlock.classList.contains("denied")) {
-          parentBlock.classList.add("error");
+        if (
+          parentBlock &&
+          !parentBlock.classList.contains("conv-batch--denied")
+        ) {
+          parentBlock.classList.add("conv-batch--error");
           appendToolErrorBadge(parentBlock);
         }
         target.after(
@@ -2613,8 +2483,12 @@ class Pane {
     const out = renderToolOutput(stripped, isError);
 
     // Mark the parent approval block as errored
-    if (isError && parentBlock && !parentBlock.classList.contains("denied")) {
-      parentBlock.classList.add("error");
+    if (
+      isError &&
+      parentBlock &&
+      !parentBlock.classList.contains("conv-batch--denied")
+    ) {
+      parentBlock.classList.add("conv-batch--error");
       appendToolErrorBadge(parentBlock);
     }
 
@@ -2816,71 +2690,8 @@ function _buildGuardFindingBubble(meta) {
 // via showOutputWarning.  Single source of truth keeps the two
 // surfaces from drifting on role / class / escape semantics.
 function _buildOutputWarningEl(assessment) {
-  const risk = normalizeRiskLevel(assessment && assessment.risk_level);
-  const flags = (assessment && assessment.flags) || [];
-  const warning = document.createElement("div");
-  warning.className = "output-warning output-warning-" + risk;
-  // role="status" (polite) rather than "alert" (assertive) — these
-  // are findings, not emergencies; the assertive announcement live
-  // would interrupt the user mid-typing on a high-risk match, which
-  // is more disruptive than informative.
-  warning.setAttribute("role", "status");
-  const labelEl = document.createElement("span");
-  labelEl.className = "output-warning-label";
-  labelEl.textContent = "⚠ " + String(risk).toUpperCase();
-  warning.appendChild(labelEl);
-  if (flags.length) {
-    warning.appendChild(document.createTextNode(" " + flags.join(", ")));
-  }
-  if (assessment && assessment.redacted) {
-    const redacted = document.createElement("span");
-    redacted.className = "output-warning-redacted";
-    redacted.textContent = " (credentials redacted)";
-    warning.appendChild(redacted);
-  }
-  // LLM-judge attribution — tier "llm" means the judge returned a verdict
-  // for this output (it may have escalated, agreed with, or cleared a
-  // heuristic-positive), NOT that it owns the displayed risk. Show the
-  // judge's own verdict + confidence so the operator can tell a regex match
-  // from a model judgement and weigh any dissent. Mirrors the intent-verdict
-  // badge's tier/confidence vocabulary.
-  if (assessment && assessment.tier === "llm") {
-    const tierEl = document.createElement("span");
-    tierEl.className = "output-warning-tier";
-    let t = "⚖ LLM";
-    // Show the judge's OWN verdict when it differs from the displayed
-    // (merged) risk — e.g. regex flagged MEDIUM but the judge said none.
-    // Same-verdict cases stay terse ("⚖ LLM · 88%").
-    if (assessment.judge_risk && assessment.judge_risk !== risk) {
-      t += ": " + assessment.judge_risk;
-    }
-    if (assessment.confidence > 0) {
-      t += " · " + Math.round(assessment.confidence * 100) + "%";
-    }
-    if (assessment.judge_model) t += " · " + assessment.judge_model;
-    tierEl.textContent = t;
-    warning.appendChild(tierEl);
-  }
-  // Rationale — the judge's one-line reasoning, surfaced as a muted second
-  // line so the finding explains itself instead of showing a bare flag
-  // list. Block element wraps below the header row.
-  if (assessment && assessment.reasoning) {
-    const reasonEl = document.createElement("div");
-    reasonEl.className = "output-warning-reasoning";
-    reasonEl.textContent = assessment.reasoning;
-    warning.appendChild(reasonEl);
-  }
-  return warning;
-}
-
-function toggleVerdictDetail(btn) {
-  const badge = btn.closest(".verdict-badge");
-  const detail = badge ? badge.nextElementSibling : null;
-  if (detail && detail.classList.contains("verdict-detail")) {
-    const isHidden = detail.style.display === "none";
-    detail.style.display = isHidden ? "block" : "none";
-    btn.textContent = isHidden ? "hide" : "details";
-  }
+  // Thin wrapper over the shared builder (risk normalized -> unknown=medium).
+  return buildConvWarning(assessment);
 }
 
 function _formatRuntime(item) {
@@ -3110,157 +2921,48 @@ function _mcpErrorTitle(err) {
 
 // ---------------------------------------------------------------------------
 // Conversational rendering helpers — tool output, media embeds, MCP-error
-// cards, verdict badges.  Used only by the Pane.  stripAnsi + the watch-result
-// card + the system-nudge marker were lifted to the shared conversation.js
-// (step 5e.1, imported at the top); the rest reconciles with the CSS-vocabulary
-// unify (5e.2), since the coordinator carries .coord-tool-* variants of them.
+// cards.  Used only by the Pane.  The approval-card builders (rows, verdict,
+// warning, actions, status) were unified into the shared conversation.js
+// (steps 5e.1/5e.2); buildToolDiv + the wrappers below delegate to them so
+// both panes emit the SAME .conv-* card.  The .tool-output / media result
+// subsystem stays interactive-only (live stream / collapse / embeds).
 // ---------------------------------------------------------------------------
 
+// Converged approval-card head strip (kicker + summary).  Module-level so
+// both showInlineToolBlock and announceToolBlock (and replay) build the same
+// head as the coordinator's buildConvBatchShell, without a fresh shell element.
+function _convApprovalHead(kickerText, items) {
+  const head = document.createElement("div");
+  head.className = "conv-batch-head";
+  const k = document.createElement("span");
+  k.className = "conv-batch-kicker";
+  k.textContent = kickerText;
+  head.appendChild(k);
+  const first =
+    items[0] && (items[0].func_name || items[0].approval_label)
+      ? items[0].func_name || items[0].approval_label
+      : "tool";
+  const summary = document.createElement("span");
+  summary.className = "conv-batch-summary";
+  summary.textContent =
+    items.length >= 2 ? first + " + " + (items.length - 1) + " more" : first;
+  head.appendChild(summary);
+  return head;
+}
+
 function buildToolDiv(item) {
-  const div = document.createElement("div");
-  div.className = "ts-approval-tool";
-  div.dataset.funcName = item.func_name || "";
-  div.dataset.callId = item.call_id || "";
-
-  const name = document.createElement("div");
-  name.className = "tool-name" + (item.error ? " tool-name--error" : "");
-  name.textContent = item.func_name || "";
-  // Inline auto-approve indicator — surfaces tools that bypassed the
-  // operator approval gate (skill allowlist / blanket / admin policy /
-  // explicit "Approve + Always") right next to the tool name.  The
-  // coord-tree pill is bounded to the coord page; this small badge
-  // gives the operator the same signal on the per-ws page they
-  // navigated into.
-  if (item.auto_approved) {
-    const badge = document.createElement("span");
-    badge.className = "tool-auto-approved";
-    const reason = item.auto_approve_reason || "auto_approve_tools";
-    badge.textContent = " auto: " + reason;
-    badge.title = "Tool auto-approved (no operator prompt) — reason: " + reason;
-    name.appendChild(badge);
-  }
-  div.appendChild(name);
-
-  const cmd = document.createElement("div");
-  cmd.className = "tool-cmd";
-  const headerText = stripAnsi(item.header || "");
-  const cleaned = headerText.replace(/^[^\s]+\s+\w+:\s*/, "");
-  if (item.func_name === "bash" && cleaned) {
-    const dollarSpan = document.createElement("span");
-    dollarSpan.className = "dollar";
-    dollarSpan.textContent = "$ ";
-    cmd.append(dollarSpan, cleaned);
-  } else {
-    cmd.textContent = cleaned || headerText;
-  }
-  div.appendChild(cmd);
-
-  if (item.preview) {
-    const diff = document.createElement("div");
-    diff.className = "tool-diff";
-    const lines = stripAnsi(item.preview).split("\n");
-    const diffNodes = [];
-    lines.forEach(function (line, i) {
-      if (i > 0) diffNodes.push("\n");
-      const trimmed = line.trim();
-      let cls = null;
-      if (trimmed.startsWith("-")) cls = "diff-del";
-      else if (trimmed.startsWith("+")) cls = "diff-add";
-      else if (trimmed.startsWith("Warning:")) cls = "diff-warn";
-      if (cls !== null) {
-        const span = document.createElement("span");
-        span.className = cls;
-        span.textContent = line;
-        diffNodes.push(span);
-      } else {
-        diffNodes.push(line);
-      }
-    });
-    diff.append(...diffNodes);
-    div.appendChild(diff);
-  }
-
-  return div;
+  // Tool row for the converged card: the shared call line (name + auto tag)
+  // plus the bash `$ cmd` / diff preview.  data-func-name is stamped for the
+  // append-time finders (buildConvRow already stamps data-call-id/-tool-name).
+  const row = buildConvRow(item, {});
+  row.dataset.funcName = item.func_name || "";
+  row.appendChild(buildConvCmd(item));
+  return row;
 }
 
 function renderVerdictBadge(verdict, judgePending) {
-  if (!verdict) return document.createDocumentFragment();
-  const risk = normalizeRiskLevel(verdict.risk_level);
-  const rec = verdict.recommendation || "review";
-  const conf = Math.round((verdict.confidence || 0) * 100);
-
-  const badge = document.createElement("div");
-  badge.className = "verdict-badge verdict-" + risk + " ts-verdict-badge";
-  badge.setAttribute("data-risk", risk);
-  if (verdict.call_id) badge.setAttribute("data-call-id", verdict.call_id);
-
-  const riskSpan = document.createElement("span");
-  riskSpan.className = "verdict-risk";
-  riskSpan.textContent = risk.toUpperCase();
-
-  const recSpan = document.createElement("span");
-  recSpan.className = "verdict-rec";
-  recSpan.textContent = rec;
-
-  const confSpan = document.createElement("span");
-  confSpan.className = "verdict-conf";
-  confSpan.textContent = conf + "%";
-
-  badge.append(riskSpan, recSpan, confSpan);
-
-  if (judgePending) {
-    const spinner = document.createElement("span");
-    spinner.className = "verdict-judge-spinner";
-    const dot = document.createElement("span");
-    dot.className = "judge-spinner-dot";
-    spinner.append(dot, " judge analyzing\u2026");
-    badge.appendChild(spinner);
-  }
-
-  const expand = document.createElement("button");
-  expand.className = "verdict-expand";
-  expand.textContent = "details";
-  expand.addEventListener("click", function () {
-    toggleVerdictDetail(this);
-  });
-  badge.appendChild(expand);
-
-  const detail = document.createElement("div");
-  detail.className = "verdict-detail";
-  detail.style.display = "none";
-
-  const summaryEl = document.createElement("div");
-  summaryEl.className = "verdict-summary";
-  summaryEl.textContent = verdict.intent_summary || "";
-
-  const reasoningEl = document.createElement("div");
-  reasoningEl.className = "verdict-reasoning";
-  reasoningEl.textContent = verdict.reasoning || "";
-
-  detail.append(summaryEl, reasoningEl);
-
-  const evidence = verdict.evidence || [];
-  if (evidence.length) {
-    const evEl = document.createElement("div");
-    evEl.className = "verdict-evidence";
-    for (const ev of evidence) {
-      const row = document.createElement("div");
-      row.textContent = "\u2022 " + ev;
-      evEl.appendChild(row);
-    }
-    detail.appendChild(evEl);
-  }
-
-  const tierEl = document.createElement("div");
-  tierEl.className = "verdict-tier";
-  let tierText = (verdict.tier || "heuristic") + " tier";
-  if (verdict.judge_model) tierText += " | " + verdict.judge_model;
-  tierEl.textContent = tierText;
-  detail.appendChild(tierEl);
-
-  const frag = document.createDocumentFragment();
-  frag.append(badge, detail);
-  return frag;
+  // Thin wrapper over the shared builder (returns a fragment [badge, detail]).
+  return buildConvVerdict(verdict, { judgePending });
 }
 
 // Append an "✗ error" pill to an approval block as a sibling of the
@@ -3269,10 +2971,10 @@ function renderVerdictBadge(verdict, judgePending) {
 // (live + history rerender) do not stack badges.
 function appendToolErrorBadge(blockEl) {
   if (!blockEl) return;
-  if (blockEl.querySelector(".ts-approval-badge--error")) return;
+  if (blockEl.querySelector(".conv-status--error")) return;
   const errBadge = document.createElement("div");
   errBadge.setAttribute("role", "status");
-  errBadge.className = "ts-approval-badge ts-approval-badge--error";
+  errBadge.className = "conv-status conv-status--error";
   errBadge.textContent = "✗ error";
   blockEl.appendChild(errBadge);
 }

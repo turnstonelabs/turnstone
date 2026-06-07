@@ -107,9 +107,7 @@ def test_coordinator_js_exposes_inline_approval_helpers():
     # low because the old severity table only mapped 'crit'.  The crit/critical
     # alias moved to the shared conversation.js (step 5e.1b); verify it there so
     # a 'critical' verdict still ranks like 'crit'.
-    shared = Path(__file__).resolve().parent.parent / (
-        "turnstone/shared_static/conversation.js"
-    )
+    shared = Path(__file__).resolve().parent.parent / ("turnstone/shared_static/conversation.js")
     assert 'crit: "critical"' in shared.read_text(encoding="utf-8")
     # Child approves must round-trip through the routing proxy at
     # /v1/api/route/workstreams/{ws_id}/approve — the bare
@@ -151,9 +149,10 @@ def test_coordinator_js_exposes_inline_approval_helpers():
     # (--running orphan promoted to --pending or --auto when SSE
     # arrives with the authoritative shape).  Both class names must
     # remain reachable from JS — dropping either breaks the reload
-    # state machine that PR #447's review pass surfaced.
-    assert "coord-tool-batch--running" in body
-    assert "coord-tool-batch--pending" in body
+    # state machine that PR #447's review pass surfaced.  (5e.2c: the
+    # coordinator now emits the shared neutral .conv-* vocabulary.)
+    assert "conv-batch--running" in body
+    assert "conv-batch--pending" in body
     # History replay's outcome classifier — denied / errored tool
     # turns must render with the correct batch state on reload, not
     # the contradictory "✓ approved" pill that pre-fix showed for
