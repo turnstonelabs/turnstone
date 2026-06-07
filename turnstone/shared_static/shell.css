@@ -205,6 +205,16 @@
 .node-row .ver.drift {
   color: var(--yellow);
 }
+/* Light-theme AA: these ≤11px rail micro-labels are --ink-4 (~3.9-4.0:1 on the
+   light --panel) — one step to --ink-3 (~6.5:1) for AA; dark --ink-4 already
+   clears it so it keeps the dimmer hint.  Same escape hatch as .tab-menu-key /
+   .conv-batch-tier.  (Drift versions keep their --yellow cue.) */
+[data-theme="light"] .sec-label,
+[data-theme="light"] .nlabel,
+[data-theme="light"] .node-row .ver:not(.drift),
+[data-theme="light"] .grp-head .gcount {
+  color: var(--ink-3);
+}
 .node-row .nws {
   font-variant-numeric: tabular-nums;
   color: var(--ink-3);
@@ -300,13 +310,13 @@
 /* connection indicator — relocated #status-bar (was the header text bar).
    `disconnected` is toggled by app.js connectSSE on stream loss. */
 .rail-conn {
-  padding: 4px 10px 2px;
-  font-size: 11px;
+  padding: 2px 10px;
+  font-size: 10px;
   color: var(--ink-4);
-  min-height: 18px;
+  min-height: 0; /* quiet when connected — don't reserve a permanent status slot */
 }
 .rail-conn.disconnected {
-  color: var(--yellow);
+  color: var(--warn);
 }
 
 /* rail footer — relocated header controls + user chip */
@@ -579,7 +589,12 @@
 .tab-menu-sep {
   height: 1px;
   margin: 6px 0;
+  /* The more-visible hairline PER THEME against the --panel-2 popup: --hair-2 is
+     lighter (more visible) on dark, --hair is darker (more visible) on light. */
   background: var(--hair-2);
+}
+[data-theme="light"] .tab-menu-sep {
+  background: var(--hair);
 }
 @keyframes tab-menu-in {
   from {
@@ -774,7 +789,9 @@
 .grp-items .row.active {
   color: var(--ink);
   background: var(--panel-2);
-  box-shadow: inset 2px 0 0 var(--hair-2);
+  /* --ink-4 reads in BOTH themes (the --hair-2 marker nearly vanished on the
+     light --panel-2); still clearly not the amber `.open` of a live session. */
+  box-shadow: inset 2px 0 0 var(--ink-4);
 }
 
 /* ===== Admin pane — adopts #view-admin (the 18 tabpanels).  The in-pane

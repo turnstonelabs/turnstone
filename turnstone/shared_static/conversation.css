@@ -115,7 +115,10 @@
   color: var(--ink-3);
 }
 .conv-batch--pending .conv-batch-kicker {
-  color: var(--warn);
+  /* The operator's primary decision cue — darken off raw --warn so it clears AA
+     on the light --panel-2 (4.17:1 -> ~5.5:1).  The mix tracks the theme (--ink-2
+     is light in dark, dark in light), so dark stays warm + passing too. */
+  color: color-mix(in srgb, var(--warn) 78%, var(--ink-2));
 }
 .conv-batch--approved .conv-batch-kicker {
   color: color-mix(in srgb, var(--ok) 70%, var(--ink-2));
