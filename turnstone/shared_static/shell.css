@@ -20,6 +20,13 @@
   height: 100vh;
   overflow: hidden;
 }
+/* Responsive (step 7): DESKTOP-FIRST, by decision — this matches the desktop-only
+   design-system scope (the console's mobile off-canvas drawer was retired in step
+   3b, and the DS itself is desktop-only).  The rail -> off-canvas drawer on mobile
+   is DEFERRED, not dropped: it would slot in here as a `max-width` @media that
+   collapses the 266px rail column into a toggled overlay.  Narrow viewports get a
+   cramped desktop layout (not a broken one) — no silent mobile-support claim.
+   Revisit only if/when the DS takes on a mobile scope. */
 
 /* ===== Rail (the | of the L) ===== */
 .rail {
