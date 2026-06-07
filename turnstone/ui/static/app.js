@@ -337,8 +337,7 @@ function showNewWsModal(forkFromWsId) {
   // Populate model dropdown
   const modelSelect = document.getElementById("new-ws-model");
   const judgeSelect = document.getElementById("new-ws-judge-model");
-  const fp = getFocusedPane();
-  const curModel = fp ? fp.modelAlias || fp.model || "" : "";
+  const curModel = ""; // (focused-pane model prefill was PaneManager-only; dead in the L-shell)
   modelSelect.textContent = "";
   judgeSelect.textContent = "";
   const defaultOpt = document.createElement("option");
@@ -1058,9 +1057,14 @@ function getCurrentWsId() {
   return a && a.type === "interactive" ? a.rawId : "";
 }
 
-// Pane focus is PaneManager's in the L-shell; callers all null-guard this.
-function getFocusedPane() {
-  return null;
+// Human-readable byte size for attachment chips + over-cap errors (mirrors
+// composer_attachments.js's IIFE-local formatSize, which isn't a global).  The
+// four call sites referenced this with no definition in scope — a ReferenceError
+// that broke file staging (pre-existing, not introduced by the L-shell work).
+function _formatAttachSize(n) {
+  if (n < 1024) return n + " B";
+  if (n < 1024 * 1024) return (n / 1024).toFixed(1) + " KB";
+  return (n / (1024 * 1024)).toFixed(1) + " MB";
 }
 
 function forkWorkstream(optWsId) {
@@ -1429,16 +1433,6 @@ function dashboardSubmit() {
       workstreams[data.ws_id] = { name: data.name, state: "idle" };
       switchTab(data.ws_id);
       hideDashboard();
-      // If we sent an initial_message, the server's worker thread already
-      // dispatched it. Echo into the pane so the user sees their own text
-      // immediately rather than waiting for SSE to backfill.
-      if (text) {
-        const pane = getFocusedPane();
-        if (pane) {
-          pane.setBusy(true);
-          pane.addUserMessage(text);
-        }
-      }
     })
     .catch(function (err) {
       input.disabled = false;
@@ -2171,16 +2165,6 @@ document.addEventListener("keydown", function (e) {
     return;
   }
 
-  // Get focused pane for approval / busy checks
-  const pane = getFocusedPane();
-
-  // Escape: cancel generation when busy
-  if (e.key === "Escape" && pane && pane.busy && !pane.pendingApproval) {
-    e.preventDefault();
-    pane.cancelGeneration();
-    return;
-  }
-
   // Ctrl+D: toggle dashboard
   if (e.ctrlKey && e.key === "d") {
     e.preventDefault();
@@ -2233,46 +2217,6 @@ document.addEventListener("keydown", function (e) {
     if (Object.keys(workstreams).length > 1) {
       e.preventDefault();
       closeWorkstream(getCurrentWsId());
-    }
-    return;
-  }
-
-  // Inline approval keybindings
-  if (pane && pane.pendingApproval) {
-    const fbInput =
-      pane.approvalBlockEl &&
-      pane.approvalBlockEl.querySelector(".ts-approval-feedback");
-    if (fbInput && document.activeElement === fbInput) {
-      if (e.key === "Enter") {
-        e.preventDefault();
-        pane.resolveApproval(true, false, pane.getFeedback());
-      } else if (e.key === "Escape") {
-        e.preventDefault();
-        pane.resolveApproval(false, false, pane.getFeedback());
-      }
-      return;
-    }
-    // Not in feedback input — intercept shortcut keys
-    e.preventDefault();
-    e.stopPropagation();
-    if (e.key === "y" || e.key === "Enter") {
-      pane.resolveApproval(true, false, pane.getFeedback());
-    } else if (e.key === "n" || e.key === "Escape") {
-      pane.resolveApproval(false, false, pane.getFeedback());
-    } else if (e.key === "a") {
-      pane.resolveApproval(true, true, pane.getFeedback());
-    } else if (e.key === "d") {
-      const details = pane.approvalBlockEl
-        ? pane.approvalBlockEl.querySelectorAll(".verdict-detail")
-        : [];
-      details.forEach(function (d) {
-        const isHidden = d.style.display === "none";
-        d.style.display = isHidden ? "block" : "none";
-        const btn2 = d.previousElementSibling
-          ? d.previousElementSibling.querySelector(".verdict-expand")
-          : null;
-        if (btn2) btn2.textContent = isHidden ? "hide" : "details";
-      });
     }
     return;
   }
