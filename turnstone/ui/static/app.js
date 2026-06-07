@@ -882,11 +882,8 @@ let _editTitleTrap = null;
 function editWorkstreamTitle(optWsId) {
   const wsId = optWsId || getCurrentWsId();
   if (!wsId) return;
-  let currentTitle = "";
-  const tabEl = document.querySelector(
-    '.ws-tab[data-ws-id="' + wsId + '"] .tab-name',
-  );
-  if (tabEl) currentTitle = tabEl.textContent.trim();
+  const ws = workstreams[wsId];
+  const currentTitle = ws && ws.name ? ws.name : "";
 
   const overlay = document.getElementById("edit-title-overlay");
   const input = document.getElementById("edit-title-input");
@@ -932,8 +929,6 @@ function cancelEditTitle() {
     document.removeEventListener("keydown", _editTitleTrap);
     _editTitleTrap = null;
   }
-  const chevron = document.querySelector(".ws-tab.active .tab-chevron");
-  if (chevron) chevron.focus();
 }
 
 function submitEditTitle() {
@@ -983,10 +978,8 @@ function confirmDeleteWorkstream(optWsId) {
   const wsId = optWsId || getCurrentWsId();
   if (!wsId) return;
   if (Object.keys(workstreams).length <= 1) return;
-  const tabEl = document.querySelector(
-    '.ws-tab[data-ws-id="' + wsId + '"] .tab-name',
-  );
-  const name = tabEl ? tabEl.textContent.trim() : wsId.substring(0, 12);
+  const ws = workstreams[wsId];
+  const name = ws && ws.name ? ws.name : wsId.substring(0, 12);
 
   _pendingDeleteWsId = wsId;
   const overlay = document.getElementById("delete-ws-overlay");
@@ -1028,13 +1021,6 @@ function cancelDeleteWs() {
   if (_deleteWsTrap) {
     document.removeEventListener("keydown", _deleteWsTrap);
     _deleteWsTrap = null;
-  }
-  const chevron = document.querySelector(".ws-tab.active .tab-chevron");
-  if (chevron) {
-    chevron.focus();
-  } else {
-    const fallback = document.getElementById("new-tab-btn");
-    if (fallback) fallback.focus();
   }
 }
 

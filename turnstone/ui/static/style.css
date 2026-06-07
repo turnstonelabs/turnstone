@@ -53,164 +53,13 @@
   font-size: 14px;
   line-height: 1;
 }
-
-/* ==========================================================================
-   Mobile overrides
-   ========================================================================== */
-@media (max-width: 600px) {
-  .ws-tab .tab-chevron {
-    opacity: 1;
-    padding: 8px 10px;
-    font-size: 14px;
-    min-width: 36px;
-    min-height: 36px;
-  }
-  .ws-tab-dropdown-item.mobile-hide {
-    display: none;
-  }
-  #split-btn {
-    display: none;
-  }
-  .tab-wsid {
-    display: none;
-  }
-}
-
-/* ==========================================================================
-   Tab bar
-   ========================================================================== */
-#tab-bar {
-  display: flex;
-  align-items: center;
-  gap: 2px;
-  padding: 4px 16px;
-  background: var(--bg-surface);
-  border-bottom: 1px solid var(--border);
-  flex-shrink: 0;
-  overflow-x: auto;
-}
-#tab-list {
-  display: flex;
-  align-items: center;
-  gap: 2px;
-}
-#tab-bar::-webkit-scrollbar {
-  height: 3px;
-}
-#tab-bar::-webkit-scrollbar-thumb {
-  background: var(--border-strong);
-  border-radius: 2px;
-}
-
-.ws-tab {
-  padding: 6px 10px;
-  border-radius: var(--radius-sm) var(--radius-sm) 0 0;
-  cursor: pointer;
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  font-size: 12px;
-  background: var(--bg);
-  border: 1px solid var(--border);
-  border-bottom: none;
-  color: var(--fg-dim);
-  white-space: nowrap;
-  user-select: none;
-  position: relative;
-  transition:
-    background 0.12s,
-    color 0.12s,
-    border-color 0.12s;
-}
-.ws-tab:hover {
-  background: var(--bg-highlight);
-  color: var(--fg-bright);
-}
 .ws-tab.active {
   background: var(--bg-highlight);
   color: var(--fg-bright);
   border-bottom: 2px solid var(--accent);
 }
-
-/* Tab state indicators — LED glow */
-.ws-tab .tab-indicator {
-  width: 8px;
-  height: 8px;
-  border-radius: 50%;
-  flex-shrink: 0;
-}
-.ws-tab .tab-indicator[data-state="idle"] {
-  background: var(--fg-dim);
-  opacity: 0.3;
-}
-.ws-tab .tab-indicator[data-state="thinking"] {
-  background: var(--cyan);
-  box-shadow: 0 0 6px var(--cyan-glow);
-  animation: pulse 1.5s ease-in-out infinite;
-  will-change: opacity;
-}
-.ws-tab .tab-indicator[data-state="running"] {
-  background: var(--green);
-  border-radius: 2px;
-  box-shadow: 0 0 6px var(--green-glow);
-  animation: pulse 1s ease-in-out infinite;
-  will-change: opacity;
-}
-.ws-tab .tab-indicator[data-state="attention"] {
-  background: var(--yellow);
-  border-radius: 1px;
-  transform: rotate(45deg);
-  box-shadow: 0 0 6px var(--yellow-glow);
-  animation: pulse 1s ease-in-out infinite;
-  will-change: opacity;
-}
-.ws-tab .tab-indicator[data-state="error"] {
-  background: var(--red);
-  box-shadow: 0 0 4px var(--red-glow);
-}
-
-.ws-tab .tab-chevron {
-  background: none;
-  border: none;
-  color: var(--fg-dim);
-  font-size: 11px;
-  cursor: pointer;
-  padding: 4px 6px;
-  line-height: 1;
-  opacity: 0;
-  transition:
-    opacity 0.15s,
-    color 0.1s,
-    background 0.1s;
-  border-radius: var(--radius-sm);
-  margin-right: -4px;
-}
-.ws-tab:hover .tab-chevron,
-.ws-tab:focus-within .tab-chevron,
-.ws-tab .tab-chevron:focus-visible {
-  opacity: 1;
-}
 .ws-tab.active .tab-chevron {
   opacity: 0.7;
-}
-.ws-tab .tab-chevron[aria-expanded="true"] {
-  opacity: 1;
-  color: var(--fg-bright);
-}
-.ws-tab .tab-chevron:hover {
-  color: var(--fg-bright);
-  background: rgba(255, 255, 255, 0.06);
-}
-
-/* Subtle ws_id badge in tabs */
-.tab-wsid {
-  font-size: 9px;
-  color: var(--fg-dim);
-  opacity: 0;
-  margin-left: 4px;
-  font-family: "IBM Plex Mono", monospace;
-  letter-spacing: 0.02em;
-  transition: opacity 0.15s;
 }
 .ws-tab:hover .tab-wsid,
 .ws-tab.active .tab-wsid {
@@ -241,29 +90,6 @@
   color: var(--accent);
   border-color: var(--accent);
 }
-
-#split-btn {
-  background: none;
-  border: 1px dashed var(--border);
-  color: var(--fg-dim);
-  border-radius: var(--radius-sm) var(--radius-sm) 0 0;
-  padding: 6px 8px;
-  cursor: pointer;
-  font-family: inherit;
-  font-size: 13px;
-  line-height: 1;
-  flex-shrink: 0;
-  transition:
-    color 0.15s,
-    border-color 0.15s,
-    background 0.15s;
-  margin-left: 2px;
-}
-#split-btn:hover {
-  background: var(--bg-highlight);
-  color: var(--accent);
-  border-color: var(--accent);
-}
 #split-btn.hidden {
   display: none;
 }
@@ -278,77 +104,6 @@
     opacity: 1;
     transform: translateY(0);
   }
-}
-.ws-tab-dropdown {
-  position: fixed;
-  background: var(--bg-surface);
-  border: 1px solid var(--border-strong);
-  border-radius: var(--radius);
-  min-width: 160px;
-  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.4);
-  z-index: 300;
-  overflow: hidden;
-  padding: 4px 0;
-  animation: dropdown-in 0.1s ease-out;
-}
-[data-theme="light"] .ws-tab-dropdown {
-  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.12);
-}
-.ws-tab-dropdown-item {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 16px;
-  width: 100%;
-  padding: 7px 14px;
-  background: none;
-  border: none;
-  color: var(--fg);
-  font: inherit;
-  font-family: var(--font-ui);
-  font-size: 13px;
-  cursor: pointer;
-  text-align: left;
-  white-space: nowrap;
-  transition: background 0.1s;
-}
-.ws-tab-dropdown-item:hover:not([aria-disabled="true"]) {
-  background: var(--bg-highlight);
-  color: var(--fg-bright);
-}
-.ws-tab-dropdown-item:focus-visible {
-  outline: 2px solid var(--accent);
-  outline-offset: -2px;
-}
-.ws-tab-dropdown-item[aria-disabled="true"] {
-  color: var(--fg-dim);
-  opacity: 0.55;
-  cursor: not-allowed;
-}
-.ws-tab-dropdown-item.destructive:hover:not([aria-disabled="true"]),
-.ws-tab-dropdown-item.destructive:focus-visible:not([aria-disabled="true"]) {
-  color: var(--red);
-  background: rgba(248, 113, 113, 0.08);
-}
-.ws-tab-dropdown-item.destructive:focus-visible:not([aria-disabled="true"]) {
-  outline-color: var(--red);
-}
-.ws-tab-dropdown-label {
-  flex: 1;
-}
-.ws-tab-dropdown-key {
-  font-family: var(--font-mono);
-  font-size: 11px;
-  color: var(--fg-dim);
-  flex-shrink: 0;
-}
-.ws-tab-dropdown-sep {
-  height: 1px;
-  background: var(--border-strong);
-  margin: 6px 0;
-}
-.header-spacer {
-  flex: 1;
 }
 
 /* Edit title & delete modals */
@@ -420,66 +175,10 @@
   color: var(--fg-bright);
   margin: 0 0 16px;
 }
-
-/* ==========================================================================
-   Split panes
-   ========================================================================== */
-#split-root {
-  display: flex;
-  flex: 1;
-  min-height: 0;
-}
-.split-container {
-  display: flex;
-  flex: 1;
-  min-height: 0;
-  min-width: 0;
-}
-.split-horizontal {
-  flex-direction: row;
-}
-.split-vertical {
-  flex-direction: column;
-}
-.split-child {
-  display: flex;
-  min-width: 0;
-  min-height: 0;
-}
-.split-handle {
-  flex: 0 0 4px;
-  background: var(--border);
-  cursor: col-resize;
-  transition: background 0.15s;
-  z-index: 1;
-  position: relative;
-  touch-action: none;
-}
 .split-handle:hover,
 .split-handle:active,
 .split-handle.dragging {
   background: var(--accent);
-}
-.split-vertical > .split-handle {
-  cursor: row-resize;
-}
-/* Expand hit area to 12px via pseudoelement */
-.split-handle::before {
-  content: "";
-  position: absolute;
-  z-index: 1;
-}
-.split-horizontal > .split-handle::before {
-  top: 0;
-  bottom: 0;
-  left: -4px;
-  right: -4px;
-}
-.split-vertical > .split-handle::before {
-  left: 0;
-  right: 0;
-  top: -4px;
-  bottom: -4px;
 }
 
 /* Pane */
@@ -559,66 +258,6 @@
 }
 .pane-close-btn:hover {
   color: var(--red);
-}
-
-/* Pane context menu */
-.pane-ctx-menu {
-  position: fixed;
-  background: var(--bg-surface);
-  border: 1px solid var(--border-strong);
-  border-radius: var(--radius);
-  min-width: 200px;
-  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.4);
-  z-index: 300;
-  overflow: hidden;
-  padding: 4px 0;
-}
-[data-theme="light"] .pane-ctx-menu {
-  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.12);
-}
-.pane-ctx-item {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 16px;
-  width: 100%;
-  padding: 7px 14px;
-  background: none;
-  border: none;
-  color: var(--fg);
-  font: inherit;
-  font-family: var(--font-ui);
-  font-size: 13px;
-  cursor: pointer;
-  text-align: left;
-  white-space: nowrap;
-  transition: background 0.1s;
-}
-.pane-ctx-item:hover:not(:disabled) {
-  background: var(--bg-highlight);
-}
-.pane-ctx-item:focus-visible {
-  outline: 2px solid var(--accent);
-  outline-offset: -2px;
-}
-.pane-ctx-item:disabled {
-  color: var(--fg-dim);
-  opacity: 0.4;
-  cursor: default;
-}
-.pane-ctx-label {
-  flex: 1;
-}
-.pane-ctx-key {
-  font-family: var(--font-mono);
-  font-size: 11px;
-  color: var(--fg-dim);
-  flex-shrink: 0;
-}
-.pane-ctx-sep {
-  height: 1px;
-  background: var(--border-strong);
-  margin: 4px 0;
 }
 
 /* ==========================================================================
@@ -1399,19 +1038,6 @@ body {
   text-overflow: ellipsis;
   white-space: nowrap;
 }
-
-/* ==========================================================================
-   Inline approval blocks
-   ========================================================================== */
-.ts-approval {
-  background: var(--bg-surface);
-  border: 1px solid var(--border);
-  /* Cyan matches .msg.tool — both are tool-role surfaces. */
-  border-left: 3px solid var(--cyan);
-  border-radius: var(--radius);
-  padding: 0;
-  font-size: 12px;
-}
 .ts-approval.approved {
   border-left-color: var(--green);
 }
@@ -1443,62 +1069,8 @@ body {
 .ts-approval.denied .ts-approval-tool .tool-name {
   color: var(--fg-dim);
 }
-/* .ts-approval (chat.css) stacks children with flex gap; the old
-   border-bottom would dangle between rows now. */
-.ts-approval-tool {
-  padding: 8px 12px;
-}
-.ts-approval-tool:last-of-type {
-  border-bottom: none;
-}
-.ts-approval-tool .tool-name {
-  color: var(--cyan);
-  font-weight: 600;
-  font-size: 11px;
-  margin-bottom: 3px;
-}
-.ts-approval-tool .tool-cmd {
-  color: var(--fg-bright);
-  white-space: pre-wrap;
-  word-break: break-all;
-  max-height: 120px;
-  overflow: hidden;
-}
 .ts-approval-tool .tool-cmd .dollar {
   color: var(--green);
-}
-.ts-approval-tool .tool-diff {
-  white-space: pre-wrap;
-  font-size: 12px;
-  margin-top: 4px;
-}
-.ts-approval-tool .tool-diff .diff-del {
-  color: var(--red);
-}
-.ts-approval-tool .tool-diff .diff-add {
-  color: var(--green);
-}
-.ts-approval-tool .tool-diff .diff-warn {
-  color: var(--yellow);
-}
-/* memory/recall calls are background metadata — the audit trail is
-   valuable but they crowd the narrative when a workstream contains
-   dozens of them.  Dim by default; full opacity on hover/focus so
-   they remain inspectable without permanently competing for
-   attention.  General-sibling combinator (~) extends the fade past
-   any verdict-badge or output-warning sitting between the tool row
-   and its output, so the whole sub-tree fades together rather than
-   leaving a full-opacity badge stranded next to a dim row. */
-.ts-approval-tool[data-func-name="memory"],
-.ts-approval-tool[data-func-name="recall"] {
-  opacity: 0.55;
-  transition: opacity 120ms ease-out;
-}
-.ts-approval-tool[data-func-name="memory"]:hover,
-.ts-approval-tool[data-func-name="memory"]:focus-within,
-.ts-approval-tool[data-func-name="recall"]:hover,
-.ts-approval-tool[data-func-name="recall"]:focus-within {
-  opacity: 1;
 }
 .ts-approval-tool[data-func-name="memory"] ~ .tool-output,
 .ts-approval-tool[data-func-name="recall"] ~ .tool-output,
@@ -1528,40 +1100,6 @@ body {
 .ts-approval-tool[data-func-name="memory"] ~ .output-warning:focus-within,
 .ts-approval-tool[data-func-name="recall"] ~ .output-warning:focus-within {
   opacity: 1;
-}
-/* .ts-approval (chat.css) stacks its children with flex gap, so a
-   border-top on the body would float above a strip of container
-   background instead of sitting flush against the previous tool row.
-   Rely on the gap as the separator. */
-.ts-approval-body {
-  padding: 8px 12px;
-  font-size: 12px;
-  background: var(--bg-highlight);
-}
-.ts-approval-actions {
-  display: flex;
-  gap: 6px;
-  margin-bottom: 6px;
-}
-.ts-approval-btn {
-  background: var(--bg);
-  border: 1px solid var(--border-strong);
-  color: var(--fg-bright);
-  border-radius: var(--radius-sm);
-  padding: 4px 12px;
-  font-family: inherit;
-  font-size: 12px;
-  cursor: pointer;
-  display: inline-flex;
-  align-items: center;
-  gap: 4px;
-  transition:
-    background 0.1s,
-    border-color 0.1s,
-    color 0.1s;
-}
-.ts-approval-btn:hover {
-  background: var(--bg-highlight);
 }
 .ts-approval-btn .key {
   display: inline-block;
@@ -1596,18 +1134,6 @@ body {
 }
 .ts-approval-feedback::placeholder {
   color: var(--fg-dim);
-}
-/* chat.css shrinks .ts-approval-badge to max-content width, so a
-   border-top would only span the text and read as a truncated line
-   (same rationale as .verdict-badge).  Colour variants come from
-   chat.css .ts-approval-badge--approved / --denied / --error — the
-   legacy .badge-* modifiers are no longer emitted. */
-.ts-approval-badge {
-  padding: 6px 12px;
-  font-size: 12px;
-  font-weight: 600;
-  overflow-wrap: break-word;
-  word-break: break-word;
 }
 .tool-output {
   padding: 8px 12px;
@@ -1810,27 +1336,6 @@ audio.media-player {
   font-size: 13px;
   font-style: italic;
   opacity: 0.7;
-}
-
-/* ==========================================================================
-   Dashboard overlay
-   ========================================================================== */
-.dashboard-overlay {
-  display: none;
-  position: fixed;
-  /* Start below the 48px .appbar so the global header (turnstone title,
-     MCP status, theme/settings buttons, and the console proxy's
-     node-picker pill) stays visible and interactive while the dashboard
-     is open.  Otherwise the picker is unreachable from the proxied
-     dashboard view and users can't switch nodes without first opening
-     a workstream.  Matches .appbar { height: 48px } in ui-base.css. */
-  top: 48px;
-  right: 0;
-  bottom: 0;
-  left: 0;
-  background: var(--bg);
-  z-index: 50;
-  overflow-y: auto;
 }
 .dashboard-overlay.active {
   display: flex;
@@ -2065,21 +1570,6 @@ audio.media-player {
 .dashboard-section {
   margin-bottom: 24px;
 }
-.dashboard-section-header {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  margin-bottom: 12px;
-}
-.dashboard-section-title {
-  font-family: var(--font-ui);
-  font-size: 11px;
-  font-weight: 600;
-  text-transform: uppercase;
-  letter-spacing: 0.1em;
-  color: var(--accent);
-  margin: 0;
-}
 /* The saved-list table styling + the multi-select delete/modal rules are
    owned by /shared/cards.css so console (Saved Coordinators) and ui/static
    (Saved Workstreams) share one source of truth. */
@@ -2226,22 +1716,6 @@ audio.media-player {
   outline: 2px solid var(--accent);
   outline-offset: 2px;
 }
-
-.verdict-judge-spinner {
-  font-size: 10px;
-  color: var(--fg-dim);
-  display: inline-flex;
-  align-items: center;
-  gap: 4px;
-  font-weight: 400;
-}
-.judge-spinner-dot {
-  width: 6px;
-  height: 6px;
-  border-radius: 50%;
-  background: var(--accent);
-  animation: judge-pulse 1.2s ease-in-out infinite;
-}
 @keyframes judge-pulse {
   0%,
   100% {
@@ -2250,65 +1724,6 @@ audio.media-player {
   50% {
     opacity: 1;
   }
-}
-
-/* Verdict glow on approval action buttons — amplifies chat.css's
-   base .ts-verdict-glow--* rules with a stronger shadow + border
-   tint on the interactive-server page. */
-.ts-approval-body.ts-verdict-glow--approve .ts-approval-btn--approve {
-  box-shadow: 0 0 8px var(--green-glow);
-  border-color: var(--green);
-}
-.ts-approval-body.ts-verdict-glow--deny .ts-approval-btn--deny {
-  box-shadow: 0 0 8px var(--red-glow);
-  border-color: var(--red);
-}
-.ts-approval-body.ts-verdict-glow--review .ts-approval-btn--approve,
-.ts-approval-body.ts-verdict-glow--review .ts-approval-btn--deny {
-  box-shadow: 0 0 6px var(--yellow-glow);
-  border-color: var(--yellow);
-}
-
-/* Output guard warning */
-.output-warning {
-  padding: 4px 8px;
-  font-size: 11px;
-  border-left: 3px solid;
-  margin: 2px 0 2px 16px;
-}
-.output-warning-low {
-  border-color: var(--cyan);
-  color: var(--cyan);
-}
-.output-warning-medium {
-  border-color: var(--yellow);
-  color: var(--yellow);
-}
-.output-warning-high {
-  border-color: var(--red);
-  color: var(--red);
-}
-.output-warning-label {
-  font-weight: 600;
-}
-.output-warning-redacted {
-  color: var(--fg-dim);
-  font-style: italic;
-}
-/* LLM-judge attribution badge — set in slightly dimmer ink than the
-   risk-coloured flag text so it reads as metadata, not another flag. */
-.output-warning-tier {
-  margin-left: 6px;
-  font-weight: 600;
-  opacity: 0.85;
-}
-/* Judge rationale — muted second line under the flag row. */
-.output-warning-reasoning {
-  margin-top: 2px;
-  color: var(--fg-dim);
-  font-style: italic;
-  white-space: pre-wrap;
-  overflow-wrap: anywhere;
 }
 
 /* ==========================================================================
@@ -2473,19 +1888,9 @@ audio.media-player {
    Reduced motion — page-specific
    ========================================================================== */
 @media (prefers-reduced-motion: reduce) {
-  .ws-tab .tab-indicator[data-state="thinking"],
-  .ws-tab .tab-indicator[data-state="running"],
-  .ws-tab .tab-indicator[data-state="attention"] {
-    animation: none;
-    opacity: 1;
-  }
   .tool-output-stream {
     animation: none;
     border-left-color: var(--accent);
-  }
-  .judge-spinner-dot {
-    animation: none;
-    opacity: 1;
   }
   .thinking-indicator::after {
     animation: none;
@@ -2515,9 +1920,6 @@ audio.media-player {
   .pane-ctx-item,
   .ws-tab-dropdown-item {
     transition: none;
-  }
-  .ws-tab-dropdown {
-    animation: none;
   }
 }
 
@@ -2561,127 +1963,8 @@ audio.media-player {
   align-self: stretch;
 }
 
-.ts-approval-tool {
-  padding: 8px 12px;
-  background: var(--panel);
-  border: 1px solid var(--hair);
-  border-radius: var(--r-sm);
-}
-
-.ts-approval-tool + .ts-approval-tool {
-  margin-top: 6px;
-}
-
-.ts-approval-tool .tool-name {
-  font-family: var(--font-mono);
-  font-size: 11px;
-  font-weight: 600;
-  color: var(--cyan);
-  margin-bottom: 4px;
-  letter-spacing: 0;
-}
-
-/* Error variant of the tool name (replaces the prior inline
-   name.style.color = "var(--red)" in buildToolDiv — inline styles win
-   over CSS and broke the token mapping). */
-.ts-approval-tool .tool-name--error {
-  color: var(--err);
-}
-
-.ts-approval-tool .tool-cmd {
-  color: var(--ink-2);
-  font-family: var(--font-mono);
-  font-size: 12px;
-  white-space: pre-wrap;
-  word-break: break-all;
-}
-
 .ts-approval-tool .tool-cmd .dollar {
   color: var(--ok);
-}
-
-.ts-approval-tool .tool-diff {
-  white-space: pre-wrap;
-  font-size: 12px;
-  margin-top: 4px;
-}
-.ts-approval-tool .tool-diff .diff-del {
-  color: var(--err);
-}
-.ts-approval-tool .tool-diff .diff-add {
-  color: var(--ok);
-}
-.ts-approval-tool .tool-diff .diff-warn {
-  color: var(--warn);
-}
-
-/* Verdict badge — semantic palette via the 12% bg / 38% border / 70%
-   text color-mix pattern.  Risk level drives the hue:
-   low=ok, medium=warn, high/critical=err. */
-.verdict-badge {
-  display: inline-flex;
-  align-items: center;
-  gap: 8px;
-  padding: 4px 10px;
-  margin-top: 6px;
-  font-family: var(--font-mono);
-  font-size: 11px;
-  font-weight: 500;
-  border: 1px solid var(--hair);
-  border-radius: 3px;
-  background: var(--panel-2);
-  color: var(--ink-2);
-  border-left-width: 3px;
-  max-width: max-content;
-}
-
-.verdict-badge.verdict-low {
-  color: color-mix(in srgb, var(--ok) 70%, var(--ink-2));
-  border-color: color-mix(in srgb, var(--ok) 38%, var(--hair));
-  border-left-color: var(--ok);
-  background: color-mix(in srgb, var(--ok) 12%, var(--panel-2));
-}
-.verdict-badge.verdict-medium {
-  color: color-mix(in srgb, var(--warn) 70%, var(--ink-2));
-  border-color: color-mix(in srgb, var(--warn) 38%, var(--hair));
-  border-left-color: var(--warn);
-  background: var(--warn-tint);
-}
-.verdict-badge.verdict-high,
-.verdict-badge.verdict-critical {
-  color: color-mix(in srgb, var(--err) 70%, var(--ink-2));
-  border-color: color-mix(in srgb, var(--err) 38%, var(--hair));
-  border-left-color: var(--err);
-  background: color-mix(in srgb, var(--err) 12%, var(--panel-2));
-}
-
-.verdict-badge .verdict-risk {
-  font-weight: 600;
-  text-transform: uppercase;
-  letter-spacing: 0.04em;
-  font-size: 10px;
-}
-.verdict-badge .verdict-rec {
-  color: inherit;
-}
-.verdict-badge .verdict-conf {
-  color: var(--ink-3);
-  font-size: 10px;
-}
-
-.verdict-judge-spinner {
-  display: inline-flex;
-  align-items: center;
-  gap: 4px;
-  color: var(--ink-3);
-  font-size: 10px;
-}
-.verdict-judge-spinner .judge-spinner-dot {
-  width: 6px;
-  height: 6px;
-  border-radius: 50%;
-  background: var(--accent);
-  animation: ts-pulse 1.2s infinite;
 }
 /* ts-pulse keyframe is defined in shared_static/ui-base.css; no
    local duplicate needed. */
@@ -2735,38 +2018,6 @@ audio.media-player {
   font-size: 10px;
 }
 
-/* Auto-approved / denied badges — flat badge aesthetic (matches the
-   .risk primitive in ui-base.css), not a button.  Uppercase mono label
-   on a soft semantic-coloured background, no border — reads as
-   "status tag" not "click me." */
-.ts-approval-badge {
-  display: inline-flex;
-  align-items: center;
-  gap: 4px;
-  padding: 2px 6px;
-  margin-top: 6px;
-  font-family: var(--font-mono);
-  font-size: 10px;
-  font-weight: 600;
-  letter-spacing: 0.04em;
-  text-transform: uppercase;
-  border-radius: 3px;
-  max-width: max-content;
-  border: none;
-}
-.ts-approval-badge--approved {
-  color: var(--ok);
-  background: var(--ok-soft);
-}
-.ts-approval-badge--denied {
-  color: var(--err);
-  background: var(--err-soft);
-}
-.ts-approval-badge--error {
-  color: #fff;
-  background: var(--err-fill);
-}
-
 /* Tool output (streamed command/fetch result) — uses the panel / ink
    tokens for surface + text colour. */
 .tool-output {
@@ -2789,19 +2040,6 @@ audio.media-player {
   font-size: 10px;
   letter-spacing: 0.04em;
   padding-top: 14px;
-}
-
-/* Verdict-glow halo on action buttons — soft coloured ring when the
-   heuristic verdict suggests an action. */
-.ts-verdict-glow--approve .ts-approval-btn--approve {
-  box-shadow: 0 0 0 2px color-mix(in srgb, var(--ok) 25%, transparent);
-}
-.ts-verdict-glow--deny .ts-approval-btn--deny {
-  box-shadow: 0 0 0 2px color-mix(in srgb, var(--err) 25%, transparent);
-}
-.ts-verdict-glow--review .ts-approval-btn--approve,
-.ts-verdict-glow--review .ts-approval-btn--deny {
-  box-shadow: 0 0 0 2px color-mix(in srgb, var(--warn) 25%, transparent);
 }
 
 /* ==========================================================================
@@ -2906,38 +2144,6 @@ audio.media-player {
   align-items: center;
   justify-content: center;
   z-index: 1000;
-}
-#settings-box {
-  background: var(--bg);
-  border: 1px solid var(--border);
-  border-radius: 6px;
-  width: min(720px, 90vw);
-  max-height: 80vh;
-  overflow-y: auto;
-  font-family: var(--font-ui);
-}
-#settings-header {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  padding: 16px 20px;
-  border-bottom: 1px solid var(--border);
-}
-#settings-header h3 {
-  margin: 0;
-  font-size: 16px;
-  color: var(--fg);
-}
-#settings-close-btn {
-  background: transparent;
-  border: none;
-  color: var(--fg-dim);
-  font-size: 18px;
-  cursor: pointer;
-  padding: 4px 8px;
-}
-#settings-body {
-  padding: 16px 20px;
 }
 #settings-mcp-loading,
 #settings-mcp-empty {

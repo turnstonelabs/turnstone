@@ -61,7 +61,10 @@ CSS_FILES = [
     "turnstone/shared_static/base.css",
     "turnstone/shared_static/ui-base.css",
     "turnstone/shared_static/chat.css",
+    "turnstone/shared_static/conversation.css",
     "turnstone/shared_static/cards.css",
+    "turnstone/shared_static/shell.css",
+    "turnstone/shared_static/interactive.css",
     "turnstone/console/static/style.css",
     "turnstone/console/static/coordinator/coordinator.css",
     "turnstone/ui/static/style.css",
@@ -87,12 +90,18 @@ PAGE_STYLESHEETS: dict[str, list[str]] = {
         "turnstone/console/static/style.css",
         "turnstone/console/static/coordinator/coordinator.css",
     ],
+    # Standalone turnstone-server now serves the L-shell (step 6): same shared
+    # sheets the console loads, in <link> order, plus the (slimmed) ui/static
+    # style.css.  No coordinator sheets (orchestration off).
     "turnstone/ui/static/index.html": [
         "turnstone/shared_static/base.css",
         "turnstone/shared_static/ui-base.css",
         "turnstone/shared_static/chat.css",
+        "turnstone/shared_static/conversation.css",
         "turnstone/shared_static/cards.css",
         "turnstone/ui/static/style.css",
+        "turnstone/shared_static/shell.css",
+        "turnstone/shared_static/interactive.css",
     ],
 }
 

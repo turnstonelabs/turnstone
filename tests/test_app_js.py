@@ -668,17 +668,17 @@ def test_phase8_xss_safe_render_in_build_mcp_error_embed() -> None:
 
 
 def test_phase8_css_classes_present_in_stylesheet() -> None:
-    """The card / badge / modal classes referenced from app.js must
-    have CSS rules. Without them the DOM still works but the visual
-    treatment is gone, which would silently degrade the consent UX."""
+    """The MCP error-embed + connections classes app.js/interactive.js reference
+    must keep their CSS rules (else the consent / connections UX silently loses
+    its visual treatment). The settings OVERLAY is retired in step 6 — MCP
+    connections render in the Admin pane's Connections panel (#view-admin), not a
+    floating dialog — so #settings-overlay / #settings-box are no longer pinned."""
     css = _STYLE_CSS.read_text(encoding="utf-8")
     for selector in [
         ".mcp-error-card",
         ".mcp-error-icon",
         ".mcp-error-action-btn",
         ".mcp-scope-pill",
-        "#settings-overlay",
-        "#settings-box",
         ".settings-revoke-btn",
         ".settings-consent-badge",
         "#revoke-mcp-overlay",
