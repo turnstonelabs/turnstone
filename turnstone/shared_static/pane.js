@@ -31,7 +31,8 @@ export class ShellPane {
     this.rawId = opts.id != null ? opts.id : null; // ws_id for keyed panes, null for singletons
     this.id = this.rawId == null ? this.type : this.type + ":" + this.rawId;
     this.title = opts.title || this.type || "";
-    this.glyph = opts.glyph || null; // a single char shown in the tab (e.g. "◇"); state glyphs use ui-base .ui-glyph-*
+    this.glyph = opts.glyph || null; // a single static char shown in the tab (e.g. "◇"); stateful panes use a live .ui-glyph-* instead
+    this.stateful = opts.stateful || false; // conversational panes: tab glyph tracks live Tier-1 state (set via setTabGlyph)
     this.closable = opts.closable !== false; // dashboard is not closable
     // DOM — created and owned by the PaneManager on mount:
     this.el = null; // <section class="pane">
@@ -107,6 +108,29 @@ export class PaneManager {
   onActiveChange(cb) {
     if (typeof cb === "function" && this._activeSubs.indexOf(cb) < 0)
       this._activeSubs.push(cb);
+  }
+
+  /** Replace a tab's leading state glyph with `el` (a built glyph span).  The
+   *  shell drives this from Tier-1 so a conversational tab shows live shape+colour
+   *  state — generic here (PaneManager owns no glyph vocabulary; the shell passes
+   *  the element, reusing the rail's builder so tab and rail render identically). */
+  setTabGlyph(paneId, el) {
+    const pane = this._panes.get(paneId);
+    if (!pane || !pane.tabEl || !el) return;
+    el.classList.add("tab-glyph"); // tab spacing (margin); colour stays the el's own
+    if (pane._glyphEl && pane._glyphEl.parentNode === pane.tabEl)
+      pane._glyphEl.replaceWith(el);
+    else pane.tabEl.insertBefore(el, pane.tabEl.firstChild);
+    pane._glyphEl = el;
+  }
+
+  /** Open panes whose tab shows live Tier-1 state — `{id, rawId}[]` (the shell
+   *  repaints these on every Tier-1 render). */
+  statefulTabs() {
+    const out = [];
+    for (const p of this._panes.values())
+      if (p.stateful && p.rawId != null) out.push({ id: p.id, rawId: p.rawId });
+    return out;
   }
 
   /** Create the pane if absent, then focus it.  Auth/cap gating is the caller's.
@@ -253,11 +277,15 @@ export class PaneManager {
     tab.setAttribute("role", "tab");
     tab.setAttribute("aria-controls", "pane-" + cssId(pane.id));
     if (pane.glyph) {
+      // Static decorative char (Dashboard ◇ / Admin ⚙).  Stateful panes get NO
+      // static glyph — the shell paints a live .ui-glyph onto the slot via
+      // setTabGlyph (on activate + every Tier-1 render).
       const g = document.createElement("span");
-      g.className = "glyph";
+      g.className = "glyph tab-glyph";
       g.setAttribute("aria-hidden", "true"); // decorative glyph, not read as content
       g.textContent = pane.glyph;
       tab.append(g);
+      pane._glyphEl = g;
     }
     tab.append(document.createTextNode(pane.title));
     // Tab-action menu (step 7): a pane that exposes `tabMenu()` gets a caret to

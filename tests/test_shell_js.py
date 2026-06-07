@@ -391,3 +391,33 @@ def test_step7_tab_menu_css_promoted_shared() -> None:
     assert "color-mix(in oklab, var(--err)" in css, (
         "the destructive item must use the DS --err token (the translation happened)"
     )
+
+
+def test_step7_live_tab_state_glyphs() -> None:
+    """Step 7 #2: conversational tabs show LIVE state glyphs driven by Tier-1 —
+    the SAME source + builder the rail uses (one writer; the pane's Tier-2 stream
+    drives its body, not the tab glyph), so tab and rail agree and the glyph never
+    sits stale at an open-time placeholder.  The coord/int static placeholders are
+    retired for a `stateful` flag."""
+    rail = _RAIL_JS.read_text(encoding="utf-8")
+    assert "export function glyph(" in rail, (
+        "rail must export its state-glyph builder so the tab reuses it (single source)"
+    )
+    pane = _PANE_JS.read_text(encoding="utf-8")
+    assert "setTabGlyph(paneId, el)" in pane and "statefulTabs()" in pane, (
+        "PaneManager must expose the generic glyph setter + the stateful-tab list"
+    )
+    assert "this.stateful" in pane, "ShellPane must carry the stateful flag"
+    shell = _SHELL_JS.read_text(encoding="utf-8")
+    assert 'import { mountRail, mountManage, glyph } from "./rail.js"' in shell, (
+        "the shell must import the rail's glyph builder (one source for tab + rail)"
+    )
+    assert "function stateForWs(" in shell and "function paintConvTabGlyphs(" in shell
+    assert "window.TS_APP.onRender" in shell and "paintConvTabGlyphs(pm)" in shell, (
+        "tab glyphs must repaint on every Tier-1 render (live, not stale)"
+    )
+    assert shell.count("stateful: true") == 2, (
+        "the coordinator + interactive panes are stateful (their static placeholders retired)"
+    )
+    css = _SHELL_CSS.read_text(encoding="utf-8")
+    assert ".tab .tab-glyph" in css, "the tab-glyph spacing rule must apply to static + live glyphs"
