@@ -515,12 +515,6 @@
   opacity: 0.55;
 }
 
-/* Wait indicator — appbar-hosted polite status badge. */
-.coord-wait-indicator {
-  margin-left: 8px;
-  color: var(--think);
-}
-
 /* Sub-700px: sidebar collapses to an accordion above the chat;
    appbar wraps its right cluster; composer tightens. */
 @media (max-width: 700px) {

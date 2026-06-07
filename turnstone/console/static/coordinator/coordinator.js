@@ -1328,6 +1328,11 @@ function createCoordinatorPane(root, wsId, opts) {
       if (!row.querySelector(".conv-row-result")) return;
     }
     batch.classList.remove("conv-batch--running");
+    // Clear the SR busy state too — a batch that completes via tool_result only
+    // (judge + gate both bypassed, early-paint on) never hits the approve_request
+    // / tool_info paths that remove aria-busy, so without this it keeps announcing
+    // "busy" after completion.
+    batch.removeAttribute("aria-busy");
     const kicker = batch.querySelector(".conv-batch-kicker");
     if (kicker && !batch.classList.contains("conv-batch--pending")) {
       const rowCount = rows.length;
@@ -2076,16 +2081,6 @@ function createCoordinatorPane(root, wsId, opts) {
         // disconnect are stale.
         loadChildren({ replace: true });
         loadTasks();
-        // Drop any in-flight wait entries — a wait_ended dropped
-        // during the SSE gap would otherwise pin the header badge
-        // forever.  The server's SSE replay doesn't cover our
-        // per-call wait_* events, so we clear and let fresh events
-        // repopulate.  #bug-4.  Both ``activeWaits`` and
-        // ``_renderWaitIndicator`` are defined below in the same
-        // IIFE — hoisted function decl + const-in-outer-scope — so
-        // they're always reachable by the time onopen fires.
-        activeWaits.clear();
-        _renderWaitIndicator();
         // Drop the live-badge cache too — entries within the 5s TTL
         // can carry stale pending_approval_detail (the child may
         // have resolved its approval during the SSE gap).  Without
@@ -2597,111 +2592,10 @@ function createCoordinatorPane(root, wsId, opts) {
       case "child_ws_approve_request":
         handleChildApproveRequest(ev);
         break;
-      // wait_for_workstream observability (#14) — the worker thread
-      // can block up to 600s inside the tool; these events drive a
-      // sidebar indicator so operators see the coordinator is alive.
-      case "wait_started":
-        handleWaitStarted(ev);
-        break;
-      case "wait_progress":
-        handleWaitProgress(ev);
-        break;
-      case "wait_ended":
-        handleWaitEnded(ev);
-        break;
       default:
         // Unknown event type — ignore silently.
         break;
     }
-  }
-
-  // ------------------------------------------------------------------
-  // wait_for_workstream progress indicator (#14)
-  // ------------------------------------------------------------------
-  //
-  // In-flight waits keyed by call_id so overlapping / nested waits
-  // each get their own badge.  Cleared on wait_ended, and on SSE
-  // reconnect (see evtSource.onopen above) — a wait_ended dropped
-  // during the gap would otherwise pin the badge indefinitely.
-  const activeWaits = new Map();
-
-  function _waitIndicatorEl() {
-    let el = root.querySelector("#coord-wait-indicator");
-    if (el) return el;
-    // Only attach to the coord header vocabulary — don't fall back to
-    // document.body, which would plant a floating badge at the page
-    // root on any template variant where the header hasn't rendered
-    // yet (#q-7).  Return null so callers skip rendering; the next
-    // event will retry.  Mount into #coord-header (appbar container)
-    // NOT #coord-status — statusEl.textContent = ev.state on every
-    // state_change event clobbers all children of #coord-status, which
-    // would delete the wait indicator on the next state tick.  As a
-    // sibling inside the appbar it stays alive across state updates.
-    const host = root.querySelector("#coord-header");
-    if (!host) return null;
-    el = document.createElement("span");
-    el.id = "coord-wait-indicator";
-    el.className = "appbar-status coord-wait-indicator";
-    el.setAttribute("role", "status");
-    el.setAttribute("aria-live", "polite");
-    el.style.display = "none";
-    el.style.marginLeft = "0.5em";
-    host.appendChild(el);
-    return el;
-  }
-
-  function _renderWaitIndicator() {
-    const el = _waitIndicatorEl();
-    if (!el) return; // header not rendered yet — retry on next event
-    if (activeWaits.size === 0) {
-      el.style.display = "none";
-      el.textContent = "";
-      return;
-    }
-    let totalWs = 0;
-    let maxElapsed = 0;
-    activeWaits.forEach((w) => {
-      totalWs += Array.isArray(w.ws_ids) ? w.ws_ids.length : 0;
-      if (typeof w.elapsed === "number" && w.elapsed > maxElapsed) {
-        maxElapsed = w.elapsed;
-      }
-    });
-    const fragments = [];
-    if (activeWaits.size > 1) fragments.push(activeWaits.size + " waits");
-    if (totalWs > 0) fragments.push(totalWs + " ws");
-    if (maxElapsed > 0) fragments.push(Math.round(maxElapsed) + "s");
-    el.textContent =
-      "\u29D7 waiting" +
-      (fragments.length ? " · " + fragments.join(" · ") : "");
-    el.style.display = "";
-  }
-
-  function handleWaitStarted(ev) {
-    const cid = ev.call_id;
-    if (!cid) return;
-    activeWaits.set(cid, {
-      ws_ids: Array.isArray(ev.ws_ids) ? ev.ws_ids.slice() : [],
-      mode: ev.mode || "any",
-      timeout: typeof ev.timeout === "number" ? ev.timeout : 60,
-      elapsed: 0,
-    });
-    _renderWaitIndicator();
-  }
-
-  function handleWaitProgress(ev) {
-    const cid = ev.call_id;
-    if (!cid) return;
-    const entry = activeWaits.get(cid);
-    if (!entry) return;
-    if (typeof ev.elapsed === "number") entry.elapsed = ev.elapsed;
-    _renderWaitIndicator();
-  }
-
-  function handleWaitEnded(ev) {
-    const cid = ev.call_id;
-    if (!cid) return;
-    activeWaits.delete(cid);
-    _renderWaitIndicator();
   }
 
   // ------------------------------------------------------------------
