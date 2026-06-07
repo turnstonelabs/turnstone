@@ -2205,7 +2205,6 @@ document.addEventListener("keydown", function (e) {
   // is active, so native browser shortcuts (e.g. Ctrl+Shift+R hard reload)
   // still work when no workstream is focused.
   if (e.ctrlKey && e.shiftKey) {
-    closeTabDropdown();
     const wsActionKey = e.key.toLowerCase();
     const activeWsId = !dashboardVisible && getCurrentWsId();
     if (wsActionKey === "e" && activeWsId) {
@@ -2231,7 +2230,6 @@ document.addEventListener("keydown", function (e) {
   }
   // Ctrl+W: close current workstream tab
   if (e.ctrlKey && !e.shiftKey && e.key === "w") {
-    closeTabDropdown();
     if (Object.keys(workstreams).length > 1) {
       e.preventDefault();
       closeWorkstream(getCurrentWsId());
@@ -2478,9 +2476,51 @@ function switchTab(wsId) {
 function renderTabBar() {
   fireRender();
 }
-function updateTabIndicator(wsId, state) {
+function updateTabIndicator(wsId, state, extra) {
   if (workstreams[wsId]) workstreams[wsId].state = state;
-  fireRender();
+  fireRender(); // rail glyph (the only surface fireRender repaints)
+  // Patch the Dashboard row in place — fireRender fans out to the rail, NOT the
+  // #dash-ws-table cells, so without this a watched row's STATE/TOKENS/CTX go
+  // stale on every ws_state tick until a full loadDashboard().  (Ported from main;
+  // the .ws-tab indicator it also patched is retired with the split-pane bar.)
+  const row = document.querySelector(
+    '#dash-ws-table .dash-row[data-ws-id="' + wsId + '"]',
+  );
+  if (!row) return;
+  const sd = STATE_DISPLAY[state] || STATE_DISPLAY.idle;
+  row.dataset.state = state;
+  const dot = row.querySelector(".dash-state-dot");
+  if (dot) dot.dataset.state = state;
+  const label = row.querySelector(".dash-state-label");
+  if (label) {
+    label.dataset.state = state;
+    label.textContent = sd.symbol + " " + sd.label;
+  }
+  if (!extra) return;
+  if (extra.tokens !== undefined) {
+    const tokEl = row.querySelector(".dash-cell-tokens");
+    if (tokEl)
+      tokEl.textContent = extra.tokens ? formatTokens(extra.tokens) : "";
+  }
+  if (extra.context_ratio !== undefined) {
+    const ctxEl = row.querySelector(".dash-cell-ctx");
+    if (ctxEl) {
+      ctxEl.className = "dash-cell-ctx " + ctxClass(extra.context_ratio);
+      ctxEl.textContent =
+        extra.context_ratio > 0
+          ? Math.round(extra.context_ratio * 100) + "%"
+          : "";
+    }
+  }
+  if (extra.activity !== undefined) {
+    const sub = row.querySelector(".dash-row-sub");
+    if (sub) {
+      sub.textContent = extra.activity || "";
+      if (extra.activity_state === "approval")
+        sub.classList.add("sub-attention");
+      else sub.classList.remove("sub-attention");
+    }
+  }
 }
 
 // Synthesize the one-node clusterState shape the rail consumes

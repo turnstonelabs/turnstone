@@ -333,6 +333,9 @@ function createCoordinatorPane(root, wsId, opts) {
         ae.isContentEditable)
     )
       return;
+    // Ignore browser/OS accelerators (Cmd+D bookmark, Ctrl+D, Alt+D) — only bare
+    // keys + Shift+A resolve, else a stray accelerator silently denies the batch.
+    if (e.ctrlKey || e.metaKey || e.altKey) return;
     const batch = _currentPendingBatch();
     if (!batch) return;
     if (e.key === "Enter") {

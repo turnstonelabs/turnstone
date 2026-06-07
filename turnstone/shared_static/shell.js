@@ -378,7 +378,11 @@ async function mountShell() {
       if (this._ctl && this._ctl.deactivate) this._ctl.deactivate();
     };
     pane.onClose = function () {
-      if (this._ctl) this._ctl.destroy();
+      if (this._ctl) {
+        if (window.TS_LOGIN && this._ctl.onLogin)
+          window.TS_LOGIN.unsubscribe(this._ctl.onLogin);
+        this._ctl.destroy();
+      }
     };
     return pane;
   });
@@ -424,7 +428,11 @@ async function mountShell() {
           }
         };
         pane.onClose = function () {
-          if (this._ctl) this._ctl.destroy();
+          if (this._ctl) {
+            if (window.TS_LOGIN && this._ctl.onLogin)
+              window.TS_LOGIN.unsubscribe(this._ctl.onLogin);
+            this._ctl.destroy();
+          }
         };
         return pane;
       });
@@ -447,14 +455,16 @@ async function mountShell() {
     }
   }
 
-  // Restore the persisted working set, else open the default Dashboard pane.
-  if (!pm.rehydrate()) pm.openPane("dashboard");
-
   window.TS_SHELL = { panes: pm, caps };
 
   // Login fan-out: app.js owns the single window.onLoginSuccess (the Tier-1
   // reconnect, set at load).  Wrap it in a tiny registry so EVERY conversational
   // pane can re-arm its own Tier-2 stream on re-auth, not just the last writer.
+  // MUST be set up BEFORE rehydrate() below: rehydrate activates the restored
+  // panes, whose onActivate subscribes here — if TS_LOGIN were defined after,
+  // a rehydrated pane would silently skip its re-auth reconnect (and onActivate
+  // never re-fires).  `unsubscribe` lets a closed pane drop its closure (else the
+  // detached controller leaks across open/close/re-login).
   const _loginSubs = [];
   if (typeof window.onLoginSuccess === "function")
     _loginSubs.push(window.onLoginSuccess);
@@ -462,6 +472,10 @@ async function mountShell() {
     subscribe(cb) {
       if (typeof cb === "function" && _loginSubs.indexOf(cb) < 0)
         _loginSubs.push(cb);
+    },
+    unsubscribe(cb) {
+      const i = _loginSubs.indexOf(cb);
+      if (i >= 0) _loginSubs.splice(i, 1);
     },
   };
   window.onLoginSuccess = function () {
@@ -473,6 +487,9 @@ async function mountShell() {
       }
     }
   };
+
+  // Restore the persisted working set, else open the default Dashboard pane.
+  if (!pm.rehydrate()) pm.openPane("dashboard");
 
   // Wire the rail's live Cluster + Workspaces sections to the Tier-1 render
   // signal (subscribe before boot so the first snapshot render is caught).
