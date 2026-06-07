@@ -1579,6 +1579,16 @@ audio.media-player {
   cursor: pointer;
 }
 
+/* Single-node standalone drops the multi-node NODE column from the WORKSTREAMS
+   table (header + cells).  Override the --dash-grid VARIABLE locally (not the
+   grid-template-columns property — that keeps it the var's single declaration, no
+   cascade flip) so just this table goes 6-col; the shared --dash-grid and the
+   Saved Workstreams table keep 7-col.  Order: STATE NAME MODEL TASK TOKENS CTX. */
+#dash-ws-colheaders,
+#dash-ws-table .dash-row-main {
+  --dash-grid: 72px 120px 90px 1fr 60px 48px;
+}
+
 /* Dashboard footer — the bar styling now lives in /shared/base.css; the
    server keeps its own bottom margin to space the footer from the saved-
    workstreams section below. */

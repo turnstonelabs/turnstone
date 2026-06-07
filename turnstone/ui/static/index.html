@@ -165,11 +165,12 @@
           <span class="dash-header-title">WORKSTREAMS</span>
           <span class="dash-header-summary" id="dash-summary"></span>
         </div>
-        <div class="dash-colheaders" aria-hidden="true">
+        <div class="dash-colheaders" id="dash-ws-colheaders" aria-hidden="true">
           <span class="dash-col dash-col-state">STATE</span>
           <span class="dash-col dash-col-name">NAME</span>
           <span class="dash-col dash-col-model">MODEL</span>
-          <span class="dash-col dash-col-node">NODE</span>
+          <!-- No NODE column on single-node standalone (a multi-node console-ism);
+               the table is gated to 6 columns in style.css (#dash-ws-colheaders). -->
           <span class="dash-col dash-col-task">TASK</span>
           <span class="dash-col dash-col-tokens">TOKENS</span>
           <span class="dash-col dash-col-ctx">CTX</span>

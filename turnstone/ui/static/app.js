@@ -712,11 +712,9 @@ function renderDashboardTable(wsList, agg) {
     if (ws.model) modelCell.title = ws.model;
     main.appendChild(modelCell);
 
-    const nodeCell = document.createElement("span");
-    nodeCell.className = "dash-cell-node";
-    nodeCell.textContent = ws.node || "local";
-    if (ws.node) nodeCell.title = ws.node;
-    main.appendChild(nodeCell);
+    // No NODE cell on standalone: this server is single-node (caps.cluster=false),
+    // so the multi-node NODE column is dropped (the workstreams table is gated to
+    // 6 columns in style.css to match the header).
 
     const taskCell = document.createElement("span");
     taskCell.className = "dash-cell-task";
