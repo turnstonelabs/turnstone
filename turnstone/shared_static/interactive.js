@@ -3303,10 +3303,7 @@ function createInteractivePane(root, wsId, opts) {
 }
 
 // --- Shared-module exports -------------------------------------------------
-// ES module: the console shell (shared_static/shell.js) imports the factory
-// directly.  The window assignments bridge the still-classic standalone
-// app.js shell (which constructs panes via window.InteractivePane) — the same
-// interop seam as window.createCoordinatorPane, plus the modern export.
-window.InteractivePane = Pane;
-window.createInteractivePane = createInteractivePane;
+// ES module: the shell (shared_static/shell.js) imports the factory directly in
+// BOTH deployments (console + standalone), so there is no window bridge — step 6
+// retired the classic standalone app.js path that read window.InteractivePane.
 export { Pane as InteractivePane, createInteractivePane };

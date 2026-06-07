@@ -1,916 +1,12 @@
 // ===========================================================================
 //  turnstone server UI — app.js
-//  Split-pane layout that hosts per-workstream Pane instances (binary layout
-//  tree, tab bar, global stream, dashboard, new-workstream modal).
+//  Standalone L-shell provider.  Owns the single-node Tier-1 feed (a flat
+//  workstream roster over /v1/api/events/global) and exposes the window.TS_APP
+//  / TS_ADMIN seams the shared shell (shell.js) reads: getClusterState (a
+//  synthesized one-node cluster), boot, onRender, showHome, and a one-tab
+//  Manage IA (MCP connections).  Sessions open as interactive panes; the
+//  binary split-pane machinery is retired in favour of PaneManager.
 // ===========================================================================
-
-// ===========================================================================
-//  1. Pane class — moved to shared_static/interactive.js
-//
-//  The per-workstream conversational Pane now lives in the shared module
-//  (window.InteractivePane), so the console L-shell can mount the same pane
-//  over a node-proxied transport.  This shell constructs it via createPane()
-//  below with the standalone host adapter (section "Layout tree").
-// ===========================================================================
-
-// ===========================================================================
-//  2. Layout tree + rendering
-// ===========================================================================
-
-const panes = {};
-let focusedPaneId = null;
-let splitRoot = null;
-const MAX_PANES = 6;
-
-function getFocusedPane() {
-  return panes[focusedPaneId] || null;
-}
-
-function setFocusedPane(paneId) {
-  if (focusedPaneId === paneId) return;
-  // Remove focused class from old pane
-  if (focusedPaneId && panes[focusedPaneId]) {
-    panes[focusedPaneId].el.classList.remove("focused");
-  }
-  focusedPaneId = paneId;
-  if (panes[paneId]) {
-    panes[paneId].el.classList.add("focused");
-    currentWsId = panes[paneId].wsId;
-    renderTabBar();
-  }
-}
-
-// The interactive Pane now lives in the shared module (window.InteractivePane).
-// This split-pane shell supplies the host adapter for the seams only it knows:
-// workstream display names, which pane is focused (focus-steal guard), the
-// stream-error recovery policy (refetch the ws list + reassign across panes),
-// and the target for the --skip-permissions banner.
-const STANDALONE_HOST = {
-  getWsName(wsId) {
-    return (workstreams[wsId] && workstreams[wsId].name) || null;
-  },
-  isFocused(pane) {
-    return pane.id === focusedPaneId;
-  },
-  onStreamError(pane) {
-    if (pane.id === focusedPaneId) refetchWorkstreamsAndReassign(pane);
-  },
-  warningTarget() {
-    return document.getElementById("ui-header");
-  },
-  onConsentDetected(server) {
-    _onConsentDetected(server);
-  },
-};
-
-function refetchWorkstreamsAndReassign(focusedPane) {
-  // Lifted from the pre-PR-D ``onerror`` body.  Triggered when the
-  // focused pane sees its EventSource enter the error state — pulls
-  // the authoritative workstream list and reassigns stale wsIds.
-  // Survives the onerror refactor as a separate concern from the
-  // SSE reconnect mechanics: native EventSource handles the same-
-  // workstream reconnect; this handles the workstream-evicted-
-  // during-disconnect recovery.
-  fetch("/v1/api/workstreams")
-    .then((r) => {
-      if (r.status === 401) {
-        showLogin();
-        return;
-      }
-      return r.json().then((data) => {
-        workstreams = {};
-        (data.workstreams || []).forEach((ws) => {
-          workstreams[ws.ws_id] = { name: ws.name, state: ws.state };
-        });
-        renderTabBar();
-        // Two passes: (1) reassign stale panes, (2) reconnect any
-        // that ended up in CLOSED state.  Native reconnect covers
-        // CONNECTING -> OPEN transitions transparently.
-        const remaining = Object.keys(workstreams);
-        if (!remaining.length) {
-          showDashboard();
-          return;
-        }
-        const usedWsIds = {};
-        for (let pid in panes) {
-          if (panes[pid].wsId && workstreams[panes[pid].wsId])
-            usedWsIds[panes[pid].wsId] = true;
-        }
-        for (let pid2 in panes) {
-          const p2 = panes[pid2];
-          if (p2.wsId && !workstreams[p2.wsId]) {
-            let newWsId = null;
-            for (let ri = 0; ri < remaining.length; ri++) {
-              if (!usedWsIds[remaining[ri]]) {
-                newWsId = remaining[ri];
-                break;
-              }
-            }
-            if (newWsId) {
-              p2.disconnectSSE();
-              // Different workstream → drop saved id; replay is
-              // per-ws so an id from ws-A is meaningless on ws-B.
-              p2._lastEventId = null;
-              p2.wsId = newWsId;
-              usedWsIds[newWsId] = true;
-              while (p2.messagesEl.firstChild)
-                p2.messagesEl.removeChild(p2.messagesEl.firstChild);
-              p2.showEmptyState();
-              p2.updateWsName();
-            }
-            // else: more panes than workstreams — leave pane stale,
-            // connectSSE below picks it up or stays disconnected.
-          }
-        }
-        // Pass 2: reconnect any pane whose EventSource ended up
-        // truly CLOSED (not just transient — native reconnect
-        // handles CONNECTING / OPEN).
-        for (let pid3 in panes) {
-          const p3 = panes[pid3];
-          if (pid3 === focusedPaneId) currentWsId = p3.wsId;
-          const dead =
-            !p3.evtSource || p3.evtSource.readyState === EventSource.CLOSED;
-          if (dead && p3.wsId && workstreams[p3.wsId]) {
-            setTimeout(
-              ((pp) => {
-                return () => {
-                  pp._loadHistoryThenConnect(pp.wsId);
-                };
-              })(p3),
-              focusedPane.retryDelay,
-            );
-          }
-        }
-        focusedPane.retryDelay = Math.min(focusedPane.retryDelay * 2, 30000);
-      });
-    })
-    .catch(() => {
-      // Fetch failed (network) — schedule a same-pane reconnect
-      // fallback in case the EventSource is genuinely dead.
-      setTimeout(() => {
-        if (
-          !focusedPane.evtSource ||
-          focusedPane.evtSource.readyState === EventSource.CLOSED
-        ) {
-          focusedPane.connectSSE(focusedPane.wsId);
-        }
-      }, focusedPane.retryDelay);
-      focusedPane.retryDelay = Math.min(focusedPane.retryDelay * 2, 30000);
-    });
-}
-
-function createPane(wsId) {
-  const p = new window.InteractivePane(wsId, { host: STANDALONE_HOST });
-  panes[p.id] = p;
-  return p;
-}
-
-function updatePaneHeaders() {
-  const root = document.getElementById("split-root");
-  const leafCount = countLeaves(splitRoot);
-  if (leafCount > 1) {
-    root.classList.add("multi-pane");
-  } else {
-    root.classList.remove("multi-pane");
-  }
-  // Hide tab-bar split button when already in multi-pane mode
-  const splitBtn = document.getElementById("split-btn");
-  if (splitBtn) {
-    if (leafCount > 1) {
-      splitBtn.classList.add("hidden");
-    } else {
-      splitBtn.classList.remove("hidden");
-    }
-  }
-}
-
-function splitFocusedPane() {
-  if (focusedPaneId) splitPane(focusedPaneId, "horizontal");
-}
-
-// --- Tree helpers ---
-
-function findLeafAndParent(node, paneId, parent, childIndex) {
-  if (!node) return null;
-  if (node.type === "leaf") {
-    if (node.pane.id === paneId) {
-      return { node: node, parent: parent, childIndex: childIndex };
-    }
-    return null;
-  }
-  // split
-  for (let i = 0; i < node.children.length; i++) {
-    const result = findLeafAndParent(node.children[i], paneId, node, i);
-    if (result) return result;
-  }
-  return null;
-}
-
-function countLeaves(node) {
-  if (!node) return 0;
-  if (node.type === "leaf") return 1;
-  let count = 0;
-  for (let i = 0; i < node.children.length; i++) {
-    count += countLeaves(node.children[i]);
-  }
-  return count;
-}
-
-function getFirstLeaf(node) {
-  if (!node) return null;
-  if (node.type === "leaf") return node.pane;
-  return getFirstLeaf(node.children[0]);
-}
-
-function replaceNode(tree, target, replacement) {
-  if (tree === target) return replacement;
-  if (tree.type === "split") {
-    for (let i = 0; i < tree.children.length; i++) {
-      if (tree.children[i] === target) {
-        tree.children[i] = replacement;
-        return tree;
-      }
-      const result = replaceNode(tree.children[i], target, replacement);
-      if (result !== tree.children[i]) {
-        tree.children[i] = result;
-        return tree;
-      }
-    }
-  }
-  return tree;
-}
-
-function splitPane(paneId, direction) {
-  if (countLeaves(splitRoot) >= MAX_PANES) return;
-  // Guard: viewport too narrow/short to fit another pane
-  const root = document.getElementById("split-root");
-  const minDim = direction === "horizontal" ? 200 : 150;
-  const available =
-    direction === "horizontal" ? root.clientWidth : root.clientHeight;
-  if (available < minDim * 2 + 4) {
-    showToast("Not enough space to split");
-    return;
-  }
-  const found = findLeafAndParent(splitRoot, paneId, null, -1);
-  if (!found) return;
-
-  // Find a workstream not already shown in any pane
-  const wsIds = Object.keys(workstreams);
-  let newWsId = null;
-  for (let i = 0; i < wsIds.length; i++) {
-    let inUse = false;
-    for (let pid in panes) {
-      if (panes[pid].wsId === wsIds[i]) {
-        inUse = true;
-        break;
-      }
-    }
-    if (!inUse) {
-      newWsId = wsIds[i];
-      break;
-    }
-  }
-  if (!newWsId) {
-    showToast("No unused workstreams \u2014 create one first");
-    return;
-  }
-
-  const newPane = createPane(newWsId);
-  const newLeaf = { type: "leaf", pane: newPane };
-  const newSplit = {
-    type: "split",
-    direction: direction,
-    children: [found.node, newLeaf],
-    ratio: 0.5,
-  };
-
-  splitRoot = replaceNode(splitRoot, found.node, newSplit);
-  renderLayout();
-  setFocusedPane(newPane.id);
-  newPane.showEmptyState();
-  newPane._loadHistoryThenConnect(newWsId);
-}
-
-function closePane(paneId) {
-  if (countLeaves(splitRoot) <= 1) return;
-  let found = findLeafAndParent(splitRoot, paneId, null, -1);
-  if (!found || !found.parent) {
-    // paneId is the root leaf — shouldn't happen if count > 1
-    // but handle: root must be a split
-    if (splitRoot.type === "split") {
-      // Find which child contains our pane
-      for (let ci = 0; ci < splitRoot.children.length; ci++) {
-        const childFound = findLeafAndParent(
-          splitRoot.children[ci],
-          paneId,
-          splitRoot,
-          ci,
-        );
-        if (childFound) {
-          found = childFound;
-          break;
-        }
-      }
-    }
-    if (!found || !found.parent) return;
-  }
-
-  // Sibling is the other child
-  const siblingIdx = found.childIndex === 0 ? 1 : 0;
-  const sibling = found.parent.children[siblingIdx];
-
-  // Replace parent split with sibling
-  splitRoot = replaceNode(splitRoot, found.parent, sibling);
-
-  // Cleanup the closed pane
-  const closedPane = panes[paneId];
-  if (closedPane) {
-    closedPane.disconnectSSE();
-    delete panes[paneId];
-  }
-
-  // If focused pane was closed, focus first available
-  if (focusedPaneId === paneId) {
-    const first = getFirstLeaf(splitRoot);
-    if (first) {
-      focusedPaneId = null; // reset so setFocusedPane triggers
-      setFocusedPane(first.id);
-    }
-  }
-
-  renderLayout();
-}
-
-function renderLayout() {
-  const root = document.getElementById("split-root");
-
-  // Save scroll positions before clearing
-  const scrollPositions = {};
-  for (let pid in panes) {
-    scrollPositions[pid] = panes[pid].messagesEl.scrollTop;
-  }
-
-  // Clear and rebuild
-  root.replaceChildren();
-  if (splitRoot) {
-    _renderLayoutNode(splitRoot, root);
-  }
-
-  // Restore scroll positions
-  for (let pid2 in panes) {
-    if (scrollPositions[pid2] !== undefined) {
-      panes[pid2].messagesEl.scrollTop = scrollPositions[pid2];
-    }
-  }
-
-  updatePaneHeaders();
-  saveLayout();
-}
-
-function _renderLayoutNode(node, container) {
-  if (node.type === "leaf") {
-    container.appendChild(node.pane.el);
-    return;
-  }
-
-  // split node
-  const splitContainer = document.createElement("div");
-  splitContainer.className = "split-container split-" + node.direction;
-
-  const child0 = document.createElement("div");
-  child0.className = "split-child";
-  child0.style.flex = String(node.ratio);
-  _renderLayoutNode(node.children[0], child0);
-  splitContainer.appendChild(child0);
-
-  const handle = document.createElement("div");
-  handle.className = "split-handle";
-  handle.setAttribute("role", "separator");
-  handle.setAttribute("tabindex", "0");
-  handle.setAttribute(
-    "aria-orientation",
-    node.direction === "horizontal" ? "vertical" : "horizontal",
-  );
-  handle.setAttribute("aria-valuenow", Math.round(node.ratio * 100));
-  handle.setAttribute("aria-valuemin", "10");
-  handle.setAttribute("aria-valuemax", "90");
-  handle.setAttribute(
-    "aria-label",
-    node.direction === "horizontal"
-      ? "Resize panes horizontally"
-      : "Resize panes vertically",
-  );
-  splitContainer.appendChild(handle);
-
-  const child1 = document.createElement("div");
-  child1.className = "split-child";
-  child1.style.flex = String(1 - node.ratio);
-  _renderLayoutNode(node.children[1], child1);
-  splitContainer.appendChild(child1);
-
-  container.appendChild(splitContainer);
-  setupDragHandle(handle, node, [child0, child1]);
-}
-
-function _dragBounds(node, handle) {
-  // Compute min/max ratio from container size and CSS min dimensions
-  const container = handle.parentElement;
-  const totalSize =
-    node.direction === "horizontal"
-      ? container.clientWidth
-      : container.clientHeight;
-  const minPx = node.direction === "horizontal" ? 200 : 150; // match CSS min-width/min-height
-  const handlePx = 4;
-  const usable = totalSize - handlePx;
-  const minRatio = usable > 0 ? Math.max(0.05, minPx / usable) : 0.1;
-  const maxRatio = usable > 0 ? Math.min(0.95, 1 - minPx / usable) : 0.9;
-  return { minRatio: minRatio, maxRatio: maxRatio, totalSize: totalSize };
-}
-
-function _applyRatio(node, children, handle, ratio) {
-  node.ratio = ratio;
-  children[0].style.flex = String(ratio);
-  children[1].style.flex = String(1 - ratio);
-  if (handle) {
-    handle.setAttribute("aria-valuenow", Math.round(ratio * 100));
-  }
-}
-
-function setupDragHandle(handle, node, children) {
-  handle.addEventListener("pointerdown", function (e) {
-    if (e.button !== 0 && e.pointerType === "mouse") return;
-    e.preventDefault();
-    handle.setPointerCapture(e.pointerId);
-    handle.classList.add("dragging");
-    const startRatio = node.ratio;
-    const bounds = _dragBounds(node, handle);
-    const startPos = node.direction === "horizontal" ? e.clientX : e.clientY;
-    document.body.style.cursor =
-      node.direction === "horizontal" ? "col-resize" : "row-resize";
-    document.body.style.userSelect = "none";
-
-    const onMove = function (e2) {
-      const delta =
-        (node.direction === "horizontal" ? e2.clientX : e2.clientY) - startPos;
-      const newRatio = Math.max(
-        bounds.minRatio,
-        Math.min(bounds.maxRatio, startRatio + delta / bounds.totalSize),
-      );
-      _applyRatio(node, children, handle, newRatio);
-    };
-    const onUp = function () {
-      handle.classList.remove("dragging");
-      document.body.style.cursor = "";
-      document.body.style.userSelect = "";
-      handle.removeEventListener("pointermove", onMove);
-      handle.removeEventListener("pointerup", onUp);
-      handle.removeEventListener("pointercancel", onUp);
-      saveLayout();
-    };
-    handle.addEventListener("pointermove", onMove);
-    handle.addEventListener("pointerup", onUp);
-    handle.addEventListener("pointercancel", onUp);
-  });
-
-  // Keyboard resizing (arrow keys)
-  handle.addEventListener("keydown", function (e) {
-    const bounds = _dragBounds(node, handle);
-    const step = e.shiftKey ? 0.1 : 0.02;
-    let delta = 0;
-    if (e.key === "ArrowRight" || e.key === "ArrowDown") delta = step;
-    else if (e.key === "ArrowLeft" || e.key === "ArrowUp") delta = -step;
-    else if (e.key === "Home") delta = -(node.ratio - bounds.minRatio);
-    else if (e.key === "End") delta = bounds.maxRatio - node.ratio;
-    else return;
-    e.preventDefault();
-    const newRatio = Math.max(
-      bounds.minRatio,
-      Math.min(bounds.maxRatio, node.ratio + delta),
-    );
-    _applyRatio(node, children, handle, newRatio);
-    saveLayout();
-  });
-}
-
-// ===========================================================================
-//  3. Layout persistence
-// ===========================================================================
-
-function serializeLayout(node) {
-  if (!node) return null;
-  if (node.type === "leaf") {
-    return { type: "leaf", wsId: node.pane.wsId };
-  }
-  return {
-    type: "split",
-    direction: node.direction,
-    ratio: node.ratio,
-    children: [
-      serializeLayout(node.children[0]),
-      serializeLayout(node.children[1]),
-    ],
-  };
-}
-
-function deserializeLayout(data, _seen) {
-  if (!_seen) _seen = {};
-  if (!data) return null;
-  if (data.type === "leaf") {
-    if (!data.wsId || !workstreams[data.wsId] || _seen[data.wsId]) return null;
-    if (Object.keys(panes).length >= MAX_PANES) return null;
-    _seen[data.wsId] = true;
-    const p = createPane(data.wsId);
-    return { type: "leaf", pane: p };
-  }
-  if (data.type === "split") {
-    const left = deserializeLayout(data.children[0], _seen);
-    const right = deserializeLayout(data.children[1], _seen);
-    if (!left && !right) return null;
-    if (!left) return right;
-    if (!right) return left;
-    return {
-      type: "split",
-      direction: data.direction || "horizontal",
-      ratio: data.ratio || 0.5,
-      children: [left, right],
-    };
-  }
-  return null;
-}
-
-function saveLayout() {
-  try {
-    const data = serializeLayout(splitRoot);
-    if (data) {
-      localStorage.setItem("turnstone_split_layout", JSON.stringify(data));
-    }
-  } catch (e) {
-    // localStorage may be unavailable
-  }
-}
-
-function restoreLayout() {
-  try {
-    const raw = localStorage.getItem("turnstone_split_layout");
-    if (!raw) return false;
-    const data = JSON.parse(raw);
-    const tree = deserializeLayout(data);
-    if (!tree) return false;
-    splitRoot = tree;
-    const first = getFirstLeaf(splitRoot);
-    if (first) {
-      setFocusedPane(first.id);
-    }
-    return true;
-  } catch (e) {
-    return false;
-  }
-}
-
-// ===========================================================================
-//  3b. Pane context menu
-// ===========================================================================
-
-let _ctxMenu = null;
-let _ctxCloseHandler = null;
-let _ctxTriggerElement = null;
-
-let _tabDropdown = null;
-let _tabDropdownCloseHandler = null;
-let _tabDropdownTrigger = null;
-
-function showPaneContextMenu(x, y, paneId) {
-  closeTabDropdown();
-  closePaneContextMenu();
-  _ctxTriggerElement = document.activeElement;
-
-  const menu = document.createElement("div");
-  menu.className = "pane-ctx-menu";
-  menu.setAttribute("role", "menu");
-  menu.setAttribute("aria-label", "Pane actions");
-  menu.addEventListener("contextmenu", function (e) {
-    e.preventDefault();
-  });
-
-  const canClose = splitRoot && countLeaves(splitRoot) > 1;
-  // Can split only if under pane limit AND there's an unused workstream
-  const usedWs = {};
-  for (let pid in panes) usedWs[panes[pid].wsId] = true;
-  const hasUnused = Object.keys(workstreams).some(function (id) {
-    return !usedWs[id];
-  });
-  const canSplit = countLeaves(splitRoot) < MAX_PANES && hasUnused;
-
-  const items = [
-    {
-      label: "Split Right",
-      key: "Ctrl+\\",
-      disabled: !canSplit,
-      action: function () {
-        splitPane(paneId, "horizontal");
-      },
-    },
-    {
-      label: "Split Down",
-      key: "Ctrl+Shift+\\",
-      disabled: !canSplit,
-      action: function () {
-        splitPane(paneId, "vertical");
-      },
-    },
-    { separator: true },
-    {
-      label: "Close Pane",
-      key: "Ctrl+Shift+W",
-      disabled: !canClose,
-      action: function () {
-        closePane(paneId);
-      },
-    },
-  ];
-
-  items.forEach(function (item) {
-    if (item.separator) {
-      const sep = document.createElement("div");
-      sep.className = "pane-ctx-sep";
-      sep.setAttribute("role", "separator");
-      menu.appendChild(sep);
-      return;
-    }
-    const btn = document.createElement("button");
-    btn.className = "pane-ctx-item";
-    btn.setAttribute("role", "menuitem");
-    btn.setAttribute("tabindex", "-1");
-    btn.disabled = !!item.disabled;
-    const labelSpan = document.createElement("span");
-    labelSpan.className = "pane-ctx-label";
-    labelSpan.textContent = item.label;
-    btn.appendChild(labelSpan);
-    if (item.key) {
-      const keySpan = document.createElement("span");
-      keySpan.className = "pane-ctx-key";
-      keySpan.textContent = item.key;
-      btn.appendChild(keySpan);
-    }
-    btn.onclick = function () {
-      closePaneContextMenu();
-      item.action();
-    };
-    menu.appendChild(btn);
-  });
-
-  // Position: ensure menu stays within viewport
-  document.body.appendChild(menu);
-  const rect = menu.getBoundingClientRect();
-  let mx = x;
-  let my = y;
-  if (mx + rect.width > window.innerWidth)
-    mx = window.innerWidth - rect.width - 4;
-  if (my + rect.height > window.innerHeight)
-    my = window.innerHeight - rect.height - 4;
-  if (mx < 0) mx = 4;
-  if (my < 0) my = 4;
-  menu.style.left = mx + "px";
-  menu.style.top = my + "px";
-  _ctxMenu = menu;
-
-  // Close on click outside, Escape, Tab; arrow key navigation
-  _ctxCloseHandler = function (e) {
-    if (e.type === "keydown") {
-      if (e.key === "Escape" || e.key === "Tab") {
-        e.preventDefault();
-        closePaneContextMenu();
-      } else if (
-        e.key === "ArrowDown" ||
-        e.key === "ArrowUp" ||
-        e.key === "Home" ||
-        e.key === "End"
-      ) {
-        e.preventDefault();
-        const btns = Array.from(
-          menu.querySelectorAll(".pane-ctx-item:not(:disabled)"),
-        );
-        if (!btns.length) return;
-        const idx = btns.indexOf(document.activeElement);
-        if (e.key === "ArrowDown") btns[(idx + 1) % btns.length].focus();
-        else if (e.key === "ArrowUp")
-          btns[(idx - 1 + btns.length) % btns.length].focus();
-        else if (e.key === "Home") btns[0].focus();
-        else if (e.key === "End") btns[btns.length - 1].focus();
-      }
-    } else if (e.type === "mousedown" && !menu.contains(e.target)) {
-      closePaneContextMenu();
-    }
-  };
-  setTimeout(function () {
-    document.addEventListener("mousedown", _ctxCloseHandler);
-    document.addEventListener("keydown", _ctxCloseHandler);
-    // Focus first enabled item
-    const first = menu.querySelector(".pane-ctx-item:not(:disabled)");
-    if (first) first.focus();
-  }, 0);
-}
-
-function closePaneContextMenu() {
-  if (_ctxMenu) {
-    _ctxMenu.remove();
-    _ctxMenu = null;
-  }
-  if (_ctxCloseHandler) {
-    document.removeEventListener("mousedown", _ctxCloseHandler);
-    document.removeEventListener("keydown", _ctxCloseHandler);
-    _ctxCloseHandler = null;
-  }
-  if (_ctxTriggerElement && document.contains(_ctxTriggerElement)) {
-    _ctxTriggerElement.focus();
-    _ctxTriggerElement = null;
-  }
-}
-
-// ---------------------------------------------------------------------------
-//  3c. Tab dropdown menu (per-tab workstream actions)
-// ---------------------------------------------------------------------------
-
-function showTabDropdown(chevronEl, wsId) {
-  closePaneContextMenu();
-  closeTabDropdown();
-  _tabDropdownTrigger = chevronEl;
-  chevronEl.setAttribute("aria-expanded", "true");
-
-  const menu = document.createElement("div");
-  menu.className = "ws-tab-dropdown";
-  menu.setAttribute("role", "menu");
-  menu.setAttribute("aria-label", "Workstream actions");
-  menu.addEventListener("contextmenu", function (e) {
-    e.preventDefault();
-  });
-
-  const isLastWs = Object.keys(workstreams).length <= 1;
-  const items = [
-    {
-      label: "Refresh title",
-      cls: "mobile-hide",
-      action: function () {
-        refreshWorkstreamTitle(wsId);
-      },
-    },
-    {
-      label: "Edit title",
-      key: "Ctrl+Shift+E",
-      action: function () {
-        editWorkstreamTitle(wsId);
-      },
-    },
-    {
-      label: "Fork",
-      key: "Ctrl+Shift+F",
-      action: function () {
-        forkWorkstream(wsId);
-      },
-    },
-    {
-      label: "Export conversation",
-      action: function () {
-        exportWorkstreamDownload(wsId);
-      },
-    },
-    {
-      label: "Close",
-      key: "Ctrl+W",
-      disabled: isLastWs,
-      action: function () {
-        closeWorkstream(wsId);
-      },
-    },
-    { separator: true },
-    {
-      label: "Delete",
-      key: "Ctrl+Shift+X",
-      cls: "destructive",
-      disabled: isLastWs,
-      action: function () {
-        confirmDeleteWorkstream(wsId);
-      },
-    },
-  ];
-
-  items.forEach(function (item) {
-    if (item.separator) {
-      const sep = document.createElement("div");
-      sep.className = "ws-tab-dropdown-sep";
-      sep.setAttribute("role", "separator");
-      menu.appendChild(sep);
-      return;
-    }
-    const btn = document.createElement("button");
-    btn.className = "ws-tab-dropdown-item" + (item.cls ? " " + item.cls : "");
-    btn.setAttribute("role", "menuitem");
-    btn.setAttribute("tabindex", "-1");
-    if (item.disabled) {
-      btn.setAttribute("aria-disabled", "true");
-      btn.setAttribute(
-        "title",
-        "Cannot " + item.label.toLowerCase() + " the last workstream",
-      );
-    }
-    const labelSpan = document.createElement("span");
-    labelSpan.className = "ws-tab-dropdown-label";
-    labelSpan.textContent = item.label;
-    btn.appendChild(labelSpan);
-    if (item.key) {
-      const keySpan = document.createElement("span");
-      keySpan.className = "ws-tab-dropdown-key";
-      keySpan.textContent = item.key;
-      keySpan.setAttribute("aria-hidden", "true");
-      btn.appendChild(keySpan);
-    }
-    btn.onclick = function () {
-      if (this.getAttribute("aria-disabled") === "true") return;
-      closeTabDropdown();
-      item.action();
-    };
-    menu.appendChild(btn);
-  });
-
-  document.body.appendChild(menu);
-
-  // Position below chevron, right-aligned
-  const cr = chevronEl.getBoundingClientRect();
-  const mr = menu.getBoundingClientRect();
-  let mx = cr.right - mr.width;
-  let my = cr.bottom + 2;
-  if (mx < 0) mx = 4;
-  if (my + mr.height > window.innerHeight) my = cr.top - mr.height - 2;
-  if (mx + mr.width > window.innerWidth) mx = window.innerWidth - mr.width - 4;
-  menu.style.left = mx + "px";
-  menu.style.top = my + "px";
-  _tabDropdown = menu;
-
-  // Keyboard handler is mirrored by the console node-picker shim in
-  // turnstone/console/server.py (search for closeHandler in _JS_PROXY_SHIM).
-  // If you change the keys or filter selector here, change them there.
-  _tabDropdownCloseHandler = function (e) {
-    if (e.type === "keydown") {
-      if (e.key === "Escape" || e.key === "Tab") {
-        e.preventDefault();
-        closeTabDropdown();
-      } else if (
-        e.key === "ArrowDown" ||
-        e.key === "ArrowUp" ||
-        e.key === "Home" ||
-        e.key === "End"
-      ) {
-        e.preventDefault();
-        const btns = Array.from(menu.querySelectorAll(".ws-tab-dropdown-item"));
-        if (!btns.length) return;
-        const idx = btns.indexOf(document.activeElement);
-        if (e.key === "ArrowDown") btns[(idx + 1) % btns.length].focus();
-        // idx <= 0 covers both "first item" (wrap to last) and "no
-        // current focus" (idx === -1, which would otherwise yield
-        // len-2 via the modulo).  Same shape as openSettingsMenu and
-        // the proxy node-picker (turnstone/console/server.py:275).
-        else if (e.key === "ArrowUp")
-          btns[idx <= 0 ? btns.length - 1 : idx - 1].focus();
-        else if (e.key === "Home") btns[0].focus();
-        else if (e.key === "End") btns[btns.length - 1].focus();
-      }
-    } else if (
-      e.type === "mousedown" &&
-      !menu.contains(e.target) &&
-      e.target !== chevronEl
-    ) {
-      closeTabDropdown();
-    }
-  };
-  const closeHandler = _tabDropdownCloseHandler;
-  const activeMenu = menu;
-  setTimeout(function () {
-    if (_tabDropdown !== activeMenu || !closeHandler) return;
-    document.addEventListener("mousedown", closeHandler);
-    document.addEventListener("keydown", closeHandler);
-    const first = activeMenu.querySelector(".ws-tab-dropdown-item");
-    if (first) first.focus();
-  }, 0);
-}
-
-function closeTabDropdown() {
-  if (_tabDropdown) {
-    _tabDropdown.remove();
-    _tabDropdown = null;
-  }
-  if (_tabDropdownCloseHandler) {
-    document.removeEventListener("mousedown", _tabDropdownCloseHandler);
-    document.removeEventListener("keydown", _tabDropdownCloseHandler);
-    _tabDropdownCloseHandler = null;
-  }
-  if (_tabDropdownTrigger) {
-    _tabDropdownTrigger.setAttribute("aria-expanded", "false");
-    if (document.contains(_tabDropdownTrigger)) {
-      _tabDropdownTrigger.focus();
-    }
-    _tabDropdownTrigger = null;
-  }
-}
 
 // ===========================================================================
 //  4. Global state
@@ -1013,19 +109,14 @@ window.onLoginSuccess = function () {
 };
 
 window.onLogout = function () {
-  for (let id in panes) {
-    panes[id].disconnectSSE();
-    delete panes[id];
-  }
-  splitRoot = null;
-  focusedPaneId = null;
+  // The shell + PaneManager own the panes; just drop the roster + Tier-1 feed.
   workstreams = {};
   currentWsId = null;
-  document.getElementById("split-root").replaceChildren();
   if (globalEvtSource) {
     globalEvtSource.close();
     globalEvtSource = null;
   }
+  fireRender();
 };
 
 // ===========================================================================
@@ -1064,180 +155,6 @@ window.onThemeChange = function (next) {
     );
   }
 })();
-
-// ===========================================================================
-//  8. Tab bar
-// ===========================================================================
-
-const tabBar = document.getElementById("tab-bar");
-const tabList = document.getElementById("tab-list");
-const newTabBtn = document.getElementById("new-tab-btn");
-
-function renderTabBar() {
-  closeTabDropdown();
-  tabList.querySelectorAll(".ws-tab").forEach(function (t) {
-    t.remove();
-  });
-
-  const wsIds = Object.keys(workstreams);
-  wsIds.forEach(function (wsId) {
-    const ws = workstreams[wsId];
-    const tab = document.createElement("div");
-    tab.className = "ws-tab" + (wsId === currentWsId ? " active" : "");
-    tab.dataset.wsId = wsId;
-    tab.setAttribute("role", "tab");
-    tab.setAttribute("tabindex", "0");
-    tab.setAttribute("aria-selected", wsId === currentWsId ? "true" : "false");
-    tab.onclick = function (e) {
-      if (e.target.classList.contains("tab-chevron")) return;
-      switchTab(wsId);
-    };
-    tab.onkeydown = function (e) {
-      if (e.key === "Enter" || e.key === " ") {
-        e.preventDefault();
-        switchTab(wsId);
-      }
-    };
-
-    const indicator = document.createElement("span");
-    indicator.className = "tab-indicator";
-    indicator.dataset.state = ws.state || "idle";
-    indicator.setAttribute("aria-label", ws.state || "idle");
-    tab.appendChild(indicator);
-
-    const name = document.createElement("span");
-    name.className = "tab-name";
-    name.textContent = ws.name || wsId.substring(0, 6);
-    tab.appendChild(name);
-
-    const wsidBadge = document.createElement("span");
-    wsidBadge.className = "tab-wsid";
-    wsidBadge.textContent = wsId.substring(0, 7);
-    tab.appendChild(wsidBadge);
-
-    const chevron = document.createElement("button");
-    chevron.className = "tab-chevron";
-    chevron.textContent = "\u25BE";
-    chevron.title = "Workstream actions";
-    chevron.setAttribute(
-      "aria-label",
-      "Actions for " + (ws.name || wsId.substring(0, 6)),
-    );
-    chevron.setAttribute("aria-haspopup", "menu");
-    chevron.setAttribute("aria-expanded", "false");
-    chevron.onclick = function (e) {
-      e.stopPropagation();
-      if (_tabDropdown && _tabDropdownTrigger === chevron) {
-        closeTabDropdown();
-      } else {
-        showTabDropdown(chevron, wsId);
-      }
-    };
-    tab.appendChild(chevron);
-
-    tabList.appendChild(tab);
-  });
-}
-
-function updateTabIndicator(wsId, state, extra) {
-  workstreams[wsId] = workstreams[wsId] || {};
-  workstreams[wsId].state = state;
-  const tab = tabBar.querySelector('.ws-tab[data-ws-id="' + wsId + '"]');
-  if (tab) {
-    const ind = tab.querySelector(".tab-indicator");
-    if (ind) ind.dataset.state = state;
-  }
-  const row = document.querySelector(
-    '#dash-ws-table .dash-row[data-ws-id="' + wsId + '"]',
-  );
-  if (row) {
-    const sd = STATE_DISPLAY[state] || STATE_DISPLAY.idle;
-    row.dataset.state = state;
-    const dot = row.querySelector(".dash-state-dot");
-    if (dot) dot.dataset.state = state;
-    const label = row.querySelector(".dash-state-label");
-    if (label) {
-      label.dataset.state = state;
-      label.textContent = sd.symbol + " " + sd.label;
-    }
-    if (extra) {
-      if (extra.tokens !== undefined) {
-        const tokEl = row.querySelector(".dash-cell-tokens");
-        if (tokEl) tokEl.textContent = formatTokens(extra.tokens);
-      }
-      if (extra.context_ratio !== undefined) {
-        const ctxEl = row.querySelector(".dash-cell-ctx");
-        if (ctxEl) {
-          ctxEl.className = "dash-cell-ctx " + ctxClass(extra.context_ratio);
-          ctxEl.textContent =
-            extra.context_ratio > 0
-              ? Math.round(extra.context_ratio * 100) + "%"
-              : "";
-        }
-      }
-      if (extra.activity !== undefined) {
-        const sub = row.querySelector(".dash-row-sub");
-        if (sub) {
-          sub.textContent = extra.activity || "";
-          if (extra.activity_state === "approval")
-            sub.classList.add("sub-attention");
-          else sub.classList.remove("sub-attention");
-        }
-      }
-    }
-  }
-}
-
-function switchTab(wsId) {
-  closeTabDropdown();
-  let pane = getFocusedPane();
-  if (!pane) {
-    // Bootstrap the first pane on a fresh-loaded page that had no
-    // workstreams to render at init time. Without this, creating
-    // or opening a workstream from the dashboard left switchTab
-    // with nowhere to attach: it early-returned, no SSE connected,
-    // the chat UI showed nothing, and only a refresh fixed it
-    // (initWorkstreams creates the pane on a now-populated
-    // workstreams list). Mirrors the bootstrap block in
-    // initWorkstreams; renderLayout fires once so the pane DOM is
-    // attached before the rest of switchTab connects SSE.
-    pane = createPane(wsId);
-    splitRoot = { type: "leaf", pane: pane };
-    setFocusedPane(pane.id);
-    renderLayout();
-  }
-  if (wsId === pane.wsId && !dashboardVisible) return;
-
-  // Track last active for close_tab_action
-  if (pane.wsId && workstreams[pane.wsId]) {
-    _lastActiveWsId = pane.wsId;
-  }
-
-  // In multi-pane mode, focus an existing pane showing this ws
-  if (splitRoot && countLeaves(splitRoot) > 1) {
-    for (let pid in panes) {
-      if (panes[pid].wsId === wsId && pid !== focusedPaneId) {
-        setFocusedPane(pid);
-        return;
-      }
-    }
-  }
-
-  pane.disconnectSSE();
-  pane.reset();
-  pane.wsId = wsId;
-  currentWsId = wsId;
-  while (pane.messagesEl.firstChild)
-    pane.messagesEl.removeChild(pane.messagesEl.firstChild);
-  pane.showEmptyState();
-  pane.updateWsName();
-  renderTabBar();
-  pane._loadHistoryThenConnect(wsId);
-
-  if (!_historyNavigation) {
-    history.pushState({ turnstone: "workstream", wsId: wsId }, "");
-  }
-}
 
 // ===========================================================================
 //  9. New workstream modal
@@ -1637,155 +554,7 @@ function submitNewWs() {
     });
 }
 
-function _reassignPanesForClosedWs(closedWsId, tabIdsBeforeClose) {
-  const remaining = Object.keys(workstreams);
-  // Collect panes showing the closed ws
-  const affected = [];
-  for (let pid in panes) {
-    if (panes[pid].wsId === closedWsId) affected.push(pid);
-  }
-  if (!affected.length) return;
-
-  // Determine target ws based on close_tab_action setting
-  let action = "last_used";
-  try {
-    action =
-      localStorage.getItem("turnstone_interface.close_tab_action") ||
-      "last_used";
-  } catch (_) {}
-
-  if (action === "dashboard" && remaining.length > 0) {
-    // Show dashboard, but still need to reassign panes to valid ws
-    for (let di = 0; di < affected.length; di++) {
-      const dp = panes[affected[di]];
-      dp.disconnectSSE();
-      if (remaining.length) {
-        dp.wsId = remaining[0];
-        dp.messagesEl.replaceChildren();
-        dp.showEmptyState();
-        dp.updateWsName();
-        dp._loadHistoryThenConnect(remaining[0]);
-      }
-    }
-    if (focusedPaneId && panes[focusedPaneId]) {
-      currentWsId = panes[focusedPaneId].wsId;
-    }
-    renderTabBar();
-    showDashboard();
-    loadDashboard();
-    return;
-  }
-
-  // Determine preferred target ws_id
-  let preferredWsId = null;
-  if (action === "last_used") {
-    if (
-      _lastActiveWsId &&
-      _lastActiveWsId !== closedWsId &&
-      workstreams[_lastActiveWsId]
-    ) {
-      preferredWsId = _lastActiveWsId;
-    }
-  } else if (action === "nearest_left" || action === "nearest_right") {
-    const idx = tabIdsBeforeClose ? tabIdsBeforeClose.indexOf(closedWsId) : -1;
-    if (idx >= 0) {
-      if (action === "nearest_left") {
-        // Walk left, then right
-        for (let li = idx - 1; li >= 0; li--) {
-          if (workstreams[tabIdsBeforeClose[li]]) {
-            preferredWsId = tabIdsBeforeClose[li];
-            break;
-          }
-        }
-        if (!preferredWsId) {
-          for (let ri = idx + 1; ri < tabIdsBeforeClose.length; ri++) {
-            if (workstreams[tabIdsBeforeClose[ri]]) {
-              preferredWsId = tabIdsBeforeClose[ri];
-              break;
-            }
-          }
-        }
-      } else {
-        // Walk right, then left
-        for (let ri2 = idx + 1; ri2 < tabIdsBeforeClose.length; ri2++) {
-          if (workstreams[tabIdsBeforeClose[ri2]]) {
-            preferredWsId = tabIdsBeforeClose[ri2];
-            break;
-          }
-        }
-        if (!preferredWsId) {
-          for (let li2 = idx - 1; li2 >= 0; li2--) {
-            if (workstreams[tabIdsBeforeClose[li2]]) {
-              preferredWsId = tabIdsBeforeClose[li2];
-              break;
-            }
-          }
-        }
-      }
-    }
-  }
-
-  // Build set of ws_ids already shown by non-affected panes
-  const usedWsIds = {};
-  for (let pid2 in panes) {
-    if (affected.indexOf(pid2) === -1) usedWsIds[panes[pid2].wsId] = true;
-  }
-
-  for (let i = 0; i < affected.length; i++) {
-    const p = panes[affected[i]];
-    // Try the preferred ws first, then fall back to first unused
-    let newWsId = null;
-    if (preferredWsId && !usedWsIds[preferredWsId]) {
-      newWsId = preferredWsId;
-    } else {
-      for (let j = 0; j < remaining.length; j++) {
-        if (!usedWsIds[remaining[j]]) {
-          newWsId = remaining[j];
-          break;
-        }
-      }
-    }
-    if (newWsId) {
-      // Reassign pane to the target workstream
-      p.disconnectSSE();
-      p.wsId = newWsId;
-      p.messagesEl.replaceChildren();
-      p.showEmptyState();
-      p.updateWsName();
-      p._loadHistoryThenConnect(newWsId);
-      usedWsIds[newWsId] = true;
-    } else if (countLeaves(splitRoot) > 1) {
-      // No unused workstream available — close redundant pane
-      closePane(affected[i]);
-    } else {
-      // Last pane — reassign to first remaining ws (will duplicate, but no choice)
-      p.disconnectSSE();
-      if (remaining.length) {
-        p.wsId = remaining[0];
-        p.messagesEl.replaceChildren();
-        p.showEmptyState();
-        p.updateWsName();
-        p._loadHistoryThenConnect(remaining[0]);
-      }
-    }
-  }
-  if (focusedPaneId && panes[focusedPaneId]) {
-    currentWsId = panes[focusedPaneId].wsId;
-  }
-  renderTabBar();
-  if (currentWsId && workstreams[currentWsId]) {
-    switchTab(currentWsId);
-  }
-}
-
 function closeWorkstream(wsId) {
-  // Capture tab order from DOM (visual order) before deletion for close_tab_action=nearest_left/right
-  const tabIdsBeforeClose = Array.from(
-    document.querySelectorAll("#tab-list .ws-tab"),
-  ).map(function (tab) {
-    return tab.dataset.wsId;
-  });
-
   authFetch("/v1/api/workstreams/" + encodeURIComponent(wsId) + "/close", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -1797,13 +566,9 @@ function closeWorkstream(wsId) {
     .then(function (data) {
       if (data.status === "ok") {
         delete workstreams[wsId];
-        renderTabBar();
-        _reassignPanesForClosedWs(wsId, tabIdsBeforeClose);
-        const remaining = Object.keys(workstreams);
-        if (remaining.length === 0) {
-          loadDashboard();
-          showDashboard();
-        }
+        closeSessionPane(wsId);
+        fireRender();
+        if (!Object.keys(workstreams).length) showDashboard();
       } else if (data.error) {
         showToast(data.error, "warning");
       }
@@ -1814,41 +579,25 @@ function closeWorkstream(wsId) {
 //  10. Dashboard
 // ===========================================================================
 
+// The dashboard is a first-class L-shell pane (#main).  "Show" focuses that
+// pane and refreshes its lists; "hide" is a no-op (activating another tab is
+// how you leave it).  boot() populates the lists once on first load.
 function showDashboard() {
-  dashboardVisible = true;
-  document.getElementById("dashboard").classList.add("active");
-  // ui-header stays interactive while the dashboard is open so the
-  // theme toggle, settings menu, and the console proxy's node-picker
-  // pill remain reachable.  See .dashboard-overlay { top: 48px } in
-  // style.css for the matching layout offset.
-  document.getElementById("tab-bar").inert = true;
-  document.getElementById("split-root").inert = true;
+  if (window.TS_SHELL && window.TS_SHELL.panes)
+    window.TS_SHELL.panes.openPane("dashboard");
   loadDashboard();
   _loadDashboardOptionsLists();
   _restoreDashboardOptionsState();
   _refreshDashboardOptionsSummary();
   _refreshDashboardSubmitLabel();
-  setTimeout(function () {
-    document.getElementById("dashboard-input").focus();
-  }, 50);
 }
 
 function hideDashboard() {
-  dashboardVisible = false;
-  document.getElementById("dashboard").classList.remove("active");
-  document.getElementById("tab-bar").inert = false;
-  document.getElementById("split-root").inert = false;
-  document.getElementById("dashboard-input").value = "";
-  _dashboardStagedFiles = [];
-  _renderDashboardChips();
-  _refreshDashboardSubmitLabel();
-  const pane = getFocusedPane();
-  if (pane) pane.inputEl.focus();
+  /* no-op: the dashboard is a pane, not an overlay (PaneManager owns focus). */
 }
 
 function toggleDashboard() {
-  if (dashboardVisible) hideDashboard();
-  else showDashboard();
+  showDashboard();
 }
 
 // Paint a transient message (loading / error) into the saved-workstreams
@@ -2306,8 +1055,8 @@ function executeDeleteWs() {
       // Update local state directly — don't call closeWorkstream which
       // would send a redundant POST to /close for an already-deleted ws.
       delete workstreams[wsId];
-      renderTabBar();
-      _reassignPanesForClosedWs(wsId, []);
+      closeSessionPane(wsId);
+      fireRender();
       if (!Object.keys(workstreams).length) {
         loadDashboard();
         showDashboard();
@@ -2320,9 +1069,14 @@ function executeDeleteWs() {
 }
 
 function getCurrentWsId() {
-  const activeTab = document.querySelector(".ws-tab.active");
-  if (activeTab) return activeTab.dataset.wsId || "";
-  return "";
+  const pm = window.TS_SHELL && window.TS_SHELL.panes;
+  const a = pm && pm.getActive ? pm.getActive() : null;
+  return a && a.type === "interactive" ? a.rawId : "";
+}
+
+// Pane focus is PaneManager's in the L-shell; callers all null-guard this.
+function getFocusedPane() {
+  return null;
 }
 
 function forkWorkstream(optWsId) {
@@ -2764,17 +1518,9 @@ function connectGlobalSSE() {
       }
     } else if (data.type === "ws_rename") {
       if (workstreams[data.ws_id]) workstreams[data.ws_id].name = data.name;
-      // Update ALL matching tab elements (not just first one)
-      const nameEls = document.querySelectorAll(
-        '[data-ws-id="' + data.ws_id + '"] .tab-name',
-      );
-      nameEls.forEach(function (el) {
-        el.textContent = data.name;
-      });
-      // Update all panes showing this workstream
-      for (let id in panes) {
-        if (panes[id].wsId === data.ws_id) panes[id].updateWsName();
-      }
+      // The open pane keeps its own name via its Tier-2 stream; the rail + tab
+      // title refresh from the roster.
+      fireRender();
     } else if (data.type === "ws_created") {
       workstreams[data.ws_id] = workstreams[data.ws_id] || {};
       workstreams[data.ws_id].name = data.name || data.ws_id.slice(0, 6);
@@ -2782,25 +1528,14 @@ function connectGlobalSSE() {
       renderTabBar();
     } else if (data.type === "ws_closed") {
       const wsId = data.ws_id;
-      // Capture tab order from DOM (visual order) before deletion for close_tab_action=nearest_left/right
-      const sseTabIds = Array.from(
-        document.querySelectorAll("#tab-list .ws-tab"),
-      ).map(function (tab) {
-        return tab.dataset.wsId;
-      });
-      // Disconnect per-ws SSE on affected panes immediately so stale
-      // events from the dying workstream don't leak into reassigned panes.
-      for (let cid in panes) {
-        if (panes[cid].wsId === wsId) panes[cid].disconnectSSE();
-      }
       delete workstreams[wsId];
-      renderTabBar();
+      closeSessionPane(wsId); // PaneManager tears down its Tier-2 stream
+      fireRender();
       if (data.reason === "evicted") {
         showToast(
           "Evicted" + (data.name ? ": " + data.name : "") + " (capacity)",
         );
       }
-      _reassignPanesForClosedWs(wsId, sseTabIds);
       if (!Object.keys(workstreams).length) showDashboard();
     } else if (data.type === "settings_changed") {
       // Re-load interface settings and apply immediately
@@ -3171,46 +1906,11 @@ let _revokeMcpTrap = null;
 let _settingsReturnFocus = null;
 
 function openSettingsPanel() {
-  const overlay = document.getElementById("settings-overlay");
-  if (!overlay) return;
-  _settingsReturnFocus = document.activeElement;
-  overlay.style.display = "flex";
-
-  if (_settingsTrap) document.removeEventListener("keydown", _settingsTrap);
-  _settingsTrap = function (e) {
-    if (e.key === "Escape") {
-      // If the nested revoke confirmation is open, let its own trap
-      // handle Escape — closing inner-first matches the delete-ws flow.
-      const inner = document.getElementById("revoke-mcp-overlay");
-      if (inner && inner.style.display !== "none") return;
-      e.preventDefault();
-      closeSettingsPanel();
-      return;
-    }
-    if (e.key === "Tab") {
-      const box = document.getElementById("settings-box");
-      if (!box) return;
-      const focusable = box.querySelectorAll(
-        "button, [href], input, select, textarea, [tabindex]:not([tabindex='-1'])",
-      );
-      if (!focusable.length) return;
-      const first = focusable[0];
-      const last = focusable[focusable.length - 1];
-      if (e.shiftKey && document.activeElement === first) {
-        e.preventDefault();
-        last.focus();
-      } else if (!e.shiftKey && document.activeElement === last) {
-        e.preventDefault();
-        first.focus();
-      }
-    }
-  };
-  document.addEventListener("keydown", _settingsTrap);
-
+  // MCP connections render in the Admin pane's Connections panel (#view-admin),
+  // which the shell shows when the Manage > Connections row opens it.  This is a
+  // pane, not a modal — so there is no overlay to show and no focus-trap; just
+  // (re)load the table into the panel's existing #settings-mcp-* nodes.
   loadMcpConnections();
-
-  const closeBtn = document.getElementById("settings-close-btn");
-  if (closeBtn) closeBtn.focus();
 }
 
 function closeSettingsPanel() {
@@ -3264,176 +1964,6 @@ let _settingsMenuCloseHandler = null;
 // the trigger BEFORE close — that way openSettingsPanel captures
 // the gear (not <body>) as _settingsReturnFocus.
 let _settingsMenuTrigger = null;
-
-function toggleSettingsMenu(triggerEl) {
-  if (_settingsMenu) closeSettingsMenu();
-  else openSettingsMenu(triggerEl);
-}
-
-function openSettingsMenu(triggerEl) {
-  if (_settingsMenu) return;
-  _settingsMenuTrigger = triggerEl;
-  triggerEl.setAttribute("aria-expanded", "true");
-  triggerEl.setAttribute("aria-controls", "settings-menu");
-
-  const menu = document.createElement("div");
-  menu.id = "settings-menu";
-  menu.className = "ws-tab-dropdown";
-  menu.setAttribute("role", "menu");
-  menu.setAttribute("aria-label", "Settings");
-  menu.addEventListener("contextmenu", function (e) {
-    e.preventDefault();
-  });
-
-  const pendingCount = _pendingConsentServers.size;
-  const items = [
-    {
-      label:
-        "MCP connections" + (pendingCount ? " (" + pendingCount + ")" : ""),
-      action: function () {
-        openSettingsPanel();
-      },
-    },
-    { separator: true },
-    {
-      label: "Logout",
-      // Destructive styling matches Delete in the workstream tab dropdown.
-      // Logout doesn't lose data, but it interrupts the session and the red
-      // hover/focus tint reduces misclick risk on a dense menu.
-      cls: "destructive",
-      action: function () {
-        logout();
-      },
-    },
-  ];
-
-  items.forEach(function (item) {
-    if (item.separator) {
-      const sep = document.createElement("div");
-      sep.className = "ws-tab-dropdown-sep";
-      sep.setAttribute("role", "separator");
-      menu.appendChild(sep);
-      return;
-    }
-    const btn = document.createElement("button");
-    btn.type = "button";
-    btn.className = "ws-tab-dropdown-item" + (item.cls ? " " + item.cls : "");
-    btn.setAttribute("role", "menuitem");
-    btn.setAttribute("tabindex", "-1");
-    const labelSpan = document.createElement("span");
-    labelSpan.className = "ws-tab-dropdown-label";
-    labelSpan.textContent = item.label;
-    btn.appendChild(labelSpan);
-    btn.onclick = function () {
-      // Refocus the trigger BEFORE close — closeSettingsMenu removes
-      // the menu DOM (including this button), and item.action() may
-      // call openSettingsPanel which captures document.activeElement
-      // as the eventual return-focus target.  Without this refocus,
-      // activeElement falls back to <body> and focus restoration
-      // sends the user nowhere when the panel later closes.
-      if (_settingsMenuTrigger) _settingsMenuTrigger.focus();
-      closeSettingsMenu();
-      item.action();
-    };
-    menu.appendChild(btn);
-  });
-
-  document.body.appendChild(menu);
-
-  // Right-align under the gear so the menu hangs off the right edge of
-  // the appbar without overflowing the viewport.  Right-edge override
-  // runs BEFORE the left-edge floor so a menu wider than the viewport
-  // still gets clamped to mx=4 instead of going negative — matches the
-  // proxy node-picker order in turnstone/console/server.py:307-309.
-  const tr = triggerEl.getBoundingClientRect();
-  const mr = menu.getBoundingClientRect();
-  let mx = tr.right - mr.width;
-  let my = tr.bottom + 4;
-  if (my + mr.height > window.innerHeight) my = tr.top - mr.height - 4;
-  if (mx + mr.width > window.innerWidth) mx = window.innerWidth - mr.width - 4;
-  if (mx < 4) mx = 4;
-  menu.style.left = mx + "px";
-  menu.style.top = my + "px";
-  _settingsMenu = menu;
-
-  _settingsMenuCloseHandler = function (e) {
-    if (e.type === "keydown") {
-      if (e.key === "Escape") {
-        e.preventDefault();
-        closeSettingsMenu();
-        triggerEl.focus();
-      } else if (e.key === "Tab") {
-        // Per WAI-ARIA APG menu pattern: Tab closes the menu AND lets
-        // focus move naturally to the next focusable element — don't
-        // preventDefault, otherwise Tab is a dead key inside the menu.
-        closeSettingsMenu();
-      } else if (
-        e.key === "ArrowDown" ||
-        e.key === "ArrowUp" ||
-        e.key === "Home" ||
-        e.key === "End"
-      ) {
-        e.preventDefault();
-        const btns = Array.from(menu.querySelectorAll(".ws-tab-dropdown-item"));
-        if (!btns.length) return;
-        const idx = btns.indexOf(document.activeElement);
-        if (e.key === "ArrowDown") btns[(idx + 1) % btns.length].focus();
-        // idx <= 0 covers both "first item" (wrap to last) and "no
-        // current focus" (idx === -1, which would otherwise yield
-        // len-2 via the modulo).  Matches showTabDropdown and the
-        // proxy node-picker (turnstone/console/server.py:275).
-        else if (e.key === "ArrowUp")
-          btns[idx <= 0 ? btns.length - 1 : idx - 1].focus();
-        else if (e.key === "Home") btns[0].focus();
-        else if (e.key === "End") btns[btns.length - 1].focus();
-      }
-    } else if (
-      e.type === "mousedown" &&
-      !menu.contains(e.target) &&
-      e.target !== triggerEl &&
-      !triggerEl.contains(e.target)
-    ) {
-      closeSettingsMenu();
-    }
-  };
-
-  // Attach the keydown listener synchronously so an Escape press
-  // queued behind the opening click isn't silently dropped: the
-  // global keydown handler at the bottom of this file returns early
-  // when _settingsMenu is set (the dashboard-Escape-wipes-composer
-  // guard), so without a synchronous menu-side listener there's a
-  // brief window where Escape has no handler at all.  Mousedown +
-  // initial focus stay deferred — mousedown to avoid the click that
-  // opened the menu firing its own outside-click close, initial
-  // focus because the menu DOM needs a tick to settle layout before
-  // we call focus() on its first item.
-  document.addEventListener("keydown", _settingsMenuCloseHandler);
-  const activeMenu = menu;
-  const closeHandler = _settingsMenuCloseHandler;
-  setTimeout(function () {
-    if (_settingsMenu !== activeMenu || !closeHandler) return;
-    document.addEventListener("mousedown", closeHandler);
-    const first = activeMenu.querySelector(".ws-tab-dropdown-item");
-    if (first) first.focus();
-  }, 0);
-}
-
-function closeSettingsMenu() {
-  if (_settingsMenu) {
-    _settingsMenu.remove();
-    _settingsMenu = null;
-  }
-  if (_settingsMenuCloseHandler) {
-    document.removeEventListener("mousedown", _settingsMenuCloseHandler);
-    document.removeEventListener("keydown", _settingsMenuCloseHandler);
-    _settingsMenuCloseHandler = null;
-  }
-  if (_settingsMenuTrigger) {
-    _settingsMenuTrigger.setAttribute("aria-expanded", "false");
-    _settingsMenuTrigger.removeAttribute("aria-controls");
-    _settingsMenuTrigger = null;
-  }
-}
 
 function loadMcpConnections() {
   const loadingEl = document.getElementById("settings-mcp-loading");
@@ -3690,14 +2220,6 @@ document.addEventListener("keydown", function (e) {
     if (idx < wsIds.length) switchTab(wsIds[idx]);
     return;
   }
-  // Ctrl+Shift+W: close pane (must come before Ctrl+W)
-  if (e.ctrlKey && e.shiftKey && e.key.toLowerCase() === "w") {
-    if (splitRoot && countLeaves(splitRoot) > 1) {
-      e.preventDefault();
-      closePane(focusedPaneId);
-    }
-    return;
-  }
   // Workstream action shortcuts — only preventDefault when a workstream
   // is active, so native browser shortcuts (e.g. Ctrl+Shift+R hard reload)
   // still work when no workstream is focused.
@@ -3731,43 +2253,8 @@ document.addEventListener("keydown", function (e) {
     closeTabDropdown();
     if (Object.keys(workstreams).length > 1) {
       e.preventDefault();
-      closeWorkstream(currentWsId);
+      closeWorkstream(getCurrentWsId());
     }
-    return;
-  }
-
-  // Ctrl+Alt+Arrow: cycle pane focus
-  if (
-    e.ctrlKey &&
-    e.altKey &&
-    (e.key === "ArrowLeft" || e.key === "ArrowRight")
-  ) {
-    e.preventDefault();
-    const paneIds = [];
-    (function collectIds(n) {
-      if (!n) return;
-      if (n.type === "leaf") {
-        paneIds.push(n.pane.id);
-      } else {
-        collectIds(n.children[0]);
-        collectIds(n.children[1]);
-      }
-    })(splitRoot);
-    if (paneIds.length > 1) {
-      let ci = paneIds.indexOf(focusedPaneId);
-      if (e.key === "ArrowRight") ci = (ci + 1) % paneIds.length;
-      else ci = (ci - 1 + paneIds.length) % paneIds.length;
-      setFocusedPane(paneIds[ci]);
-      panes[paneIds[ci]].inputEl.focus();
-    }
-    return;
-  }
-
-  // Ctrl+\: split pane
-  if (e.ctrlKey && e.code === "Backslash") {
-    e.preventDefault();
-    if (e.shiftKey) splitPane(focusedPaneId, "vertical");
-    else splitPane(focusedPaneId, "horizontal");
     return;
   }
 
@@ -3817,62 +2304,40 @@ document.addEventListener("keydown", function (e) {
 // ===========================================================================
 
 function initWorkstreams() {
-  authFetch("/v1/api/workstreams")
+  return authFetch("/v1/api/workstreams")
     .then(function (r) {
       return r.json();
     })
     .then(function (data) {
-      data.workstreams.forEach(function (ws) {
+      (data.workstreams || []).forEach(function (ws) {
         workstreams[ws.ws_id] = { name: ws.name, state: ws.state };
       });
       connectGlobalSSE();
-      const wsIds = Object.keys(workstreams);
-      if (!wsIds.length) {
-        renderTabBar();
-        showDashboard();
-        return;
-      }
-      if (!Object.keys(panes).length) {
-        if (!restoreLayout()) {
-          const p = createPane(wsIds[0]);
-          splitRoot = { type: "leaf", pane: p };
-          setFocusedPane(p.id);
-        }
-        renderLayout();
-      }
-      renderTabBar();
-      for (let id in panes) {
-        if (!panes[id].evtSource) {
-          panes[id].showEmptyState();
-          panes[id]._loadHistoryThenConnect(panes[id].wsId);
-        }
-      }
-      const params = new URLSearchParams(location.search);
-      const targetWs = params.get("ws_id");
-      if (targetWs && workstreams[targetWs]) {
-        history.replaceState(
-          { turnstone: "workstream", wsId: targetWs },
-          "",
-          location.pathname,
-        );
-        _historyNavigation = true;
-        try {
-          switchTab(targetWs);
-        } finally {
-          _historyNavigation = false;
-        }
-      } else {
-        history.replaceState({ turnstone: "dashboard" }, "", location.pathname);
-        showDashboard();
-      }
+      fireRender();
+      // Deep-link: /?ws_id=… opens that session as an interactive pane (the
+      // PaneManager already restored any persisted working set on its own).
+      const targetWs = new URLSearchParams(location.search).get("ws_id");
+      if (targetWs && workstreams[targetWs]) openSessionPane(targetWs);
     });
 }
 
-initLogin();
-pollHealth();
-loadInterfaceSettings();
-initWorkstreams();
-loadPendingConsents();
+// boot() — the shell calls this (window.TS_APP.boot) once it has built the
+// rail + tab bar and opened the Dashboard pane.  It starts login, the Tier-1
+// roster + stream, the dashboard lists, health polling, and pending MCP
+// consents.  It does NOT auto-run at parse time (the shell sequences it).
+function boot() {
+  initLogin();
+  pollHealth();
+  loadInterfaceSettings();
+  initWorkstreams();
+  loadPendingConsents();
+  // The Dashboard pane (#main) is already mounted — populate its lists.
+  loadDashboard();
+  _loadDashboardOptionsLists();
+  _restoreDashboardOptionsState();
+  _refreshDashboardOptionsSummary();
+  _refreshDashboardSubmitLabel();
+}
 
 // Free the HTTP/1.1 6-connection-per-host budget before the refresh
 // document fetch starts.  Each pane holds a long-lived per-ws SSE +
@@ -3896,9 +2361,6 @@ window.addEventListener("beforeunload", function () {
     if (globalEvtSource) {
       globalEvtSource.close();
       globalEvtSource = null;
-    }
-    for (const id in panes) {
-      if (panes[id]) panes[id].disconnectSSE();
     }
   } catch (_e) {
     /* best-effort — never block unload */
@@ -3925,15 +2387,6 @@ window.addEventListener("beforeunload", function () {
 function _reconnectDeadSSEs() {
   if (!globalEvtSource || globalEvtSource.readyState === EventSource.CLOSED) {
     connectGlobalSSE();
-  }
-  for (const id in panes) {
-    const p = panes[id];
-    if (!p || !p.wsId) continue;
-    const live =
-      p.evtSource &&
-      (p.evtSource.readyState === EventSource.OPEN ||
-        p.evtSource.readyState === EventSource.CONNECTING);
-    if (!live) p.connectSSE(p.wsId);
   }
 }
 document.addEventListener("visibilitychange", function () {
@@ -4002,3 +2455,132 @@ window.addEventListener("popstate", function (e) {
     _historyNavigation = false;
   }
 });
+
+// ===========================================================================
+//  17. L-shell seams — TS_APP (single-node Tier-1) + TS_ADMIN (Manage) + showHome
+//
+//  The shared shell (shell.js) reads window.TS_APP for the rail's live data and
+//  window.TS_ADMIN for the Manage groups.  A standalone turnstone-server is a
+//  single node, so getClusterState() synthesizes a one-node cluster from the
+//  flat `workstreams` roster this file maintains over /v1/api/events/global.
+// ===========================================================================
+
+// Rail re-render fan-out — the rail subscribes via TS_APP.onRender; every
+// roster mutation calls fireRender() so the Workspaces section stays live.
+const _renderSubs = [];
+function fireRender() {
+  for (const cb of _renderSubs) {
+    try {
+      cb();
+    } catch (e) {
+      console.error("TS_APP render subscriber failed", e);
+    }
+  }
+}
+
+// Open / focus an interactive session as a pane (base="" local transport — the
+// standalone has no node proxy; shell.js gates nodeId off caps.cluster).
+function openSessionPane(wsId) {
+  const pm = window.TS_SHELL && window.TS_SHELL.panes;
+  if (pm) pm.openPane("interactive", wsId);
+}
+function closeSessionPane(wsId) {
+  const pm = window.TS_SHELL && window.TS_SHELL.panes;
+  if (pm) pm.close("interactive:" + wsId);
+}
+
+// Lean shims for the retired tab-bar verbs the keep-code still calls — the tab
+// bar is PaneManager's now, so these re-express onto panes + the rail.
+function switchTab(wsId) {
+  openSessionPane(wsId);
+}
+function renderTabBar() {
+  fireRender();
+}
+function updateTabIndicator(wsId, state) {
+  if (workstreams[wsId]) workstreams[wsId].state = state;
+  fireRender();
+}
+
+// Synthesize the one-node clusterState shape the rail consumes
+// (cs.nodes[nid].workstreams[]).  caps.cluster is false, so the rail's Cluster
+// section is never built; only Workspaces + wsTitle read this.
+function getClusterState() {
+  const list = [];
+  for (const id in workstreams) {
+    const w = workstreams[id] || {};
+    list.push({
+      id: id,
+      name: w.name,
+      state: w.state || "idle",
+      kind: "interactive",
+      parent_ws_id: w.parent_ws_id || null,
+    });
+  }
+  return { nodes: { local: { workstreams: list } }, overview: {} };
+}
+
+// Bucket a flat ws list by parent (standalone sessions are flat → all roots);
+// shape mirrors the console seam the rail's renderWorkspaces expects.
+function bucketByParent(list) {
+  const byId = {};
+  for (const w of list) byId[w.id] = w;
+  const roots = [];
+  const orphans = [];
+  const childrenMap = {};
+  for (const w of list) {
+    const p = w.parent_ws_id;
+    if (!p) roots.push(w);
+    else if (byId[p]) (childrenMap[p] = childrenMap[p] || []).push(w);
+    else orphans.push(w);
+  }
+  return { roots: roots, orphans: orphans, childrenMap: childrenMap };
+}
+
+window.showHome = function () {
+  if (window.TS_SHELL && window.TS_SHELL.panes)
+    window.TS_SHELL.panes.openPane("dashboard");
+};
+
+window.TS_APP = window.TS_APP || {};
+window.TS_APP.getClusterState = getClusterState;
+window.TS_APP.onRender = function (cb) {
+  if (typeof cb === "function" && _renderSubs.indexOf(cb) < 0)
+    _renderSubs.push(cb);
+};
+window.TS_APP.bucketByParent = bucketByParent;
+window.TS_APP.boot = boot;
+
+// --- Manage seam: one Connections tab (MCP server connections) -------------
+const _CONN_IA = [
+  {
+    group: "Extensions",
+    tabs: [{ tab: "connections", label: "Connections", perm: null }],
+  },
+];
+let _activeAdminTab = null;
+const _adminTabSubs = [];
+window.TS_ADMIN = window.TS_ADMIN || {};
+window.TS_ADMIN.ia = _CONN_IA;
+window.TS_ADMIN.isTabAllowed = function () {
+  return true;
+};
+window.TS_ADMIN.getActiveTab = function () {
+  return _activeAdminTab;
+};
+window.TS_ADMIN.onTabChange = function (cb) {
+  if (typeof cb === "function") _adminTabSubs.push(cb);
+};
+window.TS_ADMIN.openTab = function (tab) {
+  const pm = window.TS_SHELL && window.TS_SHELL.panes;
+  if (pm) pm.openPane("admin");
+  _activeAdminTab = tab;
+  for (const cb of _adminTabSubs) {
+    try {
+      cb(tab);
+    } catch (e) {
+      console.error("TS_ADMIN tab subscriber failed", e);
+    }
+  }
+  if (tab === "connections") openSettingsPanel();
+};

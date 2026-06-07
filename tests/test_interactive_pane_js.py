@@ -25,22 +25,19 @@ def _strip_comments(js: str) -> str:
     return js
 
 
-def test_interactive_is_esm_with_window_bridge() -> None:
-    """The module is a real ES module (the first legacy pane lifted into one):
-    it ``export``s the factory for the console shell's ``import`` AND publishes
-    ``window.InteractivePane`` / ``window.createInteractivePane`` so the still
-    classic standalone ``app.js`` can read the class.  Both halves are
-    load-bearing — drop the export and the console shell can't import it; drop
-    the window bridge and the standalone shell's ``createPane`` goes undefined."""
+def test_interactive_is_esm_imported_by_the_shell() -> None:
+    """Real ES module: it ``export``s the factory the shell imports in BOTH
+    deployments.  Step 6 retired the window bridge (no window.InteractivePane)
+    and the standalone HTML no longer script-tags interactive.js — shell.js
+    pulls it via ``import``."""
     body = _INTERACTIVE.read_text(encoding="utf-8")
     assert "export { Pane as InteractivePane, createInteractivePane };" in body
-    assert "window.InteractivePane = Pane;" in body
-    assert "window.createInteractivePane = createInteractivePane;" in body
-    # And the standalone HTML must load it as a module (not a classic script).
+    assert "window.InteractivePane = Pane" not in body, (
+        "the window bridge is retired — the shell imports the factory (ESM)."
+    )
     html = _UI_INDEX.read_text(encoding="utf-8")
-    assert '<script type="module" src="/shared/interactive.js"></script>' in html, (
-        "ui/static/index.html must load interactive.js as an ES module — a "
-        "classic <script src> would choke on the top-level export."
+    assert "/shared/interactive.js" not in html, (
+        "the standalone HTML must NOT script-tag interactive.js — shell.js imports it."
     )
 
 
@@ -137,24 +134,18 @@ def test_host_seam_routes_shell_couplings() -> None:
     )
 
 
-def test_standalone_shell_constructs_via_window_bridge() -> None:
-    """The standalone ``app.js`` shell builds panes through
-    ``window.InteractivePane`` with its ``STANDALONE_HOST`` adapter, and keeps
-    the focused-pane stream-error recovery (``refetchWorkstreamsAndReassign``)
-    that moved out of the class."""
+def test_standalone_opens_sessions_via_the_shell_pane_manager() -> None:
+    """Step 6 retired the standalone's local split-pane construction: app.js no
+    longer builds panes via window.InteractivePane / STANDALONE_HOST.  Sessions
+    open through the shared shell's PaneManager — openSessionPane delegates to
+    openPane('interactive', wsId)."""
     app = _APP.read_text(encoding="utf-8")
-    assert "new window.InteractivePane(wsId, { host: STANDALONE_HOST })" in app
-    assert "const STANDALONE_HOST = {" in app
-    assert "function refetchWorkstreamsAndReassign(focusedPane) {" in app
-    # The host adapter must implement every seam the Pane calls.
-    for method in (
-        "getWsName(wsId)",
-        "isFocused(pane)",
-        "onStreamError(pane)",
-        "warningTarget()",
-        "onConsentDetected(server)",
-    ):
-        assert method in app, f"STANDALONE_HOST missing {method!r}"
-    # The class itself no longer carries the split-pane reassign method.
-    inter = _INTERACTIVE.read_text(encoding="utf-8")
-    assert "_refetchWorkstreamsAndReassign" not in inter
+    assert "STANDALONE_HOST" not in app, "the standalone host adapter is retired."
+    assert "new window.InteractivePane(" not in app, (
+        "the standalone no longer constructs panes locally."
+    )
+    start = app.index("function openSessionPane(wsId)")
+    fn = app[start : start + 300]
+    assert 'openPane("interactive", wsId)' in fn, (
+        "openSessionPane must open the session as a pane via the shell PaneManager."
+    )

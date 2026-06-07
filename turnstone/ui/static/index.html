@@ -15,79 +15,61 @@
     <link rel="stylesheet" href="/shared/chat.css" />
     <link rel="stylesheet" href="/shared/conversation.css" />
     <link rel="stylesheet" href="/shared/cards.css" />
-    <link rel="stylesheet" href="/shared/katex-0.17.0/katex.min.css" />
     <link rel="stylesheet" href="/static/style.css" />
+    <link rel="stylesheet" href="/shared/shell.css" />
+    <link rel="stylesheet" href="/shared/interactive.css" />
+    <link rel="stylesheet" href="/shared/katex-0.17.0/katex.min.css" />
   </head>
   <body>
-    <div id="ui-header" class="appbar">
-      <h1 class="appbar-title">turnstone</h1>
-      <span
-        id="mcp-status"
-        class="appbar-status"
-        role="status"
-        aria-live="polite"
-      ></span>
+    <!-- The L-shell (shell.js) reparents these into the rail (status) + footer
+     (theme/logout) and hides #header.  The standalone server has no node
+     proxy and no full admin panel, so there is no #admin-btn here; the rail's
+     Manage section opens the (single) Connections pane via the TS_ADMIN seam. -->
+    <div id="header" style="display: none">
+      <h1>
+        <a
+          href="#"
+          id="header-home-link"
+          onclick="
+            showHome();
+            return false;
+          "
+          aria-label="Home (dashboard)"
+          >turnstone</a
+        >
+      </h1>
+      <span id="status-bar" role="status" aria-live="polite"></span>
+      <span id="mcp-status" role="status" aria-live="polite"></span>
       <span
         id="health-indicator"
-        class="health-ok appbar-status"
+        class="health-ok"
         role="status"
         aria-live="polite"
         aria-atomic="true"
       ></span>
-      <span class="header-spacer appbar-spacer"></span>
-      <span class="appbar-actions">
-        <button
-          id="theme-toggle"
-          class="header-btn btn"
-          onclick="toggleTheme()"
-          aria-label="Toggle light/dark theme"
-          title="Switch to light theme"
-        >
-          &#9790;
-        </button>
-        <button
-          id="settings-btn"
-          class="header-btn btn"
-          type="button"
-          onclick="toggleSettingsMenu(this)"
-          aria-haspopup="menu"
-          aria-expanded="false"
-          aria-label="Settings"
-          title="Settings"
-        >
-          &#9881;
-        </button>
-      </span>
-    </div>
-
-    <div id="tab-bar" role="toolbar" aria-label="Workstreams">
-      <div id="tab-list" role="tablist"></div>
       <button
-        id="new-tab-btn"
-        onclick="newWorkstream()"
-        title="New workstream (Ctrl+T)"
-        aria-label="New workstream"
-        aria-keyshortcuts="Control+t"
+        id="logout-btn"
+        class="header-btn"
+        onclick="logout()"
+        style="display: none"
       >
-        +
+        logout
       </button>
       <button
-        id="split-btn"
-        onclick="splitFocusedPane()"
-        title="Split pane (Ctrl+\)"
-        aria-label="Split pane"
-        aria-keyshortcuts="Control+Backslash"
+        id="theme-toggle"
+        class="header-btn"
+        onclick="toggleTheme()"
+        aria-label="Toggle light/dark theme"
+        title="Switch to light theme"
       >
-        &#x29C9;
+        &#9790;
       </button>
     </div>
 
-    <div
-      id="dashboard"
-      class="dashboard-overlay"
-      role="region"
-      aria-label="Dashboard"
-    >
+    <!-- #main becomes the Dashboard pane body (the L-shell's default pane).  It
+     holds the new-session launcher, the live workstreams table, and the saved
+     list — the standalone's home surface. -->
+    <div id="main">
       <div class="dashboard-content">
         <div class="dashboard-composer" id="dashboard-composer">
           <textarea
@@ -281,7 +263,46 @@
       </div>
     </div>
 
-    <div id="split-root"></div>
+    <!-- The Admin pane body.  The standalone has no console-style admin panel;
+     its one Manage surface is MCP server connections, reusing the same table
+     ids the old settings overlay used so the render code is unchanged. -->
+    <div id="view-admin" style="display: none">
+      <div class="admin-content">
+        <section
+          id="view-conn"
+          class="admin-tabpanel"
+          role="tabpanel"
+          aria-label="MCP server connections"
+        >
+          <div class="admin-section-head">
+            <h2>MCP server connections</h2>
+          </div>
+          <div id="settings-mcp-loading" style="display: none">Loading...</div>
+          <div id="settings-mcp-empty" style="display: none">
+            No MCP server consents yet. Tools that need OAuth will show a
+            "Connect" button when used.
+          </div>
+          <table id="settings-mcp-table" style="display: none">
+            <thead>
+              <tr>
+                <th>Server</th>
+                <th>Scopes</th>
+                <th>Issued</th>
+                <th>Last refreshed</th>
+                <th></th>
+              </tr>
+            </thead>
+            <tbody id="settings-mcp-tbody"></tbody>
+          </table>
+          <div
+            id="settings-mcp-error"
+            role="alert"
+            aria-live="polite"
+            style="display: none"
+          ></div>
+        </section>
+      </div>
+    </div>
 
     <!-- New workstream modal -->
     <div
@@ -405,55 +426,7 @@
       </div>
     </div>
 
-    <!-- Settings: MCP server connections -->
-    <div
-      id="settings-overlay"
-      style="display: none"
-      role="dialog"
-      aria-modal="true"
-      aria-labelledby="settings-heading"
-    >
-      <div id="settings-box">
-        <div id="settings-header">
-          <h3 id="settings-heading">MCP server connections</h3>
-          <button
-            type="button"
-            id="settings-close-btn"
-            onclick="closeSettingsPanel()"
-            aria-label="Close settings"
-          >
-            &#10005;
-          </button>
-        </div>
-        <div id="settings-body">
-          <div id="settings-mcp-loading" style="display: none">Loading...</div>
-          <div id="settings-mcp-empty" style="display: none">
-            No MCP server consents yet. Tools that need OAuth will show a
-            "Connect" button when used.
-          </div>
-          <table id="settings-mcp-table" style="display: none">
-            <thead>
-              <tr>
-                <th>Server</th>
-                <th>Scopes</th>
-                <th>Issued</th>
-                <th>Last refreshed</th>
-                <th></th>
-              </tr>
-            </thead>
-            <tbody id="settings-mcp-tbody"></tbody>
-          </table>
-          <div
-            id="settings-mcp-error"
-            role="alert"
-            aria-live="polite"
-            style="display: none"
-          ></div>
-        </div>
-      </div>
-    </div>
-
-    <!-- Revoke confirmation modal (matches delete-ws pattern) -->
+    <!-- Revoke MCP connection confirmation modal -->
     <div
       id="revoke-mcp-overlay"
       style="display: none"
@@ -510,26 +483,23 @@
     <div id="toast" role="status" aria-live="polite"></div>
     <script>
       window.TURNSTONE_AUTH_TITLE = "turnstone";
+      // L-shell capability flags — a standalone turnstone-server is a single
+      // node with no cluster front-door and no console-local orchestration, so
+      // both are off (the rail's Cluster section is hidden; coordinator panes
+      // are never registered).  Manage stays on, fed by the app.js TS_ADMIN
+      // seam (one Connections tab).
+      window.TURNSTONE_SHELL_CAPS = {
+        cluster: false,
+        orchestration: false,
+        brandSub: "server",
+      };
       window.TURNSTONE_KB_SHORTCUTS = [
         {
           title: "Workstreams",
           keys: [
             {
-              desc: "Toggle dashboard",
-              badge: '<span class="kb-key">Ctrl+D</span>',
-            },
-            {
               desc: "New workstream",
               badge: '<span class="kb-key">Ctrl+T</span>',
-            },
-            {
-              desc: "Close workstream",
-              badge: '<span class="kb-key">Ctrl+W</span>',
-            },
-            {
-              desc: "Switch to tab 1\u20139",
-              badge:
-                '<span class="kb-key">Ctrl+1</span>\u2026<span class="kb-key">9</span>',
             },
             {
               desc: "Refresh title",
@@ -542,32 +512,6 @@
             {
               desc: "Fork workstream",
               badge: '<span class="kb-key">Ctrl+Shift+F</span>',
-            },
-            {
-              desc: "Delete workstream",
-              badge: '<span class="kb-key">Ctrl+Shift+X</span>',
-            },
-          ],
-        },
-        {
-          title: "Split panes",
-          keys: [
-            {
-              desc: "Split right",
-              badge: '<span class="kb-key">Ctrl+\\</span>',
-            },
-            {
-              desc: "Split down",
-              badge: '<span class="kb-key">Ctrl+Shift+\\</span>',
-            },
-            {
-              desc: "Close pane",
-              badge: '<span class="kb-key">Ctrl+Shift+W</span>',
-            },
-            {
-              desc: "Cycle pane focus",
-              badge:
-                '<span class="kb-key">Ctrl+Alt+\u2190</span> <span class="kb-key">\u2192</span>',
             },
           ],
         },
@@ -605,20 +549,6 @@
           ],
         },
         {
-          title: "Navigation",
-          keys: [
-            {
-              desc: "Navigate table rows",
-              badge:
-                '<span class="kb-key">\u2191</span> <span class="kb-key">\u2193</span>',
-            },
-            {
-              desc: "Close dashboard",
-              badge: '<span class="kb-key">Esc</span>',
-            },
-          ],
-        },
-        {
           title: "General",
           keys: [
             { desc: "Show this help", badge: '<span class="kb-key">?</span>' },
@@ -639,7 +569,10 @@
     <script src="/shared/katex-0.17.0/katex.min.js"></script>
     <script src="/shared/hljs-11.11.1/highlight.min.js"></script>
     <script src="/shared/renderer.js"></script>
-    <script type="module" src="/shared/interactive.js"></script>
+    <!-- The shell module imports the interactive pane (a /shared ES module), so
+     it is not <script>-tagged here.  app.js is classic and defines the
+     window.TS_APP / TS_ADMIN seams the deferred shell reads after it. -->
     <script src="/static/app.js"></script>
+    <script type="module" src="/shared/shell.js"></script>
   </body>
 </html>

@@ -35,28 +35,18 @@ def _pane_method_offset(body: str, name: str) -> int:
     return m.start()
 
 
-def test_switch_tab_bootstraps_pane_when_none_exists() -> None:
-    """``switchTab`` must create a pane when none exists. A fresh-
-    loaded interactive UI with no workstreams shows the dashboard
-    and creates no panes (per ``initWorkstreams``); the user's first
-    ``create`` or ``open`` then calls ``switchTab(newWsId)``. Pre-fix,
-    the early ``if (!pane) return;`` left switchTab with nowhere to
-    attach — the chat UI never connected SSE for the freshly-created
-    workstream, and only a page refresh fixed it. This test guards
-    against accidentally re-introducing the early-return."""
+def test_switch_tab_opens_an_interactive_pane() -> None:
+    """In the L-shell ``switchTab`` is a thin shim onto the PaneManager: it
+    opens/focuses the session as an interactive pane.  The split-pane
+    ``createPane`` bootstrap is retired."""
     body = _APP_JS.read_text(encoding="utf-8")
     start = body.index("function switchTab(wsId) {")
-    # Bound the search to the function body — switchTab is short.
-    fn = body[start : start + 2000]
-    assert "if (!pane) return;" not in fn, (
-        "switchTab must not early-return when no pane exists — that's "
-        "the no-chat-after-first-create bug. Bootstrap a pane instead."
+    fn = body[start : start + 400]
+    assert "openSessionPane(wsId)" in fn, (
+        "switchTab must delegate to openSessionPane (PaneManager.openPane "
+        "'interactive'), not the retired createPane bootstrap."
     )
-    # Affirmatively check the bootstrap path exists.
-    assert "createPane(wsId)" in fn, (
-        "switchTab must call createPane(wsId) to bootstrap the first "
-        "pane when getFocusedPane returns null"
-    )
+    assert "createPane" not in body, "the split-pane createPane bootstrap is retired."
 
 
 def test_tool_error_does_not_overwrite_approval_badge() -> None:
@@ -604,122 +594,54 @@ def test_phase8_no_unsafe_dom_write_in_settings_panel() -> None:
     )
 
 
-def test_phase8_settings_button_in_index_html() -> None:
-    """The gear-icon entry-point for the settings menu must remain
-    in the appbar's actions span. The console proxy IIFE prepends a
-    node pill to ``header.firstChild`` (turnstone/console/server.py:
-    202); our button is appended inside ``<span class='appbar-actions'>``
-    on the right, so they don't collide. Pin both shape constraints
-    here so a future appbar refactor keeps them disjoint."""
+def test_gear_retired_mcp_in_manage_pane() -> None:
+    """Step 6: the floating settings gear is retired — no #settings-btn, no
+    toggle/open/close gear handlers.  MCP server connections moved into the
+    Admin pane's Connections panel (#view-admin), reached via the rail's
+    Manage > Connections row (the TS_ADMIN seam)."""
+    index = _INDEX_HTML.read_text(encoding="utf-8")
+    app = _APP_JS.read_text(encoding="utf-8")
+    assert 'id="settings-btn"' not in index, "the floating settings gear is retired."
+    assert "toggleSettingsMenu" not in app, "the gear dropdown handlers are retired."
+    assert 'id="view-admin"' in index and 'id="settings-mcp-table"' in index, (
+        "MCP connections render into the Admin pane's #view-admin panel."
+    )
+    assert "window.TS_ADMIN.openTab = function" in app and '"connections"' in app, (
+        "the Manage > Connections row opens the MCP panel via the TS_ADMIN seam."
+    )
+
+
+def test_dashboard_is_the_main_pane_body() -> None:
+    """In the L-shell the dashboard is the Dashboard pane's body (#main) — the
+    shell adopts #main — not a floating overlay.  It holds the launcher + the
+    workstreams table and is not a modal."""
     body = _INDEX_HTML.read_text(encoding="utf-8")
-    assert 'id="settings-btn"' in body, (
-        "index.html must keep the #settings-btn — onclick handlers "
-        "and the consent badge target it by id."
+    assert 'id="main"' in body, "the dashboard content lives in #main (the Dashboard pane body)."
+    start = body.index('id="main"')
+    chunk = body[start : start + 4000]
+    assert 'id="dashboard-input"' in chunk and 'id="dash-ws-table"' in chunk, (
+        "#main must hold the new-session launcher + the workstreams table."
     )
-    assert 'onclick="toggleSettingsMenu(this)"' in body, (
-        "settings-btn must wire onclick=toggleSettingsMenu(this) — "
-        "the gear opens a dropdown with MCP connections + Logout; "
-        "losing the binding leaves the menu unreachable."
-    )
-    # The button must live inside <span class="appbar-actions"> so the
-    # console proxy's header.insertBefore(pill, header.firstChild)
-    # leaves it untouched.
-    actions_open = body.index('class="appbar-actions"')
-    actions_close = body.index("</span>", actions_open)
-    assert 'id="settings-btn"' in body[actions_open:actions_close], (
-        "settings-btn must be inside <span class='appbar-actions'> "
-        "so the console proxy's firstChild prepend doesn't shift it."
-    )
+    assert 'class="dashboard-overlay"' not in body, "the fixed dashboard overlay is retired."
 
 
-def test_settings_menu_handlers_defined() -> None:
-    """The gear-icon dropdown exposes a toggle/open/close trio that the
-    inline ``onclick="toggleSettingsMenu(this)"`` in index.html depends
-    on, plus the menu items themselves must wire to existing entry
-    points (``openSettingsPanel`` for MCP connections, ``logout`` for
-    sign-out). Pin all four so a rename or deletion fails loudly here
-    instead of silently leaving the gear's menu broken or wired to a
-    stale function."""
-    body = _APP_JS.read_text(encoding="utf-8")
-    for name in [
-        "function toggleSettingsMenu",
-        "function openSettingsMenu",
-        "function closeSettingsMenu",
-    ]:
-        assert name in body, f"Missing required handler: {name}"
-    # Bound to the settings-menu region so we don't accidentally match
-    # an unrelated openSettingsPanel/logout call elsewhere in the file.
-    start = body.index("function openSettingsMenu(")
-    end = body.index("function closeSettingsMenu(", start)
-    section = body[start:end]
-    assert "openSettingsPanel()" in section, (
-        "Settings menu's MCP-connections item must call openSettingsPanel() "
-        "— otherwise the existing settings overlay is unreachable from the "
-        "new dropdown."
-    )
-    assert "logout()" in section, (
-        "Settings menu's Logout item must call logout() — that's the "
-        "shared auth.js entry point that clears the cookie + session state."
-    )
-
-
-def test_dashboard_overlay_is_region_not_dialog() -> None:
-    """The dashboard overlay must be role='region' (not role='dialog' +
-    aria-modal='true').  The role downgrade is what allows ui-header to
-    stay interactive while the dashboard is open — see the comment at
-    showDashboard() in app.js.  A revert to role='dialog' + aria-modal
-    would re-trap focus and break the gear/theme buttons + the console
-    proxy's node-picker pill while the dashboard is open."""
+def test_mcp_connections_panel_and_revoke_modal_in_index_html() -> None:
+    """MCP connections moved from the floating #settings-overlay into the Admin
+    pane's Connections panel (#view-admin), reusing the same #settings-mcp-*
+    table ids so the render code is unchanged.  The revoke modal stays."""
     body = _INDEX_HTML.read_text(encoding="utf-8")
-    idx = body.index('id="dashboard"')
-    # Bound to ~600 chars after the tag so we only check this element's
-    # attributes — same shape as test_phase8_settings_modal_in_index_html.
+    assert 'id="settings-overlay"' not in body, "the floating MCP settings overlay is retired."
+    assert 'id="view-admin"' in body, "the Admin pane host (#view-admin) must exist."
+    va = body.index('id="view-admin"')
+    panel = body[va : va + 1500]
+    assert 'id="settings-mcp-table"' in panel and 'id="settings-mcp-tbody"' in panel, (
+        "the MCP table (reused ids) must live inside #view-admin."
+    )
+    idx = body.index('id="revoke-mcp-overlay"')
     chunk = body[idx : idx + 600]
-    assert 'role="region"' in chunk, (
-        "dashboard must be role='region' — see showDashboard() comment."
+    assert 'role="dialog"' in chunk and 'aria-modal="true"' in chunk, (
+        "revoke-mcp-overlay stays a modal dialog."
     )
-    assert "aria-modal" not in chunk, (
-        "dashboard must NOT be aria-modal — re-trapping focus breaks "
-        "the appbar's interactive controls (theme toggle, settings menu, "
-        "proxy node-picker pill) while the dashboard is open."
-    )
-
-
-def test_close_settings_menu_resets_aria() -> None:
-    """closeSettingsMenu must reset aria-expanded='false' AND remove
-    aria-controls from the gear trigger.  Without the reset the gear
-    keeps reporting 'expanded' to assistive tech after the menu closes;
-    without the removal aria-controls points at a dead DOM id."""
-    body = _APP_JS.read_text(encoding="utf-8")
-    start = body.index("function closeSettingsMenu(")
-    # Bound to ~600 chars so we don't catch unrelated handlers.
-    section = body[start : start + 600]
-    assert 'setAttribute("aria-expanded", "false")' in section, (
-        "closeSettingsMenu must set aria-expanded='false' on the gear."
-    )
-    assert 'removeAttribute("aria-controls")' in section, (
-        "closeSettingsMenu must remove aria-controls from the gear."
-    )
-
-
-def test_phase8_settings_modal_in_index_html() -> None:
-    """Both the settings overlay and the revoke-confirmation overlay
-    must remain in the modal area. The Escape-key deferral list in
-    app.js targets these ids, so removing them silently breaks the
-    handler chain."""
-    body = _INDEX_HTML.read_text(encoding="utf-8")
-    assert 'id="settings-overlay"' in body
-    assert 'id="revoke-mcp-overlay"' in body
-    # Each overlay must have role="dialog" + aria-modal="true" so
-    # screen readers and the existing modal-deferral handlers can
-    # treat them like the rest of the modal stack.
-    for overlay_id in ("settings-overlay", "revoke-mcp-overlay"):
-        idx = body.index(f'id="{overlay_id}"')
-        # Bound to ~600 chars after the open tag so we only check this
-        # overlay's attributes.
-        chunk = body[idx : idx + 600]
-        assert 'role="dialog"' in chunk, f"{overlay_id} missing role=dialog"
-        assert 'aria-modal="true"' in chunk, f"{overlay_id} missing aria-modal=true"
 
 
 def test_phase8_xss_safe_render_in_build_mcp_error_embed() -> None:
@@ -1236,70 +1158,30 @@ def test_redact_api_keys_runtime_smoke() -> None:
     )
 
 
-def test_beforeunload_closes_sse_connections() -> None:
-    """Pin the multi-pane refresh mitigation: the ``beforeunload``
-    handler closes ``globalEvtSource`` and every pane's ``evtSource``
-    before the page navigates away, freeing the browser's HTTP/1.1
-    6-connection-per-host budget so the refresh document fetch can
-    open a slot.  Without this handler, refresh at MAX_PANES hangs
-    in Chrome and leaves Firefox stuck on the loading state.
-
-    This is a tactical mitigation; the real fix is the console SSE
-    fan-in (one connection per page).  Pinning the handler here
-    prevents a future refactor from silently dropping it before
-    the fan-in lands."""
+def test_beforeunload_closes_global_sse() -> None:
+    """The ``beforeunload`` handler closes ``globalEvtSource`` before navigation.
+    In the L-shell the per-pane streams are owned by PaneManager/interactive.js,
+    so this handler only owns the global Tier-1 stream."""
     body = _APP_JS.read_text(encoding="utf-8")
     handler = _slice_listener_body(body, "beforeunload")
-    assert handler is not None, "beforeunload handler missing — refresh at MAX_PANES will hang."
-    assert "globalEvtSource" in handler, "beforeunload handler must reference globalEvtSource."
-    assert ".close()" in handler, "beforeunload handler must close at least one connection."
-    assert "panes" in handler, "beforeunload handler must reference the panes registry."
-    # Either bare `evtSource.close()` or `disconnectSSE()` (which closes +
-    # clears pending timers) is acceptable for per-pane teardown — pin the
-    # behaviour, not the implementation.
-    assert ".disconnectSSE()" in handler or ".evtSource.close()" in handler, (
-        "beforeunload handler must tear down per-pane SSEs "
-        "(`Pane.disconnectSSE()` is preferred — it also clears pending timers)."
+    assert handler is not None, "beforeunload handler missing."
+    assert "globalEvtSource" in handler and ".close()" in handler, (
+        "beforeunload must close the global Tier-1 stream."
     )
 
 
 def test_dead_sse_defensive_reconnect_registered() -> None:
-    """Pin the defensive reconnect: visibilitychange + focus listeners
-    must re-establish SSE connections that were closed by beforeunload
-    when the navigation didn't actually complete (e.g. another
-    beforeunload handler's "Are you sure?" dialog dismissed).  Without
-    these, the page stays alive with dead SSEs and no automatic
-    recovery — UI silently stops receiving events.
-
-    The two listeners cover different cancellation shapes: visibilitychange
-    catches hide/show; focus catches modal/browser-UI/OS-level focus loss
-    and return.  Both call the same idempotent reconnect helper."""
+    """visibilitychange + focus listeners re-open the global Tier-1 stream if it
+    was closed (e.g. a cancelled navigation).  In the L-shell per-pane streams
+    are PaneManager's, so the helper only revives the global SSE."""
     body = _APP_JS.read_text(encoding="utf-8")
-    # Both event registrations must be present.
-    assert 'addEventListener("visibilitychange"' in body, (
-        "visibilitychange listener missing — defensive reconnect won't fire on tab return."
-    )
-    assert 'addEventListener("focus"' in body, (
-        "focus listener missing — defensive reconnect won't catch "
-        "modal-dismissed cancellation paths."
-    )
-    # The reconnect helper must inspect EventSource state and call the
-    # existing connect helpers.  Slice the helper's body by walking the
-    # matching `}` so the assertions are robust to comment growth + body
-    # reorganisation.
+    assert 'addEventListener("visibilitychange"' in body
+    assert 'addEventListener("focus"' in body
     helper_body = _slice_function_body(body, "_reconnectDeadSSEs")
-    assert helper_body is not None, (
-        "_reconnectDeadSSEs helper missing — reconnect logic must live in "
-        "a named function the listeners can share."
+    assert helper_body is not None, "_reconnectDeadSSEs helper missing."
+    assert "EventSource" in helper_body and "connectGlobalSSE()" in helper_body, (
+        "_reconnectDeadSSEs must revive the global SSE when closed."
     )
-    assert "EventSource" in helper_body, (
-        "_reconnectDeadSSEs must inspect EventSource state so live or "
-        "CONNECTING sockets aren't disrupted."
-    )
-    assert "connectGlobalSSE()" in helper_body, (
-        "_reconnectDeadSSEs must reconnect the global SSE when closed."
-    )
-    assert "connectSSE(" in helper_body, "_reconnectDeadSSEs must reconnect dead per-pane SSEs."
 
 
 # ---------------------------------------------------------------------------
