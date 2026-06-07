@@ -11,7 +11,8 @@
    (indent, state dots, child highlight), and the <700px responsive
    accordion.  Rules that target .msg / .appbar / .sidebar are
    intentionally absent — those primitives ship from the shared
-   sheets and we don't restyle them here. */
+   sheets and we don't restyle them here (the coordinator pane has no
+   header at all — name/state live in the tab + rail). */
 .coord-chrome-root {
   display: flex;
   flex-direction: column;

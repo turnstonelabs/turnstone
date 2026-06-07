@@ -59,69 +59,11 @@ function buildCoordChrome(root, opts) {
   const SR =
     "position:absolute;left:-10000px;width:1px;height:1px;overflow:hidden";
 
-  // ----- appbar header -----
-  const actions = [
-    el("button", {
-      id: "coord-export-btn",
-      class: "btn",
-      type: "button",
-      "aria-label": "Export conversation",
-      title: "Export conversation (OpenAI JSON)",
-      text: "⤓",
-    }),
-    el("button", {
-      id: "coord-close-btn",
-      class: "btn",
-      "aria-label": "End coordinator session",
-      title: "End this coordinator session (terminates it on the server)",
-      text: "end",
-    }),
-  ];
-  if (opts.standalone) {
-    const theme = el("button", {
-      id: "theme-toggle",
-      class: "btn",
-      "aria-label": "Toggle light/dark theme",
-      text: "☾",
-    });
-    theme.addEventListener("click", function () {
-      if (typeof toggleTheme === "function") toggleTheme();
-    });
-    actions.push(theme);
-  }
-  const headerKids = [];
-  if (opts.standalone) {
-    headerKids.push(
-      el(
-        "a",
-        { href: "/", class: "appbar-back", "aria-label": "Back to console" },
-        [
-          el("span", {
-            class: "appbar-back-arrow",
-            "aria-hidden": "true",
-            text: "←",
-          }),
-          el("span", { text: "Console" }),
-        ],
-      ),
-    );
-  }
-  headerKids.push(
-    el("h1", { class: "appbar-title" }, [
-      document.createTextNode("turnstone "),
-      el("span", { id: "coord-name", class: "dim" }),
-    ]),
-    el("span", { id: "coord-status", class: "appbar-status" }),
-    el("span", { class: "appbar-spacer" }),
-    el("span", {
-      id: "coord-sse-status",
-      class: "appbar-status",
-      "aria-live": "polite",
-      text: "connecting…",
-    }),
-    el("span", { class: "appbar-actions" }, actions),
-  );
-  const header = el("div", { id: "coord-header", class: "appbar" }, headerKids);
+  // No pane header — name + state are shown by the tab + the rail (Workspaces);
+  // a coordinator is always a pane in the L-shell.  The conversation reclaims
+  // the full pane height.  (The busy/wait indicator self-disables without
+  // #coord-header; the SSE-connection indicator is dropped — reconnect handles
+  // transient drops, matching the interactive pane.)
 
   // ----- main column (messages + off-screen announcers + status bar + composer) -----
   const statusBar = el(
@@ -259,7 +201,7 @@ function buildCoordChrome(root, opts) {
     ],
   );
 
-  root.append(header, el("div", { id: "coord-body" }, [main, sidebar]));
+  root.append(el("div", { id: "coord-body" }, [main, sidebar]));
   if (opts.standalone) {
     root.append(
       el("div", { id: "toast", role: "status", "aria-live": "polite" }),
@@ -2009,6 +1951,7 @@ function createCoordinatorPane(root, wsId, opts) {
   // ------------------------------------------------------------------
 
   function setSseStatus(text, cls) {
+    if (!sseEl) return; // no header -> no SSE indicator (reconnect still runs)
     // Prepend a leading glyph so the state isn't conveyed by colour
     // alone (WCAG 1.4.1).  ● connected, ○ connecting, ⚠ disconnected.
     const glyph = cls === "ok" ? "● " : cls === "err" ? "⚠ " : "○ ";
@@ -2433,7 +2376,7 @@ function createCoordinatorPane(root, wsId, opts) {
         updateStatusBar(ev);
         break;
       case "state_change":
-        statusEl.textContent = ev.state || "";
+        if (statusEl) statusEl.textContent = ev.state || "";
         // Drive the composer's busy state from the canonical
         // server-side workstream state so the Stop button + queue
         // mode follow whatever the worker is doing — including
@@ -2450,7 +2393,7 @@ function createCoordinatorPane(root, wsId, opts) {
         }
         break;
       case "rename":
-        nameEl.textContent = ev.name || "";
+        if (nameEl) nameEl.textContent = ev.name || "";
         break;
       case "message_queued":
         // Server confirms the queued slot — the optimistic bubble
@@ -4137,20 +4080,10 @@ function createCoordinatorPane(root, wsId, opts) {
     });
   }
 
-  // Appbar Export button — download this coordinator's conversation as
-  // OpenAI-shaped JSON via the shared helper in utils.js.  Wired here
-  // (rather than via an inline onclick like coord-close-btn) because the
-  // helper needs the IIFE-scoped ``wsId`` const captured at load time.
-  const exportBtn = root.querySelector("#coord-export-btn");
-  if (exportBtn) {
-    exportBtn.addEventListener("click", () => {
-      exportWorkstreamDownload(wsId, exportBtn);
-    });
-  }
-
-  // "end" button — was inline onclick="coordCloseSession()"; bind per-instance.
-  const closeBtn = root.querySelector("#coord-close-btn");
-  if (closeBtn) closeBtn.addEventListener("click", coordCloseSession);
+  // Export + "end" actions moved to the pane tab dropdown (step 7) — the
+  // coordinator header is now a slim pane header.  The logic stays reachable:
+  // export via exportWorkstreamDownload(wsId) (utils.js), close via the pane's
+  // closeSession() API (coordCloseSession, on the factory return).
 
   // Mobile-only sidebar toggle — wires the accordion collapse below 700px.
   // On desktop the button is display:none so the handler is a no-op.
@@ -4418,8 +4351,8 @@ function createCoordinatorPane(root, wsId, opts) {
       wsSnapshot = await getJSON(
         "/v1/api/workstreams/" + encodeURIComponent(wsId),
       );
-      nameEl.textContent = wsSnapshot.name || "";
-      statusEl.textContent = wsSnapshot.state || "";
+      if (nameEl) nameEl.textContent = wsSnapshot.name || "";
+      if (statusEl) statusEl.textContent = wsSnapshot.state || "";
     } catch (e) {
       appendText("error", "Failed to load coordinator: " + e.message);
       return;
