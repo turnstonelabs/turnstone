@@ -149,3 +149,19 @@ def test_standalone_opens_sessions_via_the_shell_pane_manager() -> None:
     assert 'openPane("interactive", wsId)' in fn, (
         "openSessionPane must open the session as a pane via the shell PaneManager."
     )
+
+
+def test_approval_keyboard_shortcuts_wired() -> None:
+    """The converged card advertises y/n/a (+Enter/Esc) kbd hints, so the pane
+    must route those keys to resolveApproval when a pending approval is up —
+    pane-owned on this.el (the fork collapse retired the old app.js global
+    handler + getFocusedPane).  Guards against the chips over-promising."""
+    body = _INTERACTIVE.read_text(encoding="utf-8")
+    assert "if (!this.pendingApproval || !this.approvalBlockEl) return;" in body, (
+        "approval keydown must early-return unless a pending approval is up"
+    )
+    assert "e.key.toLowerCase()" in body, "the y/n/a shortcut branch"
+    assert ".conv-feedback" in body, (
+        "the feedback field uses the converged .conv-feedback, not the retired "
+        ".ts-approval-feedback"
+    )

@@ -590,6 +590,40 @@ class Pane {
     if (this._embedded) this.el.classList.add("pane--embedded");
     this.el.dataset.paneId = this.id;
 
+    // Approval keyboard shortcuts.  The converged card advertises y/n/a (+Enter/
+    // Esc) kbd hints, so route those keys to resolveApproval when this pane has a
+    // pending approval.  Pane-owned (on this.el) so it works for every embedded
+    // L-shell pane without a global handler — the old standalone wired this via
+    // the app.js global keydown + getFocusedPane, which the fork collapse retired.
+    // The composer is disabled while pending, so the only typing surface is the
+    // feedback field: there Enter approves (with feedback) / Esc denies and other
+    // keys type; elsewhere y|Enter approve, n|Esc deny, a = approve-all.
+    this.el.addEventListener("keydown", (e) => {
+      if (!this.pendingApproval || !this.approvalBlockEl) return;
+      const fb = this.approvalBlockEl.querySelector(".conv-feedback");
+      if (fb && document.activeElement === fb) {
+        if (e.key === "Enter" && !e.shiftKey) {
+          e.preventDefault();
+          this.resolveApproval(true, false, this.getFeedback());
+        } else if (e.key === "Escape") {
+          e.preventDefault();
+          this.resolveApproval(false, false, this.getFeedback());
+        }
+        return;
+      }
+      const k = e.key.toLowerCase();
+      if (k === "y" || e.key === "Enter") {
+        e.preventDefault();
+        this.resolveApproval(true, false, this.getFeedback());
+      } else if (k === "n" || e.key === "Escape") {
+        e.preventDefault();
+        this.resolveApproval(false, false, this.getFeedback());
+      } else if (k === "a") {
+        e.preventDefault();
+        this.resolveApproval(true, true, this.getFeedback());
+      }
+    });
+
     // Standalone split-pane affordances: focus tracking + the right-click
     // split/close menu.  In the L-shell the tab bar owns focus and the per-tab
     // action menu, so an embedded pane wires none of it.
