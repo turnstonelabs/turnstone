@@ -86,3 +86,67 @@ def test_risk_rank_and_max_severity_exported() -> None:
     assert "export function riskRank(" in body
     assert "export function maxSeverityItem(" in body
     assert "? riskRank(v.risk_level) : -1;" in body
+
+
+# --- step 5e.2b: the shared approval-card builders ---------------------------
+
+
+def test_card_builders_exported() -> None:
+    """The leaf DOM builders both panes' orchestration calls (5e.2c).  Drop one
+    and the calling pane fails to construct its half of the converged card."""
+    body = _body()
+    for name in (
+        "buildConvBatchShell",
+        "buildConvRow",
+        "buildConvCmd",
+        "buildConvVerdict",
+        "buildConvWarning",
+        "buildConvButton",
+        "buildConvActions",
+        "buildConvStatus",
+        "buildConvResult",
+    ):
+        assert f"export function {name}(" in body, f"{name} must be exported"
+
+
+def test_builders_emit_conv_vocabulary() -> None:
+    """The builders speak ONLY the neutral .conv-* vocabulary (conversation.css)
+    — no leaked .coord-tool-* / .ts-approval-* / .verdict-* class strings."""
+    body = _body()
+    for cls in (
+        '"conv-batch"',
+        '"conv-row"',
+        '"conv-row-call"',
+        '"conv-verdict"',
+        '"conv-warning conv-warning--"',
+        '"conv-actions"',
+        '"conv-btn conv-btn--"',
+        '"conv-status"',
+        '"conv-row-result"',
+    ):
+        assert cls in body, f"builders missing {cls}"
+    for stale in ("coord-tool-", "ts-approval-", "verdict-badge"):
+        assert stale not in body, f"builders leaked stale vocab: {stale}"
+
+
+def test_approve_all_label_unified() -> None:
+    """Button language (BRIEFING): the persistent action reads 'Approve all'
+    (a dashed --ok ghost), NOT the coordinator's old 'Always'.  The trio is
+    Approve / Deny / Approve all on the .conv-btn--{role} vocabulary."""
+    body = _body()
+    assert '"Approve all"' in body  # unified persistent-action label
+    assert '"Always"' not in body  # the coordinator's old label is gone
+    assert 'buildConvButton("approve", "Approve"' in body
+    assert 'buildConvButton("deny", "Deny"' in body
+    assert "conv-btn conv-btn--" in body
+
+
+def test_warning_and_verdict_normalize_risk() -> None:
+    """Both risk-bearing builders route risk through normalizeRiskLevel, so the
+    per-site `|| "medium"` fallbacks collapse onto the canonical unknown->medium
+    fold (5e.1b) and 'crit' aliases to 'critical'."""
+    body = _body()
+    assert "normalizeRiskLevel(verdict.risk_level)" in body, "verdict must normalize"
+    assert "normalizeRiskLevel(a.risk_level)" in body, "warning must normalize"
+    assert '"conv-warning conv-warning--" + risk' in body
+    assert 'badge.classList.add("conv-verdict--" + risk)' in body

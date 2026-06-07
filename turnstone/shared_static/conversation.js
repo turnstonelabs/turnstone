@@ -127,3 +127,459 @@ export function maxSeverityItem(items) {
   }
   return best;
 }
+
+// ===========================================================================
+// Shared approval-card builders (step 5e.2)
+//
+// Pure leaf DOM builders for the unified `.conv-*` card (conversation.css).
+// Both panes' (stateful) orchestration ASSEMBLES these; the builders own only
+// the DOM + class vocabulary, so the coordinator and interactive surfaces
+// render the SAME card.  Everything stateful -- the toolRows map, idempotent
+// upgrade-in-place, the early-paint announce shell, SSE routing -- stays in
+// the pane and CALLS these.
+//
+// House style: createElement / textContent, never innerHTML.  Set textContent
+// with NO leading whitespace: the .conv-row-cmd / -result / -diff CSS is
+// white-space:pre-wrap, so HTML/source indentation would render as a phantom
+// left indent (a real bug if a caller passes pre-indented text).
+// ===========================================================================
+
+// Empty batch shell (.conv-batch) + header strip (kicker / summary / tier).
+// The caller appends rows + actions/status and flips the state modifier
+// (--pending/--auto/--running/--approved/--denied/--error).  opts:
+//   parallel (bool)  -- >=2 calls: rows share the left rail
+//   stateClass (str) -- e.g. "conv-batch--pending" (omit for the neutral shell)
+//   kickerText / summaryText / tierText
+export function buildConvBatchShell(opts) {
+  opts = opts || {};
+  const batch = document.createElement("div");
+  batch.className = "conv-batch";
+  batch.classList.add(
+    opts.parallel ? "conv-batch--parallel" : "conv-batch--solo",
+  );
+  if (opts.stateClass) batch.classList.add(opts.stateClass);
+
+  const head = document.createElement("div");
+  head.className = "conv-batch-head";
+  const kicker = document.createElement("span");
+  kicker.className = "conv-batch-kicker";
+  kicker.textContent = opts.kickerText || "Tool";
+  head.appendChild(kicker);
+  if (opts.summaryText) {
+    const summary = document.createElement("span");
+    summary.className = "conv-batch-summary";
+    summary.textContent = opts.summaryText;
+    head.appendChild(summary);
+  }
+  if (opts.tierText) {
+    const tier = document.createElement("span");
+    tier.className = "conv-batch-tier";
+    tier.textContent = opts.tierText;
+    head.appendChild(tier);
+  }
+  batch.appendChild(head);
+  return batch;
+}
+
+// Tool-call row (.conv-row) + call line (idx / name / auto-tag / args).  The
+// caller appends verdict / cmd / warning / result / status children + manages
+// state.  item: {func_name, call_id, auto_approved, auto_approve_reason}.  opts:
+//   indexLabel  -- "1/3" pill for parallel batches (omit -> no pill)
+//   argsText    -- pre-formatted arg summary (coordinator); interactive omits
+//                  this and appends buildConvCmd() instead
+//   first/last  -- rail-tuck markers for parallel batches
+export function buildConvRow(item, opts) {
+  item = item || {};
+  opts = opts || {};
+  const row = document.createElement("div");
+  row.className = "conv-row";
+  if (opts.first) row.classList.add("conv-row--first");
+  if (opts.last) row.classList.add("conv-row--last");
+  if (item.call_id) row.dataset.callId = item.call_id;
+  // Stamp the function name so the metacog dim rule (memory/recall) and the
+  // pane's per-call routing have something to match.
+  if (item.func_name) row.dataset.toolName = item.func_name;
+
+  const call = document.createElement("div");
+  call.className = "conv-row-call";
+  if (opts.indexLabel) {
+    const idx = document.createElement("span");
+    idx.className = "conv-row-idx";
+    idx.textContent = opts.indexLabel;
+    call.appendChild(idx);
+  }
+  const name = document.createElement("span");
+  name.className = "conv-row-name";
+  name.textContent = item.func_name || "(unknown tool)";
+  if (item.auto_approved) {
+    const auto = document.createElement("span");
+    auto.className = "conv-row-auto";
+    const reason = item.auto_approve_reason || "auto_approve_tools";
+    auto.textContent = " auto: " + reason;
+    auto.title = "Tool auto-approved (no operator prompt) -- reason: " + reason;
+    name.appendChild(auto);
+  }
+  call.appendChild(name);
+  if (opts.argsText) {
+    const args = document.createElement("span");
+    args.className = "conv-row-args";
+    args.textContent = opts.argsText;
+    call.appendChild(args);
+  }
+  row.appendChild(call);
+  return row;
+}
+
+// Bash `$ cmd` line + optional unified-diff preview (interactive tool rows).
+// Returns a fragment to append into a .conv-row after the call line.  Lifts
+// buildToolDiv's header-clean + diff-parse; textContent only.
+export function buildConvCmd(item) {
+  item = item || {};
+  const frag = document.createDocumentFragment();
+  const headerText = stripAnsi(item.header || "");
+  const cleaned = headerText.replace(/^[^\s]+\s+\w+:\s*/, "");
+  const cmdText = cleaned || headerText;
+  if (cmdText) {
+    const cmd = document.createElement("div");
+    cmd.className = "conv-row-cmd";
+    if (item.func_name === "bash") {
+      const dollar = document.createElement("span");
+      dollar.className = "conv-row-cmd-dollar";
+      dollar.textContent = "$ ";
+      cmd.append(dollar, cmdText);
+    } else {
+      cmd.textContent = cmdText;
+    }
+    frag.appendChild(cmd);
+  }
+  if (item.preview) {
+    const diff = document.createElement("div");
+    diff.className = "conv-row-diff";
+    const lines = stripAnsi(item.preview).split("\n");
+    const nodes = [];
+    lines.forEach((line, i) => {
+      if (i > 0) nodes.push("\n");
+      const trimmed = line.trim();
+      let cls = null;
+      if (trimmed.startsWith("-")) cls = "conv-diff-del";
+      else if (trimmed.startsWith("+")) cls = "conv-diff-add";
+      else if (trimmed.startsWith("Warning:")) cls = "conv-diff-warn";
+      if (cls) {
+        const span = document.createElement("span");
+        span.className = cls;
+        span.textContent = line;
+        nodes.push(span);
+      } else {
+        nodes.push(line);
+      }
+    });
+    diff.append(...nodes);
+    frag.appendChild(diff);
+  }
+  return frag;
+}
+
+// Verdict badge (.conv-verdict) + expandable detail.  verdict: the judge /
+// heuristic verdict object (risk_level, recommendation, confidence,
+// intent_summary, reasoning, evidence[], tier, judge_model).  opts.judgePending
+// appends the "judge analyzing" spinner.  When `verdict` is null + judgePending,
+// returns a spinner-only badge (the stripe stays NEUTRAL -- risk isn't known
+// yet -- which is why the --{risk} class is withheld here, not just guarded in
+// CSS).  Returns a fragment [badge] or [badge, detail].
+export function buildConvVerdict(verdict, opts) {
+  opts = opts || {};
+  const frag = document.createDocumentFragment();
+  const badge = document.createElement("div");
+  badge.className = "conv-verdict";
+
+  if (!verdict) {
+    if (opts.judgePending) badge.appendChild(_convSpinner());
+    frag.appendChild(badge);
+    return frag;
+  }
+
+  const risk = normalizeRiskLevel(verdict.risk_level);
+  badge.classList.add("conv-verdict--" + risk);
+  badge.setAttribute("data-risk", risk);
+  if (verdict.call_id) badge.setAttribute("data-call-id", verdict.call_id);
+
+  const riskSpan = document.createElement("span");
+  riskSpan.className = "conv-verdict-risk";
+  riskSpan.textContent = risk.toUpperCase();
+  badge.appendChild(riskSpan);
+
+  const rec = verdict.recommendation || "review";
+  const recSpan = document.createElement("span");
+  recSpan.className =
+    "conv-verdict-rec conv-verdict-rec--" +
+    (rec === "approve" ? "approve" : rec === "deny" ? "deny" : "review");
+  recSpan.textContent = rec;
+  badge.appendChild(recSpan);
+
+  if (verdict.confidence != null) {
+    const conf = document.createElement("span");
+    conf.className = "conv-verdict-conf";
+    const v = verdict.confidence;
+    conf.textContent = (typeof v === "number" ? Math.round(v * 100) : v) + "%";
+    badge.appendChild(conf);
+  }
+
+  if (opts.judgePending) badge.appendChild(_convSpinner());
+
+  const hasDetail = !!(
+    verdict.intent_summary ||
+    verdict.reasoning ||
+    (verdict.evidence && verdict.evidence.length) ||
+    verdict.tier ||
+    verdict.judge_model
+  );
+  let detail = null;
+  if (hasDetail) {
+    const expand = document.createElement("button");
+    expand.type = "button";
+    expand.className = "conv-verdict-expand";
+    expand.textContent = "details";
+    badge.appendChild(expand);
+
+    detail = document.createElement("div");
+    detail.className = "conv-verdict-detail";
+    detail.style.display = "none";
+    if (verdict.intent_summary) {
+      const s = document.createElement("div");
+      s.className = "conv-verdict-summary";
+      s.textContent = verdict.intent_summary;
+      detail.appendChild(s);
+    }
+    if (verdict.reasoning) {
+      const r = document.createElement("div");
+      r.className = "conv-verdict-reasoning";
+      r.textContent = verdict.reasoning;
+      detail.appendChild(r);
+    }
+    const evidence = verdict.evidence || [];
+    if (evidence.length) {
+      const ev = document.createElement("div");
+      ev.className = "conv-verdict-evidence";
+      for (const e of evidence) {
+        const erow = document.createElement("div");
+        erow.textContent = "• " + e;
+        ev.appendChild(erow);
+      }
+      detail.appendChild(ev);
+    }
+    const tier = document.createElement("div");
+    tier.className = "conv-verdict-tier";
+    let t = (verdict.tier || "heuristic") + " tier";
+    if (verdict.judge_model) t += " | " + verdict.judge_model;
+    tier.textContent = t;
+    detail.appendChild(tier);
+
+    expand.addEventListener("click", () => {
+      const shown = detail.style.display !== "none";
+      detail.style.display = shown ? "none" : "block";
+      expand.textContent = shown ? "details" : "hide";
+    });
+  }
+
+  frag.appendChild(badge);
+  if (detail) frag.appendChild(detail);
+  return frag;
+}
+
+function _convSpinner() {
+  const spin = document.createElement("span");
+  spin.className = "conv-verdict-spinner";
+  const dot = document.createElement("span");
+  dot.className = "conv-verdict-spinner-dot";
+  dot.setAttribute("aria-hidden", "true");
+  spin.append(dot, " judge analyzing…");
+  return spin;
+}
+
+// Output-guard warning chip (.conv-warning--{risk}).  assessment: {risk_level,
+// flags[], redacted, tier, judge_risk, confidence, judge_model, reasoning}.
+// Risk is normalized (unknown -> medium), folding the per-site `|| "medium"`
+// fallbacks both panes carried.  Returns the chip element.
+export function buildConvWarning(assessment) {
+  const a = assessment || {};
+  const risk = normalizeRiskLevel(a.risk_level);
+  const flags = a.flags || [];
+  const chip = document.createElement("div");
+  chip.className = "conv-warning conv-warning--" + risk;
+  chip.setAttribute("role", "status");
+  const label = document.createElement("span");
+  label.className = "conv-warning-label";
+  label.textContent = "⚠ " + risk.toUpperCase();
+  chip.appendChild(label);
+  if (flags.length) {
+    chip.appendChild(document.createTextNode(" " + flags.join(", ")));
+  }
+  if (a.redacted) {
+    const red = document.createElement("span");
+    red.className = "conv-warning-redacted";
+    red.textContent = " (credentials redacted)";
+    chip.appendChild(red);
+  }
+  // LLM-judge attribution -- the judge's OWN verdict when it differs from the
+  // displayed (merged) risk, plus confidence + model, so a regex match reads
+  // apart from a model judgement.
+  if (a.tier === "llm") {
+    const tier = document.createElement("span");
+    tier.className = "conv-warning-tier";
+    let t = "⚖ LLM";
+    if (a.judge_risk && a.judge_risk !== risk) t += ": " + a.judge_risk;
+    if (a.confidence > 0) t += " · " + Math.round(a.confidence * 100) + "%";
+    if (a.judge_model) t += " · " + a.judge_model;
+    tier.textContent = t;
+    chip.appendChild(tier);
+  }
+  if (a.reasoning) {
+    const r = document.createElement("div");
+    r.className = "conv-warning-reasoning";
+    r.textContent = a.reasoning;
+    chip.appendChild(r);
+  }
+  return chip;
+}
+
+// One action button (.conv-btn--{role}).  role: "approve" | "always" | "deny".
+// kbdHint renders as a .conv-kbd chip -- the pane passes its OWN keybinding so
+// muscle memory is preserved (the look converges; the keys stay per-pane).
+export function buildConvButton(role, label, kbdHint, ariaLabel) {
+  const btn = document.createElement("button");
+  btn.type = "button";
+  btn.className = "conv-btn conv-btn--" + role;
+  btn.dataset.role = role;
+  btn.appendChild(document.createTextNode(label));
+  if (kbdHint) {
+    const kbd = document.createElement("span");
+    kbd.className = "conv-kbd";
+    kbd.setAttribute("aria-hidden", "true");
+    kbd.textContent = kbdHint;
+    btn.appendChild(kbd);
+  }
+  if (ariaLabel) btn.setAttribute("aria-label", ariaLabel);
+  return btn;
+}
+
+// Action row (.conv-actions) -- Deny / Approve all / Approve, right-aligned via
+// a spacer (the coordinator idiom).  opts:
+//   onApprove / onDeny / onAlways -- click callbacks (pane-specific resolution)
+//   alwaysLabel  -- aria/title for the "always" button; omit -> no Approve-all
+//                   button (nothing to persist)
+//   kbd: {approve, deny, always}  -- per-pane keybinding hints
+//   glowRec      -- "approve"|"deny"|"review" -> recommended-button glow
+//   withFeedback -- append the inline feedback input (interactive affordance)
+// Returns the .conv-actions element; the caller appends it to the batch.
+export function buildConvActions(opts) {
+  opts = opts || {};
+  const kbd = opts.kbd || {};
+  const actions = document.createElement("div");
+  actions.className = "conv-actions";
+  if (opts.glowRec) {
+    const g =
+      opts.glowRec === "approve"
+        ? "approve"
+        : opts.glowRec === "deny"
+          ? "deny"
+          : "review";
+    actions.classList.add("conv-verdict-glow--" + g);
+  }
+  const spacer = document.createElement("div");
+  spacer.className = "conv-actions-spacer";
+  actions.appendChild(spacer);
+
+  const deny = buildConvButton("deny", "Deny", kbd.deny, "Deny");
+  if (opts.onDeny) deny.addEventListener("click", opts.onDeny);
+  actions.appendChild(deny);
+
+  if (opts.alwaysLabel) {
+    const always = buildConvButton(
+      "always",
+      "Approve all",
+      kbd.always,
+      opts.alwaysLabel,
+    );
+    always.title = opts.alwaysLabel;
+    if (opts.onAlways) always.addEventListener("click", opts.onAlways);
+    actions.appendChild(always);
+  }
+
+  const approve = buildConvButton("approve", "Approve", kbd.approve, "Approve");
+  if (opts.onApprove) approve.addEventListener("click", opts.onApprove);
+  actions.appendChild(approve);
+
+  if (opts.withFeedback) {
+    const fb = document.createElement("input");
+    fb.type = "text";
+    fb.className = "conv-feedback";
+    fb.placeholder = "feedback (optional)";
+    actions.appendChild(fb);
+  }
+  return actions;
+}
+
+// Resolved status pill (.conv-status) -- replaces the action row after
+// approve/deny, or prefills on history replay of a resolved batch.  opts:
+//   approved (bool), always (bool), feedback (str), auto (bool).
+export function buildConvStatus(opts) {
+  opts = opts || {};
+  const status = document.createElement("div");
+  status.className = "conv-status";
+  const label = document.createElement("span");
+  if (opts.auto) {
+    status.classList.add("conv-status--auto");
+    label.textContent = "✓ auto-approved";
+  } else if (opts.approved) {
+    status.classList.add("conv-status--approved");
+    label.textContent = opts.always ? "✓ approved · always" : "✓ approved";
+  } else {
+    status.classList.add("conv-status--denied");
+    label.textContent = "✗ denied";
+  }
+  status.appendChild(label);
+  if (opts.feedback) {
+    const fb = document.createElement("span");
+    fb.className = "conv-status-feedback";
+    fb.textContent = "— " + opts.feedback;
+    status.appendChild(fb);
+  }
+  return status;
+}
+
+// Tool result block (.conv-row-result).  output: raw text; opts.isError marks
+// it (lead glyph + colour).  Pretty-prints small JSON payloads (coordinator
+// idiom).  Returns the block; the caller appends it (and may special-case
+// media / MCP-error embeds before falling back to this -- interactive).
+export function buildConvResult(output, opts) {
+  opts = opts || {};
+  const block = document.createElement("div");
+  block.className = "conv-row-result";
+  const lead = document.createElement("span");
+  lead.className = "conv-row-result-lead";
+  lead.textContent = opts.isError ? "✗ error: " : "↳ result: ";
+  block.appendChild(lead);
+  const cleaned = stripAnsi(output || "");
+  let pretty = cleaned;
+  // Pretty-print only small JSON (cap 32 KiB): a large payload can deepen into
+  // a multi-MB graph and stall the main thread; the parent is pre-wrap so raw
+  // text still wraps past the cap.
+  const CAP = 32 * 1024;
+  if (cleaned && cleaned.length <= CAP) {
+    const head = cleaned.charCodeAt(0);
+    if (head === 0x7b || head === 0x5b) {
+      try {
+        const parsed = JSON.parse(cleaned);
+        if (parsed && typeof parsed === "object") {
+          pretty = JSON.stringify(parsed, null, 2);
+        }
+      } catch (_e) {
+        /* not JSON -- fall through to raw text */
+      }
+    }
+  }
+  const body = document.createElement("span");
+  body.textContent = pretty;
+  block.appendChild(body);
+  return block;
+}
