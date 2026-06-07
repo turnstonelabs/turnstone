@@ -27,7 +27,6 @@ import {
   stripAnsi,
   buildWatchResultCard,
   buildSystemNudgeMarker,
-  normalizeRiskLevel,
   buildConvBatchShell,
   buildConvRow,
   buildConvCmd,
