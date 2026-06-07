@@ -66,6 +66,7 @@ export class PaneManager {
     this.caps = opts.caps || {};
     this.storageKey = opts.storageKey || "ts.shell.panes";
     this._types = new Map(); // type -> factory(id) => ShellPane
+    this._gates = new Map(); // type -> { canOpen, onDeny } create-time auth gate
     this._panes = new Map(); // paneId -> ShellPane
     this._order = []; // paneId[] — tab order
     this._activeId = null;
@@ -85,6 +86,16 @@ export class PaneManager {
   /** Register a pane type with a factory; `factory(id)` returns a ShellPane. */
   registerType(type, factory) {
     this._types.set(type, factory);
+  }
+
+  /** Attach a create-time auth gate to a registered type: `opts.canOpen(id)` —
+   *  a falsy return denies a NEW pane (focusing an already-open one is never
+   *  re-gated) — and `opts.onDeny(id)`, the deny feedback (e.g. a toast).  Kept
+   *  separate from registerType so the existing 2-arg registrations stay
+   *  untouched, and so PaneManager owns no scope knowledge (the shell supplies
+   *  the predicate). */
+  setAuthGate(type, opts) {
+    if (opts) this._gates.set(type, opts);
   }
 
   hasType(type) {
@@ -133,10 +144,11 @@ export class PaneManager {
     return out;
   }
 
-  /** Create the pane if absent, then focus it.  Auth/cap gating is the caller's.
-   *  `extra` is an optional open-time hint passed straight to the factory (e.g.
-   *  the interactive pane's `{nodeId}` from a rail click); it is NOT persisted,
-   *  so a factory must be able to re-derive it on rehydrate. */
+  /** Create the pane if absent, then focus it.  Creation is auth-gated by the
+   *  type's registered `canOpen` (deny -> no pane); focusing an already-open pane
+   *  is never re-gated.  `extra` is an optional open-time hint passed straight to
+   *  the factory (e.g. the interactive pane's `{nodeId}` from a rail click); it is
+   *  NOT persisted, so a factory must be able to re-derive it on rehydrate. */
   openPane(type, id, extra) {
     if (!this._types.has(type)) {
       console.warn("PaneManager: unknown pane type", type);
@@ -145,6 +157,13 @@ export class PaneManager {
     const paneId = id == null ? type : type + ":" + id;
     let pane = this._panes.get(paneId);
     if (!pane) {
+      // Auth gate runs only on CREATE — a denied pane is never built (the backend
+      // enforces the scope too; this just avoids opening a doomed pane).
+      const gate = this._gates.get(type);
+      if (gate && gate.canOpen && !gate.canOpen(id)) {
+        if (gate.onDeny) gate.onDeny(id);
+        return null;
+      }
       pane = this._types.get(type)(id, extra);
       // normalise identity in case the factory left it unset
       pane.type = type;

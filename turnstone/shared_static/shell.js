@@ -428,6 +428,20 @@ async function mountShell() {
         };
         return pane;
       });
+      // Coordinator panes need the admin.coordinator scope (the SAME gate the
+      // launcher + saved-list use).  Deny -> no pane; the rail / child-link /
+      // rehydrate open paths all route through openPane, so this gates them all at
+      // once.  The backend enforces the scope too — this just avoids opening a
+      // doomed pane.  Fail-open if the helper is somehow absent (the backend still
+      // catches it); a present helper returning false is the real deny.
+      pm.setAuthGate("coordinator", {
+        canOpen: () =>
+          typeof window._hasCoordPermission !== "function" ||
+          window._hasCoordPermission(),
+        onDeny: () =>
+          window.showToast &&
+          window.showToast("admin.coordinator permission required", "warning"),
+      });
     } catch (e) {
       console.error("L-shell: coordinator pane unavailable", e);
     }

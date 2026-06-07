@@ -434,3 +434,29 @@ def test_step7_new_tab_launcher_button() -> None:
     assert "window.showHome()" in shell, "[+] must focus the persona launcher (showHome)"
     css = _SHELL_CSS.read_text(encoding="utf-8")
     assert ".tab-add" in css, "the .tab-add button style must exist (from the scaffold)"
+
+
+def test_step7_auth_gated_open_pane() -> None:
+    """Step 7 #4: openPane auth-gates CREATION via a per-type canOpen predicate
+    (deny -> no pane; focusing an already-open pane is never re-gated).  The shell
+    supplies the gate so PaneManager stays generic.  The coordinator type gates on
+    the admin.coordinator scope (the SAME sessionStorage-backed helper the launcher
+    uses — survives refresh, so rehydrate gates correctly), covering the rail /
+    child-link / rehydrate open paths at once."""
+    pane = _PANE_JS.read_text(encoding="utf-8")
+    assert "this._gates" in pane, "PaneManager must hold a per-type auth-gate map"
+    assert "setAuthGate(type, opts)" in pane, (
+        "PaneManager must expose setAuthGate (kept separate from the 2-arg registerType)"
+    )
+    assert "gate.canOpen" in pane and "gate.onDeny" in pane, (
+        "openPane must consult canOpen on create and call onDeny on deny"
+    )
+    # the legacy factory-call shape (open-time hint threading) is preserved
+    assert "this._types.get(type)(id, extra)" in pane
+    shell = _SHELL_JS.read_text(encoding="utf-8")
+    assert "_hasCoordPermission" in shell, (
+        "the coordinator pane must gate on the admin.coordinator scope helper"
+    )
+    assert "canOpen:" in shell and "onDeny:" in shell, (
+        "the coordinator registerType must supply the auth gate"
+    )
