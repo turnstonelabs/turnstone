@@ -219,6 +219,7 @@ function createCoordinatorPane(root, wsId, opts) {
   const composerMount = root.querySelector("#coord-composer-mount");
   const composer = new Composer(composerMount, {
     sendGlyph: "\u2191",
+    layout: "stacked",
     modelChip: true,
     placeholder: "Message the coordinator\u2026",
     ariaLabel: "Coordinator input",

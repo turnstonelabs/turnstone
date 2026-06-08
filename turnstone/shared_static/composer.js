@@ -144,6 +144,9 @@
     root.className = "composer";
     var layout = opts.layout === "stacked" ? "stacked" : "inline";
     if (layout === "stacked") root.classList.add("composer--stacked");
+    // Chat composers (the model-chip hosts) get the mock's compact rounded
+    // composer box; the home launcher (no model chip) keeps its plain panel.
+    if (opts.modelChip) root.classList.add("composer--chat");
     this.el = root;
 
     // Attachment chips row — always present in the DOM when attachments
@@ -200,7 +203,7 @@
     }
     this.attachBtn = makeButton({
       className: "composer-attach",
-      text: "\ud83d\udcce",
+      text: "+",
       ariaLabel: "Attach files",
       title: "Attach files",
     });

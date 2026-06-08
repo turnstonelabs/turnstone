@@ -405,6 +405,47 @@
   margin-left: auto;
 }
 
+/* Chat composers (interactive + coordinator) = the mock's compact rounded
+   "composer box": one bordered surface holding the borderless textarea on top
+   and the [+] / model-chip / send row below.  Scoped to .composer--chat (the
+   model-chip hosts) so the home launcher's taller stacked composer is untouched. */
+.composer--chat {
+  margin: 0 12px 10px;
+  padding: 8px 11px;
+  gap: 6px;
+  background: var(--bg-surface);
+  border: 1px solid var(--border-strong);
+  border-top: 1px solid var(--border-strong);
+  border-radius: var(--radius);
+}
+.composer--chat.composer--stacked .composer-input {
+  /* Borderless — the box is the frame; the textarea is a compact 1-line input
+     that auto-grows (no 72px form-style min-height). */
+  min-height: 30px;
+  border: none;
+  background: none;
+  padding: 2px 0;
+}
+.composer--chat.composer--stacked .composer-input:focus-visible {
+  box-shadow: none;
+  border: none;
+  outline: none;
+}
+/* Plain "+" attach glyph (mock) — no button chrome. */
+.composer--chat .composer-attach {
+  border: none;
+  background: none;
+  color: var(--fg-dim);
+  font-size: 18px;
+  padding: 0 3px;
+  height: auto;
+}
+.composer--chat .composer-attach:hover {
+  background: none;
+  color: var(--accent);
+  border: none;
+}
+
 /* ============================================================
    Options disclosure — toggle button + collapsible panel.
    Rendered when the composer is constructed with opts.options.

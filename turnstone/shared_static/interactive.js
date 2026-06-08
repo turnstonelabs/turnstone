@@ -772,6 +772,7 @@ class Pane {
     // attach/paste/drop callbacks.
     this.composer = new Composer(this.el, {
       sendGlyph: "\u2191",
+      layout: "stacked",
       modelChip: true,
       attachments: {
         onAttach: (file) => {
