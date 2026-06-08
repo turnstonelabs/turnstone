@@ -1639,6 +1639,93 @@ function loadSavedCoordinators() {
     });
 }
 
+// Restore a saved interactive session from the console onto a compute node.
+// Origin-FIRST: rehydrate on the session's origin node (the saved DTO's
+// node_id, stamped at create) whenever it is still reachable.  This keeps
+// node affinity and, crucially, REUSES a session already live on its origin
+// instead of loading a duplicate copy elsewhere; the interactive pane talks
+// directly to /node/{id} for every verb, so the load-node and the pane-node
+// must be the same node (no split-brain).  Only when the origin is gone
+// (POST /open 404 = node not in registry / 502 = unreachable) do we re-home
+// onto a fresh rendezvous node via GET /v1/api/route (the router skips dead
+// nodes; persistence is shared ws_id-keyed Postgres, so any live node is
+// state-safe).  Rehydrating is required, not just node selection: the
+// per-pane SSE /events 404s on a not-loaded ws and /history alone will not
+// load it.  Mirrors the coordinator open-before-navigate and the standalone
+// dashboardResumeSession.
+function restoreInteractiveSession(wsId, originNodeId, rowEl) {
+  const pm = window.TS_SHELL && window.TS_SHELL.panes;
+  if (rowEl) rowEl.classList.add("is-busy");
+  const clearBusy = function () {
+    if (rowEl) rowEl.classList.remove("is-busy");
+  };
+  const failToast = function (status) {
+    clearBusy();
+    if (status === 429)
+      showToast("Node at capacity; close a session and retry");
+    else if (status === 403) showToast("Not permitted to restore this session");
+    else showToast("Failed to restore session (" + status + ")");
+  };
+  // Rehydrate on a specific node, then pin the pane to that SAME node.
+  // Resolves true on success, else the failing HTTP status.
+  const openOn = function (nodeId) {
+    return authFetch(
+      "/node/" +
+        encodeURIComponent(nodeId) +
+        "/v1/api/workstreams/" +
+        encodeURIComponent(wsId) +
+        "/open",
+      { method: "POST" },
+    ).then(function (r) {
+      if (!r.ok) return r.status;
+      clearBusy();
+      if (pm) pm.openPane("interactive", wsId, { nodeId: nodeId });
+      return true;
+    });
+  };
+  // Re-home onto a live rendezvous node (router skips the dead origin) when
+  // there is no origin or the origin node is gone.
+  const routeFallback = function () {
+    return authFetch("/v1/api/route?ws_id=" + encodeURIComponent(wsId))
+      .then(function (r) {
+        if (!r.ok) {
+          clearBusy();
+          showToast(
+            r.status === 503
+              ? "No nodes available to restore this session"
+              : "Could not locate session node (" + r.status + ")",
+          );
+          return null;
+        }
+        return r.json();
+      })
+      .then(function (route) {
+        if (!route) return;
+        if (!route.node_id) {
+          clearBusy();
+          showToast("Could not locate session node");
+          return;
+        }
+        return openOn(route.node_id).then(function (res) {
+          if (res !== true) failToast(res);
+        });
+      });
+  };
+  // Origin first; 404/502 (origin gone) -> rendezvous fallback.  Capacity
+  // (429) / permission (403) are surfaced, NOT silently re-homed.
+  const flow = originNodeId
+    ? openOn(originNodeId).then(function (res) {
+        if (res === true) return;
+        if (res === 404 || res === 502) return routeFallback();
+        failToast(res);
+      })
+    : routeFallback();
+  flow.catch(function () {
+    clearBusy();
+    showToast("Failed to restore session");
+  });
+}
+
 // Saved Coordinators table — same shared createSavedTable as the server UI
 // (/shared/cards.js), with a CHILDREN column instead of MSGS and the
 // body-keyed (router-proxied) delete.  Activation POSTs /open before
@@ -1688,11 +1775,23 @@ const _coordTable = createSavedTable({
     // clicks open tabs, not full-page nav).  Fall back to full-page nav only if
     // the shell isn't present.
     const pm = window.TS_SHELL && window.TS_SHELL.panes;
-    // Interactive sessions live on a compute node (node-proxied pane); no
-    // warm-pool /open — that is a coordinator concern.
+    // Interactive sessions live on a compute node and, unlike coordinators,
+    // have no warm pool: a dormant one must be routed to a live node and
+    // rehydrated there before its pane can stream (see
+    // restoreInteractiveSession).  Shell-absent falls back to a best-effort
+    // full-page nav to the origin node, whose detail page rehydrates lazily.
     if (s.kind !== "coordinator") {
-      if (!s.node_id) showToast("Session node unknown");
-      else if (pm) pm.openPane("interactive", s.ws_id, { nodeId: s.node_id });
+      if (pm) {
+        restoreInteractiveSession(s.ws_id, s.node_id, rowEl);
+      } else if (s.node_id) {
+        window.location.href =
+          "/node/" +
+          encodeURIComponent(s.node_id) +
+          "/?ws_id=" +
+          encodeURIComponent(s.ws_id);
+      } else {
+        showToast("Session node unknown");
+      }
       return;
     }
     // POST /open BEFORE navigating so capacity issues surface as a toast
