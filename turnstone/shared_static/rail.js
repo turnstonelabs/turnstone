@@ -59,6 +59,10 @@ function tagFor(kind) {
 
 // ---- Cluster section -------------------------------------------------------
 
+// Node-list collapse state — persisted across Tier-1 re-renders (the rail
+// re-renders on every snapshot).  Click the "Nodes" header to toggle.
+let _nodesCollapsed = false;
+
 function renderCluster(root, cs, TS) {
   root.replaceChildren();
   const card = document.createElement("div");
@@ -111,9 +115,15 @@ function renderCluster(root, cs, TS) {
     const wrap = document.createElement("div");
     wrap.className = "cluster-nodes";
 
-    const label = document.createElement("div");
+    const label = document.createElement("button");
+    label.type = "button";
     label.className = "nlabel";
-    label.append(document.createTextNode("Nodes · " + nodes.length));
+    label.setAttribute("aria-expanded", _nodesCollapsed ? "false" : "true");
+    const ncaret = document.createElement("span");
+    ncaret.className = "nlabel-caret";
+    ncaret.setAttribute("aria-hidden", "true");
+    ncaret.textContent = "\u25be";
+    label.append(ncaret, document.createTextNode("Nodes · " + nodes.length));
     const driftCount = (overview.versions || []).length;
     if (overview.version_drift && driftCount > 1) {
       const drift = document.createElement("span");
@@ -123,6 +133,15 @@ function renderCluster(root, cs, TS) {
       label.append(drift);
     }
     wrap.append(label);
+
+    const nodeList = document.createElement("div");
+    nodeList.className = "cluster-node-list";
+    nodeList.hidden = _nodesCollapsed;
+    label.addEventListener("click", () => {
+      _nodesCollapsed = !_nodesCollapsed;
+      nodeList.hidden = _nodesCollapsed;
+      label.setAttribute("aria-expanded", _nodesCollapsed ? "false" : "true");
+    });
 
     for (const info of nodes) {
       const item = document.createElement("button");
@@ -151,8 +170,9 @@ function renderCluster(root, cs, TS) {
         window.location.href =
           "/node/" + encodeURIComponent(info.node_id) + "/";
       });
-      wrap.append(item);
+      nodeList.append(item);
     }
+    wrap.append(nodeList);
     card.append(wrap);
   }
 

@@ -272,6 +272,10 @@ async function mountShell() {
   addTab.addEventListener("click", () => {
     if (typeof window.showHome === "function") window.showHome();
     else pm.openPane("dashboard");
+    // Land in the launcher composer so "new session" is immediately typeable —
+    // showHome on the already-active Dashboard is otherwise a no-op.
+    if (window.TS_APP && typeof window.TS_APP.focusLauncher === "function")
+      window.TS_APP.focusLauncher();
   });
   shell.tail.append(addTab);
 

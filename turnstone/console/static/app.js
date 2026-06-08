@@ -849,15 +849,17 @@ function _renderWsRow(ws, opts, container) {
   row.appendChild(sub);
 
   // Deep link: click opens proxied server UI at this workstream.
-  // Coordinator rows route to /coordinator/{ws_id}; node-backed
-  // workstreams route to the proxied /node/{node_id}/?ws_id=X UI.
+  // Row clicks open an L-shell PANE (coordinator → coordinator pane; node-backed
+  // → node-proxied interactive pane); full-page nav is the shell-absent fallback.
   const wsNodeId = ws.node;
   if (opts.isCoordinator || ws.kind === "coordinator") {
     row.classList.add("has-link");
     (function (wsId) {
       row.onclick = function () {
-        if (wsId)
-          window.location.href = "/coordinator/" + encodeURIComponent(wsId);
+        if (!wsId) return;
+        const pm = window.TS_SHELL && window.TS_SHELL.panes;
+        if (pm) pm.openPane("coordinator", wsId);
+        else window.location.href = "/coordinator/" + encodeURIComponent(wsId);
       };
       row.onkeydown = function (e) {
         if (e.key === "Enter" || e.key === " ") {
@@ -870,11 +872,14 @@ function _renderWsRow(ws, opts, container) {
     row.classList.add("has-link");
     (function (nodeId, wsId) {
       row.onclick = function () {
-        window.location.href =
-          "/node/" +
-          encodeURIComponent(nodeId) +
-          "/?ws_id=" +
-          encodeURIComponent(wsId);
+        const pm = window.TS_SHELL && window.TS_SHELL.panes;
+        if (pm) pm.openPane("interactive", wsId, { nodeId: nodeId });
+        else
+          window.location.href =
+            "/node/" +
+            encodeURIComponent(nodeId) +
+            "/?ws_id=" +
+            encodeURIComponent(wsId);
       };
       row.onkeydown = function (e) {
         if (e.key === "Enter" || e.key === " ") {
@@ -1679,18 +1684,15 @@ const _coordTable = createSavedTable({
     );
   },
   onActivate: function (s, rowEl) {
-    // Interactive sessions live on a compute node — open the node's session
-    // view directly (no warm-pool /open; that is a coordinator concern).
+    // Open the session as an L-shell PANE (the renovation: rail + saved-list
+    // clicks open tabs, not full-page nav).  Fall back to full-page nav only if
+    // the shell isn't present.
+    const pm = window.TS_SHELL && window.TS_SHELL.panes;
+    // Interactive sessions live on a compute node (node-proxied pane); no
+    // warm-pool /open — that is a coordinator concern.
     if (s.kind !== "coordinator") {
-      if (s.node_id) {
-        window.location.href =
-          "/node/" +
-          encodeURIComponent(s.node_id) +
-          "/?ws_id=" +
-          encodeURIComponent(s.ws_id);
-      } else {
-        showToast("Session node unknown");
-      }
+      if (!s.node_id) showToast("Session node unknown");
+      else if (pm) pm.openPane("interactive", s.ws_id, { nodeId: s.node_id });
       return;
     }
     // POST /open BEFORE navigating so capacity issues surface as a toast
@@ -1701,7 +1703,11 @@ const _coordTable = createSavedTable({
     })
       .then(function (r) {
         if (r.ok) {
-          window.location.href = "/coordinator/" + encodeURIComponent(s.ws_id);
+          if (rowEl) rowEl.classList.remove("is-busy");
+          if (pm) pm.openPane("coordinator", s.ws_id);
+          else
+            window.location.href =
+              "/coordinator/" + encodeURIComponent(s.ws_id);
           return;
         }
         if (rowEl) rowEl.classList.remove("is-busy");
@@ -1811,6 +1817,14 @@ window.TS_APP.bucketByParent = function (list) {
 };
 window.TS_APP.buildNodeInfo = function (node) {
   return buildNodeInfoFromSnapshot(node);
+};
+// Focus the persona launcher's composer — the [+] new-session button calls this
+// after showHome so "new session" lands you ready to type (showHome alone, on the
+// already-active Dashboard, is a no-op).  _ensureHomeComposerInit (run by
+// showHome) has set _homeCoordComposer by the time this fires.
+window.TS_APP.focusLauncher = function () {
+  if (_homeCoordComposer && typeof _homeCoordComposer.focus === "function")
+    _homeCoordComposer.focus();
 };
 window.TS_APP.boot = function () {
   history.replaceState({ view: "home" }, "");
