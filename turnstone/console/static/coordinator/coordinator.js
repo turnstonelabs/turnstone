@@ -38,6 +38,8 @@ import {
   buildConvActions,
   buildConvStatus,
   buildConvResult,
+  batchKicker,
+  indexLabel,
 } from "/shared/conversation.js";
 
 function buildCoordChrome(root, opts) {
@@ -1208,9 +1210,7 @@ function createCoordinatorPane(root, wsId, opts) {
   // string into one place keeps the two paths from drifting on a
   // future label tweak.
   function _pendingKickerText(items) {
-    return items.length >= 2
-      ? "⚠ Approval · Parallel " + items.length
-      : "⚠ Approval";
+    return batchKicker("pending", items.length);
   }
 
   function _buildBatchActions(batch, items) {
@@ -1308,8 +1308,7 @@ function createCoordinatorPane(root, wsId, opts) {
     const kicker = batch.querySelector(".conv-batch-kicker");
     if (kicker) {
       const rowCount = batch.querySelectorAll(".conv-row").length;
-      kicker.textContent =
-        rowCount >= 2 ? "Running · Parallel " + rowCount : "Running";
+      kicker.textContent = batchKicker("running", rowCount);
     }
   }
 
@@ -1333,8 +1332,7 @@ function createCoordinatorPane(root, wsId, opts) {
     const kicker = batch.querySelector(".conv-batch-kicker");
     if (kicker && !batch.classList.contains("conv-batch--pending")) {
       const rowCount = rows.length;
-      kicker.textContent =
-        rowCount >= 2 ? "Parallel · " + rowCount + " tools" : "Tool";
+      kicker.textContent = batchKicker("done", rowCount);
     }
   }
 
@@ -1470,10 +1468,7 @@ function createCoordinatorPane(root, wsId, opts) {
         // kicker already read "Running".
         const runKicker = existing.querySelector(".conv-batch-kicker");
         if (runKicker) {
-          runKicker.textContent =
-            items.length >= 2
-              ? "Running · Parallel " + items.length
-              : "Running";
+          runKicker.textContent = batchKicker("running", items.length);
         }
       } else if (opts.pending) {
         // Already pending — keep the action row, just refresh
@@ -1511,15 +1506,11 @@ function createCoordinatorPane(root, wsId, opts) {
     if (opts.pending) {
       kickerText = _pendingKickerText(items);
     } else if (opts.announce) {
-      kickerText =
-        items.length >= 2
-          ? "Evaluating · Parallel " + items.length
-          : "Evaluating";
+      kickerText = batchKicker("evaluating", items.length);
     } else if (opts.running) {
-      kickerText =
-        items.length >= 2 ? "Running · Parallel " + items.length : "Running";
+      kickerText = batchKicker("running", items.length);
     } else if (items.length >= 2) {
-      kickerText = "Parallel · " + items.length + " tools";
+      kickerText = batchKicker("done", items.length);
     } else {
       kickerText = "Tool";
     }
@@ -1554,8 +1545,8 @@ function createCoordinatorPane(root, wsId, opts) {
     let anyRowError = false;
     const renderedRows = [];
     items.forEach((it, idx) => {
-      const indexLabel = items.length >= 2 ? idx + 1 + "/" + items.length : "";
-      const row = _renderBatchRow(it, indexLabel);
+      const idxLabel = indexLabel(idx, items.length);
+      const row = _renderBatchRow(it, idxLabel);
       batch.appendChild(row);
       renderedRows.push(row);
       if (it.call_id) {

@@ -128,6 +128,24 @@ export function maxSeverityItem(items) {
   return best;
 }
 
+// Kicker text for a tool-batch head, shared so the interactive pane and the
+// coordinator render byte-identical labels.  `state`: "pending" | "evaluating" |
+// "running" | "done" (default/solo).  `n` = tool count.
+export function batchKicker(state, n) {
+  const par = n >= 2;
+  if (state === "pending")
+    return par ? "⚠ Approval · Parallel " + n : "⚠ Approval";
+  if (state === "evaluating")
+    return par ? "Evaluating · Parallel " + n : "Evaluating";
+  if (state === "running") return par ? "Running · Parallel " + n : "Running";
+  return par ? "Parallel · " + n + " tools" : "Tool";
+}
+
+// "1/3"-style index label for a parallel row; "" for a solo batch.
+export function indexLabel(idx, n) {
+  return n >= 2 ? idx + 1 + "/" + n : "";
+}
+
 // ===========================================================================
 // Shared approval-card builders (step 5e.2)
 //

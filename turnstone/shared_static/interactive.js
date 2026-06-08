@@ -34,6 +34,8 @@ import {
   buildConvWarning,
   buildConvActions,
   buildConvStatus,
+  batchKicker,
+  indexLabel,
 } from "./conversation.js";
 
 let _paneCounter = 0;
@@ -2037,9 +2039,7 @@ class Pane {
               (wasDenied ? "conv-batch--denied" : "conv-batch--approved");
             block.appendChild(
               _convApprovalHead(
-                msg.tool_calls.length >= 2
-                  ? "Parallel · " + msg.tool_calls.length + " tools"
-                  : "Tool",
+                batchKicker("done", msg.tool_calls.length),
                 msg.tool_calls.map((tc) => ({ func_name: tc.name })),
               ),
             );
@@ -2070,9 +2070,7 @@ class Pane {
               const item = { func_name: tc.name, call_id: tc.id || "", header };
               const row = buildToolDiv(
                 item,
-                msg.tool_calls.length >= 2
-                  ? idx + 1 + "/" + msg.tool_calls.length
-                  : "",
+                indexLabel(idx, msg.tool_calls.length),
               );
               // Verdict anchored to THIS row; replay verdicts are final.
               if (tc.verdict) {
@@ -2281,17 +2279,10 @@ class Pane {
       list.map((it) => it.call_id).filter(Boolean),
     );
     block.appendChild(
-      _convApprovalHead(
-        list.length >= 2
-          ? "Evaluating · Parallel " + list.length
-          : "Evaluating",
-        list,
-      ),
+      _convApprovalHead(batchKicker("evaluating", list.length), list),
     );
     list.forEach((item, idx) => {
-      block.appendChild(
-        buildToolDiv(item, list.length >= 2 ? idx + 1 + "/" + list.length : ""),
-      );
+      block.appendChild(buildToolDiv(item, indexLabel(idx, list.length)));
       const verdict =
         item.judge_verdict || item.heuristic_verdict || item.verdict;
       if (verdict) {
@@ -2352,24 +2343,15 @@ class Pane {
     block.appendChild(
       _convApprovalHead(
         autoApproved
-          ? items.length >= 2
-            ? "Parallel · " + items.length + " tools"
-            : "Tool"
-          : items.length >= 2
-            ? "⚠ Approval · Parallel " + items.length
-            : "⚠ Approval",
+          ? batchKicker("done", items.length)
+          : batchKicker("pending", items.length),
         items,
       ),
     );
 
     let glowRec = null;
     items.forEach((item, idx) => {
-      block.appendChild(
-        buildToolDiv(
-          item,
-          items.length >= 2 ? idx + 1 + "/" + items.length : "",
-        ),
-      );
+      block.appendChild(buildToolDiv(item, indexLabel(idx, items.length)));
       const verdict =
         item.judge_verdict || item.heuristic_verdict || item.verdict;
       if (verdict) {
