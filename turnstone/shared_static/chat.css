@@ -445,6 +445,20 @@
   font-size: 11px;
   letter-spacing: 0.02em;
 }
+/* Live "model · effort" read-out chip (composer row, between [+] and the
+   textarea).  Deliberately quiet: a compact mono read-out, not a button —
+   no hover/focus affordance because it isn't interactive (a per-session
+   model picker is a separate, deferred task). */
+.composer-model-chip {
+  flex-shrink: 0;
+  white-space: nowrap;
+  color: var(--ink-4);
+  font-family: var(--font-mono);
+  font-size: 11px;
+  padding: 2px 7px;
+  border: 1px solid var(--hair);
+  border-radius: var(--r-sm);
+}
 .composer-options-panel {
   display: grid;
   grid-template-columns: auto 1fr;

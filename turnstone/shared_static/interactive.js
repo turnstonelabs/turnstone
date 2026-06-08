@@ -572,7 +572,6 @@ class Pane {
     StatusBar.paint(
       {
         rootEl: this.statusBarEl,
-        modelEl: this._sbModel,
         tokensEl: this._sbTokens,
         toolsEl: this._sbTools,
         turnsEl: this._sbTurns,
@@ -580,7 +579,23 @@ class Pane {
       evt,
       { alias: this.modelAlias, model: this.model },
     );
+    // Model moved out of the status bar into the composer chip; capture the
+    // (optional) effort off the status event and repaint the chip.
+    this._effort = (evt && evt.effort) || "";
+    this._paintModelChip();
     this._lastStatusEvt = evt;
+  }
+
+  // Paint the composer's "model · effort" read-out chip.  SILENT_EFFORTS
+  // mirror (status_bar.js): "medium" is the implicit default and "" means no
+  // knob — neither is worth showing, so only a non-medium effort appends the
+  // "· effort" suffix.  An empty alias resets the chip to its placeholder.
+  _paintModelChip() {
+    if (!this.composer || !this.composer.setModel) return;
+    const alias = this.modelAlias || this.model || "";
+    const eff =
+      this._effort && this._effort !== "medium" ? " · " + this._effort : "";
+    this.composer.setModel(alias ? alias + eff : "");
   }
 
   isNearBottom() {
@@ -747,10 +762,6 @@ class Pane {
     this.statusBarEl.setAttribute("aria-atomic", "true");
     this.statusBarEl.setAttribute("aria-label", "Workstream status");
 
-    this._sbModel = document.createElement("span");
-    this._sbModel.className = "ws-sb-model";
-    this._sbModel.textContent = "\u2014";
-    this._sbModel.setAttribute("aria-label", "Model");
     this._sbTokens = document.createElement("span");
     this._sbTokens.className = "ws-sb-tokens";
     this._sbTokens.textContent = "0 / \u2014";
@@ -764,7 +775,6 @@ class Pane {
     this._sbTurns.textContent = "turn 0";
     this._sbTurns.setAttribute("aria-label", "Conversation turn");
 
-    this.statusBarEl.appendChild(this._sbModel);
     this.statusBarEl.appendChild(this._sbTokens);
     this.statusBarEl.appendChild(this._sbTools);
     this.statusBarEl.appendChild(this._sbTurns);
@@ -776,6 +786,7 @@ class Pane {
     // attach/paste/drop callbacks.
     this.composer = new Composer(this.el, {
       sendGlyph: "\u2191",
+      modelChip: true,
       attachments: {
         onAttach: (file) => {
           this.attachments.upload(file);
@@ -1283,8 +1294,7 @@ class Pane {
       case "connected":
         this.model = evt.model || "";
         this.modelAlias = evt.model_alias || evt.model || "";
-        this._sbModel.textContent = this.modelAlias || this.model || "—";
-        this._sbModel.title = this.model || "";
+        this._paintModelChip();
         if (evt.skip_permissions) {
           const existing = document.querySelector(".skip-permissions-warning");
           if (!existing) {

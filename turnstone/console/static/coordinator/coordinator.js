@@ -78,12 +78,6 @@ function buildCoordChrome(root, opts) {
     },
     [
       el("span", {
-        id: "coord-sb-model",
-        class: "ws-sb-model",
-        "aria-label": "Model",
-        text: "—",
-      }),
-      el("span", {
         id: "coord-sb-tokens",
         class: "ws-sb-tokens",
         "aria-label": "Token usage",
@@ -225,6 +219,7 @@ function createCoordinatorPane(root, wsId, opts) {
   const composerMount = root.querySelector("#coord-composer-mount");
   const composer = new Composer(composerMount, {
     sendGlyph: "\u2191",
+    modelChip: true,
     placeholder: "Message the coordinator\u2026",
     ariaLabel: "Coordinator input",
     attachments: {
@@ -400,12 +395,12 @@ function createCoordinatorPane(root, wsId, opts) {
   // this turn, conversation turn.  Driven by the connected + status
   // SSE events; mirrors the interactive pane (ui/static/app.js).
   const statusBarEl = root.querySelector("#coord-status-bar");
-  const sbModelEl = root.querySelector("#coord-sb-model");
   const sbTokensEl = root.querySelector("#coord-sb-tokens");
   const sbToolsEl = root.querySelector("#coord-sb-tools");
   const sbTurnsEl = root.querySelector("#coord-sb-turns");
   let coordModel = "";
   let coordModelAlias = "";
+  let coordEffort = "";
   let lastStatusEvt = null;
 
   let evtSource = null;
@@ -1767,7 +1762,6 @@ function createCoordinatorPane(root, wsId, opts) {
     StatusBar.paint(
       {
         rootEl: statusBarEl,
-        modelEl: sbModelEl,
         tokensEl: sbTokensEl,
         toolsEl: sbToolsEl,
         turnsEl: sbTurnsEl,
@@ -1775,7 +1769,23 @@ function createCoordinatorPane(root, wsId, opts) {
       evt,
       { alias: coordModelAlias, model: coordModel },
     );
+    // Model moved out of the status bar into the composer chip; capture the
+    // (optional) effort off the status event and repaint the chip.
+    coordEffort = (evt && evt.effort) || "";
+    paintCoordModelChip();
     lastStatusEvt = evt;
+  }
+
+  // Paint the composer's "model · effort" read-out chip.  SILENT_EFFORTS
+  // mirror (status_bar.js): "medium" is the implicit default and "" means no
+  // knob — neither is worth showing, so only a non-medium effort appends the
+  // "· effort" suffix.  An empty alias resets the chip to its placeholder.
+  function paintCoordModelChip() {
+    if (!composer || !composer.setModel) return;
+    const alias = coordModelAlias || coordModel || "";
+    const eff =
+      coordEffort && coordEffort !== "medium" ? " · " + coordEffort : "";
+    composer.setModel(alias ? alias + eff : "");
   }
 
   function coordSend() {
@@ -2410,8 +2420,7 @@ function createCoordinatorPane(root, wsId, opts) {
         // runs unconditionally on subscribe.
         coordModel = ev.model || "";
         coordModelAlias = ev.model_alias || ev.model || "";
-        sbModelEl.textContent = coordModelAlias || coordModel || "—";
-        sbModelEl.title = coordModel || "";
+        paintCoordModelChip();
         break;
       case "status":
         // Live token / context / tool / turn counters.  Replayed once

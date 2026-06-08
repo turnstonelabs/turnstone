@@ -182,6 +182,7 @@
     this.actionsRowEl = actionRow;
 
     this._buildAttachButton(actionRow, opts);
+    this._buildModelChip(actionRow, opts);
     this._buildInput(textRow, opts);
     this._buildOptionsToggle(actionRow, opts);
     this._buildSendButton(actionRow, opts);
@@ -211,6 +212,30 @@
     this.attachInput.style.display = "none";
     this.attachInput.accept = opts.attachments.accept || ATTACH_DEFAULT_ACCEPT;
     row.appendChild(this.attachInput);
+  };
+
+  // Live "model · effort" read-out chip — sits between the attach button and
+  // the textarea (matching the mock ``[+] [model · effort] input [↑]``).
+  // DISPLAY ONLY: a plain span the caller repaints via setModel() from the
+  // connected/status SSE events.  A per-session model/effort PICKER (turning
+  // this into an interactive dropdown) is a separate, deferred task; until
+  // then this is intentionally non-interactive.
+  Composer.prototype._buildModelChip = function (row, opts) {
+    if (!opts.modelChip) {
+      this.modelChipEl = null;
+      return;
+    }
+    this.modelChipEl = document.createElement("span");
+    this.modelChipEl.className = "composer-model-chip";
+    this.modelChipEl.setAttribute("aria-label", "Model");
+    this.modelChipEl.textContent = "—";
+    row.appendChild(this.modelChipEl);
+  };
+
+  // Repaint the model chip's read-out (e.g. "gpt-5 · high").  A falsy label
+  // resets it to the em-dash placeholder.  No-op when the chip is disabled.
+  Composer.prototype.setModel = function (label) {
+    if (this.modelChipEl) this.modelChipEl.textContent = label || "—";
   };
 
   Composer.prototype._buildInput = function (row, opts) {
@@ -751,6 +776,7 @@
     this.chipsEl = null;
     this.attachBtn = null;
     this.attachInput = null;
+    this.modelChipEl = null;
     this.optionsBtn = null;
     this.optionsPanel = null;
     this.optionsSummaryEl = null;
