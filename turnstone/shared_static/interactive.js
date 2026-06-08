@@ -119,6 +119,17 @@ function _toolAnnounceText(items) {
   return head + ". You can stop " + (n === 1 ? "it" : "them") + ".";
 }
 
+// Resolve a live call_id target as the LAST matching element, not the first.
+// The interactive pane is strictly serial, so a result/verdict/warning/chunk
+// belongs to the MOST-RECENT card with that call_id; a local model that reuses
+// tool-call ids across turns would otherwise route a pane-wide first-match
+// lookup into an earlier turn's card (corrupting it + leaving the current one
+// empty).  Mirrors the scoped lookup the replay path already uses.
+function _lastMatch(root, selector) {
+  const all = root.querySelectorAll(selector);
+  return all.length ? all[all.length - 1] : null;
+}
+
 // Default host adapter — console-safe no-ops so a bare ``new Pane(wsId)`` never
 // throws on a shell-only seam.  The standalone shell (app.js) and the console
 // factory (createInteractivePane) each pass a richer host.
@@ -409,7 +420,8 @@ class Pane {
 
     const escapedId = callId ? CSS.escape(callId) : "";
     let el = escapedId
-      ? this.messagesEl.querySelector(
+      ? _lastMatch(
+          this.messagesEl,
           '.tool-output-stream[data-call-id="' + escapedId + '"]',
         )
       : null;
@@ -451,7 +463,8 @@ class Pane {
   showOutputWarning(evt) {
     if (!evt.call_id || evt.risk_level === "none") return;
     const escapedId = CSS.escape(evt.call_id);
-    const toolDiv = this.messagesEl.querySelector(
+    const toolDiv = _lastMatch(
+      this.messagesEl,
       '.conv-row[data-call-id="' + escapedId + '"]',
     );
     if (!toolDiv) return;
@@ -482,7 +495,8 @@ class Pane {
   updateVerdictBadge(verdict) {
     if (!verdict || !verdict.call_id) return;
     const escapedId = CSS.escape(verdict.call_id);
-    const badge = this.messagesEl.querySelector(
+    const badge = _lastMatch(
+      this.messagesEl,
       '.conv-verdict[data-call-id="' + escapedId + '"]',
     );
     if (!badge) {
@@ -2426,7 +2440,8 @@ class Pane {
   appendToolOutput(callId, name, output, isError) {
     const escapedId = callId ? CSS.escape(callId) : "";
     let target = escapedId
-      ? this.messagesEl.querySelector(
+      ? _lastMatch(
+          this.messagesEl,
           '.conv-row[data-call-id="' + escapedId + '"]',
         )
       : null;
@@ -2448,7 +2463,8 @@ class Pane {
     // Remove the streaming output element for this tool
     let streamEl = null;
     if (escapedId) {
-      streamEl = this.messagesEl.querySelector(
+      streamEl = _lastMatch(
+        this.messagesEl,
         '.tool-output-stream[data-call-id="' + escapedId + '"]',
       );
     } else {
