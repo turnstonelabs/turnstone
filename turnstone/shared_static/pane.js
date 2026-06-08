@@ -135,6 +135,16 @@ export class PaneManager {
     pane._glyphEl = el;
   }
 
+  /** Update a tab's label text in place.  The shell drives this from Tier-1 so a
+   *  conversational tab tracks its workstream's live NAME instead of freezing at
+   *  the open-time id; pane.title is updated too so a later tab rebuild keeps it. */
+  setTabTitle(paneId, text) {
+    const pane = this._panes.get(paneId);
+    if (!pane || text == null || text === "") return;
+    pane.title = text;
+    if (pane._titleNode) pane._titleNode.textContent = text;
+  }
+
   /** Open panes whose tab shows live Tier-1 state — `{id, rawId}[]` (the shell
    *  repaints these on every Tier-1 render). */
   statefulTabs() {
@@ -306,7 +316,9 @@ export class PaneManager {
       tab.append(g);
       pane._glyphEl = g;
     }
-    tab.append(document.createTextNode(pane.title));
+    const titleNode = document.createTextNode(pane.title);
+    tab.append(titleNode);
+    pane._titleNode = titleNode; // setTabTitle repaints this from Tier-1
     // Tab-action menu (step 7): a pane that exposes `tabMenu()` gets a caret to
     // the right of its label that opens the action dropdown (the three-verb close
     // + per-persona verbs).  The Dashboard home tab exposes none, so it gets no

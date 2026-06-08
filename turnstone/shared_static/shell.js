@@ -159,6 +159,19 @@ function paintConvTabGlyphs(pm) {
     pm.setTabGlyph(t.id, glyph(stateForWs(t.rawId)));
 }
 
+// Repaint conversational tabs' labels from Tier-1 so a tab tracks its
+// workstream's live name.  The open-time title is the id-slice for a session not
+// yet in the snapshot (e.g. a just-restored saved one); this upgrades it to the
+// real name once it lands.  Only ever UPGRADE to a name — never flicker a known
+// name back to the id if the ws blips out of a single frame.
+function paintConvTabTitles(pm) {
+  for (const t of pm.statefulTabs()) {
+    const f = findWs(t.rawId, false);
+    const name = f && (f.ws.name || f.ws.title);
+    if (name) pm.setTabTitle(t.id, name);
+  }
+}
+
 // Tab-action menu items for a conversational pane — the three-verb close plus
 // the per-persona verbs.  Pane-type-derived AND deployment-aware: a verb appears
 // only when its handler exists here, so the SAME shell yields the full menu in
@@ -519,6 +532,7 @@ async function mountShell() {
   if (window.TS_APP && typeof window.TS_APP.onRender === "function") {
     window.TS_APP.onRender(() => {
       paintConvTabGlyphs(pm);
+      paintConvTabTitles(pm);
       refreshUser();
     });
   }
