@@ -834,6 +834,10 @@ class Pane {
     getVoiceRoles(this._base).then((roles) => {
       this._voiceRoles = roles;
       if (this._micBtn) this._micBtn.style.display = roles.stt ? "" : "none";
+      // Right-align the mic next to send (instead of stranded by the model
+      // chip) only when STT is actually available; .has-mic drives the CSS.
+      if (this.composer && this.composer.actionsRowEl)
+        this.composer.actionsRowEl.classList.toggle("has-mic", !!roles.stt);
     });
   }
 

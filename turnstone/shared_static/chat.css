@@ -445,6 +445,16 @@
   color: var(--accent);
   border: none;
 }
+/* STT enabled: the mic button leads the right-aligned action cluster (mic +
+   send) rather than stranding on the left next to the model chip.  The action
+   row gets .has-mic when the STT role is confirmed (interactive.js); without it,
+   send keeps its own margin-left:auto and sits alone on the right. */
+.composer-row.has-mic .composer-mic-btn {
+  margin-left: auto;
+}
+.composer-row.has-mic .composer-send {
+  margin-left: 0;
+}
 
 /* ============================================================
    Options disclosure — toggle button + collapsible panel.
