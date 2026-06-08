@@ -40,7 +40,10 @@
   padding: 13px;
   display: flex;
   flex-direction: column;
-  gap: 5px;
+  /* Trimmed from 5px: the .msg turn boxes already carry a 4px margin-bottom, so
+     a 5px flex gap stacked ~9px of dead space between segments ("too thick").
+     2px gap + the 4px element margin lands at a compact ~6px between turns. */
+  gap: 2px;
 }
 .pane--embedded .ws-status-bar {
   flex-shrink: 0;
