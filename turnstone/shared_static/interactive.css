@@ -45,6 +45,16 @@
      2px gap + the 4px element margin lands at a compact ~6px between turns. */
   gap: 2px;
 }
+/* The message list is a SCROLLING flex column (overflow-y:auto), so its children
+   must size to content and never shrink.  Without this, an `overflow:hidden`
+   card — the .conv-batch tool block — has its flex `min-height:auto` resolve to
+   0 and gets squished to a ~2px stripe (just its border) once the column fills,
+   while plain .msg blocks (overflow visible) keep their height.  That asymmetry
+   is the "tool calls collapse to an empty stripe" regression; pinning every row
+   makes the column scroll instead. */
+.pane--embedded .pane-messages > * {
+  flex-shrink: 0;
+}
 .pane--embedded .ws-status-bar {
   flex-shrink: 0;
 }

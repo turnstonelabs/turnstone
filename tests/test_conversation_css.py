@@ -16,6 +16,7 @@ from pathlib import Path
 
 _ROOT = Path(__file__).resolve().parent.parent
 _CSS = _ROOT / "turnstone/shared_static/conversation.css"
+_INTERACTIVE_CSS = _ROOT / "turnstone/shared_static/interactive.css"
 _PAGES = (
     _ROOT / "turnstone/console/static/index.html",
     _ROOT / "turnstone/console/static/coordinator/index.html",
@@ -46,6 +47,21 @@ def test_core_selectors_present() -> None:
         assert sel + " " in body or sel + "," in body or sel + "{" in body, (
             f"conversation.css missing {sel}"
         )
+
+
+def test_pane_messages_pins_children_flex_shrink() -> None:
+    """Regression guard: tool cards collapsing to a ~2px empty stripe.  The
+    interactive message list is a SCROLLING flex column, and .conv-batch sets
+    ``overflow:hidden`` — whose flex ``min-height:auto`` resolves to 0, so
+    without an explicit ``flex-shrink:0`` the tool batch gets squished to just
+    its (left-)border once the column fills.  Plain .msg blocks (overflow
+    visible) are immune, which is why the bug looked interactive-only.  Don't
+    drop the pin."""
+    css = _INTERACTIVE_CSS.read_text(encoding="utf-8")
+    sel = ".pane--embedded .pane-messages > *"
+    assert sel in css, f"interactive.css must pin {sel} so cards don't collapse"
+    block = css[css.index(sel) : css.index(sel) + 120]
+    assert "flex-shrink: 0" in block, f"{sel} must set flex-shrink: 0"
 
 
 def test_approve_uses_ok_not_warn() -> None:
