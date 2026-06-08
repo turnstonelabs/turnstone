@@ -713,12 +713,14 @@ function _storePermissions(data) {
   } else {
     sessionStorage.removeItem("turnstone_permissions");
   }
-  // Surface the authenticated identity for the rail footer's user chip.
-  // whoami returns user_id (the username); the shell reads it via ts.username
-  // and repaints once it lands.  Cleared in lockstep with permissions so the
-  // chip never shows a stale user after logout / revocation.
-  if (data && data.user_id) {
-    sessionStorage.setItem("ts.username", data.user_id);
+  // Surface the authenticated identity for the rail footer's user chip.  whoami
+  // returns the human `username` (display name) alongside the opaque user_id;
+  // the shell reads ts.username via displayNameFor and repaints once it lands.
+  // Cleared in lockstep with permissions so the chip never shows a stale user
+  // after logout / revocation.  NO fallback to user_id — that's a uuid, worse
+  // than the generic placeholder.
+  if (data && data.username) {
+    sessionStorage.setItem("ts.username", data.username);
   } else {
     sessionStorage.removeItem("ts.username");
   }

@@ -971,6 +971,12 @@ class TestServerLogin:
             if u == "testuser"
             else None
         )
+        # whoami resolves the human username/display-name by user_id for the UI.
+        mock_storage.get_user.side_effect = lambda uid: (
+            {"user_id": "uid_test", "username": "testuser", "display_name": "Test"}
+            if uid == "uid_test"
+            else None
+        )
         mock_storage.list_user_roles.return_value = [
             {"role_id": "builtin-admin", "scopes": "read,write,approve"}
         ]
@@ -1055,6 +1061,9 @@ class TestServerLogin:
         assert resp.status_code == 200
         data = resp.json()
         assert "exp" in data
+        # whoami surfaces the human display name for the UI, not the opaque
+        # user_id uuid (the rail footer renders this).
+        assert data.get("username") == "Test"
         # Default JWT TTL is 24h; exp should be > now and < now + 25h.
         now = int(time.time())
         assert now < data["exp"] < now + 25 * 3600
@@ -1233,6 +1242,12 @@ class TestConsoleLogin:
                 "display_name": "Test",
             }
             if u == "testuser"
+            else None
+        )
+        # whoami resolves the human username/display-name by user_id for the UI.
+        mock_storage.get_user.side_effect = lambda uid: (
+            {"user_id": "uid_test", "username": "testuser", "display_name": "Test"}
+            if uid == "uid_test"
             else None
         )
         mock_storage.list_user_roles.return_value = [

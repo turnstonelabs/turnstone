@@ -1422,6 +1422,20 @@ async def handle_auth_whoami(request: Request) -> Response:
     resp: dict[str, Any] = {
         "user_id": auth_result.user_id,
     }
+    # Surface the human username / display name for the UI — ``user_id`` is an
+    # opaque uuid, not something to show in the footer.  Best-effort: a storage
+    # miss just omits it, and the client then keeps its generic placeholder
+    # rather than ever rendering the raw uuid.
+    storage = getattr(request.app.state, "auth_storage", None)
+    if storage is not None and auth_result.user_id:
+        try:
+            user = storage.get_user(auth_result.user_id)
+        except Exception:
+            user = None
+        if isinstance(user, dict):
+            display = user.get("display_name") or user.get("username")
+            if display:
+                resp["username"] = display
     if auth_result.permissions:
         resp["permissions"] = ",".join(sorted(auth_result.permissions))
     # Surface the cookie/JWT expiry so the client can schedule refresh.
