@@ -2026,15 +2026,20 @@ class Pane {
             const wasDenied = !!msg.denied;
             const block = document.createElement("div");
             block.className =
-              "conv-batch conv-batch--solo " +
+              "conv-batch " +
+              (msg.tool_calls.length >= 2
+                ? "conv-batch--parallel "
+                : "conv-batch--solo ") +
               (wasDenied ? "conv-batch--denied" : "conv-batch--approved");
             block.appendChild(
               _convApprovalHead(
-                "Tool",
+                msg.tool_calls.length >= 2
+                  ? "Parallel · " + msg.tool_calls.length + " tools"
+                  : "Tool",
                 msg.tool_calls.map((tc) => ({ func_name: tc.name })),
               ),
             );
-            msg.tool_calls.forEach((tc) => {
+            msg.tool_calls.forEach((tc, idx) => {
               // Synthesize the live `item` shape from the stored tool_call so
               // replay renders the SAME .conv-row as the live path.
               let header = "";
@@ -2059,7 +2064,12 @@ class Pane {
                 header = String(tc.arguments || "").substring(0, 100);
               }
               const item = { func_name: tc.name, call_id: tc.id || "", header };
-              const row = buildToolDiv(item);
+              const row = buildToolDiv(
+                item,
+                msg.tool_calls.length >= 2
+                  ? idx + 1 + "/" + msg.tool_calls.length
+                  : "",
+              );
               // Verdict anchored to THIS row; replay verdicts are final.
               if (tc.verdict) {
                 row.appendChild(
@@ -2257,16 +2267,27 @@ class Pane {
       this.announcedBlockEl = null;
     }
     const block = document.createElement("div");
-    block.className = "conv-batch conv-batch--solo";
+    block.className =
+      "conv-batch " +
+      (list.length >= 2 ? "conv-batch--parallel" : "conv-batch--solo");
     // Indeterminate region until the judge/gate resolves; the upgrade in
     // showInlineToolBlock clears aria-busy.
     block.setAttribute("aria-busy", "true");
     block.dataset.callIds = JSON.stringify(
       list.map((it) => it.call_id).filter(Boolean),
     );
-    block.appendChild(_convApprovalHead("Evaluating", list));
-    list.forEach((item) => {
-      block.appendChild(buildToolDiv(item));
+    block.appendChild(
+      _convApprovalHead(
+        list.length >= 2
+          ? "Evaluating · Parallel " + list.length
+          : "Evaluating",
+        list,
+      ),
+    );
+    list.forEach((item, idx) => {
+      block.appendChild(
+        buildToolDiv(item, list.length >= 2 ? idx + 1 + "/" + list.length : ""),
+      );
       const verdict =
         item.judge_verdict || item.heuristic_verdict || item.verdict;
       if (verdict) {
@@ -2317,7 +2338,9 @@ class Pane {
     if (announced) announced.replaceChildren();
     block.removeAttribute("aria-busy");
     block.className =
-      "conv-batch conv-batch--solo" + (autoApproved ? " conv-batch--auto" : "");
+      "conv-batch " +
+      (items.length >= 2 ? "conv-batch--parallel" : "conv-batch--solo") +
+      (autoApproved ? " conv-batch--auto" : "");
     if (!autoApproved) {
       block.setAttribute("role", "alertdialog");
       block.setAttribute("aria-label", "Tool approval required");
@@ -2325,17 +2348,24 @@ class Pane {
     block.appendChild(
       _convApprovalHead(
         autoApproved
-          ? "Tool"
+          ? items.length >= 2
+            ? "Parallel · " + items.length + " tools"
+            : "Tool"
           : items.length >= 2
-            ? "⚠ Approval · " + items.length + " tools"
+            ? "⚠ Approval · Parallel " + items.length
             : "⚠ Approval",
         items,
       ),
     );
 
     let glowRec = null;
-    items.forEach((item) => {
-      block.appendChild(buildToolDiv(item));
+    items.forEach((item, idx) => {
+      block.appendChild(
+        buildToolDiv(
+          item,
+          items.length >= 2 ? idx + 1 + "/" + items.length : "",
+        ),
+      );
       const verdict =
         item.judge_verdict || item.heuristic_verdict || item.verdict;
       if (verdict) {
@@ -2989,11 +3019,13 @@ function _convApprovalHead(kickerText, items) {
   return head;
 }
 
-function buildToolDiv(item) {
+function buildToolDiv(item, indexLabel) {
   // Tool row for the converged card: the shared call line (name + auto tag)
   // plus the bash `$ cmd` / diff preview.  data-func-name is stamped for the
   // append-time finders (buildConvRow already stamps data-call-id/-tool-name).
-  const row = buildConvRow(item, {});
+  // indexLabel ("1/3") numbers parallel rows so the head's "+ N more" reads
+  // as a label, not hidden calls (mirrors the coordinator).
+  const row = buildConvRow(item, indexLabel ? { indexLabel } : {});
   row.dataset.funcName = item.func_name || "";
   row.appendChild(buildConvCmd(item));
   return row;
