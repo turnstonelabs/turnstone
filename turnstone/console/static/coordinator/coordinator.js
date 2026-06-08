@@ -27,7 +27,6 @@
 // shared #toast (the console shell already provides theme + toast).
 // ---------------------------------------------------------------------------
 import {
-  stripAnsi,
   buildWatchResultCard,
   buildSystemNudgeMarker,
   maxSeverityItem,
@@ -1761,8 +1760,9 @@ function createCoordinatorPane(root, wsId, opts) {
       evt,
     );
     // Model moved out of the status bar into the composer chip; capture the
-    // (optional) effort off the status event and repaint the chip.
-    coordEffort = (evt && evt.effort) || "";
+    // (optional) effort off the status event and repaint the chip.  evt is
+    // guaranteed non-null by the early return at the top of updateStatusBar.
+    coordEffort = evt.effort || "";
     paintCoordModelChip();
     lastStatusEvt = evt;
   }

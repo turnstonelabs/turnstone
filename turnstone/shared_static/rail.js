@@ -190,7 +190,9 @@ function sessionRow(ws, childCount, isChild, TS, paneManager, active) {
   const isOpen = !!(active && active.rawId === ws.id);
   btn.className =
     "row" + (isChild ? " row-child" : "") + (isOpen ? " open" : "");
-  const kind = ws.kind || (ws.parent_ws_id ? "interactive" : "interactive");
+  // Tier-1 always stamps `kind` (the snapshot defaults it to "interactive");
+  // the fallback just mirrors that default for a malformed row.
+  const kind = ws.kind || "interactive";
   btn.setAttribute(
     "aria-label",
     (ws.name || ws.title || ws.id) + ", " + (ws.state || "idle") + ", " + kind,

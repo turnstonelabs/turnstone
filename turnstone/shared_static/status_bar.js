@@ -6,13 +6,14 @@
  *
  * Both surfaces consume the same on_status SSE event shape (see
  * turnstone/core/session_ui_base.py SessionUI.on_status) and render
- * the same four cells: model, token / context-window usage with
- * optional effort suffix, tool calls this turn, conversation turn.
+ * the same three cells: token / context-window usage with optional
+ * effort suffix, tool calls this turn, conversation turn.  (The model
+ * cell moved out — both surfaces now show model/effort in the composer chip.)
  *
  * Single source of truth for warn / danger thresholds, prefix glyphs,
  * and effort-suffix rules.  Each surface owns its own DOM (different
- * element ids); the formatter takes the four span elements + the
- * status-bar root + the model strings + the SSE event.
+ * element ids); the formatter takes the three cell spans + the
+ * status-bar root + the SSE event.
  */
 (function (root) {
   "use strict";
@@ -29,7 +30,7 @@
   var SILENT_EFFORTS = { medium: 1, "": 1 };
 
   /**
-   * Repaint the four-cell status bar from an on_status SSE event.
+   * Repaint the three-cell status bar from an on_status SSE event.
    *
    * @param {Object} els — { rootEl, tokensEl, toolsEl, turnsEl }
    * @param {Object} evt — on_status payload (total_tokens, context_window,

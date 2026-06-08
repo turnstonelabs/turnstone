@@ -388,7 +388,9 @@ export class PaneManager {
       }
       return;
     }
-    let j = i;
+    // j is assigned in every branch below before tabs[j] is read (the no-match
+    // case returns first), so no initial value is needed.
+    let j;
     if (e.key === "ArrowRight" || e.key === "ArrowDown")
       j = (i + 1) % tabs.length;
     else if (e.key === "ArrowLeft" || e.key === "ArrowUp")
