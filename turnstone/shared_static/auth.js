@@ -713,6 +713,15 @@ function _storePermissions(data) {
   } else {
     sessionStorage.removeItem("turnstone_permissions");
   }
+  // Surface the authenticated identity for the rail footer's user chip.
+  // whoami returns user_id (the username); the shell reads it via ts.username
+  // and repaints once it lands.  Cleared in lockstep with permissions so the
+  // chip never shows a stale user after logout / revocation.
+  if (data && data.user_id) {
+    sessionStorage.setItem("ts.username", data.user_id);
+  } else {
+    sessionStorage.removeItem("ts.username");
+  }
 }
 
 function _setBusy(busy, label) {

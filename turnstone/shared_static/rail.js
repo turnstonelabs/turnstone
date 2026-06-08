@@ -331,21 +331,21 @@ export function mountManage(root, paneManager) {
   root.replaceChildren();
 
   // If the Admin pane is already open (e.g. restored by PaneManager.rehydrate),
-  // seed the rail to its current tab + expand the owning group; otherwise the
-  // first group expands (mock) and nothing is marked until the user clicks.
+  // seed the rail to its current tab + expand the owning group; otherwise every
+  // group starts collapsed and nothing is marked until the user clicks.
   const adminOpen =
     paneManager && paneManager.hasPane && paneManager.hasPane("admin");
   const activeTab = adminOpen && TS.getActiveTab ? TS.getActiveTab() : null;
 
   const rowByTab = new Map(); // tab -> its row <button>, for active-state sync
 
-  ia.forEach((group, gi) => {
+  ia.forEach((group) => {
     const tabs = group.tabs.filter((t) => allowed(t.tab));
     if (!tabs.length) return; // every tab in the group is gated away, drop it
 
     const expanded = activeTab
       ? group.tabs.some((t) => t.tab === activeTab) // group owning the active tab
-      : gi === 0; // default: first group open (mock)
+      : false; // default: every group collapsed — Manage is a discovery map, not a wall of open links
 
     const grp = document.createElement("div");
     grp.className = "grp";

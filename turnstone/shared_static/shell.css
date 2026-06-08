@@ -395,7 +395,8 @@
   border-color: var(--accent-dim);
   color: var(--ink);
 }
-/* logout starts hidden (app.js toggles it on auth) — keep that behaviour */
+/* The user chip is a menu button (click → Log out); reset native button
+   chrome so it reads as the rail's identity line, not a form control. */
 .user-chip {
   margin-left: auto;
   display: flex;
@@ -403,6 +404,17 @@
   gap: 7px;
   color: var(--ink-3);
   font-size: 12px;
+  padding: 4px 6px;
+  margin-right: -6px;
+  border: none;
+  border-radius: var(--r-sm);
+  background: none;
+  font-family: inherit;
+  cursor: pointer;
+}
+.user-chip:hover {
+  background: var(--panel-2);
+  color: var(--ink);
 }
 .avatar {
   width: 24px;

@@ -237,18 +237,38 @@ async function mountShell() {
     shell.connSlot.replaceWith(statusBarEl);
   }
 
-  // Relocate the header controls into the rail footer (onclick + ids preserved),
-  // then retire the now-empty header.  Order: theme · admin · logout · user.
-  for (const id of ["theme-toggle", "admin-btn", "logout-btn"]) {
-    const btn = document.getElementById(id);
-    if (btn) shell.foot.append(btn);
-  }
-  const userChip = make("span", "user-chip");
-  userChip.append(make("span", "avatar", initialsFor(caps)));
-  const nameEl = make("span", null, displayNameFor(caps));
-  userChip.append(nameEl);
+  // Relocate ONLY the theme toggle into the rail footer (id + onclick
+  // preserved), then retire the now-empty header.  The Admin button is dropped
+  // — Manage already surfaces every admin tab, so a separate footer button is
+  // redundant.  Logout moves into the user menu (the #logout-btn stays in the
+  // hidden header for its wired onclick + auth.js race-guards; the menu clicks it).
+  const themeBtn = document.getElementById("theme-toggle");
+  if (themeBtn) shell.foot.append(themeBtn);
+
+  // User chip = a menu button: click opens a small popup with Log out.  Name +
+  // avatar come from the whoami identity; the chip is built before whoami lands,
+  // so it starts at the "account" placeholder and refreshUser() repaints it once
+  // the real username arrives (see the Tier-1 hook below).
+  const userChip = make("button", "user-chip");
+  userChip.type = "button";
+  userChip.setAttribute("aria-haspopup", "menu");
+  userChip.setAttribute("aria-expanded", "false");
+  const avatarEl = make("span", "avatar", initialsFor(caps));
+  const userNameEl = make("span", "user-name", displayNameFor(caps));
+  userChip.append(avatarEl, userNameEl);
+  userChip.addEventListener("click", (e) => {
+    e.stopPropagation();
+    toggleUserMenu(userChip);
+  });
   shell.foot.append(userChip);
   if (headerEl) headerEl.style.display = "none";
+  const refreshUser = () => {
+    const nm = displayNameFor(caps);
+    if (userNameEl.textContent !== nm) {
+      userNameEl.textContent = nm;
+      avatarEl.textContent = initialsFor(caps);
+    }
+  };
 
   // ----- PaneManager: one new spine -----
   const pm = new PaneManager({
@@ -497,7 +517,10 @@ async function mountShell() {
   // rail agree and the glyph never sits stale at an open-time placeholder.  One
   // Tier-1 writer for the tab glyph; the pane's Tier-2 stream drives its body.
   if (window.TS_APP && typeof window.TS_APP.onRender === "function") {
-    window.TS_APP.onRender(() => paintConvTabGlyphs(pm));
+    window.TS_APP.onRender(() => {
+      paintConvTabGlyphs(pm);
+      refreshUser();
+    });
   }
 
   // Hand off to the legacy boot (login + Tier-1 stream) now that the shell and
@@ -509,6 +532,79 @@ async function mountShell() {
       "L-shell: window.TS_APP.boot is missing — app.js did not load",
     );
   }
+}
+
+// --- Footer user menu (Log out lives here) ---------------------------------
+// A small popup anchored to the rail-footer user chip.  Reuses the .tab-menu
+// popup chrome; the one item clicks the hidden #logout-btn so auth.js stays the
+// single owner of logout (incl. its in-flight-refresh race guards).
+let _userMenuCleanup = null;
+
+function closeUserMenu() {
+  if (_userMenuCleanup) _userMenuCleanup();
+}
+
+function toggleUserMenu(chip) {
+  if (_userMenuCleanup) {
+    closeUserMenu();
+    return;
+  }
+  const menu = document.createElement("div");
+  menu.className = "tab-menu user-menu";
+  menu.setAttribute("role", "menu");
+  menu.setAttribute("aria-label", "Account");
+  const item = document.createElement("button");
+  item.type = "button";
+  item.className = "tab-menu-item destructive";
+  item.setAttribute("role", "menuitem");
+  const label = document.createElement("span");
+  label.className = "tab-menu-label";
+  label.textContent = "Log out";
+  item.append(label);
+  item.addEventListener("click", () => {
+    closeUserMenu();
+    const lb = document.getElementById("logout-btn");
+    if (lb) lb.click();
+  });
+  menu.append(item);
+  document.body.append(menu);
+
+  // Fixed-positioned, popping UP from the chip (the footer sits at the viewport
+  // bottom); flip down only if there is no room above.
+  const ar = chip.getBoundingClientRect();
+  const mr = menu.getBoundingClientRect();
+  let x = ar.left;
+  if (x + mr.width > window.innerWidth) x = window.innerWidth - mr.width - 4;
+  if (x < 4) x = 4;
+  let y = ar.top - mr.height - 4;
+  if (y < 4) y = ar.bottom + 4;
+  menu.style.left = x + "px";
+  menu.style.top = y + "px";
+  chip.setAttribute("aria-expanded", "true");
+
+  const onDown = (e) => {
+    if (!menu.contains(e.target) && !chip.contains(e.target)) closeUserMenu();
+  };
+  const onKey = (e) => {
+    if (e.key === "Escape") {
+      closeUserMenu();
+      chip.focus();
+    }
+  };
+  _userMenuCleanup = () => {
+    document.removeEventListener("mousedown", onDown);
+    document.removeEventListener("keydown", onKey);
+    menu.remove();
+    chip.setAttribute("aria-expanded", "false");
+    _userMenuCleanup = null;
+  };
+  // Defer the listener attach so the click that opened the menu does not
+  // immediately close it.
+  setTimeout(() => {
+    document.addEventListener("mousedown", onDown);
+    document.addEventListener("keydown", onKey);
+  }, 0);
+  item.focus();
 }
 
 function displayNameFor(caps) {
