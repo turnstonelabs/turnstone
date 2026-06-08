@@ -761,6 +761,7 @@ class Pane {
     // pane-specific state) and routes file events through the composer's
     // attach/paste/drop callbacks.
     this.composer = new Composer(this.el, {
+      sendGlyph: "\u2191",
       attachments: {
         onAttach: (file) => {
           this.attachments.upload(file);

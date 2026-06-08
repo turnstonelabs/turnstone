@@ -282,6 +282,15 @@
   background: var(--accent-dim);
   filter: none;
 }
+/* Glyph send (chat composers): a square button showing the send glyph instead
+   of the word "Send"; the textual label lives in aria-label only. */
+.composer-send--glyph {
+  width: 32px;
+  padding: 0;
+  font-size: 16px;
+  font-weight: 400;
+  letter-spacing: 0;
+}
 
 /* Stop button — only rendered when the composer was constructed with
    stopBtn=true.  Distinct red colour signals "interrupt the in-flight

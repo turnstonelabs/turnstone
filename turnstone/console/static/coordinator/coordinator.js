@@ -224,6 +224,7 @@ function createCoordinatorPane(root, wsId, opts) {
   const coordMain = root.querySelector("#coord-main");
   const composerMount = root.querySelector("#coord-composer-mount");
   const composer = new Composer(composerMount, {
+    sendGlyph: "\u2191",
     placeholder: "Message the coordinator\u2026",
     ariaLabel: "Coordinator input",
     attachments: {

@@ -242,9 +242,14 @@
         : opts.queueWhileBusy
           ? "Queue"
           : this._sendLabel;
+    // Glyph mode (chat composers): show a send GLYPH instead of a word.  The
+    // textual sendLabel stays the aria-label and drives setBusy's a11y
+    // rotation, but the visible glyph is constant (setBusy never overwrites it).
+    this._sendGlyph = opts.sendGlyph || null;
     this.sendBtn = makeButton({
-      className: "composer-send",
-      text: this._sendLabel,
+      className:
+        "composer-send" + (this._sendGlyph ? " composer-send--glyph" : ""),
+      text: this._sendGlyph || this._sendLabel,
       ariaLabel: this._sendLabel + " message",
     });
     row.appendChild(this.sendBtn);
@@ -551,7 +556,10 @@
 
     // Label + aria-label rotation — universal so callers can supply a
     // busyLabel regardless of queueWhileBusy mode.
-    this.sendBtn.textContent = b ? this._busyLabel : this._sendLabel;
+    // A glyph send button keeps its constant glyph; only the aria-label
+    // (below) and the queue affordance rotate.  Text buttons rotate the label.
+    if (!this._sendGlyph)
+      this.sendBtn.textContent = b ? this._busyLabel : this._sendLabel;
     var queueAriaLabel = b
       ? "Queue message for delivery after current execution"
       : "Send message";
