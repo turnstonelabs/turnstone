@@ -1105,18 +1105,21 @@ class TestConsoleHTTPEndpoints:
     def test_index_landing_surfaces(self, client):
         status, body, ct = self._get_raw(client, "/")
         assert status == 200
-        # Nodes are reached through the bottom-bar node picker; the old
-        # always-visible NODES table was replaced by it.
-        assert 'id="csb-node-picker"' in body
-        assert 'id="csb-np-trigger"' in body
-        assert 'id="csb-np-menu"' in body
+        # Node discovery moved to the L-shell RAIL; the legacy bottom-bar node
+        # picker (and #cluster-status-bar) was retired by the renovation — guard
+        # against reintroduction (mirrors test_shell_js bottom-bar-retired).
+        assert 'id="csb-node-picker"' not in body
+        assert 'id="cluster-status-bar"' not in body
+        # The landing now boots the shared shell module, which builds the rail +
+        # tab-bar + pane host and hands off to the legacy boot.
+        assert "/shared/shell.js" in body
         # Removed in the 1.5.0 landing-page cleanup — guard against
         # accidental reintroduction.
         assert 'id="new-ws-overlay"' not in body
         assert 'id="new-ws-btn"' not in body
         assert 'id="cluster-summary-compact"' not in body
         assert 'id="view-node"' not in body
-        # Replaced by the node picker — guard against reintroduction.
+        # Replaced by the rail — guard against reintroduction.
         assert 'id="view-overview"' not in body
         assert 'id="node-table"' not in body
 

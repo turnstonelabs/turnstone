@@ -241,6 +241,15 @@
     if (this.modelChipEl) this.modelChipEl.textContent = label || "—";
   };
 
+  // Swap the textarea's idle placeholder — e.g. a launcher that reuses one
+  // composer across personas updates the task-prompt hint when the persona
+  // changes.  Leaves a busy-state placeholder swap (setBusy) untouched.
+  Composer.prototype.setPlaceholder = function (text) {
+    this._idlePlaceholder = text == null ? "" : String(text);
+    if (this.inputEl && !this._busy)
+      this.inputEl.placeholder = this._idlePlaceholder;
+  };
+
   Composer.prototype._buildInput = function (row, opts) {
     this.inputEl = document.createElement("textarea");
     this.inputEl.className = "composer-input";
@@ -740,6 +749,18 @@
     if (ctrl.options.length === 0) return;
     ctrl.options[0].textContent = text == null ? "" : String(text);
     this._refreshOptionsSummary();
+  };
+
+  // Show/hide a single options field (its label + control row).  Lets a caller
+  // reveal a field conditionally — e.g. the launcher shows the node picker only
+  // for the interactive persona, and the node list only under "Specific node".
+  // Toggles inline display (robust against the field row's own flex/grid rule,
+  // which [hidden] alone would lose a specificity battle with).
+  Composer.prototype.setOptionFieldVisible = function (id, visible) {
+    var ctrl = this._optionFields && this._optionFields[id];
+    if (!ctrl) return;
+    var row = ctrl.closest(".composer-options-field");
+    if (row) row.style.display = visible ? "" : "none";
   };
 
   Composer.prototype._refreshOptionsSummary = function () {

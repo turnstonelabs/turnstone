@@ -713,6 +713,15 @@
   min-height: 0;
 }
 
+/* Transient status line a conversational pane shows before its controller is
+   built (e.g. an interactive pane resolving + opening its node-proxied session
+   on first activate).  The error variant rides chat.css's .msg.error styling. */
+.pane-status {
+  padding: 16px;
+  color: var(--fg-dim);
+  font-size: 13px;
+}
+
 /* ===== Dashboard session launcher — persona toggle (coordinator | interactive).
    A console-dashboard control; lives here because the L-shell loads shell.css. */
 .launcher-personas {

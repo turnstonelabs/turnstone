@@ -994,8 +994,15 @@ function _createCoordinator(opts) {
         return;
       }
       onSuccess(res);
-      window.location.href =
-        "/coordinator/" + encodeURIComponent(res.data.ws_id);
+      // Open the new coordinator as an L-shell PANE (the renovation: sessions
+      // open as tabs, not full-page nav).  Full-page nav stays as the
+      // shell-absent fallback.  The session was just created + is live in the
+      // console, so the coordinator pane connects straight away (no /open hop).
+      const pm = window.TS_SHELL && window.TS_SHELL.panes;
+      if (pm) pm.openPane("coordinator", res.data.ws_id);
+      else
+        window.location.href =
+          "/coordinator/" + encodeURIComponent(res.data.ws_id);
     })
     .catch(function () {
       setBusy(false);
@@ -1028,6 +1035,50 @@ function _setLauncherKind(kind, focus) {
     btn.tabIndex = on ? 0 : -1; // roving tabindex — the radiogroup is one tab stop
     if (on && focus) btn.focus();
   });
+  _applyLauncherFields();
+}
+
+// Reflect the active persona in the shared launcher composer: the task-prompt
+// hint, and which option fields are relevant.  The node picker is
+// interactive-only (coordinators run in the console, not on a compute node);
+// its node list appears only under the "Specific node" strategy.
+function _applyLauncherFields() {
+  if (!_homeCoordComposer) return;
+  const interactive = _launcherKind === "interactive";
+  _homeCoordComposer.setPlaceholder(
+    interactive
+      ? "What do you want to work on?"
+      : "What should this coordinator orchestrate?",
+  );
+  _homeCoordComposer.setOptionFieldVisible("node_strategy", interactive);
+  const specific =
+    interactive &&
+    _homeCoordComposer.getOptionValue("node_strategy") === "node";
+  _homeCoordComposer.setOptionFieldVisible("node_id", specific);
+  if (specific) _populateLauncherNodes();
+}
+
+// Populate the launcher's "Specific node" picker from the live Tier-1 snapshot
+// (the SAME clusterState the rail node list reads), excluding the `console`
+// pseudo-node (interactive sessions run on compute nodes) and unreachable
+// nodes.  Re-read on each reveal so a node that just (dis)appeared is current.
+function _populateLauncherNodes() {
+  if (!_homeCoordComposer) return;
+  const choices = [];
+  if (clusterState && clusterState.nodes) {
+    Object.keys(clusterState.nodes)
+      .filter(function (nid) {
+        return nid !== "console";
+      })
+      .sort()
+      .forEach(function (nid) {
+        const n = clusterState.nodes[nid];
+        if (n && n.reachable === false) return;
+        const count = n && n.workstreams ? n.workstreams.length : 0;
+        choices.push({ value: nid, text: nid + " (" + count + " ws)" });
+      });
+  }
+  _homeCoordComposer.setOptionChoices("node_id", choices);
 }
 
 function _wireLauncherToggle() {
@@ -1081,10 +1132,23 @@ function _createInteractive(opts) {
   const setBusy = opts.setBusy || function () {};
   const onSuccess = opts.onSuccess || function () {};
 
+  // Node placement (launcher node-strategy picker): "node" pins to the chosen
+  // node; anything else lets the console pick the least-loaded node ("auto").
+  // Validate the specific-node choice BEFORE flipping busy so a missing pick
+  // surfaces inline without a stuck spinner.
+  let placement = "auto";
+  if (opts.node_strategy === "node") {
+    placement = (opts.node_id || "").trim();
+    if (!placement) {
+      errEl.textContent = "Choose a node, or switch to Least loaded.";
+      return;
+    }
+  }
+
   errEl.textContent = "";
   setBusy(true);
 
-  const body = { node_id: "auto" };
+  const body = { node_id: placement };
   if (name) body.name = name;
   if (skill) body.skill = skill;
   if (model) body.model = model;
@@ -1111,7 +1175,17 @@ function _createInteractive(opts) {
         return;
       }
       onSuccess(res);
-      if (node) {
+      // Open the new session as an L-shell PANE (interactive sessions are
+      // node-proxied; the pane resolves + opens on its node before streaming).
+      // Full-page nav stays as the shell-absent fallback.
+      const pm = window.TS_SHELL && window.TS_SHELL.panes;
+      if (pm) {
+        // target_node is the just-created live node; pass it as the open-time
+        // hint so the pane pins there (origin-first) instead of re-routing.  A
+        // missing node (server-contract drift) still recovers via the pane's
+        // rendezvous fallback.
+        pm.openPane("interactive", wsId, { nodeId: node || null });
+      } else if (node) {
         window.location.href =
           "/node/" +
           encodeURIComponent(node) +
@@ -1341,7 +1415,20 @@ function _mountHomeCoordComposer() {
         if (v.skill) bits.push(v.skill);
         if (v.model) bits.push(v.model);
         if (v.judge_model) bits.push("judge: " + v.judge_model);
+        // Node placement is interactive-only; surface it only when a specific
+        // node is pinned (the "Least loaded" default needs no summary line).
+        if (
+          _launcherKind === "interactive" &&
+          v.node_strategy === "node" &&
+          v.node_id
+        )
+          bits.push("node: " + v.node_id);
         return bits.join(" \u00b7 ");
+      },
+      // Re-evaluate the interactive node-picker visibility whenever a field
+      // changes (the node list appears only under the "Specific node" strategy).
+      onChange: function () {
+        _applyLauncherFields();
       },
       fields: [
         {
@@ -1372,6 +1459,27 @@ function _mountHomeCoordComposer() {
           // resolved judge alias (judge.model when set, otherwise the
           // session model — see IntentJudge.__init__).
           choices: [{ value: "", text: "Default model" }],
+        },
+        // Node placement — INTERACTIVE persona only (coordinators run in the
+        // console, not on a compute node).  _applyLauncherFields shows/hides
+        // these per persona.  "auto" → the console picks the least-loaded node;
+        // "node" → reveal the live node picker below + pin to the chosen node.
+        {
+          id: "node_strategy",
+          label: "Node",
+          type: "select",
+          choices: [
+            { value: "auto", text: "Least loaded" },
+            { value: "node", text: "Specific node…" },
+          ],
+        },
+        {
+          id: "node_id",
+          label: "Pick node",
+          type: "select",
+          // First option is the placeholder; _populateLauncherNodes appends the
+          // live reachable compute nodes (excluding the console pseudo-node).
+          choices: [{ value: "", text: "Select a node" }],
         },
       ],
     },
@@ -1547,6 +1655,9 @@ function submitHomeCoord(textFromComposer) {
       );
       return;
     }
+    // Node placement from the launcher's node-strategy picker (interactive-only).
+    shared.node_strategy = opts.node_strategy || "auto";
+    shared.node_id = (opts.node_id || "").trim();
     _createInteractive(shared);
   } else {
     shared.files = files;
@@ -1639,93 +1750,6 @@ function loadSavedCoordinators() {
     });
 }
 
-// Restore a saved interactive session from the console onto a compute node.
-// Origin-FIRST: rehydrate on the session's origin node (the saved DTO's
-// node_id, stamped at create) whenever it is still reachable.  This keeps
-// node affinity and, crucially, REUSES a session already live on its origin
-// instead of loading a duplicate copy elsewhere; the interactive pane talks
-// directly to /node/{id} for every verb, so the load-node and the pane-node
-// must be the same node (no split-brain).  Only when the origin is gone
-// (POST /open 404 = node not in registry / 502 = unreachable) do we re-home
-// onto a fresh rendezvous node via GET /v1/api/route (the router skips dead
-// nodes; persistence is shared ws_id-keyed Postgres, so any live node is
-// state-safe).  Rehydrating is required, not just node selection: the
-// per-pane SSE /events 404s on a not-loaded ws and /history alone will not
-// load it.  Mirrors the coordinator open-before-navigate and the standalone
-// dashboardResumeSession.
-function restoreInteractiveSession(wsId, originNodeId, rowEl) {
-  const pm = window.TS_SHELL && window.TS_SHELL.panes;
-  if (rowEl) rowEl.classList.add("is-busy");
-  const clearBusy = function () {
-    if (rowEl) rowEl.classList.remove("is-busy");
-  };
-  const failToast = function (status) {
-    clearBusy();
-    if (status === 429)
-      showToast("Node at capacity; close a session and retry");
-    else if (status === 403) showToast("Not permitted to restore this session");
-    else showToast("Failed to restore session (" + status + ")");
-  };
-  // Rehydrate on a specific node, then pin the pane to that SAME node.
-  // Resolves true on success, else the failing HTTP status.
-  const openOn = function (nodeId) {
-    return authFetch(
-      "/node/" +
-        encodeURIComponent(nodeId) +
-        "/v1/api/workstreams/" +
-        encodeURIComponent(wsId) +
-        "/open",
-      { method: "POST" },
-    ).then(function (r) {
-      if (!r.ok) return r.status;
-      clearBusy();
-      if (pm) pm.openPane("interactive", wsId, { nodeId: nodeId });
-      return true;
-    });
-  };
-  // Re-home onto a live rendezvous node (router skips the dead origin) when
-  // there is no origin or the origin node is gone.
-  const routeFallback = function () {
-    return authFetch("/v1/api/route?ws_id=" + encodeURIComponent(wsId))
-      .then(function (r) {
-        if (!r.ok) {
-          clearBusy();
-          showToast(
-            r.status === 503
-              ? "No nodes available to restore this session"
-              : "Could not locate session node (" + r.status + ")",
-          );
-          return null;
-        }
-        return r.json();
-      })
-      .then(function (route) {
-        if (!route) return;
-        if (!route.node_id) {
-          clearBusy();
-          showToast("Could not locate session node");
-          return;
-        }
-        return openOn(route.node_id).then(function (res) {
-          if (res !== true) failToast(res);
-        });
-      });
-  };
-  // Origin first; 404/502 (origin gone) -> rendezvous fallback.  Capacity
-  // (429) / permission (403) are surfaced, NOT silently re-homed.
-  const flow = originNodeId
-    ? openOn(originNodeId).then(function (res) {
-        if (res === true) return;
-        if (res === 404 || res === 502) return routeFallback();
-        failToast(res);
-      })
-    : routeFallback();
-  flow.catch(function () {
-    clearBusy();
-    showToast("Failed to restore session");
-  });
-}
-
 // Saved Coordinators table — same shared createSavedTable as the server UI
 // (/shared/cards.js), with a CHILDREN column instead of MSGS and the
 // body-keyed (router-proxied) delete.  Activation POSTs /open before
@@ -1777,12 +1801,15 @@ const _coordTable = createSavedTable({
     const pm = window.TS_SHELL && window.TS_SHELL.panes;
     // Interactive sessions live on a compute node and, unlike coordinators,
     // have no warm pool: a dormant one must be routed to a live node and
-    // rehydrated there before its pane can stream (see
-    // restoreInteractiveSession).  Shell-absent falls back to a best-effort
-    // full-page nav to the origin node, whose detail page rehydrates lazily.
+    // rehydrated there before its pane can stream.  The interactive pane does
+    // exactly that on first activate (resolveInteractiveNode: origin-first
+    // POST /open with a rendezvous fallback), so the saved-row click just opens
+    // the pane with the origin node as the hint.  Shell-absent falls back to a
+    // best-effort full-page nav to the origin node, whose detail page
+    // rehydrates lazily.
     if (s.kind !== "coordinator") {
       if (pm) {
-        restoreInteractiveSession(s.ws_id, s.node_id, rowEl);
+        pm.openPane("interactive", s.ws_id, { nodeId: s.node_id || null });
       } else if (s.node_id) {
         window.location.href =
           "/node/" +
@@ -1924,6 +1951,82 @@ window.TS_APP.buildNodeInfo = function (node) {
 window.TS_APP.focusLauncher = function () {
   if (_homeCoordComposer && typeof _homeCoordComposer.focus === "function")
     _homeCoordComposer.focus();
+};
+// Resolve the cluster node that should host an interactive pane's session AND
+// ensure the session is loaded there before the pane streams — the node /events
+// stream 404s on a ws not loaded on that node, and /history alone won't load it.
+// The shell's interactive pane factory calls this on first activate (fresh open,
+// saved-row resume, AND reload-rehydrate all funnel through here).
+//
+// Origin-FIRST: POST /open on the hint node (the live / origin / just-created
+// node) — this REUSES a session already loaded there instead of loading a
+// duplicate copy elsewhere, and keeps node affinity (the pane talks directly to
+// /node/{id} for every verb, so load-node == pane-node).  Only when the hint
+// node is gone (404 = not in the registry / 502 = unreachable) or there is no
+// hint do we re-home onto a live rendezvous node via GET /v1/api/route (the
+// router skips dead nodes; persistence is shared ws_id-keyed Postgres, so any
+// live node is state-safe).  Capacity (429) / permission (403) surface as an
+// error — NOT a silent re-home.  Resolves to {nodeId} on success, else {error}.
+window.TS_APP.resolveInteractiveNode = function (wsId, hintNodeId) {
+  const openOn = function (nodeId) {
+    return authFetch(
+      "/node/" +
+        encodeURIComponent(nodeId) +
+        "/v1/api/workstreams/" +
+        encodeURIComponent(wsId) +
+        "/open",
+      { method: "POST" },
+    ).then(function (r) {
+      return r.ok ? { nodeId: nodeId } : { status: r.status };
+    });
+  };
+  const failResult = function (status) {
+    if (status === 429) {
+      showToast("Node at capacity; close a session and retry");
+      return { error: "Node at capacity — close a session and retry." };
+    }
+    if (status === 403) {
+      showToast("Not permitted to open this session");
+      return { error: "You don’t have permission to open this session." };
+    }
+    return { error: "Could not open this session (" + status + ")." };
+  };
+  const routeFallback = function () {
+    return authFetch("/v1/api/route?ws_id=" + encodeURIComponent(wsId))
+      .then(function (r) {
+        if (!r.ok) {
+          const msg =
+            r.status === 503
+              ? "No nodes available to open this session."
+              : "Could not locate the session node (" + r.status + ").";
+          showToast(msg);
+          return { error: msg };
+        }
+        return r.json();
+      })
+      .then(function (route) {
+        if (!route) return { error: "Could not locate the session node." };
+        if (route.error) return route; // route fetch already failed + toasted
+        if (!route.node_id) {
+          showToast("Could not locate the session node");
+          return { error: "Could not locate the session node." };
+        }
+        return openOn(route.node_id).then(function (res) {
+          return res.nodeId ? res : failResult(res.status);
+        });
+      });
+  };
+  const flow = hintNodeId
+    ? openOn(hintNodeId).then(function (res) {
+        if (res.nodeId) return res;
+        // Origin gone -> rendezvous re-home; capacity/permission surface as-is.
+        if (res.status === 404 || res.status === 502) return routeFallback();
+        return failResult(res.status);
+      })
+    : routeFallback();
+  return flow.catch(function () {
+    return { error: "Failed to open this session." };
+  });
 };
 window.TS_APP.boot = function () {
   history.replaceState({ view: "home" }, "");

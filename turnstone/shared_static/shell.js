@@ -151,6 +151,28 @@ function stateForWs(wsId) {
   return f ? f.ws.state || "idle" : "idle";
 }
 
+// Resolve which node an interactive pane's session lives on, ENSURING the
+// session is loaded there before the pane streams.  This is the one seam that
+// makes a node-proxied session survive a reload: the node /events stream 404s
+// on a ws that isn't loaded on that node, so a freshly-rehydrated pane must
+// (re)open the session on a node first.  Resolves to {nodeId} or {error}.
+//   - Standalone (no cluster): every session is LOCAL → base "" (nodeId null),
+//     no open round-trip.
+//   - Console: the route + proxy + open work is the console's — delegate to the
+//     TS_APP seam (origin-first POST /open with a rendezvous fallback).  Without
+//     the seam (unexpected on a cluster console) fall back to the open-time hint
+//     or the live Tier-1 snapshot, accepting the pre-reload behaviour.
+function ensureInteractiveNode(caps, wsId, hint) {
+  if (!caps.cluster) return Promise.resolve({ nodeId: null });
+  if (
+    window.TS_APP &&
+    typeof window.TS_APP.resolveInteractiveNode === "function"
+  ) {
+    return window.TS_APP.resolveInteractiveNode(wsId, hint || null);
+  }
+  return Promise.resolve({ nodeId: hint || nodeForWs(wsId) || null });
+}
+
 // Repaint conversational tabs from Tier-1 in ONE pass: a single findWs per
 // stateful tab feeds BOTH the live state glyph (one Tier-1 writer; the pane's
 // Tier-2 stream drives its body, not the tab) and the live workstream name.
@@ -364,32 +386,61 @@ async function mountShell() {
             ? () => window.closeWorkstream(id)
             : null,
       });
+    // Persist the open-time node hint so a reload re-opens on the SAME node
+    // (origin-first; avoids a re-route + duplicate load).  Updated to the
+    // resolved node after ensureInteractiveNode settles, below.
+    if (extra && extra.nodeId) pane.meta = { nodeId: extra.nodeId };
     pane.onMount = function () {
-      // Node-proxy transport only exists in a cluster deployment (the console).
-      // On a single-node standalone (caps.cluster=false) every session is LOCAL,
-      // so nodeId stays null → the pane uses base="" (no /node/<id> hop), even
-      // though the synthesized one-node clusterState would otherwise name a node.
-      const nodeId = caps.cluster
-        ? (extra && extra.nodeId) || nodeForWs(id)
-        : null;
-      this._ctl = createInteractivePane(this.bodyEl, id, {
-        nodeId,
-        onClose: () => pm.close(pane.id),
-      });
+      // The controller is built LAZILY on first activate — only after the owning
+      // node is resolved AND the session is (re)opened there (the node /events
+      // stream 404s on a ws not loaded on its node, so a rehydrated pane can't
+      // just connect blind).  onMount only reserves a status line so a
+      // not-yet-resolved pane isn't a blank box.
+      this._statusEl = make("div", "pane-status", "Connecting…");
+      this.bodyEl.append(this._statusEl);
     };
     pane.onActivate = function () {
       pm.setTabGlyph(pane.id, glyph(stateForWs(id))); // live Tier-1 state glyph
-      if (!this._ctl) return;
-      this._ctl.connect(); // idempotent — opens the stream once, re-marks focus
-      if (!this._loginArmed && window.TS_LOGIN && this._ctl.onLogin) {
-        this._loginArmed = true;
-        window.TS_LOGIN.subscribe(this._ctl.onLogin);
+      if (this._ctl) {
+        this._ctl.connect(); // built — idempotent re-mark focus
+        return;
       }
+      if (this._resolving) return; // first-activate resolve already in flight
+      this._resolving = true;
+      const hint = (this.meta && this.meta.nodeId) || (extra && extra.nodeId);
+      ensureInteractiveNode(caps, id, hint).then((res) => {
+        this._resolving = false;
+        if (this._closed) return; // pane closed mid-resolve — don't build into a detached body
+        if (!res || res.error) {
+          if (this._statusEl) {
+            this._statusEl.className = "pane-status msg error";
+            this._statusEl.textContent =
+              (res && res.error) || "Could not connect to this session.";
+          }
+          return;
+        }
+        // Pin + persist the resolved node so the next reload reuses it.
+        this.meta = { nodeId: res.nodeId };
+        pm.setPaneMeta(pane.id, this.meta);
+        if (this._statusEl && this._statusEl.parentNode)
+          this._statusEl.remove();
+        this._statusEl = null;
+        this._ctl = createInteractivePane(this.bodyEl, id, {
+          nodeId: res.nodeId,
+          onClose: () => pm.close(pane.id),
+        });
+        this._ctl.connect();
+        if (window.TS_LOGIN && this._ctl.onLogin) {
+          this._loginArmed = true;
+          window.TS_LOGIN.subscribe(this._ctl.onLogin);
+        }
+      });
     };
     pane.onDeactivate = function () {
       if (this._ctl && this._ctl.deactivate) this._ctl.deactivate();
     };
     pane.onClose = function () {
+      this._closed = true; // a pending resolve must not build after close
       if (this._ctl) {
         if (window.TS_LOGIN && this._ctl.onLogin)
           window.TS_LOGIN.unsubscribe(this._ctl.onLogin);

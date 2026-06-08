@@ -135,6 +135,17 @@ export class PaneManager {
     pane._glyphEl = el;
   }
 
+  /** Update a pane's persisted open-time meta (a small serializable hint, e.g.
+   *  the interactive pane's resolved `{nodeId}`) and re-persist immediately, so
+   *  the next reload re-opens the pane with the same hint as `extra`.  Generic:
+   *  PaneManager treats meta as opaque; the pane type owns its shape. */
+  setPaneMeta(paneId, meta) {
+    const pane = this._panes.get(paneId);
+    if (!pane) return;
+    pane.meta = meta;
+    this._persist();
+  }
+
   /** Update a tab's label text in place.  The shell drives this from Tier-1 so a
    *  conversational tab tracks its workstream's live NAME instead of freezing at
    *  the open-time id; pane.title is updated too so a later tab rebuild keeps it. */
@@ -157,8 +168,11 @@ export class PaneManager {
   /** Create the pane if absent, then focus it.  Creation is auth-gated by the
    *  type's registered `canOpen` (deny -> no pane); focusing an already-open pane
    *  is never re-gated.  `extra` is an optional open-time hint passed straight to
-   *  the factory (e.g. the interactive pane's `{nodeId}` from a rail click); it is
-   *  NOT persisted, so a factory must be able to re-derive it on rehydrate. */
+   *  the factory (e.g. the interactive pane's `{nodeId}` from a rail click).  A
+   *  factory may copy a SERIALIZABLE hint onto `pane.meta` (and refresh it later
+   *  via `setPaneMeta`) to have it persisted and handed back as `extra` on
+   *  rehydrate — the interactive pane does this with its resolved nodeId so a
+   *  reload restores the pane onto the SAME node (no re-route / duplicate load). */
   openPane(type, id, extra) {
     if (!this._types.has(type)) {
       console.warn("PaneManager: unknown pane type", type);
@@ -510,7 +524,12 @@ export class PaneManager {
     try {
       const order = this._order.map((paneId) => {
         const p = this._panes.get(paneId);
-        return { type: p.type, id: p.rawId };
+        const entry = { type: p.type, id: p.rawId };
+        // A pane's serializable open-time hint (e.g. interactive nodeId) rides
+        // along so rehydrate hands it back as `extra` — only when present, so
+        // hint-less panes (dashboard/admin/coordinator) persist unchanged.
+        if (p.meta != null) entry.meta = p.meta;
+        return entry;
       });
       sessionStorage.setItem(
         this.storageKey,
@@ -539,8 +558,9 @@ export class PaneManager {
       if (item && this._types.has(item.type)) {
         // Only count it restored if the pane was actually created — an auth-gated
         // type (a coordinator pane without scope) returns null, and must not
-        // suppress the Dashboard fallback into a blank shell.
-        if (this.openPane(item.type, item.id)) restored = true;
+        // suppress the Dashboard fallback into a blank shell.  `item.meta` (e.g.
+        // the interactive pane's resolved nodeId) is handed back as `extra`.
+        if (this.openPane(item.type, item.id, item.meta)) restored = true;
       }
     }
     if (state.active && this._panes.has(state.active)) {

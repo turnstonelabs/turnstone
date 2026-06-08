@@ -182,6 +182,80 @@ def test_console_launcher_routes_by_persona() -> None:
     assert 'id="launcher-personas"' in index, "the persona toggle must be in the launcher panel"
 
 
+def test_console_launcher_creates_open_panes() -> None:
+    """Workstream-lifecycle bugfix: BOTH launcher personas open the new session as
+    an L-shell PANE (openPane), not a full-page nav — coordinator and interactive
+    alike.  Full-page nav survives only as the shell-absent fallback."""
+    app = _CONSOLE_APP.read_text(encoding="utf-8")
+    assert 'pm.openPane("coordinator", res.data.ws_id)' in app, (
+        "coordinator create must open a pane, not full-page nav"
+    )
+    assert 'pm.openPane("interactive", wsId, { nodeId: node || null })' in app, (
+        "interactive create must open a node-proxied pane with the created node as hint"
+    )
+    # The saved-row interactive resume opens a pane (the pane resolves+opens the
+    # node itself) — the bespoke restoreInteractiveSession helper is retired.
+    assert 'pm.openPane("interactive", s.ws_id, { nodeId: s.node_id || null })' in app, (
+        "saved interactive resume must open a pane with the origin node as hint"
+    )
+    assert "function restoreInteractiveSession" not in app, (
+        "restoreInteractiveSession is folded into resolveInteractiveNode + the pane factory"
+    )
+
+
+def test_console_resolve_interactive_node_seam() -> None:
+    """The console exposes resolveInteractiveNode(wsId, hint): origin-first
+    POST /open (reuse a session already loaded on its node, no duplicate), with a
+    rendezvous (/v1/api/route) fallback when the origin is gone.  This is what
+    makes a node-proxied pane survive a reload — the shell's interactive factory
+    calls it before streaming (the node /events 404s on a not-loaded ws)."""
+    app = _CONSOLE_APP.read_text(encoding="utf-8")
+    assert "window.TS_APP.resolveInteractiveNode = function (wsId, hintNodeId)" in app
+    assert "/v1/api/workstreams/" in app and '"/open"' in app, (
+        "origin-first must POST the node /open verb"
+    )
+    assert '"/v1/api/route?ws_id="' in app, "must rendezvous-fallback when the origin is gone"
+
+
+def test_console_launcher_node_strategy() -> None:
+    """Workstream-lifecycle bugfix: the interactive launcher gains a node-selection
+    strategy (Least loaded | Specific node) with a live node picker, and the shared
+    composer's task hint + node fields track the active persona."""
+    app = _CONSOLE_APP.read_text(encoding="utf-8")
+    assert 'id: "node_strategy"' in app and 'id: "node_id"' in app, (
+        "launcher must expose the node-strategy + node-picker option fields"
+    )
+    assert "function _applyLauncherFields" in app, (
+        "persona switch must update the hint + node-field visibility"
+    )
+    assert "function _populateLauncherNodes" in app, (
+        "the specific-node picker must populate from the live cluster snapshot"
+    )
+    assert 'opts.node_strategy === "node"' in app, (
+        "interactive create must pin to the chosen node only under the Specific strategy"
+    )
+    composer = (_SHARED / "composer.js").read_text(encoding="utf-8")
+    assert "Composer.prototype.setPlaceholder" in composer, (
+        "composer must support a per-persona placeholder swap"
+    )
+    assert "Composer.prototype.setOptionFieldVisible" in composer, (
+        "composer must support conditionally revealing an option field"
+    )
+
+
+def test_pane_persists_meta_for_rehydrate() -> None:
+    """Workstream-lifecycle bugfix: PaneManager persists a pane's serializable
+    open-time meta (the interactive pane's resolved nodeId) and hands it back as
+    `extra` on rehydrate, so a reload restores a node-proxied pane onto the SAME
+    node (origin-first) instead of re-routing + duplicate-loading."""
+    pane = _PANE_JS.read_text(encoding="utf-8")
+    assert "setPaneMeta(paneId, meta)" in pane, "PaneManager must expose setPaneMeta"
+    assert "entry.meta = p.meta" in pane, "_persist must include a pane's meta when present"
+    assert "this.openPane(item.type, item.id, item.meta)" in pane, (
+        "rehydrate must hand the persisted meta back to the factory as extra"
+    )
+
+
 def test_step3_admin_pane_registered_and_manage_mounted() -> None:
     """Step 3: the shell registers the singleton Admin pane (which adopts
     #view-admin) and mounts the rail's Manage groups from the admin IA seam."""
@@ -278,22 +352,31 @@ def test_step4_coordinator_pane_registered_and_wired() -> None:
 def test_step5_interactive_pane_registered_and_wired() -> None:
     """Step 5b: the shell registers a ws_id-keyed interactive pane over the
     NODE-PROXIED transport.  Both panes are ES modules the shell IMPORTS (step
-    5e.0 lifted the coordinator off window too); its node is
-    derived from the Tier-1 snapshot (nodeForWs) or an open-time hint; the rail
-    opens it as a pane passing the owning node; and the console loads the shared
-    interactive stylesheet."""
+    5e.0 lifted the coordinator off window too).  The pane is REHYDRATE-SAFE: on
+    first activate it RESOLVES its owning node and (re)opens the session there
+    before streaming (ensureInteractiveNode -> the console's resolveInteractiveNode
+    origin-first POST /open; the node /events stream 404s on a ws not loaded on
+    that node, so a reloaded pane can't connect blind), then PERSISTS the resolved
+    node so a reload restores the pane onto the same node.  The rail opens it
+    passing the owning node; the console loads the shared interactive stylesheet."""
     shell = _SHELL_JS.read_text(encoding="utf-8")
     assert 'import { createInteractivePane } from "./interactive.js"' in shell, (
         "interactive is ESM — the shell imports it (as it now does the coordinator)"
     )
     assert 'registerType("interactive"' in shell, "shell must register the interactive pane type"
     assert "createInteractivePane(this.bodyEl, id, {" in shell, (
-        "onMount must build the controller into the pane body"
+        "first activate must build the controller into the pane body"
     )
-    assert "nodeForWs(id)" in shell, (
-        "the node-proxy target must be derived from Tier-1 (rehydrate-safe)"
+    # Rehydrate-safety: the node is RESOLVED + the session (re)opened before the
+    # pane streams, and the resolved node is persisted for the next reload.
+    assert "ensureInteractiveNode(" in shell, (
+        "the node-proxy target must be resolved (origin-first open) — rehydrate-safe"
     )
-    assert "function nodeForWs(" in shell, "shell must define the node resolver"
+    assert "function ensureInteractiveNode(" in shell, "shell must define the node resolver/opener"
+    assert "function nodeForWs(" in shell, "shell must keep the Tier-1 node fallback"
+    assert "pm.setPaneMeta(pane.id" in shell, (
+        "the resolved node must be persisted so a reload restores the same node"
+    )
     # Focus-tracking lifecycle: connect/deactivate/destroy + login re-arm.
     for hook in ("this._ctl.connect()", "this._ctl.deactivate()", "this._ctl.destroy()"):
         assert hook in shell, f"interactive pane missing lifecycle {hook!r}"
