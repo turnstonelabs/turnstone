@@ -151,22 +151,16 @@ function stateForWs(wsId) {
   return f ? f.ws.state || "idle" : "idle";
 }
 
-// Repaint every stateful tab's glyph from Tier-1.  Subscribed to the render
-// signal (one Tier-1 writer for the tab glyph; the pane's Tier-2 stream drives
-// its body, not the tab) and called on activate for the initial paint.
-function paintConvTabGlyphs(pm) {
-  for (const t of pm.statefulTabs())
-    pm.setTabGlyph(t.id, glyph(stateForWs(t.rawId)));
-}
-
-// Repaint conversational tabs' labels from Tier-1 so a tab tracks its
-// workstream's live name.  The open-time title is the id-slice for a session not
-// yet in the snapshot (e.g. a just-restored saved one); this upgrades it to the
-// real name once it lands.  Only ever UPGRADE to a name — never flicker a known
-// name back to the id if the ws blips out of a single frame.
-function paintConvTabTitles(pm) {
+// Repaint conversational tabs from Tier-1 in ONE pass: a single findWs per
+// stateful tab feeds BOTH the live state glyph (one Tier-1 writer; the pane's
+// Tier-2 stream drives its body, not the tab) and the live workstream name.
+// The title only ever UPGRADES to a real name — never flickers a known name
+// back to the id-slice if the ws blips out of a frame; the glyph always
+// reflects the live state.
+function paintConvTabs(pm) {
   for (const t of pm.statefulTabs()) {
     const f = findWs(t.rawId, false);
+    pm.setTabGlyph(t.id, glyph(f ? f.ws.state || "idle" : "idle"));
     const name = f && (f.ws.name || f.ws.title);
     if (name) pm.setTabTitle(t.id, name);
   }
@@ -531,8 +525,7 @@ async function mountShell() {
   // Tier-1 writer for the tab glyph; the pane's Tier-2 stream drives its body.
   if (window.TS_APP && typeof window.TS_APP.onRender === "function") {
     window.TS_APP.onRender(() => {
-      paintConvTabGlyphs(pm);
-      paintConvTabTitles(pm);
+      paintConvTabs(pm);
       refreshUser();
     });
   }
@@ -615,6 +608,10 @@ function toggleUserMenu(chip) {
   // Defer the listener attach so the click that opened the menu does not
   // immediately close it.
   setTimeout(() => {
+    // Bail if the menu was already closed before this deferred attach ran:
+    // closeUserMenu() nulls _userMenuCleanup, so attaching now would leave the
+    // listeners with no cleanup ref to remove them (a permanent leak).
+    if (!_userMenuCleanup) return;
     document.addEventListener("mousedown", onDown);
     document.addEventListener("keydown", onKey);
   }, 0);

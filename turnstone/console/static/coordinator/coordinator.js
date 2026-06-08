@@ -1768,7 +1768,6 @@ function createCoordinatorPane(root, wsId, opts) {
         turnsEl: sbTurnsEl,
       },
       evt,
-      { alias: coordModelAlias, model: coordModel },
     );
     // Model moved out of the status bar into the composer chip; capture the
     // (optional) effort off the status event and repaint the chip.

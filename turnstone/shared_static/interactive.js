@@ -563,7 +563,6 @@ class Pane {
         turnsEl: this._sbTurns,
       },
       evt,
-      { alias: this.modelAlias, model: this.model },
     );
     // Model moved out of the status bar into the composer chip; capture the
     // (optional) effort off the status event and repaint the chip.

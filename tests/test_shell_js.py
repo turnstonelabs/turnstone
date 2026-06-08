@@ -412,9 +412,9 @@ def test_step7_live_tab_state_glyphs() -> None:
     assert 'import { mountRail, mountManage, glyph } from "./rail.js"' in shell, (
         "the shell must import the rail's glyph builder (one source for tab + rail)"
     )
-    assert "function stateForWs(" in shell and "function paintConvTabGlyphs(" in shell
-    assert "window.TS_APP.onRender" in shell and "paintConvTabGlyphs(pm)" in shell, (
-        "tab glyphs must repaint on every Tier-1 render (live, not stale)"
+    assert "function stateForWs(" in shell and "function paintConvTabs(" in shell
+    assert "window.TS_APP.onRender" in shell and "paintConvTabs(pm)" in shell, (
+        "tab glyphs (and titles) must repaint on every Tier-1 render (live, not stale)"
     )
     assert shell.count("stateful: true") == 2, (
         "the coordinator + interactive panes are stateful (their static placeholders retired)"

@@ -1426,16 +1426,6 @@
     background 0.3s,
     border-color 0.3s;
 }
-.ws-sb-model {
-  font-family: var(--font-ui);
-  font-weight: 500;
-  color: var(--accent);
-  font-size: 10px;
-  max-width: 160px;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
 .ws-sb-tokens {
   color: var(--fg-dim);
   white-space: nowrap;
@@ -1468,7 +1458,6 @@
 .ws-status-bar.ws-sb-disconnected .ws-sb-tokens {
   color: var(--red);
 }
-.ws-status-bar.ws-sb-disconnected .ws-sb-model,
 .ws-status-bar.ws-sb-disconnected .ws-sb-tools,
 .ws-status-bar.ws-sb-disconnected .ws-sb-turns {
   opacity: 0.4;

@@ -31,20 +31,12 @@
   /**
    * Repaint the four-cell status bar from an on_status SSE event.
    *
-   * @param {Object} els — { rootEl, modelEl, tokensEl, toolsEl, turnsEl }
+   * @param {Object} els — { rootEl, tokensEl, toolsEl, turnsEl }
    * @param {Object} evt — on_status payload (total_tokens, context_window,
    *   pct, effort, tool_calls_this_turn, turn_count).
-   * @param {Object} modelInfo — { alias, model } strings; alias falls
-   *   back to model when empty, "—" when both empty.
    */
-  function paintStatusBar(els, evt, modelInfo) {
+  function paintStatusBar(els, evt) {
     if (!els || !evt) return;
-    var alias = (modelInfo && modelInfo.alias) || "";
-    var model = (modelInfo && modelInfo.model) || "";
-    if (els.modelEl) {
-      els.modelEl.textContent = alias || model || "—";
-      els.modelEl.title = model || "";
-    }
 
     var totalTokens = evt.total_tokens || 0;
     var contextWindow = evt.context_window || 0;
