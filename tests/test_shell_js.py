@@ -241,6 +241,16 @@ def test_console_launcher_node_strategy() -> None:
     assert "Composer.prototype.setOptionFieldVisible" in composer, (
         "composer must support conditionally revealing an option field"
     )
+    # Review bug-1 regression: picking a node fires the composer `change` event,
+    # which re-runs _populateLauncherNodes -> setOptionChoices (a rebuild that
+    # resets the <select>).  The selection MUST be captured + restored across the
+    # rebuild, else a Specific-node session can never be launched.
+    assert 'const previous = _homeCoordComposer.getOptionValue("node_id")' in app, (
+        "_populateLauncherNodes must snapshot the current node pick before rebuild"
+    )
+    assert 'if (previous) _homeCoordComposer.setOptionValue("node_id", previous)' in app, (
+        "_populateLauncherNodes must restore the node pick after rebuild (bug-1)"
+    )
 
 
 def test_pane_persists_meta_for_rehydrate() -> None:
@@ -364,7 +374,7 @@ def test_step5_interactive_pane_registered_and_wired() -> None:
         "interactive is ESM — the shell imports it (as it now does the coordinator)"
     )
     assert 'registerType("interactive"' in shell, "shell must register the interactive pane type"
-    assert "createInteractivePane(this.bodyEl, id, {" in shell, (
+    assert "createInteractivePane(pane.bodyEl, id, {" in shell, (
         "first activate must build the controller into the pane body"
     )
     # Rehydrate-safety: the node is RESOLVED + the session (re)opened before the
@@ -376,6 +386,12 @@ def test_step5_interactive_pane_registered_and_wired() -> None:
     assert "function nodeForWs(" in shell, "shell must keep the Tier-1 node fallback"
     assert "pm.setPaneMeta(pane.id" in shell, (
         "the resolved node must be persisted so a reload restores the same node"
+    )
+    # Hot-path optimisation (review perf-1): a LIVE session (Tier-1 already names
+    # its node) connects directly — only the dormant/reload case pays the
+    # resolve+open round-trip.
+    assert "const liveNode = caps.cluster ? nodeForWs(id)" in shell, (
+        "a live ws (Tier-1 names its node) must connect directly, skipping POST /open"
     )
     # Focus-tracking lifecycle: connect/deactivate/destroy + login re-arm.
     for hook in ("this._ctl.connect()", "this._ctl.deactivate()", "this._ctl.destroy()"):

@@ -754,8 +754,9 @@
   // Show/hide a single options field (its label + control row).  Lets a caller
   // reveal a field conditionally — e.g. the launcher shows the node picker only
   // for the interactive persona, and the node list only under "Specific node".
-  // Toggles inline display (robust against the field row's own flex/grid rule,
-  // which [hidden] alone would lose a specificity battle with).
+  // Sets inline display because the row is `display: contents` (chat.css:537),
+  // which outweighs the [hidden] attribute's UA `display:none` on specificity —
+  // so toggling [hidden] alone would not actually hide the row.
   Composer.prototype.setOptionFieldVisible = function (id, visible) {
     var ctrl = this._optionFields && this._optionFields[id];
     if (!ctrl) return;

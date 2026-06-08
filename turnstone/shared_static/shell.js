@@ -391,13 +391,76 @@ async function mountShell() {
     // resolved node after ensureInteractiveNode settles, below.
     if (extra && extra.nodeId) pane.meta = { nodeId: extra.nodeId };
     pane.onMount = function () {
-      // The controller is built LAZILY on first activate — only after the owning
-      // node is resolved AND the session is (re)opened there (the node /events
-      // stream 404s on a ws not loaded on its node, so a rehydrated pane can't
-      // just connect blind).  onMount only reserves a status line so a
-      // not-yet-resolved pane isn't a blank box.
+      // The controller is built LAZILY on first activate (see beginConnect) —
+      // a node-proxied session may need its node resolved + (re)opened first.
+      // onMount only reserves a status line so a not-yet-connected pane isn't a
+      // blank box.
       this._statusEl = make("div", "pane-status", "Connecting…");
       this.bodyEl.append(this._statusEl);
+    };
+    // Build the controller on a resolved node, persist that node for the next
+    // reload, and open the stream.  nodeId null = standalone-local (base="").
+    const buildController = (nodeId) => {
+      if (pane._closed) return; // resolved after the tab was closed
+      // Persist the node so a reload restores onto the SAME node — but skip the
+      // write when it already matches (no redundant sessionStorage round-trip).
+      if (nodeId && (!pane.meta || pane.meta.nodeId !== nodeId)) {
+        pane.meta = { nodeId };
+        pm.setPaneMeta(pane.id, pane.meta);
+      }
+      if (pane._statusEl && pane._statusEl.parentNode) pane._statusEl.remove();
+      pane._statusEl = null;
+      pane._ctl = createInteractivePane(pane.bodyEl, id, {
+        nodeId,
+        onClose: () => pm.close(pane.id),
+      });
+      pane._ctl.connect();
+      if (window.TS_LOGIN && pane._ctl.onLogin) {
+        pane._loginArmed = true;
+        window.TS_LOGIN.subscribe(pane._ctl.onLogin);
+      }
+    };
+    // Errored resolve (capacity / no node free): show it in the status line and
+    // offer a one-click retry — re-clicking the tab won't re-fire onActivate
+    // (PaneManager fires it only on a pane CHANGE), so without this a transient
+    // failure would strand the pane until the user closed + reopened it.
+    const showResolveError = (msg) => {
+      const el = pane._statusEl;
+      if (!el) return;
+      el.className = "pane-status pane-status--retry msg error";
+      el.textContent = msg || "Could not connect to this session.";
+      el.title = "Click to retry";
+      el.onclick = () => {
+        if (pane._ctl || pane._resolving) return;
+        el.className = "pane-status";
+        el.title = "";
+        el.onclick = null;
+        el.textContent = "Connecting…";
+        beginConnect();
+      };
+    };
+    // First-activate connect.  A LIVE session (Tier-1 already names its node, so
+    // it is loaded there) connects DIRECTLY — no /open round-trip; this is the
+    // hot rail / active-row / just-created path.  Standalone runs locally.  Only
+    // the dormant / reload case (the snapshot has no node for this ws) resolves
+    // the node + (re)opens the session, whose /events would otherwise 404.
+    const beginConnect = () => {
+      const liveNode = caps.cluster ? nodeForWs(id) : null;
+      if (liveNode || !caps.cluster) {
+        buildController(liveNode || null);
+        return;
+      }
+      pane._resolving = true;
+      const hint = (pane.meta && pane.meta.nodeId) || (extra && extra.nodeId);
+      ensureInteractiveNode(caps, id, hint).then((res) => {
+        pane._resolving = false;
+        if (pane._closed) return; // closed mid-resolve — don't build into a detached body
+        if (!res || res.error) {
+          showResolveError(res && res.error);
+          return;
+        }
+        buildController(res.nodeId);
+      });
     };
     pane.onActivate = function () {
       pm.setTabGlyph(pane.id, glyph(stateForWs(id))); // live Tier-1 state glyph
@@ -406,35 +469,7 @@ async function mountShell() {
         return;
       }
       if (this._resolving) return; // first-activate resolve already in flight
-      this._resolving = true;
-      const hint = (this.meta && this.meta.nodeId) || (extra && extra.nodeId);
-      ensureInteractiveNode(caps, id, hint).then((res) => {
-        this._resolving = false;
-        if (this._closed) return; // pane closed mid-resolve — don't build into a detached body
-        if (!res || res.error) {
-          if (this._statusEl) {
-            this._statusEl.className = "pane-status msg error";
-            this._statusEl.textContent =
-              (res && res.error) || "Could not connect to this session.";
-          }
-          return;
-        }
-        // Pin + persist the resolved node so the next reload reuses it.
-        this.meta = { nodeId: res.nodeId };
-        pm.setPaneMeta(pane.id, this.meta);
-        if (this._statusEl && this._statusEl.parentNode)
-          this._statusEl.remove();
-        this._statusEl = null;
-        this._ctl = createInteractivePane(this.bodyEl, id, {
-          nodeId: res.nodeId,
-          onClose: () => pm.close(pane.id),
-        });
-        this._ctl.connect();
-        if (window.TS_LOGIN && this._ctl.onLogin) {
-          this._loginArmed = true;
-          window.TS_LOGIN.subscribe(this._ctl.onLogin);
-        }
-      });
+      beginConnect();
     };
     pane.onDeactivate = function () {
       if (this._ctl && this._ctl.deactivate) this._ctl.deactivate();

@@ -1064,6 +1064,13 @@ function _applyLauncherFields() {
 // nodes.  Re-read on each reveal so a node that just (dis)appeared is current.
 function _populateLauncherNodes() {
   if (!_homeCoordComposer) return;
+  // Preserve the operator's current pick across the rebuild: selecting a node
+  // fires the composer `change` event → onChange → _applyLauncherFields → here,
+  // and setOptionChoices() resets the <select> to its placeholder.  Without this
+  // the selection is wiped the instant it's made, so a Specific-node session can
+  // never be launched.  Restored only if the node still exists (else it falls
+  // back to the placeholder, which is correct — the picked node disappeared).
+  const previous = _homeCoordComposer.getOptionValue("node_id");
   const choices = [];
   if (clusterState && clusterState.nodes) {
     Object.keys(clusterState.nodes)
@@ -1079,6 +1086,7 @@ function _populateLauncherNodes() {
       });
   }
   _homeCoordComposer.setOptionChoices("node_id", choices);
+  if (previous) _homeCoordComposer.setOptionValue("node_id", previous);
 }
 
 function _wireLauncherToggle() {
@@ -1980,37 +1988,34 @@ window.TS_APP.resolveInteractiveNode = function (wsId, hintNodeId) {
       return r.ok ? { nodeId: nodeId } : { status: r.status };
     });
   };
+  // Single error surface: the failure is returned as {error} and the interactive
+  // pane writes it into its .pane-status line (the pane is always the active tab
+  // when it resolves).  No toast — one source of truth, no wording drift.
   const failResult = function (status) {
-    if (status === 429) {
-      showToast("Node at capacity; close a session and retry");
+    if (status === 429)
       return { error: "Node at capacity — close a session and retry." };
-    }
-    if (status === 403) {
-      showToast("Not permitted to open this session");
+    if (status === 403)
       return { error: "You don’t have permission to open this session." };
-    }
     return { error: "Could not open this session (" + status + ")." };
   };
   const routeFallback = function () {
     return authFetch("/v1/api/route?ws_id=" + encodeURIComponent(wsId))
       .then(function (r) {
         if (!r.ok) {
-          const msg =
-            r.status === 503
-              ? "No nodes available to open this session."
-              : "Could not locate the session node (" + r.status + ").";
-          showToast(msg);
-          return { error: msg };
+          return {
+            error:
+              r.status === 503
+                ? "No nodes available to open this session."
+                : "Could not locate the session node (" + r.status + ").",
+          };
         }
         return r.json();
       })
       .then(function (route) {
-        if (!route) return { error: "Could not locate the session node." };
-        if (route.error) return route; // route fetch already failed + toasted
-        if (!route.node_id) {
-          showToast("Could not locate the session node");
+        if (!route || route.error)
+          return route || { error: "Could not locate the session node." };
+        if (!route.node_id)
           return { error: "Could not locate the session node." };
-        }
         return openOn(route.node_id).then(function (res) {
           return res.nodeId ? res : failResult(res.status);
         });

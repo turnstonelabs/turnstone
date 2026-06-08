@@ -721,6 +721,12 @@
   color: var(--fg-dim);
   font-size: 13px;
 }
+/* An errored resolve is click-to-retry (see shell.js showResolveError). */
+.pane-status--retry {
+  cursor: pointer;
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
 
 /* ===== Dashboard session launcher — persona toggle (coordinator | interactive).
    A console-dashboard control; lives here because the L-shell loads shell.css. */
