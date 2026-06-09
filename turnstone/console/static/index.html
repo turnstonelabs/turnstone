@@ -4,6 +4,10 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>turnstone console</title>
+    <link
+      rel="icon"
+      href="data:image/svg+xml,%3Csvg%20xmlns='http://www.w3.org/2000/svg'%20viewBox='0%200%2032%2032'%3E%3Crect%20width='32'%20height='32'%20rx='7'%20fill='%230e1013'/%3E%3Cpath%20d='M8%2022a8%208%200%201%201%2016%200'%20fill='none'%20stroke='%23e5a042'%20stroke-width='3'%20stroke-linecap='round'/%3E%3Cpath%20d='M16%2021%20L21%2014'%20stroke='%23e5a042'%20stroke-width='3'%20stroke-linecap='round'/%3E%3C/svg%3E"
+    />
     <link rel="preconnect" href="https://fonts.googleapis.com" />
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
     <link
@@ -3675,7 +3679,7 @@
           id="mcp-name"
           placeholder="e.g. filesystem"
           maxlength="64"
-          pattern="[a-zA-Z0-9._-]+"
+          pattern="[a-zA-Z0-9._\-]+"
         />
         <label for="mcp-transport">Transport</label>
         <select id="mcp-transport" onchange="toggleMcpTransport()">
@@ -3990,7 +3994,7 @@
           id="model-alias"
           placeholder="e.g. gpt5-prod"
           maxlength="64"
-          pattern="[a-zA-Z0-9._-]+"
+          pattern="[a-zA-Z0-9._\-]+"
         />
         <label for="model-name"
           >Model ID
