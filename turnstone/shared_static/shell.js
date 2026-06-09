@@ -475,11 +475,21 @@ async function mountShell() {
       title: wsTitle(id),
       stateful: true, // tab shows live Tier-1 state (no static placeholder)
     });
-    // The pane's CURRENT transport base for tab-menu verbs: the live
+    // The pane's CURRENT transport base for tab-menu verbs: the LIVE
     // controller's (exact), else the persisted node hint, else the live Tier-1
     // node; null = unresolved (node-verbs are omitted until the pane connects).
-    // Standalone is always local ("").
+    // Standalone is always local ("").  A DEAD controller is the exception: its
+    // base — and the persisted hint that mirrors it — is stale once its node has
+    // lost or RE-HOMED the ws, so trusting it would let the close/delete
+    // 404-as-success lanes silently drop a tab whose session is alive on the
+    // node it re-homed to.  When dead we therefore mirror the revive path (the
+    // live Tier-1 node leads), falling back to the stale base only if the ws is
+    // gone cluster-wide, where its 404 correctly reads as "already closed".
     const menuBase = () => {
+      if (pane._ctl && pane._ctl.isDead && pane._ctl.isDead()) {
+        const live = caps.cluster ? nodeForWs(id) : null;
+        return live ? "/node/" + encodeURIComponent(live) : pane._ctl.base;
+      }
       if (pane._ctl && pane._ctl.base != null) return pane._ctl.base;
       if (pane.meta && pane.meta.nodeId)
         return "/node/" + encodeURIComponent(pane.meta.nodeId);

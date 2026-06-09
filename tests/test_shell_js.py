@@ -491,8 +491,9 @@ def test_tab_menu_base_aware_verb_lane() -> None:
     shell = _SHELL_JS.read_text(encoding="utf-8")
     assert "function postWsVerb(" in shell, "the base-aware verb POST helper must exist"
     assert '"/v1/api/workstreams/" + encodeURIComponent(wsId) + "/" + verb' in shell
-    # The interactive pane supplies its current base: live controller's (exact),
-    # else the persisted node hint, else the live Tier-1 node, else null.
+    # The interactive pane supplies its current base: a LIVE controller's
+    # (exact), else the persisted node hint, else the live Tier-1 node, else null
+    # (a DEAD controller's stale base is special-cased — see the test below).
     assert "const menuBase = ()" in shell, "the interactive pane must expose a base getter"
     assert "pane._ctl && pane._ctl.base != null" in shell, (
         "a built controller's base is authoritative for the menu verbs"
@@ -517,6 +518,33 @@ def test_tab_menu_base_aware_verb_lane() -> None:
         "the shared export util must accept the transport base"
     )
     assert '(base || "") +' in util, "the export URL must be base-prefixed"
+
+
+def test_tab_menu_dead_controller_prefers_live_node() -> None:
+    """Lifecycle round 2 follow-up: a DEAD controller's base is stale — its node
+    may have lost or RE-HOMED the ws — so the tab-menu base getter must not keep
+    aiming verbs at it.  Otherwise the close/delete 404-as-success lanes would
+    silently drop a tab whose session is alive on the node it re-homed to.  When
+    dead, ``menuBase`` mirrors the revive path (the live Tier-1 node leads); the
+    stale controller base is only the gone-cluster-wide fallback.
+    """
+    shell = _SHELL_JS.read_text(encoding="utf-8")
+    body = shell[shell.index("const menuBase = ()") :]
+    body = body[: body.index("};") + 2]
+    # The dead-controller guard must come FIRST — before the live-base return —
+    # so a stale base can never authorise the 404-as-success drop.
+    assert "pane._ctl.isDead && pane._ctl.isDead()" in body, (
+        "menuBase must special-case a dead controller"
+    )
+    assert body.index("isDead()") < body.index("pane._ctl.base != null"), (
+        "the dead-controller guard must precede the authoritative live-base return"
+    )
+    # When dead the live Tier-1 node leads (mirrors beginConnect's hint chain),
+    # falling back to the controller's own (stale) base only when no live node.
+    assert 'live ? "/node/" + encodeURIComponent(live) : pane._ctl.base' in body, (
+        "a dead pane aims at the live node, falling back to the stale base only "
+        "when the ws is gone cluster-wide"
+    )
 
 
 def test_step7_tab_menu_css_promoted_shared() -> None:
