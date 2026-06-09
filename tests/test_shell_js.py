@@ -839,8 +839,7 @@ def test_mobile_drawer_off_canvas() -> None:
     assert "@media (max-width: 768px)" in css, "the drawer is mobile-scoped"
     assert "translateX(-100%)" in css, "the closed drawer parks off-canvas"
     assert "visibility: hidden" in css, (
-        "the closed drawer must leave the Tab order / a11y tree, not merely "
-        "translate off-screen"
+        "the closed drawer must leave the Tab order / a11y tree, not merely translate off-screen"
     )
 
 
