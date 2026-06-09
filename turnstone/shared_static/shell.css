@@ -960,6 +960,10 @@
    stacked cluster glyph+count pills, one ⚙ for Manage.  Hover names come from
    the title attrs rail.js always sets.  Desktop-only: below the drawer
    breakpoint the rail overlays at full width, so the preference lies dormant.
+
+   769 = the drawer's 768 breakpoint + 1 — a matched pair (CSS @media cannot
+   read a shared token).  Change BOTH together or a 1px band gets neither
+   (or both) layouts.
    ========================================================================== */
 @media (min-width: 769px) {
   .app.rail-collapsed {
@@ -1078,6 +1082,9 @@
    ☰ in the tab bar opens it; scrim tap / Escape / opening a pane close it.
    The closed drawer is visibility:hidden so its buttons drop out of the Tab
    order and the a11y tree — not merely translated off-screen.
+
+   768 pairs with the collapse block's min-width: 769px above — change BOTH
+   together (see the note there).
    ========================================================================== */
 @media (max-width: 768px) {
   .app,

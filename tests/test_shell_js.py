@@ -778,3 +778,84 @@ def test_coordinator_pane_reconnects_on_reopen() -> None:
         "reconnect must only act on a missing/CLOSED stream"
     )
     assert "reconnect: reconnect," in coord, "the factory must return reconnect"
+
+
+# ---------------------------------------------------------------------------
+# Polish round: rail collapse + mobile drawer + the shared popup-menu helper.
+# ---------------------------------------------------------------------------
+
+
+def test_rail_collapse_glyph_strip() -> None:
+    """Desktop rail collapse: a persisted preference (localStorage
+    ``turnstone_interface.rail``) shrinks the rail to a 52px glyph-only strip —
+    live state glyphs stay the navigation, the cluster pills keep glyph+count
+    (the label rides a hideable span), Manage gets a single gear stand-in that
+    opens the Admin pane, and the toggle mirrors its state through
+    aria-expanded/aria-controls."""
+    shell = _SHELL_JS.read_text(encoding="utf-8")
+    assert 'const RAIL_COLLAPSE_KEY = "turnstone_interface.rail"' in shell, (
+        "the collapse preference must persist under the turnstone_interface key"
+    )
+    assert 'make("button", "rail-collapse")' in shell, "the collapse toggle must exist"
+    assert 'collapseBtn.setAttribute("aria-controls", "shell-rail")' in shell, (
+        "the toggle must reference the rail it controls"
+    )
+    assert 'classList.toggle("rail-collapsed", collapsed)' in shell, (
+        "collapse must be a class flip on .app (CSS owns the layout change)"
+    )
+    rail = _RAIL_JS.read_text(encoding="utf-8")
+    assert '"cpill-label"' in rail, (
+        "cluster pill labels must ride a span so the collapsed strip can hide "
+        "them while keeping glyph + count"
+    )
+    assert "manage-glyph" in rail, (
+        "Manage needs its collapsed-strip gear stand-in (rail.js mountManage)"
+    )
+    css = _SHELL_CSS.read_text(encoding="utf-8")
+    assert "grid-template-columns: 52px 1fr" in css, "the collapsed rail is 52px"
+    assert ".app.rail-collapsed .manage-glyph" in css, (
+        "the gear stand-in must flip on while collapsed"
+    )
+    assert "@media (min-width: 769px)" in css, (
+        "the collapse block must be desktop-scoped (the drawer owns mobile)"
+    )
+
+
+def test_mobile_drawer_off_canvas() -> None:
+    """Mobile drawer: below the breakpoint the rail overlays off-canvas at full
+    width.  Burger in the tab bar opens it (focus moves into the rail);
+    Escape / scrim tap / any pane activation close it; the closed drawer is
+    visibility:hidden so its buttons leave the Tab order."""
+    shell = _SHELL_JS.read_text(encoding="utf-8")
+    assert 'make("button", "rail-burger"' in shell, "the drawer toggle must exist"
+    assert 'make("div", "rail-scrim")' in shell, "the backdrop scrim must exist"
+    assert 'classList.toggle("rail-open", open)' in shell, (
+        "drawer state must be a class flip on .app"
+    )
+    assert "pm.onActiveChange(() => setDrawer(false))" in shell, (
+        "opening/focusing a pane must close the drawer that did it"
+    )
+    css = _SHELL_CSS.read_text(encoding="utf-8")
+    assert "@media (max-width: 768px)" in css, "the drawer is mobile-scoped"
+    assert "translateX(-100%)" in css, "the closed drawer parks off-canvas"
+    assert "visibility: hidden" in css, (
+        "the closed drawer must leave the Tab order / a11y tree, not merely "
+        "translate off-screen"
+    )
+
+
+def test_popup_menu_shared_helper() -> None:
+    """One popup-menu chrome: pane.js exports openPopupMenu (items,
+    positioning with flip+clamp, dismissal, aria-expanded mirroring, arrow
+    roving) and BOTH consumers ride it — the tab-action dropdown and the
+    shell's footer user menu (which pops up from the viewport-bottom chip)."""
+    pane = _PANE_JS.read_text(encoding="utf-8")
+    assert "export function openPopupMenu(" in pane, "the shared helper must exist"
+    assert pane.count("openPopupMenu(") >= 2, (
+        "the tab-action dropdown must route through the helper"
+    )
+    shell = _SHELL_JS.read_text(encoding="utf-8")
+    assert "openPopupMenu(" in shell, "the user menu must ride the shared helper"
+    assert 'prefer: "up"' in shell, (
+        "the footer chip sits at the viewport bottom — the menu pops upward"
+    )
