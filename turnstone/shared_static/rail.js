@@ -84,10 +84,16 @@ function renderCluster(root, cs, TS) {
     pill.type = "button";
     pill.className = "cpill";
     pill.setAttribute("aria-label", n + " " + STATE_LABEL[st] + ", filter");
+    pill.title = n + " " + STATE_LABEL[st]; // names the glyph+count when the rail is collapsed
     pill.append(glyph(st));
     const b = document.createElement("b");
     b.textContent = String(n);
-    pill.append(b, document.createTextNode(" " + STATE_LABEL[st]));
+    // The label rides in a span so the collapsed rail can hide it and keep the
+    // glyph + count (a bare text node is not CSS-addressable).
+    const lbl = document.createElement("span");
+    lbl.className = "cpill-label";
+    lbl.textContent = " " + STATE_LABEL[st];
+    pill.append(b, lbl);
     pill.addEventListener(
       "click",
       () => TS.drillDownByState && TS.drillDownByState(st),
@@ -148,6 +154,7 @@ function renderCluster(root, cs, TS) {
       item.type = "button";
       item.className = "node-row";
       const st = nodeState(info);
+      item.title = info.node_id; // the .nn label ellipsizes long node ids
       item.setAttribute(
         "aria-label",
         info.node_id + ", " + st + ", " + info.ws_total + " workstreams",
@@ -197,6 +204,9 @@ function sessionRow(ws, childCount, isChild, TS, paneManager, active) {
     "aria-label",
     (ws.name || ws.title || ws.id) + ", " + (ws.state || "idle") + ", " + kind,
   );
+  // Hover name — the expanded row ellipsizes long names; the collapsed rail
+  // shows only the state glyph, so the title is the whole label there.
+  btn.title = ws.name || ws.title || ws.id || "session";
   btn.append(glyph(ws.state || "idle"));
   const nm = document.createElement("span");
   nm.className = "nm";
@@ -244,6 +254,7 @@ function renderWorkspaces(root, cs, TS, paneManager) {
   const dashLi = document.createElement("li");
   const dash = document.createElement("button");
   dash.type = "button";
+  dash.title = "Dashboard"; // the collapsed rail shows only the ◇ glyph
   dash.className =
     "row" + (active && active.type === "dashboard" ? " open" : "");
   const g = document.createElement("span");
@@ -331,6 +342,29 @@ export function mountManage(root, paneManager) {
   const ia = TS.ia || [];
   const allowed = TS.isTabAllowed || (() => true);
   root.replaceChildren();
+
+  // Collapsed-rail representation: the discovery groups need text, so the
+  // collapsed strip shows ONE ⚙ row that opens/focuses the singleton Admin
+  // pane at its current tab (the rail expands back to browse the full map).
+  // Always in the DOM (CSS shows it only while the rail is collapsed), but
+  // permission-gated like the groups: no visible tab, no ⚙ either.
+  if (ia.some((g) => g.tabs.some((t) => allowed(t.tab)))) {
+    const manageGlyph = document.createElement("button");
+    manageGlyph.type = "button";
+    manageGlyph.className = "row manage-glyph";
+    manageGlyph.title = "Manage";
+    manageGlyph.setAttribute("aria-label", "Manage (open admin)");
+    const mg = document.createElement("span");
+    mg.className = "glyph";
+    mg.setAttribute("aria-hidden", "true");
+    mg.textContent = "⚙";
+    manageGlyph.append(mg);
+    manageGlyph.addEventListener(
+      "click",
+      () => paneManager && paneManager.openPane("admin"),
+    );
+    root.append(manageGlyph);
+  }
 
   // If the Admin pane is already open (e.g. restored by PaneManager.rehydrate),
   // seed the rail to its current tab + expand the owning group; otherwise every

@@ -20,13 +20,13 @@
   height: 100vh;
   overflow: hidden;
 }
-/* Responsive (step 7): DESKTOP-FIRST, by decision — this matches the desktop-only
-   design-system scope (the console's mobile off-canvas drawer was retired in step
-   3b, and the DS itself is desktop-only).  The rail -> off-canvas drawer on mobile
-   is DEFERRED, not dropped: it would slot in here as a `max-width` @media that
-   collapses the 266px rail column into a toggled overlay.  Narrow viewports get a
-   cramped desktop layout (not a broken one) — no silent mobile-support claim.
-   Revisit only if/when the DS takes on a mobile scope. */
+/* Responsive: desktop-first.  Two rail modes beyond the default 266px column,
+   both defined in the "Collapsed rail" / "Mobile drawer" sections at the end of
+   this sheet:
+     - DESKTOP COLLAPSE (user preference, `.app.rail-collapsed`): the rail
+       shrinks to a 52px glyph-only strip — live state glyphs remain the
+       navigation; text labels hide.
+     - The deferred mobile off-canvas drawer (max-width media query). */
 
 /* ===== Rail (the | of the L) ===== */
 .rail {
@@ -80,6 +80,33 @@
   outline: 2px solid var(--accent);
   outline-offset: 2px;
   border-radius: var(--r-sm);
+}
+/* collapse toggle — far side of the brand row.  Desktop-only: the mobile
+   drawer always presents the full rail, so the button hides there (see the
+   responsive section at the end of this sheet). */
+.rail-collapse {
+  margin-left: auto;
+  width: 22px;
+  height: 22px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border: 0;
+  background: none;
+  border-radius: var(--r-sm);
+  color: var(--ink-4);
+  font-size: 13px;
+  line-height: 1;
+  cursor: pointer;
+  font-family: var(--font-ui);
+}
+.rail-collapse:hover {
+  background: var(--panel-2);
+  color: var(--ink-2);
+}
+.rail-collapse:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: -2px;
 }
 .rail-scroll {
   flex: 1;
@@ -462,6 +489,15 @@
   border: 1px solid transparent;
   background: none;
   font-family: var(--font-ui);
+  /* long workstream names ellipsize (.tab-title) instead of growing the tab */
+  max-width: 240px;
+}
+.tab-title {
+  flex: 0 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 /* Tab glyph spacing — applies to BOTH the static decorative char (Dashboard /
    Admin, via .glyph) and the live state glyph (.ui-glyph-* on conversational
@@ -537,6 +573,39 @@
   align-items: center;
   gap: 8px;
   color: var(--ink-4);
+}
+/* Drawer toggle + backdrop — desktop keeps the rail in the grid, so both are
+   dormant here; the mobile block at the end of this sheet brings them up. */
+.rail-burger {
+  display: none;
+  width: 28px;
+  height: 28px;
+  align-items: center;
+  justify-content: center;
+  color: var(--ink-3);
+  border-radius: var(--r-sm);
+  cursor: pointer;
+  font-size: 14px;
+  line-height: 1;
+  border: none;
+  background: none;
+  font-family: var(--font-ui);
+  flex: none;
+}
+.rail-burger:hover {
+  background: var(--panel-2);
+  color: var(--ink);
+}
+.rail-burger:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: -2px;
+}
+.rail-scrim {
+  display: none;
+  position: fixed;
+  inset: 0;
+  z-index: 390;
+  background: color-mix(in srgb, var(--bg) 55%, transparent);
 }
 
 /* Tab-action dropdown — promoted to the shared shell sheet so the console and
@@ -809,6 +878,12 @@
 .grp {
   margin-top: 1px;
 }
+/* The Manage section's collapsed-strip stand-in (rail.js mountManage): one ⚙
+   row that opens the Admin pane.  Hidden while the rail is expanded — the
+   collapsed-rail block at the end of this sheet flips it on. */
+.manage-glyph {
+  display: none;
+}
 .grp-head {
   display: flex;
   align-items: center;
@@ -876,4 +951,179 @@
   flex-direction: column;
   /* inset off the tab-bar hairline + rail edge; .admin-content keeps its right pad */
   padding: 16px 0 0 16px;
+}
+
+/* ==========================================================================
+   Collapsed rail (desktop) — `.app.rail-collapsed` shrinks the | of the L to a
+   52px glyph-only strip.  The glyphs ARE the navigation: live session state
+   glyphs (the same Tier-1-fed .ui-glyph-* the expanded rows carry), ◇ home,
+   stacked cluster glyph+count pills, one ⚙ for Manage.  Hover names come from
+   the title attrs rail.js always sets.  Desktop-only: below the drawer
+   breakpoint the rail overlays at full width, so the preference lies dormant.
+   ========================================================================== */
+@media (min-width: 769px) {
+  .app.rail-collapsed {
+    grid-template-columns: 52px 1fr;
+  }
+  /* brand stacks: mark (home) on top, the expand toggle under it */
+  .app.rail-collapsed .rail-brand {
+    flex-direction: column;
+    gap: 10px;
+    padding: 13px 0 11px;
+  }
+  .app.rail-collapsed .brand-name,
+  .app.rail-collapsed .brand-sub {
+    display: none;
+  }
+  .app.rail-collapsed .brand-home {
+    justify-content: center;
+  }
+  .app.rail-collapsed .rail-collapse {
+    margin-left: 0;
+  }
+  .app.rail-collapsed .rail-scroll {
+    padding: 10px 5px 6px;
+    scrollbar-width: thin;
+  }
+  /* section labels become hairline separators (uppercase text won't fit) */
+  .app.rail-collapsed .sec-label {
+    height: 0;
+    padding: 0;
+    margin: 8px 6px;
+    border-top: 1px solid var(--hair);
+    overflow: hidden;
+    font-size: 0;
+  }
+  /* …except the first, which would double the brand row's border-bottom
+     (the conn slot sits between them whether or not #status-bar relocated) */
+  .app.rail-collapsed .rail-conn + .sec-label,
+  .app.rail-collapsed .rail-conn-slot + .sec-label {
+    border-top: 0;
+    margin: 0;
+  }
+  /* connection indicator: glyph-only — the message text collapses away but
+     stays in the DOM for AT; expanding the rail reveals it */
+  .app.rail-collapsed .rail-conn {
+    font-size: 0;
+    padding: 0;
+    text-align: center;
+  }
+  .app.rail-collapsed .rail-conn.disconnected::before {
+    content: "⚠";
+    font-size: 12px;
+    color: var(--warn);
+  }
+  /* cluster card: pills stack as glyph + count; the node list needs text */
+  .app.rail-collapsed .cluster {
+    padding: 7px 4px;
+  }
+  .app.rail-collapsed .cluster-row {
+    flex-direction: column;
+    align-items: center;
+    gap: 6px;
+  }
+  .app.rail-collapsed .cpill-label {
+    display: none;
+  }
+  .app.rail-collapsed .cluster-nodes {
+    display: none;
+  }
+  /* session rows: the live state glyph is the whole row */
+  .app.rail-collapsed .row {
+    justify-content: center;
+    gap: 0;
+    padding: 7px 0;
+  }
+  .app.rail-collapsed .row .nm,
+  .app.rail-collapsed .row .rcount,
+  .app.rail-collapsed .row .tag {
+    display: none;
+  }
+  .app.rail-collapsed .row.open::before {
+    left: 1px;
+  }
+  /* children flatten to peer glyphs — the hierarchy needs text to read, and
+     reachability beats hierarchy in a glyph strip (titles disambiguate) */
+  .app.rail-collapsed .children {
+    margin: 0;
+    padding: 0;
+    border-left: 0;
+  }
+  /* Manage: the ⚙ stand-in replaces the text-only discovery groups */
+  .app.rail-collapsed .grp {
+    display: none;
+  }
+  .app.rail-collapsed .manage-glyph {
+    display: flex;
+  }
+  /* footer stacks: theme toggle above the avatar-only user chip */
+  .app.rail-collapsed .rail-foot {
+    flex-direction: column;
+    gap: 6px;
+    padding: 9px 6px;
+  }
+  .app.rail-collapsed .user-chip {
+    margin: 0;
+    padding: 3px;
+  }
+  .app.rail-collapsed .user-name {
+    display: none;
+  }
+}
+
+/* ==========================================================================
+   Mobile drawer — below the breakpoint the rail leaves the grid and overlays
+   off-canvas at FULL width (the desktop collapse preference lies dormant: a
+   52px strip makes no sense when the rail floats over the content anyway).
+   ☰ in the tab bar opens it; scrim tap / Escape / opening a pane close it.
+   The closed drawer is visibility:hidden so its buttons drop out of the Tab
+   order and the a11y tree — not merely translated off-screen.
+   ========================================================================== */
+@media (max-width: 768px) {
+  .app,
+  .app.rail-collapsed {
+    grid-template-columns: 1fr;
+  }
+  .rail {
+    position: fixed;
+    inset: 0 auto 0 0;
+    width: min(286px, 84vw);
+    z-index: 400;
+    transform: translateX(-100%);
+    visibility: hidden;
+    /* visibility flips AFTER the slide-out finishes (delay = duration) */
+    transition:
+      transform 0.2s ease,
+      visibility 0s linear 0.2s;
+  }
+  .app.rail-open .rail {
+    transform: none;
+    visibility: visible;
+    transition: transform 0.2s ease;
+    box-shadow: 0 0 32px rgba(0, 0, 0, 0.45);
+  }
+  /* the desktop collapse toggle hides — the drawer is always the full rail */
+  .rail-collapse {
+    display: none;
+  }
+  .rail-burger {
+    display: inline-flex;
+  }
+  .app.rail-open .rail-scrim {
+    display: block;
+  }
+  /* tab bar scrolls horizontally; tabs tighten so 2-3 stay legible */
+  .tabbar {
+    overflow-x: auto;
+    scrollbar-width: thin;
+    padding: 8px 8px;
+  }
+  .tab {
+    max-width: 48vw;
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .rail {
+    transition: none;
+  }
 }

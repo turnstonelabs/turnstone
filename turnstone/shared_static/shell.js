@@ -41,6 +41,7 @@ function buildShell(caps) {
 
   // ----- Rail (the | of the L) -----
   const rail = make("aside", "rail");
+  rail.id = "shell-rail"; // aria-controls target for the collapse toggle
 
   const brand = make("div", "rail-brand");
   // The brand doubles as "go home" — a real <button> so it is keyboard-
@@ -55,6 +56,13 @@ function buildShell(caps) {
     if (typeof window.showHome === "function") window.showHome();
   });
   brand.append(home);
+  // Collapse toggle — shrinks the rail to a glyph-only strip (desktop only; on
+  // mobile the rail is an off-canvas drawer and this button is hidden).  Label,
+  // glyph and aria state are kept in sync by the shell's setRailCollapsed.
+  const collapseBtn = make("button", "rail-collapse");
+  collapseBtn.type = "button";
+  collapseBtn.setAttribute("aria-controls", "shell-rail");
+  brand.append(collapseBtn);
   rail.append(brand);
 
   const scroll = make("div", "rail-scroll");
@@ -81,15 +89,31 @@ function buildShell(caps) {
   // ----- Content (the — of the L): tab bar + pane host -----
   const content = make("main", "content");
   const tabbar = make("div", "tabbar");
+  // Drawer toggle — first tab-bar item, shown only at the mobile breakpoint
+  // (the rail leaves the grid and overlays off-canvas there).  State + focus
+  // hand-off are wired by mountShell's setDrawer.
+  const burger = make("button", "rail-burger", "☰");
+  burger.type = "button";
+  burger.setAttribute("aria-label", "Open navigation");
+  burger.setAttribute("aria-controls", "shell-rail");
+  burger.setAttribute("aria-expanded", "false");
   const tail = make("div", "tabbar-right"); // right-floated tab-bar chrome (empty for now)
-  tabbar.append(tail);
+  tabbar.append(burger, tail); // managed tabs insert between the two
   const panes = make("div", "panes");
   content.append(tabbar, panes);
 
-  app.append(rail, content);
+  // Backdrop scrim for the mobile drawer — fixed overlay between content and
+  // the off-canvas rail; decorative (the burger/Escape carry the semantics).
+  const scrim = make("div", "rail-scrim");
+  scrim.setAttribute("aria-hidden", "true");
+
+  app.append(rail, content, scrim);
   return {
     app,
     rail,
+    collapseBtn,
+    burger,
+    scrim,
     scroll,
     connSlot,
     foot,
@@ -357,6 +381,46 @@ async function mountShell() {
   // (toast, modals, the login overlay appended later by auth.js) stay siblings.
   document.body.insertBefore(shell.app, document.body.firstChild);
 
+  // ----- Rail collapse (desktop) -----
+  // Collapsed = a glyph-only strip: live state glyphs stay (sessions, cluster
+  // counts), text labels hide, Manage becomes a single ⚙ row (rail.js).  A UI
+  // preference, so it persists across sessions in localStorage (same home as
+  // the theme), unlike the per-tab working set in sessionStorage.  CSS scopes
+  // the collapsed layout to desktop; the mobile drawer always shows the full
+  // rail, so the preference simply lies dormant there.
+  const RAIL_COLLAPSE_KEY = "turnstone_interface.rail";
+  const setRailCollapsed = (collapsed, persist) => {
+    shell.app.classList.toggle("rail-collapsed", collapsed);
+    shell.collapseBtn.textContent = collapsed ? "»" : "«"; // » / «
+    const label = collapsed ? "Expand navigation" : "Collapse navigation";
+    shell.collapseBtn.setAttribute("aria-label", label);
+    shell.collapseBtn.title = label;
+    shell.collapseBtn.setAttribute(
+      "aria-expanded",
+      collapsed ? "false" : "true",
+    );
+    if (persist) {
+      try {
+        localStorage.setItem(
+          RAIL_COLLAPSE_KEY,
+          collapsed ? "collapsed" : "expanded",
+        );
+      } catch (e) {
+        /* localStorage unavailable (private mode) — the toggle still works */
+      }
+    }
+  };
+  let railCollapsed = false;
+  try {
+    railCollapsed = localStorage.getItem(RAIL_COLLAPSE_KEY) === "collapsed";
+  } catch (e) {
+    /* unreadable preference — default expanded */
+  }
+  setRailCollapsed(railCollapsed, false);
+  shell.collapseBtn.addEventListener("click", () =>
+    setRailCollapsed(!shell.app.classList.contains("rail-collapsed"), true),
+  );
+
   // Relocate the connection indicator into the rail (id preserved → connectSSE
   // keeps writing to it; just styled as a rail line now).
   if (statusBarEl) {
@@ -404,6 +468,33 @@ async function mountShell() {
     tailEl: shell.tail,
     caps,
   });
+
+  // ----- Mobile drawer (the rail off-canvas below the breakpoint) -----
+  // Open moves focus into the rail (its buttons are unreachable while
+  // off-canvas — the closed drawer is visibility:hidden); close returns it to
+  // the burger only for Escape, the keyboard path.  Any pane activation closes
+  // the drawer: a rail tap that opened/focused a pane has done its job, and
+  // the stale-open drawer would cover the very pane it opened.  Desktop is
+  // untouched — the classes exist but the media query ignores them.
+  const drawerOpen = () => shell.app.classList.contains("rail-open");
+  const setDrawer = (open) => {
+    if (open === drawerOpen()) return;
+    shell.app.classList.toggle("rail-open", open);
+    shell.burger.setAttribute("aria-expanded", open ? "true" : "false");
+    if (open) {
+      const first = shell.rail.querySelector("button");
+      if (first) first.focus();
+    }
+  };
+  shell.burger.addEventListener("click", () => setDrawer(!drawerOpen()));
+  shell.scrim.addEventListener("mousedown", () => setDrawer(false));
+  document.addEventListener("keydown", (e) => {
+    if (e.key === "Escape" && drawerOpen()) {
+      setDrawer(false);
+      shell.burger.focus();
+    }
+  });
+  pm.onActiveChange(() => setDrawer(false));
 
   // [+] new-tab (step 7): a shortcut to the persona launcher.  The Dashboard pane
   // hosts the unified coordinator/interactive launcher (a new session needs a task

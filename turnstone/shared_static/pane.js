@@ -357,7 +357,12 @@ export class PaneManager {
       tab.append(g);
       pane._glyphEl = g;
     }
-    const titleNode = document.createTextNode(pane.title);
+    // The title is a span (not a bare text node) so CSS can ellipsize it —
+    // tabs cap their width (tighter on mobile) instead of growing unbounded
+    // with a long workstream name.
+    const titleNode = document.createElement("span");
+    titleNode.className = "tab-title";
+    titleNode.textContent = pane.title;
     tab.append(titleNode);
     pane._titleNode = titleNode; // setTabTitle repaints this from Tier-1
     // Tab-action menu (step 7): a pane that exposes `tabMenu()` gets a caret to
