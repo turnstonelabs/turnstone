@@ -11,13 +11,10 @@
 //  session living on a cluster node (the LOCALITY invariant).
 //
 //  ES module — the first legacy pane lifted into a real module (step 5a; the
-//  coordinator pane followed in 5e.0).  The shared substrate it leans on —
-//  composer/renderer/etc. — is still classic, consumed as globals.  The console
-//  shell.js imports the factory directly; the standalone loads it as
-//  `<script type="module">`.  It also publishes `window.InteractivePane` /
-//  `window.createInteractivePane` so the still-classic standalone `app.js`
-//  shell can read the class — safe because app.js builds panes only AFTER the
-//  workstream fetch resolves, well after this deferred module has executed.
+//  coordinator pane followed in 5e.0, and the shared substrate it leans on —
+//  composer/renderer/auth/etc. — became modules too, imported below).  The
+//  console shell.js imports the factory directly; the standalone loads it as
+//  `<script type="module">`.
 //
 //  House style: programmatic DOM, NO innerHTML (the renderer is the sole
 //  sanctioned exception); pane code root-scopes to its own element.
@@ -37,6 +34,14 @@ import {
   batchKicker,
   indexLabel,
 } from "./conversation.js";
+import { authFetch } from "./auth.js";
+import { showToast } from "./toast.js";
+import { Composer } from "./composer.js";
+import { createAttachmentController } from "./composer_attachments.js";
+import { createQueueController } from "./composer_queue.js";
+import { StatusBar } from "./status_bar.js";
+import { streamingRender, streamingRenderFinalize } from "./renderer.js";
+import { setMarkdown, operatorSourceLabel } from "./utils.js";
 
 let _paneCounter = 0;
 

@@ -1,18 +1,28 @@
-/* Shared utility functions — turnstone design system */
+/* Shared utility functions — turnstone design system
 
-function escapeHtml(text) {
+   ES module at the BOTTOM of the shared module graph: imports nothing, so
+   renderer.js / auth.js / kb.js / cards.js can import from here without
+   cycles.  The two helpers that call upward (setMarkdown → renderer,
+   exportWorkstreamDownload → toast/auth) late-bind through window at CALL
+   time instead — importing them here would close an import cycle.
+
+   The window bridge at the bottom keeps the still-classic consumers
+   (console app.js / admin.js / governance.js, ui app.js, inline onclick=)
+   working; modules should import instead. */
+
+export function escapeHtml(text) {
   const el = document.createElement("span");
   el.textContent = text;
   return el.innerHTML.replace(/'/g, "&#39;").replace(/"/g, "&quot;");
 }
 
-function formatTokens(n) {
+export function formatTokens(n) {
   if (n >= 1000000) return (n / 1000000).toFixed(1) + "M";
   if (n >= 1000) return (n / 1000).toFixed(1) + "k";
   return String(n || 0);
 }
 
-function ctxClass(ratio) {
+export function ctxClass(ratio) {
   if (ratio <= 0) return "ctx-idle";
   const pct = ratio * 100;
   if (pct < 30) return "ctx-low";
@@ -21,7 +31,7 @@ function ctxClass(ratio) {
   return "ctx-danger";
 }
 
-function formatUptime(seconds) {
+export function formatUptime(seconds) {
   if (!seconds) return "";
   if (seconds < 60) return seconds + "s";
   const min = Math.floor(seconds / 60);
@@ -30,7 +40,7 @@ function formatUptime(seconds) {
   return hr + "h " + (min % 60) + "m";
 }
 
-function formatCount(n) {
+export function formatCount(n) {
   if (n >= 1000) return (n / 1000).toFixed(1) + "k";
   return String(n);
 }
@@ -51,14 +61,14 @@ const OPERATOR_SOURCE_LABELS = {
   tool_error: "tool error",
   skill_hint: "skill hint",
 };
-function operatorSourceLabel(source) {
+export function operatorSourceLabel(source) {
   return OPERATOR_SOURCE_LABELS[source] || source || "operator";
 }
 
 // Naive ISO-8601 → "Nm ago" / "Nh ago" / "Nd ago" / locale date.
 // Tolerates space-as-separator (SQLite default) and missing TZ marker
 // (assumes UTC, matching the storage layer's stamp).
-function formatRelativeTime(iso) {
+export function formatRelativeTime(iso) {
   if (!iso) return "";
   let s = String(iso).replace(" ", "T");
   if (!s.endsWith("Z") && !s.includes("+")) s += "Z";
@@ -83,7 +93,7 @@ function formatRelativeTime(iso) {
 // actually appear in our id formats — hex ws_ids, alphanumeric
 // node_ids — and escapes the characters a CSS attribute selector
 // treats specially.
-function cssEscape(s) {
+export function cssEscape(s) {
   const str = String(s == null ? "" : s);
   if (typeof CSS !== "undefined" && typeof CSS.escape === "function") {
     return CSS.escape(str);
@@ -98,7 +108,7 @@ function cssEscape(s) {
 // a DocumentFragment lets callers use either append() or
 // replaceChildren() depending on whether the button is fresh or
 // rebuilt in place.
-function makeKeyLabel(hint, label) {
+export function makeKeyLabel(hint, label) {
   const span = document.createElement("span");
   span.className = "key";
   span.textContent = hint;
@@ -111,7 +121,7 @@ function makeKeyLabel(hint, label) {
 // "Loading…", "Failed to load", and "No active workstreams" states
 // across the dashboard surfaces.  Callers typically pass the result to
 // el.replaceChildren(...) so the empty card replaces existing content.
-function makeEmptyState(text) {
+export function makeEmptyState(text) {
   const div = document.createElement("div");
   div.className = "dashboard-empty";
   div.textContent = text;
@@ -125,7 +135,7 @@ function makeEmptyState(text) {
 // interpolation) — DOMParser will faithfully parse whatever it is
 // given.  The DOMParser path keeps the unsafe sink off the call site
 // without requiring every caller to construct DOM elements by hand.
-function setSafeHtml(el, html) {
+export function setSafeHtml(el, html) {
   const parsed = new DOMParser().parseFromString(html, "text/html");
   el.replaceChildren(...Array.from(parsed.body.childNodes));
 }
@@ -137,9 +147,9 @@ function setSafeHtml(el, html) {
 // as renderer.js is trusted.  postRenderMarkdown finishes the job —
 // hljs highlighting + mermaid SVG rendering for any code blocks the
 // markdown emitted.
-function setMarkdown(el, content) {
-  setSafeHtml(el, renderMarkdown(content));
-  postRenderMarkdown(el);
+export function setMarkdown(el, content) {
+  setSafeHtml(el, window.renderMarkdown(content));
+  window.postRenderMarkdown(el);
 }
 
 // Download a workstream's conversation as OpenAI-shaped JSON.  Hits
@@ -154,9 +164,9 @@ function setMarkdown(el, content) {
 // authFetch already handles the 401 (shows login) and
 // 429 (retry) paths and returns the raw Response, so we read .blob()
 // directly and synthesise an anchor click to trigger the browser save.
-async function exportWorkstreamDownload(wsId, btn, base) {
+export async function exportWorkstreamDownload(wsId, btn, base) {
   if (!wsId) {
-    showToast("No conversation to export", "error");
+    window.showToast("No conversation to export", "error");
     return;
   }
   // Re-entrancy guard: a double-click (or Enter+Enter) must not fire two
@@ -177,14 +187,14 @@ async function exportWorkstreamDownload(wsId, btn, base) {
       "/export";
     let r;
     try {
-      r = await authFetch(url);
+      r = await window.authFetch(url);
     } catch (e) {
       // authFetch throws Error("auth") on 401 after showing the login
       // modal — nothing more to do here.
       return;
     }
     if (!r || !r.ok) {
-      showToast("Export failed", "error");
+      window.showToast("Export failed", "error");
       return;
     }
     let filename = wsId + ".json";
@@ -202,7 +212,7 @@ async function exportWorkstreamDownload(wsId, btn, base) {
     a.click();
     a.remove();
     URL.revokeObjectURL(objUrl);
-    showToast("Exported " + filename);
+    window.showToast("Exported " + filename);
   } finally {
     exportWorkstreamDownload._busy = false;
     if (btn) {
@@ -211,3 +221,24 @@ async function exportWorkstreamDownload(wsId, btn, base) {
     }
   }
 }
+
+// --- Legacy window bridge ---------------------------------------------------
+// Classic consumers (console app.js / admin.js / governance.js, ui app.js,
+// inline onclick=) still reach these as globals; they only do so at event /
+// boot time, well after this deferred module has evaluated.  New module code
+// imports instead.  Drop entries as the classic bundles migrate.
+Object.assign(window, {
+  escapeHtml,
+  formatTokens,
+  ctxClass,
+  formatUptime,
+  formatCount,
+  operatorSourceLabel,
+  formatRelativeTime,
+  cssEscape,
+  makeKeyLabel,
+  makeEmptyState,
+  setSafeHtml,
+  setMarkdown,
+  exportWorkstreamDownload,
+});

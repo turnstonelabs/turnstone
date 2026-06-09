@@ -2,12 +2,16 @@
    L-shell bootstrap — builds the unified rail + tab-bar + pane-host frame and
    hands off to the legacy app boot.
 
-   The FIRST ES-module citizen in shared_static (the rest are classic scripts).
-   Being `type="module"` it is deferred, so it runs AFTER every classic script —
-   including app.js, which now defines `window.TS_APP.boot` without auto-running
-   it.  So the order is: classic scripts define globals → this module builds the
-   shell and reparents the existing DOM → it calls `TS_APP.boot()` to start
-   login + the Tier-1 cluster stream under the shell.
+   The shared substrate (utils/toast/auth/composer/renderer/…) is ES modules
+   like this file; only theme.js (FOUC), the vendored libs, and the legacy
+   app/admin/governance bundles remain classic.  Being `type="module"` this
+   file is deferred and last in document order, so it runs AFTER every classic
+   script — including app.js, which defines `window.TS_APP.boot` without
+   auto-running it — and after the substrate modules have installed their
+   transitional window bridges.  So the order is: classic scripts define the
+   legacy globals → substrate modules evaluate → this module builds the shell
+   and reparents the existing DOM → it calls `TS_APP.boot()` to start login +
+   the Tier-1 cluster stream under the shell.
 
    Re-point without rewiring: the cluster stream writes its connection status via
    getElementById("status-bar"); we MOVE that element (id preserved) into the
@@ -21,6 +25,7 @@
 
 import { PaneManager, ShellPane } from "./pane.js";
 import { mountRail, mountManage, glyph } from "./rail.js";
+import { authFetch } from "./auth.js";
 // The interactive pane is a real ES module beside us in /shared (step 5a) — the
 // shell imports it directly, and it exists in every deployment.  The coordinator
 // pane lives at an absolute /static path that only the CONSOLE serves, so it is

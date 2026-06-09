@@ -1,12 +1,12 @@
-"""Static smoke guards for the L-shell ES-module bundles.
+"""Static smoke guards for the shared_static ES-module bundles.
 
-``shell.js`` + ``pane.js`` are the first ES-module citizens in
-``shared_static`` (the rest are classic IIFE scripts loaded via ``<script
-src>``).  This mirrors ``test_app_js.py``'s posture — Python-side string /
-parse assertions that catch the silent one-line regression — adapted for
-module semantics: ``node --check`` only parses ``import`` / ``export`` when
-the file carries an ``.mjs`` extension, so the parse guard copies to a temp
-``.mjs`` first.
+The whole shared substrate is ES modules now (utils/toast/auth/composer/…
+followed shell.js + pane.js; only theme.js — FOUC-critical — and the vendored
+libs stay classic).  This mirrors ``test_app_js.py``'s posture — Python-side
+string / parse assertions that catch the silent one-line regression — adapted
+for module semantics: ``node --check`` only parses ``import`` / ``export``
+when the file carries an ``.mjs`` extension, so the parse guard copies to a
+temp ``.mjs`` first.
 """
 
 from __future__ import annotations
@@ -29,7 +29,45 @@ _CONSOLE_APP = _ROOT / "turnstone/console/static/app.js"
 _CONSOLE_ADMIN = _ROOT / "turnstone/console/static/admin.js"
 
 _RAIL_JS = _SHARED / "rail.js"
-_ESM_BUNDLES = [_SHELL_JS, _PANE_JS, _RAIL_JS]
+
+# Every shared ES module — parse-guarded with module semantics.  (auth/kb/
+# utils moved here from test_app_js's classic sweep when they were converted.)
+_ESM_BUNDLES = [
+    _SHELL_JS,
+    _PANE_JS,
+    _RAIL_JS,
+    _SHARED / "utils.js",
+    _SHARED / "toast.js",
+    _SHARED / "kb.js",
+    _SHARED / "cards.js",
+    _SHARED / "auth.js",
+    _SHARED / "renderer.js",
+    _SHARED / "status_bar.js",
+    _SHARED / "composer.js",
+    _SHARED / "composer_attachments.js",
+    _SHARED / "composer_queue.js",
+    _SHARED / "interactive.js",
+    _SHARED / "conversation.js",
+]
+
+# Sink scan: everything except renderer.js — the one sanctioned HTML-string
+# producer (its output is consumed via setSafeHtml; see utils.js docstring).
+_ESM_SINK_BUNDLES = [b for b in _ESM_BUNDLES if b.name != "renderer.js"]
+
+# Style ratchet: var-free modules only.  The lifted legacy bundles (cards/
+# renderer/status_bar/composer*) keep their pre-module `var` style — converting
+# them was a loader change, not a rewrite; don't grow NEW var use elsewhere.
+_ESM_NO_VAR_BUNDLES = [
+    _SHELL_JS,
+    _PANE_JS,
+    _RAIL_JS,
+    _SHARED / "utils.js",
+    _SHARED / "toast.js",
+    _SHARED / "kb.js",
+    _SHARED / "auth.js",
+    _SHARED / "interactive.js",
+    _SHARED / "conversation.js",
+]
 
 # The same unsafe DOM-write / dynamic-code sink set that ``test_app_js.py``
 # pins for the classic bundles — kept local so the two test files stay
@@ -65,7 +103,7 @@ def test_esm_bundle_parses(bundle: Path) -> None:
     assert proc.returncode == 0, f"node --check failed for {bundle.name}:\n{proc.stderr}"
 
 
-@pytest.mark.parametrize("bundle", _ESM_BUNDLES, ids=lambda p: p.name)
+@pytest.mark.parametrize("bundle", _ESM_SINK_BUNDLES, ids=lambda p: p.name)
 def test_esm_bundle_no_unsafe_sink(bundle: Path) -> None:
     """The shell builds DOM with createElement / textContent / append — never
     an HTML-string sink.  Keep it that way (XSS-free by construction once the
@@ -75,7 +113,7 @@ def test_esm_bundle_no_unsafe_sink(bundle: Path) -> None:
     assert not offenders, f"{bundle.name}: unsafe DOM/code sink at line(s) {offenders[:10]}"
 
 
-@pytest.mark.parametrize("bundle", _ESM_BUNDLES, ids=lambda p: p.name)
+@pytest.mark.parametrize("bundle", _ESM_NO_VAR_BUNDLES, ids=lambda p: p.name)
 def test_esm_bundle_has_no_var_decl(bundle: Path) -> None:
     """Match the modern-keyword posture of the swept classic bundles."""
     body = bundle.read_text(encoding="utf-8")

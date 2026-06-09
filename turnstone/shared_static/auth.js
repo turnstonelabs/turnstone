@@ -6,7 +6,18 @@
    1. Check /v1/api/auth/status — detect if setup is needed
    2. If setup_required → show first-time setup wizard (create admin user)
    3. If auth_enabled + has_users → show login (username:password)
-   4. Legacy: token-based login still supported via toggle */
+   4. Legacy: token-based login still supported via toggle
+
+   ES module (imports utils/toast).  The window bridge at the bottom keeps
+   the still-classic consumers working — app.js calls initLogin() from its
+   boot path and logout() rides an inline onclick.  Parse-time side effects
+   (BroadcastChannel wiring, the whoami refresh schedule, permissionsReady)
+   now run at module eval — after the classic scripts, before the shell
+   module calls TS_APP.boot(); every consumer reads them at boot time or
+   later, so the shift is observable only in ordering, not behaviour. */
+
+import { escapeHtml, setSafeHtml } from "./utils.js";
+import { showToast } from "./toast.js";
 
 const _AUTH_TITLE = window.TURNSTONE_AUTH_TITLE || "turnstone";
 let _loginTrapHandler = null;
@@ -36,7 +47,7 @@ if (_authChannel) {
   };
 }
 
-async function authFetch(url, opts) {
+export async function authFetch(url, opts) {
   const maxRetries = 2;
   for (let attempt = 0; attempt <= maxRetries; attempt++) {
     const r = await fetch(url, opts);
@@ -292,7 +303,7 @@ function _cancelRefreshTimer() {
   }
 }
 
-function initLogin() {
+export function initLogin() {
   const overlay = document.createElement("div");
   overlay.id = "login-overlay";
   overlay.style.display = "none";
@@ -484,7 +495,7 @@ function _showError(msg) {
   }
 }
 
-function showLogin(reason, oidcError) {
+export function showLogin(reason, oidcError) {
   const overlay = document.getElementById("login-overlay");
   if (!overlay) return;
   overlay.style.display = "flex";
@@ -554,7 +565,7 @@ function showLogin(reason, oidcError) {
   document.addEventListener("keydown", _loginTrapHandler);
 }
 
-function hideLogin() {
+export function hideLogin() {
   const overlay = document.getElementById("login-overlay");
   if (overlay) overlay.style.display = "none";
   document.body.style.overflow = "";
@@ -761,7 +772,7 @@ function _onSuccess() {
   _scheduleRefreshFromWhoami();
 }
 
-function logout() {
+export function logout() {
   // Set flag + abort in-flight fetches BEFORE the network call so any
   // concurrent _tryRefresh() / _scheduleRefreshFromWhoami() bails its
   // post-fetch effects (see _loggedOut handling above).  Without this,
@@ -792,3 +803,14 @@ function logout() {
 if (typeof window !== "undefined") {
   _scheduleRefreshFromWhoami();
 }
+
+// --- Legacy window bridge ---------------------------------------------------
+// Still-classic consumers reach these as globals at event/boot time (after
+// this deferred module evaluated).  New module code imports instead.
+Object.assign(window, {
+  authFetch,
+  showLogin,
+  hideLogin,
+  logout,
+  initLogin,
+});

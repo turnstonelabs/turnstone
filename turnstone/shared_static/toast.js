@@ -1,13 +1,14 @@
 /* Shared toast notification — turnstone design system
-   Configure timeout via window.TURNSTONE_TOAST_TIMEOUT (default 3000ms) */
+   Configure timeout via window.TURNSTONE_TOAST_TIMEOUT (default 3000ms).
+   ES module, dependency-free; window bridge below for classic consumers. */
 
-var _toastQueue = [];
-var _toastTimer = null;
-var _toastShowing = false;
-var _TOAST_TIMEOUT = window.TURNSTONE_TOAST_TIMEOUT || 3000;
+const _toastQueue = [];
+let _toastTimer = null;
+let _toastShowing = false;
+const _TOAST_TIMEOUT = window.TURNSTONE_TOAST_TIMEOUT || 3000;
 
-function showToast(message, type) {
-  var el = document.getElementById("toast");
+export function showToast(message, type) {
+  const el = document.getElementById("toast");
   if (!el) return;
   if (_toastShowing) {
     _toastQueue.push({ message: message, type: type });
@@ -29,9 +30,14 @@ function _displayToast(el, message, type) {
     _toastTimer = null;
     if (_toastQueue.length) {
       setTimeout(function () {
-        var item = _toastQueue.shift();
+        const item = _toastQueue.shift();
         _displayToast(el, item.message, item.type);
       }, 300);
     }
   }, _TOAST_TIMEOUT);
 }
+
+// --- Legacy window bridge ---------------------------------------------------
+// Still-classic consumers reach this as a global at event/boot time (after
+// this deferred module evaluated).  New module code imports instead.
+window.showToast = showToast;
