@@ -1723,7 +1723,7 @@ function loadSavedCoordinators() {
   // Freeze the list while the user is multi-selecting — re-rendering
   // mid-mode would shuffle the visible page out from under them.  The
   // delete-mode wrapper drains the retry flag on cancel/onClose.
-  if (typeof _coordTable !== "undefined" && _coordTable.controller.inMode()) {
+  if (_coordTable && _coordTable.controller.inMode()) {
     _savedCoordsRetry = true;
     return;
   }
@@ -1741,7 +1741,7 @@ function loadSavedCoordinators() {
       // fetch was already in flight, defer the render — re-rendering
       // mid-selection would shuffle visible cards and reshape selections.
       if (
-        typeof _coordTable !== "undefined" &&
+        _coordTable &&
         _coordTable.controller.inMode()
       ) {
         _savedCoordsRetry = true;
@@ -1771,6 +1771,12 @@ function loadSavedCoordinators() {
 // (/shared/cards.js), with a CHILDREN column instead of MSGS and the
 // body-keyed (router-proxied) delete.  Activation POSTs /open before
 // navigating so capacity limits surface as a toast, not a broken page.
+let _coordTable = null;
+
+// Built at boot, not parse: the saved-table substrate (/shared/cards.js) is a
+// deferred ES module now, so its bridged globals (SavedColumns,
+// createSavedTable) don't exist yet while this classic file parses.
+function _initSavedCoordTable() {
 const COORD_COLUMNS = [
   SavedColumns.name(),
   {
@@ -1794,7 +1800,7 @@ const COORD_COLUMNS = [
   SavedColumns.last(),
   SavedColumns.id(),
 ];
-const _coordTable = createSavedTable({
+_coordTable = createSavedTable({
   headerEl: document.getElementById("coord-saved-colheaders"),
   bodyEl: document.getElementById("saved-coord-cards"),
   filterEl: document.getElementById("coord-filter"),
@@ -1896,6 +1902,7 @@ const _coordTable = createSavedTable({
     },
   },
 });
+}
 
 // HTML inline-onclick wrappers — keep the global names the markup binds
 // to and forward to the shared controller.
@@ -2044,6 +2051,7 @@ window.TS_APP.resolveInteractiveNode = function (wsId, hintNodeId) {
 };
 window.TS_APP.boot = function () {
   history.replaceState({ view: "home" }, "");
+  _initSavedCoordTable(); // substrate modules have evaluated by boot time
   initLogin();
   // loadOverview fetches the cluster snapshot — both the node list AND
   // the active-coordinators list come from the same snapshot + SSE patch

@@ -793,6 +793,12 @@ function updateDashFooter(agg) {
 // the per-app inputs are the column spec, the DOM refs, and the path-keyed
 // delete request.  Coordinators (console/static) use the same helper with a
 // CHILDREN column instead of MSGS.
+let _wsTable = null;
+
+// Built at boot, not parse: the saved-table substrate (/shared/cards.js) is a
+// deferred ES module now, so its bridged globals (SavedColumns,
+// createSavedTable) don't exist yet while this classic file parses.
+function _initSavedWsTable() {
 const WS_COLUMNS = [
   SavedColumns.name(),
   SavedColumns.model(),
@@ -801,7 +807,7 @@ const WS_COLUMNS = [
   SavedColumns.last(),
   SavedColumns.id(),
 ];
-const _wsTable = createSavedTable({
+_wsTable = createSavedTable({
   headerEl: document.getElementById("ws-saved-colheaders"),
   bodyEl: document.getElementById("dashboard-saved-cards"),
   filterEl: document.getElementById("ws-filter"),
@@ -830,6 +836,7 @@ const _wsTable = createSavedTable({
     },
   },
 });
+}
 
 // HTML inline-onclick wrappers — keep the global names the existing markup
 // binds to (`onclick="startWsDeleteMode()"` etc.) and forward to the shared
@@ -2226,6 +2233,7 @@ function initWorkstreams() {
 // roster + stream, the dashboard lists, health polling, and pending MCP
 // consents.  It does NOT auto-run at parse time (the shell sequences it).
 function boot() {
+  _initSavedWsTable(); // substrate modules have evaluated by boot time
   initLogin();
   pollHealth();
   loadInterfaceSettings();
