@@ -58,6 +58,137 @@ export class ShellPane {
 }
 
 /**
+ * Generic popup menu on the shared `.tab-menu` chrome — items, positioning,
+ * dismissal (Escape/Tab, outside-mousedown), and arrow-key roving in one
+ * place.  Used by the PaneManager's tab-action dropdown and the shell's
+ * footer user menu (one menu vocabulary, one behaviour).
+ *
+ * `items` are `{label, key?, cls?, separator?, action}`.  `opts`:
+ *   - label:         the menu's aria-label.
+ *   - cls:           extra class(es) on the `.tab-menu` element.
+ *   - prefer:        "down" (default) opens under the anchor, flipping up on
+ *                    overflow; "up" the reverse (e.g. a viewport-bottom chip).
+ *   - align:         "end" (default) right-aligns to the anchor; "start" left.
+ *   - expandEl:      element whose aria-expanded mirrors the menu (often the
+ *                    anchor's host button).
+ *   - returnFocusEl: focus target when the menu closes via keyboard.
+ *   - ignoreEl:      outside-mousedown ignore region (defaults to the anchor).
+ *   - onClose:       cleanup notification (fires exactly once).
+ *
+ * Returns `{ menu, close }`; `close()` is idempotent.
+ */
+export function openPopupMenu(anchor, items, opts) {
+  opts = opts || {};
+  const menu = document.createElement("div");
+  menu.className = "tab-menu" + (opts.cls ? " " + opts.cls : "");
+  menu.setAttribute("role", "menu");
+  if (opts.label) menu.setAttribute("aria-label", opts.label);
+
+  let closed = false;
+  const close = () => {
+    if (closed) return;
+    closed = true;
+    document.removeEventListener("keydown", onKey);
+    document.removeEventListener("mousedown", onDown);
+    if (menu.parentNode) menu.parentNode.removeChild(menu);
+    if (opts.expandEl && opts.expandEl.isConnected)
+      opts.expandEl.setAttribute("aria-expanded", "false");
+    if (opts.onClose) opts.onClose();
+  };
+
+  for (const item of items) {
+    if (item.separator) {
+      const sep = document.createElement("div");
+      sep.className = "tab-menu-sep";
+      sep.setAttribute("role", "separator");
+      menu.append(sep);
+      continue;
+    }
+    const btn = document.createElement("button");
+    btn.type = "button";
+    btn.className = "tab-menu-item" + (item.cls ? " " + item.cls : "");
+    btn.setAttribute("role", "menuitem");
+    btn.tabIndex = -1;
+    const label = document.createElement("span");
+    label.className = "tab-menu-label";
+    label.textContent = item.label;
+    btn.append(label);
+    if (item.key) {
+      const key = document.createElement("span");
+      key.className = "tab-menu-key";
+      key.setAttribute("aria-hidden", "true"); // a visual hint, not the action
+      key.textContent = item.key;
+      btn.append(key);
+    }
+    btn.addEventListener("click", () => {
+      close();
+      try {
+        item.action();
+      } catch (e) {
+        console.error("popup menu: action failed", item.label, e);
+      }
+    });
+    menu.append(btn);
+  }
+  document.body.append(menu);
+
+  // Position fixed against the anchor; flip on overflow, clamp to viewport.
+  const ar = anchor.getBoundingClientRect();
+  const mr = menu.getBoundingClientRect();
+  let x = opts.align === "start" ? ar.left : ar.right - mr.width;
+  if (x < 4) x = 4;
+  if (x + mr.width > window.innerWidth) x = window.innerWidth - mr.width - 4;
+  let y;
+  if (opts.prefer === "up") {
+    y = ar.top - mr.height - 4;
+    if (y < 4) y = ar.bottom + 4;
+  } else {
+    y = ar.bottom + 2;
+    if (y + mr.height > window.innerHeight) y = ar.top - mr.height - 2;
+    if (y < 4) y = 4; // never strand the menu above the viewport (short window)
+  }
+  menu.style.left = x + "px";
+  menu.style.top = y + "px";
+  if (opts.expandEl) opts.expandEl.setAttribute("aria-expanded", "true");
+
+  const onKey = (e) => {
+    const btns = Array.from(menu.querySelectorAll(".tab-menu-item"));
+    if (e.key === "Escape" || e.key === "Tab") {
+      e.preventDefault();
+      close();
+      if (opts.returnFocusEl) opts.returnFocusEl.focus();
+    } else if (
+      e.key === "ArrowDown" ||
+      e.key === "ArrowUp" ||
+      e.key === "Home" ||
+      e.key === "End"
+    ) {
+      e.preventDefault();
+      if (!btns.length) return;
+      const idx = btns.indexOf(document.activeElement);
+      if (e.key === "ArrowDown") btns[(idx + 1) % btns.length].focus();
+      else if (e.key === "ArrowUp")
+        btns[(idx - 1 + btns.length) % btns.length].focus();
+      else if (e.key === "Home") btns[0].focus();
+      else btns[btns.length - 1].focus();
+    }
+  };
+  const ignoreEl = opts.ignoreEl || anchor;
+  const onDown = (e) => {
+    if (!menu.contains(e.target) && !ignoreEl.contains(e.target)) close();
+  };
+  document.addEventListener("keydown", onKey);
+  // Defer the outside-mousedown attach a tick so the opening click that
+  // bubbled to document doesn't immediately re-close the menu.
+  setTimeout(() => {
+    if (!closed) document.addEventListener("mousedown", onDown);
+  }, 0);
+  const first = menu.querySelector(".tab-menu-item");
+  if (first) first.focus();
+  return { menu, close };
+}
+
+/**
  * Owns the tab bar + pane host.  `openPane(type, id?)` is create-or-focus;
  * singletons are keyed by `type`, multi-instance panes by `type:id`.
  */
@@ -436,8 +567,8 @@ export class PaneManager {
 
   /** Open a pane's tab-action dropdown, anchored under its caret.  Generic: the
    *  item set comes from `pane.tabMenu()` (wired per type in the shell); the
-   *  PaneManager owns only the chrome + keyboard + positioning.  Singleton menu —
-   *  opening one closes any other.  Items are
+   *  chrome + keyboard + positioning live in the shared openPopupMenu helper.
+   *  Singleton menu — opening one closes any other.  Items are
    *  `{label, key?, cls?, separator?, action}`. */
   _openTabMenu(tab, pane) {
     this._closeTabMenu();
@@ -449,109 +580,26 @@ export class PaneManager {
       return;
     }
     if (!items.length) return;
-
-    const menu = document.createElement("div");
-    menu.className = "tab-menu";
-    menu.setAttribute("role", "menu");
-    menu.setAttribute("aria-label", (pane.title || "Pane") + " actions");
-    for (const item of items) {
-      if (item.separator) {
-        const sep = document.createElement("div");
-        sep.className = "tab-menu-sep";
-        sep.setAttribute("role", "separator");
-        menu.append(sep);
-        continue;
-      }
-      const btn = document.createElement("button");
-      btn.type = "button";
-      btn.className = "tab-menu-item" + (item.cls ? " " + item.cls : "");
-      btn.setAttribute("role", "menuitem");
-      btn.tabIndex = -1;
-      const label = document.createElement("span");
-      label.className = "tab-menu-label";
-      label.textContent = item.label;
-      btn.append(label);
-      if (item.key) {
-        const key = document.createElement("span");
-        key.className = "tab-menu-key";
-        key.setAttribute("aria-hidden", "true"); // a visual hint, not the action
-        key.textContent = item.key;
-        btn.append(key);
-      }
-      btn.addEventListener("click", () => {
-        this._closeTabMenu();
-        try {
-          item.action();
-        } catch (e) {
-          console.error("PaneManager: tab action failed", item.label, e);
-        }
-      });
-      menu.append(btn);
-    }
-    document.body.append(menu);
-
-    // Position fixed, right-aligned under the caret; flip up / clamp on overflow.
-    const anchor = tab.querySelector(".tab-caret") || tab;
-    const ar = anchor.getBoundingClientRect();
-    const mr = menu.getBoundingClientRect();
-    let x = ar.right - mr.width;
-    let y = ar.bottom + 2;
-    if (x < 4) x = 4;
-    if (x + mr.width > window.innerWidth) x = window.innerWidth - mr.width - 4;
-    if (y + mr.height > window.innerHeight) y = ar.top - mr.height - 2;
-    if (y < 4) y = 4; // never strand the menu above the viewport (short window)
-    menu.style.left = x + "px";
-    menu.style.top = y + "px";
-    tab.setAttribute("aria-expanded", "true");
-
-    const onKey = (e) => {
-      const btns = Array.from(menu.querySelectorAll(".tab-menu-item"));
-      if (e.key === "Escape" || e.key === "Tab") {
-        e.preventDefault();
-        this._closeTabMenu();
-        tab.focus();
-      } else if (
-        e.key === "ArrowDown" ||
-        e.key === "ArrowUp" ||
-        e.key === "Home" ||
-        e.key === "End"
-      ) {
-        e.preventDefault();
-        if (!btns.length) return;
-        const idx = btns.indexOf(document.activeElement);
-        if (e.key === "ArrowDown") btns[(idx + 1) % btns.length].focus();
-        else if (e.key === "ArrowUp")
-          btns[(idx - 1 + btns.length) % btns.length].focus();
-        else if (e.key === "Home") btns[0].focus();
-        else btns[btns.length - 1].focus();
-      }
-    };
-    const onDown = (e) => {
-      if (!menu.contains(e.target) && !tab.contains(e.target))
-        this._closeTabMenu();
-    };
-    this._openMenu = { menu, tab, onKey, onDown };
-    document.addEventListener("keydown", onKey);
-    // Defer the outside-mousedown attach a tick so the opening click that
-    // bubbled to document doesn't immediately re-close the menu.
-    setTimeout(() => {
-      if (this._openMenu && this._openMenu.menu === menu)
-        document.addEventListener("mousedown", onDown);
-    }, 0);
-    const first = menu.querySelector(".tab-menu-item");
-    if (first) first.focus();
+    const handle = openPopupMenu(
+      tab.querySelector(".tab-caret") || tab,
+      items,
+      {
+        label: (pane.title || "Pane") + " actions",
+        expandEl: tab,
+        returnFocusEl: tab,
+        ignoreEl: tab, // a click elsewhere on the tab is menu-adjacent, not "outside"
+        onClose: () => {
+          if (this._openMenu && this._openMenu.handle === handle)
+            this._openMenu = null;
+        },
+      },
+    );
+    this._openMenu = { handle };
   }
 
   /** Tear down the open tab-action dropdown (if any) + its document listeners. */
   _closeTabMenu() {
-    const m = this._openMenu;
-    if (!m) return;
-    this._openMenu = null;
-    document.removeEventListener("keydown", m.onKey);
-    document.removeEventListener("mousedown", m.onDown);
-    if (m.menu.parentNode) m.menu.parentNode.removeChild(m.menu);
-    if (m.tab && m.tab.isConnected)
-      m.tab.setAttribute("aria-expanded", "false");
+    if (this._openMenu) this._openMenu.handle.close(); // onClose clears the ref
   }
 
   _persist() {

@@ -23,7 +23,7 @@
    (pane code stays root-scoped).
    ========================================================================== */
 
-import { PaneManager, ShellPane } from "./pane.js";
+import { PaneManager, ShellPane, openPopupMenu } from "./pane.js";
 import { mountRail, mountManage, glyph } from "./rail.js";
 import { authFetch } from "./auth.js";
 // The interactive pane is a real ES module beside us in /shared (step 5a) — the
@@ -946,80 +946,41 @@ async function mountShell() {
 }
 
 // --- Footer user menu (Log out lives here) ---------------------------------
-// A small popup anchored to the rail-footer user chip.  Reuses the .tab-menu
-// popup chrome; the one item clicks the hidden #logout-btn so auth.js stays the
-// single owner of logout (incl. its in-flight-refresh race guards).
-let _userMenuCleanup = null;
-
-function closeUserMenu() {
-  if (_userMenuCleanup) _userMenuCleanup();
-}
+// A small popup anchored to the rail-footer user chip, riding the shared
+// openPopupMenu chrome (pane.js — same vocabulary + keyboard behaviour as the
+// tab-action dropdown).  The one item clicks the hidden #logout-btn so auth.js
+// stays the single owner of logout (incl. its in-flight-refresh race guards).
+let _userMenu = null;
 
 function toggleUserMenu(chip) {
-  if (_userMenuCleanup) {
-    closeUserMenu();
+  if (_userMenu) {
+    _userMenu.close();
     return;
   }
-  const menu = document.createElement("div");
-  menu.className = "tab-menu user-menu";
-  menu.setAttribute("role", "menu");
-  menu.setAttribute("aria-label", "Account");
-  const item = document.createElement("button");
-  item.type = "button";
-  item.className = "tab-menu-item destructive";
-  item.setAttribute("role", "menuitem");
-  const label = document.createElement("span");
-  label.className = "tab-menu-label";
-  label.textContent = "Log out";
-  item.append(label);
-  item.addEventListener("click", () => {
-    closeUserMenu();
-    const lb = document.getElementById("logout-btn");
-    if (lb) lb.click();
-  });
-  menu.append(item);
-  document.body.append(menu);
-
-  // Fixed-positioned, popping UP from the chip (the footer sits at the viewport
-  // bottom); flip down only if there is no room above.
-  const ar = chip.getBoundingClientRect();
-  const mr = menu.getBoundingClientRect();
-  let x = ar.left;
-  if (x + mr.width > window.innerWidth) x = window.innerWidth - mr.width - 4;
-  if (x < 4) x = 4;
-  let y = ar.top - mr.height - 4;
-  if (y < 4) y = ar.bottom + 4;
-  menu.style.left = x + "px";
-  menu.style.top = y + "px";
-  chip.setAttribute("aria-expanded", "true");
-
-  const onDown = (e) => {
-    if (!menu.contains(e.target) && !chip.contains(e.target)) closeUserMenu();
-  };
-  const onKey = (e) => {
-    if (e.key === "Escape") {
-      closeUserMenu();
-      chip.focus();
-    }
-  };
-  _userMenuCleanup = () => {
-    document.removeEventListener("mousedown", onDown);
-    document.removeEventListener("keydown", onKey);
-    menu.remove();
-    chip.setAttribute("aria-expanded", "false");
-    _userMenuCleanup = null;
-  };
-  // Defer the listener attach so the click that opened the menu does not
-  // immediately close it.
-  setTimeout(() => {
-    // Bail if the menu was already closed before this deferred attach ran:
-    // closeUserMenu() nulls _userMenuCleanup, so attaching now would leave the
-    // listeners with no cleanup ref to remove them (a permanent leak).
-    if (!_userMenuCleanup) return;
-    document.addEventListener("mousedown", onDown);
-    document.addEventListener("keydown", onKey);
-  }, 0);
-  item.focus();
+  _userMenu = openPopupMenu(
+    chip,
+    [
+      {
+        label: "Log out",
+        cls: "destructive",
+        action: () => {
+          const lb = document.getElementById("logout-btn");
+          if (lb) lb.click();
+        },
+      },
+    ],
+    {
+      cls: "user-menu",
+      label: "Account",
+      prefer: "up", // the footer chip sits at the viewport bottom
+      align: "start",
+      expandEl: chip,
+      returnFocusEl: chip,
+      onClose: () => {
+        _userMenu = null;
+      },
+    },
+  );
 }
 
 function displayNameFor(caps) {

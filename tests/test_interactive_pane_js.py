@@ -42,18 +42,20 @@ def test_interactive_is_esm_imported_by_the_shell() -> None:
 
 
 def test_pane_constructor_takes_transport_and_host_seam() -> None:
-    """The constructor grew the ``(wsId, opts)`` seam: a transport ``base`` (the
-    node-proxy prefix), an ``embedded`` flag (drop the standalone split-pane
-    chrome), and a ``host`` adapter for the few things only the surrounding
-    shell knows."""
+    """The constructor takes the ``(wsId, opts)`` seam: a transport ``base``
+    (the node-proxy prefix) and a ``host`` adapter for the few things only the
+    surrounding shell knows.  The old ``embedded`` flag is gone — every pane is
+    L-shell-hosted since the step-6 fork collapse."""
     body = _INTERACTIVE.read_text(encoding="utf-8")
     assert "constructor(wsId, opts) {" in body
     for field in (
         "this._base = opts.base",
-        "this._embedded = !!opts.embedded",
         "this._host = opts.host || INTERACTIVE_DEFAULT_HOST",
     ):
         assert field in body, f"missing constructor seam: {field!r}"
+    assert "opts.embedded" not in body, (
+        "the embedded flag is retired — every pane is L-shell-hosted."
+    )
 
 
 def test_transport_urls_are_base_prefixed() -> None:
@@ -76,21 +78,33 @@ def test_transport_urls_are_base_prefixed() -> None:
     assert "new EventSource(evtUrl" in body
 
 
-def test_embedded_chrome_is_gated() -> None:
-    """The standalone split-pane affordances (focus tracking, context menu,
-    split/close buttons) AND the pane header are gated behind ``!this._embedded``:
-    the console (embedded) pane has NO header — name / persona / state live in
-    the tab + rail, and the conversation reclaims the full pane height."""
+def test_split_pane_chrome_is_retired() -> None:
+    """The standalone split-pane chrome is GONE, not gated: no pane header
+    (name / persona / state live in the tab + rail; the conversation owns the
+    full pane height), no focus tracking, no split/close buttons.  The dead
+    ``!this._embedded`` branches referenced shell globals (setFocusedPane,
+    splitPane, splitRoot…) that no longer exist anywhere — reaching them was a
+    guaranteed ReferenceError, so their removal is a bugfix too."""
     body = _INTERACTIVE.read_text(encoding="utf-8")
-    assert "if (!this._embedded) {" in body, "standalone chrome must be gated"
-    assert 'this.el.classList.add("pane--embedded")' in body
-    # The embedded pane builds NO header — the persona tag is gone (the rail's
-    # INT/COORD vocabulary shows it instead).
+    assert "_embedded" not in body, "the embedded gate is retired (always-on)"
+    assert 'className = "pane pane--embedded"' in body, (
+        "the pane root must carry pane--embedded unconditionally — "
+        "interactive.css scopes the slim-chrome layout to it"
+    )
+    for gone in (
+        "setFocusedPane",
+        "showPaneContextMenu",
+        "splitPane(",
+        "splitRoot",
+        "this.headerEl",
+        '"pane-header"',
+        '"pane-action-btn"',
+        "updateWsName",
+    ):
+        assert gone not in body, f"retired split-pane symbol {gone!r} resurfaced"
+    # The persona tag stays gone (the rail's INT/COORD vocabulary shows it).
     assert '"pane-persona-tag"' not in body
     assert '"INTERACTIVE"' not in body
-    # The header (workstream name + split/close actions) builds for standalone
-    # only — gated, not unconditional.
-    assert 'this.headerEl = document.createElement("div")' in body
 
 
 def test_factory_returns_lifecycle_over_node_proxy() -> None:
@@ -114,13 +128,16 @@ def test_host_seam_routes_shell_couplings() -> None:
     badge reference survives in the module."""
     body = _INTERACTIVE.read_text(encoding="utf-8")
     for call in (
-        "this._host.getWsName(",
         "this._host.isFocused(this)",
         "this._host.onStreamError(this)",
         "this._host.warningTarget(this)",
         "this._host.onConsentDetected(",
     ):
         assert call in body, f"missing host seam call {call!r}"
+    assert "getWsName" not in body, (
+        "getWsName left the host seam with the pane header — the tab + rail "
+        "own the workstream name now."
+    )
     code = _strip_comments(body)
     # The classic split-pane shell globals must not leak into the module as
     # bare code references (URL path strings excepted, handled above).

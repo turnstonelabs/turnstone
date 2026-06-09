@@ -478,7 +478,11 @@ function hideNewWsModal() {
     document.removeEventListener("keydown", _newWsTrapHandler);
     _newWsTrapHandler = null;
   }
-  document.getElementById("new-tab-btn").focus();
+  // Hand focus back to the shell's [+] new-session affordance.  The old
+  // #new-tab-btn went with the retired split-pane tab bar — the unguarded
+  // lookup threw on every modal close after that.
+  const back = document.querySelector(".tab-add");
+  if (back) back.focus();
 }
 
 function submitNewWs() {
@@ -1918,28 +1922,9 @@ function closeSettingsPanel() {
 }
 
 // ---------------------------------------------------------------------------
-//  Settings menu (gear icon dropdown — MCP connections + Logout)
+//  MCP connections panel (Manage -> Connections via the rail; the old gear
+//  dropdown that fronted it was retired with the split-pane tab bar)
 // ---------------------------------------------------------------------------
-//
-// Reuses the .ws-tab-dropdown shell for visual + behavioural consistency
-// with the workstream tab dropdown and the console proxy's node-picker.
-// Keyboard handling matches the proxy node-picker (the APG-correct
-// reference): Tab closes the menu WITHOUT preventDefault so focus
-// moves naturally to the next focusable; Escape closes + refocuses
-// the trigger.  showTabDropdown collapses Tab and Escape into a
-// single preventDefault branch — that's a pre-existing divergence,
-// tracked as a follow-up to align showTabDropdown to APG.  ArrowUp
-// uses an `idx <= 0` guard (not modulo) so the no-focus case wraps
-// to the last item rather than the second-to-last — same shape as
-// showTabDropdown and the proxy node-picker.
-
-let _settingsMenu = null;
-let _settingsMenuCloseHandler = null;
-// Cached at open time so closeSettingsMenu can reset ARIA without
-// re-querying by id, and so the menu-item click path can refocus
-// the trigger BEFORE close — that way openSettingsPanel captures
-// the gear (not <body>) as _settingsReturnFocus.
-let _settingsMenuTrigger = null;
 
 function loadMcpConnections() {
   const loadingEl = document.getElementById("settings-mcp-loading");
@@ -2151,14 +2136,6 @@ document.addEventListener("keydown", function (e) {
     const modal = document.getElementById(modalIds[mi]);
     if (modal && modal.style.display !== "none") return;
   }
-  // Settings menu is a transient dropdown, not a modal overlay, but
-  // the global Escape handler must not reach hideDashboard() while
-  // it's open — that would wipe the composer out from under the user
-  // (hideDashboard clears dashboard-input.value and _dashboardStagedFiles).
-  // The menu's own keydown handler (registered async via setTimeout(0)
-  // in openSettingsMenu) handles Escape and Tab.
-  if (_settingsMenu) return;
-
   if (e.key === "Escape" && dashboardVisible) {
     e.preventDefault();
     hideDashboard();

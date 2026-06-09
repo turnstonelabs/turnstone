@@ -130,11 +130,6 @@ function _toolAnnounceText(items) {
 // throws on a shell-only seam.  The standalone shell (app.js) and the console
 // factory (createInteractivePane) each pass a richer host.
 const INTERACTIVE_DEFAULT_HOST = {
-  // Workstream display name — the surrounding shell knows it; a bare pane falls
-  // back to a short id (see updateWsName).
-  getWsName() {
-    return null;
-  },
   // Is THIS pane the user's current focus?  Gates focus-stealing so a caret is
   // never yanked into a backgrounded pane.  A lone pane is always focused.
   isFocused() {
@@ -163,19 +158,17 @@ class Pane {
     this.wsId = wsId || null;
     // Transport + host seam.  ``base`` is the node-proxy URL prefix ("" for a
     // local session, "/node/{id}" when the console proxies a session that lives
-    // on a cluster node — the LOCALITY invariant).  ``embedded`` drops the
-    // standalone split-pane chrome (focus tracking, context menu, split/close
-    // buttons) for the L-shell's tab + slim header.  ``host`` supplies the few
-    // things only the surrounding shell knows (workstream name, which pane is
-    // focused, the stream-error recovery policy, the warning-banner target);
-    // see the standalone adapter in app.js and createInteractivePane below.
+    // on a cluster node — the LOCALITY invariant).  ``host`` supplies the few
+    // things only the surrounding shell knows (which pane is focused, the
+    // stream-error recovery policy, the warning-banner target); see
+    // createInteractivePane below.  Every pane is L-shell-hosted — the
+    // standalone split-pane chrome (focus tracking, context menu, header with
+    // split/close buttons) was retired with the step-6 fork collapse.
     this._base = opts.base || "";
-    this._embedded = !!opts.embedded;
     this._host = opts.host || INTERACTIVE_DEFAULT_HOST;
     this._onClose = typeof opts.onClose === "function" ? opts.onClose : null;
     this.evtSource = null;
     this.el = null;
-    this.headerEl = null;
     this.messagesEl = null;
     this.inputEl = null;
     this.sendBtn = null;
@@ -229,16 +222,6 @@ class Pane {
     this.attachments.clearChips();
     this._stopRecording(true);
     this._stopTTS();
-  }
-
-  updateWsName() {
-    if (!this.headerEl) return; // no header in the embedded L-shell pane
-    const nameEl = this.headerEl.querySelector(".pane-ws-name");
-    if (nameEl) {
-      nameEl.textContent = this.wsId
-        ? this._host.getWsName(this.wsId) || this.wsId.substring(0, 8)
-        : "";
-    }
   }
 
   disconnectSSE() {
@@ -610,8 +593,7 @@ class Pane {
 
   _createDOM() {
     this.el = document.createElement("div");
-    this.el.className = "pane";
-    if (this._embedded) this.el.classList.add("pane--embedded");
+    this.el.className = "pane pane--embedded";
     this.el.dataset.paneId = this.id;
 
     // Approval keyboard shortcuts.  The converged card advertises y/n/a (+Enter/
@@ -648,98 +630,12 @@ class Pane {
       }
     });
 
-    // Standalone split-pane affordances: focus tracking + the right-click
-    // split/close menu.  In the L-shell the tab bar owns focus and the per-tab
-    // action menu, so an embedded pane wires none of it.
-    if (!this._embedded) {
-      // Focus on mousedown (before child clicks)
-      this.el.addEventListener("mousedown", () => {
-        setFocusedPane(this.id);
-      });
-      // Also track keyboard focus moving into this pane (e.g. Tab into textarea)
-      this.el.addEventListener(
-        "focusin",
-        () => {
-          setFocusedPane(this.id);
-        },
-        true,
-      );
-
-      // Right-click context menu for split/close actions — skip interactive
-      // elements (textareas, links, buttons) so native copy/paste works
-      this.el.addEventListener("contextmenu", (e) => {
-        const tag = e.target.tagName;
-        if (
-          tag === "TEXTAREA" ||
-          tag === "INPUT" ||
-          tag === "A" ||
-          tag === "BUTTON" ||
-          e.target.isContentEditable
-        )
-          return;
-        const sel = window.getSelection();
-        if (sel && sel.toString().length > 0) return;
-        e.preventDefault();
-        setFocusedPane(this.id);
-        showPaneContextMenu(e.clientX, e.clientY, this.id);
-      });
-    }
-
-    // No pane header in the L-shell (embedded): the workstream name, persona,
-    // and state are shown by the tab and the rail (Workspaces).  The standalone
-    // split-pane (retired in step 6) still builds a header for its split/close
-    // actions.  The --skip-permissions banner lands in messagesEl now (see the
-    // host warningTarget), not the header.
-    if (!this._embedded) {
-      this.headerEl = document.createElement("div");
-      this.headerEl.className = "pane-header";
-
-      const wsName = document.createElement("span");
-      wsName.className = "pane-ws-name";
-      wsName.textContent = this.wsId
-        ? this._host.getWsName(this.wsId) || this.wsId.substring(0, 8)
-        : "";
-      this.headerEl.appendChild(wsName);
-
-      const actions = document.createElement("div");
-      actions.className = "pane-actions";
-
-      const splitRightBtn = document.createElement("button");
-      splitRightBtn.className = "pane-action-btn";
-      splitRightBtn.title = "Split right";
-      splitRightBtn.setAttribute("aria-label", "Split right");
-      splitRightBtn.textContent = "\u2502";
-      splitRightBtn.onclick = (e) => {
-        e.stopPropagation();
-        splitPane(this.id, "horizontal");
-      };
-      actions.appendChild(splitRightBtn);
-
-      const splitDownBtn = document.createElement("button");
-      splitDownBtn.className = "pane-action-btn";
-      splitDownBtn.title = "Split down";
-      splitDownBtn.setAttribute("aria-label", "Split down");
-      splitDownBtn.textContent = "\u2500";
-      splitDownBtn.onclick = (e) => {
-        e.stopPropagation();
-        splitPane(this.id, "vertical");
-      };
-      actions.appendChild(splitDownBtn);
-
-      const closeBtn = document.createElement("button");
-      closeBtn.className = "pane-action-btn pane-close-btn";
-      closeBtn.title = "Close pane";
-      closeBtn.setAttribute("aria-label", "Close pane");
-      closeBtn.textContent = "\u00d7";
-      closeBtn.onclick = (e) => {
-        e.stopPropagation();
-        if (countLeaves(splitRoot) > 1) closePane(this.id);
-      };
-      actions.appendChild(closeBtn);
-
-      this.headerEl.appendChild(actions);
-      this.el.appendChild(this.headerEl);
-    }
+    // No pane header: the workstream name, persona, and state are shown by the
+    // tab and the rail (Workspaces); the --skip-permissions banner lands in
+    // messagesEl (see the host warningTarget).  The standalone split-pane
+    // chrome that used to live here (focus tracking, right-click context menu,
+    // a header with split/close buttons) was retired with the step-6 fork
+    // collapse.
 
     // Messages area
     this.messagesEl = document.createElement("div");
@@ -3312,24 +3208,6 @@ function createInteractivePane(root, wsId, opts) {
   };
 
   const host = {
-    // Workstream name from the Tier-1 cluster snapshot the shell owns, else the
-    // name the opener passed; Pane falls back to a short id.
-    getWsName(id) {
-      try {
-        const TS = window.TS_APP;
-        const cs = TS && TS.getClusterState && TS.getClusterState();
-        if (cs && cs.nodes) {
-          for (const nid in cs.nodes) {
-            for (const ws of cs.nodes[nid].workstreams || []) {
-              if (ws.id === id) return ws.name || ws.title || null;
-            }
-          }
-        }
-      } catch (e) {
-        /* snapshot not ready yet */
-      }
-      return opts.name || null;
-    },
     // Only the visible tab steals focus — never yank the caret into a
     // backgrounded pane mid background-replay.
     isFocused() {
@@ -3373,7 +3251,6 @@ function createInteractivePane(root, wsId, opts) {
   };
 
   const pane = new Pane(wsId, {
-    embedded: true,
     base,
     host,
     onClose: opts.onClose,
