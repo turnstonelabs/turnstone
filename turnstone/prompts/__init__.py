@@ -89,7 +89,7 @@ def build_operator_instruction_declaration(nonce: str) -> str:
 
     Declares the per-session *nonce* as the sole trusted ``<system-reminder>``
     marker so the fold (:func:`turnstone.core.fence.wrap`) can rely on it: the
-    model trusts only ``<system-reminder_<nonce>>`` blocks and treats every
+    model trusts only ``<system-reminder_{nonce}>`` blocks and treats every
     other ``<system-reminder>``-style marker (e.g. one forged in tool output,
     files, or web pages) as untrusted data.  Emitted only when the model uses
     the fold path — the native mid-conversation-system path (claude-opus-4-8,
