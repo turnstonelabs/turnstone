@@ -1395,6 +1395,12 @@ def _build_health_dict(app_state: Any) -> dict[str, Any]:
             "resources": mc.resource_count,
             "prompts": mc.prompt_count,
         }
+    # Only present when tls.enabled: "active" (serving HTTPS) or "fallback"
+    # (TLS init failed, serving plain HTTP). Makes a silently-downgraded
+    # node observable.
+    tls_state = getattr(app_state, "tls_state", None)
+    if tls_state:
+        data["tls"] = tls_state
     return data
 
 
@@ -4635,7 +4641,12 @@ def main() -> None:
         try:
             import asyncio
 
-            from turnstone.core.tls import TLSClient, build_cert_hostnames
+            from turnstone.core.tls import (
+                TLS_INIT_RETRY_ATTEMPTS,
+                TLSClient,
+                build_cert_hostnames,
+                prepare_pem_runtime_dir,
+            )
 
             # The advertised host (the name the collector + routing proxy dial)
             # is placed first so it becomes the cert's primary domain / SAN and
@@ -4651,14 +4662,17 @@ def main() -> None:
                 storage=get_storage(),
                 hostnames=hostnames,
             )
-            asyncio.run(tls_client.init())
+            asyncio.run(tls_client.init(attempts=TLS_INIT_RETRY_ATTEMPTS))
             bundle = tls_client.bundle
             if bundle:
                 from lacme.mtls import write_pem_files_persistent
 
+                # Fixed parent dir (vs. a random tmpdir) so the container
+                # healthcheck can find the cert and probe over mTLS.
                 pem_paths = write_pem_files_persistent(
                     bundle,
                     ca_pem=tls_client.ca_pem,
+                    directory=prepare_pem_runtime_dir(),
                 )
                 ssl_kwargs.update(pem_paths.as_uvicorn_kwargs())
                 if tls_client.ca_pem:
@@ -4668,15 +4682,28 @@ def main() -> None:
 
                 # Store client on app state for lifespan renewal
                 app.state.tls_client = tls_client
+                pem_dir_state = {"dir": pem_paths.cert.parent}
 
                 def _reload_server_cert(new_bundle: Any) -> None:
                     """Swap a renewed cert into uvicorn's live SSL context.
 
                     uvicorn loads its cert once at boot and never reloads, so
                     without this the served cert would expire mid-process and
-                    break every mTLS peer.
+                    break every mTLS peer. The on-disk runtime PEMs (the
+                    healthcheck's client identity) expire on the same clock,
+                    so they are refreshed alongside.
                     """
-                    from turnstone.core.tls import swap_context_cert
+                    from turnstone.core.tls import refresh_runtime_pems, swap_context_cert
+
+                    try:
+                        new_paths = refresh_runtime_pems(
+                            new_bundle,
+                            ca_pem=tls_client.ca_pem,
+                            previous=pem_dir_state["dir"],
+                        )
+                        pem_dir_state["dir"] = new_paths.cert.parent
+                    except Exception:
+                        log.warning("TLS runtime PEM refresh failed", exc_info=True)
 
                     cfg = getattr(app.state, "uvicorn_config", None)
                     live_ctx = getattr(cfg, "ssl", None) if cfg is not None else None
@@ -4691,10 +4718,15 @@ def main() -> None:
                     app.state.advertise_url = _advertise_url.replace("http://", "https://", 1)
                 else:
                     app.state.advertise_url = _advertise_url
+                app.state.tls_state = "active"
                 log.info("TLS enabled — serving HTTPS")
             else:
+                app.state.tls_state = "fallback"
                 log.warning("TLS enabled but no cert available")
         except Exception as exc:
+            # Surfaced as tls:"fallback" in /health — a node serving plain
+            # HTTP while TLS is configured should be visible, not silent.
+            app.state.tls_state = "fallback"
             log.warning(
                 "TLS initialization failed — serving plain HTTP: %s: %s",
                 type(exc).__name__,

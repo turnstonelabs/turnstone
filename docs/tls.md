@@ -88,6 +88,32 @@ Console (CA + ACME Server)
 - **Frontend cert** (HTTPS): From an external ACME CA (e.g. Let's Encrypt)
   if `tls.acme_directory` is set, otherwise self-issued from the internal CA.
 
+### Boot, retry, and fallback
+
+With `tls.enabled`, a node fetches the CA cert and requests its own cert
+during startup, retrying with exponential backoff (6 attempts, ~31 s total)
+— enough to absorb a whole-stack restart where every node races the console
+for its listener. If all attempts fail, the node **falls back to plain
+HTTP** (availability over confidentiality) and reports `"tls": "fallback"`
+in `GET /health`; a node serving HTTPS reports `"tls": "active"`, and the
+key is absent when TLS is disabled. Fallback persists until the next
+restart — it is not upgraded in place.
+
+### Container healthcheck under mTLS
+
+An mTLS listener rejects plain-HTTP probes at the socket, so
+`docker/healthcheck.py` falls back to HTTPS when the plain probe fails:
+it presents the node's own cert as the client cert and pins the cluster
+CA, using the PEM files the server writes at boot under
+`$TURNSTONE_TLS_PEM_DIR` (default `<tmpdir>/turnstone-tls`). The probe
+dials `localhost` for the TLS attempt — the internal CA issues DNS SANs
+only, so a literal-IP URL would fail verification. Cert renewal rewrites
+the PEM dir alongside the live listener swap, so the probe's client cert
+never outlives the served cert. With TLS disabled the plain probe succeeds
+and the PEM directory is never consulted. On bare metal with multiple
+nodes per host, set `TURNSTONE_TLS_PEM_DIR` per node (each boot clears
+stale `lacme-pem-*` dirs under its root).
+
 ---
 
 ## Configuration

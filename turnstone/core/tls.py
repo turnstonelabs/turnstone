@@ -13,6 +13,7 @@ Flow:
 
 from __future__ import annotations
 
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
@@ -27,6 +28,81 @@ log = get_logger(__name__)
 
 _RENEW_INTERVAL_HOURS = 24
 _RENEW_BEFORE_EXPIRY_DAYS = 1
+
+# Boot-time init retry budget: 1+2+4+8+16 s ≈ 31 s of backoff. Sized to
+# absorb a whole-stack restart, where every node races the console for the
+# CA cert (compose re-enforces depends_on ordering only on `up`, not
+# `restart`) and the console needs a few seconds to start accepting
+# connections.
+TLS_INIT_RETRY_ATTEMPTS = 6
+
+
+def tls_pem_runtime_dir() -> Path:
+    """Parent directory for the boot-time PEM files.
+
+    A fixed, well-known location (override: ``TURNSTONE_TLS_PEM_DIR``) so the
+    container healthcheck can present the node's own cert as an mTLS client
+    cert without DB access. ``write_pem_files`` creates a ``lacme-pem-*``
+    subdirectory under it.
+    """
+    import os
+    import tempfile
+
+    env = os.environ.get("TURNSTONE_TLS_PEM_DIR")
+    return Path(env) if env else Path(tempfile.gettempdir()) / "turnstone-tls"
+
+
+def prepare_pem_runtime_dir() -> Path:
+    """Create the PEM runtime dir (0700) and clear stale ``lacme-pem-*`` dirs.
+
+    Stale subdirectories accumulate when a previous process dies before its
+    atexit cleanup runs (SIGKILL, OOM). Clearing them at boot — before the new
+    PEM dir is written — keeps exactly one live dir, so the healthcheck can't
+    pick up an expired cert. Assumes one node per PEM root: two processes
+    sharing a root would clear each other's live dirs (containers each get a
+    private tmpfs; on bare metal set TURNSTONE_TLS_PEM_DIR per node).
+    """
+    import os
+    import shutil
+    import stat
+
+    root = tls_pem_runtime_dir()
+    try:
+        st = os.lstat(root)
+    except FileNotFoundError:
+        st = None
+    if st is not None and (stat.S_ISLNK(st.st_mode) or st.st_uid != os.geteuid()):
+        # The default root lives in shared /tmp on bare metal: a hostile
+        # local user could pre-create it as a symlink (redirecting where the
+        # key material lands) or as a dir they own. Refuse both; our own
+        # stale dir from a prior boot passes (chmod below repairs mode).
+        raise RuntimeError(
+            f"PEM runtime dir {root} exists but is a symlink or not owned by this process"
+        )
+    root.mkdir(mode=0o700, parents=True, exist_ok=True)
+    os.chmod(root, 0o700)
+    for stale in root.glob("lacme-pem-*"):
+        shutil.rmtree(stale, ignore_errors=True)
+    return root
+
+
+def refresh_runtime_pems(bundle: Any, *, ca_pem: bytes | None, previous: Path | None) -> Any:
+    """Write a renewed bundle under the runtime root and drop the old dir.
+
+    Keeps the on-disk PEMs (the healthcheck's mTLS client identity) in
+    lockstep with the served cert: certs live 48 hours, so the boot-time
+    files would expire and flip the container unhealthy two renewals in.
+    The new dir is written before the old one is removed, so a concurrent
+    probe always finds at least one complete dir.
+    """
+    import shutil
+
+    from lacme.mtls import write_pem_files
+
+    new_paths = write_pem_files(bundle, ca_pem=ca_pem, directory=tls_pem_runtime_dir())
+    if previous is not None and previous != new_paths.cert.parent:
+        shutil.rmtree(previous, ignore_errors=True)
+    return new_paths
 
 
 def _require_lacme() -> Any:
@@ -203,17 +279,42 @@ class TLSClient:
             except Exception:
                 log.warning("tls.cert.reload_hook_failed", exc_info=True)
 
-    async def init(self) -> None:
+    async def init(self, *, attempts: int = 1, base_delay: float = 1.0) -> None:
         """Fetch CA root cert and request a service certificate.
 
         If no console_url was provided, discovers it from the services
         table. Performs initial cert provisioning over plain HTTP (ACME
         protocol provides integrity via JWS).
+
+        With ``attempts > 1``, failures are retried with exponential backoff
+        (``base_delay * 2**n``). A node restarted alongside the console loses
+        the race for the console's listener by well under a second; without
+        retries that one refused connection downgrades the node to plain HTTP
+        for its entire lifetime, even when a valid cert sits in the store.
+        Discovery, CA fetch, and cert request are all idempotent, so the whole
+        sequence is retried as a unit.
         """
-        if not self._console_url:
-            self._console_url = self._discover_console_url()
-        await self._fetch_ca_cert()
-        await self._request_cert()
+        import asyncio
+
+        for attempt in range(1, attempts + 1):
+            try:
+                if not self._console_url:
+                    self._console_url = self._discover_console_url()
+                await self._fetch_ca_cert()
+                await self._request_cert()
+                return
+            except Exception as exc:
+                if attempt >= attempts:
+                    raise
+                delay = base_delay * 2 ** (attempt - 1)
+                log.warning(
+                    "tls.init.retrying",
+                    attempt=attempt,
+                    max_attempts=attempts,
+                    delay_seconds=delay,
+                    error=f"{type(exc).__name__}: {exc}",
+                )
+                await asyncio.sleep(delay)
 
     def _discover_console_url(self) -> str:
         """Look up the console URL from the services table."""
@@ -245,8 +346,11 @@ class TLSClient:
                 resp.raise_for_status()
                 self._ca_pem = resp.content
                 log.info("tls.ca.fetched", url=url)
-        except Exception:
-            log.error("tls.ca.fetch_failed", url=url, exc_info=True)
+        except Exception as exc:
+            # Warning, not error: init() may retry this, and the terminal
+            # failure is logged by the caller. Full traceback at debug.
+            log.warning("tls.ca.fetch_failed", url=url, error=f"{type(exc).__name__}: {exc}")
+            log.debug("tls.ca.fetch_failed traceback", exc_info=True)
             raise
 
     async def _request_cert(self) -> None:
