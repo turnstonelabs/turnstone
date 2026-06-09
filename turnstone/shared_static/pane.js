@@ -47,6 +47,12 @@ export class ShellPane {
   onActivate() {}
   /** Pane left the visible tab — keep-or-teardown is per-type. */
   onDeactivate() {}
+  /** An openPane() call targeted this ALREADY-OPEN pane — explicit user intent
+   *  (saved-list resume, rail row, child link), distinct from onActivate which
+   *  also fires on plain tab switches and only on a pane CHANGE.  Conversational
+   *  panes use this to revive a dead session even when the pane is already the
+   *  active tab.  `extra` is the caller's open-time hint (e.g. `{nodeId}`). */
+  onReopen(extra) {}
   /** Pane is being destroyed — release resources (close streams, timers). */
   onClose() {}
 }
@@ -106,6 +112,14 @@ export class PaneManager {
   hasPane(type, id) {
     const paneId = id == null ? type : type + ":" + id;
     return this._panes.has(paneId);
+  }
+
+  /** The open pane for (type, id), or null — lets the shell reach a pane for
+   *  cross-cutting lifecycle signals (e.g. Tier-1 ws_closed → mark its session
+   *  controller dead).  Omit id for a singleton. */
+  getPane(type, id) {
+    const paneId = id == null ? type : type + ":" + id;
+    return this._panes.get(paneId) || null;
   }
 
   /** The active pane's identity ({type, rawId}), or null — lets the rail mark
@@ -180,6 +194,7 @@ export class PaneManager {
     }
     const paneId = id == null ? type : type + ":" + id;
     let pane = this._panes.get(paneId);
+    const existed = !!pane;
     if (!pane) {
       // Auth gate runs only on CREATE — a denied pane is never built (the backend
       // enforces the scope too; this just avoids opening a doomed pane).
@@ -198,6 +213,18 @@ export class PaneManager {
       this._mount(pane);
     }
     this.activate(paneId);
+    // Explicit-reopen signal: openPane on an existing pane is a user saying
+    // "open this AGAIN" (saved-list resume, rail row, child link) — activate()
+    // alone can't carry that (it no-ops hooks on the already-active pane, and
+    // onActivate also fires on plain tab switches).  Fired AFTER activate so
+    // the pane is visible when it reacts (e.g. revives a dead session).
+    if (existed) {
+      try {
+        pane.onReopen(extra);
+      } catch (e) {
+        console.error("PaneManager: onReopen failed", paneId, e);
+      }
+    }
     return pane;
   }
 

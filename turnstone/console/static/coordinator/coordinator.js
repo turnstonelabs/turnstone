@@ -4682,6 +4682,19 @@ function createCoordinatorPane(root, wsId, opts) {
       _childObserver.disconnect();
   }
 
+  // Reconnect a DEAD stream NOW (reset backoff), leaving a live one alone —
+  // OPEN is healthy and CONNECTING means native retry / a fresh connect is
+  // already working the problem.  The shell calls this on an explicit re-open
+  // of an already-open pane (saved-list resume POSTs /open first): a
+  // coordinator whose session was closed under the pane sits in the capped
+  // retry loop — this short-circuits straight to a fresh /events against the
+  // reopened session (a stale replay cursor degrades to the server's
+  // fresh-replay path).
+  function reconnect() {
+    if (evtSource && evtSource.readyState !== EventSource.CLOSED) return;
+    onLogin();
+  }
+
   // Enter-to-send / Shift-Enter newline / IME-safe handling lives in
   // shared/composer.js; no duplicate listener here.
   return {
@@ -4689,6 +4702,7 @@ function createCoordinatorPane(root, wsId, opts) {
     connect: init,
     destroy: destroy,
     onLogin: onLogin,
+    reconnect: reconnect,
     closeSession: coordCloseSession,
   };
 }

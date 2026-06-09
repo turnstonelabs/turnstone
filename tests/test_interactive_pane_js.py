@@ -165,3 +165,30 @@ def test_approval_keyboard_shortcuts_wired() -> None:
         "the feedback field uses the converged .conv-feedback, not the retired "
         ".ts-approval-feedback"
     )
+
+
+def test_controller_terminal_dead_state() -> None:
+    """Lifecycle round 2: the console controller must STOP reconnect-polling a
+    session that is gone (closed / evicted / node restarted) — three consecutive
+    CLOSED recovery beats → give up: stream closed, status bar terminal,
+    ``opts.onDead()`` fired once.  A successful stream open resets the counter
+    (the new host.onStreamOpen seam).  ``isDead()`` / ``markDead()`` / ``base``
+    are the shell's revive surface; a dead controller also ignores the login
+    re-arm (recovery may need a DIFFERENT node — the shell's revive owns it)."""
+    body = _INTERACTIVE.read_text(encoding="utf-8")
+    # The give-up ladder.
+    assert "let dead = false;" in body and "let failCount = 0;" in body
+    assert "const giveUp = function () {" in body
+    assert "failCount += 1;" in body and "if (failCount >= 3) giveUp();" in body
+    assert 'pane._sbTokens.textContent = "Disconnected"' in body, (
+        "the terminal state must be worded distinctly from the transient Reconnecting…"
+    )
+    assert "opts.onDead" in body, "the shell must hear about the give-up"
+    # The reset seam: Pane.connectSSE onopen → host.onStreamOpen → failCount = 0.
+    assert "this._host.onStreamOpen(this)" in body
+    assert "onStreamOpen() {}" in body, "the default host must carry the no-op"
+    # The shell-facing surface.
+    assert "isDead()" in body and "markDead: giveUp," in body
+    assert "base: base," in body, "the controller must expose its transport base"
+    # Dead controllers don't reconnect on re-auth.
+    assert "if (connected && !dead) pane._loadHistoryThenConnect(wsId);" in body

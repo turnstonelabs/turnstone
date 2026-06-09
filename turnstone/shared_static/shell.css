@@ -727,6 +727,28 @@
   text-decoration: underline;
   text-underline-offset: 2px;
 }
+/* Dead-session reconnect affordance (shell.js showDeadBanner) — a real <button>
+   for keyboard/AT reach, restyled so native OS button chrome doesn't leak into
+   the pane; reads as an error status line.  Sits above the (dead) conversation. */
+.pane-dead-banner {
+  display: block;
+  width: 100%;
+  text-align: left;
+  background: none;
+  border: 0;
+  border-bottom: 1px solid var(--hair);
+  font: inherit;
+  font-size: 13px;
+  color: color-mix(in srgb, var(--err) 80%, var(--ink-2));
+}
+.pane-dead-banner:hover {
+  color: var(--err);
+  background: color-mix(in oklab, var(--err) 8%, transparent);
+}
+.pane-dead-banner:focus-visible {
+  outline: 2px solid var(--err);
+  outline-offset: -2px;
+}
 
 /* ===== Dashboard session launcher — persona toggle (coordinator | interactive).
    A console-dashboard control; lives here because the L-shell loads shell.css. */

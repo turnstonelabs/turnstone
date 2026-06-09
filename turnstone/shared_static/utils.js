@@ -143,14 +143,18 @@ function setMarkdown(el, content) {
 }
 
 // Download a workstream's conversation as OpenAI-shaped JSON.  Hits
-// GET /v1/api/workstreams/{ws_id}/export, which streams a
+// GET {base}/v1/api/workstreams/{ws_id}/export, which streams a
 // ``{"messages":[...]}`` body with a Content-Disposition attachment
 // filename.  Shared by the interactive appbar (app.js) and the
 // coordinator appbar (coordinator.js) so both export buttons behave
-// identically.  authFetch already handles the 401 (shows login) and
+// identically.  ``base`` is the session's transport prefix — "" for a
+// local / console-homed session (the default), "/node/{id}" when the
+// console proxies a node-hosted interactive session (the export must
+// come from the node that owns the conversation, not the console).
+// authFetch already handles the 401 (shows login) and
 // 429 (retry) paths and returns the raw Response, so we read .blob()
 // directly and synthesise an anchor click to trigger the browser save.
-async function exportWorkstreamDownload(wsId, btn) {
+async function exportWorkstreamDownload(wsId, btn, base) {
   if (!wsId) {
     showToast("No conversation to export", "error");
     return;
@@ -166,7 +170,11 @@ async function exportWorkstreamDownload(wsId, btn) {
     btn.setAttribute("aria-busy", "true");
   }
   try {
-    const url = "/v1/api/workstreams/" + encodeURIComponent(wsId) + "/export";
+    const url =
+      (base || "") +
+      "/v1/api/workstreams/" +
+      encodeURIComponent(wsId) +
+      "/export";
     let r;
     try {
       r = await authFetch(url);

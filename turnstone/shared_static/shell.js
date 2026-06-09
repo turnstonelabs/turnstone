@@ -156,14 +156,29 @@ function stateForWs(wsId) {
 // makes a node-proxied session survive a reload: the node /events stream 404s
 // on a ws that isn't loaded on that node, so a freshly-rehydrated pane must
 // (re)open the session on a node first.  Resolves to {nodeId} or {error}.
-//   - Standalone (no cluster): every session is LOCAL → base "" (nodeId null),
-//     no open round-trip.
+//   - Standalone (no cluster): every session is LOCAL → base "" (nodeId null).
+//     The first-activate path skips the /open round-trip (the resume flows
+//     POST /open before opening the pane); the REVIVE path passes `openFirst`
+//     because a closed / post-restart session 404s its /events until reopened.
 //   - Console: the route + proxy + open work is the console's — delegate to the
-//     TS_APP seam (origin-first POST /open with a rendezvous fallback).  Without
-//     the seam (unexpected on a cluster console) fall back to the open-time hint
-//     or the live Tier-1 snapshot, accepting the pre-reload behaviour.
-function ensureInteractiveNode(caps, wsId, hint) {
-  if (!caps.cluster) return Promise.resolve({ nodeId: null });
+//     TS_APP seam (origin-first POST /open with a rendezvous fallback; it always
+//     opens, so `openFirst` is implicit).  Without the seam (unexpected on a
+//     cluster console) fall back to the open-time hint or the live Tier-1
+//     snapshot, accepting the pre-reload behaviour.
+function ensureInteractiveNode(caps, wsId, hint, openFirst) {
+  if (!caps.cluster) {
+    if (!openFirst) return Promise.resolve({ nodeId: null });
+    return authFetch(
+      "/v1/api/workstreams/" + encodeURIComponent(wsId) + "/open",
+      { method: "POST" },
+    )
+      .then((r) =>
+        r.ok
+          ? { nodeId: null }
+          : { error: "Could not reopen this session (" + r.status + ")." },
+      )
+      .catch(() => ({ error: "Could not reopen this session." }));
+  }
   if (
     window.TS_APP &&
     typeof window.TS_APP.resolveInteractiveNode === "function"
@@ -188,22 +203,55 @@ function paintConvTabs(pm) {
   }
 }
 
+// POST a workstream verb against a pane's OWN transport base — the node proxy
+// for a console interactive pane, "" locally.  The base-aware fallback lane for
+// deployments without the classic verb globals (see convTabMenu).
+function postWsVerb(base, wsId, verb, body) {
+  return authFetch(
+    base + "/v1/api/workstreams/" + encodeURIComponent(wsId) + "/" + verb,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body || {}),
+    },
+  );
+}
+
 // Tab-action menu items for a conversational pane — the three-verb close plus
-// the per-persona verbs.  Pane-type-derived AND deployment-aware: a verb appears
-// only when its handler exists here, so the SAME shell yields the full menu in
-// the standalone (whose interactive verbs are classic globals in ui/static's
-// app.js) and a reduced menu in the console — the capability-derived-affordances
-// thesis applied to the tab menu.  `opts`: titleVerbs (Refresh/Edit/Fork title),
-// deleteVerb (the destructive Delete), closeSession (stop the workstream itself).
+// the per-persona verbs.  Pane-type-derived AND deployment-aware, in two lanes:
+// the classic verb GLOBALS where they exist (the standalone's ui/static app.js,
+// whose verbs also manage its local roster), else a base-aware fallback that
+// POSTs the verb straight to the pane's own transport base (`opts.base()` — the
+// console's node proxy).  A node-verb is omitted only when no base is resolvable
+// yet (a never-activated pane with no node hint) — never aimed at the wrong
+// origin.  `opts`: titleVerbs (Refresh/Edit/Fork title), deleteVerb (the
+// destructive Delete), closeSession (stop the workstream itself), base (a
+// () => string|null transport-base getter; omitted = "" local).
 function convTabMenu(pane, pm, wsId, opts) {
   opts = opts || {};
   const G = window;
   const items = [];
+  const base = typeof opts.base === "function" ? opts.base() : "";
+  const toast = (msg, kind) => {
+    if (typeof G.showToast === "function") G.showToast(msg, kind);
+  };
   if (opts.titleVerbs) {
     if (typeof G.refreshWorkstreamTitle === "function")
       items.push({
         label: "Refresh title",
         action: () => G.refreshWorkstreamTitle(wsId),
+      });
+    else if (base != null)
+      items.push({
+        label: "Refresh title",
+        action: () =>
+          postWsVerb(base, wsId, "refresh-title")
+            .then((r) =>
+              r.ok
+                ? toast("Title regeneration started…", "info")
+                : toast("Failed to refresh title", "error"),
+            )
+            .catch(() => toast("Failed to refresh title", "error")),
       });
     if (typeof G.editWorkstreamTitle === "function")
       items.push({
@@ -211,6 +259,27 @@ function convTabMenu(pane, pm, wsId, opts) {
         key: "Ctrl+Shift+E",
         action: () => G.editWorkstreamTitle(wsId),
       });
+    else if (base != null)
+      items.push({
+        label: "Edit title",
+        action: () => {
+          const f = findWs(wsId, false);
+          const cur = (f && (f.ws.name || f.ws.title)) || "";
+          const next = window.prompt("Session title", cur);
+          if (next == null) return; // cancelled
+          const title = next.trim();
+          if (!title || title === cur) return;
+          postWsVerb(base, wsId, "title", { title })
+            .then((r) =>
+              r.ok
+                ? toast("Title updated", "success")
+                : toast("Failed to set title", "error"),
+            )
+            .catch(() => toast("Failed to set title", "error"));
+        },
+      });
+    // Fork stays global-only: it needs the standalone's seeded new-session
+    // modal; the console has no interactive fork surface (yet).
     if (typeof G.forkWorkstream === "function")
       items.push({
         label: "Fork",
@@ -218,12 +287,14 @@ function convTabMenu(pane, pm, wsId, opts) {
         action: () => G.forkWorkstream(wsId),
       });
   }
-  if (typeof G.exportWorkstreamDownload === "function")
+  // Export is base-aware everywhere (a proxied pane must export from its node,
+  // not the console origin) — omitted while the node is unresolved.
+  if (typeof G.exportWorkstreamDownload === "function" && base != null)
     items.push({
       label: "Export conversation",
-      action: () => G.exportWorkstreamDownload(wsId),
+      action: () => G.exportWorkstreamDownload(wsId, null, base),
     });
-  items.push({ separator: true });
+  if (items.length) items.push({ separator: true });
   // Close pane — drop the tab, leave the session running (PaneManager-level).
   items.push({
     label: "Close pane",
@@ -233,14 +304,41 @@ function convTabMenu(pane, pm, wsId, opts) {
   // Close workstream — stop the session itself (distinct from closing the tab).
   if (opts.closeSession)
     items.push({ label: "Close workstream", action: opts.closeSession });
-  // Delete — destroy + unsave (interactive standalone only; confirms itself).
-  if (opts.deleteVerb && typeof G.confirmDeleteWorkstream === "function")
-    items.push({
-      label: "Delete",
-      key: "Ctrl+Shift+X",
-      cls: "destructive",
-      action: () => G.confirmDeleteWorkstream(wsId),
-    });
+  // Delete — destroy + unsave.  Standalone delegates to its modal-confirming
+  // global; the console fallback confirms inline and deletes on the node.
+  if (opts.deleteVerb) {
+    if (typeof G.confirmDeleteWorkstream === "function")
+      items.push({
+        label: "Delete",
+        key: "Ctrl+Shift+X",
+        cls: "destructive",
+        action: () => G.confirmDeleteWorkstream(wsId),
+      });
+    else if (base != null)
+      items.push({
+        label: "Delete",
+        cls: "destructive",
+        action: () => {
+          if (!window.confirm("Delete this session? This cannot be undone."))
+            return;
+          postWsVerb(base, wsId, "delete")
+            .then((r) => {
+              // 404 = no row left to delete (already deleted elsewhere) — the
+              // intent is satisfied either way; drop the tab.
+              if (!r.ok && r.status !== 404) {
+                toast("Failed to delete session", "error");
+                return;
+              }
+              pm.close(pane.id);
+              toast("Session deleted", "success");
+              // The saved list holds the deleted row — refresh it if present.
+              if (typeof G.loadSavedCoordinators === "function")
+                G.loadSavedCoordinators();
+            })
+            .catch(() => toast("Failed to delete session", "error"));
+        },
+      });
+  }
   return items;
 }
 
@@ -377,15 +475,56 @@ async function mountShell() {
       title: wsTitle(id),
       stateful: true, // tab shows live Tier-1 state (no static placeholder)
     });
-    pane.tabMenu = () =>
-      convTabMenu(pane, pm, id, {
+    // The pane's CURRENT transport base for tab-menu verbs: the live
+    // controller's (exact), else the persisted node hint, else the live Tier-1
+    // node; null = unresolved (node-verbs are omitted until the pane connects).
+    // Standalone is always local ("").
+    const menuBase = () => {
+      if (pane._ctl && pane._ctl.base != null) return pane._ctl.base;
+      if (pane.meta && pane.meta.nodeId)
+        return "/node/" + encodeURIComponent(pane.meta.nodeId);
+      if (!caps.cluster) return "";
+      const live = nodeForWs(id);
+      return live ? "/node/" + encodeURIComponent(live) : null;
+    };
+    pane.tabMenu = () => {
+      // Close workstream: the standalone's roster-managing global where it
+      // exists, else end the session on its own node (confirm-first, like the
+      // coordinator's End session) and drop the tab.  Hidden while the node is
+      // unresolved — same omit-don't-misaim rule as the other node-verbs.
+      const closeBase = menuBase();
+      const closeSession =
+        typeof window.closeWorkstream === "function"
+          ? () => window.closeWorkstream(id)
+          : closeBase == null
+            ? null
+            : () => {
+                if (
+                  !window.confirm(
+                    "End this session? The server will terminate it.",
+                  )
+                )
+                  return;
+                const failToast = () => {
+                  if (typeof window.showToast === "function")
+                    window.showToast("Could not end session", "error");
+                };
+                postWsVerb(closeBase, id, "close")
+                  .then((r) => {
+                    // 404 = nothing left to stop (closed under us / node lost
+                    // it) — the user's intent is satisfied; drop the tab.
+                    if (r.ok || r.status === 404) pm.close(pane.id);
+                    else failToast();
+                  })
+                  .catch(failToast);
+              };
+      return convTabMenu(pane, pm, id, {
         titleVerbs: true,
         deleteVerb: true,
-        closeSession:
-          typeof window.closeWorkstream === "function"
-            ? () => window.closeWorkstream(id)
-            : null,
+        base: menuBase,
+        closeSession: closeSession,
       });
+    };
     // Persist the open-time node hint so a reload re-opens on the SAME node
     // (origin-first; avoids a re-route + duplicate load).  Updated to the
     // resolved node after ensureInteractiveNode settles, below.
@@ -413,6 +552,7 @@ async function mountShell() {
       pane._ctl = createInteractivePane(pane.bodyEl, id, {
         nodeId,
         onClose: () => pm.close(pane.id),
+        onDead: showDeadBanner,
       });
       pane._ctl.connect();
       if (window.TS_LOGIN && pane._ctl.onLogin) {
@@ -420,11 +560,49 @@ async function mountShell() {
         window.TS_LOGIN.subscribe(pane._ctl.onLogin);
       }
     };
+    // Terminal dead session (the controller exhausted its reconnects, or Tier-1
+    // said ws_closed): keep the conversation readable, but surface ONE
+    // actionable affordance.  Reviving is never automatic — a deliberately
+    // closed session must not resurrect on a timer; the user (or an explicit
+    // reopen gesture) decides.
+    const showDeadBanner = () => {
+      if (pane._closed || pane._deadBanner) return;
+      const b = document.createElement("button");
+      b.type = "button";
+      b.className = "pane-status pane-status--retry pane-dead-banner";
+      b.textContent = "Session disconnected — click to reconnect.";
+      b.addEventListener("click", () => revive());
+      pane.bodyEl.prepend(b);
+      pane._deadBanner = b;
+    };
+    // Tear down the dead controller and re-run the resolve + connect path.
+    // forceResolve: the session may need (re)opening on its node (POST /open)
+    // or may have re-homed — never trust the dead controller's base.  An
+    // explicit fresh hint (a saved-row click carries the roster's node_id)
+    // supersedes the stale persisted one.
+    const revive = (freshNodeId) => {
+      if (pane._closed || pane._resolving || !pane._ctl) return;
+      if (pane._deadBanner) {
+        pane._deadBanner.remove();
+        pane._deadBanner = null;
+      }
+      if (window.TS_LOGIN && pane._ctl.onLogin)
+        window.TS_LOGIN.unsubscribe(pane._ctl.onLogin);
+      pane._ctl.destroy();
+      pane._ctl = null;
+      if (freshNodeId && (!pane.meta || pane.meta.nodeId !== freshNodeId)) {
+        pane.meta = { nodeId: freshNodeId };
+        pm.setPaneMeta(pane.id, pane.meta);
+      }
+      pane._statusEl = make("div", "pane-status", "Reconnecting…");
+      pane.bodyEl.append(pane._statusEl);
+      beginConnect(true);
+    };
     // Errored resolve (capacity / no node free): show it in the status line and
     // offer a one-click retry — re-clicking the tab won't re-fire onActivate
     // (PaneManager fires it only on a pane CHANGE), so without this a transient
     // failure would strand the pane until the user closed + reopened it.
-    const showResolveError = (msg) => {
+    const showResolveError = (msg, forceResolve) => {
       const el = pane._statusEl;
       if (!el) return;
       el.className = "pane-status pane-status--retry msg error";
@@ -436,7 +614,7 @@ async function mountShell() {
         el.title = "";
         el.onclick = null;
         el.textContent = "Connecting…";
-        beginConnect();
+        beginConnect(forceResolve);
       };
     };
     // First-activate connect.  A LIVE session (Tier-1 already names its node, so
@@ -444,19 +622,26 @@ async function mountShell() {
     // hot rail / active-row / just-created path.  Standalone runs locally.  Only
     // the dormant / reload case (the snapshot has no node for this ws) resolves
     // the node + (re)opens the session, whose /events would otherwise 404.
-    const beginConnect = () => {
+    // `forceResolve` (the revive path) skips BOTH fast paths so the resolve
+    // POSTs /open — the give-up fired because /events 404'd, so the session
+    // needs (re)loading even when a stale Tier-1 row still names a node.  The
+    // live node (when one exists) stays the HINT, so the origin-first /open
+    // reuses a genuinely-live session in place rather than loading a second
+    // copy on the old meta node.
+    const beginConnect = (forceResolve) => {
       const liveNode = caps.cluster ? nodeForWs(id) : null;
-      if (liveNode || !caps.cluster) {
+      if (!forceResolve && (liveNode || !caps.cluster)) {
         buildController(liveNode || null);
         return;
       }
       pane._resolving = true;
-      const hint = (pane.meta && pane.meta.nodeId) || (extra && extra.nodeId);
-      ensureInteractiveNode(caps, id, hint).then((res) => {
+      const hint =
+        liveNode || (pane.meta && pane.meta.nodeId) || (extra && extra.nodeId);
+      ensureInteractiveNode(caps, id, hint, forceResolve).then((res) => {
         pane._resolving = false;
         if (pane._closed) return; // closed mid-resolve — don't build into a detached body
         if (!res || res.error) {
-          showResolveError(res && res.error);
+          showResolveError(res && res.error, forceResolve);
           return;
         }
         buildController(res.nodeId);
@@ -465,11 +650,23 @@ async function mountShell() {
     pane.onActivate = function () {
       pm.setTabGlyph(pane.id, glyph(stateForWs(id))); // live Tier-1 state glyph
       if (this._ctl) {
+        if (this._ctl.isDead && this._ctl.isDead()) {
+          showDeadBanner(); // visible terminal state; reviving is the user's call
+          return;
+        }
         this._ctl.connect(); // built — idempotent re-mark focus
         return;
       }
       if (this._resolving) return; // first-activate resolve already in flight
       beginConnect();
+    };
+    // Explicit re-open (saved-list resume, rail row, child link) targeted this
+    // already-open pane.  A healthy pane needs nothing (activate re-marked
+    // focus); a DEAD one revives — this is the "resume with a pre-existing tab"
+    // path, which previously focused the dead pane and reconnected nothing.
+    pane.onReopen = function (reExtra) {
+      if (this._ctl && this._ctl.isDead && this._ctl.isDead())
+        revive(reExtra && reExtra.nodeId);
     };
     pane.onDeactivate = function () {
       if (this._ctl && this._ctl.deactivate) this._ctl.deactivate();
@@ -525,6 +722,14 @@ async function mountShell() {
             }
           }
         };
+        // Explicit re-open (saved-list resume with this pane already open): the
+        // resume already POSTed /open, so a coordinator whose stream went dead
+        // (session was closed, console restarted) just needs a fresh connect —
+        // reconnect() no-ops on a healthy OPEN stream.
+        pane.onReopen = function () {
+          if (this._connected && this._ctl && this._ctl.reconnect)
+            this._ctl.reconnect();
+        };
         pane.onClose = function () {
           if (this._ctl) {
             if (window.TS_LOGIN && this._ctl.onLogin)
@@ -553,7 +758,14 @@ async function mountShell() {
     }
   }
 
-  window.TS_SHELL = { panes: pm, caps };
+  // Tier-1 lifecycle → pane signal.  The console's ws_closed handler calls this
+  // so an open pane on that session stops its reconnect loop NOW (instead of
+  // 404-polling a session that is gone) and shows the reconnect affordance.
+  const notifySessionClosed = (wsId) => {
+    const p = pm.getPane("interactive", wsId);
+    if (p && p._ctl && p._ctl.markDead) p._ctl.markDead();
+  };
+  window.TS_SHELL = { panes: pm, caps, notifySessionClosed };
 
   // Login fan-out: app.js owns the single window.onLoginSuccess (the Tier-1
   // reconnect, set at load).  Wrap it in a tiny registry so EVERY conversational

@@ -139,6 +139,9 @@ const INTERACTIVE_DEFAULT_HOST = {
   // bare/console pane relies on it, so this is a no-op.  The standalone focused
   // pane additionally refetches + reassigns the ws list (see app.js).
   onStreamError() {},
+  // EventSource (re)opened — the dual of onStreamError.  The console pane host
+  // uses it to reset its terminal-failure counter (see createInteractivePane).
+  onStreamOpen() {},
   // Where the ``--skip-permissions`` banner lands (standalone: #ui-header).
   warningTarget(pane) {
     return pane.messagesEl;
@@ -877,6 +880,7 @@ class Pane {
       this.retryDelay = 1000;
       this.statusBarEl.classList.remove("ws-sb-disconnected");
       if (this._lastStatusEvt) this.updateStatus(this._lastStatusEvt);
+      this._host.onStreamOpen(this);
     };
 
     this.evtSource.onmessage = (e) => {
@@ -3266,6 +3270,41 @@ function createInteractivePane(root, wsId, opts) {
   let active = false;
   let connected = false;
   let recoverTimer = null;
+  // Terminal-failure tracking.  Native EventSource auto-reconnect (plus the 5s
+  // CLOSED-state recovery below) covers transient drops — but a session that is
+  // GONE from its node (closed/evicted, node restarted, re-homed) 404s every
+  // reconnect forever.  After 3 consecutive CLOSED checks the controller gives
+  // up: stream closed, timers dropped, status bar terminal, `opts.onDead()`
+  // fired ONCE so the shell can paint its reconnect affordance.  Recovery is
+  // the shell's revive path (re-resolve node + POST /open + rebuild) — never
+  // automatic, so a deliberately-closed session is not resurrected by a timer.
+  // A successful stream open resets the counter (host.onStreamOpen).
+  let dead = false;
+  let failCount = 0;
+
+  const giveUp = function () {
+    if (dead) return;
+    dead = true;
+    failCount = 0;
+    if (recoverTimer) {
+      clearTimeout(recoverTimer);
+      recoverTimer = null;
+    }
+    // Invalidate any in-flight history load: its .finally would otherwise
+    // reopen a stream for a session we just declared dead.
+    pane._historyLoadToken = (pane._historyLoadToken || 0) + 1;
+    pane.disconnectSSE();
+    // Terminal wording — the transient error path says "Reconnecting…".
+    pane.statusBarEl.classList.add("ws-sb-disconnected");
+    pane._sbTokens.textContent = "Disconnected";
+    if (typeof opts.onDead === "function") {
+      try {
+        opts.onDead();
+      } catch (e) {
+        console.error("interactive pane: onDead callback failed", e);
+      }
+    }
+  };
 
   const host = {
     // Workstream name from the Tier-1 cluster snapshot the shell owns, else the
@@ -3295,17 +3334,28 @@ function createInteractivePane(root, wsId, opts) {
     // deliberately does not close the source on error).  Guard the terminal
     // case: if the source is genuinely CLOSED after a beat, open a fresh
     // same-ws stream.  No global ws-list refetch — a console pane owns one ws.
+    // Three consecutive CLOSED beats = the session is gone, not flaky: give up
+    // (a dead session would otherwise be 404-polled every 5s indefinitely).
     onStreamError(pane) {
+      if (dead) return;
       if (recoverTimer) clearTimeout(recoverTimer);
       recoverTimer = setTimeout(() => {
         recoverTimer = null;
         if (
-          !pane.evtSource ||
-          pane.evtSource.readyState === EventSource.CLOSED
+          pane.evtSource &&
+          pane.evtSource.readyState !== EventSource.CLOSED
         ) {
-          pane.connectSSE(pane.wsId);
+          return; // native reconnect is still working the problem
         }
+        failCount += 1;
+        if (failCount >= 3) giveUp();
+        else pane.connectSSE(pane.wsId);
       }, 5000);
+    },
+    // Stream (re)opened — the session is reachable again; reset the give-up
+    // counter so unrelated future blips get a fresh allowance.
+    onStreamOpen() {
+      failCount = 0;
     },
     // The --skip-permissions banner lands in the pane's own slim header.
     warningTarget(pane) {
@@ -3328,6 +3378,10 @@ function createInteractivePane(root, wsId, opts) {
   return {
     wsId: wsId,
     pane: pane,
+    // The transport base this controller talks through ("" local, "/node/{id}"
+    // proxied) — the shell's tab-menu verbs aim at the SAME backend the pane
+    // streams from.
+    base: base,
     // First activation opens the Tier-2 stream (REST history first, then live);
     // re-activations just re-mark focus.  Idempotent — the shell calls it on
     // every tab switch.
@@ -3343,10 +3397,18 @@ function createInteractivePane(root, wsId, opts) {
     deactivate() {
       active = false;
     },
-    // Re-auth fan-out: reconnect the stream.
+    // Re-auth fan-out: reconnect the stream.  A dead controller stays dead —
+    // recovery is the shell's revive path (which may need a different node).
     onLogin() {
-      if (connected) pane._loadHistoryThenConnect(wsId);
+      if (connected && !dead) pane._loadHistoryThenConnect(wsId);
     },
+    // Terminal-state surface for the shell: `isDead()` gates revive-vs-connect
+    // on activate/reopen; `markDead()` lets Tier-1 lifecycle (ws_closed) stop
+    // the retry loop NOW instead of after three failed beats.
+    isDead() {
+      return dead;
+    },
+    markDead: giveUp,
     // Full teardown — close the stream + all timers/recording/tts, drop the
     // recovery timer, detach the DOM.  A backgrounded pane must not leak an
     // upstream node connection.

@@ -146,6 +146,15 @@ function patchClusterState(data) {
     if (typeof loadSavedCoordinators === "function") {
       loadSavedCoordinators();
     }
+    // An open pane on this session must stop reconnect-polling a stream that
+    // is now gone and show its reconnect affordance instead (the shell owns
+    // the pane lifecycle; this is the Tier-1 → pane seam).
+    if (
+      window.TS_SHELL &&
+      typeof window.TS_SHELL.notifySessionClosed === "function"
+    ) {
+      window.TS_SHELL.notifySessionClosed(data.ws_id);
+    }
   } else if (t === "ws_rename") {
     Object.keys(clusterState.nodes).forEach(function (nid) {
       (clusterState.nodes[nid].workstreams || []).forEach(function (ws) {

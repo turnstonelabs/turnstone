@@ -453,7 +453,9 @@ def test_step7_tab_menu_wired_per_persona() -> None:
     header's removed Export + end (5e.2e) return here as Export + Close workstream
     (its controller's closeSession).  The three-verb close (Close pane = pm.close
     != Close workstream != Delete) is the spine; the standalone interactive verbs
-    are feature-detected globals, so the console degrades to a reduced menu."""
+    prefer the feature-detected globals (which also manage its local roster), and
+    a deployment without them (the console) falls back to the base-aware lane
+    (see test_tab_menu_base_aware_verb_lane)."""
     shell = _SHELL_JS.read_text(encoding="utf-8")
     assert "function convTabMenu(" in shell, "the shared tab-menu builder must exist"
     assert shell.count("pane.tabMenu =") >= 3, (
@@ -471,11 +473,50 @@ def test_step7_tab_menu_wired_per_persona() -> None:
     assert "exportWorkstreamDownload" in shell, "Export conversation must wire the shared util"
     # Deployment-aware: the standalone interactive verbs are feature-detected globals.
     assert 'typeof window.closeWorkstream === "function"' in shell, (
-        "the interactive Close workstream is a standalone-only global (feature-detected)"
+        "the interactive Close workstream prefers the standalone global (feature-detected)"
     )
     assert "refreshWorkstreamTitle" in shell and "confirmDeleteWorkstream" in shell, (
-        "the interactive title/delete verbs are feature-detected standalone globals"
+        "the interactive title/delete verbs prefer the standalone globals"
     )
+
+
+def test_tab_menu_base_aware_verb_lane() -> None:
+    """Lifecycle round 2: a proxied interactive pane's tab menu must act on the
+    pane's OWN transport base, not the console origin — the globals lane only
+    exists on the standalone.  convTabMenu therefore takes a `base` getter and
+    falls back to POSTing the verb at {base}/v1/api/workstreams/{ws}/{verb}; a
+    node-verb is OMITTED while no base is resolvable (never aimed at the wrong
+    origin), and Export forwards the base to the shared util (a proxied export
+    must come from the node that owns the conversation)."""
+    shell = _SHELL_JS.read_text(encoding="utf-8")
+    assert "function postWsVerb(" in shell, "the base-aware verb POST helper must exist"
+    assert '"/v1/api/workstreams/" + encodeURIComponent(wsId) + "/" + verb' in shell
+    # The interactive pane supplies its current base: live controller's (exact),
+    # else the persisted node hint, else the live Tier-1 node, else null.
+    assert "const menuBase = ()" in shell, "the interactive pane must expose a base getter"
+    assert "pane._ctl && pane._ctl.base != null" in shell, (
+        "a built controller's base is authoritative for the menu verbs"
+    )
+    # Fallback verbs exist for the console: refresh-title / title / close / delete.
+    for verb in ('"refresh-title"', '"title"', '"close"', '"delete"'):
+        assert (
+            f"postWsVerb(base, wsId, {verb}" in shell
+            or f"postWsVerb(closeBase, id, {verb}" in shell
+        ), f"the {verb} verb must have a base-aware fallback"
+    # Export rides the base too (3-arg form), and node-verbs are null-gated.
+    assert "exportWorkstreamDownload(wsId, null, base)" in shell
+    assert "base != null" in shell, "node-verbs must be omitted while the base is unresolved"
+    # Destructive fallbacks confirm first (window.confirm is the house precedent).
+    assert shell.count("window.confirm(") >= 2, (
+        "the close + delete fallbacks must confirm before acting"
+    )
+    # No leading separator when the verb section is empty.
+    assert "if (items.length) items.push({ separator: true })" in shell
+    util = (_SHARED / "utils.js").read_text(encoding="utf-8")
+    assert "function exportWorkstreamDownload(wsId, btn, base)" in util, (
+        "the shared export util must accept the transport base"
+    )
+    assert '(base || "") +' in util, "the export URL must be base-prefixed"
 
 
 def test_step7_tab_menu_css_promoted_shared() -> None:
@@ -559,3 +600,115 @@ def test_step7_auth_gated_open_pane() -> None:
     assert "canOpen:" in shell and "onDeny:" in shell, (
         "the coordinator registerType must supply the auth gate"
     )
+
+
+# ---------------------------------------------------------------------------
+# Workstream-lifecycle round 2: dead-session revive + explicit-reopen seam.
+# ---------------------------------------------------------------------------
+
+
+def test_pane_manager_reopen_seam() -> None:
+    """openPane() on an ALREADY-OPEN pane fires `pane.onReopen(extra)` — the
+    explicit-intent signal (saved-list resume, rail row, child link) that
+    activate() cannot carry: hooks no-op on the already-active pane, and
+    onActivate also fires on plain tab switches.  Fired AFTER activate so the
+    pane is visible when it reacts.  getPane lets the shell reach a pane for
+    cross-cutting lifecycle signals."""
+    pane = _PANE_JS.read_text(encoding="utf-8")
+    assert "onReopen(extra) {}" in pane, "ShellPane must document the onReopen hook"
+    assert "const existed = !!pane" in pane, "openPane must remember create-vs-focus"
+    assert "pane.onReopen(extra)" in pane, "openPane must fire onReopen on existing panes"
+    # Ordering: the reopen signal comes after activation.
+    assert pane.index("this.activate(paneId)") < pane.index("pane.onReopen(extra)")
+    assert "getPane(type, id)" in pane, "PaneManager must expose getPane for the shell"
+
+
+def test_interactive_pane_dead_session_revive() -> None:
+    """The reported round-2 bug: an interactive session whose stream died
+    (closed / evicted / node restarted) could never reconnect while its tab
+    existed — openPane focused the dead pane, onActivate's connect() is one-shot,
+    and the controller's recovery loop re-dialed the SAME node forever.  The fix:
+    the shell paints a click-to-reconnect banner when the controller reports
+    dead, and an explicit reopen (onReopen) revives — tear down the dead
+    controller, re-resolve the node (POST /open), rebuild."""
+    shell = _SHELL_JS.read_text(encoding="utf-8")
+    assert "const showDeadBanner = ()" in shell, "the dead banner painter must exist"
+    assert "pane-dead-banner" in shell, "the banner carries its own style hook"
+    css = _SHELL_CSS.read_text(encoding="utf-8")
+    assert ".pane-dead-banner" in css and ".pane-dead-banner:focus-visible" in css, (
+        "the banner is a real <button>; shell.css must reset its native chrome "
+        "and give it a keyboard focus treatment"
+    )
+    assert "Session disconnected" in shell, "the banner states the terminal condition"
+    assert "const revive = (freshNodeId)" in shell, "the revive path must exist"
+    assert "onDead: showDeadBanner" in shell, (
+        "the controller's terminal give-up must surface the banner"
+    )
+    # Revive is full teardown + re-resolve: unsubscribe login, destroy, rebuild.
+    ridx = shell.index("const revive =")
+    rbody = shell[ridx : ridx + 900]
+    assert "TS_LOGIN.unsubscribe" in rbody and "destroy()" in rbody
+    assert "beginConnect(true)" in rbody, "revive must force the resolve path"
+    # onActivate shows the banner for a dead controller instead of connect();
+    # onReopen revives (the resume-with-a-pre-existing-tab path).
+    assert "this._ctl.isDead && this._ctl.isDead()" in shell
+    assert "revive(reExtra && reExtra.nodeId)" in shell, (
+        "onReopen must revive with the caller's fresh node hint"
+    )
+    # The standalone revive path must (re)open the local session — /events 404s
+    # on an unloaded ws; only the forceResolve lane POSTs /open.
+    assert "function ensureInteractiveNode(caps, wsId, hint, openFirst)" in shell
+    eidx = shell.index("function ensureInteractiveNode(")
+    ebody = shell[eidx : eidx + 700]
+    assert '"/open"' in ebody and '{ method: "POST" }' in ebody.replace("\n", " ").replace(
+        "  ", " "
+    ).replace("  ", " "), "standalone openFirst must POST /open"
+    # Revive must skip BOTH fast paths (a stale Tier-1 row must not bypass the
+    # /open), while the live node — when present — stays the resolve HINT so an
+    # origin-first /open reuses a genuinely-live session instead of loading a
+    # duplicate copy on the old meta node.
+    assert "if (!forceResolve && (liveNode || !caps.cluster))" in shell, (
+        "beginConnect's fast paths must both yield to the forced resolve"
+    )
+    assert "liveNode || (pane.meta && pane.meta.nodeId)" in shell, (
+        "the live Tier-1 node must lead the resolve-hint chain"
+    )
+
+
+def test_shell_marks_pane_dead_on_ws_closed() -> None:
+    """Tier-1 ws_closed → the open pane stops reconnect-polling a session that
+    is GONE and shows the reconnect affordance immediately (the console keeps
+    the tab — unlike the standalone, which closes the pane outright)."""
+    shell = _SHELL_JS.read_text(encoding="utf-8")
+    assert "const notifySessionClosed = (wsId)" in shell
+    assert 'pm.getPane("interactive", wsId)' in shell
+    assert "p._ctl.markDead()" in shell
+    assert "window.TS_SHELL = { panes: pm, caps, notifySessionClosed }" in shell, (
+        "the seam must be exported on TS_SHELL for the console's Tier-1 handler"
+    )
+    app = _CONSOLE_APP.read_text(encoding="utf-8")
+    closed = app.index('=== "ws_closed"')
+    block = app[closed : closed + 1200]
+    assert "notifySessionClosed" in block, (
+        "the console ws_closed handler must notify the shell's open pane"
+    )
+
+
+def test_coordinator_pane_reconnects_on_reopen() -> None:
+    """The coordinator variant of resume-with-a-pre-existing-tab: the saved-list
+    resume POSTs /open BEFORE openPane, so the dead pane just needs a fresh
+    stream — onReopen calls the controller's reconnect(), which resets backoff
+    and reconnects only when the source is gone or CLOSED (OPEN is healthy;
+    CONNECTING means native retry / a fresh connect is already in flight)."""
+    shell = _SHELL_JS.read_text(encoding="utf-8")
+    assert "this._ctl.reconnect()" in shell, (
+        "the coordinator pane's onReopen must drive the controller's reconnect"
+    )
+    coord = (_ROOT / "turnstone/console/static/coordinator/coordinator.js").read_text(
+        encoding="utf-8"
+    )
+    assert "function reconnect()" in coord
+    assert "readyState !== EventSource.CLOSED) return" in coord.replace("\n", " "), (
+        "reconnect must only act on a missing/CLOSED stream"
+    )
+    assert "reconnect: reconnect," in coord, "the factory must return reconnect"
