@@ -1407,6 +1407,35 @@ class TestAnthropicHelpers:
         assert caps.token_param == "max_tokens"
         assert caps.thinking_mode == "adaptive"
 
+    def test_capabilities_fable_5(self) -> None:
+        from turnstone.core.providers._anthropic import AnthropicProvider
+
+        provider = AnthropicProvider()
+        caps = provider.get_capabilities("claude-fable-5")
+        assert caps.context_window == 1000000
+        assert caps.max_output_tokens == 128000
+        assert caps.thinking_mode == "adaptive"
+        assert caps.supports_effort is True
+        assert "xhigh" in caps.effort_levels
+        assert "max" in caps.effort_levels
+        assert caps.supports_temperature is False
+        assert caps.thinking_display == "summarized"
+        assert caps.supports_web_search is True
+        assert caps.supports_tool_search is True
+        assert caps.supports_vision is True
+        assert caps.supports_reasoning_replay is True
+        assert caps.supports_mid_conversation_system is True
+
+    def test_capabilities_fable_5_dated(self) -> None:
+        from turnstone.core.providers._anthropic import AnthropicProvider
+
+        provider = AnthropicProvider()
+        caps = provider.get_capabilities("claude-fable-5-20260815")
+        assert caps.context_window == 1000000
+        assert caps.supports_temperature is False
+        assert caps.thinking_display == "summarized"
+        assert caps.supports_mid_conversation_system is True
+
     def test_capabilities_opus_4_8(self) -> None:
         from turnstone.core.providers._anthropic import AnthropicProvider
 

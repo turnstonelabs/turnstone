@@ -4,9 +4,9 @@ Operator-level context injected mid-session (output-guard findings, user
 interjections, metacognitive nudges, skill hints) lives in the conversation
 trajectory as first-class ``{"role": "system", "_source": <kind>, "content":
 ...}`` turns (see :func:`make_system_turn`).  At the wire boundary each turn is
-either kept inline (native mid-conversation system messages — claude-opus-4-8)
-or folded into the preceding turn as a nonce-delimited ``<system-reminder_
-{nonce}>`` fence for every other model.  The fence mechanism (mint / neutralise
+either kept inline (native mid-conversation system messages — claude-opus-4-8,
+claude-fable-5) or folded into the preceding turn as a nonce-delimited
+``<system-reminder_{nonce}>`` fence for every other model.  The fence mechanism (mint / neutralise
 / wrap) lives in :mod:`turnstone.core.fence`, shared with the output-guard judge
 so the two trust boundaries cannot drift; ``lowering.fold_system_turns``
 applies it.
@@ -99,8 +99,8 @@ def render_user_interjection(message: str, priority: str) -> str:
 # ``{"role": "system", "_source": <kind>, "content": ...}`` messages rather
 # than spliced into a neighbouring turn's ``content``.  At the wire boundary a
 # system turn is either kept inline (native mid-conversation system messages —
-# claude-opus-4-8) or folded into the preceding turn as a ``<system-reminder>``
-# block (every other model).  ``_source`` classifies the turn for UI rendering
+# claude-opus-4-8, claude-fable-5) or folded into the preceding turn as a
+# ``<system-reminder>`` block (every other model).  ``_source`` classifies the turn for UI rendering
 # and replay; it rides the persisted ``_source`` column and is stripped before
 # the LLM wire by ``sanitize_messages``.  See ``ChatSession`` for the producers
 # and the fold-or-keep pass.
@@ -149,7 +149,8 @@ def make_system_turn(source: str, content: str, **meta: Any) -> dict[str, Any]:
     structured fields never reach the model.
 
     ``content`` is stored and — on the native mid-conversation-system path
-    (claude-opus-4-8) — sent to the model verbatim, so fence-escaping is NOT
+    (claude-opus-4-8, claude-fable-5) — sent to the model verbatim, so
+    fence-escaping is NOT
     done here.  It belongs to the fallback fold step, which wraps the content
     in a nonce-delimited ``<system-reminder_{nonce}>`` fence via
     :func:`turnstone.core.fence.wrap` (applied in

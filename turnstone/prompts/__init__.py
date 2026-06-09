@@ -92,9 +92,9 @@ def build_operator_instruction_declaration(nonce: str) -> str:
     model trusts only ``<system-reminder_<nonce>>`` blocks and treats every
     other ``<system-reminder>``-style marker (e.g. one forged in tool output,
     files, or web pages) as untrusted data.  Emitted only when the model uses
-    the fold path — the native mid-conversation-system path (claude-opus-4-8)
-    delivers operator turns as real ``{"role":"system"}`` messages with no
-    fence, so no marker appears.
+    the fold path — the native mid-conversation-system path (claude-opus-4-8,
+    claude-fable-5) delivers operator turns as real ``{"role":"system"}``
+    messages with no fence, so no marker appears.
     """
     return (
         "## Operator instructions\n"

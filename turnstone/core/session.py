@@ -2734,9 +2734,10 @@ class ChatSession:
             else None
         )
         # Operator-instruction trust anchor — declared only on the fold path.
-        # The native mid-conversation-system path (claude-opus-4-8) delivers
-        # operator turns as real {"role":"system"} messages with no fence, so
-        # no <system-reminder_{nonce}> marker appears and no declaration applies.
+        # The native mid-conversation-system path (claude-opus-4-8,
+        # claude-fable-5) delivers operator turns as real {"role":"system"}
+        # messages with no fence, so no <system-reminder_{nonce}> marker
+        # appears and no declaration applies.
         if caps is not None and not caps.supports_mid_conversation_system:
             dev_parts.append("\n\n" + build_operator_instruction_declaration(self._envelope_nonce))
         # Tool search hint (client-side mode only — native mode needs no hint).
@@ -2932,8 +2933,9 @@ class ChatSession:
         :func:`turnstone.core.lowering.fold_system_turns`: non-native
         models get each turn wrapped as a nonce-delimited
         ``<system-reminder>`` block on the preceding turn; native
-        mid-conversation-system models (claude-opus-4-8) keep them inline
-        for the Anthropic converter to emit as real ``system`` messages.
+        mid-conversation-system models (claude-opus-4-8, claude-fable-5)
+        keep them inline for the Anthropic converter to emit as real
+        ``system`` messages.
 
         Messages without a foldable system turn pass through unchanged
         (same object reference) so the common case is allocation-free.

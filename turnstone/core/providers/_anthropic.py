@@ -84,6 +84,27 @@ _ANTHROPIC_DEFAULT = ModelCapabilities(
 )
 
 _ANTHROPIC_CAPABILITIES: dict[str, ModelCapabilities] = {
+    # Fable 5: same wire surface as opus-4-8 (adaptive-only thinking, no
+    # sampling params, prefill rejected) with one extra constraint — an
+    # explicit thinking={"type": "disabled"} is a 400 on this model; thinking
+    # must be adaptive or the param omitted entirely.  The adaptive branch in
+    # _build_thinking_and_kwargs never emits "disabled", so this is safe as
+    # long as thinking_mode stays "adaptive".
+    "claude-fable-5": ModelCapabilities(
+        context_window=1000000,
+        max_output_tokens=128000,
+        token_param="max_tokens",
+        thinking_mode="adaptive",
+        supports_effort=True,
+        effort_levels=("low", "medium", "high", "xhigh", "max"),
+        supports_web_search=True,
+        supports_tool_search=True,
+        supports_vision=True,
+        supports_temperature=False,
+        thinking_display="summarized",
+        supports_reasoning_replay=True,
+        supports_mid_conversation_system=True,
+    ),
     "claude-opus-4-8": ModelCapabilities(
         context_window=1000000,
         max_output_tokens=128000,
@@ -361,7 +382,8 @@ class AnthropicProvider:
         (``ChatSession._try_stream`` / ``_utility_completion``) always
         pass the resolved flag explicitly.
 
-        ``supports_mid_conversation_system`` (claude-opus-4-8) makes the
+        ``supports_mid_conversation_system`` (claude-opus-4-8,
+        claude-fable-5) makes the
         system-role handling position-aware: leading system/developer
         messages (the base prompt) still hoist into the top-level
         ``system`` param, but a system message appearing AFTER a
