@@ -795,19 +795,33 @@ def _slice_function_body(body: str, fn_name: str) -> str | None:
 
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent
-# Bundles that completed the var → const/let sweep.  Add a new JS file
-# here only after it has itself been swept — the var-free + const-reassign
-# guards below will otherwise fail loudly on any pre-sweep `var` it
-# contains.  coordinator.js is intentionally excluded (already modern;
-# 3 surviving `var` are by design per the sweep briefing).
+# CLASSIC bundles that completed the var → const/let sweep.  Add a new JS
+# file here only after it has itself been swept — the var-free +
+# const-reassign guards below will otherwise fail loudly on any pre-sweep
+# `var` it contains.  coordinator.js is intentionally excluded (already
+# modern; 3 surviving `var` are by design per the sweep briefing).  The
+# shared_static files that used to sit here (auth/kb/utils) are ES modules
+# now — test_shell_js.py sweeps them with module semantics.
 _SWEPT_BUNDLES = [
     _REPO_ROOT / "turnstone/ui/static/app.js",
     _REPO_ROOT / "turnstone/console/static/admin.js",
     _REPO_ROOT / "turnstone/console/static/governance.js",
     _REPO_ROOT / "turnstone/console/static/app.js",
+]
+
+# The const-reassign analysis below is pure text — module vs script semantics
+# is irrelevant — so the var-free ES modules ride the same guard (their parse
+# + var + sink guards live in test_shell_js.py).
+_CONST_GUARD_BUNDLES = _SWEPT_BUNDLES + [
     _REPO_ROOT / "turnstone/shared_static/auth.js",
     _REPO_ROOT / "turnstone/shared_static/kb.js",
     _REPO_ROOT / "turnstone/shared_static/utils.js",
+    _REPO_ROOT / "turnstone/shared_static/toast.js",
+    _REPO_ROOT / "turnstone/shared_static/shell.js",
+    _REPO_ROOT / "turnstone/shared_static/pane.js",
+    _REPO_ROOT / "turnstone/shared_static/rail.js",
+    _REPO_ROOT / "turnstone/shared_static/interactive.js",
+    _REPO_ROOT / "turnstone/shared_static/conversation.js",
 ]
 
 
@@ -1046,7 +1060,7 @@ def _enclosing_block(
     )
 
 
-@pytest.mark.parametrize("bundle", _SWEPT_BUNDLES, ids=lambda p: p.name)
+@pytest.mark.parametrize("bundle", _CONST_GUARD_BUNDLES, ids=lambda p: p.name)
 def test_swept_bundle_has_no_const_reassign(bundle: Path) -> None:
     """For each ``const X = …`` declaration, fail if X is reassigned
     *within the same block scope* (``X = …``, ``X +=``, ``X++``, ``++X``,

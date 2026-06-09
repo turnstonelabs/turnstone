@@ -1,9 +1,12 @@
 /* Shared keyboard shortcuts overlay — turnstone design system
-   Configure: window.TURNSTONE_KB_SHORTCUTS = [{title, keys: [{desc, badge}]}] */
+   Configure: window.TURNSTONE_KB_SHORTCUTS = [{title, keys: [{desc, badge}]}]
+   ES module; the "?" / Escape document listener registers at module eval. */
+
+import { escapeHtml, setSafeHtml } from "./utils.js";
 
 let _kbPreviousFocus = null;
 
-function showKbHelp() {
+export function showKbHelp() {
   _kbPreviousFocus = document.activeElement;
   const existing = document.getElementById("kb-overlay");
   if (existing) existing.remove();
@@ -35,7 +38,7 @@ function showKbHelp() {
   document.getElementById("kb-box").focus();
 }
 
-function hideKbHelp() {
+export function hideKbHelp() {
   const el = document.getElementById("kb-overlay");
   if (el) el.remove();
   if (_kbPreviousFocus && _kbPreviousFocus.focus) {
@@ -62,3 +65,8 @@ document.addEventListener("keydown", function (e) {
     }
   }
 });
+
+// --- Legacy window bridge ---------------------------------------------------
+// Still-classic consumers reach this as a global at event/boot time (after
+// this deferred module evaluated).  New module code imports instead.
+Object.assign(window, { showKbHelp, hideKbHelp });

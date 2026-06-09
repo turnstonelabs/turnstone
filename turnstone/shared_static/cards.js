@@ -9,10 +9,17 @@
                                        multi-select delete controller
      - createSavedCardsController    — the delete-mode controller (below)
 
+   ES module (imports utils/toast/auth; window bridge below for the
+   still-classic app.js consumers).
+
    Built with safe DOM APIs (createElement + textContent), never innerHTML,
    so user-supplied alias/title/name/skill fields never reach the DOM as
    HTML.  Depends on formatRelativeTime (from /shared/utils.js).
 */
+
+import { formatRelativeTime } from "./utils.js";
+import { showToast } from "./toast.js";
+import { authFetch } from "./auth.js";
 
 /* ==========================================================================
    Saved-list TABLE primitives — the row builder (renderSessionRow) plus a
@@ -78,7 +85,7 @@ function _nameCell(sess) {
    cell(sess)->Node|string, sort(sess)->comparable}.  The only difference
    between the two surfaces is count("message_count","MSGS") vs
    count("child_count","CHILDREN"). */
-var SavedColumns = {
+export var SavedColumns = {
   name: function () {
     return {
       key: "name",
@@ -173,7 +180,7 @@ var SavedColumns = {
    list isn't dimmed by base.css's `[data-state="idle"]` rule.  The grid
    template comes from the `--saved-grid` CSS var that createSavedTable sets
    once per render (not rebuilt per row). */
-function renderSessionRow(sess, opts) {
+export function renderSessionRow(sess, opts) {
   opts = opts || {};
   var columns = opts.columns || [];
   var row = document.createElement("div");
@@ -234,7 +241,7 @@ function renderSessionRow(sess, opts) {
      emptyText         — empty-state copy
      delete            — {idPrefix, buttonId, buildDeleteRequest, onClose}
    returns { setItems(items), render(), controller }. */
-function createSavedTable(opts) {
+export function createSavedTable(opts) {
   var state = {
     items: [],
     filter: "",
@@ -601,7 +608,7 @@ function createSavedTable(opts) {
                          closes the post-delete results modal.  Typical
                          use: re-fetch the saved list.
 */
-function createSavedCardsController(opts) {
+export function createSavedCardsController(opts) {
   var state = { mode: false, selected: {}, items: [] };
   var batchTrap = null;
   /* Element that owned focus when the modal opened — restored in
@@ -991,3 +998,13 @@ function createSavedCardsController(opts) {
     confirm: confirm,
   };
 }
+
+// --- Legacy window bridge ---------------------------------------------------
+// Still-classic consumers reach these as globals at event/boot time (after
+// this deferred module evaluated).  New module code imports instead.
+Object.assign(window, {
+  SavedColumns,
+  renderSessionRow,
+  createSavedTable,
+  createSavedCardsController,
+});

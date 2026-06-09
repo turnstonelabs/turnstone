@@ -1,4 +1,9 @@
 // renderer.js — Markdown + LaTeX rendering (no external deps except KaTeX)
+//
+// ES module (imports utils; vendor hljs/katex/mermaid stay lazy typeof-guarded
+// globals).  Window bridge at the bottom for the still-classic consumers.
+
+import { escapeHtml } from "./utils.js";
 
 // ---------------------------------------------------------------------------
 //  Inline formatting
@@ -8,7 +13,7 @@
 var _SAFE_TAGS =
   /&lt;(\/?(?:br|kbd|mark|sub|sup|ins|wbr|abbr|small|u|s))(?:\s*\/?)&gt;/gi;
 
-function inlineMarkdown(text) {
+export function inlineMarkdown(text) {
   // Escape HTML first so only tags we generate are real
   text = escapeHtml(text);
   // Restore safe HTML tags (attribute-free only — already escaped so no XSS)
@@ -256,7 +261,7 @@ function _langToCssClass(lang) {
 // ---------------------------------------------------------------------------
 //  Main markdown renderer
 // ---------------------------------------------------------------------------
-function renderMarkdown(text) {
+export function renderMarkdown(text) {
   // Scope footnote IDs per top-level render call (prevents collisions across messages)
   if (_fnDepth === 0) _fnScopeId++;
   _fnDepth++;
@@ -808,7 +813,7 @@ function _applyCachedHljs(el, cachedHtml) {
   el.classList.add("hljs");
 }
 
-function postRenderHljs(containerEl) {
+export function postRenderHljs(containerEl) {
   if (typeof hljs === "undefined") return;
   if (!_hljsConfigured) {
     hljs.configure({ ignoreUnescapedHTML: true });
@@ -853,7 +858,7 @@ function postRenderHljs(containerEl) {
   }
 }
 
-function postRenderMarkdown(containerEl) {
+export function postRenderMarkdown(containerEl) {
   postRenderHljs(containerEl);
   // Render mermaid diagrams (lazy-loads mermaid.js on first use)
   postRenderMermaid(containerEl);
@@ -1213,7 +1218,7 @@ function postRenderMermaid(containerEl) {
   });
 }
 
-function reRenderAllMermaid() {
+export function reRenderAllMermaid() {
   if (_mermaidState !== "ready") return;
   _initMermaid();
   var els = document.querySelectorAll(
@@ -1264,7 +1269,7 @@ function _streamingRenderApply(el, buffer) {
   }
 }
 
-function streamingRender(el, buffer) {
+export function streamingRender(el, buffer) {
   if (!el) return;
   // Short-circuit identical-buffer calls (e.g. SSE retry / resume).
   // V8's string === length-compares internally so the explicit check is
@@ -1283,7 +1288,7 @@ function streamingRender(el, buffer) {
   });
 }
 
-function streamingRenderFinalize(el, buffer) {
+export function streamingRenderFinalize(el, buffer) {
   if (!el) return;
   // Flush any pending rAF-scheduled render so the finalize sees the
   // final buffer exactly once, then run the expensive post-render
@@ -1297,3 +1302,16 @@ function streamingRenderFinalize(el, buffer) {
     postRenderMarkdown(el);
   }
 }
+
+// --- Legacy window bridge ---------------------------------------------------
+// Still-classic consumers reach these as globals at event/boot time (after
+// this deferred module evaluated).  New module code imports instead.
+Object.assign(window, {
+  renderMarkdown,
+  inlineMarkdown,
+  postRenderHljs,
+  postRenderMarkdown,
+  reRenderAllMermaid,
+  streamingRender,
+  streamingRenderFinalize,
+});
