@@ -11,6 +11,14 @@ Each test invokes ``node -e`` with a small wrapper that loads
 the rendered HTML for a sample input. The assertions check the
 resulting markup contains the expected ``<span class="katex">…</span>``
 placeholder and not the raw delimiter.
+
+Both files are ES modules now; ``_demodulize`` strips the module syntax
+so the script-semantics harness keeps working.  That is DELIBERATE, not
+a shortcut: the mermaid harness pokes renderer-internal state
+(``_mermaidState``) that script evaluation exposes as a context global
+but a real module would encapsulate.  Module semantics themselves are
+covered elsewhere (``test_shell_js`` parses every shared module with
+``node --check`` as ``.mjs``); these tests pin renderer BEHAVIOR.
 """
 
 from __future__ import annotations
@@ -36,9 +44,24 @@ def _has_node() -> bool:
 pytestmark = pytest.mark.skipif(not _has_node(), reason="node not available")
 
 
+def _demodulize(path: Path) -> str:
+    """Strip ES-module syntax so ``vm.runInThisContext`` (script semantics)
+    can evaluate the file: imports drop (the harness loads the whole
+    dependency set into one shared context, so cross-file bindings resolve
+    as context globals, exactly like the pre-module classic scripts), and
+    ``export`` keywords peel off their declarations."""
+    src = path.read_text(encoding="utf-8")
+    src = re.sub(r"^import\s+\{[\s\S]*?\}\s+from\s+\"[^\"]+\";\s*$", "", src, flags=re.M)
+    src = re.sub(r"^import\s+[^;\n]+;\s*$", "", src, flags=re.M)
+    src = re.sub(
+        r"^export\s+(?=(?:async\s+)?(?:function|const|let|var|class)\b)", "", src, flags=re.M
+    )
+    src = re.sub(r"^export\s*\{[^}]*\};\s*$", "", src, flags=re.M)
+    return src
+
+
 _HARNESS_TEMPLATE = """
 const vm = require('vm');
-const fs = require('fs');
 global.document = {
   createElement: () => {
     let t = '';
@@ -60,8 +83,8 @@ global.katex = {
     ']</span>',
 };
 global.window = global;
-vm.runInThisContext(fs.readFileSync(%(utils)s, 'utf8'));
-vm.runInThisContext(fs.readFileSync(%(renderer)s, 'utf8'));
+vm.runInThisContext(%(utils_src)s);
+vm.runInThisContext(%(renderer_src)s);
 const input = %(input)s;
 process.stdout.write(renderMarkdown(input));
 """
@@ -70,8 +93,8 @@ process.stdout.write(renderMarkdown(input));
 def _render(markdown: str) -> str:
     """Render ``markdown`` through renderer.js + return the HTML."""
     harness = _HARNESS_TEMPLATE % {
-        "utils": json.dumps(str(_UTILS_JS)),
-        "renderer": json.dumps(str(_RENDERER_JS)),
+        "utils_src": json.dumps(_demodulize(_UTILS_JS)),
+        "renderer_src": json.dumps(_demodulize(_RENDERER_JS)),
         "input": json.dumps(markdown),
     }
     result = subprocess.run(
@@ -263,7 +286,6 @@ def test_dollar_signs_never_render_as_math_across_paragraphs() -> None:
 
 _MERMAID_HARNESS_TEMPLATE = """
 const vm = require('vm');
-const fs = require('fs');
 
 // Minimal DOM fake — enough surface for postRenderMermaid + the
 // mermaid render path. Each created element tracks its attributes,
@@ -431,12 +453,14 @@ global.hljs = {
   },
 };
 
-vm.runInThisContext(fs.readFileSync(%(utils)s, 'utf8'));
-vm.runInThisContext(fs.readFileSync(%(renderer)s, 'utf8'));
+vm.runInThisContext(%(utils_src)s);
+vm.runInThisContext(%(renderer_src)s);
 
 // Mermaid is normally lazy-loaded via _loadMermaid which fetches a
 // script tag. Force-mark it ready so postRenderMermaid invokes the
-// render path synchronously without trying to inject a script.
+// render path synchronously without trying to inject a script.  (This
+// poke is WHY the harness script-evaluates the demodulized source: a
+// real module would encapsulate _mermaidState.)
 _mermaidState = 'ready';
 
 %(scenario)s
@@ -446,8 +470,8 @@ _mermaidState = 'ready';
 def _run_mermaid_scenario(scenario_js: str) -> dict[str, Any]:
     """Run a JS snippet against the mermaid-aware harness, return JSON output."""
     harness = _MERMAID_HARNESS_TEMPLATE % {
-        "utils": json.dumps(str(_UTILS_JS)),
-        "renderer": json.dumps(str(_RENDERER_JS)),
+        "utils_src": json.dumps(_demodulize(_UTILS_JS)),
+        "renderer_src": json.dumps(_demodulize(_RENDERER_JS)),
         "scenario": scenario_js,
     }
     result = subprocess.run(
