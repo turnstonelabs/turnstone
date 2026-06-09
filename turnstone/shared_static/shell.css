@@ -474,6 +474,15 @@
   position: relative;
   z-index: 20;
 }
+/* The tabs live in their own strip (the role=tablist element — the burger and
+   the [+] tail sit OUTSIDE it in .tabbar, see shell.js buildShell).  On mobile
+   the strip is the horizontal scroller, so those stay pinned. */
+.tabstrip {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  min-width: 0;
+}
 .tab {
   position: relative;
   flex: none;
@@ -1119,11 +1128,14 @@
   .app.rail-open .rail-scrim {
     display: block;
   }
-  /* tab bar scrolls horizontally; tabs tighten so 2-3 stay legible */
+  /* the tab strip scrolls horizontally (burger + [+] stay pinned); tabs
+     tighten so 2-3 stay legible */
   .tabbar {
+    padding: 8px 8px;
+  }
+  .tabstrip {
     overflow-x: auto;
     scrollbar-width: thin;
-    padding: 8px 8px;
   }
   .tab {
     max-width: 48vw;

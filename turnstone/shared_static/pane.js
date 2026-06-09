@@ -165,10 +165,16 @@ export function openPopupMenu(anchor, items, opts) {
     ) {
       e.preventDefault();
       if (!btns.length) return;
+      // idx -1 = no item focused (a click on a separator / the menu surface
+      // moves focus off the items without closing).  ArrowDown's modulo
+      // already enters at the top then; ArrowUp must enter at the BOTTOM —
+      // unguarded, (-1 - 1 + n) % n lands on the second-to-last item.
       const idx = btns.indexOf(document.activeElement);
       if (e.key === "ArrowDown") btns[(idx + 1) % btns.length].focus();
       else if (e.key === "ArrowUp")
-        btns[(idx - 1 + btns.length) % btns.length].focus();
+        btns[
+          idx < 0 ? btns.length - 1 : (idx - 1 + btns.length) % btns.length
+        ].focus();
       else if (e.key === "Home") btns[0].focus();
       else btns[btns.length - 1].focus();
     }
