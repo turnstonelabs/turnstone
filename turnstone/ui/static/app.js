@@ -826,12 +826,17 @@ function refreshWorkstreamTitle(optWsId) {
     });
 }
 
+let _editTitleWsId = null;
+
 function editWorkstreamTitle(optWsId) {
   const wsId = optWsId || getCurrentWsId();
   if (!wsId) return;
   const ws = workstreams[wsId];
   const currentTitle = ws && ws.name ? ws.name : "";
 
+  // Pin the target: submit must rename THIS workstream, not whichever
+  // pane is active by then (menu-rename on a background tab).
+  _editTitleWsId = wsId;
   const dlg = document.getElementById("edit-title-dialog");
   const input = document.getElementById("edit-title-input");
   input.value = currentTitle;
@@ -844,7 +849,11 @@ function editWorkstreamTitle(optWsId) {
     }
   };
   document.getElementById("edit-title-save").onclick = submitEditTitle;
-  window.TurnstoneHatch.openDialog(dlg);
+  window.TurnstoneHatch.openDialog(dlg, {
+    onClose: function () {
+      _editTitleWsId = null;
+    },
+  });
   input.select();
 }
 
@@ -854,7 +863,7 @@ function cancelEditTitle() {
 }
 
 function submitEditTitle() {
-  const wsId = getCurrentWsId();
+  const wsId = _editTitleWsId;
   if (!wsId) return;
   const dlg = document.getElementById("edit-title-dialog");
   // Enter arrives straight from the input's keydown — the busy capture
@@ -933,7 +942,11 @@ function cancelDeleteWs() {
 function executeDeleteWs() {
   const wsId = _pendingDeleteWsId;
   if (!wsId) return;
-  cancelDeleteWs();
+  const dlg = document.getElementById("delete-ws-dialog");
+  // Hold the dialog open under the busy lock until the request resolves —
+  // the revoke confirm's pattern. On failure the user keeps their context
+  // (retry or cancel) instead of a toast over an already-closed dialog.
+  window.TurnstoneHatch.setBusy(dlg, true);
 
   const url = "/v1/api/workstreams/" + encodeURIComponent(wsId) + "/delete";
 
@@ -944,6 +957,8 @@ function executeDeleteWs() {
       return r.json();
     })
     .then(function () {
+      window.TurnstoneHatch.setBusy(dlg, false);
+      cancelDeleteWs();
       // Update local state directly — don't call closeWorkstream which
       // would send a redundant POST to /close for an already-deleted ws.
       delete workstreams[wsId];
@@ -956,6 +971,7 @@ function executeDeleteWs() {
       showToast("Workstream deleted", "success");
     })
     .catch(function (err) {
+      window.TurnstoneHatch.setBusy(dlg, false);
       showToast(err.message || "Failed to delete workstream", "error");
     });
 }
@@ -1788,8 +1804,6 @@ function _announce(text) {
 // ===========================================================================
 
 let _pendingRevokeServer = null;
-let _settingsTrap = null;
-let _settingsReturnFocus = null;
 
 function openSettingsPanel() {
   // MCP connections render in the Admin pane's Connections panel (#view-admin),
@@ -1800,29 +1814,12 @@ function openSettingsPanel() {
 }
 
 function closeSettingsPanel() {
-  // If the nested revoke confirmation is still up, tear it down first
-  // — otherwise hiding the parent panel would leave an orphan modal
-  // overlay floating with its own keydown trap still attached. The
-  // Escape-key path inside the parent's keydown trap defers to the
-  // inner trap; this branch is the close-button path that doesn't go
-  // through that trap.
+  // If the nested revoke confirmation is still up, close it first so
+  // hiding the parent panel doesn't strand an open dialog.
   const inner = document.getElementById("revoke-mcp-dialog");
   if (inner && inner.open) {
     cancelRevokeMcp();
   }
-  if (_settingsTrap) {
-    document.removeEventListener("keydown", _settingsTrap);
-    _settingsTrap = null;
-  }
-  if (
-    _settingsReturnFocus &&
-    typeof _settingsReturnFocus.focus === "function"
-  ) {
-    try {
-      _settingsReturnFocus.focus();
-    } catch (_) {}
-  }
-  _settingsReturnFocus = null;
 }
 
 // ---------------------------------------------------------------------------
@@ -1941,7 +1938,7 @@ function promptRevokeMcp(server) {
   const msg = document.getElementById("revoke-mcp-message");
   if (msg) {
     msg.textContent =
-      "Disconnect " +
+      "Revoke the connection to " +
       server +
       "? Tools that need this server will require re-consent.";
   }
@@ -1977,7 +1974,7 @@ function confirmRevokeMcp() {
       if (!r.ok) throw new Error("HTTP " + r.status);
       window.TurnstoneHatch.setBusy(dlg, false);
       cancelRevokeMcp();
-      showToast("Disconnected " + server);
+      showToast("Revoked connection to " + server);
       loadMcpConnections();
     })
     .catch(function (err) {

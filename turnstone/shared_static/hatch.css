@@ -422,7 +422,8 @@
   font-weight: 400;
   text-transform: none;
   letter-spacing: 0;
-  opacity: 0.65;
+  /* 0.65 over fg-dim compounded below 4.5:1 at 10px on dark */
+  opacity: 0.8;
 }
 [data-theme="light"] .label-hint {
   opacity: 1;
@@ -611,7 +612,12 @@
   padding: 8px 18px;
   background: var(--bg-highlight);
   color: var(--fg);
-  border: 1px solid var(--border-strong);
+  /* The ghost button's boundary must clear ~3:1 against the --code-bg foot
+     strip (WCAG 1.4.11) — border-strong's white/black 10-12% tints measure
+     ~1.2:1 there. Variable-routed so the kind variants' border-color
+     declarations still win on the property. */
+  --sh-btn-border: color-mix(in srgb, var(--ink) 28%, transparent);
+  border: 1px solid var(--sh-btn-border);
   border-radius: var(--r-sm);
   font-family: var(--font-ui);
   font-size: 12px;
@@ -622,6 +628,10 @@
     background 0.15s,
     border-color 0.15s,
     filter 0.15s;
+}
+[data-theme="light"] .sh-btn {
+  /* pale-on-pale needs more ink than dark does */
+  --sh-btn-border: color-mix(in srgb, var(--ink) 45%, transparent);
 }
 .sh-btn:hover {
   background: var(--bg-elevated);
@@ -988,6 +998,11 @@ details.rawhatch .rawhatch-body {
   .hatch[data-busy] .sh-led {
     animation: none;
     opacity: 1;
+  }
+  /* with the pulse off, give busy a static cue beyond the opacity dim */
+  .hatch[data-busy] .sh-btn--primary::after,
+  .hatch[data-busy] .sh-btn--danger::after {
+    content: " …";
   }
   .sh-btn,
   .sh-x,
