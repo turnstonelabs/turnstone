@@ -162,3 +162,60 @@ def test_classic_scripts_use_the_bridge_only_at_handler_time() -> None:
                     f"{path.name}:{i}: top-level TurnstoneHatch reference — "
                     "the window bridge only exists after modules evaluate"
                 )
+
+
+def test_every_hatch_button_is_wired() -> None:
+    """The bug class that shipped a dead model-Save button: converted markup
+    drops inline onclick=, so every id-bearing non-[data-close] button inside
+    a dialog.hatch MUST have JS wiring — a direct .onclick/.addEventListener
+    on its getElementById, or wiring through the variable it's assigned to.
+    (data-close and container-delegated id-less buttons are hatch-owned.)"""
+    js_by_app = {
+        "console": [
+            _ROOT / "turnstone/console/static/admin.js",
+            _ROOT / "turnstone/console/static/governance.js",
+            _ROOT / "turnstone/console/static/app.js",
+            _ROOT / "turnstone/shared_static/cards.js",
+        ],
+        "ui": [
+            _ROOT / "turnstone/ui/static/app.js",
+            _ROOT / "turnstone/shared_static/cards.js",
+        ],
+    }
+    # Built via cards.js's `$("${idPrefix}-confirm-btn")` helper — the literal
+    # id never appears in JS; the wiring is delBtn.onclick in confirm().
+    allowlist = {"ws-delete-confirm-btn", "coord-delete-confirm-btn"}
+    for app, index in (("console", _CONSOLE_INDEX), ("ui", _UI_INDEX)):
+        html = index.read_text(encoding="utf-8")
+        js = "\n".join(p.read_text(encoding="utf-8") for p in js_by_app[app])
+        for dm in re.finditer(r"<dialog\b[^>]*class=\"[^\"]*\bhatch\b[^\"]*\"[^>]*>", html):
+            body = html[dm.end() : html.index("</dialog>", dm.end())]
+            for bm in re.finditer(r"<button\b[^>]*>", body):
+                tag = bm.group(0)
+                if "data-close" in tag:
+                    continue
+                idm = re.search(r'id="([^"]+)"', tag)
+                if not idm or idm.group(1) in allowlist:
+                    continue
+                bid = re.escape(idm.group(1))
+                direct = re.search(
+                    r'getElementById\(\s*"%s"\s*\)[\s\S]{0,120}?\.(?:onclick|addEventListener)'
+                    % bid,
+                    js,
+                )
+                wired = bool(direct)
+                if not wired:
+                    for vm in re.finditer(
+                        r'(?:const|var|let)\s+(\w+)\s*=\s*document\.getElementById\(\s*"%s"\s*\)'
+                        % bid,
+                        js,
+                    ):
+                        var = re.escape(vm.group(1))
+                        if re.search(r"\b%s\s*\.\s*(?:onclick|addEventListener)" % var, js):
+                            wired = True
+                            break
+                assert wired, (
+                    f"{app}: button #{idm.group(1)} inside a dialog.hatch has no "
+                    "click wiring — the converted markup has no onclick, so an "
+                    "unwired button is silently dead (the model-Save bug class)"
+                )

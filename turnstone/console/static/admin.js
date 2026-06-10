@@ -6644,6 +6644,8 @@ function _refreshModelSuggestions() {
       }
     });
   }
+  const modelSubmit = document.getElementById("model-create-submit");
+  if (modelSubmit) modelSubmit.addEventListener("click", submitCreateModel);
   const detectBtn = document.getElementById("model-detect-btn");
   if (detectBtn) detectBtn.addEventListener("click", detectModel);
   const recalBtn2 = document.getElementById("model-recalibrate-btn");
