@@ -287,6 +287,40 @@ class TestIntentVerdictBulkInsert:
         assert v1["risk_level"] == "low" and v1["tier"] == "heuristic"
         assert v2["risk_level"] == "high" and v2["tier"] == "llm"
 
+    def test_bulk_insert_pk_collision_skips_only_colliding_row(self, db):
+        """Regression: the async judge daemon can UPSERT a fallback row —
+        reusing a heuristic verdict_id from the incoming batch — BEFORE
+        ``approve_tools`` runs the bulk write.  The bulk insert must skip
+        just that row (keeping the daemon's tier upgrade) instead of
+        aborting the whole statement and silently losing every sibling
+        row in the batch."""
+        # Daemon won the race: fallback row already sits on b2's PK.
+        db.upsert_intent_verdict(
+            **_make_verdict_kwargs(
+                verdict_id="b2",
+                call_id="c2",
+                tier="llm_fallback",
+                judge_model="judge-model",
+            )
+        )
+        db.create_intent_verdicts_bulk(
+            [
+                _make_verdict_kwargs(verdict_id="b1", call_id="c1"),
+                _make_verdict_kwargs(verdict_id="b2", call_id="c2"),  # collides
+                _make_verdict_kwargs(verdict_id="b3", call_id="c3"),
+            ]
+        )
+        # Siblings landed despite the mid-batch collision.
+        for vid in ("b1", "b3"):
+            v = db.get_intent_verdict(vid)
+            assert v is not None, f"sibling row {vid} lost to the collision"
+            assert v["tier"] == "heuristic"
+        # The colliding row kept the daemon's upgrade, not the bulk stamp.
+        v2 = db.get_intent_verdict("b2")
+        assert v2 is not None
+        assert v2["tier"] == "llm_fallback"
+        assert v2["judge_model"] == "judge-model"
+
 
 # ---------------------------------------------------------------------------
 # List queries

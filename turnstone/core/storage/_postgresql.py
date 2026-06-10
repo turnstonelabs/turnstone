@@ -3642,6 +3642,16 @@ class PostgreSQLBackend:
             conn.commit()
 
     def create_intent_verdicts_bulk(self, verdicts: list[dict[str, Any]]) -> None:
+        # ON CONFLICT DO NOTHING per row: the async judge daemon can land
+        # an UPSERT (which INSERTs the heuristic verdict_id it reuses)
+        # before this bulk write runs.  A plain INSERT would abort the
+        # whole statement on that one collision — silently discarding
+        # every OTHER row in the batch (the caller swallows storage
+        # errors).  Skipping just the colliding row also keeps the
+        # daemon's tier upgrade ("llm_fallback") instead of regressing
+        # it to the bulk's heuristic stamp.
+        from sqlalchemy.dialects.postgresql import insert as pg_insert
+
         if not verdicts:
             return
         now = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S")
@@ -3667,7 +3677,10 @@ class PostgreSQLBackend:
             for v in verdicts
         ]
         with self._conn() as conn:
-            conn.execute(sa.insert(intent_verdicts), rows)
+            conn.execute(
+                pg_insert(intent_verdicts).on_conflict_do_nothing(index_elements=["verdict_id"]),
+                rows,
+            )
             conn.commit()
 
     def get_intent_verdict(self, verdict_id: str) -> dict[str, Any] | None:

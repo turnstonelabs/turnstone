@@ -1480,25 +1480,22 @@ class SessionUIBase:
                 }
                 for v in verdicts
             ]
-            # Plain INSERT (not UPSERT) at the bulk site.  The race
-            # where a daemon-judge verdict lands BEFORE this bulk
-            # write IS reachable today: ``_evaluate_intent``
-            # (session.py) spawns the daemon thread before
-            # ``approve_tools`` is called, and the daemon's first
-            # emission (heuristic-only short batch, fast LLM response,
-            # or cancel-event ``_deliver_fallbacks`` from judge.py)
-            # can fire ``_persist_intent_verdict`` before this bulk
-            # INSERT runs.  Outcome of that race is unchanged by the
-            # per-row UPSERT switch: the bulk INSERT statement aborts
-            # on PK collision regardless of whether the colliding row
-            # was planted by INSERT or UPSERT, and the wrapping
-            # ``try/except`` swallows it.  Race A (daemon fires AFTER
-            # bulk) IS improved by the fix: heuristic→llm_fallback
-            # upgrade-in-place now lands.  Future bulk-side hardening
-            # (``ON CONFLICT DO NOTHING``) would preserve the OTHER
-            # rows in the batch when one collides, but would keep the
-            # daemon's ``tier`` ("llm"/"llm_fallback") for the
-            # colliding row instead of the bulk's heuristic stamp.
+            # The daemon-judge race where a verdict lands BEFORE this
+            # bulk write IS reachable: ``_evaluate_intent`` (session.py)
+            # spawns the daemon thread before ``approve_tools`` is
+            # called, and the daemon's first emission (heuristic-only
+            # short batch, fast LLM response, or cancel-event
+            # ``_deliver_fallbacks`` from judge.py) can fire
+            # ``_persist_intent_verdict`` first — a fallback UPSERT
+            # plants the very ``verdict_id`` this batch is about to
+            # INSERT.  The bulk site inserts ``ON CONFLICT DO NOTHING``
+            # so that one collision skips only its own row: the rest of
+            # the batch still lands, and the colliding row keeps the
+            # daemon's ``llm_fallback`` tier upgrade instead of being
+            # regressed to the heuristic stamp.  (Plain INSERT here used
+            # to abort the entire statement — and the ``try/except``
+            # below swallowed it — discarding the whole batch's
+            # heuristic rows.)
             storage.create_intent_verdicts_bulk(rows)
         except Exception:
             log.debug("Failed to bulk-persist intent verdicts", exc_info=True)

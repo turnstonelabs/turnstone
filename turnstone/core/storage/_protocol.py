@@ -1736,8 +1736,10 @@ class StorageBackend(Protocol):
 
         Used by :meth:`SessionUIBase._persist_intent_verdict` for every
         async LLM-tier delivery; the synchronous heuristic-bulk path
-        (:meth:`create_intent_verdicts_bulk`) stays as plain INSERT
-        since each heuristic UUID is freshly generated per turn.
+        (:meth:`create_intent_verdicts_bulk`) inserts with per-row
+        ``ON CONFLICT DO NOTHING`` instead — its UUIDs are freshly
+        generated per turn, but the daemon can race a fallback UPSERT
+        of one of those same IDs in ahead of the bulk write.
         """
         ...
 
@@ -1754,6 +1756,15 @@ class StorageBackend(Protocol):
         vocabulary. Used by the synchronous heuristic-verdict
         persistence loop in ``approve_tools`` so a tool-heavy turn
         doesn't pay N×commit latency before the approval prompt renders.
+
+        Inserts ``ON CONFLICT (verdict_id) DO NOTHING``: the async judge
+        daemon's first delivery can UPSERT a fallback row — which reuses
+        a heuristic ``verdict_id`` from this very batch — before the
+        bulk write runs.  Aborting the whole statement on that collision
+        (plain-INSERT behavior) silently discarded every other row in
+        the batch; skipping just the colliding row keeps the rest AND
+        preserves the daemon's ``llm_fallback`` tier upgrade rather
+        than regressing it to the heuristic stamp.
         """
         ...
 
