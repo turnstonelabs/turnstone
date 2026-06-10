@@ -46,7 +46,7 @@ function _displayToast(el, message, type) {
       } catch (e) {
         /* already hidden */
       }
-      el.popover = null; // restore the classic fade path
+      el.removeAttribute("popover"); // restore the classic fade path
     }
     _toastShowing = false;
     _toastTimer = null;

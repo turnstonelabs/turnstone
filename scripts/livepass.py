@@ -194,7 +194,8 @@ UI_TEMPLATE = """<!doctype html>
           {
             ws_id: "c3d4e5f6a1b2",
             title:
-              "a very long workstream title that should wrap rather than punch out of the dialog box entirely",
+              "a very long workstream title that should wrap " +
+              "rather than punch out of the dialog box entirely",
           },
         ]);
         c.toggleAll();

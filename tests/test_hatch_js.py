@@ -199,19 +199,17 @@ def test_every_hatch_button_is_wired() -> None:
                     continue
                 bid = re.escape(idm.group(1))
                 direct = re.search(
-                    r'getElementById\(\s*"%s"\s*\)[\s\S]{0,120}?\.(?:onclick|addEventListener)'
-                    % bid,
+                    rf'getElementById\(\s*"{bid}"\s*\)[\s\S]{{0,120}}?\.(?:onclick|addEventListener)',
                     js,
                 )
                 wired = bool(direct)
                 if not wired:
                     for vm in re.finditer(
-                        r'(?:const|var|let)\s+(\w+)\s*=\s*document\.getElementById\(\s*"%s"\s*\)'
-                        % bid,
+                        rf'(?:const|var|let)\s+(\w+)\s*=\s*document\.getElementById\(\s*"{bid}"\s*\)',
                         js,
                     ):
                         var = re.escape(vm.group(1))
-                        if re.search(r"\b%s\s*\.\s*(?:onclick|addEventListener)" % var, js):
+                        if re.search(rf"\b{var}\s*\.\s*(?:onclick|addEventListener)", js):
                             wired = True
                             break
                 assert wired, (

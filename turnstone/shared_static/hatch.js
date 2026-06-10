@@ -180,6 +180,7 @@ export function closeShelf(dlg) {
   // hide it when no open shelf shares the host.
   let hostStillBusy = false;
   for (const [other] of _shelfState) {
+    if (!other.isConnected) continue; // detached with its pane — not an owner
     if (state.scrim.parentElement === _hostOf(other)) hostStillBusy = true;
   }
   if (!hostStillBusy) state.scrim.hidden = true;
