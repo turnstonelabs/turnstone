@@ -2067,6 +2067,366 @@
               </button>
             </footer>
           </dialog>
+
+          <!-- Model shelf (create + edit) — pane-scoped. Capabilities are an
+               LED tile matrix over the known-model table (sparse-override
+               semantics: only explicit keys and user deltas from the resolved
+               baseline are persisted); the raw JSON survives as the advanced
+               escape hatch holding everything the tiles don't manage. -->
+          <dialog
+            class="hatch hatch--shelf hatch--lg"
+            id="model-shelf"
+            data-kind="create"
+            aria-labelledby="model-create-title"
+          >
+            <header class="sh-head">
+              <span class="sh-led" aria-hidden="true"></span>
+              <h2 class="sh-title" id="model-create-title">Add model</h2>
+              <span class="sh-tag" aria-hidden="true" id="model-shelf-tag"
+                >MDL-NEW</span
+              >
+              <button class="sh-x" data-close aria-label="Close">✕</button>
+            </header>
+            <div class="sh-body">
+              <div
+                id="model-create-error"
+                class="sh-alert"
+                role="alert"
+                aria-live="assertive"
+                aria-atomic="true"
+              ></div>
+              <input type="hidden" id="model-edit-id" value="" />
+              <div class="field-pair">
+                <div>
+                  <label for="model-alias">Alias</label>
+                  <input
+                    type="text"
+                    id="model-alias"
+                    placeholder="e.g. gpt5-prod"
+                    maxlength="64"
+                    pattern="[a-zA-Z0-9._\-]+"
+                  />
+                </div>
+                <div>
+                  <label for="model-name"
+                    >Model ID
+                    <span class="label-hint"
+                      >(type to autocomplete)</span
+                    ></label
+                  >
+                  <input
+                    type="text"
+                    id="model-name"
+                    placeholder="e.g. gpt-5"
+                    list="model-name-suggestions"
+                  />
+                  <datalist id="model-name-suggestions"></datalist>
+                </div>
+              </div>
+              <div class="field-pair">
+                <div>
+                  <label for="model-provider">Provider</label>
+                  <select id="model-provider">
+                    <option value="openai">openai</option>
+                    <option value="anthropic">anthropic</option>
+                    <option value="google">google</option>
+                    <option value="openai-compatible">openai-compatible</option>
+                  </select>
+                </div>
+                <div>
+                  <label for="model-base-url"
+                    >Base URL
+                    <span class="label-hint"
+                      >(empty = provider default)</span
+                    ></label
+                  >
+                  <input
+                    type="text"
+                    id="model-base-url"
+                    placeholder="https://api.openai.com/v1"
+                  />
+                </div>
+              </div>
+              <div class="field-pair">
+                <div>
+                  <label for="model-api-key"
+                    >API Key
+                    <span class="label-hint"
+                      >(write-only, never displayed)</span
+                    ></label
+                  >
+                  <input
+                    type="password"
+                    id="model-api-key"
+                    placeholder="sk-..."
+                    autocomplete="off"
+                  />
+                </div>
+                <div>
+                  <label for="model-ctx-window"
+                    >Context window
+                    <span class="label-hint">(0 = auto-detect)</span></label
+                  >
+                  <input
+                    type="number"
+                    id="model-ctx-window"
+                    value="0"
+                    min="0"
+                  />
+                </div>
+              </div>
+              <label class="toggle-switch">
+                <input type="checkbox" id="model-enabled" checked />
+                <span class="toggle-track" aria-hidden="true"></span>
+                <span class="toggle-label">Active</span>
+              </label>
+
+              <div class="sh-section">Sampling defaults</div>
+              <div class="field-pair">
+                <div>
+                  <label for="model-temperature"
+                    >Temperature
+                    <span class="label-hint">(empty = global)</span></label
+                  >
+                  <input
+                    type="number"
+                    id="model-temperature"
+                    placeholder="Global default"
+                    step="0.1"
+                    min="0"
+                    max="2"
+                  />
+                </div>
+                <div>
+                  <label for="model-max-tokens"
+                    >Max tokens
+                    <span class="label-hint">(empty = global)</span></label
+                  >
+                  <input
+                    type="number"
+                    id="model-max-tokens"
+                    placeholder="Global default"
+                    min="1"
+                  />
+                </div>
+              </div>
+              <label for="model-reasoning-effort"
+                >Reasoning effort
+                <span class="label-hint">(empty = global)</span></label
+              >
+              <select id="model-reasoning-effort">
+                <option value="">Global default</option>
+                <option value="none">None</option>
+                <option value="minimal">Minimal</option>
+                <option value="low">Low</option>
+                <option value="medium">Medium</option>
+                <option value="high">High</option>
+                <option value="xhigh">Extra High</option>
+                <option value="max">Max</option>
+              </select>
+
+              <div id="model-server-compat-section" hidden>
+                <div class="sh-section">Server compatibility</div>
+                <div class="field-pair">
+                  <div>
+                    <label for="model-server-type"
+                      >Server type
+                      <span class="label-hint"
+                        >(auto-detected or manual)</span
+                      ></label
+                    >
+                    <select id="model-server-type">
+                      <option value="">Auto / Unknown</option>
+                      <option value="vllm">vLLM</option>
+                      <option value="llama.cpp">llama.cpp</option>
+                      <option value="openai-compatible">
+                        Other OpenAI-compatible
+                      </option>
+                    </select>
+                  </div>
+                  <div>
+                    <label for="model-api-surface"
+                      >API surface
+                      <span class="label-hint">(chat vs responses)</span></label
+                    >
+                    <select id="model-api-surface">
+                      <option value="">Inherit (Chat Completions)</option>
+                      <option value="chat">Chat Completions (pinned)</option>
+                      <option value="responses">Responses API</option>
+                    </select>
+                  </div>
+                </div>
+                <label for="model-thinking-mode"
+                  >Thinking mode
+                  <span class="label-hint"
+                    >(chat-template reasoning)</span
+                  ></label
+                >
+                <select id="model-thinking-mode">
+                  <option value="">None</option>
+                  <option value="manual">Enabled</option>
+                </select>
+                <div id="model-thinking-param-row" hidden>
+                  <label for="model-thinking-param"
+                    >Template param name
+                    <span class="label-hint"
+                      >(Granite/DeepSeek use "thinking")</span
+                    ></label
+                  >
+                  <input
+                    type="text"
+                    id="model-thinking-param"
+                    class="sh-mono"
+                    value="enable_thinking"
+                    placeholder="enable_thinking"
+                  />
+                </div>
+                <label for="model-extra-body"
+                  >Extra body params
+                  <span class="label-hint"
+                    >(JSON, merged into every request)</span
+                  ></label
+                >
+                <textarea
+                  id="model-extra-body"
+                  class="sh-mono"
+                  rows="2"
+                  placeholder='{"skip_special_tokens": false}'
+                ></textarea>
+              </div>
+
+              <div class="sh-section">Capabilities</div>
+              <div class="autofill" id="model-autofill" hidden>
+                Loaded from the built-in table for
+                <span class="mono" id="model-autofill-name"></span>
+                <span class="src">· override anything below</span>
+              </div>
+              <div class="capgrid" id="model-capgrid">
+                <label class="cap"
+                  ><input type="checkbox" data-cap="supports_tools" /><span
+                    class="cap-led"
+                  ></span
+                  ><span class="cap-name">Tools</span></label
+                >
+                <label class="cap"
+                  ><input type="checkbox" data-cap="supports_streaming" /><span
+                    class="cap-led"
+                  ></span
+                  ><span class="cap-name">Streaming</span></label
+                >
+                <label class="cap"
+                  ><input type="checkbox" data-cap="supports_vision" /><span
+                    class="cap-led"
+                  ></span
+                  ><span class="cap-name">Vision</span></label
+                >
+                <label class="cap"
+                  ><input type="checkbox" data-cap="supports_web_search" /><span
+                    class="cap-led"
+                  ></span
+                  ><span class="cap-name">Server-side web search</span></label
+                >
+                <label class="cap"
+                  ><input
+                    type="checkbox"
+                    data-cap="supports_temperature"
+                  /><span class="cap-led"></span
+                  ><span class="cap-name">Temperature</span></label
+                >
+                <label class="cap"
+                  ><input type="checkbox" data-cap="supports_effort" /><span
+                    class="cap-led"
+                  ></span
+                  ><span class="cap-name">Reasoning-effort control</span></label
+                >
+                <label class="cap"
+                  ><input
+                    type="checkbox"
+                    data-cap="supports_transcription"
+                  /><span class="cap-led"></span
+                  ><span class="cap-name">Transcription (STT)</span></label
+                >
+                <label class="cap"
+                  ><input
+                    type="checkbox"
+                    data-cap="supports_speech_synthesis"
+                  /><span class="cap-led"></span
+                  ><span class="cap-name">Speech (TTS)</span></label
+                >
+                <label class="cap"
+                  ><input type="checkbox" data-cap="supports_rerank" /><span
+                    class="cap-led"
+                  ></span
+                  ><span class="cap-name">Reranker</span></label
+                >
+              </div>
+              <details class="rawhatch">
+                <summary>Advanced capabilities JSON</summary>
+                <div class="rawhatch-body">
+                  <textarea
+                    id="model-capabilities"
+                    rows="3"
+                    placeholder='{"max_output_tokens": 32000}'
+                  ></textarea>
+                </div>
+              </details>
+
+              <div class="toggle-stack">
+                <label
+                  class="toggle-switch"
+                  title="Surface stored reasoning text on /history responses (UI bubble on page reload). Storage of reasoning bytes is unaffected by this flag — they ride in provider_data regardless."
+                >
+                  <input
+                    type="checkbox"
+                    id="model-surface-persisted-reasoning"
+                    checked
+                  />
+                  <span class="toggle-track" aria-hidden="true"></span>
+                  <span class="toggle-label">Surface persisted reasoning</span>
+                </label>
+                <label
+                  class="toggle-switch"
+                  title="Replay stored reasoning blocks back to the model on subsequent provider calls. Capability-dependent; off by default for cost/spec compliance."
+                >
+                  <input type="checkbox" id="model-replay-reasoning" />
+                  <span class="toggle-track" aria-hidden="true"></span>
+                  <span class="toggle-label">Replay reasoning to model</span>
+                </label>
+              </div>
+              <div
+                id="model-detect-result"
+                role="status"
+                aria-live="polite"
+                hidden
+              ></div>
+            </div>
+            <footer class="sh-foot">
+              <div class="sh-foot-meta">
+                <span id="model-calibration-chip" class="scope-badge"></span>
+              </div>
+              <button
+                type="button"
+                id="model-detect-btn"
+                class="sh-btn sh-btn--quiet"
+                title="Probe endpoint to verify connectivity and discover models"
+              >
+                Detect
+              </button>
+              <button
+                type="button"
+                id="model-recalibrate-btn"
+                class="sh-btn sh-btn--quiet"
+                hidden
+                title="Re-probe this reranker's /rerank endpoint and update its calibrated floor"
+              >
+                Re-calibrate
+              </button>
+              <button class="sh-btn" data-close>Cancel</button>
+              <button id="model-create-submit" class="sh-btn sh-btn--primary">
+                Create
+              </button>
+            </footer>
+          </dialog>
         </div>
         <!-- /admin-layout -->
       </div>
@@ -3970,302 +4330,6 @@
             onclick="submitInstallMcp()"
           >
             Install
-          </button>
-        </div>
-      </div>
-    </div>
-
-    <!-- Model create/edit modal -->
-    <div
-      id="model-create-overlay"
-      style="display: none"
-      role="dialog"
-      aria-modal="true"
-      aria-labelledby="model-create-title"
-    >
-      <div id="model-create-box" class="admin-modal">
-        <h2 id="model-create-title">Add Model</h2>
-        <div
-          id="model-create-error"
-          role="alert"
-          aria-live="assertive"
-          aria-atomic="true"
-        ></div>
-        <input type="hidden" id="model-edit-id" value="" />
-        <label
-          class="toggle-switch toggle--flush"
-          title="Disable to hide this alias from every model dropdown (workstreams, schedules, channel adapters, role assignments) without removing the definition."
-        >
-          <input type="checkbox" id="model-enabled" checked />
-          <span class="toggle-track" aria-hidden="true"></span>
-          <span class="toggle-label">Active</span>
-        </label>
-        <label for="model-alias">Alias</label>
-        <input
-          type="text"
-          id="model-alias"
-          placeholder="e.g. gpt5-prod"
-          maxlength="64"
-          pattern="[a-zA-Z0-9._\-]+"
-        />
-        <label for="model-name"
-          >Model ID
-          <span style="font-weight: 400; text-transform: none"
-            >(type to autocomplete)</span
-          ></label
-        >
-        <input
-          type="text"
-          id="model-name"
-          placeholder="e.g. gpt-5"
-          list="model-name-suggestions"
-        />
-        <datalist id="model-name-suggestions"></datalist>
-        <label for="model-provider">Provider</label>
-        <select id="model-provider">
-          <option value="openai">openai</option>
-          <option value="anthropic">anthropic</option>
-          <option value="google">google</option>
-          <option value="openai-compatible">openai-compatible</option>
-        </select>
-        <label for="model-base-url"
-          >Base URL
-          <span style="font-weight: 400; text-transform: none"
-            >(empty = provider default)</span
-          ></label
-        >
-        <input
-          type="text"
-          id="model-base-url"
-          placeholder="https://api.openai.com/v1"
-        />
-        <label for="model-api-key"
-          >API Key
-          <span style="font-weight: 400; text-transform: none"
-            >(write-only, never displayed)</span
-          ></label
-        >
-        <input
-          type="password"
-          id="model-api-key"
-          placeholder="sk-..."
-          autocomplete="off"
-        />
-        <label for="model-ctx-window"
-          >Context Window
-          <span style="font-weight: 400; text-transform: none"
-            >(0 = auto-detect from model)</span
-          ></label
-        >
-        <input type="number" id="model-ctx-window" value="0" min="0" />
-        <div class="modal-section-divider" role="separator">
-          Sampling Defaults
-        </div>
-        <label for="model-temperature"
-          >Temperature
-          <span style="font-weight: 400; text-transform: none"
-            >(empty = use global default)</span
-          ></label
-        >
-        <input
-          type="number"
-          id="model-temperature"
-          placeholder="Global default"
-          step="0.1"
-          min="0"
-          max="2"
-        />
-        <label for="model-max-tokens"
-          >Max Tokens
-          <span style="font-weight: 400; text-transform: none"
-            >(empty = use global default)</span
-          ></label
-        >
-        <input
-          type="number"
-          id="model-max-tokens"
-          placeholder="Global default"
-          min="1"
-        />
-        <label for="model-reasoning-effort"
-          >Reasoning Effort
-          <span style="font-weight: 400; text-transform: none"
-            >(empty = use global default)</span
-          ></label
-        >
-        <select id="model-reasoning-effort">
-          <option value="">Global default</option>
-          <option value="none">None</option>
-          <option value="minimal">Minimal</option>
-          <option value="low">Low</option>
-          <option value="medium">Medium</option>
-          <option value="high">High</option>
-          <option value="xhigh">Extra High</option>
-          <option value="max">Max</option>
-        </select>
-        <div id="model-server-compat-section" style="display: none">
-          <div class="modal-section-divider" role="separator">
-            Server Compatibility
-          </div>
-          <label for="model-server-type"
-            >Server Type
-            <span style="font-weight: 400; text-transform: none"
-              >(auto-detected or manual)</span
-            ></label
-          >
-          <select id="model-server-type">
-            <option value="">Auto / Unknown</option>
-            <option value="vllm">vLLM</option>
-            <option value="llama.cpp">llama.cpp</option>
-            <option value="openai-compatible">Other OpenAI-compatible</option>
-          </select>
-          <label for="model-api-surface"
-            >API Surface
-            <span style="font-weight: 400; text-transform: none"
-              >(Chat Completions vs Responses)</span
-            ></label
-          >
-          <select id="model-api-surface">
-            <option value="">Inherit (Chat Completions)</option>
-            <option value="chat">Chat Completions (pinned)</option>
-            <option value="responses">Responses API</option>
-          </select>
-          <label for="model-thinking-mode"
-            >Thinking Mode
-            <span style="font-weight: 400; text-transform: none"
-              >(reasoning / chain-of-thought)</span
-            ></label
-          >
-          <select id="model-thinking-mode" onchange="_toggleThinkingParam()">
-            <option value="">None</option>
-            <option value="manual">Enabled</option>
-          </select>
-          <div id="model-thinking-param-row" style="display: none">
-            <label for="model-thinking-param" style="font-size: 11px"
-              >Template param name
-              <span style="font-weight: 400; text-transform: none"
-                >(Granite/DeepSeek use "thinking")</span
-              ></label
-            >
-            <input
-              type="text"
-              id="model-thinking-param"
-              value="enable_thinking"
-              placeholder="enable_thinking"
-              style="font-family: var(--font-mono); font-size: 11px"
-            />
-          </div>
-          <label for="model-extra-body"
-            >Extra body params
-            <span style="font-weight: 400; text-transform: none"
-              >(JSON, merged into every request)</span
-            ></label
-          >
-          <textarea
-            id="model-extra-body"
-            rows="2"
-            placeholder='{"skip_special_tokens": false}'
-            style="font-family: var(--font-mono); font-size: 11px"
-          ></textarea>
-        </div>
-        <label for="model-capabilities"
-          >Capabilities
-          <span style="font-weight: 400; text-transform: none"
-            >(JSON)</span
-          ></label
-        >
-        <textarea
-          id="model-capabilities"
-          rows="3"
-          placeholder='{"supports_vision": true}'
-          style="font-family: var(--font-mono); font-size: 11px"
-        ></textarea>
-        <div class="toggle-stack">
-          <label
-            class="toggle-switch"
-            title="Surface stored reasoning text on /history responses (UI bubble on page reload). Storage of reasoning bytes is unaffected by this flag — they ride in provider_data regardless."
-          >
-            <input
-              type="checkbox"
-              id="model-surface-persisted-reasoning"
-              checked
-            />
-            <span class="toggle-track" aria-hidden="true"></span>
-            <span class="toggle-label">Surface persisted reasoning</span>
-          </label>
-          <label
-            class="toggle-switch"
-            title="Replay stored reasoning blocks back to the model on subsequent provider calls. Capability-dependent; off by default for cost/spec compliance."
-          >
-            <input type="checkbox" id="model-replay-reasoning" />
-            <span class="toggle-track" aria-hidden="true"></span>
-            <span class="toggle-label">Replay reasoning to model</span>
-          </label>
-        </div>
-        <div id="model-detect-area" style="margin-top: 14px">
-          <button
-            type="button"
-            id="model-detect-btn"
-            class="admin-action-btn"
-            onclick="detectModel()"
-            style="width: auto; padding: 7px 16px; font-size: 12px"
-            title="Probe endpoint to verify connectivity and discover models"
-          >
-            Detect
-          </button>
-          <button
-            type="button"
-            id="model-recalibrate-btn"
-            class="admin-action-btn"
-            onclick="recalibrateModel()"
-            style="
-              width: auto;
-              padding: 7px 16px;
-              font-size: 12px;
-              margin-left: 8px;
-              display: none;
-            "
-            title="Re-probe this reranker's /rerank endpoint and update its calibrated floor"
-          >
-            Re-calibrate
-          </button>
-          <span
-            id="model-calibration-chip"
-            class="scope-badge"
-            style="
-              display: none;
-              margin-left: 8px;
-              vertical-align: middle;
-              font-size: 11px;
-              text-transform: none;
-              letter-spacing: 0;
-            "
-          ></span>
-          <div
-            id="model-detect-result"
-            role="status"
-            aria-live="polite"
-            style="
-              display: none;
-              margin-top: 8px;
-              padding: 10px 12px;
-              border-radius: 6px;
-              font-size: 12px;
-              border: 1px solid var(--border);
-              word-break: break-word;
-            "
-          ></div>
-        </div>
-        <div class="modal-buttons">
-          <button class="modal-cancel" onclick="hideCreateModelModal()">
-            Cancel
-          </button>
-          <button
-            id="model-create-submit"
-            class="modal-submit"
-            onclick="submitCreateModel()"
-          >
-            Create
           </button>
         </div>
       </div>

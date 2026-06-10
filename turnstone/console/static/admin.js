@@ -2644,7 +2644,6 @@ function _installTrap(overlayId, boxId, trapRef) {
         else if (overlayId === "mcp-detail-overlay") hideMcpDetailModal();
         else if (overlayId === "mcp-install-overlay") hideInstallMcpModal();
         else if (overlayId === "github-import-overlay") hideGitHubImportModal();
-        else if (overlayId === "model-create-overlay") hideCreateModelModal();
         else if (overlayId === "create-ppolicy-overlay")
           hideCreatePromptPolicyModal();
         else if (overlayId === "edit-ppolicy-overlay")
@@ -2729,7 +2728,6 @@ document.addEventListener("keydown", function (e) {
     ["mcp-import-overlay", hideImportMcpModal],
     ["mcp-create-overlay", hideCreateMcpModal],
     ["github-import-overlay", hideGitHubImportModal],
-    ["model-create-overlay", hideCreateModelModal],
     ["create-ppolicy-overlay", hideCreatePromptPolicyModal],
     ["edit-ppolicy-overlay", hideEditPromptPolicyModal],
     ["create-hr-overlay", hideCreateHRModal],
@@ -5201,12 +5199,57 @@ function _pollInstallStatus(serverId, serverName, attempt) {
 
 let _modelDefs = [];
 let _modelDefaultAlias = "";
-let _modelCreateTrap = null;
-let _modelCreateTrigger = null;
+let _modelShelfHandle = null;
 // Reranker calibration fields extracted out of the capabilities textarea in the
 // edit modal (like server_compat), held here so they survive an unrelated edit
 // and are re-merged on save. Reset per modal open.
 let _rerankCalFields = {};
+
+// Capability tile matrix — sparse-override semantics. The 9 tiles display
+// merge(dataclass defaults, known-model table baseline, explicit overrides);
+// only EXPLICIT keys persist (saved keys + tiles the user toggled), so a
+// known model keeps tracking future table updates instead of being pinned.
+const _MODEL_CAP_KEYS = [
+  "supports_tools",
+  "supports_streaming",
+  "supports_vision",
+  "supports_web_search",
+  "supports_temperature",
+  "supports_effort",
+  "supports_transcription",
+  "supports_speech_synthesis",
+  "supports_rerank",
+];
+const _MODEL_CAP_DEFAULTS = {
+  supports_tools: true,
+  supports_streaming: true,
+  supports_vision: false,
+  supports_web_search: false,
+  supports_temperature: true,
+  supports_effort: false,
+  supports_transcription: false,
+  supports_speech_synthesis: false,
+  supports_rerank: false,
+};
+let _modelCapsBaseline = {}; // known-model table values (display + delta base)
+let _modelCapsExplicit = {}; // keys that persist: saved-in-JSON + user-toggled
+
+function _modelTileEl(key) {
+  return document.querySelector('#model-capgrid input[data-cap="' + key + '"]');
+}
+function _modelGetTile(key) {
+  const el = _modelTileEl(key);
+  return el ? el.checked : _MODEL_CAP_DEFAULTS[key];
+}
+function _modelRenderTiles() {
+  _MODEL_CAP_KEYS.forEach(function (k) {
+    const el = _modelTileEl(k);
+    if (!el) return;
+    if (k in _modelCapsExplicit) el.checked = !!_modelCapsExplicit[k];
+    else if (k in _modelCapsBaseline) el.checked = !!_modelCapsBaseline[k];
+    else el.checked = _MODEL_CAP_DEFAULTS[k];
+  });
+}
 
 // Roles surfaced in the Models → Roles sub-tab.  Each entry maps a
 // settings-registry key onto a UX label.  ``effortKey`` is optional —
@@ -5866,18 +5909,17 @@ function _isPlainObject(v) {
 function _toggleThinkingParam() {
   const mode = document.getElementById("model-thinking-mode").value;
   const row = document.getElementById("model-thinking-param-row");
-  row.style.display = mode ? "" : "none";
+  row.hidden = !mode;
   // Set default when first enabling
   const paramEl = document.getElementById("model-thinking-param");
   if (mode && !paramEl.value) paramEl.value = "enable_thinking";
 }
 
 function showCreateModelModal() {
-  _modelCreateTrigger = document.activeElement;
-  const ov = document.getElementById("model-create-overlay");
-  ov.style.display = "flex";
   document.getElementById("model-edit-id").value = "";
-  document.getElementById("model-create-title").textContent = "Add Model";
+  document.getElementById("model-create-title").textContent = "Add model";
+  document.getElementById("model-shelf-tag").textContent = "MDL-NEW";
+  document.getElementById("model-shelf").setAttribute("data-kind", "create");
   document.getElementById("model-create-submit").textContent = "Create";
   document.getElementById("model-create-error").classList.remove("is-visible");
   document.getElementById("model-alias").value = "";
@@ -5894,7 +5936,7 @@ function showCreateModelModal() {
   document.getElementById("model-api-surface").value = "";
   document.getElementById("model-thinking-mode").value = "";
   document.getElementById("model-thinking-param").value = "";
-  document.getElementById("model-thinking-param-row").style.display = "none";
+  document.getElementById("model-thinking-param-row").hidden = true;
   document.getElementById("model-extra-body").value = "";
   document.getElementById("model-capabilities").value = "";
   // Clear validation error styling from prior submit attempts
@@ -5906,7 +5948,7 @@ function showCreateModelModal() {
   document.getElementById("model-enabled").checked = true;
   document.getElementById("model-surface-persisted-reasoning").checked = true;
   document.getElementById("model-replay-reasoning").checked = false;
-  document.getElementById("model-detect-result").style.display = "none";
+  document.getElementById("model-detect-result").hidden = true;
   document.getElementById("model-detect-btn").disabled = false;
   document.getElementById("model-detect-btn").textContent = "Detect";
   // Reranker calibration: reset extracted fields and hide the chip + the
@@ -5915,11 +5957,17 @@ function showCreateModelModal() {
   const _calChip = document.getElementById("model-calibration-chip");
   if (_calChip) _calChip.style.display = "none";
   const _recalBtn = document.getElementById("model-recalibrate-btn");
-  if (_recalBtn) _recalBtn.style.display = "none";
+  if (_recalBtn) _recalBtn.hidden = true;
+  _modelCapsBaseline = {};
+  _modelCapsExplicit = {};
+  _modelRenderTiles();
+  document.getElementById("model-autofill").hidden = true;
   _refreshModelSuggestions();
   _applyProviderDefaults();
+  _modelShelfHandle = window.TurnstoneHatch.openShelf(
+    document.getElementById("model-shelf"),
+  );
   document.getElementById("model-alias").focus();
-  _modelCreateTrap = _installTrap("model-create-overlay", "model-create-box");
 }
 
 function showEditModelModal(definitionId) {
@@ -5933,7 +5981,9 @@ function showEditModelModal(definitionId) {
     .then(function (m) {
       showCreateModelModal();
       document.getElementById("model-edit-id").value = definitionId;
-      document.getElementById("model-create-title").textContent = "Edit Model";
+      document.getElementById("model-create-title").textContent = "Edit model";
+      document.getElementById("model-shelf-tag").textContent = "MDL-EDIT";
+      document.getElementById("model-shelf").setAttribute("data-kind", "edit");
       document.getElementById("model-create-submit").textContent = "Save";
       document.getElementById("model-alias").value = m.alias || "";
       document.getElementById("model-name").value = m.model || "";
@@ -5998,6 +6048,17 @@ function showEditModelModal(definitionId) {
           }
         },
       );
+      // Lift the 9 matrix keys out of the JSON into the tiles — they are
+      // the row's explicit overrides and the textarea holds the remainder.
+      _modelCapsExplicit = {};
+      _MODEL_CAP_KEYS.forEach(function (k) {
+        if (k in capsObj) {
+          _modelCapsExplicit[k] = !!capsObj[k];
+          delete capsObj[k];
+        }
+      });
+      _modelRenderTiles();
+      _modelCapsRefreshBaseline();
       // Remove structured fields from capabilities display — only delete
       // thinking_mode/thinking_param when the UI successfully captured them.
       delete capsObj.server_compat;
@@ -6013,8 +6074,7 @@ function showEditModelModal(definitionId) {
         Object.assign({ supports_rerank: isReranker }, _rerankCalFields),
       );
       const recalBtn = document.getElementById("model-recalibrate-btn");
-      if (recalBtn)
-        recalBtn.style.display = isReranker ? "inline-block" : "none";
+      if (recalBtn) recalBtn.hidden = !isReranker;
       document.getElementById("model-enabled").checked = m.enabled !== false;
       // Reasoning persistence flags — defaults match the dataclass
       // defaults (persist=true, replay=false) when the API returns
@@ -6031,11 +6091,8 @@ function showEditModelModal(definitionId) {
 }
 
 function hideCreateModelModal() {
-  document.getElementById("model-create-overlay").style.display = "none";
-  _modelCreateTrap = _removeTrap(_modelCreateTrap);
-  if (_modelCreateTrigger && _modelCreateTrigger.focus)
-    _modelCreateTrigger.focus();
-  _modelCreateTrigger = null;
+  window.TurnstoneHatch.closeShelf(document.getElementById("model-shelf"));
+  _modelShelfHandle = null;
 }
 
 function submitCreateModel() {
@@ -6123,6 +6180,13 @@ function submitCreateModel() {
     caps.server_compat = serverCompat;
   }
 
+  // Capability tiles: persist exactly the explicit keys (saved-in-JSON +
+  // user-toggled). A key typed directly into the raw JSON wins (operator
+  // override) — same philosophy as the calibration re-merge below.
+  Object.keys(_modelCapsExplicit).forEach(function (k) {
+    if (!(k in caps)) caps[k] = _modelGetTile(k);
+  });
+
   // Re-merge reranker calibration fields extracted on edit so an unrelated edit
   // doesn't silently drop the calibration. A field typed directly into the
   // capabilities JSON wins (operator override).
@@ -6190,7 +6254,7 @@ function submitCreateModel() {
     ? "/v1/api/admin/model-definitions/" + encodeURIComponent(editId)
     : "/v1/api/admin/model-definitions";
 
-  document.getElementById("model-create-submit").disabled = true;
+  window.TurnstoneHatch.setBusy(document.getElementById("model-shelf"), true);
   authFetch(url, {
     method: method,
     headers: { "Content-Type": "application/json" },
@@ -6213,7 +6277,10 @@ function submitCreateModel() {
       _showModelError(e.message);
     })
     .finally(function () {
-      document.getElementById("model-create-submit").disabled = false;
+      window.TurnstoneHatch.setBusy(
+        document.getElementById("model-shelf"),
+        false,
+      );
     });
 }
 
@@ -6280,7 +6347,7 @@ function _paintCalibrationChip(caps) {
 function _clearDetectResult() {
   const rd = document.getElementById("model-detect-result");
   if (rd) {
-    rd.style.display = "none";
+    rd.hidden = true;
     rd.textContent = "";
     rd.style.borderColor = "";
   }
@@ -6289,14 +6356,7 @@ function _clearDetectResult() {
 // Best-effort: is the model being edited a reranker? Reads supports_rerank from
 // the capabilities textarea (the chip/calibration flow keeps it there).
 function _editingReranker() {
-  try {
-    const c = JSON.parse(
-      document.getElementById("model-capabilities").value.trim() || "{}",
-    );
-    return _isPlainObject(c) && !!c.supports_rerank;
-  } catch (e) {
-    return false;
-  }
+  return _modelGetTile("supports_rerank");
 }
 
 function detectModel() {
@@ -6307,7 +6367,7 @@ function detectModel() {
   btn.setAttribute("aria-busy", "true");
   // Calibrate-on-detect adds a ~20s endpoint probe, so signal it.
   btn.textContent = isReranker ? "Calibrating\u2026" : "Detecting\u2026";
-  resultDiv.style.display = "none";
+  resultDiv.hidden = true;
   resultDiv.textContent = "";
 
   const form = {
@@ -6335,7 +6395,7 @@ function detectModel() {
       return r.json();
     })
     .then(function (d) {
-      resultDiv.style.display = "block";
+      resultDiv.hidden = false;
       resultDiv.textContent = "";
       if (d.error && !d.reachable) {
         resultDiv.appendChild(
@@ -6471,7 +6531,7 @@ function detectModel() {
     })
     .catch(function (e) {
       if (e.message === "auth") return;
-      resultDiv.style.display = "block";
+      resultDiv.hidden = false;
       resultDiv.textContent = "";
       resultDiv.appendChild(_detectResultLine("\u2717 " + e.message, "red"));
       resultDiv.style.borderColor = "var(--red)";
@@ -6507,7 +6567,7 @@ function recalibrateModel() {
       return r.json();
     })
     .then(function (d) {
-      resultDiv.style.display = "block";
+      resultDiv.hidden = false;
       resultDiv.textContent = "";
       if (d.error) {
         resultDiv.appendChild(_detectResultLine("✗ " + d.error, "red"));
@@ -6542,7 +6602,7 @@ function recalibrateModel() {
     })
     .catch(function (e) {
       if (e.message === "auth") return;
-      resultDiv.style.display = "block";
+      resultDiv.hidden = false;
       resultDiv.textContent = "";
       resultDiv.appendChild(_detectResultLine("✗ " + e.message, "red"));
       resultDiv.style.borderColor = "var(--red)";
@@ -6560,46 +6620,56 @@ function recalibrateModel() {
 let _capsTimer = null;
 function _onModelFieldChange() {
   clearTimeout(_capsTimer);
-  _capsTimer = setTimeout(function () {
-    const overlay = document.getElementById("model-create-overlay");
-    if (!overlay || overlay.style.display === "none") return;
-    const provider = document.getElementById("model-provider").value;
-    const modelName = document.getElementById("model-name").value.trim();
-    if (!modelName) return;
-    authFetch(
-      "/v1/api/admin/model-capabilities?provider=" +
-        encodeURIComponent(provider) +
-        "&model=" +
-        encodeURIComponent(modelName),
-    )
-      .then(function (r) {
-        return r.json();
-      })
-      .then(function (d) {
-        if (!d.known || !d.capabilities) return;
-        const ctxInput = document.getElementById("model-ctx-window");
-        if (
-          parseInt(ctxInput.value, 10) === 0 &&
-          d.capabilities.context_window
-        ) {
-          ctxInput.value = d.capabilities.context_window;
-        }
-        const capsInput = document.getElementById("model-capabilities");
-        if (!capsInput.value.trim()) {
-          const caps = Object.assign({}, d.capabilities);
-          delete caps.context_window;
-          delete caps.max_output_tokens;
-          delete caps.token_param;
-          delete caps.supports_streaming;
-          delete caps.supports_tools;
-          const text = JSON.stringify(caps, null, 2);
-          if (text !== "{}") capsInput.value = text;
-        }
-      })
-      .catch(function () {
-        /* silent */
+  _capsTimer = setTimeout(_modelCapsRefreshBaseline, 500);
+}
+
+/* Known-model lookup feeding the tile matrix: the table becomes the display
+   BASELINE (with the provenance banner), explicit overrides stay on top, and
+   nothing is written into the raw JSON — known models keep tracking the
+   table at runtime instead of being pinned at save time. */
+function _modelCapsRefreshBaseline() {
+  const shelf = document.getElementById("model-shelf");
+  if (!shelf || !shelf.open) return;
+  const provider = document.getElementById("model-provider").value;
+  const modelName = document.getElementById("model-name").value.trim();
+  const banner = document.getElementById("model-autofill");
+  if (!modelName || provider === "openai-compatible") {
+    _modelCapsBaseline = {};
+    banner.hidden = true;
+    _modelRenderTiles();
+    return;
+  }
+  authFetch(
+    "/v1/api/admin/model-capabilities?provider=" +
+      encodeURIComponent(provider) +
+      "&model=" +
+      encodeURIComponent(modelName),
+  )
+    .then(function (r) {
+      return r.json();
+    })
+    .then(function (d) {
+      if (!d.known || !d.capabilities) {
+        _modelCapsBaseline = {};
+        banner.hidden = true;
+        _modelRenderTiles();
+        return;
+      }
+      const ctxInput = document.getElementById("model-ctx-window");
+      if (parseInt(ctxInput.value, 10) === 0 && d.capabilities.context_window) {
+        ctxInput.value = d.capabilities.context_window;
+      }
+      _modelCapsBaseline = {};
+      _MODEL_CAP_KEYS.forEach(function (k) {
+        if (k in d.capabilities) _modelCapsBaseline[k] = !!d.capabilities[k];
       });
-  }, 500);
+      document.getElementById("model-autofill-name").textContent = modelName;
+      banner.hidden = false;
+      _modelRenderTiles();
+    })
+    .catch(function () {
+      /* silent */
+    });
 }
 /* Provider-specific placeholder hints for base_url and model ID fields.
    Keep URLs in sync with _PROVIDER_DEFAULT_URLS in console/server.py
@@ -6667,6 +6737,34 @@ function _refreshModelSuggestions() {
 (function () {
   const nameEl = document.getElementById("model-name");
   const provEl = document.getElementById("model-provider");
+  const tmEl = document.getElementById("model-thinking-mode");
+  if (tmEl) tmEl.addEventListener("change", _toggleThinkingParam);
+  const grid = document.getElementById("model-capgrid");
+  if (grid) {
+    grid.addEventListener("change", function (e) {
+      const cap = e.target && e.target.getAttribute("data-cap");
+      if (!cap) return;
+      // a toggle IS the override decision — the key persists from here on
+      _modelCapsExplicit[cap] = e.target.checked;
+      if (cap === "supports_rerank") {
+        const recalBtn = document.getElementById("model-recalibrate-btn");
+        if (recalBtn)
+          recalBtn.hidden = !(
+            e.target.checked && document.getElementById("model-edit-id").value
+          );
+        _paintCalibrationChip(
+          Object.assign(
+            { supports_rerank: e.target.checked },
+            _rerankCalFields,
+          ),
+        );
+      }
+    });
+  }
+  const detectBtn = document.getElementById("model-detect-btn");
+  if (detectBtn) detectBtn.addEventListener("click", detectModel);
+  const recalBtn2 = document.getElementById("model-recalibrate-btn");
+  if (recalBtn2) recalBtn2.addEventListener("click", recalibrateModel);
   if (nameEl) nameEl.addEventListener("input", _onModelFieldChange);
   if (provEl) {
     provEl.addEventListener("change", _onModelFieldChange);
