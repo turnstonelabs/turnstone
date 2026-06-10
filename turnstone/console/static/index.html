@@ -264,7 +264,7 @@
 
       <!-- ADMIN PANEL -->
       <div id="view-admin" style="display: none">
-        <div id="admin-layout" class="admin-layout">
+        <div id="admin-layout" class="admin-layout hatch-host">
           <!-- Content area -->
           <div id="admin-content" class="admin-content">
             <!-- Users Tab -->
@@ -1823,6 +1823,250 @@
             </div>
           </div>
           <!-- /admin-content -->
+
+          <!-- Schedule shelf (create + edit) — pane-scoped; the cron DSL is
+               compiled from the Runs builder, previewed by the server's
+               croniter via the NEXT RUNS read-out. Cron mode stays as the
+               raw escape hatch with the same read-out. -->
+          <dialog
+            class="hatch hatch--shelf"
+            id="schedule-shelf"
+            data-kind="create"
+            aria-labelledby="schedule-shelf-title"
+          >
+            <header class="sh-head">
+              <span class="sh-led" aria-hidden="true"></span>
+              <h2 class="sh-title" id="schedule-shelf-title">New schedule</h2>
+              <span class="sh-tag" aria-hidden="true" id="schedule-shelf-tag"
+                >SCH-NEW</span
+              >
+              <button class="sh-x" data-close aria-label="Close">✕</button>
+            </header>
+            <div class="sh-body">
+              <div
+                id="schedule-shelf-error"
+                class="sh-alert"
+                role="alert"
+                aria-live="assertive"
+                aria-atomic="true"
+              ></div>
+              <input id="sch-id" type="hidden" />
+              <label for="sch-name">Name</label>
+              <input
+                id="sch-name"
+                type="text"
+                placeholder="Daily health check"
+                autocomplete="off"
+              />
+              <label for="sch-desc"
+                >Description <span class="label-hint">optional</span></label
+              >
+              <input id="sch-desc" type="text" autocomplete="off" />
+
+              <div class="sh-section">When</div>
+              <label id="sch-runs-label">Runs</label>
+              <div
+                class="seg"
+                role="group"
+                aria-labelledby="sch-runs-label"
+                id="sch-seg"
+              >
+                <button type="button" data-mode="daily" aria-pressed="true">
+                  Daily
+                </button>
+                <button type="button" data-mode="weekly" aria-pressed="false">
+                  Weekly
+                </button>
+                <button type="button" data-mode="monthly" aria-pressed="false">
+                  Monthly
+                </button>
+                <button type="button" data-mode="interval" aria-pressed="false">
+                  Interval
+                </button>
+                <button type="button" data-mode="once" aria-pressed="false">
+                  Once
+                </button>
+                <button type="button" data-mode="cron" aria-pressed="false">
+                  Cron
+                </button>
+              </div>
+              <div data-sch-pane="daily">
+                <label for="sch-time-daily"
+                  >At time <span class="label-hint">— UTC</span></label
+                >
+                <input id="sch-time-daily" type="time" value="06:00" />
+              </div>
+              <div data-sch-pane="weekly" hidden>
+                <label id="sch-days-label">On days</label>
+                <div
+                  class="chips"
+                  id="sch-days"
+                  role="group"
+                  aria-labelledby="sch-days-label"
+                >
+                  <button type="button" data-day="1" aria-pressed="false">
+                    Mon
+                  </button>
+                  <button type="button" data-day="2" aria-pressed="false">
+                    Tue
+                  </button>
+                  <button type="button" data-day="3" aria-pressed="false">
+                    Wed
+                  </button>
+                  <button type="button" data-day="4" aria-pressed="false">
+                    Thu
+                  </button>
+                  <button type="button" data-day="5" aria-pressed="false">
+                    Fri
+                  </button>
+                  <button type="button" data-day="6" aria-pressed="false">
+                    Sat
+                  </button>
+                  <button type="button" data-day="0" aria-pressed="false">
+                    Sun
+                  </button>
+                </div>
+                <label for="sch-time-weekly"
+                  >At time <span class="label-hint">— UTC</span></label
+                >
+                <input id="sch-time-weekly" type="time" value="06:00" />
+              </div>
+              <div data-sch-pane="monthly" hidden>
+                <div class="field-pair">
+                  <div>
+                    <label for="sch-dom">On day</label>
+                    <input
+                      id="sch-dom"
+                      type="number"
+                      min="1"
+                      max="31"
+                      value="1"
+                    />
+                  </div>
+                  <div>
+                    <label for="sch-time-monthly"
+                      >At time <span class="label-hint">— UTC</span></label
+                    >
+                    <input id="sch-time-monthly" type="time" value="06:00" />
+                  </div>
+                </div>
+              </div>
+              <div data-sch-pane="interval" hidden>
+                <div class="field-pair">
+                  <div>
+                    <label for="sch-every">Every</label>
+                    <input id="sch-every" type="number" min="1" value="4" />
+                  </div>
+                  <div>
+                    <label for="sch-unit">Unit</label>
+                    <select id="sch-unit">
+                      <option value="hours">hours</option>
+                      <option value="minutes">minutes</option>
+                    </select>
+                  </div>
+                </div>
+              </div>
+              <div data-sch-pane="once" hidden>
+                <label for="sch-at"
+                  >Run at
+                  <span class="label-hint">— your local time</span></label
+                >
+                <input id="sch-at" type="datetime-local" />
+              </div>
+              <div data-sch-pane="cron" hidden>
+                <label for="sch-cron"
+                  >Cron expression
+                  <span class="label-hint"
+                    >min hour day month weekday</span
+                  ></label
+                >
+                <input
+                  id="sch-cron"
+                  type="text"
+                  class="sh-mono"
+                  placeholder="0 9 * * MON-FRI"
+                  autocomplete="off"
+                  spellcheck="false"
+                />
+              </div>
+              <div class="readout" role="status" aria-live="polite">
+                <div class="readout-head">
+                  <span class="readout-label">Next runs</span>
+                  <span class="readout-desc" id="sch-desc-out"></span>
+                </div>
+                <div class="readout-rows" id="sch-runs-out"></div>
+              </div>
+
+              <div class="sh-section">Target</div>
+              <label for="sch-target">Target</label>
+              <select id="sch-target">
+                <option value="auto">Auto (best available)</option>
+                <option value="pool">Pool (any bridge)</option>
+                <option value="all">All nodes</option>
+                <option value="node">Specific node...</option>
+              </select>
+              <div id="sch-node-group" hidden>
+                <label for="sch-node">Node ID</label>
+                <input
+                  id="sch-node"
+                  type="text"
+                  placeholder="node-001"
+                  autocomplete="off"
+                  spellcheck="false"
+                />
+              </div>
+
+              <div class="sh-section">Execution</div>
+              <label for="sch-model"
+                >Model <span class="label-hint">optional</span></label
+              >
+              <select id="sch-model">
+                <option value="">Default model</option>
+              </select>
+              <label for="sch-template"
+                >Skill <span class="label-hint">optional</span></label
+              >
+              <select id="sch-template">
+                <option value="">None</option>
+              </select>
+              <label for="sch-message">Initial message</label>
+              <textarea
+                id="sch-message"
+                rows="3"
+                placeholder="What should the workstream do?"
+              ></textarea>
+              <label class="toggle-switch">
+                <input id="sch-autoapprove" type="checkbox" />
+                <span class="toggle-track" aria-hidden="true"></span>
+                <span class="toggle-label">Auto-approve tool calls</span>
+              </label>
+              <label class="toggle-switch" id="sch-enabled-row" hidden>
+                <input id="sch-enabled" type="checkbox" />
+                <span class="toggle-track" aria-hidden="true"></span>
+                <span class="toggle-label">Enabled</span>
+              </label>
+              <label
+                >Notify on completion
+                <span class="label-hint">optional</span></label
+              >
+              <div id="sch-notify-rows"></div>
+              <button
+                type="button"
+                class="admin-inline-add"
+                id="sch-notify-add"
+                aria-label="Add notification target"
+              >
+                + Add target
+              </button>
+            </div>
+            <footer class="sh-foot">
+              <div class="sh-foot-meta" id="sch-compiled-out"></div>
+              <button class="sh-btn" data-close>Cancel</button>
+              <button id="sch-submit" class="sh-btn sh-btn--primary">
+                Create
+              </button>
+            </footer>
+          </dialog>
         </div>
         <!-- /admin-layout -->
       </div>
@@ -2156,248 +2400,6 @@
             onclick="submitCreateChannel()"
           >
             Link
-          </button>
-        </div>
-      </div>
-    </div>
-
-    <!-- Create Schedule Modal -->
-    <div
-      id="create-schedule-overlay"
-      style="display: none"
-      role="dialog"
-      aria-modal="true"
-      aria-labelledby="create-schedule-title"
-    >
-      <div id="create-schedule-box" class="admin-modal admin-modal-wide">
-        <h2 id="create-schedule-title">New Schedule</h2>
-        <div
-          id="create-schedule-error"
-          role="alert"
-          aria-live="assertive"
-          aria-atomic="true"
-        ></div>
-        <div class="modal-columns">
-          <div class="modal-col">
-            <div class="modal-col-heading">Schedule</div>
-            <label for="cs-name">Name</label>
-            <input
-              id="cs-name"
-              type="text"
-              placeholder="Daily health check"
-              autocomplete="off"
-            />
-            <label for="cs-desc"
-              >Description <span class="label-hint">optional</span></label
-            >
-            <input id="cs-desc" type="text" placeholder="" autocomplete="off" />
-            <label for="cs-type">Schedule type</label>
-            <select id="cs-type" onchange="toggleScheduleTypeFields()">
-              <option value="cron">Cron (recurring)</option>
-              <option value="at">At (one-shot)</option>
-            </select>
-            <div id="cs-cron-group">
-              <label for="cs-cron">Cron expression</label>
-              <input
-                id="cs-cron"
-                type="text"
-                placeholder="0 9 * * MON-FRI"
-                autocomplete="off"
-                spellcheck="false"
-                aria-describedby="cs-cron-hint"
-              />
-              <span
-                id="cs-cron-hint"
-                class="label-hint"
-                style="display: block; margin-top: 3px"
-                >min hour day month weekday</span
-              >
-            </div>
-            <div id="cs-at-group" style="display: none">
-              <label for="cs-at">Run at</label>
-              <input id="cs-at" type="datetime-local" />
-            </div>
-            <label for="cs-target">Target</label>
-            <select id="cs-target" onchange="toggleScheduleNodeField()">
-              <option value="auto">Auto (best available)</option>
-              <option value="pool">Pool (any bridge)</option>
-              <option value="all">All nodes</option>
-              <option value="node">Specific node...</option>
-            </select>
-            <div id="cs-node-group" style="display: none">
-              <label for="cs-node">Node ID</label>
-              <input
-                id="cs-node"
-                type="text"
-                placeholder="node-001"
-                autocomplete="off"
-                spellcheck="false"
-              />
-            </div>
-          </div>
-          <div class="modal-col">
-            <div class="modal-col-heading">Execution</div>
-            <label for="cs-model"
-              >Model <span class="label-hint">optional</span></label
-            >
-            <select id="cs-model">
-              <option value="">Default model</option>
-            </select>
-            <label for="cs-template"
-              >Skill <span class="label-hint">optional</span></label
-            >
-            <select id="cs-template">
-              <option value="">None</option>
-            </select>
-            <label for="cs-message">Initial message</label>
-            <textarea
-              id="cs-message"
-              rows="3"
-              placeholder="What should the workstream do?"
-            ></textarea>
-            <label class="toggle-switch">
-              <input id="cs-autoapprove" type="checkbox" />
-              <span class="toggle-track" aria-hidden="true"></span>
-              <span class="toggle-label">Auto-approve tool calls</span>
-            </label>
-            <label
-              >Notify on completion
-              <span class="label-hint">optional</span></label
-            >
-            <div id="cs-notify-rows"></div>
-            <button
-              type="button"
-              class="admin-inline-add"
-              onclick="_addNotifyRow('cs')"
-              aria-label="Add notification target"
-            >
-              + Add target
-            </button>
-          </div>
-        </div>
-        <div class="modal-buttons">
-          <button class="modal-cancel" onclick="hideCreateScheduleModal()">
-            Cancel
-          </button>
-          <button
-            id="cs-submit"
-            class="modal-submit"
-            onclick="submitCreateSchedule()"
-          >
-            Create
-          </button>
-        </div>
-      </div>
-    </div>
-
-    <!-- Edit Schedule Modal -->
-    <div
-      id="edit-schedule-overlay"
-      style="display: none"
-      role="dialog"
-      aria-modal="true"
-      aria-labelledby="edit-schedule-title"
-    >
-      <div id="edit-schedule-box" class="admin-modal admin-modal-wide">
-        <h2 id="edit-schedule-title">Edit Schedule</h2>
-        <div
-          id="edit-schedule-error"
-          role="alert"
-          aria-live="assertive"
-          aria-atomic="true"
-        ></div>
-        <input id="es-id" type="hidden" />
-        <div class="modal-columns">
-          <div class="modal-col">
-            <div class="modal-col-heading">Schedule</div>
-            <label for="es-name">Name</label>
-            <input id="es-name" type="text" autocomplete="off" />
-            <label for="es-desc">Description</label>
-            <input id="es-desc" type="text" autocomplete="off" />
-            <label for="es-type">Schedule type</label>
-            <select id="es-type" onchange="toggleEditScheduleTypeFields()">
-              <option value="cron">Cron (recurring)</option>
-              <option value="at">At (one-shot)</option>
-            </select>
-            <div id="es-cron-group">
-              <label for="es-cron">Cron expression</label>
-              <input
-                id="es-cron"
-                type="text"
-                autocomplete="off"
-                spellcheck="false"
-              />
-            </div>
-            <div id="es-at-group" style="display: none">
-              <label for="es-at">Run at</label>
-              <input id="es-at" type="datetime-local" />
-            </div>
-            <label for="es-target">Target</label>
-            <select id="es-target" onchange="toggleEditScheduleNodeField()">
-              <option value="auto">Auto (best available)</option>
-              <option value="pool">Pool (any bridge)</option>
-              <option value="all">All nodes</option>
-              <option value="node">Specific node...</option>
-            </select>
-            <div id="es-node-group" style="display: none">
-              <label for="es-node">Node ID</label>
-              <input
-                id="es-node"
-                type="text"
-                autocomplete="off"
-                spellcheck="false"
-              />
-            </div>
-          </div>
-          <div class="modal-col">
-            <div class="modal-col-heading">Execution</div>
-            <label for="es-model">Model</label>
-            <select id="es-model">
-              <option value="">Default model</option>
-            </select>
-            <label for="es-template"
-              >Skill <span class="label-hint">optional</span></label
-            >
-            <select id="es-template">
-              <option value="">None</option>
-            </select>
-            <label for="es-message">Initial message</label>
-            <textarea id="es-message" rows="3"></textarea>
-            <label class="toggle-switch">
-              <input id="es-autoapprove" type="checkbox" />
-              <span class="toggle-track" aria-hidden="true"></span>
-              <span class="toggle-label">Auto-approve tool calls</span>
-            </label>
-            <label class="toggle-switch">
-              <input id="es-enabled" type="checkbox" />
-              <span class="toggle-track" aria-hidden="true"></span>
-              <span class="toggle-label">Enabled</span>
-            </label>
-            <label
-              >Notify on completion
-              <span class="label-hint">optional</span></label
-            >
-            <div id="es-notify-rows"></div>
-            <button
-              type="button"
-              class="admin-inline-add"
-              onclick="_addNotifyRow('es')"
-              aria-label="Add notification target"
-            >
-              + Add target
-            </button>
-          </div>
-        </div>
-        <div class="modal-buttons">
-          <button class="modal-cancel" onclick="hideEditScheduleModal()">
-            Cancel
-          </button>
-          <button
-            id="es-submit"
-            class="modal-submit"
-            onclick="submitEditSchedule()"
-          >
-            Save
           </button>
         </div>
       </div>

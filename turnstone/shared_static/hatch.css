@@ -389,6 +389,23 @@
 .sh-body label:first-child {
   margin-top: 0;
 }
+/* The console's label.toggle-switch (style.css) ties with .sh-body label at
+   0,1,1 and hatch.css loads later — restate the toggle's own layout at 0,2,1
+   (the same exception .admin-modal label.toggle-switch makes today). */
+.sh-body label.toggle-switch {
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
+  margin: 14px 0 0;
+  text-transform: none;
+  letter-spacing: 0;
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--fg);
+}
+.sh-mono {
+  font-family: var(--font-mono);
+}
 .label-hint {
   font-weight: 400;
   text-transform: none;

@@ -1121,10 +1121,7 @@ function confirmUnlinkChannel(channelType, channelUserId) {
 // Schedules
 // ---------------------------------------------------------------------------
 
-let _csTrapHandler = null;
-let _esTrapHandler = null;
 let _srTrapHandler = null;
-let _editScheduleTriggerEl = null;
 let _runsScheduleTriggerEl = null;
 
 function loadAdminSchedules() {
@@ -1528,301 +1525,528 @@ function _utcToLocalDatetime(utcStr) {
   );
 }
 
-// --- Create Schedule Modal ---
+// --- Schedule shelf (create + edit) ---
+// The cron DSL is compiled, not typed: the segmented Runs control builds
+// schedule_type/cron_expr/at_time, and the NEXT RUNS read-out previews the
+// result through the server's croniter (POST /v1/api/admin/schedules/preview)
+// as the user edits.  Cron mode is the raw escape hatch with the same live
+// read-out.  Storage is unchanged: on edit the saved expression is
+// reverse-parsed back into the friendly mode when its shape matches
+// (_cronToScheduleMode), else the editor opens in Cron mode.
 
-function toggleScheduleTypeFields() {
-  const t = document.getElementById("cs-type").value;
-  document.getElementById("cs-cron-group").style.display =
-    t === "cron" ? "" : "none";
-  document.getElementById("cs-at-group").style.display =
-    t === "at" ? "" : "none";
-  if (t === "cron") document.getElementById("cs-cron").focus();
-  else document.getElementById("cs-at").focus();
+let _schWired = false;
+let _schPreviewTimer = null;
+let _schPreviewSeq = 0;
+let _schShelfHandle = null;
+
+function _schMode() {
+  const seg = document.getElementById("sch-seg");
+  const on = seg.querySelector('[aria-pressed="true"]');
+  return on ? on.getAttribute("data-mode") : "daily";
 }
 
-function toggleScheduleNodeField() {
-  const v = document.getElementById("cs-target").value;
-  document.getElementById("cs-node-group").style.display =
-    v === "node" ? "" : "none";
-  if (v === "node") document.getElementById("cs-node").focus();
-}
-
-function showCreateScheduleModal() {
-  const overlay = document.getElementById("create-schedule-overlay");
-  overlay.style.display = "flex";
+function _schSetMode(mode) {
+  const seg = document.getElementById("sch-seg");
+  seg.querySelectorAll("button[data-mode]").forEach(function (b) {
+    b.setAttribute(
+      "aria-pressed",
+      b.getAttribute("data-mode") === mode ? "true" : "false",
+    );
+  });
   document
-    .getElementById("create-schedule-error")
+    .querySelectorAll("#schedule-shelf [data-sch-pane]")
+    .forEach(function (pane) {
+      pane.hidden = pane.getAttribute("data-sch-pane") !== mode;
+    });
+}
+
+function _schSelectedDays() {
+  const out = [];
+  document
+    .querySelectorAll('#sch-days button[aria-pressed="true"]')
+    .forEach(function (b) {
+      out.push(parseInt(b.getAttribute("data-day"), 10));
+    });
+  return out.sort();
+}
+
+function _schSetDays(days) {
+  document.querySelectorAll("#sch-days button").forEach(function (b) {
+    const d = parseInt(b.getAttribute("data-day"), 10);
+    b.setAttribute("aria-pressed", days.indexOf(d) >= 0 ? "true" : "false");
+  });
+}
+
+function _schTimeParts(id) {
+  const v = document.getElementById(id).value || "06:00";
+  const parts = v.split(":");
+  return [parseInt(parts[0], 10) || 0, parseInt(parts[1], 10) || 0];
+}
+
+// Compile the builder state down to the wire fields.  Returns
+// {schedule_type, cron_expr, at_time} or {error}.
+function _schCompile() {
+  const mode = _schMode();
+  if (mode === "once") {
+    const local = document.getElementById("sch-at").value || "";
+    if (!local) return { error: "Pick a date and time" };
+    return {
+      schedule_type: "at",
+      cron_expr: "",
+      at_time: _localToUtcIso(local),
+    };
+  }
+  if (mode === "cron") {
+    const expr = (document.getElementById("sch-cron").value || "").trim();
+    if (!expr) return { error: "Cron expression is required" };
+    return { schedule_type: "cron", cron_expr: expr, at_time: "" };
+  }
+  let h, m;
+  if (mode === "daily") {
+    [h, m] = _schTimeParts("sch-time-daily");
+    return {
+      schedule_type: "cron",
+      cron_expr: m + " " + h + " * * *",
+      at_time: "",
+    };
+  }
+  if (mode === "weekly") {
+    const days = _schSelectedDays();
+    if (!days.length) return { error: "Select at least one day" };
+    [h, m] = _schTimeParts("sch-time-weekly");
+    return {
+      schedule_type: "cron",
+      cron_expr: m + " " + h + " * * " + days.join(","),
+      at_time: "",
+    };
+  }
+  if (mode === "monthly") {
+    const dom = parseInt(document.getElementById("sch-dom").value, 10);
+    if (!dom || dom < 1 || dom > 31)
+      return { error: "Day of month must be 1-31" };
+    [h, m] = _schTimeParts("sch-time-monthly");
+    return {
+      schedule_type: "cron",
+      cron_expr: m + " " + h + " " + dom + " * *",
+      at_time: "",
+    };
+  }
+  // interval
+  const n = parseInt(document.getElementById("sch-every").value, 10);
+  if (!n || n < 1) return { error: "Interval must be at least 1" };
+  const unit = document.getElementById("sch-unit").value;
+  const expr = unit === "hours" ? "0 */" + n + " * * *" : "*/" + n + " * * * *";
+  return { schedule_type: "cron", cron_expr: expr, at_time: "" };
+}
+
+const _SCH_DAY_NAMES = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+
+function _schDescribe() {
+  const mode = _schMode();
+  const t = function (id) {
+    const parts = _schTimeParts(id);
+    const pad = function (n) {
+      return n < 10 ? "0" + n : "" + n;
+    };
+    return pad(parts[0]) + ":" + pad(parts[1]);
+  };
+  if (mode === "daily") return "every day at " + t("sch-time-daily") + " UTC";
+  if (mode === "weekly") {
+    const names = _schSelectedDays().map(function (d) {
+      return _SCH_DAY_NAMES[d];
+    });
+    return names.length
+      ? "every " + names.join(", ") + " at " + t("sch-time-weekly") + " UTC"
+      : "no days selected";
+  }
+  if (mode === "monthly")
+    return (
+      "monthly on day " +
+      (document.getElementById("sch-dom").value || "?") +
+      " at " +
+      t("sch-time-monthly") +
+      " UTC"
+    );
+  if (mode === "interval")
+    return (
+      "every " +
+      (document.getElementById("sch-every").value || "?") +
+      " " +
+      document.getElementById("sch-unit").value
+    );
+  if (mode === "once") return "one time";
+  return "custom cron";
+}
+
+// Reverse-parse a saved expression into builder state.  Only the exact
+// shapes the builder emits round-trip; anything else opens in Cron mode.
+function _cronToScheduleMode(expr) {
+  let m = /^(\d{1,2}) (\d{1,2}) \* \* \*$/.exec(expr);
+  if (m) return { mode: "daily", h: +m[2], min: +m[1] };
+  m = /^(\d{1,2}) (\d{1,2}) \* \* ([0-7](?:,[0-7])*)$/.exec(expr);
+  if (m)
+    return {
+      mode: "weekly",
+      h: +m[2],
+      min: +m[1],
+      days: m[3].split(",").map(function (d) {
+        return +d % 7; // cron allows 7 for Sunday
+      }),
+    };
+  m = /^(\d{1,2}) (\d{1,2}) (\d{1,2}) \* \*$/.exec(expr);
+  if (m) return { mode: "monthly", h: +m[2], min: +m[1], dom: +m[3] };
+  m = /^0 \*\/(\d+) \* \* \*$/.exec(expr);
+  if (m) return { mode: "interval", every: +m[1], unit: "hours" };
+  m = /^\*\/(\d+) \* \* \* \*$/.exec(expr);
+  if (m) return { mode: "interval", every: +m[1], unit: "minutes" };
+  return { mode: "cron" };
+}
+
+function _schSetTime(id, h, min) {
+  const pad = function (n) {
+    return n < 10 ? "0" + n : "" + n;
+  };
+  document.getElementById(id).value = pad(h) + ":" + pad(min);
+}
+
+// Apply a saved schedule's timing to the builder (edit mode).
+function _schApplyTiming(scheduleType, cronExpr, atTime) {
+  if (scheduleType === "at") {
+    document.getElementById("sch-at").value = _utcToLocalDatetime(atTime);
+    _schSetMode("once");
+    return;
+  }
+  const parsed = _cronToScheduleMode(cronExpr || "");
+  if (parsed.mode === "daily")
+    _schSetTime("sch-time-daily", parsed.h, parsed.min);
+  else if (parsed.mode === "weekly") {
+    _schSetTime("sch-time-weekly", parsed.h, parsed.min);
+    _schSetDays(parsed.days);
+  } else if (parsed.mode === "monthly") {
+    _schSetTime("sch-time-monthly", parsed.h, parsed.min);
+    document.getElementById("sch-dom").value = parsed.dom;
+  } else if (parsed.mode === "interval") {
+    document.getElementById("sch-every").value = parsed.every;
+    document.getElementById("sch-unit").value = parsed.unit;
+  } else {
+    document.getElementById("sch-cron").value = cronExpr || "";
+  }
+  _schSetMode(parsed.mode);
+}
+
+function _schFmtUtc(iso) {
+  // Server emits "YYYY-MM-DDTHH:MM:SS" (UTC, no suffix) or "+00:00" ISO.
+  const d = new Date(/[Z+]/.test(iso) ? iso : iso + "Z");
+  if (isNaN(d.getTime())) return iso;
+  const pad = function (n) {
+    return n < 10 ? "0" + n : "" + n;
+  };
+  return (
+    _SCH_DAY_NAMES[d.getUTCDay()] +
+    " " +
+    d.getUTCFullYear() +
+    "-" +
+    pad(d.getUTCMonth() + 1) +
+    "-" +
+    pad(d.getUTCDate()) +
+    " " +
+    pad(d.getUTCHours()) +
+    ":" +
+    pad(d.getUTCMinutes()) +
+    " UTC"
+  );
+}
+
+function _schRel(iso) {
+  const d = new Date(/[Z+]/.test(iso) ? iso : iso + "Z");
+  if (isNaN(d.getTime())) return "";
+  const mins = Math.round((d.getTime() - Date.now()) / 60000);
+  if (mins < 1) return "now";
+  if (mins < 60) return "in " + mins + "m";
+  if (mins < 48 * 60) return "in " + Math.round(mins / 60) + "h";
+  return "in " + Math.round(mins / (24 * 60)) + "d";
+}
+
+function _schRenderRuns(runs, errText) {
+  const rows = document.getElementById("sch-runs-out");
+  while (rows.firstChild) rows.removeChild(rows.firstChild);
+  if (errText) {
+    const err = document.createElement("div");
+    err.className = "err";
+    err.textContent = errText;
+    rows.appendChild(err);
+    return;
+  }
+  runs.forEach(function (iso) {
+    const row = document.createElement("div");
+    row.className = "readout-row";
+    const when = document.createElement("span");
+    when.textContent = _schFmtUtc(iso);
+    const rel = document.createElement("span");
+    rel.className = "rel";
+    rel.textContent = _schRel(iso);
+    row.appendChild(when);
+    row.appendChild(rel);
+    rows.appendChild(row);
+  });
+}
+
+function _schRenderCompiled(compiled) {
+  const meta = document.getElementById("sch-compiled-out");
+  while (meta.firstChild) meta.removeChild(meta.firstChild);
+  if (compiled.error) return;
+  if (compiled.schedule_type === "at") {
+    meta.appendChild(document.createTextNode("runs once at "));
+    const span = document.createElement("span");
+    span.className = "mono";
+    span.textContent = compiled.at_time;
+    meta.appendChild(span);
+  } else {
+    meta.appendChild(document.createTextNode("compiles to "));
+    const span = document.createElement("span");
+    span.className = "mono";
+    span.textContent = compiled.cron_expr;
+    meta.appendChild(span);
+  }
+}
+
+// Debounced read-out refresh: description + compiled text render instantly,
+// the next-runs list arrives from the croniter preview endpoint.
+function _schPreview() {
+  document.getElementById("sch-desc-out").textContent = _schDescribe();
+  const compiled = _schCompile();
+  _schRenderCompiled(compiled);
+  if (compiled.error) {
+    _schRenderRuns([], compiled.error);
+    return;
+  }
+  if (_schPreviewTimer) clearTimeout(_schPreviewTimer);
+  const seq = ++_schPreviewSeq;
+  _schPreviewTimer = setTimeout(function () {
+    authFetch("/v1/api/admin/schedules/preview", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(compiled),
+    })
+      .then(function (r) {
+        return r.json();
+      })
+      .then(function (data) {
+        if (seq !== _schPreviewSeq) return; // a newer edit superseded us
+        if (!data.valid) _schRenderRuns([], data.error || "Invalid schedule");
+        else _schRenderRuns(data.next || []);
+      })
+      .catch(function () {
+        if (seq === _schPreviewSeq) _schRenderRuns([], "Preview unavailable");
+      });
+  }, 250);
+}
+
+function _schWire() {
+  if (_schWired) return;
+  _schWired = true;
+  document.getElementById("sch-seg").addEventListener("click", function (e) {
+    const b = e.target.closest("button[data-mode]");
+    if (!b) return;
+    _schSetMode(b.getAttribute("data-mode"));
+    _schPreview();
+  });
+  document.getElementById("sch-days").addEventListener("click", function (e) {
+    const b = e.target.closest("button[data-day]");
+    if (!b) return;
+    b.setAttribute(
+      "aria-pressed",
+      b.getAttribute("aria-pressed") === "true" ? "false" : "true",
+    );
+    _schPreview();
+  });
+  [
+    "sch-time-daily",
+    "sch-time-weekly",
+    "sch-time-monthly",
+    "sch-dom",
+    "sch-every",
+    "sch-unit",
+    "sch-at",
+    "sch-cron",
+  ].forEach(function (id) {
+    const el = document.getElementById(id);
+    el.addEventListener("input", _schPreview);
+    el.addEventListener("change", _schPreview);
+  });
+  document.getElementById("sch-target").addEventListener("change", function () {
+    const isNode = this.value === "node";
+    document.getElementById("sch-node-group").hidden = !isNode;
+    if (isNode) document.getElementById("sch-node").focus();
+  });
+  document
+    .getElementById("sch-notify-add")
+    .addEventListener("click", function () {
+      _addNotifyRow("sch");
+    });
+  document
+    .getElementById("sch-submit")
+    .addEventListener("click", _submitScheduleShelf);
+}
+
+// Shared open path: reset to a clean create state, then edit overwrites.
+function _schResetForm() {
+  document
+    .getElementById("schedule-shelf-error")
     .classList.remove("is-visible");
-  document.getElementById("cs-name").value = "";
-  document.getElementById("cs-desc").value = "";
-  document.getElementById("cs-type").value = "cron";
-  document.getElementById("cs-cron").value = "";
-  document.getElementById("cs-at").value = "";
-  document.getElementById("cs-target").value = "auto";
-  document.getElementById("cs-node").value = "";
-  document.getElementById("cs-message").value = "";
-  document.getElementById("cs-autoapprove").checked = false;
-  _populateNotifyRows("cs", []);
-  // Populate model dropdown
-  _populateScheduleSelect("cs-model", "/v1/api/models", "alias", "alias", {
+  document.getElementById("sch-id").value = "";
+  document.getElementById("sch-name").value = "";
+  document.getElementById("sch-desc").value = "";
+  document.getElementById("sch-time-daily").value = "06:00";
+  document.getElementById("sch-time-weekly").value = "06:00";
+  document.getElementById("sch-time-monthly").value = "06:00";
+  _schSetDays([]);
+  document.getElementById("sch-dom").value = "1";
+  document.getElementById("sch-every").value = "4";
+  document.getElementById("sch-unit").value = "hours";
+  document.getElementById("sch-at").value = "";
+  document.getElementById("sch-cron").value = "";
+  document.getElementById("sch-target").value = "auto";
+  document.getElementById("sch-node").value = "";
+  document.getElementById("sch-node-group").hidden = true;
+  document.getElementById("sch-message").value = "";
+  document.getElementById("sch-autoapprove").checked = false;
+  document.getElementById("sch-enabled").checked = true;
+  _populateNotifyRows("sch", []);
+  _schSetMode("daily");
+}
+
+function _schPopulateSelects(selectedModel, selectedSkill) {
+  _populateScheduleSelect("sch-model", "/v1/api/models", "alias", "alias", {
     listKey: "models",
+    selected: selectedModel || "",
     display: function (m) {
       return m.alias === m.model ? m.alias : m.alias + " (" + m.model + ")";
     },
     afterPopulate: _decorateScheduleModelPlaceholder,
   });
-  // Populate skill dropdown
   _populateScheduleSelect(
-    "cs-template",
+    "sch-template",
     "/v1/api/admin/skills",
     "name",
     "name",
     {
       listKey: "skills",
+      selected: selectedSkill || "",
       display: function (s) {
         return s.name;
       },
     },
   );
-  toggleScheduleTypeFields();
-  toggleScheduleNodeField();
-  document.getElementById("cs-submit").disabled = false;
-  document.getElementById("cs-submit").textContent = "Create";
-  _csTrapHandler = _installTrap(
-    "create-schedule-overlay",
-    "create-schedule-box",
-  );
-  setTimeout(function () {
-    document.getElementById("cs-name").focus();
-  }, 50);
 }
 
-function hideCreateScheduleModal() {
-  document.getElementById("create-schedule-overlay").style.display = "none";
-  _csTrapHandler = _removeTrap(_csTrapHandler);
-  const trigger = document.querySelector("#admin-schedules .admin-action-btn");
-  if (trigger) trigger.focus();
+function _schOpen(title, tag, kind, submitLabel) {
+  const shelf = document.getElementById("schedule-shelf");
+  document.getElementById("schedule-shelf-title").textContent = title;
+  document.getElementById("schedule-shelf-tag").textContent = tag;
+  shelf.setAttribute("data-kind", kind);
+  document.getElementById("sch-submit").textContent = submitLabel;
+  _schShelfHandle = window.TurnstoneHatch.openShelf(shelf);
+  document.getElementById("sch-name").focus();
+  _schPreview();
 }
 
-function submitCreateSchedule() {
-  const name = (document.getElementById("cs-name").value || "").trim();
-  const desc = (document.getElementById("cs-desc").value || "").trim();
-  const schedType = document.getElementById("cs-type").value;
-  const cronExpr = (document.getElementById("cs-cron").value || "").trim();
-  let atTime = document.getElementById("cs-at").value || "";
-  let targetMode = document.getElementById("cs-target").value;
-  const nodeId = (document.getElementById("cs-node").value || "").trim();
-  const model = (document.getElementById("cs-model").value || "").trim();
-  const message = (document.getElementById("cs-message").value || "").trim();
-  const skill = (document.getElementById("cs-template").value || "").trim();
-  const autoApprove = document.getElementById("cs-autoapprove").checked;
-  const notifyTargets = _collectNotifyTargets("cs");
-  const errEl = document.getElementById("create-schedule-error");
-
-  if (!name) return _showModalError(errEl, "Name is required");
-  if (!message) return _showModalError(errEl, "Initial message is required");
-  if (schedType === "cron" && !cronExpr)
-    return _showModalError(errEl, "Cron expression is required");
-  if (schedType === "at" && !atTime)
-    return _showModalError(errEl, "Run time is required");
-
-  // Convert browser local time to UTC for the server
-  if (schedType === "at" && atTime) {
-    atTime = _localToUtcIso(atTime);
-  }
-
-  if (targetMode === "node") targetMode = nodeId;
-
-  const btn = document.getElementById("cs-submit");
-  btn.disabled = true;
-  btn.textContent = "Creating\u2026";
-
-  authFetch("/v1/api/admin/schedules", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      name: name,
-      description: desc,
-      schedule_type: schedType,
-      cron_expr: cronExpr,
-      at_time: atTime,
-      target_mode: targetMode,
-      model: model,
-      initial_message: message,
-      auto_approve: autoApprove,
-      skill: skill,
-      notify_targets: notifyTargets,
-    }),
-  })
-    .then(function (r) {
-      if (!r.ok)
-        return r.json().then(function (d) {
-          throw new Error(d.error || "Failed");
-        });
-      return r.json();
-    })
-    .then(function () {
-      hideCreateScheduleModal();
-      showToast("Schedule '" + name + "' created");
-      loadAdminSchedules();
-    })
-    .catch(function (err) {
-      btn.disabled = false;
-      btn.textContent = "Create";
-      _showModalError(errEl, err.message || "Failed to create schedule");
-    });
-}
-
-// --- Edit Schedule Modal ---
-
-function toggleEditScheduleTypeFields() {
-  const t = document.getElementById("es-type").value;
-  document.getElementById("es-cron-group").style.display =
-    t === "cron" ? "" : "none";
-  document.getElementById("es-at-group").style.display =
-    t === "at" ? "" : "none";
-  if (t === "cron") document.getElementById("es-cron").focus();
-  else document.getElementById("es-at").focus();
-}
-
-function toggleEditScheduleNodeField() {
-  const v = document.getElementById("es-target").value;
-  document.getElementById("es-node-group").style.display =
-    v === "node" ? "" : "none";
-  if (v === "node") document.getElementById("es-node").focus();
+function showCreateScheduleModal() {
+  _schWire();
+  _schResetForm();
+  document.getElementById("sch-enabled-row").hidden = true;
+  _schPopulateSelects("", "");
+  _schOpen("New schedule", "SCH-NEW", "create", "Create");
 }
 
 function showEditScheduleModal(taskId) {
-  _editScheduleTriggerEl = document.activeElement;
+  _schWire();
   authFetch("/v1/api/admin/schedules/" + encodeURIComponent(taskId))
     .then(function (r) {
       if (!r.ok) throw new Error("Not found");
       return r.json();
     })
     .then(function (s) {
-      document.getElementById("es-id").value = s.task_id;
-      document.getElementById("es-name").value = s.name || "";
-      document.getElementById("es-desc").value = s.description || "";
-      document.getElementById("es-type").value = s.schedule_type;
-      document.getElementById("es-cron").value = s.cron_expr || "";
-      document.getElementById("es-at").value = _utcToLocalDatetime(s.at_time);
+      _schResetForm();
+      document.getElementById("sch-id").value = s.task_id;
+      document.getElementById("sch-name").value = s.name || "";
+      document.getElementById("sch-desc").value = s.description || "";
+      _schApplyTiming(s.schedule_type, s.cron_expr, s.at_time);
       const isSpecificNode =
         s.target_mode &&
         s.target_mode !== "auto" &&
         s.target_mode !== "pool" &&
         s.target_mode !== "all";
-      document.getElementById("es-target").value = isSpecificNode
+      document.getElementById("sch-target").value = isSpecificNode
         ? "node"
         : s.target_mode;
-      document.getElementById("es-node").value = isSpecificNode
+      document.getElementById("sch-node").value = isSpecificNode
         ? s.target_mode
         : "";
-      // Populate model dropdown with current value pre-selected
-      _populateScheduleSelect("es-model", "/v1/api/models", "alias", "alias", {
-        listKey: "models",
-        selected: s.model || "",
-        display: function (m) {
-          return m.alias === m.model ? m.alias : m.alias + " (" + m.model + ")";
-        },
-        afterPopulate: _decorateScheduleModelPlaceholder,
-      });
-      // Populate skill dropdown with current value pre-selected
-      _populateScheduleSelect(
-        "es-template",
-        "/v1/api/admin/skills",
-        "name",
-        "name",
-        {
-          listKey: "skills",
-          selected: s.skill || "",
-          display: function (sk) {
-            return sk.name;
-          },
-        },
+      document.getElementById("sch-node-group").hidden = !isSpecificNode;
+      _schPopulateSelects(s.model || "", s.skill || "");
+      document.getElementById("sch-message").value = s.initial_message || "";
+      document.getElementById("sch-autoapprove").checked = !!s.auto_approve;
+      document.getElementById("sch-enabled").checked = !!s.enabled;
+      document.getElementById("sch-enabled-row").hidden = false;
+      _populateNotifyRows("sch", s.notify_targets || []);
+      _schOpen(
+        "Edit schedule — " + (s.name || s.task_id),
+        "SCH-EDIT",
+        "edit",
+        "Save",
       );
-      document.getElementById("es-message").value = s.initial_message || "";
-      document.getElementById("es-autoapprove").checked = !!s.auto_approve;
-      document.getElementById("es-enabled").checked = !!s.enabled;
-      _populateNotifyRows("es", s.notify_targets || []);
-      toggleEditScheduleTypeFields();
-      toggleEditScheduleNodeField();
-      document
-        .getElementById("edit-schedule-error")
-        .classList.remove("is-visible");
-      document.getElementById("es-submit").disabled = false;
-      document.getElementById("es-submit").textContent = "Save";
-      const overlay = document.getElementById("edit-schedule-overlay");
-      overlay.style.display = "flex";
-      _esTrapHandler = _installTrap(
-        "edit-schedule-overlay",
-        "edit-schedule-box",
-      );
-      setTimeout(function () {
-        document.getElementById("es-name").focus();
-      }, 50);
     })
     .catch(function () {
       showToast("Failed to load schedule");
     });
 }
 
-function hideEditScheduleModal() {
-  document.getElementById("edit-schedule-overlay").style.display = "none";
-  _esTrapHandler = _removeTrap(_esTrapHandler);
-  if (_editScheduleTriggerEl && _editScheduleTriggerEl.isConnected) {
-    _editScheduleTriggerEl.focus();
-  }
-  _editScheduleTriggerEl = null;
-}
-
-function submitEditSchedule() {
-  const taskId = document.getElementById("es-id").value;
-  const name = (document.getElementById("es-name").value || "").trim();
-  const message = (document.getElementById("es-message").value || "").trim();
-  const schedType = document.getElementById("es-type").value;
-  const cronExpr = (document.getElementById("es-cron").value || "").trim();
-  let targetMode = document.getElementById("es-target").value;
-  if (targetMode === "node")
-    targetMode = (document.getElementById("es-node").value || "").trim();
-  let atTime = document.getElementById("es-at").value || "";
-
-  const editNotifyTargets = _collectNotifyTargets("es");
-  const errEl = document.getElementById("edit-schedule-error");
+function _submitScheduleShelf() {
+  const shelf = document.getElementById("schedule-shelf");
+  const errEl = document.getElementById("schedule-shelf-error");
+  const taskId = document.getElementById("sch-id").value;
+  const name = (document.getElementById("sch-name").value || "").trim();
+  const message = (document.getElementById("sch-message").value || "").trim();
 
   if (!name) return _showModalError(errEl, "Name is required");
   if (!message) return _showModalError(errEl, "Initial message is required");
-  if (schedType === "cron" && !cronExpr)
-    return _showModalError(errEl, "Cron expression is required");
-  if (schedType === "at" && !atTime)
-    return _showModalError(errEl, "Run time is required");
+  const compiled = _schCompile();
+  if (compiled.error) return _showModalError(errEl, compiled.error);
 
-  // Convert browser local time to UTC for the server
-  if (schedType === "at" && atTime) {
-    atTime = _localToUtcIso(atTime);
+  let targetMode = document.getElementById("sch-target").value;
+  if (targetMode === "node") {
+    targetMode = (document.getElementById("sch-node").value || "").trim();
+    if (!targetMode) return _showModalError(errEl, "Node ID is required");
   }
 
-  const btn = document.getElementById("es-submit");
-  btn.disabled = true;
-  btn.textContent = "Saving\u2026";
+  const body = {
+    name: name,
+    description: (document.getElementById("sch-desc").value || "").trim(),
+    schedule_type: compiled.schedule_type,
+    cron_expr: compiled.cron_expr,
+    at_time: compiled.at_time,
+    target_mode: targetMode,
+    model: (document.getElementById("sch-model").value || "").trim(),
+    skill: (document.getElementById("sch-template").value || "").trim(),
+    initial_message: message,
+    auto_approve: document.getElementById("sch-autoapprove").checked,
+    notify_targets: _collectNotifyTargets("sch"),
+  };
+  if (taskId) body.enabled = document.getElementById("sch-enabled").checked;
 
-  authFetch("/v1/api/admin/schedules/" + encodeURIComponent(taskId), {
-    method: "PUT",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      name: name,
-      description: (document.getElementById("es-desc").value || "").trim(),
-      schedule_type: schedType,
-      cron_expr: cronExpr,
-      at_time: atTime,
-      target_mode: targetMode,
-      model: (document.getElementById("es-model").value || "").trim(),
-      skill: (document.getElementById("es-template").value || "").trim(),
-      initial_message: message,
-      auto_approve: document.getElementById("es-autoapprove").checked,
-      enabled: document.getElementById("es-enabled").checked,
-      notify_targets: editNotifyTargets,
-    }),
-  })
+  errEl.classList.remove("is-visible");
+  window.TurnstoneHatch.setBusy(shelf, true);
+  authFetch(
+    taskId
+      ? "/v1/api/admin/schedules/" + encodeURIComponent(taskId)
+      : "/v1/api/admin/schedules",
+    {
+      method: taskId ? "PUT" : "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    },
+  )
     .then(function (r) {
       if (!r.ok)
         return r.json().then(function (d) {
@@ -1831,14 +2055,16 @@ function submitEditSchedule() {
       return r.json();
     })
     .then(function () {
-      hideEditScheduleModal();
-      showToast("Schedule updated");
+      window.TurnstoneHatch.setBusy(shelf, false);
+      if (_schShelfHandle) _schShelfHandle.close();
+      showToast(
+        taskId ? "Schedule updated" : "Schedule '" + name + "' created",
+      );
       loadAdminSchedules();
     })
     .catch(function (err) {
-      btn.disabled = false;
-      btn.textContent = "Save";
-      _showModalError(errEl, err.message || "Failed to update schedule");
+      window.TurnstoneHatch.setBusy(shelf, false);
+      _showModalError(errEl, err.message || "Failed to save schedule");
     });
 }
 
@@ -2402,9 +2628,6 @@ function _installTrap(overlayId, boxId, trapRef) {
         else if (overlayId === "token-created-overlay") hideTokenCreatedModal();
         else if (overlayId === "create-channel-overlay")
           hideCreateChannelModal();
-        else if (overlayId === "create-schedule-overlay")
-          hideCreateScheduleModal();
-        else if (overlayId === "edit-schedule-overlay") hideEditScheduleModal();
         else if (overlayId === "schedule-runs-overlay") hideScheduleRunsModal();
         else if (overlayId === "confirm-overlay") hideConfirmModal();
         else if (overlayId === "create-role-overlay") hideCreateRoleModal();
@@ -2477,18 +2700,6 @@ document.addEventListener("keydown", function (e) {
   if (cc && cc.style.display !== "none") {
     e.preventDefault();
     hideCreateChannelModal();
-    return;
-  }
-  const cso = document.getElementById("create-schedule-overlay");
-  if (cso && cso.style.display !== "none") {
-    e.preventDefault();
-    hideCreateScheduleModal();
-    return;
-  }
-  const eso = document.getElementById("edit-schedule-overlay");
-  if (eso && eso.style.display !== "none") {
-    e.preventDefault();
-    hideEditScheduleModal();
     return;
   }
   const sro = document.getElementById("schedule-runs-overlay");
