@@ -296,6 +296,13 @@ class TLSClient:
         """
         import asyncio
 
+        if attempts < 1:
+            # range(1, attempts + 1) would be empty: init() would return
+            # "successfully" with no CA and no cert.
+            raise ValueError(f"attempts must be >= 1, got {attempts}")
+        if base_delay < 0:
+            raise ValueError(f"base_delay must be >= 0, got {base_delay}")
+
         for attempt in range(1, attempts + 1):
             try:
                 if not self._console_url:

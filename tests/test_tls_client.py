@@ -128,6 +128,22 @@ def _make_flaky_client(monkeypatch, failures: int):
 
 
 @pytest.mark.anyio
+async def test_init_rejects_invalid_retry_params():
+    """attempts < 1 would make init() a silent no-op; fail fast instead."""
+    from turnstone.core.tls import TLSClient
+
+    client = TLSClient(
+        storage=get_storage(),
+        console_url="http://console:9999",
+        hostnames=["node-1"],
+    )
+    with pytest.raises(ValueError, match="attempts must be >= 1"):
+        await client.init(attempts=0)
+    with pytest.raises(ValueError, match="base_delay must be >= 0"):
+        await client.init(attempts=2, base_delay=-1.0)
+
+
+@pytest.mark.anyio
 async def test_init_default_single_attempt(monkeypatch):
     """Default init() keeps the old behavior: one attempt, no sleep."""
     client, calls, sleeps = _make_flaky_client(monkeypatch, failures=1)
