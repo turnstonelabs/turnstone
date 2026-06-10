@@ -953,17 +953,12 @@
  *     <span class="toggle-label">Enabled</span>
  *   </label>
  */
-/* Selector is doubled with .admin-modal so we win the specificity
- * battle against ``.admin-modal label`` (0,1,1) — without that, the
- * parent rule's display:block + text-transform:uppercase + margins
- * cascade and we lose the inline-flex layout.
- *
- * Default margin-top: 14px matches the .admin-modal label cadence
- * for toggles that sit directly between regular labelled rows
- * (schedule/policy/skill modals).  When a toggle is inside an
- * explicit ``.toggle-stack`` flex container, the stack resets the
- * margin so the parent's gap controls spacing on its own. */
-.admin-modal label.toggle-switch,
+/* Default margin-top: 14px matches the shelf form cadence for toggles
+ * that sit directly between regular labelled rows.  When a toggle is
+ * inside an explicit ``.toggle-stack`` flex container, the stack resets
+ * the margin so the parent's gap controls spacing on its own.  (Inside
+ * a hatch body, hatch.css restates this layout at higher specificity —
+ * the .sh-body label.toggle-switch exception.) */
 label.toggle-switch {
   display: inline-flex;
   align-items: center;
@@ -978,7 +973,6 @@ label.toggle-switch {
   font-weight: 500;
   color: var(--fg);
 }
-.admin-modal .toggle-stack > label.toggle-switch,
 .toggle-stack > label.toggle-switch {
   margin: 0;
 }
@@ -987,23 +981,15 @@ label.toggle-switch {
  * toggle is the first row of a modal (under the h2) or when it lives
  * in a dynamically-rendered row that already supplies its own
  * spacing (e.g. judge bool settings). */
-.admin-modal label.toggle-switch.toggle--flush,
 label.toggle-switch.toggle--flush {
   margin-top: 0;
 }
-.admin-modal .toggle-stack,
 .toggle-stack {
   display: flex;
   flex-direction: column;
   gap: 10px;
   margin-top: 16px;
 }
-/* Hidden-input + track rules also need the .admin-modal prefix to
- * outrank ``.admin-modal input:not([type="hidden"])`` (same
- * specificity 0,2,1; that one comes later in source so without the
- * bump it wins and forces width:100% on the hidden input, popping it
- * back into the layout). */
-.admin-modal .toggle-switch input[type="checkbox"],
 .toggle-switch input[type="checkbox"] {
   /* Visually hidden but still focusable + click-targetable via the
    * <label> wrap.  Avoids display:none, which would strip the input
@@ -1018,7 +1004,6 @@ label.toggle-switch.toggle--flush {
   clip: rect(0 0 0 0);
   white-space: nowrap;
 }
-.admin-modal .toggle-switch .toggle-track,
 .toggle-switch .toggle-track {
   position: relative;
   flex: 0 0 auto;
@@ -1039,7 +1024,6 @@ label.toggle-switch.toggle--flush {
     background 0.18s ease,
     box-shadow 0.18s ease;
 }
-.admin-modal .toggle-switch .toggle-track::before,
 .toggle-switch .toggle-track::before {
   content: "";
   position: absolute;
@@ -1051,21 +1035,17 @@ label.toggle-switch.toggle--flush {
   border-radius: 50%;
   transition: transform 0.18s ease;
 }
-.admin-modal .toggle-switch input:checked + .toggle-track,
 .toggle-switch input:checked + .toggle-track {
   background: var(--accent);
   box-shadow: none;
 }
-.admin-modal .toggle-switch input:checked + .toggle-track::before,
 .toggle-switch input:checked + .toggle-track::before {
   transform: translateX(18px);
   background: var(--bg);
 }
-.admin-modal .toggle-switch input:focus-visible + .toggle-track,
 .toggle-switch input:focus-visible + .toggle-track {
   box-shadow: 0 0 0 3px var(--accent-dim);
 }
-.admin-modal .toggle-switch input:disabled + .toggle-track,
 .toggle-switch input:disabled + .toggle-track {
   opacity: 0.4;
 }
@@ -1086,21 +1066,6 @@ label.toggle-switch.toggle--flush {
   color: var(--fg-dim);
 }
 
-/* Hair divider for separating conceptually-grouped toggles inside a
- * stack — used between the lone "Enabled" toggle and the paired
- * Reasoning toggles in the Add Model modal so the grouping reads
- * without needing a subheading or indent.  Margin: 0 because the
- * .toggle-stack flex container already supplies a 10px gap on each
- * side; adding a margin on top would visually separate the divider
- * twice. */
-.admin-modal hr.toggle-group-divider,
-hr.toggle-group-divider {
-  border: 0;
-  border-top: 1px solid var(--border);
-  margin: 0;
-  width: 100%;
-}
-
 /* Segmented option list — vertical card group for radio choices that
  * benefit from a strong selected-state highlight.  The native
  * ``<input type="radio">`` is visually hidden but stays focusable;
@@ -1119,7 +1084,6 @@ hr.toggle-group-divider {
  *     ...
  *   </div>
  */
-.admin-modal .segmented-control,
 .segmented-control {
   display: flex;
   flex-direction: column;
@@ -1129,7 +1093,6 @@ hr.toggle-group-divider {
   background: var(--bg);
   margin-top: 8px;
 }
-.admin-modal .segmented-option,
 .segmented-option {
   display: flex;
   align-items: center;
@@ -1220,28 +1183,8 @@ hr.toggle-group-divider {
   color: var(--accent);
 }
 
-/* Admin modals */
-.admin-modal {
-  background: var(--bg-surface);
-  border: 1px solid var(--border-strong);
-  border-radius: var(--radius);
-  padding: 32px;
-  width: 380px;
-  max-width: 90vw;
-  max-height: 85vh;
-  overflow-y: auto;
-  box-shadow:
-    0 24px 48px -12px rgba(0, 0, 0, 0.5),
-    0 0 80px -20px var(--accent-dim);
-  position: relative;
-}
-.admin-modal.admin-modal-wide {
-  width: 820px;
-}
+/* Narrow viewport: the MCP-detail two-column read-out stacks. */
 @media (max-width: 700px) {
-  .admin-modal.admin-modal-wide {
-    width: auto;
-  }
   .modal-columns {
     grid-template-columns: 1fr;
     gap: 20px 0;
@@ -1255,89 +1198,6 @@ hr.toggle-group-divider {
   .modal-columns > .modal-col:last-child {
     padding-left: 0;
   }
-}
-.admin-modal::before {
-  content: "";
-  position: absolute;
-  top: 0;
-  left: 20%;
-  right: 20%;
-  height: 2px;
-  background: linear-gradient(90deg, transparent, var(--accent), transparent);
-  border-radius: 1px;
-  z-index: 1;
-  pointer-events: none;
-}
-.admin-modal h2 {
-  font-family: var(--font-ui);
-  font-size: 15px;
-  font-weight: 700;
-  color: var(--accent);
-  margin-bottom: 16px;
-  letter-spacing: 0.02em;
-}
-.admin-modal label {
-  display: block;
-  font-family: var(--font-ui);
-  font-size: 10px;
-  font-weight: 600;
-  text-transform: uppercase;
-  letter-spacing: 0.08em;
-  color: var(--fg-dim);
-  margin-bottom: 5px;
-  margin-top: 12px;
-}
-.admin-modal label:first-of-type {
-  margin-top: 0;
-}
-.admin-modal input:not([type="hidden"]),
-.admin-modal select,
-.admin-modal textarea {
-  width: 100%;
-  padding: 9px 12px;
-  background: var(--bg);
-  border: 1px solid var(--border-strong);
-  border-radius: var(--radius-sm);
-  color: var(--fg);
-  font: inherit;
-  font-size: 13px;
-  transition:
-    border-color 0.15s,
-    box-shadow 0.15s;
-}
-.admin-modal input:focus,
-.admin-modal select:focus,
-.admin-modal textarea:focus {
-  border-color: var(--accent);
-  outline: none;
-  box-shadow: 0 0 0 3px var(--accent-dim);
-}
-.admin-modal input:disabled,
-.admin-modal select:disabled,
-.admin-modal textarea:disabled {
-  opacity: 0.55;
-  cursor: not-allowed;
-  background: var(--bg-highlight);
-  border-color: var(--border);
-  color: var(--fg-dim);
-}
-.admin-modal input::placeholder,
-.admin-modal textarea::placeholder {
-  color: var(--fg-dim);
-  opacity: 0.6;
-}
-.admin-modal textarea {
-  resize: vertical;
-  min-height: 40px;
-}
-.admin-modal [role="alert"] {
-  display: none;
-  color: var(--red);
-  font-size: 12px;
-  margin-bottom: 8px;
-}
-.admin-modal [role="alert"].is-visible {
-  display: block;
 }
 
 .admin-inline-add {
@@ -1432,61 +1292,10 @@ hr.toggle-group-divider {
   }
 }
 
-.admin-details {
-  margin-top: 12px;
-  border: 1px solid var(--border);
-  border-radius: 6px;
-  padding: 0 12px;
-}
-.admin-details[open] {
-  padding-bottom: 12px;
-}
-.admin-details summary {
-  cursor: pointer;
-  padding: 10px 0;
-  font-family: var(--font-ui);
-  font-size: 11px;
-  font-weight: 600;
-  text-transform: uppercase;
-  letter-spacing: 0.06em;
-  color: var(--fg-dim);
-  display: flex;
-  justify-content: space-between;
-  align-items: center;
-  list-style: none;
-}
-.admin-details summary::-webkit-details-marker {
-  display: none;
-}
-.admin-details summary::after {
-  content: "\25B8";
-  font-size: 11px;
-  color: var(--fg-dim);
-  transition: transform 0.15s ease;
-}
-.admin-details[open] summary::after {
-  transform: rotate(90deg);
-}
-.admin-details summary .label-hint {
-  font-weight: 400;
-}
-.admin-details label:first-of-type {
-  margin-top: 4px;
-}
-
 /* ==========================================================================
-   Skill Spec Modal — two-column manifest layout
+   Skill shelf — two-column spec body
    Left: Identity / Manifest / Deployment  |  Right: Skill Content
    ========================================================================== */
-.admin-modal-skill {
-  padding: 28px 28px 24px;
-}
-/* Reserve space for the absolute-positioned lock button (top-right) so a
-   long title can never collide with it. */
-.admin-modal-skill > h2 {
-  padding-right: 44px;
-}
-
 .skill-spec-body {
   display: grid;
   grid-template-columns: 1fr 1.55fr;
@@ -1641,79 +1450,6 @@ h3.skill-spec-heading {
   .skill-config-grid {
     grid-template-columns: 1fr 1fr;
   }
-}
-
-.modal-buttons {
-  display: flex;
-  gap: 10px;
-  margin-top: 20px;
-}
-.modal-cancel {
-  flex: 1;
-  padding: 9px;
-  background: var(--bg-highlight);
-  color: var(--fg);
-  border: 1px solid var(--border-strong);
-  border-radius: var(--radius-sm);
-  font: inherit;
-  font-family: var(--font-ui);
-  font-size: 12px;
-  font-weight: 500;
-  cursor: pointer;
-  transition: background 0.15s;
-}
-.modal-cancel:hover {
-  background: var(--bg-elevated);
-}
-.modal-cancel:focus-visible {
-  outline: 2px solid var(--accent);
-  outline-offset: 2px;
-}
-.modal-cancel:disabled {
-  opacity: 0.5;
-  cursor: not-allowed;
-  pointer-events: none;
-}
-.modal-submit {
-  flex: 1;
-  padding: 9px;
-  background: var(--accent);
-  color: var(--bg);
-  border: none;
-  border-radius: var(--radius-sm);
-  font: inherit;
-  font-family: var(--font-ui);
-  font-size: 12px;
-  font-weight: 600;
-  cursor: pointer;
-  transition: filter 0.15s;
-}
-.modal-submit:hover {
-  filter: brightness(1.1);
-}
-.modal-submit:focus-visible {
-  /* fg-bright (not accent) — modal-submit has an accent background, so
-     accent-on-accent would be invisible. Cancel/secondary use --accent
-     because their backgrounds are transparent / highlight. */
-  outline: 2px solid var(--fg-bright);
-  outline-offset: 2px;
-}
-.modal-submit:disabled {
-  opacity: 0.4;
-  cursor: not-allowed;
-  filter: none;
-}
-#create-template-overlay,
-#edit-template-overlay {
-  position: fixed;
-  inset: 0;
-  background: rgba(0, 0, 0, 0.7);
-  backdrop-filter: blur(6px);
-  -webkit-backdrop-filter: blur(6px);
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  z-index: 600;
 }
 
 /* Token display (show-once) */
@@ -2353,8 +2089,8 @@ h3.skill-spec-heading {
 /* Permission section grouping — keeps each namespace contiguous so
  * the row-flow grid below doesn't slice ``admin.*`` mid-column.  The
  * caps-styled ``.perm-section-label`` re-anchors the toggles to the
- * modal's typographic system (matches ``.admin-modal label``: 10px
- * caps, 0.08em letter-spacing, fg-dim). */
+ * shelf's typographic system (matches ``.sh-body label``: 10px caps,
+ * 0.08em letter-spacing, fg-dim). */
 .perm-section {
   margin-top: 12px;
 }
@@ -2380,7 +2116,6 @@ h3.skill-spec-heading {
  * permission name in monospace + lower case (it's an identifier, not
  * a heading) — overrides the .toggle-label's caps/letter-spacing
  * cadence used elsewhere in admin modals. */
-.admin-modal .perm-grid label.toggle-switch.perm-toggle,
 .perm-grid label.toggle-switch.perm-toggle {
   margin: 0;
 }
@@ -2398,14 +2133,12 @@ h3.skill-spec-heading {
  * human-readable role display names so we keep ui-font + caps-on so
  * the stack reads like a settings list.  Only override the layout
  * margin (the modal already provides outer padding). */
-.admin-modal .user-roles-list,
 .user-roles-list {
   display: flex;
   flex-direction: column;
   gap: 6px;
   margin-top: 8px;
 }
-.admin-modal .user-roles-list label.toggle-switch.user-role-toggle,
 .user-roles-list label.toggle-switch.user-role-toggle {
   margin: 0;
 }
@@ -3647,17 +3380,6 @@ h3.skill-spec-heading {
 }
 
 /* Modal section divider for field groups */
-.modal-section-divider {
-  font-family: var(--font-ui);
-  font-size: 9px;
-  font-weight: 600;
-  text-transform: uppercase;
-  letter-spacing: 0.1em;
-  color: var(--fg-dim);
-  margin: 16px 0 4px;
-  padding-top: 12px;
-  border-top: 1px solid var(--border);
-}
 
 /* Model source badge */
 .scope-db {
@@ -3705,13 +3427,7 @@ h3.skill-spec-heading {
   #view-admin {
     animation: none;
   }
-  .admin-action-btn,
-  .modal-cancel,
-  .modal-submit {
-    transition: none;
-  }
-  .admin-modal input,
-  .admin-modal select {
+  .admin-action-btn {
     transition: none;
   }
   .mcp-status-dot.connecting {
@@ -3719,9 +3435,6 @@ h3.skill-spec-heading {
   }
   .oidc-detail-panel,
   .admin-expand-indicator {
-    transition: none;
-  }
-  .admin-details summary::after {
     transition: none;
   }
   .mcp-view-btn,

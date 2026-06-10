@@ -16,14 +16,6 @@ let _skillDiscoverResults = [];
 let _skillDiscoverQuery = "";
 let _pendingResources = [];
 
-// Trap handler refs for modals
-let _ctmTrapHandler = null; // create template
-let _etmTrapHandler = null; // edit template
-
-// Trigger element refs for focus restoration
-let _ctmTriggerEl = null;
-let _etmTriggerEl = null;
-
 // ---------------------------------------------------------------------------
 // Roles
 // ---------------------------------------------------------------------------

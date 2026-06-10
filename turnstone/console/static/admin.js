@@ -2587,83 +2587,14 @@ function copyCreatedToken() {
   }
 }
 
-// ---------------------------------------------------------------------------
-// Modal focus trap + keyboard
-// ---------------------------------------------------------------------------
-
-function _modalFocusTrap(boxId) {
-  return function (e) {
-    if (e.key === "Tab") {
-      const box = document.getElementById(boxId);
-      if (!box) return;
-      const focusable = box.querySelectorAll(
-        "input:not([disabled]):not([type='hidden']), select:not([disabled]), textarea:not([disabled]), button:not([disabled])",
-      );
-      const visible = [];
-      for (let i = 0; i < focusable.length; i++) {
-        if (focusable[i].offsetParent !== null) visible.push(focusable[i]);
-      }
-      if (visible.length === 0) return;
-      const first = visible[0];
-      const last = visible[visible.length - 1];
-      if (e.shiftKey) {
-        if (document.activeElement === first) {
-          e.preventDefault();
-          last.focus();
-        }
-      } else {
-        if (document.activeElement === last) {
-          e.preventDefault();
-          first.focus();
-        }
-      }
-    }
-  };
-}
-
-function _installTrap(overlayId, boxId, trapRef) {
-  const overlay = document.getElementById(overlayId);
-  if (overlay) {
-    overlay.onclick = function (e) {
-      if (e.target === overlay) {
-        if (overlayId === "create-template-overlay") hideCreateTemplateModal();
-        else if (overlayId === "edit-template-overlay") hideEditTemplateModal();
-      }
-    };
-  }
-  document.body.style.overflow = "hidden";
-  const handler = _modalFocusTrap(boxId);
-  document.addEventListener("keydown", handler);
-  return handler;
-}
-
-function _removeTrap(handler) {
-  if (handler) document.removeEventListener("keydown", handler);
-  document.body.style.overflow = "";
-  return null;
-}
-
-// Global Escape key for admin modals
+// Escape closes any open settings help popover (the settings panels and the
+// shelf form help buttons share the same popover component).
 document.addEventListener("keydown", function (e) {
   if (e.key !== "Escape") return;
-  // Close any open settings help popover first
   const openHelp = document.querySelector('.settings-help-popover[style=""]');
   if (openHelp) {
     e.preventDefault();
     _closeAllSettingsHelp();
-    return;
-  }
-  const govOverlays = [
-    ["create-template-overlay", hideCreateTemplateModal],
-    ["edit-template-overlay", hideEditTemplateModal],
-  ];
-  for (let gi = 0; gi < govOverlays.length; gi++) {
-    const govEl = document.getElementById(govOverlays[gi][0]);
-    if (govEl && govEl.style.display !== "none") {
-      e.preventDefault();
-      govOverlays[gi][1]();
-      return;
-    }
   }
 });
 
@@ -3576,12 +3507,11 @@ function _resetSetting(key) {
 // Helpers
 // ---------------------------------------------------------------------------
 
-// Show an error message in a modal's [role="alert"] element. The .is-visible
-// class is the canonical toggle — see `.admin-modal [role="alert"]` in
-// style.css. Do NOT use `el.style.display = "block"` here; the CSS rule
-// `.admin-modal [role="alert"] { display: none }` is selector-equivalent and
-// will hide the element again as soon as the inline style is cleared. Hide
-// side is `el.classList.remove("is-visible")`.
+// Show an error message in a shelf's sh-alert element. The .is-visible class
+// is the canonical toggle — see `.sh-alert` in hatch.css. Do NOT use
+// `el.style.display = "block"` here; the CSS rule `.sh-alert { display: none }`
+// is selector-equivalent and will hide the element again as soon as the
+// inline style is cleared. Hide side is `el.classList.remove("is-visible")`.
 function _showModalError(el, msg) {
   el.textContent = msg;
   el.classList.add("is-visible");
