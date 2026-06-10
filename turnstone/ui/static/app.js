@@ -800,12 +800,6 @@ function toggleSelectAll() {
 function confirmWsDeleteSelection() {
   _wsTable.controller.confirmSelection();
 }
-function cancelWsDelete() {
-  _wsTable.controller.closeModal();
-}
-function confirmWsDelete() {
-  _wsTable.controller.confirm();
-}
 
 // --- Workstream title management ---
 
@@ -2014,9 +2008,6 @@ document.addEventListener("keydown", function (e) {
   // Defer while a document-modal hatch dialog is open — native dialogs own
   // their Escape, and global shortcuts must not fire under the top layer.
   if (document.querySelector("dialog:modal")) return;
-  // The batch ws-delete modal is still a legacy overlay with its own trap.
-  const wsDel = document.getElementById("ws-delete-overlay");
-  if (wsDel && wsDel.style.display !== "none") return;
   if (e.key === "Escape" && dashboardVisible) {
     e.preventDefault();
     hideDashboard();

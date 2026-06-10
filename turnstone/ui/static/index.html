@@ -484,39 +484,40 @@
       </footer>
     </dialog>
 
-    <!-- Delete workstreams confirmation modal (batch) -->
-    <div
-      id="ws-delete-overlay"
-      class="ws-delete-modal-overlay"
-      style="display: none"
-      role="dialog"
-      aria-modal="true"
+    <!-- Delete workstreams confirmation (batch, document-modal) — the list,
+     foot meta and action label are populated by the shared cards.js
+     controller (idPrefix "ws-delete"). -->
+    <dialog
+      class="hatch hatch--dialog hatch--md"
+      id="ws-delete-dialog"
+      data-kind="danger"
+      role="alertdialog"
       aria-labelledby="ws-delete-title"
     >
-      <div id="ws-delete-box" class="ws-delete-modal-box">
-        <h3 id="ws-delete-title">Delete Workstreams</h3>
-        <div id="ws-delete-error" role="alert" aria-live="assertive"></div>
-        <p id="ws-delete-count"></p>
-        <div id="ws-delete-list" class="ws-delete-modal-list"></div>
-        <div id="ws-delete-buttons" class="ws-delete-modal-buttons">
-          <button
-            id="ws-delete-cancel-btn"
-            type="button"
-            onclick="cancelWsDelete()"
-          >
-            Cancel
-          </button>
-          <button
-            id="ws-delete-confirm-btn"
-            class="ws-delete-confirm"
-            type="button"
-            onclick="confirmWsDelete()"
-          >
-            Delete
-          </button>
-        </div>
+      <header class="sh-head">
+        <span class="sh-led" aria-hidden="true"></span>
+        <h2 class="sh-title" id="ws-delete-title">Delete workstreams</h2>
+        <button class="sh-x" data-close aria-label="Close">✕</button>
+      </header>
+      <div class="sh-body">
+        <div
+          id="ws-delete-error"
+          class="sh-alert"
+          role="alert"
+          aria-live="assertive"
+          aria-atomic="true"
+        ></div>
+        <p class="sh-prose" id="ws-delete-count"></p>
+        <div id="ws-delete-list"></div>
       </div>
-    </div>
+      <footer class="sh-foot">
+        <div class="sh-foot-meta" id="ws-delete-meta"></div>
+        <button class="sh-btn" data-close autofocus>Cancel</button>
+        <button id="ws-delete-confirm-btn" class="sh-btn sh-btn--danger">
+          Delete
+        </button>
+      </footer>
+    </dialog>
 
     <div id="toast" role="status" aria-live="polite"></div>
     <script>

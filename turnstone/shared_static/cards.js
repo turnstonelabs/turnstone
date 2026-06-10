@@ -577,21 +577,22 @@ export function createSavedTable(opts) {
      - delete-mode state (active flag + selected ws_id set)
      - card decoration (checkbox + key/click overrides)
      - the bottom toolbar wiring (count, Select All, Delete Selected)
-     - the confirmation modal (focus trap, batch fan-out, results view)
+     - the confirmation dialog (hatch dialog tier: batch fan-out + results
+       view; focus trap / Escape / busy lock belong to hatch.js)
 
    It does NOT own how cards get fetched or rendered — the caller's
    render() is invoked when the controller needs the list redrawn (mode
    transitions, Select-All toggles).
 
    Required opts:
-     idPrefix          — DOM-id prefix shared by the toolbar + modal
+     idPrefix          — DOM-id prefix shared by the toolbar + dialog
                          (e.g. "ws-delete" / "coord-delete").  The DOM
                          must already contain `${idPrefix}-bar`,
                          `${idPrefix}-bar-count`, `${idPrefix}-bar-delete`,
-                         `${idPrefix}-bar-select-all`, `${idPrefix}-overlay`,
-                         `${idPrefix}-box`, `${idPrefix}-error`,
+                         `${idPrefix}-bar-select-all`, `${idPrefix}-dialog`
+                         (a `dialog.hatch.hatch--dialog`), `${idPrefix}-error`,
                          `${idPrefix}-count`, `${idPrefix}-list`,
-                         `${idPrefix}-confirm-btn`, `${idPrefix}-cancel-btn`.
+                         `${idPrefix}-meta`, `${idPrefix}-confirm-btn`.
      buttonId          — id of the section's start/cancel toggle button.
      noun              — singular display word for the item kind, e.g.
                          "workstream" / "coordinator".  Used in toast +
@@ -610,11 +611,6 @@ export function createSavedTable(opts) {
 */
 export function createSavedCardsController(opts) {
   var state = { mode: false, selected: {}, items: [] };
-  var batchTrap = null;
-  /* Element that owned focus when the modal opened — restored in
-     closeModal() so keyboard users land back on the toggle button (or
-     wherever they came from) instead of <body>.  WCAG 2.4.3. */
-  var prevFocus = null;
 
   function $(id) {
     return document.getElementById(opts.idPrefix + "-" + id);
@@ -767,13 +763,19 @@ export function createSavedCardsController(opts) {
   }
 
   function _byId() {
-    /* Single-pass index over the visible items so the modal + fan-out
+    /* Single-pass index over the visible items so the dialog + fan-out
        paths don't repeat O(N) `find` calls per selection. */
     var map = {};
     state.items.forEach(function (s) {
       map[s.ws_id] = s;
     });
     return map;
+  }
+
+  function _deleteLabel(count) {
+    return (
+      "Delete " + count + " " + (count === 1 ? opts.noun : opts.noun + "s")
+    );
   }
 
   function confirmSelection() {
@@ -785,14 +787,24 @@ export function createSavedCardsController(opts) {
       return;
     }
     var byId = _byId();
-    var overlay = $("overlay");
+    var dlg = $("dialog");
     var countEl = $("count");
     var listEl = $("list");
     var errorEl = $("error");
-    if (errorEl) errorEl.textContent = "";
+    var metaEl = $("meta");
+    if (errorEl) {
+      errorEl.textContent = "";
+      errorEl.classList.remove("is-visible");
+    }
+    /* The results view hides Cancel (Close-only foot) — restore it. */
+    var cancelBtn = dlg.querySelector(".sh-foot [data-close]");
+    if (cancelBtn) cancelBtn.hidden = false;
+    if (metaEl) metaEl.textContent = selected.length + " selected";
     if (countEl) {
       countEl.textContent =
-        selected.length + " " + opts.noun + "(s) will be permanently deleted:";
+        (selected.length === 1
+          ? "This " + opts.noun
+          : "These " + opts.noun + "s") + " will be permanently deleted:";
     }
     if (listEl) {
       listEl.replaceChildren();
@@ -807,92 +819,37 @@ export function createSavedCardsController(opts) {
     }
     var delBtn = $("confirm-btn");
     if (delBtn) {
-      delBtn.textContent = "Delete";
-      delBtn.disabled = false;
-      delBtn.classList.remove("ws-delete-close");
-      delBtn.classList.add("ws-delete-confirm");
+      delBtn.textContent = _deleteLabel(selected.length);
+      delBtn.classList.add("sh-btn--danger");
       delBtn.onclick = confirm;
     }
-    var cancelBtn = $("cancel-btn");
-    if (cancelBtn) cancelBtn.disabled = false;
-    if (overlay) overlay.style.display = "flex";
-
-    if (batchTrap) document.removeEventListener("keydown", batchTrap);
-    batchTrap = function (e) {
-      if (e.key === "Escape") {
-        e.preventDefault();
-        closeModal();
-        return;
-      }
-      if (e.key === "Tab") {
-        var box = $("box");
-        if (!box) return;
-        var focusable = box.querySelectorAll("button:not(:disabled)");
-        if (!focusable.length) return;
-        var first = focusable[0];
-        var last = focusable[focusable.length - 1];
-        if (e.shiftKey && document.activeElement === first) {
-          e.preventDefault();
-          last.focus();
-        } else if (!e.shiftKey && document.activeElement === last) {
-          e.preventDefault();
-          first.focus();
-        }
-      }
-    };
-    document.addEventListener("keydown", batchTrap);
-    /* Snapshot the pre-modal focus owner so closeModal() can return to
-       it.  Captured before we move focus into the dialog so the
-       restore-target is the caller, not the dialog itself. */
-    prevFocus = document.activeElement;
-    if (cancelBtn) cancelBtn.focus();
+    /* Hatch owns the rest: focus trap, Escape, backdrop click, the busy
+       lock, and focus restore to the opener.  Cancel carries the markup
+       autofocus (destructive-confirm rule). */
+    window.TurnstoneHatch.openDialog(dlg);
   }
 
   function closeModal() {
-    var overlay = $("overlay");
-    if (overlay) overlay.style.display = "none";
-    if (batchTrap) {
-      document.removeEventListener("keydown", batchTrap);
-      batchTrap = null;
-    }
-    /* Pick the most useful focus target:
-         1. prevFocus (where the user came from), if it's still in the
-            DOM and visible.  Esc / Cancel paths land here — the bar is
-            still on screen, so focus returns to "Delete Selected".
-         2. The section toggle button — always present, semantic exit
-            point for the flow.  Used when prevFocus has been hidden by
-            cancel() (post-delete Close path: cancel() ran first and
-            put `.ws-delete-bar` at display:none, so the bar's button
-            is no longer focusable). */
-    var target = prevFocus;
-    if (!target || target.offsetParent === null) {
-      target = document.getElementById(opts.buttonId);
-    }
-    if (target && typeof target.focus === "function") {
-      try {
-        target.focus();
-      } catch (_) {
-        /* node detached between open and close — give up silently */
-      }
-    }
-    prevFocus = null;
+    var dlg = $("dialog");
+    if (dlg && dlg.open) dlg.close();
   }
 
   function confirm() {
     var selected = Object.keys(state.selected);
     if (!selected.length) return;
     var byId = _byId();
+    var dlg = $("dialog");
     var errorEl = $("error");
     var listEl = $("list");
     var countEl = $("count");
+    var metaEl = $("meta");
     var delBtn = $("confirm-btn");
-    var cancelBtn = $("cancel-btn");
-    if (errorEl) errorEl.textContent = "";
-    if (delBtn) {
-      delBtn.disabled = true;
-      delBtn.textContent = "Deleting...";
+    if (errorEl) {
+      errorEl.textContent = "";
+      errorEl.classList.remove("is-visible");
     }
-    if (cancelBtn) cancelBtn.disabled = true;
+    /* LED pulses, actions lock, dismissal refused while the fan-out runs. */
+    window.TurnstoneHatch.setBusy(dlg, true);
 
     var results = [];
     var promises = selected.map(function (wsId) {
@@ -939,6 +896,7 @@ export function createSavedCardsController(opts) {
     });
 
     Promise.all(promises).then(function () {
+      window.TurnstoneHatch.setBusy(dlg, false);
       if (listEl) {
         listEl.replaceChildren();
         results.forEach(function (r) {
@@ -958,27 +916,28 @@ export function createSavedCardsController(opts) {
       if (countEl) {
         countEl.textContent = okCount + " deleted, " + failCount + " failed";
       }
+      if (metaEl) metaEl.textContent = "";
+      /* Close-only foot: a Cancel beside a Close would be the redundant
+         dismissal pair the foot grammar forbids. */
+      var cancelBtn = dlg ? dlg.querySelector(".sh-foot [data-close]") : null;
+      if (cancelBtn) cancelBtn.hidden = true;
       if (delBtn) {
-        delBtn.disabled = false;
         delBtn.textContent = "Close";
-        /* Swap modifier classes so styling is intent-driven instead of
-           cascade-positional: the Close button picks up the default
-           ".ws-delete-modal-buttons button" rule once .ws-delete-confirm
-           is removed. */
-        delBtn.classList.remove("ws-delete-confirm");
-        delBtn.classList.add("ws-delete-close");
+        /* The results view's action is no longer destructive — drop the
+           danger fill (confirmSelection restores it on the next open). */
+        delBtn.classList.remove("sh-btn--danger");
         delBtn.onclick = function () {
-          /* Order matters: cancel() reshapes the toggle button via
-             setIconButton(), which preserves the element identity but
-             swaps its subtree.  closeModal() then focuses prevFocus —
-             which IS that toggle button — landing on a freshly rebuilt
-             "Delete" affordance instead of <body>. */
+          /* Order matters: cancel() hides the delete bar, so the dialog's
+             native focus restore (the opener was the bar's button) no-ops
+             on a display:none element — hand focus to the section toggle,
+             which cancel() just rebuilt as a fresh "Delete" affordance. */
           cancel();
           closeModal();
+          var t = document.getElementById(opts.buttonId);
+          if (t && typeof t.focus === "function") t.focus();
           if (typeof opts.onClose === "function") opts.onClose();
         };
       }
-      if (cancelBtn) cancelBtn.disabled = false;
     });
   }
 

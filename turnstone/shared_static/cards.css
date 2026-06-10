@@ -163,100 +163,25 @@
   background: var(--bg-highlight);
 }
 
-/* Delete modal — id-scoped so the surface that owns it controls visibility.
-   Both ui/static (#ws-delete-overlay) and console/static
-   (#coord-delete-overlay) share the same shape via the .ws-delete-modal
-   class hooks below. */
-.ws-delete-modal-overlay {
-  position: fixed;
-  inset: 0;
-  background: rgba(0, 0, 0, 0.6);
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  z-index: 10000;
-}
-.ws-delete-modal-box {
-  background: var(--bg-surface);
-  border: 1px solid var(--border);
-  border-radius: var(--radius);
-  padding: 24px;
-  max-width: 480px;
-  width: 90%;
-}
-.ws-delete-modal-box h3 {
-  margin: 0 0 12px;
-  font-size: 16px;
-  color: var(--fg-bright);
-}
-.ws-delete-modal-list {
-  max-height: 200px;
-  overflow-y: auto;
-  margin: 12px 0;
-}
-.ws-delete-modal-list .ws-delete-item {
+/* Batch-delete confirm list — rendered by cards.js inside the
+   #ws-delete-dialog / #coord-delete-dialog hatch dialogs.  The dialog
+   chrome, alert strip and scroll region are hatch.css's (the sh-body is
+   the only scroll region); only the row treatment lives here. */
+.ws-delete-item {
   padding: 6px 0;
   font-size: 13px;
   color: var(--fg-bright);
   border-bottom: 1px solid var(--border);
   /* Long aliases / raw ws_ids in the confirm + results list shouldn't
-     punch out of the modal at narrow viewports. */
+     punch out of the dialog at narrow viewports. */
   word-break: break-word;
 }
-/* Modal alert region — only painted when the controller writes a
-   message.  Both close paths clear it, so :not(:empty) keeps the box
-   invisible at rest and avoids an empty-frame artefact. */
-.ws-delete-modal-box [role="alert"]:not(:empty) {
-  background: rgba(248, 113, 113, 0.08);
-  border: 1px solid var(--red);
-  color: var(--red);
-  border-radius: var(--radius);
-  padding: 8px 10px;
-  font-size: 12px;
-  margin-bottom: 8px;
-}
-[data-theme="light"] .ws-delete-modal-box [role="alert"]:not(:empty) {
-  background: rgba(220, 38, 38, 0.06);
-}
-.ws-delete-modal-list .ws-delete-item:last-child {
+.ws-delete-item:last-child {
   border-bottom: none;
 }
-.ws-delete-modal-list .ws-delete-item.ws-delete-error {
+.ws-delete-item.ws-delete-error {
   color: var(--red);
 }
-.ws-delete-modal-buttons {
-  display: flex;
-  gap: 8px;
-  justify-content: flex-end;
-  margin-top: 16px;
-}
-.ws-delete-modal-buttons button {
-  padding: 8px 20px;
-  border-radius: var(--radius);
-  font-size: 13px;
-  font-weight: 500;
-  cursor: pointer;
-  border: 1px solid var(--border);
-  background: transparent;
-  color: var(--fg-bright);
-}
-.ws-delete-modal-buttons button.ws-delete-confirm {
-  /* Mirror .ws-delete-bar-btn's contrast bump — same destructive
-     filled-button treatment, same dark-theme AA fix. */
-  background: #dc2626;
-  color: #fff;
-  border-color: #dc2626;
-}
-[data-theme="light"] .ws-delete-modal-buttons button.ws-delete-confirm {
-  background: var(--red);
-  border-color: var(--red);
-}
-/* `.ws-delete-close` is a state-marker, not a colour rule — the
-   controller drops `.ws-delete-confirm` when the modal transitions to
-   the post-delete "Close" state, and the default
-   `.ws-delete-modal-buttons button` rule above already provides the
-   transparent / fg-bright / border styling.  The class itself is useful
-   for DOM inspection and as a future hook. */
 
 /* ==========================================================================
    Pagination — shared by the console's filtered admin lists and the saved

@@ -1740,10 +1740,7 @@ function loadSavedCoordinators() {
       // Belt-and-braces: if the user entered delete mode while this
       // fetch was already in flight, defer the render — re-rendering
       // mid-selection would shuffle visible cards and reshape selections.
-      if (
-        _coordTable &&
-        _coordTable.controller.inMode()
-      ) {
+      if (_coordTable && _coordTable.controller.inMode()) {
         _savedCoordsRetry = true;
         return;
       }
@@ -1777,131 +1774,134 @@ let _coordTable = null;
 // deferred ES module now, so its bridged globals (SavedColumns,
 // createSavedTable) don't exist yet while this classic file parses.
 function _initSavedCoordTable() {
-const COORD_COLUMNS = [
-  SavedColumns.name(),
-  {
-    key: "kind",
-    label: "KIND",
-    width: "62px",
-    cell: function (s) {
-      const tag = document.createElement("span");
-      const coord = s.kind === "coordinator";
-      tag.className = "persona-tag" + (coord ? " coord" : " int");
-      tag.textContent = coord ? "COORD" : "INT";
-      return tag;
+  const COORD_COLUMNS = [
+    SavedColumns.name(),
+    {
+      key: "kind",
+      label: "KIND",
+      width: "62px",
+      cell: function (s) {
+        const tag = document.createElement("span");
+        const coord = s.kind === "coordinator";
+        tag.className = "persona-tag" + (coord ? " coord" : " int");
+        tag.textContent = coord ? "COORD" : "INT";
+        return tag;
+      },
+      sort: function (s) {
+        return s.kind || "";
+      },
     },
-    sort: function (s) {
-      return s.kind || "";
+    SavedColumns.model(),
+    SavedColumns.count("child_count", "CHILDREN", "92px"),
+    SavedColumns.ctx(),
+    SavedColumns.last(),
+    SavedColumns.id(),
+  ];
+  _coordTable = createSavedTable({
+    headerEl: document.getElementById("coord-saved-colheaders"),
+    bodyEl: document.getElementById("saved-coord-cards"),
+    filterEl: document.getElementById("coord-filter"),
+    footerEl: document.getElementById("coord-saved-footer"),
+    paginationEl: document.getElementById("coord-pagination"),
+    columns: COORD_COLUMNS,
+    noun: "session",
+    emptyText: "No saved sessions",
+    activateLabel: function (s) {
+      return (
+        "Resume " +
+        (s.kind === "coordinator" ? "coordinator" : "session") +
+        ": " +
+        (s.alias || s.title || s.name || s.ws_id)
+      );
     },
-  },
-  SavedColumns.model(),
-  SavedColumns.count("child_count", "CHILDREN", "92px"),
-  SavedColumns.ctx(),
-  SavedColumns.last(),
-  SavedColumns.id(),
-];
-_coordTable = createSavedTable({
-  headerEl: document.getElementById("coord-saved-colheaders"),
-  bodyEl: document.getElementById("saved-coord-cards"),
-  filterEl: document.getElementById("coord-filter"),
-  footerEl: document.getElementById("coord-saved-footer"),
-  paginationEl: document.getElementById("coord-pagination"),
-  columns: COORD_COLUMNS,
-  noun: "session",
-  emptyText: "No saved sessions",
-  activateLabel: function (s) {
-    return (
-      "Resume " +
-      (s.kind === "coordinator" ? "coordinator" : "session") +
-      ": " +
-      (s.alias || s.title || s.name || s.ws_id)
-    );
-  },
-  onActivate: function (s, rowEl) {
-    // Open the session as an L-shell PANE (the renovation: rail + saved-list
-    // clicks open tabs, not full-page nav).  Fall back to full-page nav only if
-    // the shell isn't present.
-    const pm = window.TS_SHELL && window.TS_SHELL.panes;
-    // Interactive sessions live on a compute node and, unlike coordinators,
-    // have no warm pool: a dormant one must be routed to a live node and
-    // rehydrated there before its pane can stream.  The interactive pane does
-    // exactly that on first activate (resolveInteractiveNode: origin-first
-    // POST /open with a rendezvous fallback), so the saved-row click just opens
-    // the pane with the origin node as the hint.  Shell-absent falls back to a
-    // best-effort full-page nav to the origin node, whose detail page
-    // rehydrates lazily.
-    if (s.kind !== "coordinator") {
-      if (pm) {
-        pm.openPane("interactive", s.ws_id, { nodeId: s.node_id || null });
-      } else if (s.node_id) {
-        window.location.href =
-          "/node/" +
-          encodeURIComponent(s.node_id) +
-          "/?ws_id=" +
-          encodeURIComponent(s.ws_id);
-      } else {
-        showToast("Session node unknown");
-      }
-      return;
-    }
-    // POST /open BEFORE navigating so capacity issues surface as a toast
-    // instead of a broken-looking detail page.
-    if (rowEl) rowEl.classList.add("is-busy");
-    authFetch("/v1/api/workstreams/" + encodeURIComponent(s.ws_id) + "/open", {
-      method: "POST",
-    })
-      .then(function (r) {
-        if (r.ok) {
-          if (rowEl) rowEl.classList.remove("is-busy");
-          if (pm) pm.openPane("coordinator", s.ws_id);
-          else
-            window.location.href =
-              "/coordinator/" + encodeURIComponent(s.ws_id);
-          return;
-        }
-        if (rowEl) rowEl.classList.remove("is-busy");
-        if (r.status === 429) {
-          showToast(
-            "All coordinator slots are active — close one first to restore this session",
-          );
-        } else if (r.status === 404) {
-          showToast("Coordinator no longer available");
-          loadSavedCoordinators();
-        } else if (r.status === 503) {
-          showToast("Coordinator subsystem not configured");
+    onActivate: function (s, rowEl) {
+      // Open the session as an L-shell PANE (the renovation: rail + saved-list
+      // clicks open tabs, not full-page nav).  Fall back to full-page nav only if
+      // the shell isn't present.
+      const pm = window.TS_SHELL && window.TS_SHELL.panes;
+      // Interactive sessions live on a compute node and, unlike coordinators,
+      // have no warm pool: a dormant one must be routed to a live node and
+      // rehydrated there before its pane can stream.  The interactive pane does
+      // exactly that on first activate (resolveInteractiveNode: origin-first
+      // POST /open with a rendezvous fallback), so the saved-row click just opens
+      // the pane with the origin node as the hint.  Shell-absent falls back to a
+      // best-effort full-page nav to the origin node, whose detail page
+      // rehydrates lazily.
+      if (s.kind !== "coordinator") {
+        if (pm) {
+          pm.openPane("interactive", s.ws_id, { nodeId: s.node_id || null });
+        } else if (s.node_id) {
+          window.location.href =
+            "/node/" +
+            encodeURIComponent(s.node_id) +
+            "/?ws_id=" +
+            encodeURIComponent(s.ws_id);
         } else {
-          showToast("Failed to restore coordinator (" + r.status + ")");
+          showToast("Session node unknown");
         }
-      })
-      .catch(function () {
-        if (rowEl) rowEl.classList.remove("is-busy");
-        showToast("Failed to restore coordinator");
-      });
-  },
-  delete: {
-    idPrefix: "coord-delete",
-    buttonId: "coord-delete-btn",
-    // Coordinators live on whichever node owns the ws_id; the router proxy
-    // reads ws_id from the body, resolves the owning node via rendezvous
-    // hashing, and forwards to that node's POST workstreams/{ws_id}/delete.
-    buildDeleteRequest: function (wsId) {
-      return {
-        url: "/v1/api/route/workstreams/delete",
-        options: {
+        return;
+      }
+      // POST /open BEFORE navigating so capacity issues surface as a toast
+      // instead of a broken-looking detail page.
+      if (rowEl) rowEl.classList.add("is-busy");
+      authFetch(
+        "/v1/api/workstreams/" + encodeURIComponent(s.ws_id) + "/open",
+        {
           method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ ws_id: wsId }),
         },
-      };
+      )
+        .then(function (r) {
+          if (r.ok) {
+            if (rowEl) rowEl.classList.remove("is-busy");
+            if (pm) pm.openPane("coordinator", s.ws_id);
+            else
+              window.location.href =
+                "/coordinator/" + encodeURIComponent(s.ws_id);
+            return;
+          }
+          if (rowEl) rowEl.classList.remove("is-busy");
+          if (r.status === 429) {
+            showToast(
+              "All coordinator slots are active — close one first to restore this session",
+            );
+          } else if (r.status === 404) {
+            showToast("Coordinator no longer available");
+            loadSavedCoordinators();
+          } else if (r.status === 503) {
+            showToast("Coordinator subsystem not configured");
+          } else {
+            showToast("Failed to restore coordinator (" + r.status + ")");
+          }
+        })
+        .catch(function () {
+          if (rowEl) rowEl.classList.remove("is-busy");
+          showToast("Failed to restore coordinator");
+        });
     },
-    onClose: function () {
-      // Drain queued retries before the explicit reload (see the freeze
-      // gate in loadSavedCoordinators) so .finally() doesn't double-fetch.
-      _savedCoordsRetry = false;
-      loadSavedCoordinators();
+    delete: {
+      idPrefix: "coord-delete",
+      buttonId: "coord-delete-btn",
+      // Coordinators live on whichever node owns the ws_id; the router proxy
+      // reads ws_id from the body, resolves the owning node via rendezvous
+      // hashing, and forwards to that node's POST workstreams/{ws_id}/delete.
+      buildDeleteRequest: function (wsId) {
+        return {
+          url: "/v1/api/route/workstreams/delete",
+          options: {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ ws_id: wsId }),
+          },
+        };
+      },
+      onClose: function () {
+        // Drain queued retries before the explicit reload (see the freeze
+        // gate in loadSavedCoordinators) so .finally() doesn't double-fetch.
+        _savedCoordsRetry = false;
+        loadSavedCoordinators();
+      },
     },
-  },
-});
+  });
 }
 
 // HTML inline-onclick wrappers — keep the global names the markup binds
@@ -1923,12 +1923,6 @@ function toggleCoordSelectAll() {
 }
 function confirmCoordDeleteSelection() {
   _coordTable.controller.confirmSelection();
-}
-function cancelCoordDelete() {
-  _coordTable.controller.closeModal();
-}
-function confirmCoordDelete() {
-  _coordTable.controller.confirm();
 }
 
 // --- Init ---
