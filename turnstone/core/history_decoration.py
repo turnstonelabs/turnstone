@@ -98,13 +98,17 @@ def load_verdict_indexes(
     return verdicts_by_call_id, assessments_by_call_id
 
 
-def build_verdict_payload(vrow: dict[str, Any]) -> dict[str, Any] | None:
+def build_verdict_payload(vrow: dict[str, Any]) -> dict[str, Any]:
     """Project a stored ``intent_verdicts`` row into the wire shape.
 
-    Returns ``None`` when the verdict is the unflagged baseline
-    (``risk_level == "none"``) — the client's ``renderVerdictBadge``
-    helper would suppress those anyway, so skipping at the wire layer
-    keeps the payload tight on long workstreams.
+    Ships every row, including the unflagged baseline (``risk_level ==
+    "none"``) — the live path renders a badge for every verdict the
+    judge delivers (``buildConvVerdict`` has no risk filter), so the
+    replay payload must carry the same set or rehydration silently
+    "loses" verdicts the operator watched land live.  An earlier
+    revision suppressed ``none`` rows here on the assumption the
+    client filtered them anyway; it never did, and the asymmetry
+    surfaced as benign verdicts vanishing after a restart.
 
     Drops ``call_id`` and ``func_name`` from the wire payload — they're
     already carried on the parent ``tc.id`` / ``tc.name`` fields.
@@ -115,10 +119,8 @@ def build_verdict_payload(vrow: dict[str, Any]) -> dict[str, Any] | None:
     badge can render ``⚖ llm:claude-haiku-4`` on history-only batches
     rather than the bare ``⚖ llm`` label.
     """
-    if (vrow.get("risk_level") or "none") == "none":
-        return None
     payload: dict[str, Any] = {
-        "risk_level": vrow.get("risk_level", "medium"),
+        "risk_level": vrow.get("risk_level") or "none",
         "recommendation": vrow.get("recommendation", "review"),
         "confidence": vrow.get("confidence", 0.0),
         "intent_summary": vrow.get("intent_summary", ""),
@@ -190,17 +192,15 @@ def decorate_tool_call(
     either the OpenAI-nested ``{id, function: {name, arguments}}`` shape —
     what ``decorate_history_messages`` passes from the REST ``/history``
     pipeline — or a flattened ``{id, name, arguments}`` shape.  No-ops
-    cleanly when the call_id has no matching row (unflagged tools stay
-    clean).
+    cleanly when the call_id has no matching row (tools the judge never
+    evaluated stay clean).
     """
     call_id = tc.get("id", "") or ""
     if not call_id:
         return
     vrow = verdicts_by_call_id.get(call_id)
     if vrow is not None:
-        verdict = build_verdict_payload(vrow)
-        if verdict is not None:
-            tc["verdict"] = verdict
+        tc["verdict"] = build_verdict_payload(vrow)
     slot = assessments_by_call_id.get(call_id)
     if slot is not None:
         assessment = build_merged_output_assessment_payload(slot)

@@ -24,12 +24,16 @@ class TestBuildVerdictPayload:
     """The wire-shape projection that's the single source of truth for
     what intent_verdict fields ship to the client."""
 
-    def test_skips_unflagged_baseline(self) -> None:
-        """``risk_level`` "none" is the unflagged-tool baseline; the
-        client filters those anyway, so projecting None at the wire
-        layer keeps the payload tight on long workstreams."""
-        row = {"risk_level": "none", "recommendation": "approve", "tier": "heuristic"}
-        assert build_verdict_payload(row) is None
+    def test_ships_unflagged_baseline(self) -> None:
+        """``risk_level`` "none" rows ship like any other — the live
+        path paints a badge for every delivered verdict (the client
+        has no risk filter), so replay must carry the same set or
+        benign verdicts vanish on rehydrate (live/replay parity)."""
+        row = {"risk_level": "none", "recommendation": "approve", "tier": "llm"}
+        out = build_verdict_payload(row)
+        assert out["risk_level"] == "none"
+        assert out["recommendation"] == "approve"
+        assert out["tier"] == "llm"
 
     def test_drops_call_id_and_func_name(self) -> None:
         """The client already has these on ``tc.id`` / ``tc.name``;
@@ -243,13 +247,14 @@ class TestDecorateToolCall:
         decorate_tool_call(tc, verdicts, {})
         assert "verdict" not in tc
 
-    def test_skips_unflagged_verdict(self) -> None:
-        """``build_verdict_payload`` returns None for unflagged rows;
-        decorate_tool_call must not stamp ``verdict`` in that case."""
+    def test_stamps_unflagged_verdict(self) -> None:
+        """A ``risk_level="none"`` row still stamps ``verdict`` — the
+        operator saw the badge live, so it must survive rehydrate."""
         tc: dict[str, object] = {"id": "call_1", "name": "bash"}
-        verdicts = {"call_1": {"risk_level": "none", "tier": "heuristic"}}
+        verdicts = {"call_1": {"risk_level": "none", "tier": "llm"}}
         decorate_tool_call(tc, verdicts, {})
-        assert "verdict" not in tc
+        assert "verdict" in tc
+        assert tc["verdict"]["risk_level"] == "none"  # type: ignore[index]
 
     def test_handles_empty_id(self) -> None:
         """A tool_call with no id can't be paired against the lookup
@@ -310,6 +315,38 @@ class TestDecorateHistoryMessages:
         assert "advisories" not in messages[2]
         assert messages[3]["content"] == "short"
         assert "advisories" not in messages[3]
+
+    def test_parallel_batch_keeps_every_judged_verdict(self) -> None:
+        """Regression: a parallel batch where the judge cleared most
+        calls (``risk_level="none"``) must rehydrate with a verdict on
+        EVERY judged call, not just the flagged minority.  The old
+        wire-layer ``none`` filter made benign verdicts vanish after a
+        restart while the live stream had shown all of them."""
+        calls = [f"call_{i}" for i in range(8)]
+        verdicts = {
+            cid: {
+                "risk_level": "low" if i < 2 else "none",
+                "recommendation": "approve",
+                "confidence": 0.9,
+                "intent_summary": f"benign op {i}",
+                "tier": "llm",
+            }
+            for i, cid in enumerate(calls)
+        }
+        messages: list[dict[str, object]] = [
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {"id": cid, "function": {"name": "read_file", "arguments": "{}"}}
+                    for cid in calls
+                ],
+            },
+        ]
+        decorate_history_messages(messages, verdicts, {})
+        tool_calls = messages[0]["tool_calls"]  # type: ignore[index]
+        decorated = [tc["verdict"]["risk_level"] for tc in tool_calls]
+        assert decorated == ["low", "low"] + ["none"] * 6
 
     def test_no_op_on_empty_indexes(self) -> None:
         """When neither table has rows for the workstream, the wire
