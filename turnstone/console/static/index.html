@@ -2427,6 +2427,99 @@
               </button>
             </footer>
           </dialog>
+
+          <!-- Tool-policy shelf (create + edit) — pane-scoped. The priority
+               field is annotated with its evaluation neighbors (computed from
+               the already-loaded policy list; policies run highest-first). -->
+          <dialog
+            class="hatch hatch--shelf"
+            id="policy-shelf"
+            data-kind="create"
+            aria-labelledby="policy-shelf-title"
+          >
+            <header class="sh-head">
+              <span class="sh-led" aria-hidden="true"></span>
+              <h2 class="sh-title" id="policy-shelf-title">New tool policy</h2>
+              <span class="sh-tag" aria-hidden="true" id="policy-shelf-tag"
+                >POL-NEW</span
+              >
+              <button class="sh-x" data-close aria-label="Close">✕</button>
+            </header>
+            <div class="sh-body">
+              <div
+                id="policy-shelf-error"
+                class="sh-alert"
+                role="alert"
+                aria-live="assertive"
+                aria-atomic="true"
+              ></div>
+              <input id="pol-id" type="hidden" />
+              <label for="pol-name">Name</label>
+              <input
+                id="pol-name"
+                type="text"
+                placeholder="e.g. Block shell access"
+                autocomplete="off"
+              />
+              <label for="pol-pattern"
+                >Tool pattern
+                <span class="label-hint"
+                  >glob: bash*, file_write, *</span
+                ></label
+              >
+              <input
+                id="pol-pattern"
+                type="text"
+                class="sh-mono"
+                placeholder="bash*"
+                autocomplete="off"
+                spellcheck="false"
+              />
+              <div class="field-pair">
+                <div>
+                  <label for="pol-action">Action</label>
+                  <select id="pol-action">
+                    <option value="ask">Ask (require approval)</option>
+                    <option value="allow">Allow (auto-approve)</option>
+                    <option value="deny">Deny (block)</option>
+                  </select>
+                </div>
+                <div>
+                  <label for="pol-priority"
+                    >Priority
+                    <span class="label-hint"
+                      >higher = evaluated first</span
+                    ></label
+                  >
+                  <input
+                    id="pol-priority"
+                    type="number"
+                    value="0"
+                    min="0"
+                    max="9999"
+                  />
+                </div>
+              </div>
+              <div
+                class="match-strip"
+                id="pol-neighbors"
+                role="status"
+                aria-live="polite"
+              ></div>
+              <label class="toggle-switch" id="pol-enabled-row" hidden>
+                <input id="pol-enabled" type="checkbox" checked />
+                <span class="toggle-track" aria-hidden="true"></span>
+                <span class="toggle-label">Enabled</span>
+              </label>
+            </div>
+            <footer class="sh-foot">
+              <div class="sh-foot-meta"></div>
+              <button class="sh-btn" data-close>Cancel</button>
+              <button id="pol-submit" class="sh-btn sh-btn--primary">
+                Create
+              </button>
+            </footer>
+          </dialog>
         </div>
         <!-- /admin-layout -->
       </div>
@@ -2669,60 +2762,58 @@
     </div>
 
     <!-- Token Created (show-once) Modal -->
-    <div
-      id="token-created-overlay"
-      style="display: none"
-      role="dialog"
-      aria-modal="true"
+    <dialog
+      class="hatch hatch--dialog"
+      id="token-created-dialog"
+      data-kind="success"
       aria-labelledby="token-created-title"
     >
-      <div id="token-created-box" class="admin-modal">
-        <h2 id="token-created-title">Token Created</h2>
-        <p class="token-created-warning">
-          Copy this token now. It will not be shown again.
+      <header class="sh-head">
+        <span class="sh-led" aria-hidden="true"></span>
+        <h2 class="sh-title" id="token-created-title">Token created</h2>
+        <span class="sh-tag" aria-hidden="true">TOK-ISSUE</span>
+        <button class="sh-x" data-close aria-label="Close">✕</button>
+      </header>
+      <div class="sh-body">
+        <div id="token-created-value" class="sh-artifact"></div>
+        <p class="sh-callout">
+          Shown once — store it now. Turnstone keeps only the hash.
         </p>
-        <div id="token-created-value" class="token-display"></div>
-        <div class="modal-buttons">
-          <button class="modal-submit" onclick="copyCreatedToken()">
-            Copy to clipboard
-          </button>
-          <button class="modal-cancel" onclick="hideTokenCreatedModal()">
-            Done
-          </button>
-        </div>
       </div>
-    </div>
+      <footer class="sh-foot">
+        <div class="sh-foot-meta"></div>
+        <button class="sh-btn" data-close>Done</button>
+        <button id="tc-copy" class="sh-btn sh-btn--primary" autofocus>
+          Copy token
+        </button>
+      </footer>
+    </dialog>
 
     <!-- Confirm Action Modal (reusable) -->
-    <div
-      id="confirm-overlay"
-      style="display: none"
+    <dialog
+      class="hatch hatch--dialog"
+      id="confirm-dialog"
+      data-kind="danger"
       role="alertdialog"
-      aria-modal="true"
       aria-labelledby="confirm-title"
       aria-describedby="confirm-message"
     >
-      <div id="confirm-box" class="admin-modal">
-        <h2 id="confirm-title">Confirm</h2>
-        <p
-          id="confirm-message"
-          style="color: var(--fg-dim); margin: 12px 0 20px; line-height: 1.5"
-        ></p>
-        <div class="modal-buttons">
-          <button class="modal-cancel" onclick="hideConfirmModal()">
-            Cancel
-          </button>
-          <button
-            id="confirm-submit"
-            class="modal-submit"
-            style="background: var(--red); border-color: var(--red)"
-            onclick="_confirmCallback()"
-          >
-            Confirm
-          </button>
-        </div>
+      <header class="sh-head">
+        <span class="sh-led" aria-hidden="true"></span>
+        <h2 class="sh-title" id="confirm-title">Confirm</h2>
+        <button class="sh-x" data-close aria-label="Close">✕</button>
+      </header>
+      <div class="sh-body">
+        <p class="sh-prose" id="confirm-message"></p>
       </div>
-    </div>
+      <footer class="sh-foot">
+        <div class="sh-foot-meta"></div>
+        <button class="sh-btn" data-close autofocus>Cancel</button>
+        <button id="confirm-submit" class="sh-btn sh-btn--danger">
+          Confirm
+        </button>
+      </footer>
+    </dialog>
 
     <!-- Create Channel Link Modal -->
     <div
@@ -2903,122 +2994,6 @@
             Cancel
           </button>
           <button class="modal-submit" onclick="submitUserRoles()">Save</button>
-        </div>
-      </div>
-    </div>
-
-    <!-- Create Policy Modal -->
-    <div
-      id="create-policy-overlay"
-      style="display: none"
-      role="dialog"
-      aria-modal="true"
-      aria-labelledby="create-policy-title"
-    >
-      <div id="create-policy-box" class="admin-modal">
-        <h2 id="create-policy-title">Create Tool Policy</h2>
-        <div
-          id="create-policy-error"
-          role="alert"
-          aria-live="assertive"
-          aria-atomic="true"
-        ></div>
-        <label for="cp-name">Name</label>
-        <input
-          id="cp-name"
-          type="text"
-          placeholder="e.g. Block shell access"
-          autocomplete="off"
-        />
-        <label for="cp-pattern"
-          >Tool pattern
-          <span class="label-hint"
-            >glob syntax: bash*, file_write, *</span
-          ></label
-        >
-        <input
-          id="cp-pattern"
-          type="text"
-          placeholder="bash*"
-          autocomplete="off"
-          spellcheck="false"
-        />
-        <label for="cp-action">Action</label>
-        <select id="cp-action">
-          <option value="ask">Ask (require approval)</option>
-          <option value="allow">Allow (auto-approve)</option>
-          <option value="deny">Deny (block)</option>
-        </select>
-        <label for="cp-priority"
-          >Priority
-          <span class="label-hint">higher = evaluated first</span></label
-        >
-        <input id="cp-priority" type="number" value="0" min="0" max="9999" />
-        <div class="modal-buttons">
-          <button class="modal-cancel" onclick="hideCreatePolicyModal()">
-            Cancel
-          </button>
-          <button
-            id="cp-submit"
-            class="modal-submit"
-            onclick="submitCreatePolicy()"
-          >
-            Create
-          </button>
-        </div>
-      </div>
-    </div>
-
-    <!-- Edit Policy Modal -->
-    <div
-      id="edit-policy-overlay"
-      style="display: none"
-      role="dialog"
-      aria-modal="true"
-      aria-labelledby="edit-policy-title"
-    >
-      <div id="edit-policy-box" class="admin-modal">
-        <h2 id="edit-policy-title">Edit Tool Policy</h2>
-        <div
-          id="edit-policy-error"
-          role="alert"
-          aria-live="assertive"
-          aria-atomic="true"
-        ></div>
-        <input id="ep-id" type="hidden" />
-        <label for="ep-name">Name</label>
-        <input id="ep-name" type="text" autocomplete="off" />
-        <label for="ep-pattern">Tool pattern</label>
-        <input
-          id="ep-pattern"
-          type="text"
-          autocomplete="off"
-          spellcheck="false"
-        />
-        <label for="ep-action">Action</label>
-        <select id="ep-action">
-          <option value="ask">Ask (require approval)</option>
-          <option value="allow">Allow (auto-approve)</option>
-          <option value="deny">Deny (block)</option>
-        </select>
-        <label for="ep-priority">Priority</label>
-        <input id="ep-priority" type="number" value="0" min="0" max="9999" />
-        <label class="toggle-switch">
-          <input id="ep-enabled" type="checkbox" checked />
-          <span class="toggle-track" aria-hidden="true"></span>
-          <span class="toggle-label">Enabled</span>
-        </label>
-        <div class="modal-buttons">
-          <button class="modal-cancel" onclick="hideEditPolicyModal()">
-            Cancel
-          </button>
-          <button
-            id="ep-submit"
-            class="modal-submit"
-            onclick="submitEditPolicy()"
-          >
-            Save
-          </button>
         </div>
       </div>
     </div>

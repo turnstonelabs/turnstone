@@ -31,8 +31,6 @@ let _etmTrapHandler = null; // edit template
 let _crTriggerEl = null;
 let _erTriggerEl = null;
 let _urTriggerEl = null;
-let _cpTriggerEl = null;
-let _epTriggerEl = null;
 let _ctmTriggerEl = null;
 let _etmTriggerEl = null;
 
@@ -904,75 +902,107 @@ function _renderGovPolicies(items) {
   });
 }
 
+// --- Tool-policy shelf (create + edit) ---
+// One pane-scoped shelf; the priority field is annotated with its evaluation
+// neighbors from the already-loaded _govPolicies (highest priority first), so
+// "where does 200 land?" answers itself while typing. No backend involved.
+
+let _polWired = false;
+let _polShelfHandle = null;
+
+function _polChip(text) {
+  const span = document.createElement("span");
+  span.className = "match-chip";
+  span.textContent = text;
+  return span;
+}
+
+function _polRenderNeighbors() {
+  const strip = document.getElementById("pol-neighbors");
+  while (strip.firstChild) strip.removeChild(strip.firstChild);
+  const selfId = document.getElementById("pol-id").value;
+  const pr = parseInt(document.getElementById("pol-priority").value, 10) || 0;
+  const others = _govPolicies.filter(function (q) {
+    return q.policy_id !== selfId;
+  });
+  if (!others.length) return;
+  // Highest priority evaluates first: the policy just BEFORE us is the
+  // smallest priority above ours; just AFTER us, the largest below.
+  let before = null;
+  let after = null;
+  others.forEach(function (q) {
+    if (q.priority > pr && (!before || q.priority < before.priority))
+      before = q;
+    if (q.priority <= pr && (!after || q.priority > after.priority)) after = q;
+  });
+  const count = document.createElement("span");
+  count.className = "match-count";
+  count.textContent = "evaluates";
+  strip.appendChild(count);
+  if (before) {
+    const lbl = document.createElement("span");
+    lbl.className = "match-count";
+    lbl.textContent = "after";
+    strip.appendChild(lbl);
+    strip.appendChild(_polChip(before.name + " (" + before.priority + ")"));
+  } else {
+    const first = document.createElement("span");
+    first.className = "match-count";
+    first.textContent = "first";
+    strip.appendChild(first);
+  }
+  if (after) {
+    const lbl2 = document.createElement("span");
+    lbl2.className = "match-count";
+    lbl2.textContent = "\u00b7 before";
+    strip.appendChild(lbl2);
+    strip.appendChild(_polChip(after.name + " (" + after.priority + ")"));
+  } else if (before) {
+    const last = document.createElement("span");
+    last.className = "match-count";
+    last.textContent = "\u00b7 last";
+    strip.appendChild(last);
+  }
+}
+
+function _polWire() {
+  if (_polWired) return;
+  _polWired = true;
+  document
+    .getElementById("pol-priority")
+    .addEventListener("input", _polRenderNeighbors);
+  document
+    .getElementById("pol-submit")
+    .addEventListener("click", _submitPolicyShelf);
+}
+
 function showCreatePolicyModal() {
-  _cpTriggerEl = document.activeElement;
-  const ov = document.getElementById("create-policy-overlay");
-  ov.style.display = "flex";
-  document.getElementById("cp-name").value = "";
-  document.getElementById("cp-pattern").value = "";
-  document.getElementById("cp-action").value = "ask";
-  document.getElementById("cp-priority").value = "0";
-  document.getElementById("create-policy-error").classList.remove("is-visible");
-  document.getElementById("cp-name").focus();
-  _cpTrapHandler = _installTrap("create-policy-overlay", "create-policy-box");
+  _polWire();
+  document.getElementById("policy-shelf-error").classList.remove("is-visible");
+  document.getElementById("pol-id").value = "";
+  document.getElementById("pol-name").value = "";
+  document.getElementById("pol-pattern").value = "";
+  document.getElementById("pol-action").value = "ask";
+  document.getElementById("pol-priority").value = "0";
+  document.getElementById("pol-enabled").checked = true;
+  document.getElementById("pol-enabled-row").hidden = true;
+  document.getElementById("policy-shelf-title").textContent = "New tool policy";
+  document.getElementById("policy-shelf-tag").textContent = "POL-NEW";
+  const shelf = document.getElementById("policy-shelf");
+  shelf.setAttribute("data-kind", "create");
+  document.getElementById("pol-submit").textContent = "Create";
+  _polRenderNeighbors();
+  _polShelfHandle = window.TurnstoneHatch.openShelf(shelf);
+  document.getElementById("pol-name").focus();
 }
 
 function hideCreatePolicyModal() {
-  document.getElementById("create-policy-overlay").style.display = "none";
-  _cpTrapHandler = _removeTrap(_cpTrapHandler);
-  if (_cpTriggerEl && _cpTriggerEl.focus) {
-    _cpTriggerEl.focus();
-  }
-  _cpTriggerEl = null;
-}
-
-function submitCreatePolicy() {
-  const name = document.getElementById("cp-name").value.trim();
-  const pattern = document.getElementById("cp-pattern").value.trim();
-  const action = document.getElementById("cp-action").value;
-  const priority =
-    parseInt(document.getElementById("cp-priority").value, 10) || 0;
-  if (!name || !pattern) {
-    const e = document.getElementById("create-policy-error");
-    e.textContent = "Name and pattern are required";
-    e.classList.add("is-visible");
-    return;
-  }
-  document.getElementById("cp-submit").disabled = true;
-  authFetch("/v1/api/admin/policies", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      name: name,
-      tool_pattern: pattern,
-      action: action,
-      priority: priority,
-    }),
-  })
-    .then(function (r) {
-      if (!r.ok)
-        return r.json().then(function (d) {
-          throw new Error(d.error || "Failed");
-        });
-      return r.json();
-    })
-    .then(function () {
-      hideCreatePolicyModal();
-      showToast("Policy created");
-      loadGovPolicies();
-    })
-    .catch(function (e) {
-      const el = document.getElementById("create-policy-error");
-      el.textContent = e.message;
-      el.classList.add("is-visible");
-    })
-    .finally(function () {
-      document.getElementById("cp-submit").disabled = false;
-    });
+  window.TurnstoneHatch.closeShelf(document.getElementById("policy-shelf"));
+  _polShelfHandle = null;
 }
 
 function showEditPolicyModal(policyId) {
-  _epTriggerEl = document.activeElement;
+  _polWire();
   let policy = null;
   for (let i = 0; i < _govPolicies.length; i++) {
     if (_govPolicies[i].policy_id === policyId) {
@@ -981,41 +1011,57 @@ function showEditPolicyModal(policyId) {
     }
   }
   if (!policy) return;
-  const ov = document.getElementById("edit-policy-overlay");
-  ov.style.display = "flex";
-  document.getElementById("ep-id").value = policyId;
-  document.getElementById("ep-name").value = policy.name;
-  document.getElementById("ep-pattern").value = policy.tool_pattern;
-  document.getElementById("ep-action").value = policy.action;
-  document.getElementById("ep-priority").value = policy.priority;
-  document.getElementById("ep-enabled").checked = policy.enabled;
-  document.getElementById("edit-policy-error").classList.remove("is-visible");
-  _epTrapHandler = _installTrap("edit-policy-overlay", "edit-policy-box");
+  document.getElementById("policy-shelf-error").classList.remove("is-visible");
+  document.getElementById("pol-id").value = policyId;
+  document.getElementById("pol-name").value = policy.name;
+  document.getElementById("pol-pattern").value = policy.tool_pattern;
+  document.getElementById("pol-action").value = policy.action;
+  document.getElementById("pol-priority").value = policy.priority;
+  document.getElementById("pol-enabled").checked = policy.enabled;
+  document.getElementById("pol-enabled-row").hidden = false;
+  document.getElementById("policy-shelf-title").textContent =
+    "Edit tool policy \u2014 " + policy.name;
+  document.getElementById("policy-shelf-tag").textContent = "POL-EDIT";
+  const shelf = document.getElementById("policy-shelf");
+  shelf.setAttribute("data-kind", "edit");
+  document.getElementById("pol-submit").textContent = "Save";
+  _polRenderNeighbors();
+  _polShelfHandle = window.TurnstoneHatch.openShelf(shelf);
+  document.getElementById("pol-name").focus();
 }
 
 function hideEditPolicyModal() {
-  document.getElementById("edit-policy-overlay").style.display = "none";
-  _epTrapHandler = _removeTrap(_epTrapHandler);
-  if (_epTriggerEl && _epTriggerEl.focus) {
-    _epTriggerEl.focus();
-  }
-  _epTriggerEl = null;
+  hideCreatePolicyModal();
 }
 
-function submitEditPolicy() {
-  const id = document.getElementById("ep-id").value;
-  document.getElementById("ep-submit").disabled = true;
-  authFetch("/v1/api/admin/policies/" + id, {
-    method: "PUT",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      name: document.getElementById("ep-name").value.trim(),
-      tool_pattern: document.getElementById("ep-pattern").value.trim(),
-      action: document.getElementById("ep-action").value,
-      priority: parseInt(document.getElementById("ep-priority").value, 10) || 0,
-      enabled: document.getElementById("ep-enabled").checked,
-    }),
-  })
+function _submitPolicyShelf() {
+  const shelf = document.getElementById("policy-shelf");
+  const errEl = document.getElementById("policy-shelf-error");
+  const policyId = document.getElementById("pol-id").value;
+  const name = document.getElementById("pol-name").value.trim();
+  const pattern = document.getElementById("pol-pattern").value.trim();
+  if (!name || !pattern) {
+    errEl.textContent = "Name and pattern are required";
+    errEl.classList.add("is-visible");
+    return;
+  }
+  const body = {
+    name: name,
+    tool_pattern: pattern,
+    action: document.getElementById("pol-action").value,
+    priority: parseInt(document.getElementById("pol-priority").value, 10) || 0,
+  };
+  if (policyId) body.enabled = document.getElementById("pol-enabled").checked;
+  errEl.classList.remove("is-visible");
+  window.TurnstoneHatch.setBusy(shelf, true);
+  authFetch(
+    policyId ? "/v1/api/admin/policies/" + policyId : "/v1/api/admin/policies",
+    {
+      method: policyId ? "PUT" : "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    },
+  )
     .then(function (r) {
       if (!r.ok)
         return r.json().then(function (d) {
@@ -1024,17 +1070,15 @@ function submitEditPolicy() {
       return r.json();
     })
     .then(function () {
-      hideEditPolicyModal();
-      showToast("Policy updated");
+      window.TurnstoneHatch.setBusy(shelf, false);
+      hideCreatePolicyModal();
+      showToast(policyId ? "Policy updated" : "Policy created");
       loadGovPolicies();
     })
     .catch(function (e) {
-      const el = document.getElementById("edit-policy-error");
-      el.textContent = e.message;
-      el.classList.add("is-visible");
-    })
-    .finally(function () {
-      document.getElementById("ep-submit").disabled = false;
+      window.TurnstoneHatch.setBusy(shelf, false);
+      errEl.textContent = e.message;
+      errEl.classList.add("is-visible");
     });
 }
 

@@ -81,6 +81,11 @@
 .hatch:not([open]) {
   display: none;
 }
+/* hidden must always win inside a hatch — display rules on form chrome
+   (e.g. label.toggle-switch's inline-flex) would otherwise defeat it. */
+.hatch [hidden] {
+  display: none !important;
+}
 
 .hatch--shelf {
   position: absolute;

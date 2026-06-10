@@ -7,12 +7,9 @@ let _adminChannelUserId = "";
 let _lastCreatedToken = "";
 let _cuTrapHandler = null;
 let _ctTrapHandler = null;
-let _tcTrapHandler = null;
 let _ccTrapHandler = null;
-let _cfTrapHandler = null;
 let _adminWatches = [];
 let _confirmCallbackFn = null;
-let _confirmTriggerEl = null;
 
 // Settings whose choices are populated dynamically from the live model
 // alias list, and whose empty-string option renders as "(server default)".
@@ -2554,16 +2551,19 @@ function submitCreateToken() {
 
 function showTokenCreatedModal(token) {
   document.getElementById("token-created-value").textContent = token;
-  document.getElementById("token-created-overlay").style.display = "flex";
-  _tcTrapHandler = _installTrap("token-created-overlay", "token-created-box");
+  window.TurnstoneHatch.openDialog(
+    document.getElementById("token-created-dialog"),
+    {
+      onClose: function () {
+        _lastCreatedToken = "";
+      },
+    },
+  );
 }
 
 function hideTokenCreatedModal() {
-  document.getElementById("token-created-overlay").style.display = "none";
-  _tcTrapHandler = _removeTrap(_tcTrapHandler);
-  _lastCreatedToken = "";
-  const trigger = document.querySelector("#admin-tokens .admin-action-btn");
-  if (trigger) trigger.focus();
+  const d = document.getElementById("token-created-dialog");
+  if (d.open) d.close();
 }
 
 function copyCreatedToken() {
@@ -2625,16 +2625,12 @@ function _installTrap(overlayId, boxId, trapRef) {
       if (e.target === overlay) {
         if (overlayId === "create-user-overlay") hideCreateUserModal();
         else if (overlayId === "create-token-overlay") hideCreateTokenModal();
-        else if (overlayId === "token-created-overlay") hideTokenCreatedModal();
         else if (overlayId === "create-channel-overlay")
           hideCreateChannelModal();
         else if (overlayId === "schedule-runs-overlay") hideScheduleRunsModal();
-        else if (overlayId === "confirm-overlay") hideConfirmModal();
         else if (overlayId === "create-role-overlay") hideCreateRoleModal();
         else if (overlayId === "edit-role-overlay") hideEditRoleModal();
         else if (overlayId === "user-roles-overlay") hideUserRolesModal();
-        else if (overlayId === "create-policy-overlay") hideCreatePolicyModal();
-        else if (overlayId === "edit-policy-overlay") hideEditPolicyModal();
         else if (overlayId === "create-template-overlay")
           hideCreateTemplateModal();
         else if (overlayId === "edit-template-overlay") hideEditTemplateModal();
@@ -2689,12 +2685,6 @@ document.addEventListener("keydown", function (e) {
     hideCreateTokenModal();
     return;
   }
-  const tc = document.getElementById("token-created-overlay");
-  if (tc && tc.style.display !== "none") {
-    e.preventDefault();
-    hideTokenCreatedModal();
-    return;
-  }
   const cc = document.getElementById("create-channel-overlay");
   if (cc && cc.style.display !== "none") {
     e.preventDefault();
@@ -2707,19 +2697,10 @@ document.addEventListener("keydown", function (e) {
     hideScheduleRunsModal();
     return;
   }
-  const cf = document.getElementById("confirm-overlay");
-  if (cf && cf.style.display !== "none") {
-    e.preventDefault();
-    hideConfirmModal();
-    return;
-  }
-  // Governance modals
   const govOverlays = [
     ["create-role-overlay", hideCreateRoleModal],
     ["edit-role-overlay", hideEditRoleModal],
     ["user-roles-overlay", hideUserRolesModal],
-    ["create-policy-overlay", hideCreatePolicyModal],
-    ["edit-policy-overlay", hideEditPolicyModal],
     ["create-template-overlay", hideCreateTemplateModal],
     ["edit-template-overlay", hideEditTemplateModal],
     ["memory-detail-overlay", hideMemoryDetailModal],
@@ -2751,41 +2732,31 @@ document.addEventListener("keydown", function (e) {
 
 function showConfirmModal(title, message, actionLabel, callback) {
   _confirmCallbackFn = callback;
-  _confirmTriggerEl = document.activeElement;
   document.getElementById("confirm-title").textContent = title;
   document.getElementById("confirm-message").textContent = message;
   const btn = document.getElementById("confirm-submit");
   btn.textContent = actionLabel;
   btn.disabled = false;
-  const overlay = document.getElementById("confirm-overlay");
-  overlay.style.display = "flex";
-  _cfTrapHandler = _installTrap("confirm-overlay", "confirm-box");
-  setTimeout(function () {
-    btn.focus();
-  }, 50);
+  // Cancel carries the autofocus: Enter on a freshly-opened destructive
+  // confirm must not fire the action (deliberate change from the legacy
+  // action-focused behavior).
+  window.TurnstoneHatch.openDialog(document.getElementById("confirm-dialog"), {
+    onClose: function () {
+      _confirmCallbackFn = null;
+    },
+  });
 }
 
 function hideConfirmModal() {
-  document.getElementById("confirm-overlay").style.display = "none";
-  _cfTrapHandler = _removeTrap(_cfTrapHandler);
-  if (
-    _confirmTriggerEl &&
-    _confirmTriggerEl.focus &&
-    _confirmTriggerEl.isConnected
-  ) {
-    _confirmTriggerEl.focus();
-  }
-  _confirmCallbackFn = null;
-  _confirmTriggerEl = null;
+  const d = document.getElementById("confirm-dialog");
+  if (d.open) d.close();
 }
 
 function _confirmCallback() {
   const fn = _confirmCallbackFn;
   _confirmCallbackFn = null;
-  const btn = document.getElementById("confirm-submit");
-  if (btn) btn.disabled = true;
-  if (fn) fn();
   hideConfirmModal();
+  if (fn) fn();
 }
 
 // ---------------------------------------------------------------------------
@@ -6735,6 +6706,10 @@ function _refreshModelSuggestions() {
 
 /* Register listeners once at page load */
 (function () {
+  const confirmBtn = document.getElementById("confirm-submit");
+  if (confirmBtn) confirmBtn.addEventListener("click", _confirmCallback);
+  const tcCopy = document.getElementById("tc-copy");
+  if (tcCopy) tcCopy.addEventListener("click", copyCreatedToken);
   const nameEl = document.getElementById("model-name");
   const provEl = document.getElementById("model-provider");
   const tmEl = document.getElementById("model-thinking-mode");

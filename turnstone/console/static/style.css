@@ -1774,15 +1774,11 @@ textarea.skill-content-area {
 
 #create-user-overlay,
 #create-token-overlay,
-#token-created-overlay,
 #create-channel-overlay,
-#confirm-overlay,
 #schedule-runs-overlay,
 #create-role-overlay,
 #edit-role-overlay,
 #user-roles-overlay,
-#create-policy-overlay,
-#edit-policy-overlay,
 #create-ppolicy-overlay,
 #edit-ppolicy-overlay,
 #create-template-overlay,
@@ -1806,14 +1802,6 @@ textarea.skill-content-area {
   align-items: center;
   justify-content: center;
   z-index: 600;
-}
-/* Confirm dialogs are launched FROM other overlays (e.g. unlock-skill from
-   the edit-template modal). They share z-index 600, so DOM order picks the
-   winner — and confirm-overlay is earlier in the DOM, so it would render
-   underneath. Bump it above the per-feature overlays but keep it below
-   toasts (z-index 700). */
-#confirm-overlay {
-  z-index: 650;
 }
 
 /* Token display (show-once) */
