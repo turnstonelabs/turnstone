@@ -2626,14 +2626,9 @@ function _installTrap(overlayId, boxId, trapRef) {
   if (overlay) {
     overlay.onclick = function (e) {
       if (e.target === overlay) {
-        if (overlayId === "create-role-overlay") hideCreateRoleModal();
-        else if (overlayId === "edit-role-overlay") hideEditRoleModal();
-        else if (overlayId === "user-roles-overlay") hideUserRolesModal();
-        else if (overlayId === "create-template-overlay")
-          hideCreateTemplateModal();
+        if (overlayId === "create-template-overlay") hideCreateTemplateModal();
         else if (overlayId === "edit-template-overlay") hideEditTemplateModal();
         else if (overlayId === "memory-detail-overlay") hideMemoryDetailModal();
-        else if (overlayId === "github-import-overlay") hideGitHubImportModal();
         else if (overlayId === "create-ppolicy-overlay")
           hideCreatePromptPolicyModal();
         else if (overlayId === "edit-ppolicy-overlay")
@@ -2668,13 +2663,9 @@ document.addEventListener("keydown", function (e) {
     return;
   }
   const govOverlays = [
-    ["create-role-overlay", hideCreateRoleModal],
-    ["edit-role-overlay", hideEditRoleModal],
-    ["user-roles-overlay", hideUserRolesModal],
     ["create-template-overlay", hideCreateTemplateModal],
     ["edit-template-overlay", hideEditTemplateModal],
     ["memory-detail-overlay", hideMemoryDetailModal],
-    ["github-import-overlay", hideGitHubImportModal],
     ["create-ppolicy-overlay", hideCreatePromptPolicyModal],
     ["edit-ppolicy-overlay", hideEditPromptPolicyModal],
     ["create-hr-overlay", hideCreateHRModal],

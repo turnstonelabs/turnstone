@@ -15,22 +15,14 @@ let _skillCurrentView = "installed";
 let _skillDiscoverResults = [];
 let _skillDiscoverQuery = "";
 let _pendingResources = [];
-let _giTrapHandler = null;
-let _giTriggerEl = null;
 
 // Trap handler refs for modals
-let _crTrapHandler = null; // create role
-let _erTrapHandler = null; // edit role
-let _urTrapHandler = null; // user roles
 let _cpTrapHandler = null; // create policy
 let _epTrapHandler = null; // edit policy
 let _ctmTrapHandler = null; // create template
 let _etmTrapHandler = null; // edit template
 
 // Trigger element refs for focus restoration
-let _crTriggerEl = null;
-let _erTriggerEl = null;
-let _urTriggerEl = null;
 let _ctmTriggerEl = null;
 let _etmTriggerEl = null;
 
@@ -474,75 +466,53 @@ function _collectPermCheckboxes(prefix) {
   return perms.join(",");
 }
 
+// --- Role shelf (create + edit) ---
+// One pane-scoped shelf; a hidden role-id decides POST vs PUT.  Create shows
+// the slug-name row; edit hides it, carries the display name (disabled for
+// builtin rows) and renders the permission grid with baseline marks so submit
+// can diff against the built-in defaults.  The grid uses a single "role"
+// prefix for both modes.
+
+let _roleWired = false;
+
+function _roleWire() {
+  if (_roleWired) return;
+  _roleWired = true;
+  document
+    .getElementById("role-submit")
+    .addEventListener("click", _submitRoleShelf);
+}
+
 function showCreateRoleModal() {
-  _crTriggerEl = document.activeElement;
-  const ov = document.getElementById("create-role-overlay");
-  ov.style.display = "flex";
-  document.getElementById("cr-name").value = "";
-  document.getElementById("cr-displayname").value = "";
+  _roleWire();
+  const shelf = document.getElementById("role-shelf");
+  document.getElementById("role-shelf-error").classList.remove("is-visible");
+  document.getElementById("role-id").value = "";
+  document.getElementById("role-name").value = "";
+  document.getElementById("role-name-row").hidden = false;
+  const dname = document.getElementById("role-displayname");
+  dname.value = "";
+  dname.disabled = false;
   setSafeHtml(
-    document.getElementById("cr-perms-container"),
-    _buildPermCheckboxes("cr", []),
+    document.getElementById("role-perms-container"),
+    _buildPermCheckboxes("role", []),
   );
-  document.getElementById("create-role-error").classList.remove("is-visible");
-  document.getElementById("cr-name").focus();
-  _crTrapHandler = _installTrap("create-role-overlay", "create-role-box");
+  shelf.removeAttribute("data-builtin");
+  shelf.removeAttribute("data-baseline");
+  shelf.setAttribute("data-kind", "create");
+  document.getElementById("role-shelf-title").textContent = "New role";
+  document.getElementById("role-shelf-tag").textContent = "ROLE-NEW";
+  document.getElementById("role-submit").textContent = "Create";
+  window.TurnstoneHatch.openShelf(shelf);
+  document.getElementById("role-name").focus();
 }
 
 function hideCreateRoleModal() {
-  document.getElementById("create-role-overlay").style.display = "none";
-  _crTrapHandler = _removeTrap(_crTrapHandler);
-  if (_crTriggerEl && _crTriggerEl.focus) {
-    _crTriggerEl.focus();
-  }
-  _crTriggerEl = null;
-}
-
-function submitCreateRole() {
-  const name = document.getElementById("cr-name").value.trim();
-  let dname = document.getElementById("cr-displayname").value.trim();
-  const perms = _collectPermCheckboxes("cr");
-  if (!name) {
-    const e = document.getElementById("create-role-error");
-    e.textContent = "Name is required";
-    e.classList.add("is-visible");
-    return;
-  }
-  if (!dname) dname = name;
-  document.getElementById("cr-submit").disabled = true;
-  authFetch("/v1/api/admin/roles", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      name: name,
-      display_name: dname,
-      permissions: perms,
-    }),
-  })
-    .then(function (r) {
-      if (!r.ok)
-        return r.json().then(function (d) {
-          throw new Error(d.error || "Failed");
-        });
-      return r.json();
-    })
-    .then(function () {
-      hideCreateRoleModal();
-      showToast("Role created");
-      loadGovRoles();
-    })
-    .catch(function (e) {
-      const el = document.getElementById("create-role-error");
-      el.textContent = e.message;
-      el.classList.add("is-visible");
-    })
-    .finally(function () {
-      document.getElementById("cr-submit").disabled = false;
-    });
+  window.TurnstoneHatch.closeShelf(document.getElementById("role-shelf"));
 }
 
 function showEditRoleModal(roleId) {
-  _erTriggerEl = document.activeElement;
+  _roleWire();
   let role = null;
   for (let i = 0; i < _govRoles.length; i++) {
     if (_govRoles[i].role_id === roleId) {
@@ -551,22 +521,16 @@ function showEditRoleModal(roleId) {
     }
   }
   if (!role) return;
-  const ov = document.getElementById("edit-role-overlay");
-  ov.style.display = "flex";
-  document.getElementById("er-id").value = roleId;
-  // Builtin rows expose the name field read-only — only display_name and
-  // permissions are mutable on customs; for builtins, only permissions
-  // (via the override layer).  The display_name input is kept visible on
-  // builtin rows but disabled to reduce surprise.
-  const nameInput = document.getElementById("er-name");
+  const shelf = document.getElementById("role-shelf");
+  document.getElementById("role-shelf-error").classList.remove("is-visible");
+  document.getElementById("role-id").value = roleId;
+  // The slug name is immutable on edit — hide its row.  The display name is
+  // mutable on customs; for builtin rows it is kept visible but disabled to
+  // reduce surprise (only permissions, via the override layer, are mutable).
+  document.getElementById("role-name-row").hidden = true;
+  const nameInput = document.getElementById("role-displayname");
   nameInput.value = role.display_name;
   nameInput.disabled = !!role.builtin;
-
-  const titleEl = document.getElementById("edit-role-title");
-  if (titleEl)
-    titleEl.textContent = role.builtin
-      ? "Customize Built-in Role"
-      : "Edit Role";
 
   const baseline = role.builtin
     ? (role.permissions || "")
@@ -578,88 +542,114 @@ function showEditRoleModal(roleId) {
     : null;
   const selected = _effectivePerms(role);
 
-  // Persist the baseline + builtin flag on the form so submit can diff
+  // Persist the baseline + builtin flag on the shelf so submit can diff
   // without re-walking _govRoles (which could have been refreshed mid-edit).
-  const form = document.getElementById("edit-role-box");
-  if (form) {
-    form.dataset.builtin = role.builtin ? "1" : "0";
-    form.dataset.baseline = baseline ? baseline.join(",") : "";
-  }
+  shelf.dataset.builtin = role.builtin ? "1" : "0";
+  shelf.dataset.baseline = baseline ? baseline.join(",") : "";
 
   setSafeHtml(
-    document.getElementById("er-perms-container"),
-    _buildPermCheckboxes("er", selected, baseline),
+    document.getElementById("role-perms-container"),
+    _buildPermCheckboxes("role", selected, baseline),
   );
-  document.getElementById("edit-role-error").classList.remove("is-visible");
-  _erTrapHandler = _installTrap("edit-role-overlay", "edit-role-box");
+  shelf.setAttribute("data-kind", "edit");
+  document.getElementById("role-shelf-title").textContent = role.builtin
+    ? "Customize built-in role — " + role.display_name
+    : "Edit role — " + role.display_name;
+  document.getElementById("role-shelf-tag").textContent = "ROLE-EDIT";
+  document.getElementById("role-submit").textContent = "Save";
+  window.TurnstoneHatch.openShelf(shelf);
+  if (!role.builtin) nameInput.focus();
 }
 
 function hideEditRoleModal() {
-  document.getElementById("edit-role-overlay").style.display = "none";
-  _erTrapHandler = _removeTrap(_erTrapHandler);
-  if (_erTriggerEl && _erTriggerEl.focus) {
-    _erTriggerEl.focus();
-  }
-  _erTriggerEl = null;
+  hideCreateRoleModal();
 }
 
-function submitEditRole() {
-  const roleId = document.getElementById("er-id").value;
-  const dname = document.getElementById("er-name").value.trim();
-  const form = document.getElementById("edit-role-box");
-  const isBuiltin = form && form.dataset.builtin === "1";
-  document.getElementById("er-submit").disabled = true;
+function _submitRoleShelf() {
+  const shelf = document.getElementById("role-shelf");
+  const errEl = document.getElementById("role-shelf-error");
+  const roleId = document.getElementById("role-id").value;
 
-  let fetchOpts;
   let url;
-  if (isBuiltin) {
-    // Diff against baseline → {grant, revoke}. Display name is immutable.
-    //
-    // Crucial safety property: the diff universe is the set of permissions
-    // we actually RENDERED as toggles, not the full baseline.  If the
-    // permission taxonomy in `_PERMISSION_SECTIONS` ever falls behind a
-    // new server-side perm (e.g. migration adds it to builtin-admin
-    // before this file ships the toggle), naïve baseline-vs-selected
-    // diffing would treat every unrendered perm as "user wants this
-    // revoked" and silently strip it.  Limiting the universe to rendered
-    // toggles makes the editor a NO-OP for unknown perms — they pass
-    // through untouched.
-    const renderedNodes = document.querySelectorAll('input[name="er-perm"]');
-    const renderedSet = {};
-    for (let i = 0; i < renderedNodes.length; i++)
-      renderedSet[renderedNodes[i].value] = true;
-    const baseline = (form.dataset.baseline || "").split(",").filter(Boolean);
-    const baselineSet = {};
-    for (let i = 0; i < baseline.length; i++) baselineSet[baseline[i]] = true;
-    const selectedStr = _collectPermCheckboxes("er");
-    const selected = selectedStr.split(",").filter(Boolean);
-    const selectedSet = {};
-    for (let i = 0; i < selected.length; i++) selectedSet[selected[i]] = true;
-    const grant = [];
-    const revoke = [];
-    for (const p in selectedSet) {
-      if (!baselineSet[p]) grant.push(p);
+  let fetchOpts;
+  if (!roleId) {
+    const name = document.getElementById("role-name").value.trim();
+    let dname = document.getElementById("role-displayname").value.trim();
+    const perms = _collectPermCheckboxes("role");
+    if (!name) {
+      errEl.textContent = "Name is required";
+      errEl.classList.add("is-visible");
+      return;
     }
-    for (const p in baselineSet) {
-      // Only revoke perms the user could actually see — unrendered ones
-      // are out of scope for this edit and must round-trip unchanged.
-      if (renderedSet[p] && !selectedSet[p]) revoke.push(p);
-    }
-    url = "/v1/api/admin/roles/" + roleId + "/overrides";
+    if (!dname) dname = name;
+    url = "/v1/api/admin/roles";
     fetchOpts = {
-      method: "PUT",
+      method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ grant: grant, revoke: revoke }),
+      body: JSON.stringify({
+        name: name,
+        display_name: dname,
+        permissions: perms,
+      }),
     };
   } else {
-    const perms = _collectPermCheckboxes("er");
-    url = "/v1/api/admin/roles/" + roleId;
-    fetchOpts = {
-      method: "PUT",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ display_name: dname, permissions: perms }),
-    };
+    const dname = document.getElementById("role-displayname").value.trim();
+    const isBuiltin = shelf.dataset.builtin === "1";
+    if (isBuiltin) {
+      // Diff against baseline → {grant, revoke}. Display name is immutable.
+      //
+      // Crucial safety property: the diff universe is the set of permissions
+      // we actually RENDERED as toggles, not the full baseline.  If the
+      // permission taxonomy in `_PERMISSION_SECTIONS` ever falls behind a
+      // new server-side perm (e.g. migration adds it to builtin-admin
+      // before this file ships the toggle), naïve baseline-vs-selected
+      // diffing would treat every unrendered perm as "user wants this
+      // revoked" and silently strip it.  Limiting the universe to rendered
+      // toggles makes the editor a NO-OP for unknown perms — they pass
+      // through untouched.
+      const renderedNodes = document.querySelectorAll(
+        'input[name="role-perm"]',
+      );
+      const renderedSet = {};
+      for (let i = 0; i < renderedNodes.length; i++)
+        renderedSet[renderedNodes[i].value] = true;
+      const baseline = (shelf.dataset.baseline || "")
+        .split(",")
+        .filter(Boolean);
+      const baselineSet = {};
+      for (let i = 0; i < baseline.length; i++) baselineSet[baseline[i]] = true;
+      const selectedStr = _collectPermCheckboxes("role");
+      const selected = selectedStr.split(",").filter(Boolean);
+      const selectedSet = {};
+      for (let i = 0; i < selected.length; i++) selectedSet[selected[i]] = true;
+      const grant = [];
+      const revoke = [];
+      for (const p in selectedSet) {
+        if (!baselineSet[p]) grant.push(p);
+      }
+      for (const p in baselineSet) {
+        // Only revoke perms the user could actually see — unrendered ones
+        // are out of scope for this edit and must round-trip unchanged.
+        if (renderedSet[p] && !selectedSet[p]) revoke.push(p);
+      }
+      url = "/v1/api/admin/roles/" + roleId + "/overrides";
+      fetchOpts = {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ grant: grant, revoke: revoke }),
+      };
+    } else {
+      const perms = _collectPermCheckboxes("role");
+      url = "/v1/api/admin/roles/" + roleId;
+      fetchOpts = {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ display_name: dname, permissions: perms }),
+      };
+    }
   }
+  errEl.classList.remove("is-visible");
+  window.TurnstoneHatch.setBusy(shelf, true);
   authFetch(url, fetchOpts)
     .then(function (r) {
       if (!r.ok)
@@ -669,29 +659,40 @@ function submitEditRole() {
       return r.json();
     })
     .then(function () {
-      hideEditRoleModal();
-      showToast("Role updated");
+      window.TurnstoneHatch.setBusy(shelf, false);
+      hideCreateRoleModal();
+      showToast(roleId ? "Role updated" : "Role created");
       loadGovRoles();
     })
     .catch(function (e) {
-      const el = document.getElementById("edit-role-error");
-      el.textContent = e.message;
-      el.classList.add("is-visible");
-    })
-    .finally(function () {
-      document.getElementById("er-submit").disabled = false;
+      window.TurnstoneHatch.setBusy(shelf, false);
+      errEl.textContent = e.message;
+      errEl.classList.add("is-visible");
     });
 }
 
-// User roles modal (launched from Users tab)
+// --- User-roles shelf (launched from the Users tab) ---
+
+let _urWired = false;
+
+function _urWire() {
+  if (_urWired) return;
+  _urWired = true;
+  document
+    .getElementById("ur-submit")
+    .addEventListener("click", submitUserRoles);
+}
+
 function showUserRolesModal(userId) {
-  _urTriggerEl = document.activeElement;
-  const ov = document.getElementById("user-roles-overlay");
-  ov.style.display = "flex";
+  _urWire();
+  const shelf = document.getElementById("user-roles-shelf");
+  document
+    .getElementById("user-roles-shelf-error")
+    .classList.remove("is-visible");
   document.getElementById("ur-user-id").value = userId;
   const container = document.getElementById("ur-roles-container");
   setSafeHtml(container, '<div class="dashboard-empty">Loading...</div>');
-  _urTrapHandler = _installTrap("user-roles-overlay", "user-roles-box");
+  window.TurnstoneHatch.openShelf(shelf);
   // Fetch all roles and user's current roles
   Promise.all([
     authFetch("/v1/api/admin/roles").then(function (r) {
@@ -738,12 +739,7 @@ function showUserRolesModal(userId) {
 }
 
 function hideUserRolesModal() {
-  document.getElementById("user-roles-overlay").style.display = "none";
-  _urTrapHandler = _removeTrap(_urTrapHandler);
-  if (_urTriggerEl && _urTriggerEl.focus) {
-    _urTriggerEl.focus();
-  }
-  _urTriggerEl = null;
+  window.TurnstoneHatch.closeShelf(document.getElementById("user-roles-shelf"));
 }
 
 function submitUserRoles() {
@@ -3270,30 +3266,39 @@ function installDiscoveredSkill(skill) {
     });
 }
 
+let _giWired = false;
+
+function _giWire() {
+  if (_giWired) return;
+  _giWired = true;
+  document
+    .getElementById("gi-submit")
+    .addEventListener("click", submitGitHubImport);
+}
+
 function showGitHubImportModal() {
-  _giTriggerEl = document.activeElement;
-  document.getElementById("github-import-overlay").style.display = "";
+  _giWire();
   const urlInput = document.getElementById("gi-url");
   urlInput.value = "";
-  const errEl = document.getElementById("github-import-error");
+  const errEl = document.getElementById("github-import-shelf-error");
   errEl.textContent = "";
   errEl.classList.remove("is-visible");
-  _giTrapHandler = _installTrap("github-import-overlay", "github-import-box");
+  window.TurnstoneHatch.openShelf(
+    document.getElementById("github-import-shelf"),
+  );
   urlInput.focus();
 }
 
 function hideGitHubImportModal() {
-  document.getElementById("github-import-overlay").style.display = "none";
-  _giTrapHandler = _removeTrap(_giTrapHandler);
-  if (_giTriggerEl) {
-    _giTriggerEl.focus();
-    _giTriggerEl = null;
-  }
+  window.TurnstoneHatch.closeShelf(
+    document.getElementById("github-import-shelf"),
+  );
 }
 
 function submitGitHubImport() {
+  const shelf = document.getElementById("github-import-shelf");
   const url = (document.getElementById("gi-url").value || "").trim();
-  const errEl = document.getElementById("github-import-error");
+  const errEl = document.getElementById("github-import-shelf-error");
   if (!url) {
     errEl.textContent = "URL is required";
     errEl.classList.add("is-visible");
@@ -3305,10 +3310,8 @@ function submitGitHubImport() {
     return;
   }
 
-  const submitBtn = document.getElementById("gi-submit");
-  submitBtn.disabled = true;
-  submitBtn.textContent = "Installing\u2026";
   errEl.classList.remove("is-visible");
+  window.TurnstoneHatch.setBusy(shelf, true);
 
   authFetch("/v1/api/admin/skills/install", {
     method: "POST",
@@ -3323,6 +3326,7 @@ function submitGitHubImport() {
       return r.json();
     })
     .then(function (data) {
+      window.TurnstoneHatch.setBusy(shelf, false);
       hideGitHubImportModal();
       const count = data.installed.length;
       const skipCount = (data.skipped || []).length;
@@ -3348,12 +3352,9 @@ function submitGitHubImport() {
       loadGovSkills();
     })
     .catch(function (e) {
+      window.TurnstoneHatch.setBusy(shelf, false);
       errEl.textContent = e.message;
       errEl.classList.add("is-visible");
-    })
-    .finally(function () {
-      submitBtn.disabled = false;
-      submitBtn.textContent = "Install";
     });
 }
 

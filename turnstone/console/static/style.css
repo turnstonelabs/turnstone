@@ -1772,15 +1772,11 @@ textarea.skill-content-area {
   pointer-events: none;
 }
 
-#create-role-overlay,
-#edit-role-overlay,
-#user-roles-overlay,
 #create-ppolicy-overlay,
 #edit-ppolicy-overlay,
 #create-template-overlay,
 #edit-template-overlay,
 #memory-detail-overlay,
-#github-import-overlay,
 #create-hr-overlay,
 #edit-hr-overlay,
 #create-ogp-overlay,

@@ -2998,6 +2998,150 @@
               <button class="sh-btn" data-close>Close</button>
             </footer>
           </dialog>
+
+          <!-- Role shelf (create + edit) — pane-scoped. The slug-name row is
+               create-only; on edit the display name carries over (disabled for
+               builtin rows) and the permission grid renders with baseline
+               marks so submit can diff against the built-in defaults. -->
+          <dialog
+            class="hatch hatch--shelf"
+            id="role-shelf"
+            data-kind="create"
+            aria-labelledby="role-shelf-title"
+          >
+            <header class="sh-head">
+              <span class="sh-led" aria-hidden="true"></span>
+              <h2 class="sh-title" id="role-shelf-title">New role</h2>
+              <span class="sh-tag" aria-hidden="true" id="role-shelf-tag"
+                >ROLE-NEW</span
+              >
+              <button class="sh-x" data-close aria-label="Close">✕</button>
+            </header>
+            <div class="sh-body">
+              <div
+                id="role-shelf-error"
+                class="sh-alert"
+                role="alert"
+                aria-live="assertive"
+                aria-atomic="true"
+              ></div>
+              <input id="role-id" type="hidden" />
+              <div id="role-name-row">
+                <label for="role-name">Name</label>
+                <input
+                  id="role-name"
+                  type="text"
+                  class="sh-mono"
+                  placeholder="e.g. security-reviewer"
+                  autocomplete="off"
+                  spellcheck="false"
+                />
+              </div>
+              <label for="role-displayname">Display name</label>
+              <input
+                id="role-displayname"
+                type="text"
+                placeholder="Security Reviewer"
+                autocomplete="off"
+              />
+              <fieldset class="perm-fieldset">
+                <legend>Permissions</legend>
+                <div
+                  id="role-perms-container"
+                  role="group"
+                  aria-label="Permissions"
+                ></div>
+              </fieldset>
+            </div>
+            <footer class="sh-foot">
+              <div class="sh-foot-meta"></div>
+              <button class="sh-btn" data-close>Cancel</button>
+              <button id="role-submit" class="sh-btn sh-btn--primary">
+                Create
+              </button>
+            </footer>
+          </dialog>
+
+          <!-- User-roles shelf — pane-scoped. The role toggle list is filled
+               from the live roles + the user's current assignments. -->
+          <dialog
+            class="hatch hatch--shelf"
+            id="user-roles-shelf"
+            data-kind="edit"
+            aria-labelledby="user-roles-shelf-title"
+          >
+            <header class="sh-head">
+              <span class="sh-led" aria-hidden="true"></span>
+              <h2 class="sh-title" id="user-roles-shelf-title">Assign roles</h2>
+              <span class="sh-tag" aria-hidden="true">ROLE-MAP</span>
+              <button class="sh-x" data-close aria-label="Close">✕</button>
+            </header>
+            <div class="sh-body">
+              <div
+                id="user-roles-shelf-error"
+                class="sh-alert"
+                role="alert"
+                aria-live="assertive"
+                aria-atomic="true"
+              ></div>
+              <input id="ur-user-id" type="hidden" />
+              <div id="ur-roles-container"></div>
+            </div>
+            <footer class="sh-foot">
+              <div class="sh-foot-meta"></div>
+              <button class="sh-btn" data-close>Cancel</button>
+              <button id="ur-submit" class="sh-btn sh-btn--primary">
+                Save
+              </button>
+            </footer>
+          </dialog>
+
+          <!-- GitHub import shelf — pane-scoped. Single URL field. -->
+          <dialog
+            class="hatch hatch--shelf"
+            id="github-import-shelf"
+            data-kind="create"
+            aria-labelledby="github-import-shelf-title"
+          >
+            <header class="sh-head">
+              <span class="sh-led" aria-hidden="true"></span>
+              <h2 class="sh-title" id="github-import-shelf-title">
+                Import from GitHub
+              </h2>
+              <span class="sh-tag" aria-hidden="true">SKILL-GH</span>
+              <button class="sh-x" data-close aria-label="Close">✕</button>
+            </header>
+            <div class="sh-body">
+              <div
+                id="github-import-shelf-error"
+                class="sh-alert"
+                role="alert"
+                aria-live="assertive"
+                aria-atomic="true"
+              ></div>
+              <label for="gi-url"
+                >GitHub URL
+                <span class="label-hint"
+                  >a repository or SKILL.md link</span
+                ></label
+              >
+              <input
+                id="gi-url"
+                type="url"
+                class="sh-mono"
+                placeholder="https://github.com/owner/repo"
+                autocomplete="off"
+                spellcheck="false"
+              />
+            </div>
+            <footer class="sh-foot">
+              <div class="sh-foot-meta"></div>
+              <button class="sh-btn" data-close>Cancel</button>
+              <button id="gi-submit" class="sh-btn sh-btn--primary">
+                Install
+              </button>
+            </footer>
+          </dialog>
         </div>
         <!-- /admin-layout -->
       </div>
@@ -3075,52 +3219,6 @@
     <script src="/shared/katex-0.17.0/katex.min.js"></script>
     <script src="/shared/hljs-11.11.1/highlight.min.js"></script>
     <script type="module" src="/shared/renderer.js"></script>
-
-    <!-- GitHub Import Modal -->
-    <div
-      id="github-import-overlay"
-      style="display: none"
-      role="dialog"
-      aria-modal="true"
-      aria-labelledby="github-import-title"
-    >
-      <div id="github-import-box" class="admin-modal">
-        <h2 id="github-import-title">Import from GitHub</h2>
-        <div
-          id="github-import-error"
-          role="alert"
-          aria-live="assertive"
-          aria-atomic="true"
-        ></div>
-        <label for="gi-url">GitHub URL</label>
-        <input
-          id="gi-url"
-          type="url"
-          placeholder="https://github.com/owner/repo"
-          autocomplete="off"
-          spellcheck="false"
-          aria-describedby="gi-url-hint"
-        />
-        <p
-          id="gi-url-hint"
-          style="font-size: 11px; color: var(--fg-dim); margin: 4px 0 12px"
-        >
-          Paste a link to a repository or SKILL.md file
-        </p>
-        <div class="modal-buttons">
-          <button class="modal-cancel" onclick="hideGitHubImportModal()">
-            Cancel
-          </button>
-          <button
-            id="gi-submit"
-            class="modal-submit"
-            onclick="submitGitHubImport()"
-          >
-            Install
-          </button>
-        </div>
-      </div>
-    </div>
 
     <!-- Token Created (show-once) Modal -->
     <dialog
@@ -3211,129 +3309,6 @@
         </button>
       </footer>
     </dialog>
-
-    <!-- Create Role Modal -->
-    <div
-      id="create-role-overlay"
-      style="display: none"
-      role="dialog"
-      aria-modal="true"
-      aria-labelledby="create-role-title"
-    >
-      <div id="create-role-box" class="admin-modal admin-modal-wide">
-        <h2 id="create-role-title">Create Role</h2>
-        <div
-          id="create-role-error"
-          role="alert"
-          aria-live="assertive"
-          aria-atomic="true"
-        ></div>
-        <label for="cr-name">Name</label>
-        <input
-          id="cr-name"
-          type="text"
-          placeholder="e.g. security-reviewer"
-          autocomplete="off"
-          spellcheck="false"
-        />
-        <label for="cr-displayname">Display name</label>
-        <input
-          id="cr-displayname"
-          type="text"
-          placeholder="Security Reviewer"
-          autocomplete="off"
-        />
-        <fieldset class="perm-fieldset">
-          <legend>Permissions</legend>
-          <div
-            id="cr-perms-container"
-            role="group"
-            aria-label="Permissions"
-          ></div>
-        </fieldset>
-        <div class="modal-buttons">
-          <button class="modal-cancel" onclick="hideCreateRoleModal()">
-            Cancel
-          </button>
-          <button
-            id="cr-submit"
-            class="modal-submit"
-            onclick="submitCreateRole()"
-          >
-            Create
-          </button>
-        </div>
-      </div>
-    </div>
-
-    <!-- Edit Role Modal -->
-    <div
-      id="edit-role-overlay"
-      style="display: none"
-      role="dialog"
-      aria-modal="true"
-      aria-labelledby="edit-role-title"
-    >
-      <div id="edit-role-box" class="admin-modal admin-modal-wide">
-        <h2 id="edit-role-title">Edit Role</h2>
-        <div
-          id="edit-role-error"
-          role="alert"
-          aria-live="assertive"
-          aria-atomic="true"
-        ></div>
-        <input id="er-id" type="hidden" />
-        <label for="er-name">Display name</label>
-        <input id="er-name" type="text" autocomplete="off" />
-        <fieldset class="perm-fieldset">
-          <legend>Permissions</legend>
-          <div
-            id="er-perms-container"
-            role="group"
-            aria-label="Permissions"
-          ></div>
-        </fieldset>
-        <div class="modal-buttons">
-          <button class="modal-cancel" onclick="hideEditRoleModal()">
-            Cancel
-          </button>
-          <button
-            id="er-submit"
-            class="modal-submit"
-            onclick="submitEditRole()"
-          >
-            Save
-          </button>
-        </div>
-      </div>
-    </div>
-
-    <!-- User Roles Modal -->
-    <div
-      id="user-roles-overlay"
-      style="display: none"
-      role="dialog"
-      aria-modal="true"
-      aria-labelledby="user-roles-title"
-    >
-      <div id="user-roles-box" class="admin-modal">
-        <h2 id="user-roles-title">Assign Roles</h2>
-        <div
-          id="user-roles-error"
-          role="alert"
-          aria-live="assertive"
-          aria-atomic="true"
-        ></div>
-        <input id="ur-user-id" type="hidden" />
-        <div id="ur-roles-container"></div>
-        <div class="modal-buttons">
-          <button class="modal-cancel" onclick="hideUserRolesModal()">
-            Cancel
-          </button>
-          <button class="modal-submit" onclick="submitUserRoles()">Save</button>
-        </div>
-      </div>
-    </div>
 
     <!-- Create Prompt Policy Modal -->
     <div
