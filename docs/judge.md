@@ -238,7 +238,10 @@ still stream to the UI and persist, stamped with the decision. The daemon is
 aborted only when the next tool batch supersedes it or the session closes —
 then each unfinished item degrades to an `llm_fallback` verdict. With
 `cancel_on_approval = true` the abort additionally fires the moment the gate
-resolves, trading verdict completeness for inference savings.
+resolves, trading verdict completeness for inference savings — recommended
+when the judge shares a single local inference backend with the session model,
+where a large batch's remaining judge calls would otherwise compete with the
+next turn's completion.
 
 Verdicts that arrive after a *newer batch* has replaced the judge generation
 are withheld from the live surfaces (a reused call_id must never ride a stale

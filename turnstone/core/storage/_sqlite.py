@@ -3815,14 +3815,8 @@ class SQLiteBackend:
             conn.commit()
 
     def create_intent_verdicts_bulk(self, verdicts: list[dict[str, Any]]) -> None:
-        # ON CONFLICT DO NOTHING per row: the async judge daemon can land
-        # an UPSERT (which INSERTs the heuristic verdict_id it reuses)
-        # before this bulk write runs.  A plain INSERT would abort the
-        # whole statement on that one collision — silently discarding
-        # every OTHER row in the batch (the caller swallows storage
-        # errors).  Skipping just the colliding row also keeps the
-        # daemon's tier upgrade ("llm_fallback") instead of regressing
-        # it to the bulk's heuristic stamp.
+        # ON CONFLICT DO NOTHING — see the protocol docstring for the
+        # daemon-races-the-bulk-write rationale.
         from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 
         if not verdicts:
