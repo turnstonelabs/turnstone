@@ -5,9 +5,6 @@ let _adminUsers = [];
 let _adminTokenUserId = "";
 let _adminChannelUserId = "";
 let _lastCreatedToken = "";
-let _cuTrapHandler = null;
-let _ctTrapHandler = null;
-let _ccTrapHandler = null;
 let _adminWatches = [];
 let _confirmCallbackFn = null;
 
@@ -1118,8 +1115,7 @@ function confirmUnlinkChannel(channelType, channelUserId) {
 // Schedules
 // ---------------------------------------------------------------------------
 
-let _srTrapHandler = null;
-let _runsScheduleTriggerEl = null;
+let _srShelfHandle = null;
 
 function loadAdminSchedules() {
   authFetch("/v1/api/admin/schedules")
@@ -2068,7 +2064,6 @@ function _submitScheduleShelf() {
 // --- Schedule Runs Modal ---
 
 function showScheduleRuns(taskId) {
-  _runsScheduleTriggerEl = document.activeElement;
   authFetch(
     "/v1/api/admin/schedules/" + encodeURIComponent(taskId) + "/runs?limit=50",
   )
@@ -2120,11 +2115,8 @@ function showScheduleRuns(taskId) {
         }
         setSafeHtml(container, html);
       }
-      const overlay = document.getElementById("schedule-runs-overlay");
-      overlay.style.display = "flex";
-      _srTrapHandler = _installTrap(
-        "schedule-runs-overlay",
-        "schedule-runs-box",
+      _srShelfHandle = window.TurnstoneHatch.openShelf(
+        document.getElementById("schedule-runs-shelf"),
       );
     })
     .catch(function () {
@@ -2133,12 +2125,10 @@ function showScheduleRuns(taskId) {
 }
 
 function hideScheduleRunsModal() {
-  document.getElementById("schedule-runs-overlay").style.display = "none";
-  _srTrapHandler = _removeTrap(_srTrapHandler);
-  if (_runsScheduleTriggerEl && _runsScheduleTriggerEl.isConnected) {
-    _runsScheduleTriggerEl.focus();
-  }
-  _runsScheduleTriggerEl = null;
+  window.TurnstoneHatch.closeShelf(
+    document.getElementById("schedule-runs-shelf"),
+  );
+  _srShelfHandle = null;
 }
 
 // ---------------------------------------------------------------------------
@@ -2316,51 +2306,56 @@ function _cancelWatch(watchId, nodeId, name) {
 // Create Channel Link Modal
 // ---------------------------------------------------------------------------
 
+let _channelWired = false;
+let _channelShelfHandle = null;
+
+function _channelWire() {
+  if (_channelWired) return;
+  _channelWired = true;
+  const ctSel = document.getElementById("cc-type");
+  ctSel.addEventListener("change", function () {
+    document.getElementById("cc-uid").placeholder = _notifyIdPlaceholder(
+      ctSel.value,
+    );
+  });
+  document
+    .getElementById("cc-submit")
+    .addEventListener("click", submitCreateChannel);
+}
+
 function showCreateChannelModal() {
   if (!_adminChannelUserId) {
     showToast("Select a user first");
     return;
   }
-  const overlay = document.getElementById("create-channel-overlay");
-  overlay.style.display = "flex";
-  document
-    .getElementById("create-channel-error")
-    .classList.remove("is-visible");
+  _channelWire();
+  const shelf = document.getElementById("channel-shelf");
+  document.getElementById("channel-shelf-error").classList.remove("is-visible");
   const ctSel = document.getElementById("cc-type");
   const uidInput = document.getElementById("cc-uid");
   ctSel.value = "discord";
   uidInput.value = "";
   uidInput.placeholder = _notifyIdPlaceholder(ctSel.value);
-  ctSel.onchange = function () {
-    uidInput.placeholder = _notifyIdPlaceholder(ctSel.value);
-  };
-  document.getElementById("cc-submit").disabled = false;
-  document.getElementById("cc-submit").textContent = "Link";
-  _ccTrapHandler = _installTrap("create-channel-overlay", "create-channel-box");
-  setTimeout(function () {
-    uidInput.focus();
-  }, 50);
+  _channelShelfHandle = window.TurnstoneHatch.openShelf(shelf);
+  uidInput.focus();
 }
 
 function hideCreateChannelModal() {
-  document.getElementById("create-channel-overlay").style.display = "none";
-  _ccTrapHandler = _removeTrap(_ccTrapHandler);
-  const trigger = document.querySelector("#admin-channels .admin-action-btn");
-  if (trigger) trigger.focus();
+  window.TurnstoneHatch.closeShelf(document.getElementById("channel-shelf"));
+  _channelShelfHandle = null;
 }
 
 function submitCreateChannel() {
+  const shelf = document.getElementById("channel-shelf");
   const channelType = document.getElementById("cc-type").value;
   const channelUserId = (document.getElementById("cc-uid").value || "").trim();
-  const errEl = document.getElementById("create-channel-error");
+  const errEl = document.getElementById("channel-shelf-error");
 
   if (!channelUserId)
     return _showModalError(errEl, "External user ID is required");
 
-  const btn = document.getElementById("cc-submit");
-  btn.disabled = true;
-  btn.textContent = "Linking\u2026";
-
+  errEl.classList.remove("is-visible");
+  window.TurnstoneHatch.setBusy(shelf, true);
   authFetch(
     "/v1/api/admin/users/" +
       encodeURIComponent(_adminChannelUserId) +
@@ -2386,13 +2381,13 @@ function submitCreateChannel() {
       return r.json();
     })
     .then(function () {
+      window.TurnstoneHatch.setBusy(shelf, false);
       hideCreateChannelModal();
       showToast("Channel account linked");
       loadAdminChannels();
     })
     .catch(function (err) {
-      btn.disabled = false;
-      btn.textContent = "Link";
+      window.TurnstoneHatch.setBusy(shelf, false);
       _showModalError(errEl, err.message || "Failed to link channel account");
     });
 }
@@ -2401,37 +2396,43 @@ function submitCreateChannel() {
 // Create User Modal
 // ---------------------------------------------------------------------------
 
+let _userWired = false;
+let _userShelfHandle = null;
+
+function _userWire() {
+  if (_userWired) return;
+  _userWired = true;
+  document
+    .getElementById("cu-submit")
+    .addEventListener("click", submitCreateUser);
+}
+
 function showCreateUserModal() {
-  const overlay = document.getElementById("create-user-overlay");
-  overlay.style.display = "flex";
-  document.getElementById("create-user-error").classList.remove("is-visible");
+  _userWire();
+  const shelf = document.getElementById("user-shelf");
+  document.getElementById("user-shelf-error").classList.remove("is-visible");
   document.getElementById("cu-username").value = "";
   document.getElementById("cu-displayname").value = "";
   document.getElementById("cu-password").value = "";
   document.getElementById("cu-confirm").value = "";
-  document.getElementById("cu-submit").disabled = false;
-  document.getElementById("cu-submit").textContent = "Create";
-  _cuTrapHandler = _installTrap("create-user-overlay", "create-user-box");
-  setTimeout(function () {
-    document.getElementById("cu-username").focus();
-  }, 50);
+  _userShelfHandle = window.TurnstoneHatch.openShelf(shelf);
+  document.getElementById("cu-username").focus();
 }
 
 function hideCreateUserModal() {
-  document.getElementById("create-user-overlay").style.display = "none";
-  _cuTrapHandler = _removeTrap(_cuTrapHandler);
-  const trigger = document.querySelector("#admin-users .admin-action-btn");
-  if (trigger) trigger.focus();
+  window.TurnstoneHatch.closeShelf(document.getElementById("user-shelf"));
+  _userShelfHandle = null;
 }
 
 function submitCreateUser() {
+  const shelf = document.getElementById("user-shelf");
   const username = (document.getElementById("cu-username").value || "").trim();
   const displayName = (
     document.getElementById("cu-displayname").value || ""
   ).trim();
   const password = document.getElementById("cu-password").value || "";
   const confirm = document.getElementById("cu-confirm").value || "";
-  const errEl = document.getElementById("create-user-error");
+  const errEl = document.getElementById("user-shelf-error");
 
   if (!username) return _showModalError(errEl, "Username is required");
   if (!displayName) return _showModalError(errEl, "Display name is required");
@@ -2441,10 +2442,8 @@ function submitCreateUser() {
   if (password !== confirm)
     return _showModalError(errEl, "Passwords do not match");
 
-  const btn = document.getElementById("cu-submit");
-  btn.disabled = true;
-  btn.textContent = "Creating\u2026";
-
+  errEl.classList.remove("is-visible");
+  window.TurnstoneHatch.setBusy(shelf, true);
   authFetch("/v1/api/admin/users", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -2463,13 +2462,13 @@ function submitCreateUser() {
       return r.json();
     })
     .then(function () {
+      window.TurnstoneHatch.setBusy(shelf, false);
       hideCreateUserModal();
       showToast("User '" + username + "' created");
       loadAdminUsers();
     })
     .catch(function (err) {
-      btn.disabled = false;
-      btn.textContent = "Create";
+      window.TurnstoneHatch.setBusy(shelf, false);
       _showModalError(errEl, err.message || "Failed to create user");
     });
 }
@@ -2478,45 +2477,49 @@ function submitCreateUser() {
 // Create Token Modal
 // ---------------------------------------------------------------------------
 
+let _tokenWired = false;
+let _tokenShelfHandle = null;
+
+function _tokenWire() {
+  if (_tokenWired) return;
+  _tokenWired = true;
+  document
+    .getElementById("ct-submit")
+    .addEventListener("click", submitCreateToken);
+}
+
 function showCreateTokenModal() {
   if (!_adminTokenUserId) {
     showToast("Select a user first");
     return;
   }
-  const overlay = document.getElementById("create-token-overlay");
-  overlay.style.display = "flex";
-  document.getElementById("create-token-error").classList.remove("is-visible");
+  _tokenWire();
+  const shelf = document.getElementById("token-shelf");
+  document.getElementById("token-shelf-error").classList.remove("is-visible");
   document.getElementById("ct-name").value = "";
   document.getElementById("ct-scopes").value = "read,write,approve";
   document.getElementById("ct-expires").value = "";
-  document.getElementById("ct-submit").disabled = false;
-  document.getElementById("ct-submit").textContent = "Create";
-  _ctTrapHandler = _installTrap("create-token-overlay", "create-token-box");
-  setTimeout(function () {
-    document.getElementById("ct-name").focus();
-  }, 50);
+  _tokenShelfHandle = window.TurnstoneHatch.openShelf(shelf);
+  document.getElementById("ct-name").focus();
 }
 
 function hideCreateTokenModal() {
-  document.getElementById("create-token-overlay").style.display = "none";
-  _ctTrapHandler = _removeTrap(_ctTrapHandler);
-  const trigger = document.querySelector("#admin-tokens .admin-action-btn");
-  if (trigger) trigger.focus();
+  window.TurnstoneHatch.closeShelf(document.getElementById("token-shelf"));
+  _tokenShelfHandle = null;
 }
 
 function submitCreateToken() {
+  const shelf = document.getElementById("token-shelf");
   const name = (document.getElementById("ct-name").value || "").trim();
   const scopes = document.getElementById("ct-scopes").value;
   const expiresDays = document.getElementById("ct-expires").value;
-  const errEl = document.getElementById("create-token-error");
-
-  const btn = document.getElementById("ct-submit");
-  btn.disabled = true;
-  btn.textContent = "Creating\u2026";
+  const errEl = document.getElementById("token-shelf-error");
 
   const body = { name: name, scopes: scopes };
   if (expiresDays) body.expires_days = parseInt(expiresDays, 10);
 
+  errEl.classList.remove("is-visible");
+  window.TurnstoneHatch.setBusy(shelf, true);
   authFetch(
     "/v1/api/admin/users/" + encodeURIComponent(_adminTokenUserId) + "/tokens",
     {
@@ -2533,14 +2536,14 @@ function submitCreateToken() {
       return r.json();
     })
     .then(function (data) {
+      window.TurnstoneHatch.setBusy(shelf, false);
       hideCreateTokenModal();
       _lastCreatedToken = data.token;
       showTokenCreatedModal(data.token);
       loadAdminTokens();
     })
     .catch(function (err) {
-      btn.disabled = false;
-      btn.textContent = "Create";
+      window.TurnstoneHatch.setBusy(shelf, false);
       _showModalError(errEl, err.message || "Failed to create token");
     });
 }
@@ -2623,12 +2626,7 @@ function _installTrap(overlayId, boxId, trapRef) {
   if (overlay) {
     overlay.onclick = function (e) {
       if (e.target === overlay) {
-        if (overlayId === "create-user-overlay") hideCreateUserModal();
-        else if (overlayId === "create-token-overlay") hideCreateTokenModal();
-        else if (overlayId === "create-channel-overlay")
-          hideCreateChannelModal();
-        else if (overlayId === "schedule-runs-overlay") hideScheduleRunsModal();
-        else if (overlayId === "create-role-overlay") hideCreateRoleModal();
+        if (overlayId === "create-role-overlay") hideCreateRoleModal();
         else if (overlayId === "edit-role-overlay") hideEditRoleModal();
         else if (overlayId === "user-roles-overlay") hideUserRolesModal();
         else if (overlayId === "create-template-overlay")
@@ -2671,30 +2669,6 @@ document.addEventListener("keydown", function (e) {
   if (openHelp) {
     e.preventDefault();
     _closeAllSettingsHelp();
-    return;
-  }
-  const cu = document.getElementById("create-user-overlay");
-  if (cu && cu.style.display !== "none") {
-    e.preventDefault();
-    hideCreateUserModal();
-    return;
-  }
-  const ct = document.getElementById("create-token-overlay");
-  if (ct && ct.style.display !== "none") {
-    e.preventDefault();
-    hideCreateTokenModal();
-    return;
-  }
-  const cc = document.getElementById("create-channel-overlay");
-  if (cc && cc.style.display !== "none") {
-    e.preventDefault();
-    hideCreateChannelModal();
-    return;
-  }
-  const sro = document.getElementById("schedule-runs-overlay");
-  if (sro && sro.style.display !== "none") {
-    e.preventDefault();
-    hideScheduleRunsModal();
     return;
   }
   const govOverlays = [

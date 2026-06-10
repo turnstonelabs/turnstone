@@ -2520,6 +2520,198 @@
               </button>
             </footer>
           </dialog>
+
+          <!-- Create-user shelf — pane-scoped. -->
+          <dialog
+            class="hatch hatch--shelf"
+            id="user-shelf"
+            data-kind="create"
+            aria-labelledby="user-shelf-title"
+          >
+            <header class="sh-head">
+              <span class="sh-led" aria-hidden="true"></span>
+              <h2 class="sh-title" id="user-shelf-title">New user</h2>
+              <span class="sh-tag" aria-hidden="true">USR-NEW</span>
+              <button class="sh-x" data-close aria-label="Close">✕</button>
+            </header>
+            <div class="sh-body">
+              <div
+                id="user-shelf-error"
+                class="sh-alert"
+                role="alert"
+                aria-live="assertive"
+                aria-atomic="true"
+              ></div>
+              <label for="cu-username">Username</label>
+              <input
+                id="cu-username"
+                type="text"
+                placeholder="login username"
+                autocomplete="off"
+                spellcheck="false"
+              />
+              <label for="cu-displayname">Display name</label>
+              <input
+                id="cu-displayname"
+                type="text"
+                placeholder="Full name"
+                autocomplete="off"
+              />
+              <label for="cu-password">Password</label>
+              <input
+                id="cu-password"
+                type="password"
+                placeholder="Minimum 8 characters"
+                autocomplete="new-password"
+              />
+              <label for="cu-confirm">Confirm password</label>
+              <input
+                id="cu-confirm"
+                type="password"
+                placeholder="Confirm password"
+                autocomplete="new-password"
+              />
+            </div>
+            <footer class="sh-foot">
+              <div class="sh-foot-meta"></div>
+              <button class="sh-btn" data-close>Cancel</button>
+              <button id="cu-submit" class="sh-btn sh-btn--primary">
+                Create
+              </button>
+            </footer>
+          </dialog>
+
+          <!-- Create-token shelf — pane-scoped. The issued secret hands off to
+               the token-created dialog (document tier). -->
+          <dialog
+            class="hatch hatch--shelf"
+            id="token-shelf"
+            data-kind="create"
+            aria-labelledby="token-shelf-title"
+          >
+            <header class="sh-head">
+              <span class="sh-led" aria-hidden="true"></span>
+              <h2 class="sh-title" id="token-shelf-title">New API token</h2>
+              <span class="sh-tag" aria-hidden="true">TOK-NEW</span>
+              <button class="sh-x" data-close aria-label="Close">✕</button>
+            </header>
+            <div class="sh-body">
+              <div
+                id="token-shelf-error"
+                class="sh-alert"
+                role="alert"
+                aria-live="assertive"
+                aria-atomic="true"
+              ></div>
+              <label for="ct-name"
+                >Token name <span class="label-hint">optional</span></label
+              >
+              <input
+                id="ct-name"
+                type="text"
+                placeholder="e.g. CI pipeline, bridge-prod"
+                autocomplete="off"
+              />
+              <label for="ct-scopes">Scopes</label>
+              <select id="ct-scopes">
+                <option value="read,write,approve">
+                  Full access (read, write, approve)
+                </option>
+                <option value="read,write">Read + write</option>
+                <option value="read">Read only</option>
+              </select>
+              <label for="ct-expires"
+                >Expiry <span class="label-hint">optional</span></label
+              >
+              <select id="ct-expires">
+                <option value="">Never</option>
+                <option value="30">30 days</option>
+                <option value="90">90 days</option>
+                <option value="365">1 year</option>
+              </select>
+            </div>
+            <footer class="sh-foot">
+              <div class="sh-foot-meta"></div>
+              <button class="sh-btn" data-close>Cancel</button>
+              <button id="ct-submit" class="sh-btn sh-btn--primary">
+                Create
+              </button>
+            </footer>
+          </dialog>
+
+          <!-- Link-channel shelf — pane-scoped. -->
+          <dialog
+            class="hatch hatch--shelf"
+            id="channel-shelf"
+            data-kind="create"
+            aria-labelledby="channel-shelf-title"
+          >
+            <header class="sh-head">
+              <span class="sh-led" aria-hidden="true"></span>
+              <h2 class="sh-title" id="channel-shelf-title">
+                Link channel account
+              </h2>
+              <span class="sh-tag" aria-hidden="true">CHN-LINK</span>
+              <button class="sh-x" data-close aria-label="Close">✕</button>
+            </header>
+            <div class="sh-body">
+              <div
+                id="channel-shelf-error"
+                class="sh-alert"
+                role="alert"
+                aria-live="assertive"
+                aria-atomic="true"
+              ></div>
+              <label for="cc-type">Channel type</label>
+              <select id="cc-type">
+                <option value="discord">Discord</option>
+                <option value="slack">Slack</option>
+              </select>
+              <label for="cc-uid"
+                >External user ID
+                <span class="label-hint"
+                  >the user's ID on the platform</span
+                ></label
+              >
+              <input
+                id="cc-uid"
+                type="text"
+                autocomplete="off"
+                spellcheck="false"
+              />
+            </div>
+            <footer class="sh-foot">
+              <div class="sh-foot-meta"></div>
+              <button class="sh-btn" data-close>Cancel</button>
+              <button id="cc-submit" class="sh-btn sh-btn--primary">
+                Link
+              </button>
+            </footer>
+          </dialog>
+
+          <!-- Schedule-runs shelf — pane-scoped, read-only run history. -->
+          <dialog
+            class="hatch hatch--shelf hatch--lg"
+            id="schedule-runs-shelf"
+            data-kind="inspect"
+            aria-labelledby="schedule-runs-shelf-title"
+          >
+            <header class="sh-head">
+              <span class="sh-led" aria-hidden="true"></span>
+              <h2 class="sh-title" id="schedule-runs-shelf-title">
+                Run history
+              </h2>
+              <span class="sh-tag" aria-hidden="true">SCH-RUNS</span>
+              <button class="sh-x" data-close aria-label="Close">✕</button>
+            </header>
+            <div class="sh-body">
+              <div id="schedule-runs-table"></div>
+            </div>
+            <footer class="sh-foot">
+              <div class="sh-foot-meta"></div>
+              <button class="sh-btn" data-close>Close</button>
+            </footer>
+          </dialog>
         </div>
         <!-- /admin-layout -->
       </div>
@@ -2644,123 +2836,6 @@
       </div>
     </div>
 
-    <!-- Create User Modal -->
-    <div
-      id="create-user-overlay"
-      style="display: none"
-      role="dialog"
-      aria-modal="true"
-      aria-labelledby="create-user-title"
-    >
-      <div id="create-user-box" class="admin-modal">
-        <h2 id="create-user-title">Create User</h2>
-        <div
-          id="create-user-error"
-          role="alert"
-          aria-live="assertive"
-          aria-atomic="true"
-        ></div>
-        <label for="cu-username">Username</label>
-        <input
-          id="cu-username"
-          type="text"
-          placeholder="login username"
-          autocomplete="off"
-          spellcheck="false"
-        />
-        <label for="cu-displayname">Display name</label>
-        <input
-          id="cu-displayname"
-          type="text"
-          placeholder="Full name"
-          autocomplete="off"
-        />
-        <label for="cu-password">Password</label>
-        <input
-          id="cu-password"
-          type="password"
-          placeholder="Minimum 8 characters"
-          autocomplete="new-password"
-        />
-        <label for="cu-confirm">Confirm password</label>
-        <input
-          id="cu-confirm"
-          type="password"
-          placeholder="Confirm password"
-          autocomplete="new-password"
-        />
-        <div class="modal-buttons">
-          <button class="modal-cancel" onclick="hideCreateUserModal()">
-            Cancel
-          </button>
-          <button
-            id="cu-submit"
-            class="modal-submit"
-            onclick="submitCreateUser()"
-          >
-            Create
-          </button>
-        </div>
-      </div>
-    </div>
-
-    <!-- Create Token Modal -->
-    <div
-      id="create-token-overlay"
-      style="display: none"
-      role="dialog"
-      aria-modal="true"
-      aria-labelledby="create-token-title"
-    >
-      <div id="create-token-box" class="admin-modal">
-        <h2 id="create-token-title">Create API Token</h2>
-        <div
-          id="create-token-error"
-          role="alert"
-          aria-live="assertive"
-          aria-atomic="true"
-        ></div>
-        <label for="ct-name"
-          >Token name <span class="label-hint">optional</span></label
-        >
-        <input
-          id="ct-name"
-          type="text"
-          placeholder="e.g. CI pipeline, bridge-prod"
-          autocomplete="off"
-        />
-        <label for="ct-scopes">Scopes</label>
-        <select id="ct-scopes">
-          <option value="read,write,approve">
-            Full access (read, write, approve)
-          </option>
-          <option value="read,write">Read + write</option>
-          <option value="read">Read only</option>
-        </select>
-        <label for="ct-expires"
-          >Expiry <span class="label-hint">optional</span></label
-        >
-        <select id="ct-expires">
-          <option value="">Never</option>
-          <option value="30">30 days</option>
-          <option value="90">90 days</option>
-          <option value="365">1 year</option>
-        </select>
-        <div class="modal-buttons">
-          <button class="modal-cancel" onclick="hideCreateTokenModal()">
-            Cancel
-          </button>
-          <button
-            id="ct-submit"
-            class="modal-submit"
-            onclick="submitCreateToken()"
-          >
-            Create
-          </button>
-        </div>
-      </div>
-    </div>
-
     <!-- Token Created (show-once) Modal -->
     <dialog
       class="hatch hatch--dialog"
@@ -2814,66 +2889,6 @@
         </button>
       </footer>
     </dialog>
-
-    <!-- Create Channel Link Modal -->
-    <div
-      id="create-channel-overlay"
-      style="display: none"
-      role="dialog"
-      aria-modal="true"
-      aria-labelledby="create-channel-title"
-    >
-      <div id="create-channel-box" class="admin-modal">
-        <h2 id="create-channel-title">Link Channel Account</h2>
-        <div
-          id="create-channel-error"
-          role="alert"
-          aria-live="assertive"
-          aria-atomic="true"
-        ></div>
-        <label for="cc-type">Channel type</label>
-        <select id="cc-type">
-          <option value="discord">Discord</option>
-          <option value="slack">Slack</option>
-        </select>
-        <label for="cc-uid"
-          >External user ID
-          <span class="label-hint">the user's ID on the platform</span></label
-        >
-        <input id="cc-uid" type="text" autocomplete="off" spellcheck="false" />
-        <div class="modal-buttons">
-          <button class="modal-cancel" onclick="hideCreateChannelModal()">
-            Cancel
-          </button>
-          <button
-            id="cc-submit"
-            class="modal-submit"
-            onclick="submitCreateChannel()"
-          >
-            Link
-          </button>
-        </div>
-      </div>
-    </div>
-
-    <!-- Schedule Runs Modal -->
-    <div
-      id="schedule-runs-overlay"
-      style="display: none"
-      role="dialog"
-      aria-modal="true"
-      aria-labelledby="schedule-runs-title"
-    >
-      <div id="schedule-runs-box" class="admin-modal admin-modal-wide">
-        <h2 id="schedule-runs-title">Run History</h2>
-        <div id="schedule-runs-table"></div>
-        <div class="modal-buttons">
-          <button class="modal-cancel" onclick="hideScheduleRunsModal()">
-            Close
-          </button>
-        </div>
-      </div>
-    </div>
 
     <!-- Create Role Modal -->
     <div

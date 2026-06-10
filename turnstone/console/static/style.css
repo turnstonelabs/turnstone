@@ -1772,10 +1772,6 @@ textarea.skill-content-area {
   pointer-events: none;
 }
 
-#create-user-overlay,
-#create-token-overlay,
-#create-channel-overlay,
-#schedule-runs-overlay,
 #create-role-overlay,
 #edit-role-overlay,
 #user-roles-overlay,
