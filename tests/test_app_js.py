@@ -628,7 +628,8 @@ def test_dashboard_is_the_main_pane_body() -> None:
 def test_mcp_connections_panel_and_revoke_modal_in_index_html() -> None:
     """MCP connections moved from the floating #settings-overlay into the Admin
     pane's Connections panel (#view-admin), reusing the same #settings-mcp-*
-    table ids so the render code is unchanged.  The revoke modal stays."""
+    table ids so the render code is unchanged.  The revoke confirm lives on the
+    hatch dialog tier (native document-modal)."""
     body = _INDEX_HTML.read_text(encoding="utf-8")
     assert 'id="settings-overlay"' not in body, "the floating MCP settings overlay is retired."
     assert 'id="view-admin"' in body, "the Admin pane host (#view-admin) must exist."
@@ -637,10 +638,11 @@ def test_mcp_connections_panel_and_revoke_modal_in_index_html() -> None:
     assert 'id="settings-mcp-table"' in panel and 'id="settings-mcp-tbody"' in panel, (
         "the MCP table (reused ids) must live inside #view-admin."
     )
-    idx = body.index('id="revoke-mcp-overlay"')
-    chunk = body[idx : idx + 600]
-    assert 'role="dialog"' in chunk and 'aria-modal="true"' in chunk, (
-        "revoke-mcp-overlay stays a modal dialog."
+    idx = body.index('id="revoke-mcp-dialog"')
+    chunk = body[max(0, idx - 200) : idx + 600]
+    assert "hatch--dialog" in chunk and 'role="alertdialog"' in chunk, (
+        "the revoke confirm is a hatch dialog-tier alertdialog "
+        "(native showModal supplies modality — no aria-modal attribute)."
     )
 
 
@@ -672,7 +674,9 @@ def test_phase8_css_classes_present_in_stylesheet() -> None:
     must keep their CSS rules (else the consent / connections UX silently loses
     its visual treatment). The settings OVERLAY is retired in step 6 — MCP
     connections render in the Admin pane's Connections panel (#view-admin), not a
-    floating dialog — so #settings-overlay / #settings-box are no longer pinned."""
+    floating dialog — so #settings-overlay / #settings-box are no longer pinned.
+    The revoke confirm's chrome moved to /shared/hatch.css with the dialog-tier
+    conversion, so no #revoke-mcp-* rule is pinned here either."""
     css = _STYLE_CSS.read_text(encoding="utf-8")
     for selector in [
         ".mcp-error-card",
@@ -681,7 +685,6 @@ def test_phase8_css_classes_present_in_stylesheet() -> None:
         ".mcp-scope-pill",
         ".settings-revoke-btn",
         ".settings-consent-badge",
-        "#revoke-mcp-overlay",
     ]:
         assert selector in css, f"Missing CSS rule for {selector}"
 
