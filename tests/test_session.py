@@ -513,6 +513,75 @@ class TestTaskExec:
         captured[0](fake_verdict)  # must not raise
         session.ui.on_intent_verdict.assert_not_called()
 
+    def _drive_gate(self, session, monkeypatch, *, cancel_on_approval: bool):
+        """Run one needs_approval bash item through ``_execute_tools`` with a
+        stubbed judge + approval gate; return the cancel event the judge
+        daemon would be watching."""
+        from unittest.mock import PropertyMock
+
+        from turnstone.core.judge import JudgeConfig
+
+        captured: dict[str, Any] = {}
+        fake_verdict = MagicMock()
+        fake_verdict.to_dict.return_value = {
+            "verdict_id": "v0",
+            "call_id": "c1",
+            "tier": "heuristic",
+        }
+        fake_judge = MagicMock()
+
+        def _eval(items, *_a, **kw):
+            captured["event"] = kw.get("cancel_event")
+            return [fake_verdict] * len(items)
+
+        fake_judge.evaluate.side_effect = _eval
+        monkeypatch.setattr(session, "_ensure_judge", lambda: fake_judge)
+
+        cfg = JudgeConfig(enabled=True, cancel_on_approval=cancel_on_approval)
+        item = {
+            "call_id": "c1",
+            "func_name": "bash",
+            "needs_approval": True,
+            "command": "ls",
+            "execute": lambda _it: "ok",
+        }
+        with (
+            patch.object(type(session), "_judge_cfg", new_callable=PropertyMock, return_value=cfg),
+            patch.object(session, "_safe_prepare_tool", return_value=item),
+            patch.object(session.ui, "approve_tools", return_value=(True, None)),
+        ):
+            session._execute_tools(
+                [{"id": "c1", "type": "function", "function": {"name": "bash", "arguments": "{}"}}]
+            )
+        return captured["event"]
+
+    def test_gate_resolution_keeps_judge_running_by_default(self, tmp_db, monkeypatch) -> None:
+        """cancel_on_approval=False (the default): resolving the approval
+        gate must NOT fire the judge's abort signal — the daemon runs every
+        item to completion so each call lands a real LLM verdict, exactly
+        what the setting's help text promises.  An unconditional set in the
+        gate's ``finally`` used to degrade every still-queued item to a
+        heuristic fallback row the instant the operator approved."""
+        session = _make_session()
+        event = self._drive_gate(session, monkeypatch, cancel_on_approval=False)
+        assert event is not None
+        assert not event.is_set()
+
+        # The supersede path still aborts unconditionally: the next batch
+        # fires the previous generation's event before spawning its own.
+        session._judge_cancel_event = event
+        self._drive_gate(session, monkeypatch, cancel_on_approval=False)
+        assert event.is_set()
+
+    def test_gate_resolution_cancels_judge_when_opted_in(self, tmp_db, monkeypatch) -> None:
+        """cancel_on_approval=True: the gate's ``finally`` fires the abort
+        signal as soon as the approval resolves, trading verdict
+        completeness for inference savings."""
+        session = _make_session()
+        event = self._drive_gate(session, monkeypatch, cancel_on_approval=True)
+        assert event is not None
+        assert event.is_set()
+
 
 # ---------------------------------------------------------------------------
 # Per-call model override on task_agent

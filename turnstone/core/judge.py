@@ -94,7 +94,11 @@ class JudgeConfig:
     output_guard_model: str = ""  # alias for the LLM stage; empty = inherit session model
     output_guard_llm_timeout: float = 30.0  # wall-clock budget for the LLM stage
     redact_secrets: bool = True
-    cancel_on_approval: bool = False  # True = abort remaining items on user approval
+    # True = the approval gate's resolution aborts remaining evaluations
+    # (saves inference; undone items degrade to heuristic fallbacks).
+    # False (default) = the daemon runs every item to completion; only a
+    # generation supersede (next batch) or session close aborts it.
+    cancel_on_approval: bool = False
 
 
 # ---------------------------------------------------------------------------
@@ -984,10 +988,13 @@ class IntentJudge:
                 ``func_args``, ``approval_label``, ``call_id``).
             messages: Conversation history (OpenAI message format).
             callback: Called with each LLM verdict (or timeout/error fallback).
-            cancel_event: When set, the daemon judge thread abandons
-                remaining work.  Callers should set this after the user
-                has already made an approval decision so the judge does
-                not keep consuming inference resources.
+            cancel_event: Unconditional abort signal — when set, the
+                daemon abandons remaining work and delivers heuristic
+                fallback verdicts for every undone item.  The caller
+                owns the firing policy: ChatSession fires it when a
+                newer batch supersedes this generation, on session
+                close, and — only when ``cancel_on_approval`` is
+                enabled — as soon as the approval gate resolves.
 
         Returns:
             List of heuristic verdicts (one per item), available immediately.
@@ -1031,21 +1038,29 @@ class IntentJudge:
     ) -> None:
         """Daemon thread: run LLM judge for each item and invoke callback.
 
-        When ``cancel_on_approval`` is True, remaining evaluations are
-        aborted as soon as the user approves/denies.  When False (default),
-        every evaluation runs to completion so all verdicts are delivered.
+        ``cancel_event`` is an unconditional abort signal: once it fires,
+        in-flight work stops and every remaining item is delivered as a
+        heuristic fallback verdict (each call still gets exactly one
+        verdict — Smart Approvals and the advisory UI both rely on the
+        full set arriving).  Which actor fires the event is the CALLER's
+        policy, not this loop's: ChatSession fires it at approval
+        resolution only when ``cancel_on_approval`` is enabled, and
+        always when the next batch supersedes this generation or the
+        session closes.  With ``cancel_on_approval=False`` (default) and
+        no supersede, every evaluation runs to completion so all
+        verdicts are delivered.
         """
         client = self._create_client()
         executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="judge-api")
         try:
             for idx, (item, h_verdict) in enumerate(zip(items, heuristic_verdicts, strict=True)):
-                if cancel_event and cancel_event.is_set() and self._config.cancel_on_approval:
+                if cancel_event and cancel_event.is_set():
                     log.info("judge.cancelled", remaining=len(items) - idx)
                     self._deliver_fallbacks(
                         items[idx:],
                         heuristic_verdicts[idx:],
                         callback,
-                        "judge cancelled by user approval",
+                        "judge cancelled before evaluating this call",
                     )
                     return
                 try:
@@ -1087,15 +1102,15 @@ class IntentJudge:
                             call_id=fallback.call_id,
                         )
                         callback(fallback)
-                    # After delivering this item's verdict, check if we should
-                    # abort remaining items due to user approval.
-                    if cancel_event and cancel_event.is_set() and self._config.cancel_on_approval:
+                    # After delivering this item's verdict, check whether the
+                    # abort signal fired while we were evaluating it.
+                    if cancel_event and cancel_event.is_set():
                         log.info("judge.cancelled.after_eval", call_id=item.get("call_id", ""))
                         self._deliver_fallbacks(
                             items[idx + 1 :],
                             heuristic_verdicts[idx + 1 :],
                             callback,
-                            "judge cancelled by user approval",
+                            "judge cancelled before evaluating this call",
                         )
                         return
                 except _ExecutorPoisonedError:

@@ -5276,8 +5276,14 @@ class ChatSession:
         async LLM judge that delivers final verdicts via UI callback.
 
         Returns a cancel event that, when set, tells the daemon judge
-        thread to abandon remaining work.  Callers should set this
-        after the user has made an approval decision.
+        thread to abandon remaining work (each undone item degrades to
+        a heuristic fallback verdict).  ``_execute_tools`` fires it
+        unconditionally when the next batch supersedes this generation,
+        ``close()`` fires it on session teardown, and the approval
+        gate's ``finally`` fires it on decision only when
+        ``judge.cancel_on_approval`` is enabled — the default leaves
+        the daemon running to completion so every call gets a real
+        LLM verdict for the audit trail.
         """
         judge = self._ensure_judge()
         if not judge:
@@ -6087,8 +6093,22 @@ class ChatSession:
         try:
             approved, user_feedback = self.ui.approve_tools(items)
         finally:
-            if judge_cancel:
-                judge_cancel.set()  # user decided (or disconnected) — stop judge
+            # Gate resolution fires the judge's abort signal only when the
+            # operator opted in: with ``judge.cancel_on_approval`` the daemon
+            # stops spending inference the moment a decision lands (remaining
+            # items degrade to heuristic fallback verdicts).  With the
+            # default False the daemon runs every item to completion — the
+            # contract the setting's help text promises — and late verdicts
+            # stream + persist through ``_on_verdict``.  An unconditional
+            # set here used to defeat that: ``_evaluate_single`` polls the
+            # event regardless of config, so every undone item silently
+            # became a fallback row the instant the gate resolved.  A stale
+            # daemon is still bounded to one batch of real work by the
+            # unconditional supersede-set at the top of the next batch and
+            # by ``close()``.
+            jc_live = self._judge_cfg
+            if judge_cancel and jc_live and jc_live.cancel_on_approval:
+                judge_cancel.set()
         self._emit_state("running")
         if not approved:
             # Mark all pending items as denied

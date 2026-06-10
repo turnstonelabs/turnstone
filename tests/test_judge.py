@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -295,6 +296,75 @@ class TestErrorHandling:
         assert result is None
         # Should have been called exactly once — no retries
         assert provider.create_completion.call_count == 1
+
+
+# ---------------------------------------------------------------------------
+# Cancel-event semantics
+# ---------------------------------------------------------------------------
+
+
+def _wait_for(results: list[IntentVerdict], count: int, timeout: float = 5.0) -> None:
+    deadline = time.monotonic() + timeout
+    while len(results) < count and time.monotonic() < deadline:
+        time.sleep(0.02)
+
+
+class TestCancelEventSemantics:
+    """The cancel event is an unconditional abort signal at the judge
+    layer: once it fires, no further inference is spent and every undone
+    item degrades to a heuristic fallback verdict.  WHO fires it is
+    ChatSession policy (always on generation supersede / close; on
+    approval resolution only when ``cancel_on_approval`` is enabled) —
+    this loop must not second-guess the signal against its own config,
+    which is what previously broke the run-to-completion contract."""
+
+    def test_fired_event_aborts_with_default_config(self):
+        provider = _make_mock_provider(_good_verdict_json())
+        judge = _make_judge(provider)
+        assert judge._config.cancel_on_approval is False  # pin the default
+        cancel = threading.Event()
+        cancel.set()  # supersede/close happened before the daemon started
+
+        results: list[IntentVerdict] = []
+        items = [_make_item(call_id=f"tc_{i}") for i in range(3)]
+        judge.evaluate(
+            items,
+            [{"role": "user", "content": "test"}],
+            results.append,
+            cancel_event=cancel,
+        )
+        _wait_for(results, 3)
+
+        # Every item still gets exactly one verdict (Smart Approvals and
+        # the advisory UI wait on the full set) — all fallbacks...
+        assert [v.call_id for v in results] == ["tc_0", "tc_1", "tc_2"]
+        assert all(v.tier == "llm_fallback" for v in results)
+        assert all("cancelled" in v.reasoning for v in results)
+        # ...and no inference was spent after the abort signal.
+        assert provider.create_completion.call_count == 0
+
+    def test_unfired_event_runs_every_item_with_default_config(self):
+        """The run-to-completion contract: with cancel_on_approval=False
+        and no abort signal, all items get REAL LLM verdicts — resolving
+        the gate must not have fired the event (that's pinned on the
+        session side), and this loop must keep evaluating."""
+        provider = _make_mock_provider(_good_verdict_json())
+        judge = _make_judge(provider)
+        cancel = threading.Event()  # never fired
+
+        results: list[IntentVerdict] = []
+        items = [_make_item(call_id=f"tc_{i}") for i in range(3)]
+        judge.evaluate(
+            items,
+            [{"role": "user", "content": "test"}],
+            results.append,
+            cancel_event=cancel,
+        )
+        _wait_for(results, 3)
+
+        assert [v.call_id for v in results] == ["tc_0", "tc_1", "tc_2"]
+        assert all(v.tier == "llm" for v in results)
+        assert provider.create_completion.call_count == 3
 
 
 # ---------------------------------------------------------------------------
