@@ -2633,10 +2633,6 @@ function _installTrap(overlayId, boxId, trapRef) {
           hideCreateTemplateModal();
         else if (overlayId === "edit-template-overlay") hideEditTemplateModal();
         else if (overlayId === "memory-detail-overlay") hideMemoryDetailModal();
-        else if (overlayId === "mcp-create-overlay") hideCreateMcpModal();
-        else if (overlayId === "mcp-import-overlay") hideImportMcpModal();
-        else if (overlayId === "mcp-detail-overlay") hideMcpDetailModal();
-        else if (overlayId === "mcp-install-overlay") hideInstallMcpModal();
         else if (overlayId === "github-import-overlay") hideGitHubImportModal();
         else if (overlayId === "create-ppolicy-overlay")
           hideCreatePromptPolicyModal();
@@ -2678,10 +2674,6 @@ document.addEventListener("keydown", function (e) {
     ["create-template-overlay", hideCreateTemplateModal],
     ["edit-template-overlay", hideEditTemplateModal],
     ["memory-detail-overlay", hideMemoryDetailModal],
-    ["mcp-install-overlay", hideInstallMcpModal],
-    ["mcp-detail-overlay", hideMcpDetailModal],
-    ["mcp-import-overlay", hideImportMcpModal],
-    ["mcp-create-overlay", hideCreateMcpModal],
     ["github-import-overlay", hideGitHubImportModal],
     ["create-ppolicy-overlay", hideCreatePromptPolicyModal],
     ["edit-ppolicy-overlay", hideEditPromptPolicyModal],
@@ -3623,14 +3615,13 @@ function _showModalError(el, msg) {
 /* ── MCP Servers tab ─────────────────────────────────────────────────────── */
 
 let _mcpServers = [];
-let _mcpCreateTrap = null;
-let _mcpCreateTrigger = null;
-let _mcpImportTrap = null;
-let _mcpImportTrigger = null;
-let _mcpDetailTrap = null;
-let _mcpDetailTrigger = null;
-let _mcpInstallTrap = null;
-let _mcpInstallTrigger = null;
+let _mcpWired = false;
+let _mcpShelfHandle = null;
+let _mcpImportWired = false;
+let _mcpImportShelfHandle = null;
+let _mcpDetailShelfHandle = null;
+let _mcpInstallWired = false;
+let _mcpInstallHandle = null;
 let _mcpInstallServer = null;
 let _mcpCurrentView = "servers";
 let _registryResults = [];
@@ -3997,10 +3988,8 @@ function _renderMcpServers(items) {
 
 function toggleMcpTransport() {
   const v = document.getElementById("mcp-transport").value;
-  document.getElementById("mcp-stdio-fields").style.display =
-    v === "stdio" ? "" : "none";
-  document.getElementById("mcp-http-fields").style.display =
-    v === "streamable-http" ? "" : "none";
+  document.getElementById("mcp-stdio-fields").hidden = v !== "stdio";
+  document.getElementById("mcp-http-fields").hidden = v !== "streamable-http";
   // Re-evaluate auth-field visibility because the headers row lives
   // inside mcp-http-fields and gets toggled there.
   toggleMcpAuthFields();
@@ -4018,7 +4007,7 @@ function toggleMcpAuthFields() {
   const authType = _selectedMcpAuthType();
   const oauthDiv = document.getElementById("mcp-oauth-fields");
   if (oauthDiv) {
-    oauthDiv.style.display = authType === "oauth_user" ? "" : "none";
+    oauthDiv.hidden = authType !== "oauth_user";
   }
   // The "Headers" textarea (inside mcp-http-fields) is only meaningful
   // for static auth; hide it for 'none' / 'oauth_user' so operators
@@ -4027,8 +4016,8 @@ function toggleMcpAuthFields() {
   if (headersInput) {
     const headersLabel = document.querySelector('label[for="mcp-headers"]');
     const show = authType === "static";
-    headersInput.style.display = show ? "" : "none";
-    if (headersLabel) headersLabel.style.display = show ? "" : "none";
+    headersInput.hidden = !show;
+    if (headersLabel) headersLabel.hidden = !show;
   }
 }
 
@@ -4043,13 +4032,34 @@ function _wireMcpAudienceAutofill() {
   });
 }
 
-function showCreateMcpModal() {
-  _mcpCreateTrigger = document.activeElement;
-  const ov = document.getElementById("mcp-create-overlay");
-  ov.style.display = "flex";
+function _mcpWire() {
+  if (_mcpWired) return;
+  _mcpWired = true;
+  document
+    .getElementById("mcp-transport")
+    .addEventListener("change", toggleMcpTransport);
+  const authRadios = document.getElementsByName("mcp-auth-type");
+  for (let i = 0; i < authRadios.length; i++) {
+    authRadios[i].addEventListener("change", toggleMcpAuthFields);
+  }
+  document
+    .getElementById("mcp-create-submit")
+    .addEventListener("click", submitCreateMcp);
+  _wireMcpAudienceAutofill();
+}
+
+function _mcpOpen(title, tag, kind, submitLabel) {
+  const shelf = document.getElementById("mcp-shelf");
+  document.getElementById("mcp-shelf-title").textContent = title;
+  document.getElementById("mcp-shelf-tag").textContent = tag;
+  shelf.setAttribute("data-kind", kind);
+  document.getElementById("mcp-create-submit").textContent = submitLabel;
+  _mcpShelfHandle = window.TurnstoneHatch.openShelf(shelf);
+  document.getElementById("mcp-name").focus();
+}
+
+function _mcpResetForm() {
   document.getElementById("mcp-edit-id").value = "";
-  document.getElementById("mcp-create-title").textContent = "Add MCP Server";
-  document.getElementById("mcp-create-submit").textContent = "Create";
   document.getElementById("mcp-name").value = "";
   document.getElementById("mcp-transport").value = "stdio";
   document.getElementById("mcp-command").value = "";
@@ -4072,12 +4082,16 @@ function showCreateMcpModal() {
   document.getElementById("mcp-create-error").classList.remove("is-visible");
   toggleMcpTransport();
   toggleMcpAuthFields();
-  _wireMcpAudienceAutofill();
-  document.getElementById("mcp-name").focus();
-  _mcpCreateTrap = _installTrap("mcp-create-overlay", "mcp-create-box");
+}
+
+function showCreateMcpModal() {
+  _mcpWire();
+  _mcpResetForm();
+  _mcpOpen("Add MCP server", "MCP-NEW", "create", "Create");
 }
 
 function showEditMcpModal(serverId) {
+  _mcpWire();
   // Fetch with reveal=true to get actual secret values for editing
   authFetch("/v1/api/admin/mcp-servers/" + serverId + "?reveal=true")
     .then(function (r) {
@@ -4085,11 +4099,8 @@ function showEditMcpModal(serverId) {
       return r.json();
     })
     .then(function (s) {
-      showCreateMcpModal();
+      _mcpResetForm();
       document.getElementById("mcp-edit-id").value = serverId;
-      document.getElementById("mcp-create-title").textContent =
-        "Edit MCP Server";
-      document.getElementById("mcp-create-submit").textContent = "Save";
       document.getElementById("mcp-name").value = s.name;
       document.getElementById("mcp-transport").value = s.transport;
       document.getElementById("mcp-command").value = s.command || "";
@@ -4142,6 +4153,7 @@ function showEditMcpModal(serverId) {
         s.oauth_audience || "";
       toggleMcpTransport();
       toggleMcpAuthFields();
+      _mcpOpen("Edit MCP server — " + s.name, "MCP-EDIT", "edit", "Save");
     })
     .catch(function () {
       showToast("Failed to load server details");
@@ -4149,10 +4161,8 @@ function showEditMcpModal(serverId) {
 }
 
 function hideCreateMcpModal() {
-  document.getElementById("mcp-create-overlay").style.display = "none";
-  _mcpCreateTrap = _removeTrap(_mcpCreateTrap);
-  if (_mcpCreateTrigger && _mcpCreateTrigger.focus) _mcpCreateTrigger.focus();
-  _mcpCreateTrigger = null;
+  window.TurnstoneHatch.closeShelf(document.getElementById("mcp-shelf"));
+  _mcpShelfHandle = null;
 }
 
 function _parseMcpForm() {
@@ -4239,11 +4249,12 @@ function _parseMcpForm() {
 }
 
 function submitCreateMcp() {
+  const shelf = document.getElementById("mcp-shelf");
+  const errEl = document.getElementById("mcp-create-error");
   const form = _parseMcpForm();
   if (form.error) {
-    const e = document.getElementById("mcp-create-error");
-    e.textContent = form.error;
-    e.classList.add("is-visible");
+    errEl.textContent = form.error;
+    errEl.classList.add("is-visible");
     return;
   }
   const editId = document.getElementById("mcp-edit-id").value;
@@ -4252,7 +4263,8 @@ function submitCreateMcp() {
     ? "/v1/api/admin/mcp-servers/" + editId
     : "/v1/api/admin/mcp-servers";
 
-  document.getElementById("mcp-create-submit").disabled = true;
+  errEl.classList.remove("is-visible");
+  window.TurnstoneHatch.setBusy(shelf, true);
   authFetch(url, {
     method: method,
     headers: { "Content-Type": "application/json" },
@@ -4266,18 +4278,16 @@ function submitCreateMcp() {
       return r.json();
     })
     .then(function () {
+      window.TurnstoneHatch.setBusy(shelf, false);
       hideCreateMcpModal();
       showToast(editId ? "Server updated" : "Server created");
       _flagMcpSyncPending();
       loadAdminMcp();
     })
     .catch(function (e) {
-      const el = document.getElementById("mcp-create-error");
-      el.textContent = e.message;
-      el.classList.add("is-visible");
-    })
-    .finally(function () {
-      document.getElementById("mcp-create-submit").disabled = false;
+      window.TurnstoneHatch.setBusy(shelf, false);
+      errEl.textContent = e.message;
+      errEl.classList.add("is-visible");
     });
 }
 
@@ -4337,7 +4347,6 @@ function showMcpDetailModal(serverId) {
 
 function _openMcpDetail(s) {
   if (!s) return;
-  _mcpDetailTrigger = document.activeElement;
 
   let html = '<div class="modal-columns">';
   html += '<div class="modal-col">';
@@ -4441,31 +4450,36 @@ function _openMcpDetail(s) {
 
   document.getElementById("mcp-detail-title").textContent = s.name;
   setSafeHtml(document.getElementById("mcp-detail-content"), html);
-  document.getElementById("mcp-detail-overlay").style.display = "flex";
-  _mcpDetailTrap = _installTrap("mcp-detail-overlay", "mcp-detail-box");
+  _mcpDetailShelfHandle = window.TurnstoneHatch.openShelf(
+    document.getElementById("mcp-detail-shelf"),
+  );
 }
 
 function hideMcpDetailModal() {
-  document.getElementById("mcp-detail-overlay").style.display = "none";
-  _mcpDetailTrap = _removeTrap(_mcpDetailTrap);
-  if (_mcpDetailTrigger && _mcpDetailTrigger.focus) _mcpDetailTrigger.focus();
-  _mcpDetailTrigger = null;
+  window.TurnstoneHatch.closeShelf(document.getElementById("mcp-detail-shelf"));
+  _mcpDetailShelfHandle = null;
+}
+
+function _mcpImportWire() {
+  if (_mcpImportWired) return;
+  _mcpImportWired = true;
+  document
+    .getElementById("mcp-import-submit")
+    .addEventListener("click", submitImportMcp);
 }
 
 function showImportMcpModal() {
-  _mcpImportTrigger = document.activeElement;
-  document.getElementById("mcp-import-overlay").style.display = "flex";
+  _mcpImportWire();
+  const shelf = document.getElementById("mcp-import-shelf");
   document.getElementById("mcp-import-json").value = "";
   document.getElementById("mcp-import-error").classList.remove("is-visible");
+  _mcpImportShelfHandle = window.TurnstoneHatch.openShelf(shelf);
   document.getElementById("mcp-import-json").focus();
-  _mcpImportTrap = _installTrap("mcp-import-overlay", "mcp-import-box");
 }
 
 function hideImportMcpModal() {
-  document.getElementById("mcp-import-overlay").style.display = "none";
-  _mcpImportTrap = _removeTrap(_mcpImportTrap);
-  if (_mcpImportTrigger && _mcpImportTrigger.focus) _mcpImportTrigger.focus();
-  _mcpImportTrigger = null;
+  window.TurnstoneHatch.closeShelf(document.getElementById("mcp-import-shelf"));
+  _mcpImportShelfHandle = null;
 }
 
 function submitImportMcp() {
@@ -4491,7 +4505,10 @@ function submitImportMcp() {
     e3.classList.add("is-visible");
     return;
   }
-  document.getElementById("mcp-import-submit").disabled = true;
+  const shelf = document.getElementById("mcp-import-shelf");
+  const errEl = document.getElementById("mcp-import-error");
+  errEl.classList.remove("is-visible");
+  window.TurnstoneHatch.setBusy(shelf, true);
   authFetch("/v1/api/admin/mcp-servers/import", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -4505,6 +4522,7 @@ function submitImportMcp() {
       return r.json();
     })
     .then(function (data) {
+      window.TurnstoneHatch.setBusy(shelf, false);
       hideImportMcpModal();
       let msg = "Imported " + (data.imported || []).length;
       if ((data.skipped || []).length)
@@ -4516,12 +4534,9 @@ function submitImportMcp() {
       loadAdminMcp();
     })
     .catch(function (e) {
-      const el = document.getElementById("mcp-import-error");
-      el.textContent = e.message;
-      el.classList.add("is-visible");
-    })
-    .finally(function () {
-      document.getElementById("mcp-import-submit").disabled = false;
+      window.TurnstoneHatch.setBusy(shelf, false);
+      errEl.textContent = e.message;
+      errEl.classList.add("is-visible");
     });
 }
 
@@ -4795,10 +4810,16 @@ function _initiateRegistryInstall(srv) {
   _showInstallMcpModal(srv, hasRemote, hasPackage);
 }
 
+function _mcpInstallWire() {
+  if (_mcpInstallWired) return;
+  _mcpInstallWired = true;
+  document
+    .getElementById("mcp-install-submit")
+    .addEventListener("click", submitInstallMcp);
+}
+
 function _showInstallMcpModal(srv, hasRemote, hasPackage) {
-  _mcpInstallTrigger = document.activeElement;
-  const ov = document.getElementById("mcp-install-overlay");
-  ov.style.display = "flex";
+  _mcpInstallWire();
   document.getElementById("mcp-install-error").classList.remove("is-visible");
 
   // Summary
@@ -4846,7 +4867,14 @@ function _showInstallMcpModal(srv, hasRemote, hasPackage) {
   }
 
   _updateInstallFields();
-  _mcpInstallTrap = _installTrap("mcp-install-overlay", "mcp-install-box");
+  _mcpInstallHandle = window.TurnstoneHatch.openDialog(
+    document.getElementById("mcp-install-dialog"),
+    {
+      onClose: function () {
+        _mcpInstallServer = null;
+      },
+    },
+  );
 }
 
 function _updateInstallFields() {
@@ -4995,12 +5023,8 @@ function _updateInstallFields() {
 }
 
 function hideInstallMcpModal() {
-  document.getElementById("mcp-install-overlay").style.display = "none";
-  _mcpInstallTrap = _removeTrap(_mcpInstallTrap);
-  if (_mcpInstallTrigger && _mcpInstallTrigger.focus)
-    _mcpInstallTrigger.focus();
-  _mcpInstallTrigger = null;
-  _mcpInstallServer = null;
+  const d = document.getElementById("mcp-install-dialog");
+  if (d.open) d.close();
 }
 
 function submitInstallMcp() {
@@ -5035,8 +5059,10 @@ function _doRegistryInstall(
   env,
   headers,
 ) {
-  const submitBtn = document.getElementById("mcp-install-submit");
-  if (submitBtn) submitBtn.disabled = true;
+  // Two entry points share this: the one-click card path (no dialog) and the
+  // install dialog's submit. The dialog's busy lock only applies when it's open.
+  const dialog = document.getElementById("mcp-install-dialog");
+  if (dialog.open) window.TurnstoneHatch.setBusy(dialog, true);
 
   authFetch("/v1/api/admin/mcp-registry/install", {
     method: "POST",
@@ -5058,10 +5084,8 @@ function _doRegistryInstall(
       return r.json();
     })
     .then(function (data) {
-      const overlay = document.getElementById("mcp-install-overlay");
-      if (overlay && overlay.style.display !== "none") {
-        hideInstallMcpModal();
-      }
+      window.TurnstoneHatch.setBusy(dialog, false);
+      if (dialog.open) hideInstallMcpModal();
       const serverName = data.name || registryName;
       showToast("Installed " + serverName + " — connecting to nodes\u2026");
       // Re-search to update installed status
@@ -5074,9 +5098,9 @@ function _doRegistryInstall(
       }
     })
     .catch(function (e) {
-      const overlay = document.getElementById("mcp-install-overlay");
+      window.TurnstoneHatch.setBusy(dialog, false);
       const errEl = document.getElementById("mcp-install-error");
-      if (errEl && overlay && overlay.style.display !== "none") {
+      if (errEl && dialog.open) {
         errEl.textContent = e.message;
         errEl.classList.add("is-visible");
       } else {
@@ -5084,9 +5108,6 @@ function _doRegistryInstall(
         // Re-render to reset card button states
         _renderRegistryResults();
       }
-    })
-    .finally(function () {
-      if (submitBtn) submitBtn.disabled = false;
     });
 }
 

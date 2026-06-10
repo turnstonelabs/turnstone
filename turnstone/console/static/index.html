@@ -2712,6 +2712,292 @@
               <button class="sh-btn" data-close>Close</button>
             </footer>
           </dialog>
+
+          <!-- MCP server shelf (create + edit) — pane-scoped. Transport-
+               conditional field groups toggle on the hidden attribute; the
+               multitenant-auth fieldset carries over as-is. -->
+          <dialog
+            class="hatch hatch--shelf hatch--lg"
+            id="mcp-shelf"
+            data-kind="create"
+            aria-labelledby="mcp-shelf-title"
+          >
+            <header class="sh-head">
+              <span class="sh-led" aria-hidden="true"></span>
+              <h2 class="sh-title" id="mcp-shelf-title">Add MCP server</h2>
+              <span class="sh-tag" aria-hidden="true" id="mcp-shelf-tag"
+                >MCP-NEW</span
+              >
+              <button class="sh-x" data-close aria-label="Close">✕</button>
+            </header>
+            <div class="sh-body">
+              <div
+                id="mcp-create-error"
+                class="sh-alert"
+                role="alert"
+                aria-live="assertive"
+                aria-atomic="true"
+              ></div>
+              <input type="hidden" id="mcp-edit-id" value="" />
+              <label for="mcp-name">Server name</label>
+              <input
+                type="text"
+                id="mcp-name"
+                class="sh-mono"
+                placeholder="e.g. filesystem"
+                maxlength="64"
+                pattern="[a-zA-Z0-9._\-]+"
+                autocomplete="off"
+                spellcheck="false"
+              />
+              <label for="mcp-transport">Transport</label>
+              <select id="mcp-transport">
+                <option value="stdio">stdio</option>
+                <option value="streamable-http">streamable-http</option>
+              </select>
+              <div id="mcp-stdio-fields">
+                <label for="mcp-command">Command</label>
+                <input
+                  type="text"
+                  id="mcp-command"
+                  class="sh-mono"
+                  placeholder="e.g. npx"
+                  autocomplete="off"
+                  spellcheck="false"
+                />
+                <label for="mcp-args"
+                  >Arguments <span class="label-hint">one per line</span></label
+                >
+                <textarea
+                  id="mcp-args"
+                  class="sh-mono"
+                  rows="3"
+                  placeholder="-y&#10;@modelcontextprotocol/server-filesystem&#10;/tmp"
+                ></textarea>
+                <label for="mcp-env"
+                  >Environment variables
+                  <span class="label-hint">KEY=VALUE, one per line</span></label
+                >
+                <textarea
+                  id="mcp-env"
+                  class="sh-mono"
+                  rows="2"
+                  placeholder="API_KEY=..."
+                ></textarea>
+              </div>
+              <div id="mcp-http-fields" hidden>
+                <label for="mcp-url">URL</label>
+                <input
+                  type="text"
+                  id="mcp-url"
+                  class="sh-mono"
+                  placeholder="https://..."
+                  autocomplete="off"
+                  spellcheck="false"
+                />
+                <label for="mcp-headers"
+                  >Headers
+                  <span class="label-hint"
+                    >KEY: VALUE, one per line</span
+                  ></label
+                >
+                <textarea
+                  id="mcp-headers"
+                  class="sh-mono"
+                  rows="2"
+                  placeholder="Authorization: Bearer ..."
+                ></textarea>
+              </div>
+              <div class="sh-section">Multitenant authorization</div>
+              <div
+                class="segmented-control"
+                role="radiogroup"
+                aria-label="Multitenant Authorization"
+              >
+                <label class="segmented-option">
+                  <input
+                    type="radio"
+                    name="mcp-auth-type"
+                    id="mcp-auth-none"
+                    value="none"
+                  />
+                  <span class="segmented-indicator" aria-hidden="true"></span>
+                  <span class="segmented-text">No authorization</span>
+                </label>
+                <label class="segmented-option">
+                  <input
+                    type="radio"
+                    name="mcp-auth-type"
+                    id="mcp-auth-static"
+                    value="static"
+                    checked
+                  />
+                  <span class="segmented-indicator" aria-hidden="true"></span>
+                  <span class="segmented-text"
+                    >Static headers
+                    <span class="segmented-hint"
+                      >single shared identity</span
+                    ></span
+                  >
+                </label>
+                <label class="segmented-option">
+                  <input
+                    type="radio"
+                    name="mcp-auth-type"
+                    id="mcp-auth-oauth"
+                    value="oauth_user"
+                  />
+                  <span class="segmented-indicator" aria-hidden="true"></span>
+                  <span class="segmented-text"
+                    >Per-user OAuth 2.1
+                    <span class="segmented-hint">recommended</span></span
+                  >
+                </label>
+              </div>
+              <div id="mcp-oauth-fields" hidden>
+                <label for="mcp-oauth-as-url"
+                  >Authorization server URL
+                  <span class="label-hint"
+                    >optional — override discovery when the MCP server URL is
+                    not the OAuth issuer</span
+                  ></label
+                >
+                <input
+                  type="text"
+                  id="mcp-oauth-as-url"
+                  class="sh-mono"
+                  placeholder="https://auth.example.com"
+                />
+                <label for="mcp-oauth-registration">Client registration</label>
+                <select id="mcp-oauth-registration">
+                  <option value="preregistered">preregistered</option>
+                  <option value="dcr">dcr (Dynamic Client Registration)</option>
+                </select>
+                <label for="mcp-oauth-client-id">Client ID</label>
+                <input
+                  type="text"
+                  id="mcp-oauth-client-id"
+                  class="sh-mono"
+                  placeholder="(operator-issued client_id)"
+                />
+                <label for="mcp-oauth-client-secret"
+                  >Client secret
+                  <span class="label-hint"
+                    >write-only, never displayed</span
+                  ></label
+                >
+                <input
+                  type="password"
+                  id="mcp-oauth-client-secret"
+                  placeholder="***"
+                  autocomplete="off"
+                />
+                <label for="mcp-oauth-scopes"
+                  >Scopes <span class="label-hint">space-separated</span></label
+                >
+                <input
+                  type="text"
+                  id="mcp-oauth-scopes"
+                  class="sh-mono"
+                  placeholder="openid profile"
+                />
+                <label for="mcp-oauth-audience"
+                  >Audience
+                  <span class="label-hint">auto-populated from URL</span></label
+                >
+                <input
+                  type="text"
+                  id="mcp-oauth-audience"
+                  class="sh-mono"
+                  placeholder="https://mcp.example.com"
+                />
+              </div>
+              <label class="toggle-switch">
+                <input type="checkbox" id="mcp-auto-approve" />
+                <span class="toggle-track" aria-hidden="true"></span>
+                <span class="toggle-label">Auto-approve tools</span>
+              </label>
+              <label class="toggle-switch">
+                <input type="checkbox" id="mcp-enabled" checked />
+                <span class="toggle-track" aria-hidden="true"></span>
+                <span class="toggle-label">Enabled</span>
+              </label>
+            </div>
+            <footer class="sh-foot">
+              <div class="sh-foot-meta"></div>
+              <button class="sh-btn" data-close>Cancel</button>
+              <button id="mcp-create-submit" class="sh-btn sh-btn--primary">
+                Create
+              </button>
+            </footer>
+          </dialog>
+
+          <!-- MCP import shelf — pane-scoped JSON paste. -->
+          <dialog
+            class="hatch hatch--shelf"
+            id="mcp-import-shelf"
+            data-kind="create"
+            aria-labelledby="mcp-import-shelf-title"
+          >
+            <header class="sh-head">
+              <span class="sh-led" aria-hidden="true"></span>
+              <h2 class="sh-title" id="mcp-import-shelf-title">
+                Import MCP config
+              </h2>
+              <span class="sh-tag" aria-hidden="true">MCP-IMPORT</span>
+              <button class="sh-x" data-close aria-label="Close">✕</button>
+            </header>
+            <div class="sh-body">
+              <div
+                id="mcp-import-error"
+                class="sh-alert"
+                role="alert"
+                aria-live="assertive"
+                aria-atomic="true"
+              ></div>
+              <label for="mcp-import-json">Paste JSON</label>
+              <textarea
+                id="mcp-import-json"
+                class="sh-mono"
+                rows="10"
+                placeholder='{"mcpServers":{"filesystem":{"command":"npx","args":["-y","@modelcontextprotocol/server-filesystem","/tmp"]}}}'
+              ></textarea>
+              <p class="sh-prose" style="margin-top: 10px">
+                Paste a JSON object with a <code>mcpServers</code> key (Claude
+                Desktop / VS Code / Cursor format). Existing servers with the
+                same name will be skipped.
+              </p>
+            </div>
+            <footer class="sh-foot">
+              <div class="sh-foot-meta"></div>
+              <button class="sh-btn" data-close>Cancel</button>
+              <button id="mcp-import-submit" class="sh-btn sh-btn--primary">
+                Import
+              </button>
+            </footer>
+          </dialog>
+
+          <!-- MCP detail shelf — pane-scoped, read-only server info. -->
+          <dialog
+            class="hatch hatch--shelf hatch--lg"
+            id="mcp-detail-shelf"
+            data-kind="inspect"
+            aria-labelledby="mcp-detail-title"
+          >
+            <header class="sh-head">
+              <span class="sh-led" aria-hidden="true"></span>
+              <h2 class="sh-title" id="mcp-detail-title">MCP server detail</h2>
+              <span class="sh-tag" aria-hidden="true">MCP-INFO</span>
+              <button class="sh-x" data-close aria-label="Close">✕</button>
+            </header>
+            <div class="sh-body">
+              <div id="mcp-detail-content"></div>
+            </div>
+            <footer class="sh-foot">
+              <div class="sh-foot-meta"></div>
+              <button class="sh-btn" data-close>Close</button>
+            </footer>
+          </dialog>
         </div>
         <!-- /admin-layout -->
       </div>
@@ -2886,6 +3172,42 @@
         <button class="sh-btn" data-close autofocus>Cancel</button>
         <button id="confirm-submit" class="sh-btn sh-btn--danger">
           Confirm
+        </button>
+      </footer>
+    </dialog>
+
+    <!-- Install MCP Server (document-modal) — the summary/source/fields
+         containers are populated by _showInstallMcpModal from the registry
+         entry; the dialog shell is static. -->
+    <dialog
+      class="hatch hatch--dialog"
+      id="mcp-install-dialog"
+      data-kind="create"
+      aria-labelledby="mcp-install-title"
+    >
+      <header class="sh-head">
+        <span class="sh-led" aria-hidden="true"></span>
+        <h2 class="sh-title" id="mcp-install-title">Install MCP server</h2>
+        <span class="sh-tag" aria-hidden="true">MCP-INSTALL</span>
+        <button class="sh-x" data-close aria-label="Close">✕</button>
+      </header>
+      <div class="sh-body">
+        <div
+          id="mcp-install-error"
+          class="sh-alert"
+          role="alert"
+          aria-live="assertive"
+          aria-atomic="true"
+        ></div>
+        <div id="mcp-install-summary"></div>
+        <div id="mcp-install-source-select"></div>
+        <div id="mcp-install-fields"></div>
+      </div>
+      <footer class="sh-foot">
+        <div class="sh-foot-meta"></div>
+        <button class="sh-btn" data-close>Cancel</button>
+        <button id="mcp-install-submit" class="sh-btn sh-btn--primary">
+          Install
         </button>
       </footer>
     </dialog>
@@ -4014,312 +4336,6 @@
           </button>
           <button id="mem-detail-delete" class="modal-submit admin-btn-danger">
             Delete
-          </button>
-        </div>
-      </div>
-    </div>
-
-    <div
-      id="mcp-create-overlay"
-      style="display: none"
-      role="dialog"
-      aria-modal="true"
-      aria-labelledby="mcp-create-title"
-    >
-      <div id="mcp-create-box" class="admin-modal">
-        <h2 id="mcp-create-title">Add MCP Server</h2>
-        <div
-          id="mcp-create-error"
-          role="alert"
-          aria-live="assertive"
-          aria-atomic="true"
-        ></div>
-        <input type="hidden" id="mcp-edit-id" value="" />
-        <label for="mcp-name">Server Name</label>
-        <input
-          type="text"
-          id="mcp-name"
-          placeholder="e.g. filesystem"
-          maxlength="64"
-          pattern="[a-zA-Z0-9._\-]+"
-        />
-        <label for="mcp-transport">Transport</label>
-        <select id="mcp-transport" onchange="toggleMcpTransport()">
-          <option value="stdio">stdio</option>
-          <option value="streamable-http">streamable-http</option>
-        </select>
-        <div id="mcp-stdio-fields">
-          <label for="mcp-command">Command</label>
-          <input type="text" id="mcp-command" placeholder="e.g. npx" />
-          <label for="mcp-args"
-            >Arguments
-            <span style="font-weight: 400; text-transform: none"
-              >(one per line)</span
-            ></label
-          >
-          <textarea
-            id="mcp-args"
-            rows="3"
-            placeholder="-y&#10;@modelcontextprotocol/server-filesystem&#10;/tmp"
-          ></textarea>
-          <label for="mcp-env"
-            >Environment Variables
-            <span style="font-weight: 400; text-transform: none"
-              >(KEY=VALUE, one per line)</span
-            ></label
-          >
-          <textarea id="mcp-env" rows="2" placeholder="API_KEY=..."></textarea>
-        </div>
-        <div id="mcp-http-fields" style="display: none">
-          <label for="mcp-url">URL</label>
-          <input type="text" id="mcp-url" placeholder="https://..." />
-          <label for="mcp-headers"
-            >Headers
-            <span style="font-weight: 400; text-transform: none"
-              >(KEY: VALUE, one per line)</span
-            ></label
-          >
-          <textarea
-            id="mcp-headers"
-            rows="2"
-            placeholder="Authorization: Bearer ..."
-          ></textarea>
-        </div>
-        <fieldset
-          id="mcp-auth-section"
-          style="
-            border: 1px solid var(--border);
-            padding: 10px 12px;
-            margin-top: 12px;
-          "
-        >
-          <legend style="font-size: 12px; padding: 0 6px">
-            Multitenant Authorization
-          </legend>
-          <div
-            class="segmented-control"
-            role="radiogroup"
-            aria-label="Multitenant Authorization"
-          >
-            <label class="segmented-option">
-              <input
-                type="radio"
-                name="mcp-auth-type"
-                id="mcp-auth-none"
-                value="none"
-                onchange="toggleMcpAuthFields()"
-              />
-              <span class="segmented-indicator" aria-hidden="true"></span>
-              <span class="segmented-text">No authorization</span>
-            </label>
-            <label class="segmented-option">
-              <input
-                type="radio"
-                name="mcp-auth-type"
-                id="mcp-auth-static"
-                value="static"
-                onchange="toggleMcpAuthFields()"
-                checked
-              />
-              <span class="segmented-indicator" aria-hidden="true"></span>
-              <span class="segmented-text"
-                >Static headers
-                <span class="segmented-hint">single shared identity</span></span
-              >
-            </label>
-            <label class="segmented-option">
-              <input
-                type="radio"
-                name="mcp-auth-type"
-                id="mcp-auth-oauth"
-                value="oauth_user"
-                onchange="toggleMcpAuthFields()"
-              />
-              <span class="segmented-indicator" aria-hidden="true"></span>
-              <span class="segmented-text"
-                >Per-user OAuth 2.1
-                <span class="segmented-hint">recommended</span></span
-              >
-            </label>
-          </div>
-          <div id="mcp-oauth-fields" style="display: none; margin-top: 8px">
-            <label for="mcp-oauth-as-url"
-              >Authorization Server URL
-              <span style="font-weight: 400; text-transform: none"
-                >(optional — override discovery when MCP server URL is not the
-                OAuth issuer)</span
-              ></label
-            >
-            <input
-              type="text"
-              id="mcp-oauth-as-url"
-              placeholder="https://auth.example.com"
-            />
-            <label for="mcp-oauth-registration">Client Registration</label>
-            <select id="mcp-oauth-registration">
-              <option value="preregistered">preregistered</option>
-              <option value="dcr">dcr (Dynamic Client Registration)</option>
-            </select>
-            <label for="mcp-oauth-client-id">Client ID</label>
-            <input
-              type="text"
-              id="mcp-oauth-client-id"
-              placeholder="(operator-issued client_id)"
-            />
-            <label for="mcp-oauth-client-secret"
-              >Client Secret
-              <span style="font-weight: 400; text-transform: none"
-                >(write-only, never displayed)</span
-              ></label
-            >
-            <input
-              type="password"
-              id="mcp-oauth-client-secret"
-              placeholder="***"
-              autocomplete="off"
-            />
-            <label for="mcp-oauth-scopes"
-              >Scopes
-              <span style="font-weight: 400; text-transform: none"
-                >(space-separated)</span
-              ></label
-            >
-            <input
-              type="text"
-              id="mcp-oauth-scopes"
-              placeholder="openid profile"
-            />
-            <label for="mcp-oauth-audience"
-              >Audience
-              <span style="font-weight: 400; text-transform: none"
-                >(auto-populated from URL)</span
-              ></label
-            >
-            <input
-              type="text"
-              id="mcp-oauth-audience"
-              placeholder="https://mcp.example.com"
-            />
-          </div>
-        </fieldset>
-        <div class="toggle-stack">
-          <label class="toggle-switch">
-            <input type="checkbox" id="mcp-auto-approve" />
-            <span class="toggle-track" aria-hidden="true"></span>
-            <span class="toggle-label">Auto-approve tools</span>
-          </label>
-          <label class="toggle-switch">
-            <input type="checkbox" id="mcp-enabled" checked />
-            <span class="toggle-track" aria-hidden="true"></span>
-            <span class="toggle-label">Enabled</span>
-          </label>
-        </div>
-        <div class="modal-buttons">
-          <button class="modal-cancel" onclick="hideCreateMcpModal()">
-            Cancel
-          </button>
-          <button
-            id="mcp-create-submit"
-            class="modal-submit"
-            onclick="submitCreateMcp()"
-          >
-            Create
-          </button>
-        </div>
-      </div>
-    </div>
-
-    <div
-      id="mcp-import-overlay"
-      style="display: none"
-      role="dialog"
-      aria-modal="true"
-      aria-labelledby="mcp-import-title"
-    >
-      <div id="mcp-import-box" class="admin-modal">
-        <h2 id="mcp-import-title">Import MCP Config</h2>
-        <div
-          id="mcp-import-error"
-          role="alert"
-          aria-live="assertive"
-          aria-atomic="true"
-        ></div>
-        <label for="mcp-import-json">Paste JSON</label>
-        <textarea
-          id="mcp-import-json"
-          rows="10"
-          placeholder='{"mcpServers":{"filesystem":{"command":"npx","args":["-y","@modelcontextprotocol/server-filesystem","/tmp"]}}}'
-          style="font-family: var(--font-mono); font-size: 11px"
-        ></textarea>
-        <p style="font-size: 11px; color: var(--fg-dim); margin-top: 8px">
-          Paste a JSON object with a <code>mcpServers</code> key (Claude Desktop
-          / VS Code / Cursor format). Existing servers with the same name will
-          be skipped.
-        </p>
-        <div class="modal-buttons">
-          <button class="modal-cancel" onclick="hideImportMcpModal()">
-            Cancel
-          </button>
-          <button
-            id="mcp-import-submit"
-            class="modal-submit"
-            onclick="submitImportMcp()"
-          >
-            Import
-          </button>
-        </div>
-      </div>
-    </div>
-
-    <div
-      id="mcp-detail-overlay"
-      style="display: none"
-      role="dialog"
-      aria-modal="true"
-      aria-labelledby="mcp-detail-title"
-    >
-      <div
-        id="mcp-detail-box"
-        class="admin-modal admin-modal-wide mcp-detail-modal"
-      >
-        <h2 id="mcp-detail-title">MCP Server Detail</h2>
-        <div id="mcp-detail-content"></div>
-        <div class="modal-buttons">
-          <button class="modal-cancel" onclick="hideMcpDetailModal()">
-            Close
-          </button>
-        </div>
-      </div>
-    </div>
-
-    <div
-      id="mcp-install-overlay"
-      style="display: none"
-      role="dialog"
-      aria-modal="true"
-      aria-labelledby="mcp-install-title"
-    >
-      <div id="mcp-install-box" class="admin-modal">
-        <h2 id="mcp-install-title">Install MCP Server</h2>
-        <div
-          id="mcp-install-error"
-          role="alert"
-          aria-live="assertive"
-          aria-atomic="true"
-        ></div>
-        <div id="mcp-install-summary"></div>
-        <div id="mcp-install-source-select"></div>
-        <div id="mcp-install-fields"></div>
-        <div class="modal-buttons">
-          <button class="modal-cancel" onclick="hideInstallMcpModal()">
-            Cancel
-          </button>
-          <button
-            id="mcp-install-submit"
-            class="modal-submit"
-            onclick="submitInstallMcp()"
-          >
-            Install
           </button>
         </div>
       </div>
