@@ -491,7 +491,7 @@ function showCreateRoleModal() {
   shelf.removeAttribute("data-baseline");
   shelf.setAttribute("data-kind", "create");
   document.getElementById("role-shelf-title").textContent = "New role";
-  document.getElementById("role-shelf-tag").textContent = "ROLE-NEW";
+  document.getElementById("role-shelf-tag").textContent = "ROL-NEW";
   document.getElementById("role-submit").textContent = "Create";
   window.TurnstoneHatch.openShelf(shelf);
   document.getElementById("role-name").focus();
@@ -545,10 +545,19 @@ function showEditRoleModal(roleId) {
   document.getElementById("role-shelf-title").textContent = role.builtin
     ? "Customize built-in role — " + role.display_name
     : "Edit role — " + role.display_name;
-  document.getElementById("role-shelf-tag").textContent = "ROLE-EDIT";
+  document.getElementById("role-shelf-tag").textContent = "ROL-EDIT";
   document.getElementById("role-submit").textContent = "Save";
   window.TurnstoneHatch.openShelf(shelf);
-  if (!role.builtin) nameInput.focus();
+  if (!role.builtin) {
+    nameInput.focus();
+  } else {
+    // Builtin rows disable the name field — land on the first enabled
+    // control (the first permission toggle) instead.
+    const firstPerm = shelf.querySelector(
+      'input[name="role-perm"]:not(:disabled)',
+    );
+    if (firstPerm) firstPerm.focus();
+  }
 }
 
 function hideEditRoleModal() {
@@ -719,6 +728,11 @@ function showUserRolesModal(userId) {
       }
       html += "</div>";
       setSafeHtml(container, html);
+      // The toggle list is the shelf's only field group — focus its first
+      // entry once rendered (the explicit-focus pattern the other shelves
+      // apply to their first field).
+      const firstToggle = container.querySelector('input[name="ur-role"]');
+      if (firstToggle) firstToggle.focus();
     })
     .catch(function () {
       setSafeHtml(
@@ -1687,7 +1701,7 @@ function showCreateTemplateModal() {
   document.getElementById("sklc-enabled").checked = true;
   // Mode-exclusive blocks: pending resources in, scan + server resources out.
   document.getElementById("skl-lock").hidden = true;
-  document.getElementById("etm-scan-section").style.display = "none";
+  document.getElementById("etm-scan-section").hidden = true;
   document.getElementById("ctm-resources-section").hidden = false;
   document.getElementById("etm-resources-section").hidden = true;
   // Collapse the progressive-disclosure sections (shared DOM — a readonly
@@ -1702,7 +1716,7 @@ function showCreateTemplateModal() {
   shelf.setAttribute("data-kind", "create");
   document.getElementById("skill-shelf-title").textContent = "New skill";
   document.getElementById("skill-shelf-tag").textContent = "SKL-NEW";
-  document.getElementById("skl-submit").textContent = "Create skill";
+  document.getElementById("skl-submit").textContent = "Create";
   document.getElementById("skl-cancel").textContent = "Cancel";
   window.TurnstoneHatch.openShelf(shelf, { onClose: _skillShelfClosed });
   document.getElementById("skl-name").focus();
@@ -1972,7 +1986,7 @@ function showEditTemplateModal(tmplId) {
   const scanSection = document.getElementById("etm-scan-section");
   if (scanSection) {
     if (tmpl.risk_level) {
-      scanSection.style.display = "";
+      scanSection.hidden = false;
       const scanClassMap = {
         safe: "scope-scan-safe",
         low: "scope-scan-low",
@@ -2022,7 +2036,7 @@ function showEditTemplateModal(tmplId) {
       }
       setSafeHtml(document.getElementById("etm-scan-report"), scanHtml);
     } else {
-      scanSection.style.display = "none";
+      scanSection.hidden = true;
     }
   }
   const rescanBtn = document.getElementById("etm-rescan-btn");
@@ -2067,7 +2081,9 @@ function showEditTemplateModal(tmplId) {
   // means the operator detached the skill from upstream and may have edits.
   const isUnlockedInstall =
     !isReadonly && tmpl.origin && tmpl.origin === "source";
-  shelf.setAttribute("data-kind", "edit");
+  // Locked installs are a read-out, not an edit surface — inspect chrome.
+  // The unlock flow re-renders in place with readonly=false, flipping to edit.
+  shelf.setAttribute("data-kind", isReadonly ? "inspect" : "edit");
   document.getElementById("skill-shelf-title").textContent =
     (isReadonly ? "View skill — " : "Edit skill — ") + tmpl.name;
   document.getElementById("skill-shelf-tag").textContent = "SKL-EDIT";
@@ -2077,9 +2093,7 @@ function showEditTemplateModal(tmplId) {
   lockBtn.hidden = !isReadonly;
   lockBtn.dataset.skillId = tmplId;
   lockBtn.dataset.skillName = tmpl.name || "";
-  document.getElementById("skl-submit").textContent = isReadonly
-    ? "Save config"
-    : "Save changes";
+  document.getElementById("skl-submit").textContent = "Save";
   document.getElementById("skl-cancel").textContent = isReadonly
     ? "Close"
     : "Cancel";
@@ -3592,8 +3606,9 @@ function showCreatePromptPolicyModal() {
   document.getElementById("ppolicy-enabled").checked = true;
   document.getElementById("ppolicy-enabled-row").hidden = true;
   shelf.setAttribute("data-kind", "create");
-  document.getElementById("ppolicy-shelf-title").textContent = "New prompt";
-  document.getElementById("ppolicy-shelf-tag").textContent = "PP-NEW";
+  document.getElementById("ppolicy-shelf-title").textContent =
+    "New prompt policy";
+  document.getElementById("ppolicy-shelf-tag").textContent = "PPO-NEW";
   document.getElementById("ppolicy-submit").textContent = "Create";
   window.TurnstoneHatch.openShelf(shelf);
   document.getElementById("ppolicy-name").focus();
@@ -3625,7 +3640,7 @@ function showEditPromptPolicyModal(policyId) {
   shelf.setAttribute("data-kind", "edit");
   document.getElementById("ppolicy-shelf-title").textContent =
     "Edit prompt — " + p.name;
-  document.getElementById("ppolicy-shelf-tag").textContent = "PP-EDIT";
+  document.getElementById("ppolicy-shelf-tag").textContent = "PPO-EDIT";
   document.getElementById("ppolicy-submit").textContent = "Save";
   window.TurnstoneHatch.openShelf(shelf);
   document.getElementById("ppolicy-name").focus();

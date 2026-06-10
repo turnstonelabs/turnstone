@@ -2280,7 +2280,7 @@ function _cancelWatch(watchId, nodeId, name) {
   showConfirmModal(
     "Cancel Watch",
     "Cancel watch \u2018" + name + "\u2019? This will stop future polling.",
-    "Cancel watch",
+    "Stop watch",
     function () {
       authFetch(
         "/v1/api/admin/watches/" + encodeURIComponent(watchId) + "/cancel",
@@ -2337,7 +2337,7 @@ function showCreateChannelModal() {
   uidInput.value = "";
   uidInput.placeholder = _notifyIdPlaceholder(ctSel.value);
   _channelShelfHandle = window.TurnstoneHatch.openShelf(shelf);
-  uidInput.focus();
+  ctSel.focus();
 }
 
 function hideCreateChannelModal() {
@@ -4000,7 +4000,7 @@ function _mcpResetForm() {
 function showCreateMcpModal() {
   _mcpWire();
   _mcpResetForm();
-  _mcpOpen("Add MCP server", "MCP-NEW", "create", "Create");
+  _mcpOpen("New MCP server", "MCP-NEW", "create", "Create");
 }
 
 function showEditMcpModal(serverId) {
@@ -4354,6 +4354,12 @@ function _openMcpDetail(s) {
           '<br><span style="color:var(--red);font-size:11px">' +
           escapeHtml(ns.error) +
           "</span>";
+      }
+      // The dot alone would make the healthy state color-only — pair it
+      // with a text token, mirroring the error-text sibling above.
+      if (ns.connected) {
+        nodeInfo +=
+          '<br><span style="color:var(--fg-dim);font-size:11px">connected</span>';
       }
       html += "<li>" + dot + nodeInfo + "</li>";
     }
@@ -4837,7 +4843,7 @@ function _updateInstallFields() {
         '">' +
         escapeHtml(varKeys[vi]) +
         (v.is_required
-          ? ' <span style="color:var(--red)">*</span>'
+          ? ' <span style="color:var(--red)" aria-hidden="true">*</span>'
           : ' <span class="label-hint">optional</span>') +
         "</label>";
       if (v.choices && v.choices.length) {
@@ -4846,7 +4852,9 @@ function _updateInstallFields() {
           vi +
           '" data-var-name="' +
           escapeHtml(varKeys[vi]) +
-          '">';
+          '"' +
+          (v.is_required ? " required" : "") +
+          ">";
         if (!v.is_required) html += '<option value="">--</option>';
         for (let ci = 0; ci < v.choices.length; ci++) {
           const sel = v.choices[ci] === (v["default"] || "") ? " selected" : "";
@@ -4870,7 +4878,9 @@ function _updateInstallFields() {
           escapeHtml(v.description || "") +
           '" value="' +
           escapeHtml(v["default"] || "") +
-          '">';
+          '"' +
+          (v.is_required ? " required" : "") +
+          ">";
       }
     }
     // Required headers
@@ -4882,7 +4892,7 @@ function _updateInstallFields() {
         '">' +
         escapeHtml(h.name) +
         (h.is_required
-          ? ' <span style="color:var(--red)">*</span>'
+          ? ' <span style="color:var(--red)" aria-hidden="true">*</span>'
           : ' <span class="label-hint">optional</span>') +
         "</label>";
       html +=
@@ -4894,7 +4904,9 @@ function _updateInstallFields() {
         escapeHtml(h.name) +
         '" placeholder="' +
         escapeHtml(h.description || "") +
-        '">';
+        '"' +
+        (h.is_required ? " required" : "") +
+        ">";
     }
   } else if (source === "package" && srv.packages && srv.packages[pkgIndex]) {
     const pkg = srv.packages[pkgIndex];
@@ -4907,7 +4919,7 @@ function _updateInstallFields() {
         '">' +
         escapeHtml(ev.name) +
         (ev.is_required
-          ? ' <span style="color:var(--red)">*</span>'
+          ? ' <span style="color:var(--red)" aria-hidden="true">*</span>'
           : ' <span class="label-hint">optional</span>') +
         "</label>";
       html +=
@@ -4921,7 +4933,9 @@ function _updateInstallFields() {
         escapeHtml(ev.description || "") +
         '" value="' +
         escapeHtml(ev["default"] || "") +
-        '">';
+        '"' +
+        (ev.is_required ? " required" : "") +
+        ">";
     }
   }
 
@@ -5796,7 +5810,7 @@ function _toggleThinkingParam() {
 
 function showCreateModelModal() {
   document.getElementById("model-edit-id").value = "";
-  document.getElementById("model-create-title").textContent = "Add model";
+  document.getElementById("model-create-title").textContent = "New model";
   document.getElementById("model-shelf-tag").textContent = "MDL-NEW";
   document.getElementById("model-shelf").setAttribute("data-kind", "create");
   document.getElementById("model-create-submit").textContent = "Create";
@@ -5860,7 +5874,8 @@ function showEditModelModal(definitionId) {
     .then(function (m) {
       showCreateModelModal();
       document.getElementById("model-edit-id").value = definitionId;
-      document.getElementById("model-create-title").textContent = "Edit model";
+      document.getElementById("model-create-title").textContent =
+        "Edit model — " + (m.alias || definitionId);
       document.getElementById("model-shelf-tag").textContent = "MDL-EDIT";
       document.getElementById("model-shelf").setAttribute("data-kind", "edit");
       document.getElementById("model-create-submit").textContent = "Save";

@@ -1479,16 +1479,18 @@
                 rows="3"
                 placeholder="What should the workstream do?"
               ></textarea>
-              <label class="toggle-switch">
-                <input id="sch-autoapprove" type="checkbox" />
-                <span class="toggle-track" aria-hidden="true"></span>
-                <span class="toggle-label">Auto-approve tool calls</span>
-              </label>
-              <label class="toggle-switch" id="sch-enabled-row" hidden>
-                <input id="sch-enabled" type="checkbox" />
-                <span class="toggle-track" aria-hidden="true"></span>
-                <span class="toggle-label">Enabled</span>
-              </label>
+              <div class="toggle-stack">
+                <label class="toggle-switch">
+                  <input id="sch-autoapprove" type="checkbox" />
+                  <span class="toggle-track" aria-hidden="true"></span>
+                  <span class="toggle-label">Auto-approve tool calls</span>
+                </label>
+                <label class="toggle-switch" id="sch-enabled-row" hidden>
+                  <input id="sch-enabled" type="checkbox" />
+                  <span class="toggle-track" aria-hidden="true"></span>
+                  <span class="toggle-label">Enabled</span>
+                </label>
+              </div>
               <label
                 >Notify on completion
                 <span class="label-hint">optional</span></label
@@ -1525,7 +1527,7 @@
           >
             <header class="sh-head">
               <span class="sh-led" aria-hidden="true"></span>
-              <h2 class="sh-title" id="model-create-title">Add model</h2>
+              <h2 class="sh-title" id="model-create-title">New model</h2>
               <span class="sh-tag" aria-hidden="true" id="model-shelf-tag"
                 >MDL-NEW</span
               >
@@ -1554,9 +1556,7 @@
                 <div>
                   <label for="model-name"
                     >Model ID
-                    <span class="label-hint"
-                      >(type to autocomplete)</span
-                    ></label
+                    <span class="label-hint">type to autocomplete</span></label
                   >
                   <input
                     type="text"
@@ -1581,7 +1581,7 @@
                   <label for="model-base-url"
                     >Base URL
                     <span class="label-hint"
-                      >(empty = provider default)</span
+                      >empty = provider default</span
                     ></label
                   >
                   <input
@@ -1596,7 +1596,7 @@
                   <label for="model-api-key"
                     >API Key
                     <span class="label-hint"
-                      >(write-only, never displayed)</span
+                      >write-only, never displayed</span
                     ></label
                   >
                   <input
@@ -1609,7 +1609,7 @@
                 <div>
                   <label for="model-ctx-window"
                     >Context window
-                    <span class="label-hint">(0 = auto-detect)</span></label
+                    <span class="label-hint">0 = auto-detect</span></label
                   >
                   <input
                     type="number"
@@ -1630,7 +1630,7 @@
                 <div>
                   <label for="model-temperature"
                     >Temperature
-                    <span class="label-hint">(empty = global)</span></label
+                    <span class="label-hint">empty = global</span></label
                   >
                   <input
                     type="number"
@@ -1644,7 +1644,7 @@
                 <div>
                   <label for="model-max-tokens"
                     >Max tokens
-                    <span class="label-hint">(empty = global)</span></label
+                    <span class="label-hint">empty = global</span></label
                   >
                   <input
                     type="number"
@@ -1656,7 +1656,7 @@
               </div>
               <label for="model-reasoning-effort"
                 >Reasoning effort
-                <span class="label-hint">(empty = global)</span></label
+                <span class="label-hint">empty = global</span></label
               >
               <select id="model-reasoning-effort">
                 <option value="">Global default</option>
@@ -1676,7 +1676,7 @@
                     <label for="model-server-type"
                       >Server type
                       <span class="label-hint"
-                        >(auto-detected or manual)</span
+                        >auto-detected or manual</span
                       ></label
                     >
                     <select id="model-server-type">
@@ -1691,7 +1691,7 @@
                   <div>
                     <label for="model-api-surface"
                       >API surface
-                      <span class="label-hint">(chat vs responses)</span></label
+                      <span class="label-hint">chat vs responses</span></label
                     >
                     <select id="model-api-surface">
                       <option value="">Inherit (Chat Completions)</option>
@@ -1702,9 +1702,7 @@
                 </div>
                 <label for="model-thinking-mode"
                   >Thinking mode
-                  <span class="label-hint"
-                    >(chat-template reasoning)</span
-                  ></label
+                  <span class="label-hint">chat-template reasoning</span></label
                 >
                 <select id="model-thinking-mode">
                   <option value="">None</option>
@@ -1714,7 +1712,7 @@
                   <label for="model-thinking-param"
                     >Template param name
                     <span class="label-hint"
-                      >(Granite/DeepSeek use "thinking")</span
+                      >Granite/DeepSeek use "thinking"</span
                     ></label
                   >
                   <input
@@ -1728,7 +1726,7 @@
                 <label for="model-extra-body"
                   >Extra body params
                   <span class="label-hint"
-                    >(JSON, merged into every request)</span
+                    >JSON, merged into every request</span
                   ></label
                 >
                 <textarea
@@ -2168,7 +2166,7 @@
           >
             <header class="sh-head">
               <span class="sh-led" aria-hidden="true"></span>
-              <h2 class="sh-title" id="mcp-shelf-title">Add MCP server</h2>
+              <h2 class="sh-title" id="mcp-shelf-title">New MCP server</h2>
               <span class="sh-tag" aria-hidden="true" id="mcp-shelf-tag"
                 >MCP-NEW</span
               >
@@ -2356,16 +2354,18 @@
                   placeholder="https://mcp.example.com"
                 />
               </div>
-              <label class="toggle-switch">
-                <input type="checkbox" id="mcp-auto-approve" />
-                <span class="toggle-track" aria-hidden="true"></span>
-                <span class="toggle-label">Auto-approve tools</span>
-              </label>
-              <label class="toggle-switch">
-                <input type="checkbox" id="mcp-enabled" checked />
-                <span class="toggle-track" aria-hidden="true"></span>
-                <span class="toggle-label">Enabled</span>
-              </label>
+              <div class="toggle-stack">
+                <label class="toggle-switch">
+                  <input type="checkbox" id="mcp-auto-approve" />
+                  <span class="toggle-track" aria-hidden="true"></span>
+                  <span class="toggle-label">Auto-approve tools</span>
+                </label>
+                <label class="toggle-switch">
+                  <input type="checkbox" id="mcp-enabled" checked />
+                  <span class="toggle-track" aria-hidden="true"></span>
+                  <span class="toggle-label">Enabled</span>
+                </label>
+              </div>
             </div>
             <footer class="sh-foot">
               <div class="sh-foot-meta"></div>
@@ -2457,7 +2457,7 @@
               <span class="sh-led" aria-hidden="true"></span>
               <h2 class="sh-title" id="role-shelf-title">New role</h2>
               <span class="sh-tag" aria-hidden="true" id="role-shelf-tag"
-                >ROLE-NEW</span
+                >ROL-NEW</span
               >
               <button class="sh-x" data-close aria-label="Close">✕</button>
             </header>
@@ -2517,7 +2517,7 @@
             <header class="sh-head">
               <span class="sh-led" aria-hidden="true"></span>
               <h2 class="sh-title" id="user-roles-shelf-title">Assign roles</h2>
-              <span class="sh-tag" aria-hidden="true">ROLE-MAP</span>
+              <span class="sh-tag" aria-hidden="true">USR-ROLES</span>
               <button class="sh-x" data-close aria-label="Close">✕</button>
             </header>
             <div class="sh-body">
@@ -2552,7 +2552,7 @@
               <h2 class="sh-title" id="github-import-shelf-title">
                 Import from GitHub
               </h2>
-              <span class="sh-tag" aria-hidden="true">SKILL-GH</span>
+              <span class="sh-tag" aria-hidden="true">SKL-IMPORT</span>
               <button class="sh-x" data-close aria-label="Close">✕</button>
             </header>
             <div class="sh-body">
@@ -2597,9 +2597,11 @@
           >
             <header class="sh-head">
               <span class="sh-led" aria-hidden="true"></span>
-              <h2 class="sh-title" id="ppolicy-shelf-title">New prompt</h2>
+              <h2 class="sh-title" id="ppolicy-shelf-title">
+                New prompt policy
+              </h2>
               <span class="sh-tag" aria-hidden="true" id="ppolicy-shelf-tag"
-                >PP-NEW</span
+                >PPO-NEW</span
               >
               <button class="sh-x" data-close aria-label="Close">✕</button>
             </header>
@@ -2784,7 +2786,8 @@
               </div>
               <textarea id="hr-args" rows="3" class="sh-mono"></textarea>
               <label for="hr-conf"
-                >Confidence<button
+                >Confidence <span class="label-hint">0.0–1.0</span
+                ><button
                   type="button"
                   class="settings-help-btn"
                   data-help-target="hr-conf-help"
@@ -2808,7 +2811,10 @@
                 min="0"
                 max="1"
               />
-              <label for="hr-intent">Intent description</label>
+              <label for="hr-intent"
+                >Intent description
+                <span class="label-hint">supports {arg_snippet}</span></label
+              >
               <input
                 id="hr-intent"
                 type="text"
@@ -2995,7 +3001,10 @@
             </div>
             <footer class="sh-foot">
               <div class="sh-foot-meta"></div>
-              <button id="mem-detail-delete" class="sh-btn sh-btn--danger">
+              <button
+                id="mem-detail-delete"
+                class="sh-btn sh-btn--quiet sh-btn--quiet-danger"
+              >
                 Delete
               </button>
               <button class="sh-btn" data-close>Close</button>
@@ -3398,11 +3407,7 @@
                   </label>
                 </div>
               </details>
-              <div
-                id="etm-scan-section"
-                style="display: none"
-                class="admin-field"
-              >
+              <div id="etm-scan-section" class="admin-field" hidden>
                 <span class="admin-field-heading" id="etm-scan-heading"
                   >Security Scan</span
                 >
@@ -3516,7 +3521,7 @@
               <div class="sh-foot-meta" id="skill-shelf-meta"></div>
               <button id="skl-cancel" class="sh-btn" data-close>Cancel</button>
               <button id="skl-submit" class="sh-btn sh-btn--primary">
-                Create skill
+                Create
               </button>
             </footer>
           </dialog>
@@ -3682,7 +3687,11 @@
       <footer class="sh-foot">
         <div class="sh-foot-meta"></div>
         <button class="sh-btn" data-close>Cancel</button>
-        <button id="mcp-install-submit" class="sh-btn sh-btn--primary">
+        <button
+          id="mcp-install-submit"
+          class="sh-btn sh-btn--primary"
+          autofocus
+        >
           Install
         </button>
       </footer>

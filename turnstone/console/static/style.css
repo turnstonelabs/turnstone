@@ -1456,6 +1456,18 @@ h3.skill-spec-heading {
   font-variant-emoji: text;
 }
 
+/* Destructive variant of the hatch quiet button — text-weight danger for
+   foot actions that destroy (memory-detail Delete), keeping the filled
+   err treatment reserved for confirm-dialog primaries. Doubled class so
+   the rule beats the later-loaded hatch.css `.sh-btn--quiet` color. */
+.sh-btn.sh-btn--quiet-danger {
+  color: var(--err);
+}
+.sh-btn.sh-btn--quiet-danger:hover {
+  background: color-mix(in srgb, var(--err) 10%, transparent);
+  color: var(--err);
+}
+
 /* Narrow pane (mobile OR a tight split): single column, matching the
    shelf's own bottom-sheet container breakpoint in hatch.css. */
 @container pane (max-width: 700px) {
