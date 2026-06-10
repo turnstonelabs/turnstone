@@ -5599,6 +5599,45 @@ def _validate_schedule_fields(schedule_type: str, cron_expr: str, at_time: str) 
     return None
 
 
+async def admin_preview_schedule(request: Request) -> JSONResponse:
+    """POST /v1/api/admin/schedules/preview — validate timing, return next runs.
+
+    Pure compute (no storage): powers the schedule editor's NEXT RUNS read-out,
+    re-queried as the user types.  Invalid input is a normal preview outcome
+    (the read-out renders the message live), so it answers 200 with
+    ``valid: false`` rather than a 4xx.
+    """
+    from turnstone.core.auth import require_permission
+    from turnstone.core.web_helpers import read_json_or_400
+
+    err = require_permission(request, "admin.schedules")
+    if err:
+        return err
+
+    body = await read_json_or_400(request)
+    if isinstance(body, JSONResponse):
+        return body
+
+    schedule_type = str(body.get("schedule_type", "")).strip()
+    cron_expr = str(body.get("cron_expr", "")).strip()[:256]
+    at_time = str(body.get("at_time", "")).strip()[:64]
+
+    verr = _validate_schedule_fields(schedule_type, cron_expr, at_time)
+    if verr:
+        return JSONResponse({"valid": False, "error": verr, "next": []})
+
+    if schedule_type == "at":
+        return JSONResponse({"valid": True, "error": "", "next": [at_time]})
+
+    from datetime import UTC, datetime
+
+    from croniter import croniter
+
+    cron = croniter(cron_expr, datetime.now(UTC))
+    runs = [cron.get_next(datetime).strftime("%Y-%m-%dT%H:%M:%S") for _ in range(3)]
+    return JSONResponse({"valid": True, "error": "", "next": runs})
+
+
 async def admin_list_schedules(request: Request) -> JSONResponse:
     """GET /v1/api/admin/schedules — list all scheduled tasks."""
     from turnstone.core.auth import require_permission
@@ -13047,6 +13086,13 @@ def create_app(
                     ),
                     Route("/api/admin/schedules", admin_list_schedules),
                     Route("/api/admin/schedules", admin_create_schedule, methods=["POST"]),
+                    # Registered before the {task_id} routes so the literal
+                    # segment wins the match.
+                    Route(
+                        "/api/admin/schedules/preview",
+                        admin_preview_schedule,
+                        methods=["POST"],
+                    ),
                     Route("/api/admin/schedules/{task_id}", admin_get_schedule),
                     Route("/api/admin/schedules/{task_id}", admin_update_schedule, methods=["PUT"]),
                     Route(

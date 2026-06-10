@@ -21,6 +21,7 @@ from turnstone.console.server import (
     admin_get_schedule,
     admin_list_schedule_runs,
     admin_list_schedules,
+    admin_preview_schedule,
     admin_update_schedule,
 )
 from turnstone.core.auth import AuthResult
@@ -54,6 +55,11 @@ def client(storage):
                 routes=[
                     Route("/api/admin/schedules", admin_list_schedules),
                     Route("/api/admin/schedules", admin_create_schedule, methods=["POST"]),
+                    Route(
+                        "/api/admin/schedules/preview",
+                        admin_preview_schedule,
+                        methods=["POST"],
+                    ),
                     Route("/api/admin/schedules/{task_id}", admin_get_schedule),
                     Route(
                         "/api/admin/schedules/{task_id}",
@@ -283,3 +289,68 @@ class TestScheduleAPI:
         resp = client.get(f"/v1/api/admin/schedules/{task_id}/runs?limit=abc")
         assert resp.status_code == 200
         assert resp.json()["runs"] == []
+
+
+class TestPreviewSchedule:
+    """POST /v1/api/admin/schedules/preview — the editor's NEXT RUNS read-out."""
+
+    def test_valid_cron_returns_three_ascending_runs(self, client):
+        resp = client.post(
+            "/v1/api/admin/schedules/preview",
+            json={"schedule_type": "cron", "cron_expr": "0 6 * * *"},
+        )
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["valid"] is True
+        assert data["error"] == ""
+        assert len(data["next"]) == 3
+        assert data["next"] == sorted(data["next"])
+        # All at 06:00 (the daily expression's only firing time)
+        assert all(t.endswith("T06:00:00") for t in data["next"])
+
+    def test_invalid_cron_is_a_200_with_the_message(self, client):
+        resp = client.post(
+            "/v1/api/admin/schedules/preview",
+            json={"schedule_type": "cron", "cron_expr": "not a cron"},
+        )
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["valid"] is False
+        assert "Invalid cron expression" in data["error"]
+        assert data["next"] == []
+
+    def test_missing_cron_expr(self, client):
+        resp = client.post(
+            "/v1/api/admin/schedules/preview",
+            json={"schedule_type": "cron", "cron_expr": ""},
+        )
+        data = resp.json()
+        assert data["valid"] is False
+        assert "cron_expr is required" in data["error"]
+
+    def test_at_future_echoes_the_time(self, client):
+        resp = client.post(
+            "/v1/api/admin/schedules/preview",
+            json={"schedule_type": "at", "at_time": "2030-01-01T12:00:00+00:00"},
+        )
+        data = resp.json()
+        assert data["valid"] is True
+        assert data["next"] == ["2030-01-01T12:00:00+00:00"]
+
+    def test_at_in_the_past_is_invalid(self, client):
+        resp = client.post(
+            "/v1/api/admin/schedules/preview",
+            json={"schedule_type": "at", "at_time": "2020-01-01T12:00:00+00:00"},
+        )
+        data = resp.json()
+        assert data["valid"] is False
+        assert "future" in data["error"]
+
+    def test_unknown_schedule_type(self, client):
+        resp = client.post(
+            "/v1/api/admin/schedules/preview",
+            json={"schedule_type": "sometimes"},
+        )
+        data = resp.json()
+        assert data["valid"] is False
+        assert "schedule_type" in data["error"]
