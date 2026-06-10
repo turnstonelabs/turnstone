@@ -3706,6 +3706,7 @@
       data-kind="danger"
       role="alertdialog"
       aria-labelledby="coord-delete-title"
+      aria-describedby="coord-delete-count"
     >
       <header class="sh-head">
         <span class="sh-led" aria-hidden="true"></span>
@@ -3720,7 +3721,12 @@
           aria-live="assertive"
           aria-atomic="true"
         ></div>
-        <p class="sh-prose" id="coord-delete-count"></p>
+        <p
+          class="sh-prose"
+          id="coord-delete-count"
+          aria-live="polite"
+          aria-atomic="true"
+        ></p>
         <div id="coord-delete-list"></div>
       </div>
       <footer class="sh-foot">

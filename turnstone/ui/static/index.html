@@ -420,7 +420,6 @@
           maxlength="80"
           placeholder="Enter title..."
           aria-label="Workstream title"
-          autofocus
         />
       </div>
       <footer class="sh-foot">
@@ -469,7 +468,7 @@
     >
       <header class="sh-head">
         <span class="sh-led" aria-hidden="true"></span>
-        <h2 class="sh-title" id="revoke-mcp-heading">Revoke connection?</h2>
+        <h2 class="sh-title" id="revoke-mcp-heading">Revoke connection</h2>
         <button class="sh-x" data-close aria-label="Close">✕</button>
       </header>
       <div class="sh-body">
@@ -493,6 +492,7 @@
       data-kind="danger"
       role="alertdialog"
       aria-labelledby="ws-delete-title"
+      aria-describedby="ws-delete-count"
     >
       <header class="sh-head">
         <span class="sh-led" aria-hidden="true"></span>
@@ -507,7 +507,12 @@
           aria-live="assertive"
           aria-atomic="true"
         ></div>
-        <p class="sh-prose" id="ws-delete-count"></p>
+        <p
+          class="sh-prose"
+          id="ws-delete-count"
+          aria-live="polite"
+          aria-atomic="true"
+        ></p>
         <div id="ws-delete-list"></div>
       </div>
       <footer class="sh-foot">

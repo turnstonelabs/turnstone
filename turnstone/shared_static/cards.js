@@ -796,9 +796,11 @@ export function createSavedCardsController(opts) {
       errorEl.textContent = "";
       errorEl.classList.remove("is-visible");
     }
-    /* The results view hides Cancel (Close-only foot) — restore it. */
+    /* The results view hides Cancel (Close-only foot) and may have
+       flipped the chrome to the success kind — restore both. */
     var cancelBtn = dlg.querySelector(".sh-foot [data-close]");
     if (cancelBtn) cancelBtn.hidden = false;
+    dlg.setAttribute("data-kind", "danger");
     if (metaEl) metaEl.textContent = selected.length + " selected";
     if (countEl) {
       countEl.textContent =
@@ -875,7 +877,15 @@ export function createSavedCardsController(opts) {
                 /* fall through */
               }
             } else if (body) {
-              errMsg = shortId + ": " + body.substring(0, 200);
+              // Non-JSON failures are often whole HTML error pages (proxy
+              // 502s, gateway timeouts) — strip markup before display.
+              var plain = body
+                .replace(/<(style|script)[\s\S]*?<\/\1>/gi, " ")
+                .replace(/<[^>]+>/g, " ")
+                .replace(/\s+/g, " ")
+                .trim();
+              errMsg =
+                shortId + ": " + (plain.substring(0, 120) || "HTTP " + status);
             }
             results.push({
               name: name,
@@ -916,6 +926,18 @@ export function createSavedCardsController(opts) {
       if (countEl) {
         countEl.textContent = okCount + " deleted, " + failCount + " failed";
       }
+      // Failures land in the live alert region (the summary prose is
+      // polite-live for the all-good case); a clean run flips the chrome
+      // to the success kind — red head over "3 deleted, 0 failed" would
+      // disagree with the de-dangered foot.
+      var errEl = dlg ? dlg.querySelector(".sh-alert") : null;
+      if (errEl && failCount > 0) {
+        errEl.textContent =
+          failCount + " of " + results.length + " deletions failed";
+        errEl.classList.add("is-visible");
+      }
+      if (dlg)
+        dlg.setAttribute("data-kind", failCount === 0 ? "success" : "danger");
       if (metaEl) metaEl.textContent = "";
       /* Close-only foot: a Cancel beside a Close would be the redundant
          dismissal pair the foot grammar forbids. */
@@ -937,6 +959,9 @@ export function createSavedCardsController(opts) {
           if (t && typeof t.focus === "function") t.focus();
           if (typeof opts.onClose === "function") opts.onClose();
         };
+        // The state just changed under the user — land focus somewhere
+        // predictable (the only remaining action).
+        delBtn.focus();
       }
     });
   }

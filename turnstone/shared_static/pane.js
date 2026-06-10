@@ -122,6 +122,12 @@ export function openPopupMenu(anchor, items, opts) {
     }
     btn.addEventListener("click", () => {
       close();
+      // close() just removed the focused item from the DOM — without a
+      // handoff, focus falls to <body>, and a dialog opened by the action
+      // captures body as its opener (so its close-restore no-ops). Hand
+      // focus to the menu's return target before the action runs.
+      const back = opts.returnFocusEl || anchor;
+      if (back && back.isConnected) back.focus();
       try {
         item.action();
       } catch (e) {
