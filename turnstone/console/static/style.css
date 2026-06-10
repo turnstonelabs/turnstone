@@ -1772,15 +1772,9 @@ textarea.skill-content-area {
   pointer-events: none;
 }
 
-#create-ppolicy-overlay,
-#edit-ppolicy-overlay,
 #create-template-overlay,
 #edit-template-overlay,
-#memory-detail-overlay,
-#create-hr-overlay,
-#edit-hr-overlay,
-#create-ogp-overlay,
-#edit-ogp-overlay {
+#memory-detail-overlay {
   position: fixed;
   inset: 0;
   background: rgba(0, 0, 0, 0.7);

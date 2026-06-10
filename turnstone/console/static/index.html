@@ -658,562 +658,6 @@
               </div>
             </div>
 
-            <!-- Judge: Create Heuristic Rule Modal -->
-            <div
-              id="create-hr-overlay"
-              style="display: none"
-              role="dialog"
-              aria-modal="true"
-              aria-labelledby="create-hr-title"
-            >
-              <div id="create-hr-box" class="admin-modal admin-modal-wide">
-                <h2 id="create-hr-title">Create Heuristic Rule</h2>
-                <div
-                  id="create-hr-error"
-                  role="alert"
-                  aria-live="assertive"
-                  aria-atomic="true"
-                ></div>
-                <label for="hr-name">Name</label>
-                <input
-                  id="hr-name"
-                  type="text"
-                  placeholder="my-custom-rule"
-                  autocomplete="off"
-                  spellcheck="false"
-                />
-                <div style="display: flex; gap: 12px">
-                  <div style="flex: 1">
-                    <label for="hr-tier">Tier</label>
-                    <select id="hr-tier">
-                      <option>critical</option>
-                      <option>high</option>
-                      <option selected>medium</option>
-                      <option>low</option>
-                    </select>
-                  </div>
-                  <div style="flex: 1">
-                    <label for="hr-risk">Risk Level</label>
-                    <select id="hr-risk">
-                      <option>critical</option>
-                      <option>high</option>
-                      <option selected>medium</option>
-                      <option>low</option>
-                    </select>
-                  </div>
-                  <div style="flex: 1">
-                    <label for="hr-rec">Recommendation</label>
-                    <select id="hr-rec">
-                      <option>approve</option>
-                      <option selected>review</option>
-                      <option>deny</option>
-                    </select>
-                  </div>
-                </div>
-                <label for="hr-tool"
-                  >Tool Pattern<button
-                    type="button"
-                    class="settings-help-btn"
-                    data-help-target="hr-tool-help"
-                    aria-label="Help for Tool Pattern"
-                    aria-expanded="false"
-                  ></button
-                ></label>
-                <div
-                  id="hr-tool-help"
-                  class="settings-help-popover"
-                  style="display: none"
-                >
-                  fnmatch syntax: bash, write_file, mcp__*
-                </div>
-                <input
-                  id="hr-tool"
-                  type="text"
-                  value="bash"
-                  autocomplete="off"
-                  spellcheck="false"
-                />
-                <label for="hr-args"
-                  >Arg Patterns<button
-                    type="button"
-                    class="settings-help-btn"
-                    data-help-target="hr-args-help"
-                    aria-label="Help for Arg Patterns"
-                    aria-expanded="false"
-                  ></button
-                ></label>
-                <div
-                  id="hr-args-help"
-                  class="settings-help-popover"
-                  style="display: none"
-                >
-                  One regex per line. Each pattern is matched against the
-                  serialized tool arguments.
-                </div>
-                <textarea
-                  id="hr-args"
-                  rows="3"
-                  style="font-family: var(--font-mono); font-size: 12px"
-                ></textarea>
-                <label for="hr-conf"
-                  >Confidence<button
-                    type="button"
-                    class="settings-help-btn"
-                    data-help-target="hr-conf-help"
-                    aria-label="Help for Confidence"
-                    aria-expanded="false"
-                  ></button
-                ></label>
-                <div
-                  id="hr-conf-help"
-                  class="settings-help-popover"
-                  style="display: none"
-                >
-                  Rule confidence between 0.0 and 1.0. Higher values mean the
-                  rule is more certain when it matches.
-                </div>
-                <input
-                  id="hr-conf"
-                  type="number"
-                  step="0.05"
-                  value="0.8"
-                  min="0"
-                  max="1"
-                  style="width: 100px"
-                />
-                <label for="hr-intent">Intent Description</label>
-                <input
-                  id="hr-intent"
-                  type="text"
-                  placeholder="Detected dangerous operation: {arg_snippet}"
-                  autocomplete="off"
-                />
-                <label for="hr-reason">Reasoning</label>
-                <input
-                  id="hr-reason"
-                  type="text"
-                  placeholder="Explain why this is risky"
-                  autocomplete="off"
-                />
-                <div class="modal-buttons">
-                  <button class="modal-cancel" onclick="hideCreateHRModal()">
-                    Cancel
-                  </button>
-                  <button
-                    id="hr-submit"
-                    class="modal-submit"
-                    onclick="submitCreateHeuristicRule()"
-                  >
-                    Create
-                  </button>
-                </div>
-              </div>
-            </div>
-
-            <!-- Judge: Create Output Guard Pattern Modal -->
-            <div
-              id="create-ogp-overlay"
-              style="display: none"
-              role="dialog"
-              aria-modal="true"
-              aria-labelledby="create-ogp-title"
-            >
-              <div id="create-ogp-box" class="admin-modal admin-modal-wide">
-                <h2 id="create-ogp-title">Create Output Guard Pattern</h2>
-                <div
-                  id="create-ogp-error"
-                  role="alert"
-                  aria-live="assertive"
-                  aria-atomic="true"
-                ></div>
-                <label for="ogp-name">Name</label>
-                <input
-                  id="ogp-name"
-                  type="text"
-                  placeholder="my-pattern"
-                  autocomplete="off"
-                  spellcheck="false"
-                />
-                <div style="display: flex; gap: 12px">
-                  <div style="flex: 1">
-                    <label for="ogp-cat">Category</label>
-                    <select id="ogp-cat">
-                      <option>prompt_injection</option>
-                      <option>credentials</option>
-                      <option>encoded_payloads</option>
-                      <option>adversarial_urls</option>
-                      <option>info_disclosure</option>
-                    </select>
-                  </div>
-                  <div style="flex: 1">
-                    <label for="ogp-risk">Risk Level</label>
-                    <select id="ogp-risk">
-                      <option>high</option>
-                      <option selected>medium</option>
-                      <option>low</option>
-                    </select>
-                  </div>
-                </div>
-                <label for="ogp-pattern">Regex Pattern</label>
-                <input
-                  id="ogp-pattern"
-                  type="text"
-                  autocomplete="off"
-                  spellcheck="false"
-                  style="font-family: var(--font-mono); font-size: 12px"
-                />
-                <button
-                  class="admin-btn-action"
-                  style="margin: 4px 0 8px"
-                  onclick="validateOGRegex()"
-                >
-                  Validate regex
-                </button>
-                <span
-                  id="ogp-regex-result"
-                  role="status"
-                  aria-live="polite"
-                  style="font-size: 11px; margin-left: 8px"
-                ></span>
-                <label for="ogp-flag">Flag Name</label>
-                <input
-                  id="ogp-flag"
-                  type="text"
-                  placeholder="my_flag"
-                  autocomplete="off"
-                  spellcheck="false"
-                />
-                <label for="ogp-ann">Annotation</label>
-                <input
-                  id="ogp-ann"
-                  type="text"
-                  placeholder="Human-readable description"
-                  autocomplete="off"
-                />
-                <label for="ogp-flags"
-                  >Pattern Flags<button
-                    type="button"
-                    class="settings-help-btn"
-                    data-help-target="ogp-flags-help"
-                    aria-label="Help for Pattern Flags"
-                    aria-expanded="false"
-                  ></button
-                ></label>
-                <div
-                  id="ogp-flags-help"
-                  class="settings-help-popover"
-                  style="display: none"
-                >
-                  Comma-separated regex compilation flags: IGNORECASE,
-                  MULTILINE, DOTALL.
-                </div>
-                <input id="ogp-flags" type="text" autocomplete="off" />
-                <div style="display: flex; gap: 16px; margin: 8px 0">
-                  <label
-                    style="
-                      display: flex;
-                      align-items: center;
-                      gap: 6px;
-                      font-size: 12px;
-                    "
-                    ><input id="ogp-cred" type="checkbox" /> Is
-                    Credential</label
-                  >
-                  <label style="font-size: 12px"
-                    >Redact Label
-                    <input
-                      id="ogp-redact"
-                      type="text"
-                      placeholder="api_key"
-                      style="width: 100px; margin-left: 4px"
-                  /></label>
-                </div>
-                <div class="modal-buttons">
-                  <button class="modal-cancel" onclick="hideCreateOGPModal()">
-                    Cancel
-                  </button>
-                  <button
-                    id="ogp-submit"
-                    class="modal-submit"
-                    onclick="submitCreateOGPattern()"
-                  >
-                    Create
-                  </button>
-                </div>
-              </div>
-            </div>
-
-            <!-- Judge: Edit Heuristic Rule Modal -->
-            <div
-              id="edit-hr-overlay"
-              style="display: none"
-              role="dialog"
-              aria-modal="true"
-              aria-labelledby="edit-hr-title"
-            >
-              <div id="edit-hr-box" class="admin-modal admin-modal-wide">
-                <h2 id="edit-hr-title">Edit Heuristic Rule</h2>
-                <div
-                  id="edit-hr-error"
-                  role="alert"
-                  aria-live="assertive"
-                  aria-atomic="true"
-                ></div>
-                <input id="ehr-id" type="hidden" />
-                <input id="ehr-builtin" type="hidden" />
-                <input id="ehr-priority" type="hidden" value="0" />
-                <label for="ehr-name">Name</label>
-                <input
-                  id="ehr-name"
-                  type="text"
-                  autocomplete="off"
-                  spellcheck="false"
-                />
-                <div style="display: flex; gap: 12px">
-                  <div style="flex: 1">
-                    <label for="ehr-tier">Tier</label>
-                    <select id="ehr-tier">
-                      <option>critical</option>
-                      <option>high</option>
-                      <option>medium</option>
-                      <option>low</option>
-                    </select>
-                  </div>
-                  <div style="flex: 1">
-                    <label for="ehr-risk">Risk Level</label>
-                    <select id="ehr-risk">
-                      <option>critical</option>
-                      <option>high</option>
-                      <option>medium</option>
-                      <option>low</option>
-                    </select>
-                  </div>
-                  <div style="flex: 1">
-                    <label for="ehr-rec">Recommendation</label>
-                    <select id="ehr-rec">
-                      <option>approve</option>
-                      <option>review</option>
-                      <option>deny</option>
-                    </select>
-                  </div>
-                </div>
-                <label for="ehr-tool"
-                  >Tool Pattern<button
-                    type="button"
-                    class="settings-help-btn"
-                    data-help-target="ehr-tool-help"
-                    aria-label="Help for Tool Pattern"
-                    aria-expanded="false"
-                  ></button
-                ></label>
-                <div
-                  id="ehr-tool-help"
-                  class="settings-help-popover"
-                  style="display: none"
-                >
-                  fnmatch syntax: bash, write_file, mcp__*
-                </div>
-                <input
-                  id="ehr-tool"
-                  type="text"
-                  autocomplete="off"
-                  spellcheck="false"
-                />
-                <label for="ehr-args"
-                  >Arg Patterns<button
-                    type="button"
-                    class="settings-help-btn"
-                    data-help-target="ehr-args-help"
-                    aria-label="Help for Arg Patterns"
-                    aria-expanded="false"
-                  ></button
-                ></label>
-                <div
-                  id="ehr-args-help"
-                  class="settings-help-popover"
-                  style="display: none"
-                >
-                  One regex per line. Each pattern is matched against the
-                  serialized tool arguments.
-                </div>
-                <textarea
-                  id="ehr-args"
-                  rows="3"
-                  style="font-family: var(--font-mono); font-size: 12px"
-                ></textarea>
-                <label for="ehr-conf"
-                  >Confidence<button
-                    type="button"
-                    class="settings-help-btn"
-                    data-help-target="ehr-conf-help"
-                    aria-label="Help for Confidence"
-                    aria-expanded="false"
-                  ></button
-                ></label>
-                <div
-                  id="ehr-conf-help"
-                  class="settings-help-popover"
-                  style="display: none"
-                >
-                  Rule confidence between 0.0 and 1.0. Higher values mean the
-                  rule is more certain when it matches.
-                </div>
-                <input
-                  id="ehr-conf"
-                  type="number"
-                  step="0.05"
-                  min="0"
-                  max="1"
-                  style="width: 100px"
-                />
-                <label for="ehr-intent">Intent Description</label>
-                <input id="ehr-intent" type="text" autocomplete="off" />
-                <label for="ehr-reason">Reasoning</label>
-                <input id="ehr-reason" type="text" autocomplete="off" />
-                <div class="modal-buttons">
-                  <button class="modal-cancel" onclick="hideEditHRModal()">
-                    Cancel
-                  </button>
-                  <button
-                    id="ehr-submit"
-                    class="modal-submit"
-                    onclick="submitEditHeuristicRule()"
-                  >
-                    Save
-                  </button>
-                </div>
-              </div>
-            </div>
-
-            <!-- Judge: Edit Output Guard Pattern Modal -->
-            <div
-              id="edit-ogp-overlay"
-              style="display: none"
-              role="dialog"
-              aria-modal="true"
-              aria-labelledby="edit-ogp-title"
-            >
-              <div id="edit-ogp-box" class="admin-modal admin-modal-wide">
-                <h2 id="edit-ogp-title">Edit Output Guard Pattern</h2>
-                <div
-                  id="edit-ogp-error"
-                  role="alert"
-                  aria-live="assertive"
-                  aria-atomic="true"
-                ></div>
-                <input id="eogp-id" type="hidden" />
-                <input id="eogp-builtin" type="hidden" />
-                <input id="eogp-priority" type="hidden" value="0" />
-                <label for="eogp-name">Name</label>
-                <input
-                  id="eogp-name"
-                  type="text"
-                  autocomplete="off"
-                  spellcheck="false"
-                />
-                <div style="display: flex; gap: 12px">
-                  <div style="flex: 1">
-                    <label for="eogp-cat">Category</label>
-                    <select id="eogp-cat">
-                      <option>prompt_injection</option>
-                      <option>credentials</option>
-                      <option>encoded_payloads</option>
-                      <option>adversarial_urls</option>
-                      <option>info_disclosure</option>
-                    </select>
-                  </div>
-                  <div style="flex: 1">
-                    <label for="eogp-risk">Risk Level</label>
-                    <select id="eogp-risk">
-                      <option>high</option>
-                      <option>medium</option>
-                      <option>low</option>
-                    </select>
-                  </div>
-                </div>
-                <label for="eogp-pattern">Regex Pattern</label>
-                <input
-                  id="eogp-pattern"
-                  type="text"
-                  autocomplete="off"
-                  spellcheck="false"
-                  style="font-family: var(--font-mono); font-size: 12px"
-                />
-                <button
-                  class="admin-btn-action"
-                  style="margin: 4px 0 8px"
-                  onclick="validateEditOGRegex()"
-                >
-                  Validate regex
-                </button>
-                <span
-                  id="eogp-regex-result"
-                  role="status"
-                  aria-live="polite"
-                  style="font-size: 11px; margin-left: 8px"
-                ></span>
-                <label for="eogp-flag">Flag Name</label>
-                <input
-                  id="eogp-flag"
-                  type="text"
-                  autocomplete="off"
-                  spellcheck="false"
-                />
-                <label for="eogp-ann">Annotation</label>
-                <input id="eogp-ann" type="text" autocomplete="off" />
-                <label for="eogp-flags"
-                  >Pattern Flags<button
-                    type="button"
-                    class="settings-help-btn"
-                    data-help-target="eogp-flags-help"
-                    aria-label="Help for Pattern Flags"
-                    aria-expanded="false"
-                  ></button
-                ></label>
-                <div
-                  id="eogp-flags-help"
-                  class="settings-help-popover"
-                  style="display: none"
-                >
-                  Comma-separated regex compilation flags: IGNORECASE,
-                  MULTILINE, DOTALL.
-                </div>
-                <input id="eogp-flags" type="text" autocomplete="off" />
-                <div style="display: flex; gap: 16px; margin: 8px 0">
-                  <label
-                    style="
-                      display: flex;
-                      align-items: center;
-                      gap: 6px;
-                      font-size: 12px;
-                    "
-                    ><input id="eogp-cred" type="checkbox" /> Is
-                    Credential</label
-                  >
-                  <label style="font-size: 12px"
-                    >Redact Label
-                    <input
-                      id="eogp-redact"
-                      type="text"
-                      placeholder="api_key"
-                      style="width: 100px; margin-left: 4px"
-                  /></label>
-                </div>
-                <div class="modal-buttons">
-                  <button class="modal-cancel" onclick="hideEditOGPModal()">
-                    Cancel
-                  </button>
-                  <button
-                    id="eogp-submit"
-                    class="modal-submit"
-                    onclick="submitEditOGPattern()"
-                  >
-                    Save
-                  </button>
-                </div>
-              </div>
-            </div>
-
             <!-- Skills Tab -->
             <div id="admin-skills" class="admin-panel" style="display: none">
               <div class="admin-toolbar">
@@ -3142,6 +2586,392 @@
               </button>
             </footer>
           </dialog>
+
+          <!-- Prompt-policy shelf (create + edit) — pane-scoped. A hidden
+               ppolicy-id decides POST vs PUT; the Enabled toggle is edit-only. -->
+          <dialog
+            class="hatch hatch--shelf hatch--lg"
+            id="ppolicy-shelf"
+            data-kind="create"
+            aria-labelledby="ppolicy-shelf-title"
+          >
+            <header class="sh-head">
+              <span class="sh-led" aria-hidden="true"></span>
+              <h2 class="sh-title" id="ppolicy-shelf-title">New prompt</h2>
+              <span class="sh-tag" aria-hidden="true" id="ppolicy-shelf-tag"
+                >PP-NEW</span
+              >
+              <button class="sh-x" data-close aria-label="Close">✕</button>
+            </header>
+            <div class="sh-body">
+              <div
+                id="ppolicy-shelf-error"
+                class="sh-alert"
+                role="alert"
+                aria-live="assertive"
+                aria-atomic="true"
+              ></div>
+              <input id="ppolicy-id" type="hidden" />
+              <label for="ppolicy-name"
+                >Name
+                <span class="label-hint">slug-style identifier</span></label
+              >
+              <input
+                id="ppolicy-name"
+                type="text"
+                class="sh-mono"
+                placeholder="e.g. web_search, data_handling"
+                autocomplete="off"
+              />
+              <label for="ppolicy-gate"
+                >Tool gate
+                <span class="label-hint"
+                  >tool name or blank for unconditional</span
+                ></label
+              >
+              <input
+                id="ppolicy-gate"
+                type="text"
+                class="sh-mono"
+                placeholder="e.g. web_search"
+                autocomplete="off"
+              />
+              <label for="ppolicy-content"
+                >Content
+                <span class="label-hint"
+                  >markdown body for system message</span
+                ></label
+              >
+              <textarea
+                id="ppolicy-content"
+                rows="10"
+                class="sh-mono"
+                placeholder="## Policy Name&#10;&#10;Behavioral guidance..."
+                spellcheck="false"
+              ></textarea>
+              <label for="ppolicy-priority"
+                >Priority
+                <span class="label-hint"
+                  >higher = assembled later (closer to conversation)</span
+                ></label
+              >
+              <input
+                id="ppolicy-priority"
+                type="number"
+                value="0"
+                min="0"
+                max="9999"
+              />
+              <label class="toggle-switch" id="ppolicy-enabled-row" hidden>
+                <input id="ppolicy-enabled" type="checkbox" checked />
+                <span class="toggle-track" aria-hidden="true"></span>
+                <span class="toggle-label">Enabled</span>
+              </label>
+            </div>
+            <footer class="sh-foot">
+              <div class="sh-foot-meta"></div>
+              <button class="sh-btn" data-close>Cancel</button>
+              <button id="ppolicy-submit" class="sh-btn sh-btn--primary">
+                Create
+              </button>
+            </footer>
+          </dialog>
+
+          <!-- Heuristic-rule shelf (create + edit) — pane-scoped. Hidden id +
+               builtin flag decide PUT vs override-POST; the name field is
+               disabled for builtin rows. The settings-help-popover buttons
+               carry over verbatim (their toggle code is independent). -->
+          <dialog
+            class="hatch hatch--shelf hatch--lg"
+            id="hr-shelf"
+            data-kind="create"
+            aria-labelledby="hr-shelf-title"
+          >
+            <header class="sh-head">
+              <span class="sh-led" aria-hidden="true"></span>
+              <h2 class="sh-title" id="hr-shelf-title">New heuristic rule</h2>
+              <span class="sh-tag" aria-hidden="true" id="hr-shelf-tag"
+                >HR-NEW</span
+              >
+              <button class="sh-x" data-close aria-label="Close">✕</button>
+            </header>
+            <div class="sh-body">
+              <div
+                id="hr-shelf-error"
+                class="sh-alert"
+                role="alert"
+                aria-live="assertive"
+                aria-atomic="true"
+              ></div>
+              <input id="hr-id" type="hidden" />
+              <input id="hr-builtin" type="hidden" />
+              <input id="hr-priority" type="hidden" value="0" />
+              <label for="hr-name">Name</label>
+              <input
+                id="hr-name"
+                type="text"
+                class="sh-mono"
+                placeholder="my-custom-rule"
+                autocomplete="off"
+                spellcheck="false"
+              />
+              <div class="field-pair">
+                <div>
+                  <label for="hr-tier">Tier</label>
+                  <select id="hr-tier">
+                    <option>critical</option>
+                    <option>high</option>
+                    <option selected>medium</option>
+                    <option>low</option>
+                  </select>
+                </div>
+                <div>
+                  <label for="hr-risk">Risk level</label>
+                  <select id="hr-risk">
+                    <option>critical</option>
+                    <option>high</option>
+                    <option selected>medium</option>
+                    <option>low</option>
+                  </select>
+                </div>
+              </div>
+              <label for="hr-rec">Recommendation</label>
+              <select id="hr-rec">
+                <option>approve</option>
+                <option selected>review</option>
+                <option>deny</option>
+              </select>
+              <label for="hr-tool"
+                >Tool pattern<button
+                  type="button"
+                  class="settings-help-btn"
+                  data-help-target="hr-tool-help"
+                  aria-label="Help for Tool Pattern"
+                  aria-expanded="false"
+                ></button
+              ></label>
+              <div
+                id="hr-tool-help"
+                class="settings-help-popover"
+                style="display: none"
+              >
+                fnmatch syntax: bash, write_file, mcp__*
+              </div>
+              <input
+                id="hr-tool"
+                type="text"
+                class="sh-mono"
+                value="bash"
+                autocomplete="off"
+                spellcheck="false"
+              />
+              <label for="hr-args"
+                >Arg patterns<button
+                  type="button"
+                  class="settings-help-btn"
+                  data-help-target="hr-args-help"
+                  aria-label="Help for Arg Patterns"
+                  aria-expanded="false"
+                ></button
+              ></label>
+              <div
+                id="hr-args-help"
+                class="settings-help-popover"
+                style="display: none"
+              >
+                One regex per line. Each pattern is matched against the
+                serialized tool arguments.
+              </div>
+              <textarea id="hr-args" rows="3" class="sh-mono"></textarea>
+              <label for="hr-conf"
+                >Confidence<button
+                  type="button"
+                  class="settings-help-btn"
+                  data-help-target="hr-conf-help"
+                  aria-label="Help for Confidence"
+                  aria-expanded="false"
+                ></button
+              ></label>
+              <div
+                id="hr-conf-help"
+                class="settings-help-popover"
+                style="display: none"
+              >
+                Rule confidence between 0.0 and 1.0. Higher values mean the rule
+                is more certain when it matches.
+              </div>
+              <input
+                id="hr-conf"
+                type="number"
+                step="0.05"
+                value="0.8"
+                min="0"
+                max="1"
+              />
+              <label for="hr-intent">Intent description</label>
+              <input
+                id="hr-intent"
+                type="text"
+                placeholder="Detected dangerous operation: {arg_snippet}"
+                autocomplete="off"
+              />
+              <label for="hr-reason">Reasoning</label>
+              <input
+                id="hr-reason"
+                type="text"
+                placeholder="Explain why this is risky"
+                autocomplete="off"
+              />
+            </div>
+            <footer class="sh-foot">
+              <div class="sh-foot-meta"></div>
+              <button class="sh-btn" data-close>Cancel</button>
+              <button id="hr-submit" class="sh-btn sh-btn--primary">
+                Create
+              </button>
+            </footer>
+          </dialog>
+
+          <!-- Output-guard shelf (create + edit) — pane-scoped. Hidden id +
+               builtin flag decide PUT vs override-POST. The regex validator
+               sits in the FOOT (quiet button); its result stays in the body. -->
+          <dialog
+            class="hatch hatch--shelf hatch--lg"
+            id="ogp-shelf"
+            data-kind="create"
+            aria-labelledby="ogp-shelf-title"
+          >
+            <header class="sh-head">
+              <span class="sh-led" aria-hidden="true"></span>
+              <h2 class="sh-title" id="ogp-shelf-title">
+                New output-guard pattern
+              </h2>
+              <span class="sh-tag" aria-hidden="true" id="ogp-shelf-tag"
+                >OGP-NEW</span
+              >
+              <button class="sh-x" data-close aria-label="Close">✕</button>
+            </header>
+            <div class="sh-body">
+              <div
+                id="ogp-shelf-error"
+                class="sh-alert"
+                role="alert"
+                aria-live="assertive"
+                aria-atomic="true"
+              ></div>
+              <input id="ogp-id" type="hidden" />
+              <input id="ogp-builtin" type="hidden" />
+              <input id="ogp-priority" type="hidden" value="0" />
+              <label for="ogp-name">Name</label>
+              <input
+                id="ogp-name"
+                type="text"
+                class="sh-mono"
+                placeholder="my-pattern"
+                autocomplete="off"
+                spellcheck="false"
+              />
+              <div class="field-pair">
+                <div>
+                  <label for="ogp-cat">Category</label>
+                  <select id="ogp-cat">
+                    <option>prompt_injection</option>
+                    <option>credentials</option>
+                    <option>encoded_payloads</option>
+                    <option>adversarial_urls</option>
+                    <option>info_disclosure</option>
+                  </select>
+                </div>
+                <div>
+                  <label for="ogp-risk">Risk level</label>
+                  <select id="ogp-risk">
+                    <option>high</option>
+                    <option selected>medium</option>
+                    <option>low</option>
+                  </select>
+                </div>
+              </div>
+              <label for="ogp-pattern">Regex pattern</label>
+              <input
+                id="ogp-pattern"
+                type="text"
+                class="sh-mono"
+                autocomplete="off"
+                spellcheck="false"
+              />
+              <div
+                id="ogp-regex-result"
+                class="match-strip"
+                role="status"
+                aria-live="polite"
+              ></div>
+              <label for="ogp-flag">Flag name</label>
+              <input
+                id="ogp-flag"
+                type="text"
+                class="sh-mono"
+                placeholder="my_flag"
+                autocomplete="off"
+                spellcheck="false"
+              />
+              <label for="ogp-ann">Annotation</label>
+              <input
+                id="ogp-ann"
+                type="text"
+                placeholder="Human-readable description"
+                autocomplete="off"
+              />
+              <label for="ogp-flags"
+                >Pattern flags<button
+                  type="button"
+                  class="settings-help-btn"
+                  data-help-target="ogp-flags-help"
+                  aria-label="Help for Pattern Flags"
+                  aria-expanded="false"
+                ></button
+              ></label>
+              <div
+                id="ogp-flags-help"
+                class="settings-help-popover"
+                style="display: none"
+              >
+                Comma-separated regex compilation flags: IGNORECASE, MULTILINE,
+                DOTALL.
+              </div>
+              <input
+                id="ogp-flags"
+                type="text"
+                class="sh-mono"
+                autocomplete="off"
+              />
+              <div class="field-pair">
+                <label class="toggle-switch">
+                  <input id="ogp-cred" type="checkbox" />
+                  <span class="toggle-track" aria-hidden="true"></span>
+                  <span class="toggle-label">Is credential</span>
+                </label>
+                <div>
+                  <label for="ogp-redact">Redact label</label>
+                  <input
+                    id="ogp-redact"
+                    type="text"
+                    placeholder="api_key"
+                    autocomplete="off"
+                  />
+                </div>
+              </div>
+            </div>
+            <footer class="sh-foot">
+              <div class="sh-foot-meta"></div>
+              <button id="ogp-validate" class="sh-btn sh-btn--quiet">
+                Validate regex
+              </button>
+              <button class="sh-btn" data-close>Cancel</button>
+              <button id="ogp-submit" class="sh-btn sh-btn--primary">
+                Create
+              </button>
+            </footer>
+          </dialog>
         </div>
         <!-- /admin-layout -->
       </div>
@@ -3309,122 +3139,6 @@
         </button>
       </footer>
     </dialog>
-
-    <!-- Create Prompt Policy Modal -->
-    <div
-      id="create-ppolicy-overlay"
-      style="display: none"
-      role="dialog"
-      aria-modal="true"
-      aria-labelledby="create-ppolicy-title"
-    >
-      <div id="create-ppolicy-box" class="admin-modal admin-modal-wide">
-        <h2 id="create-ppolicy-title">Create Prompt</h2>
-        <div
-          id="cpp-error"
-          role="alert"
-          aria-live="assertive"
-          aria-atomic="true"
-        ></div>
-        <label for="cpp-name"
-          >Name <span class="label-hint">slug-style identifier</span></label
-        >
-        <input
-          id="cpp-name"
-          type="text"
-          placeholder="e.g. web_search, data_handling"
-          autocomplete="off"
-        />
-        <label for="cpp-gate"
-          >Tool Gate
-          <span class="label-hint"
-            >tool name or blank for unconditional</span
-          ></label
-        >
-        <input
-          id="cpp-gate"
-          type="text"
-          placeholder="e.g. web_search"
-          autocomplete="off"
-        />
-        <label for="cpp-content"
-          >Content
-          <span class="label-hint"
-            >markdown body for system message</span
-          ></label
-        >
-        <textarea
-          id="cpp-content"
-          rows="10"
-          placeholder="## Policy Name&#10;&#10;Behavioral guidance..."
-          spellcheck="false"
-        ></textarea>
-        <label for="cpp-priority"
-          >Priority
-          <span class="label-hint"
-            >higher = assembled later (closer to conversation)</span
-          ></label
-        >
-        <input id="cpp-priority" type="number" value="0" min="0" max="9999" />
-        <div class="modal-buttons">
-          <button class="modal-cancel" onclick="hideCreatePromptPolicyModal()">
-            Cancel
-          </button>
-          <button
-            id="cpp-submit"
-            class="modal-submit"
-            onclick="submitCreatePromptPolicy()"
-          >
-            Create
-          </button>
-        </div>
-      </div>
-    </div>
-
-    <!-- Edit Prompt Policy Modal -->
-    <div
-      id="edit-ppolicy-overlay"
-      style="display: none"
-      role="dialog"
-      aria-modal="true"
-      aria-labelledby="edit-ppolicy-title"
-    >
-      <div id="edit-ppolicy-box" class="admin-modal admin-modal-wide">
-        <h2 id="edit-ppolicy-title">Edit Prompt</h2>
-        <div
-          id="epp-error"
-          role="alert"
-          aria-live="assertive"
-          aria-atomic="true"
-        ></div>
-        <input id="epp-id" type="hidden" />
-        <label for="epp-name">Name</label>
-        <input id="epp-name" type="text" autocomplete="off" />
-        <label for="epp-gate">Tool Gate</label>
-        <input id="epp-gate" type="text" autocomplete="off" />
-        <label for="epp-content">Content</label>
-        <textarea id="epp-content" rows="10" spellcheck="false"></textarea>
-        <label for="epp-priority">Priority</label>
-        <input id="epp-priority" type="number" value="0" min="0" max="9999" />
-        <label class="toggle-switch">
-          <input id="epp-enabled" type="checkbox" checked />
-          <span class="toggle-track" aria-hidden="true"></span>
-          <span class="toggle-label">Enabled</span>
-        </label>
-        <div class="modal-buttons">
-          <button class="modal-cancel" onclick="hideEditPromptPolicyModal()">
-            Cancel
-          </button>
-          <button
-            id="epp-submit"
-            class="modal-submit"
-            onclick="submitEditPromptPolicy()"
-          >
-            Save
-          </button>
-        </div>
-      </div>
-    </div>
 
     <!-- Create Skill Modal -->
     <div

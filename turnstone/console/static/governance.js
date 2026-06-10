@@ -3363,10 +3363,6 @@ function submitGitHubImport() {
 // ---------------------------------------------------------------------------
 
 let _promptPolicies = [];
-let _cppTrapHandler = null;
-let _cppTriggerEl = null;
-let _eppTrapHandler = null;
-let _eppTriggerEl = null;
 
 function loadPromptPolicies() {
   authFetch("/v1/api/admin/prompt-policies")
@@ -3495,78 +3491,45 @@ function _renderPromptPolicies(items) {
   });
 }
 
+// --- Prompt-policy shelf (create + edit) ---
+// One pane-scoped shelf; a hidden ppolicy-id decides POST vs PUT and the
+// Enabled toggle is edit-only.
+
+let _ppolicyWired = false;
+
+function _ppolicyWire() {
+  if (_ppolicyWired) return;
+  _ppolicyWired = true;
+  document
+    .getElementById("ppolicy-submit")
+    .addEventListener("click", _submitPromptPolicyShelf);
+}
+
 function showCreatePromptPolicyModal() {
-  _cppTriggerEl = document.activeElement;
-  const ov = document.getElementById("create-ppolicy-overlay");
-  ov.style.display = "flex";
-  document.getElementById("cpp-name").value = "";
-  document.getElementById("cpp-gate").value = "";
-  document.getElementById("cpp-content").value = "";
-  document.getElementById("cpp-priority").value = "0";
-  document.getElementById("cpp-error").classList.remove("is-visible");
-  document.getElementById("cpp-name").focus();
-  _cppTrapHandler = _installTrap(
-    "create-ppolicy-overlay",
-    "create-ppolicy-box",
-  );
+  _ppolicyWire();
+  const shelf = document.getElementById("ppolicy-shelf");
+  document.getElementById("ppolicy-shelf-error").classList.remove("is-visible");
+  document.getElementById("ppolicy-id").value = "";
+  document.getElementById("ppolicy-name").value = "";
+  document.getElementById("ppolicy-gate").value = "";
+  document.getElementById("ppolicy-content").value = "";
+  document.getElementById("ppolicy-priority").value = "0";
+  document.getElementById("ppolicy-enabled").checked = true;
+  document.getElementById("ppolicy-enabled-row").hidden = true;
+  shelf.setAttribute("data-kind", "create");
+  document.getElementById("ppolicy-shelf-title").textContent = "New prompt";
+  document.getElementById("ppolicy-shelf-tag").textContent = "PP-NEW";
+  document.getElementById("ppolicy-submit").textContent = "Create";
+  window.TurnstoneHatch.openShelf(shelf);
+  document.getElementById("ppolicy-name").focus();
 }
 
 function hideCreatePromptPolicyModal() {
-  document.getElementById("create-ppolicy-overlay").style.display = "none";
-  _cppTrapHandler = _removeTrap(_cppTrapHandler);
-  if (_cppTriggerEl && _cppTriggerEl.focus) {
-    _cppTriggerEl.focus();
-  }
-  _cppTriggerEl = null;
-}
-
-function submitCreatePromptPolicy() {
-  const errEl = document.getElementById("cpp-error");
-  const name = document.getElementById("cpp-name").value.trim();
-  const content = document.getElementById("cpp-content").value.trim();
-  if (!name || !content) {
-    errEl.textContent = "Name and content are required";
-    errEl.classList.add("is-visible");
-    return;
-  }
-  errEl.classList.remove("is-visible");
-  const submitBtn = document.getElementById("cpp-submit");
-  submitBtn.disabled = true;
-  authFetch("/v1/api/admin/prompt-policies", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      name: name,
-      content: content,
-      tool_gate: document.getElementById("cpp-gate").value.trim(),
-      priority:
-        parseInt(document.getElementById("cpp-priority").value, 10) || 0,
-      enabled: true,
-    }),
-  })
-    .then(function (r) {
-      if (!r.ok)
-        return r.json().then(function (d) {
-          throw new Error(d.error || "Failed");
-        });
-      return r.json();
-    })
-    .then(function () {
-      hideCreatePromptPolicyModal();
-      showToast("Prompt created");
-      loadPromptPolicies();
-    })
-    .catch(function (e) {
-      errEl.textContent = e.message;
-      errEl.classList.add("is-visible");
-    })
-    .finally(function () {
-      submitBtn.disabled = false;
-    });
+  window.TurnstoneHatch.closeShelf(document.getElementById("ppolicy-shelf"));
 }
 
 function showEditPromptPolicyModal(policyId) {
-  _eppTriggerEl = document.activeElement;
+  _ppolicyWire();
   let p = null;
   for (let i = 0; i < _promptPolicies.length; i++) {
     if (_promptPolicies[i].policy_id === policyId) {
@@ -3575,53 +3538,61 @@ function showEditPromptPolicyModal(policyId) {
     }
   }
   if (!p) return;
-  document.getElementById("epp-id").value = p.policy_id;
-  document.getElementById("epp-name").value = p.name;
-  document.getElementById("epp-gate").value = p.tool_gate || "";
-  document.getElementById("epp-content").value = p.content || "";
-  document.getElementById("epp-priority").value = p.priority || 0;
-  document.getElementById("epp-enabled").checked = p.enabled;
-  document.getElementById("epp-error").classList.remove("is-visible");
-  const ov = document.getElementById("edit-ppolicy-overlay");
-  ov.style.display = "flex";
-  document.getElementById("epp-name").focus();
-  _eppTrapHandler = _installTrap("edit-ppolicy-overlay", "edit-ppolicy-box");
+  const shelf = document.getElementById("ppolicy-shelf");
+  document.getElementById("ppolicy-shelf-error").classList.remove("is-visible");
+  document.getElementById("ppolicy-id").value = p.policy_id;
+  document.getElementById("ppolicy-name").value = p.name;
+  document.getElementById("ppolicy-gate").value = p.tool_gate || "";
+  document.getElementById("ppolicy-content").value = p.content || "";
+  document.getElementById("ppolicy-priority").value = p.priority || 0;
+  document.getElementById("ppolicy-enabled").checked = p.enabled;
+  document.getElementById("ppolicy-enabled-row").hidden = false;
+  shelf.setAttribute("data-kind", "edit");
+  document.getElementById("ppolicy-shelf-title").textContent =
+    "Edit prompt — " + p.name;
+  document.getElementById("ppolicy-shelf-tag").textContent = "PP-EDIT";
+  document.getElementById("ppolicy-submit").textContent = "Save";
+  window.TurnstoneHatch.openShelf(shelf);
+  document.getElementById("ppolicy-name").focus();
 }
 
 function hideEditPromptPolicyModal() {
-  document.getElementById("edit-ppolicy-overlay").style.display = "none";
-  _eppTrapHandler = _removeTrap(_eppTrapHandler);
-  if (_eppTriggerEl && _eppTriggerEl.focus) {
-    _eppTriggerEl.focus();
-  }
-  _eppTriggerEl = null;
+  hideCreatePromptPolicyModal();
 }
 
-function submitEditPromptPolicy() {
-  const errEl = document.getElementById("epp-error");
-  const policyId = document.getElementById("epp-id").value;
-  const name = document.getElementById("epp-name").value.trim();
-  const content = document.getElementById("epp-content").value.trim();
+function _submitPromptPolicyShelf() {
+  const shelf = document.getElementById("ppolicy-shelf");
+  const errEl = document.getElementById("ppolicy-shelf-error");
+  const policyId = document.getElementById("ppolicy-id").value;
+  const name = document.getElementById("ppolicy-name").value.trim();
+  const content = document.getElementById("ppolicy-content").value.trim();
   if (!name || !content) {
     errEl.textContent = "Name and content are required";
     errEl.classList.add("is-visible");
     return;
   }
+  const body = {
+    name: name,
+    content: content,
+    tool_gate: document.getElementById("ppolicy-gate").value.trim(),
+    priority:
+      parseInt(document.getElementById("ppolicy-priority").value, 10) || 0,
+    enabled: policyId
+      ? document.getElementById("ppolicy-enabled").checked
+      : true,
+  };
   errEl.classList.remove("is-visible");
-  const submitBtn = document.getElementById("epp-submit");
-  submitBtn.disabled = true;
-  authFetch("/v1/api/admin/prompt-policies/" + policyId, {
-    method: "PUT",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      name: name,
-      content: content,
-      tool_gate: document.getElementById("epp-gate").value.trim(),
-      priority:
-        parseInt(document.getElementById("epp-priority").value, 10) || 0,
-      enabled: document.getElementById("epp-enabled").checked,
-    }),
-  })
+  window.TurnstoneHatch.setBusy(shelf, true);
+  authFetch(
+    policyId
+      ? "/v1/api/admin/prompt-policies/" + policyId
+      : "/v1/api/admin/prompt-policies",
+    {
+      method: policyId ? "PUT" : "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    },
+  )
     .then(function (r) {
       if (!r.ok)
         return r.json().then(function (d) {
@@ -3630,16 +3601,15 @@ function submitEditPromptPolicy() {
       return r.json();
     })
     .then(function () {
-      hideEditPromptPolicyModal();
-      showToast("Prompt updated");
+      window.TurnstoneHatch.setBusy(shelf, false);
+      hideCreatePromptPolicyModal();
+      showToast(policyId ? "Prompt updated" : "Prompt created");
       loadPromptPolicies();
     })
     .catch(function (e) {
+      window.TurnstoneHatch.setBusy(shelf, false);
       errEl.textContent = e.message;
       errEl.classList.add("is-visible");
-    })
-    .finally(function () {
-      submitBtn.disabled = false;
     });
 }
 
@@ -3651,14 +3621,6 @@ let _judgeSettings = [];
 let _judgeHeuristicRules = [];
 let _judgeOGPatterns = [];
 let _judgeModelDefs = [];
-let _chrTrapHandler = null; // create heuristic rule
-let _cogpTrapHandler = null; // create output guard pattern
-let _chrTriggerEl = null;
-let _cogpTriggerEl = null;
-let _ehrTrapHandler = null; // edit heuristic rule
-let _eogpTrapHandler = null; // edit output guard pattern
-let _ehrTriggerEl = null;
-let _eogpTriggerEl = null;
 
 // -- Sub-section switcher ---------------------------------------------------
 
@@ -4200,11 +4162,30 @@ function deleteHeuristicRule(ruleId) {
   );
 }
 
+// --- Heuristic-rule shelf (create + edit) ---
+// One pane-scoped shelf; a hidden hr-id + hr-builtin flag decide PUT (DB row)
+// vs override-POST (first edit of a built-in) vs plain POST (new rule). The
+// name field is disabled for built-in rows.
+
+let _hrWired = false;
+
+function _hrWire() {
+  if (_hrWired) return;
+  _hrWired = true;
+  document
+    .getElementById("hr-submit")
+    .addEventListener("click", _submitHRShelf);
+}
+
 function showCreateHeuristicRuleModal() {
-  _chrTriggerEl = document.activeElement;
-  const ov = document.getElementById("create-hr-overlay");
-  ov.style.display = "flex";
+  _hrWire();
+  const shelf = document.getElementById("hr-shelf");
+  document.getElementById("hr-shelf-error").classList.remove("is-visible");
+  document.getElementById("hr-id").value = "";
+  document.getElementById("hr-builtin").value = "";
+  document.getElementById("hr-priority").value = "0";
   document.getElementById("hr-name").value = "";
+  document.getElementById("hr-name").disabled = false;
   document.getElementById("hr-tier").value = "medium";
   document.getElementById("hr-risk").value = "medium";
   document.getElementById("hr-rec").value = "review";
@@ -4213,66 +4194,16 @@ function showCreateHeuristicRuleModal() {
   document.getElementById("hr-conf").value = "0.8";
   document.getElementById("hr-intent").value = "";
   document.getElementById("hr-reason").value = "";
-  document.getElementById("create-hr-error").classList.remove("is-visible");
-  document.getElementById("hr-submit").disabled = false;
+  shelf.setAttribute("data-kind", "create");
+  document.getElementById("hr-shelf-title").textContent = "New heuristic rule";
+  document.getElementById("hr-shelf-tag").textContent = "HR-NEW";
+  document.getElementById("hr-submit").textContent = "Create";
+  window.TurnstoneHatch.openShelf(shelf);
   document.getElementById("hr-name").focus();
-  _chrTrapHandler = _installTrap("create-hr-overlay", "create-hr-box");
 }
 
 function hideCreateHRModal() {
-  document.getElementById("create-hr-overlay").style.display = "none";
-  _chrTrapHandler = _removeTrap(_chrTrapHandler);
-  if (_chrTriggerEl && _chrTriggerEl.focus) _chrTriggerEl.focus();
-  _chrTriggerEl = null;
-}
-
-function submitCreateHeuristicRule() {
-  const errEl = document.getElementById("create-hr-error");
-  errEl.classList.remove("is-visible");
-  const argsText = document.getElementById("hr-args").value.trim();
-  const argPatterns = argsText
-    ? argsText.split("\n").filter(function (l) {
-        return l.trim();
-      })
-    : [];
-  const payload = {
-    name: document.getElementById("hr-name").value.trim(),
-    tier: document.getElementById("hr-tier").value,
-    risk_level: document.getElementById("hr-risk").value,
-    recommendation: document.getElementById("hr-rec").value,
-    tool_pattern: document.getElementById("hr-tool").value.trim(),
-    arg_patterns: argPatterns,
-    confidence: parseFloat(document.getElementById("hr-conf").value) || 0.8,
-    intent_template: document.getElementById("hr-intent").value.trim(),
-    reasoning_template: document.getElementById("hr-reason").value.trim(),
-    enabled: true,
-  };
-  const btn = document.getElementById("hr-submit");
-  btn.disabled = true;
-  authFetch("/v1/api/admin/judge/heuristic-rules", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(payload),
-  })
-    .then(function (r) {
-      if (!r.ok)
-        return r.json().then(function (d) {
-          throw new Error(d.error || "Failed");
-        });
-      return r.json();
-    })
-    .then(function () {
-      hideCreateHRModal();
-      showToast("Rule created");
-      loadJudgeHeuristicRules();
-    })
-    .catch(function (e) {
-      errEl.textContent = e.message;
-      errEl.classList.add("is-visible");
-    })
-    .finally(function () {
-      btn.disabled = false;
-    });
+  window.TurnstoneHatch.closeShelf(document.getElementById("hr-shelf"));
 }
 
 // -- Heuristic Rule: disable / edit / reset ---------------------------------
@@ -4357,16 +4288,18 @@ function resetHeuristicRule(ruleId) {
   );
 }
 
-function _populateEditHRModal(rule, isBuiltin) {
-  document.getElementById("ehr-id").value = rule.rule_id || "";
-  document.getElementById("ehr-builtin").value = isBuiltin ? "true" : "false";
-  document.getElementById("ehr-priority").value = rule.priority || 0;
-  document.getElementById("ehr-name").value = rule.name;
-  document.getElementById("ehr-name").disabled = isBuiltin;
-  document.getElementById("ehr-tier").value = rule.tier || rule.risk_level;
-  document.getElementById("ehr-risk").value = rule.risk_level;
-  document.getElementById("ehr-rec").value = rule.recommendation;
-  document.getElementById("ehr-tool").value = rule.tool_pattern;
+function _showEditHRShelf(rule, isBuiltin) {
+  _hrWire();
+  const shelf = document.getElementById("hr-shelf");
+  document.getElementById("hr-id").value = rule.rule_id || "";
+  document.getElementById("hr-builtin").value = isBuiltin ? "true" : "false";
+  document.getElementById("hr-priority").value = rule.priority || 0;
+  document.getElementById("hr-name").value = rule.name;
+  document.getElementById("hr-name").disabled = isBuiltin;
+  document.getElementById("hr-tier").value = rule.tier || rule.risk_level;
+  document.getElementById("hr-risk").value = rule.risk_level;
+  document.getElementById("hr-rec").value = rule.recommendation;
+  document.getElementById("hr-tool").value = rule.tool_pattern;
   // arg_patterns comes as JSON string from API
   let args = rule.arg_patterns || "[]";
   if (typeof args === "string") {
@@ -4376,16 +4309,21 @@ function _populateEditHRModal(rule, isBuiltin) {
       args = [];
     }
   }
-  document.getElementById("ehr-args").value = args.join("\n");
-  document.getElementById("ehr-conf").value = rule.confidence;
-  document.getElementById("ehr-intent").value = rule.intent_template || "";
-  document.getElementById("ehr-reason").value = rule.reasoning_template || "";
-  document.getElementById("edit-hr-error").classList.remove("is-visible");
-  document.getElementById("ehr-submit").disabled = false;
+  document.getElementById("hr-args").value = args.join("\n");
+  document.getElementById("hr-conf").value = rule.confidence;
+  document.getElementById("hr-intent").value = rule.intent_template || "";
+  document.getElementById("hr-reason").value = rule.reasoning_template || "";
+  document.getElementById("hr-shelf-error").classList.remove("is-visible");
+  shelf.setAttribute("data-kind", "edit");
+  document.getElementById("hr-shelf-title").textContent =
+    "Edit heuristic rule — " + rule.name;
+  document.getElementById("hr-shelf-tag").textContent = "HR-EDIT";
+  document.getElementById("hr-submit").textContent = "Save";
+  window.TurnstoneHatch.openShelf(shelf);
+  document.getElementById("hr-tier").focus();
 }
 
 function showEditHeuristicRuleModal(ruleId) {
-  _ehrTriggerEl = document.activeElement;
   let rule = null;
   for (let i = 0; i < _judgeHeuristicRules.length; i++) {
     if (_judgeHeuristicRules[i].rule_id === ruleId) {
@@ -4394,15 +4332,10 @@ function showEditHeuristicRuleModal(ruleId) {
     }
   }
   if (!rule) return;
-  _populateEditHRModal(rule, !!rule.builtin);
-  const ov = document.getElementById("edit-hr-overlay");
-  ov.style.display = "flex";
-  document.getElementById("ehr-tier").focus();
-  _ehrTrapHandler = _installTrap("edit-hr-overlay", "edit-hr-box");
+  _showEditHRShelf(rule, !!rule.builtin);
 }
 
 function showEditBuiltinHeuristicRuleModal(name) {
-  _ehrTriggerEl = document.activeElement;
   let rule = null;
   for (let i = 0; i < _judgeHeuristicRules.length; i++) {
     if (
@@ -4414,44 +4347,37 @@ function showEditBuiltinHeuristicRuleModal(name) {
     }
   }
   if (!rule) return;
-  _populateEditHRModal(rule, true);
-  const ov = document.getElementById("edit-hr-overlay");
-  ov.style.display = "flex";
-  document.getElementById("ehr-tier").focus();
-  _ehrTrapHandler = _installTrap("edit-hr-overlay", "edit-hr-box");
+  _showEditHRShelf(rule, true);
 }
 
 function hideEditHRModal() {
-  document.getElementById("edit-hr-overlay").style.display = "none";
-  _ehrTrapHandler = _removeTrap(_ehrTrapHandler);
-  if (_ehrTriggerEl && _ehrTriggerEl.focus) _ehrTriggerEl.focus();
-  _ehrTriggerEl = null;
+  hideCreateHRModal();
 }
 
-function submitEditHeuristicRule() {
-  const errEl = document.getElementById("edit-hr-error");
+function _submitHRShelf() {
+  const shelf = document.getElementById("hr-shelf");
+  const errEl = document.getElementById("hr-shelf-error");
   errEl.classList.remove("is-visible");
-  const argsText = document.getElementById("ehr-args").value.trim();
+  const argsText = document.getElementById("hr-args").value.trim();
   const argPatterns = argsText
     ? argsText.split("\n").filter(function (l) {
         return l.trim();
       })
     : [];
-  const ruleId = document.getElementById("ehr-id").value;
+  const ruleId = document.getElementById("hr-id").value;
+  const isBuiltin = document.getElementById("hr-builtin").value === "true";
   const payload = {
-    name: document.getElementById("ehr-name").value.trim(),
-    tier: document.getElementById("ehr-tier").value,
-    risk_level: document.getElementById("ehr-risk").value,
-    recommendation: document.getElementById("ehr-rec").value,
-    tool_pattern: document.getElementById("ehr-tool").value.trim(),
+    name: document.getElementById("hr-name").value.trim(),
+    tier: document.getElementById("hr-tier").value,
+    risk_level: document.getElementById("hr-risk").value,
+    recommendation: document.getElementById("hr-rec").value,
+    tool_pattern: document.getElementById("hr-tool").value.trim(),
     arg_patterns: argPatterns,
-    confidence: parseFloat(document.getElementById("ehr-conf").value) || 0.8,
-    intent_template: document.getElementById("ehr-intent").value.trim(),
-    reasoning_template: document.getElementById("ehr-reason").value.trim(),
-    priority: parseInt(document.getElementById("ehr-priority").value, 10) || 0,
+    confidence: parseFloat(document.getElementById("hr-conf").value) || 0.8,
+    intent_template: document.getElementById("hr-intent").value.trim(),
+    reasoning_template: document.getElementById("hr-reason").value.trim(),
+    priority: parseInt(document.getElementById("hr-priority").value, 10) || 0,
   };
-  const btn = document.getElementById("ehr-submit");
-  btn.disabled = true;
 
   let url, method;
   if (ruleId) {
@@ -4459,12 +4385,14 @@ function submitEditHeuristicRule() {
     url = "/v1/api/admin/judge/heuristic-rules/" + ruleId;
     method = "PUT";
   } else {
-    // Pure built-in first edit — create override
+    // New custom rule, or a built-in's first edit — both POST. The built-in
+    // case creates an override row (builtin flag), the custom case a plain row.
     url = "/v1/api/admin/judge/heuristic-rules";
     method = "POST";
-    payload.builtin = true;
     payload.enabled = true;
+    if (isBuiltin) payload.builtin = true;
   }
+  window.TurnstoneHatch.setBusy(shelf, true);
   authFetch(url, {
     method: method,
     headers: { "Content-Type": "application/json" },
@@ -4478,16 +4406,21 @@ function submitEditHeuristicRule() {
       return r.json();
     })
     .then(function () {
-      hideEditHRModal();
-      showToast(ruleId ? "Rule updated" : "Rule overridden");
+      window.TurnstoneHatch.setBusy(shelf, false);
+      hideCreateHRModal();
+      showToast(
+        ruleId
+          ? "Rule updated"
+          : isBuiltin
+            ? "Rule overridden"
+            : "Rule created",
+      );
       loadJudgeHeuristicRules();
     })
     .catch(function (e) {
+      window.TurnstoneHatch.setBusy(shelf, false);
       errEl.textContent = e.message;
       errEl.classList.add("is-visible");
-    })
-    .finally(function () {
-      btn.disabled = false;
     });
 }
 
@@ -4719,31 +4652,55 @@ function deleteOGPattern(patternId) {
   );
 }
 
+// --- Output-guard shelf (create + edit) ---
+// One pane-scoped shelf; a hidden ogp-id + ogp-builtin flag decide PUT (DB row)
+// vs override-POST (first edit of a built-in) vs plain POST (new pattern). The
+// name + flag fields are disabled for built-in rows. The Validate-regex button
+// lives in the foot; its result lands in the #ogp-regex-result body strip.
+
+let _ogpWired = false;
+
+function _ogpWire() {
+  if (_ogpWired) return;
+  _ogpWired = true;
+  document
+    .getElementById("ogp-submit")
+    .addEventListener("click", _submitOGPShelf);
+  document
+    .getElementById("ogp-validate")
+    .addEventListener("click", validateOGRegex);
+}
+
 function showCreateOutputGuardPatternModal() {
-  _cogpTriggerEl = document.activeElement;
-  const ov = document.getElementById("create-ogp-overlay");
-  ov.style.display = "flex";
+  _ogpWire();
+  const shelf = document.getElementById("ogp-shelf");
+  document.getElementById("ogp-shelf-error").classList.remove("is-visible");
+  document.getElementById("ogp-id").value = "";
+  document.getElementById("ogp-builtin").value = "";
+  document.getElementById("ogp-priority").value = "0";
   document.getElementById("ogp-name").value = "";
+  document.getElementById("ogp-name").disabled = false;
   document.getElementById("ogp-cat").value = "prompt_injection";
   document.getElementById("ogp-risk").value = "medium";
   document.getElementById("ogp-pattern").value = "";
   document.getElementById("ogp-flag").value = "";
+  document.getElementById("ogp-flag").disabled = false;
   document.getElementById("ogp-ann").value = "";
   document.getElementById("ogp-flags").value = "";
   document.getElementById("ogp-cred").checked = false;
   document.getElementById("ogp-redact").value = "";
   document.getElementById("ogp-regex-result").textContent = "";
-  document.getElementById("create-ogp-error").classList.remove("is-visible");
-  document.getElementById("ogp-submit").disabled = false;
+  shelf.setAttribute("data-kind", "create");
+  document.getElementById("ogp-shelf-title").textContent =
+    "New output-guard pattern";
+  document.getElementById("ogp-shelf-tag").textContent = "OGP-NEW";
+  document.getElementById("ogp-submit").textContent = "Create";
+  window.TurnstoneHatch.openShelf(shelf);
   document.getElementById("ogp-name").focus();
-  _cogpTrapHandler = _installTrap("create-ogp-overlay", "create-ogp-box");
 }
 
 function hideCreateOGPModal() {
-  document.getElementById("create-ogp-overlay").style.display = "none";
-  _cogpTrapHandler = _removeTrap(_cogpTrapHandler);
-  if (_cogpTriggerEl && _cogpTriggerEl.focus) _cogpTriggerEl.focus();
-  _cogpTriggerEl = null;
+  window.TurnstoneHatch.closeShelf(document.getElementById("ogp-shelf"));
 }
 
 function validateOGRegex() {
@@ -4774,49 +4731,6 @@ function validateOGRegex() {
     .catch(function () {
       resultEl.textContent = "Validation failed";
       resultEl.style.color = "var(--red)";
-    });
-}
-
-function submitCreateOGPattern() {
-  const errEl = document.getElementById("create-ogp-error");
-  errEl.classList.remove("is-visible");
-  const payload = {
-    name: document.getElementById("ogp-name").value.trim(),
-    category: document.getElementById("ogp-cat").value,
-    risk_level: document.getElementById("ogp-risk").value,
-    pattern: document.getElementById("ogp-pattern").value,
-    flag_name: document.getElementById("ogp-flag").value.trim(),
-    annotation: document.getElementById("ogp-ann").value.trim(),
-    pattern_flags: document.getElementById("ogp-flags").value.trim(),
-    is_credential: document.getElementById("ogp-cred").checked,
-    redact_label: document.getElementById("ogp-redact").value.trim(),
-    enabled: true,
-  };
-  const btn = document.getElementById("ogp-submit");
-  btn.disabled = true;
-  authFetch("/v1/api/admin/judge/output-guard-patterns", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(payload),
-  })
-    .then(function (r) {
-      if (!r.ok)
-        return r.json().then(function (d) {
-          throw new Error(d.error || "Failed");
-        });
-      return r.json();
-    })
-    .then(function () {
-      hideCreateOGPModal();
-      showToast("Pattern created");
-      loadJudgeOGPatterns();
-    })
-    .catch(function (e) {
-      errEl.textContent = e.message;
-      errEl.classList.add("is-visible");
-    })
-    .finally(function () {
-      btn.disabled = false;
     });
 }
 
@@ -4902,28 +4816,35 @@ function resetOGPattern(patternId) {
   );
 }
 
-function _populateEditOGPModal(pat, isBuiltin) {
-  document.getElementById("eogp-id").value = pat.pattern_id || "";
-  document.getElementById("eogp-builtin").value = isBuiltin ? "true" : "false";
-  document.getElementById("eogp-priority").value = pat.priority || 0;
-  document.getElementById("eogp-name").value = pat.name;
-  document.getElementById("eogp-name").disabled = isBuiltin;
-  document.getElementById("eogp-cat").value = pat.category;
-  document.getElementById("eogp-risk").value = pat.risk_level;
-  document.getElementById("eogp-pattern").value = pat.pattern || "";
-  document.getElementById("eogp-flag").value = pat.flag_name || "";
-  document.getElementById("eogp-flag").disabled = isBuiltin;
-  document.getElementById("eogp-ann").value = pat.annotation || "";
-  document.getElementById("eogp-flags").value = pat.pattern_flags || "";
-  document.getElementById("eogp-cred").checked = !!pat.is_credential;
-  document.getElementById("eogp-redact").value = pat.redact_label || "";
-  document.getElementById("eogp-regex-result").textContent = "";
-  document.getElementById("edit-ogp-error").classList.remove("is-visible");
-  document.getElementById("eogp-submit").disabled = false;
+function _showEditOGPShelf(pat, isBuiltin) {
+  _ogpWire();
+  const shelf = document.getElementById("ogp-shelf");
+  document.getElementById("ogp-id").value = pat.pattern_id || "";
+  document.getElementById("ogp-builtin").value = isBuiltin ? "true" : "false";
+  document.getElementById("ogp-priority").value = pat.priority || 0;
+  document.getElementById("ogp-name").value = pat.name;
+  document.getElementById("ogp-name").disabled = isBuiltin;
+  document.getElementById("ogp-cat").value = pat.category;
+  document.getElementById("ogp-risk").value = pat.risk_level;
+  document.getElementById("ogp-pattern").value = pat.pattern || "";
+  document.getElementById("ogp-flag").value = pat.flag_name || "";
+  document.getElementById("ogp-flag").disabled = isBuiltin;
+  document.getElementById("ogp-ann").value = pat.annotation || "";
+  document.getElementById("ogp-flags").value = pat.pattern_flags || "";
+  document.getElementById("ogp-cred").checked = !!pat.is_credential;
+  document.getElementById("ogp-redact").value = pat.redact_label || "";
+  document.getElementById("ogp-regex-result").textContent = "";
+  document.getElementById("ogp-shelf-error").classList.remove("is-visible");
+  shelf.setAttribute("data-kind", "edit");
+  document.getElementById("ogp-shelf-title").textContent =
+    "Edit output-guard pattern — " + pat.name;
+  document.getElementById("ogp-shelf-tag").textContent = "OGP-EDIT";
+  document.getElementById("ogp-submit").textContent = "Save";
+  window.TurnstoneHatch.openShelf(shelf);
+  document.getElementById("ogp-cat").focus();
 }
 
 function showEditOGPatternModal(patternId) {
-  _eogpTriggerEl = document.activeElement;
   let pat = null;
   for (let i = 0; i < _judgeOGPatterns.length; i++) {
     if (_judgeOGPatterns[i].pattern_id === patternId) {
@@ -4932,15 +4853,10 @@ function showEditOGPatternModal(patternId) {
     }
   }
   if (!pat) return;
-  _populateEditOGPModal(pat, !!pat.builtin);
-  const ov = document.getElementById("edit-ogp-overlay");
-  ov.style.display = "flex";
-  document.getElementById("eogp-cat").focus();
-  _eogpTrapHandler = _installTrap("edit-ogp-overlay", "edit-ogp-box");
+  _showEditOGPShelf(pat, !!pat.builtin);
 }
 
 function showEditBuiltinOGPatternModal(name) {
-  _eogpTriggerEl = document.activeElement;
   let pat = null;
   for (let i = 0; i < _judgeOGPatterns.length; i++) {
     if (_judgeOGPatterns[i].name === name && !_judgeOGPatterns[i].pattern_id) {
@@ -4949,80 +4865,45 @@ function showEditBuiltinOGPatternModal(name) {
     }
   }
   if (!pat) return;
-  _populateEditOGPModal(pat, true);
-  const ov = document.getElementById("edit-ogp-overlay");
-  ov.style.display = "flex";
-  document.getElementById("eogp-cat").focus();
-  _eogpTrapHandler = _installTrap("edit-ogp-overlay", "edit-ogp-box");
+  _showEditOGPShelf(pat, true);
 }
 
 function hideEditOGPModal() {
-  document.getElementById("edit-ogp-overlay").style.display = "none";
-  _eogpTrapHandler = _removeTrap(_eogpTrapHandler);
-  if (_eogpTriggerEl && _eogpTriggerEl.focus) _eogpTriggerEl.focus();
-  _eogpTriggerEl = null;
+  hideCreateOGPModal();
 }
 
-function validateEditOGRegex() {
-  const pattern = document.getElementById("eogp-pattern").value;
-  const resultEl = document.getElementById("eogp-regex-result");
-  if (!pattern) {
-    resultEl.textContent = "";
-    return;
-  }
-  authFetch("/v1/api/admin/judge/validate-regex", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ pattern: pattern }),
-  })
-    .then(function (r) {
-      if (!r.ok) throw new Error("Validation failed");
-      return r.json();
-    })
-    .then(function (d) {
-      if (d.valid) {
-        resultEl.textContent = "Valid";
-        resultEl.style.color = "var(--green)";
-      } else {
-        resultEl.textContent = d.error || "Invalid";
-        resultEl.style.color = "var(--red)";
-      }
-    })
-    .catch(function () {
-      resultEl.textContent = "Validation failed";
-      resultEl.style.color = "var(--red)";
-    });
-}
-
-function submitEditOGPattern() {
-  const errEl = document.getElementById("edit-ogp-error");
+function _submitOGPShelf() {
+  const shelf = document.getElementById("ogp-shelf");
+  const errEl = document.getElementById("ogp-shelf-error");
   errEl.classList.remove("is-visible");
-  const patternId = document.getElementById("eogp-id").value;
+  const patternId = document.getElementById("ogp-id").value;
+  const isBuiltin = document.getElementById("ogp-builtin").value === "true";
   const payload = {
-    name: document.getElementById("eogp-name").value.trim(),
-    category: document.getElementById("eogp-cat").value,
-    risk_level: document.getElementById("eogp-risk").value,
-    pattern: document.getElementById("eogp-pattern").value,
-    flag_name: document.getElementById("eogp-flag").value.trim(),
-    annotation: document.getElementById("eogp-ann").value.trim(),
-    pattern_flags: document.getElementById("eogp-flags").value.trim(),
-    is_credential: document.getElementById("eogp-cred").checked,
-    redact_label: document.getElementById("eogp-redact").value.trim(),
-    priority: parseInt(document.getElementById("eogp-priority").value, 10) || 0,
+    name: document.getElementById("ogp-name").value.trim(),
+    category: document.getElementById("ogp-cat").value,
+    risk_level: document.getElementById("ogp-risk").value,
+    pattern: document.getElementById("ogp-pattern").value,
+    flag_name: document.getElementById("ogp-flag").value.trim(),
+    annotation: document.getElementById("ogp-ann").value.trim(),
+    pattern_flags: document.getElementById("ogp-flags").value.trim(),
+    is_credential: document.getElementById("ogp-cred").checked,
+    redact_label: document.getElementById("ogp-redact").value.trim(),
+    priority: parseInt(document.getElementById("ogp-priority").value, 10) || 0,
   };
-  const btn = document.getElementById("eogp-submit");
-  btn.disabled = true;
 
   let url, method;
   if (patternId) {
     url = "/v1/api/admin/judge/output-guard-patterns/" + patternId;
     method = "PUT";
   } else {
+    // New custom pattern, or a built-in's first edit — both POST. The
+    // built-in case creates an override row (builtin flag).
     url = "/v1/api/admin/judge/output-guard-patterns";
     method = "POST";
-    payload.builtin = true;
     payload.enabled = true;
+    if (isBuiltin) payload.builtin = true;
   }
+  window.TurnstoneHatch.setBusy(shelf, true);
   authFetch(url, {
     method: method,
     headers: { "Content-Type": "application/json" },
@@ -5036,15 +4917,20 @@ function submitEditOGPattern() {
       return r.json();
     })
     .then(function () {
-      hideEditOGPModal();
-      showToast(patternId ? "Pattern updated" : "Pattern overridden");
+      window.TurnstoneHatch.setBusy(shelf, false);
+      hideCreateOGPModal();
+      showToast(
+        patternId
+          ? "Pattern updated"
+          : isBuiltin
+            ? "Pattern overridden"
+            : "Pattern created",
+      );
       loadJudgeOGPatterns();
     })
     .catch(function (e) {
+      window.TurnstoneHatch.setBusy(shelf, false);
       errEl.textContent = e.message;
       errEl.classList.add("is-visible");
-    })
-    .finally(function () {
-      btn.disabled = false;
     });
 }
