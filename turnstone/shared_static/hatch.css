@@ -1,0 +1,979 @@
+/* ==========================================================================
+   Service-hatch containers — the admin create/edit/inspect SHELF and the
+   confirm/show-once DIALOG.  One chrome vocabulary (machined head/foot
+   strips, kind LED, designation plate, hairline), two mounting points:
+
+     <dialog class="hatch hatch--shelf" data-kind="create" aria-labelledby=…>
+       <header class="sh-head">
+         <span class="sh-led" aria-hidden="true"></span>
+         <h2 class="sh-title" id="…">Edit schedule</h2>
+         <span class="sh-tag" aria-hidden="true">SCH-EDIT</span>
+         <button class="sh-x" data-close aria-label="Close">✕</button>
+       </header>
+       <div class="sh-body">…fields…</div>
+       <footer class="sh-foot">
+         <div class="sh-foot-meta">…read-out…</div>
+         <button class="sh-btn" data-close>Cancel</button>
+         <button class="sh-btn sh-btn--primary">Save</button>
+       </footer>
+     </dialog>
+
+   The shelf is PANE-SCOPED and non-modal (`dialog.show()`): it mounts inside
+   the pane element (which carries `.hatch-host`), docks to its right edge,
+   and dims only that pane via a sibling `.pane-scrim` — the rail, tab bar
+   and any other pane stay live.  Split panes work by construction: each
+   pane owns its shelf.  The dialog tier is document-modal (`showModal()`)
+   and stacks above any shelf via the top layer.  Behaviour lives in
+   shared_static/hatch.js.
+
+   Kinds (data-kind): create | edit (amber, default) · danger (err) ·
+   success (ok) · inspect (cyan).  Never color alone: the title text always
+   names the action.
+   ========================================================================== */
+
+/* The pane that hosts shelves: positioning context + container for the
+   narrow-pane sheet breakpoint (a SPLIT pane is narrow even on a desktop
+   viewport, so the breakpoint is a container query, not a media query).
+   contain:layout (implied by container-type) also makes this the containing
+   block for the absolutely-positioned shelf. */
+.hatch-host {
+  position: relative;
+  overflow: hidden;
+  container-type: inline-size;
+  container-name: pane;
+}
+
+.pane-scrim {
+  position: absolute;
+  inset: 0;
+  z-index: 40;
+  background: rgba(0, 0, 0, 0.45);
+  backdrop-filter: blur(2px);
+  -webkit-backdrop-filter: blur(2px);
+  animation: pane-scrim-in 0.18s ease-out;
+}
+/* light scrim needs more ink to read as "this pane is parked" */
+[data-theme="light"] .pane-scrim {
+  background: rgba(30, 33, 40, 0.35);
+}
+.pane-scrim[hidden] {
+  display: none;
+}
+@keyframes pane-scrim-in {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
+
+/* ---- containers ---------------------------------------------------------
+   Class-only base selector: the container rules below re-declare surface/
+   border and must win on source order (an element-qualified `dialog.hatch`
+   at 0,1,1 would out-rank `.hatch--shelf` at 0,1,0). */
+.hatch {
+  padding: 0;
+  border: none;
+  background: none;
+  color: var(--fg);
+}
+.hatch:not([open]) {
+  display: none;
+}
+
+.hatch--shelf {
+  position: absolute;
+  inset: 0 0 0 auto; /* dock to the pane's right edge */
+  margin: 0;
+  z-index: 41; /* above the pane scrim; no global ladder */
+  width: min(480px, 100%);
+  height: 100%;
+  max-height: 100%;
+  display: flex;
+  flex-direction: column;
+  background: var(--panel-2);
+  border-left: 1px solid var(--hair-2);
+  box-shadow:
+    -24px 0 48px -12px rgba(0, 0, 0, 0.5),
+    0 0 80px -20px var(--accent-dim);
+}
+.hatch--shelf.hatch--lg {
+  width: min(680px, 100%);
+}
+.hatch--shelf.hatch--xl {
+  width: min(920px, 100%);
+}
+[data-theme="light"] .hatch--shelf {
+  box-shadow: -24px 0 48px -12px rgba(15, 23, 42, 0.25);
+}
+@keyframes shelf-in {
+  from {
+    transform: translateX(24px);
+    opacity: 0;
+  }
+  to {
+    transform: none;
+    opacity: 1;
+  }
+}
+.hatch--shelf[open] {
+  animation: shelf-in 0.2s cubic-bezier(0.2, 0.9, 0.3, 1);
+}
+
+/* Narrow pane (mobile OR a tight split): the shelf becomes a bottom sheet. */
+@container pane (max-width: 700px) {
+  .hatch--shelf,
+  .hatch--shelf.hatch--lg,
+  .hatch--shelf.hatch--xl {
+    inset: auto 0 0 0;
+    width: 100%;
+    height: 96%;
+    border-left: none;
+    border-top: 1px solid var(--hair-2);
+    border-radius: var(--r-lg) var(--r-lg) 0 0;
+  }
+  .hatch--shelf[open] {
+    animation: shelf-in-sheet 0.2s cubic-bezier(0.2, 0.9, 0.3, 1);
+  }
+  .field-pair,
+  .capgrid {
+    grid-template-columns: 1fr;
+  }
+}
+@keyframes shelf-in-sheet {
+  from {
+    transform: translateY(24px);
+    opacity: 0;
+  }
+  to {
+    transform: none;
+    opacity: 1;
+  }
+}
+
+/* Document-modal tier: confirms + show-once artifacts.  margin:auto restores
+   the UA centering that the global reset flattens. */
+.hatch--dialog {
+  margin: auto;
+  width: min(400px, calc(100vw - 32px));
+  max-height: min(85vh, 920px);
+  display: flex;
+  flex-direction: column;
+  border: 1px solid var(--hair-2);
+  border-radius: var(--r-lg);
+  overflow: hidden;
+  background: var(--panel-2);
+  box-shadow:
+    0 0 0 1px rgba(255, 255, 255, 0.03),
+    0 24px 48px -12px rgba(0, 0, 0, 0.5),
+    0 0 80px -20px var(--accent-dim);
+}
+[data-theme="light"] .hatch--dialog {
+  box-shadow:
+    0 24px 48px -12px rgba(15, 23, 42, 0.25),
+    0 0 80px -20px var(--accent-dim);
+}
+.hatch--dialog::backdrop {
+  background: radial-gradient(
+    ellipse at center,
+    rgba(0, 0, 0, 0.58) 0%,
+    rgba(0, 0, 0, 0.78) 100%
+  );
+  backdrop-filter: blur(6px);
+  -webkit-backdrop-filter: blur(6px);
+}
+/* ::backdrop cannot see [data-theme] on <html> in all engines; the dark
+   scrim is acceptable on light theme (it reads as a focus vignette). */
+@keyframes hatch-dialog-in {
+  from {
+    opacity: 0;
+    transform: translateY(10px) scale(0.985);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+@keyframes hatch-backdrop-in {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
+.hatch--dialog[open] {
+  animation: hatch-dialog-in 0.16s cubic-bezier(0.2, 0.9, 0.3, 1);
+}
+.hatch--dialog[open]::backdrop {
+  animation: hatch-backdrop-in 0.18s ease-out;
+}
+
+/* ---- kind accent: one custom property drives hairline + LED + title ----- */
+.hatch {
+  --hatch-accent: var(--accent);
+  --hatch-accent-glow: var(--accent-glow-strong);
+}
+.hatch[data-kind="danger"] {
+  --hatch-accent: var(--red);
+  --hatch-accent-glow: var(--red-glow);
+}
+.hatch[data-kind="success"] {
+  --hatch-accent: var(--green);
+  --hatch-accent-glow: var(--green-glow);
+}
+.hatch[data-kind="inspect"] {
+  --hatch-accent: var(--cyan);
+  --hatch-accent-glow: var(--cyan-glow);
+}
+
+/* ---- head: machined strip ------------------------------------------------ */
+.sh-head {
+  position: relative;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 13px 16px 12px;
+  background: var(--code-bg);
+  border-bottom: 1px solid var(--hair);
+  flex-shrink: 0;
+}
+/* the signature center-fading hairline: top edge on dialogs… */
+.sh-head::before {
+  content: "";
+  position: absolute;
+  top: 0;
+  left: 14%;
+  right: 14%;
+  height: 2px;
+  border-radius: 1px;
+  background: linear-gradient(
+    90deg,
+    transparent,
+    var(--hatch-accent),
+    transparent
+  );
+}
+/* …rotated onto the LEFT edge on the docked shelf */
+.hatch--shelf .sh-head::before {
+  left: 0;
+  right: auto;
+  top: 10%;
+  bottom: 10%;
+  width: 2px;
+  height: auto;
+  background: linear-gradient(
+    180deg,
+    transparent,
+    var(--hatch-accent),
+    transparent
+  );
+}
+@keyframes hairline-bloom {
+  0% {
+    box-shadow: 0 0 0 0 transparent;
+    opacity: 0.2;
+  }
+  45% {
+    box-shadow: 0 0 18px 1px var(--hatch-accent-glow);
+    opacity: 1;
+  }
+  100% {
+    box-shadow: 0 0 0 0 transparent;
+    opacity: 1;
+  }
+}
+.hatch[open] .sh-head::before {
+  animation: hairline-bloom 0.7s ease-out 0.08s backwards;
+}
+
+.sh-led {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--hatch-accent);
+  box-shadow: 0 0 6px var(--hatch-accent-glow);
+  flex-shrink: 0;
+}
+@keyframes sh-led-busy {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.3;
+  }
+}
+.hatch[data-busy] .sh-led {
+  animation: sh-led-busy 1.1s ease-in-out infinite;
+}
+
+.sh-title {
+  font-family: var(--font-ui);
+  font-size: 12px;
+  font-weight: 700;
+  letter-spacing: 0.09em;
+  text-transform: uppercase;
+  color: var(--hatch-accent);
+  flex: 1;
+  min-width: 0;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+/* stamped designation plate — optional; omit on confirms */
+.sh-tag {
+  font-family: var(--font-mono);
+  font-size: 10px;
+  letter-spacing: 0.06em;
+  color: var(--ink-4);
+  border: 1px solid var(--hair);
+  border-radius: var(--r-sm);
+  padding: 2px 7px;
+  flex-shrink: 0;
+  user-select: none;
+}
+.sh-x {
+  appearance: none;
+  background: none;
+  border: none;
+  border-radius: var(--r-sm);
+  color: var(--ink-4);
+  font-size: 13px;
+  line-height: 1;
+  width: 24px;
+  height: 24px;
+  margin: -4px -6px -4px 0;
+  cursor: pointer;
+  flex-shrink: 0;
+  transition:
+    color 0.12s,
+    background 0.12s;
+}
+.sh-x:hover {
+  color: var(--ink);
+  background: color-mix(in srgb, var(--ink) 8%, transparent);
+}
+.sh-x:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+
+/* ---- body: the only scrolling region ------------------------------------- */
+.sh-body {
+  padding: 20px 24px 24px;
+  overflow-y: auto;
+  min-height: 0;
+  flex: 1;
+}
+.sh-body::-webkit-scrollbar {
+  width: 6px;
+}
+.sh-body::-webkit-scrollbar-thumb {
+  background: var(--border-strong);
+  border-radius: 3px;
+}
+
+/* form cadence — the .admin-modal label/input language, carried verbatim */
+.sh-body label {
+  display: block;
+  font-family: var(--font-ui);
+  font-size: 10px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--fg-dim);
+  margin: 14px 0 5px;
+}
+.sh-body label:first-child {
+  margin-top: 0;
+}
+.label-hint {
+  font-weight: 400;
+  text-transform: none;
+  letter-spacing: 0;
+  opacity: 0.65;
+}
+[data-theme="light"] .label-hint {
+  opacity: 0.85;
+}
+.sh-body input:not([type="checkbox"]):not([type="radio"]),
+.sh-body select,
+.sh-body textarea {
+  width: 100%;
+  padding: 9px 12px;
+  background: var(--bg);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--r-sm);
+  color: var(--fg);
+  font: inherit;
+  font-size: 13px;
+  transition:
+    border-color 0.15s,
+    box-shadow 0.15s;
+}
+.sh-body input:focus-visible,
+.sh-body select:focus-visible,
+.sh-body textarea:focus-visible {
+  border-color: var(--accent);
+  outline: none;
+  box-shadow: 0 0 0 3px var(--accent-dim);
+}
+.sh-body input:disabled,
+.sh-body select:disabled,
+.sh-body textarea:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+  background: var(--bg-highlight);
+  border-color: var(--border);
+  color: var(--fg-dim);
+}
+.sh-body input::placeholder,
+.sh-body textarea::placeholder {
+  color: var(--fg-dim);
+  opacity: 0.6;
+}
+.sh-body textarea {
+  resize: vertical;
+  min-height: 64px;
+}
+.sh-body select {
+  appearance: none;
+  -webkit-appearance: none;
+  cursor: pointer;
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='8' viewBox='0 0 12 8'%3E%3Cpath d='M1 1l5 5 5-5' stroke='%238a93ad' stroke-width='1.5' fill='none' stroke-linecap='round'/%3E%3C/svg%3E");
+  background-repeat: no-repeat;
+  background-position: right 12px center;
+  padding-right: 32px;
+}
+
+/* inline error region (role=alert) */
+.sh-alert {
+  display: none;
+  font-size: 12px;
+  color: var(--red);
+  background: color-mix(in srgb, var(--red) 8%, transparent);
+  border: 1px solid color-mix(in srgb, var(--red) 35%, transparent);
+  border-radius: var(--r-sm);
+  padding: 8px 12px;
+  margin-bottom: 14px;
+}
+.sh-alert.is-visible {
+  display: block;
+}
+
+/* section heading — diamond bullet + hairline rule */
+.sh-section {
+  font-family: var(--font-ui);
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: var(--accent);
+  padding-bottom: 7px;
+  border-bottom: 1px solid var(--hair);
+  margin: 24px 0 4px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.sh-section:first-child {
+  margin-top: 0;
+}
+.sh-section::before {
+  content: "";
+  width: 4px;
+  height: 4px;
+  background: var(--accent);
+  border-radius: 1px;
+  transform: rotate(45deg);
+  opacity: 0.7;
+}
+
+/* two side-by-side fields */
+.field-pair {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 0 14px;
+}
+
+/* confirm prose + show-once artifact + callout (dialog-tier content) */
+.sh-prose {
+  font-size: 13px;
+  color: var(--ink-2);
+}
+.sh-prose strong {
+  color: var(--ink);
+  font-weight: 600;
+}
+.sh-prose code {
+  font-family: var(--font-mono);
+  font-size: 12px;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: var(--r-sm);
+  padding: 1px 5px;
+}
+.sh-artifact {
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+  color: var(--fg-bright);
+  background: var(--bg);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--r-sm);
+  padding: 12px 14px;
+  word-break: break-all;
+  user-select: all;
+}
+.sh-callout {
+  display: flex;
+  gap: 8px;
+  align-items: baseline;
+  font-size: 11.5px;
+  color: var(--yellow);
+  margin: 12px 0 0;
+}
+.sh-callout::before {
+  content: "▲";
+  font-size: 8px;
+  transform: translateY(-1px);
+}
+
+/* ---- foot: machined strip, actions right --------------------------------- */
+.sh-foot {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 12px 16px;
+  background: var(--code-bg);
+  border-top: 1px solid var(--hair);
+  flex-shrink: 0;
+}
+.sh-foot-meta {
+  flex: 1;
+  font-size: 11px;
+  color: var(--ink-4);
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.sh-foot-meta .mono {
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+}
+.sh-foot-meta .ok {
+  color: var(--green);
+}
+.sh-foot-meta .err {
+  color: var(--red);
+}
+/* light --ink-4 on the foot strip is sub-AA at 11px — one step up (the
+   .tab-menu-key precedent); dark keeps the dimmer hint. */
+[data-theme="light"] .sh-foot-meta,
+[data-theme="light"] .sh-tag,
+[data-theme="light"] .sh-x {
+  color: var(--ink-3);
+}
+
+.sh-btn {
+  appearance: none;
+  padding: 8px 18px;
+  background: var(--bg-highlight);
+  color: var(--fg);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--r-sm);
+  font-family: var(--font-ui);
+  font-size: 12px;
+  font-weight: 500;
+  cursor: pointer;
+  flex-shrink: 0;
+  transition:
+    background 0.15s,
+    border-color 0.15s,
+    filter 0.15s;
+}
+.sh-btn:hover {
+  background: var(--bg-elevated);
+}
+.sh-btn:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+.sh-btn:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+.sh-btn--primary {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: var(--bg);
+  font-weight: 600;
+}
+.sh-btn--primary:hover {
+  background: var(--accent);
+  filter: brightness(1.1);
+}
+.sh-btn--primary:focus-visible {
+  /* accent-on-accent would vanish — same rule as .modal-submit today */
+  outline-color: var(--fg-bright);
+}
+.sh-btn--danger {
+  background: var(--err-fill);
+  border-color: var(--err-fill);
+  color: #fff;
+  font-weight: 600;
+}
+.sh-btn--danger:hover {
+  filter: brightness(1.12);
+}
+.sh-btn--danger:focus-visible {
+  outline-color: var(--fg-bright);
+}
+.sh-btn--quiet {
+  background: none;
+  border-color: transparent;
+  color: var(--ink-3);
+}
+.sh-btn--quiet:hover {
+  background: color-mix(in srgb, var(--ink) 7%, transparent);
+  color: var(--ink);
+}
+
+/* busy: LED pulses (above); the action cluster locks */
+.hatch[data-busy] .sh-btn {
+  pointer-events: none;
+  opacity: 0.6;
+}
+.hatch[data-busy] .sh-btn--primary,
+.hatch[data-busy] .sh-btn--danger {
+  opacity: 0.85;
+}
+
+/* ==========================================================================
+   Smart-input primitives — "the system already knows"
+   ========================================================================== */
+
+/* segmented mode picker (compiles to the raw field) */
+.seg {
+  display: flex;
+  background: var(--bg);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--r-sm);
+  padding: 3px;
+  gap: 2px;
+}
+.seg button {
+  flex: 1;
+  background: none;
+  border: none;
+  border-radius: 3px;
+  color: var(--fg-dim);
+  font: inherit;
+  font-family: var(--font-ui);
+  font-size: 11.5px;
+  font-weight: 500;
+  padding: 6px 4px;
+  cursor: pointer;
+  transition:
+    background 0.12s,
+    color 0.12s;
+  white-space: nowrap;
+}
+.seg button:hover {
+  color: var(--fg);
+}
+.seg button[aria-pressed="true"] {
+  background: var(--accent-dim);
+  color: var(--accent);
+  font-weight: 600;
+}
+.seg button:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: -2px;
+}
+
+/* toggle chip row (days of week etc.) */
+.chips {
+  display: flex;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+.chips button {
+  background: var(--bg);
+  border: 1px solid var(--border-strong);
+  color: var(--fg-dim);
+  border-radius: var(--r-sm);
+  font: inherit;
+  font-family: var(--font-ui);
+  font-size: 11px;
+  font-weight: 600;
+  min-width: 38px;
+  padding: 6px 0;
+  cursor: pointer;
+  transition:
+    background 0.12s,
+    border-color 0.12s,
+    color 0.12s;
+}
+.chips button[aria-pressed="true"] {
+  background: var(--accent-dim);
+  border-color: var(--accent);
+  color: var(--accent);
+}
+.chips button:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+
+/* the instrument read-out — recessed display strip with live data */
+.readout {
+  margin-top: 14px;
+  background: var(--code-bg);
+  border: 1px solid var(--hair);
+  border-radius: var(--r-sm);
+  overflow: hidden;
+  position: relative;
+}
+.readout::before {
+  content: "";
+  position: absolute;
+  left: 0;
+  top: 0;
+  bottom: 0;
+  width: 2px;
+  background: var(--hatch-accent, var(--accent));
+  opacity: 0.7;
+}
+.readout-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 12px 7px 14px;
+  border-bottom: 1px solid var(--hair);
+}
+.readout-label {
+  font-family: var(--font-ui);
+  font-size: 9px;
+  font-weight: 700;
+  letter-spacing: 0.12em;
+  color: var(--ink-4);
+  text-transform: uppercase;
+}
+.readout-desc {
+  flex: 1;
+  text-align: right;
+  font-size: 11.5px;
+  color: var(--accent);
+  font-weight: 600;
+}
+.readout-rows {
+  padding: 6px 14px 8px;
+}
+.readout-row {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--ink-2);
+  padding: 2.5px 0;
+}
+.readout-row .rel {
+  color: var(--ink-4);
+}
+.readout-rows .err {
+  color: var(--red);
+  font-family: var(--font-ui);
+  font-size: 11.5px;
+  padding: 4px 0;
+}
+[data-theme="light"] .readout-label,
+[data-theme="light"] .readout-row .rel {
+  color: var(--ink-3);
+}
+
+/* autofill provenance banner */
+.autofill {
+  display: flex;
+  gap: 8px;
+  align-items: baseline;
+  margin-top: 10px;
+  font-size: 11.5px;
+  color: var(--green);
+}
+.autofill::before {
+  content: "✓";
+  font-size: 10px;
+}
+.autofill .src {
+  color: var(--ink-4);
+}
+[data-theme="light"] .autofill .src {
+  color: var(--ink-3);
+}
+.autofill .mono {
+  font-family: var(--font-mono);
+}
+
+/* capability matrix — label.cap out-ranks the .sh-body label micro-label
+   cadence (the .admin-modal label.toggle-switch specificity war) */
+.capgrid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 6px 14px;
+  margin-top: 8px;
+}
+.sh-body label.cap {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  background: var(--bg);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--r-sm);
+  padding: 7px 10px;
+  cursor: pointer;
+  transition: border-color 0.12s;
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--fg);
+  text-transform: none;
+  letter-spacing: 0;
+  margin: 0;
+}
+.sh-body label.cap:hover {
+  border-color: var(--accent-dim);
+}
+.cap input {
+  position: absolute;
+  opacity: 0;
+  pointer-events: none;
+}
+.cap .cap-led {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--fg-dim);
+  opacity: 0.35;
+  flex-shrink: 0;
+  transition:
+    background 0.12s,
+    opacity 0.12s,
+    box-shadow 0.12s;
+}
+.cap:has(input:checked) .cap-led {
+  background: var(--green);
+  opacity: 1;
+  box-shadow: 0 0 5px var(--green-glow);
+}
+.cap:has(input:checked) {
+  border-color: color-mix(in srgb, var(--green) 30%, var(--border-strong));
+}
+.cap:has(input:focus-visible) {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+.cap:has(input:disabled) {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+.cap .cap-name {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* live match preview chips (patterns / priority neighbors) */
+.match-strip {
+  margin-top: 8px;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 5px;
+  align-items: baseline;
+}
+.match-strip .match-count {
+  font-size: 11px;
+  color: var(--ink-4);
+  margin-right: 2px;
+}
+[data-theme="light"] .match-strip .match-count {
+  color: var(--ink-3);
+}
+.match-strip .match-count b {
+  color: var(--green);
+  font-weight: 600;
+}
+.match-chip {
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  color: var(--ink-2);
+  background: var(--bg);
+  border: 1px solid var(--hair);
+  border-radius: var(--r-sm);
+  padding: 2px 7px;
+}
+
+/* raw escape hatch — collapsed details */
+details.rawhatch {
+  margin-top: 18px;
+  border: 1px dashed var(--border-strong);
+  border-radius: var(--r-sm);
+}
+details.rawhatch summary {
+  cursor: pointer;
+  padding: 8px 12px;
+  font-family: var(--font-ui);
+  font-size: 11px;
+  color: var(--ink-4);
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  font-weight: 600;
+  user-select: none;
+}
+[data-theme="light"] details.rawhatch summary {
+  color: var(--ink-3);
+}
+details.rawhatch summary:hover {
+  color: var(--ink-2);
+}
+details.rawhatch summary:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: -2px;
+}
+details.rawhatch[open] summary {
+  border-bottom: 1px dashed var(--border-strong);
+}
+details.rawhatch .rawhatch-body {
+  padding: 12px;
+}
+.sh-body details.rawhatch textarea,
+.sh-body details.rawhatch input:not([type="checkbox"]) {
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+}
+
+/* ---- reduced motion ------------------------------------------------------ */
+@media (prefers-reduced-motion: reduce) {
+  .hatch[open],
+  .hatch--dialog[open]::backdrop,
+  .pane-scrim {
+    animation: none;
+  }
+  .hatch[open] .sh-head::before {
+    animation: none;
+  }
+  .hatch[data-busy] .sh-led {
+    animation: none;
+    opacity: 1;
+  }
+  .sh-btn,
+  .sh-x,
+  .seg button,
+  .chips button,
+  .cap .cap-led {
+    transition: none;
+  }
+}
