@@ -5555,18 +5555,31 @@ def _normalize_task_dict(task: dict[str, Any]) -> dict[str, Any]:
     return task
 
 
+def _next_cron_runs(cron_expr: str, count: int) -> list[str] | None:
+    """Next *count* firings of *cron_expr* as naive-UTC ISO strings.
+
+    Returns None for expressions that pass croniter.is_valid but can never
+    match a real calendar date (``0 0 30 2 *`` — get_next raises
+    CroniterBadDateError after exhausting its search window).
+    """
+    from datetime import UTC, datetime
+
+    from croniter import CroniterBadDateError, croniter
+
+    cron = croniter(cron_expr, datetime.now(UTC))
+    try:
+        return [cron.get_next(datetime).strftime("%Y-%m-%dT%H:%M:%S") for _ in range(count)]
+    except CroniterBadDateError:
+        return None
+
+
 def _compute_next_run(schedule_type: str, cron_expr: str, at_time: str) -> str:
     """Compute the next run time for a schedule. Empty string if invalid."""
     if schedule_type == "at":
         return at_time
     if schedule_type == "cron" and cron_expr:
-        from datetime import UTC, datetime
-
-        from croniter import croniter
-
-        cron = croniter(cron_expr, datetime.now(UTC))
-        next_dt = cron.get_next(datetime)
-        return str(next_dt.strftime("%Y-%m-%dT%H:%M:%S"))
+        runs = _next_cron_runs(cron_expr, 1)
+        return runs[0] if runs else ""
     return ""
 
 
@@ -5629,13 +5642,20 @@ async def admin_preview_schedule(request: Request) -> JSONResponse:
     if schedule_type == "at":
         return JSONResponse({"valid": True, "error": "", "next": [at_time]})
 
-    from datetime import UTC, datetime
-
-    from croniter import croniter
-
-    cron = croniter(cron_expr, datetime.now(UTC))
-    runs = [cron.get_next(datetime).strftime("%Y-%m-%dT%H:%M:%S") for _ in range(3)]
-    return JSONResponse({"valid": True, "error": "", "next": runs})
+    runs = _next_cron_runs(cron_expr, 3)
+    if runs is None:
+        # croniter.is_valid passes these, but the date never exists
+        # (e.g. ``0 0 30 2 *``) — a preview outcome, not a server error.
+        return JSONResponse(
+            {
+                "valid": False,
+                "error": "Cron expression never matches a real calendar date",
+                "next": [],
+            }
+        )
+    # The 'at' branch echoes an offset-bearing ISO; keep next[] uniform so
+    # consumers parse every element identically.
+    return JSONResponse({"valid": True, "error": "", "next": [r + "+00:00" for r in runs]})
 
 
 async def admin_list_schedules(request: Request) -> JSONResponse:

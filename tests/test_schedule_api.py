@@ -305,8 +305,9 @@ class TestPreviewSchedule:
         assert data["error"] == ""
         assert len(data["next"]) == 3
         assert data["next"] == sorted(data["next"])
-        # All at 06:00 (the daily expression's only firing time)
-        assert all(t.endswith("T06:00:00") for t in data["next"])
+        # All at 06:00 (the daily expression's only firing time), in the
+        # uniform offset-bearing shape the 'at' branch also uses
+        assert all(t.endswith("T06:00:00+00:00") for t in data["next"])
 
     def test_invalid_cron_is_a_200_with_the_message(self, client):
         resp = client.post(
@@ -354,3 +355,36 @@ class TestPreviewSchedule:
         data = resp.json()
         assert data["valid"] is False
         assert "schedule_type" in data["error"]
+
+    def test_impossible_calendar_date_cron_is_a_200_not_a_500(self, client):
+        """croniter.is_valid passes '0 0 30 2 *' (Feb 30) but get_next raises
+        CroniterBadDateError — the preview must answer its 200/valid:false
+        contract, not crash."""
+        resp = client.post(
+            "/v1/api/admin/schedules/preview",
+            json={"schedule_type": "cron", "cron_expr": "0 0 30 2 *"},
+        )
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["valid"] is False
+        assert "calendar" in data["error"]
+        assert data["next"] == []
+
+    def test_create_with_impossible_date_cron_does_not_500(self, client):
+        """_compute_next_run shares the guard: creating such a schedule must
+        not crash (next_run computes as empty)."""
+        resp = client.post(
+            "/v1/api/admin/schedules",
+            json=_cron_payload(cron_expr="0 0 31 4 *"),
+        )
+        assert resp.status_code == 200
+        assert resp.json()["next_run"] == ""
+
+    def test_cron_next_runs_carry_a_utc_offset(self, client):
+        """next[] must be one shape: the 'at' branch echoes offset-bearing
+        ISO, so the cron branch appends the UTC offset too."""
+        resp = client.post(
+            "/v1/api/admin/schedules/preview",
+            json={"schedule_type": "cron", "cron_expr": "0 6 * * *"},
+        )
+        assert all(t.endswith("+00:00") for t in resp.json()["next"])

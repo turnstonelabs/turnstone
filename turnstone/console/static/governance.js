@@ -388,7 +388,7 @@ function _buildPermCheckboxes(prefix, selected, baseline) {
   // ``baseline`` is optional — when provided (builtin-role edits) each
   // toggle gets a small visual mark showing whether the perm is on by
   // default and whether the current state is an override (added or
-  // removed).  ``submitEditRole`` diffs the toggle state against the
+  // removed).  ``_submitRoleShelf`` diffs the toggle state against the
   // baseline to produce the {grant, revoke} payload for /overrides.
   const baselineSet = {};
   if (baseline)
@@ -923,7 +923,6 @@ function _renderGovPolicies(items) {
 // "where does 200 land?" answers itself while typing. No backend involved.
 
 let _polWired = false;
-let _polShelfHandle = null;
 
 function _polChip(text) {
   const span = document.createElement("span");
@@ -1007,13 +1006,12 @@ function showCreatePolicyModal() {
   shelf.setAttribute("data-kind", "create");
   document.getElementById("pol-submit").textContent = "Create";
   _polRenderNeighbors();
-  _polShelfHandle = window.TurnstoneHatch.openShelf(shelf);
+  window.TurnstoneHatch.openShelf(shelf);
   document.getElementById("pol-name").focus();
 }
 
 function hideCreatePolicyModal() {
   window.TurnstoneHatch.closeShelf(document.getElementById("policy-shelf"));
-  _polShelfHandle = null;
 }
 
 function showEditPolicyModal(policyId) {
@@ -1041,7 +1039,7 @@ function showEditPolicyModal(policyId) {
   shelf.setAttribute("data-kind", "edit");
   document.getElementById("pol-submit").textContent = "Save";
   _polRenderNeighbors();
-  _polShelfHandle = window.TurnstoneHatch.openShelf(shelf);
+  window.TurnstoneHatch.openShelf(shelf);
   document.getElementById("pol-name").focus();
 }
 

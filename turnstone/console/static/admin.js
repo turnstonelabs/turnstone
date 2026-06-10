@@ -1115,8 +1115,6 @@ function confirmUnlinkChannel(channelType, channelUserId) {
 // Schedules
 // ---------------------------------------------------------------------------
 
-let _srShelfHandle = null;
-
 function loadAdminSchedules() {
   authFetch("/v1/api/admin/schedules")
     .then(function (r) {
@@ -2115,7 +2113,7 @@ function showScheduleRuns(taskId) {
         }
         setSafeHtml(container, html);
       }
-      _srShelfHandle = window.TurnstoneHatch.openShelf(
+      window.TurnstoneHatch.openShelf(
         document.getElementById("schedule-runs-shelf"),
       );
     })
@@ -2128,7 +2126,6 @@ function hideScheduleRunsModal() {
   window.TurnstoneHatch.closeShelf(
     document.getElementById("schedule-runs-shelf"),
   );
-  _srShelfHandle = null;
 }
 
 // ---------------------------------------------------------------------------
@@ -2307,7 +2304,6 @@ function _cancelWatch(watchId, nodeId, name) {
 // ---------------------------------------------------------------------------
 
 let _channelWired = false;
-let _channelShelfHandle = null;
 
 function _channelWire() {
   if (_channelWired) return;
@@ -2336,13 +2332,12 @@ function showCreateChannelModal() {
   ctSel.value = "discord";
   uidInput.value = "";
   uidInput.placeholder = _notifyIdPlaceholder(ctSel.value);
-  _channelShelfHandle = window.TurnstoneHatch.openShelf(shelf);
+  window.TurnstoneHatch.openShelf(shelf);
   ctSel.focus();
 }
 
 function hideCreateChannelModal() {
   window.TurnstoneHatch.closeShelf(document.getElementById("channel-shelf"));
-  _channelShelfHandle = null;
 }
 
 function submitCreateChannel() {
@@ -2397,7 +2392,6 @@ function submitCreateChannel() {
 // ---------------------------------------------------------------------------
 
 let _userWired = false;
-let _userShelfHandle = null;
 
 function _userWire() {
   if (_userWired) return;
@@ -2415,13 +2409,12 @@ function showCreateUserModal() {
   document.getElementById("cu-displayname").value = "";
   document.getElementById("cu-password").value = "";
   document.getElementById("cu-confirm").value = "";
-  _userShelfHandle = window.TurnstoneHatch.openShelf(shelf);
+  window.TurnstoneHatch.openShelf(shelf);
   document.getElementById("cu-username").focus();
 }
 
 function hideCreateUserModal() {
   window.TurnstoneHatch.closeShelf(document.getElementById("user-shelf"));
-  _userShelfHandle = null;
 }
 
 function submitCreateUser() {
@@ -2478,7 +2471,6 @@ function submitCreateUser() {
 // ---------------------------------------------------------------------------
 
 let _tokenWired = false;
-let _tokenShelfHandle = null;
 
 function _tokenWire() {
   if (_tokenWired) return;
@@ -2499,13 +2491,12 @@ function showCreateTokenModal() {
   document.getElementById("ct-name").value = "";
   document.getElementById("ct-scopes").value = "read,write,approve";
   document.getElementById("ct-expires").value = "";
-  _tokenShelfHandle = window.TurnstoneHatch.openShelf(shelf);
+  window.TurnstoneHatch.openShelf(shelf);
   document.getElementById("ct-name").focus();
 }
 
 function hideCreateTokenModal() {
   window.TurnstoneHatch.closeShelf(document.getElementById("token-shelf"));
-  _tokenShelfHandle = null;
 }
 
 function submitCreateToken() {
@@ -3529,12 +3520,8 @@ function _showModalError(el, msg) {
 
 let _mcpServers = [];
 let _mcpWired = false;
-let _mcpShelfHandle = null;
 let _mcpImportWired = false;
-let _mcpImportShelfHandle = null;
-let _mcpDetailShelfHandle = null;
 let _mcpInstallWired = false;
-let _mcpInstallHandle = null;
 let _mcpInstallServer = null;
 let _mcpCurrentView = "servers";
 let _registryResults = [];
@@ -3967,7 +3954,7 @@ function _mcpOpen(title, tag, kind, submitLabel) {
   document.getElementById("mcp-shelf-tag").textContent = tag;
   shelf.setAttribute("data-kind", kind);
   document.getElementById("mcp-create-submit").textContent = submitLabel;
-  _mcpShelfHandle = window.TurnstoneHatch.openShelf(shelf);
+  window.TurnstoneHatch.openShelf(shelf);
   document.getElementById("mcp-name").focus();
 }
 
@@ -4075,7 +4062,6 @@ function showEditMcpModal(serverId) {
 
 function hideCreateMcpModal() {
   window.TurnstoneHatch.closeShelf(document.getElementById("mcp-shelf"));
-  _mcpShelfHandle = null;
 }
 
 function _parseMcpForm() {
@@ -4369,14 +4355,11 @@ function _openMcpDetail(s) {
 
   document.getElementById("mcp-detail-title").textContent = s.name;
   setSafeHtml(document.getElementById("mcp-detail-content"), html);
-  _mcpDetailShelfHandle = window.TurnstoneHatch.openShelf(
-    document.getElementById("mcp-detail-shelf"),
-  );
+  window.TurnstoneHatch.openShelf(document.getElementById("mcp-detail-shelf"));
 }
 
 function hideMcpDetailModal() {
   window.TurnstoneHatch.closeShelf(document.getElementById("mcp-detail-shelf"));
-  _mcpDetailShelfHandle = null;
 }
 
 function _mcpImportWire() {
@@ -4392,13 +4375,12 @@ function showImportMcpModal() {
   const shelf = document.getElementById("mcp-import-shelf");
   document.getElementById("mcp-import-json").value = "";
   document.getElementById("mcp-import-error").classList.remove("is-visible");
-  _mcpImportShelfHandle = window.TurnstoneHatch.openShelf(shelf);
+  window.TurnstoneHatch.openShelf(shelf);
   document.getElementById("mcp-import-json").focus();
 }
 
 function hideImportMcpModal() {
   window.TurnstoneHatch.closeShelf(document.getElementById("mcp-import-shelf"));
-  _mcpImportShelfHandle = null;
 }
 
 function submitImportMcp() {
@@ -4786,7 +4768,7 @@ function _showInstallMcpModal(srv, hasRemote, hasPackage) {
   }
 
   _updateInstallFields();
-  _mcpInstallHandle = window.TurnstoneHatch.openDialog(
+  window.TurnstoneHatch.openDialog(
     document.getElementById("mcp-install-dialog"),
     {
       onClose: function () {
@@ -5092,7 +5074,6 @@ function _pollInstallStatus(serverId, serverName, attempt) {
 
 let _modelDefs = [];
 let _modelDefaultAlias = "";
-let _modelShelfHandle = null;
 // Reranker calibration fields extracted out of the capabilities textarea in the
 // edit modal (like server_compat), held here so they survive an unrelated edit
 // and are re-merged on save. Reset per modal open.
@@ -5857,9 +5838,7 @@ function showCreateModelModal() {
   document.getElementById("model-autofill").hidden = true;
   _refreshModelSuggestions();
   _applyProviderDefaults();
-  _modelShelfHandle = window.TurnstoneHatch.openShelf(
-    document.getElementById("model-shelf"),
-  );
+  window.TurnstoneHatch.openShelf(document.getElementById("model-shelf"));
   document.getElementById("model-alias").focus();
 }
 
@@ -5986,7 +5965,6 @@ function showEditModelModal(definitionId) {
 
 function hideCreateModelModal() {
   window.TurnstoneHatch.closeShelf(document.getElementById("model-shelf"));
-  _modelShelfHandle = null;
 }
 
 function submitCreateModel() {
@@ -6512,6 +6490,7 @@ function recalibrateModel() {
    changes the provider, look up static capabilities and pre-fill
    context_window and the capabilities textarea. */
 let _capsTimer = null;
+let _modelCapsSeq = 0;
 function _onModelFieldChange() {
   clearTimeout(_capsTimer);
   _capsTimer = setTimeout(_modelCapsRefreshBaseline, 500);
@@ -6533,6 +6512,9 @@ function _modelCapsRefreshBaseline() {
     _modelRenderTiles();
     return;
   }
+  // Two type-then-pause cycles can have both fetches in flight; a reordered
+  // older response must not clobber the tiles (the _schPreviewSeq pattern).
+  const seq = ++_modelCapsSeq;
   authFetch(
     "/v1/api/admin/model-capabilities?provider=" +
       encodeURIComponent(provider) +
@@ -6543,6 +6525,7 @@ function _modelCapsRefreshBaseline() {
       return r.json();
     })
     .then(function (d) {
+      if (seq !== _modelCapsSeq) return; // superseded by a newer edit
       if (!d.known || !d.capabilities) {
         _modelCapsBaseline = {};
         banner.hidden = true;
@@ -6597,7 +6580,9 @@ function _applyProviderDefaults() {
   // Server compat section only applies to local model servers
   const scSection = document.getElementById("model-server-compat-section");
   if (scSection) {
-    scSection.style.display = provider === "openai-compatible" ? "" : "none";
+    // hidden attr, not style.display — `.hatch [hidden]` is !important and
+    // an inline display can never un-hide it.
+    scSection.hidden = provider !== "openai-compatible";
   }
 }
 

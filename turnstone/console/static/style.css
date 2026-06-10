@@ -290,10 +290,10 @@
    so the two dashboards share one source of truth. */
 
 /* ==========================================================================
-   Toast override — position above cluster status bar AND above admin modal
-   overlays (which sit at z-index 600).  Without this, toasts fired while a
-   modal is open — e.g. paste-to-fill on the Create Skill modal — render
-   behind the dimmed backdrop and never reach the user.
+   Toast override — sit above the cluster status bar.  Stacking against the
+   hatch dialogs needs no z-index at all: a document-modal <dialog> owns the
+   top layer, and toast.js promotes the toast to a manual popover (also top
+   layer, later = higher) while one is open.
    ========================================================================== */
 #toast {
   bottom: 56px;
@@ -913,24 +913,15 @@
   color: var(--accent);
 }
 
-/* Two-column form layout for wide modals */
+/* Two-column read-out grid — survives for the MCP-detail inspect shelf
+   (admin.js _openMcpDetail builds .modal-columns/.modal-col). */
 .modal-columns {
   display: grid;
   grid-template-columns: 1fr 1fr;
   gap: 0;
 }
-.modal-col > label:first-child,
-.modal-col > .modal-col-heading + label {
+.modal-col > label:first-child {
   margin-top: 0;
-}
-.modal-col-heading {
-  font-family: var(--font-ui);
-  font-size: 9px;
-  font-weight: 600;
-  text-transform: uppercase;
-  letter-spacing: 0.1em;
-  color: var(--accent);
-  margin-bottom: 10px;
 }
 .modal-columns > .modal-col:first-child {
   border-right: 1px solid var(--border);
@@ -3100,6 +3091,10 @@ h3.skill-spec-heading {
 .mcp-install-source-group {
   margin-bottom: 14px;
 }
+/* Doubled with .sh-body — the fourth label-rooted shelf component (after
+   toggle-switch / cap / segmented-option) that must out-rank the hatch.css
+   label micro-cadence at 0,1,1. */
+.sh-body label.mcp-install-source-label,
 .mcp-install-source-label {
   display: flex;
   align-items: center;
@@ -3415,8 +3410,6 @@ h3.skill-spec-heading {
   outline: 2px solid var(--accent);
   outline-offset: 1px;
 }
-
-/* Modal section divider for field groups */
 
 /* Model source badge */
 .scope-db {

@@ -61,10 +61,20 @@ function _scrimFor(host) {
   return scrim;
 }
 
+function _pruneDetached() {
+  // A pane can be closed (PaneManager removes its element) while its shelf
+  // is open — the entry would otherwise pin a detached dialog forever and
+  // leave the document Escape listener targeting a ghost.
+  for (const [dlg] of _shelfState) {
+    if (!dlg.isConnected) closeShelf(dlg);
+  }
+}
+
 function _onEscape(e) {
   if (e.key !== "Escape") return;
   // A document-modal dialog above (confirm-from-shelf) owns Escape natively.
   if (document.querySelector("dialog:modal")) return;
+  _pruneDetached();
   let top = null;
   for (const [dlg] of _shelfState) top = dlg; // Map preserves insertion order
   if (!top) return;
@@ -124,6 +134,7 @@ function _wireCloseDelegation(dlg, isShelf) {
  */
 export function openShelf(dlg, opts) {
   opts = opts || {};
+  _pruneDetached();
   if (_shelfState.has(dlg)) return { close: () => closeShelf(dlg) };
   const host = _hostOf(dlg);
   // One shelf per pane: a second open() retargets the pane's shelf slot.
@@ -162,7 +173,7 @@ export function closeShelf(dlg) {
   const state = _shelfState.get(dlg);
   if (!state) return;
   _shelfState.delete(dlg);
-  if (dlg.open) dlg.close();
+  if (dlg.isConnected && dlg.open) dlg.close();
   dlg.removeAttribute("data-busy");
   for (const el of state.inerted) el.inert = false;
   // Another shelf may still own this pane's scrim (retarget race) — only

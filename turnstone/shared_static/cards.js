@@ -827,8 +827,21 @@ export function createSavedCardsController(opts) {
     }
     /* Hatch owns the rest: focus trap, Escape, backdrop click, the busy
        lock, and focus restore to the opener.  Cancel carries the markup
-       autofocus (destructive-confirm rule). */
-    window.TurnstoneHatch.openDialog(dlg);
+       autofocus (destructive-confirm rule).  The onClose runs on EVERY
+       dismissal path (footer Close, header ✕, Escape, backdrop) — once
+       results are showing, any of them must exit delete mode and refresh
+       the now-stale list, not just the footer button. */
+    state.resultsShown = false;
+    window.TurnstoneHatch.openDialog(dlg, {
+      onClose: function () {
+        if (!state.resultsShown) return; // pre-delete cancel keeps the mode
+        state.resultsShown = false;
+        cancel();
+        var t = document.getElementById(opts.buttonId);
+        if (t && typeof t.focus === "function") t.focus();
+        if (typeof opts.onClose === "function") opts.onClose();
+      },
+    });
   }
 
   function closeModal() {
@@ -930,11 +943,10 @@ export function createSavedCardsController(opts) {
       // polite-live for the all-good case); a clean run flips the chrome
       // to the success kind — red head over "3 deleted, 0 failed" would
       // disagree with the de-dangered foot.
-      var errEl = dlg ? dlg.querySelector(".sh-alert") : null;
-      if (errEl && failCount > 0) {
-        errEl.textContent =
+      if (errorEl && failCount > 0) {
+        errorEl.textContent =
           failCount + " of " + results.length + " deletions failed";
-        errEl.classList.add("is-visible");
+        errorEl.classList.add("is-visible");
       }
       if (dlg)
         dlg.setAttribute("data-kind", failCount === 0 ? "success" : "danger");
@@ -943,22 +955,16 @@ export function createSavedCardsController(opts) {
          dismissal pair the foot grammar forbids. */
       var cancelBtn = dlg ? dlg.querySelector(".sh-foot [data-close]") : null;
       if (cancelBtn) cancelBtn.hidden = true;
+      state.resultsShown = true;
       if (delBtn) {
         delBtn.textContent = "Close";
         /* The results view's action is no longer destructive — drop the
            danger fill (confirmSelection restores it on the next open). */
         delBtn.classList.remove("sh-btn--danger");
-        delBtn.onclick = function () {
-          /* Order matters: cancel() hides the delete bar, so the dialog's
-             native focus restore (the opener was the bar's button) no-ops
-             on a display:none element — hand focus to the section toggle,
-             which cancel() just rebuilt as a fresh "Delete" affordance. */
-          cancel();
-          closeModal();
-          var t = document.getElementById(opts.buttonId);
-          if (t && typeof t.focus === "function") t.focus();
-          if (typeof opts.onClose === "function") opts.onClose();
-        };
+        /* Teardown (exit delete mode, refresh the stale list, focus the
+           rebuilt section toggle) lives on the dialog's onClose so the
+           header ✕ / Escape / backdrop run it too — Close just closes. */
+        delBtn.onclick = closeModal;
         // The state just changed under the user — land focus somewhere
         // predictable (the only remaining action).
         delBtn.focus();

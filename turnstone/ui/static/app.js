@@ -854,6 +854,9 @@ function editWorkstreamTitle(optWsId) {
       _editTitleWsId = null;
     },
   });
+  // select() sets the selection but does NOT move focus (per spec) — without
+  // this, focus stays on the header ✕ and Enter closes instead of submitting.
+  input.focus();
   input.select();
 }
 
