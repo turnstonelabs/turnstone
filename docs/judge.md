@@ -231,6 +231,20 @@ calls for approval, it calls `_evaluate_intent()` which:
 4. Attaches each heuristic verdict to its item as `_heuristic_verdict`
 5. The daemon thread runs the LLM judge and delivers results via `ui.on_intent_verdict()`
 
+The daemon evaluates items sequentially, so a large parallel batch can outlive
+its approval gate. With `cancel_on_approval = false` (the default) the daemon
+runs every item to completion: verdicts that land after the operator decided
+still stream to the UI and persist, stamped with the decision. The daemon is
+aborted only when the next tool batch supersedes it or the session closes —
+then each unfinished item degrades to an `llm_fallback` verdict. With
+`cancel_on_approval = true` the abort additionally fires the moment the gate
+resolves, trading verdict completeness for inference savings.
+
+Verdicts that arrive after a *newer batch* has replaced the judge generation
+are withheld from the live surfaces (a reused call_id must never ride a stale
+`approve` into Smart Approvals) but still persist with
+`user_decision = "superseded"` so the audit trail records the judge's answer.
+
 Sub-agents (plan agent, task agent) are exempt from intent validation -- they
 always get full tool visibility without judge evaluation.
 
@@ -242,7 +256,13 @@ All verdicts are persisted to the `intent_verdicts` table (migration 012):
 
 - Heuristic verdicts are stored when the `approve_request` event is emitted
 - LLM verdicts are stored when the `intent_verdict` event is delivered
-- The `user_decision` column is updated when the user approves or denies
+- The `user_decision` column is updated when the user approves or denies;
+  auto-approved rows carry the bypass reason (`policy`, `blanket`,
+  `auto_approve_tools`, `smart_approval`), and rows whose verdict landed only
+  after a newer batch replaced the judge generation carry `superseded`
+- Every stored verdict — including the benign `risk_level = "none"` majority —
+  is re-attached to its tool call on history replay, so a reloaded workstream
+  shows the same verdict badges the live stream did
 
 The console admin panel exposes verdict history via:
 
