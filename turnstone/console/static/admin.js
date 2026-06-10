@@ -2628,7 +2628,6 @@ function _installTrap(overlayId, boxId, trapRef) {
       if (e.target === overlay) {
         if (overlayId === "create-template-overlay") hideCreateTemplateModal();
         else if (overlayId === "edit-template-overlay") hideEditTemplateModal();
-        else if (overlayId === "memory-detail-overlay") hideMemoryDetailModal();
       }
     };
   }
@@ -2657,7 +2656,6 @@ document.addEventListener("keydown", function (e) {
   const govOverlays = [
     ["create-template-overlay", hideCreateTemplateModal],
     ["edit-template-overlay", hideEditTemplateModal],
-    ["memory-detail-overlay", hideMemoryDetailModal],
   ];
   for (let gi = 0; gi < govOverlays.length; gi++) {
     const govEl = document.getElementById(govOverlays[gi][0]);

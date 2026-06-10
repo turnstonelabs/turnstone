@@ -2790,8 +2790,6 @@ function _populateAuditUserFilter() {
 // ---------------------------------------------------------------------------
 
 let _adminMemories = [];
-let _memDetailTrap = null;
-let _memDetailTrigger = null;
 let _memSearchTimer = null;
 let _memSearchBound = false;
 
@@ -2926,9 +2924,7 @@ function _renderAdminMemories(items, total) {
 }
 
 function showMemoryDetailModal(memoryId) {
-  _memDetailTrigger = document.activeElement;
-  const ov = document.getElementById("memory-detail-overlay");
-  ov.style.display = "flex";
+  const shelf = document.getElementById("memory-detail-shelf");
   setSafeHtml(
     document.getElementById("memory-detail-body"),
     '<div class="dashboard-empty">Loading…</div>',
@@ -2939,8 +2935,9 @@ function showMemoryDetailModal(memoryId) {
   delBtn.disabled = true;
   delBtn.onclick = null;
 
-  // Focus close button for keyboard accessibility
-  const closeBtn = ov.querySelector(".modal-cancel");
+  window.TurnstoneHatch.openShelf(shelf);
+  // Focus the close button for keyboard accessibility
+  const closeBtn = shelf.querySelector(".sh-x");
   if (closeBtn) closeBtn.focus();
 
   authFetch("/v1/api/admin/memories/" + encodeURIComponent(memoryId))
@@ -3002,15 +2999,12 @@ function showMemoryDetailModal(memoryId) {
         '<div class="dashboard-empty">Failed to load memory</div>',
       );
     });
-
-  _memDetailTrap = _installTrap("memory-detail-overlay", "memory-detail-box");
 }
 
 function hideMemoryDetailModal() {
-  document.getElementById("memory-detail-overlay").style.display = "none";
-  _memDetailTrap = _removeTrap(_memDetailTrap);
-  if (_memDetailTrigger && _memDetailTrigger.focus) _memDetailTrigger.focus();
-  _memDetailTrigger = null;
+  window.TurnstoneHatch.closeShelf(
+    document.getElementById("memory-detail-shelf"),
+  );
 }
 
 function deleteAdminMemory(memoryId, memoryName) {
@@ -3028,11 +3022,8 @@ function deleteAdminMemory(memoryId, memoryName) {
     })
     .then(function () {
       showToast("Memory deleted");
-      // Close detail modal if open
-      if (
-        document.getElementById("memory-detail-overlay").style.display !==
-        "none"
-      ) {
+      // Close detail shelf if open
+      if (document.getElementById("memory-detail-shelf").open) {
         hideMemoryDetailModal();
       }
       loadAdminMemories();

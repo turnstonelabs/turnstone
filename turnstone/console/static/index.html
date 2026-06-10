@@ -2972,6 +2972,35 @@
               </button>
             </footer>
           </dialog>
+
+          <!-- Memory-detail shelf (inspect) — pane-scoped read-out; the body
+               is rendered by showMemoryDetailModal. The foot keeps the Delete
+               action wired after the record loads. -->
+          <dialog
+            class="hatch hatch--shelf hatch--lg"
+            id="memory-detail-shelf"
+            data-kind="inspect"
+            aria-labelledby="memory-detail-shelf-title"
+          >
+            <header class="sh-head">
+              <span class="sh-led" aria-hidden="true"></span>
+              <h2 class="sh-title" id="memory-detail-shelf-title">
+                Memory detail
+              </h2>
+              <span class="sh-tag" aria-hidden="true">MEM-INFO</span>
+              <button class="sh-x" data-close aria-label="Close">✕</button>
+            </header>
+            <div class="sh-body">
+              <div id="memory-detail-body"></div>
+            </div>
+            <footer class="sh-foot">
+              <div class="sh-foot-meta"></div>
+              <button id="mem-detail-delete" class="sh-btn sh-btn--danger">
+                Delete
+              </button>
+              <button class="sh-btn" data-close>Close</button>
+            </footer>
+          </dialog>
         </div>
         <!-- /admin-layout -->
       </div>
@@ -4004,27 +4033,6 @@
             onclick="submitEditTemplate()"
           >
             Save
-          </button>
-        </div>
-      </div>
-    </div>
-
-    <div
-      id="memory-detail-overlay"
-      style="display: none"
-      role="dialog"
-      aria-modal="true"
-      aria-labelledby="memory-detail-title"
-    >
-      <div id="memory-detail-box" class="admin-modal admin-modal-wide">
-        <h2 id="memory-detail-title">Memory Detail</h2>
-        <div id="memory-detail-body"></div>
-        <div class="modal-buttons">
-          <button class="modal-cancel" onclick="hideMemoryDetailModal()">
-            Close
-          </button>
-          <button id="mem-detail-delete" class="modal-submit admin-btn-danger">
-            Delete
           </button>
         </div>
       </div>
