@@ -5433,18 +5433,32 @@ class ChatSession:
         def _on_verdict(verdict: object) -> None:
             """Callback from the daemon judge thread.
 
-            Drop the verdict when a newer turn has replaced this judge
-            generation.  With ``cancel_on_approval=False`` (the default) the
-            prior turn's daemon runs to completion and would otherwise write a
-            stale verdict — keyed only by ``call_id`` — into the freshly-reset
-            ``_llm_verdicts`` cache; a model that reuses a ``call_id`` across
-            turns could then ride that stale ``approve`` to a wrongful Smart
-            Approval of a *different* call.  Identity-comparing the live
-            generation closes that without affecting same-turn late delivery
-            (``cancel_on_approval=False`` still streams this turn's verdicts,
-            since the session event still points at this ``cancel_event``).
+            Withhold the verdict from the live surfaces when a newer turn has
+            replaced this judge generation.  With ``cancel_on_approval=False``
+            (the default) the prior turn's daemon runs to completion and would
+            otherwise write a stale verdict — keyed only by ``call_id`` — into
+            the freshly-reset ``_llm_verdicts`` cache; a model that reuses a
+            ``call_id`` across turns could then ride that stale ``approve`` to
+            a wrongful Smart Approval of a *different* call.  Identity-
+            comparing the live generation closes that without affecting
+            same-turn late delivery (``cancel_on_approval=False`` still
+            streams this turn's verdicts, since the session event still
+            points at this ``cancel_event``).
+
+            Superseded verdicts still reach the audit table via the UI's
+            ``on_superseded_intent_verdict`` (persist-only, duck-typed —
+            display-only UIs like the CLI don't define it and skip straight
+            to the drop).  Without that, every judge ruling that landed after
+            the next turn began left ``intent_verdicts`` claiming the judge
+            never answered.
             """
             if self._judge_cancel_event is not cancel_event:
+                persist_only = getattr(self.ui, "on_superseded_intent_verdict", None)
+                if persist_only is not None:
+                    try:
+                        persist_only(verdict.to_dict())  # type: ignore[attr-defined]
+                    except Exception:
+                        log.debug("judge.superseded_verdict_persist_failed", exc_info=True)
                 return
             try:
                 self.ui.on_intent_verdict(verdict.to_dict())  # type: ignore[attr-defined]

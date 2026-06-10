@@ -5,6 +5,7 @@ import contextlib
 import json
 import subprocess
 import time
+from types import SimpleNamespace
 from typing import Any
 from unittest.mock import MagicMock, patch
 
@@ -456,12 +457,15 @@ class TestTaskExec:
 
     def test_evaluate_intent_drops_superseded_generation_verdict(self, tmp_db, monkeypatch) -> None:
         """A prior turn's judge daemon (still running because
-        cancel_on_approval defaults False) must NOT deliver verdicts once a
-        newer turn has superseded it — otherwise a model that reuses a
-        call_id across turns could ride a stale ``approve`` into a wrongful
-        Smart Approval of a different call."""
+        cancel_on_approval defaults False) must NOT deliver verdicts to the
+        live surfaces once a newer turn has superseded it — otherwise a model
+        that reuses a call_id across turns could ride a stale ``approve``
+        into a wrongful Smart Approval of a different call.  The superseded
+        verdict is NOT lost, though: it routes to the persist-only audit
+        hook so ``intent_verdicts`` still records the judge's ruling."""
         session = _make_session()
         session.ui.on_intent_verdict = MagicMock()
+        session.ui.on_superseded_intent_verdict = MagicMock()
         fake_verdict = MagicMock()
         fake_verdict.to_dict.return_value = {"verdict_id": "v0", "call_id": "c1", "tier": "llm"}
         captured: list[Any] = []
@@ -476,13 +480,38 @@ class TestTaskExec:
         session._evaluate_intent([dict(item)])  # generation B supersedes A
         callback_a, callback_b = captured[0], captured[1]
 
-        # A's late verdict (the superseded daemon) is dropped.
+        # A's late verdict: withheld from the live surfaces, persisted for audit.
         callback_a(fake_verdict)
         session.ui.on_intent_verdict.assert_not_called()
+        session.ui.on_superseded_intent_verdict.assert_called_once_with(
+            {"verdict_id": "v0", "call_id": "c1", "tier": "llm"}
+        )
 
         # B's verdict (the current generation) is delivered normally.
         callback_b(fake_verdict)
         session.ui.on_intent_verdict.assert_called_once()
+        session.ui.on_superseded_intent_verdict.assert_called_once()  # unchanged
+
+    def test_superseded_verdict_skips_persist_on_display_only_ui(self, tmp_db, monkeypatch) -> None:
+        """Display-only UIs (CLI / eval) don't define the persist-only hook;
+        the superseded path must degrade to a plain drop, not raise."""
+        session = _make_session()
+        session.ui = SimpleNamespace(on_intent_verdict=MagicMock())  # no superseded hook
+        fake_verdict = MagicMock()
+        fake_verdict.to_dict.return_value = {"verdict_id": "v0", "call_id": "c1", "tier": "llm"}
+        captured: list[Any] = []
+        fake_judge = MagicMock()
+        fake_judge.evaluate.side_effect = lambda items, *_a, **kw: (
+            captured.append(kw.get("callback")) or [fake_verdict] * len(items)
+        )
+        monkeypatch.setattr(session, "_ensure_judge", lambda: fake_judge)
+
+        item = {"call_id": "c1", "func_name": "bash", "needs_approval": True, "command": "ls"}
+        session._evaluate_intent([dict(item)])  # generation A
+        session._evaluate_intent([dict(item)])  # generation B supersedes A
+
+        captured[0](fake_verdict)  # must not raise
+        session.ui.on_intent_verdict.assert_not_called()
 
 
 # ---------------------------------------------------------------------------

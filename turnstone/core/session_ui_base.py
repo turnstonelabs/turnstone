@@ -1387,6 +1387,34 @@ class SessionUIBase:
         if decision:
             self._persist_verdict_decisions([verdict], decision)
 
+    def on_superseded_intent_verdict(self, verdict: dict[str, Any]) -> None:
+        """Persist (audit-only) a verdict whose judge generation was superseded.
+
+        ``ChatSession._on_verdict`` routes here instead of
+        :meth:`on_intent_verdict` when a newer turn has replaced the
+        daemon's generation.  The live surfaces deliberately stay
+        untouched — no ``_llm_verdicts`` cache write, no SSE enqueue,
+        no ``_verdict_cond`` notify, no ``_pending_verdicts`` park —
+        because the verdict's call_id belongs to an already-resolved
+        batch, and a model that reuses call_ids across turns could
+        ride a stale cached ``approve`` into a wrongful Smart Approval
+        of a *different* call.  Dropping the verdict entirely (the
+        previous behavior) kept that safety property but left a
+        permanent hole in ``intent_verdicts``: the audit table said
+        "the judge never answered" for calls it actually ruled on.
+
+        ``user_decision`` is stamped ``"superseded"`` — no decision was
+        ever taken on THIS verdict; its call's gate resolved before the
+        judge finished.  The stamp only lands on fresh ``tier="llm"``
+        rows: a superseded *fallback* reuses its heuristic row's
+        verdict_id, and ``upsert_intent_verdict`` excludes
+        ``user_decision`` from the on-conflict SET, so the decision
+        already recorded on that row survives the tier upgrade.
+        """
+        row = dict(verdict)
+        row.setdefault("user_decision", "superseded")
+        self._persist_intent_verdict(row)
+
     def _record_judge_metric(self, verdict: dict[str, Any]) -> None:
         """Extension point for transport-specific Prometheus metrics.
 

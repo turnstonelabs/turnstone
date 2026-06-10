@@ -173,6 +173,35 @@ def test_on_intent_verdict_stamps_immediately_when_decision_already_set() -> Non
     storage.update_intent_verdict.assert_called_once_with("v-late", user_decision="approved")
 
 
+def test_on_superseded_intent_verdict_persists_without_live_surfaces() -> None:
+    """The persist-only audit hook for verdicts that landed after a newer
+    turn replaced their judge generation: the row reaches storage with
+    user_decision="superseded", but NONE of the live surfaces move — no
+    SSE event, no ``_llm_verdicts`` cache entry (Smart Approvals must
+    never see a stale call_id), no ``_pending_verdicts`` park (the next
+    ``resolve_approval`` must not stamp it with the wrong decision)."""
+    storage = MagicMock()
+    ui = _make_ui()
+    lq = ui._register_listener()
+    verdict = {
+        "verdict_id": "v-late",
+        "call_id": "c-late",
+        "func_name": "bash",
+        "risk_level": "low",
+        "tier": "llm",
+    }
+    with _patch_get_storage(storage):
+        ui.on_superseded_intent_verdict(verdict)
+    storage.upsert_intent_verdict.assert_called_once()
+    kwargs = storage.upsert_intent_verdict.call_args.kwargs
+    assert kwargs["verdict_id"] == "v-late"
+    assert kwargs["user_decision"] == "superseded"
+    assert lq.empty()  # no SSE delivery
+    assert "c-late" not in ui._llm_verdicts  # no replay-cache write
+    assert ui._pending_verdicts == []  # no decision-stamp park
+    assert "user_decision" not in verdict  # caller's dict not mutated
+
+
 def test_llm_verdict_cache_evicts_oldest_at_cap() -> None:
     """FIFO eviction at ``_LLM_VERDICT_CACHE_MAX`` prevents unbounded
     growth on a long-running session."""

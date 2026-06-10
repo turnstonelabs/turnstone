@@ -1676,6 +1676,11 @@ class StorageBackend(Protocol):
         ``"approved"`` / ``"denied"`` / ``"timeout"`` (user-driven) or
         ``"policy"`` / ``"blanket"`` / ``"auto_approve_tools"``
         (auto-approve reason, mirroring :class:`AutoApproveReason`).
+        Rows whose verdict landed only after a newer turn replaced the
+        judge generation are written directly with ``"superseded"`` —
+        no decision was ever taken on that verdict (its call's gate
+        resolved before the judge finished); see
+        ``SessionUIBase.on_superseded_intent_verdict``.
         """
         ...
 
