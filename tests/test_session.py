@@ -561,7 +561,7 @@ class TestTaskExec:
         item to completion so each call lands a real LLM verdict, exactly
         what the setting's help text promises.  An unconditional set in the
         gate's ``finally`` used to degrade every still-queued item to a
-        heuristic fallback row the instant the operator approved."""
+        llm_fallback row the instant the operator approved."""
         session = _make_session()
         event = self._drive_gate(session, monkeypatch, cancel_on_approval=False)
         assert event is not None

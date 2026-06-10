@@ -5277,7 +5277,8 @@ class ChatSession:
 
         Returns a cancel event that, when set, tells the daemon judge
         thread to abandon remaining work (each undone item degrades to
-        a heuristic fallback verdict).  ``_execute_tools`` fires it
+        an ``llm_fallback`` verdict carrying the heuristic content).
+        ``_execute_tools`` fires it
         unconditionally when the next batch supersedes this generation,
         ``close()`` fires it on session teardown, and the approval
         gate's ``finally`` fires it on decision only when
@@ -6096,7 +6097,8 @@ class ChatSession:
             # Gate resolution fires the judge's abort signal only when the
             # operator opted in: with ``judge.cancel_on_approval`` the daemon
             # stops spending inference the moment a decision lands (remaining
-            # items degrade to heuristic fallback verdicts).  With the
+            # items degrade to ``llm_fallback`` verdicts, heuristic
+            # content relabeled).  With the
             # default False the daemon runs every item to completion — the
             # contract the setting's help text promises — and late verdicts
             # stream + persist through ``_on_verdict``.  An unconditional

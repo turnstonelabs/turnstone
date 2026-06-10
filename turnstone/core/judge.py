@@ -95,7 +95,8 @@ class JudgeConfig:
     output_guard_llm_timeout: float = 30.0  # wall-clock budget for the LLM stage
     redact_secrets: bool = True
     # True = the approval gate's resolution aborts remaining evaluations
-    # (saves inference; undone items degrade to heuristic fallbacks).
+    # (saves inference; undone items degrade to ``llm_fallback`` verdicts
+    # carrying the heuristic content).
     # False (default) = the daemon runs every item to completion; only a
     # generation supersede (next batch) or session close aborts it.
     cancel_on_approval: bool = False
@@ -989,8 +990,9 @@ class IntentJudge:
             messages: Conversation history (OpenAI message format).
             callback: Called with each LLM verdict (or timeout/error fallback).
             cancel_event: Unconditional abort signal — when set, the
-                daemon abandons remaining work and delivers heuristic
-                fallback verdicts for every undone item.  The caller
+                daemon abandons remaining work and delivers
+                ``llm_fallback`` verdicts (heuristic-derived) for every
+                undone item.  The caller
                 owns the firing policy: ChatSession fires it when a
                 newer batch supersedes this generation, on session
                 close, and — only when ``cancel_on_approval`` is
@@ -1039,8 +1041,9 @@ class IntentJudge:
         """Daemon thread: run LLM judge for each item and invoke callback.
 
         ``cancel_event`` is an unconditional abort signal: once it fires,
-        in-flight work stops and every remaining item is delivered as a
-        heuristic fallback verdict (each call still gets exactly one
+        in-flight work stops and every remaining item is delivered as an
+        ``llm_fallback`` verdict — the heuristic verdict's content,
+        relabeled (each call still gets exactly one
         verdict — Smart Approvals and the advisory UI both rely on the
         full set arriving).  Which actor fires the event is the CALLER's
         policy, not this loop's: ChatSession fires it at approval
@@ -1145,7 +1148,7 @@ class IntentJudge:
         callback: Callable[[IntentVerdict], None],
         reason: str,
     ) -> None:
-        """Deliver heuristic fallback verdicts for items the judge didn't complete."""
+        """Deliver ``llm_fallback`` verdicts (heuristic content) for items the judge didn't complete."""
         for _item, h_verdict in zip(remaining_items, remaining_verdicts, strict=True):
             fallback = IntentVerdict(
                 verdict_id=h_verdict.verdict_id,

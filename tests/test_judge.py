@@ -312,7 +312,7 @@ def _wait_for(results: list[IntentVerdict], count: int, timeout: float = 5.0) ->
 class TestCancelEventSemantics:
     """The cancel event is an unconditional abort signal at the judge
     layer: once it fires, no further inference is spent and every undone
-    item degrades to a heuristic fallback verdict.  WHO fires it is
+    item degrades to an ``llm_fallback`` verdict (heuristic-derived).  WHO fires it is
     ChatSession policy (always on generation supersede / close; on
     approval resolution only when ``cancel_on_approval`` is enabled) —
     this loop must not second-guess the signal against its own config,
