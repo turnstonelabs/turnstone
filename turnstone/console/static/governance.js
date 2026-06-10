@@ -17,8 +17,6 @@ let _skillDiscoverQuery = "";
 let _pendingResources = [];
 
 // Trap handler refs for modals
-let _cpTrapHandler = null; // create policy
-let _epTrapHandler = null; // edit policy
 let _ctmTrapHandler = null; // create template
 let _etmTrapHandler = null; // edit template
 
