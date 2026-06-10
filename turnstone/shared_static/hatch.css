@@ -101,7 +101,7 @@
   border-left: 1px solid var(--hair-2);
   box-shadow:
     -24px 0 48px -12px rgba(0, 0, 0, 0.5),
-    0 0 80px -20px var(--accent-dim);
+    0 0 80px -20px var(--hatch-accent-dim);
 }
 .hatch--shelf.hatch--lg {
   width: min(680px, 100%);
@@ -172,12 +172,12 @@
   box-shadow:
     0 0 0 1px rgba(255, 255, 255, 0.03),
     0 24px 48px -12px rgba(0, 0, 0, 0.5),
-    0 0 80px -20px var(--accent-dim);
+    0 0 80px -20px var(--hatch-accent-dim);
 }
 [data-theme="light"] .hatch--dialog {
   box-shadow:
     0 24px 48px -12px rgba(15, 23, 42, 0.25),
-    0 0 80px -20px var(--accent-dim);
+    0 0 80px -20px var(--hatch-accent-dim);
 }
 .hatch--dialog::backdrop {
   background: radial-gradient(
@@ -219,18 +219,22 @@
 .hatch {
   --hatch-accent: var(--accent);
   --hatch-accent-glow: var(--accent-glow-strong);
+  --hatch-accent-dim: var(--accent-dim);
 }
 .hatch[data-kind="danger"] {
   --hatch-accent: var(--red);
   --hatch-accent-glow: var(--red-glow);
+  --hatch-accent-dim: color-mix(in srgb, var(--red) 15%, transparent);
 }
 .hatch[data-kind="success"] {
   --hatch-accent: var(--green);
   --hatch-accent-glow: var(--green-glow);
+  --hatch-accent-dim: color-mix(in srgb, var(--green) 15%, transparent);
 }
 .hatch[data-kind="inspect"] {
   --hatch-accent: var(--cyan);
   --hatch-accent-glow: var(--cyan-glow);
+  --hatch-accent-dim: color-mix(in srgb, var(--cyan) 15%, transparent);
 }
 
 /* ---- head: machined strip ------------------------------------------------ */
@@ -418,7 +422,7 @@
   opacity: 0.65;
 }
 [data-theme="light"] .label-hint {
-  opacity: 0.85;
+  opacity: 1;
 }
 .sh-body input:not([type="checkbox"]):not([type="radio"]),
 .sh-body select,
@@ -656,7 +660,7 @@
 .sh-btn--quiet {
   background: none;
   border-color: transparent;
-  color: var(--ink-3);
+  color: var(--ink-2);
 }
 .sh-btn--quiet:hover {
   background: color-mix(in srgb, var(--ink) 7%, transparent);
@@ -830,9 +834,6 @@
   font-size: 10px;
 }
 .autofill .src {
-  color: var(--ink-4);
-}
-[data-theme="light"] .autofill .src {
   color: var(--ink-3);
 }
 .autofill .mono {
@@ -918,11 +919,8 @@
 }
 .match-strip .match-count {
   font-size: 11px;
-  color: var(--ink-4);
-  margin-right: 2px;
-}
-[data-theme="light"] .match-strip .match-count {
   color: var(--ink-3);
+  margin-right: 2px;
 }
 .match-strip .match-count b {
   color: var(--green);
@@ -949,14 +947,11 @@ details.rawhatch summary {
   padding: 8px 12px;
   font-family: var(--font-ui);
   font-size: 11px;
-  color: var(--ink-4);
+  color: var(--ink-3);
   text-transform: uppercase;
   letter-spacing: 0.08em;
   font-weight: 600;
   user-select: none;
-}
-[data-theme="light"] details.rawhatch summary {
-  color: var(--ink-3);
 }
 details.rawhatch summary:hover {
   color: var(--ink-2);

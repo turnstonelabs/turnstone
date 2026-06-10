@@ -1093,6 +1093,11 @@ label.toggle-switch.toggle--flush {
   background: var(--bg);
   margin-top: 8px;
 }
+/* Doubled with .sh-body so the cards survive the label micro-cadence
+   (.sh-body label in the later-loaded hatch.css ties bare .segmented-option
+   at 0,1,1 and strips the flex layout — the indicator collapses onto the
+   first letters and unselected rows lose their dot entirely). */
+.sh-body label.segmented-option,
 .segmented-option {
   display: flex;
   align-items: center;
@@ -1183,8 +1188,10 @@ label.toggle-switch.toggle--flush {
   color: var(--accent);
 }
 
-/* Narrow viewport: the MCP-detail two-column read-out stacks. */
-@media (max-width: 700px) {
+/* Narrow PANE: the MCP-detail two-column read-out stacks (container query —
+   a tight split is narrow on a wide viewport, same rule as the shelf's
+   sheet mode). */
+@container pane (max-width: 700px) {
   .modal-columns {
     grid-template-columns: 1fr;
     gap: 20px 0;
@@ -1312,6 +1319,13 @@ label.toggle-switch.toggle--flush {
   padding-left: 22px;
   display: flex;
   flex-direction: column;
+  /* The body is the scroll container; pinning the content column keeps the
+     SKILL.md pane visible while the (taller) meta column scrolls — the whole
+     point of the two-column split. */
+  position: sticky;
+  top: 0;
+  align-self: start;
+  max-height: 100%;
 }
 
 .skill-spec-section {
@@ -1396,6 +1410,17 @@ h3.skill-spec-heading {
   min-width: 0;
 }
 
+/* Light theme: the off-state track's --bg fill is the same near-white as
+   the panel (~1.2:1) — give it real ink so on/off reads without hunting the
+   thumb. Dark keeps the recessed --bg + inset ring (visible there). */
+[data-theme="light"] .toggle-switch .toggle-track {
+  background: color-mix(in srgb, var(--ink) 18%, transparent);
+  box-shadow: none;
+}
+[data-theme="light"] .toggle-switch input:checked + .toggle-track {
+  background: var(--accent);
+}
+
 /* Origin badge — provenance chip in the skill shelf's foot meta lane
    (installed/customized skills). Sized to the 11px foot strip. */
 .skill-origin-badge {
@@ -1408,8 +1433,8 @@ h3.skill-spec-heading {
   text-transform: uppercase;
   letter-spacing: 0.1em;
   color: var(--cyan);
-  background: rgba(103, 232, 249, 0.07);
-  border: 1px solid rgba(103, 232, 249, 0.18);
+  background: color-mix(in srgb, var(--cyan) 15%, transparent);
+  border: 1px solid color-mix(in srgb, var(--cyan) 35%, transparent);
   border-radius: var(--radius-sm);
   padding: 2px 7px;
   max-width: 100%;

@@ -734,6 +734,10 @@ function hideUserRolesModal() {
 
 function submitUserRoles() {
   const userId = document.getElementById("ur-user-id").value;
+  window.TurnstoneHatch.setBusy(
+    document.getElementById("user-roles-shelf"),
+    true,
+  );
   const boxes = document.querySelectorAll('input[name="ur-role"]');
   const selected = [];
   for (let i = 0; i < boxes.length; i++) {
@@ -776,11 +780,22 @@ function submitUserRoles() {
       return Promise.all(promises);
     })
     .then(function () {
+      window.TurnstoneHatch.setBusy(
+        document.getElementById("user-roles-shelf"),
+        false,
+      );
       hideUserRolesModal();
       showToast("Roles updated");
     })
     .catch(function () {
-      showToast("Failed to update roles");
+      window.TurnstoneHatch.setBusy(
+        document.getElementById("user-roles-shelf"),
+        false,
+      );
+      _showModalError(
+        document.getElementById("user-roles-shelf-error"),
+        "Failed to update roles",
+      );
     });
 }
 

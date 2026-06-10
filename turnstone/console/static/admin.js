@@ -3519,6 +3519,10 @@ function _resetSetting(key) {
 function _showModalError(el, msg) {
   el.textContent = msg;
   el.classList.add("is-visible");
+  // The alert sits at the top of the scrollable body; the submit button in
+  // the sticky foot. At scroll-bottom a failed submit would otherwise paint
+  // nothing in view.
+  if (el.scrollIntoView) el.scrollIntoView({ block: "nearest" });
 }
 
 /* ── MCP Servers tab ─────────────────────────────────────────────────────── */

@@ -52,10 +52,23 @@ def test_shelf_escape_defers_to_a_modal_above() -> None:
 
 def test_busy_lock_refuses_dismissal() -> None:
     """While a submit is in flight (data-busy) the container must hold:
-    Escape, scrim clicks, and [data-close] are all refused."""
+    Escape, scrim clicks, [data-close], keyboard re-submit, and the dialog
+    tier's native cancel are ALL refused."""
     body = _HATCH_JS.read_text(encoding="utf-8")
     assert 'top.hasAttribute("data-busy")' in body, "Escape must check busy"
     assert 'dlg.hasAttribute("data-busy")' in body, "data-close must check busy"
+    # Scrim click mid-flight must not close the shelf.
+    scrim_handler = body.split('scrim.addEventListener("click"', 1)[1].split("});", 1)[0]
+    assert 'hasAttribute("data-busy")' in scrim_handler, (
+        "the scrim click handler must hold the door while busy"
+    )
+    # Enter on the focused primary dispatches a click — a capture-phase guard
+    # must swallow it before surface submit handlers re-fire the request.
+    assert "{ capture: true }" in body, "busy needs the capture-phase guard"
+    # The dialog tier's native Escape arrives as `cancel`.
+    assert 'addEventListener("cancel"' in body, "openDialog must intercept cancel while busy"
+    # Busy is announced, not just painted.
+    assert 'setAttribute("aria-busy", "true")' in body
 
 
 def test_window_bridge_for_classic_scripts() -> None:

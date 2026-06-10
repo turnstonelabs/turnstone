@@ -52,6 +52,7 @@ function _scrimFor(host) {
     scrim.hidden = true;
     scrim.addEventListener("click", () => {
       for (const [dlg] of _shelfState) {
+        if (dlg.hasAttribute("data-busy")) continue; // submit in flight
         if (_hostOf(dlg) === host) closeShelf(dlg);
       }
     });
@@ -75,6 +76,27 @@ function _onEscape(e) {
 function _wireCloseDelegation(dlg, isShelf) {
   if (dlg._hatchWired) return;
   dlg._hatchWired = true;
+  // Busy is a HARD lock. pointer-events:none only stops the mouse — Enter on
+  // the still-focused primary dispatches a synthetic click that would reach
+  // the surface's submit handler and double-fire the request. Swallow every
+  // non-[data-close] activation at capture before surface listeners see it
+  // (and [data-close] is refused below anyway).
+  dlg.addEventListener(
+    "click",
+    (e) => {
+      if (dlg.hasAttribute("data-busy")) {
+        e.stopPropagation();
+        e.preventDefault();
+      }
+    },
+    { capture: true },
+  );
+  // The dialog tier's native Escape arrives as `cancel` — hold that door too.
+  if (!isShelf) {
+    dlg.addEventListener("cancel", (e) => {
+      if (dlg.hasAttribute("data-busy")) e.preventDefault();
+    });
+  }
   dlg.addEventListener("click", (e) => {
     if (dlg.hasAttribute("data-busy")) return;
     if (e.target.closest("[data-close]")) {
@@ -190,8 +212,13 @@ export function openDialog(dlg, opts) {
 
 /** Busy lock: LED pulses, actions lock, Escape/scrim/[data-close] refused. */
 export function setBusy(dlg, busy) {
-  if (busy) dlg.setAttribute("data-busy", "");
-  else dlg.removeAttribute("data-busy");
+  if (busy) {
+    dlg.setAttribute("data-busy", "");
+    dlg.setAttribute("aria-busy", "true");
+  } else {
+    dlg.removeAttribute("data-busy");
+    dlg.removeAttribute("aria-busy");
+  }
 }
 
 /* Transitional bridge for the classic admin/governance scripts (the

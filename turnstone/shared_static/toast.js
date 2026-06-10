@@ -21,11 +21,33 @@ function _displayToast(el, message, type) {
   el.textContent = message;
   el.classList.remove("toast-error");
   if (type === "error") el.classList.add("toast-error");
+  // A document-modal <dialog> owns the top layer, which stacks above every
+  // z-index — a toast fired while one is open (e.g. "Token copied" over the
+  // token-created dialog) would render underneath. Promote to a manual
+  // popover ONLY for that case: popovers join the top layer above the open
+  // dialog, while the everyday path keeps the fade transition (a persistent
+  // popover attribute would impose UA display:none and kill it).
+  if ("showPopover" in el && document.querySelector("dialog:modal")) {
+    el.popover = "manual";
+    try {
+      el.showPopover();
+    } catch (e) {
+      /* already showing */
+    }
+  }
   el.classList.add("show");
   _toastShowing = true;
   if (_toastTimer) clearTimeout(_toastTimer);
   _toastTimer = setTimeout(function () {
     el.classList.remove("show");
+    if (el.popover) {
+      try {
+        el.hidePopover();
+      } catch (e) {
+        /* already hidden */
+      }
+      el.popover = null; // restore the classic fade path
+    }
     _toastShowing = false;
     _toastTimer = null;
     if (_toastQueue.length) {
