@@ -2594,6 +2594,10 @@ document.addEventListener("keydown", function (e) {
   const openHelp = document.querySelector('.settings-help-popover[style=""]');
   if (openHelp) {
     e.preventDefault();
+    // Layered dismissal: a popover inside an open shelf consumes this
+    // Escape entirely — hatch.js's document listener (registered later, on
+    // first openShelf) must not also close the shelf underneath it.
+    e.stopImmediatePropagation();
     _closeAllSettingsHelp();
   }
 });
