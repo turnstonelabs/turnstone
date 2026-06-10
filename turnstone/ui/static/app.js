@@ -160,7 +160,6 @@ window.onThemeChange = function (next) {
 //  9. New workstream modal
 // ===========================================================================
 
-let _newWsTrapHandler = null;
 let _forkFromWsId = "";
 
 // Staged files for the new-workstream modal.  Distinct from the pane's
@@ -266,35 +265,46 @@ function _isAttachmentAllowed(file) {
   return false;
 }
 
+// In-dialog error strip (sh-alert).  Empty message clears + hides; a set
+// message also scrolls into view — the alert sits at the top of the
+// scrollable body while the submit lives in the pinned foot.
+function _newWsError(msg) {
+  const el = document.getElementById("new-ws-error");
+  el.textContent = msg || "";
+  if (msg) {
+    el.classList.add("is-visible");
+    if (el.scrollIntoView) el.scrollIntoView({ block: "nearest" });
+  } else {
+    el.classList.remove("is-visible");
+  }
+}
+
 function _newWsAddFiles(files) {
-  const errEl = document.getElementById("new-ws-error");
   for (let i = 0; i < files.length; i++) {
     const f = files[i];
     if (_newWsStagedFiles.length >= _NEW_WS_MAX_FILES) {
-      errEl.textContent =
-        "At most " + _NEW_WS_MAX_FILES + " attachments per workstream";
-      errEl.style.display = "block";
+      _newWsError(
+        "At most " + _NEW_WS_MAX_FILES + " attachments per workstream",
+      );
       return;
     }
     if (!_isAttachmentAllowed(f)) {
-      errEl.textContent =
+      _newWsError(
         "Unsupported file type: " +
-        f.name +
-        " (allowed: png/jpeg/gif/webp images, text)";
-      errEl.style.display = "block";
+          f.name +
+          " (allowed: png/jpeg/gif/webp images, text)",
+      );
       return;
     }
     const isImage = (f.type || "").indexOf("image/") === 0;
     const cap = isImage ? _NEW_WS_IMAGE_CAP : _NEW_WS_TEXT_CAP;
     if (f.size > cap) {
-      errEl.textContent =
-        f.name + " exceeds the " + _formatAttachSize(cap) + " cap";
-      errEl.style.display = "block";
+      _newWsError(f.name + " exceeds the " + _formatAttachSize(cap) + " cap");
       return;
     }
     _newWsStagedFiles.push(f);
   }
-  errEl.style.display = "none";
+  _newWsError("");
   _newWsRenderChips();
 }
 
@@ -304,35 +314,27 @@ function newWorkstream() {
 
 function showNewWsModal(forkFromWsId) {
   _forkFromWsId = forkFromWsId || "";
-  const overlay = document.getElementById("new-ws-overlay");
-  overlay.style.display = "flex";
-  document.body.style.overflow = "hidden";
+  const dlg = document.getElementById("new-ws-dialog");
 
-  // Update title and button text based on mode
+  // Update title, plate and button text based on mode
   const titleEl = document.getElementById("new-ws-title");
+  const tagEl = document.getElementById("new-ws-tag");
   const submitBtn = document.getElementById("new-ws-submit");
   if (_forkFromWsId) {
-    titleEl.textContent = "Fork Workstream";
+    titleEl.textContent = "Fork workstream";
+    tagEl.textContent = "WS-FORK";
     submitBtn.textContent = "Fork";
   } else {
-    titleEl.textContent = "New Workstream";
+    titleEl.textContent = "New workstream";
+    tagEl.textContent = "WS-NEW";
     submitBtn.textContent = "Create";
   }
 
   // Hide skill dropdown when forking (not relevant — fork copies history)
   const skillLabel = document.querySelector('label[for="new-ws-skill"]');
   const skillSelect = document.getElementById("new-ws-skill");
-  if (_forkFromWsId) {
-    if (skillLabel) skillLabel.style.display = "none";
-    if (skillSelect) skillSelect.style.display = "none";
-  } else {
-    if (skillLabel) skillLabel.style.display = "";
-    if (skillSelect) skillSelect.style.display = "";
-  }
-
-  overlay.onclick = function (e) {
-    if (e.target === overlay) hideNewWsModal();
-  };
+  if (skillLabel) skillLabel.hidden = !!_forkFromWsId;
+  if (skillSelect) skillSelect.hidden = !!_forkFromWsId;
 
   // Populate model dropdown
   const modelSelect = document.getElementById("new-ws-model");
@@ -399,10 +401,7 @@ function showNewWsModal(forkFromWsId) {
   document.getElementById("new-ws-name").value = "";
   const initEl = document.getElementById("new-ws-initial-message");
   if (initEl) initEl.value = "";
-  const errEl = document.getElementById("new-ws-error");
-  errEl.style.display = "none";
-  errEl.textContent = "";
-  submitBtn.disabled = false;
+  _newWsError("");
 
   // Reset attachment staging.  Forks don't carry attachments —
   // disable the attach UI in that case (the fork inherits its
@@ -411,7 +410,7 @@ function showNewWsModal(forkFromWsId) {
   const attachRow = document.getElementById("new-ws-attach-row");
   const attachInput = document.getElementById("new-ws-attach-input");
   const attachBtn = document.getElementById("new-ws-attach-btn");
-  if (attachRow) attachRow.style.display = _forkFromWsId ? "none" : "";
+  if (attachRow) attachRow.hidden = !!_forkFromWsId;
   if (attachInput) attachInput.value = "";
   _newWsRenderChips();
   if (attachBtn && attachInput) {
@@ -426,71 +425,21 @@ function showNewWsModal(forkFromWsId) {
     };
   }
 
-  document.getElementById("new-ws-cancel").onclick = hideNewWsModal;
   submitBtn.onclick = submitNewWs;
-
-  _newWsTrapHandler = function (e) {
-    if (e.key === "Escape") {
-      e.preventDefault();
-      hideNewWsModal();
-      return;
-    }
-    if (
-      e.key === "Enter" &&
-      e.target.tagName !== "TEXTAREA" &&
-      e.target.tagName !== "SELECT"
-    ) {
-      e.preventDefault();
-      submitNewWs();
-      return;
-    }
-    if (e.key !== "Tab") return;
-    const box = document.getElementById("new-ws-box");
-    const focusable = box.querySelectorAll(
-      'input, select, button, [tabindex]:not([tabindex="-1"])',
-    );
-    if (!focusable.length) return;
-    const first = focusable[0],
-      last = focusable[focusable.length - 1];
-    if (e.shiftKey) {
-      if (document.activeElement === first) {
-        e.preventDefault();
-        last.focus();
-      }
-    } else {
-      if (document.activeElement === last) {
-        e.preventDefault();
-        first.focus();
-      }
-    }
-  };
-  document.addEventListener("keydown", _newWsTrapHandler);
-  setTimeout(function () {
-    document.getElementById("new-ws-name").focus();
-  }, 50);
+  window.TurnstoneHatch.openDialog(dlg, {
+    onClose: function () {
+      _forkFromWsId = "";
+    },
+  });
 }
 
 function hideNewWsModal() {
-  _forkFromWsId = "";
-  document.getElementById("new-ws-overlay").style.display = "none";
-  document.body.style.overflow = "";
-  if (_newWsTrapHandler) {
-    document.removeEventListener("keydown", _newWsTrapHandler);
-    _newWsTrapHandler = null;
-  }
-  // Hand focus back to the shell's [+] new-session affordance.  The old
-  // #new-tab-btn went with the retired split-pane tab bar — the unguarded
-  // lookup threw on every modal close after that.
-  const back = document.querySelector(".tab-add");
-  if (back) back.focus();
+  const d = document.getElementById("new-ws-dialog");
+  if (d.open) d.close();
 }
 
 function submitNewWs() {
-  const submitBtn = document.getElementById("new-ws-submit");
-  if (submitBtn.disabled) return;
-  submitBtn.disabled = true;
-  submitBtn.textContent = _forkFromWsId ? "Forking\u2026" : "Creating\u2026";
-
+  const dlg = document.getElementById("new-ws-dialog");
   const body = {};
   const name = document.getElementById("new-ws-name").value.trim();
   const model = document.getElementById("new-ws-model").value.trim();
@@ -507,8 +456,8 @@ function submitNewWs() {
   if (_forkFromWsId) body.resume_ws = _forkFromWsId;
   if (initial_message) body.initial_message = initial_message;
 
-  const errEl = document.getElementById("new-ws-error");
-  errEl.style.display = "none";
+  _newWsError("");
+  window.TurnstoneHatch.setBusy(dlg, true);
 
   let fetchOpts;
   const staged = _forkFromWsId ? [] : _newWsStagedFiles.slice();
@@ -533,11 +482,9 @@ function submitNewWs() {
       return r.json();
     })
     .then(function (data) {
+      window.TurnstoneHatch.setBusy(dlg, false);
       if (data.error) {
-        errEl.textContent = data.error;
-        errEl.style.display = "block";
-        submitBtn.disabled = false;
-        submitBtn.textContent = _forkFromWsId ? "Fork" : "Create";
+        _newWsError(data.error);
         return;
       }
       if (data.ws_id) {
@@ -548,12 +495,12 @@ function submitNewWs() {
       }
     })
     .catch(function () {
-      errEl.textContent = _forkFromWsId
-        ? "Failed to fork workstream"
-        : "Failed to create workstream";
-      errEl.style.display = "block";
-      submitBtn.disabled = false;
-      submitBtn.textContent = _forkFromWsId ? "Fork" : "Create";
+      window.TurnstoneHatch.setBusy(dlg, false);
+      _newWsError(
+        _forkFromWsId
+          ? "Failed to fork workstream"
+          : "Failed to create workstream",
+      );
     });
 }
 
@@ -799,43 +746,43 @@ let _wsTable = null;
 // deferred ES module now, so its bridged globals (SavedColumns,
 // createSavedTable) don't exist yet while this classic file parses.
 function _initSavedWsTable() {
-const WS_COLUMNS = [
-  SavedColumns.name(),
-  SavedColumns.model(),
-  SavedColumns.count("message_count", "MSGS"),
-  SavedColumns.ctx(),
-  SavedColumns.last(),
-  SavedColumns.id(),
-];
-_wsTable = createSavedTable({
-  headerEl: document.getElementById("ws-saved-colheaders"),
-  bodyEl: document.getElementById("dashboard-saved-cards"),
-  filterEl: document.getElementById("ws-filter"),
-  footerEl: document.getElementById("ws-saved-footer"),
-  paginationEl: document.getElementById("ws-pagination"),
-  columns: WS_COLUMNS,
-  noun: "workstream",
-  emptyText: "No saved workstreams",
-  activateLabel: function (s) {
-    return "Resume: " + (s.alias || s.title || s.ws_id);
-  },
-  onActivate: function (s) {
-    dashboardResumeSession(s.ws_id);
-  },
-  delete: {
-    idPrefix: "ws-delete",
-    buttonId: "ws-delete-btn",
-    buildDeleteRequest: function (wsId) {
-      return {
-        url: "/v1/api/workstreams/" + encodeURIComponent(wsId) + "/delete",
-        options: { method: "POST" },
-      };
+  const WS_COLUMNS = [
+    SavedColumns.name(),
+    SavedColumns.model(),
+    SavedColumns.count("message_count", "MSGS"),
+    SavedColumns.ctx(),
+    SavedColumns.last(),
+    SavedColumns.id(),
+  ];
+  _wsTable = createSavedTable({
+    headerEl: document.getElementById("ws-saved-colheaders"),
+    bodyEl: document.getElementById("dashboard-saved-cards"),
+    filterEl: document.getElementById("ws-filter"),
+    footerEl: document.getElementById("ws-saved-footer"),
+    paginationEl: document.getElementById("ws-pagination"),
+    columns: WS_COLUMNS,
+    noun: "workstream",
+    emptyText: "No saved workstreams",
+    activateLabel: function (s) {
+      return "Resume: " + (s.alias || s.title || s.ws_id);
     },
-    onClose: function () {
-      loadDashboard();
+    onActivate: function (s) {
+      dashboardResumeSession(s.ws_id);
     },
-  },
-});
+    delete: {
+      idPrefix: "ws-delete",
+      buttonId: "ws-delete-btn",
+      buildDeleteRequest: function (wsId) {
+        return {
+          url: "/v1/api/workstreams/" + encodeURIComponent(wsId) + "/delete",
+          options: { method: "POST" },
+        };
+      },
+      onClose: function () {
+        loadDashboard();
+      },
+    },
+  });
 }
 
 // HTML inline-onclick wrappers — keep the global names the existing markup
@@ -885,63 +832,40 @@ function refreshWorkstreamTitle(optWsId) {
     });
 }
 
-let _editTitleTrap = null;
-
 function editWorkstreamTitle(optWsId) {
   const wsId = optWsId || getCurrentWsId();
   if (!wsId) return;
   const ws = workstreams[wsId];
   const currentTitle = ws && ws.name ? ws.name : "";
 
-  const overlay = document.getElementById("edit-title-overlay");
+  const dlg = document.getElementById("edit-title-dialog");
   const input = document.getElementById("edit-title-input");
   input.value = currentTitle;
-  overlay.style.display = "flex";
-  overlay.onclick = function (e) {
-    if (e.target === overlay) cancelEditTitle();
-  };
-
-  // Focus trap + Escape
-  if (_editTitleTrap) document.removeEventListener("keydown", _editTitleTrap);
-  _editTitleTrap = function (e) {
-    if (e.key === "Escape") {
+  // A rename is a styled prompt(): Enter submits.  Escape is the native
+  // dialog cancel; hatch.js owns the trap and the data-close buttons.
+  input.onkeydown = function (e) {
+    if (e.key === "Enter") {
       e.preventDefault();
-      cancelEditTitle();
-      return;
-    }
-    if (e.key === "Tab") {
-      const box = document.getElementById("edit-title-box");
-      const focusable = box.querySelectorAll("input, button");
-      const first = focusable[0];
-      const last = focusable[focusable.length - 1];
-      if (e.shiftKey && document.activeElement === first) {
-        e.preventDefault();
-        last.focus();
-      } else if (!e.shiftKey && document.activeElement === last) {
-        e.preventDefault();
-        first.focus();
-      }
+      submitEditTitle();
     }
   };
-  document.addEventListener("keydown", _editTitleTrap);
-
-  setTimeout(function () {
-    input.focus();
-    input.select();
-  }, 50);
+  document.getElementById("edit-title-save").onclick = submitEditTitle;
+  window.TurnstoneHatch.openDialog(dlg);
+  input.select();
 }
 
 function cancelEditTitle() {
-  document.getElementById("edit-title-overlay").style.display = "none";
-  if (_editTitleTrap) {
-    document.removeEventListener("keydown", _editTitleTrap);
-    _editTitleTrap = null;
-  }
+  const d = document.getElementById("edit-title-dialog");
+  if (d.open) d.close();
 }
 
 function submitEditTitle() {
   const wsId = getCurrentWsId();
   if (!wsId) return;
+  const dlg = document.getElementById("edit-title-dialog");
+  // Enter arrives straight from the input's keydown — the busy capture
+  // guard only swallows clicks, so re-submits are refused here.
+  if (dlg.hasAttribute("data-busy")) return;
   const input = document.getElementById("edit-title-input");
   const newTitle = input.value.trim();
   if (!newTitle) {
@@ -951,6 +875,7 @@ function submitEditTitle() {
 
   const url = "/v1/api/workstreams/" + encodeURIComponent(wsId) + "/title";
 
+  window.TurnstoneHatch.setBusy(dlg, true);
   authFetch(url, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -961,6 +886,7 @@ function submitEditTitle() {
       return r.json();
     })
     .then(function (data) {
+      window.TurnstoneHatch.setBusy(dlg, false);
       cancelEditTitle();
       // Optimistic update — SSE ws_rename will confirm
       const nameEls = document.querySelectorAll(
@@ -973,6 +899,7 @@ function submitEditTitle() {
       showToast("Title updated", "success");
     })
     .catch(function (err) {
+      window.TurnstoneHatch.setBusy(dlg, false);
       showToast(err.message || "Failed to set title", "error");
     });
 }
@@ -980,7 +907,6 @@ function submitEditTitle() {
 // --- Workstream deletion ---
 
 let _pendingDeleteWsId = null;
-let _deleteWsTrap = null;
 
 function confirmDeleteWorkstream(optWsId) {
   const wsId = optWsId || getCurrentWsId();
@@ -990,46 +916,24 @@ function confirmDeleteWorkstream(optWsId) {
   const name = ws && ws.name ? ws.name : wsId.substring(0, 12);
 
   _pendingDeleteWsId = wsId;
-  const overlay = document.getElementById("delete-ws-overlay");
-  const msg = document.getElementById("delete-ws-message");
-  msg.textContent = 'Delete "' + name + '"? This cannot be undone.';
-  overlay.style.display = "flex";
-
-  // Focus trap + Escape
-  if (_deleteWsTrap) document.removeEventListener("keydown", _deleteWsTrap);
-  _deleteWsTrap = function (e) {
-    if (e.key === "Escape") {
-      e.preventDefault();
-      cancelDeleteWs();
-      return;
-    }
-    if (e.key === "Tab") {
-      const box = document.getElementById("delete-ws-box");
-      const focusable = box.querySelectorAll("button");
-      const first = focusable[0];
-      const last = focusable[focusable.length - 1];
-      if (e.shiftKey && document.activeElement === first) {
-        e.preventDefault();
-        last.focus();
-      } else if (!e.shiftKey && document.activeElement === last) {
-        e.preventDefault();
-        first.focus();
-      }
-    }
-  };
-  document.addEventListener("keydown", _deleteWsTrap);
-
-  const cancelBtn = overlay.querySelector("button");
-  if (cancelBtn) cancelBtn.focus();
+  document.getElementById("delete-ws-message").textContent =
+    'Delete "' + name + '"? This cannot be undone.';
+  document.getElementById("delete-ws-confirm").onclick = executeDeleteWs;
+  // Cancel carries the autofocus — Enter on a freshly-opened destructive
+  // confirm must not fire the action (the console confirm-dialog rule).
+  window.TurnstoneHatch.openDialog(
+    document.getElementById("delete-ws-dialog"),
+    {
+      onClose: function () {
+        _pendingDeleteWsId = null;
+      },
+    },
+  );
 }
 
 function cancelDeleteWs() {
-  _pendingDeleteWsId = null;
-  document.getElementById("delete-ws-overlay").style.display = "none";
-  if (_deleteWsTrap) {
-    document.removeEventListener("keydown", _deleteWsTrap);
-    _deleteWsTrap = null;
-  }
+  const d = document.getElementById("delete-ws-dialog");
+  if (d.open) d.close();
 }
 
 function executeDeleteWs() {
@@ -1891,7 +1795,6 @@ function _announce(text) {
 
 let _pendingRevokeServer = null;
 let _settingsTrap = null;
-let _revokeMcpTrap = null;
 let _settingsReturnFocus = null;
 
 function openSettingsPanel() {
@@ -1909,8 +1812,8 @@ function closeSettingsPanel() {
   // Escape-key path inside the parent's keydown trap defers to the
   // inner trap; this branch is the close-button path that doesn't go
   // through that trap.
-  const inner = document.getElementById("revoke-mcp-overlay");
-  if (inner && inner.style.display !== "none") {
+  const inner = document.getElementById("revoke-mcp-dialog");
+  if (inner && inner.open) {
     cancelRevokeMcp();
   }
   if (_settingsTrap) {
@@ -2042,54 +1945,27 @@ function promptRevokeMcp(server) {
   if (!server) return;
   _pendingRevokeServer = server;
   const msg = document.getElementById("revoke-mcp-message");
-  const overlay = document.getElementById("revoke-mcp-overlay");
   if (msg) {
     msg.textContent =
       "Disconnect " +
       server +
       "? Tools that need this server will require re-consent.";
   }
-  if (overlay) overlay.style.display = "flex";
-
-  if (_revokeMcpTrap) document.removeEventListener("keydown", _revokeMcpTrap);
-  _revokeMcpTrap = function (e) {
-    if (e.key === "Escape") {
-      e.preventDefault();
-      cancelRevokeMcp();
-      return;
-    }
-    if (e.key === "Tab") {
-      const box = document.getElementById("revoke-mcp-box");
-      if (!box) return;
-      const focusable = box.querySelectorAll("button");
-      if (!focusable.length) return;
-      const first = focusable[0];
-      const last = focusable[focusable.length - 1];
-      if (e.shiftKey && document.activeElement === first) {
-        e.preventDefault();
-        last.focus();
-      } else if (!e.shiftKey && document.activeElement === last) {
-        e.preventDefault();
-        first.focus();
-      }
-    }
-  };
-  document.addEventListener("keydown", _revokeMcpTrap);
-
-  const cancelBtn = overlay
-    ? overlay.querySelector("button:not(.danger)")
-    : null;
-  if (cancelBtn) cancelBtn.focus();
+  document.getElementById("revoke-mcp-confirm").onclick = confirmRevokeMcp;
+  // Cancel carries the autofocus (the console confirm-dialog rule).
+  window.TurnstoneHatch.openDialog(
+    document.getElementById("revoke-mcp-dialog"),
+    {
+      onClose: function () {
+        _pendingRevokeServer = null;
+      },
+    },
+  );
 }
 
 function cancelRevokeMcp() {
-  _pendingRevokeServer = null;
-  const overlay = document.getElementById("revoke-mcp-overlay");
-  if (overlay) overlay.style.display = "none";
-  if (_revokeMcpTrap) {
-    document.removeEventListener("keydown", _revokeMcpTrap);
-    _revokeMcpTrap = null;
-  }
+  const d = document.getElementById("revoke-mcp-dialog");
+  if (d && d.open) d.close();
 }
 
 function confirmRevokeMcp() {
@@ -2098,16 +1974,20 @@ function confirmRevokeMcp() {
     cancelRevokeMcp();
     return;
   }
+  const dlg = document.getElementById("revoke-mcp-dialog");
+  window.TurnstoneHatch.setBusy(dlg, true);
   authFetch("/v1/api/mcp/oauth/connections/" + encodeURIComponent(server), {
     method: "DELETE",
   })
     .then(function (r) {
       if (!r.ok) throw new Error("HTTP " + r.status);
+      window.TurnstoneHatch.setBusy(dlg, false);
       cancelRevokeMcp();
       showToast("Disconnected " + server);
       loadMcpConnections();
     })
     .catch(function (err) {
+      window.TurnstoneHatch.setBusy(dlg, false);
       cancelRevokeMcp();
       showToast("Failed to revoke: " + err.message);
     });
@@ -2131,18 +2011,12 @@ function _formatRelativeTimestamp(iso) {
 }
 
 document.addEventListener("keydown", function (e) {
-  // Defer to modal's own keydown handler when any modal is open
-  const modalIds = [
-    "new-ws-overlay",
-    "edit-title-overlay",
-    "delete-ws-overlay",
-    "ws-delete-overlay",
-    "revoke-mcp-overlay",
-  ];
-  for (let mi = 0; mi < modalIds.length; mi++) {
-    const modal = document.getElementById(modalIds[mi]);
-    if (modal && modal.style.display !== "none") return;
-  }
+  // Defer while a document-modal hatch dialog is open — native dialogs own
+  // their Escape, and global shortcuts must not fire under the top layer.
+  if (document.querySelector("dialog:modal")) return;
+  // The batch ws-delete modal is still a legacy overlay with its own trap.
+  const wsDel = document.getElementById("ws-delete-overlay");
+  if (wsDel && wsDel.style.display !== "none") return;
   if (e.key === "Escape" && dashboardVisible) {
     e.preventDefault();
     hideDashboard();

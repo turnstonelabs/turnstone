@@ -22,6 +22,7 @@
     <link rel="stylesheet" href="/static/style.css" />
     <link rel="stylesheet" href="/shared/shell.css" />
     <link rel="stylesheet" href="/shared/interactive.css" />
+    <link rel="stylesheet" href="/shared/hatch.css" />
     <link rel="stylesheet" href="/shared/katex-0.17.0/katex.min.css" />
   </head>
   <body>
@@ -307,49 +308,63 @@
       </div>
     </div>
 
-    <!-- New workstream modal -->
-    <div
-      id="new-ws-overlay"
-      style="display: none"
-      role="dialog"
-      aria-modal="true"
+    <!-- New workstream dialog (document-modal) — also the fork launcher:
+     showNewWsModal(forkFromWsId) retitles the head and hides the
+     skill / attach rows (a fork inherits its parent's history). -->
+    <dialog
+      class="hatch hatch--dialog hatch--md"
+      id="new-ws-dialog"
+      data-kind="create"
       aria-labelledby="new-ws-title"
     >
-      <div id="new-ws-box">
-        <h3 id="new-ws-title">New Workstream</h3>
-        <div id="new-ws-error" role="alert" aria-live="assertive"></div>
+      <header class="sh-head">
+        <span class="sh-led" aria-hidden="true"></span>
+        <h2 class="sh-title" id="new-ws-title">New workstream</h2>
+        <span class="sh-tag" aria-hidden="true" id="new-ws-tag">WS-NEW</span>
+        <button class="sh-x" data-close aria-label="Close">✕</button>
+      </header>
+      <div class="sh-body">
+        <div
+          id="new-ws-error"
+          class="sh-alert"
+          role="alert"
+          aria-live="assertive"
+          aria-atomic="true"
+        ></div>
         <label for="new-ws-name"
-          >Name <span class="nws-hint">optional</span></label
+          >Name <span class="label-hint">optional</span></label
         >
         <input
           id="new-ws-name"
           type="text"
           placeholder="Auto-generated if empty"
           autocomplete="off"
+          autofocus
         />
         <label for="new-ws-model"
-          >Model <span class="nws-hint">optional</span></label
+          >Model <span class="label-hint">optional</span></label
         >
         <select id="new-ws-model">
           <option value="">Default model</option>
         </select>
         <label for="new-ws-judge-model"
-          >Judge Model <span class="nws-hint">optional</span></label
+          >Judge model <span class="label-hint">optional</span></label
         >
         <select id="new-ws-judge-model">
           <option value="">Default (agent model)</option>
         </select>
         <label for="new-ws-skill"
-          >Skill <span class="nws-hint">optional</span></label
+          >Skill <span class="label-hint">optional</span></label
         >
         <select id="new-ws-skill">
           <option value="">Use defaults</option>
         </select>
         <label for="new-ws-initial-message"
-          >First message <span class="nws-hint">optional</span></label
+          >First message <span class="label-hint">optional</span></label
         >
         <textarea
           id="new-ws-initial-message"
+          class="sh-mono"
           rows="3"
           placeholder="Sent as the first turn after the workstream is created"
         ></textarea>
@@ -366,7 +381,7 @@
             id="new-ws-attach-input"
             type="file"
             multiple
-            style="display: none"
+            hidden
             accept="image/png,image/jpeg,image/gif,image/webp,text/*,.md,.txt,.json,.yaml,.yml,.toml,.xml,.html,.css,.js,.jsx,.ts,.tsx,.py,.go,.rs,.java,.c,.cpp,.h,.hpp,.sh,.sql,.ini,.conf"
           />
           <div
@@ -375,79 +390,99 @@
             aria-label="Pending attachments"
           ></div>
         </div>
-        <div id="new-ws-buttons">
-          <button id="new-ws-cancel" type="button">Cancel</button>
-          <button id="new-ws-submit" type="button">Create</button>
-        </div>
       </div>
-    </div>
+      <footer class="sh-foot">
+        <div class="sh-foot-meta"></div>
+        <button class="sh-btn" data-close>Cancel</button>
+        <button id="new-ws-submit" class="sh-btn sh-btn--primary">
+          Create
+        </button>
+      </footer>
+    </dialog>
 
-    <!-- Edit title modal -->
-    <div
-      id="edit-title-overlay"
-      style="display: none"
-      role="dialog"
-      aria-modal="true"
+    <!-- Rename workstream dialog (document-modal) — a styled prompt(): one
+     field, Enter submits, no designation plate. -->
+    <dialog
+      class="hatch hatch--dialog"
+      id="edit-title-dialog"
+      data-kind="edit"
       aria-labelledby="edit-title-heading"
     >
-      <div id="edit-title-box">
-        <h3 id="edit-title-heading">Edit Title</h3>
+      <header class="sh-head">
+        <span class="sh-led" aria-hidden="true"></span>
+        <h2 class="sh-title" id="edit-title-heading">Rename workstream</h2>
+        <button class="sh-x" data-close aria-label="Close">✕</button>
+      </header>
+      <div class="sh-body">
         <input
           id="edit-title-input"
           type="text"
           maxlength="80"
           placeholder="Enter title..."
-          onkeydown="
-            if (event.key === 'Enter') submitEditTitle();
-            if (event.key === 'Escape') cancelEditTitle();
-          "
+          aria-label="Workstream title"
+          autofocus
         />
-        <div id="edit-title-buttons">
-          <button type="button" onclick="cancelEditTitle()">Cancel</button>
-          <button type="button" onclick="submitEditTitle()">Save</button>
-        </div>
       </div>
-    </div>
+      <footer class="sh-foot">
+        <div class="sh-foot-meta"></div>
+        <button class="sh-btn" data-close>Cancel</button>
+        <button id="edit-title-save" class="sh-btn sh-btn--primary">
+          Save
+        </button>
+      </footer>
+    </dialog>
 
-    <!-- Delete workstream confirmation modal -->
-    <div
-      id="delete-ws-overlay"
-      style="display: none"
-      role="dialog"
-      aria-modal="true"
+    <!-- Delete workstream confirmation (document-modal) -->
+    <dialog
+      class="hatch hatch--dialog"
+      id="delete-ws-dialog"
+      data-kind="danger"
+      role="alertdialog"
       aria-labelledby="delete-ws-heading"
+      aria-describedby="delete-ws-message"
     >
-      <div id="delete-ws-box">
-        <h3 id="delete-ws-heading">Delete Workstream</h3>
-        <p id="delete-ws-message"></p>
-        <div id="delete-ws-buttons">
-          <button type="button" onclick="cancelDeleteWs()">Cancel</button>
-          <button type="button" class="danger" onclick="executeDeleteWs()">
-            Delete
-          </button>
-        </div>
+      <header class="sh-head">
+        <span class="sh-led" aria-hidden="true"></span>
+        <h2 class="sh-title" id="delete-ws-heading">Delete workstream</h2>
+        <button class="sh-x" data-close aria-label="Close">✕</button>
+      </header>
+      <div class="sh-body">
+        <p class="sh-prose" id="delete-ws-message"></p>
       </div>
-    </div>
+      <footer class="sh-foot">
+        <div class="sh-foot-meta"></div>
+        <button class="sh-btn" data-close autofocus>Cancel</button>
+        <button id="delete-ws-confirm" class="sh-btn sh-btn--danger">
+          Delete
+        </button>
+      </footer>
+    </dialog>
 
-    <!-- Revoke MCP connection confirmation modal -->
-    <div
-      id="revoke-mcp-overlay"
-      style="display: none"
-      role="dialog"
-      aria-modal="true"
+    <!-- Revoke MCP connection confirmation (document-modal) -->
+    <dialog
+      class="hatch hatch--dialog"
+      id="revoke-mcp-dialog"
+      data-kind="danger"
+      role="alertdialog"
       aria-labelledby="revoke-mcp-heading"
+      aria-describedby="revoke-mcp-message"
     >
-      <div id="revoke-mcp-box">
-        <h3 id="revoke-mcp-heading">Revoke connection?</h3>
-        <p id="revoke-mcp-message"></p>
-        <div id="revoke-mcp-buttons">
-          <button type="button" onclick="cancelRevokeMcp()">Cancel</button>
-          <button type="button" class="danger" onclick="confirmRevokeMcp()">
-            Revoke
-          </button>
-        </div>
+      <header class="sh-head">
+        <span class="sh-led" aria-hidden="true"></span>
+        <h2 class="sh-title" id="revoke-mcp-heading">Revoke connection?</h2>
+        <button class="sh-x" data-close aria-label="Close">✕</button>
+      </header>
+      <div class="sh-body">
+        <p class="sh-prose" id="revoke-mcp-message"></p>
       </div>
-    </div>
+      <footer class="sh-foot">
+        <div class="sh-foot-meta"></div>
+        <button class="sh-btn" data-close autofocus>Cancel</button>
+        <button id="revoke-mcp-confirm" class="sh-btn sh-btn--danger">
+          Revoke
+        </button>
+      </footer>
+    </dialog>
 
     <!-- Delete workstreams confirmation modal (batch) -->
     <div
@@ -575,6 +610,7 @@
     <script type="module" src="/shared/composer_queue.js"></script>
     <script type="module" src="/shared/status_bar.js"></script>
     <script type="module" src="/shared/auth.js"></script>
+    <script type="module" src="/shared/hatch.js"></script>
     <script type="module" src="/shared/kb.js"></script>
     <script src="/shared/katex-0.17.0/katex.min.js"></script>
     <script src="/shared/hljs-11.11.1/highlight.min.js"></script>

@@ -16,6 +16,7 @@ _ROOT = Path(__file__).resolve().parent.parent
 _HATCH_JS = _ROOT / "turnstone/shared_static/hatch.js"
 _HATCH_CSS = _ROOT / "turnstone/shared_static/hatch.css"
 _CONSOLE_INDEX = _ROOT / "turnstone/console/static/index.html"
+_UI_INDEX = _ROOT / "turnstone/ui/static/index.html"
 
 
 def test_shelf_is_nonmodal_and_dialog_is_modal() -> None:
@@ -84,6 +85,12 @@ def test_console_loads_hatch_assets() -> None:
     assert '<script type="module" src="/shared/hatch.js"></script>' in html
 
 
+def test_ui_loads_hatch_assets() -> None:
+    html = _UI_INDEX.read_text(encoding="utf-8")
+    assert '<link rel="stylesheet" href="/shared/hatch.css" />' in html
+    assert '<script type="module" src="/shared/hatch.js"></script>' in html
+
+
 def test_css_base_selector_is_class_only() -> None:
     """``dialog.hatch`` (0,1,1) would out-rank the container surface rules
     (0,1,0) and re-introduce the transparent-shelf bug — the base selector
@@ -121,18 +128,18 @@ def test_css_reduced_motion_and_light_theme_pass() -> None:
 
 
 def test_hatch_markup_shape() -> None:
-    """Every ``dialog.hatch`` in the console markup carries the full
-    anatomy: a tier class, sh-head/sh-body/sh-foot, and aria-labelledby.
-    (Vacuously true until the first Phase-1 surface lands.)"""
-    html = _CONSOLE_INDEX.read_text(encoding="utf-8")
-    for m in re.finditer(r"<dialog\b[^>]*class=\"[^\"]*\bhatch\b[^\"]*\"[^>]*>", html):
-        tag = m.group(0)
-        assert "hatch--shelf" in tag or "hatch--dialog" in tag, tag
-        assert 'aria-labelledby="' in tag, f"missing aria-labelledby: {tag}"
-        # The dialog's body (up to its close tag) must have the three strips.
-        rest = html[m.end() : html.index("</dialog>", m.end())]
-        for cls in ("sh-head", "sh-body", "sh-foot"):
-            assert cls in rest, f"dialog missing .{cls}: {tag}"
+    """Every ``dialog.hatch`` in the console AND ui markup carries the full
+    anatomy: a tier class, sh-head/sh-body/sh-foot, and aria-labelledby."""
+    for index in (_CONSOLE_INDEX, _UI_INDEX):
+        html = index.read_text(encoding="utf-8")
+        for m in re.finditer(r"<dialog\b[^>]*class=\"[^\"]*\bhatch\b[^\"]*\"[^>]*>", html):
+            tag = m.group(0)
+            assert "hatch--shelf" in tag or "hatch--dialog" in tag, f"{index.name}: {tag}"
+            assert 'aria-labelledby="' in tag, f"{index.name}: missing aria-labelledby: {tag}"
+            # The dialog's body (up to its close tag) must have the three strips.
+            rest = html[m.end() : html.index("</dialog>", m.end())]
+            for cls in ("sh-head", "sh-body", "sh-foot"):
+                assert cls in rest, f"{index.name}: dialog missing .{cls}: {tag}"
 
 
 def test_classic_scripts_use_the_bridge_only_at_handler_time() -> None:
@@ -141,13 +148,17 @@ def test_classic_scripts_use_the_bridge_only_at_handler_time() -> None:
     #644 const-initializer lesson).  Heuristic guard: no top-level
     ``TurnstoneHatch`` use — every reference must sit inside a function
     body (indented)."""
-    for name in ("admin.js", "governance.js", "app.js"):
-        path = _ROOT / "turnstone/console/static" / name
+    classic = [
+        _ROOT / "turnstone/console/static" / name
+        for name in ("admin.js", "governance.js", "app.js")
+    ]
+    classic.append(_ROOT / "turnstone/ui/static/app.js")
+    for path in classic:
         if not path.exists():
             continue
         for i, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
             if "TurnstoneHatch" in line and not line.startswith((" ", "\t")):
                 raise AssertionError(
-                    f"{name}:{i}: top-level TurnstoneHatch reference — "
+                    f"{path.name}:{i}: top-level TurnstoneHatch reference — "
                     "the window bridge only exists after modules evaluate"
                 )
