@@ -1566,38 +1566,15 @@ h3.skill-spec-heading {
   flex-direction: column;
 }
 
-/* Chained `textarea.` so the rule beats `.admin-modal textarea` (0,1,1) on
-   source order — without that bump, min-height: 220px loses to the modal's
-   default min-height: 40px and the spec content textarea renders short. */
-textarea.skill-content-area {
+/* Scoped under `.sh-body` so the rule beats hatch.css's `.sh-body textarea`
+   (0,1,1, later in source) — without that bump, the shelf's `font: inherit`
+   + min-height: 64px would flatten the mono face and the 220px floor. */
+.sh-body textarea.skill-content-area {
   flex: 1;
   min-height: 220px;
   font-family: var(--font-mono);
   font-size: 11.5px;
   line-height: 1.65;
-}
-
-.skill-vars-row {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  margin-top: 8px;
-  min-height: 18px;
-}
-
-.skill-vars-label {
-  font-family: var(--font-ui);
-  font-size: 10px;
-  font-weight: 700;
-  text-transform: uppercase;
-  letter-spacing: 0.1em;
-  color: var(--fg-dim);
-  white-space: nowrap;
-  flex-shrink: 0;
-}
-
-.skill-vars-display {
-  font-size: 11px;
 }
 
 .skill-config-grid {
@@ -1610,7 +1587,8 @@ textarea.skill-content-area {
   min-width: 0;
 }
 
-/* Origin badge — shown for remotely installed (readonly) skills */
+/* Origin badge — provenance chip in the skill shelf's foot meta lane
+   (installed/customized skills). Sized to the 11px foot strip. */
 .skill-origin-badge {
   display: inline-flex;
   align-items: center;
@@ -1624,8 +1602,7 @@ textarea.skill-content-area {
   background: rgba(103, 232, 249, 0.07);
   border: 1px solid rgba(103, 232, 249, 0.18);
   border-radius: var(--radius-sm);
-  padding: 5px 10px;
-  margin-bottom: 14px;
+  padding: 2px 7px;
   max-width: 100%;
   overflow: hidden;
   text-overflow: ellipsis;
@@ -1637,7 +1614,17 @@ textarea.skill-content-area {
   flex-shrink: 0;
 }
 
-@media (max-width: 700px) {
+/* Head lock affordance on the skill shelf — the sh-x ghost recipe minus its
+   right-edge margin compensation (the lock sits mid-strip, left of the
+   designation plate). Text-variant keeps the glyph monochrome. */
+#skill-shelf .skl-lock {
+  margin: -4px 0;
+  font-variant-emoji: text;
+}
+
+/* Narrow pane (mobile OR a tight split): single column, matching the
+   shelf's own bottom-sheet container breakpoint in hatch.css. */
+@container pane (max-width: 700px) {
   .skill-spec-body {
     grid-template-columns: 1fr;
   }
@@ -1653,16 +1640,6 @@ textarea.skill-content-area {
   }
   .skill-config-grid {
     grid-template-columns: 1fr 1fr;
-  }
-  /* Touch target: 44×44 minimum on mobile (WCAG 2.5.5 / Apple HIG). */
-  .skill-lock-btn {
-    width: 44px;
-    height: 44px;
-    top: 8px;
-    right: 8px;
-  }
-  .admin-modal-skill > h2 {
-    padding-right: 56px;
   }
 }
 
@@ -1726,52 +1703,6 @@ textarea.skill-content-area {
   cursor: not-allowed;
   filter: none;
 }
-/* Lock-icon affordance in the top-right of an installed (readonly) skill's
-   edit modal — clicking detaches the skill from upstream so spec fields
-   become editable. Reserved for the modal it lives in; not a generic
-   button class. */
-.skill-lock-btn {
-  position: absolute;
-  /* top: 18px (not 14px) so the button drops below the modal's accent-line
-     decoration's visual zone instead of competing with it horizontally. */
-  top: 18px;
-  right: 14px;
-  width: 32px;
-  height: 32px;
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  padding: 0;
-  background: transparent;
-  color: var(--fg);
-  border: 1px solid var(--border-strong);
-  border-radius: var(--radius-sm);
-  font-size: 14px;
-  /* Render the lock glyph as text where supported (keeps the monochrome
-     instrument-panel aesthetic instead of a coloured emoji). Browsers
-     that don't support font-variant-emoji fall back gracefully. */
-  font-variant-emoji: text;
-  cursor: pointer;
-  transition:
-    background 0.15s,
-    border-color 0.15s;
-  z-index: 2;
-}
-.skill-lock-btn:hover {
-  background: var(--bg-highlight);
-  border-color: var(--accent);
-  color: var(--accent);
-}
-.skill-lock-btn:focus-visible {
-  outline: 2px solid var(--accent);
-  outline-offset: 2px;
-}
-.skill-lock-btn:disabled {
-  opacity: 0.5;
-  cursor: not-allowed;
-  pointer-events: none;
-}
-
 #create-template-overlay,
 #edit-template-overlay {
   position: fixed;
@@ -3776,8 +3707,7 @@ textarea.skill-content-area {
   }
   .admin-action-btn,
   .modal-cancel,
-  .modal-submit,
-  .skill-lock-btn {
+  .modal-submit {
     transition: none;
   }
   .admin-modal input,

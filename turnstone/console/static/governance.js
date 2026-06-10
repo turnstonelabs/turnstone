@@ -1268,17 +1268,17 @@ function _renderGovSkills(items) {
 const _SKILL_FRONTMATTER_RE = /^---\s*\r?\n/;
 
 const _SKILL_FIELD_MAP = {
-  name: "ctm-name",
-  description: "skill-description",
-  tags: "skill-tags",
-  author: "skill-author",
-  version: "skill-version",
-  license: "skill-license",
-  compatibility: "skill-compatibility",
-  allowed_tools: "csk-allowed-tools",
-  paths: "skill-paths",
-  arguments: "skill-arguments",
-  argument_hint: "skill-argument-hint",
+  name: "skl-name",
+  description: "skl-description",
+  tags: "skl-tags",
+  author: "skl-author",
+  version: "skl-version",
+  license: "skl-license",
+  compatibility: "skl-compatibility",
+  allowed_tools: "sklc-allowed-tools",
+  paths: "skl-paths",
+  arguments: "skl-arguments",
+  argument_hint: "skl-argument-hint",
 };
 
 // Inflight paste-parse fetch — referenced from hideCreateTemplateModal so a
@@ -1348,7 +1348,7 @@ function _applyParsedSkill(parsed, contentTextarea, fieldMap) {
   // existing user choice (a checkbox the admin already ticked stays
   // ticked even if the parsed value disagrees).
   if (parsed.user_invocable === false) {
-    const hidden = document.getElementById("skill-hidden-from-menu");
+    const hidden = document.getElementById("skl-hidden-from-menu");
     if (hidden && !hidden.checked) {
       hidden.checked = true;
       filled++;
@@ -1363,12 +1363,12 @@ function _applyParsedSkill(parsed, contentTextarea, fieldMap) {
 }
 
 function _setSkillPasteHintBusy(busy) {
-  const hint = document.getElementById("ctm-paste-hint");
+  const hint = document.getElementById("skl-paste-hint");
   if (!hint) return;
   const rest = hint.querySelector(".skill-paste-hint-rest");
   const busyEl = hint.querySelector(".skill-paste-hint-busy");
-  if (rest) rest.style.display = busy ? "none" : "";
-  if (busyEl) busyEl.style.display = busy ? "" : "none";
+  if (rest) rest.hidden = busy;
+  if (busyEl) busyEl.hidden = !busy;
 }
 
 function _handleSkillContentPaste(event, fieldMap) {
@@ -1465,115 +1465,264 @@ function _detectTemplateVars(content) {
   return result;
 }
 
-function _updateVarsDisplay(contentId, displayId) {
-  const content = document.getElementById(contentId).value || "";
+// Variable strip under the content textarea — mono chips plus a count,
+// recomputed on every content edit. The foot meta mirrors the count when
+// provenance isn't occupying that lane (see _updateSkillShelfMeta).
+function _updateVarsDisplay() {
+  const content = document.getElementById("skl-content").value || "";
   const vars = _detectTemplateVars(content);
-  document.getElementById(displayId).textContent = vars.length
-    ? vars.join(", ")
-    : "(none)";
+  const strip = document.getElementById("skl-variables");
+  strip.textContent = "";
+  const count = document.createElement("span");
+  count.className = "match-count";
+  if (vars.length) {
+    const b = document.createElement("b");
+    b.textContent = String(vars.length);
+    count.appendChild(b);
+    count.appendChild(
+      document.createTextNode(
+        " variable" + (vars.length === 1 ? "" : "s") + " detected",
+      ),
+    );
+  } else {
+    count.textContent = "no variables detected";
+  }
+  strip.appendChild(count);
+  for (let i = 0; i < vars.length; i++) {
+    const chip = document.createElement("span");
+    chip.className = "match-chip";
+    chip.textContent = vars[i];
+    strip.appendChild(chip);
+  }
+  _updateSkillShelfMeta(vars);
 }
 
-function showCreateTemplateModal() {
-  _ctmTriggerEl = document.activeElement;
-  const ov = document.getElementById("create-template-overlay");
-  ov.style.display = "flex";
-  document.getElementById("ctm-name").value = "";
-  document.getElementById("ctm-category").value = "general";
-  document.getElementById("skill-description").value = "";
-  document.getElementById("skill-tags").value = "";
-  document.getElementById("skill-author").value = "";
-  document.getElementById("skill-version").value = "";
-  document.getElementById("skill-license").value = "";
-  document.getElementById("skill-compatibility").value = "";
-  document.getElementById("skill-paths").value = "";
-  document.getElementById("skill-hidden-from-menu").checked = false;
-  document.getElementById("skill-arguments").value = "";
-  document.getElementById("skill-argument-hint").value = "";
-  document.getElementById("skill-activation").value = "named";
-  const ctmContent = document.getElementById("ctm-content");
-  ctmContent.value = "";
-  document.getElementById("ctm-variables").textContent = "(none)";
-  ctmContent.oninput = function () {
-    _updateVarsDisplay("ctm-content", "ctm-variables");
-  };
-  ctmContent.onpaste = function (event) {
-    _handleSkillContentPaste(event, _SKILL_FIELD_MAP);
-  };
-  document.getElementById("ctm-default").checked = false;
-  // Session config fields
-  document.getElementById("csk-model").value = "";
-  document.getElementById("csk-temperature").value = "";
-  document.getElementById("csk-reasoning-effort").value = "";
-  document.getElementById("csk-max-tokens").value = "";
-  document.getElementById("csk-token-budget").value = "";
-  document.getElementById("csk-agent-max-turns").value = "";
-  document.getElementById("csk-auto-approve").checked = false;
-  document.getElementById("csk-allowed-tools").value = "";
-  document.getElementById("csk-allowed-tools").disabled = false;
-  document.getElementById("csk-notify-on-complete").value = "";
-  document.getElementById("csk-enabled").checked = true;
-  document.getElementById("csk-auto-approve").onchange = function () {
-    document.getElementById("csk-allowed-tools").disabled = this.checked;
-  };
+// ---------------------------------------------------------------------------
+// Skill shelf (create + edit) — one pane-scoped xl shelf; a hidden skl-id
+// decides POST vs PUT. Spec/manifest fields lock for readonly (installed)
+// skills; the head lock button runs the unlock-confirm flow and re-renders
+// the open shelf in place.
+// ---------------------------------------------------------------------------
+
+// Spec/content fields — locked for installed (readonly) skills to preserve
+// source fidelity; create mode re-arms them because the merged shelf reuses
+// one DOM across modes.
+const _SKILL_SPEC_FIELD_IDS = [
+  "skl-name",
+  "skl-category",
+  "skl-description",
+  "skl-tags",
+  "skl-author",
+  "skl-version",
+  "skl-license",
+  "skl-compatibility",
+  "skl-paths",
+  "skl-arguments",
+  "skl-argument-hint",
+  "skl-activation",
+  "skl-content",
+  "skl-default",
+];
+
+// Provenance line for the foot meta — set while an installed/customized
+// skill is open (the foot read-out IS the provenance lane); null means the
+// meta mirrors the live variable count instead.
+let _skillShelfProvenance = null;
+
+let _skillShelfWired = false;
+
+function _skillShelfWire() {
+  if (_skillShelfWired) return;
+  _skillShelfWired = true;
+  document.getElementById("skl-submit").addEventListener("click", function () {
+    if (document.getElementById("skl-id").value) submitEditTemplate();
+    else submitCreateTemplate();
+  });
+  document.getElementById("skl-lock").addEventListener("click", unlockSkill);
   document
-    .getElementById("create-template-error")
-    .classList.remove("is-visible");
-  // Clear resource list
-  _pendingResources = [];
-  _renderPendingResources();
-  document.getElementById("ctm-name").focus();
-  _ctmTrapHandler = _installTrap(
-    "create-template-overlay",
-    "create-template-box",
-  );
+    .getElementById("skl-content")
+    .addEventListener("input", _updateVarsDisplay);
+  document
+    .getElementById("sklc-auto-approve")
+    .addEventListener("change", function () {
+      document.getElementById("sklc-allowed-tools").disabled = this.checked;
+    });
+  document
+    .getElementById("ctm-res-add")
+    .addEventListener("click", _addPendingResource);
+  document
+    .getElementById("etm-add-resource-btn")
+    .addEventListener("click", function () {
+      _showAddResourceForm(document.getElementById("skl-id").value);
+    });
 }
 
-function hideCreateTemplateModal() {
-  // Cancel any inflight paste-parse so a late response can't reach into a
-  // closed (or freshly reopened) modal and clobber state.  AbortController
-  // also short-circuits the .then chain — see _handleSkillContentPaste.
-  // After abort, the handler's .catch/.finally bail via _isCurrent() before
-  // resetting the textarea, so we proactively restore the paste-induced
-  // visible state here.  Otherwise reopening would land on a disabled
-  // textarea stuck on "Parsing…".
+// Foot read-out: provenance when the open skill carries it, else a mirror
+// of the variable count from the strip under the content textarea.
+function _updateSkillShelfMeta(vars) {
+  const meta = document.getElementById("skill-shelf-meta");
+  if (!meta || _skillShelfProvenance) return;
+  if (!vars) {
+    vars = _detectTemplateVars(
+      document.getElementById("skl-content").value || "",
+    );
+  }
+  meta.textContent = vars.length
+    ? vars.length + " variable" + (vars.length === 1 ? "" : "s") + " detected"
+    : "";
+  meta.removeAttribute("title");
+}
+
+// Origin/locked provenance in the foot meta. An unlocked install retains
+// origin="source" — combined with !readonly it means the operator detached
+// the skill from upstream and may have edits.
+function _renderSkillShelfProvenance(tmpl, isReadonly, isUnlockedInstall) {
+  const meta = document.getElementById("skill-shelf-meta");
+  if (!meta) return;
+  meta.textContent = "";
+  meta.removeAttribute("title");
+  let chipText = null;
+  let rest = "";
+  if (isReadonly) {
+    if (tmpl.source_url || (tmpl.origin && tmpl.origin !== "manual")) {
+      chipText = "installed";
+    }
+    rest = tmpl.source_url
+      ? tmpl.source_url + " · locked — unlock to edit"
+      : "locked — unlock to edit";
+  } else if (isUnlockedInstall) {
+    chipText = "customized";
+    rest = "from " + (tmpl.source_url || "upstream");
+  } else {
+    _skillShelfProvenance = null;
+    _updateSkillShelfMeta();
+    return;
+  }
+  _skillShelfProvenance = (chipText ? chipText + " " : "") + rest;
+  if (chipText) {
+    const chip = document.createElement("span");
+    chip.className = "skill-origin-badge";
+    chip.textContent = chipText;
+    meta.appendChild(chip);
+    meta.appendChild(document.createTextNode(" "));
+  }
+  meta.appendChild(document.createTextNode(rest));
+  meta.title = _skillShelfProvenance;
+}
+
+// Fires exactly once per open, on every dismissal path (data-close, Escape,
+// scrim click, programmatic close). Cancels any inflight paste-parse so a
+// late response can't reach into a closed (or freshly reopened) shelf and
+// clobber state. AbortController also short-circuits the .then chain — see
+// _handleSkillContentPaste. After abort, the handler's .catch/.finally bail
+// via _isCurrent() before resetting the textarea, so we proactively restore
+// the paste-induced visible state here. Otherwise reopening would land on a
+// disabled textarea stuck on "Parsing…".
+function _skillShelfClosed() {
   if (_ctmPasteController) {
     _ctmPasteController.abort();
     _ctmPasteController = null;
-    const ctmContent = document.getElementById("ctm-content");
-    if (ctmContent) {
-      ctmContent.disabled = false;
-      ctmContent.removeAttribute("aria-busy");
+    const content = document.getElementById("skl-content");
+    if (content) {
+      content.disabled = false;
+      content.removeAttribute("aria-busy");
     }
     _setSkillPasteHintBusy(false);
   }
-  document.getElementById("create-template-overlay").style.display = "none";
-  _ctmTrapHandler = _removeTrap(_ctmTrapHandler);
-  if (_ctmTriggerEl && _ctmTriggerEl.focus) {
-    _ctmTriggerEl.focus();
-  }
-  _ctmTriggerEl = null;
+}
+
+function showCreateTemplateModal() {
+  _skillShelfWire();
+  const shelf = document.getElementById("skill-shelf");
+  document.getElementById("skill-shelf-error").classList.remove("is-visible");
+  document.getElementById("skl-id").value = "";
+  document.getElementById("skl-name").value = "";
+  document.getElementById("skl-category").value = "general";
+  document.getElementById("skl-description").value = "";
+  document.getElementById("skl-tags").value = "";
+  document.getElementById("skl-author").value = "";
+  document.getElementById("skl-version").value = "";
+  document.getElementById("skl-license").value = "";
+  document.getElementById("skl-compatibility").value = "";
+  document.getElementById("skl-paths").value = "";
+  document.getElementById("skl-hidden-from-menu").checked = false;
+  document.getElementById("skl-arguments").value = "";
+  document.getElementById("skl-argument-hint").value = "";
+  document.getElementById("skl-activation").value = "named";
+  // A previous readonly edit render leaves spec fields disabled — the
+  // merged shelf reuses one DOM, so create must re-arm them.
+  _SKILL_SPEC_FIELD_IDS.forEach(function (id) {
+    const el = document.getElementById(id);
+    if (!el) return;
+    el.disabled = false;
+    el.removeAttribute("aria-describedby");
+  });
+  const content = document.getElementById("skl-content");
+  content.value = "";
+  // Paste-to-parse is a create-mode affordance (edit clears the handler).
+  content.onpaste = function (event) {
+    _handleSkillContentPaste(event, _SKILL_FIELD_MAP);
+  };
+  content.setAttribute("aria-describedby", "skl-paste-hint");
+  document.getElementById("skl-paste-hint").hidden = false;
+  document.getElementById("skl-default").checked = false;
+  // Session config fields
+  document.getElementById("sklc-model").value = "";
+  document.getElementById("sklc-temperature").value = "";
+  document.getElementById("sklc-reasoning-effort").value = "";
+  document.getElementById("sklc-max-tokens").value = "";
+  document.getElementById("sklc-token-budget").value = "";
+  document.getElementById("sklc-agent-max-turns").value = "";
+  document.getElementById("sklc-auto-approve").checked = false;
+  document.getElementById("sklc-allowed-tools").value = "";
+  document.getElementById("sklc-allowed-tools").disabled = false;
+  document.getElementById("sklc-notify-on-complete").value = "";
+  document.getElementById("sklc-enabled").checked = true;
+  // Mode-exclusive blocks: pending resources in, scan + server resources out.
+  document.getElementById("skl-lock").hidden = true;
+  document.getElementById("etm-scan-section").style.display = "none";
+  document.getElementById("ctm-resources-section").hidden = false;
+  document.getElementById("etm-resources-section").hidden = true;
+  // Collapse the progressive-disclosure sections (shared DOM — a readonly
+  // edit render leaves them expanded otherwise).
+  const allDetails = document.querySelectorAll("#skill-shelf details.rawhatch");
+  for (let d = 0; d < allDetails.length; d++) allDetails[d].open = false;
+  // Clear resource list
+  _pendingResources = [];
+  _renderPendingResources();
+  _skillShelfProvenance = null;
+  _updateVarsDisplay();
+  shelf.setAttribute("data-kind", "create");
+  document.getElementById("skill-shelf-title").textContent = "New skill";
+  document.getElementById("skill-shelf-tag").textContent = "SKL-NEW";
+  document.getElementById("skl-submit").textContent = "Create skill";
+  document.getElementById("skl-cancel").textContent = "Cancel";
+  window.TurnstoneHatch.openShelf(shelf, { onClose: _skillShelfClosed });
+  document.getElementById("skl-name").focus();
+}
+
+function hideCreateTemplateModal() {
+  window.TurnstoneHatch.closeShelf(document.getElementById("skill-shelf"));
 }
 
 function submitCreateTemplate() {
   // Clear any prior error before re-validating — a successful submit shouldn't
-  // leave stale red text on-screen, and the in-flight PUT period shouldn't
+  // leave stale red text on-screen, and the in-flight POST period shouldn't
   // either. Cheaper than reasoning about every catch path remembering to
   // clear on success.
-  const prevErr = document.getElementById("create-template-error");
-  if (prevErr) {
-    prevErr.classList.remove("is-visible");
-    prevErr.textContent = "";
-  }
-  const name = document.getElementById("ctm-name").value.trim();
-  const content = document.getElementById("ctm-content").value;
+  const shelf = document.getElementById("skill-shelf");
+  const errEl = document.getElementById("skill-shelf-error");
+  errEl.classList.remove("is-visible");
+  errEl.textContent = "";
+  const name = document.getElementById("skl-name").value.trim();
+  const content = document.getElementById("skl-content").value;
   if (!name || !content) {
-    const e = document.getElementById("create-template-error");
-    e.textContent = "Name and content are required";
-    e.classList.add("is-visible");
+    errEl.textContent = "Name and content are required";
+    errEl.classList.add("is-visible");
     return;
   }
   const varList = _detectTemplateVars(content);
-  const tagsRaw = (document.getElementById("skill-tags").value || "").trim();
+  const tagsRaw = (document.getElementById("skl-tags").value || "").trim();
   const tagsArray = tagsRaw
     ? tagsRaw
         .split(",")
@@ -1583,14 +1732,14 @@ function submitCreateTemplate() {
         .filter(Boolean)
     : [];
   // Session config fields
-  const csTemp = document.getElementById("csk-temperature").value.trim();
-  const csMaxTok = document.getElementById("csk-max-tokens").value.trim();
-  const csBudget = document.getElementById("csk-token-budget").value.trim();
+  const csTemp = document.getElementById("sklc-temperature").value.trim();
+  const csMaxTok = document.getElementById("sklc-max-tokens").value.trim();
+  const csBudget = document.getElementById("sklc-token-budget").value.trim();
   const csMaxTurns = document
-    .getElementById("csk-agent-max-turns")
+    .getElementById("sklc-agent-max-turns")
     .value.trim();
   const csAllowed = (
-    document.getElementById("csk-allowed-tools").value || ""
+    document.getElementById("sklc-allowed-tools").value || ""
   ).trim();
   const csAllowedArr = csAllowed
     ? csAllowed
@@ -1601,7 +1750,7 @@ function submitCreateTemplate() {
         .filter(Boolean)
     : [];
   const csNotifyRaw = (
-    document.getElementById("csk-notify-on-complete").value || ""
+    document.getElementById("sklc-notify-on-complete").value || ""
   ).trim();
   let csNotifyVal = "[]";
   if (csNotifyRaw) {
@@ -1611,63 +1760,60 @@ function submitCreateTemplate() {
         throw new Error("must be a JSON array");
       csNotifyVal = JSON.stringify(csNotifyParsed);
     } catch (ne) {
-      const ne2 = document.getElementById("create-template-error");
-      ne2.textContent = "Notify on completion: " + ne.message;
-      ne2.classList.add("is-visible");
+      errEl.textContent = "Notify on completion: " + ne.message;
+      errEl.classList.add("is-visible");
       return;
     }
   }
-  document.getElementById("ctm-submit").disabled = true;
-  const csVersion = (
-    document.getElementById("skill-version").value || ""
-  ).trim();
-  const csPathsArr = (document.getElementById("skill-paths").value || "")
+  const csVersion = (document.getElementById("skl-version").value || "").trim();
+  const csPathsArr = (document.getElementById("skl-paths").value || "")
     .split(",")
     .map(function (p) {
       return p.trim();
     })
     .filter(Boolean);
-  const csArgsArr = (document.getElementById("skill-arguments").value || "")
+  const csArgsArr = (document.getElementById("skl-arguments").value || "")
     .split(",")
     .map(function (a) {
       return a.trim();
     })
     .filter(Boolean);
   const csArgumentHint = (
-    document.getElementById("skill-argument-hint").value || ""
+    document.getElementById("skl-argument-hint").value || ""
   ).trim();
   const createBody = {
     name: name,
-    category: document.getElementById("ctm-category").value,
+    category: document.getElementById("skl-category").value,
     description: (
-      document.getElementById("skill-description").value || ""
+      document.getElementById("skl-description").value || ""
     ).trim(),
     tags: JSON.stringify(tagsArray),
-    author: (document.getElementById("skill-author").value || "").trim(),
-    license: (document.getElementById("skill-license").value || "").trim(),
+    author: (document.getElementById("skl-author").value || "").trim(),
+    license: (document.getElementById("skl-license").value || "").trim(),
     compatibility: (
-      document.getElementById("skill-compatibility").value || ""
+      document.getElementById("skl-compatibility").value || ""
     ).trim(),
-    activation: document.getElementById("skill-activation").value,
+    activation: document.getElementById("skl-activation").value,
     content: content,
     variables: JSON.stringify(varList),
-    is_default: document.getElementById("ctm-default").checked,
-    model: document.getElementById("csk-model").value.trim(),
-    auto_approve: document.getElementById("csk-auto-approve").checked,
+    is_default: document.getElementById("skl-default").checked,
+    model: document.getElementById("sklc-model").value.trim(),
+    auto_approve: document.getElementById("sklc-auto-approve").checked,
     temperature: csTemp ? parseFloat(csTemp) : null,
-    reasoning_effort: document.getElementById("csk-reasoning-effort").value,
+    reasoning_effort: document.getElementById("sklc-reasoning-effort").value,
     max_tokens: csMaxTok ? parseInt(csMaxTok, 10) : null,
     token_budget: csBudget ? parseInt(csBudget, 10) : 0,
     agent_max_turns: csMaxTurns ? parseInt(csMaxTurns, 10) : null,
     allowed_tools: JSON.stringify(csAllowedArr),
     paths: JSON.stringify(csPathsArr),
-    hidden_from_menu: document.getElementById("skill-hidden-from-menu").checked,
+    hidden_from_menu: document.getElementById("skl-hidden-from-menu").checked,
     arguments: JSON.stringify(csArgsArr),
     argument_hint: csArgumentHint,
     notify_on_complete: csNotifyVal,
-    enabled: document.getElementById("csk-enabled").checked,
+    enabled: document.getElementById("sklc-enabled").checked,
   };
   if (csVersion) createBody.version = csVersion;
+  window.TurnstoneHatch.setBusy(shelf, true);
   authFetch("/v1/api/admin/skills", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -1697,6 +1843,7 @@ function submitCreateTemplate() {
         });
         Promise.all(promises)
           .then(function () {
+            window.TurnstoneHatch.setBusy(shelf, false);
             hideCreateTemplateModal();
             showToast(
               "Skill created with " + _pendingResources.length + " resource(s)",
@@ -1704,35 +1851,33 @@ function submitCreateTemplate() {
             loadGovSkills();
           })
           .catch(function () {
+            window.TurnstoneHatch.setBusy(shelf, false);
             hideCreateTemplateModal();
             showToast("Skill created (some resources failed)");
             loadGovSkills();
           });
       } else {
+        window.TurnstoneHatch.setBusy(shelf, false);
         hideCreateTemplateModal();
         showToast("Skill created");
         loadGovSkills();
       }
     })
     .catch(function (e) {
-      const el = document.getElementById("create-template-error");
-      el.textContent = e.message;
-      el.classList.add("is-visible");
-    })
-    .finally(function () {
-      document.getElementById("ctm-submit").disabled = false;
+      window.TurnstoneHatch.setBusy(shelf, false);
+      errEl.textContent = e.message;
+      errEl.classList.add("is-visible");
     });
 }
 
 function showEditTemplateModal(tmplId) {
-  const ov = document.getElementById("edit-template-overlay");
-  // When called against an already-open modal (e.g. mutate-in-place after
-  // unlock), preserve the original trigger so focus restores to the row
-  // launcher on close, and don't reinstall the focus trap.
-  const alreadyOpen = ov && ov.style.display === "flex";
-  if (!alreadyOpen) {
-    _etmTriggerEl = document.activeElement;
-  }
+  _skillShelfWire();
+  const shelf = document.getElementById("skill-shelf");
+  // When called against an already-open shelf (mutate-in-place after unlock
+  // or re-scan), openShelf below is a no-op that keeps the original opener,
+  // so focus restores to the row launcher on close — and we skip the
+  // focus-on-open below so a screen reader doesn't get a transition.
+  const alreadyOpen = shelf.open;
   let tmpl = null;
   for (let i = 0; i < _govSkills.length; i++) {
     if (_govSkills[i].template_id === tmplId) {
@@ -1741,11 +1886,11 @@ function showEditTemplateModal(tmplId) {
     }
   }
   if (!tmpl) return;
-  ov.style.display = "flex";
-  document.getElementById("etm-id").value = tmplId;
-  document.getElementById("etm-name").value = tmpl.name;
-  document.getElementById("etm-category").value = tmpl.category;
-  document.getElementById("etm-description").value = tmpl.description || "";
+  document.getElementById("skill-shelf-error").classList.remove("is-visible");
+  document.getElementById("skl-id").value = tmplId;
+  document.getElementById("skl-name").value = tmpl.name;
+  document.getElementById("skl-category").value = tmpl.category;
+  document.getElementById("skl-description").value = tmpl.description || "";
   // Parse tags from JSON array to comma-separated display
   let tagsDisplay = "";
   try {
@@ -1754,11 +1899,11 @@ function showEditTemplateModal(tmplId) {
   } catch (e) {
     tagsDisplay = tmpl.tags || "";
   }
-  document.getElementById("etm-tags").value = tagsDisplay;
-  document.getElementById("etm-author").value = tmpl.author || "";
-  document.getElementById("etm-version").value = tmpl.version || "";
-  document.getElementById("etm-license").value = tmpl.license || "";
-  document.getElementById("etm-compatibility").value = tmpl.compatibility || "";
+  document.getElementById("skl-tags").value = tagsDisplay;
+  document.getElementById("skl-author").value = tmpl.author || "";
+  document.getElementById("skl-version").value = tmpl.version || "";
+  document.getElementById("skl-license").value = tmpl.license || "";
+  document.getElementById("skl-compatibility").value = tmpl.compatibility || "";
   let pathsDisplay = "";
   try {
     const pathsList = JSON.parse(tmpl.paths || "[]");
@@ -1766,8 +1911,8 @@ function showEditTemplateModal(tmplId) {
   } catch (e) {
     pathsDisplay = tmpl.paths || "";
   }
-  document.getElementById("etm-paths").value = pathsDisplay;
-  document.getElementById("etm-hidden-from-menu").checked = Boolean(
+  document.getElementById("skl-paths").value = pathsDisplay;
+  document.getElementById("skl-hidden-from-menu").checked = Boolean(
     tmpl.hidden_from_menu,
   );
   let argumentsDisplay = "";
@@ -1777,29 +1922,29 @@ function showEditTemplateModal(tmplId) {
   } catch (e) {
     argumentsDisplay = tmpl.arguments || "";
   }
-  document.getElementById("etm-arguments").value = argumentsDisplay;
-  document.getElementById("etm-argument-hint").value = tmpl.argument_hint || "";
-  document.getElementById("etm-activation").value = tmpl.activation || "named";
-  document.getElementById("etm-content").value = tmpl.content;
-  _updateVarsDisplay("etm-content", "etm-variables");
-  document.getElementById("etm-content").oninput = function () {
-    _updateVarsDisplay("etm-content", "etm-variables");
-  };
-  document.getElementById("etm-default").checked = tmpl.is_default;
+  document.getElementById("skl-arguments").value = argumentsDisplay;
+  document.getElementById("skl-argument-hint").value = tmpl.argument_hint || "";
+  document.getElementById("skl-activation").value = tmpl.activation || "named";
+  const content = document.getElementById("skl-content");
+  content.value = tmpl.content;
+  // Paste-to-parse is a create-mode affordance.
+  content.onpaste = null;
+  document.getElementById("skl-paste-hint").hidden = true;
+  document.getElementById("skl-default").checked = tmpl.is_default;
   // Session config fields
-  document.getElementById("esk-model").value = tmpl.model || "";
-  document.getElementById("esk-temperature").value =
+  document.getElementById("sklc-model").value = tmpl.model || "";
+  document.getElementById("sklc-temperature").value =
     tmpl.temperature != null ? tmpl.temperature : "";
-  document.getElementById("esk-reasoning-effort").value =
+  document.getElementById("sklc-reasoning-effort").value =
     tmpl.reasoning_effort || "";
-  document.getElementById("esk-max-tokens").value =
+  document.getElementById("sklc-max-tokens").value =
     tmpl.max_tokens != null ? tmpl.max_tokens : "";
-  document.getElementById("esk-token-budget").value = tmpl.token_budget
+  document.getElementById("sklc-token-budget").value = tmpl.token_budget
     ? tmpl.token_budget
     : "";
-  document.getElementById("esk-agent-max-turns").value =
+  document.getElementById("sklc-agent-max-turns").value =
     tmpl.agent_max_turns != null ? tmpl.agent_max_turns : "";
-  document.getElementById("esk-auto-approve").checked =
+  document.getElementById("sklc-auto-approve").checked =
     tmpl.auto_approve || false;
   // allowed_tools: parse JSON array to comma-separated display
   let allowedDisplay = "";
@@ -1809,19 +1954,13 @@ function showEditTemplateModal(tmplId) {
   } catch (e) {
     allowedDisplay = tmpl.allowed_tools || "";
   }
-  document.getElementById("esk-allowed-tools").value = allowedDisplay;
-  document.getElementById("esk-allowed-tools").disabled =
+  document.getElementById("sklc-allowed-tools").value = allowedDisplay;
+  document.getElementById("sklc-allowed-tools").disabled =
     tmpl.auto_approve || false;
-  document.getElementById("esk-enabled").checked = tmpl.enabled !== false;
+  document.getElementById("sklc-enabled").checked = tmpl.enabled !== false;
   const notifyVal = tmpl.notify_on_complete || "[]";
-  document.getElementById("esk-notify-on-complete").value =
+  document.getElementById("sklc-notify-on-complete").value =
     notifyVal && notifyVal !== "[]" ? notifyVal : "";
-  document.getElementById("esk-auto-approve").onchange = function () {
-    document.getElementById("esk-allowed-tools").disabled = this.checked;
-  };
-  // The CSS contract for .admin-modal [role="alert"] is hide-by-default,
-  // .is-visible to show — so toggling style.display does nothing here.
-  document.getElementById("edit-template-error").classList.remove("is-visible");
   // Scan report section
   const scanSection = document.getElementById("etm-scan-section");
   if (scanSection) {
@@ -1893,7 +2032,7 @@ function showEditTemplateModal(tmplId) {
         })
         .then(function (data) {
           showToast("Scan complete: " + (data.risk_level || "unknown"));
-          // Refresh the modal by re-loading skills and re-opening
+          // Refresh the shelf by re-loading skills and re-rendering in place
           loadGovSkills();
           // Update current tmpl in memory
           tmpl.risk_level = data.risk_level;
@@ -1912,9 +2051,7 @@ function showEditTemplateModal(tmplId) {
   }
   // Reset collapsible state before applying readonly rules (prevents state leak
   // when switching between readonly and editable skills in the same session)
-  const allDetails = document.querySelectorAll(
-    "#edit-template-box .admin-details",
-  );
+  const allDetails = document.querySelectorAll("#skill-shelf details.rawhatch");
   for (let d = 0; d < allDetails.length; d++) allDetails[d].open = false;
 
   // --- Readonly mode for imported skills ---
@@ -1923,70 +2060,31 @@ function showEditTemplateModal(tmplId) {
   // means the operator detached the skill from upstream and may have edits.
   const isUnlockedInstall =
     !isReadonly && tmpl.origin && tmpl.origin === "source";
-  const editTitle = document.getElementById("edit-template-title");
-  if (editTitle)
-    editTitle.textContent = isReadonly ? "View Skill" : "Edit Skill";
-  // Origin badge — show provenance for installed skills
-  const originBadge = document.getElementById("etm-origin-badge");
-  if (originBadge) {
-    if (isReadonly && tmpl.source_url) {
-      originBadge.textContent = "Installed from \u00a0" + tmpl.source_url;
-      originBadge.style.display = "inline-flex";
-    } else if (isReadonly && tmpl.origin && tmpl.origin !== "manual") {
-      originBadge.textContent = "Installed skill";
-      originBadge.style.display = "inline-flex";
-    } else if (isUnlockedInstall && tmpl.source_url) {
-      originBadge.textContent = "Customized from \u00a0" + tmpl.source_url;
-      originBadge.style.display = "inline-flex";
-    } else if (isUnlockedInstall) {
-      originBadge.textContent = "Customized from upstream";
-      originBadge.style.display = "inline-flex";
-    } else {
-      originBadge.style.display = "none";
-    }
-  }
-  const lockBtn = document.getElementById("etm-lock-btn");
-  if (lockBtn) {
-    // Inline-flex (not "") so display: none doesn't bleed into a
-    // browser-default block reflow on re-show.
-    lockBtn.style.display = isReadonly ? "inline-flex" : "none";
-    lockBtn.dataset.skillId = tmplId;
-    lockBtn.dataset.skillName = tmpl.name || "";
-  }
-  const submitBtn = document.getElementById("etm-submit");
-  if (submitBtn) {
-    submitBtn.style.display = "";
-    submitBtn.textContent = isReadonly ? "Save Config" : "Save";
-    // Always reset to enabled — submitEditTemplate disables this on click
-    // and re-enables in .finally, but a stale disabled=true survives a
-    // mutate-in-place re-render (e.g. after unlock) and would leave the
-    // button non-functional otherwise.
-    submitBtn.disabled = false;
-  }
-  // Spec/content fields: locked for installed skills (preserve source fidelity).
-  // Point screen readers at the origin badge so the "why is this disabled?"
-  // affordance sighted users see is also announced.
-  [
-    "etm-name",
-    "etm-category",
-    "etm-description",
-    "etm-tags",
-    "etm-author",
-    "etm-version",
-    "etm-license",
-    "etm-compatibility",
-    "etm-paths",
-    "etm-arguments",
-    "etm-argument-hint",
-    "etm-activation",
-    "etm-content",
-    "etm-default",
-  ].forEach(function (id) {
+  shelf.setAttribute("data-kind", "edit");
+  document.getElementById("skill-shelf-title").textContent =
+    (isReadonly ? "View skill — " : "Edit skill — ") + tmpl.name;
+  document.getElementById("skill-shelf-tag").textContent = "SKL-EDIT";
+  // Origin + locked-state provenance renders in the foot meta lane.
+  _renderSkillShelfProvenance(tmpl, isReadonly, isUnlockedInstall);
+  const lockBtn = document.getElementById("skl-lock");
+  lockBtn.hidden = !isReadonly;
+  lockBtn.dataset.skillId = tmplId;
+  lockBtn.dataset.skillName = tmpl.name || "";
+  document.getElementById("skl-submit").textContent = isReadonly
+    ? "Save config"
+    : "Save changes";
+  document.getElementById("skl-cancel").textContent = isReadonly
+    ? "Close"
+    : "Cancel";
+  // Spec/content fields: locked for installed skills (preserve source
+  // fidelity). Point screen readers at the foot provenance so the "why is
+  // this disabled?" affordance sighted users see is also announced.
+  _SKILL_SPEC_FIELD_IDS.forEach(function (id) {
     const el = document.getElementById(id);
     if (!el) return;
     el.disabled = isReadonly;
     if (isReadonly) {
-      el.setAttribute("aria-describedby", "etm-origin-badge");
+      el.setAttribute("aria-describedby", "skill-shelf-meta");
     } else {
       el.removeAttribute("aria-describedby");
     }
@@ -1997,69 +2095,54 @@ function showEditTemplateModal(tmplId) {
   // without unlocking the row.  Must match SKILL_RUNTIME_CONFIG_FIELDS
   // in turnstone/core/skill_field_validation.py.
   [
-    "esk-model",
-    "esk-temperature",
-    "esk-reasoning-effort",
-    "esk-max-tokens",
-    "esk-token-budget",
-    "esk-agent-max-turns",
-    "esk-auto-approve",
-    "esk-enabled",
-    "etm-hidden-from-menu",
+    "sklc-model",
+    "sklc-temperature",
+    "sklc-reasoning-effort",
+    "sklc-max-tokens",
+    "sklc-token-budget",
+    "sklc-agent-max-turns",
+    "sklc-auto-approve",
+    "sklc-enabled",
+    "skl-hidden-from-menu",
   ].forEach(function (id) {
     const el = document.getElementById(id);
     if (el) el.disabled = false;
   });
-  // esk-allowed-tools follows auto_approve state, not readonly state
-  const allowedToolsEl = document.getElementById("esk-allowed-tools");
+  // sklc-allowed-tools follows auto_approve state, not readonly state
+  const allowedToolsEl = document.getElementById("sklc-allowed-tools");
   if (allowedToolsEl) allowedToolsEl.disabled = tmpl.auto_approve || false;
-  const cancelBtn = document.querySelector("#edit-template-box .modal-cancel");
-  if (cancelBtn) cancelBtn.textContent = isReadonly ? "Close" : "Cancel";
   // Auto-expand Runtime Config collapsible for installed skills so config is visible
   if (isReadonly) {
-    const details = document.querySelectorAll(
-      "#edit-template-box .admin-details",
-    );
+    const details = document.querySelectorAll("#skill-shelf details.rawhatch");
     for (let d = 0; d < details.length; d++) details[d].open = true;
   }
+  // Mode-exclusive blocks: server-backed resources in, pending-resource
+  // builder out.
+  document.getElementById("ctm-resources-section").hidden = true;
+  document.getElementById("etm-resources-section").hidden = false;
+  _updateVarsDisplay();
   // --- Skill Resources ---
-  const resSection = document.getElementById("etm-resources-section");
-  if (resSection) {
-    _loadSkillResources(tmplId, isReadonly);
-  }
+  _loadSkillResources(tmplId, isReadonly);
+  window.TurnstoneHatch.openShelf(shelf, { onClose: _skillShelfClosed });
   if (!alreadyOpen) {
-    _etmTrapHandler = _installTrap(
-      "edit-template-overlay",
-      "edit-template-box",
-    );
-    // Focus management — only on the initial open. Re-renders preserve
-    // wherever focus was so a screen reader doesn't get a transition.
-    // For readonly skills, prefer the lock button so keyboard users land
-    // on the unlock affordance instead of having to Tab past every
-    // disabled spec field to reach it. Cancel is still one Shift-Tab away.
+    // Focus management — only on the initial open. For readonly skills,
+    // prefer the head lock button so keyboard users land on the unlock
+    // affordance instead of having to Tab past every disabled spec field
+    // to reach it.
     if (isReadonly) {
-      if (lockBtn && lockBtn.style.display !== "none") {
-        lockBtn.focus();
-      } else if (cancelBtn) {
-        cancelBtn.focus();
-      }
+      lockBtn.focus();
     } else {
-      document.getElementById("etm-name").focus();
+      document.getElementById("skl-name").focus();
     }
   }
 }
 
 function hideEditTemplateModal() {
-  document.getElementById("edit-template-overlay").style.display = "none";
-  _etmTrapHandler = _removeTrap(_etmTrapHandler);
-  if (_etmTriggerEl && _etmTriggerEl.focus) {
-    _etmTriggerEl.focus();
-  }
-  _etmTriggerEl = null;
+  hideCreateTemplateModal();
 }
 
 function unlockSkill() {
-  const btn = document.getElementById("etm-lock-btn");
+  const btn = document.getElementById("skl-lock");
   if (!btn) return;
   const skillId = btn.dataset.skillId;
   const skillName = btn.dataset.skillName || "this skill";
@@ -2078,7 +2161,7 @@ function unlockSkill() {
 }
 
 function _performUnlockSkill(skillId) {
-  const btn = document.getElementById("etm-lock-btn");
+  const btn = document.getElementById("skl-lock");
   if (btn) btn.disabled = true;
   authFetch("/v1/api/admin/skills/" + skillId + "/unlock", {
     method: "POST",
@@ -2093,7 +2176,7 @@ function _performUnlockSkill(skillId) {
     })
     .then(function () {
       showToast("Skill unlocked — fields are now editable");
-      // Refresh the cached list, then re-render the open modal in place from
+      // Refresh the cached list, then re-render the open shelf in place from
       // the fresh row. No close/reopen → no flicker, no focus bounce.
       return loadGovSkills().then(function () {
         showEditTemplateModal(skillId);
@@ -2359,15 +2442,14 @@ function submitEditTemplate() {
   // leave stale red text visible during the in-flight PUT, and a successful
   // PUT shouldn't either. Cheaper than reasoning about every catch path
   // remembering to clear on success.
-  const prevErr = document.getElementById("edit-template-error");
-  if (prevErr) {
-    prevErr.classList.remove("is-visible");
-    prevErr.textContent = "";
-  }
-  const id = document.getElementById("etm-id").value;
-  const content = document.getElementById("etm-content").value;
+  const shelf = document.getElementById("skill-shelf");
+  const errEl = document.getElementById("skill-shelf-error");
+  errEl.classList.remove("is-visible");
+  errEl.textContent = "";
+  const id = document.getElementById("skl-id").value;
+  const content = document.getElementById("skl-content").value;
   const varList = _detectTemplateVars(content);
-  const tagsRaw = (document.getElementById("etm-tags").value || "").trim();
+  const tagsRaw = (document.getElementById("skl-tags").value || "").trim();
   const tagsArray = tagsRaw
     ? tagsRaw
         .split(",")
@@ -2377,14 +2459,14 @@ function submitEditTemplate() {
         .filter(Boolean)
     : [];
   // Session config fields
-  const esTemp = document.getElementById("esk-temperature").value.trim();
-  const esMaxTok = document.getElementById("esk-max-tokens").value.trim();
-  const esBudget = document.getElementById("esk-token-budget").value.trim();
+  const esTemp = document.getElementById("sklc-temperature").value.trim();
+  const esMaxTok = document.getElementById("sklc-max-tokens").value.trim();
+  const esBudget = document.getElementById("sklc-token-budget").value.trim();
   const esMaxTurns = document
-    .getElementById("esk-agent-max-turns")
+    .getElementById("sklc-agent-max-turns")
     .value.trim();
   const esAllowed = (
-    document.getElementById("esk-allowed-tools").value || ""
+    document.getElementById("sklc-allowed-tools").value || ""
   ).trim();
   const esAllowedArr = esAllowed
     ? esAllowed
@@ -2395,7 +2477,7 @@ function submitEditTemplate() {
         .filter(Boolean)
     : [];
   const esNotifyRaw = (
-    document.getElementById("esk-notify-on-complete").value || ""
+    document.getElementById("sklc-notify-on-complete").value || ""
   ).trim();
   let esNotifyVal = "[]";
   if (esNotifyRaw) {
@@ -2405,61 +2487,60 @@ function submitEditTemplate() {
         throw new Error("must be a JSON array");
       esNotifyVal = JSON.stringify(esNotifyParsed);
     } catch (ne) {
-      const ne3 = document.getElementById("edit-template-error");
-      ne3.textContent = "Notify on completion: " + ne.message;
-      ne3.classList.add("is-visible");
+      errEl.textContent = "Notify on completion: " + ne.message;
+      errEl.classList.add("is-visible");
       return;
     }
   }
-  document.getElementById("etm-submit").disabled = true;
-  const esVersion = (document.getElementById("etm-version").value || "").trim();
-  const esPathsArr = (document.getElementById("etm-paths").value || "")
+  const esVersion = (document.getElementById("skl-version").value || "").trim();
+  const esPathsArr = (document.getElementById("skl-paths").value || "")
     .split(",")
     .map(function (p) {
       return p.trim();
     })
     .filter(Boolean);
-  const esArgsArr = (document.getElementById("etm-arguments").value || "")
+  const esArgsArr = (document.getElementById("skl-arguments").value || "")
     .split(",")
     .map(function (a) {
       return a.trim();
     })
     .filter(Boolean);
   const esArgumentHint = (
-    document.getElementById("etm-argument-hint").value || ""
+    document.getElementById("skl-argument-hint").value || ""
   ).trim();
   const updateBody = {
-    name: document.getElementById("etm-name").value.trim(),
-    category: document.getElementById("etm-category").value,
+    name: document.getElementById("skl-name").value.trim(),
+    category: document.getElementById("skl-category").value,
     description: (
-      document.getElementById("etm-description").value || ""
+      document.getElementById("skl-description").value || ""
     ).trim(),
     tags: JSON.stringify(tagsArray),
-    author: (document.getElementById("etm-author").value || "").trim(),
-    license: (document.getElementById("etm-license").value || "").trim(),
+    author: (document.getElementById("skl-author").value || "").trim(),
+    license: (document.getElementById("skl-license").value || "").trim(),
     compatibility: (
-      document.getElementById("etm-compatibility").value || ""
+      document.getElementById("skl-compatibility").value || ""
     ).trim(),
     paths: JSON.stringify(esPathsArr),
-    hidden_from_menu: document.getElementById("etm-hidden-from-menu").checked,
+    hidden_from_menu: document.getElementById("skl-hidden-from-menu").checked,
     arguments: JSON.stringify(esArgsArr),
     argument_hint: esArgumentHint,
-    activation: document.getElementById("etm-activation").value,
+    activation: document.getElementById("skl-activation").value,
     content: content,
     variables: JSON.stringify(varList),
-    is_default: document.getElementById("etm-default").checked,
-    model: document.getElementById("esk-model").value.trim(),
-    auto_approve: document.getElementById("esk-auto-approve").checked,
+    is_default: document.getElementById("skl-default").checked,
+    model: document.getElementById("sklc-model").value.trim(),
+    auto_approve: document.getElementById("sklc-auto-approve").checked,
     temperature: esTemp ? parseFloat(esTemp) : null,
-    reasoning_effort: document.getElementById("esk-reasoning-effort").value,
+    reasoning_effort: document.getElementById("sklc-reasoning-effort").value,
     max_tokens: esMaxTok ? parseInt(esMaxTok, 10) : null,
     token_budget: esBudget ? parseInt(esBudget, 10) : 0,
     agent_max_turns: esMaxTurns ? parseInt(esMaxTurns, 10) : null,
     allowed_tools: JSON.stringify(esAllowedArr),
     notify_on_complete: esNotifyVal,
-    enabled: document.getElementById("esk-enabled").checked,
+    enabled: document.getElementById("sklc-enabled").checked,
   };
   if (esVersion) updateBody.version = esVersion;
+  window.TurnstoneHatch.setBusy(shelf, true);
   authFetch("/v1/api/admin/skills/" + id, {
     method: "PUT",
     headers: { "Content-Type": "application/json" },
@@ -2473,17 +2554,15 @@ function submitEditTemplate() {
       return r.json();
     })
     .then(function () {
+      window.TurnstoneHatch.setBusy(shelf, false);
       hideEditTemplateModal();
       showToast("Skill updated");
       loadGovSkills();
     })
     .catch(function (e) {
-      const el = document.getElementById("edit-template-error");
-      el.textContent = e.message;
-      el.classList.add("is-visible");
-    })
-    .finally(function () {
-      document.getElementById("etm-submit").disabled = false;
+      window.TurnstoneHatch.setBusy(shelf, false);
+      errEl.textContent = e.message;
+      errEl.classList.add("is-visible");
     });
 }
 
