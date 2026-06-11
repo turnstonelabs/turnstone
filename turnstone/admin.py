@@ -439,6 +439,44 @@ def _discover_console_url() -> str:
 # ---------------------------------------------------------------------------
 
 
+def _cmd_orphan_conversations(args: argparse.Namespace) -> None:
+    """Scan for (and with --delete purge) conversation rows whose workstream is gone."""
+    storage = _get_storage(args)
+    orphans = storage.list_orphan_conversations()
+    if not orphans:
+        print("No orphan conversation rows.")
+        return
+    width = max(len(o["ws_id"]) for o in orphans)
+    print(f"{'ws_id':<{width}}  {'rows':>5}  {'refs':>4}  first       last")
+    for o in orphans:
+        print(
+            f"{o['ws_id']:<{width}}  {o['rows']:>5}  {o['attachment_refs']:>4}  "
+            f"{(o['first'] or '')[:10]}  {(o['last'] or '')[:10]}"
+        )
+    total_rows = sum(o["rows"] for o in orphans)
+    total_refs = sum(o["attachment_refs"] for o in orphans)
+    print(
+        f"\n{len(orphans)} orphan workstream(s), {total_rows} conversation row(s), "
+        f"{total_refs} attachment ref(s)."
+    )
+    if not args.delete:
+        print("Re-run with --delete to purge them.")
+        return
+    if not args.yes:
+        reply = input(f"Delete {total_rows} row(s) across {len(orphans)} workstream(s)? [y/N] ")
+        if reply.strip().lower() not in ("y", "yes"):
+            print("Aborted.", file=sys.stderr)
+            sys.exit(1)
+    result = storage.delete_orphan_conversations([o["ws_id"] for o in orphans])
+    summary = (
+        f"Purged {result['rows']} row(s) across {result['workstreams']} workstream(s); "
+        f"released {result['released_refs']} attachment ref(s)"
+    )
+    if result["skipped"]:
+        summary += f"; skipped {result['skipped']} re-registered workstream(s)"
+    print(summary + ".")
+
+
 def _cmd_rerank_calibrate(args: argparse.Namespace) -> None:
     from turnstone.core.config import get_rerank_instruction
     from turnstone.core.config_store import ConfigStore
@@ -619,6 +657,15 @@ def main() -> None:
         help="Write the calibration onto the model's capabilities",
     )
 
+    p_orph = sub.add_parser(
+        "orphan-conversations",
+        help="Scan (and with --delete purge) conversation rows whose workstream row is gone",
+    )
+    p_orph.add_argument(
+        "--delete", action="store_true", help="Purge the orphans after the scan report"
+    )
+    p_orph.add_argument("--yes", action="store_true", help="Skip the interactive confirmation")
+
     args = parser.parse_args()
     if not args.command:
         parser.print_help()
@@ -638,6 +685,7 @@ def main() -> None:
         "set-node-metadata": _cmd_set_node_metadata,
         "delete-node-metadata": _cmd_delete_node_metadata,
         "export": _cmd_export,
+        "orphan-conversations": _cmd_orphan_conversations,
         "rerank-calibrate": _cmd_rerank_calibrate,
     }
     dispatch[args.command](args)
