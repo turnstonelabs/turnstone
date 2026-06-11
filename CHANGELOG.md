@@ -12,75 +12,212 @@ Three release tracks are maintained:
 - **`stable/1.5`** — patch-only (`v1.5.x`)
 - **`main`** — experimental (next major)
 
-## [Unreleased]
+## [1.6.0]
+
+The first stable release of the 1.6 line — and the first under Apache 2.0.
+
+> **⚠️ Before upgrading from 1.5.x:** 1.6.0 changes the internal
+> conversation storage schema (Alembic migration `060`, applied
+> automatically on first start). The migration converts existing
+> workstreams and attachments in place — **back up your storage before
+> upgrading** (`pg_dump` for PostgreSQL; copy the database file for
+> SQLite). Background: discussion
+> [#631](https://github.com/turnstonelabs/turnstone/discussions/631).
+
+**Breaking changes at a glance** (details in the sections below):
+`web_search` backend overhaul (Tavily/DuckDuckGo removed, `topic` →
+`category`), the `man` / `math` / `plan_agent` built-in tools and the
+plan-review protocol removed, and the body-keyed `/v1/api/command`
+endpoint replaced by path-keyed workstream verbs.
+
+### License
+
+- **Relicensed to Apache 2.0** — from BUSL-1.1, effective with this
+  release (#546, contributor assent record in #548). Versions 1.5.x and
+  earlier remain under BUSL-1.1 as shipped, and the `stable/1.4` /
+  `stable/1.5` branches keep their original LICENSE. New `NOTICE` and
+  `CONTRIBUTORS.md` files; `THIRD-PARTY-NOTICES` refreshed to match the
+  bundled library versions.
 
 ### Added
 
-- **Self-hosted SearxNG web search** — the `web_search` tool's backend for
-  local/vLLM models is now a bundled [SearxNG](https://searxng.org) service
-  (`searxng` in both compose stacks; internal docker network only, JSON API
-  enabled, rate limiter off). Two new settings configure it: `tools.searxng_url`
-  (default `http://searxng:8080`, env `TURNSTONE_SEARXNG_URL`) and
-  `tools.searxng_engines` (env `TURNSTONE_SEARXNG_ENGINES`). Commercial providers
-  (Anthropic, OpenAI) continue to use their own native server-side search and
-  never touch SearxNG; the `mcp:server:tool` backend is unchanged. A persistent
-  `searxng-cache` volume keeps its favicon/internal cache across restarts, and
-  Caddy can serve SearxNG's own web UI on a dedicated port (dev stack:
-  `https://localhost:8444`, localhost-only; production: opt-in). See
-  [docs/docker.md](docs/docker.md) for the AGPL-3.0 §13 note that applies to
-  operators who expose the bundled SearxNG publicly.
-
-- **`turnstone-admin` reads `config.toml`** — the admin CLI now honors
-  the same `[database]` section that `turnstone-server` does, with the
-  same precedence (`CLI / config.toml > TURNSTONE_DB_* env > defaults`).
-  Operators with DB credentials in `config.toml` no longer need to
-  re-export `TURNSTONE_DB_URL` before every admin invocation.  Newly
-  plumbed through to `init_storage`: `pool_size`, `sslmode`,
-  `sslrootcert`, `sslcert`, `sslkey` — previously the admin CLI
-  silently dropped these.  A new `--config PATH` flag mirrors the
-  one already on `turnstone-server`.
+- **Mid-conversation system messages** — advisories, watch results,
+  skill hints, and operator interjections are now first-class
+  `role=system` turns in the trajectory instead of ad-hoc reminder
+  envelopes. Models with native mid-conversation system support receive
+  them verbatim; for everything else they fold into a nonce-fenced
+  wrapper. The one-shot `_reminders` side-channel is gone.
+- **Self-hosted SearxNG web search** — the `web_search` backend for
+  local/vLLM models is now a bundled [SearxNG](https://searxng.org)
+  service (in both compose stacks; internal network only). Configure via
+  `tools.searxng_url` / `tools.searxng_engines`. Commercial providers
+  keep their native server-side search; the model can target a corpus by
+  passing `category` (`general`, `news`, `it`, `science`). Operators
+  exposing the bundled SearxNG publicly: see the AGPL-3.0 §13 note in
+  [docs/docker.md](docs/docker.md).
+- **Endpoint-backed reranking** — a reranker is now a per-model
+  definition (Cohere/Jina-compatible wire: vLLM, TEI, llama.cpp, or a
+  commercial endpoint), disabled by default. When configured it scores
+  `web_search` results and the BM25 retrieval surfaces (deferred tools,
+  skills, memory) behind a `tools.rerank_bm25` toggle with a relevance
+  floor; a calibration CLI (and calibrate-on-detect) tunes the floor
+  per model.
+- **Proactive memory relevance** — injected memories are selected by
+  BM25 + reranker against the recent user messages instead of recency
+  alone, and first composition defers to the first user turn so fresh
+  sessions select against a real query.
+- **Smart Approvals** — opt-in (default off): high-confidence `approve`
+  verdicts from the intent judge auto-approve the tool call instead of
+  waiting for a human, with a confidence threshold and verdict
+  bookkeeping designed so a denied or reset judge never auto-fires.
+- **Early-painted tool calls** — committed tool calls render immediately
+  as pending cards (both UIs upgrade the card in place by `call_id`)
+  instead of waiting for the judge verdict, so big parallel batches no
+  longer sit invisible during judging.
+- **Voice I/O v1** — speech-to-text and text-to-speech as model roles
+  speaking the OpenAI audio wire protocol (#618); the interactive
+  composer grows a mic button.
+- **Rewind / retry / edit-first-message** — full UX in both the
+  interactive UI and the coordinator pane, backed by shared path-keyed
+  verb handlers (#549).
+- **Workstream export** — download a conversation as OpenAI-format
+  messages JSON.
+- **Skills platform round** — `SKILL.md` ingestion learns
+  `when_to_use` / `model` / `effort` / `paths`; prompt substitution
+  supports `$ARGUMENTS`, `$N`, `$<name>`, and `${CLAUDE_*}` (#572);
+  per-skill `disable-model-invocation` and `user-invocable` flags
+  (#571); `skill` + `list_skills` unify into one dual-kind tool; new
+  `model.skills.write` permission.
+- **Coordinator hardening for small models** — workstream references in
+  coordinator tool calls are validated with did-you-mean recovery, and
+  `wait_for_workstream` fails fast with uniform `not_found` entries
+  instead of hanging on a hallucinated `ws_id`.
+- **Provider support** — Claude Fable 5 and Claude Opus 4.8; xAI/Grok
+  via the OpenAI Responses lane; vLLM reasoning-field replay completes
+  the reasoning-persistence work (#537).
+- **Cluster-by-default deployment** — the compose stack fronts
+  everything with Caddy and supports bare-metal node join; a one-line
+  `curl | bash` installer bootstraps a node; nodes with no configured
+  models boot into a degraded state instead of crash-looping; channel
+  gateways stand by when no adapter token is set.
+- **MCP OAuth tokens encrypted at rest**.
+- **`turnstone-admin` reads `config.toml`** — same `[database]` section
+  and precedence as the server (`CLI / config.toml > TURNSTONE_DB_* env
+  > defaults`), including `pool_size` and the `ssl*` knobs it previously
+  dropped; new `--config PATH` flag.
 
 ### Changed
 
+- **Conversation storage and the provider wire are rebuilt around a
+  canonical trajectory** (migration `060` — see the upgrade note).
+  Internally a conversation is now a provider-neutral `Turn` sequence
+  lowered to each provider's wire format at send time; provider-specific
+  tool-call metadata rides an opaque producer-tagged lane (replayed
+  verbatim to the producing provider, rebuilt for others); attachments
+  become content-addressed, reference-counted rows resolved at the
+  provider boundary; orphan tool-call repair happens once, at send time.
+  Wire-visible behavior is unchanged for OpenAI-compatible providers;
+  histories are preserved across the migration.
+- **The console and web UI share one L-shell** — a left glyph rail, a
+  tab bar, and a pane host now frame interactive chats, coordinator
+  sessions, dashboards, and the admin panel as tabs in a single window;
+  the standalone web UI adopts the same shell and the old split-pane
+  layout is retired. Coordinator and interactive conversations render
+  through shared `.conv-*` card builders, the rail collapses to a glyph
+  strip (remembered per browser), mobile gets an off-canvas drawer, and
+  the frontend is now ES modules end to end.
+- **Admin panel modals → the Service Hatch shelf** — all ~35 admin
+  modals are replaced by pane-scoped shelves plus a small dialog tier
+  for confirmations. Schedules gain a cron builder with a next-3-runs
+  preview endpoint, model capabilities render as an LED tile matrix, and
+  the legacy modal machinery is deleted.
+- **SSE delivery is resumable end to end** — per-workstream ring buffer
+  with `Last-Event-ID` replay (cap raised 2,000 → 50,000), fresh-connect
+  and reconnect unified on one event-id cursor (in-flight tool batches
+  included), persisted `last_error` replays on connect, the console
+  proxy forwards `Last-Event-ID`, and panes close their connections on
+  `beforeunload` to stop multi-pane refresh from exhausting the
+  browser's per-host connection cap (#539).
+- **Workstream verbs are path-keyed** *(BREAKING)* — `rewind` / `retry`
+  / `edit-first-message` live at
+  `/v1/api/workstreams/{ws_id}/<verb>` alongside the other session
+  verbs; the body-keyed `/v1/api/command` endpoint is removed (#549).
+- **`/history` is projected server-side** — both UIs consume the same
+  REST-first wire shape instead of re-deriving it client-side.
+- **Saved workstreams & coordinators: card grid → sortable table** with
+  model/skill/context columns, pagination, and a unified selector across
+  both dashboards.
 - **`tools.web_search_backend` accepted values** *(BREAKING)* — now `""`
-  (auto), `"searxng"`, or `"mcp:server:tool"`. The old `"tavily"` and `"ddg"`
-  values are gone; a config still set to either disables web search and logs a
-  warning. Auto-detect resolves to SearxNG when `searxng_url` is set, otherwise
-  no client (the `web_search` tool is dropped for models without native search).
-- **`web_search` tool: `topic` → `category`** *(BREAKING)* — the LLM-facing
-  parameter is renamed and its values are now `general` (default), `news`, `it`
-  (code/tech), or `science`, mapped to SearxNG categories so the model can target
-  the right corpus. The Tavily-era `finance` topic (no SearxNG equivalent) is gone.
+  (auto), `"searxng"`, or `"mcp:server:tool"`. The old `"tavily"` and
+  `"ddg"` values are gone; a config still set to either disables web
+  search and logs a warning. Auto-detect resolves to SearxNG when
+  `searxng_url` is set.
+- **`web_search` tool: `topic` → `category`** *(BREAKING)* — renamed
+  LLM-facing parameter; values map to SearxNG categories. The Tavily-era
+  `finance` topic is gone.
+- **Core install includes what most deployments use** — `anthropic`,
+  `postgres`, `console`, and `tls` are core dependencies rather than
+  extras.
+- **NODES table → bottom-bar node picker** in the console.
+
+### Fixed
+
+- **Cluster mTLS actually survives operations** — certificate identity
+  keys on the advertised host rather than the container ID, renewals are
+  scoped per node, reloaded certs hot-swap into the live SSL context,
+  and healthchecks/boot retries are mTLS-aware.
+- **Intent-verdict lifecycle** — history replay ships risk-none verdict
+  rows (live/replay parity), late verdicts persist as `superseded` for
+  the audit trail instead of vanishing, bulk verdict insert tolerates
+  per-row conflicts, and cancel-on-approval honors its run-to-completion
+  contract.
+- **Usage accounting** — dashboard totals were under-counting; auxiliary
+  LLM spend (judge, rerank, memory) is now recorded.
+- **Concurrent first-boot migrations** no longer deadlock on the
+  advisory lock.
+- **Output renderer** — single-`$` inline math no longer false-positives
+  in prose; `strip_html` preserves block structure and drops a ReDoS
+  risk.
+- **Model registry** orders versions numerically (no more `1.10 < 1.9`
+  selection).
 
 ### Removed
 
-- **Tavily and DuckDuckGo `web_search` backends** *(BREAKING)* — replaced by the
-  bundled self-hosted SearxNG service (see Added). Removed: the
-  `tools.tavily_api_key` setting, the `$TAVILY_API_KEY` env var, the
-  `[api].tavily_key` config key, and the `ddg` install extra (the `ddgs`
-  dependency). Migration: use the bundled SearxNG (it ships in the compose stacks
-  by default) or point `TURNSTONE_SEARXNG_URL` at an existing instance. No
-  database migration required.
-- **`man`, `math`, and `plan_agent` built-in tools removed** — `man` and
-  `math` duplicated capabilities already available through `bash`; `plan_agent`
-  is better expressed as a `task_agent` running a planning skill.  Removing
-  them simplifies the tool surface and cuts per-call token cost.  This release
-  also removes: the `math` sandbox executor (`turnstone.core.sandbox`) and the
-  `[sandbox]` extra's role for it; the read-only `AGENT_TOOLS` sub-agent tool
-  set and the `agent` tool-metadata key; the plan-review protocol
-  (`/v1/api/plan` endpoint, `plan_review`/`plan_resolved` SSE events, the
-  `on_plan_review` SDK/UI hook); and the `model.plan_alias` /
-  `model.plan_effort` ConfigStore settings (and the corresponding
-  `[model].plan_model` / `[model].plan_effort` config.toml knobs).
-  **Breaking change** on the experimental 1.6 line.  Interactive built-in tool
-  count moves from 19 → 16; `TASK_AGENT_TOOLS` from 13 → 11.
+- **Tavily and DuckDuckGo `web_search` backends** *(BREAKING)* —
+  replaced by the bundled SearxNG service. Removed:
+  `tools.tavily_api_key`, `$TAVILY_API_KEY`, `[api].tavily_key`, and the
+  `ddg` install extra. Point `TURNSTONE_SEARXNG_URL` at an existing
+  instance or use the bundled one; no database migration required.
+- **`man`, `math`, and `plan_agent` built-in tools** *(BREAKING)* —
+  `man`/`math` duplicated `bash`; planning is better expressed as a
+  `task_agent` running a planning skill. Also removed: the `math`
+  sandbox executor, the read-only `AGENT_TOOLS` sub-agent set, the
+  plan-review protocol (`/v1/api/plan`, `plan_review`/`plan_resolved`
+  SSE events, `on_plan_review` hooks), and the `model.plan_*` settings.
+  Interactive built-in tool count: 19 → 16.
 
 ### Security
 
-- **Permissive `config.toml` now warns** — `turnstone.core.config.load_config`
-  logs a single warning when the resolved config file is group- or
-  world-readable (any bit in `0o077`).  DB password and TLS key paths
-  live in `[database]`; operators usually want the file at `0600`.
+- **Zero direct-HTML frontend** — every `innerHTML` sink across the
+  console and web UI is replaced with DOM construction or `setSafeHtml`,
+  inline handlers became delegated bindings, and CI lints pin the
+  invariant (plus `var`-free and const-reassign checks) across all
+  swept bundles.
+- **Output guard grows an LLM stage** — merged with the heuristics as
+  escalate-only (an LLM verdict can raise but never lower a heuristic
+  positive), with annotated findings, a capability gate, and hardening
+  against domain-camouflaged injection (#560, #573).
+- **One trust-fence primitive** — operator and judge envelopes share a
+  nonce-fenced wrapper (64-bit nonces, host-escaping); the output guard
+  flags nonce forgery, and skill hints no longer echo model-controlled
+  filter values into trusted text.
+- **RBAC** — built-in role overrides get an editor, and several
+  under-enforced permission gates are tightened (#585).
+- **Permissive `config.toml` warns** — a single startup warning when the
+  resolved config file is group- or world-readable; operators usually
+  want `0600`.
+- **Dependency floors** — `starlette>=1.0.1` (PYSEC-2026-161 host-header
+  path injection) and `aiohttp>=3.14.0` (security release).
 
 ## [1.5.17]
 
