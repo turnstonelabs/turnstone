@@ -33,7 +33,7 @@ RUN useradd --create-home --shell /bin/bash turnstone
 WORKDIR /app
 
 # Install dependencies first (cached layer — only re-runs when deps change)
-COPY pyproject.toml uv.lock README.md LICENSE ./
+COPY pyproject.toml uv.lock README.md LICENSE NOTICE THIRD-PARTY-NOTICES ./
 RUN uv sync --frozen --no-install-project --no-dev \
     --no-compile --extra all
 

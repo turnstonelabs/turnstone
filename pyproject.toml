@@ -7,7 +7,8 @@ name = "turnstone"
 version = "1.6.0rc2"
 description = "Multi-node AI orchestration platform with tool use, agent routing, and cluster simulation."
 readme = "README.md"
-license = "BUSL-1.1"
+license = "Apache-2.0"
+license-files = ["LICENSE", "NOTICE", "THIRD-PARTY-NOTICES"]
 requires-python = ">=3.11"
 authors = [{name = "Patrick Buckley", email = "buckleypm@gmail.com"}]
 keywords = ["ai", "chat", "llm", "agent", "tools", "openai"]

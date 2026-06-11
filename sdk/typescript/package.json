@@ -30,7 +30,7 @@
     "sdk",
     "client"
   ],
-  "license": "BUSL-1.1",
+  "license": "Apache-2.0",
   "devDependencies": {
     "typescript": "^6.0.0",
     "vitest": "^4.1"

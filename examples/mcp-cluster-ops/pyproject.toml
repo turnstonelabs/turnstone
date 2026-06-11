@@ -7,7 +7,7 @@ name = "mcp-cluster-ops"
 version = "0.1.0"
 description = "MCP server for Turnstone cluster operations — reference implementation."
 requires-python = ">=3.11"
-license = "BUSL-1.1"
+license = "Apache-2.0"
 dependencies = [
     "turnstone",
     "mcp>=1.6",

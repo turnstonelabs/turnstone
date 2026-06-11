@@ -2,11 +2,11 @@ Turnstone — Third-Party Notices
 
 This file contains the licenses and notices for third-party software bundled
 with Turnstone. Each bundled dependency retains its original license; the
-Turnstone BUSL-1.1 license does not apply to these components.
+Turnstone Apache-2.0 license does not apply to these components.
 
 ================================================================================
 
-KaTeX 0.16.38
+KaTeX 0.17.0
 https://katex.org/
 https://github.com/KaTeX/KaTeX
 
@@ -70,7 +70,7 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 ================================================================================
 
-Mermaid 11.13.0
+Mermaid 11.15.0
 https://mermaid.js.org/
 https://github.com/mermaid-js/mermaid
 
@@ -98,7 +98,7 @@ SOFTWARE.
 
 ================================================================================
 
-hls.js 1.6.15
+hls.js 1.6.16
 https://github.com/video-dev/hls.js
 
 Copyright 2017 Dailymotion

@@ -108,7 +108,7 @@ pgbouncer:
   maxClientConn: 5000
   maxDbConnections: 80
 ```
-:
+
 ---
 
 ## Configuration reference

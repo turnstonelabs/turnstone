@@ -3,7 +3,7 @@
 [![CI](https://github.com/turnstonelabs/turnstone/actions/workflows/ci.yml/badge.svg)](https://github.com/turnstonelabs/turnstone/actions/workflows/ci.yml)
 [![PyPI](https://img.shields.io/pypi/v/turnstone)](https://pypi.org/project/turnstone/)
 [![Python](https://img.shields.io/pypi/pyversions/turnstone)](https://pypi.org/project/turnstone/)
-[![License](https://img.shields.io/badge/license-BSL--1.1-blue)](LICENSE)
+[![License](https://img.shields.io/badge/license-Apache--2.0-blue)](LICENSE)
 [![Discord](https://img.shields.io/badge/Discord-join%20us-5865F2?logo=discord&logoColor=white)](https://discord.gg/Nh3bWMacaq)
 
 Self-hosted, local-first orchestration for tool-using AI agents. Give LLMs real tools — shell, files, search, web — and run them across your own cluster with direct HTTP routing and interactive interfaces. Your code, your models, your data stay on hardware you control: no telemetry, no phone-home.
@@ -169,4 +169,4 @@ Questions, ideas, or want to show what you're building? Join us on Discord:
 
 ## License
 
-[Business Source License 1.1](LICENSE) — free for all use except hosting as a managed service. Converts to Apache 2.0 on 2030-03-01.
+[Apache License 2.0](LICENSE), as of version 1.6.0. Versions 1.5.x and earlier remain under the Business Source License 1.1 they shipped with.

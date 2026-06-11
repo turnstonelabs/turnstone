@@ -56,4 +56,4 @@ Open an issue at https://github.com/turnstonelabs/turnstone/issues with:
 ## License
 
 By contributing, you agree that your contributions will be licensed under the
-project's [Business Source License 1.1](LICENSE).
+project's [Apache License 2.0](LICENSE).
