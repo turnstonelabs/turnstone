@@ -12,7 +12,13 @@ import sqlalchemy as sa
 
 from turnstone.core.attachments import unreadable_placeholder
 from turnstone.core.log import get_logger
-from turnstone.core.storage._schema import workstream_attachments
+from turnstone.core.storage._schema import (
+    conversations,
+    workstream_attachments,
+    workstream_config,
+    workstream_overrides,
+    workstreams,
+)
 from turnstone.core.trajectory import (
     AttachmentRef,
     ContentBlock,
@@ -171,6 +177,100 @@ def release_attachment_refs(conn: Any, attachment_ids: list[str]) -> None:
             )
         )
     )
+
+
+def find_orphan_conversations(conn: Any) -> list[dict[str, Any]]:
+    """Conversation ws_ids that have no ``workstreams`` row, with row stats.
+
+    Orphans come from writers that persisted without a registered workstream:
+    historically the pre-unification CLI/server paths, and the
+    delete-during-inflight race (a late tool-result save re-creating rows
+    after ``delete_workstream``).  Read-only; ordered oldest-first.  Each
+    entry carries the attachment-ref count so a purge's refcount release is
+    visible before it happens.
+    """
+    rows = conn.execute(
+        sa.select(
+            conversations.c.ws_id,
+            sa.func.count().label("row_count"),
+            sa.func.min(conversations.c.timestamp).label("first"),
+            sa.func.max(conversations.c.timestamp).label("last"),
+        )
+        .select_from(
+            conversations.outerjoin(workstreams, conversations.c.ws_id == workstreams.c.ws_id)
+        )
+        .where(workstreams.c.ws_id.is_(None))
+        .group_by(conversations.c.ws_id)
+        .order_by(sa.func.min(conversations.c.timestamp))
+    ).fetchall()
+    orphans: list[dict[str, Any]] = []
+    for ws_id, row_count, first, last in rows:
+        referenced = conn.execute(
+            sa.select(conversations.c.attachments).where(
+                sa.and_(
+                    conversations.c.ws_id == ws_id,
+                    conversations.c.attachments.is_not(None),
+                )
+            )
+        ).fetchall()
+        ref_count = sum(len(parse_attachment_refs(refs)) for (refs,) in referenced)
+        orphans.append(
+            {
+                "ws_id": ws_id,
+                "rows": int(row_count),
+                "first": first,
+                "last": last,
+                "attachment_refs": ref_count,
+            }
+        )
+    return orphans
+
+
+def purge_orphan_conversations(conn: Any, ws_ids: list[str]) -> dict[str, int]:
+    """Delete conversation rows for the *ws_ids* that are STILL orphans.
+
+    Orphan-ness is re-verified here, inside the caller's transaction — a
+    ws_id that gained a ``workstreams`` row between scan and purge is counted
+    in ``skipped`` and left untouched, so a stale scan can never delete a
+    live workstream's history.  Mirrors ``delete_workstream``'s cascade for
+    rows with no owning workstream: release the deleted rows' attachment
+    refcounts, then sweep the matching ``workstream_config`` /
+    ``workstream_overrides`` rows.  Caller owns commit.
+    """
+    if not ws_ids:
+        return {"workstreams": 0, "rows": 0, "released_refs": 0, "skipped": 0}
+    registered = {
+        row[0]
+        for row in conn.execute(
+            sa.select(workstreams.c.ws_id).where(workstreams.c.ws_id.in_(ws_ids))
+        ).fetchall()
+    }
+    targets = [w for w in ws_ids if w not in registered]
+    if not targets:
+        return {"workstreams": 0, "rows": 0, "released_refs": 0, "skipped": len(registered)}
+    referenced = conn.execute(
+        sa.select(conversations.c.attachments).where(
+            sa.and_(
+                conversations.c.ws_id.in_(targets),
+                conversations.c.attachments.is_not(None),
+            )
+        )
+    ).fetchall()
+    ref_ids: list[str] = []
+    for (refs,) in referenced:
+        ref_ids.extend(parse_attachment_refs(refs))
+    release_attachment_refs(conn, ref_ids)
+    deleted = conn.execute(
+        sa.delete(conversations).where(conversations.c.ws_id.in_(targets))
+    ).rowcount
+    conn.execute(sa.delete(workstream_config).where(workstream_config.c.ws_id.in_(targets)))
+    conn.execute(sa.delete(workstream_overrides).where(workstream_overrides.c.ws_id.in_(targets)))
+    return {
+        "workstreams": len(targets),
+        "rows": int(deleted or 0),
+        "released_refs": len(ref_ids),
+        "skipped": len(registered),
+    }
 
 
 def attachment_to_content_part(att: dict[str, Any]) -> dict[str, Any] | None:

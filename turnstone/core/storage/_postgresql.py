@@ -115,15 +115,17 @@ from turnstone.core.storage._utils import (
     escape_like as _escape_like,
 )
 from turnstone.core.storage._utils import (
+    find_orphan_conversations,
+    prepare_provider_data_for_save,
+    purge_orphan_conversations,
+    release_attachment_refs,
+    sanitize_text,
+)
+from turnstone.core.storage._utils import (
     normalize_search_terms as _normalize_search_terms,
 )
 from turnstone.core.storage._utils import (
     parse_attachment_refs as _parse_attachment_refs,
-)
-from turnstone.core.storage._utils import (
-    prepare_provider_data_for_save,
-    release_attachment_refs,
-    sanitize_text,
 )
 from turnstone.core.storage._utils import (
     reconstruct_messages as _reconstruct_messages,
@@ -908,6 +910,16 @@ class PostgreSQLBackend:
             result = conn.execute(sa.delete(workstreams).where(workstreams.c.ws_id == ws_id))
             conn.commit()
             return result.rowcount > 0
+
+    def list_orphan_conversations(self) -> list[dict[str, Any]]:
+        with self._conn() as conn:
+            return find_orphan_conversations(conn)
+
+    def delete_orphan_conversations(self, ws_ids: list[str]) -> dict[str, int]:
+        with self._conn() as conn:
+            result = purge_orphan_conversations(conn, ws_ids)
+            conn.commit()
+            return result
 
     # -- Workstream attachments (content-addressed, refcounted) ----------------
 

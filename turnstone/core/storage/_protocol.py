@@ -633,6 +633,27 @@ class StorageBackend(Protocol):
         """Delete a workstream and all its conversations + config."""
         ...
 
+    def list_orphan_conversations(self) -> list[dict[str, Any]]:
+        """Conversation ws_ids with no ``workstreams`` row.
+
+        One dict per orphan workstream — keys ``ws_id``, ``rows``, ``first``,
+        ``last`` (ISO text timestamps), ``attachment_refs`` — ordered
+        oldest-first.  Read-only; feeds the ``turnstone-admin
+        orphan-conversations`` maintenance verb.
+        """
+        ...
+
+    def delete_orphan_conversations(self, ws_ids: list[str]) -> dict[str, int]:
+        """Purge conversation rows for the *ws_ids* that are STILL orphaned.
+
+        Re-verifies against ``workstreams`` in-transaction (a re-registered
+        ws_id is skipped, never deleted), releases the deleted rows'
+        attachment refcounts, and sweeps matching ``workstream_config`` /
+        ``workstream_overrides`` rows.  Returns counts keyed ``workstreams``,
+        ``rows``, ``released_refs``, ``skipped``.
+        """
+        ...
+
     def list_workstreams(
         self,
         node_id: str | None = None,
