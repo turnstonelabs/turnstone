@@ -349,10 +349,11 @@ export function mountRail(sections, caps) {
 // rebuild (the IA is static, but the section re-mounts on shell init) re-applies
 // the live counts rather than dropping them.  `null` label = clear.
 const _rowBadges = new Map(); // tabKey -> { count, label }
-// Rebuilt each mount: the row <button> and the OWNING group's head <button> for
-// every tab key, so a badge can also surface on the head when the group is
-// collapsed (a collapsed group hides its rows — the head must carry the signal).
-let _rowEls = new Map(); // tabKey -> { row, head, group }
+// Rebuilt each mount: the row <button> + owning group key for every tab.  The
+// group's head <button> (where a collapsed group surfaces its summed badge —
+// a collapsed group hides its rows, so the head must carry the signal) is
+// looked up via _groupEls, not duplicated here.
+let _rowEls = new Map(); // tabKey -> { row, group }
 let _groupEls = new Map(); // group key -> { head, tabKeys: [] }
 
 /** Paint (or clear) the badge slot inside a host button, keyed by a stable
@@ -517,8 +518,9 @@ export function mountManage(root, paneManager) {
         if (TS.openTab) TS.openTab(t.tab);
       });
       rowByTab.set(t.tab, row);
-      // Register the row + its owning group for the badge hook.
-      _rowEls.set(t.tab, { row, head, group: group.group });
+      // Register the row + its owning group for the badge hook (the group's
+      // head element is resolved through _groupEls when needed).
+      _rowEls.set(t.tab, { row, group: group.group });
       items.append(row);
     }
 
