@@ -178,6 +178,7 @@ function showAdmin(tab) {
 }
 
 function switchAdminTab(tab) {
+  const tabChanged = tab !== _adminTab;
   _adminTab = tab;
   // Hide no-permissions empty state if it was showing
   const noPerms = document.getElementById("admin-no-permissions");
@@ -205,6 +206,15 @@ function switchAdminTab(tab) {
   for (let p = 0; p < panels.length; p++) {
     const el = document.getElementById("admin-" + panels[p]);
     if (el) el.style.display = panels[p] === tab ? "" : "none";
+  }
+
+  // One #admin-content scroller serves every panel — a leftover offset from
+  // a tall tab must not carry into the next (the app.js #main reset is the
+  // precedent for pane-local navigation).  Same-tab re-entry (showAdmin on
+  // pane focus) keeps the user's place.
+  if (tabChanged) {
+    const contentEl = document.getElementById("admin-content");
+    if (contentEl) contentEl.scrollTop = 0;
   }
 
   if (tab === "users") loadAdminUsers();

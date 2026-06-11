@@ -26,6 +26,11 @@ UI harness (?open=): new-ws · new-ws-fork · edit-title · delete-ws ·
 Console harness (?open=): schedule-create · schedule-edit · model-create ·
   model-edit · model-save (drives a Save click; document.title becomes
   PUT-OK-<n> on success) · policy · confirm · token
+  Plus &tall=1 (90-row users panel — the .admin-content scroll state; add
+  &scrolled=1 to land mid-list, combinable with ?open= to pin a shelf over
+  scrolled content).  The console page wraps the fragment in the REAL
+  L-shell chain — pane-pinned height, interior scroller — so scroll/dock
+  geometry matches production; keep it that way.
   Governance surfaces (roles/HR/OGP/memory/skill) need fixtures that are not
   canned yet — add a fixture + driver branch below when you need one.
 
@@ -222,18 +227,44 @@ CONSOLE_TEMPLATE = """<!doctype html>
     <meta charset="utf-8" />
     <title>console livepass</title>
     <link rel="stylesheet" href="shared/base.css" />
+    <link rel="stylesheet" href="shared/ui-base.css" />
     <link rel="stylesheet" href="console-static/style.css" />
+    <link rel="stylesheet" href="shared/shell.css" />
     <link rel="stylesheet" href="shared/hatch.css" />
-    <style>
-      body { padding: 0; }
-      #view-admin { padding: 20px; height: 100vh; box-sizing: border-box; }
-      #admin-layout { height: 100%; }
-    </style>
   </head>
   <body>
-    <div id="view-admin">
-      <!-- FRAGMENT:BEGIN -->
-      <!-- FRAGMENT:END -->
+    <!-- The REAL L-shell chain (shell.js buildShell + pane.js DOM, verbatim
+         class names) so the harness inherits production scroll geometry:
+         .pane-body > #view-admin > .admin-layout height-pin the hatch-host
+         and .admin-content is the pane's interior scroller.  Never replace
+         this with bespoke height overrides — the clipped-pane / displaced-
+         shelf regressions were invisible to the harness precisely because
+         it used to pin #admin-layout with its own CSS. -->
+    <div class="app">
+      <aside class="rail" id="shell-rail">
+        <div class="rail-brand">
+          <button class="brand-home" type="button">
+            <div class="brand-mark"></div>
+            <span class="brand-name">turnstone</span>
+            <span class="brand-sub">console</span>
+          </button>
+        </div>
+      </aside>
+      <main class="content">
+        <div class="tabbar"></div>
+        <div class="panes">
+          <section class="pane">
+            <!-- no .pane-head: PaneManager._mount builds section.pane >
+                 div.pane-body only -->
+            <div class="pane-body">
+              <div id="view-admin">
+                <!-- FRAGMENT:BEGIN -->
+                <!-- FRAGMENT:END -->
+              </div>
+            </div>
+          </section>
+        </div>
+      </main>
     </div>
     <div id="toast" role="status" aria-live="polite"></div>
     <script>
@@ -331,6 +362,29 @@ CONSOLE_TEMPLATE = """<!doctype html>
         if (q.get("theme") === "light")
           document.documentElement.dataset.theme = "light";
         var open = q.get("open") || "";
+        // ?tall=1 — the scroll state: one panel visible with enough rows to
+        // overflow the pane, so a screenshot shows .admin-content scrolling
+        // (and a shelf staying docked above it).  Mirrors switchAdminTab's
+        // one-panel-visible invariant without booting the tab loaders.
+        if (q.get("tall")) {
+          var panels = document.querySelectorAll(".admin-panel");
+          for (var i = 0; i < panels.length; i++)
+            panels[i].style.display =
+              panels[i].id === "admin-users" ? "" : "none";
+          // No fallback: a fragment rename must fail loudly, not misplace rows.
+          var rowHost = document.querySelector("#admin-users [role=list]");
+          rowHost.textContent = ""; // drop the static "Loading users…" stub
+          for (var r = 0; r < 90; r++) {
+            var row = document.createElement("div");
+            row.className = "admin-row"; // real row chrome — geometry tracks production
+            row.textContent =
+              "user-" + String(r).padStart(3, "0") + " \\u00b7 synthetic row";
+            rowHost.appendChild(row);
+          }
+          var content = document.getElementById("admin-content");
+          if (content && q.get("scrolled"))
+            content.scrollTop = content.scrollHeight / 2; // land mid-list
+        }
         setTimeout(function () {
           if (open === "schedule-create") showCreateScheduleModal();
           else if (open === "schedule-edit") showEditScheduleModal("t1");
