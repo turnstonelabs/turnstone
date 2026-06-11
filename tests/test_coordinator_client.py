@@ -2050,6 +2050,11 @@ def test_wait_for_workstream_not_found_returns_sentinel(hex_storage):
     assert snap["state"] == "not_found"
     assert snap["message"] == "(no workstream with this id among your children)"
     assert snap["truncated"] is False
+    # One key set across real and not_found entries — uniform consumer
+    # access, no per-state conditionals (updated/name empty here).
+    assert set(snap) == {"state", "tokens", "updated", "name", "message", "truncated"}
+    assert snap["updated"] == ""
+    assert snap["name"] == ""
 
 
 def test_wait_for_workstream_running_child_message_is_null(populated_storage):

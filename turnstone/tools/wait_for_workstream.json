@@ -7,7 +7,7 @@
       "ws_ids": {
         "type": "array",
         "items": { "type": "string" },
-        "description": "Workstream ids to wait on (each exactly 32 hex chars, copied verbatim from spawn_batch / list_workstreams results). Accepts 1 or more; capped at 32 per call. Unknown or malformed ids fail the call immediately with did-you-mean suggestions — no waiting happens."
+        "description": "Workstream ids to wait on (each exactly 32 hex chars, copied verbatim from spawn_batch / list_workstreams results). Accepts 1 or more; capped at 32 per call. Malformed ids fail the call before any waiting; well-formed ids that can't be observed abort it on the first tick — both return did-you-mean suggestions."
       },
       "timeout": {
         "type": "number",

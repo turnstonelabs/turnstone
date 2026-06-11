@@ -953,9 +953,10 @@ class CoordinatorClient:
         shape.  Foreign and nonexistent ids collapse into one
         indistinguishable payload (no existence oracle); every hint
         references only this coordinator's own children.  Results are
-        keyed by the validated ws_id; own-child entries also carry the
-        display ``name`` for orientation (names are labels, NOT
-        addresses).
+        keyed by the validated ws_id and share one key set —
+        ``not_found`` entries carry empty ``updated`` / ``name`` — with
+        the display ``name`` filled in for own children as orientation
+        (names are labels, NOT addresses).
 
         ``progress_callback`` is invoked once per poll cycle with the
         current snapshot dict + elapsed seconds.  Swallows callback
@@ -1095,7 +1096,14 @@ class CoordinatorClient:
             for wid in cleaned:
                 row = rows.get(wid)
                 if row is None or not self._row_in_own_subtree(wid, row):
-                    snaps[wid] = {"state": "not_found", "tokens": 0}
+                    # Same key set as real entries (updated/name empty)
+                    # so callers consume results[ws_id] uniformly.
+                    snaps[wid] = {
+                        "state": "not_found",
+                        "tokens": 0,
+                        "updated": "",
+                        "name": "",
+                    }
                     continue
                 snaps[wid] = {
                     "state": str(row.get("state") or ""),
