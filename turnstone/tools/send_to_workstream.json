@@ -6,7 +6,7 @@
     "properties": {
       "ws_id": {
         "type": "string",
-        "description": "Workstream id that should receive the message."
+        "description": "Workstream id that should receive the message — exactly 32 hex chars, copied verbatim from spawn_batch / list_workstreams results (display names are not addresses)."
       },
       "message": {
         "type": "string",

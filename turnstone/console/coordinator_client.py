@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import concurrent.futures
 import json
+import re
 import secrets
 import threading
 import time
@@ -52,16 +53,15 @@ from turnstone.core.workstream import WorkstreamKind
 WAIT_REAL_TERMINAL_STATES: frozenset[str] = frozenset({"idle", "error", "closed", "deleted"})
 
 # Reportable terminal states — superset of the real ones, also includes the
-# ``denied`` short-circuit shape returned for foreign / missing ws_ids.
-# Used inside ``wait_for_workstream`` to decide when ``mode='any'`` on a
-# pure-denied list should short-circuit with ``complete=False`` (no real
-# work to wait for) and when ``mode='all'`` has fully settled.  NOT used
-# for the ``mode='any'`` real-terminal completion condition and NOT used
-# by the resolved-count summary (which counts only real terminals —
-# ``denied`` is a rejection, not a resolution).  A single typo'd /
-# foreign id shouldn't satisfy ``mode="any"`` and let the model declare
-# a wait complete while every real child is still running.
-WAIT_TERMINAL_STATES: frozenset[str] = WAIT_REAL_TERMINAL_STATES | frozenset({"denied"})
+# ``not_found`` shape returned for foreign / missing / mid-wait-deleted
+# ws_ids.  ``not_found`` is NOT a completion state: the wait loop fails
+# fast the moment any polled id reports it (an unobservable member makes
+# the requested wait unsatisfiable — see the fail-fast block in
+# ``wait_for_workstream``), and the resolved-count summary counts only
+# real terminals.  This set's remaining job is the message-sentinel
+# branch in the result enrichment: states whose ``message`` is a fixed
+# sentinel rather than a storage read.
+WAIT_TERMINAL_STATES: frozenset[str] = WAIT_REAL_TERMINAL_STATES | frozenset({"not_found"})
 
 # Hard cap on ws_ids per call.  Polling happens once per ws_id per tick, so a
 # runaway list would amplify storage load without giving the model anything
@@ -121,8 +121,63 @@ _WAIT_MESSAGE_TAIL_LIMIT: int = 20
 # followed by an error) would otherwise produce a sentinel that
 # falsely claims no output exists at all.
 _WAIT_SENTINEL_CLOSED = "(workstream closed)"
-_WAIT_SENTINEL_DENIED = "(workstream denied: not in coordinator subtree or does not exist)"
+_WAIT_SENTINEL_NOT_FOUND = "(no workstream with this id among your children)"
 _WAIT_SENTINEL_NO_RECENT_ASSISTANT = "(no recent assistant output)"
+
+# ---------------------------------------------------------------------------
+# Model-supplied workstream-id validation — the coordinator LLM hand-copies
+# ws_ids between tool results and tool calls, and models garble long hex
+# runs (the canonical incident: a 32-char id whose ``aaa`` run collapsed to
+# a single ``a``, leaving a 30-char id no tool could act on, which then
+# read back to the model as a dead child).  ws_id arguments are therefore
+# validated at the tool boundary:
+#
+# - a full 32-hex id passes straight through (ownership still enforced by
+#   the per-verb guards, at unchanged storage cost);
+# - a direct child's exact id of any other shape still resolves (legacy /
+#   synthetic ids predate the 32-hex convention);
+# - anything else — truncated, garbled, non-hex, or a display name —
+#   fails fast with a did-you-mean + a roster of the coordinator's own
+#   children, so a garbled id is recoverable in one round-trip.
+#
+# Near-miss ids are NEVER auto-resolved — a mutating verb must not guess.
+# Display names are NOT addresses (they're mutable and non-unique); a ref
+# matching a child's name errors with a pointer at the right ws_id.
+# Validation and every hint consult ONLY the coordinator's own direct
+# children, preserving the no-existence-oracle guarantee for foreign ids.
+# ---------------------------------------------------------------------------
+
+# A well-formed ws_id: exactly 32 lowercase hex chars (``uuid4().hex``).
+_WS_REF_ID_RE = re.compile(r"^[0-9a-f]{32}$")
+
+# Max Levenshtein distance for a did-you-mean candidate.  The incident
+# class (character-run collapse / duplication / single-char typo) sits at
+# distance 1-2; unrelated 32-hex ids sit at ~28+, so 3 is generous
+# headroom with no false-positive risk in practice.
+_WS_REF_SUGGEST_DISTANCE: int = 3
+
+# Children listed inline in an unresolvable-ws_id error.  Enough to
+# re-orient the model without flooding the tool result on wide fan-outs;
+# the error text points at list_workstreams for the rest.
+_WS_REF_ROSTER_CAP: int = 8
+
+# Page size for the validation roster query — far above any practical
+# direct-children count, so the exact-match / did-you-mean scans never
+# judge against a silently truncated page.
+_WS_REF_ROSTER_QUERY_LIMIT: int = 1000
+
+# Did-you-mean candidates surfaced per unresolvable ref.
+_WS_REF_SUGGEST_CAP: int = 2
+
+# Echoed-ref clip applied inside error STRINGS — the structured
+# ``ws_id`` field carries the full value and the format note reports
+# the true length, so the clip only bounds operator-facing text.
+# Covers a full 32-hex id with slack.
+_WS_REF_ECHO_CLIP: int = 48
+
+# Cap on the assembled top-level ``error`` string when several refs
+# fail in one wait call.
+_WS_REF_ERROR_TEXT_CAP: int = 2000
 
 _TASK_STATUSES = frozenset({"pending", "in_progress", "done", "blocked"})
 # Hard cap on tasks per coordinator — the full list is read and re-serialized
@@ -140,6 +195,45 @@ _TASK_TITLE_MAX = 200
 # enough to bound one stall per child per turn regardless of how many
 # inspect calls the model fires.
 _LIVE_CACHE_TTL_SECONDS = 2.0
+
+
+def _levenshtein_capped(a: str, b: str, cap: int) -> int:
+    """Levenshtein distance with an early-exit band.
+
+    Returns ``cap + 1`` as soon as the distance provably exceeds ``cap``,
+    so did-you-mean scans across a coordinator's children stay cheap per
+    candidate instead of O(len^2).  Plain DP otherwise — inputs are short
+    (ws_ids are 32 chars) so nothing cleverer is warranted.
+    """
+    if a == b:
+        return 0
+    la, lb = len(a), len(b)
+    if abs(la - lb) > cap:
+        return cap + 1
+    if la > lb:
+        a, b, la, lb = b, a, lb, la
+    prev = list(range(la + 1))
+    for j in range(1, lb + 1):
+        cur = [j] + [0] * la
+        bj = b[j - 1]
+        row_best = cur[0]
+        for i in range(1, la + 1):
+            cost = 0 if a[i - 1] == bj else 1
+            cur[i] = min(prev[i] + 1, cur[i - 1] + 1, prev[i - 1] + cost)
+            row_best = min(row_best, cur[i])
+        if row_best > cap:
+            return cap + 1
+        prev = cur
+    return prev[la] if prev[la] <= cap else cap + 1
+
+
+def _trim_ws_ref_hint(payload: dict[str, Any]) -> dict[str, Any]:
+    """Per-ref entry for wait's ``invalid_ws_ids`` / ``not_found``
+    channels — one shared shape: ``{ws_id, error, did_you_mean?}``.
+    The children roster is identical across refs in one call, so it
+    rides ONCE at the response top level instead of per entry.
+    """
+    return {key: payload[key] for key in ("ws_id", "error", "did_you_mean") if key in payload}
 
 
 def _utc_now_iso() -> str:
@@ -486,6 +580,177 @@ class CoordinatorClient:
             return False
         return bool(row.get("user_id")) and row.get("user_id") == self._user_id
 
+    # -- model-supplied ws_id validation ------------------------------------
+
+    def _children_roster(self) -> list[dict[str, Any]]:
+        """Direct children of this coordinator (any kind, own tenant only).
+
+        Powers ws_id validation and the did-you-mean / roster blocks in
+        unresolvable-id errors.  Unlike :meth:`list_children` this does
+        NOT filter ``kind`` — a coordinator-kind child passes the
+        per-verb ownership guards (``_is_own_subtree`` checks parent +
+        user only), so validation must see the same set or a legacy
+        exact id could validate for one verb and 404 on another.  One
+        SQL page capped at ``_WS_REF_ROSTER_QUERY_LIMIT``; failures
+        collapse to an empty roster (hints degrade, validation still
+        errors honestly).
+        """
+        try:
+            raw = self._storage.list_workstreams(
+                limit=_WS_REF_ROSTER_QUERY_LIMIT,
+                parent_ws_id=self._coord_ws_id,
+                user_id=self._user_id or None,
+            )
+        except Exception:
+            log.debug("coord_client.ws_ref.roster_failed", exc_info=True)
+            return []
+        roster: list[dict[str, Any]] = []
+        for row in raw:
+            try:
+                m = row._mapping  # SQLAlchemy Row
+            except AttributeError:
+                # Fallback for non-Row tuples (test doubles, etc.) —
+                # column order mirrors list_children's fallback map.
+                m = {"ws_id": row[0], "name": row[2], "state": row[3]}
+            roster.append(
+                {
+                    "ws_id": str(m["ws_id"] or ""),
+                    "name": str(m["name"] or ""),
+                    "state": str(m["state"] or ""),
+                }
+            )
+        return roster
+
+    def _ws_ref_error(
+        self,
+        ref: str,
+        *,
+        roster: list[dict[str, Any]] | None = None,
+    ) -> dict[str, Any]:
+        """Uniform unresolvable-ws_id error payload.
+
+        One shape for malformed / foreign / nonexistent ids: the message
+        never distinguishes "exists but isn't yours" from "doesn't
+        exist" (no existence oracle), and every hint it carries
+        (did-you-mean, roster) is computed from the coordinator's OWN
+        children only.  Suggestions are advisory text — nothing here
+        auto-resolves, so a near-miss id can never route a mutating verb
+        to a guessed target.
+        """
+        if roster is None:
+            roster = self._children_roster()
+        ref_l = (ref or "").strip().lower()
+        # Clip the echoed ref in the STRING — a hostile / oversize ws_id
+        # must not flood operator-facing text (see _WS_REF_ECHO_CLIP).
+        shown = ref if len(ref) <= _WS_REF_ECHO_CLIP else ref[: _WS_REF_ECHO_CLIP - 3] + "..."
+        parts = [f"no workstream matching {shown!r} among your children"]
+        did: list[dict[str, str]] = []
+        name_hits = [c for c in roster if c["name"] and c["name"].strip().lower() == ref_l]
+        if name_hits:
+            # The model pasted a display NAME.  Point it straight at the
+            # id — names are mutable, non-unique labels, deliberately not
+            # addresses.
+            did = [
+                {"ws_id": c["ws_id"], "name": c["name"]} for c in name_hits[:_WS_REF_SUGGEST_CAP]
+            ]
+            parts.append(
+                "that is a child NAME, not an id — names are display "
+                f"labels; did you mean ws_id {did[0]['ws_id']}?"
+            )
+        else:
+            scored = sorted(
+                (
+                    (_levenshtein_capped(ref_l, c["ws_id"], _WS_REF_SUGGEST_DISTANCE), c)
+                    for c in roster
+                ),
+                key=lambda pair: pair[0],
+            )
+            did = [
+                {"ws_id": c["ws_id"], "name": c["name"]}
+                for dist, c in scored
+                if dist <= _WS_REF_SUGGEST_DISTANCE
+            ][:_WS_REF_SUGGEST_CAP]
+            if did:
+                parts.append(
+                    "did you mean "
+                    + " or ".join(f"{c['ws_id']} ({c['name'] or 'unnamed'})" for c in did)
+                    + "?"
+                )
+        if not _WS_REF_ID_RE.fullmatch(ref_l):
+            parts.append(
+                f"ws ids are exactly 32 lowercase hex chars (got {len(ref_l)}) — "
+                "copy them verbatim from spawn_batch / list_workstreams results"
+            )
+        parts.append("use list_workstreams to re-check ids")
+        payload: dict[str, Any] = {
+            "error": "; ".join(parts),
+            "status": 404,
+            "ws_id": ref,
+        }
+        if did:
+            payload["did_you_mean"] = did
+        payload["children"] = [
+            {"ws_id": c["ws_id"], "name": c["name"], "state": c["state"]}
+            for c in roster[:_WS_REF_ROSTER_CAP]
+        ]
+        payload["children_truncated"] = len(roster) > _WS_REF_ROSTER_CAP
+        return payload
+
+    def _resolve_ws_ref(
+        self,
+        ref: str,
+        *,
+        roster: list[dict[str, Any]] | None = None,
+    ) -> tuple[str, dict[str, Any] | None]:
+        """Validate a model-supplied ws_id argument.
+
+        Returns ``(ws_id, None)`` on success, ``("", error_payload)``
+        otherwise.  Accepted shapes, in match order:
+
+        1. the coordinator's own ws_id, verbatim;
+        2. a full 32-lowercase-hex id (case-folded) — passes through
+           WITHOUT a roster read, so the hot path costs exactly what it
+           did before validation existed; ownership stays with the
+           per-verb guards;
+        3. a direct child's EXACT id of any other shape — covers
+           legacy / synthetic ids that predate the 32-hex convention.
+
+        Anything else — truncated, garbled, non-hex, a display name —
+        fails with the did-you-mean payload.  The pasted-a-name case is
+        called out explicitly in the error; near-miss ids are NEVER
+        auto-resolved.
+        """
+        r = (ref or "").strip()
+        if not r:
+            return "", self._ws_ref_error(r, roster=roster)
+        if r == self._coord_ws_id:
+            return r, None
+        rl = r.lower()
+        if _WS_REF_ID_RE.fullmatch(rl):
+            return rl, None
+        if roster is None:
+            roster = self._children_roster()
+        for c in roster:
+            if c["ws_id"] in (r, rl):
+                return c["ws_id"], None
+        return "", self._ws_ref_error(r, roster=roster)
+
+    def _resolve_owned(self, ws_id: str) -> tuple[str, dict[str, Any] | None]:
+        """Resolve + ownership-guard a model-supplied ws_id in one step.
+
+        Shared preamble for the mutating verbs (send / close / cancel /
+        delete): format-resolve via :meth:`_resolve_ws_ref`, then the
+        tenant gate via :meth:`_is_own_subtree`.  Returns
+        ``(ws_id, None)`` or ``("", error_payload)`` — one home so a
+        future guard change (audit hook, logging) lands once.
+        """
+        resolved, ref_err = self._resolve_ws_ref(ws_id)
+        if ref_err is not None:
+            return "", ref_err
+        if not self._is_own_subtree(resolved):
+            return "", self._ws_ref_error(resolved)
+        return resolved, None
+
     # -- model-invoked mutating ops (HTTP) ---------------------------------
 
     def spawn(
@@ -517,9 +782,10 @@ class CoordinatorClient:
         return self._post("spawn", body)
 
     def send(self, ws_id: str, message: str) -> dict[str, Any]:
-        if not self._is_own_subtree(ws_id):
-            return {"error": f"workstream not in coordinator subtree: {ws_id}", "status": 404}
-        return self._post("send", {"message": message}, ws_id=ws_id)
+        resolved, ref_err = self._resolve_owned(ws_id)
+        if ref_err is not None:
+            return ref_err
+        return self._post("send", {"message": message}, ws_id=resolved)
 
     def emit_audit(self, action: str, detail: dict[str, Any]) -> None:
         """Record an audit row attributed to this coordinator session.
@@ -541,12 +807,13 @@ class CoordinatorClient:
         )
 
     def close_workstream(self, ws_id: str, reason: str = "") -> dict[str, Any]:
-        if not self._is_own_subtree(ws_id):
-            return {"error": f"workstream not in coordinator subtree: {ws_id}", "status": 404}
+        resolved, ref_err = self._resolve_owned(ws_id)
+        if ref_err is not None:
+            return ref_err
         body: dict[str, Any] = {}
         if reason:
             body["reason"] = reason
-        return self._post("close", body, ws_id=ws_id)
+        return self._post("close", body, ws_id=resolved)
 
     def close_all_children(self, reason: str = "") -> dict[str, Any]:
         """Soft-close every direct child of this coordinator (console-side fan-out).
@@ -563,9 +830,10 @@ class CoordinatorClient:
         return self._post("close_all_children", body, ws_id=self._coord_ws_id)
 
     def delete(self, ws_id: str) -> dict[str, Any]:
-        if not self._is_own_subtree(ws_id):
-            return {"error": f"workstream not in coordinator subtree: {ws_id}", "status": 404}
-        return self._post("delete", {"ws_id": ws_id})
+        resolved, ref_err = self._resolve_owned(ws_id)
+        if ref_err is not None:
+            return ref_err
+        return self._post("delete", {"ws_id": resolved})
 
     # -- console-endpoint helpers (NOT model-invoked tools) -----------------
 
@@ -587,9 +855,10 @@ class CoordinatorClient:
         return self._post("approve", body, ws_id=ws_id)
 
     def cancel(self, ws_id: str) -> dict[str, Any]:
-        if not self._is_own_subtree(ws_id):
-            return {"error": f"workstream not in coordinator subtree: {ws_id}", "status": 404}
-        return self._post("cancel", {}, ws_id=ws_id)
+        resolved, ref_err = self._resolve_owned(ws_id)
+        if ref_err is not None:
+            return ref_err
+        return self._post("cancel", {}, ws_id=resolved)
 
     def rewind(self, ws_id: str, turns: int) -> dict[str, Any]:
         if not self._is_own_subtree(ws_id):
@@ -630,16 +899,18 @@ class CoordinatorClient:
         because hard-delete cascades the row out of storage, but it
         stays in the set so a legacy / synthetic-test row carrying
         that state still counts).  ``mode='all'`` returns once every
-        ws_id has settled (real terminal OR ``denied``).  Returns
-        ``{"results": {ws_id: {state, tokens, updated, message, truncated}},
-        "elapsed": float, "complete": bool, "mode": mode}``.  ``complete``
-        is True when the wait condition was met before the deadline,
-        False when the timeout fired (results carry whatever last state
-        was observed).
+        ws_id is real-terminal — an id that can't be observed never
+        rides along to a "complete" result (see the not_found fail-fast
+        below).  Returns
+        ``{"results": {ws_id: {state, tokens, updated, name, message,
+        truncated}}, "elapsed": float, "complete": bool, "mode": mode}``.
+        ``complete`` is True when the wait condition was met before the
+        deadline, False when the timeout fired (results carry whatever
+        last state was observed).
 
         ``message`` carries the child's last assistant message text for
         ``idle`` / ``error`` states, or a short status sentinel for
-        ``closed`` / ``denied``.  Non-terminal entries (e.g. ``running``
+        ``closed`` / ``not_found``.  Non-terminal entries (e.g. ``running``
         after a timeout) and ``deleted`` rows carry ``None`` — hard
         deletes cascade rows out of storage so a real ``deleted`` state
         is never observed; the legacy/synthetic-row path falls into the
@@ -665,13 +936,26 @@ class CoordinatorClient:
         dict from silently exiting on tick one (which the naive
         missing-entry-counts-as-changed rule would cause).
 
-        Cross-tenant guard: a ws_id that's neither the coordinator
-        itself nor one of its own children appears with
-        ``state="denied"`` and never blocks the wait — a model that
-        emits a foreign id learns immediately rather than spinning
-        until timeout.  A ws_id that doesn't exist at all collapses
-        into the same ``denied`` shape so wait can't be used as an
-        existence oracle.
+        Unresolvable ids fail fast.  Refs are validated up front — a
+        malformed ws_id (truncated / garbled / non-hex / a display
+        name) errors immediately, before any waiting happens, with
+        top-level ``error`` / ``invalid_ws_ids`` / ``children`` fields.
+        Per-ref entries in ``invalid_ws_ids`` and ``not_found`` share
+        one shape — ``{ws_id, error, did_you_mean}`` — and the children
+        roster rides once at top level on both channels.  A
+        well-formed id that is foreign, nonexistent, or hard-deleted
+        mid-wait surfaces as ``state="not_found"`` and aborts the wait
+        on the tick that observes it: ``complete=False`` plus top-level
+        ``error`` / ``not_found`` / ``children`` fields.  Without this,
+        an unobservable member either burns the whole timeout
+        (``mode='all'`` could never satisfy) or silently rides along to
+        a "complete" result missing a lane — the original incident
+        shape.  Foreign and nonexistent ids collapse into one
+        indistinguishable payload (no existence oracle); every hint
+        references only this coordinator's own children.  Results are
+        keyed by the validated ws_id; own-child entries also carry the
+        display ``name`` for orientation (names are labels, NOT
+        addresses).
 
         ``progress_callback`` is invoked once per poll cycle with the
         current snapshot dict + elapsed seconds.  Swallows callback
@@ -731,6 +1015,45 @@ class CoordinatorClient:
                 "elapsed": 0.0,
                 "mode": mode,
             }
+        # Validate model-supplied refs before anything else touches them.
+        # The roster query is skipped when every ref is already the coord
+        # itself or a full 32-hex id (the overwhelmingly common case), so
+        # validation adds no storage cost to the hot path.
+        needs_roster = any(
+            w != self._coord_ws_id and not _WS_REF_ID_RE.fullmatch(w.lower()) for w in cleaned
+        )
+        roster = self._children_roster() if needs_roster else None
+        resolved_ids: list[str] = []
+        resolved_seen: set[str] = set()
+        invalid: list[dict[str, Any]] = []
+        for ref in cleaned:
+            rid, ref_err = self._resolve_ws_ref(ref, roster=roster)
+            if ref_err is not None:
+                invalid.append(ref_err)
+                continue
+            if rid not in resolved_seen:
+                resolved_seen.add(rid)
+                resolved_ids.append(rid)
+        if invalid:
+            # Tool-boundary fail-fast: error the whole call rather than
+            # waiting on the valid subset — the model asked to observe a
+            # set it can't observe, and a partial wait hides exactly the
+            # lost-lane failure this guards against.  Entries share the
+            # ``not_found`` channel's per-ref shape; the roster rides
+            # once at top level.
+            return {
+                "error": " | ".join(str(e.get("error") or "") for e in invalid)[
+                    :_WS_REF_ERROR_TEXT_CAP
+                ],
+                "invalid_ws_ids": [_trim_ws_ref_hint(e) for e in invalid],
+                "children": invalid[0].get("children", []),
+                "children_truncated": invalid[0].get("children_truncated", False),
+                "results": {},
+                "complete": False,
+                "elapsed": 0.0,
+                "mode": mode,
+            }
+        cleaned = resolved_ids
         try:
             timeout_f = float(timeout)
         except (TypeError, ValueError):
@@ -755,7 +1078,8 @@ class CoordinatorClient:
             aggregate batch) instead of two-per-id, cutting per-tick
             round-trips from O(N) to O(1) at the documented cap.
             Cross-tenant + missing-row cases collapse into a single
-            ``denied`` shape so wait can't be used as an existence oracle.
+            ``not_found`` shape so wait can't be used as an existence
+            oracle.
             """
             try:
                 rows = self._storage.get_workstreams_batch(cleaned)
@@ -771,28 +1095,22 @@ class CoordinatorClient:
             for wid in cleaned:
                 row = rows.get(wid)
                 if row is None or not self._row_in_own_subtree(wid, row):
-                    snaps[wid] = {"state": "denied", "tokens": 0}
+                    snaps[wid] = {"state": "not_found", "tokens": 0}
                     continue
                 snaps[wid] = {
                     "state": str(row.get("state") or ""),
                     "tokens": int(tokens_by_wid.get(wid, 0) or 0),
                     "updated": row.get("updated") or "",
+                    "name": str(row.get("name") or ""),
                 }
             return snaps
 
         def _is_real_terminal(snap: dict[str, Any]) -> bool:
             # Real-terminal — these states drive ``complete=True``.
-            # ``denied`` is intentionally excluded so a single typo'd /
-            # foreign / nonexistent ws_id can't satisfy ``mode="any"``
-            # while every real child is still running.
+            # ``not_found`` is intentionally excluded: an unobservable
+            # member can't satisfy ``mode="any"`` — it aborts the wait
+            # via the fail-fast below instead.
             return snap.get("state", "") in self._WAIT_REAL_TERMINAL_STATES
-
-        def _is_settled(snap: dict[str, Any]) -> bool:
-            # Settled — terminal OR denied.  Used to decide when the
-            # wait should give up because there's nothing left to
-            # observe (no real ws_ids in the polled set, or every real
-            # one has already finished).
-            return snap.get("state", "") in self._WAIT_TERMINAL_STATES
 
         def _diff_since(snap: dict[str, Any], prev: dict[str, Any]) -> bool:
             """True when ``snap`` differs from the ``since`` hint on any
@@ -804,6 +1122,7 @@ class CoordinatorClient:
 
         last_results: dict[str, dict[str, Any]] = {}
         complete = False
+        not_found_ids: list[str] = []
         # Subscribe to in-process state-change events for the watched
         # ws_ids when the bus is wired.  ``register_waiter`` returns a
         # single ``threading.Event`` registered against every id so a
@@ -816,13 +1135,13 @@ class CoordinatorClient:
         # registry on this console process, so a foreign ws_id passed by
         # an untrusted coord LLM (prompt injection) would otherwise leak
         # wake-up timing as a side channel — _snapshot_all returns
-        # ``denied`` for the content, but the *time* at which the wait
+        # ``not_found`` for the content, but the *time* at which the wait
         # un-blocked would correlate with the foreign ws_id's next
         # state-class event.  Filter ``cleaned`` to own-subtree ids
         # before registering; foreign / missing ws_ids stay in the
-        # snapshot list so they still surface as ``denied`` in
-        # ``_snapshot_all`` and exit via the pure-denied short-circuit
-        # below.  Predicate shared with ``_snapshot_all`` via
+        # snapshot list so they still surface as ``not_found`` in
+        # ``_snapshot_all`` and exit via the not_found fail-fast in the
+        # loop.  Predicate shared with ``_snapshot_all`` via
         # :meth:`_row_in_own_subtree`.
         try:
             pre_rows = self._storage.get_workstreams_batch(cleaned)
@@ -849,7 +1168,20 @@ class CoordinatorClient:
                     except Exception:
                         log.debug("coord_client.wait.progress_cb_failed", exc_info=True)
                 real_terminal = [_is_real_terminal(snap) for snap in results.values()]
-                settled = [_is_settled(snap) for snap in results.values()]
+                # Fail fast on unobservable members — foreign, nonexistent,
+                # or hard-deleted mid-wait.  Checked BEFORE the since-diff
+                # and mode conditions: an unobservable member invalidates
+                # the requested wait regardless of what the rest are doing
+                # (``mode='all'`` could never satisfy; ``mode='any'`` /
+                # ``since`` could "succeed" while silently dropping a
+                # lane).  The snapshot already collapsed foreign and
+                # missing into one ``not_found`` shape, so exiting here
+                # leaks nothing a single-tick wait wouldn't.
+                not_found_ids = [
+                    wid for wid, snap in results.items() if snap.get("state") == "not_found"
+                ]
+                if not_found_ids:
+                    break
                 # ``since`` — orthogonal to mode.  If the caller supplied a
                 # prior snapshot, any diff on a ws_id that IS in ``since_map``
                 # exits the wait so a follow-up call doesn't re-count
@@ -869,19 +1201,13 @@ class CoordinatorClient:
                     if any(real_terminal):
                         complete = True
                         break
-                    # Pure-denied list: every snap is settled but none is a
-                    # real terminal — no work to wait for.  Short-circuit so
-                    # the model sees the denied results immediately rather
-                    # than spinning the timeout (``complete=False`` because
-                    # the wait condition never had a real chance to fire).
-                    if all(settled):
-                        break
                 else:  # mode == "all"
-                    if all(settled):
-                        # Every ws_id is settled (real-terminal or denied).
-                        # The wait condition is met — the model gets the
-                        # full results dict and decides what each terminal
-                        # state means.
+                    if all(real_terminal):
+                        # Every ws_id actually finished observable work.
+                        # ``not_found`` members can't ride along to a
+                        # "complete" result — the fail-fast above exits
+                        # first — so ``complete=True`` means every lane
+                        # really resolved.
                         complete = True
                         break
                 remaining = deadline - time.monotonic()
@@ -898,14 +1224,13 @@ class CoordinatorClient:
                     # a deliberate 4x trade vs the pre-bus 0.5 s poll.
                     wake_event.wait(min(remaining, self._WAIT_HEARTBEAT_INTERVAL))
                 else:
-                    # Pure-foreign / pure-denied list: every cleaned
-                    # ws_id was filtered out of ``own_subtree`` so the
-                    # bus has nothing to wake on.  The pure-denied
-                    # short-circuit above exits ``mode='any'`` on the
-                    # first tick; ``mode='all'`` falls through to here
-                    # and must burn the timeout.  Use the heartbeat
-                    # cadence for the deadline carve-up so
-                    # ``progress_callback`` keeps firing.
+                    # No wake source for this wait (no registered own-
+                    # subtree ids — e.g. a bus-less test fixture).  Fall
+                    # back to the heartbeat cadence so
+                    # ``progress_callback`` keeps firing.  Foreign /
+                    # missing ids can't park here past one tick: the
+                    # not_found fail-fast above exits on the tick that
+                    # observes them.
                     time.sleep(min(self._WAIT_HEARTBEAT_INTERVAL, remaining))
         finally:
             # Always unregister so a crash mid-wait can't leak the
@@ -920,7 +1245,7 @@ class CoordinatorClient:
         # Bundle each terminal child's last assistant message inline so the
         # coordinator LLM doesn't have to follow up with one
         # ``inspect_workstream`` per ws.  Only ``idle`` / ``error`` ws_ids
-        # actually hit storage (``closed`` / ``denied`` return a sentinel
+        # actually hit storage (``closed`` / ``not_found`` return a sentinel
         # without I/O), so split them and parallelize the storage-bound
         # subset across a small thread pool — at the WAIT_MAX_WS_IDS=32
         # cap, 8 workers cuts a worst-case all-idle fan-out from 32
@@ -965,12 +1290,30 @@ class CoordinatorClient:
             else:
                 msg, trunc = None, False
             enriched_results[wid] = {**snap, "message": msg, "truncated": trunc}
-        return {
+        response: dict[str, Any] = {
             "results": enriched_results,
             "complete": complete,
             "elapsed": round(time.monotonic() - start, 3),
             "mode": mode,
         }
+        if not_found_ids:
+            # The wait aborted on unobservable members — surface a loud
+            # top-level error with recovery hints (did-you-mean + child
+            # roster) so a garbled id reads as "fix the id and re-issue",
+            # not as a dead child.  Hints reference only this
+            # coordinator's own children; foreign and nonexistent ids
+            # produce identical payloads (no existence oracle).
+            hint_roster = self._children_roster()
+            hints = [self._ws_ref_error(wid, roster=hint_roster) for wid in not_found_ids]
+            response["not_found"] = [_trim_ws_ref_hint(h) for h in hints]
+            response["error"] = " | ".join(str(h.get("error") or "") for h in hints)[
+                :_WS_REF_ERROR_TEXT_CAP
+            ]
+            response["children"] = hints[0].get("children", []) if hints else []
+            response["children_truncated"] = (
+                hints[0].get("children_truncated", False) if hints else False
+            )
+        return response
 
     # -- model-invoked read ops (direct storage) ---------------------------
 
@@ -1495,10 +1838,11 @@ class CoordinatorClient:
 
         Cross-tenant guard: the coordinator's LLM input is untrusted, so
         the inspectable scope is restricted to (a) the coordinator
-        itself or (b) a row whose ``parent_ws_id`` is this coordinator
-        (i.e. one of its own children).  Any other ws_id returns the
-        same not-found shape used for genuine misses, avoiding an
-        existence oracle.
+        itself or (b) one of its own children — ``parent_ws_id`` AND
+        ``user_id`` parity via :meth:`_row_in_own_subtree`, matching
+        the wait / mutating paths.  Any other ws_id returns the same
+        not-found shape used for genuine misses, avoiding an existence
+        oracle.
 
         ``include_provider_content`` defaults to False.  Provider-native
         content blocks (``_provider_content`` / ``provider_blocks``)
@@ -1507,20 +1851,25 @@ class CoordinatorClient:
         them for provider-fidelity replay tooling; regular inspect
         calls get the trimmed shape.
         """
+        resolved, ref_err = self._resolve_ws_ref(ws_id)
+        if ref_err is not None:
+            return ref_err
+        ws_id = resolved
         full = self._storage.get_workstream(ws_id)
-        # Echoing the ws_id back inside the error STRING was a stylistic
-        # carry-over — the structured ``ws_id`` field already carries
-        # the value the caller asked about.  The bare error message
-        # ("workstream not found") is enough; the same shape is used
-        # for cross-tenant rows so the existence-leak guarantee is
-        # preserved either way.
-        miss = {"error": "workstream not found", "ws_id": ws_id}
+        # Misses return the same did-you-mean payload for nonexistent and
+        # cross-tenant rows alike, so the existence-leak guarantee is
+        # preserved while a garbled id stays recoverable in one
+        # round-trip (the structured ``ws_id`` field echoes the value
+        # the caller asked about).
         if full is None:
-            return miss
-        is_self = ws_id == self._coord_ws_id
-        is_own_child = full.get("parent_ws_id") == self._coord_ws_id
-        if not (is_self or is_own_child):
-            return miss
+            return self._ws_ref_error(ws_id)
+        # Ownership parity with every other verb: parent AND user_id
+        # (``_row_in_own_subtree``).  The parent-only check this
+        # replaces let a forged / migration-era row (parent_ws_id=coord,
+        # user_id=other-tenant) be read through inspect while the wait
+        # and mutating paths rejected the same shape (#506).
+        if not self._row_in_own_subtree(ws_id, full):
+            return self._ws_ref_error(ws_id)
         # load_messages returns the full history in chronological order.
         # We slice the tail in Python because the SQL tail-N is
         # approximate across conversation boundaries.  Defensive
@@ -2103,7 +2452,7 @@ def _wait_message_for(
       exhaustion is more actionable than the prior assistant turn,
       and the prior shape's "(no recent assistant output)" sentinel
       hid that signal entirely.
-    - ``closed`` / ``denied`` — short status sentinel.  No
+    - ``closed`` / ``not_found`` — short status sentinel.  No
       message-history read because there's nothing meaningful to
       return — a partial last message could be misleading mid-thought.
     - any other state (e.g. ``running``, or a ``deleted`` synthetic /
@@ -2117,8 +2466,8 @@ def _wait_message_for(
     already completed; the model just gets ``message: null`` for the
     affected ws and can fall back to inspect).
     """
-    if state == "denied":
-        return _WAIT_SENTINEL_DENIED, False
+    if state == "not_found":
+        return _WAIT_SENTINEL_NOT_FOUND, False
     if state == "closed":
         return _WAIT_SENTINEL_CLOSED, False
     if state == "error":

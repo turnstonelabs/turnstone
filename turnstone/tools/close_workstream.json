@@ -6,7 +6,7 @@
     "properties": {
       "ws_id": {
         "type": "string",
-        "description": "Workstream id to soft-close."
+        "description": "Workstream id to soft-close — exactly 32 hex chars, copied verbatim. Unknown or malformed ids error with did-you-mean suggestions; nothing is ever guessed."
       },
       "reason": {
         "type": "string",

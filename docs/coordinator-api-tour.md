@@ -237,14 +237,21 @@ Key properties:
   tool with a fresh timeout.
 - **Modes** — `mode="any"` returns as soon as one child reaches a
   real terminal state (`idle` / `error` / `closed` / `deleted`);
-  `mode="all"` waits for every polled child.
+  `mode="all"` waits for every polled child to reach a real
+  terminal state.
 - **Progress throttling** — the poll loop runs every 500 ms but the
   SSE emission is diff-on-state-change plus a 5-second heartbeat.  A
   600 s wait generates O(dozens) of progress events, not 1200.
-- **Denied rows** — an id the caller doesn't own (cross-tenant) or a
-  missing row is reported as a `denied` state in the results dict;
-  `mode="any"` won't satisfy on a pure-denied list (the LLM should
-  treat it as a config error, not a completion).
+- **Unresolvable ids** — ws_ids are validated up front (exactly
+  32 hex chars; copy them verbatim): a malformed id fails the call
+  immediately with did-you-mean suggestions and a roster of the
+  coord's children.  An id the caller doesn't own, a missing row, or
+  a child hard-deleted mid-wait is reported as `state="not_found"`
+  and aborts the wait on the tick that observes it (top-level
+  `error` / `not_found` / `children` fields, `complete=false`) — the
+  LLM should fix the id and re-issue, not conclude the child died.
+  Foreign and missing collapse into one shape, so the wait can't be
+  used as an existence oracle.
 
 Prefer `wait_for_workstream` over polling `inspect_workstream` in a
 loop — a wait consumes one assistant turn regardless of how long the

@@ -6,7 +6,7 @@
     "properties": {
       "ws_id": {
         "type": "string",
-        "description": "Workstream id to hard-delete."
+        "description": "Workstream id to hard-delete — exactly 32 hex chars, copied verbatim. Unknown or malformed ids error with did-you-mean suggestions; nothing is ever guessed (this verb is irreversible)."
       }
     },
     "required": ["ws_id"]
