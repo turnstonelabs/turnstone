@@ -396,9 +396,11 @@ def test_phase8_mcp_error_helpers_defined() -> None:
     (interactive consent / forbidden / operator card) moved into the shared
     interactive module with the Pane.  The consent-badge state
     (``_pendingConsentServers`` / ``_onConsentDetected``) stays in the
-    standalone shell — it drives the settings-gear badge — and the pane reaches
-    it through the ``host.onConsentDetected`` seam (a no-op in the console,
-    which has no gear badge).  Pin both halves and the seam."""
+    standalone shell — it drives the rail's Manage-row badge — and the pane
+    reaches it through the ``host.onConsentDetected`` seam.  The shared host
+    bridges that seam to the standalone via ``window.TS_APP.onConsentDetected``
+    (undefined on the console, so it stays a no-op there).  Pin both halves and
+    the bridge."""
     inter = _INTERACTIVE_JS.read_text(encoding="utf-8")
     assert "function tryParseMcpError" in inter
     assert "function buildMcpErrorEmbed" in inter
@@ -408,12 +410,40 @@ def test_phase8_mcp_error_helpers_defined() -> None:
     assert "onConsentDetected(s)" in inter, (
         "the pane must notify consent through host.onConsentDetected"
     )
+    # The shared host bridges the seam to the standalone subsystem (feature-
+    # detected, so the console — which never defines the hook — no-ops).
+    assert "window.TS_APP.onConsentDetected(server)" in inter, (
+        "the shared interactive host must bridge onConsentDetected to the TS_APP seam"
+    )
     app = _APP_JS.read_text(encoding="utf-8")
     assert "_pendingConsentServers" in app
     assert "function _onConsentDetected" in app
-    assert "onConsentDetected(server)" in app, (
-        "STANDALONE_HOST must wire host.onConsentDetected -> _onConsentDetected"
+    assert "window.TS_APP.onConsentDetected = _onConsentDetected" in app, (
+        "the standalone must expose _onConsentDetected on the TS_APP seam for the pane bridge"
     )
+
+
+def test_consent_badge_drives_rail_manage_row() -> None:
+    """The pending-consent badge was re-homed off the retired settings gear
+    (``#settings-btn``, deleted in the L-shell renovation, which silently made
+    the badge invisible) onto the rail's Manage > Connections row.  Classic
+    app.js can't import the ESM rail module, so it drives the rail's generic
+    ``setRowBadge`` hook through the ``window.TS_SHELL`` bridge — keyed on the
+    standalone's Connections tab.  Pin the new lane and the absence of the dead
+    gear lookup."""
+    app = _APP_JS.read_text(encoding="utf-8")
+    # The badge refresh must drive the rail bridge, not the deleted gear.
+    assert 'getElementById("settings-btn")' not in app, (
+        "the consent badge must no longer target the retired #settings-btn gear"
+    )
+    assert "shell.setRowBadge(_CONSENT_BADGE_TAB" in app, (
+        "_refreshConsentBadge must drive the rail Manage-row badge via the TS_SHELL bridge"
+    )
+    assert 'const _CONSENT_BADGE_TAB = "connections"' in app, (
+        "the standalone badge rides the Connections Manage tab (its MCP surface)"
+    )
+    # The hydrate + clear paths must still funnel through the single refresh.
+    assert "function loadPendingConsents" in app and "_refreshConsentBadge()" in app
 
 
 def test_phase8_settings_panel_handlers_defined() -> None:
@@ -676,7 +706,9 @@ def test_phase8_css_classes_present_in_stylesheet() -> None:
     connections render in the Admin pane's Connections panel (#view-admin), not a
     floating dialog — so #settings-overlay / #settings-box are no longer pinned.
     The revoke confirm's chrome moved to /shared/hatch.css with the dialog-tier
-    conversion, so no #revoke-mcp-* rule is pinned here either."""
+    conversion, so no #revoke-mcp-* rule is pinned here either.  The pending-
+    consent badge moved off the retired settings gear onto the rail's Manage row
+    (shell.css `.rail-badge`), so `.settings-consent-badge` is gone from here."""
     css = _STYLE_CSS.read_text(encoding="utf-8")
     for selector in [
         ".mcp-error-card",
@@ -684,9 +716,13 @@ def test_phase8_css_classes_present_in_stylesheet() -> None:
         ".mcp-error-action-btn",
         ".mcp-scope-pill",
         ".settings-revoke-btn",
-        ".settings-consent-badge",
     ]:
         assert selector in css, f"Missing CSS rule for {selector}"
+    # The dead gear-badge rule must be GONE (its host #settings-btn was retired).
+    assert ".settings-consent-badge" not in css, (
+        "the retired settings-gear consent badge CSS must be removed "
+        "(the badge now lives on the rail Manage row — shell.css .rail-badge)"
+    )
 
 
 def test_phase8_consent_url_prefix_check_in_click_handler() -> None:

@@ -3244,10 +3244,18 @@ function createInteractivePane(root, wsId, opts) {
     warningTarget(pane) {
       return pane.messagesEl;
     },
-    // MCP re-consent surfaces inline in the pane card; the console has no
-    // settings-gear badge to drive (a future console consent surface can hook
-    // here).
-    onConsentDetected() {},
+    // MCP re-consent surfaces inline in the pane card; the STANDALONE additionally
+    // drives a Manage-row attention badge — bridged through the TS_APP seam so the
+    // shared factory stays deployment-agnostic (the console doesn't define the
+    // hook, so this stays a no-op there).
+    onConsentDetected(server) {
+      if (
+        window.TS_APP &&
+        typeof window.TS_APP.onConsentDetected === "function"
+      ) {
+        window.TS_APP.onConsentDetected(server);
+      }
+    },
   };
 
   const pane = new Pane(wsId, {

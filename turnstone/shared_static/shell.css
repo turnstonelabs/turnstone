@@ -997,6 +997,38 @@
   box-shadow: inset 2px 0 0 var(--ink-4);
 }
 
+/* Manage-row attention badge (rail.js `setRowBadge` / `badge`) — a small count
+   chip pinned to the row tail (and to a COLLAPSED group's head, so a hidden row
+   never hides the signal).  DS warn vocabulary: the ⚠ glyph PLUS the tinted
+   chip carry the meaning (never colour alone), so it reads at chip size and
+   flips themes by construction (the --warn family is defined per theme). */
+.rail-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  margin-left: auto; /* push to the row/head tail past the flex-1 label */
+  padding: 0 5px;
+  border-radius: var(--r-sm);
+  background: var(--warn-tint);
+  border: 1px solid var(--warn-tint-border);
+  color: var(--warn);
+  font-size: 10px;
+  line-height: 1.5;
+  font-variant-numeric: tabular-nums;
+  flex: none;
+}
+/* The group head already auto-spaces with its own gap, and its --warn count
+   should not fight the dim --ink-4 tab count beside it. */
+.grp-head .rail-badge {
+  margin-left: 6px;
+}
+.rail-badge .rail-badge-glyph {
+  font-weight: 700;
+}
+.rail-badge b {
+  font-weight: 600;
+}
+
 /* ===== Admin pane — adopts #view-admin (the 18 tabpanels).  The in-pane
    sidebar is retired (the rail's Manage groups navigate), so #view-admin fills
    the pane body and the content host renders full-width. ===== */

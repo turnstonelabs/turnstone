@@ -39,6 +39,24 @@ export function glyph(state) {
   return el;
 }
 
+/** A small count chip for a Manage row/group head — glyph + count (never colour
+ *  alone), DS warn vocabulary (shell.css `.rail-badge`).  The count rides the
+ *  text; the ⚠ glyph is aria-hidden because the supplied `label` already names
+ *  the condition for assistive tech.  Returns a detached span the caller mounts. */
+function badge(count, label) {
+  const el = document.createElement("span");
+  el.className = "rail-badge";
+  const g = document.createElement("span");
+  g.className = "rail-badge-glyph";
+  g.setAttribute("aria-hidden", "true");
+  g.textContent = "⚠"; // ⚠ — pairs the colour with a glyph (chip-contrast rule)
+  const n = document.createElement("b");
+  n.textContent = String(count);
+  el.append(g, n);
+  if (label) el.setAttribute("aria-label", label);
+  return el;
+}
+
 /** Derive a node's overall state glyph from its workstream mix + health. */
 function nodeState(info) {
   if (!info.reachable) return "error";
@@ -325,6 +343,79 @@ export function mountRail(sections, caps) {
 
 // ---- Manage section (admin IA → collapsible discovery groups) --------------
 
+// Generic Manage-row badge state.  A subsystem (e.g. the standalone consent
+// badge) drives a count onto a tab row by KEY via `setRowBadge`; rail.js stays
+// agnostic about what the count means.  Kept module-level so a `mountManage`
+// rebuild (the IA is static, but the section re-mounts on shell init) re-applies
+// the live counts rather than dropping them.  `null` label = clear.
+const _rowBadges = new Map(); // tabKey -> { count, label }
+// Rebuilt each mount: the row <button> and the OWNING group's head <button> for
+// every tab key, so a badge can also surface on the head when the group is
+// collapsed (a collapsed group hides its rows — the head must carry the signal).
+let _rowEls = new Map(); // tabKey -> { row, head, group }
+let _groupEls = new Map(); // group key -> { head, tabKeys: [] }
+
+/** Paint (or clear) the badge slot inside a host button, keyed by a stable
+ *  `.rail-badge` child so repeated calls replace rather than stack. */
+function _applyBadge(host, count, label) {
+  if (!host) return;
+  const existing = host.querySelector(":scope > .rail-badge");
+  if (!count) {
+    if (existing) existing.remove();
+    return;
+  }
+  const fresh = badge(count, label);
+  if (existing) host.replaceChild(fresh, existing);
+  else host.append(fresh);
+}
+
+/** Sum the live badge counts for a group's tabs — drives the head badge so a
+ *  COLLAPSED group still shows that something inside it needs attention. */
+function _groupCount(groupKey) {
+  const grp = _groupEls.get(groupKey);
+  if (!grp) return 0;
+  let total = 0;
+  for (const tabKey of grp.tabKeys) {
+    const b = _rowBadges.get(tabKey);
+    if (b) total += b.count;
+  }
+  return total;
+}
+
+/**
+ * Generic Manage-row badge hook.  `setRowBadge(tabKey, count, label?)` stamps a
+ * count chip on that tab's row and, so the signal survives a collapsed group,
+ * mirrors the group's total onto its head.  `count` 0 (or falsy) clears the row.
+ * Drives off the refs `mountManage` registered; a no-op before the first mount
+ * (the consent subsystem re-drives it after `_refreshConsentBadge`).
+ *
+ * rail.js owns the MECHANISM only — callers own the meaning (no consent specifics
+ * here), matching the rail's seam-driven posture.
+ */
+export function setRowBadge(tabKey, count, label) {
+  const n = Number(count) || 0;
+  if (n > 0) _rowBadges.set(tabKey, { count: n, label: label || "" });
+  else _rowBadges.delete(tabKey);
+  const ref = _rowEls.get(tabKey);
+  if (!ref) return; // not mounted yet (or gated away) — state is kept for remount
+  _applyBadge(ref.row, n, label);
+  // The collapsed-group head mirrors the group's running total + its own label.
+  const total = _groupCount(ref.group);
+  const grp = _groupEls.get(ref.group);
+  _applyBadge(
+    grp && grp.head,
+    total,
+    total ? total + " in " + ref.group + " awaiting attention" : "",
+  );
+}
+
+/** Re-stamp every stored badge after a (re)mount rebuilt the row/head refs.
+ *  `setRowBadge` self-guards a missing ref and recomputes each head total, so
+ *  replaying the stored rows lands both rows and heads at their correct sums. */
+function _reapplyBadges() {
+  for (const [tabKey, b] of _rowBadges) setRowBadge(tabKey, b.count, b.label);
+}
+
 /**
  * Build the rail's Manage groups from the admin IA seam (admin.js exposes
  * `window.TS_ADMIN`).  Each group is a collapsible `.grp` whose head toggles
@@ -374,6 +465,9 @@ export function mountManage(root, paneManager) {
   const activeTab = adminOpen && TS.getActiveTab ? TS.getActiveTab() : null;
 
   const rowByTab = new Map(); // tab -> its row <button>, for active-state sync
+  // Rebuild the badge ref maps for this mount (the previous DOM is gone).
+  _rowEls = new Map();
+  _groupEls = new Map();
 
   ia.forEach((group) => {
     const tabs = group.tabs.filter((t) => allowed(t.tab));
@@ -404,6 +498,8 @@ export function mountManage(root, paneManager) {
     count.className = "gcount";
     count.textContent = String(tabs.length);
     head.append(chev, name, count);
+    // Register the head so a collapsed group can carry its tabs' badge total.
+    _groupEls.set(group.group, { head, tabKeys: tabs.map((t) => t.tab) });
 
     const items = document.createElement("div");
     items.className = "grp-items";
@@ -421,6 +517,8 @@ export function mountManage(root, paneManager) {
         if (TS.openTab) TS.openTab(t.tab);
       });
       rowByTab.set(t.tab, row);
+      // Register the row + its owning group for the badge hook.
+      _rowEls.set(t.tab, { row, head, group: group.group });
       items.append(row);
     }
 
@@ -433,6 +531,9 @@ export function mountManage(root, paneManager) {
     grp.append(head, items);
     root.append(grp);
   });
+
+  // Re-apply any live row badges a subsystem set before/across this (re)mount.
+  _reapplyBadges();
 
   // Single writer for the Manage active-row: the row for the current admin tab
   // carries `.active`.  admin.js notifies on every switchAdminTab; seed it here
