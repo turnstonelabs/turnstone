@@ -8,6 +8,8 @@ visitor lands on the page but all API calls fail).
 
 from __future__ import annotations
 
+import re
+
 import pytest
 from starlette.applications import Starlette
 from starlette.routing import Route
@@ -412,8 +414,13 @@ def test_coord_dedups_system_turn_against_history_by_event_id():
     # End at the NEXT switch case, not the first ``break;`` — the dedup-skip
     # ``...has(sysEid)) break;`` is itself a break that precedes the ``.add(``,
     # so a ``break;``-bounded slice would drop the record half.
-    sys_case_end = body.index('\n      case "', sys_case + 1)
-    live_block = body[sys_case:sys_case_end]
+    # Whitespace-tolerant so a reformat can't silently break the bound.
+    next_case = re.search(r'\n\s*case "', body[sys_case + 1 :])
+    assert next_case, (
+        "no switch case found after system_turn to bound the pin slice — if "
+        "system_turn became the last case, re-anchor this pin's end marker."
+    )
+    live_block = body[sys_case : sys_case + 1 + next_case.start()]
     assert "renderedSystemEventIds.has(" in live_block, (
         "the live system_turn handler must CONSULT the dedup set (skip an id "
         "already painted from /history) — not just reference the Set elsewhere."
@@ -424,10 +431,16 @@ def test_coord_dedups_system_turn_against_history_by_event_id():
     )
 
     # The history render path must seed the set from each replayed system row's
-    # event_id, so a subsequent live replay of the same id is skipped.
+    # event_id, so a subsequent live replay of the same id is skipped.  Bound
+    # the slice structurally — from the system-role branch to the next role
+    # branch in the same chain (falling back to a generous window when it's
+    # the last branch) — so adding comments/fields inside the branch can't
+    # false-fail a pin that only cares about the wiring.
     assert 'role === "system"' in body
     sys_replay = body.index('role === "system"', body.index("refetchHistory"))
-    replay_window = body[sys_replay : sys_replay + 600]
+    next_role = re.search(r"role\s*===", body[sys_replay + 1 :])
+    replay_end = sys_replay + 1 + next_role.start() if next_role else sys_replay + 1500
+    replay_window = body[sys_replay:replay_end]
     assert "renderedSystemEventIds.add(" in replay_window, (
         "the history render's system-role branch must record each replayed "
         "turn's event_id so the live system_turn handler can dedup against it."
