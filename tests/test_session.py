@@ -2913,6 +2913,181 @@ class TestMemoryCompositionDeferral:
         assert session._system_composed_with_context is False
 
 
+class TestMemoryAccessTouch:
+    """Access metadata (``access_count`` / ``last_accessed``) moves only when
+    the model actually sees a memory: the injected top-k during composition,
+    and explicit search/get reads via the memory tool.  Save/list and the
+    wider candidate pool must NOT bump the counter.
+    """
+
+    @staticmethod
+    def _access_count(name: str, scope: str = "global", scope_id: str = "") -> int:
+        from turnstone.core.storage import get_storage
+
+        mem = get_storage().get_structured_memory_by_name(name, scope, scope_id)
+        assert mem is not None, f"memory {name!r} not found"
+        return int(mem["access_count"])
+
+    @staticmethod
+    def _save(name: str, content: str) -> None:
+        from turnstone.core.memory import save_structured_memory
+
+        save_structured_memory(name, content, scope="global")
+
+    @staticmethod
+    def _empty_session() -> ChatSession:
+        """A session whose __init__ composed before any memory existed.
+
+        The constructor composes the system prefix once; building it before
+        the memories are saved keeps that first (empty) compose from touching
+        rows, so the tests observe only the turn-driven recompose below.
+        """
+        return _make_session(ws_id="ws-1", user_id="user-1")
+
+    @staticmethod
+    def _compose_turn(session: ChatSession, query: str) -> None:
+        """Drive one user turn's worth of composition.
+
+        Mirrors ``send``: a fresh user turn invalidates the per-turn memory
+        caches, then the prefix recomposes against the new query.
+        """
+        session._invalidate_memory_cache()
+        session.messages.append(turn_from_dict({"role": "user", "content": query}))
+        session._init_system_messages()
+
+    def test_composition_touches_injected_memories(self, tmp_db):
+        session = self._empty_session()
+        self._save("kafka_runbook", "restart the kafka broker pods")
+        self._save("kafka_alerts", "kafka consumer lag alert thresholds")
+        self._compose_turn(session, "how do I restart kafka")
+        # Both query-matching memories were injected, so both got touched once.
+        assert self._access_count("kafka_runbook") == 1
+        assert self._access_count("kafka_alerts") == 1
+
+    def test_composition_skips_unmatched_candidates(self, tmp_db):
+        """The candidate pool is a superset of the injected set — a memory
+        that loses BM25 ranking (no query overlap) must NOT be touched."""
+        session = self._empty_session()
+        self._save("kafka_runbook", "restart the kafka broker pods")
+        self._save("garden_notes", "tomato watering schedule midsummer")
+        self._compose_turn(session, "restart kafka broker pods status")
+        # The matching memory was injected and touched.
+        assert self._access_count("kafka_runbook") == 1
+        # The non-matching one was a candidate but never injected.
+        assert self._access_count("garden_notes") == 0
+        # Sanity: it really was in the visible candidate pool.
+        visible = {m["name"] for m in session._list_visible_memories()}
+        assert "garden_notes" in visible
+
+    def test_composition_touches_each_memory_once_per_turn(self, tmp_db):
+        """``_init_system_messages`` runs many times within a turn (tool
+        results, MCP refresh); the injected set must be touched at most once
+        per memory between user turns, not once per recompose."""
+        session = self._empty_session()
+        self._save("kafka_runbook", "restart the kafka broker pods")
+        self._compose_turn(session, "how do I restart kafka")
+        # Several mid-turn recomposes (no new user turn between them).
+        session._init_system_messages()
+        session._init_system_messages()
+        assert self._access_count("kafka_runbook") == 1
+        # A genuinely new turn lets the same memory be counted again.
+        self._compose_turn(session, "kafka again please")
+        assert self._access_count("kafka_runbook") == 2
+
+    def test_composition_touches_exactly_the_injected_keys(self, tmp_db):
+        """Spy the touch boundary and assert the keys match the names the
+        composer rendered into the ``<memories>`` block — exactly, not the
+        candidate pool."""
+        session = self._empty_session()
+        self._save("kafka_runbook", "restart the kafka broker pods")
+        self._save("garden_notes", "tomato watering schedule midsummer")
+        session._invalidate_memory_cache()
+        session.messages.append(
+            turn_from_dict({"role": "user", "content": "restart kafka broker pods status"})
+        )
+        touched: list[tuple[str, str, str]] = []
+        with patch(
+            "turnstone.core.session.touch_structured_memories",
+            side_effect=lambda keys: touched.extend(keys),
+        ):
+            session._init_system_messages()
+        joined = "\n".join(m["content"] for m in session.system_messages if m["role"] == "system")
+        touched_names = {name for name, _, _ in touched}
+        assert touched_names == {"kafka_runbook"}
+        assert '<memory name="kafka_runbook"' in joined
+        assert '<memory name="garden_notes"' not in joined
+
+    def test_composition_survives_touch_storage_error(self, tmp_db):
+        """A storage blow-up inside the touch must not break composition —
+        the facade swallows it and the memory block still lands."""
+        from turnstone.core.storage import get_storage
+
+        session = self._empty_session()
+        self._save("kafka_runbook", "restart the kafka broker pods")
+        session._invalidate_memory_cache()
+        session.messages.append(
+            turn_from_dict({"role": "user", "content": "how do I restart kafka"})
+        )
+        with patch.object(
+            get_storage(),
+            "touch_structured_memories",
+            side_effect=RuntimeError("storage exploded"),
+        ):
+            session._init_system_messages()
+        joined = "\n".join(m["content"] for m in session.system_messages if m["role"] == "system")
+        assert '<memory name="kafka_runbook"' in joined
+
+    def test_search_action_touches_returned_hits(self, tmp_db):
+        session = self._empty_session()
+        self._save("kafka_runbook", "restart the kafka broker pods")
+        item = session._prepare_memory("call_1", {"action": "search", "query": "kafka"})
+        assert "error" not in item
+        session._exec_memory(item)
+        assert self._access_count("kafka_runbook") == 1
+
+    def test_get_action_touches_fetched_memory(self, tmp_db):
+        session = self._empty_session()
+        self._save("kafka_runbook", "restart the kafka broker pods")
+        item = session._prepare_memory(
+            "call_1", {"action": "get", "name": "kafka_runbook", "scope": "global"}
+        )
+        assert "error" not in item
+        session._exec_memory(item)
+        assert self._access_count("kafka_runbook") == 1
+
+    def test_get_miss_touches_nothing(self, tmp_db):
+        session = self._empty_session()
+        self._save("kafka_runbook", "restart the kafka broker pods")
+        item = session._prepare_memory(
+            "call_1", {"action": "get", "name": "no_such_mem", "scope": "global"}
+        )
+        _, msg = session._exec_memory(item)
+        assert "not found" in msg
+        # The existing row must not be collaterally touched by a miss.
+        assert self._access_count("kafka_runbook") == 0
+
+    def test_list_action_does_not_touch(self, tmp_db):
+        session = self._empty_session()
+        self._save("kafka_runbook", "restart the kafka broker pods")
+        item = session._prepare_memory("call_1", {"action": "list"})
+        session._exec_memory(item)
+        assert self._access_count("kafka_runbook") == 0
+
+    def test_save_action_does_not_touch_access_count(self, tmp_db):
+        """The save action handler itself must not bump ``access_count`` —
+        that counter is read traffic only.  (The recompose a save triggers
+        may surface the row via the composition path; that is exercised by
+        the composition tests.  Suppressed here to isolate the handler.)"""
+        session = self._empty_session()
+        item = session._prepare_memory(
+            "call_1",
+            {"action": "save", "name": "kafka_runbook", "content": "x", "scope": "global"},
+        )
+        with patch.object(session, "_init_system_messages"):
+            session._exec_memory(item)
+        assert self._access_count("kafka_runbook") == 0
+
+
 class TestMetacognitiveBuffers:
     """Nudges drain through advisory channels, not the system message."""
 
