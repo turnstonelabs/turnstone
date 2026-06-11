@@ -6,7 +6,7 @@
     "properties": {
       "ws_id": {
         "type": "string",
-        "description": "Workstream id to inspect."
+        "description": "Workstream id to inspect — exactly 32 hex chars, copied verbatim from spawn_batch / list_workstreams results. Unknown or malformed ids error with did-you-mean suggestions and a roster of your children; nothing is ever guessed."
       },
       "message_limit": {
         "type": "integer",

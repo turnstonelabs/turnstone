@@ -168,19 +168,33 @@ Every ws_id returned by `spawn_workstream` / `spawn_batch` is a
 invent ws_ids — a model that hallucinates `"child-1"` or `"ws-abc"`
 hits the tenant guard in `CoordinatorClient._is_own_subtree`, which
 validates ws_id against `parent_ws_id=coord_ws_id` AND
-`user_id=owner` in storage.  The rejection shape varies by tool:
+`user_id=owner` in storage.  The rejection shape is uniform and
+recovery-oriented:
 
 - **Mutating ops** (`send_to_workstream`, `close_workstream`,
-  `cancel_workstream`, `delete_workstream`) return
-  `{"error": "workstream not in coordinator subtree: <ws_id>", "status": 404}`
-  — the skill should treat this as a tool error, not an empty result.
-- **`inspect_workstream`** returns `{"error": "workstream not found", "ws_id": "<ws_id>"}`
-  (same shape as a genuinely missing row, so the guard can't be
-  used as an existence oracle).
-- **`wait_for_workstream`** reports the offending id with
-  `state="denied"` in its `results` dict; `mode="any"` won't
-  satisfy on a pure-denied list, so a hallucinated id won't trick
-  the wait into reporting "complete".
+  `cancel_workstream`, `delete_workstream`) and
+  **`inspect_workstream`** return
+  `{"error": "no workstream matching '<ref>' among your children; …",
+  "status": 404, "ws_id": "<ref>", "did_you_mean": [...],
+  "children": [...], "children_truncated": bool}` — a did-you-mean
+  (edit distance ≤ 3 against the coord's own children, which catches
+  the garbled-hex incident class: a 32-char id whose `aaa` run
+  collapsed to `a`) plus a roster of the coord's children.  A ref
+  that matches a child's display NAME is called out explicitly with
+  the right id (names are mutable labels, not addresses).  Foreign
+  and nonexistent ids produce the same payload (no existence
+  oracle), every hint references only the coord's own children, and
+  near-miss ids are never auto-resolved — the skill should fix the
+  id and re-issue, not treat the child as dead.
+- **`wait_for_workstream`** validates ids before waiting: a
+  malformed id fails the whole call immediately (`invalid_ws_ids`
+  carries the per-id payloads above, `elapsed=0`); a well-formed id
+  that is foreign, nonexistent, or hard-deleted mid-wait surfaces as
+  `state="not_found"` and aborts the wait on that tick with
+  top-level `error` / `not_found` / `children` fields.
+  `complete=true` therefore means every polled lane really finished
+  — an unobservable id can neither burn the timeout nor ride along
+  to a "complete" result.
 
 Pattern: capture each spawn result in the next tool call's input.
 The JSON tool-result carries `{"child_ws_id": "...", "name": "...",

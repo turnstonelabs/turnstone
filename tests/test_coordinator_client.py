@@ -9,6 +9,7 @@ storage-call path.
 from __future__ import annotations
 
 import json
+import threading
 import time
 from typing import TYPE_CHECKING, Any
 
@@ -405,7 +406,10 @@ def test_mutating_ops_reject_foreign_ws_id_without_hitting_proxy():
     ]:
         result = call("ws-foreign", **kwargs)  # type: ignore[arg-type]
         assert result["status"] == 404
-        assert "not in coordinator subtree" in result["error"]
+        assert "no workstream matching" in result["error"]
+        # Recovery payload: a roster of the coord's own children rides
+        # along so a garbled id is fixable in one round-trip.
+        assert {c["ws_id"] for c in result["children"]} == {"ws-x", "ws-y"}
     # No HTTP requests issued — guard rejected before _post.
     assert captured == []
 
@@ -419,6 +423,56 @@ def test_mutating_ops_accept_self_ws_id():
     client.send("coord-1", "hi")
     assert len(captured) == 1
     assert captured[0].url.path == "/v1/api/route/workstreams/coord-1/send"
+
+
+def test_mutating_ops_reject_foreign_hex_id_with_recovery_payload():
+    """A well-formed 32-hex id that isn't ours passes format validation
+    and dies on the ownership guard with the SAME recovery payload as a
+    malformed ref — uniform shape, no existence oracle, no HTTP."""
+    client, captured = _mock_client(_ok_json({"status": 200}))
+    result = client.send("f" * 32, "hi")
+    assert result["status"] == 404
+    assert "no workstream matching" in result["error"]
+    assert {c["ws_id"] for c in result["children"]} == {"ws-x", "ws-y"}
+    assert captured == []
+
+
+def test_mutating_ops_reject_child_name_with_id_pointer(tmp_path):
+    """A model that pastes a child's display NAME instead of its id is
+    pointed straight at the right ws_id — names are mutable, non-unique
+    labels (the title generator can rewrite what the operator sees), so
+    they are deliberately NOT addresses and nothing resolves silently."""
+    st = SQLiteBackend(str(tmp_path / "names.db"))
+    st.register_workstream("coord-1", kind="coordinator", user_id="user-1")
+    real = "7c61eafe470c54caaa89490a4b9c0f7d"
+    st.register_workstream(
+        real,
+        kind="interactive",
+        parent_ws_id="coord-1",
+        state="running",
+        user_id="user-1",
+        name="minisforum-research",
+    )
+    captured: list[httpx.Request] = []
+
+    def _trap(req: httpx.Request) -> httpx.Response:
+        captured.append(req)
+        return httpx.Response(200, json={})
+
+    client = CoordinatorClient(
+        console_base_url="http://console",
+        storage=st,
+        token_factory=lambda: "t",
+        coord_ws_id="coord-1",
+        user_id="user-1",
+        http_client=httpx.Client(transport=httpx.MockTransport(_trap)),
+        child_event_bus=ChildEventBus(),
+    )
+    result = client.send("minisforum-research", "status?")
+    assert result["status"] == 404
+    assert "names are display labels" in result["error"]
+    assert result["did_you_mean"][0]["ws_id"] == real
+    assert captured == []
 
 
 # ---------------------------------------------------------------------------
@@ -558,34 +612,42 @@ def test_inspect_missing_ws_returns_error(populated_storage):
     assert "error" in result
 
 
-def test_inspect_not_found_does_not_echo_ws_id_in_error_string(populated_storage):
-    """The error STRING is bare ("workstream not found") — the
-    structured ``ws_id`` field carries the queried id.  Pre-fix the
-    error message echoed the ws_id back at the caller who just sent
-    it, which was redundant and a stylistic departure from the rest
-    of the surface.  Echo-in-string is also one more place a
-    hostile/oversize ws_id could land in operator-facing text."""
+def test_inspect_not_found_references_ref_but_clips_oversize(populated_storage):
+    """The error string names the unresolvable ref — it sits next to
+    the did-you-mean hints now, so it's load-bearing context — but
+    clips it to a bounded length so a hostile / oversize ws_id can't
+    flood operator-facing text (the prior bare-string design's
+    concern).  The structured ``ws_id`` field carries the full
+    value, and the format note reports the true length."""
     client = _make_read_client(populated_storage)
     result = client.inspect("does-not-exist-xyz")
-    assert result["error"] == "workstream not found"
-    # The structured field still carries the ws_id for context.
+    assert "does-not-exist-xyz" in result["error"]
     assert result["ws_id"] == "does-not-exist-xyz"
+    oversize = "z" * 300
+    clipped = client.inspect(oversize)
+    assert oversize not in clipped["error"]
+    assert "(got 300)" in clipped["error"]
+    assert clipped["ws_id"] == oversize
 
 
 def test_inspect_cross_tenant_returns_same_shape_as_missing(populated_storage):
     """The cross-tenant guard MUST return the exact same shape as a
-    genuinely missing ws_id — that's the existence-leak defence the
-    error-string echo was carrying weight for too.  Asserting the
-    shape match here pins the property going forward."""
-    # ``unrelated`` exists in storage but is not a coord-1 child.
+    genuinely missing ws_id — the existence-leak defence.  The error
+    text embeds the (caller-supplied) ref, so compare with the refs
+    factored out; same-length refs make the strings otherwise
+    byte-identical."""
+    # ``unrelated`` exists in storage but is not a coord-1 child;
+    # ``missing-x`` (same length) doesn't exist at all.
     client = _make_read_client(populated_storage)
     cross_tenant = client.inspect("unrelated")
-    missing = client.inspect("does-not-exist-abc")
-    # Same key set, same error string, only the ws_id field differs.
+    missing = client.inspect("missing-x")
     assert cross_tenant.keys() == missing.keys()
-    assert cross_tenant["error"] == missing["error"] == "workstream not found"
+    assert "no workstream matching" in missing["error"]
+    assert cross_tenant["error"].replace("unrelated", "X") == missing["error"].replace(
+        "missing-x", "X"
+    )
     assert cross_tenant["ws_id"] == "unrelated"
-    assert missing["ws_id"] == "does-not-exist-abc"
+    assert missing["ws_id"] == "missing-x"
 
 
 def test_list_children_excludes_closed_by_default(tmp_path):
@@ -1252,76 +1314,266 @@ def test_wait_for_workstream_all_mode_times_out_on_running_child(populated_stora
     assert result["results"]["child-b"]["state"] == "running"
 
 
-def test_wait_for_workstream_denies_foreign_ws_id(populated_storage):
-    """A ws_id outside the coordinator's subtree returns state='denied'.
-    With mode='any' on a pure-denied list there's no real work to wait
-    for, so the wait short-circuits sub-second with complete=False —
-    the model sees the denied state immediately and can correct rather
-    than spinning the timeout."""
+def test_wait_for_workstream_foreign_legacy_ref_fails_validation(populated_storage):
+    """A ref outside the coordinator's subtree that isn't id-shaped
+    ('unrelated') dies at the validation boundary: the call errors
+    immediately with a per-ref recovery payload and performs no
+    waiting at all."""
     client = _make_read_client(populated_storage)
     result = client.wait_for_workstream(["unrelated"], timeout=5, mode="any")
-    assert result["results"]["unrelated"]["state"] == "denied"
     assert result["complete"] is False
-    assert result["elapsed"] < 1.0
+    assert result["elapsed"] == 0.0
+    assert result["results"] == {}
+    assert "no workstream matching" in result["error"]
+    assert result["invalid_ws_ids"][0]["ws_id"] == "unrelated"
+    # Unified channel shape: trimmed per-ref entries, roster once at
+    # top level (same as the in-loop not_found channel).
+    assert "children" not in result["invalid_ws_ids"][0]
+    assert {c["ws_id"] for c in result["children"]} == {"child-a", "child-b", "child-coord"}
 
 
-def test_wait_for_workstream_denies_cross_tenant_child(populated_storage):
+def test_wait_for_workstream_cross_tenant_child_fails_validation(populated_storage):
     """Defense-in-depth (Copilot #506): a row whose ``parent_ws_id``
     matches the coordinator but whose ``user_id`` belongs to a
-    different tenant must collapse to ``denied`` — otherwise a
-    forged / migration-era / pre-tenant-gate row would let a
-    coordinator's LLM observe foreign-tenant state through
+    different tenant must stay unobservable.  The validation roster is
+    tenant-filtered in SQL, so the forged row never resolves and the
+    coordinator's LLM can't observe foreign-tenant state through
     ``wait_for_workstream``.  The ``populated_storage`` fixture's
     ``cross-tenant-child`` row has exactly this shape
-    (parent_ws_id="coord-1", user_id="user-2").
-    """
+    (parent_ws_id="coord-1", user_id="user-2")."""
     client = _make_read_client(populated_storage)
     result = client.wait_for_workstream(["cross-tenant-child"], timeout=5, mode="any")
-    assert result["results"]["cross-tenant-child"]["state"] == "denied"
     assert result["complete"] is False
-    assert result["elapsed"] < 1.0
+    assert result["results"] == {}
+    assert "no workstream matching" in result["error"]
 
 
-def test_wait_for_workstream_missing_ws_id_indistinguishable_from_denied(populated_storage):
-    """A ws_id that doesn't exist collapses into the same 'denied'
-    shape as a foreign ws_id so wait can't be used as an existence
-    oracle (matches the 404-mask contract inspect uses).  Same
-    short-circuit semantics as the pure-foreign case."""
+def test_wait_for_workstream_missing_ref_indistinguishable_from_foreign(populated_storage):
+    """A ref that doesn't exist produces the same payload as a foreign
+    one (same-length refs make the error strings byte-identical once
+    the echoed ref is factored out), so the validation boundary can't
+    be used as an existence oracle."""
     client = _make_read_client(populated_storage)
-    result = client.wait_for_workstream(["does-not-exist"], timeout=5, mode="any")
-    assert result["results"]["does-not-exist"]["state"] == "denied"
+    foreign = client.wait_for_workstream(["unrelated"], timeout=5)
+    missing = client.wait_for_workstream(["missing-x"], timeout=5)
+    f_err, m_err = foreign["invalid_ws_ids"][0], missing["invalid_ws_ids"][0]
+    assert f_err.keys() == m_err.keys()
+    assert f_err["error"].replace("unrelated", "X") == m_err["error"].replace("missing-x", "X")
+
+
+def test_wait_for_workstream_mixed_invalid_ref_errors_whole_call(populated_storage):
+    """Successor to the bug-2 false-positive regression: one valid
+    (running) child plus one unresolvable ref must never produce a
+    'complete' wait.  Under the fail-fast contract the whole call
+    errors immediately — a partial wait over the valid subset would
+    hide exactly the lost-lane failure the validation exists to
+    surface."""
+    client = _make_read_client(populated_storage)
+    result = client.wait_for_workstream(["child-b", "unrelated"], timeout=5, mode="any")
     assert result["complete"] is False
-    assert result["elapsed"] < 1.0
+    assert result["elapsed"] == 0.0
+    assert result["results"] == {}
+    assert result["invalid_ws_ids"][0]["ws_id"] == "unrelated"
+
+    # mode='all' is identical — previously a denied member counted as
+    # 'settled' and the wait completed, silently dropping the lane.
+    result_all = client.wait_for_workstream(["child-a", "unrelated"], timeout=5, mode="all")
+    assert result_all["complete"] is False
+    assert result_all["results"] == {}
 
 
-def test_wait_for_workstream_any_does_not_short_circuit_on_mixed_denied(populated_storage):
-    """Regression for the bug-2 false-positive: mode='any' with one
-    real (running) child and one denied id must NOT return
-    complete=True on the denied id — wait until the real child reaches
-    a real terminal state, or time out."""
-    client = _make_read_client(populated_storage)
-    result = client.wait_for_workstream(["child-b", "unrelated"], timeout=1.0, mode="any")
-    # child-b never reaches terminal in the test fixture; denied alone
-    # must not satisfy the any condition; wait must hit the timeout.
+# ---------------------------------------------------------------------------
+# wait_for_workstream — in-loop not_found fail-fast (32-hex refs)
+# ---------------------------------------------------------------------------
+#
+# Production ws_ids are ``uuid4().hex``.  A well-formed-but-unobservable
+# id passes the validation boundary and must abort the wait on the first
+# tick that sees it — never burn the timeout, never ride along to a
+# "complete" result.  The fixture mirrors the original field incident: a
+# coordinator LLM collapsed the ``aaa`` run in a child's id to a single
+# ``a`` and then read the resulting not-found as a dead child.
+
+REAL_CHILD_HEX = "7c61eafe470c54caaa89490a4b9c0f7d"
+CORRUPTED_CHILD_HEX = "7c61eafe470c54ca89490a4b9c0f7d"  # aaa -> a, 30 chars
+RUNNING_CHILD_HEX = "9cc8205058d528130fb469eaf75650f3"
+FOREIGN_HEX = "f" * 32
+MISSING_HEX = "e" * 32
+FORGED_HEX = "d" * 32  # parent_ws_id forged to coord-1, foreign user_id
+
+
+@pytest.fixture
+def hex_storage(tmp_path):
+    st = SQLiteBackend(str(tmp_path / "coord-hex.db"))
+    st.register_workstream("coord-1", kind="coordinator", user_id="user-1")
+    st.register_workstream(
+        REAL_CHILD_HEX,
+        kind="interactive",
+        parent_ws_id="coord-1",
+        state="idle",
+        user_id="user-1",
+        name="minisforum-research",
+    )
+    st.register_workstream(
+        RUNNING_CHILD_HEX,
+        kind="interactive",
+        parent_ws_id="coord-1",
+        state="running",
+        user_id="user-1",
+        name="beelink-research",
+    )
+    st.register_workstream(FOREIGN_HEX, kind="interactive", user_id="user-2")
+    st.register_workstream(FORGED_HEX, kind="interactive", parent_ws_id="coord-1", user_id="user-2")
+    return st
+
+
+def test_wait_incident_regression_corrupted_id_gets_did_you_mean(hex_storage):
+    """THE incident: a 30-char id (character-run collapse) must fail the
+    call instantly with the real child id as a did-you-mean — pre-fix
+    it burned the full timeout and read as a dead child."""
+    client = _make_read_client(hex_storage)
+    result = client.wait_for_workstream([CORRUPTED_CHILD_HEX], timeout=300, mode="all")
     assert result["complete"] is False
-    assert result["elapsed"] >= 1.0
-    assert result["results"]["unrelated"]["state"] == "denied"
-    assert result["results"]["child-b"]["state"] == "running"
+    assert result["elapsed"] == 0.0
+    assert result["results"] == {}
+    bad = result["invalid_ws_ids"][0]
+    assert bad["ws_id"] == CORRUPTED_CHILD_HEX
+    assert bad["did_you_mean"][0]["ws_id"] == REAL_CHILD_HEX
+    assert bad["did_you_mean"][0]["name"] == "minisforum-research"
+    assert "(got 30)" in bad["error"]
 
 
-def test_wait_for_workstream_all_completes_when_real_terminal_and_denied_mixed(
-    populated_storage,
-):
-    """mode='all' should consider denied ids as 'settled' so a wait on
-    [real-idle, denied] completes after the first tick instead of
-    waiting out the timeout — the model gets the full results dict
-    and can act on the per-id state."""
-    client = _make_read_client(populated_storage)
-    result = client.wait_for_workstream(["child-a", "unrelated"], timeout=5, mode="all")
+def test_wait_foreign_hex_id_aborts_on_first_tick(hex_storage):
+    """A well-formed foreign id passes validation, snapshots as
+    ``not_found``, and aborts the wait immediately — even in mode='any'
+    with a real running child alongside (the old contract silently
+    waited out the timeout here)."""
+    client = _make_read_client(hex_storage)
+    result = client.wait_for_workstream([RUNNING_CHILD_HEX, FOREIGN_HEX], timeout=30, mode="any")
+    assert result["complete"] is False
+    assert result["elapsed"] < 5.0
+    assert result["results"][FOREIGN_HEX]["state"] == "not_found"
+    assert result["results"][FOREIGN_HEX]["message"] == (
+        "(no workstream with this id among your children)"
+    )
+    assert result["results"][RUNNING_CHILD_HEX]["state"] == "running"
+    assert [h["ws_id"] for h in result["not_found"]] == [FOREIGN_HEX]
+    assert "no workstream matching" in result["error"]
+    assert {c["ws_id"] for c in result["children"]} == {REAL_CHILD_HEX, RUNNING_CHILD_HEX}
+
+
+def test_wait_mode_all_never_completes_with_not_found_member(hex_storage):
+    """Successor to the silent-ride-along: mode='all' with [idle,
+    foreign] previously returned complete=True (denied counted as
+    'settled'), reporting success while a lane was missing.  Now the
+    unobservable member aborts the call with complete=False."""
+    client = _make_read_client(hex_storage)
+    result = client.wait_for_workstream([REAL_CHILD_HEX, FOREIGN_HEX], timeout=5, mode="all")
+    assert result["complete"] is False
+    assert result["results"][FOREIGN_HEX]["state"] == "not_found"
+    assert result["results"][REAL_CHILD_HEX]["state"] == "idle"
+
+
+def test_wait_foreign_and_missing_hex_payloads_identical(hex_storage):
+    """Existence-oracle pin for the fail-fast path: an existing
+    foreign-tenant id and a nonexistent id produce identical result
+    entries and identical top-level hints (modulo the echoed ref)."""
+    client = _make_read_client(hex_storage)
+    foreign = client.wait_for_workstream([FOREIGN_HEX], timeout=5)
+    missing = client.wait_for_workstream([MISSING_HEX], timeout=5)
+    assert foreign["results"][FOREIGN_HEX] == missing["results"][MISSING_HEX]
+    f_hint, m_hint = foreign["not_found"][0], missing["not_found"][0]
+    assert f_hint.keys() == m_hint.keys()
+    assert f_hint["error"].replace(FOREIGN_HEX, "ID") == m_hint["error"].replace(MISSING_HEX, "ID")
+
+
+def test_wait_results_carry_child_display_name(hex_storage):
+    """Own-child entries carry the display ``name`` for orientation —
+    a label, not an address."""
+    client = _make_read_client(hex_storage)
+    result = client.wait_for_workstream([REAL_CHILD_HEX], timeout=5, mode="any")
     assert result["complete"] is True
-    assert result["elapsed"] < 1.0
-    assert result["results"]["child-a"]["state"] == "idle"
-    assert result["results"]["unrelated"]["state"] == "denied"
+    assert result["results"][REAL_CHILD_HEX]["name"] == "minisforum-research"
+
+
+def test_wait_mid_wait_hard_delete_aborts(hex_storage, monkeypatch):
+    """A child hard-deleted while a wait is in flight flips to
+    ``not_found`` on the next tick and aborts the wait — the
+    coordinator hears about the vanished lane in seconds, not at
+    timeout."""
+    monkeypatch.setattr(CoordinatorClient, "_WAIT_HEARTBEAT_INTERVAL", 0.05)
+    client = _make_read_client(hex_storage)
+
+    def _delete_soon() -> None:
+        time.sleep(0.3)
+        hex_storage.delete_workstream(RUNNING_CHILD_HEX)
+
+    deleter = threading.Thread(target=_delete_soon)
+    deleter.start()
+    try:
+        result = client.wait_for_workstream([RUNNING_CHILD_HEX], timeout=30, mode="all")
+    finally:
+        deleter.join()
+    assert result["complete"] is False
+    assert result["results"][RUNNING_CHILD_HEX]["state"] == "not_found"
+    assert result["elapsed"] < 10.0
+
+
+def test_inspect_corrupted_id_gets_did_you_mean(hex_storage):
+    """inspect_workstream shares the validation boundary: the incident
+    id gets the did-you-mean pointer, and the real id still inspects."""
+    client = _make_read_client(hex_storage)
+    result = client.inspect(CORRUPTED_CHILD_HEX)
+    assert result["did_you_mean"][0]["ws_id"] == REAL_CHILD_HEX
+    assert "(got 30)" in result["error"]
+    ok = client.inspect(REAL_CHILD_HEX)
+    assert ok["state"] == "idle"
+
+
+def test_inspect_rejects_forged_cross_tenant_hex_row(hex_storage):
+    """Parity with the wait / mutating gates (#506): a row forged with
+    parent_ws_id=coord but a foreign user_id must not be readable
+    through inspect either — same not-found shape, no history leak."""
+    client = _make_read_client(hex_storage)
+    result = client.inspect(FORGED_HEX)
+    assert "no workstream matching" in result["error"]
+    assert "messages" not in result
+
+
+def test_ws_ref_validation_survives_roster_query_failure(hex_storage, monkeypatch):
+    """Storage failure during the roster read degrades hints to empty
+    but validation still errors honestly (never resolves blind)."""
+    client = _make_read_client(hex_storage)
+
+    def _boom(*args: object, **kwargs: object) -> None:
+        raise RuntimeError("storage down")
+
+    monkeypatch.setattr(hex_storage, "list_workstreams", _boom)
+    result = client.send("not-a-real-id", "hi")
+    assert result["status"] == 404
+    assert "no workstream matching" in result["error"]
+    assert result["children"] == []
+
+
+def test_uppercase_full_hex_ref_case_folds(hex_storage):
+    """Models occasionally upcase hex; a full 32-hex ref resolves
+    case-insensitively."""
+    client = _make_read_client(hex_storage)
+    ok = client.inspect(REAL_CHILD_HEX.upper())
+    assert ok.get("error") is None
+    assert ok["state"] == "idle"
+
+
+def test_wait_since_hint_does_not_mask_not_found(hex_storage):
+    """The not_found fail-fast outranks the since-diff early exit — a
+    diffing since hint must not convert an unobservable-id abort into
+    complete=True."""
+    client = _make_read_client(hex_storage)
+    since = {RUNNING_CHILD_HEX: {"state": "idle", "tokens": 0, "updated": ""}}
+    result = client.wait_for_workstream(
+        [RUNNING_CHILD_HEX, FOREIGN_HEX], timeout=5, mode="any", since=since
+    )
+    assert result["complete"] is False
+    assert result["results"][FOREIGN_HEX]["state"] == "not_found"
 
 
 def test_wait_for_workstream_rejects_invalid_mode(populated_storage):
@@ -1788,15 +2040,15 @@ def test_wait_for_workstream_closed_returns_sentinel(populated_storage):
     assert snap["truncated"] is False
 
 
-def test_wait_for_workstream_denied_returns_sentinel(populated_storage):
-    """Cross-tenant / nonexistent ws_ids surface as denied — the
-    sentinel lets the coord LLM recognise the rejection without
-    parsing state strings on its own."""
-    client = _make_read_client(populated_storage)
-    result = client.wait_for_workstream(["unrelated"], timeout=5, mode="any")
-    snap = result["results"]["unrelated"]
-    assert snap["state"] == "denied"
-    assert snap["message"].startswith("(workstream denied")
+def test_wait_for_workstream_not_found_returns_sentinel(hex_storage):
+    """Unobservable ws_ids surface a fixed sentinel message so the
+    coord LLM recognises the rejection without parsing state strings
+    on its own."""
+    client = _make_read_client(hex_storage)
+    result = client.wait_for_workstream([FOREIGN_HEX], timeout=5, mode="any")
+    snap = result["results"][FOREIGN_HEX]
+    assert snap["state"] == "not_found"
+    assert snap["message"] == "(no workstream with this id among your children)"
     assert snap["truncated"] is False
 
 

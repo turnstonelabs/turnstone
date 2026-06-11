@@ -6,7 +6,7 @@
     "properties": {
       "ws_id": {
         "type": "string",
-        "description": "Workstream id to cancel."
+        "description": "Workstream id to cancel — exactly 32 hex chars, copied verbatim. Unknown or malformed ids error with did-you-mean suggestions; nothing is ever guessed."
       }
     },
     "required": ["ws_id"]

@@ -10012,7 +10012,17 @@ class ChatSession:
         # Surface client-side validation errors as tool errors rather
         # than rendering them as a "successful" wait result.
         if result.get("error"):
-            msg = f"Error: {result['error']}"
+            if result.get("not_found") or result.get("invalid_ws_ids"):
+                # Unresolvable-id failures carry a structured recovery
+                # payload — per-id ``did_you_mean``, the children
+                # roster, and (on the in-loop abort) live ``results``
+                # for the still-observable lanes.  Serialize the whole
+                # object so the model can fix the id and re-issue; a
+                # bare-string collapse would discard exactly the hints
+                # the client built for it.
+                msg = "Error: " + json.dumps(result, separators=(",", ":"), default=str)
+            else:
+                msg = f"Error: {result['error']}"
             self._report_tool_result(call_id, "wait_for_workstream", msg, is_error=True)
             self._emit_wait_event(
                 "wait_ended",
@@ -10023,7 +10033,7 @@ class ChatSession:
         elapsed = result.get("elapsed", 0.0)
         complete = result.get("complete", False)
         # Count children that genuinely finished work (real terminals
-        # only — ``denied`` is a rejection, not a resolution).  Earlier
+        # only — ``not_found`` is a rejection, not a resolution).  Earlier
         # versions counted any non-empty ``state`` and inverted the
         # truth on timeout (rendered as ``"timeout (N/N resolved)"``).
         # Inline import — ``turnstone.core`` shouldn't import from
