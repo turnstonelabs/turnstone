@@ -134,6 +134,31 @@ class TestOrphanPurge:
             ).scalar()
         assert left == 0
 
+    def test_purge_dedupes_input(self, backend):
+        """Duplicate ws_ids must not inflate counts or bind params."""
+        _orphan(backend, "ghost1", n=2)
+        result = backend.delete_orphan_conversations(["ghost1", "ghost1", "ghost1"])
+        assert result["workstreams"] == 1
+        assert result["rows"] == 2
+        assert result["skipped"] == 0
+
+    def test_purge_unknown_ws_counts_skipped(self, backend):
+        """An input with no rows and no workstream is reported, not purged."""
+        result = backend.delete_orphan_conversations(["nope-never-existed"])
+        assert result == {"workstreams": 0, "rows": 0, "released_refs": 0, "skipped": 1}
+
+    def test_purge_chunks_large_input(self, backend, monkeypatch):
+        """IN-lists are chunked (SQLite bind-parameter limits) without losing rows."""
+        import turnstone.core.storage._utils as storage_utils
+
+        monkeypatch.setattr(storage_utils, "_PURGE_CHUNK", 2)
+        for i in range(5):
+            _orphan(backend, f"ghost{i}", n=1)
+        result = backend.delete_orphan_conversations([f"ghost{i}" for i in range(5)])
+        assert result["workstreams"] == 5
+        assert result["rows"] == 5
+        assert backend.list_orphan_conversations() == []
+
     def test_purge_empty_list_is_noop(self, backend):
         assert backend.delete_orphan_conversations([]) == {
             "workstreams": 0,
