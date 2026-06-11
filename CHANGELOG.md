@@ -6,10 +6,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [PEP 440](https://peps.python.org/pep-0440/) for
 version numbers (`X.Y.Z`, with `X.Y.ZaN` / `bN` / `rcN` for pre-releases).
 
-Three release tracks are maintained:
+Four release tracks are maintained:
 
 - **`stable/1.4`** — patch-only (`v1.4.x`)
 - **`stable/1.5`** — patch-only (`v1.5.x`)
+- **`stable/1.6`** — patch-only (`v1.6.x`)
 - **`main`** — experimental (next major)
 
 ## [1.6.0]
