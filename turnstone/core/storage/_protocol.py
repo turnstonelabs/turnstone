@@ -646,11 +646,13 @@ class StorageBackend(Protocol):
     def delete_orphan_conversations(self, ws_ids: list[str]) -> dict[str, int]:
         """Purge conversation rows for the *ws_ids* that are STILL orphaned.
 
-        Re-verifies against ``workstreams`` in-transaction (a re-registered
-        ws_id is skipped, never deleted), releases the deleted rows'
-        attachment refcounts, and sweeps matching ``workstream_config`` /
-        ``workstream_overrides`` rows.  Returns counts keyed ``workstreams``,
-        ``rows``, ``released_refs``, ``skipped``.
+        Orphan-ness is enforced inside the DELETE itself (correlated
+        ``NOT EXISTS`` against ``workstreams``) and refcounts are released
+        from its ``RETURNING`` — a ws_id registered before or during the
+        purge keeps both its rows and its refcounts.  Sweeps the purged
+        ws_ids' ``workstream_config`` / ``workstream_overrides`` rows.
+        Returns counts keyed ``workstreams``, ``rows``, ``released_refs``,
+        ``skipped`` (distinct inputs not purged).
         """
         ...
 
