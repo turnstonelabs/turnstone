@@ -645,8 +645,11 @@ class Pane {
     this.el.addEventListener("keydown", (e) => {
       if (e.key !== "Enter") return;
       const btn = e.target.closest(".media-play-btn");
-      if (!btn) return;
-      btn.click();
+      if (!btn || btn.disabled) return;
+      // Single-path activation: preventDefault stops the browser's native
+      // Enter-to-click from dispatching a second activation behind ours.
+      e.preventDefault();
+      activateMediaPlayButton(btn);
     });
 
     // No pane header: the workstream name, persona, and state are shown by the
@@ -2764,6 +2767,10 @@ function _activatePlayer(btn) {
   player.autoplay = true;
   player.className = "media-player";
 
+  // Held so the error handler can tear the instance down before the player
+  // node is replaced — otherwise its listeners/loader timers run detached.
+  let hls = null;
+
   // Prefer direct stream when the source supports it; fall back to HLS
   // only when transcoding is needed.
   if (directStream && url) {
@@ -2774,7 +2781,7 @@ function _activatePlayer(btn) {
     typeof Hls !== "undefined" &&
     Hls.isSupported()
   ) {
-    const hls = new Hls();
+    hls = new Hls();
     hls.loadSource(hlsUrl);
     hls.attachMedia(player);
   } else if (
@@ -2788,6 +2795,10 @@ function _activatePlayer(btn) {
   }
 
   player.addEventListener("error", function () {
+    if (hls) {
+      hls.destroy();
+      hls = null; // media error events can repeat — never double-destroy
+    }
     const card = player.closest(".media-embed");
     const titleEl = card ? card.querySelector(".media-card-title") : null;
     const label = titleEl ? ": " + titleEl.textContent : "";
