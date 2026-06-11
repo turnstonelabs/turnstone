@@ -26,11 +26,17 @@ UI harness (?open=): new-ws · new-ws-fork · edit-title · delete-ws ·
 Console harness (?open=): schedule-create · schedule-edit · model-create ·
   model-edit · model-save (drives a Save click; document.title becomes
   PUT-OK-<n> on success) · policy · confirm · token
-  Plus &tall=1 (90-row users panel — the .admin-content scroll state; add
-  &scrolled=1 to land mid-list, combinable with ?open= to pin a shelf over
-  scrolled content).  The console page wraps the fragment in the REAL
-  L-shell chain — pane-pinned height, interior scroller — so scroll/dock
-  geometry matches production; keep it that way.
+  Plus &tall=1 (90-row users panel — the .admin-content scroll state; the
+  synthetic rows wrap to two lines, so judge overflow geometry, not row
+  cadence) · &scrolled=1 lands mid-list, &scrolled=bottom shows the 24px
+  scroll tail · &focuslast=1 focuses the last shelf-body control (the
+  displaced-dock regression probe: only .sh-body may scroll; head/foot stay
+  pinned).  All combinable with ?open=.  The console page wraps the fragment
+  in the REAL L-shell chain — pane-pinned height, interior scroller — so
+  scroll/dock geometry matches production; keep it that way.  Body-level
+  dialogs (confirm/install/coord-delete) are injected as riders; a driven
+  ?open= that ends with no open dialog stamps OPEN-FAILED-<state> into the
+  title instead of passing silently.
   Governance surfaces (roles/HR/OGP/memory/skill) need fixtures that are not
   canned yet — add a fixture + driver branch below when you need one.
 
@@ -217,8 +223,9 @@ UI_TEMPLATE = """<!doctype html>
 """
 
 # --------------------------------------------------------------------------
-# Console harness — the admin pane fragment hosts the shelves; body-level
-# hatch dialogs (confirm/token/install/batch) ride along inside it.
+# Console harness — the admin pane fragment hosts the shelves (token-created
+# included); dialog-tier markup outside the fragment (confirm/install/
+# coord-delete) is injected via the RIDERS marker in build().
 # model-save click-drives the submit: document.title flips to PUT-OK-<n>.
 # --------------------------------------------------------------------------
 CONSOLE_TEMPLATE = """<!doctype html>
@@ -266,6 +273,12 @@ CONSOLE_TEMPLATE = """<!doctype html>
         </div>
       </main>
     </div>
+    <!-- Body-level dialog tier (confirm / install / coord-delete): their
+         markup sits OUTSIDE #admin-layout in index.html, so the fragment
+         extraction misses them — build() injects every hatch dialog the
+         fragment does not already contain. -->
+    <!-- RIDERS:BEGIN -->
+    <!-- RIDERS:END -->
     <div id="toast" role="status" aria-live="polite"></div>
     <script>
       (function () {
@@ -383,7 +396,10 @@ CONSOLE_TEMPLATE = """<!doctype html>
           }
           var content = document.getElementById("admin-content");
           if (content && q.get("scrolled"))
-            content.scrollTop = content.scrollHeight / 2; // land mid-list
+            content.scrollTop =
+              q.get("scrolled") === "bottom"
+                ? content.scrollHeight // the 24px scroll-tail state
+                : content.scrollHeight / 2; // land mid-list
         }
         setTimeout(function () {
           if (open === "schedule-create") showCreateScheduleModal();
@@ -415,6 +431,22 @@ CONSOLE_TEMPLATE = """<!doctype html>
               var d = document.querySelector("dialog[open]");
               if (d) window.TurnstoneHatch.setBusy(d, true);
             }, 400);
+          // A driven state that ends with nothing open must fail LOUDLY in
+          // the screenshot pipeline, not render a quietly dialog-less page.
+          setTimeout(function () {
+            var top = document.querySelector("dialog[open]");
+            if (open && !top) document.title = "OPEN-FAILED-" + open;
+            // &focuslast=1 — the displaced-dock regression probe: focus the
+            // last form control in the shelf BODY (the visually-hidden
+            // toggle/radio inputs live there).  Only .sh-body may scroll;
+            // the head/foot strips must stay pinned in the screenshot.
+            if (top && q.get("focuslast")) {
+              var els = top.querySelectorAll(
+                ".sh-body input, .sh-body select, .sh-body textarea",
+              );
+              if (els.length) els[els.length - 1].focus();
+            }
+          }, 600);
         }, 150);
       });
     </script>
@@ -441,11 +473,15 @@ def build(out: Path) -> None:
 
     symlink(con / "shared", ROOT / "turnstone/shared_static")
     symlink(con / "console-static", ROOT / "turnstone/console/static")
-    (con / "livepass.html").write_text(
-        inject(CONSOLE_TEMPLATE, "FRAGMENT", extract_admin_fragment()),
-        encoding="utf-8",
-    )
-    print(f"{con}/livepass.html — admin fragment embedded")
+    frag = extract_admin_fragment()
+    # Dialog-tier markup living OUTSIDE #admin-layout (confirm, install,
+    # coord-delete) would otherwise be silently absent — and ?open=confirm
+    # would screenshot a dialog-less page while the gate stayed green.
+    riders = [b for b in extract_dialogs(CONSOLE_INDEX) if b not in frag]
+    page = inject(CONSOLE_TEMPLATE, "FRAGMENT", frag)
+    page = inject(page, "RIDERS", "\n".join(riders))
+    (con / "livepass.html").write_text(page, encoding="utf-8")
+    print(f"{con}/livepass.html — admin fragment + {len(riders)} rider dialogs")
 
 
 def main() -> None:
