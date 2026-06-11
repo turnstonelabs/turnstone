@@ -443,6 +443,26 @@ def test_phase8_mcp_error_helpers_defined() -> None:
     )
 
 
+def test_media_player_activation_not_duplicated_in_standalone() -> None:
+    """The media-player activation (``_loadHls`` / ``_activatePlayer`` + the
+    click/keydown delegate) moved into the shared interactive pane so BOTH the
+    standalone server and the console activate the Play button.  The standalone
+    app.js must NOT keep its own copy — a duplicate document-level listener
+    would double-fire on the standalone (two players swapped in) while the lift
+    is what fixed the console (where app.js was never the host).  Pin the
+    standalone clean so the stale copy can't drift back in."""
+    app = _APP_JS.read_text(encoding="utf-8")
+    for name in ("_loadHls", "_activatePlayer", "_isHlsUrl", "media-play-btn"):
+        assert name not in app, (
+            f"standalone app.js must not re-declare the lifted media player "
+            f"({name!r}) — it lives in shared_static/interactive.js now"
+        )
+    # The lift target carries the real implementation (the click delegate too).
+    inter = _INTERACTIVE_JS.read_text(encoding="utf-8")
+    assert "function _activatePlayer(" in inter
+    assert "activateMediaPlayButton(btn)" in inter
+
+
 def test_phase8_settings_panel_handlers_defined() -> None:
     """The settings modal exposes four entry points that the inline
     ``onclick`` attributes in index.html depend on. Renaming or

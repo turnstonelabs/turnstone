@@ -630,6 +630,25 @@ class Pane {
       }
     });
 
+    // Click-to-play for media embeds.  Pane-owned (on this.el) and root-scoped
+    // via closest(".media-play-btn") so every embedded L-shell pane activates
+    // its own players — the old standalone wired this via a document-level
+    // delegated listener in app.js, which the console host never loaded (so the
+    // Play button was dead in console-hosted panes).  Enter on a focused button
+    // routes through the same path, mirroring the approval keydown above.
+    this.el.addEventListener("click", (e) => {
+      const btn = e.target.closest(".media-play-btn");
+      if (!btn) return;
+      e.preventDefault();
+      activateMediaPlayButton(btn);
+    });
+    this.el.addEventListener("keydown", (e) => {
+      if (e.key !== "Enter") return;
+      const btn = e.target.closest(".media-play-btn");
+      if (!btn) return;
+      btn.click();
+    });
+
     // No pane header: the workstream name, persona, and state are shown by the
     // tab and the rail (Workspaces); the --skip-permissions banner lands in
     // messagesEl (see the host warningTarget).  The standalone split-pane
@@ -2691,6 +2710,135 @@ function _tryPrettyJson(text) {
     return null;
   }
   return _redactApiKeys(JSON.stringify(obj, null, 2));
+}
+
+// ---------------------------------------------------------------------------
+//  HLS lazy-loader + click-to-play (lifted from the standalone app.js so
+//  console-hosted panes activate media too).  Follows the mermaid.js
+//  lazy-load pattern in /shared/renderer.js: the vendor is fetched by absolute
+//  /shared/ URL on first use, so it resolves in BOTH the standalone server and
+//  the console (where /shared is mounted at the root and node-proxied panes
+//  also reach it via /node/{id}/shared/).
+// ---------------------------------------------------------------------------
+let _hlsState = "idle";
+let _hlsQueue = [];
+
+function _loadHls(callback) {
+  if (_hlsState === "ready") {
+    callback();
+    return;
+  }
+  _hlsQueue.push(callback);
+  if (_hlsState === "loading") return;
+  _hlsState = "loading";
+  const script = document.createElement("script");
+  script.src = "/shared/hls-1.6.16/hls.min.js";
+  script.onload = function () {
+    _hlsState = "ready";
+    const q = _hlsQueue;
+    _hlsQueue = [];
+    for (let i = 0; i < q.length; i++) q[i]();
+  };
+  script.onerror = function () {
+    _hlsState = "idle";
+    const q = _hlsQueue;
+    _hlsQueue = [];
+    // Fall through — _activatePlayer will use stream_url since Hls is undefined
+    for (let i = 0; i < q.length; i++) q[i]();
+  };
+  document.head.appendChild(script);
+}
+
+function _isHlsUrl(url) {
+  return typeof url === "string" && /\.m3u8(\?|$)/i.test(url);
+}
+
+function _activatePlayer(btn) {
+  const url = btn.dataset.streamUrl;
+  const hlsUrl = btn.dataset.hlsUrl;
+  const isAudio = btn.dataset.audioOnly === "true";
+  const directStream = btn.dataset.directStream === "true";
+
+  const player = document.createElement(isAudio ? "audio" : "video");
+  player.controls = true;
+  player.autoplay = true;
+  player.className = "media-player";
+
+  // Prefer direct stream when the source supports it; fall back to HLS
+  // only when transcoding is needed.
+  if (directStream && url) {
+    player.src = url;
+  } else if (
+    hlsUrl &&
+    !isAudio &&
+    typeof Hls !== "undefined" &&
+    Hls.isSupported()
+  ) {
+    const hls = new Hls();
+    hls.loadSource(hlsUrl);
+    hls.attachMedia(player);
+  } else if (
+    hlsUrl &&
+    !isAudio &&
+    player.canPlayType("application/vnd.apple.mpegurl")
+  ) {
+    player.src = hlsUrl;
+  } else {
+    player.src = url;
+  }
+
+  player.addEventListener("error", function () {
+    const card = player.closest(".media-embed");
+    const titleEl = card ? card.querySelector(".media-card-title") : null;
+    const label = titleEl ? ": " + titleEl.textContent : "";
+
+    const err = document.createElement("div");
+    err.className = "media-player-error";
+    err.setAttribute("role", "alert");
+    err.textContent = "Failed to load stream" + label;
+
+    const retry = document.createElement("button");
+    retry.className = "media-play-btn";
+    retry.type = "button";
+    retry.dataset.streamUrl = url;
+    retry.dataset.hlsUrl = hlsUrl || "";
+    retry.dataset.audioOnly = String(isAudio);
+    retry.dataset.directStream = String(directStream);
+    retry.setAttribute("aria-label", "Retry" + label);
+    retry.appendChild(document.createTextNode("▶ Retry"));
+
+    const container = document.createElement("div");
+    container.appendChild(err);
+    container.appendChild(retry);
+    player.replaceWith(container);
+  });
+
+  btn.replaceWith(player);
+}
+
+// Activate a clicked/Enter-pressed play button: show the loading affordance,
+// then ensure hls.js is loaded before swapping in the player when the source
+// needs it.  The pane wires this from a root-scoped this.el listener.
+function activateMediaPlayButton(btn) {
+  btn.disabled = true;
+  const labelEl = btn.querySelector("span:last-child");
+  if (labelEl) {
+    labelEl.textContent = "Loading…";
+  } else {
+    btn.textContent = "▶ Loading…";
+  }
+
+  const hlsUrl = btn.dataset.hlsUrl;
+  const isAudio = btn.dataset.audioOnly === "true";
+
+  // If HLS URL present and not audio, ensure hls.js is loaded first
+  if (hlsUrl && !isAudio && _isHlsUrl(hlsUrl)) {
+    _loadHls(function () {
+      _activatePlayer(btn);
+    });
+  } else {
+    _activatePlayer(btn);
+  }
 }
 
 function buildMediaCard(item) {

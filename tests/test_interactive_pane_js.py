@@ -184,6 +184,42 @@ def test_approval_keyboard_shortcuts_wired() -> None:
     )
 
 
+def test_media_playback_lifted_and_pane_owned() -> None:
+    """The media Play affordance is rendered by the pane (buildPlayButton /
+    buildMediaEmbed), so its activation must live in the pane too — the old
+    standalone wired a DOCUMENT-level click/keydown listener in app.js, which
+    the console host never loaded (so the button was dead in console-hosted
+    panes).  The fix mirrors the approval-keydown pattern: a pane-owned listener
+    on this.el, root-scoped via closest(".media-play-btn").  Pin both the
+    lifted helpers and the pane wiring so the document-level regression can't
+    silently come back."""
+    body = _INTERACTIVE.read_text(encoding="utf-8")
+    # The lifted activation machinery now lives in the shared module.
+    for fn in (
+        "function _loadHls(",
+        "function _isHlsUrl(",
+        "function _activatePlayer(",
+        "function activateMediaPlayButton(",
+    ):
+        assert fn in body, f"media player helper must be lifted into the pane: {fn}"
+    # The HLS vendor is fetched by absolute /shared/ URL (resolves in BOTH the
+    # standalone server and the console, where /shared is mounted at the root).
+    assert 'script.src = "/shared/hls-1.6.16/hls.min.js";' in body
+    # Pane-owned + root-scoped — NOT a document-level delegated listener.
+    assert 'this.el.addEventListener("click"' in body, (
+        "media play must be wired on this.el (pane-owned), not document"
+    )
+    assert 'e.target.closest(".media-play-btn")' in body, (
+        "the play handler must be root-scoped via closest, not a document-wide id"
+    )
+    assert "activateMediaPlayButton(btn)" in body
+    collapsed = _strip_comments(body)
+    assert 'document.addEventListener("click"' not in collapsed, (
+        "the pane must not register a document-level click delegate — that is "
+        "the standalone regression that left console panes dead"
+    )
+
+
 def test_controller_terminal_dead_state() -> None:
     """Lifecycle round 2: the console controller must STOP reconnect-polling a
     session that is gone (closed / evicted / node restarted) — three consecutive
