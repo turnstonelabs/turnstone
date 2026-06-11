@@ -6,9 +6,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [PEP 440](https://peps.python.org/pep-0440/) for
 version numbers (`X.Y.Z`, with `X.Y.ZaN` / `bN` / `rcN` for pre-releases).
 
-Four release tracks are maintained:
+Three release tracks are maintained — the current stable, one prior
+stable, and the experimental line:
 
-- **`stable/1.4`** — patch-only (`v1.4.x`)
 - **`stable/1.5`** — patch-only (`v1.5.x`)
 - **`stable/1.6`** — patch-only (`v1.6.x`)
 - **`main`** — experimental (next major)
@@ -35,8 +35,8 @@ endpoint replaced by path-keyed workstream verbs.
 
 - **Relicensed to Apache 2.0** — from BUSL-1.1, effective with this
   release (#546, contributor assent record in #548). Versions 1.5.x and
-  earlier remain under BUSL-1.1 as shipped, and the `stable/1.4` /
-  `stable/1.5` branches keep their original LICENSE. New `NOTICE` and
+  earlier remain under BUSL-1.1 as shipped, and the `stable/1.5` branch
+  keeps its original LICENSE. New `NOTICE` and
   `CONTRIBUTORS.md` files; `THIRD-PARTY-NOTICES` refreshed to match the
   bundled library versions.
 
@@ -196,6 +196,10 @@ endpoint replaced by path-keyed workstream verbs.
   plan-review protocol (`/v1/api/plan`, `plan_review`/`plan_resolved`
   SSE events, `on_plan_review` hooks), and the `model.plan_*` settings.
   Interactive built-in tool count: 19 → 16.
+- **`stable/1.4` track retired** — the maintenance policy is now the
+  current stable plus one prior (`stable/1.6` + `stable/1.5` as of this
+  release). 1.4's final release was `v1.4.0`; its tags and released
+  artifacts remain available, under BUSL-1.1 as shipped.
 
 ### Security
 
