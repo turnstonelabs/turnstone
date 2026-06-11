@@ -330,6 +330,63 @@ def test_step3_rail_manage_builds_from_admin_seam() -> None:
     assert "aria-expanded" in body, "collapsible group heads must expose aria-expanded"
 
 
+def test_rail_manage_row_badge_hook() -> None:
+    """rail.js owns a GENERIC Manage-row count badge — `setRowBadge(tabKey, count,
+    label?)` stamps a glyph+count chip on a tab row (DS warn `.rail-badge`), and so
+    a COLLAPSED group never hides the signal, mirrors the group's running total onto
+    its head.  rail.js stays agnostic about what the count means (no consent
+    specifics here); a subsystem drives it.  `mountManage` registers the row/head
+    refs and re-applies live counts across a (re)mount.  This is the re-homing
+    target for the MCP consent badge after its settings-gear host was deleted."""
+    body = _RAIL_JS.read_text(encoding="utf-8")
+    assert "export function setRowBadge(tabKey, count, label)" in body, (
+        "rail must export the generic setRowBadge hook (mechanism, not meaning)"
+    )
+    # The chip pairs colour with a glyph (never colour alone — chip-contrast rule).
+    assert "rail-badge" in body and '"⚠"' in body, (
+        "the badge must carry a ⚠ glyph alongside the count (not colour alone)"
+    )
+    # The collapsed-group head must carry the group total so a hidden row's signal
+    # still surfaces — pin the head propagation + the per-group sum.
+    assert "function _groupCount(" in body, "the head badge must sum the group's tab counts"
+    assert "_groupEls" in body and "_rowEls" in body, (
+        "mountManage must register row + owning-group-head refs for the badge hook"
+    )
+    assert "_reapplyBadges()" in body, (
+        "a (re)mount must re-apply any live badge state (the refs are rebuilt)"
+    )
+    # rail.js stays agnostic — the hook takes a generic tabKey/count, with no
+    # consent-specific endpoint, fetch, or branch (an explanatory comment naming a
+    # sample caller is fine; logic is not).  `setRowBadge` itself never fetches.
+    badge_fn = body[body.index("export function setRowBadge") :]
+    badge_fn = badge_fn[: badge_fn.index("\n}\n") + 3]
+    assert "fetch" not in badge_fn and "/v1/" not in badge_fn, (
+        "the generic badge hook must not reach into a subsystem (no fetch / endpoint)"
+    )
+    # No colour-only treatment: the chip uses DS warn tokens AND a glyph.
+    css = _SHELL_CSS.read_text(encoding="utf-8")
+    assert ".rail-badge" in css, "shell.css must carry the .rail-badge chip rule"
+    badge_block = css[css.index(".rail-badge") :]
+    badge_block = badge_block[: badge_block.index("\n.grp") if "\n.grp" in badge_block else 800]
+    assert "var(--warn" in badge_block, (
+        "the badge chip must use the DS --warn family (theme-flips by construction)"
+    )
+    assert "#" not in badge_block, "the badge chip must be token-only (no hex) so themes flip"
+
+
+def test_shell_bridges_setrowbadge_for_classic_subsystems() -> None:
+    """shell.js is the ESM module bridge: a classic-script subsystem (the
+    standalone consent badge in ui/static/app.js) can't import rail.js, so the
+    shell re-exports `setRowBadge` on the `window.TS_SHELL` seam.  Pin the import
+    and the seam so the bridge can't be silently dropped (which would re-break the
+    badge the same way the gear deletion did)."""
+    body = _SHELL_JS.read_text(encoding="utf-8")
+    assert 'setRowBadge } from "./rail.js"' in body, "shell must import setRowBadge from rail.js"
+    assert "notifySessionClosed, setRowBadge }" in body, (
+        "TS_SHELL must expose setRowBadge for classic subsystems (the consent-badge bridge)"
+    )
+
+
 def test_step3_admin_seam_and_thin_show_admin() -> None:
     """admin.js exposes the TS_ADMIN seam (IA + shared perm gate + active-tab +
     openTab) and showAdmin is now a thin delegator that opens the singleton
@@ -615,7 +672,7 @@ def test_step7_live_tab_state_glyphs() -> None:
     )
     assert "this.stateful" in pane, "ShellPane must carry the stateful flag"
     shell = _SHELL_JS.read_text(encoding="utf-8")
-    assert 'import { mountRail, mountManage, glyph } from "./rail.js"' in shell, (
+    assert 'import { mountRail, mountManage, glyph, setRowBadge } from "./rail.js"' in shell, (
         "the shell must import the rail's glyph builder (one source for tab + rail)"
     )
     assert "function stateForWs(" in shell and "function paintConvTabs(" in shell
@@ -749,7 +806,7 @@ def test_shell_marks_pane_dead_on_ws_closed() -> None:
     assert "const notifySessionClosed = (wsId)" in shell
     assert 'pm.getPane("interactive", wsId)' in shell
     assert "p._ctl.markDead()" in shell
-    assert "window.TS_SHELL = { panes: pm, caps, notifySessionClosed }" in shell, (
+    assert "window.TS_SHELL = { panes: pm, caps, notifySessionClosed, setRowBadge }" in shell, (
         "the seam must be exported on TS_SHELL for the console's Tier-1 handler"
     )
     app = _CONSOLE_APP.read_text(encoding="utf-8")

@@ -1822,16 +1822,3 @@ audio.media-player {
 .settings-revoke-btn:hover {
   background: rgba(255, 0, 0, 0.05);
 }
-.settings-consent-badge {
-  display: inline-block;
-  margin-left: 4px;
-  background: var(--red);
-  color: var(--bg);
-  border-radius: 8px;
-  font-size: 10px;
-  padding: 1px 5px;
-  vertical-align: top;
-  font-weight: 600;
-  line-height: 1.4;
-  font-family: var(--font-ui);
-}

@@ -24,7 +24,7 @@
    ========================================================================== */
 
 import { PaneManager, ShellPane, openPopupMenu } from "./pane.js";
-import { mountRail, mountManage, glyph } from "./rail.js";
+import { mountRail, mountManage, glyph, setRowBadge } from "./rail.js";
 import { authFetch } from "./auth.js";
 // The interactive pane is a real ES module beside us in /shared (step 5a) — the
 // shell imports it directly, and it exists in every deployment.  The coordinator
@@ -880,7 +880,11 @@ async function mountShell() {
     const p = pm.getPane("interactive", wsId);
     if (p && p._ctl && p._ctl.markDead) p._ctl.markDead();
   };
-  window.TS_SHELL = { panes: pm, caps, notifySessionClosed };
+  // `setRowBadge` lets a classic-script subsystem (the standalone consent badge
+  // in ui/static/app.js) stamp a count chip on a Manage row without importing the
+  // ESM rail module — the shell is its module bridge.  Generic: the rail owns the
+  // chip mechanism, the caller owns what the count means.
+  window.TS_SHELL = { panes: pm, caps, notifySessionClosed, setRowBadge };
 
   // Login fan-out: app.js owns the single window.onLoginSuccess (the Tier-1
   // reconnect, set at load).  Wrap it in a tiny registry so EVERY conversational

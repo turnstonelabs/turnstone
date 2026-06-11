@@ -1473,17 +1473,19 @@ function connectGlobalSSE() {
 }
 
 // ===========================================================================
-//  12. MCP consent badge (standalone settings-gear pending-consent indicator)
+//  12. MCP consent badge (standalone pending-consent indicator)
 //
 //  The tool-output / media / MCP-error / verdict renderers that used to live in
 //  this section moved to shared_static/interactive.js with the Pane.  What
-//  stays here is the standalone consent-badge subsystem: the gear badge lives
-//  in this shell's header, so the pane only notifies it (host.onConsentDetected
-//  -> _onConsentDetected) and the dashboard hydrates it via loadPendingConsents.
+//  stays here is the standalone consent-badge subsystem: it owns the pending set
+//  and drives the rail's Manage > Connections row badge (via the TS_SHELL bridge
+//  — `setRowBadge`).  An interactive pane only NOTIFIES it (the shared host
+//  bridges `onConsentDetected` to the TS_APP seam below); `loadPendingConsents`
+//  hydrates it on boot.  The settings-gear it used to hang on is retired.
 // ===========================================================================
 
 // Module-level set of servers with an unresolved consent prompt; drives the
-// gear-icon badge so the user has a stable signal that re-consent is pending
+// Manage-row badge so the user has a stable signal that re-consent is pending
 // after the inline card scrolls out of view.
 const _pendingConsentServers = new Set();
 
@@ -1528,32 +1530,26 @@ function loadPendingConsents() {
     });
 }
 
+// The Manage tab the pending-consent badge rides on.  The standalone's Manage IA
+// (TS_ADMIN.ia, below) is a single Extensions > Connections tab where MCP server
+// connections live; the badge surfaces there (and, when that group is collapsed,
+// on its head — the rail handles that).  The retired settings-gear it used to
+// hang on is gone with the L-shell renovation.
+const _CONSENT_BADGE_TAB = "connections";
+
 function _refreshConsentBadge() {
-  const btn = document.getElementById("settings-btn");
-  if (!btn) return;
-  let existing = btn.querySelector(".settings-consent-badge");
   const n = _pendingConsentServers.size;
-  // Keep the visible badge and the accessible name in lockstep so screen-
-  // reader users get the same pending-consent signal that sighted users
-  // get from the red dot. The badge itself stays aria-hidden because the
-  // count is already reflected in the button's aria-label/title.
-  if (n === 0) {
-    if (existing) existing.remove();
-    btn.setAttribute("aria-label", "Settings");
-    btn.setAttribute("title", "Settings");
-    return;
-  }
-  if (!existing) {
-    existing = document.createElement("span");
-    existing.className = "settings-consent-badge";
-    existing.setAttribute("aria-hidden", "true");
-    btn.appendChild(existing);
-  }
-  existing.textContent = String(n);
+  // Drive the rail's generic Manage-row badge through the shell bridge (classic
+  // app.js can't import the ESM rail module).  The chip's own ⚠ glyph + count
+  // carry the signal; `label` keeps the accessible name in lockstep.  A no-op
+  // before the rail mounts — `loadPendingConsents` re-drives it after boot.
+  const shell = window.TS_SHELL;
+  if (!shell || typeof shell.setRowBadge !== "function") return;
   const label =
-    "Settings (" + n + " MCP consent" + (n === 1 ? "" : "s") + " pending)";
-  btn.setAttribute("aria-label", label);
-  btn.setAttribute("title", label);
+    n === 0
+      ? ""
+      : n + " MCP server" + (n === 1 ? "" : "s") + " awaiting consent";
+  shell.setRowBadge(_CONSENT_BADGE_TAB, n, label);
 }
 
 /**
@@ -2230,6 +2226,11 @@ window.TS_APP.onRender = function (cb) {
 };
 window.TS_APP.bucketByParent = bucketByParent;
 window.TS_APP.boot = boot;
+// Live MCP-consent notifications from an interactive pane (the shared pane host
+// bridges its `onConsentDetected` here when this seam exists; the console leaves
+// it undefined, so the pane no-ops there).  Adds the server to the pending set
+// and re-paints the Manage-row badge.
+window.TS_APP.onConsentDetected = _onConsentDetected;
 
 // --- Manage seam: one Connections tab (MCP server connections) -------------
 const _CONN_IA = [
