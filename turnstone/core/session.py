@@ -86,6 +86,7 @@ from turnstone.core.memory import (
     search_visible_structured_memories,
     set_message_attachments,
     set_workstream_alias,
+    touch_structured_memories,
     update_workstream_title,
 )
 from turnstone.core.memory_relevance import (
@@ -1031,6 +1032,10 @@ class ChatSession:
         # tool results) and the recent-context string is identical across
         # them.  Invalidated on user-turn append and on memory write/delete.
         self._mem_search_cache: dict[tuple[str, str, int], list[dict[str, str]]] = {}
+        # Per-turn dedup for composition touches: ``_init_system_messages`` runs
+        # many times within a turn, so the injected set is touched at most once
+        # per memory per turn.  Cleared alongside the search cache.
+        self._touched_memory_keys: set[tuple[str, str, str]] = set()
         self._ws_id = ws_id or uuid.uuid4().hex
         self._title_generated = False
         self._read_files: set[str] = set()
@@ -2873,6 +2878,9 @@ class ChatSession:
                 candidates=len(visible_mems),
                 injected=len(relevant),
             )
+            # Access metadata tracks what the model actually saw — touch the
+            # injected top-k, not the candidate pool.
+            self._touch_injected_memories(relevant)
             if relevant:
                 dev_parts.append("")
                 dev_parts.append(build_memory_context(relevant))
@@ -7439,6 +7447,7 @@ class ChatSession:
     def _invalidate_memory_cache(self) -> None:
         """Drop the per-turn search cache; call on user-turn append + memory writes."""
         self._mem_search_cache.clear()
+        self._touched_memory_keys.clear()
 
     def _select_memory_candidates(self, context: str) -> tuple[list[dict[str, str]], str]:
         """Pick the candidate set fed into BM25 ranking.
@@ -7475,6 +7484,38 @@ class ChatSession:
         if not search_hits:
             return extra, "recency"
         return search_hits + extra, ("union" if extra else "search")
+
+    @staticmethod
+    def _memory_keys(rows: list[dict[str, str]]) -> list[tuple[str, str, str]]:
+        """Build ``(name, scope, scope_id)`` touch keys from memory rows.
+
+        The storage read helpers return ``SELECT *`` rows, so all three
+        columns are present.
+        """
+        return [(r.get("name", ""), r.get("scope", ""), r.get("scope_id", "")) for r in rows]
+
+    def _touch_injected_memories(self, rows: list[dict[str, str]]) -> None:
+        """Touch the memories injected into the system prefix this turn.
+
+        ``_init_system_messages`` recomposes many times per turn; gate on the
+        per-turn touched-key set so each surfaced memory is counted at most
+        once between user turns.  Best-effort: the facade swallows storage
+        errors, so a failed touch never breaks composition.
+        """
+        fresh = [k for k in self._memory_keys(rows) if k not in self._touched_memory_keys]
+        if not fresh:
+            return
+        self._touched_memory_keys.update(fresh)
+        touch_structured_memories(fresh)
+
+    def _touch_read_memories(self, rows: list[dict[str, str]]) -> None:
+        """Touch memories returned by an explicit memory-tool read.
+
+        A search/get is a distinct user-driven access each time it runs, so
+        these are counted unconditionally (not subject to the composition
+        per-turn dedup).  Best-effort via the facade.
+        """
+        touch_structured_memories(self._memory_keys(rows))
 
     def _check_metacognitive_nudge(self, user_message: str) -> tuple[str, str] | None:
         """Check if a metacognitive nudge should fire for *user_message*.
@@ -11489,6 +11530,7 @@ class ChatSession:
                         found_scope = scope
                         break
                 if mem:
+                    self._touch_read_memories([mem])
                     content = mem.get("content", "")
                     desc = mem.get("description", "")
                     mem_type = mem.get("type", "")
@@ -11566,6 +11608,7 @@ class ChatSession:
                     result_count=len(rows),
                     query=item["query"][:120],
                 )
+                self._touch_read_memories(rows)
                 if rows:
                     lines = []
                     for m in rows:
