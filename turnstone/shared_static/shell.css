@@ -860,7 +860,9 @@
   font-size: 12px;
   font-weight: 500;
   font-family: var(--font-ui);
-  border-radius: 3px;
+  /* r-sm, matching the shared :focus-visible rule below — a literal here
+     would make the corner radius pop on keyboard focus */
+  border-radius: var(--r-sm);
   cursor: pointer;
   transition:
     background 0.12s,
