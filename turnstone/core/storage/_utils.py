@@ -189,6 +189,7 @@ def find_orphan_conversations(conn: Any) -> list[dict[str, Any]]:
     entry carries the attachment-ref count so a purge's refcount release is
     visible before it happens.
     """
+    anti_join = conversations.outerjoin(workstreams, conversations.c.ws_id == workstreams.c.ws_id)
     rows = conn.execute(
         sa.select(
             conversations.c.ws_id,
@@ -196,80 +197,98 @@ def find_orphan_conversations(conn: Any) -> list[dict[str, Any]]:
             sa.func.min(conversations.c.timestamp).label("first"),
             sa.func.max(conversations.c.timestamp).label("last"),
         )
-        .select_from(
-            conversations.outerjoin(workstreams, conversations.c.ws_id == workstreams.c.ws_id)
-        )
+        .select_from(anti_join)
         .where(workstreams.c.ws_id.is_(None))
         .group_by(conversations.c.ws_id)
         .order_by(sa.func.min(conversations.c.timestamp))
     ).fetchall()
-    orphans: list[dict[str, Any]] = []
-    for ws_id, row_count, first, last in rows:
-        referenced = conn.execute(
-            sa.select(conversations.c.attachments).where(
-                sa.and_(
-                    conversations.c.ws_id == ws_id,
-                    conversations.c.attachments.is_not(None),
-                )
+    # Ref counts in ONE pass over the orphan rows that carry attachments —
+    # not a query per orphan workstream, so the scan stays proportional to
+    # orphan ROW count.
+    ref_counts: dict[str, int] = {}
+    ref_rows = conn.execute(
+        sa.select(conversations.c.ws_id, conversations.c.attachments)
+        .select_from(anti_join)
+        .where(
+            sa.and_(
+                workstreams.c.ws_id.is_(None),
+                conversations.c.attachments.is_not(None),
             )
-        ).fetchall()
-        ref_count = sum(len(parse_attachment_refs(refs)) for (refs,) in referenced)
-        orphans.append(
-            {
-                "ws_id": ws_id,
-                "rows": int(row_count),
-                "first": first,
-                "last": last,
-                "attachment_refs": ref_count,
-            }
         )
-    return orphans
+    ).fetchall()
+    for ws_id, refs in ref_rows:
+        ref_counts[ws_id] = ref_counts.get(ws_id, 0) + len(parse_attachment_refs(refs))
+    return [
+        {
+            "ws_id": ws_id,
+            "rows": int(row_count),
+            "first": first,
+            "last": last,
+            "attachment_refs": ref_counts.get(ws_id, 0),
+        }
+        for ws_id, row_count, first, last in rows
+    ]
+
+
+# IN-list chunk size for the purge statements — mirrors the storage layer's
+# existing bulk chunking (SQLite bind-parameter limits).
+_PURGE_CHUNK = 500
 
 
 def purge_orphan_conversations(conn: Any, ws_ids: list[str]) -> dict[str, int]:
     """Delete conversation rows for the *ws_ids* that are STILL orphans.
 
-    Orphan-ness is re-verified here, inside the caller's transaction — a
-    ws_id that gained a ``workstreams`` row between scan and purge is counted
-    in ``skipped`` and left untouched, so a stale scan can never delete a
-    live workstream's history.  Mirrors ``delete_workstream``'s cascade for
-    rows with no owning workstream: release the deleted rows' attachment
-    refcounts, then sweep the matching ``workstream_config`` /
-    ``workstream_overrides`` rows.  Caller owns commit.
+    Orphan-ness is enforced INSIDE the DELETE itself (a correlated
+    ``NOT EXISTS`` against ``workstreams``), and the refcounts to release
+    come from the DELETE's ``RETURNING`` — so refs are released for exactly
+    the rows that were deleted.  A ws_id registered at any point before the
+    DELETE statement keeps both its rows AND its refcounts; there is no
+    pre-count/delete window to underflow.  (Needs ``DELETE .. RETURNING``:
+    PostgreSQL, or SQLite ≥ 3.35.)
+
+    Input is de-duplicated and all IN-lists are chunked.  ``skipped`` =
+    distinct input ws_ids not purged (registered before/during the purge, or
+    no rows).  The purged ws_ids' ``workstream_config`` /
+    ``workstream_overrides`` rows are swept.  Caller owns commit.
     """
-    if not ws_ids:
+    distinct = list(dict.fromkeys(ws_ids))
+    if not distinct:
         return {"workstreams": 0, "rows": 0, "released_refs": 0, "skipped": 0}
-    registered = {
-        row[0]
-        for row in conn.execute(
-            sa.select(workstreams.c.ws_id).where(workstreams.c.ws_id.in_(ws_ids))
-        ).fetchall()
-    }
-    targets = [w for w in ws_ids if w not in registered]
-    if not targets:
-        return {"workstreams": 0, "rows": 0, "released_refs": 0, "skipped": len(registered)}
-    referenced = conn.execute(
-        sa.select(conversations.c.attachments).where(
-            sa.and_(
-                conversations.c.ws_id.in_(targets),
-                conversations.c.attachments.is_not(None),
-            )
-        )
-    ).fetchall()
     ref_ids: list[str] = []
-    for (refs,) in referenced:
-        ref_ids.extend(parse_attachment_refs(refs))
+    purged_ws: set[str] = set()
+    rows_deleted = 0
+    for i in range(0, len(distinct), _PURGE_CHUNK):
+        chunk = distinct[i : i + _PURGE_CHUNK]
+        returned = conn.execute(
+            sa.delete(conversations)
+            .where(
+                sa.and_(
+                    conversations.c.ws_id.in_(chunk),
+                    ~sa.exists(
+                        sa.select(workstreams.c.ws_id).where(
+                            workstreams.c.ws_id == conversations.c.ws_id
+                        )
+                    ),
+                )
+            )
+            .returning(conversations.c.ws_id, conversations.c.attachments)
+        ).fetchall()
+        for ws_id, refs in returned:
+            purged_ws.add(ws_id)
+            rows_deleted += 1
+            if refs:
+                ref_ids.extend(parse_attachment_refs(refs))
     release_attachment_refs(conn, ref_ids)
-    deleted = conn.execute(
-        sa.delete(conversations).where(conversations.c.ws_id.in_(targets))
-    ).rowcount
-    conn.execute(sa.delete(workstream_config).where(workstream_config.c.ws_id.in_(targets)))
-    conn.execute(sa.delete(workstream_overrides).where(workstream_overrides.c.ws_id.in_(targets)))
+    swept = sorted(purged_ws)
+    for i in range(0, len(swept), _PURGE_CHUNK):
+        chunk = swept[i : i + _PURGE_CHUNK]
+        conn.execute(sa.delete(workstream_config).where(workstream_config.c.ws_id.in_(chunk)))
+        conn.execute(sa.delete(workstream_overrides).where(workstream_overrides.c.ws_id.in_(chunk)))
     return {
-        "workstreams": len(targets),
-        "rows": int(deleted or 0),
+        "workstreams": len(purged_ws),
+        "rows": rows_deleted,
         "released_refs": len(ref_ids),
-        "skipped": len(registered),
+        "skipped": len(distinct) - len(purged_ws),
     }
 
 
