@@ -35,10 +35,18 @@
    narrow-pane sheet breakpoint (a SPLIT pane is narrow even on a desktop
    viewport, so the breakpoint is a container query, not a media query).
    contain:layout (implied by container-type) also makes this the containing
-   block for the absolutely-positioned shelf. */
+   block for the absolutely-positioned shelf.
+
+   overflow must be `clip`, never `hidden`: hidden makes the host a
+   PROGRAMMATIC scroll container — focus-into-view (tabbing to a control,
+   clicking a visually-hidden toggle input) silently scrolls it, dragging
+   the docked shelf and the pane content out of alignment with no scrollbar
+   to recover by.  clip only clips paint; the host can never scroll, so
+   scrolling stays where it belongs — the pane's interior scroller and the
+   shelf's .sh-body. */
 .hatch-host {
   position: relative;
-  overflow: hidden;
+  overflow: clip;
   container-type: inline-size;
   container-name: pane;
 }
@@ -862,6 +870,10 @@
   margin-top: 8px;
 }
 .sh-body label.cap {
+  /* The containing block for the visually-hidden abspos input below: without
+     it the input sits at its static position OUTSIDE the .sh-body scroller,
+     overhangs the shelf, and focus-scrolls the wrong ancestor. */
+  position: relative;
   display: flex;
   align-items: center;
   gap: 8px;

@@ -411,11 +411,20 @@
   flex: 1;
 }
 
-/* Content area */
+/* Content area — the manage pane's interior scroller.  The chain above it
+   (#view-admin → .admin-layout) is height-pinned by the L-shell pane and the
+   .hatch-host clips, so this is the last box that can own tab overflow.  It
+   scrolls so the docked shelf — positioned against .admin-layout, OUTSIDE
+   this scroller — stays put while tab content moves beneath it; the same
+   division of labor as #main inside the dashboard pane. */
 .admin-content {
   flex: 1;
   min-width: 0;
+  overflow-y: auto;
   padding-right: 20px;
+  /* scroll tail — the last row must not hug the pane edge (#main keeps 60px;
+     the admin tables are denser, so less) */
+  padding-bottom: 24px;
 }
 
 .admin-toolbar {
@@ -746,9 +755,10 @@
    text-overflow "…".  The actions cell inherits `.admin-col`'s
    `overflow: hidden`, which would re-clip a dropdown, so we override it
    to `visible` and anchor an absolutely-positioned menu to the kebab
-   container.  `.admin-content` does not scroll (the document does), so
-   the menu — glued to its cell — overlays the page without being
-   clipped by any ancestor. */
+   container.  The menu lives inside the `.admin-content` scroller and
+   rides with its row; the viewport-aware flip-up in _initKebabMenus
+   keeps bottom rows' menus inside the visible box, and scrolling
+   dismisses an open menu before the scroller's edge could clip it. */
 .admin-col-actions,
 .admin-col-mactions {
   overflow: visible;
@@ -951,6 +961,11 @@
  * a hatch body, hatch.css restates this layout at higher specificity —
  * the .sh-body label.toggle-switch exception.) */
 label.toggle-switch {
+  /* The containing block for the visually-hidden abspos input below: without
+     it the input sits at its static position outside whatever scroller the
+     toggle lives in (.sh-body, .admin-content) and focus-scrolls the wrong
+     ancestor — inside a shelf that shoved the whole hatch off its dock. */
+  position: relative;
   display: inline-flex;
   align-items: center;
   gap: 10px;
@@ -1090,6 +1105,11 @@ label.toggle-switch.toggle--flush {
    first letters and unselected rows lose their dot entirely). */
 .sh-body label.segmented-option,
 .segmented-option {
+  /* The containing block for the visually-hidden abspos radio below — same
+     anchor label.toggle-switch and .sh-body label.cap carry: an unanchored
+     input sits at its static position outside the .sh-body scroller and
+     focus-scrolls the wrong ancestor when the radiogroup is below the fold. */
+  position: relative;
   display: flex;
   align-items: center;
   gap: 10px;
