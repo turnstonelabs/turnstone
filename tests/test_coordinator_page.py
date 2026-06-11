@@ -401,6 +401,38 @@ def test_coord_dedups_system_turn_against_history_by_event_id():
         "false-skip after clear_ui / replay_truncated."
     )
 
+    # The seam must be wired on BOTH read paths, not merely present somewhere
+    # in the file — a refactor that keeps the Set but drops the live-handler
+    # consultation (or the history-side record) silently re-opens the
+    # double-render. Scope each assertion to its block so the wiring, not the
+    # bare symbol, is pinned. (A dedupe-neutered factory — guard short-circuited
+    # to ``false`` — still contains ``renderedSystemEventIds.has(`` and so
+    # passes the file-global checks above; these slice checks catch it.)
+    sys_case = body.index('case "system_turn":')
+    # End at the NEXT switch case, not the first ``break;`` — the dedup-skip
+    # ``...has(sysEid)) break;`` is itself a break that precedes the ``.add(``,
+    # so a ``break;``-bounded slice would drop the record half.
+    sys_case_end = body.index('\n      case "', sys_case + 1)
+    live_block = body[sys_case:sys_case_end]
+    assert "renderedSystemEventIds.has(" in live_block, (
+        "the live system_turn handler must CONSULT the dedup set (skip an id "
+        "already painted from /history) — not just reference the Set elsewhere."
+    )
+    assert "renderedSystemEventIds.add(" in live_block, (
+        "the live system_turn handler must RECORD the id it renders so a later "
+        "/history re-render (clear_ui) doesn't repaint it."
+    )
+
+    # The history render path must seed the set from each replayed system row's
+    # event_id, so a subsequent live replay of the same id is skipped.
+    assert 'role === "system"' in body
+    sys_replay = body.index('role === "system"', body.index("refetchHistory"))
+    replay_window = body[sys_replay : sys_replay + 600]
+    assert "renderedSystemEventIds.add(" in replay_window, (
+        "the history render's system-role branch must record each replayed "
+        "turn's event_id so the live system_turn handler can dedup against it."
+    )
+
 
 def test_coord_retry_walk_skips_operator_context_cards():
     """Retry must NOT regenerate a stale assistant turn when the last DOM row is

@@ -285,6 +285,33 @@ def test_system_turn_dedups_against_history_by_event_id() -> None:
         "replayHistory (and the live handler) must record system-turn ids for the dedup set."
     )
 
+    # Pin the wiring on BOTH read paths, scoped to its method — a refactor that
+    # keeps the Set but drops the live-handler consultation (or the
+    # replayHistory-side record) silently re-opens the double-render while the
+    # file-global checks above still pass.
+    live_start = body.index('case "system_turn":')
+    # End at the NEXT switch case, not the first ``break;`` — the dedup-skip
+    # path breaks before the ``.add(``, so a ``break;``-bounded slice would
+    # drop the record half and false-fail the ``.add(`` assertion below.
+    live_end = body.index('\n      case "', live_start + 1)
+    live_block = body[live_start:live_end]
+    assert re.search(r"_renderedSystemEventIds[\s\S]*?\.\s*has\(", live_block), (
+        "the live system_turn handler must CONSULT the dedup set (skip an id "
+        "already painted from /history), not merely reference the Set elsewhere."
+    )
+    assert re.search(r"_renderedSystemEventIds[\s\S]*?\.\s*add\(", live_block), (
+        "the live system_turn handler must RECORD the id it renders so a later "
+        "/history re-render (clear_ui) doesn't repaint it."
+    )
+
+    replay_start = _pane_method_offset(body, "replayHistory")
+    replay_end = _pane_method_offset(body, "_attachRetryToLastAssistant")
+    replay_block = body[replay_start:replay_end]
+    assert re.search(r"_renderedSystemEventIds[\s\S]*?\.\s*add\(", replay_block), (
+        "replayHistory must record each replayed system row's event_id so the "
+        "live system_turn handler can dedup against it."
+    )
+
 
 def test_retry_walk_skips_operator_context_cards() -> None:
     """Interactive twin of the coord retry-skip guard.
