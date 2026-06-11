@@ -293,8 +293,13 @@ def test_system_turn_dedups_against_history_by_event_id() -> None:
     # End at the NEXT switch case, not the first ``break;`` — the dedup-skip
     # path breaks before the ``.add(``, so a ``break;``-bounded slice would
     # drop the record half and false-fail the ``.add(`` assertion below.
-    live_end = body.index('\n      case "', live_start + 1)
-    live_block = body[live_start:live_end]
+    # Whitespace-tolerant so a reformat can't silently break the bound.
+    next_case = re.search(r'\n\s*case "', body[live_start + 1 :])
+    assert next_case, (
+        "no switch case found after system_turn to bound the pin slice — if "
+        "system_turn became the last case, re-anchor this pin's end marker."
+    )
+    live_block = body[live_start : live_start + 1 + next_case.start()]
     assert re.search(r"_renderedSystemEventIds[\s\S]*?\.\s*has\(", live_block), (
         "the live system_turn handler must CONSULT the dedup set (skip an id "
         "already painted from /history), not merely reference the Set elsewhere."
