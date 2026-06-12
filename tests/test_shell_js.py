@@ -751,6 +751,10 @@ def test_pane_manager_split_engine() -> None:
     assert "closeCell(paneId)" in pane and "_refreshCellChips()" in pane
     assert 'b.className = "cell-unsplit"' in pane
     assert '"Close pane"' in pane, "the single-pane chip mode"
+    # mode-DISTINCT glyphs (designer P1: identical signifier + locus with a
+    # reversible/destructive divergence is a mode-error trap)
+    assert 'b.textContent = multi ? "−" : "✕"' in pane
+    assert '"cell-unsplit--close"' in pane
     assert "this._removeCellChip(pane)" in pane
     # open-beside: the coordinator child-link placement (split right of the
     # focused cell, degrade to the plain swap on deny)
@@ -768,6 +772,10 @@ def test_pane_manager_split_engine() -> None:
     # occlusion bug); the ::before bar sits above the ring line
     assert ".panes--split > section.pane.split-focused::after" in css
     assert ".cell-unsplit" in css, "the per-cell hide-from-split chip style"
+    assert ".cell-unsplit--close:hover" in css, "destructive mode telegraphs on hover"
+    # the pane is the chip's containing block in BOTH modes — unpositioned,
+    # the single-pane chip anchored to the VIEWPORT (offsetParent <body>)
+    assert ".panes > section.pane" in css
 
 
 def test_step7_auth_gated_open_pane() -> None:

@@ -857,7 +857,6 @@ export class PaneManager {
       b = document.createElement("button");
       b.type = "button";
       b.className = "cell-unsplit";
-      b.textContent = "✕";
       b.addEventListener("click", () => {
         if (this._layout && this._leafFor(pane.id)) this.closeCell(pane.id);
         else this.close(pane.id);
@@ -865,6 +864,13 @@ export class PaneManager {
       pane.el.append(b);
       pane._cellChip = b;
     }
+    // Mode-DISTINCT glyphs — an identical signifier at an identical locus with
+    // divergent outcomes is a mode-error trap (split-mode muscle memory would
+    // fire the destructive close): − hides the cell (reversible — the tab
+    // stays), ✕ closes the pane.  Close mode also wears a danger hover
+    // (shell.css .cell-unsplit--close).
+    b.textContent = multi ? "−" : "✕";
+    b.classList.toggle("cell-unsplit--close", !multi);
     const label = multi ? "Hide from split — the tab stays open" : "Close pane";
     b.title = label;
     b.setAttribute("aria-label", label);
