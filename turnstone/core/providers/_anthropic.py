@@ -71,6 +71,11 @@ _WEB_SEARCH_TOOL_TYPE = "web_search_20250305"
 # Tool search: server-side BM25 tool discovery for deferred tools
 _TOOL_SEARCH_TOOL_TYPE = "tool_search_tool_bm25"
 
+# extra_params keys consumed internally (``_reasoning_params``) — never
+# forwarded to the wire ``extra_body``.  Keeps real-Anthropic request
+# bodies byte-identical when a caller threads thinking overrides.
+_INTERNAL_EXTRA_PARAMS = frozenset({"thinking_budget_tokens"})
+
 # -- model capabilities -------------------------------------------------------
 
 _ANTHROPIC_DEFAULT = ModelCapabilities(
@@ -80,6 +85,27 @@ _ANTHROPIC_DEFAULT = ModelCapabilities(
     thinking_mode="manual",
     supports_web_search=True,
     supports_vision=True,
+    supports_reasoning_replay=True,
+)
+
+# Anthropic-compatible local servers (vLLM's /v1/messages endpoint):
+# token_param must be "max_tokens" (the only token param the endpoint
+# accepts); the "thinking" request param is not consumed by vLLM — the
+# reasoning toggle rides chat_template_kwargs via extra_body, so
+# thinking_mode stays "none"; supports_reasoning_replay stays True even
+# so, because the endpoint emits and round-trips thinking blocks whenever
+# the chat template enables reasoning (the request param is simply not
+# the switch); native web_search / tool_search server-tool types 400 on
+# vLLM (tools require input_schema); vision is opt-in per model.
+# supports_temperature stays True via the dataclass default.
+_ANTHROPIC_COMPAT_DEFAULT = ModelCapabilities(
+    context_window=200000,
+    max_output_tokens=64000,
+    token_param="max_tokens",
+    thinking_mode="none",
+    supports_web_search=False,
+    supports_tool_search=False,
+    supports_vision=False,
     supports_reasoning_replay=True,
 )
 
@@ -239,13 +265,24 @@ ANTHROPIC_REASONING_BLOCK_TYPES = frozenset({"thinking", "redacted_thinking"})
 
 
 class AnthropicProvider:
-    """Provider for Anthropic's Messages API with native streaming."""
+    """Provider for Anthropic's Messages API with native streaming.
+
+    ``compat=True`` serves Anthropic-compatible local servers (vLLM's
+    ``/v1/messages``): same wire translation, but capabilities come from
+    ``_ANTHROPIC_COMPAT_DEFAULT`` for every model — the static Claude
+    table never applies to local checkpoints.
+    """
+
+    def __init__(self, *, compat: bool = False) -> None:
+        self._compat = compat
 
     @property
     def provider_name(self) -> str:
-        return "anthropic"
+        return "anthropic-compatible" if self._compat else "anthropic"
 
     def get_capabilities(self, model: str) -> ModelCapabilities:
+        if self._compat:
+            return _ANTHROPIC_COMPAT_DEFAULT
         return _lookup_capabilities(model, _ANTHROPIC_CAPABILITIES, _ANTHROPIC_DEFAULT)
 
     # -- web search tool injection -------------------------------------------
@@ -351,6 +388,13 @@ class AnthropicProvider:
             effort = _map_reasoning_to_effort(reasoning_effort, caps.effort_levels)
             if effort:
                 kwargs["output_config"] = {"effort": effort}
+
+        # Operator server_compat extra_body overrides (e.g. chat_template_kwargs
+        # for anthropic-compatible local servers) ride the SDK's extra_body.
+        if extra_params:
+            wire_extra = {k: v for k, v in extra_params.items() if k not in _INTERNAL_EXTRA_PARAMS}
+            if wire_extra:
+                kwargs["extra_body"] = wire_extra
 
         return kwargs
 

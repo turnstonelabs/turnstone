@@ -3135,7 +3135,10 @@ class ChatSession:
 
         Forwards operator-supplied ``server_compat["extra_body"]`` overrides
         (``skip_special_tokens``, ``reasoning_format``, or explicit
-        ``chat_template_kwargs``) to the OpenAI SDK ``extra_body``.  Operators
+        ``chat_template_kwargs``) to the OpenAI SDK ``extra_body`` on the
+        OpenAI-shaped lanes, and to the Anthropic SDK ``extra_body`` on the
+        anthropic-compatible lane (the channel for vLLM's
+        ``chat_template_kwargs`` reasoning toggle).  Operators
         running gpt-oss-style local templates that consume ``reasoning_effort``
         from ``chat_template_kwargs`` should set it explicitly under
         ``server_compat["extra_body"]["chat_template_kwargs"]``.
@@ -3151,9 +3154,11 @@ class ChatSession:
         from turnstone.core.server_compat import merge_server_compat
 
         prov = provider or self._provider
-        # Only OpenAI-shaped providers consume extra_body.  Anthropic/Google
-        # have their own param paths handled inside their providers.
-        if prov.provider_name not in ("openai", "openai-compatible"):
+        # extra_body consumers: the OpenAI-shaped providers, plus the
+        # anthropic-compatible lane (server_compat extra_body rides the
+        # Anthropic SDK's extra_body).  Real Anthropic and Google keep
+        # their own param paths handled inside their providers.
+        if prov.provider_name not in ("openai", "openai-compatible", "anthropic-compatible"):
             return None
         extra = merge_server_compat(None, self._get_server_compat(model_alias))
         return extra or None
