@@ -165,6 +165,25 @@ class TestProbeModelEndpoint:
         assert result["context_window"] == 1000000
 
     @patch("turnstone.core.providers.create_client")
+    def test_anthropic_compatible_server_type(self, mock_cc: MagicMock) -> None:
+        m = _mock_model("deepseek-ai/DeepSeek-V4-Flash")
+        mock_cc.return_value = _mock_client(m)
+
+        result = probe_model_endpoint("anthropic-compatible", "http://localhost:8000", "dummy")
+        assert result["reachable"] is True
+        assert result["server_type"] == "anthropic-compatible"
+        assert result["context_window"] is None
+
+    @patch("turnstone.core.providers.create_client")
+    def test_anthropic_compatible_max_model_len(self, mock_cc: MagicMock) -> None:
+        m = _mock_model("deepseek-ai/DeepSeek-V4-Flash", max_model_len=131072)
+        mock_cc.return_value = _mock_client(m)
+
+        result = probe_model_endpoint("anthropic-compatible", "http://localhost:8000", "dummy")
+        assert result["context_window"] == 131072
+        assert result["server_type"] == "anthropic-compatible"
+
+    @patch("turnstone.core.providers.create_client")
     def test_connection_failure(self, mock_cc: MagicMock) -> None:
         mock_cc.side_effect = OSError("Connection refused")
 

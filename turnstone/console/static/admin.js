@@ -5596,7 +5596,8 @@ function _renderModels(items) {
         ? "model-provider-anthropic"
         : m.provider === "google"
           ? "model-provider-google"
-          : m.provider === "openai-compatible"
+          : m.provider === "openai-compatible" ||
+              m.provider === "anthropic-compatible"
             ? "model-provider-compat"
             : "model-provider-openai";
 
@@ -5896,12 +5897,16 @@ function showEditModelModal(definitionId) {
         ? capsObj.server_compat
         : {};
       // Only extract thinking_mode into the dropdown when the UI can
-      // represent it ("manual" or "").  Values like "adaptive" (Anthropic-
-      // only) stay in the raw capabilities JSON so they aren't silently
-      // lost on save.
+      // represent it ("manual" or "") AND the provider round-trips the
+      // dropdown on save (every provider except anthropic-compatible —
+      // see submitCreateModel).  Unrepresentable values like "adaptive"
+      // and anthropic-compatible rows keep thinking_mode in the raw
+      // capabilities JSON so it isn't silently lost on save.
       const tmVal = capsObj.thinking_mode || "";
       const tmRepresentable = tmVal === "" || tmVal === "manual";
-      if (tmRepresentable) {
+      const tmCaptured =
+        tmRepresentable && (m.provider || "openai") !== "anthropic-compatible";
+      if (tmCaptured) {
         document.getElementById("model-thinking-mode").value = tmVal;
         document.getElementById("model-thinking-param").value =
           capsObj.thinking_param || "";
@@ -5945,7 +5950,7 @@ function showEditModelModal(definitionId) {
       // Remove structured fields from capabilities display — only delete
       // thinking_mode/thinking_param when the UI successfully captured them.
       delete capsObj.server_compat;
-      if (tmRepresentable) {
+      if (tmCaptured) {
         delete capsObj.thinking_mode;
         delete capsObj.thinking_param;
       }
@@ -6017,10 +6022,16 @@ function submitCreateModel() {
     }
   }
 
-  // Thinking mode → capabilities (provider uses this to inject
-  // the correct chat_template_kwargs param automatically).
+  const providerVal = document.getElementById("model-provider").value;
+
+  // Thinking mode → capabilities.  thinking_mode round-trips through the
+  // dropdown for every provider EXCEPT anthropic-compatible, where it
+  // stays in the raw capabilities JSON (mirroring the edit-load lift):
+  // that lane hides the dropdown row and drives reasoning via extra-body
+  // chat_template_kwargs, so a lingering dropdown value must never be
+  // persisted.
   const thinkingMode = document.getElementById("model-thinking-mode").value;
-  if (thinkingMode) {
+  if (providerVal !== "anthropic-compatible" && thinkingMode) {
     caps.thinking_mode = thinkingMode;
     // Preserve thinking_param so Granite/DeepSeek "thinking" key
     // isn't silently reverted to the default "enable_thinking".
@@ -6028,20 +6039,25 @@ function submitCreateModel() {
     if (savedParam) caps.thinking_param = savedParam;
   }
 
-  // Build server_compat from structured fields.  Only meaningful for
-  // openai-compatible aliases — for other providers the section is hidden
+  // Build server_compat from structured fields.  Only meaningful for the
+  // compat lanes (openai-compatible: all fields; anthropic-compatible: the
+  // extra-body JSON only) — for other providers the section is hidden
   // but the form values can linger after a provider switch, so gate the
   // whole block on the active provider to keep persisted state honest.
   const serverCompat = {};
-  const providerVal = document.getElementById("model-provider").value;
   const ebEl = document.getElementById("model-extra-body");
   ebEl.removeAttribute("aria-invalid");
   ebEl.style.borderColor = "";
-  if (providerVal === "openai-compatible") {
-    const serverType = document.getElementById("model-server-type").value;
-    if (serverType) serverCompat.server_type = serverType;
-    const apiSurface = document.getElementById("model-api-surface").value;
-    if (apiSurface) serverCompat.api_surface = apiSurface;
+  if (
+    providerVal === "openai-compatible" ||
+    providerVal === "anthropic-compatible"
+  ) {
+    if (providerVal === "openai-compatible") {
+      const serverType = document.getElementById("model-server-type").value;
+      if (serverType) serverCompat.server_type = serverType;
+      const apiSurface = document.getElementById("model-api-surface").value;
+      if (apiSurface) serverCompat.api_surface = apiSurface;
+    }
     const ebText = ebEl.value.trim();
     if (ebText) {
       try {
@@ -6516,7 +6532,11 @@ function _modelCapsRefreshBaseline() {
   const provider = document.getElementById("model-provider").value;
   const modelName = document.getElementById("model-name").value.trim();
   const banner = document.getElementById("model-autofill");
-  if (!modelName || provider === "openai-compatible") {
+  if (
+    !modelName ||
+    provider === "openai-compatible" ||
+    provider === "anthropic-compatible"
+  ) {
     _modelCapsBaseline = {};
     banner.hidden = true;
     _modelRenderTiles();
@@ -6578,6 +6598,10 @@ const _providerDefaults = {
     urlPlaceholder: "e.g. https://your-provider.com/v1",
     modelPlaceholder: "GLM5",
   },
+  "anthropic-compatible": {
+    urlPlaceholder: "e.g. http://your-vllm-host:8000",
+    modelPlaceholder: "deepseek-ai/DeepSeek-V4-Flash",
+  },
 };
 
 /* Update placeholders when provider changes. */
@@ -6592,8 +6616,18 @@ function _applyProviderDefaults() {
   if (scSection) {
     // hidden attr, not style.display — `.hatch [hidden]` is !important and
     // an inline display can never un-hide it.
-    scSection.hidden = provider !== "openai-compatible";
+    scSection.hidden =
+      provider !== "openai-compatible" && provider !== "anthropic-compatible";
   }
+  // Within the section, server type / API surface / thinking mode are
+  // openai-compatible knobs — the anthropic-compatible lane is configured
+  // through the extra-body JSON alone, so collapse the section to just
+  // that field.
+  const hideOpenaiOnlyRows = provider === "anthropic-compatible";
+  ["model-server-fields-row", "model-thinking-mode-row"].forEach(function (id) {
+    const row = document.getElementById(id);
+    if (row) row.hidden = hideOpenaiOnlyRows;
+  });
 }
 
 /* Populate the model name datalist with known model prefixes for the

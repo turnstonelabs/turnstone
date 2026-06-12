@@ -817,6 +817,14 @@ def probe_model_endpoint(
             if known is not None:
                 result["context_window"] = known["context_window"]
             result["server_type"] = "xai"
+        elif provider == "anthropic-compatible":
+            # No static table for local models; vLLM exposes max_model_len
+            # as an extra field the Anthropic SDK preserves (extra="allow").
+            if inspect_obj is not None:
+                max_len = inspect_obj.model_dump().get("max_model_len")
+                if isinstance(max_len, int) and max_len > 0:
+                    result["context_window"] = max_len
+            result["server_type"] = "anthropic-compatible"
         else:
             # OpenAI-compatible path
             _detect_openai_compat(result, inspect_obj, inspect_id, base_url)

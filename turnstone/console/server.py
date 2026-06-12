@@ -10210,7 +10210,9 @@ async def admin_import_mcp_config(request: Request) -> JSONResponse:
 # ---------------------------------------------------------------------------
 
 _MODEL_ALIAS_RE = re.compile(r"^[a-zA-Z0-9._-]+$")
-_MODEL_PROVIDERS = frozenset({"openai", "anthropic", "openai-compatible", "google", "xai"})
+_MODEL_PROVIDERS = frozenset(
+    {"openai", "anthropic", "openai-compatible", "anthropic-compatible", "google", "xai"}
+)
 _REASONING_EFFORT_CHOICES = frozenset(
     {"", "none", "minimal", "low", "medium", "high", "xhigh", "max"}
 )
