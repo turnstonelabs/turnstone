@@ -220,6 +220,16 @@ class TestCompatFactory:
         mock_anthropic_cls.assert_called_once_with(base_url="/v1")
 
     @patch("turnstone.core.providers._anthropic._ensure_anthropic")
+    def test_create_client_requires_base_url(self, mock_ensure: MagicMock) -> None:
+        """Empty base_url fails at construction — the local-only lane must
+        never fall back to the SDK's https://api.anthropic.com default."""
+        from turnstone.core.providers import create_client
+
+        with pytest.raises(ValueError, match="anthropic-compatible requires base_url"):
+            create_client("anthropic-compatible", base_url="", api_key="dummy")
+        mock_ensure.return_value.Anthropic.assert_not_called()
+
+    @patch("turnstone.core.providers._anthropic._ensure_anthropic")
     def test_create_client_real_lane_base_url_untouched(self, mock_ensure: MagicMock) -> None:
         """The real anthropic lane forwards base_url verbatim — the /v1
         normalization is compat-lane-only."""

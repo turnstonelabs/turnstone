@@ -775,9 +775,11 @@ wire translation as the real Anthropic lane, but every model resolves to
 the `_ANTHROPIC_COMPAT_DEFAULT` capabilities (200K context, 64K output,
 `token_param=max_tokens`, `thinking_mode=none`, no native
 web_search/tool_search, no vision) — the static Claude table never
-applies to local checkpoints. `base_url` is the server root WITHOUT
-`/v1` (the Anthropic SDK appends `/v1/messages`); a trailing `/v1`
-pasted out of openai-compatible habit is stripped automatically. Set a
+applies to local checkpoints. `base_url` is required — the server root
+WITHOUT `/v1` (the Anthropic SDK appends `/v1/messages`); a trailing
+`/v1` pasted out of openai-compatible habit is stripped automatically,
+and an empty value fails at client construction rather than falling
+back to the commercial endpoint. Set a
 placeholder `api_key` (e.g. `"dummy"`) for unauthenticated servers. Tool calling
 needs the server started with `--enable-auto-tool-choice
 --tool-call-parser <family>` plus the matching reasoning parser.

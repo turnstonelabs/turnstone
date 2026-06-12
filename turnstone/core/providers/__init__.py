@@ -153,7 +153,15 @@ def create_client(provider_name: str, *, base_url: str, api_key: str) -> Any:
         kwargs: dict[str, str] = {}
         if resolved_key is not None:
             kwargs["api_key"] = resolved_key
-        if provider_name == "anthropic-compatible" and base_url:
+        if provider_name == "anthropic-compatible":
+            # The lane targets local /v1/messages servers; without a
+            # base_url the SDK would default to https://api.anthropic.com
+            # and send compat-shaped requests to the commercial API.
+            if not base_url:
+                raise ValueError(
+                    "anthropic-compatible requires base_url (the server root, "
+                    "e.g. http://your-vllm-host:8000)"
+                )
             # The Anthropic SDK appends /v1/... to base_url, so a
             # /v1-suffixed URL (the openai-compatible convention) would
             # request /v1/v1/messages and 404.  Tolerate the suffix.
