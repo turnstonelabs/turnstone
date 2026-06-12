@@ -736,6 +736,11 @@ def test_pane_manager_split_engine() -> None:
     assert 'setAttribute("role", "separator")' in pane
     assert "setPointerCapture" in pane and "_ratioBounds(node)" in pane
     assert '"aria-valuenow"' in pane and "ArrowRight" in pane
+    # the ARIA range mirrors the REAL clamp (_ratioBounds per handle in the
+    # _applyLayout loop) — never a hard-coded constant
+    assert "this._ratioBounds(h.node)" in pane
+    assert '"aria-valuemin"' in pane and '"aria-valuemax"' in pane
+    assert 'setAttribute("aria-valuemin", "10")' not in pane
     # limits: cell minimums + cap (the old ui/static ceiling, kept)
     assert "SPLIT_MAX_CELLS = 6" in pane
     assert "SPLIT_MIN_W = 200" in pane and "SPLIT_MIN_H = 150" in pane
