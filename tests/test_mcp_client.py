@@ -6,7 +6,7 @@ import asyncio
 import concurrent.futures
 import json
 import time
-from contextlib import AsyncExitStack
+from contextlib import AsyncExitStack, suppress
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -153,8 +153,26 @@ def running_loop_mgr():
     try:
         yield mgr, loop, thread
     finally:
+        # Drain BEFORE stopping: a task left pending (or finished-but-
+        # unretrieved) on a stopped loop becomes cross-test global state —
+        # asyncio reports it at GC time, mid-suite, onto whatever stream
+        # pytest has attached THEN (the "I/O operation on closed file"
+        # spew), and a silently-abandoned loop thread keeps running
+        # manager code against torn-down mocks.
+        async def _cancel_pending() -> None:
+            tasks = [t for t in asyncio.all_tasks() if t is not asyncio.current_task()]
+            for t in tasks:
+                t.cancel()
+            for t in tasks:
+                with suppress(BaseException):
+                    await t
+
+        with suppress(Exception):
+            asyncio.run_coroutine_threadsafe(_cancel_pending(), loop).result(timeout=5)
         loop.call_soon_threadsafe(loop.stop)
-        thread.join(timeout=2)
+        thread.join(timeout=5)
+        assert not thread.is_alive(), "mcp test loop thread failed to stop within 5s"
+        loop.close()
 
 
 # ---------------------------------------------------------------------------
@@ -2706,11 +2724,22 @@ class TestCBAutoReconnectRefresh:
             patch.object(mgr, "_refresh_server", side_effect=_refresh),
         ):
             session = mgr._cb_auto_reconnect("srv")
-            # Wait for the scheduled refresh task to actually run on the loop.
+            # Wait for the scheduled refresh task to actually run on the loop,
+            # then for the tracked task to DRAIN — exiting the patch context
+            # while the task is still in flight would hand the un-patched
+            # method to its tail.
             assert refresh_event.wait(timeout=5), "refresh task was not scheduled"
+            deadline = time.time() + 5
+            while mgr._background_tasks and time.time() < deadline:
+                time.sleep(0.02)
+            assert not mgr._background_tasks, "background refresh task never drained"
         assert session is new_session
 
-    def test_auto_reconnect_swallows_refresh_failure(self, running_loop_mgr):
+    def test_auto_reconnect_retrieves_and_logs_refresh_failure(self, running_loop_mgr):
+        """A refresh failure must be RETRIEVED and logged by the task's
+        done-callback — not abandoned for asyncio to report as "Task exception
+        was never retrieved" at GC time (which lands on whatever stream pytest
+        has attached by then: the closed-file CI spew)."""
         import threading as _threading
 
         mgr, _loop, _thread = running_loop_mgr
@@ -2728,10 +2757,32 @@ class TestCBAutoReconnectRefresh:
         with (
             patch.object(mgr, "_connect_one", side_effect=_connect_one),
             patch.object(mgr, "_refresh_server", side_effect=_refresh_failing),
+            patch("turnstone.core.mcp_client.log") as mock_log,
         ):
-            # Must not raise — refresh failures are non-fatal.
+            # Must not raise — refresh failures are non-fatal to the caller.
             session = mgr._cb_auto_reconnect("srv")
-            # Background refresh actually started and exception was swallowed
-            # by the task without affecting the synchronous caller.
             assert refresh_started.wait(timeout=5), "refresh task was not scheduled"
+            # Poll for the WARNING while the patch is still active — gating on
+            # set-emptiness alone would race the un-patch (review-caught: the
+            # warning could land on the restored real logger).
+            deadline = time.time() + 5
+            warn_calls = []
+            while not warn_calls and time.time() < deadline:
+                warn_calls = [
+                    c for c in mock_log.warning.call_args_list if "MCP background" in str(c.args[0])
+                ]
+                time.sleep(0.02)
+            # The tracked task must also fully drain (emptiness now implies
+            # "done AND reported" — discard is the callback's LAST step).
+            deadline = time.time() + 5
+            while mgr._background_tasks and time.time() < deadline:
+                time.sleep(0.02)
+            assert not mgr._background_tasks, "background refresh task never drained"
         assert session is new_session
+        assert warn_calls, (
+            "the refresh failure must be logged by the done-callback, not left "
+            "for GC-time reporting"
+        )
+        exc = warn_calls[0].kwargs.get("exc_info")
+        assert isinstance(exc, RuntimeError)
+        assert "catalog fetch broke" in str(exc)
