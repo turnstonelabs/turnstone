@@ -686,17 +686,70 @@ def test_step7_live_tab_state_glyphs() -> None:
     assert ".tab .tab-glyph" in css, "the tab-glyph spacing rule must apply to static + live glyphs"
 
 
-def test_step7_new_tab_launcher_button() -> None:
-    """Step 7 #3: the tab bar's right tail carries a [+] new-session button that
-    focuses the persona launcher (the Dashboard pane hosts it; a new session needs
-    a task prompt so it composes there).  Cross-deployment via showHome with an
-    openPane fallback; reuses the scaffold's .tab-add styling."""
+def test_split_view_controls() -> None:
+    """The revived split-view's affordance surface: Split right / Split down /
+    Unsplit buttons in the tab-bar tail (they REPLACED the redundant [+] — the
+    permanent Dashboard tab is the launcher).  Deliberately NO contextmenu
+    override (the pre-L-shell split UI hijacked right-click); denials surface
+    as a toast with the manager's reason."""
     shell = _SHELL_JS.read_text(encoding="utf-8")
-    assert 'make("button", "tab-add")' in shell, "the [+] new-tab button must exist"
-    assert "shell.tail.append(addTab)" in shell, "the [+] lives in the right-floated tail slot"
-    assert "window.showHome()" in shell, "[+] must focus the persona launcher (showHome)"
+    assert 'tbBtn("tb-split", "◫", "Split right")' in shell
+    assert 'tbBtn("tb-split tb-split--down", "◫", "Split down")' in shell
+    assert 'pm.splitFocused("right")' in shell and 'pm.splitFocused("down")' in shell
+    assert "pm.unsplit()" in shell, "the Unsplit button must call pm.unsplit"
+    assert "unsplitBtn.hidden = !pm.isSplit()" in shell, (
+        "Unsplit only shows while split (synced via onActiveChange)"
+    )
+    assert "shell.tail.append(splitRightBtn, splitDownBtn, unsplitBtn)" in shell
+    # The [+] is gone with its showHome/focusLauncher plumbing kept out.
+    assert "tab-add" not in shell, "the [+] new-tab button was replaced by the split controls"
     css = _SHELL_CSS.read_text(encoding="utf-8")
-    assert ".tab-add" in css, "the .tab-add button style must exist (from the scaffold)"
+    assert ".tb-split" in css and ".tb-split--down .tb-glyph" in css, (
+        "split buttons styled; the down variant rotates the GLYPH (not the button)"
+    )
+    assert "tab-add" not in css, "the dead .tab-add style must not survive"
+
+
+def test_pane_manager_split_engine() -> None:
+    """The split-view engine in PaneManager: an optional binary layout tree
+    (null = the pre-feature single-pane behaviour, bit-for-bit).  Visible panes
+    are positioned by inline % insets — NEVER reparented, so live stream DOM,
+    scroll state and media survive every layout change.  Tabs stay global:
+    active = the focused cell, a backgrounded tab swaps into it, a click inside
+    a visible pane focuses its cell.  Separators resize by drag AND keyboard
+    (role=separator + aria-value*); the tree persists in the working-set blob
+    and rehydrate prunes leaves whose pane did not restore."""
+    pane = _PANE_JS.read_text(encoding="utf-8")
+    # public surface
+    assert "splitFocused(dir)" in pane and "unsplit()" in pane and "isSplit()" in pane
+    # no reparenting: layout is applied as % insets on the pane elements
+    assert 'p.el.style.left = r.x * 100 + "%"' in pane
+    # the focused-cell swap + pure focus move both live in activate()
+    assert "this._leafFor(paneId)" in pane and "target.paneId = paneId" in pane
+    # close() collapses the cell and prefers the absorbing sibling as fallback
+    assert "_collapseLeaf(leaf)" in pane and "preferFallback" in pane
+    # auto-fill source: most-recently-focused backgrounded pane
+    assert "_nextBackgroundPane()" in pane and "this._mru" in pane
+    # separators: ARIA + keyboard + pointer-capture drag, ratio bounds from the
+    # split node's OWN px region (nested splits clamp against their own space)
+    assert 'setAttribute("role", "separator")' in pane
+    assert "setPointerCapture" in pane and "_ratioBounds(node)" in pane
+    assert '"aria-valuenow"' in pane and "ArrowRight" in pane
+    # limits: cell minimums + cap (the old ui/static ceiling, kept)
+    assert "SPLIT_MAX_CELLS = 6" in pane
+    assert "SPLIT_MIN_W = 200" in pane and "SPLIT_MIN_H = 150" in pane
+    # persistence: layout rides the working-set blob; restore prunes dead leaves
+    assert "state.layout = this._serializeLayout(this._layout)" in pane
+    assert "_restoreLayout(data)" in pane and "seen.has(d.paneId)" in pane
+    # the visible-but-unfocused tab marker
+    assert 'classList.toggle("shown"' in pane
+    css = _SHELL_CSS.read_text(encoding="utf-8")
+    assert ".panes--split > section.pane" in css, (
+        "split cells must target section.pane ONLY — the interactive pane's inner "
+        "div also carries .pane (the step-5b lesson)"
+    )
+    assert ".split-handle" in css and "col-resize" in css and "row-resize" in css
+    assert ".tab.shown:not(.active)" in css, "the visible-but-unfocused tab marker"
 
 
 def test_step7_auth_gated_open_pane() -> None:
