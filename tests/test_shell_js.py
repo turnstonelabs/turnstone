@@ -776,6 +776,12 @@ def test_pane_manager_split_engine() -> None:
     # the pane is the chip's containing block in BOTH modes — unpositioned,
     # the single-pane chip anchored to the VIEWPORT (offsetParent <body>)
     assert ".panes > section.pane" in css
+    # pane-hosted coordinator sidebar drops below the chip's corner lane —
+    # the chip sat exactly on the Children refresh button (user report)
+    coord_chrome = (_ROOT / "turnstone/console/static/coordinator/coord-chrome.css").read_text(
+        encoding="utf-8"
+    )
+    assert ".pane-body.coord-chrome-root #coord-sidebar.sidebar" in coord_chrome
 
 
 def test_step7_auth_gated_open_pane() -> None:
