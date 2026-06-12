@@ -590,6 +590,10 @@
 }
 .tb-split .tb-glyph {
   display: inline-block;
+  /* greyscale AA — subpixel RGB rendering fringes these box-drawing glyphs
+     with blue/amber bleed against the panel */
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
 }
 .tb-split--down .tb-glyph {
   transform: rotate(90deg);
@@ -777,6 +781,13 @@
 .panes--split {
   position: relative;
 }
+/* The pane is the containing block in BOTH modes: unpositioned, the per-pane
+   ✕ chip's absolute would resolve to the VIEWPORT (offsetParent <body>) and
+   only coincidentally land near the pane corner.  The split rule below wins
+   on specificity while split. */
+.panes > section.pane {
+  position: relative;
+}
 .panes--split > section.pane {
   position: absolute;
   overflow: hidden;
@@ -799,10 +810,18 @@
   z-index: 12;
   pointer-events: none;
 }
+/* light needs a hotter mix: 55% measured 2.60:1 there (sub-3:1); 75% clears.
+   Dark stays 55% (3.75:1) — hotter reads as a heavy border on dark. */
+[data-theme="light"] .panes--split > section.pane.split-focused::after {
+  box-shadow: inset 0 0 0 1px
+    color-mix(in srgb, var(--accent) 75%, var(--hair-2));
+}
 .panes--split > section.pane.split-focused::before {
   content: "";
   position: absolute;
-  inset: 0 0 auto 0; /* top edge, full cell width */
+  /* 1px in from the cell sides so the bar never butts a separator line into
+     one doubled-accent stripe at the T-junction */
+  inset: 0 1px auto 1px;
   height: 2px;
   background: var(--accent);
   z-index: 13; /* above the ring overlay — a clean bar, not bar-plus-ring-line */
@@ -815,32 +834,49 @@
    the 2px focus bar and the cell corner. */
 .cell-unsplit {
   position: absolute;
-  top: 6px;
-  right: 10px;
+  top: 5px;
+  right: 14px; /* clear of the message scroller's scrollbar gutter */
   z-index: 14;
-  width: 22px;
-  height: 22px;
+  /* 28px: WCAG 2.5.8's 24px floor + a hair (22px under-shot it) */
+  width: 28px;
+  height: 28px;
   display: flex;
   align-items: center;
   justify-content: center;
-  border: 1px solid var(--hair-2);
+  /* --hair-2 measured ~1.3:1 against the chip bg — an invisible boundary;
+     --ink-4 clears 3:1 in both themes */
+  border: 1px solid var(--ink-4);
   border-radius: var(--r-sm);
   background: var(--panel-2);
   color: var(--ink-3);
-  font-size: 11px;
+  font-size: 12px;
   line-height: 1;
   cursor: pointer;
-  opacity: 0.75;
+  opacity: 0.85;
 }
 .cell-unsplit:hover {
   opacity: 1;
   color: var(--ink);
   border-color: var(--accent-dim);
 }
+/* the destructive mode (single-pane "Close pane" ✕) telegraphs BEFORE the
+   click lands — split-mode muscle memory must not fire it blind */
+.cell-unsplit--close:hover {
+  color: var(--err);
+  border-color: var(--err);
+}
 .cell-unsplit:focus-visible {
   opacity: 1;
   outline: 2px solid var(--accent);
   outline-offset: -2px;
+}
+.cell-unsplit--close:focus-visible {
+  outline-color: var(--err);
+}
+/* light resting glyph at .85 sat right at the 3:1 floor with --ink-3 — one
+   ink step restores headroom (~4.5:1) without making the chip shout */
+[data-theme="light"] .cell-unsplit {
+  color: var(--ink-2);
 }
 /* separator — a 7px hit area straddling the cell boundary with a 1px visual
    line; drag (pointer capture) or arrow keys resize, see pane.js _wireHandle.
@@ -914,7 +950,9 @@
   bottom: 2px;
   height: 2px;
   border-radius: 2px;
-  background: color-mix(in srgb, var(--accent) 55%, transparent);
+  /* 80%: 55% composited to 2.34:1 on the light --panel (sub-3:1 for a
+     load-bearing state mark); 80% = ~3.7:1 light / ~5:1 dark */
+  background: color-mix(in srgb, var(--accent) 80%, transparent);
 }
 .pane-head {
   display: flex;
