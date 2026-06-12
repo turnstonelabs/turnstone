@@ -1,0 +1,116 @@
+{
+  "name": "The Vale of Understone",
+  "width": 96,
+  "height": 48,
+  "spawn": [20, 24],
+  "legend": {
+    ".": "grass",
+    "T": "tree",
+    "~": "water",
+    "=": "road",
+    "f": "forest",
+    "#": "wall"
+  },
+  "terrain_rows": [
+    "TTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTT",
+    "TTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTT",
+    "TT..............................................f....f.ff.ffffffffffffffffffffffffffffffffffffTT",
+    "TT..............................................f..f...f.fffffffffffffffffffffffffffffffffffffTT",
+    "TT....~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~ffffTT",
+    "TT....~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~ffffTT",
+    "TT....~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~ffffTT",
+    "TT....~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~ffffTT",
+    "TT................................................f.ff.ff.fff.ffffffffffffffffffffffffffffffffTT",
+    "TT................................................f..ff.f.ffffffffffffffffffffffffffffffffffffTT",
+    "TT.....................................................ffffff.ffffffffffffffffffffffffffffffffTT",
+    "TT...................................................f.ff...ffffffff##f##fffffffffffffffffffffTT",
+    "TT.............................................f.f.f..f.ffffffffffff#=.f#fffffffffffffffffffffTT",
+    "TT....................................................f.f.ff.fffff====f##fffffffffffffffffffffTT",
+    "TT.................................................f.f...fff.fffff=fffffffffffffffffffffffffffTT",
+    "TT......................................................fff.ffffff=fffffffffffffffffffffffffffTT",
+    "TT................................................f...fffff.ffffff=fffffffffffffffffffffffffffTT",
+    "TT.........................................................ff.ffff=fffffffffffffffffffffffffffTT",
+    "TT...................................................f.f.ff.ffffff=fffffffffffffffffffffffffffTT",
+    "TT.....................................................ffff..fffff=fffffffffffffffffffffffffffTT",
+    "TT................................................f....f....ffffff=fffffffffffffffffffffffffffTT",
+    "TT................................................f..f.ffff..fffff=fffffffffffffffffffffffffffTT",
+    "TT.......................................................ff.f.ffff=fffffffffffffffffffffffffffTT",
+    "TT...............................................f.ff.f.....ffffff=fffffffffffffffffffffffffffTT",
+    "TT..................==.============================================fffffffffffffffffffffffffffTT",
+    "TT...............................................f..f....fff.fffffffffffffffffffffffffffffffffTT",
+    "TT...................................................ff.f.f.f.ffffffffffffffffffffffffffffffffTT",
+    "TT..................................................f...f.fff.ffffffffffffffffffffffffffffffffTT",
+    "TT...................................................f...ffff.ffffffffffffffffffffffffffffffffTT",
+    "TT..................................................ff.fff.ff.ffffffffffffffffffffffffffffffffTT",
+    "TT.................................................f......f.ffffffffffffffffffffffffffffffffffTT",
+    "TT....................................................ff..ff..ffffffffffffffffffffffffffffffffTT",
+    "TT....................................................ff..f..fffffffffffffffffffffffffffffffffTT",
+    "TT......................................................ffffffffffffffffffffffffffffffffffffffTT",
+    "TT....................................................f.fff...ffffffffffffffffffffffffffffffffTT",
+    "TT.................................................ff....fffffffffffffffffffffffffffffffffffffTT",
+    "TT...............................................f........ffffffffffffffffffffffffffffffffffffTT",
+    "TT..................................................f.ff.....fffffffffffffffffffffffffffffffffTT",
+    "TT...............................................f.f...ff.f..fffffffffffffffffffffffffffffffffTT",
+    "TT.....................................................ff..f.fffffffffffffffffffffffffffffffffTT",
+    "TT...................................................ff...ffffffffffffffffffffffffffffffffffffTT",
+    "TT................................................f....f.ffff.ffffffffffffffffffffffffffffffffTT",
+    "TT..................................................f...ff.fffffffffffffffffffffffffffffffffffTT",
+    "TT....................................................f.ff.f..ffffffffffffffffffffffffffffffffTT",
+    "TT.............................................ff......fffffffffffffffffffffffffffffffffffffffTT",
+    "TT................................................f.f...f....fffffffffffffffffffffffffffffffffTT",
+    "TTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTT",
+    "TTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTT"
+  ],
+  "locations": [
+    {
+      "key": "inn",
+      "x": 18,
+      "y": 24
+    },
+    {
+      "key": "shop",
+      "x": 22,
+      "y": 24
+    },
+    {
+      "key": "healer",
+      "x": 20,
+      "y": 22
+    },
+    {
+      "key": "dungeon",
+      "x": 70,
+      "y": 12
+    }
+  ],
+  "zones": [
+    {
+      "key": "forest_near",
+      "rect": [30, 18, 60, 36],
+      "tier_lo": 1,
+      "tier_hi": 2
+    },
+    {
+      "key": "dungeon_deep",
+      "rect": [66, 8, 80, 20],
+      "tier_lo": 3,
+      "tier_hi": 5
+    }
+  ],
+  "settings": {
+    "daily_turns": 10,
+    "rest_cost": 15,
+    "heal_cost_per_hp": 2,
+    "starting_gold": 20,
+    "starting_weapon": "rusty_dagger",
+    "starting_armor": "cloth_tunic",
+    "xp_base": 100,
+    "growth": {
+      "max_hp": 6,
+      "atk": 2,
+      "def": 1
+    },
+    "bestow_daily_budget": 25,
+    "dungeon_tiers": [4, 5]
+  }
+}

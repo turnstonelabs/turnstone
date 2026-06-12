@@ -1,0 +1,58 @@
+[
+  {
+    "id": "rusty_dagger",
+    "name": "Rusty Dagger",
+    "slot": "weapon",
+    "atk": 2,
+    "price": 0
+  },
+  {
+    "id": "short_sword",
+    "name": "Short Sword",
+    "slot": "weapon",
+    "atk": 5,
+    "price": 40
+  },
+  {
+    "id": "war_axe",
+    "name": "War Axe",
+    "slot": "weapon",
+    "atk": 9,
+    "price": 120
+  },
+  {
+    "id": "cloth_tunic",
+    "name": "Cloth Tunic",
+    "slot": "armor",
+    "def": 1,
+    "price": 0
+  },
+  {
+    "id": "leather_armor",
+    "name": "Leather Armor",
+    "slot": "armor",
+    "def": 3,
+    "price": 50
+  },
+  {
+    "id": "chainmail",
+    "name": "Chainmail",
+    "slot": "armor",
+    "def": 6,
+    "price": 140
+  },
+  {
+    "id": "minor_potion",
+    "name": "Minor Potion",
+    "slot": "consumable",
+    "heal": 15,
+    "price": 12
+  },
+  {
+    "id": "greater_potion",
+    "name": "Greater Potion",
+    "slot": "consumable",
+    "heal": 40,
+    "price": 35
+  }
+]

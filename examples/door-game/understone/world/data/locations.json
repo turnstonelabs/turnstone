@@ -1,0 +1,62 @@
+{
+  "inn": {
+    "kind": "inn",
+    "name": "The Sleeping Drake",
+    "glyph": "I",
+    "color": "town",
+    "actions": [
+      "rest",
+      "leave"
+    ],
+    "flavor": [
+      "Lamplight pools on worn oak tables.",
+      "The innkeeper nods toward the hearth.",
+      "A night's rest restores you fully."
+    ]
+  },
+  "shop": {
+    "kind": "shop",
+    "name": "Gravel & Sons Outfitters",
+    "glyph": "$",
+    "color": "town",
+    "actions": [
+      "buy",
+      "sell",
+      "leave"
+    ],
+    "flavor": [
+      "Racks of steel and leather line the walls.",
+      "Buying a weapon or armour equips it at once.",
+      "Potions are quaffed on purchase (no pack to carry).",
+      "Old gear sells back for half its price."
+    ]
+  },
+  "healer": {
+    "kind": "healer",
+    "name": "The Quiet Shrine",
+    "glyph": "+",
+    "color": "town",
+    "actions": [
+      "heal",
+      "leave"
+    ],
+    "flavor": [
+      "Incense curls beneath a still blue flame.",
+      "The keeper mends wounds for coin, per point of vigour."
+    ]
+  },
+  "dungeon": {
+    "kind": "dungeon",
+    "name": "The Understone Deep",
+    "glyph": ">",
+    "color": "dungeon",
+    "actions": [
+      "descend",
+      "leave"
+    ],
+    "flavor": [
+      "A cold throat of stone descends into dark.",
+      "To descend is to face a troll, then something worse."
+    ]
+  }
+}
