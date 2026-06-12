@@ -59,7 +59,28 @@ def test_win_deltas_are_exact_for_pinned_seed() -> None:
     result = resolve_fight(GameRNG(seed=_WIN_SEED), player, monster)
     # Pinned from a determinism probe; guards against silent damage drift.
     assert result.hp_delta == -1
-    assert len(result.log) == 5
+    # The engine no longer emits a "falls + reward" line — that sentence is
+    # composed by the game façade where the xp/gold are actually banked — so
+    # the WIN log is one line shorter than before and ends on the kill blow.
+    assert len(result.log) == 4
+    assert result.log[-1] == "You strike for 6. (Field Rat: 0 HP)"
+
+
+def test_win_log_does_not_claim_rewards() -> None:
+    """The engine narrates the kill blow only; it never claims xp/gold itself.
+
+    Reward ownership lives in the façade (so the Wyrm-win legacy reset, which
+    keeps no xp/gold, narrates no reward). The deltas are still carried on the
+    result for the caller to apply.
+    """
+    player = make_player(hp=20, max_hp=20, atk=5, def_=1)
+    monster = make_monster(hp=6, atk=3, def_=0, xp=8, gold=3)
+    result = resolve_fight(GameRNG(seed=_WIN_SEED), player, monster)
+    assert result.outcome is Outcome.WIN
+    assert result.xp_delta == 8 and result.gold_delta == 3  # deltas still set
+    joined = "\n".join(result.log)
+    assert "falls" not in joined  # no kill/reward sentence in the engine log
+    assert "XP" not in joined and "gold" not in joined
 
 
 def test_loss_flags_bounce_without_rewards() -> None:

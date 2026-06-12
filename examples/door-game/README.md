@@ -28,6 +28,27 @@ is the whole interface. Once the server is registered with your assistant:
 Everything the assistant needs to run the game well is returned by
 `door_help`.
 
+## Gameplay
+
+A run is a little RPG loop, played a bit each day:
+
+- **Explore** the overworld of box-drawing maps. Walking is free, but the wild
+  country has texture — a step may turn up a wandering monster, a purse of
+  gold, a healing spring, a small trap (which can never kill you), or a scrap
+  of old Vale lore. Only one such find happens per move, and the non-combat
+  ones don't interrupt your walk.
+- **Fight, shop, and heal** in and around town. Fighting and descending the
+  dungeon gauntlet each spend one of your daily turns; resting, shopping and
+  moving do not.
+- **Win the game** by slaying **the Wyrm Below**. Once your hero is seasoned
+  enough, `challenge` it at the dungeon. A victory frees the Vale, carves your
+  run into the **Hall of Legends**, and — in the tradition of *Legend of the
+  Red Dragon* — begins a new life: your character resets to first-day gear and
+  stats but keeps a permanent ★ for every Wyrm slain, ready to do it all again.
+- **Read the news.** `door_log` is the **Understone Herald**, a shared
+  broadsheet of notable deeds across the whole world — who joined, who rose a
+  level, who was dragged home by a goblin, and who freed the Vale.
+
 ## Installation
 
 This example uses [`uv`](https://docs.astral.sh/uv/). From the example
@@ -120,9 +141,9 @@ url = "http://localhost:8077/mcp"
 | `door_status` | The character sheet (read-only). |
 | `door_look` | Redraw the current view — overworld map or location menu. |
 | `door_move` | Walk the overworld (free; no daily turn spent). |
-| `door_action` | Context verbs: fight, flee, rest, buy, sell, heal, descend, leave. |
-| `door_log` | Catch up on what happened in the world while away. |
-| `door_rank` | The leaderboard. |
+| `door_action` | Context verbs: fight, flee, rest, buy, sell, heal, descend, challenge (the Wyrm), leave. |
+| `door_log` | The Understone Herald — the shared feed of notable deeds. |
+| `door_rank` | The leaderboard, plus the Hall of Legends (★ marks Wyrm kills). |
 | `door_bestow` | Game-master grant of a little gold/healing for a story beat. |
 
 ## A note on identity and safety

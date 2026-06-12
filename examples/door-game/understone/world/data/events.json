@@ -1,0 +1,66 @@
+{
+  "events": [
+    {
+      "kind": "fight",
+      "weight": 55,
+      "text": "Something snarls out of the brush."
+    },
+    {
+      "kind": "gold",
+      "weight": 8,
+      "text": "a rotted coin-purse half-buried in moss",
+      "min": 4,
+      "max": 12
+    },
+    {
+      "kind": "gold",
+      "weight": 7,
+      "text": "a few coins spilled from some luckless traveller",
+      "min": 2,
+      "max": 9
+    },
+    {
+      "kind": "heal",
+      "weight": 5,
+      "text": "a clearwater spring",
+      "min": 5,
+      "max": 12
+    },
+    {
+      "kind": "heal",
+      "weight": 5,
+      "text": "a quiet fae blessing",
+      "min": 4,
+      "max": 10
+    },
+    {
+      "kind": "trap",
+      "weight": 5,
+      "text": "a snare of old briars",
+      "min": 3,
+      "max": 9
+    },
+    {
+      "kind": "trap",
+      "weight": 5,
+      "text": "loose stones twist your ankle",
+      "min": 2,
+      "max": 8
+    },
+    {
+      "kind": "lore",
+      "weight": 3,
+      "text": "an old waystone, its rune worn to a coiled, scaled shape."
+    },
+    {
+      "kind": "lore",
+      "weight": 3,
+      "text": "the wind carries a low note from the east, like something vast turning in its sleep."
+    },
+    {
+      "kind": "lore",
+      "weight": 4,
+      "text": "a charcoal sketch nailed to a tree: a stair of stone descending into a great open mouth."
+    }
+  ]
+}

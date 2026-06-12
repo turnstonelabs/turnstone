@@ -43,5 +43,16 @@
     "def": 6,
     "xp": 140,
     "gold": 60
+  },
+  {
+    "tier": 6,
+    "name": "the Wyrm Below",
+    "hp": 120,
+    "atk": 24,
+    "def": 8,
+    "xp": 400,
+    "gold": 250,
+    "boss": true,
+    "id": "wyrm_below"
   }
 ]

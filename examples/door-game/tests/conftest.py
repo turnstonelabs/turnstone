@@ -21,6 +21,7 @@ from understone.engine.models import (
     Settings,
     Slot,
     TerrainDef,
+    WorldEvent,
     Zone,
 )
 from understone.engine.world import World
@@ -46,12 +47,17 @@ DEFAULT_SETTINGS = Settings(
     starting_gold=20,
     starting_weapon="rusty_dagger",
     starting_armor="cloth_tunic",
+    start_hp=20,
+    start_atk=3,
+    start_def=0,
     xp_base=100,
     growth_max_hp=6,
     growth_atk=2,
     growth_def=1,
     bestow_daily_budget=25,
     dungeon_tiers=(4, 5),
+    boss_monster="wyrm_below",
+    wyrm_min_level=6,
 )
 
 
@@ -64,12 +70,17 @@ def make_settings(**overrides: object) -> Settings:
         "starting_gold": DEFAULT_SETTINGS.starting_gold,
         "starting_weapon": DEFAULT_SETTINGS.starting_weapon,
         "starting_armor": DEFAULT_SETTINGS.starting_armor,
+        "start_hp": DEFAULT_SETTINGS.start_hp,
+        "start_atk": DEFAULT_SETTINGS.start_atk,
+        "start_def": DEFAULT_SETTINGS.start_def,
         "xp_base": DEFAULT_SETTINGS.xp_base,
         "growth_max_hp": DEFAULT_SETTINGS.growth_max_hp,
         "growth_atk": DEFAULT_SETTINGS.growth_atk,
         "growth_def": DEFAULT_SETTINGS.growth_def,
         "bestow_daily_budget": DEFAULT_SETTINGS.bestow_daily_budget,
         "dungeon_tiers": DEFAULT_SETTINGS.dungeon_tiers,
+        "boss_monster": DEFAULT_SETTINGS.boss_monster,
+        "wyrm_min_level": DEFAULT_SETTINGS.wyrm_min_level,
     }
     base.update(overrides)
     return Settings(**base)  # type: ignore[arg-type]
@@ -99,6 +110,7 @@ def make_player(**overrides: object) -> Player:
         "log_cursor": 0,
         "bestow_spent": 0,
         "bestow_day": 0,
+        "wins": 0,
     }
     fields.update(overrides)
     return Player(**fields)  # type: ignore[arg-type]
@@ -106,7 +118,17 @@ def make_player(**overrides: object) -> Player:
 
 def make_monster(**overrides: object) -> Monster:
     """Build a Monster at tier-1 defaults."""
-    fields = {"tier": 1, "name": "Field Rat", "hp": 6, "atk": 3, "def_": 0, "xp": 8, "gold": 3}
+    fields = {
+        "tier": 1,
+        "name": "Field Rat",
+        "hp": 6,
+        "atk": 3,
+        "def_": 0,
+        "xp": 8,
+        "gold": 3,
+        "monster_id": "",
+        "boss": False,
+    }
     fields.update(overrides)
     return Monster(**fields)  # type: ignore[arg-type]
 
@@ -122,6 +144,7 @@ def make_world(
     monsters: list[Monster] | None = None,
     items: list[Item] | None = None,
     settings: Settings | None = None,
+    events: list[WorldEvent] | None = None,
 ) -> World:
     """Build a small synthetic World (all-grass by default)."""
     if grid is None:
@@ -137,6 +160,7 @@ def make_world(
         monsters=monsters or [make_monster()],
         items=items or _default_items(),
         settings=settings or DEFAULT_SETTINGS,
+        events=events,
     )
 
 

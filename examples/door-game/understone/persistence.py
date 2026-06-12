@@ -23,7 +23,7 @@ from typing import TYPE_CHECKING
 
 from understone.engine.log import Event
 from understone.engine.models import Mode, Player
-from understone.engine.rank import RankEntry
+from understone.engine.rank import HallEntry, RankEntry
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -58,6 +58,7 @@ _PLAYER_COLUMNS = (
     "log_cursor",
     "bestow_spent",
     "bestow_day",
+    "wins",
 )
 
 
@@ -97,7 +98,8 @@ class Store:
                 last_seen   TEXT NOT NULL,
                 log_cursor  INTEGER NOT NULL,
                 bestow_spent INTEGER NOT NULL,
-                bestow_day  INTEGER NOT NULL
+                bestow_day  INTEGER NOT NULL,
+                wins        INTEGER NOT NULL DEFAULT 0
             );
 
             CREATE TABLE IF NOT EXISTS events (
@@ -106,6 +108,14 @@ class Store:
                 actor TEXT NOT NULL,
                 kind  TEXT NOT NULL,
                 text  TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS hall_of_fame (
+                id           INTEGER PRIMARY KEY AUTOINCREMENT,
+                name         TEXT NOT NULL,
+                win_ts       TEXT NOT NULL,
+                run_days     INTEGER NOT NULL,
+                level_at_win INTEGER NOT NULL
             );
 
             CREATE TABLE IF NOT EXISTS meta (
@@ -172,6 +182,14 @@ class Store:
         )
         return int(cur.lastrowid or 0)
 
+    def insert_hall_row(self, name: str, win_ts: str, run_days: int, level_at_win: int) -> int:
+        """Append a Hall of Legends row (no commit) and return its new id."""
+        cur = self._conn.execute(
+            "INSERT INTO hall_of_fame(name, win_ts, run_days, level_at_win) VALUES(?, ?, ?, ?)",
+            (name, win_ts, run_days, level_at_win),
+        )
+        return int(cur.lastrowid or 0)
+
     def commit(self) -> None:
         """Commit the current transaction."""
         self._conn.commit()
@@ -181,12 +199,35 @@ class Store:
     def top_ranks(self, limit: int = 10) -> list[RankEntry]:
         """Return the leaderboard ordered by level, xp, then name."""
         rows = self._conn.execute(
-            "SELECT name, level, xp, gold FROM players "
+            "SELECT name, level, xp, gold, wins FROM players "
             "ORDER BY level DESC, xp DESC, name ASC LIMIT ?",
             (limit,),
         )
         return [
-            RankEntry(name=row["name"], level=row["level"], xp=row["xp"], gold=row["gold"])
+            RankEntry(
+                name=row["name"],
+                level=row["level"],
+                xp=row["xp"],
+                gold=row["gold"],
+                wins=row["wins"],
+            )
+            for row in rows
+        ]
+
+    def top_hall(self, limit: int = 5) -> list[HallEntry]:
+        """Return the most recent Hall of Legends rows, newest first."""
+        rows = self._conn.execute(
+            "SELECT name, win_ts, run_days, level_at_win FROM hall_of_fame "
+            "ORDER BY id DESC LIMIT ?",
+            (limit,),
+        )
+        return [
+            HallEntry(
+                name=row["name"],
+                win_ts=row["win_ts"],
+                run_days=row["run_days"],
+                level_at_win=row["level_at_win"],
+            )
             for row in rows
         ]
 
@@ -223,6 +264,7 @@ def _player_to_row(player: Player) -> tuple[object, ...]:
         player.log_cursor,
         player.bestow_spent,
         player.bestow_day,
+        player.wins,
     )
 
 
@@ -249,6 +291,7 @@ def _row_to_player(row: sqlite3.Row) -> Player:
         log_cursor=row["log_cursor"],
         bestow_spent=row["bestow_spent"],
         bestow_day=row["bestow_day"],
+        wins=row["wins"],
     )
 
 

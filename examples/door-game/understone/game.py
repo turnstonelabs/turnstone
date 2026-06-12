@@ -18,7 +18,7 @@ from typing import TYPE_CHECKING
 from understone.engine import combat, leveling, movement, turns
 from understone.engine.log import Event, since
 from understone.engine.models import Mode, Player, Slot
-from understone.engine.rank import RankEntry, leaderboard
+from understone.engine.rank import HallEntry, RankEntry, leaderboard
 from understone.engine.rng import GameRNG
 from understone.persistence import EVENT_TAIL_KEEP
 from understone.screen.grid import Cell, CellGrid
@@ -42,6 +42,50 @@ _NAME_MAX_LEN = 24
 _REASON_MAX_LEN = 120
 
 _COLOR_BY_NAME = {c.value: c for c in Color}
+
+# The Understone Herald — the public feed's masthead and its "all quiet" line.
+_HERALD_HEADER = "═══ The Understone Herald ═══"
+_HERALD_QUIET = "The Vale is still; the Herald has no fresh word for you."
+
+# Public-feed write templates, 2-3 phrasings per notable kind, picked per write
+# so the broadsheet reads with period variety. Only NOTABLE beats reach the feed
+# (joins, blessings, level-ups, defeats, and the Wyrm's fate); routine town
+# errands stay private. Player names are sanitised at join and monster names come
+# from the validated pack, so interpolation here is safe.
+_HERALD_TEMPLATES: dict[str, tuple[str, ...]] = {
+    "join": (
+        "{name} has signed the ledger and set out into the Vale.",
+        "A new adventurer, {name}, arrives at the western gate.",
+        "Word spreads of {name}, newly come to seek their fortune.",
+    ),
+    "bestow": (
+        "Fortune favours {name}: {granted} — {reason}",
+        "A boon falls upon {name}: {granted}. ({reason})",
+        "The fates smile on {name} with {granted} — {reason}",
+    ),
+    "level_up": (
+        "{name} now strides the Vale at level {n}.",
+        "Hardened by trials, {name} rises to level {n}.",
+        "{name} has grown in renown, reaching level {n}.",
+    ),
+    "defeat": (
+        "{name} was dragged back to town by a {monster}.",
+        "A {monster} bested {name}, who limped home to lick their wounds.",
+        "{name} fell to a {monster} and woke at the spawn-stone.",
+    ),
+    "wyrm_win": (
+        "THE WYRM IS SLAIN! {name} has freed the Vale!",
+        "THE WYRM BELOW IS DEAD! {name} stands triumphant over its ruin!",
+    ),
+    "wyrm_lose": (
+        "{name} was devoured by the Wyrm Below.",
+        "The Wyrm Below swallowed {name} whole; the Vale mourns.",
+    ),
+    "wyrm_flee": (
+        "{name} fled the Wyrm Below, alive but unproven.",
+        "{name} broke from the Wyrm Below and ran for the light.",
+    ),
+}
 
 
 class Game:
@@ -105,6 +149,17 @@ class Game:
     def _ensure_day(self, player: Player) -> None:
         if turns.ensure_day(player, self.clock, self.world.settings.daily_turns):
             player.last_seen = self._now_iso()
+
+    def _herald(self, kind: str, actor: str, **fields: object) -> tuple[str, str, str]:
+        """Build a public feed event for *kind*, picking a phrasing via the RNG.
+
+        Returns the ``(kind, actor, text)`` tuple ``_persist`` expects. The
+        phrasing is chosen from :data:`_HERALD_TEMPLATES` so the broadsheet
+        varies; the choice is deterministic under a seeded RNG.
+        """
+        phrasings = _HERALD_TEMPLATES[kind]
+        text = phrasings[self.rng.choice_index(len(phrasings))].format(name=actor, **fields)
+        return (kind, actor, text)
 
     def _persist(self, player: Player, *events: tuple[str, str, str]) -> None:
         """Update + append in one transaction, then commit (state changes).
@@ -202,18 +257,15 @@ class Game:
             return self._overworld_frame(existing, lines=[banner])
 
         settings = self.world.settings
-        weapon = self.world.item_by_id(settings.starting_weapon)
-        armor = self.world.item_by_id(settings.starting_armor)
-        atk = 3 + (weapon.atk if weapon else 0)
-        def_ = 0 + (armor.def_ if armor else 0)
+        atk, def_, max_hp = self._fresh_combat_stats()
         now = self._now_iso()
         today = self.clock().toordinal()
         player = Player(
             name=clean,
             x=self.world.spawn[0],
             y=self.world.spawn[1],
-            hp=20,
-            max_hp=20,
+            hp=max_hp,
+            max_hp=max_hp,
             level=1,
             xp=0,
             gold=settings.starting_gold,
@@ -230,17 +282,30 @@ class Game:
             log_cursor=self._latest_event_id(),
             bestow_spent=0,
             bestow_day=today,
+            wins=0,
         )
         self.players[clean] = player
-        self._persist(
-            player,
-            ("join", clean, f"{clean} stepped into {self.world.name} for the first time."),
-        )
+        self._persist(player, self._herald("join", clean))
         banner = (
             f"You arrive in {self.world.name}, {clean}. A road runs east from the town.\n"
             "New here? Call door_help to learn how the world is run."
         )
         return self._overworld_frame(player, lines=[banner])
+
+    def _fresh_combat_stats(self) -> tuple[int, int, int]:
+        """Return the fresh ``(atk, def_, max_hp)`` for the starting kit.
+
+        Shared by ``join`` and the Wyrm-slain legacy reset so a new hero and a
+        reborn one start from exactly the same numbers. The un-equipped human
+        baseline (HP/ATK/DEF) comes from the content pack's settings; the
+        starting weapon/armour bonuses are added on top.
+        """
+        settings = self.world.settings
+        weapon = self.world.item_by_id(settings.starting_weapon)
+        armor = self.world.item_by_id(settings.starting_armor)
+        atk = settings.start_atk + (weapon.atk if weapon else 0)
+        def_ = settings.start_def + (armor.def_ if armor else 0)
+        return atk, def_, settings.start_hp
 
     def _latest_event_id(self) -> int:
         return self.events[-1].event_id if self.events else 0
@@ -316,9 +381,26 @@ class Game:
                 lines.append(f"You reach {loc.name} and step inside.")
         elif result.blocked:
             lines.append(f"Your way is blocked by {result.blocked_reason}.")
+        if result.event is not None:
+            lines.append(self._narrate_event(result.event))
         if result.pending_fight is not None:
             lines.append("Something blocks your path, snarling. (door_action: fight  or  flee)")
         return lines
+
+    @staticmethod
+    def _narrate_event(event: movement.MoveEvent) -> str:
+        """Render a private overworld event line (already applied to the player)."""
+        if event.kind == "gold":
+            return f"You find {event.text} — +{event.amount} gold."
+        if event.kind == "heal":
+            if event.amount <= 0:
+                return f"You come upon {event.text}, but you are already whole."
+            return f"You come upon {event.text} — +{event.amount} HP."
+        if event.kind == "trap":
+            if event.amount <= 0:
+                return f"You stumble into {event.text}, but shrug it off."
+            return f"You stumble into {event.text} — -{event.amount} HP."
+        return f"You pass {event.text}"
 
     # -- tool: action ----------------------------------------------------
 
@@ -375,34 +457,54 @@ class Game:
             result = combat.resolve_fight(child, player, monster)
         return self._apply_fight(player, result)
 
+    def _apply_xp_with_herald(
+        self, player: Player, amount: int, lines: list[str]
+    ) -> list[tuple[str, str, str]]:
+        """Award XP, append per-level narration to *lines*, and herald the climb.
+
+        Returns the public-feed events to persist: a single ``level_up`` beat at
+        the highest level reached (a multi-level jump is one notable beat, not a
+        flood), or none when no level was gained.
+        """
+        gains = leveling.apply_xp(player, amount, self.world.settings)
+        for gain in gains:
+            lines.append(
+                f"You reach level {gain.new_level}! "
+                f"(+{gain.hp_gain} HP, +{gain.atk_gain} ATK, +{gain.def_gain} DEF)"
+            )
+        if not gains:
+            return []
+        return [self._herald("level_up", player.name, n=gains[-1].new_level)]
+
+    @staticmethod
+    def _append_kill_and_reward(lines: list[str], result: combat.FightResult) -> None:
+        """Compose the ``"The <monster> falls. +X XP, +Y gold."`` line.
+
+        Combat itself no longer narrates the kill's reward — the engine cannot
+        know whether the caller will actually bank the xp/gold. This appends the
+        full falls+reward line at the ownership layer, the instant the gold/xp
+        are applied, so a reward is never narrated where none is granted (the
+        Wyrm-win legacy reset builds its own celebration and calls this NOT at
+        all). The text matches the old single-line form exactly.
+        """
+        lines.append(
+            f"The {result.monster_name} falls. +{result.xp_delta} XP, +{result.gold_delta} gold."
+        )
+
     def _apply_fight(self, player: Player, result: combat.FightResult) -> str:
         lines = list(result.log)
         events: list[tuple[str, str, str]] = []
 
         player.hp = max(1, player.hp + result.hp_delta)
-        if result.gold_delta:
+        if result.outcome is combat.Outcome.WIN:
+            self._append_kill_and_reward(lines, result)
             player.gold += result.gold_delta
-        if result.xp_delta:
-            gains = leveling.apply_xp(player, result.xp_delta, self.world.settings)
-            for gain in gains:
-                lines.append(
-                    f"You reach level {gain.new_level}! "
-                    f"(+{gain.hp_gain} HP, +{gain.atk_gain} ATK, +{gain.def_gain} DEF)"
-                )
-                events.append(
-                    ("level", player.name, f"{player.name} reached level {gain.new_level}.")
-                )
+            events.extend(self._apply_xp_with_herald(player, result.xp_delta, lines))
 
         if result.bounce_to_spawn:
             player.hp = 1
             player.x, player.y = self.world.spawn
-            events.append(
-                ("defeat", player.name, f"{player.name} was felled by a {result.monster_name}.")
-            )
-        elif result.outcome is combat.Outcome.WIN:
-            events.append(
-                ("victory", player.name, f"{player.name} bested a {result.monster_name}.")
-            )
+            events.append(self._herald("defeat", player.name, monster=result.monster_name))
 
         self._persist(player, *events)
         return self._overworld_frame(player, lines=lines)
@@ -433,6 +535,8 @@ class Game:
             return self._sell(player)
         if verb == "descend":
             return self._descend(player)
+        if verb == "challenge":
+            return self._challenge(player)
         return self._location_menu(player, lines=[f"The '{verb}' option isn't ready."])
 
     def _leave(self, player: Player) -> str:
@@ -444,9 +548,8 @@ class Game:
     def _rest(self, player: Player) -> str:
         cost = self.world.settings.rest_cost
         if leveling.rest(player, cost):
-            self._persist(
-                player, ("rest", player.name, f"{player.name} slept the night at the inn.")
-            )
+            # A night's rest is a private errand, not Herald news; persist only.
+            self._persist(player)
             return self._location_menu(
                 player, lines=[f"You sleep deeply and wake at full health. (-{cost} gold)"]
             )
@@ -465,7 +568,8 @@ class Game:
                 player,
                 lines=[f"You haven't the coin for healing ({per_hp} gold per point)."],
             )
-        self._persist(player, ("heal", player.name, f"{player.name} was mended at the shrine."))
+        # Mending at the shrine is a private errand; persist without Herald news.
+        self._persist(player)
         return self._location_menu(
             player,
             lines=[f"The keeper restores {outcome.healed} HP. (-{outcome.cost} gold)"],
@@ -485,7 +589,8 @@ class Game:
             )
         player.gold -= item.price
         line = self._equip_or_quaff(player, item)
-        self._persist(player, ("buy", player.name, f"{player.name} bought {item.name}."))
+        # Shopping is a private errand; persist without Herald news.
+        self._persist(player)
         return self._location_menu(player, lines=[line])
 
     def _equip_or_quaff(self, player: Player, item: Item) -> str:
@@ -525,7 +630,8 @@ class Game:
         fallback = self.world.item_by_id(starter)
         player.atk -= weapon.atk - (fallback.atk if fallback else 0)
         player.weapon_id = starter
-        self._persist(player, ("sell", player.name, f"{player.name} sold a {weapon.name}."))
+        # Selling back gear is a private errand; persist without Herald news.
+        self._persist(player)
         return self._location_menu(
             player,
             lines=[
@@ -560,12 +666,13 @@ class Game:
                 lines=["You're too weary to descend today. Return tomorrow."],
             )
         lines = ["You descend into the Understone Deep..."]
+        events: list[tuple[str, str, str]] = []
         for tier in self.world.settings.dungeon_tiers:
             band = self.world.monsters_for_tier_band(tier, tier)
             if not band:
                 continue
-            # band[0] on purpose: the boss ladder is a fixed, repeatable endgame
-            # encounter (the the classic door games fixed-dragon convention), never randomized.
+            # band[0] on purpose: the gauntlet ladder is a fixed, repeatable
+            # encounter (the classic fixed-foe convention), never randomized.
             monster = band[0]
             result = combat.resolve_fight(self.rng.child(), player, monster)
             lines.append("")
@@ -576,37 +683,154 @@ class Game:
                 player.x, player.y = self.world.spawn
                 player.mode = Mode.TILE
                 player.at_location = ""
-                self._persist(
-                    player,
-                    ("defeat", player.name, f"{player.name} fell in the Deep to a {monster.name}."),
-                )
+                events.append(self._herald("defeat", player.name, monster=monster.name))
+                self._persist(player, *events)
                 return self._overworld_frame(player, lines=lines)
-            if result.gold_delta:
+            if result.outcome is combat.Outcome.WIN:
+                self._append_kill_and_reward(lines, result)
                 player.gold += result.gold_delta
-            if result.xp_delta:
-                for gain in leveling.apply_xp(player, result.xp_delta, self.world.settings):
-                    lines.append(
-                        f"You reach level {gain.new_level}! "
-                        f"(+{gain.hp_gain} HP, +{gain.atk_gain} ATK, +{gain.def_gain} DEF)"
-                    )
+                events.extend(self._apply_xp_with_herald(player, result.xp_delta, lines))
         lines.append("")
         lines.append("You climb back to the surface, victorious and laden.")
-        self._persist(
-            player, ("descend", player.name, f"{player.name} cleared the Understone Deep.")
-        )
+        self._persist(player, *events)
         return self._location_menu(player, lines=lines)
+
+    # -- the Wyrm Below: the endgame challenge ---------------------------
+
+    def _challenge(self, player: Player) -> str:
+        """Face the Wyrm Below — the win condition, with a classic-door-game-style reset.
+
+        Gated behind ``wyrm_min_level``; spends a daily turn like a fight; then
+        resolves a single fight against the boss. A win immortalises the run in
+        the Hall of Legends and reincarnates the hero (legend kept as a ★); a
+        loss bounces them to the spawn; a stalemate counts as a flight.
+        """
+        min_level = self.world.settings.wyrm_min_level
+        if player.level < min_level:
+            return self._location_menu(
+                player,
+                lines=[
+                    f"The Wyrm Below stirs only for those of the {_ordinal(min_level)} "
+                    "circle or beyond. Grow stronger, then return."
+                ],
+            )
+
+        boss = self.world.monster_by_id(self.world.settings.boss_monster)
+        if boss is None:
+            # Defensive: the loader guarantees the boss resolves, so this is an
+            # in-fiction fallback rather than a crossing exception. Checked
+            # before the day-roll so an unfightable challenge never mutates state.
+            return self._location_menu(
+                player, lines=["The deep is silent; the Wyrm does not answer today."]
+            )
+
+        self._ensure_day(player)
+        if not turns.spend_turn(player):
+            self.store.upsert_player(player)
+            self.store.commit()
+            return self._location_menu(
+                player,
+                lines=["You are too spent to challenge the Wyrm today. Return tomorrow."],
+            )
+
+        result = combat.resolve_fight(self.rng.child(), player, boss)
+        if result.outcome is combat.Outcome.WIN:
+            return self._wyrm_won(player, result)
+        if result.bounce_to_spawn:
+            return self._wyrm_lost(player, result)
+        return self._wyrm_fled(player, result)
+
+    def _wyrm_won(self, player: Player, result: combat.FightResult) -> str:
+        """Record the kill, herald it, and reincarnate the hero with a ★."""
+        lines = list(result.log)
+        level_at_win = player.level
+        run_days = self._run_days(player)
+        self.store.insert_hall_row(player.name, self._now_iso(), run_days, level_at_win)
+        event = self._herald("wyrm_win", player.name)
+        self._reset_with_legacy(player)
+        self._persist(player, event)
+
+        days_word = "day" if run_days == 1 else "days"
+        lines.append("")
+        lines.append(f"THE WYRM BELOW IS SLAIN. {player.name}, you have freed the Vale.")
+        lines.append(
+            f"Your legend is carved into the Hall of Legends: "
+            f"level {level_at_win}, a {run_days}-{days_word} road."
+        )
+        lines.append(
+            "The Vale renews itself around you. You begin again at the town, your gear "
+            "and gold as on your first day — but the star of this victory is yours forever "
+            f"(★ x{player.wins})."
+        )
+        return self._overworld_frame(player, lines=lines)
+
+    def _wyrm_lost(self, player: Player, result: combat.FightResult) -> str:
+        """Standard defeat: bounce to spawn at 1 HP, herald the devouring."""
+        lines = list(result.log)
+        player.hp = 1
+        player.x, player.y = self.world.spawn
+        player.mode = Mode.TILE
+        player.at_location = ""
+        self._persist(player, self._herald("wyrm_lose", player.name))
+        return self._overworld_frame(player, lines=lines)
+
+    def _wyrm_fled(self, player: Player, result: combat.FightResult) -> str:
+        """Stalemate flight: keep any HP lost, herald the retreat, stay put."""
+        lines = list(result.log)
+        player.hp = max(1, player.hp + result.hp_delta)
+        self._persist(player, self._herald("wyrm_flee", player.name))
+        return self._location_menu(player, lines=lines)
+
+    def _run_days(self, player: Player) -> int:
+        """Whole days between the hero's creation and now (clock-derived, >= 0)."""
+        try:
+            created = datetime.fromisoformat(player.created_at)
+        except ValueError:
+            return 0
+        return max(0, (self.clock() - created).days)
+
+    def _reset_with_legacy(self, player: Player) -> None:
+        """Reincarnate *player* to fresh-start values, banking the win as legend.
+
+        Stats, equipment, HP, gold, level/xp and position all return to the
+        first-day baseline and ``created_at`` is restamped; ``wins`` rises by
+        one. The daily clock (turns/turn_day), the bestow pool, and the log
+        cursor are deliberately UNTOUCHED — a legacy run is a fresh character,
+        not a fresh day.
+        """
+        settings = self.world.settings
+        atk, def_, max_hp = self._fresh_combat_stats()
+        player.wins += 1
+        player.level = 1
+        player.xp = 0
+        player.gold = settings.starting_gold
+        player.atk = atk
+        player.def_ = def_
+        player.max_hp = max_hp
+        player.hp = max_hp
+        player.weapon_id = settings.starting_weapon
+        player.armor_id = settings.starting_armor
+        player.x, player.y = self.world.spawn
+        player.mode = Mode.TILE
+        player.at_location = ""
+        player.created_at = self._now_iso()
 
     # -- tool: log -------------------------------------------------------
 
     def log(self, name: str) -> str:
-        """Report events since the player's cursor, then advance it."""
+        """Report events since the player's cursor, then advance it.
+
+        Dressed as the Understone Herald broadsheet: a masthead, the fresh
+        dispatches, then the status footer. Read-path/cursor semantics are
+        unchanged — only the framing is new.
+        """
         player = self._get(name)
         if player is None:
             return self._unknown(name)
         fresh, new_cursor = since(self.events, player.log_cursor)
         if not fresh:
-            return "All quiet since your last visit.\n" + self._footer(player)
-        lines = ["While you were away:"]
+            return f"{_HERALD_HEADER}\n{_HERALD_QUIET}\n" + self._footer(player)
+        lines = [_HERALD_HEADER, "Word from across the Vale since your last visit:"]
         lines.extend(f"  - {event.text}" for event in fresh)
         player.log_cursor = new_cursor
         self._persist(player)
@@ -615,14 +839,20 @@ class Game:
     # -- tool: rank ------------------------------------------------------
 
     def rank(self, name: str) -> str:
-        """Render the top-10 leaderboard, marking the caller's row."""
+        """Render the top-10 leaderboard, marking the caller's row.
+
+        Names carry one ★ per Wyrm slain. Main ordering is unchanged (level
+        desc, xp desc, name asc). Below the table, the Hall of Legends lists
+        the most recent completed runs; it is omitted entirely when empty.
+        """
         entries = [
-            RankEntry(name=p.name, level=p.level, xp=p.xp, gold=p.gold)
+            RankEntry(name=p.name, level=p.level, xp=p.xp, gold=p.gold, wins=p.wins)
             for p in self.players.values()
         ]
         top = leaderboard(entries, limit=10)
         caller = name.strip()
         lines = _render_rank_table(top, caller)
+        lines.extend(_render_hall(self.store.top_hall(5)))
         player = self._get(caller)
         footer = self._footer(player) if player is not None else "[ The Vale of Understone ]"
         return "\n".join(lines) + "\n" + footer
@@ -682,8 +912,9 @@ class Game:
         if heal_applied:
             parts.append(f"+{heal_applied} HP")
         granted = " and ".join(parts)
-        text = f"Fortune favours {player.name}: {granted} — {clean_reason}"
-        self._persist(player, ("bestow", player.name, text))
+        self._persist(
+            player, self._herald("bestow", player.name, granted=granted, reason=clean_reason)
+        )
         confirm = (
             f"A bestowal falls upon {player.name}: {granted}.\n"
             f"Reason: {clean_reason}\n"
@@ -693,8 +924,13 @@ class Game:
 
 
 def _render_rank_table(entries: list[RankEntry], caller: str) -> list[str]:
-    """Render a box-drawing leaderboard table, marking the caller's row."""
-    header = "  #  Adventurer            Lv     XP   Gold"
+    """Render a box-drawing leaderboard table, marking the caller's row.
+
+    The name and the win-stars live in separate columns so a long name can
+    never swallow its own ★s: a 24-wide name field, then a 6-wide stars field
+    (``★`` per win up to five, then a compact ``★xN`` for more).
+    """
+    header = f"  #  {'Adventurer':<24} {'★':<6} Lv     XP   Gold"
     width = len(header) + 2
     top = "┌" + "─" * width + "┐"
     bottom = "└" + "─" * width + "┘"
@@ -704,7 +940,62 @@ def _render_rank_table(entries: list[RankEntry], caller: str) -> list[str]:
         lines.append("│ " + "(no heroes have ventured yet)".ljust(width - 1) + "│")
     for i, entry in enumerate(entries, start=1):
         mark = "*" if entry.name == caller else " "
-        row = f"{mark}{i:>2}  {entry.name:<20.20} {entry.level:>2} {entry.xp:>6} {entry.gold:>6}"
+        stars = _win_stars(entry.wins)
+        row = (
+            f"{mark}{i:>2}  {entry.name:<24.24} {stars:<6} "
+            f"{entry.level:>2} {entry.xp:>6} {entry.gold:>6}"
+        )
         lines.append("│ " + row.ljust(width - 1) + "│")
     lines.append(bottom)
     return lines
+
+
+def _win_stars(wins: int) -> str:
+    """Render the win column: blank at zero, ``★`` per win to five, then ``★xN``."""
+    if wins <= 0:
+        return ""
+    if wins <= 5:
+        return "★" * wins
+    return f"★x{wins}"
+
+
+def _render_hall(entries: list[HallEntry]) -> list[str]:
+    """Render the Hall of Legends block under the leaderboard, or nothing.
+
+    Each row is one immortalised run: the hero's name, the level they slew the
+    Wyrm at, the length of that run in days, and the date. Returns an empty
+    list when no one has yet won, so the section vanishes entirely.
+    """
+    if not entries:
+        return []
+    out = ["", "Hall of Legends — those who slew the Wyrm Below:"]
+    for entry in entries:
+        days_word = "day" if entry.run_days == 1 else "days"
+        date = entry.win_ts[:10]
+        out.append(
+            f"  ★ {entry.name:<20.20} Lv {entry.level_at_win:>2}  "
+            f"{entry.run_days:>3} {days_word:<4}  {date}"
+        )
+    return out
+
+
+_ORDINALS = (
+    "zeroth",
+    "first",
+    "second",
+    "third",
+    "fourth",
+    "fifth",
+    "sixth",
+    "seventh",
+    "eighth",
+    "ninth",
+    "tenth",
+)
+
+
+def _ordinal(n: int) -> str:
+    """Return a lowercase fictional ordinal for *n* (falls back to ``Nth``)."""
+    if 0 <= n < len(_ORDINALS):
+        return _ORDINALS[n]
+    return f"{n}th"

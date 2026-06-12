@@ -6,6 +6,7 @@ The pack is a directory of JSON files:
 * ``monsters.json``  — monster definitions by tier.
 * ``items.json``     — equipment / consumable definitions.
 * ``locations.json`` — location kinds (name, glyph, actions, flavour).
+* ``events.json``    — the weighted overworld encounter table.
 * ``world.json``     — the map: dimensions, spawn, legend-compressed
   ``terrain_rows``, location placements, zones, and economy ``settings``.
 
@@ -26,6 +27,7 @@ from understone.engine.models import (
     Settings,
     Slot,
     TerrainDef,
+    WorldEvent,
     Zone,
 )
 from understone.engine.world import World
@@ -39,9 +41,21 @@ _SETTINGS_BANDS: dict[str, tuple[int, int | None]] = {
     "rest_cost": (0, None),
     "heal_cost_per_hp": (0, None),
     "starting_gold": (0, None),
+    "start_hp": (1, 500),
+    "start_atk": (0, 100),
+    "start_def": (0, 100),
     "xp_base": (1, None),
     "bestow_daily_budget": (0, 500),
+    "wyrm_min_level": (1, 50),
 }
+
+# Per-kind amount bands for the overworld event table (inclusive).
+_EVENT_AMOUNT_BANDS: dict[str, tuple[int, int]] = {
+    "gold": (1, 500),
+    "trap": (1, 500),
+    "heal": (1, 100),
+}
+_EVENT_KINDS = frozenset({"fight", "gold", "heal", "trap", "lore"})
 
 
 def load_world(pack_dir: str | Path) -> World:
@@ -54,7 +68,8 @@ def load_world(pack_dir: str | Path) -> World:
     monsters = _load_monsters(root)
     items = _load_items(root)
     location_kinds = _load_location_kinds(root)
-    return _load_map(root, terrain_defs, monsters, items, location_kinds)
+    events = _load_events(root)
+    return _load_map(root, terrain_defs, monsters, items, location_kinds, events)
 
 
 def _read_json(root: Path, name: str) -> Any:
@@ -126,6 +141,8 @@ def _load_monsters(root: Path) -> list[Monster]:
                 def_=def_,
                 xp=xp,
                 gold=gold,
+                monster_id=str(spec.get("id", "")),
+                boss=bool(spec.get("boss", False)),
             )
         )
     if not out:
@@ -185,12 +202,75 @@ def _load_location_kinds(root: Path) -> dict[str, dict[str, Any]]:
     return raw
 
 
+def _load_events(root: Path) -> list[WorldEvent]:
+    """Parse and validate the weighted overworld event table.
+
+    Requires at least one ``fight`` entry (else a walk could never spawn a
+    monster), strictly-positive weights, ``min <= max`` within the per-kind
+    amount band, and non-empty text on every non-fight entry. Each failure
+    names the file, the row index, and the offending field.
+    """
+    raw = _read_json(root, "events.json")
+    if not isinstance(raw, dict):
+        raise WorldLoadError("events.json must be an object with an 'events' list")
+    rows = _require(raw, "events", "events.json")
+    if not isinstance(rows, list) or not rows:
+        raise WorldLoadError("events.json 'events' must be a non-empty list of event objects")
+
+    out: list[WorldEvent] = []
+    has_fight = False
+    for i, spec in enumerate(rows):
+        where = f"events.json[{i}]"
+        if not isinstance(spec, dict):
+            raise WorldLoadError(f"{where} must be an object")
+        kind = str(_require(spec, "kind", where))
+        if kind not in _EVENT_KINDS:
+            valid = ", ".join(sorted(_EVENT_KINDS))
+            raise WorldLoadError(f"{where} kind {kind!r} is not one of: {valid}")
+        weight = int(_require(spec, "weight", where))
+        if weight <= 0:
+            raise WorldLoadError(f"{where} weight must be > 0, got {weight}")
+        lo, hi = _decode_event_amount(spec, kind, where)
+        text = str(spec.get("text", ""))
+        if kind != "fight" and not text.strip():
+            raise WorldLoadError(f"{where} kind {kind!r} requires non-empty 'text'")
+        if kind == "fight":
+            has_fight = True
+        out.append(WorldEvent(kind=kind, weight=weight, text=text, lo=lo, hi=hi))
+
+    if not has_fight:
+        raise WorldLoadError("events.json must contain at least one 'fight' entry")
+    return out
+
+
+def _decode_event_amount(spec: dict[str, Any], kind: str, where: str) -> tuple[int, int]:
+    """Return the ``(lo, hi)`` amount band for an event row, validated.
+
+    Value-bearing kinds (gold/heal/trap) must declare ``min``/``max`` within
+    the per-kind band with ``min <= max``; fight/lore carry no amount.
+    """
+    band = _EVENT_AMOUNT_BANDS.get(kind)
+    if band is None:
+        return 0, 0
+    band_lo, band_hi = band
+    lo = int(_require(spec, "min", where))
+    hi = int(_require(spec, "max", where))
+    if lo > hi:
+        raise WorldLoadError(f"{where} min {lo} exceeds max {hi}")
+    if lo < band_lo or hi > band_hi:
+        raise WorldLoadError(
+            f"{where} {kind} amount {lo}..{hi} is out of band ({band_lo}..{band_hi})"
+        )
+    return lo, hi
+
+
 def _load_map(
     root: Path,
     terrain_defs: dict[str, TerrainDef],
     monsters: list[Monster],
     items: list[Item],
     location_kinds: dict[str, dict[str, Any]],
+    events: list[WorldEvent],
 ) -> World:
     raw = _read_json(root, "world.json")
     if not isinstance(raw, dict):
@@ -229,6 +309,7 @@ def _load_map(
         monsters=monsters,
         items=items,
         settings=settings,
+        events=events,
     )
 
 
@@ -423,6 +504,7 @@ def _decode_settings(raw: dict[str, Any], items: list[Item], monsters: list[Mons
             )
 
     dungeon_tiers = _decode_dungeon_tiers(spec, monsters)
+    boss_monster = _decode_boss_monster(spec, monsters)
 
     return Settings(
         daily_turns=values["daily_turns"],
@@ -431,25 +513,52 @@ def _decode_settings(raw: dict[str, Any], items: list[Item], monsters: list[Mons
         starting_gold=values["starting_gold"],
         starting_weapon=starting_weapon,
         starting_armor=starting_armor,
+        start_hp=values["start_hp"],
+        start_atk=values["start_atk"],
+        start_def=values["start_def"],
         xp_base=values["xp_base"],
         growth_max_hp=growth_max_hp,
         growth_atk=growth_atk,
         growth_def=growth_def,
         bestow_daily_budget=values["bestow_daily_budget"],
         dungeon_tiers=dungeon_tiers,
+        boss_monster=boss_monster,
+        wyrm_min_level=values["wyrm_min_level"],
     )
+
+
+def _decode_boss_monster(spec: dict[str, Any], monsters: list[Monster]) -> str:
+    """Resolve and validate the endgame boss monster id.
+
+    The id must name a monster in the pack, and that monster must carry the
+    ``boss`` flag (so the endgame foe is never a stray random encounter).
+    """
+    boss_id = str(_require(spec, "boss_monster", "world.json settings"))
+    by_id = {m.monster_id: m for m in monsters if m.monster_id}
+    monster = by_id.get(boss_id)
+    if monster is None:
+        raise WorldLoadError(
+            f"world.json settings.boss_monster = {boss_id!r} is not a known monster id"
+        )
+    if not monster.boss:
+        raise WorldLoadError(
+            f'world.json settings.boss_monster = {boss_id!r} must be flagged "boss": true'
+        )
+    return boss_id
 
 
 def _decode_dungeon_tiers(spec: dict[str, Any], monsters: list[Monster]) -> tuple[int, ...]:
     """Parse the ordered dungeon-gauntlet tier ladder, one foe per tier.
 
-    Each tier must be backed by at least one monster in the pack, or the
-    gauntlet would silently skip that rung.
+    Each tier must be backed by at least one NON-BOSS monster in the pack, or
+    the gauntlet would silently skip that rung: the gauntlet draws from
+    ``monsters_for_tier_band``, which excludes boss monsters, so a boss-only
+    tier loads cleanly yet has no fightable foe at runtime.
     """
     raw_tiers = _require(spec, "dungeon_tiers", "world.json settings")
     if not (isinstance(raw_tiers, list) and raw_tiers):
         raise WorldLoadError("world.json settings.dungeon_tiers must be a non-empty list of tiers")
-    available = {m.tier for m in monsters}
+    available = {m.tier for m in monsters if not m.boss}
     tiers: list[int] = []
     for i, value in enumerate(raw_tiers):
         tier = int(value)

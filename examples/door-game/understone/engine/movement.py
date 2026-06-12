@@ -1,11 +1,18 @@
 """Overworld movement resolution.
 
 Movement walks tile by tile so each intermediate cell is checked for
-walls/edges and rolls an encounter. The walk stops early on the first of:
-running out of steps, hitting a blocked cell, stepping onto a location
-door (flips to MENU), or triggering a wandering-monster encounter.
+walls/edges and rolls an encounter. When a roll fires it weighted-picks one
+row from the world's event table. A ``fight`` row STOPS the walk (a wandering
+monster bars the path); the value-bearing rows (gold/heal/trap) and pure
+``lore`` are applied immediately and the walk continues — but only one event
+fires per walk, so once any row has fired no further cells roll.
 
-Movement spends no daily turns — only fighting does.
+The walk stops early on the first of: running out of steps, hitting a blocked
+cell, stepping onto a location door (flips to MENU), or a ``fight`` encounter.
+
+Movement spends no daily turns — only fighting does. Gold/heal/trap deltas are
+applied straight to the player here (movement already mutates the player's
+position), floored/capped so a trap never kills and a spring never overfills.
 """
 
 from __future__ import annotations
@@ -16,7 +23,7 @@ from typing import TYPE_CHECKING
 from understone.engine.models import Mode
 
 if TYPE_CHECKING:
-    from understone.engine.models import Player
+    from understone.engine.models import Player, WorldEvent
     from understone.engine.rng import GameRNG
     from understone.engine.world import World
 
@@ -42,13 +49,29 @@ _HEADINGS: dict[str, str] = {
 
 
 @dataclass(slots=True)
+class MoveEvent:
+    """A non-fight overworld event already applied to the player.
+
+    ``kind`` is ``gold``/``heal``/``trap``/``lore``; ``text`` is the pack's
+    flavour line; ``amount`` is the rolled magnitude (0 for ``lore``). The
+    player's hp/gold have already been mutated by ``resolve_move`` — this
+    record exists only so the façade can narrate what happened.
+    """
+
+    kind: str
+    text: str
+    amount: int = 0
+
+
+@dataclass(slots=True)
 class MoveResult:
     """Outcome of a movement attempt.
 
     ``steps_taken`` counts cells actually entered. ``blocked`` is set when a
     wall/edge stopped the walk. ``entered_location`` carries a location key
     when the walk ended on a door. ``pending_fight`` carries an opponent
-    tier band when an encounter interrupted the walk.
+    tier band when a ``fight`` encounter interrupted the walk. ``event``
+    carries a non-fight overworld event (already applied) when one fired.
     """
 
     steps_taken: int
@@ -56,6 +79,7 @@ class MoveResult:
     blocked_reason: str = ""
     entered_location: str | None = None
     pending_fight: tuple[int, int] | None = None
+    event: MoveEvent | None = None
     path_notes: list[str] = field(default_factory=list)
 
 
@@ -101,6 +125,7 @@ def resolve_move(
     """
     directions = parse_directions(steps, heading, distance)[:max_steps]
     result = MoveResult(steps_taken=0)
+    fired = False  # at most one overworld event per walk
 
     for direction in directions:
         dx, dy = _DELTAS[direction]
@@ -126,14 +151,55 @@ def resolve_move(
             result.entered_location = location.key
             break
 
+        if fired:
+            continue
         band = _encounter_band(world, nx, ny)
-        if band is not None:
-            terrain = world.terrain_at(nx, ny)
-            if rng.chance(terrain.encounter_rate):
-                result.pending_fight = band
-                break
+        if band is None:
+            continue
+        terrain = world.terrain_at(nx, ny)
+        if not rng.chance(terrain.encounter_rate):
+            continue
+        fired = True
+        picked = _pick_event(world, rng)
+        if picked is None or picked.kind == "fight":
+            result.pending_fight = band
+            break
+        result.event = _apply_event(player, rng, picked)
 
     return result
+
+
+def _pick_event(world: World, rng: GameRNG) -> WorldEvent | None:
+    """Weighted-pick one row from the world's event table, or ``None``.
+
+    Returns ``None`` only when the pack ships no event table at all, in which
+    case the caller falls back to the legacy always-a-fight behaviour.
+    """
+    weights = world.event_weights()
+    if not weights:
+        return None
+    return world.events[rng.weighted_index(weights)]
+
+
+def _apply_event(player: Player, rng: GameRNG, event: WorldEvent) -> MoveEvent:
+    """Apply a non-fight event to *player* and return a record for narration.
+
+    ``gold`` credits a rolled amount; ``heal`` adds hp capped at ``max_hp``;
+    ``trap`` subtracts hp floored at 1 (a trap never kills, and never touches
+    gold); ``lore`` mutates nothing. Amounts roll over ``[lo, hi]``.
+    """
+    if event.kind == "lore":
+        return MoveEvent(kind="lore", text=event.text)
+    amount = rng.randint(event.lo, event.hi)
+    if event.kind == "gold":
+        player.gold += amount
+    elif event.kind == "heal":
+        amount = min(amount, player.max_hp - player.hp)
+        player.hp += amount
+    elif event.kind == "trap":
+        amount = min(amount, max(player.hp - 1, 0))
+        player.hp -= amount
+    return MoveEvent(kind=event.kind, text=event.text, amount=amount)
 
 
 def _encounter_band(world: World, x: int, y: int) -> tuple[int, int] | None:

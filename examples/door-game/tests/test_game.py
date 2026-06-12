@@ -180,9 +180,11 @@ def test_log_reports_then_advances(tmp_path: Path, clock: object) -> None:
     game.join("Sigrun")
     first = game.log("Brandr")
     assert "Sigrun" in first or "Brandr" in first
+    assert "The Understone Herald" in first  # dressed as the broadsheet
     # The cursor advanced; a second read with no new events is quiet.
     second = game.log("Brandr")
-    assert "All quiet" in second
+    assert "The Understone Herald" in second  # the masthead still prints
+    assert "still" in second.lower()  # the herald-flavoured "all quiet" line
 
 
 def test_rank_marks_caller(tmp_path: Path, clock: object) -> None:
@@ -194,6 +196,48 @@ def test_rank_marks_caller(tmp_path: Path, clock: object) -> None:
     assert "Brandr" in out and "Sigrun" in out
     assert "*" in out  # the caller's row is marked
     assert "┌" in out  # box-drawing table
+
+
+# ---------------------------------------------------------------------------
+# Rank ★ column: stars live in their own column, so a long name keeps them
+# ---------------------------------------------------------------------------
+
+
+def test_win_stars_column_formats() -> None:
+    """Zero is blank, 1..5 render as ★ runs, and >5 collapses to ★xN."""
+    from understone.game import _win_stars
+
+    assert _win_stars(0) == ""
+    assert _win_stars(1) == "★"
+    assert _win_stars(5) == "★★★★★"
+    assert _win_stars(7) == "★x7"
+
+
+def test_long_name_with_one_win_keeps_its_star() -> None:
+    """A full 24-char name no longer eats its own ★ (the v0.1 truncation bug).
+
+    The name occupied the whole 20-wide field before, clipping the star away;
+    with a separate stars column the ★ survives beside a maximal name.
+    """
+    from understone.engine.rank import RankEntry
+    from understone.game import _render_rank_table
+
+    name = "X" * 24
+    rows = _render_rank_table([RankEntry(name=name, level=5, xp=100, gold=50, wins=1)], caller="")
+    body = "\n".join(rows)
+    assert name in body  # the full name is present
+    assert "★" in body  # and so is its star
+
+
+def test_high_win_count_renders_compact_marker() -> None:
+    """Seven wins render as the compact ``★x7`` rather than seven glyphs."""
+    from understone.engine.rank import RankEntry
+    from understone.game import _render_rank_table
+
+    rows = _render_rank_table([RankEntry(name="Champ", level=9, xp=9, gold=9, wins=7)], caller="")
+    body = "\n".join(rows)
+    assert "★x7" in body
+    assert "★★★★★★★" not in body  # not seven literal stars
 
 
 def test_shared_world_other_player_marker(tmp_path: Path, clock: object) -> None:
@@ -587,7 +631,8 @@ def test_event_tail_is_capped_but_log_still_works(tmp_path: Path, clock: object)
     game.join("Brandr")
     game.players["Brandr"].log_cursor = recent_cursor
     out = game.log("Brandr")
-    assert "While you were away" in out
+    assert "The Understone Herald" in out  # broadsheet masthead
+    assert "since your last visit" in out
     fresh, new_cursor = since(game.events, recent_cursor)
     assert fresh  # there are events past the cursor
     assert new_cursor == game.events[-1].event_id

@@ -36,6 +36,23 @@ class GameRNG:
         """Return a random index in ``[0, count)``."""
         return self._random.randrange(count)
 
+    def weighted_index(self, weights: list[int]) -> int:
+        """Return an index into ``weights`` chosen in proportion to them.
+
+        A single uniform draw is mapped through the cumulative sum, so the
+        result is deterministic under a fixed seed. ``weights`` must be
+        non-empty with a positive total (the loader guarantees this for the
+        content pack's event table).
+        """
+        total = sum(weights)
+        roll = self._random.randrange(total)
+        cumulative = 0
+        for index, weight in enumerate(weights):
+            cumulative += weight
+            if roll < cumulative:
+                return index
+        return len(weights) - 1
+
     def child(self) -> GameRNG:
         """Derive an independent child RNG seeded from the master stream."""
         return GameRNG(self._random.getrandbits(64))

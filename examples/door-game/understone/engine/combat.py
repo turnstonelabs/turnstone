@@ -74,7 +74,10 @@ def resolve_fight(rng: GameRNG, player: Player, monster: Monster) -> FightResult
             result.xp_delta = monster.xp
             result.gold_delta = monster.gold
             result.hp_delta = player_hp - player.hp
-            result.log.append(f"The {monster.name} falls. +{monster.xp} XP, +{monster.gold} gold.")
+            # The kill round (the strike line above) stays; the "falls + reward"
+            # sentence is composed by the caller at the moment it actually banks
+            # the xp/gold, so a reward is never narrated where none is applied
+            # (e.g. the Wyrm-win legacy reset, which keeps no xp/gold).
             return result
 
         taken = _swing(rng, monster.atk, player.def_)
