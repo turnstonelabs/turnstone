@@ -163,9 +163,7 @@ def running_loop_mgr():
             tasks = [t for t in asyncio.all_tasks() if t is not asyncio.current_task()]
             for t in tasks:
                 t.cancel()
-            for t in tasks:
-                with suppress(BaseException):
-                    await t
+            await asyncio.gather(*tasks, return_exceptions=True)
 
         with suppress(Exception):
             asyncio.run_coroutine_threadsafe(_cancel_pending(), loop).result(timeout=5)
@@ -2041,6 +2039,37 @@ class TestShutdownCleanup:
         assert mgr.get_prompts() == []
         assert mgr._resource_map == {}
         assert mgr._prompt_map == {}
+
+    def test_shutdown_closes_owned_loop_and_clears_refs(self):
+        """When the manager owns the loop thread, shutdown must close the loop
+        (selector resources leak otherwise) and drop both refs; a second
+        shutdown is then a clean no-op."""
+        import threading as _threading
+
+        mgr = MCPClientManager({})
+        loop = asyncio.new_event_loop()
+        thread = _threading.Thread(target=loop.run_forever, daemon=True)
+        thread.start()
+        mgr._loop = loop
+        mgr._thread = thread
+
+        mgr.shutdown()
+        assert loop.is_closed()
+        assert mgr._loop is None
+        assert mgr._thread is None
+        mgr.shutdown()  # idempotent
+
+    def test_shutdown_leaves_unowned_loop_open(self):
+        """Tests (and any embedder) that wire ``_loop`` directly without a
+        thread own the loop's lifecycle — shutdown must not close it."""
+        mgr = MCPClientManager({})
+        loop = asyncio.new_event_loop()
+        mgr._loop = loop
+        try:
+            mgr.shutdown()
+            assert not loop.is_closed()
+        finally:
+            loop.close()
 
 
 # ---------------------------------------------------------------------------
