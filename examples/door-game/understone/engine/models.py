@@ -56,11 +56,17 @@ class Player:
     log_cursor: int
     bestow_spent: int
     bestow_day: int
+    wins: int = 0
 
 
 @dataclass(frozen=True, slots=True)
 class Monster:
-    """A static monster definition from the content pack."""
+    """A static monster definition from the content pack.
+
+    ``boss`` monsters are the fixed endgame foe (the Wyrm Below): they are
+    excluded from random tier-band selection and only ever faced through the
+    deliberate ``challenge`` verb.
+    """
 
     tier: int
     name: str
@@ -69,6 +75,8 @@ class Monster:
     def_: int
     xp: int
     gold: int
+    monster_id: str = ""
+    boss: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -128,6 +136,23 @@ class Zone:
 
 
 @dataclass(frozen=True, slots=True)
+class WorldEvent:
+    """One row of the weighted overworld encounter table.
+
+    ``kind`` is one of ``fight``/``gold``/``heal``/``trap``/``lore``.
+    ``weight`` biases random selection. ``lo``/``hi`` bound the rolled amount
+    for the value-bearing kinds (gold/heal/trap); they are unused for
+    ``fight`` (the foe comes from the zone band) and ``lore`` (pure flavour).
+    """
+
+    kind: str
+    weight: int
+    text: str
+    lo: int
+    hi: int
+
+
+@dataclass(frozen=True, slots=True)
 class Settings:
     """Economy and progression parameters sourced from the content pack."""
 
@@ -137,9 +162,14 @@ class Settings:
     starting_gold: int
     starting_weapon: str
     starting_armor: str
+    start_hp: int
+    start_atk: int
+    start_def: int
     xp_base: int
     growth_max_hp: int
     growth_atk: int
     growth_def: int
     bestow_daily_budget: int
     dungeon_tiers: tuple[int, ...]
+    boss_monster: str
+    wyrm_min_level: int

@@ -16,6 +16,7 @@ if TYPE_CHECKING:
         Monster,
         Settings,
         TerrainDef,
+        WorldEvent,
         Zone,
     )
 
@@ -36,6 +37,7 @@ class World:
         monsters: list[Monster],
         items: list[Item],
         settings: Settings,
+        events: list[WorldEvent] | None = None,
     ) -> None:
         self.name = name
         self.width = width
@@ -47,11 +49,16 @@ class World:
         self.monsters = monsters
         self.items = items
         self.settings = settings
+        self.events: list[WorldEvent] = events or []
+        self._event_weights: list[int] = [e.weight for e in self.events]
         self._loc_by_xy: dict[tuple[int, int], LocationDef] = {
             (loc.x, loc.y): loc for loc in locations
         }
         self._loc_by_key: dict[str, LocationDef] = {loc.key: loc for loc in locations}
         self._item_by_id: dict[str, Item] = {it.item_id: it for it in items}
+        self._monster_by_id: dict[str, Monster] = {
+            m.monster_id: m for m in monsters if m.monster_id
+        }
 
     def in_bounds(self, x: int, y: int) -> bool:
         """Return whether ``(x, y)`` is inside the map rectangle."""
@@ -73,6 +80,14 @@ class World:
         """Return the item with the given id, if any."""
         return self._item_by_id.get(item_id)
 
+    def monster_by_id(self, monster_id: str) -> Monster | None:
+        """Return the monster with the given id, if any (boss lookup)."""
+        return self._monster_by_id.get(monster_id)
+
+    def event_weights(self) -> list[int]:
+        """Return the parallel weight list for the overworld event table."""
+        return self._event_weights
+
     def is_walkable(self, x: int, y: int) -> bool:
         """Return whether a player may stand on ``(x, y)``.
 
@@ -93,5 +108,10 @@ class World:
         return None
 
     def monsters_for_tier_band(self, lo: int, hi: int) -> list[Monster]:
-        """Return monsters whose tier falls within ``[lo, hi]`` inclusive."""
-        return [m for m in self.monsters if lo <= m.tier <= hi]
+        """Return non-boss monsters whose tier falls within ``[lo, hi]``.
+
+        Boss monsters (the Wyrm Below) are never returned: they are the fixed
+        endgame foe, faced only through the deliberate ``challenge`` verb, and
+        must never surface as a random encounter or a dungeon-gauntlet rung.
+        """
+        return [m for m in self.monsters if lo <= m.tier <= hi and not m.boss]

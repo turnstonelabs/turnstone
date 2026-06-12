@@ -104,6 +104,9 @@
     "starting_gold": 20,
     "starting_weapon": "rusty_dagger",
     "starting_armor": "cloth_tunic",
+    "start_hp": 20,
+    "start_atk": 3,
+    "start_def": 0,
     "xp_base": 100,
     "growth": {
       "max_hp": 6,
@@ -111,6 +114,8 @@
       "def": 1
     },
     "bestow_daily_budget": 25,
-    "dungeon_tiers": [4, 5]
+    "dungeon_tiers": [4, 5],
+    "boss_monster": "wyrm_below",
+    "wyrm_min_level": 6
   }
 }

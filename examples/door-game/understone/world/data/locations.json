@@ -4,10 +4,7 @@
     "name": "The Sleeping Drake",
     "glyph": "I",
     "color": "town",
-    "actions": [
-      "rest",
-      "leave"
-    ],
+    "actions": ["rest", "leave"],
     "flavor": [
       "Lamplight pools on worn oak tables.",
       "The innkeeper nods toward the hearth.",
@@ -19,11 +16,7 @@
     "name": "Gravel & Sons Outfitters",
     "glyph": "$",
     "color": "town",
-    "actions": [
-      "buy",
-      "sell",
-      "leave"
-    ],
+    "actions": ["buy", "sell", "leave"],
     "flavor": [
       "Racks of steel and leather line the walls.",
       "Buying a weapon or armour equips it at once.",
@@ -36,10 +29,7 @@
     "name": "The Quiet Shrine",
     "glyph": "+",
     "color": "town",
-    "actions": [
-      "heal",
-      "leave"
-    ],
+    "actions": ["heal", "leave"],
     "flavor": [
       "Incense curls beneath a still blue flame.",
       "The keeper mends wounds for coin, per point of vigour."
@@ -50,13 +40,11 @@
     "name": "The Understone Deep",
     "glyph": ">",
     "color": "dungeon",
-    "actions": [
-      "descend",
-      "leave"
-    ],
+    "actions": ["descend", "challenge", "leave"],
     "flavor": [
       "A cold throat of stone descends into dark.",
-      "To descend is to face a troll, then something worse."
+      "To descend is to face a troll, then something worse.",
+      "Deeper still, the old tales say, the Wyrm Below coils and waits."
     ]
   }
 }

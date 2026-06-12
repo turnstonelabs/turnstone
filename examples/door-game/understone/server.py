@@ -85,9 +85,37 @@ NARRATION
 
 THE DAILY RHYTHM
   Each adventurer has a small budget of turns per real-world UTC day. Only
-  fighting and descending spend a turn; moving, resting, shopping and looking
-  do not. When the budget is gone, the day is done — encourage the player to
-  return tomorrow. This is a correspondence game: a little each day.
+  fighting, descending, and challenging the Wyrm spend a turn; moving,
+  resting, shopping and looking do not. When the budget is gone, the day is
+  done — encourage the player to return tomorrow. This is a correspondence
+  game: a little each day.
+
+WANDERING THE FOREST (the texture of a walk)
+  A step through wild country may turn up more than a monster. The server
+  rolls a private encounter table as the player walks: most often a foe (which
+  stops the walk for a fight or flight), but sometimes a purse of gold, a
+  healing spring, a small trap (it can never kill — it floors at 1 HP), or a
+  scrap of Vale lore. The non-combat finds are applied at once, narrated in
+  the move result, and do NOT stop the walk; at most one such event happens
+  per move. These finds are PRIVATE — they are not Herald news — so narrate
+  them as the quiet texture of travelling, and watch the lore: it whispers of
+  something coiled beneath the dungeon.
+
+THE WYRM BELOW (the endgame, and how to win)
+  Deep under the dungeon sleeps the Wyrm Below — a fixed, fearsome boss and
+  the ONLY win condition. At the dungeon, a sufficiently seasoned hero may
+  'challenge' it (door_action action="challenge"). Under the level threshold,
+  the server turns them away in-fiction; once allowed, the challenge spends a
+  daily turn and resolves in one call, like a fight.
+    * On victory the hero FREES THE VALE. The triumph is heralded to everyone,
+      the run is carved into the Hall of Legends (shown by door_rank), and the
+      hero is reborn in a classic-door-game-style legacy reset: level, gold, gear and stats
+      return to first-day values and they stand again at the town — but they
+      keep a permanent ★ for the win, and may set out to do it all again. Their
+      remaining turns for the day and their place in the world carry over.
+    * On defeat the Wyrm devours them; they wake at the spawn, barely alive.
+  Play this beat big: it is the climax of a whole run. Narrate the reset as the
+  Vale renewing itself around an undying legend, not as a death.
 
 BESTOWING FORTUNE (use sparingly)
   door_bestow lets you, the storyteller, grant a little gold or healing to
@@ -106,9 +134,9 @@ TOOL CHEAT-SHEET
   door_move(player, ...)         Walk the overworld (free). steps="NNEE" or
                                  heading="east" + distance=3 (max 8 per call).
   door_action(player, action)    Context verb: fight, flee, rest, buy, sell,
-                                 heal, descend, leave.
-  door_log(player)               Catch up on what happened while away.
-  door_rank(player)              The leaderboard.
+                                 heal, descend, challenge (the Wyrm), leave.
+  door_log(player)               Read the Understone Herald (the shared feed).
+  door_rank(player)              The leaderboard + Hall of Legends (★ = wins).
   door_bestow(player, reason...) Grant a little gold/healing for a story beat.
 
 GETTING STARTED
@@ -267,13 +295,17 @@ def door_action(player: str, action: str, target: str = "", item: str = "") -> s
     The legal verbs depend on where the adventurer is. On the overworld:
     'fight' or 'flee' a wandering monster (fighting spends one daily turn).
     Inside a building: 'rest' (inn), 'buy'/'sell' (shop), 'heal' (healer),
-    'descend' (dungeon), or 'leave'. An illegal verb returns the list of
-    verbs that are valid right here.
+    or 'leave'. At the dungeon: 'descend' the gauntlet, or 'challenge' the
+    Wyrm Below — the endgame boss and the only way to win. The challenge is
+    gated by level (under-level heroes are turned away in-fiction) and, once
+    allowed, spends a daily turn and resolves in a single call like a fight:
+    a victory frees the Vale and begins a new life (see door_help), a defeat
+    bounces you home. An illegal verb returns the verbs valid right here.
 
     Args:
         player: The adventurer's name.
         action: The verb to attempt (fight, flee, rest, buy, sell, heal,
-            descend, leave).
+            descend, challenge, leave).
         target: Reserved for future targeted actions.
         item: For shop 'buy', the item id to purchase.
     """
@@ -311,8 +343,11 @@ def door_log(player: str) -> str:
 def door_rank(player: str = "") -> str:
     """Show the Roll of Heroes — the top-ten leaderboard.
 
-    Ordered by level, then experience. If the caller names themselves and
-    they place in the top ten, their row is marked.
+    Ordered by level, then experience, then name. If the caller names
+    themselves and they place in the top ten, their row is marked. Each ★
+    beside a name is one slaying of the Wyrm Below. Below the table, the Hall
+    of Legends lists the most recent completed runs (name, level at the kill,
+    days the run took, date); it is omitted while no one has yet won.
 
     Args:
         player: The caller's name (optional; marks their row when present).

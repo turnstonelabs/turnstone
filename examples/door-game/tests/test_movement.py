@@ -18,7 +18,7 @@ from tests.conftest import (
     make_player,
     make_world,
 )
-from understone.engine.models import Mode
+from understone.engine.models import Mode, WorldEvent
 from understone.engine.movement import MAX_STEPS, parse_directions, resolve_move
 from understone.engine.rng import GameRNG
 
@@ -34,10 +34,14 @@ class _NeverRNG(GameRNG):
 
 
 class _AlwaysRNG(GameRNG):
-    """An RNG whose chance() always fires (forces an encounter)."""
+    """An RNG whose chance() always fires (forces an encounter).
 
-    def __init__(self) -> None:
-        super().__init__(seed=0)
+    The seed still drives ``weighted_index``/``randint``, so different seeds
+    select different event rows while every encounter roll fires.
+    """
+
+    def __init__(self, seed: int = 0) -> None:
+        super().__init__(seed=seed)
 
     def chance(self, probability: float) -> bool:  # noqa: ARG002
         return True
@@ -228,3 +232,105 @@ def test_no_zone_means_no_encounter() -> None:
     result = resolve_move(world, player, _AlwaysRNG(), heading="east", distance=3)
     assert result.pending_fight is None
     assert result.steps_taken == 3
+
+
+# ---------------------------------------------------------------------------
+# Weighted non-combat overworld events (v0.2)
+# ---------------------------------------------------------------------------
+
+
+def _event_world(*events: WorldEvent) -> object:
+    """An all-forest, fully-zoned world carrying a crafted event table."""
+    grid = [[FOREST for _ in range(11)] for _ in range(11)]
+    zone = Zone(key="wood", x0=0, y0=0, x1=10, y1=10, tier_lo=1, tier_hi=2)
+    return make_world(grid=grid, zones=[zone], events=list(events))
+
+
+def test_event_fight_stops_the_walk() -> None:
+    """A fight-kind event sets pending_fight and halts the walk like v0.1."""
+    world = _event_world(WorldEvent("fight", 1, "", 0, 0))
+    player = make_player(x=5, y=5)
+    result = resolve_move(world, player, _AlwaysRNG(), heading="east", distance=5)
+    assert result.pending_fight == (1, 2)
+    assert result.event is None
+    assert result.steps_taken == 1  # stopped on the first triggering cell
+
+
+def test_event_gold_credits_and_continues() -> None:
+    """A gold event credits the rolled amount and does NOT stop the walk."""
+    world = _event_world(WorldEvent("gold", 1, "a coin-purse", 5, 5))
+    player = make_player(x=5, y=5, gold=10)
+    result = resolve_move(world, player, _AlwaysRNG(), heading="east", distance=3)
+    assert result.event is not None
+    assert result.event.kind == "gold"
+    assert result.event.amount == 5  # min == max == 5, so deterministic
+    assert player.gold == 15
+    assert result.pending_fight is None
+    assert result.steps_taken == 3  # the walk ran to completion
+
+
+def test_event_heal_caps_at_max_hp() -> None:
+    """A heal event never overfills: hp is clamped to max_hp."""
+    world = _event_world(WorldEvent("heal", 1, "a spring", 50, 50))
+    player = make_player(x=5, y=5, hp=18, max_hp=20)
+    result = resolve_move(world, player, _AlwaysRNG(), heading="east", distance=1)
+    assert player.hp == 20  # +50 requested, capped at the 2 missing
+    assert result.event is not None and result.event.amount == 2
+
+
+def test_event_trap_floors_hp_at_one_and_spares_gold() -> None:
+    """A trap event never kills (floors at 1 HP) and never touches gold."""
+    world = _event_world(WorldEvent("trap", 1, "old briars", 500, 500))
+    player = make_player(x=5, y=5, hp=10, max_hp=20, gold=42)
+    result = resolve_move(world, player, _AlwaysRNG(), heading="east", distance=1)
+    assert player.hp == 1  # huge trap, but floored
+    assert player.gold == 42  # gold untouched
+    assert result.event is not None and result.event.amount == 9  # only 9 could be taken
+
+
+def test_event_lore_mutates_nothing() -> None:
+    """A lore event changes no state and reports a zero amount."""
+    world = _event_world(WorldEvent("lore", 1, "an old waystone", 0, 0))
+    player = make_player(x=5, y=5, hp=15, max_hp=20, gold=7)
+    before = (player.hp, player.gold)
+    result = resolve_move(world, player, _AlwaysRNG(), heading="east", distance=2)
+    assert (player.hp, player.gold) == before
+    assert result.event is not None and result.event.kind == "lore"
+    assert result.event.amount == 0
+    assert result.steps_taken == 2
+
+
+def test_at_most_one_event_per_walk() -> None:
+    """Once any event fires, no further cells roll for the rest of the walk.
+
+    Two distinct gold rolls would credit 2 gold (1 each); a single fired event
+    credits exactly 1, proving the walk stops rolling after the first trigger.
+    """
+    world = _event_world(WorldEvent("gold", 1, "a coin", 1, 1))
+    player = make_player(x=5, y=5, gold=0)
+    resolve_move(world, player, _AlwaysRNG(), heading="east", distance=5)
+    assert player.gold == 1  # exactly one event, not five
+
+
+def test_each_event_kind_reachable_with_crafted_table() -> None:
+    """Equal weights make every kind in a crafted table reachable from movement."""
+    table = [
+        WorldEvent("fight", 1, "", 0, 0),
+        WorldEvent("gold", 1, "g", 1, 1),
+        WorldEvent("heal", 1, "h", 1, 1),
+        WorldEvent("trap", 1, "t", 1, 1),
+        WorldEvent("lore", 1, "l", 0, 0),
+    ]
+    zone = Zone(key="wood", x0=0, y0=0, x1=0, y1=0, tier_lo=1, tier_hi=2)
+    grid = [[FOREST for _ in range(11)] for _ in range(11)]
+    world = make_world(grid=grid, zones=[zone], events=table)
+
+    seen: set[str] = set()
+    for seed in range(60):
+        player = make_player(x=0, y=1, hp=10, max_hp=20)  # one step north into the zone cell
+        result = resolve_move(world, player, _AlwaysRNG(seed), steps="N")
+        if result.pending_fight is not None:
+            seen.add("fight")
+        elif result.event is not None:
+            seen.add(result.event.kind)
+    assert seen == {"fight", "gold", "heal", "trap", "lore"}
