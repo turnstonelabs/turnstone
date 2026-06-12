@@ -2385,7 +2385,7 @@ requires-dist = [
     { name = "httpx", specifier = ">=0.28" },
     { name = "httpx-sse", specifier = ">=0.4" },
     { name = "lacme", specifier = ">=1.0.5" },
-    { name = "mcp", specifier = ">=1.27" },
+    { name = "mcp", specifier = ">=1.27,<2" },
     { name = "mypy", marker = "extra == 'dev'", specifier = ">=1.14" },
     { name = "openai", specifier = ">=2.37" },
     { name = "psycopg", extras = ["binary"], specifier = ">=3.2" },
