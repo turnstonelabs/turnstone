@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import concurrent.futures
+import inspect
 import json
 import time
 from contextlib import AsyncExitStack, suppress
@@ -24,6 +25,26 @@ from turnstone.core.tools import INTERACTIVE_TOOLS, TOOLS, merge_mcp_tools
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+
+def _dispatch_stub(mock_future: MagicMock) -> Any:
+    """Stand-in for ``asyncio.run_coroutine_threadsafe`` in sync-bridge tests.
+
+    Closes the never-scheduled coroutine before handing back the canned
+    future — a mocked dispatch never awaits it, and an unawaited coroutine
+    GC-fires "coroutine ... was never awaited" inside whatever unrelated
+    test happens to be running when collection finally occurs (cross-test
+    bleed that per-test filterwarnings markers cannot catch).
+    """
+
+    def _rct(coro: Any, _loop: Any) -> MagicMock:
+        # Only real coroutines need (or survive) closing — several tests
+        # dispatch a plain MagicMock return value through this seam.
+        if inspect.iscoroutine(coro):
+            coro.close()
+        return mock_future
+
+    return _rct
 
 
 def _fake_mcp_tool(name: str = "search", description: str = "Search stuff") -> MagicMock:
@@ -2228,7 +2249,7 @@ class TestFutureCancellation:
         mock_future = MagicMock()
         mock_future.result.side_effect = concurrent.futures.TimeoutError()
         with (
-            patch("asyncio.run_coroutine_threadsafe", return_value=mock_future),
+            patch("asyncio.run_coroutine_threadsafe", new=_dispatch_stub(mock_future)),
             pytest.raises(TimeoutError, match="timed out"),
         ):
             mgr.call_tool_sync("mcp__test__search", {"query": "x"}, timeout=1)
@@ -2239,7 +2260,7 @@ class TestFutureCancellation:
         mock_future = MagicMock()
         mock_future.result.side_effect = concurrent.futures.TimeoutError()
         with (
-            patch("asyncio.run_coroutine_threadsafe", return_value=mock_future),
+            patch("asyncio.run_coroutine_threadsafe", new=_dispatch_stub(mock_future)),
             pytest.raises(TimeoutError, match="timed out"),
         ):
             mgr.read_resource_sync("file:///a.txt", timeout=1)
@@ -2250,7 +2271,7 @@ class TestFutureCancellation:
         mock_future = MagicMock()
         mock_future.result.side_effect = concurrent.futures.TimeoutError()
         with (
-            patch("asyncio.run_coroutine_threadsafe", return_value=mock_future),
+            patch("asyncio.run_coroutine_threadsafe", new=_dispatch_stub(mock_future)),
             pytest.raises(TimeoutError, match="timed out"),
         ):
             mgr.get_prompt_sync("mcp__test__review", timeout=1)
@@ -2263,7 +2284,7 @@ class TestFutureCancellation:
         mock_future.result.side_effect = concurrent.futures.TimeoutError()
         with (
             patch.object(mgr, "_refresh_all", return_value=MagicMock()),
-            patch("asyncio.run_coroutine_threadsafe", return_value=mock_future),
+            patch("asyncio.run_coroutine_threadsafe", new=_dispatch_stub(mock_future)),
             pytest.raises(TimeoutError, match="timed out"),
         ):
             mgr.refresh_sync(timeout=1)
@@ -2378,8 +2399,6 @@ class TestCircuitBreaker:
         assert "srv" not in mgr._circuit_open_until
         assert "srv" not in mgr._circuit_trip_count
 
-    @pytest.mark.filterwarnings("ignore::pytest.PytestUnraisableExceptionWarning")
-    @pytest.mark.filterwarnings("ignore:coroutine.*was never awaited:RuntimeWarning")
     def test_call_tool_sync_records_failure_on_timeout(self):
         mgr = MCPClientManager({"test": {"type": "stdio", "command": "echo"}})
         mock_session = MagicMock()
@@ -2390,7 +2409,7 @@ class TestCircuitBreaker:
         mock_future = MagicMock()
         mock_future.result.side_effect = concurrent.futures.TimeoutError()
         with (
-            patch("asyncio.run_coroutine_threadsafe", return_value=mock_future),
+            patch("asyncio.run_coroutine_threadsafe", new=_dispatch_stub(mock_future)),
             pytest.raises(TimeoutError),
         ):
             mgr.call_tool_sync("mcp__test__ping", {}, timeout=1)
@@ -2410,7 +2429,7 @@ class TestCircuitBreaker:
         mock_result.isError = False
         mock_future = MagicMock()
         mock_future.result.return_value = mock_result
-        with patch("asyncio.run_coroutine_threadsafe", return_value=mock_future):
+        with patch("asyncio.run_coroutine_threadsafe", new=_dispatch_stub(mock_future)):
             mgr.call_tool_sync("mcp__test__ping", {}, timeout=5)
         assert mgr._consecutive_failures.get("test") is None
 
@@ -2427,7 +2446,7 @@ class TestCircuitBreaker:
         mock_future = MagicMock()
         mock_future.result.side_effect = BrokenPipeError("dead")
         with (
-            patch("asyncio.run_coroutine_threadsafe", return_value=mock_future),
+            patch("asyncio.run_coroutine_threadsafe", new=_dispatch_stub(mock_future)),
             pytest.raises(BrokenPipeError),
         ):
             mgr.call_tool_sync("mcp__test__ping", {}, timeout=5)
@@ -2461,7 +2480,7 @@ class TestCircuitBreaker:
         mock_future = MagicMock()
         mock_future.result.side_effect = McpError(ErrorData(code=-32601, message="tool not found"))
         with (
-            patch("asyncio.run_coroutine_threadsafe", return_value=mock_future),
+            patch("asyncio.run_coroutine_threadsafe", new=_dispatch_stub(mock_future)),
             pytest.raises(McpError),
         ):
             mgr.call_tool_sync("mcp__test__ping", {}, timeout=5)

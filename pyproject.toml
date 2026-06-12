@@ -94,6 +94,15 @@ include = [
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 markers = ["live: requires a running LLM backend"]
+filterwarnings = [
+    # mcp v1 deprecates streamablehttp_client for an entry point whose call
+    # shape only settles in v2 — adoption rides the deliberate v2 migration
+    # (pin capped <2); silence exactly this message until then.
+    "ignore:Use `streamable_http_client` instead",
+    # starlette deprecates the httpx-backed TestClient; revisit at the next
+    # starlette floor bump.
+    "ignore:Using `httpx` with `starlette.testclient` is deprecated",
+]
 
 [tool.ruff]
 target-version = "py311"
