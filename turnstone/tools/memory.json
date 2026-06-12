@@ -55,11 +55,11 @@
       }
     },
     "coordinator": {
-      "description": "Persistent orchestration memory for this coordinator session. Actions: 'save' stores a memory, 'get' retrieves full content by name, 'search' finds memories by query, 'delete' removes a memory, 'list' shows all memories. Use 'get' to read full content — search/list truncate previews to 200 chars. Memories have a type (user/project/feedback/reference). Coordinator memories are private to this coordinator and survive across its turns; they are NOT visible to its child workstreams.",
+      "description": "Persistent orchestration memory shared by all of your user's coordinator sessions. Actions: 'save' stores a memory, 'get' retrieves full content by name, 'search' finds memories by query, 'delete' removes a memory, 'list' shows all memories. Use 'get' to read full content — search/list truncate previews to 200 chars. Memories have a type (user/project/feedback/reference). Coordinator memories survive across coordinator sessions — save orchestration knowledge worth keeping (recurring procedures, environment facts, lessons from past runs). They are NOT visible to child workstreams.",
       "parameter_overrides": {
         "scope": {
           "enum": ["coordinator"],
-          "description": "Always 'coordinator' for coord sessions — coord memories are isolated to the coordinator's own orchestration namespace. This field can be omitted; it defaults to 'coordinator'."
+          "description": "Always 'coordinator' for coord sessions — the per-user orchestration namespace, durable across coordinator sessions. This field can be omitted; it defaults to 'coordinator'."
         }
       }
     }

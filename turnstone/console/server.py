@@ -4507,9 +4507,16 @@ def _bootstrap_coord_subsystem(
         return ConsoleCoordinatorUI(ws_id=ws.id, user_id=ws.user_id or "")
 
     def _coord_client_factory(ws_id: str, user_id: str) -> CoordinatorClient:
+        # No empty-uid fallback: CoordinatorTokenManager's contract is
+        # "sub — the coordinator's real creator user_id", and
+        # ChatSession.__init__ refuses to construct an anonymous
+        # coordinator before any token is minted (minting is lazy).
+        # Masking an empty uid as a phantom principal here would hand
+        # a read/write/approve + admin.coordinator token to a user
+        # that doesn't exist and persist its children under that name.
         ttl = int(config_store.get("coordinator.session_jwt_ttl_seconds"))
         tm = CoordinatorTokenManager(
-            user_id=user_id or "system",
+            user_id=user_id,
             scopes=frozenset({"read", "write", "approve"}),
             permissions=frozenset({"admin.coordinator"}),
             secret=jwt_secret,

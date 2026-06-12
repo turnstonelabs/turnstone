@@ -361,6 +361,7 @@ def test_chatsession_coordinator_kind_excludes_interactive_tools(tmp_db):
         temperature=0.5,
         max_tokens=4096,
         tool_timeout=30,
+        user_id="user-1",  # the constructor refuses anonymous coordinators
         kind="coordinator",
     )
     names = {t["function"]["name"] for t in sess._tools}
@@ -401,6 +402,7 @@ def test_chatsession_coordinator_kind_does_not_merge_mcp_tools(tmp_db):
         temperature=0.5,
         max_tokens=4096,
         tool_timeout=30,
+        user_id="user-1",  # the constructor refuses anonymous coordinators
         kind="coordinator",
         mcp_client=mcp_client,
     )

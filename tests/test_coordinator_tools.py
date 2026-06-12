@@ -630,6 +630,7 @@ def test_prepare_fails_cleanly_when_coord_client_missing(monkeypatch):
         tool_timeout=30,
         context_window=16384,
         ws_id="coord-1",
+        user_id="user-1",  # the constructor refuses anonymous coordinators
         kind="coordinator",
         coord_client=None,
     )
