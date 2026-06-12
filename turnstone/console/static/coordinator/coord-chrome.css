@@ -62,12 +62,13 @@
   flex-direction: column;
   min-height: 0;
 }
-/* Pane-hosted only: the shell's per-pane ✕/− chip floats in the pane's
-   top-right corner (top 5px + 28px tall) — exactly where this sidebar's
-   toggle row and the Children refresh sit.  Drop the sidebar content below
-   the chip's lane; padding (not margin) keeps the column's left border
-   running the full pane height.  The standalone coordinator page has no
-   chip, so the 14px default stands there. */
+/* Pane-hosted: the shell's per-pane ✕/− chip floats in the pane's top-right
+   corner (top 5px + 28px tall) — exactly where this sidebar's toggle row and
+   the Children refresh sit.  Drop the sidebar content below the chip's lane;
+   padding (not margin) keeps the column's left border running the full pane
+   height.  (In practice this is EVERY coordinator — the /coordinator/{ws_id}
+   standalone page is a chip-less direct-URL fallback no UI path navigates to;
+   the .pane-body scope just keeps that lane honest.) */
 .pane-body.coord-chrome-root #coord-sidebar.sidebar {
   padding-top: 44px;
 }
