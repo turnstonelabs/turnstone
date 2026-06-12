@@ -806,6 +806,21 @@ export class PaneManager {
       el.style.top = h.y * 100 + "%";
       if (h.node.dir === "row") el.style.height = h.span * 100 + "%";
       else el.style.width = h.span * 100 + "%";
+      // The ARIA range is the REAL clamp (_ratioBounds: the cell minimums
+      // against this split's OWN px region — nested splits sit tighter than
+      // any constant; the old hard-coded 10–90 misreported it to AT).  It
+      // refreshes with every drag/keyboard/structure pass through here; a
+      // bare window resize can stale it until the next interaction (no
+      // resize listener by design — % insets make resizes free), which is
+      // still strictly truer than a constant.  The max>=min guard covers a
+      // host shrunk below two minimums, where the bounds legitimately cross.
+      const b = this._ratioBounds(h.node);
+      const lo = Math.round(b.min * 100);
+      el.setAttribute("aria-valuemin", String(lo));
+      el.setAttribute(
+        "aria-valuemax",
+        String(Math.max(lo, Math.round(b.max * 100))),
+      );
       el.setAttribute("aria-valuenow", String(Math.round(h.node.ratio * 100)));
     }
   }
@@ -916,9 +931,8 @@ export class PaneManager {
       "aria-orientation",
       node.dir === "row" ? "vertical" : "horizontal",
     );
-    el.setAttribute("aria-valuemin", "10");
-    el.setAttribute("aria-valuemax", "90");
-    el.setAttribute("aria-valuenow", String(Math.round(node.ratio * 100)));
+    // aria-valuenow/min/max are written by _applyLayout's handle loop (the
+    // single writer) — the range comes from _ratioBounds, not a constant.
     el.setAttribute(
       "aria-label",
       node.dir === "row"
