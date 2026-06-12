@@ -310,9 +310,15 @@ function createCoordinatorPane(root, wsId, opts) {
     const childNode = link.dataset.nodeId;
     if (!childWs || !childNode) return;
     const pm = window.TS_SHELL && window.TS_SHELL.panes;
-    if (pm && pm.openPane) {
+    if (pm && pm.openPaneBeside) {
       e.preventDefault();
-      pm.openPane("interactive", childWs, { nodeId: childNode });
+      // Beside, not instead: the child lands in a cell to the RIGHT of the
+      // coordinator (you are usually cross-checking the child against the
+      // tree that spawned it, so the parent stays on screen).  The click's
+      // pointerdown already focused this coordinator's cell, so "beside the
+      // focused cell" is beside THIS pane; a denied split (cell cap / narrow
+      // viewport) degrades to the old focused-cell swap.
+      pm.openPaneBeside("interactive", childWs, { nodeId: childNode });
     }
   });
   // Approval keyboard shortcuts (designer P2 — the console twin of the

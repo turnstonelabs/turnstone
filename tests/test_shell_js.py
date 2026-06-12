@@ -720,8 +720,9 @@ def test_pane_manager_split_engine() -> None:
     (role=separator + aria-value*); the tree persists in the working-set blob
     and rehydrate prunes leaves whose pane did not restore."""
     pane = _PANE_JS.read_text(encoding="utf-8")
-    # public surface
-    assert "splitFocused(dir)" in pane and "unsplit()" in pane and "isSplit()" in pane
+    # public surface (splitFocused takes an optional explicit fill — openPaneBeside)
+    assert "splitFocused(dir, fillId)" in pane
+    assert "unsplit()" in pane and "isSplit()" in pane
     # no reparenting: layout is applied as % insets on the pane elements
     assert 'p.el.style.left = r.x * 100 + "%"' in pane
     # the focused-cell swap + pure focus move both live in activate()
@@ -743,6 +744,18 @@ def test_pane_manager_split_engine() -> None:
     assert "_restoreLayout(data)" in pane and "seen.has(d.paneId)" in pane
     # the visible-but-unfocused tab marker
     assert 'classList.toggle("shown"' in pane
+    # per-pane ✕: split mode hides ONE cell keeping the tab (closeCell);
+    # single-pane it closes the pane (withheld from non-closable) — the click
+    # decides at click time, the label tracks the mode.  Manager-injected into
+    # the pane SECTION (content untouched), removed via _clearCellStyle.
+    assert "closeCell(paneId)" in pane and "_refreshCellChips()" in pane
+    assert 'b.className = "cell-unsplit"' in pane
+    assert '"Close pane"' in pane, "the single-pane chip mode"
+    assert "this._removeCellChip(pane)" in pane
+    # open-beside: the coordinator child-link placement (split right of the
+    # focused cell, degrade to the plain swap on deny)
+    assert "openPaneBeside(type, id, extra)" in pane
+    assert 'this.splitFocused("right", paneId)' in pane
     css = _SHELL_CSS.read_text(encoding="utf-8")
     assert ".panes--split > section.pane" in css, (
         "split cells must target section.pane ONLY — the interactive pane's inner "
@@ -750,6 +763,11 @@ def test_pane_manager_split_engine() -> None:
     )
     assert ".split-handle" in css and "col-resize" in css and "row-resize" in css
     assert ".tab.shown:not(.active)" in css, "the visible-but-unfocused tab marker"
+    # the focused ring rides an ::after OVERLAY — an inset shadow on the
+    # section itself paints UNDER edge-touching children (the status-bar
+    # occlusion bug); the ::before bar sits above the ring line
+    assert ".panes--split > section.pane.split-focused::after" in css
+    assert ".cell-unsplit" in css, "the per-cell hide-from-split chip style"
 
 
 def test_step7_auth_gated_open_pane() -> None:
@@ -851,14 +869,17 @@ def test_interactive_pane_dead_session_revive() -> None:
     )
 
 
-def test_shell_marks_pane_dead_on_ws_closed() -> None:
-    """Tier-1 ws_closed → the open pane stops reconnect-polling a session that
-    is GONE and shows the reconnect affordance immediately (the console keeps
-    the tab — unlike the standalone, which closes the pane outright)."""
+def test_shell_closes_pane_on_ws_closed() -> None:
+    """Tier-1 ws_closed → the open pane CLOSES outright (tab gone; a split
+    cell collapses onto its sibling) — the coordinator-closes-its-child flow,
+    matching the standalone's pane-auto-close.  The dead-BANNER lane survives
+    for streams that die WITHOUT a ws_closed (node crash / network), where the
+    session may still be revivable."""
     shell = _SHELL_JS.read_text(encoding="utf-8")
     assert "const notifySessionClosed = (wsId)" in shell
     assert 'pm.getPane("interactive", wsId)' in shell
-    assert "p._ctl.markDead()" in shell
+    assert "if (p) pm.close(p.id)" in shell, "ws_closed closes the pane, not mark-dead"
+    assert "showDeadBanner" in shell, "the banner lane must survive for non-closed deaths"
     assert "window.TS_SHELL = { panes: pm, caps, notifySessionClosed, setRowBadge }" in shell, (
         "the seam must be exported on TS_SHELL for the console's Tier-1 handler"
     )

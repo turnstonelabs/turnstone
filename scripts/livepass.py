@@ -527,14 +527,20 @@ SHELL_TEMPLATE = """<!doctype html>
             p.onMount = function () {
               const wrap = document.createElement("div");
               wrap.style.cssText =
-                "padding:16px;display:flex;flex-direction:column;gap:10px;overflow:auto;";
+                "flex:1;min-height:0;padding:16px;display:flex;flex-direction:column;gap:10px;overflow:auto;";
               for (const [role, text] of lines) {
                 const d = document.createElement("div");
                 d.className = "msg " + role;
                 d.textContent = text;
                 wrap.append(d);
               }
-              this.bodyEl.append(wrap);
+              // Edge-touching opaque chrome — the strip that occluded the
+              // focus ring before the ::after overlay; keeps the bug class
+              // visible in every future pass.
+              const sb = document.createElement("div");
+              sb.className = "ws-status-bar";
+              sb.textContent = "17,418 / 393,216 (4.4%) · max 9 tools";
+              this.bodyEl.append(wrap, sb);
             };
             return p;
           });

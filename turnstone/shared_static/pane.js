@@ -358,7 +358,7 @@ export class PaneManager {
    *  via `setPaneMeta`) to have it persisted and handed back as `extra` on
    *  rehydrate — the interactive pane does this with its resolved nodeId so a
    *  reload restores the pane onto the SAME node (no re-route / duplicate load). */
-  openPane(type, id, extra) {
+  openPane(type, id, extra, _beside) {
     if (!this._types.has(type)) {
       console.warn("PaneManager: unknown pane type", type);
       return null;
@@ -383,7 +383,14 @@ export class PaneManager {
       this._order.push(paneId);
       this._mount(pane);
     }
-    this.activate(paneId);
+    if (_beside && this._activeId !== paneId && !this._leafFor(paneId)) {
+      // Open BESIDE the focused cell (see openPaneBeside) — a denied split
+      // (cap / space) degrades to the plain focused-cell placement below.
+      const r = this.splitFocused("right", paneId);
+      if (!r.ok) this.activate(paneId);
+    } else {
+      this.activate(paneId);
+    }
     // Explicit-reopen signal: openPane on an existing pane is a user saying
     // "open this AGAIN" (saved-list resume, rail row, child link) — activate()
     // alone can't carry that (it no-ops hooks on the already-active pane, and
@@ -397,6 +404,17 @@ export class PaneManager {
       }
     }
     return pane;
+  }
+
+  /** openPane, but a pane that was not already on screen lands in a fresh
+   *  cell to the RIGHT of the focused one instead of replacing it — the
+   *  coordinator child-link gesture (the parent stays visible; you are
+   *  usually cross-checking the child against the tree that spawned it).
+   *  An already-visible pane is just focused; a denied split (cell cap /
+   *  not enough space) degrades to the plain focused-cell swap.  Everything
+   *  else (auth gate, factory hint, onReopen) is openPane's. */
+  openPaneBeside(type, id, extra) {
+    return this.openPane(type, id, extra, true);
   }
 
   _mount(pane) {
@@ -470,6 +488,7 @@ export class PaneManager {
       }
     }
     if (this._layout) this._applyLayout();
+    this._refreshCellChips();
     this._renderTabs();
     this._persist();
     this._notifyActive();
@@ -537,12 +556,13 @@ export class PaneManager {
   }
 
   /** Split the focused pane's cell — `dir` "right" puts the new cell beside
-   *  it, "down" below it.  The new cell shows the most-recently-focused
-   *  backgrounded pane: splitting never duplicates a pane (panes are keyed
-   *  singletons — two mounts of one session would race its stream).  Returns
-   *  `{ok:true}` or `{ok:false, reason}`; the CALLER owns user feedback (the
-   *  shell toasts the reason — PaneManager stays chrome-free). */
-  splitFocused(dir) {
+   *  it, "down" below it.  The new cell shows `fillId` when given (the
+   *  openPaneBeside path), else the most-recently-focused backgrounded pane.
+   *  Splitting never duplicates a pane (panes are keyed singletons — two
+   *  mounts of one session would race its stream).  Returns `{ok:true}` or
+   *  `{ok:false, reason}`; the CALLER owns user feedback (the shell toasts
+   *  the reason — PaneManager stays chrome-free). */
+  splitFocused(dir, fillId) {
     const activeId = this._activeId;
     if (!activeId || !this._panes.has(activeId))
       return { ok: false, reason: "Nothing to split" };
@@ -551,12 +571,23 @@ export class PaneManager {
         ok: false,
         reason: "Pane limit reached (" + SPLIT_MAX_CELLS + ")",
       };
-    const fillId = this._nextBackgroundPane();
-    if (!fillId)
-      return {
-        ok: false,
-        reason: "Every open tab is already visible — open another one first",
-      };
+    if (fillId != null) {
+      // An explicit fill must be an open, backgrounded, non-focused pane —
+      // anything else is the caller's bug; deny so it can degrade cleanly.
+      if (
+        !this._panes.has(fillId) ||
+        fillId === activeId ||
+        this._leafFor(fillId)
+      )
+        return { ok: false, reason: "Not splittable" };
+    } else {
+      fillId = this._nextBackgroundPane();
+      if (!fillId)
+        return {
+          ok: false,
+          reason: "Every open tab is already visible — open another one first",
+        };
+    }
     // Space guard: the focused cell must fit two cells plus the divider.
     const rect = this._cellRect(activeId);
     const need =
@@ -594,6 +625,24 @@ export class PaneManager {
     this._renderTabs();
     this._persist();
     this._notifyActive();
+  }
+
+  /** Remove ONE cell from the split — the pane stays open as a (now hidden)
+   *  tab and its sibling absorbs the space.  The per-cell ✕ chip calls this;
+   *  distinct from close() (destroys the pane) and unsplit() (collapses every
+   *  cell but the focused one). */
+  closeCell(paneId) {
+    if (!this._layout) return;
+    const leaf = this._leafFor(paneId);
+    if (!leaf) return;
+    const sibling = this._collapseLeaf(leaf); // hides the pane + may exit split mode
+    if (this._activeId === paneId && sibling) {
+      this.activate(sibling); // fires the focus hooks + renders + persists + notifies
+    } else {
+      this._renderTabs();
+      this._persist();
+      this._notifyActive();
+    }
   }
 
   // ----- tree helpers -----
@@ -774,6 +823,7 @@ export class PaneManager {
       this._clearCellStyle(p);
       if (keepId) p.el.hidden = p.id !== keepId;
     }
+    this._refreshCellChips(); // the survivor's ✕ flips to close-pane mode
   }
 
   _clearCellStyle(pane) {
@@ -782,6 +832,49 @@ export class PaneManager {
     pane.el.style.width = "";
     pane.el.style.height = "";
     pane.el.classList.remove("split-focused");
+    this._removeCellChip(pane);
+  }
+
+  /** The per-pane ✕ chip, top-right of every VISIBLE pane.  Mode-dependent:
+   *  in a multi-cell split it hides that cell (closeCell — the tab stays);
+   *  single-pane it closes the pane outright (tab and all), so it is withheld
+   *  from non-closable panes (the Dashboard) there.  The click decides at
+   *  CLICK time, the label tracks the mode.  Injected by the MANAGER into the
+   *  pane's section (not bodyEl — pane content is never touched). */
+  _refreshCellChips() {
+    const multi = !!this._layout && this._leaves().length > 1;
+    for (const p of this._panes.values()) {
+      const want =
+        !p.el.hidden && (multi ? !!this._leafFor(p.id) : p.closable !== false);
+      if (want) this._ensureCellChip(p, multi);
+      else this._removeCellChip(p);
+    }
+  }
+
+  _ensureCellChip(pane, multi) {
+    let b = pane._cellChip;
+    if (!b || !b.isConnected) {
+      b = document.createElement("button");
+      b.type = "button";
+      b.className = "cell-unsplit";
+      b.textContent = "✕";
+      b.addEventListener("click", () => {
+        if (this._layout && this._leafFor(pane.id)) this.closeCell(pane.id);
+        else this.close(pane.id);
+      });
+      pane.el.append(b);
+      pane._cellChip = b;
+    }
+    const label = multi ? "Hide from split — the tab stays open" : "Close pane";
+    b.title = label;
+    b.setAttribute("aria-label", label);
+  }
+
+  _removeCellChip(pane) {
+    if (pane._cellChip) {
+      pane._cellChip.remove();
+      pane._cellChip = null;
+    }
   }
 
   /** Focus follows the pointer between cells: a click anywhere inside a
@@ -789,6 +882,9 @@ export class PaneManager {
    *  stop propagation of bubbled events). */
   _onPanesPointerdown(e) {
     if (!this._layout) return;
+    // The ✕ chip collapses its cell — focusing that cell first would fire a
+    // spurious onActivate on the very pane about to leave the screen.
+    if (e.target.closest && e.target.closest(".cell-unsplit")) return;
     let el = e.target;
     // The ShellPane <section> is the DIRECT child of the host (the interactive
     // pane's inner <div> also carries .pane — walking to the direct child
@@ -975,6 +1071,7 @@ export class PaneManager {
       const first = this._firstLeaf(tree);
       if (first) this.activate(first.paneId);
     }
+    this._refreshCellChips();
     this._renderTabs(); // pick up the .shown markers
   }
 

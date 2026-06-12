@@ -146,9 +146,10 @@ function patchClusterState(data) {
     if (typeof loadSavedCoordinators === "function") {
       loadSavedCoordinators();
     }
-    // An open pane on this session must stop reconnect-polling a stream that
-    // is now gone and show its reconnect affordance instead (the shell owns
-    // the pane lifecycle; this is the Tier-1 → pane seam).
+    // An open pane on this session closes with it — the coordinator just
+    // closed its child (or the session ended elsewhere); a lingering tab
+    // would only reconnect-poll a stream that is gone (the shell owns the
+    // pane lifecycle; this is the Tier-1 → pane seam).
     if (
       window.TS_SHELL &&
       typeof window.TS_SHELL.notifySessionClosed === "function"

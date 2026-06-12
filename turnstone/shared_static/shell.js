@@ -892,12 +892,15 @@ async function mountShell() {
     }
   }
 
-  // Tier-1 lifecycle → pane signal.  The console's ws_closed handler calls this
-  // so an open pane on that session stops its reconnect loop NOW (instead of
-  // 404-polling a session that is gone) and shows the reconnect affordance.
+  // Tier-1 lifecycle → pane signal.  The console's ws_closed handler calls
+  // this so an open pane on a CLOSED session closes outright — tab gone, a
+  // split cell collapses onto its sibling.  This is the coordinator-closes-
+  // its-child flow (and matches the standalone's pane-auto-close); the dead-
+  // BANNER lane stays for streams that die WITHOUT a ws_closed (node crash,
+  // network) where the session may still be revivable.
   const notifySessionClosed = (wsId) => {
     const p = pm.getPane("interactive", wsId);
-    if (p && p._ctl && p._ctl.markDead) p._ctl.markDead();
+    if (p) pm.close(p.id);
   };
   // `setRowBadge` lets a classic-script subsystem (the standalone consent badge
   // in ui/static/app.js) stamp a count chip on a Manage row without importing the
