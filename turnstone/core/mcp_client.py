@@ -57,7 +57,7 @@ from turnstone.core.mcp_oauth import (
 )
 
 if TYPE_CHECKING:
-    from collections.abc import Awaitable, Callable
+    from collections.abc import Awaitable, Callable, Coroutine
 
 log = get_logger("turnstone.mcp")
 
@@ -606,6 +606,13 @@ class MCPClientManager:
         # rows exist, so deferring keeps the task count at zero in
         # static-only deployments).
         self._user_pool_eviction_task: asyncio.Task[None] | None = None
+
+        # Strong references to fire-and-forget background tasks (catalog
+        # refreshes etc.).  ``create_task`` alone keeps only a weak ref — an
+        # untracked task can be GC'd mid-flight, and its exception surfaces
+        # as "Task exception was never retrieved" at GC time instead of
+        # being logged where it happened.  See ``_spawn_background``.
+        self._background_tasks: set[asyncio.Task[Any]] = set()
 
     def _ensure_static_state(self, name: str) -> StaticServerState:
         """Get or create the StaticServerState for ``name``.
@@ -2712,6 +2719,25 @@ class MCPClientManager:
 
     def shutdown(self) -> None:
         """Close all MCP sessions and stop the background loop."""
+        # Cancel tracked background tasks (catalog refreshes etc.) FIRST —
+        # they are pure auxiliaries, and draining them up front means the
+        # stack teardown below can't race an in-flight refresh.
+        if self._loop and self._background_tasks:
+
+            async def _cancel_background() -> None:
+                tasks = list(self._background_tasks)
+                for task in tasks:
+                    task.cancel()
+                for task in tasks:
+                    with contextlib.suppress(BaseException):
+                        await task
+
+            future = asyncio.run_coroutine_threadsafe(_cancel_background(), self._loop)
+            try:
+                future.result(timeout=10)
+            except Exception:
+                log.debug("Error cancelling MCP background tasks", exc_info=True)
+
         # Cancel the pool eviction task, then close all pool entries
         # before tearing down static-path state. Both run on the
         # mcp-loop so dispatcher coroutines can't race them.
@@ -2769,6 +2795,7 @@ class MCPClientManager:
             self._thread.join(timeout=5)
 
         # Clear all state
+        self._background_tasks.clear()
         self._static_servers.clear()
         self._db_managed.clear()
         self._tools = []
@@ -3327,6 +3354,33 @@ class MCPClientManager:
             # broken the first failure re-trips the circuit immediately.
             self._circuit_open_until.pop(server_name, None)
 
+    def _spawn_background(self, coro: Coroutine[Any, Any, Any], label: str) -> asyncio.Task[Any]:
+        """Schedule *coro* as a tracked background task (loop thread only).
+
+        Holds a strong reference until completion and retrieves the task's
+        outcome in a done-callback: failures are logged once, here, at
+        warning — never deferred to garbage collection, where they surface
+        as "Task exception was never retrieved" on whatever stream happens
+        to be attached at the time.  ``shutdown()`` cancels anything still
+        tracked before stopping the loop.
+        """
+        task = asyncio.create_task(coro)
+        self._background_tasks.add(task)
+
+        def _done(t: asyncio.Task[Any]) -> None:
+            try:
+                if not t.cancelled():
+                    exc = t.exception()
+                    if exc is not None:
+                        log.warning("MCP background %s failed", label, exc_info=exc)
+            finally:
+                # Discard LAST so set-emptiness means "done AND reported" —
+                # a watcher keying on emptiness must never race the warning.
+                self._background_tasks.discard(t)
+
+        task.add_done_callback(_done)
+        return task
+
     def _cb_auto_reconnect(self, server_name: str) -> Any:
         """Attempt reconnection for a disconnected server during half-open probe.
 
@@ -3355,13 +3409,18 @@ class MCPClientManager:
 
         # Schedule catalog refresh on the loop without blocking the caller.
         # The reconnected session is valid for the imminent dispatch; catalog
-        # drift will be reconciled on the loop in the background.
+        # drift will be reconciled on the loop in the background.  The task is
+        # tracked: a refresh FAILURE is logged by the done-callback — this
+        # except only covers the scheduling itself.
         def _schedule_refresh() -> None:
             try:
-                asyncio.create_task(self._refresh_server(server_name))
+                self._spawn_background(
+                    self._refresh_server(server_name),
+                    f"catalog refresh after reconnect for '{server_name}'",
+                )
             except Exception:
                 log.warning(
-                    "Catalog refresh after reconnect failed for '%s'",
+                    "Scheduling catalog refresh after reconnect failed for '%s'",
                     server_name,
                     exc_info=True,
                 )
