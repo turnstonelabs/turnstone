@@ -1,0 +1,47 @@
+[
+  {
+    "tier": 1,
+    "name": "Field Rat",
+    "hp": 6,
+    "atk": 3,
+    "def": 0,
+    "xp": 8,
+    "gold": 3
+  },
+  {
+    "tier": 2,
+    "name": "Goblin",
+    "hp": 12,
+    "atk": 5,
+    "def": 1,
+    "xp": 18,
+    "gold": 7
+  },
+  {
+    "tier": 3,
+    "name": "Forest Wolf",
+    "hp": 20,
+    "atk": 8,
+    "def": 2,
+    "xp": 35,
+    "gold": 14
+  },
+  {
+    "tier": 4,
+    "name": "Cave Troll",
+    "hp": 38,
+    "atk": 12,
+    "def": 4,
+    "xp": 70,
+    "gold": 30
+  },
+  {
+    "tier": 5,
+    "name": "Stone Wyrm",
+    "hp": 60,
+    "atk": 18,
+    "def": 6,
+    "xp": 140,
+    "gold": 60
+  }
+]

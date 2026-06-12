@@ -1,0 +1,55 @@
+[build-system]
+requires = ["hatchling>=1.29"]
+build-backend = "hatchling.build"
+
+[project]
+name = "understone"
+version = "0.1.0"
+description = "Understone — a BBS-style ANSI door game served over MCP."
+requires-python = ">=3.11"
+license = "Apache-2.0"
+dependencies = [
+    "mcp>=1.27,<2",
+]
+
+[project.scripts]
+understone = "understone.server:main"
+
+[project.optional-dependencies]
+test = ["pytest>=9.0"]
+dev = ["ruff>=0.9", "mypy>=1.14"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["understone"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+target-version = "py311"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "N", "UP", "B", "A", "SIM", "TCH"]
+ignore = ["E501"]
+
+[tool.ruff.format]
+quote-style = "double"
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+warn_return_any = true
+warn_unused_configs = true
+disallow_untyped_defs = true
+disallow_incomplete_defs = true
+check_untyped_defs = true
+no_implicit_optional = true
+
+[[tool.mypy.overrides]]
+module = ["mcp", "mcp.*"]
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = "tests.*"
+disallow_untyped_defs = false
