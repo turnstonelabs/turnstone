@@ -77,7 +77,7 @@ or MCP config can do adds to it.  Current members:
 | `delete_workstream`       | wind-down       | Hard-delete one child.  Requires approval.                          |
 | `list_nodes`              | discover        | Enumerate live cluster nodes + capabilities.                        |
 | `skills` (action=find)    | discover        | Browse the skill catalog; opt-in `kind` filter narrows by audience. |
-| `memory`                  | persist         | Orchestration scratchpad keyed by the `coordinator` scope.          |
+| `memory`                  | persist         | Durable orchestration memory (`coordinator` scope, per-user — survives across coordinator sessions). |
 | `notify`                  | broadcast       | Post a status update to a human channel at a narrative beat.        |
 | `tasks`                   | plan            | Orchestrator-only scratchpad.  Children don't see it.               |
 

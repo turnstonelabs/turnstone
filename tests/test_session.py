@@ -2259,28 +2259,36 @@ class TestCoordinatorMemoryScope:
     be steered by attackers, so the coord scope must NOT become a delivery
     channel that injects child-controlled text into the parent's system
     message.
+
+    The scope is keyed by the coordinator's creator ``user_id`` (NOT its
+    ws_id), so the namespace is durable: every coordinator session the
+    same user runs shares it.  The containment gate is the session KIND —
+    children share the parent's user_id and must still be rejected.
     """
 
-    def test_coordinator_session_resolves_to_own_ws_id(self, tmp_db):
+    def test_coordinator_session_resolves_to_user_id(self, tmp_db):
         from turnstone.core.session import ChatSession
         from turnstone.core.workstream import WorkstreamKind
 
         session = _make_session(
             ws_id="coord-1",
+            user_id="user-1",
             kind=WorkstreamKind.COORDINATOR,
         )
         assert isinstance(session, ChatSession)  # type narrow
-        assert session._resolve_scope_id("coordinator") == "coord-1"
+        assert session._resolve_scope_id("coordinator") == "user-1"
 
     def test_child_session_resolves_empty(self, tmp_db):
-        """A child interactive ws of a coord does NOT inherit the
-        coord's scope_id — the row is private to the coord.  Children
-        get an empty scope_id which ``_validate_scope`` translates into
-        an explicit reject."""
+        """A child interactive ws of a coord does NOT inherit the coord
+        scope even though it shares the coord's ``user_id`` — the gate
+        is the session kind, not the scope_id value.  Children get an
+        empty scope_id which ``_validate_scope`` translates into an
+        explicit reject."""
         from turnstone.core.workstream import WorkstreamKind
 
         session = _make_session(
             ws_id="child-a",
+            user_id="user-1",  # same user as the parent coord
             kind=WorkstreamKind.INTERACTIVE,
             parent_ws_id="coord-1",
         )
@@ -2288,11 +2296,13 @@ class TestCoordinatorMemoryScope:
 
     def test_top_level_interactive_resolves_empty(self, tmp_db):
         """An IC session with no parent also has no coord context — same
-        empty scope_id, same explicit reject from ``_validate_scope``."""
+        empty scope_id, same explicit reject from ``_validate_scope`` —
+        even when authenticated as a user who owns coordinators."""
         from turnstone.core.workstream import WorkstreamKind
 
         session = _make_session(
             ws_id="ws-top",
+            user_id="user-1",
             kind=WorkstreamKind.INTERACTIVE,
             parent_ws_id=None,
         )
@@ -2332,6 +2342,7 @@ class TestCoordinatorMemoryScope:
 
         session = _make_session(
             ws_id="coord-1",
+            user_id="user-1",
             kind=WorkstreamKind.COORDINATOR,
         )
         assert session._validate_scope("coordinator", "call_1") is None
@@ -2339,11 +2350,13 @@ class TestCoordinatorMemoryScope:
     def test_prepare_memory_save_accepts_coord_scope_for_coord(self, tmp_db):
         """The ``save`` action's preparer must round-trip
         scope='coordinator' through to the execute item with scope_id
-        resolved to the coord's own ws_id."""
+        resolved to the coord's creator user_id (the durable per-user
+        namespace key)."""
         from turnstone.core.workstream import WorkstreamKind
 
         session = _make_session(
             ws_id="coord-1",
+            user_id="user-1",
             kind=WorkstreamKind.COORDINATOR,
         )
         item = session._prepare_memory(
@@ -2357,16 +2370,19 @@ class TestCoordinatorMemoryScope:
         )
         assert "error" not in item
         assert item["scope"] == "coordinator"
-        assert item["scope_id"] == "coord-1"
+        assert item["scope_id"] == "user-1"
 
     def test_prepare_memory_save_rejects_coord_scope_for_child(self, tmp_db):
         """Children's memory(action='save', scope='coordinator') must
         return an error item, not silently downgrade to a different
-        scope and not write into the coord's namespace."""
+        scope and not write into the coord's namespace.  The child
+        shares the parent's user_id — exactly the credentials a
+        user-keyed scope would accept if kind weren't the gate."""
         from turnstone.core.workstream import WorkstreamKind
 
         session = _make_session(
             ws_id="child-a",
+            user_id="user-1",  # same user as the parent coord
             kind=WorkstreamKind.INTERACTIVE,
             parent_ws_id="coord-1",
         )
@@ -2383,10 +2399,10 @@ class TestCoordinatorMemoryScope:
         assert "coordinator" in item["error"]
 
     def test_coord_save_visible_only_to_coord(self, tmp_db):
-        """A coord-scope memory must be visible to the coord but
-        NOT to its children, NOT to other coords' children, and NOT to
-        unrelated top-level IC sessions.  The coord-scope row is
-        private to the coord that owns it."""
+        """A coord-scope memory must be visible to its user's coordinator
+        sessions (ALL of them — the namespace is per-user durable) but
+        NOT to children (same user!), NOT to unrelated IC sessions, and
+        NOT to another user's coordinators."""
         from turnstone.core.memory import save_structured_memory
         from turnstone.core.workstream import WorkstreamKind
 
@@ -2394,21 +2410,33 @@ class TestCoordinatorMemoryScope:
             "private_plan",
             "internal coord notes",
             scope="coordinator",
-            scope_id="coord-1",
+            scope_id="user-1",
         )
 
         coord = _make_session(
             ws_id="coord-1",
+            user_id="user-1",
             kind=WorkstreamKind.COORDINATOR,
         )
-        # The coord sees its own row.
+        # The coord sees its user's row.
         coord_visible = {m["name"] for m in coord._list_visible_memories()}
         assert "private_plan" in coord_visible
 
-        # Children of the SAME coord don't see it — closes the
-        # prompt-injection lane.
+        # A LATER coordinator session of the same user (fresh ws_id)
+        # sees the same row — this is the persistence the per-user
+        # keying buys; under ws_id keying this set was always empty.
+        coord_next = _make_session(
+            ws_id="coord-9",
+            user_id="user-1",
+            kind=WorkstreamKind.COORDINATOR,
+        )
+        assert "private_plan" in {m["name"] for m in coord_next._list_visible_memories()}
+
+        # Children of the SAME coord — same user_id — don't see it.
+        # Closes the prompt-injection lane: kind is the gate.
         child = _make_session(
             ws_id="child-a",
+            user_id="user-1",
             kind=WorkstreamKind.INTERACTIVE,
             parent_ws_id="coord-1",
         )
@@ -2418,15 +2446,17 @@ class TestCoordinatorMemoryScope:
         # Children of a DIFFERENT coord don't see it (cross-coord).
         unrelated_child = _make_session(
             ws_id="child-b",
+            user_id="user-2",
             kind=WorkstreamKind.INTERACTIVE,
             parent_ws_id="coord-2",
         )
         unrelated_child_visible = {m["name"] for m in unrelated_child._list_visible_memories()}
         assert "private_plan" not in unrelated_child_visible
 
-        # A different coord doesn't see another coord's row.
+        # Another USER's coordinator doesn't see this user's rows.
         other_coord = _make_session(
             ws_id="coord-2",
+            user_id="user-2",
             kind=WorkstreamKind.COORDINATOR,
         )
         other_coord_visible = {m["name"] for m in other_coord._list_visible_memories()}
@@ -2463,9 +2493,10 @@ class TestCoordinatorMemoryScope:
             kind=WorkstreamKind.COORDINATOR,
         )
         visible = {m["name"] for m in coord._list_visible_memories()}
-        # The coord's own ws_id matching workstream-scope rows must NOT
-        # leak in — coord and IC use different scopes even if their
-        # ids could collide on synthetic test inputs.
+        # ``user_note`` is the sharpest case now: its scope_id
+        # ("user-1") is IDENTICAL to the coord's coordinator scope_id —
+        # the scope COLUMN is what keeps the namespaces disjoint.  Same
+        # for ``ws_note`` matching the coord's ws_id.
         assert "ws_note" not in visible
         assert "user_note" not in visible
         assert "global_note" not in visible
@@ -2489,7 +2520,7 @@ class TestCoordinatorMemoryScope:
             "coord_x",
             "orchestration content",
             scope="coordinator",
-            scope_id="coord-1",
+            scope_id="user-1",
         )
 
         coord = _make_session(
@@ -2527,6 +2558,7 @@ class TestCoordinatorMemoryScope:
 
         coord = _make_session(
             ws_id="coord-1",
+            user_id="user-1",
             kind=WorkstreamKind.COORDINATOR,
         )
         item = coord._prepare_memory(
@@ -2535,7 +2567,7 @@ class TestCoordinatorMemoryScope:
         )
         assert "error" not in item
         assert item["scope"] == "coordinator"
-        assert item["scope_id"] == "coord-1"
+        assert item["scope_id"] == "user-1"
 
     def test_coord_implicit_walk_only_coordinator(self, tmp_db):
         """Coord ``memory(action='get')`` with no explicit scope must
@@ -2546,6 +2578,7 @@ class TestCoordinatorMemoryScope:
 
         coord = _make_session(
             ws_id="coord-1",
+            user_id="user-1",
             kind=WorkstreamKind.COORDINATOR,
         )
         item = coord._prepare_memory(
@@ -2573,6 +2606,110 @@ class TestCoordinatorMemoryScope:
         assert "error" not in item
         scopes = [s for s, _ in item["scopes_to_try"]]
         assert scopes == ["workstream", "user", "global"]
+
+    def test_coord_memory_persists_across_sessions(self, tmp_db):
+        """End-to-end through the real save lane: a memory saved by one
+        coordinator session is readable by a LATER coordinator session
+        of the same user (fresh ws_id) — the regression this scope
+        redesign exists to fix.  Under ws_id keying the second session
+        was born into an empty namespace every time."""
+        from turnstone.core.workstream import WorkstreamKind
+
+        first = _make_session(
+            ws_id="coord-old",
+            user_id="user-1",
+            kind=WorkstreamKind.COORDINATOR,
+        )
+        item = first._prepare_memory(
+            "call_1",
+            {
+                "action": "save",
+                "name": "deploy_runbook",
+                "content": "drain node before rotating certs",
+                "scope": "coordinator",
+            },
+        )
+        assert "error" not in item
+        result = item["execute"](item)
+        assert "Saved" in str(result) or "saved" in str(result).lower()
+
+        # Brand-new coordinator session, new ws_id, same user.
+        second = _make_session(
+            ws_id="coord-new",
+            user_id="user-1",
+            kind=WorkstreamKind.COORDINATOR,
+        )
+        get_item = second._prepare_memory(
+            "call_2",
+            {"action": "get", "name": "deploy_runbook"},
+        )
+        assert "error" not in get_item
+        out = str(get_item["execute"](get_item))
+        assert "drain node before rotating certs" in out
+
+    def test_coordinator_session_requires_user_id(self, tmp_db):
+        """Anonymous coordinators must not be constructible: the
+        constructor is the host-independent choke point (create,
+        rehydrate, and any future host all pass through it).  An empty
+        user_id would otherwise key the durable scope on ``""`` —
+        one namespace shared by every unauthenticated session — and
+        mint child-spawn tokens for a phantom principal."""
+        import pytest
+
+        from turnstone.core.workstream import WorkstreamKind
+
+        with pytest.raises(ValueError, match="authenticated user_id"):
+            _make_session(
+                ws_id="coord-anon",
+                kind=WorkstreamKind.COORDINATOR,
+            )
+        with pytest.raises(ValueError, match="authenticated user_id"):
+            _make_session(
+                ws_id="coord-anon",
+                user_id="",
+                kind=WorkstreamKind.COORDINATOR,
+            )
+
+    def test_validate_scope_backstop_rejects_unauthenticated_coord(self, tmp_db):
+        """Defense-in-depth behind the constructor guard: if a session
+        ever reaches the memory layer as an unauthenticated coordinator
+        (test double, future host bypass), the save lane is refused at
+        validation and scope resolution stays empty/fail-closed."""
+        from turnstone.core.workstream import WorkstreamKind
+
+        coord = _make_session(
+            ws_id="coord-1",
+            user_id="user-1",
+            kind=WorkstreamKind.COORDINATOR,
+        )
+        coord._user_id = ""  # simulate a constructor-bypassing double
+        err = coord._validate_scope("coordinator", "call_1")
+        assert err is not None
+        assert "requires authenticated user identity" in err["error"]
+        assert coord._coordinator_scope_id() == ""
+        item = coord._prepare_memory(
+            "call_1",
+            {"action": "save", "name": "x", "content": "y", "scope": "coordinator"},
+        )
+        assert "error" in item
+
+        # The implicit read lane must fail closed too: the storage
+        # helpers treat a falsy scope_id as "no scope_id filter", so
+        # ("coordinator", "") would otherwise read EVERY user's
+        # coordinator rows.  Seed another user's row and prove the
+        # unauthenticated double sees nothing, not everything.
+        from turnstone.core.memory import save_structured_memory
+
+        save_structured_memory(
+            "other_users_row",
+            "must not leak",
+            scope="coordinator",
+            scope_id="user-9",
+        )
+        assert coord._visible_scopes() == []
+        assert coord._visible_memory_count() == 0
+        assert coord._list_visible_memories() == []
+        assert coord._search_visible_memories("leak") == []
 
 
 class TestMemoryToolAudit:

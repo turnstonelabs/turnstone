@@ -945,6 +945,20 @@ class ChatSession:
         parent_ws_id: str | None = None,
         coord_client: Any = None,
     ):
+        if kind == WorkstreamKind.COORDINATOR and not user_id:
+            # Coordinators carry real authority — they mint child-spawn
+            # tokens as their creator and own a durable per-user memory
+            # namespace — so an anonymous one must never exist. The
+            # empty-string user_id sentinel is an interactive-only lane
+            # (CLI / eval / placeholder sessions); every coordinator
+            # host authenticates (console HTTP create 401s an empty
+            # principal), leaving rehydration of a corrupt or legacy
+            # row as the path this guard surfaces.
+            raise ValueError(
+                "coordinator sessions require an authenticated user_id; "
+                f"refusing to construct an anonymous coordinator (ws_id={ws_id!r}). "
+                "If this is a persisted legacy row, delete or close it."
+            )
         self.client = client
         self.model = model
         # Coordinator plumbing: populated by the console's session factory
@@ -7281,6 +7295,16 @@ class ChatSession:
         content (MCP tool output, attachments) which can be steered to
         plant instructions, and the new scope must not become a
         delivery channel back into the parent's prompt.
+
+        The containment gate is the session KIND (children are always
+        INTERACTIVE \u2014 :meth:`_validate_scope` rejects them before this
+        resolver runs), not secrecy of the scope_id value.  That is
+        what lets the coord scope key on the durable ``user_id``
+        (shared with children, visible cluster-wide as display
+        metadata) without widening the write surface: no lane \u2014 memory
+        tool or REST (``_VALID_MEMORY_SCOPES`` in ``server.py`` omits
+        ``coordinator``) \u2014 accepts a caller-supplied coordinator
+        scope_id.
         """
         if scope == "workstream":
             return self._ws_id
@@ -7291,20 +7315,27 @@ class ChatSession:
         return ""
 
     def _coordinator_scope_id(self) -> str:
-        """Return the ws_id anchoring the ``coordinator`` memory scope, or ``""``.
+        """Return the user_id anchoring the ``coordinator`` memory scope, or ``""``.
 
         Only a coordinator session has a coord scope \u2014 returns
-        ``self._ws_id`` for ``kind == COORDINATOR``, ``""`` otherwise.
-        Children of a coord get an empty scope_id, which
-        :meth:`_validate_scope` translates into an explicit reject \u2014
-        children must use ``workstream`` or ``user`` scope for their
-        own memories.
+        ``self._user_id`` for ``kind == COORDINATOR``, ``""`` otherwise.
+        Keying on the user (not the ws_id) makes the namespace durable:
+        every coordinator session the same user runs shares one
+        orchestration memory, so notes survive close/reopen.  Children
+        of a coord get an empty scope_id, which :meth:`_validate_scope`
+        translates into an explicit reject \u2014 children must use
+        ``workstream`` or ``user`` scope for their own memories.
+
+        ``""`` for an unauthenticated coordinator is unreachable in
+        practice (``__init__`` refuses to construct one) but kept
+        fail-closed: an empty scope_id never resolves to a readable or
+        writable namespace.
 
         See :meth:`_resolve_scope_id`'s docstring for the security
         rationale (cross-session prompt-injection containment).
         """
         if self._kind == WorkstreamKind.COORDINATOR:
-            return self._ws_id
+            return self._user_id
         return ""
 
     def _validate_scope(self, scope: str, call_id: str) -> dict[str, Any] | None:
@@ -7316,9 +7347,11 @@ class ChatSession:
         doesn't accidentally mutate or read user-context rows.
 
         Interactive sessions reject ``coordinator`` for the symmetric
-        reason \u2014 coord-scope rows are private to a coordinator
-        session, and an IC writer could otherwise be a cross-session
-        prompt-injection lane into the parent coord's system message.
+        reason \u2014 coord-scope rows belong to a per-user namespace read
+        only by that user's COORDINATOR sessions, and an IC writer
+        (children share the parent's user_id, so the kind check is the
+        gate) could otherwise be a cross-session prompt-injection lane
+        into the parent coord's system message.
         """
         if scope == "user" and not self._user_id:
             return {
@@ -7328,6 +7361,27 @@ class ChatSession:
                 "preview": "",
                 "needs_approval": False,
                 "error": "Error: 'user' scope requires authenticated user identity",
+            }
+        if (
+            scope == "coordinator"
+            and self._kind == WorkstreamKind.COORDINATOR
+            and not self._user_id
+        ):
+            # Backstop for the save lane: search/list reject empty
+            # scope_ids in _exec_memory, but save would otherwise write
+            # a ("coordinator", "") row shared by every unauthenticated
+            # session. Unreachable through real hosts (__init__ refuses
+            # COORDINATOR without a user_id); guards test doubles and
+            # future hosts. Kind-scoped so non-coordinator callers keep
+            # the clearer kind-mismatch error below regardless of their
+            # auth state.
+            return {
+                "call_id": call_id,
+                "func_name": "memory",
+                "header": "\u2717 memory: coordinator scope requires authentication",
+                "preview": "",
+                "needs_approval": False,
+                "error": "Error: 'coordinator' scope requires authenticated user identity",
             }
         if self._kind == WorkstreamKind.COORDINATOR and scope != "coordinator":
             return {
@@ -7397,7 +7451,10 @@ class ChatSession:
         message, which the coord shouldn't be reasoning over.
         """
         if self._kind == WorkstreamKind.COORDINATOR:
-            return count_structured_memories(scope="coordinator", scope_id=self._ws_id)
+            scope_id = self._coordinator_scope_id()
+            if not scope_id:
+                return 0
+            return count_structured_memories(scope="coordinator", scope_id=scope_id)
         n = count_structured_memories(scope="global")
         n += count_structured_memories(scope="workstream", scope_id=self._ws_id)
         if self._user_id:
@@ -7412,7 +7469,16 @@ class ChatSession:
         the single-query visibility helpers.
         """
         if self._kind == WorkstreamKind.COORDINATOR:
-            return [("coordinator", self._ws_id)]
+            scope_id = self._coordinator_scope_id()
+            # Fail-closed on an empty scope_id (unreachable through real
+            # hosts — __init__ refuses anonymous coordinators): the
+            # storage helpers treat a falsy scope_id as "no scope_id
+            # filter" (that's how ``global`` works), so passing
+            # ("coordinator", "") through would read EVERY user's
+            # coordinator rows instead of none.
+            if not scope_id:
+                return []
+            return [("coordinator", scope_id)]
         scopes: list[tuple[str, str]] = [("global", ""), ("workstream", self._ws_id)]
         if self._user_id:
             scopes.append(("user", self._user_id))

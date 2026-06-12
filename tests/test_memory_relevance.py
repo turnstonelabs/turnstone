@@ -452,7 +452,9 @@ class TestCompositionCandidateSelection:
             kind=WorkstreamKind.COORDINATOR,
         )
         scopes = coord._visible_scopes()
-        assert scopes == [("coordinator", "coord-1")]
+        # Keyed by the creator user_id (durable per-user namespace),
+        # not the session's ws_id.
+        assert scopes == [("coordinator", "user-1")]
         # And: search uses those same scopes (no global/user fan-in)
         coord.messages = turns_from_dicts([{"role": "user", "content": "anything"}])
         with patch(
@@ -462,7 +464,7 @@ class TestCompositionCandidateSelection:
             coord._search_visible_memories("anything", limit=5)
         search_mock.assert_called_once()
         # Second positional arg is the scopes list
-        assert search_mock.call_args.args[1] == [("coordinator", "coord-1")]
+        assert search_mock.call_args.args[1] == [("coordinator", "user-1")]
 
 
 class TestCompositionRerankFiltersWiring:

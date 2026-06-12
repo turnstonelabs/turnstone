@@ -26,14 +26,39 @@ Each memory has three dimensions:
 
 ### Memory scopes
 
-| Scope        | Visibility                                                |
-|--------------|-----------------------------------------------------------|
-| `global`     | Visible to all workstreams and users                      |
-| `workstream` | Visible only within the originating workstream            |
-| `user`       | Follows the authenticated user across workstreams         |
+| Scope         | Visibility                                                      |
+|---------------|-----------------------------------------------------------------|
+| `global`      | Visible to all workstreams and users                            |
+| `workstream`  | Visible only within the originating workstream                  |
+| `user`        | Follows the authenticated user across workstreams               |
+| `coordinator` | Coordinator sessions only; follows the user across coordinators |
 
 A memory's identity is the tuple `(name, scope, scope_id)`. Saving a memory
 with the same identity upserts -- updating content while preserving the ID.
+
+### Coordinator scope
+
+Coordinator sessions are isolated to a single scope: `coordinator`, keyed by
+the coordinator's creator `user_id`. It is durable -- every coordinator
+session the same user runs (including concurrent ones) shares one
+orchestration namespace, so procedures and lessons survive close/reopen.
+
+Isolation is bidirectional and enforced by session kind, not by secrecy of
+the scope id:
+
+- A coordinator session can read and write **only** `coordinator`-scope rows.
+  It never sees `global`/`workstream`/`user` memories, so content written by
+  interactive sessions (which routinely ingest untrusted MCP/attachment
+  output) cannot reach a coordinator's system message.
+- Interactive sessions -- including a coordinator's own children, which share
+  its `user_id` -- are rejected from the `coordinator` scope on every memory
+  action. Children cannot plant rows the parent coordinator would read.
+- The REST memory API (`/v1/api/memories`) does not accept the `coordinator`
+  scope at all; the scope is written exclusively through a coordinator
+  session's own memory tool.
+
+Coordinator sessions require an authenticated user identity -- an anonymous
+coordinator cannot be constructed, so the scope id is always a real user.
 
 ### BM25 relevance injection
 
