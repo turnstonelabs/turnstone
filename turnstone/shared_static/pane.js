@@ -6,7 +6,9 @@
    host is generic and every surface is a registered factory.  This is the spine
    the rest of the renovation hangs off — step 1 exercises it with a single
    `dashboard` pane that adopts the legacy `#main`; richer pane types arrive in
-   steps 2-5.
+   steps 2-5.  The split-view section lets the host show several open panes at
+   once (the revived split-pane feature — see "Split view" below); without an
+   active split tree the manager is strictly one-pane-per-tab.
 
    House style: ES module, programmatic DOM (createElement / textContent /
    append), NO innerHTML.  Panes scope all queries to their own `bodyEl` so they
@@ -18,6 +20,15 @@
 function cssId(s) {
   return String(s).replace(/[^a-zA-Z0-9_-]/g, "-");
 }
+
+/* ----- Split view limits (the revived split-pane feature) -----
+   A split cell below ~200×150 can't render a usable conversation (the composer
+   alone needs ~150px of width headroom); 6 cells is the old ui/static ceiling,
+   kept — past it the cells fall under the minimums on any sane viewport. */
+const SPLIT_MAX_CELLS = 6;
+const SPLIT_MIN_W = 200;
+const SPLIT_MIN_H = 150;
+const SPLIT_HANDLE_PX = 7; // keep in sync with shell.css .split-handle--row/--col
 
 /**
  * A pane: a typed window with its own scoped root.  Subtypes (or callers that
@@ -221,6 +232,23 @@ export class PaneManager {
     this._activeId = null;
     this._activeSubs = []; // active-pane-change listeners (e.g. the rail marker)
     this._openMenu = null; // the currently-open tab-action dropdown, if any
+    // Split view: a binary layout tree ({type:"leaf",paneId} | {type:"split",
+    // dir:"row"|"col", ratio, children:[2]}), or null — null is single-pane
+    // mode, where every code path below behaves exactly as before the feature.
+    // Visible panes are positioned by inline % insets (no reparenting: a pane's
+    // live SSE DOM and media elements are never detached).
+    this._layout = null;
+    this._handleEls = []; // live .split-handle separators (rebuilt per layout change)
+    this._mru = []; // paneId[], most-recently-focused first (split auto-fill order)
+    // Clicking anywhere inside a visible-but-unfocused pane focuses its cell
+    // (capture phase — pane content may stopPropagation on bubbled events).
+    if (this.panesEl) {
+      this.panesEl.addEventListener(
+        "pointerdown",
+        (e) => this._onPanesPointerdown(e),
+        true,
+      );
+    }
     // The tab bar is a WAI-ARIA tablist; arrow keys rove focus across the open
     // tabs (delegated, so it survives tab reconciliation).
     if (this.tabbarEl) {
@@ -394,31 +422,54 @@ export class PaneManager {
     this._renderTabs();
   }
 
-  /** Show one pane, hide the rest, fire deactivate/activate hooks. */
+  /** Show one pane (single-pane mode: hide the rest) or focus it (split mode),
+   *  firing deactivate/activate hooks.  In split mode "active" means FOCUSED:
+   *  a pane already in a cell keeps every cell as-is (pure focus move); a
+   *  backgrounded pane swaps into the focused cell, parking that cell's
+   *  current pane.  onDeactivate therefore means "lost focus", not necessarily
+   *  "hidden" — which matches the panes' contract (interactive panes only stop
+   *  focus-stealing and keep streaming: exactly what a visible-but-unfocused
+   *  cell wants). */
   activate(paneId) {
     // Re-activating the already-active pane is a cheap no-op (it still re-renders
     // tabs / re-persists / re-notifies below, just no onDeactivate/onActivate).
     if (!this._panes.has(paneId)) return;
     const prev = this._activeId ? this._panes.get(this._activeId) : null;
-    if (prev && prev.id !== paneId) {
+    const next = this._panes.get(paneId);
+    const changed = this._activeId !== paneId;
+    if (this._layout) {
+      if (changed && !this._leafFor(paneId)) {
+        // Swap the backgrounded pane into the focused cell.
+        const target = this._leafFor(this._activeId) || this._firstLeaf();
+        const old = target ? this._panes.get(target.paneId) : null;
+        if (target) target.paneId = paneId;
+        if (old && old !== next) {
+          old.el.hidden = true;
+          this._clearCellStyle(old);
+        }
+      }
+    } else if (prev && prev.id !== paneId) {
       prev.el.hidden = true;
+    }
+    if (changed && prev) {
       try {
         prev.onDeactivate();
       } catch (e) {
         console.error("PaneManager: onDeactivate failed", prev.id, e);
       }
     }
-    const next = this._panes.get(paneId);
     next.el.hidden = false;
-    const changed = this._activeId !== paneId;
     this._activeId = paneId;
     if (changed) {
+      // Most-recently-focused order — the split auto-fill source.
+      this._mru = [paneId].concat(this._mru.filter((p) => p !== paneId));
       try {
         next.onActivate();
       } catch (e) {
         console.error("PaneManager: onActivate failed", paneId, e);
       }
     }
+    if (this._layout) this._applyLayout();
     this._renderTabs();
     this._persist();
     this._notifyActive();
@@ -434,11 +485,19 @@ export class PaneManager {
     }
   }
 
-  /** Drop a pane (tab + content), release it, focus a neighbour. */
+  /** Drop a pane (tab + content), release it, focus a neighbour.  In split
+   *  mode a visible pane's cell collapses first (its sibling takes the space),
+   *  and the sibling is preferred as the fallback focus target so closing a
+   *  cell lands you on the pane that absorbed it. */
   close(paneId) {
     const pane = this._panes.get(paneId);
     if (!pane || pane.closable === false) return;
     this._closeTabMenu(); // a dropdown anchored on the closing tab must not strand
+    let preferFallback = null;
+    if (this._layout) {
+      const leaf = this._leafFor(paneId);
+      if (leaf) preferFallback = this._collapseLeaf(leaf);
+    }
     try {
       pane.onClose();
     } catch (e) {
@@ -447,15 +506,476 @@ export class PaneManager {
     if (pane.el && pane.el.parentNode) pane.el.parentNode.removeChild(pane.el);
     this._panes.delete(paneId);
     this._order = this._order.filter((p) => p !== paneId);
+    this._mru = this._mru.filter((p) => p !== paneId);
     if (this._activeId === paneId) {
       this._activeId = null;
-      const fallback = this._order[this._order.length - 1];
+      const fallback = preferFallback || this._order[this._order.length - 1];
       if (fallback)
         this.activate(fallback); // fires _notifyActive itself
       else this._notifyActive(); // last pane closed — clear the marker
+    } else {
+      this._notifyActive(); // split state may have changed (a cell collapsed)
     }
     this._renderTabs();
     this._persist();
+  }
+
+  /* ===== Split view ============================================================
+     The layout tree shows MORE than one open pane at once.  Tabs stay global:
+     the active tab is the FOCUSED cell, clicking a backgrounded tab swaps that
+     pane into the focused cell, clicking inside a visible pane focuses its
+     cell.  Cells are rendered as inline % insets on the pane elements
+     themselves — a pane is NEVER reparented or detached, so its live stream
+     DOM, scroll positions and media elements are untouched by layout changes.
+     With `_layout === null` (the default) every path above behaves exactly as
+     it did before this feature existed.
+     ========================================================================== */
+
+  /** Is the pane host currently showing more than one cell? */
+  isSplit() {
+    return !!this._layout;
+  }
+
+  /** Split the focused pane's cell — `dir` "right" puts the new cell beside
+   *  it, "down" below it.  The new cell shows the most-recently-focused
+   *  backgrounded pane: splitting never duplicates a pane (panes are keyed
+   *  singletons — two mounts of one session would race its stream).  Returns
+   *  `{ok:true}` or `{ok:false, reason}`; the CALLER owns user feedback (the
+   *  shell toasts the reason — PaneManager stays chrome-free). */
+  splitFocused(dir) {
+    const activeId = this._activeId;
+    if (!activeId || !this._panes.has(activeId))
+      return { ok: false, reason: "Nothing to split" };
+    if (this._leafCount() >= SPLIT_MAX_CELLS)
+      return {
+        ok: false,
+        reason: "Pane limit reached (" + SPLIT_MAX_CELLS + ")",
+      };
+    const fillId = this._nextBackgroundPane();
+    if (!fillId)
+      return {
+        ok: false,
+        reason: "Every open tab is already visible — open another one first",
+      };
+    // Space guard: the focused cell must fit two cells plus the divider.
+    const rect = this._cellRect(activeId);
+    const need =
+      (dir === "down" ? SPLIT_MIN_H : SPLIT_MIN_W) * 2 + SPLIT_HANDLE_PX;
+    if ((dir === "down" ? rect.h : rect.w) < need)
+      return { ok: false, reason: "Not enough space to split" };
+    const leaf = this._layout ? this._leafFor(activeId) : null;
+    const node = {
+      type: "split",
+      dir: dir === "down" ? "col" : "row",
+      ratio: 0.5,
+      children: [
+        leaf || { type: "leaf", paneId: activeId },
+        { type: "leaf", paneId: fillId },
+      ],
+    };
+    if (!leaf) {
+      this._layout = node;
+    } else {
+      const found = this._findParent(this._layout, leaf);
+      if (found) found.parent.children[found.index] = node;
+      else this._layout = node; // the leaf was the root (defensive — see _collapseLeaf)
+    }
+    this.panesEl.classList.add("panes--split");
+    this._applyLayout(true);
+    this.activate(fillId); // focus the new cell (already a leaf → pure focus move)
+    return { ok: true };
+  }
+
+  /** Collapse back to a single pane — the focused one.  The other panes stay
+   *  open as tabs (they just stop being visible); nothing is closed. */
+  unsplit() {
+    if (!this._layout) return;
+    this._exitLayout(this._activeId);
+    this._renderTabs();
+    this._persist();
+    this._notifyActive();
+  }
+
+  // ----- tree helpers -----
+
+  _leaves(node, out) {
+    out = out || [];
+    node = node || this._layout;
+    if (!node) return out;
+    if (node.type === "leaf") out.push(node);
+    else {
+      this._leaves(node.children[0], out);
+      this._leaves(node.children[1], out);
+    }
+    return out;
+  }
+
+  _leafCount() {
+    return this._layout ? this._leaves().length : 1;
+  }
+
+  _leafFor(paneId) {
+    if (paneId == null || !this._layout) return null;
+    return this._leaves().find((l) => l.paneId === paneId) || null;
+  }
+
+  _firstLeaf(node) {
+    node = node || this._layout;
+    if (!node) return null;
+    return node.type === "leaf" ? node : this._firstLeaf(node.children[0]);
+  }
+
+  _findParent(node, target) {
+    if (!node || node.type === "leaf") return null;
+    for (let i = 0; i < 2; i++) {
+      if (node.children[i] === target) return { parent: node, index: i };
+      const found = this._findParent(node.children[i], target);
+      if (found) return found;
+    }
+    return null;
+  }
+
+  /** Remove a leaf: its sibling subtree takes the parent's place.  Exits split
+   *  mode when one cell remains.  Returns the sibling's first pane id — the
+   *  natural focus target for a close() that emptied the focused cell. */
+  _collapseLeaf(leaf) {
+    const found = this._findParent(this._layout, leaf);
+    if (!found) {
+      // The leaf IS the root — a tree this small should already have exited
+      // split mode; recover rather than strand a stale layout.
+      this._exitLayout(null);
+      return null;
+    }
+    const sibling = found.parent.children[found.index === 0 ? 1 : 0];
+    const grand = this._findParent(this._layout, found.parent);
+    if (grand) grand.parent.children[grand.index] = sibling;
+    else this._layout = sibling;
+    const first = this._firstLeaf(sibling);
+    if (this._layout.type === "leaf") this._exitLayout(this._layout.paneId);
+    else this._applyLayout(true);
+    return first ? first.paneId : null;
+  }
+
+  /** The most-recently-focused open pane that is not currently visible —
+   *  what a fresh split cell shows.  Null when every open pane is visible. */
+  _nextBackgroundPane() {
+    const visible = new Set(
+      this._layout
+        ? this._leaves().map((l) => l.paneId)
+        : [this._activeId].filter(Boolean),
+    );
+    for (const pid of this._mru) {
+      if (this._panes.has(pid) && !visible.has(pid)) return pid;
+    }
+    for (const pid of this._order) {
+      if (!visible.has(pid)) return pid;
+    }
+    return null;
+  }
+
+  // ----- geometry + rendering -----
+
+  /** The px rect of a pane's current cell (the whole host when unsplit). */
+  _cellRect(paneId) {
+    const W = this.panesEl.clientWidth;
+    const H = this.panesEl.clientHeight;
+    if (!this._layout) return { x: 0, y: 0, w: W, h: H };
+    let hit = null;
+    const walk = (node, x, y, w, h) => {
+      if (hit) return;
+      if (node.type === "leaf") {
+        if (node.paneId === paneId) hit = { x, y, w, h };
+        return;
+      }
+      const r = node.ratio;
+      if (node.dir === "row") {
+        walk(node.children[0], x, y, w * r, h);
+        walk(node.children[1], x + w * r, y, w * (1 - r), h);
+      } else {
+        walk(node.children[0], x, y, w, h * r);
+        walk(node.children[1], x, y + h * r, w, h * (1 - r));
+      }
+    };
+    walk(this._layout, 0, 0, W, H);
+    return hit || { x: 0, y: 0, w: W, h: H };
+  }
+
+  /** Lay the visible panes out as % insets and place the separators.
+   *  `rebuild` re-creates the handle ELEMENTS (tree structure changed);
+   *  without it only styles update, so a mid-drag handle keeps its pointer
+   *  capture.  % insets make window resizes free — no JS resize listener. */
+  _applyLayout(rebuild) {
+    if (!this._layout) return;
+    const rects = new Map();
+    const handles = [];
+    const walk = (node, x, y, w, h) => {
+      if (node.type === "leaf") {
+        rects.set(node.paneId, { x, y, w, h });
+        return;
+      }
+      const r = node.ratio;
+      if (node.dir === "row") {
+        walk(node.children[0], x, y, w * r, h);
+        handles.push({ node, x: x + w * r, y, span: h });
+        walk(node.children[1], x + w * r, y, w * (1 - r), h);
+      } else {
+        walk(node.children[0], x, y, w, h * r);
+        handles.push({ node, x, y: y + h * r, span: w });
+        walk(node.children[1], x, y + h * r, w, h * (1 - r));
+      }
+    };
+    walk(this._layout, 0, 0, 1, 1);
+    const multi = rects.size > 1;
+    for (const p of this._panes.values()) {
+      const r = rects.get(p.id);
+      if (r) {
+        p.el.hidden = false;
+        p.el.style.left = r.x * 100 + "%";
+        p.el.style.top = r.y * 100 + "%";
+        p.el.style.width = r.w * 100 + "%";
+        p.el.style.height = r.h * 100 + "%";
+        // The focus ring only means something with 2+ cells on screen.
+        p.el.classList.toggle(
+          "split-focused",
+          multi && p.id === this._activeId,
+        );
+      } else {
+        p.el.hidden = true;
+        this._clearCellStyle(p);
+      }
+    }
+    if (rebuild) {
+      for (const h of this._handleEls) h.remove();
+      this._handleEls = handles.map((h) => this._buildHandle(h.node));
+    }
+    // Position fresh AND surviving handles from the same walk (identical
+    // traversal order, so index pairing is stable while the tree shape is).
+    for (let i = 0; i < handles.length && i < this._handleEls.length; i++) {
+      const h = handles[i];
+      const el = this._handleEls[i];
+      el.style.left = h.x * 100 + "%";
+      el.style.top = h.y * 100 + "%";
+      if (h.node.dir === "row") el.style.height = h.span * 100 + "%";
+      else el.style.width = h.span * 100 + "%";
+      el.setAttribute("aria-valuenow", String(Math.round(h.node.ratio * 100)));
+    }
+  }
+
+  /** Leave split mode.  `keepId` (usually the focused pane) stays visible and
+   *  the other panes hide; null leaves visibility to the caller (the close()
+   *  fallback re-activates).  No extra deactivate hooks fire: a pane hidden
+   *  here already lost focus — and with it its onDeactivate — earlier. */
+  _exitLayout(keepId) {
+    this._layout = null;
+    this.panesEl.classList.remove("panes--split");
+    for (const h of this._handleEls) h.remove();
+    this._handleEls = [];
+    for (const p of this._panes.values()) {
+      this._clearCellStyle(p);
+      if (keepId) p.el.hidden = p.id !== keepId;
+    }
+  }
+
+  _clearCellStyle(pane) {
+    pane.el.style.left = "";
+    pane.el.style.top = "";
+    pane.el.style.width = "";
+    pane.el.style.height = "";
+    pane.el.classList.remove("split-focused");
+  }
+
+  /** Focus follows the pointer between cells: a click anywhere inside a
+   *  visible-but-unfocused pane focuses it (capture phase — pane content may
+   *  stop propagation of bubbled events). */
+  _onPanesPointerdown(e) {
+    if (!this._layout) return;
+    let el = e.target;
+    // The ShellPane <section> is the DIRECT child of the host (the interactive
+    // pane's inner <div> also carries .pane — walking to the direct child
+    // disambiguates without knowing any pane-type internals).
+    while (el && el.parentElement !== this.panesEl) el = el.parentElement;
+    if (!el || !el.classList || !el.classList.contains("pane")) return;
+    for (const p of this._panes.values()) {
+      if (p.el === el) {
+        if (p.id !== this._activeId && this._leafFor(p.id)) this.activate(p.id);
+        return;
+      }
+    }
+  }
+
+  // ----- separators (drag + keyboard resize) -----
+
+  _buildHandle(node) {
+    const el = document.createElement("div");
+    el.className = "split-handle split-handle--" + node.dir;
+    el.setAttribute("role", "separator");
+    el.tabIndex = 0;
+    el.setAttribute(
+      "aria-orientation",
+      node.dir === "row" ? "vertical" : "horizontal",
+    );
+    el.setAttribute("aria-valuemin", "10");
+    el.setAttribute("aria-valuemax", "90");
+    el.setAttribute("aria-valuenow", String(Math.round(node.ratio * 100)));
+    el.setAttribute(
+      "aria-label",
+      node.dir === "row"
+        ? "Resize panes horizontally"
+        : "Resize panes vertically",
+    );
+    this._wireHandle(el, node);
+    this.panesEl.append(el);
+    return el;
+  }
+
+  /** Ratio bounds that keep both children of a split above the cell minimums,
+   *  derived from the split node's CURRENT px region (so nested splits clamp
+   *  against their own space, not the whole host). */
+  _ratioBounds(node) {
+    const W = this.panesEl.clientWidth;
+    const H = this.panesEl.clientHeight;
+    let region = null;
+    const walk = (n, x, y, w, h) => {
+      if (region) return;
+      if (n === node) {
+        region = { w, h };
+        return;
+      }
+      if (n.type === "leaf") return;
+      const r = n.ratio;
+      if (n.dir === "row") {
+        walk(n.children[0], x, y, w * r, h);
+        walk(n.children[1], x + w * r, y, w * (1 - r), h);
+      } else {
+        walk(n.children[0], x, y, w, h * r);
+        walk(n.children[1], x, y + h * r, w, h * (1 - r));
+      }
+    };
+    walk(this._layout, 0, 0, W, H);
+    const px = region ? (node.dir === "row" ? region.w : region.h) : 0;
+    const minPx = node.dir === "row" ? SPLIT_MIN_W : SPLIT_MIN_H;
+    return {
+      min: px > 0 ? Math.max(0.05, minPx / px) : 0.1,
+      max: px > 0 ? Math.min(0.95, 1 - minPx / px) : 0.9,
+      px: px || 1,
+    };
+  }
+
+  _wireHandle(el, node) {
+    el.addEventListener("pointerdown", (e) => {
+      // Touch/pen carry no primary-button semantics — only filter MOUSE
+      // non-primary buttons (a bare `e.button !== 0` would break touch).
+      if (e.button !== 0 && e.pointerType === "mouse") return;
+      e.preventDefault();
+      el.setPointerCapture(e.pointerId);
+      el.classList.add("dragging");
+      const bounds = this._ratioBounds(node);
+      const startRatio = node.ratio;
+      const horiz = node.dir === "row";
+      const startPos = horiz ? e.clientX : e.clientY;
+      document.body.style.cursor = horiz ? "col-resize" : "row-resize";
+      document.body.style.userSelect = "none";
+      const onMove = (e2) => {
+        const delta = (horiz ? e2.clientX : e2.clientY) - startPos;
+        node.ratio = Math.max(
+          bounds.min,
+          Math.min(bounds.max, startRatio + delta / bounds.px),
+        );
+        this._applyLayout();
+      };
+      const onUp = () => {
+        el.classList.remove("dragging");
+        document.body.style.cursor = "";
+        document.body.style.userSelect = "";
+        document.removeEventListener("pointermove", onMove);
+        document.removeEventListener("pointerup", onUp);
+        document.removeEventListener("pointercancel", onUp);
+        this._persist(); // the settled ratio is part of the working set
+      };
+      // The move/up listeners live on DOCUMENT, not the handle: a layout
+      // rebuild can remove the handle MID-DRAG (e.g. a server-side ws_closed
+      // collapses a cell), and handle-bound listeners would die with it,
+      // stranding the body-wide cursor/user-select overrides.  Capture loss on
+      // removal just redirects the events to the hit-test chain — document
+      // still hears them and onUp always runs.
+      document.addEventListener("pointermove", onMove);
+      document.addEventListener("pointerup", onUp);
+      document.addEventListener("pointercancel", onUp);
+    });
+    // Keyboard resize: arrows nudge (Shift = coarse), Home/End to the bounds.
+    el.addEventListener("keydown", (e) => {
+      const bounds = this._ratioBounds(node);
+      const step = e.shiftKey ? 0.1 : 0.02;
+      let delta = 0;
+      if (e.key === "ArrowRight" || e.key === "ArrowDown") delta = step;
+      else if (e.key === "ArrowLeft" || e.key === "ArrowUp") delta = -step;
+      else if (e.key === "Home") delta = bounds.min - node.ratio;
+      else if (e.key === "End") delta = bounds.max - node.ratio;
+      else return;
+      e.preventDefault();
+      node.ratio = Math.max(
+        bounds.min,
+        Math.min(bounds.max, node.ratio + delta),
+      );
+      this._applyLayout();
+      this._persist();
+    });
+  }
+
+  // ----- persistence -----
+
+  _serializeLayout(node) {
+    if (node.type === "leaf") return { type: "leaf", paneId: node.paneId };
+    return {
+      type: "split",
+      dir: node.dir,
+      ratio: node.ratio,
+      children: [
+        this._serializeLayout(node.children[0]),
+        this._serializeLayout(node.children[1]),
+      ],
+    };
+  }
+
+  /** Re-apply a persisted layout after rehydrate re-opened the panes.  Leaves
+   *  whose pane did not restore (skipped type, auth-denied, duplicate) prune
+   *  away and their sibling absorbs the space — the same degrade-don't-error
+   *  stance rehydrate takes on pane types. */
+  _restoreLayout(data) {
+    const seen = new Set();
+    const prune = (d) => {
+      if (!d || typeof d !== "object") return null;
+      if (d.type === "leaf") {
+        if (!this._panes.has(d.paneId) || seen.has(d.paneId)) return null;
+        seen.add(d.paneId);
+        return { type: "leaf", paneId: d.paneId };
+      }
+      if (d.type !== "split" || !Array.isArray(d.children)) return null;
+      const a = prune(d.children[0]);
+      const b = prune(d.children[1]);
+      if (!a || !b) return a || b;
+      return {
+        type: "split",
+        dir: d.dir === "col" ? "col" : "row",
+        ratio:
+          typeof d.ratio === "number" && d.ratio >= 0.05 && d.ratio <= 0.95
+            ? d.ratio
+            : 0.5,
+        children: [a, b],
+      };
+    };
+    const tree = prune(data);
+    if (!tree || tree.type === "leaf") return; // 0-1 cells — stay single-pane
+    this._layout = tree;
+    this.panesEl.classList.add("panes--split");
+    this._applyLayout(true);
+    // The persisted active pane may have failed to restore — focus the first
+    // cell rather than leaving a hidden pane active.
+    if (!this._leafFor(this._activeId)) {
+      const first = this._firstLeaf(tree);
+      if (first) this.activate(first.paneId);
+    }
+    this._renderTabs(); // pick up the .shown markers
   }
 
   _renderTabs() {
@@ -538,10 +1058,13 @@ export class PaneManager {
   }
 
   /** Refresh a tab's selection state: roving tabindex (only the selected tab is
-   *  in the Tab order) + aria-selected + the `.active` style hook. */
+   *  in the Tab order) + aria-selected + the `.active` style hook.  `.shown`
+   *  marks a pane that is VISIBLE in a split cell without being the focused
+   *  one (aria-selected stays single — selection means focus). */
   _refreshTab(tab, pane) {
     const active = pane.id === this._activeId;
     tab.classList.toggle("active", active);
+    tab.classList.toggle("shown", !active && !!this._leafFor(pane.id));
     tab.setAttribute("aria-selected", active ? "true" : "false");
     tab.tabIndex = active ? 0 : -1;
   }
@@ -625,10 +1148,11 @@ export class PaneManager {
         if (p.meta != null) entry.meta = p.meta;
         return entry;
       });
-      sessionStorage.setItem(
-        this.storageKey,
-        JSON.stringify({ order, active: this._activeId }),
-      );
+      const state = { order, active: this._activeId };
+      // The split tree rides along (leaves reference pane ids, which are
+      // deterministic type[:id] strings — rehydrate recomputes the same ones).
+      if (this._layout) state.layout = this._serializeLayout(this._layout);
+      sessionStorage.setItem(this.storageKey, JSON.stringify(state));
     } catch (e) {
       /* sessionStorage may be unavailable (private mode / disabled) — non-fatal */
     }
@@ -660,6 +1184,9 @@ export class PaneManager {
     if (state.active && this._panes.has(state.active)) {
       this.activate(state.active);
     }
+    // Layout LAST: every pane it references is open (or pruned), and the
+    // active pane is settled — the restore just re-applies the cells.
+    if (restored && state.layout) this._restoreLayout(state.layout);
     return restored;
   }
 }

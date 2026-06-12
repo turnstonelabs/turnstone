@@ -39,6 +39,12 @@ Console harness (?open=): schedule-create · schedule-edit · model-create ·
   title instead of passing silently.
   Governance surfaces (roles/HR/OGP/memory/skill) need fixtures that are not
   canned yet — add a fixture + driver branch below when you need one.
+Shell harness (?split=): right (default) · down · three · none — boots the
+  REAL shell.js + pane.js split-view engine over stubbed seams (two demo
+  conversational panes; ?split=three adds the Dashboard cell).  + &theme=light.
+  document.title stamps SPLIT-READY-<visible cells> on success and
+  SPLIT-FAILED-<reason> when a driven split was denied — judge the focused
+  cell's top accent bar, the separators, and the .shown tab marker.
 
 Rebuild after ANY markup change: the dialog blocks are embedded at build
 time. Assets are symlinked, so CSS/JS edits are live on refresh.
@@ -455,6 +461,129 @@ CONSOLE_TEMPLATE = """<!doctype html>
 """
 
 
+# --------------------------------------------------------------------------
+# Shell harness — the SPLIT-VIEW surface.  Unlike the ui/console pages (which
+# embed extracted markup), this one boots the REAL shell.js + pane.js over
+# stubbed classic seams and drives the split engine via ?split=.  Two demo
+# conversational panes give the cells plausible content; the Dashboard pane
+# (registered by the shell itself) fills the third cell in ?split=three.
+# Loud-failure rule: the title stamps SPLIT-READY-<cells> only when the built
+# state matches the request — a denied/failed split stamps SPLIT-FAILED-<why>.
+# --------------------------------------------------------------------------
+SHELL_TEMPLATE = """<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>shell livepass</title>
+    <link rel="stylesheet" href="shared/base.css" />
+    <link rel="stylesheet" href="shared/ui-base.css" />
+    <link rel="stylesheet" href="shared/chat.css" />
+    <link rel="stylesheet" href="shared/conversation.css" />
+    <link rel="stylesheet" href="shared/cards.css" />
+    <link rel="stylesheet" href="static/style.css" />
+    <link rel="stylesheet" href="shared/shell.css" />
+    <link rel="stylesheet" href="shared/interactive.css" />
+  </head>
+  <body>
+    <div id="header"><div id="status-bar"></div><button id="theme-toggle">☾</button></div>
+    <div id="breadcrumb"></div>
+    <div id="main" style="padding: 18px">
+      <h2 style="margin: 0 0 8px">Dashboard</h2>
+      <p style="color: var(--ink-3)">
+        Launcher + workstreams table live here (livepass stub).
+      </p>
+    </div>
+    <div id="view-admin" style="display: none"></div>
+    <script>
+      window.TURNSTONE_SHELL_CAPS = { cluster: false, brandSub: "console" };
+      window.TS_APP = {
+        boot() {},
+        getClusterState() { return { nodes: {} }; },
+        onRender() {},
+      };
+      window.TS_ADMIN = {};
+      var q = new URLSearchParams(location.search);
+      if (q.get("theme") === "light")
+        document.documentElement.dataset.theme = "light";
+    </script>
+    <script type="module" src="shared/shell.js"></script>
+    <script type="module">
+      const q = new URLSearchParams(location.search);
+      for (let i = 0; i < 100 && !window.TS_SHELL; i++)
+        await new Promise((r) => setTimeout(r, 20));
+      if (!window.TS_SHELL) {
+        document.title = "SPLIT-FAILED-no-shell";
+      } else {
+        sessionStorage.clear();
+        const pm = window.TS_SHELL.panes;
+        const { ShellPane } = await import("./shared/pane.js");
+        const mkConv = (type, title, lines) => {
+          pm.registerType(type, () => {
+            const p = new ShellPane({ type, title });
+            p.tabMenu = () => [
+              { label: "Close pane", action: () => pm.close(p.id) },
+            ];
+            p.onMount = function () {
+              const wrap = document.createElement("div");
+              wrap.style.cssText =
+                "padding:16px;display:flex;flex-direction:column;gap:10px;overflow:auto;";
+              for (const [role, text] of lines) {
+                const d = document.createElement("div");
+                d.className = "msg " + role;
+                d.textContent = text;
+                wrap.append(d);
+              }
+              this.bodyEl.append(wrap);
+            };
+            return p;
+          });
+        };
+        mkConv("repro", "repro-flaky-suite", [
+          ["user", "Track down the flaky retry in the channel gateway tests."],
+          [
+            "assistant",
+            "Three suspects so far — the debounce window in mcp_client, the " +
+              "circuit-breaker reset, and the socket-mode reconnect. Bisecting now.",
+          ],
+          [
+            "assistant",
+            "Found it: the breaker reset races the stream pre-close. Patch incoming.",
+          ],
+        ]);
+        mkConv("relnotes", "draft-1.6.2-notes", [
+          ["user", "Draft the 1.6.2 patch notes from the merged PR list."],
+          [
+            "assistant",
+            "Pulling #657–#662. Consent badge, orphan verb, MCP task hygiene, " +
+              "the anthropic-compatible lane, and the mcp<2 cap.",
+          ],
+        ]);
+        pm.openPane("repro");
+        pm.openPane("relnotes");
+        const want = q.get("split") || "right";
+        let failed = null;
+        if (want !== "none") {
+          const r1 = pm.splitFocused("right");
+          if (!r1.ok) failed = r1.reason;
+          if (!failed && (want === "three" || want === "down")) {
+            const r2 = pm.splitFocused("down");
+            if (!r2.ok) failed = r2.reason;
+          }
+        }
+        const cells = document.querySelectorAll(
+          ".panes > section.pane:not([hidden])",
+        ).length;
+        document.title = failed
+          ? "SPLIT-FAILED-" + failed
+          : "SPLIT-READY-" + cells;
+      }
+    </script>
+  </body>
+</html>
+"""
+
+
 def build(out: Path) -> None:
     ui = out / "ui"
     con = out / "console"
@@ -482,6 +611,13 @@ def build(out: Path) -> None:
     page = inject(page, "RIDERS", "\n".join(riders))
     (con / "livepass.html").write_text(page, encoding="utf-8")
     print(f"{con}/livepass.html — admin fragment + {len(riders)} rider dialogs")
+
+    sh = out / "shell"
+    sh.mkdir(parents=True, exist_ok=True)
+    symlink(sh / "shared", ROOT / "turnstone/shared_static")
+    symlink(sh / "static", ROOT / "turnstone/console/static")
+    (sh / "livepass.html").write_text(SHELL_TEMPLATE, encoding="utf-8")
+    print(f"{sh}/livepass.html — split-view shell surface")
 
 
 def main() -> None:

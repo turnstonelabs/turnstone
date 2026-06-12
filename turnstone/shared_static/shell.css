@@ -559,22 +559,40 @@
 .tab-caret:hover {
   background: var(--hair-2);
 }
-.tab-add {
+/* Split controls in the tab-bar tail (they replaced the redundant [+] — the
+   permanent Dashboard tab IS the launcher).  One ◫ glyph for both directions;
+   the down variant rotates the glyph span, not the button (a rotated button
+   would rotate its focus ring too). */
+.tb-split {
   width: 28px;
   height: 28px;
   display: flex;
   align-items: center;
   justify-content: center;
-  color: var(--ink-4);
+  /* --ink-3, not the chrome-ghost --ink-4: these are available CONTROLS and
+     the [+] convention they replaced is gone — they must read as present. */
+  color: var(--ink-3);
   border-radius: var(--r-sm);
   cursor: pointer;
-  font-size: 16px;
+  font-size: 14px;
+  line-height: 1;
   border: none;
   background: none;
+  font-family: var(--font-ui);
 }
-.tab-add:hover {
+.tb-split:hover {
   background: var(--panel-2);
   color: var(--ink-2);
+}
+.tb-split:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: -2px;
+}
+.tb-split .tb-glyph {
+  display: inline-block;
+}
+.tb-split--down .tb-glyph {
+  transform: rotate(90deg);
 }
 .tabbar-right {
   margin-left: auto;
@@ -582,6 +600,9 @@
   align-items: center;
   gap: 8px;
   color: var(--ink-4);
+  /* hairline fence so the split cluster reads as one "layout" control group */
+  border-left: 1px solid var(--hair);
+  padding-left: 10px;
 }
 /* Drawer toggle + backdrop — desktop keeps the rail in the grid, so both are
    dormant here; the mobile block at the end of this sheet brings them up. */
@@ -729,8 +750,8 @@
   }
 }
 
-/* pane host — ONE pane visible per tab (no split; the mock's 2-up was a
-   display device only, so this is a single column, not `1fr 1fr`). */
+/* pane host — ONE pane visible per tab by default; the split view below can
+   show several at once (PaneManager toggles .panes--split). */
 .panes {
   flex: 1;
   display: grid;
@@ -745,6 +766,111 @@
 }
 .pane[hidden] {
   display: none;
+}
+
+/* ===== Split view — visible panes become absolutely-positioned cells (inline
+   % insets from PaneManager._applyLayout; % keeps window resizes free).  The
+   panes stay DIRECT children of .panes and are never reparented, so a live
+   stream's DOM, scroll state and media playback ride out every layout change.
+   Only `section.pane` (the ShellPane host) is targeted — the interactive
+   pane's INNER div also carries .pane (the 5b lesson) and must not match. ===== */
+.panes--split {
+  position: relative;
+}
+.panes--split > section.pane {
+  position: absolute;
+  overflow: hidden;
+}
+/* the focused cell — only meaningful with 2+ cells.  A quiet inset ring PLUS
+   a 2px top accent bar (the rail's .row.open::before vocabulary): the bar is
+   the load-bearing cue — designer-measured, no thin tinted ring clears WCAG
+   1.4.11's 3:1 on the light theme, and 38%-mix was ~invisible on dark. */
+.panes--split > section.pane.split-focused {
+  box-shadow: inset 0 0 0 1px
+    color-mix(in srgb, var(--accent) 55%, var(--hair-2));
+}
+.panes--split > section.pane.split-focused::before {
+  content: "";
+  position: absolute;
+  inset: 0 0 auto 0; /* top edge, full cell width */
+  height: 2px;
+  background: var(--accent);
+  z-index: 6; /* above the separators (z:5) where they meet the corner */
+  pointer-events: none;
+}
+/* separator — a 7px hit area straddling the cell boundary with a 1px visual
+   line; drag (pointer capture) or arrow keys resize, see pane.js _wireHandle.
+   Resting line is --ink-4, the lightest token clearing 3:1 in BOTH themes
+   (--hair measured ~1.3:1 — an undiscoverable drag target); hover/drag goes
+   SOLID accent and thickens (--accent-dim was a luminance DROP on hover). */
+.split-handle {
+  position: absolute;
+  z-index: 5;
+}
+.split-handle--row {
+  width: 7px;
+  cursor: col-resize;
+  transform: translateX(-50%);
+}
+.split-handle--col {
+  height: 7px;
+  cursor: row-resize;
+  transform: translateY(-50%);
+}
+.split-handle::after {
+  content: "";
+  position: absolute;
+  background: var(--ink-4);
+}
+.split-handle--row::after {
+  left: 3px;
+  top: 0;
+  bottom: 0;
+  width: 1px;
+}
+.split-handle--col::after {
+  top: 3px;
+  left: 0;
+  right: 0;
+  height: 1px;
+}
+.split-handle:hover::after,
+.split-handle.dragging::after,
+.split-handle:focus-visible::after {
+  background: var(--accent);
+}
+.split-handle:focus-visible {
+  outline: none;
+}
+.split-handle--row:hover::after,
+.split-handle--row.dragging::after,
+.split-handle--row:focus-visible::after {
+  left: 2px;
+  width: 3px;
+}
+.split-handle--col:hover::after,
+.split-handle--col.dragging::after,
+.split-handle--col:focus-visible::after {
+  top: 2px;
+  height: 3px;
+}
+/* a visible-but-unfocused pane's tab — the three tab states must each read:
+   rest (bare) → shown (accent UNDERLINE — a shape, not a fill delta; rhymes
+   with the focused cell's TOP bar) → active (panel fill).  Designer-measured:
+   a border/fill-only delta between shown and active was ≤1.1:1. */
+.tab.shown:not(.active) {
+  border-color: var(--hair-2);
+  color: var(--ink-2);
+}
+.tab.shown:not(.active)::after {
+  content: "";
+  position: absolute;
+  left: 8px;
+  right: 8px;
+  bottom: 2px;
+  height: 2px;
+  border-radius: 2px;
+  background: color-mix(in srgb, var(--accent) 55%, transparent);
 }
 .pane-head {
   display: flex;
@@ -1218,6 +1344,16 @@
   }
   .tab {
     max-width: 48vw;
+  }
+  /* splits are a desktop affordance (a phone viewport is below the cell
+     minimums before the first divider lands) — and with the buttons gone the
+     tail's group fence has nothing to fence */
+  .tb-split {
+    display: none;
+  }
+  .tabbar-right {
+    border-left: 0;
+    padding-left: 0;
   }
 }
 @media (prefers-reduced-motion: reduce) {

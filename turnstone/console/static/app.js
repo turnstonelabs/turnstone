@@ -1962,14 +1962,6 @@ window.TS_APP.bucketByParent = function (list) {
 window.TS_APP.buildNodeInfo = function (node) {
   return buildNodeInfoFromSnapshot(node);
 };
-// Focus the persona launcher's composer — the [+] new-session button calls this
-// after showHome so "new session" lands you ready to type (showHome alone, on the
-// already-active Dashboard, is a no-op).  _ensureHomeComposerInit (run by
-// showHome) has set _homeCoordComposer by the time this fires.
-window.TS_APP.focusLauncher = function () {
-  if (_homeCoordComposer && typeof _homeCoordComposer.focus === "function")
-    _homeCoordComposer.focus();
-};
 // Resolve the cluster node that should host an interactive pane's session AND
 // ensure the session is loaded there before the pane streams — the node /events
 // stream 404s on a ws not loaded on that node, and /history alone won't load it.

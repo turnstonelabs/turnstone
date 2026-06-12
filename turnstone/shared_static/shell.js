@@ -510,26 +510,45 @@ async function mountShell() {
   });
   pm.onActiveChange(() => setDrawer(false));
 
-  // [+] new-tab (step 7): a shortcut to the persona launcher.  The Dashboard pane
-  // hosts the unified coordinator/interactive launcher (a new session needs a task
-  // prompt, so it composes there) — "new session" focuses it.  showHome is exposed
-  // by both deployments; openPane is the fallback.  Lives in the right-floated tail
-  // slot per the brief.  (Auth is the launcher's own concern — it gates each
-  // persona option; focusing it is always safe.)
-  const addTab = make("button", "tab-add");
-  addTab.type = "button";
-  addTab.setAttribute("aria-label", "New session");
-  addTab.title = "New session";
-  addTab.textContent = "+";
-  addTab.addEventListener("click", () => {
-    if (typeof window.showHome === "function") window.showHome();
-    else pm.openPane("dashboard");
-    // Land in the launcher composer so "new session" is immediately typeable —
-    // showHome on the already-active Dashboard is otherwise a no-op.
-    if (window.TS_APP && typeof window.TS_APP.focusLauncher === "function")
-      window.TS_APP.focusLauncher();
-  });
-  shell.tail.append(addTab);
+  // Split controls (the revived split-view): they act on the FOCUSED pane.
+  // Split right / split down open a second cell beside/below it, filled with
+  // the most-recently-used backgrounded tab; Unsplit returns to one pane and
+  // only shows while split.  They replaced the old [+] new-session button —
+  // the permanent Dashboard tab IS the launcher, so [+] duplicated one click.
+  // Deliberately NO contextmenu override anywhere (the pre-L-shell split UI
+  // hijacked right-click): these buttons are the whole affordance surface.
+  const tbBtn = (cls, glyph, label) => {
+    const b = make("button", cls);
+    b.type = "button";
+    b.setAttribute("aria-label", label);
+    b.title = label;
+    const g = make("span", "tb-glyph", glyph);
+    g.setAttribute("aria-hidden", "true"); // the button's aria-label speaks
+    b.append(g);
+    return b;
+  };
+  // Denials surface as a toast (space / pane-limit / nothing to show) — the
+  // manager stays chrome-free and just returns the reason.
+  const splitFeedback = (r) => {
+    if (r && !r.ok && r.reason && typeof window.showToast === "function")
+      window.showToast(r.reason, "warning");
+  };
+  const splitRightBtn = tbBtn("tb-split", "◫", "Split right");
+  splitRightBtn.addEventListener("click", () =>
+    splitFeedback(pm.splitFocused("right")),
+  );
+  const splitDownBtn = tbBtn("tb-split tb-split--down", "◫", "Split down");
+  splitDownBtn.addEventListener("click", () =>
+    splitFeedback(pm.splitFocused("down")),
+  );
+  const unsplitBtn = tbBtn("tb-split", "□", "Unsplit — keep the focused pane");
+  unsplitBtn.addEventListener("click", () => pm.unsplit());
+  const syncSplitControls = () => {
+    unsplitBtn.hidden = !pm.isSplit();
+  };
+  pm.onActiveChange(syncSplitControls);
+  syncSplitControls();
+  shell.tail.append(splitRightBtn, splitDownBtn, unsplitBtn);
 
   // Dashboard pane (step 1): a singleton that ADOPTS the legacy #main so the
   // console renders unchanged inside the new shell.  Real pane types (admin,
