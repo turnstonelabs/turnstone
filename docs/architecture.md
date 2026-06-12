@@ -702,7 +702,7 @@ agent_model = "claude"
 
 Each `[models.*]` entry produces a `ModelConfig` with a `provider` field
 (default: `"openai"`). Supported values: `"openai"`, `"anthropic"`, `"google"`,
-and `"openai-compatible"`.
+`"openai-compatible"`, and `"anthropic-compatible"`.
 
 **Per-model sampling overrides:** Each model can specify `temperature`,
 `max_tokens`, and `reasoning_effort` to override the global defaults from
@@ -764,6 +764,61 @@ model = "qwen-3.5-vl"
 [models.qwen-vl.capabilities]
 supports_vision = true
 ```
+
+**Anthropic-compatible local servers (vLLM `/v1/messages`):** the
+`"anthropic-compatible"` provider drives local servers that expose
+Anthropic's Messages API for arbitrary checkpoints — vLLM's
+`/v1/messages` endpoint, which requires a release with thinking-block
+support in the Anthropic endpoint (post-2026-02-28; verified against
+v0.22.1rc1). The lane reuses `AnthropicProvider` in compat mode: same
+wire translation as the real Anthropic lane, but every model resolves to
+the `_ANTHROPIC_COMPAT_DEFAULT` capabilities (200K context, 64K output,
+`token_param=max_tokens`, `thinking_mode=none`, no native
+web_search/tool_search, no vision) — the static Claude table never
+applies to local checkpoints. `base_url` is the server root WITHOUT
+`/v1` (the Anthropic SDK appends `/v1/messages`); a trailing `/v1`
+pasted out of openai-compatible habit is stripped automatically. Set a
+placeholder `api_key` (e.g. `"dummy"`) for unauthenticated servers. Tool calling
+needs the server started with `--enable-auto-tool-choice
+--tool-call-parser <family>` plus the matching reasoning parser.
+Per-model capability overrides opt in to what the checkpoint actually
+supports:
+
+```toml
+[models.vllm-claude]
+provider = "anthropic-compatible"
+base_url = "http://localhost:8000"   # no /v1 — the SDK appends /v1/messages
+api_key = "dummy"
+model = "deepseek-ai/DeepSeek-V4-Flash"
+
+[models.vllm-claude.capabilities]
+supports_vision = true                    # multimodal checkpoints only
+supports_mid_conversation_system = true   # template-dependent
+context_window = 131072
+```
+
+The reasoning toggle does NOT use Anthropic's `thinking` request param.
+Toggle it through the chat template instead: set `{"chat_template_kwargs":
+{"thinking": false}}` as extra body params in the admin Models
+server-compat section (for this provider the section shows only the
+extra-body field — server type, API surface, and thinking mode are
+openai-compatible-only knobs); the provider forwards it via the SDK's
+`extra_body`.
+
+Verified quirks of vLLM's Anthropic endpoint:
+
+* The `thinking` request param is silently dropped — use
+  `chat_template_kwargs` (above) to control reasoning.
+* `stop_sequences` cut the raw stream wherever the text appears —
+  including inside thinking — and report `end_turn` with
+  `stop_sequence=None`. Turnstone does not send stop sequences from
+  this provider.
+* No cache telemetry: `usage` carries input/output token counts only
+  (no `cache_creation_input_tokens` / `cache_read_input_tokens`).
+* Images require a multimodal checkpoint — text-only models return a
+  500 on image blocks, so `supports_vision` stays opt-in per model.
+* Mid-conversation `role: "system"` turns are template-dependent —
+  opt in per model via `supports_mid_conversation_system`.
 
 **Database model definitions:** On server entry points, models can also be
 defined in the `model_definitions` table (admin Models tab). DB models support

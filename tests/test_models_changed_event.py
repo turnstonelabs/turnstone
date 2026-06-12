@@ -142,6 +142,24 @@ def test_create_emits_models_changed(storage: SQLiteBackend) -> None:
     assert collector.emit_models_changed.call_count == 1
 
 
+def test_create_accepts_anthropic_compatible_provider(storage: SQLiteBackend) -> None:
+    """anthropic-compatible passes the _MODEL_PROVIDERS enum check."""
+    client, collector = _make_client(storage)
+    resp = client.post(
+        "/v1/api/admin/model-definitions",
+        json={
+            "alias": "vllm-messages",
+            "model": "deepseek-ai/DeepSeek-V4-Flash",
+            "provider": "anthropic-compatible",
+            "base_url": "http://localhost:8000",
+            "api_key": "dummy",
+            "context_window": 131072,
+        },
+    )
+    assert resp.status_code == 200, resp.text
+    assert collector.emit_models_changed.call_count == 1
+
+
 def test_update_emits_models_changed(storage: SQLiteBackend) -> None:
     _seed(storage, definition_id="m1", alias="local")
     client, collector = _make_client(storage)

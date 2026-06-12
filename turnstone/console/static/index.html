@@ -1577,6 +1577,7 @@
                     <option value="anthropic">anthropic</option>
                     <option value="google">google</option>
                     <option value="openai-compatible">openai-compatible</option>
+                    <option value="anthropic-compatible">anthropic-compatible</option>
                   </select>
                 </div>
                 <div>
@@ -1673,7 +1674,7 @@
 
               <div id="model-server-compat-section" hidden>
                 <div class="sh-section">Server compatibility</div>
-                <div class="field-pair">
+                <div class="field-pair" id="model-server-fields-row">
                   <div>
                     <label for="model-server-type"
                       >Server type
@@ -1702,28 +1703,32 @@
                     </select>
                   </div>
                 </div>
-                <label for="model-thinking-mode"
-                  >Thinking mode
-                  <span class="label-hint">chat-template reasoning</span></label
-                >
-                <select id="model-thinking-mode">
-                  <option value="">None</option>
-                  <option value="manual">Enabled</option>
-                </select>
-                <div id="model-thinking-param-row" hidden>
-                  <label for="model-thinking-param"
-                    >Template param name
+                <div id="model-thinking-mode-row">
+                  <label for="model-thinking-mode"
+                    >Thinking mode
                     <span class="label-hint"
-                      >Granite/DeepSeek use "thinking"</span
+                      >chat-template reasoning</span
                     ></label
                   >
-                  <input
-                    type="text"
-                    id="model-thinking-param"
-                    class="sh-mono"
-                    value="enable_thinking"
-                    placeholder="enable_thinking"
-                  />
+                  <select id="model-thinking-mode">
+                    <option value="">None</option>
+                    <option value="manual">Enabled</option>
+                  </select>
+                  <div id="model-thinking-param-row" hidden>
+                    <label for="model-thinking-param"
+                      >Template param name
+                      <span class="label-hint"
+                        >Granite/DeepSeek use "thinking"</span
+                      ></label
+                    >
+                    <input
+                      type="text"
+                      id="model-thinking-param"
+                      class="sh-mono"
+                      value="enable_thinking"
+                      placeholder="enable_thinking"
+                    />
+                  </div>
                 </div>
                 <label for="model-extra-body"
                   >Extra body params
