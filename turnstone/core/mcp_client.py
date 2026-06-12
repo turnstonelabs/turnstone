@@ -2721,16 +2721,21 @@ class MCPClientManager:
         """Close all MCP sessions and stop the background loop."""
         # Cancel tracked background tasks (catalog refreshes etc.) FIRST —
         # they are pure auxiliaries, and draining them up front means the
-        # stack teardown below can't race an in-flight refresh.
-        if self._loop and self._background_tasks:
+        # stack teardown below can't race an in-flight refresh.  Submitted
+        # whenever a loop exists — NOT gated on a main-thread truthiness
+        # check of ``_background_tasks``: a spawn queued via
+        # call_soon_threadsafe may not have reached the set yet, but ready
+        # callbacks run in FIFO order, so by the time the drain coroutine
+        # snapshots the set ON the loop, every earlier-queued spawn has
+        # landed.  ``is_running()`` guard: on a stopped loop nothing can
+        # execute the drain — submitting would just stall on the future.
+        if self._loop is not None and self._loop.is_running():
 
             async def _cancel_background() -> None:
                 tasks = list(self._background_tasks)
                 for task in tasks:
                     task.cancel()
-                for task in tasks:
-                    with contextlib.suppress(BaseException):
-                        await task
+                await asyncio.gather(*tasks, return_exceptions=True)
 
             future = asyncio.run_coroutine_threadsafe(_cancel_background(), self._loop)
             try:
@@ -2793,6 +2798,18 @@ class MCPClientManager:
             self._loop.call_soon_threadsafe(self._loop.stop)
         if self._thread:
             self._thread.join(timeout=5)
+            if self._thread.is_alive():
+                # Closing a still-running loop raises; the daemon thread dies
+                # with the process, so leaving the loop open is the lesser
+                # evil.  Loud because a stuck loop thread is itself a bug.
+                log.warning("MCP loop thread did not stop within 5s; loop left open")
+            else:
+                if self._loop is not None:
+                    self._loop.close()
+                self._loop = None
+                self._thread = None
+        # When no thread was started (tests wire ``_loop`` directly) the loop
+        # is not ours to close — the stop above is all the owner needs.
 
         # Clear all state
         self._background_tasks.clear()
