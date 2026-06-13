@@ -1,0 +1,79 @@
+[
+  {
+    "id": "charred_shiv",
+    "name": "Charred Shiv",
+    "slot": "weapon",
+    "atk": 2,
+    "price": 0
+  },
+  {
+    "id": "obsidian_knife",
+    "name": "Obsidian Knife",
+    "slot": "weapon",
+    "atk": 5,
+    "price": 40
+  },
+  {
+    "id": "basalt_cleaver",
+    "name": "Basalt Cleaver",
+    "slot": "weapon",
+    "atk": 7,
+    "price": 80
+  },
+  {
+    "id": "molten_maul",
+    "name": "Molten Maul",
+    "slot": "weapon",
+    "atk": 9,
+    "price": 120
+  },
+  {
+    "id": "scorched_rags",
+    "name": "Scorched Rags",
+    "slot": "armor",
+    "def": 1,
+    "price": 0
+  },
+  {
+    "id": "ashplate_vest",
+    "name": "Ashplate Vest",
+    "slot": "armor",
+    "def": 2,
+    "price": 25
+  },
+  {
+    "id": "slaghide_armor",
+    "name": "Slaghide Armor",
+    "slot": "armor",
+    "def": 3,
+    "price": 50
+  },
+  {
+    "id": "obsidian_carapace",
+    "name": "Obsidian Carapace",
+    "slot": "armor",
+    "def": 6,
+    "price": 140
+  },
+  {
+    "id": "ember_tonic",
+    "name": "Ember Tonic",
+    "slot": "consumable",
+    "heal": 15,
+    "price": 12
+  },
+  {
+    "id": "cooling_draught",
+    "name": "Cooling Draught",
+    "slot": "consumable",
+    "heal": 40,
+    "price": 35
+  },
+  {
+    "id": "quenchwater_flask",
+    "name": "Quenchwater Flask",
+    "slot": "consumable",
+    "heal": 70,
+    "price": 60
+  }
+]

@@ -150,6 +150,59 @@ def test_cli_newpack_authoring_md_has_width_rule_and_live_palette(tmp_path: Path
         assert f"`{glyph}`" in manual, f"palette glyph {glyph!r} missing from manual"
 
 
+def test_cli_newpack_authoring_md_documents_v07_action_sets(tmp_path: Path) -> None:
+    """AUTHORING.md documents each building's real verb menu, gamble included.
+
+    The v0.8 doc fix: the inn's live `gamble` verb was previously absent, and
+    the per-building menus are now an explicit table. This pins the table rows
+    and the "quaff anywhere" note so a doc regression trips.
+    """
+    dest = tmp_path / "mypack"
+    cli.cli_newpack(dest, out=StringIO(), err=StringIO())
+    manual = (dest / "AUTHORING.md").read_text(encoding="utf-8")
+
+    assert "| `inn` | `rest`, `gamble`, `leave` |" in manual
+    assert "| `shop` | `buy`, `sell`, `forge`, `leave` |" in manual
+    assert "| `healer` | `heal`, `leave` |" in manual
+    assert "| `dungeon` | `descend`, `challenge`, `leave` |" in manual
+    assert "`quaff`" in manual and "legal **anywhere**" in manual
+
+
+def test_cli_newpack_authoring_md_states_color_advisory_and_spawn_walkable(
+    tmp_path: Path,
+) -> None:
+    """AUTHORING.md states color is advisory (loader does not validate it) and
+    that spawn must be on walkable terrain — both v0.8 honesty fixes."""
+    dest = tmp_path / "mypack"
+    cli.cli_newpack(dest, out=StringIO(), err=StringIO())
+    manual = (dest / "AUTHORING.md").read_text(encoding="utf-8")
+
+    # color is documented as advisory / not validated (it matches loader behaviour).
+    assert "advisory and not validated" in manual
+    # spawn's walkability requirement is now stated where spawn is introduced.
+    assert "must be on walkable terrain" in manual
+
+
+def test_cli_newpack_authoring_md_has_validate_coverage_split(tmp_path: Path) -> None:
+    """AUTHORING.md honestly separates machine-enforced rules from eyeball-only.
+
+    The v0.8 subsection lists what `validate` DOES catch (including the two new
+    enforcements — rare-as-guardian and single-boss) and what it does NOT (chief
+    among them: location menu `actions` contents are unvalidated).
+    """
+    dest = tmp_path / "mypack"
+    cli.cli_newpack(dest, out=StringIO(), err=StringIO())
+    manual = (dest / "AUTHORING.md").read_text(encoding="utf-8")
+
+    assert "What `validate` checks, and what it cannot" in manual
+    # The newly-enforced rules are named in the DOES-catch list.
+    assert "Exactly one boss" in manual
+    assert "fixed rung guardian) must" in manual  # rare-as-guardian enforcement
+    # The eyeball-only short list names the actions gap and the flavour caveat.
+    assert "Location menu `actions` contents" in manual
+    assert "Flavour and narration quality" in manual
+
+
 def test_cli_newpack_refuses_non_empty_dir(tmp_path: Path) -> None:
     dest = tmp_path / "occupied"
     dest.mkdir()
@@ -201,6 +254,17 @@ def test_main_newpack_dispatch(tmp_path: Path) -> None:
         server.main(["newpack", str(dest)])
     assert exc.value.code == 0
     assert (dest / "AUTHORING.md").exists()
+
+
+def test_main_worlds_dispatch(capsys: pytest.CaptureFixture) -> None:
+    """`understone worlds` routes through main, exits 0, and lists the Vale."""
+    with pytest.raises(SystemExit) as exc:
+        server.main(["worlds"])
+    assert exc.value.code == 0
+    out = capsys.readouterr().out
+    assert "vale" in out
+    assert "The Vale of Understone" in out
+    assert "UNDERSTONE_WORLD=" in out
 
 
 def test_bare_invocation_resolves_to_serve_without_side_effects() -> None:

@@ -5,7 +5,7 @@ library, takes no part in argument parsing (``server.main`` owns the argparse
 front end), and writes to the streams it is handed. That keeps the authoring
 loop — ``newpack`` then ``validate`` — testable as plain function calls.
 
-Two entry points back the two verbs:
+Three entry points back the three verbs:
 
 * :func:`cli_validate` loads a pack and, on success, prints a human-readable
   report; on failure it prints the loader's author-facing message and returns
@@ -14,6 +14,9 @@ Two entry points back the two verbs:
   starting template and writes an ``AUTHORING.md`` manual whose bands table is
   generated from the loader's own band data, so the documented limits can
   never drift from the enforced ones.
+* :func:`cli_worlds` lists the bundled worlds — the default Vale plus every
+  alternate pack shipped under ``world/packs/`` — loading each so it can report
+  whether it is sound or flawed, the discovery seam for "worlds without authors".
 """
 
 from __future__ import annotations
@@ -24,7 +27,7 @@ from typing import TYPE_CHECKING, TextIO
 
 from understone.engine.textwidth import SAFE_PALETTE
 from understone.errors import WorldLoadError
-from understone.world import PACKAGED_WORLD_DIR, loader
+from understone.world import PACKAGED_WORLD_DIR, bundled_world_dirs, loader
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -97,6 +100,57 @@ def cli_newpack(dest: Path, out: TextIO | None = None, err: TextIO | None = None
     return 0
 
 
+def cli_worlds(out: TextIO | None = None, err: TextIO | None = None) -> int:
+    """List every bundled world, reporting each as sound or flawed; return 0.
+
+    Discovers the worlds through :func:`~understone.world.bundled_world_dirs`
+    (the default Vale first, then the alternate packs alphabetically) and loads
+    each one. Each world is one line — its slug, name, ``WxH``, and either
+    ``sound`` or ``flawed: <short reason>`` — so a shipped pack that has gone
+    out of band is visible at a glance rather than only failing at serve time.
+    A flawed world is reported, not fatal: the listing always returns 0 and
+    always ends with the hint for serving an alternate. *err* is accepted for a
+    uniform signature with the other verbs; the listing writes only to *out*.
+    """
+    out = out if out is not None else sys.stdout
+    for slug, world_dir in bundled_world_dirs():
+        print(_world_line(slug, world_dir), file=out)
+    print("", file=out)
+    print(
+        "Serve one with UNDERSTONE_WORLD=<path> (or the default Vale needs no setting).",
+        file=out,
+    )
+    return 0
+
+
+def _world_line(slug: str, world_dir: Path) -> str:
+    """Render one ``worlds`` listing line for the world at *world_dir*.
+
+    Loads the world to report its real name, dimensions, and soundness. A pack
+    that fails to load is summarised as ``flawed: <reason>`` using the loader's
+    own author-facing message (truncated to keep the listing to one line per
+    world), never raised — the listing surveys every bundled world even when one
+    is broken.
+    """
+    try:
+        world = loader.load_world(world_dir)
+    except WorldLoadError as exc:
+        return f"  {slug:<10} flawed: {_short_reason(str(exc))}"
+    return f"  {slug:<10} {world.name} — {world.width}x{world.height} — sound"
+
+
+# How much of a loader error message the one-line ``worlds`` summary keeps.
+_FLAW_REASON_MAX = 70
+
+
+def _short_reason(message: str) -> str:
+    """Trim a loader error to a single readable clause for the worlds listing."""
+    flattened = " ".join(message.split())
+    if len(flattened) <= _FLAW_REASON_MAX:
+        return flattened
+    return flattened[: _FLAW_REASON_MAX - 1].rstrip() + "…"
+
+
 def _pack_report(world: World) -> str:
     """Render the success report for a loaded *world*.
 
@@ -148,7 +202,8 @@ def build_authoring_md() -> str:
     enforces and admits, and cannot silently drift from it.
     """
     md = _AUTHORING_TEMPLATE.replace("{{BANDS}}", _render_bands())
-    return md.replace("{{PALETTE}}", _render_palette())
+    md = md.replace("{{PALETTE}}", _render_palette())
+    return md.replace("{{VALIDATE_COVERAGE}}", _render_validate_coverage())
 
 
 def _render_bands() -> str:
@@ -198,7 +253,19 @@ def _render_bands() -> str:
         parts.append(f"| `{kind}` | `{lo}..{hi}` |")
     parts.append(
         "\n(`fight` and `lore` carry no amount; `fight` draws its foe from the "
-        "zone tier band, `lore` is pure flavour text.)"
+        "zone tier band, `lore` is pure flavour text.)\n"
+    )
+
+    parts.append("### Watch theme (`world.json` → `settings.watch_theme`)\n")
+    legal = ", ".join(f"`{name}`" for name in sorted(loader.WATCH_THEMES))
+    parts.append(
+        f"OPTIONAL. The CRT palette the live Watch page paints your world in, "
+        f"one of: {legal}. It defaults to `{loader.DEFAULT_WATCH_THEME}` (the "
+        f"original green phosphor), so you may leave it out entirely — a pack "
+        f"that omits it looks exactly as the bundled Vale always has. Set it to "
+        f"give your world its own colour: `amber` is a warm gold monitor, `ice` "
+        f"a cold pale blue, `ember` a hot red/orange. An unknown name is a load "
+        f"error naming the legal set."
     )
 
     return "\n".join(parts)
@@ -224,6 +291,46 @@ def _render_palette() -> str:
         "carry the period BBS / CP437 flavour and are all guaranteed safe:\n\n"
         f"{glyphs}"
     )
+
+
+def _render_validate_coverage() -> str:
+    """Render the list of rules the loader actually enforces, generated from it.
+
+    The figures that can drift (the number of banded settings, the name-length
+    cap, the reserved glyphs) are read from the live loader so the list cannot
+    fall out of step with what `validate` does; the prose names each family of
+    check. This is the machine-enforced half of the honesty split in the manual
+    — the eyeball-only half is hand-written below it, because "is the fiction
+    any good" is exactly what the loader can never see.
+    """
+    settings_count = len(loader.SETTINGS_BANDS)
+    reserved = ", ".join(f"`{g}`" for g in _reserved_glyph_list())
+    bullets = [
+        f"* **Economy and progression bands** — every one of the {settings_count} "
+        "`settings` fields must sit in its allowed range (the table above), and "
+        "`growth` must be present and non-negative.",
+        "* **Glyph safety** — every terrain, location, and legend glyph must render "
+        f"exactly one column and must not be a reserved marker ({reserved}).",
+        "* **Map integrity** — `width`/`height` in band, every `terrain_rows` row "
+        "exactly `width` long with `height` rows, and every row character in the "
+        "`legend`.",
+        "* **Walkability** — `spawn` and every placed location must sit on walkable "
+        "terrain (and no two locations share a cell).",
+        f"* **Display-name length** — every monster, item, and location name within "
+        f"`{loader.MAX_NAME_LEN}` printable characters; content lists within their caps.",
+        "* **The fight row** — `events.json` must hold at least one `fight` entry, "
+        "with weights `> 0`, `min <= max`, and amounts in their per-kind band.",
+        "* **Cross-references** — `legend` → terrain key, location placements → "
+        "`locations.json` keys, `starting_weapon`/`starting_armor` → item ids, "
+        '`boss_monster` → a monster flagged `"boss": true`, and '
+        "`rare_drop_item` → a consumable item id.",
+        "* **Zone tiers** — every zone's tier band must overlap at least one monster tier.",
+        "* **Dungeon ladder** — every `dungeon_tiers` tier must have a non-boss "
+        "monster, and that tier's FIRST monster (its fixed rung guardian) must "
+        "not be `rare`.",
+        '* **Exactly one boss** — at most one monster may carry `"boss": true`.',
+    ]
+    return "\n".join(bullets)
 
 
 _AUTHORING_TEMPLATE = """\
@@ -295,7 +402,12 @@ An object whose keys are the single-character legend symbols used in the map.
 * `walkable` — may a player stand here.
 * `encounter_rate` — `0.0`..`1.0`, the per-step chance a walk rolls the event
   table on this terrain.
-* `color` — a palette role string (`floor`, `tree`, `water`, `wall`, ...).
+* `color` — a palette role string. It is **advisory and not validated**: the
+  loader stores it but the v1 text renderer draws glyphs only, so any string
+  loads and an unrecognised role simply maps to the default at render time. The
+  roles a future colour renderer will recognise are `floor`, `wall`, `water`,
+  `tree`, `town`, and `dungeon`; pick the closest, but a typo here is harmless,
+  not a load error.
 
 ### `monsters.json`
 
@@ -344,15 +456,26 @@ An object keyed by location key. Each entry is a building kind with a menu of
 ```json
 {
   "inn": {"kind": "inn", "name": "The Sleeping Drake", "glyph": "I",
-          "color": "town", "actions": ["rest", "leave"],
+          "color": "town", "actions": ["rest", "gamble", "leave"],
           "flavor": ["Lamplight pools on worn oak tables."]}
 }
 ```
 
-The verbs the engine understands are `rest` (inn), `buy`/`sell`/`forge` (shop),
-`heal` (healer), `descend`/`challenge` (dungeon), and `leave`. (`quaff` is legal
-anywhere and needs no menu entry.) Give each building the menu that matches its
-role.
+Give each building the menu that matches its role. The four building kinds and
+the verbs the engine honours inside each are:
+
+| `kind` | actions the engine understands |
+| --- | --- |
+| `inn` | `rest`, `gamble`, `leave` |
+| `shop` | `buy`, `sell`, `forge`, `leave` |
+| `healer` | `heal`, `leave` |
+| `dungeon` | `descend`, `challenge`, `leave` |
+
+`quaff` (drink a satchel tonic) is legal **anywhere** and needs no menu entry.
+The `actions` list is advisory — it is the menu the narrator offers, NOT a
+validated whitelist (see "What `validate` checks" below): a verb the engine does
+not back simply confuses the narrator, so give each building only the verbs from
+its row above.
 
 ### `events.json`
 
@@ -375,10 +498,12 @@ There MUST be at least one `fight` row, or a walk could never find a monster.
 
 ### `world.json`
 
-The binding file: `name`, `width`, `height`, `spawn` `[x, y]`, a `legend`
-mapping characters to terrain keys, `terrain_rows` (one string per row, each
-exactly `width` long), a `locations` list of `{"key", "x", "y"}` placements,
-a `zones` list (rectangles that bias monster tiers), and a `settings` object.
+The binding file: `name`, `width`, `height`, `spawn` `[x, y]` (the hero's start
+cell, which must be on walkable terrain), a `legend` mapping characters to
+terrain keys, `terrain_rows` (one string per row, each exactly `width` long), a
+`locations` list of `{"key", "x", "y"}` placements (each also on walkable
+terrain), a `zones` list (rectangles that bias monster tiers), and a `settings`
+object.
 
 ```json
 {"key": "forest_near", "rect": [30, 18, 60, 36], "tier_lo": 1, "tier_hi": 2}
@@ -462,11 +587,15 @@ a fully-forged piece is a multi-day saving.
 surfaces seldom, stats and rewards a clear notch above its tier, and remember it
 always drops `rare_drop_item` (a consumable) into the satchel. Keep rares OFF
 the first slot of any `dungeon_tiers` tier, or they would become a fixed rung
-guardian instead of a rare roll.
+guardian instead of a rare roll — `validate` now ENFORCES this, so a rare in a
+dungeon tier's lead slot is a load error, not just bad form. Place the rare
+anywhere after that tier's first ordinary monster.
 
-**Location menus.** Give each building only the actions it can honour. An inn
-that offers `buy` but no shop logic will confuse the narrator; match the menu
-to the building's role. The shop verbs are `buy`, `sell`, and `forge`.
+**Location menus.** Give each building only the actions it can honour, drawn
+from the per-kind table under `locations.json` above. An inn that offers `buy`
+but no shop logic will confuse the narrator. This is the one major thing
+`validate` does NOT check (see below): a wrong or invented verb loads fine and
+only muddles the narration, so it is on you to match each menu to its building.
 
 ---
 
@@ -480,4 +609,26 @@ failure you get one precise line naming the file, the row, and the field.
 The error messages are deliberately instructive: they are the authoring API.
 Keep editing and re-validating until the door stands open, then point the
 server at your pack with `UNDERSTONE_WORLD=mypack`.
+
+### What `validate` checks, and what it cannot
+
+`validate` runs your pack through the very loader the server uses, so a pack
+that validates will load and serve. But the loader checks *structure and
+references*, not *meaning* — it cannot read your fiction. Keep the split honest:
+
+**`validate` DOES catch (a load error if wrong):**
+
+{{VALIDATE_COVERAGE}}
+
+**`validate` does NOT catch (the eyeball-only short list):**
+
+* **Location menu `actions` contents.** The list is the narrator's menu, not a
+  validated whitelist: a verb the engine does not back (a typo, or a fictional
+  `pray`) loads fine and only confuses the narration. Match each building's menu
+  to the per-kind table under `locations.json`.
+* **Flavour and narration quality.** Names, `flavor` lines, event `text`, the
+  feel of the tier curve and the economy — the loader checks they are present
+  and in band, never whether they are *good*. That judgement is yours; the
+  `simulate` bot can tell you a world is winnable and sanely paced, but only you
+  can tell whether it is worth playing.
 """

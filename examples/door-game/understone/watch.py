@@ -42,6 +42,10 @@ def build_world_payload(world: World) -> dict[str, object]:
     them as an overlay). ``legend`` maps every terrain glyph that appears to a
     palette colour *name*; the client owns the name→hex mapping. Completeness is
     a contract: every glyph in ``glyph_rows`` has a ``legend`` entry.
+
+    ``theme`` is the pack's Watch CRT palette (``settings.watch_theme``); the
+    page looks it up in its own JS THEME table on fetch and swaps the CSS
+    custom-property values, so each world has its own phosphor colour.
     """
     glyph_rows: list[str] = []
     legend: dict[str, str] = {}
@@ -67,6 +71,7 @@ def build_world_payload(world: World) -> dict[str, object]:
         "name": world.name,
         "width": world.width,
         "height": world.height,
+        "theme": world.settings.watch_theme,
         "glyph_rows": glyph_rows,
         "legend": legend,
         "locations": locations,
@@ -318,6 +323,63 @@ _WATCH_HTML_TEMPLATE = """\
 (function () {
   "use strict";
 
+  // Per-world CRT palette. Each named theme is a set of CSS custom-property
+  // values applied to :root when world.json arrives (the pack's
+  // settings.watch_theme picks one). "phosphor" holds the EXACT values of the
+  // :root block above, so the default Vale is pixel-for-pixel unchanged; the
+  // others re-tint the whole console:
+  //   phosphor — the original green CRT (default).
+  //   amber    — a warm gold CRT (classic amber monochrome monitor).
+  //   ice      — a pale, cold blue CRT.
+  //   ember    — a hot red/orange CRT.
+  // The day/night wash from v0.6 composes ON TOP of whichever theme is set.
+  var THEMES = {
+    phosphor: {
+      "--phosphor": "#7dffa0",
+      "--phosphor-dim": "#2f7a46",
+      "--amber": "#ffb44d",
+      "--bg": "#050a06",
+      "--panel": "#0a140d",
+      "--edge": "#163a22"
+    },
+    amber: {
+      "--phosphor": "#ffc14d",
+      "--phosphor-dim": "#7a5320",
+      "--amber": "#fff0a8",
+      "--bg": "#0a0702",
+      "--panel": "#14100a",
+      "--edge": "#3a2c16"
+    },
+    ice: {
+      "--phosphor": "#9fe6ff",
+      "--phosphor-dim": "#2f5f7a",
+      "--amber": "#ffe07d",
+      "--bg": "#04080a",
+      "--panel": "#0a1014",
+      "--edge": "#16303a"
+    },
+    ember: {
+      "--phosphor": "#ff8a6b",
+      "--phosphor-dim": "#7a3320",
+      "--amber": "#ffd07d",
+      "--bg": "#0a0503",
+      "--panel": "#140a07",
+      "--edge": "#3a1c16"
+    }
+  };
+
+  // Swap the CSS custom-property values for the pack's theme. Unknown or
+  // missing theme names fall back to "phosphor", so the console always has a
+  // coherent palette even if a future theme reaches the page unknown.
+  function applyTheme(name) {
+    var theme = THEMES[name] || THEMES.phosphor;
+    for (var prop in theme) {
+      if (Object.prototype.hasOwnProperty.call(theme, prop)) {
+        document.documentElement.style.setProperty(prop, theme[prop]);
+      }
+    }
+  }
+
   // Palette colour-name -> phosphor-tinted hex. Mirrors understone.screen.palette
   // Color values; the base map is coloured from this, never from the server.
   var PALETTE = {
@@ -376,6 +438,7 @@ _WATCH_HTML_TEMPLATE = """\
   // Paint the base map ONCE. Each row is a sequence of <span> runs, a new run
   // only where the legend colour changes, so a row is a handful of spans.
   function paintMap(world) {
+    applyTheme(world.theme);
     document.getElementById("world-name").textContent = world.name + " — Live Watch";
     var legend = world.legend || {};
     var rows = world.glyph_rows || [];

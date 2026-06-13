@@ -20,6 +20,7 @@ Usage::
     python -m understone       # via module
     understone validate PATH   # check a content pack loads cleanly
     understone newpack PATH    # scaffold a new pack + authoring manual
+    understone worlds          # list the bundled worlds and their soundness
 
 Environment variables
 ---------------------
@@ -42,7 +43,7 @@ from typing import TYPE_CHECKING
 from mcp.server.fastmcp import FastMCP
 from starlette.responses import HTMLResponse, JSONResponse, Response
 
-from understone import cli, watch
+from understone import cli, sim, watch
 from understone.errors import WorldLoadError
 from understone.game import Game
 from understone.persistence import Store
@@ -583,6 +584,17 @@ def _build_parser() -> argparse.ArgumentParser:
     validate.add_argument("path", type=Path, help="the pack directory to validate")
     newpack = sub.add_parser("newpack", help="scaffold a new content pack from the bundled world")
     newpack.add_argument("path", type=Path, help="the directory to create the pack in")
+    sub.add_parser("worlds", help="list the bundled worlds and whether each is sound")
+    sim = sub.add_parser("simulate", help="run a greedy balance bot over a pack and report")
+    sim.add_argument("path", type=Path, help="the pack directory to simulate")
+    sim.add_argument("--days", type=int, default=30, help="sim-days to play (default 30)")
+    sim.add_argument("--seed", type=int, default=1, help="RNG seed (default 1)")
+    sim.add_argument(
+        "--seeds",
+        type=int,
+        default=None,
+        help="run a sweep of this many seeds from --seed and aggregate",
+    )
     return parser
 
 
@@ -598,4 +610,8 @@ def main(argv: list[str] | None = None) -> None:
         raise SystemExit(cli.cli_validate(args.path))
     if args.cmd == "newpack":
         raise SystemExit(cli.cli_newpack(args.path))
+    if args.cmd == "worlds":
+        raise SystemExit(cli.cli_worlds())
+    if args.cmd == "simulate":
+        raise SystemExit(sim.cli_simulate(args.path, args.days, args.seed, seeds=args.seeds))
     _serve()

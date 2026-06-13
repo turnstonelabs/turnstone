@@ -68,6 +68,7 @@ DEFAULT_SETTINGS = Settings(
     forge_base_cost=60,
     forge_max_plus=3,
     rare_drop_item="minor_potion",
+    watch_theme="phosphor",
 )
 
 
@@ -101,6 +102,7 @@ def make_settings(**overrides: object) -> Settings:
         "forge_base_cost": DEFAULT_SETTINGS.forge_base_cost,
         "forge_max_plus": DEFAULT_SETTINGS.forge_max_plus,
         "rare_drop_item": DEFAULT_SETTINGS.rare_drop_item,
+        "watch_theme": DEFAULT_SETTINGS.watch_theme,
     }
     base.update(overrides)
     return Settings(**base)  # type: ignore[arg-type]

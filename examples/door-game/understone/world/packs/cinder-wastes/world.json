@@ -1,0 +1,132 @@
+{
+  "name": "The Cinder Wastes",
+  "width": 96,
+  "height": 48,
+  "spawn": [20, 24],
+  "legend": {
+    ".": "ash",
+    "A": "spire",
+    "~": "slag",
+    "=": "basalt",
+    "c": "cinder",
+    "#": "caldera"
+  },
+  "terrain_rows": [
+    "################################################################################################",
+    "#.........................................................ccccccccccccccccccccccccccccccccccccc#",
+    "#............A......................A.....................cAccccccccccccccccccccccAcccccccccccc#",
+    "#.......A......................A......................A...cccccccccccccccccccAccccccccccccccccc#",
+    "#..A..~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~cccccccc#",
+    "#.....~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~cccAcccc#",
+    "#.....~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~cccccccc#",
+    "#.....~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~cccccccc#",
+    "#.....A......................A......................A.....cccccccccccccccccAccccccccccccccccccc#",
+    "#A......................A......................A..........ccccccccccccAccccccccccccccccccccccAc#",
+    "#..................A......................A...............cccccccAcc#####cccccccccccccccAcccccc#",
+    "#.............A......................A....................ccAccccccc#ccc#ccccccccccAccccccccccc#",
+    "#........A......................A......................A..cccccccc====cc#cccccAcccccccccccccccc#",
+    "#...A......................A......................A.......cccccccc=c#####Accccccccccccccccccccc#",
+    "#.....................A......................A............cccccccc=cAccccccccccccccccccccccAccc#",
+    "#................A......................A.................cccccAcc=cccccccccccccccccccAcccccccc#",
+    "#...........A......................A......................Accccccc=ccccccccccccccAccccccccccccc#",
+    "#......A......................A......................A....cccccccc=cccccccccAcccccccccccccccccc#",
+    "#.A......................A......................A.........cccccccc=ccccAccccccccccccccccccccccA#",
+    "#...................A......................A..............cccccccc=ccccccccccccccccccccccAccccc#",
+    "#.....................................A...................cccAcccc=cccccccccccccccccAcccccccccc#",
+    "#.........A......................A......................A.cccccccc=ccccccccccccAccccccccccccccc#",
+    "#....A.............................................A......cccccccc=cccccccAcccccccccccccccccccc#",
+    "#.............................................A...........cccccccc=ccAccccccccccccccccccccccAcc#",
+    "#.=================================================================ccccccccccccccccccccAccccccc#",
+    "#............A......................A.....................cAccccccccccccccccccccccAcccccccccccc#",
+    "#.......A......................A......................A...cccccccccccccccccccAccccccccccccccccc#",
+    "#..A.............................................A........ccccccccccccccAcccccccccccccccccccccc#",
+    "#...........................................A.............cccccccccAccccccccccccccccccccccAcccc#",
+    "#...............A......................A..................ccccAccccccccccccccccccccccAccccccccc#",
+    "#..........A......................A......................AccccccccccccccccccccccAcccccccccccccc#",
+    "#.....A......................A......................A.....cccccccccccccccccAccccccccccccccccccc#",
+    "#A......................A......................A..........ccccccccccccAccccccccccccccccccccccAc#",
+    "#..................A......................A...............cccccccAccccccccccccccccccccccAcccccc#",
+    "#.............A......................A....................ccAccccccccccccccccccccccAccccccccccc#",
+    "#........A......................A......................A..ccccccccccccccccccccAcccccccccccccccc#",
+    "#...A......................A......................A.......cccccccccccccccAccccccccccccccccccccc#",
+    "#.....................A......................A............ccccccccccAccccccccccccccccccccccAccc#",
+    "#................A......................A.................cccccAccccccccccccccccccccccAcccccccc#",
+    "#...........A......................A......................AccccccccccccccccccccccAccccccccccccc#",
+    "#......A......................A......................A....ccccccccccccccccccAcccccccccccccccccc#",
+    "#.A......................A......................A.........cccccccccccccAccccccccccccccccccccccA#",
+    "#...................A......................A..............ccccccccAccccccccccccccccccccccAccccc#",
+    "#..............A......................A...................cccAccccccccccccccccccccccAcccccccccc#",
+    "#.........A......................A......................A.cccccccccccccccccccccAccccccccccccccc#",
+    "#....A......................A......................A......ccccccccccccccccAcccccccccccccccccccc#",
+    "#.........................................................ccccccccccccccccccccccccccccccccccccc#",
+    "################################################################################################"
+  ],
+  "locations": [
+    {
+      "key": "inn",
+      "x": 18,
+      "y": 24
+    },
+    {
+      "key": "shop",
+      "x": 22,
+      "y": 24
+    },
+    {
+      "key": "healer",
+      "x": 20,
+      "y": 22
+    },
+    {
+      "key": "dungeon",
+      "x": 70,
+      "y": 12
+    }
+  ],
+  "zones": [
+    {
+      "key": "ash_flats",
+      "rect": [30, 18, 60, 36],
+      "tier_lo": 1,
+      "tier_hi": 2
+    },
+    {
+      "key": "caldera_deep",
+      "rect": [60, 8, 82, 22],
+      "tier_lo": 3,
+      "tier_hi": 5
+    }
+  ],
+  "settings": {
+    "daily_turns": 10,
+    "rest_cost": 15,
+    "heal_cost_per_hp": 2,
+    "starting_gold": 20,
+    "starting_weapon": "charred_shiv",
+    "starting_armor": "scorched_rags",
+    "start_hp": 20,
+    "start_atk": 3,
+    "start_def": 0,
+    "xp_base": 100,
+    "growth": {
+      "max_hp": 6,
+      "atk": 2,
+      "def": 1
+    },
+    "bestow_daily_budget": 25,
+    "dungeon_tiers": [3, 4, 5],
+    "boss_monster": "magma_wyrm",
+    "wyrm_min_level": 6,
+    "ambush_min_level": 3,
+    "ambush_level_band": 2,
+    "ambush_gold_pct": 25,
+    "post_daily_cap": 5,
+    "gamble_max_bet": 50,
+    "gamble_daily_cap": 5,
+    "satchel_max": 3,
+    "forge_base_cost": 60,
+    "forge_max_plus": 3,
+    "rare_drop_item": "cooling_draught",
+    "watch_theme": "ember"
+  }
+}
