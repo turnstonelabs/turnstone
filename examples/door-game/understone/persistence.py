@@ -65,6 +65,10 @@ _PLAYER_COLUMNS = (
     "post_day",
     "gambles",
     "gamble_day",
+    "deepest_rung",
+    "satchel",
+    "weapon_plus",
+    "armor_plus",
 )
 
 
@@ -109,7 +113,11 @@ class Store:
                 posts_sent  INTEGER NOT NULL DEFAULT 0,
                 post_day    INTEGER NOT NULL DEFAULT 0,
                 gambles     INTEGER NOT NULL DEFAULT 0,
-                gamble_day  INTEGER NOT NULL DEFAULT 0
+                gamble_day  INTEGER NOT NULL DEFAULT 0,
+                deepest_rung INTEGER NOT NULL DEFAULT 0,
+                satchel     TEXT NOT NULL DEFAULT '',
+                weapon_plus INTEGER NOT NULL DEFAULT 0,
+                armor_plus  INTEGER NOT NULL DEFAULT 0
             );
 
             CREATE TABLE IF NOT EXISTS events (
@@ -326,6 +334,10 @@ def _player_to_row(player: Player) -> tuple[object, ...]:
         player.post_day,
         player.gambles,
         player.gamble_day,
+        player.deepest_rung,
+        player.satchel,
+        player.weapon_plus,
+        player.armor_plus,
     )
 
 
@@ -357,6 +369,10 @@ def _row_to_player(row: sqlite3.Row) -> Player:
         post_day=row["post_day"],
         gambles=row["gambles"],
         gamble_day=row["gamble_day"],
+        deepest_rung=row["deepest_rung"],
+        satchel=row["satchel"],
+        weapon_plus=row["weapon_plus"],
+        armor_plus=row["armor_plus"],
     )
 
 

@@ -547,3 +547,113 @@ def test_overlong_monster_name_rejected(tmp_path: Path) -> None:
     _rewrite(pack / "monsters.json", mutate)
     with pytest.raises(WorldLoadError, match=r"monsters\.json\[0\] name is 49 characters"):
         load_world(pack)
+
+
+# ---------------------------------------------------------------------------
+# v0.7 loader rejections: the satchel/forge bands, rare_drop_item, monster weight
+# ---------------------------------------------------------------------------
+
+
+def test_rare_drop_item_unknown_rejected(tmp_path: Path) -> None:
+    """A rare_drop_item that names no item is rejected with the item-id message."""
+    pack = _clone_pack(tmp_path)
+
+    def mutate(data: dict[str, Any]) -> None:
+        data["settings"]["rare_drop_item"] = "no_such_draught"
+
+    _rewrite(pack / "world.json", mutate)
+    with pytest.raises(WorldLoadError, match="rare_drop_item = 'no_such_draught' is not a known"):
+        load_world(pack)
+
+
+def test_rare_drop_item_non_consumable_rejected(tmp_path: Path) -> None:
+    """A rare_drop_item that names a weapon (not a consumable) is rejected.
+
+    The drop goes straight into the satchel to be quaffed, so a weapon or
+    armour id is incoherent — the loader pins the slot.
+    """
+    pack = _clone_pack(tmp_path)
+
+    def mutate(data: dict[str, Any]) -> None:
+        data["settings"]["rare_drop_item"] = "iron_sword"  # a weapon, not a draught
+
+    _rewrite(pack / "world.json", mutate)
+    with pytest.raises(WorldLoadError, match="rare_drop_item = 'iron_sword' must be a consumable"):
+        load_world(pack)
+
+
+def test_satchel_max_out_of_band_rejected(tmp_path: Path) -> None:
+    """satchel_max above its 1..10 band is a load error."""
+    pack = _clone_pack(tmp_path)
+
+    def mutate(data: dict[str, Any]) -> None:
+        data["settings"]["satchel_max"] = 11
+
+    _rewrite(pack / "world.json", mutate)
+    with pytest.raises(WorldLoadError, match=r"satchel_max = 11 is out of band \(1\.\.10\)"):
+        load_world(pack)
+
+
+def test_forge_max_plus_out_of_band_rejected(tmp_path: Path) -> None:
+    """forge_max_plus above its 0..10 band is a load error."""
+    pack = _clone_pack(tmp_path)
+
+    def mutate(data: dict[str, Any]) -> None:
+        data["settings"]["forge_max_plus"] = 11
+
+    _rewrite(pack / "world.json", mutate)
+    with pytest.raises(WorldLoadError, match=r"forge_max_plus = 11 is out of band \(0\.\.10\)"):
+        load_world(pack)
+
+
+def test_forge_base_cost_out_of_band_rejected(tmp_path: Path) -> None:
+    """forge_base_cost below its floor of 1 is a load error."""
+    pack = _clone_pack(tmp_path)
+
+    def mutate(data: dict[str, Any]) -> None:
+        data["settings"]["forge_base_cost"] = 0
+
+    _rewrite(pack / "world.json", mutate)
+    with pytest.raises(WorldLoadError, match=r"forge_base_cost = 0 is out of band \(1\.\.10000\)"):
+        load_world(pack)
+
+
+def test_monster_zero_weight_rejected(tmp_path: Path) -> None:
+    """A monster weight of 0 is rejected (the weighted pick needs a positive total)."""
+    pack = _clone_pack(tmp_path)
+
+    def mutate(data: list[dict[str, Any]]) -> None:
+        data[0]["weight"] = 0
+
+    _rewrite(pack / "monsters.json", mutate)
+    with pytest.raises(WorldLoadError, match=r"monsters\.json\[0\] weight must be > 0"):
+        load_world(pack)
+
+
+def test_shipped_pack_carries_rares_and_weights() -> None:
+    """The shipped pack parses the v0.7 rare beasts with their low weights."""
+    world = load_world(SHIPPED)
+    rares = [m for m in world.monsters if m.rare]
+    names = {m.name for m in rares}
+    assert names == {"the Gilded Stag", "the Hollow Knight"}
+    assert all(m.weight == 1 for m in rares)  # rares surface seldom
+    # The rare_drop_item resolves to a consumable.
+    drop = world.item_by_id(world.settings.rare_drop_item)
+    assert drop is not None and drop.slot.value == "consumable"
+    # The new economy settings land on their shipped values.
+    assert world.settings.satchel_max == 3
+    assert world.settings.forge_base_cost == 60
+    assert world.settings.forge_max_plus == 3
+    assert world.settings.dungeon_tiers == (3, 4, 5)
+
+
+def test_monster_weight_and_rare_default_when_omitted(tmp_path: Path) -> None:
+    """A monster spec without weight/rare loads as weight 10, rare False.
+
+    Both fields are optional with defaults, so an unannotated common monster
+    (the shipped Field Rat) parses to the default weight and the non-rare flag.
+    """
+    world = load_world(SHIPPED)
+    rat = next(m for m in world.monsters if m.name == "Field Rat")
+    assert rat.weight == 10  # the default biasing weight
+    assert rat.rare is False

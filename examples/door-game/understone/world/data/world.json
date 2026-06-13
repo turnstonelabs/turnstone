@@ -114,7 +114,7 @@
       "def": 1
     },
     "bestow_daily_budget": 25,
-    "dungeon_tiers": [4, 5],
+    "dungeon_tiers": [3, 4, 5],
     "boss_monster": "wyrm_below",
     "wyrm_min_level": 6,
     "ambush_min_level": 3,
@@ -122,6 +122,10 @@
     "ambush_gold_pct": 25,
     "post_daily_cap": 5,
     "gamble_max_bet": 50,
-    "gamble_daily_cap": 5
+    "gamble_daily_cap": 5,
+    "satchel_max": 3,
+    "forge_base_cost": 60,
+    "forge_max_plus": 3,
+    "rare_drop_item": "greater_potion"
   }
 }

@@ -37,14 +37,23 @@ A run is a little RPG loop, played a bit each day:
   gold, a healing spring, a small trap (which can never kill you), or a scrap
   of old Vale lore. Only one such find happens per move, and the non-combat
   ones don't interrupt your walk.
-- **Fight, shop, and heal** in and around town. Fighting and descending the
-  dungeon gauntlet each spend one of your daily turns; resting, shopping and
+- **Fight, shop, and heal** in and around town. Fighting and descending one
+  rung of the dungeon each spend one of your daily turns; resting, shopping and
   moving do not.
+- **Delve the deep, a rung at a time.** The dungeon is a ladder of guardians:
+  each `descend` faces the next one past your deepest and either advances your
+  depth or bounces you home (your depth persists either way). Carry a few
+  **potions in your satchel** — `quaff` the strongest when you choose, and if a
+  fight would kill you the satchel saves you automatically, the elixir burning
+  down your throat at death's edge. Spend gold at the shop's **forge** to add a
+  +1 edge to your gear, and watch for the **rare beasts** that prowl the forest:
+  felling one is Herald news and always drops a draught.
 - **Win the game** by slaying **the Wyrm Below**. Once your hero is seasoned
-  enough, `challenge` it at the dungeon. A victory frees the Vale, carves your
-  run into the **Hall of Legends**, and — in the tradition of *Legend of the
-  Red Dragon* — begins a new life: your character resets to first-day gear and
-  stats but keeps a permanent ★ for every Wyrm slain, ready to do it all again.
+  enough AND has plumbed the deep to its floor, `challenge` it at the dungeon. A
+  victory frees the Vale, carves your run into the **Hall of Legends**, and — in
+  the tradition of the classic BBS door games — begins a new life: your
+  character resets to first-day gear and stats but keeps a permanent ★ for every
+  Wyrm slain, ready to do it all again.
 - **Read the news.** `door_log` is the **Understone Herald**, a shared
   broadsheet of notable deeds across the whole world — who joined, who rose a
   level, who was dragged home by a goblin, and who freed the Vale.
@@ -217,7 +226,7 @@ url = "http://localhost:8077/mcp"
 | `door_status` | The character sheet (read-only). |
 | `door_look` | Redraw the current view — overworld map or location menu. |
 | `door_move` | Walk the overworld (free; no daily turn spent). |
-| `door_action` | Context verbs: fight, flee, ambush (a rival), rest, buy, sell, heal, gamble (inn dice), descend, challenge (the Wyrm), post (mail another player), leave. |
+| `door_action` | Context verbs: fight, flee, ambush (a rival), rest, buy, sell, forge (a +1 edge), heal, gamble (inn dice), descend (one rung), challenge (the Wyrm), post (mail another player), quaff (a carried potion), leave. |
 | `door_log` | The Understone Herald — the shared feed of notable deeds. |
 | `door_rank` | The leaderboard, plus the Hall of Legends (★ marks Wyrm kills). |
 | `door_bestow` | Game-master grant of a little gold/healing for a story beat. |

@@ -113,12 +113,39 @@ WANDERING THE FOREST (the texture of a walk)
   them as the quiet texture of travelling, and watch the lore: it whispers of
   something coiled beneath the dungeon.
 
+DELVING DEEP (the reasons to come back)
+  Beneath the daily reset are four standing draws that reward a returning hero.
+  * THE RUNG LADDER. The dungeon is a ladder of guardians fought one rung per
+    'descend' (each costs a daily turn). A descent faces the NEXT rung past your
+    deepest; a win advances your depth and you climb back out, a loss bounces
+    you home but your depth PERSISTS — you re-enter where you left off. Reaching
+    the last rung opens the Wyrm's door (the depth gate above). Narrate the deep
+    as a slow, earned descent, a rung at a time.
+  * THE SATCHEL AND THE DEATH-SAVE. A small satchel carries a few potions
+    (buying one at the shop now STOWS it instead of drinking it). 'quaff'
+    (anywhere, no turn) drinks the strongest. The heart of it: if a fight would
+    KILL the active fighter and they carry a potion, the strongest is drunk
+    AUTOMATICALLY — they survive standing at the potion's value, no bounce, no
+    spawn reset. Play that beat big: the elixir burning down their throat at the
+    edge of death. (A sleeping ambush victim never auto-quaffs — they are
+    asleep.)
+  * THE FORGE. The shop's forge spends gold to add a +1 edge to the equipped
+    weapon or armour ('forge' target="weapon"/"armour"), up to a cap, each tier
+    dearer than the last — the late-game gold sink. Swapping or selling that
+    piece loses the edge with it.
+  * RARE BEASTS. A few named beasts prowl the forest, surfacing seldom. Felling
+    one is loud — a public Herald flash — and it always guards a draught that
+    drops into the satchel (if there is room). Treat a rare kill as a small
+    legend in itself.
+
 THE WYRM BELOW (the endgame, and how to win)
   Deep under the dungeon sleeps the Wyrm Below — a fixed, fearsome boss and
   the ONLY win condition. At the dungeon, a sufficiently seasoned hero may
-  'challenge' it (door_action action="challenge"). Under the level threshold,
-  the server turns them away in-fiction; once allowed, the challenge spends a
-  daily turn and resolves in one call, like a fight.
+  'challenge' it (door_action action="challenge"). The Wyrm gates on BOTH
+  level AND depth: an under-level hero is turned away first, and even a high
+  hero who has not plumbed the deep to its floor (see DELVING DEEP) is told the
+  Wyrm will not stir. Once both are met, the challenge spends a daily turn and
+  resolves in one call, like a fight.
     * On victory the hero FREES THE VALE. The triumph is heralded to everyone,
       the run is carved into the Hall of Legends (shown by door_rank), and the
       hero is reborn in a classic-door-game-style legacy reset: level, gold, gear and stats
@@ -170,9 +197,10 @@ TOOL CHEAT-SHEET
   door_move(player, ...)         Walk the overworld (free). steps="NNEE" or
                                  heading="east" + distance=3 (max 8 per call).
   door_action(player, action)    Context verb: fight, flee, ambush (a rival),
-                                 rest, buy, sell, heal, gamble (dice at the
-                                 inn), descend, challenge (the Wyrm), post (a
-                                 note for another player), leave.
+                                 rest, buy, sell, forge (a +1 edge), heal,
+                                 gamble (dice at the inn), descend (one rung),
+                                 challenge (the Wyrm), post (a note), quaff (a
+                                 carried potion), leave.
   door_log(player)               Read the Understone Herald (the shared feed).
   door_rank(player)              The leaderboard + Hall of Legends (★ = wins).
   door_bestow(player, reason...) Grant a little gold/healing for a story beat.
@@ -344,22 +372,29 @@ def door_action(
     'fight' or 'flee' a wandering monster (fighting spends one daily turn), or
     'ambush' a named rival who has not yet acted today — a sleeping-rival
     robbery in the spirit of the classic door-game player-kill (target=<name>, spends a turn).
-    Inside a building: 'rest' (inn), 'buy'/'sell' (shop), 'heal' (healer), or
-    'leave'. At the inn you may also 'gamble' a stake of gold at dice
-    (amount=<gold>). At the dungeon: 'descend' the gauntlet, or 'challenge' the
-    Wyrm Below — the endgame boss and the only way to win. The challenge is
-    gated by level (under-level heroes are turned away in-fiction) and, once
-    allowed, spends a daily turn and resolves in a single call like a fight:
-    a victory frees the Vale and begins a new life (see door_help), a defeat
-    bounces you home. Anywhere, 'post' leaves a private note for another player
-    (target=<name>, text=<message>) that they read on their next door_log;
-    posting costs no turn. An illegal verb returns the verbs valid right here.
+    Inside a building: 'rest' (inn), 'buy'/'sell'/'forge' (shop), 'heal'
+    (healer), or 'leave'. At the inn you may also 'gamble' a stake of gold at
+    dice (amount=<gold>). Buying a potion now stows it in your satchel rather
+    than drinking it; 'forge' (target="weapon"/"armour", at the shop) spends
+    gold to add a +1 edge to your equipped gear, up to a cap. At the dungeon:
+    'descend' ONE rung of the deep — the next guardian past your deepest, one
+    per turn — or 'challenge' the Wyrm Below, the endgame boss and the only way
+    to win. Descending a rung advances your depth; reaching the floor opens the
+    Wyrm's door. The challenge is gated by BOTH level and depth (you must have
+    plumbed the deep to its floor) and, once allowed, spends a daily turn and
+    resolves in a single call like a fight: a victory frees the Vale and begins
+    a new life (see door_help), a defeat bounces you home. Anywhere and at no
+    turn cost: 'post' leaves a private note for another player (target=<name>,
+    text=<message>) read on their next door_log, and 'quaff' drinks the
+    strongest potion from your satchel. An illegal verb returns the verbs valid
+    right here.
 
     Args:
         player: The adventurer's name.
         action: The verb to attempt (fight, flee, ambush, rest, buy, sell,
-            heal, gamble, descend, challenge, post, leave).
-        target: The other player's name for 'ambush' and 'post'.
+            forge, heal, gamble, descend, challenge, post, quaff, leave).
+        target: The other player's name for 'ambush'/'post', or the slot
+            ("weapon"/"armour") for 'forge'.
         item: For shop 'buy', the item id to purchase.
         text: For 'post', the note left for the target (<= 120 characters).
         amount: For inn 'gamble', the gold wagered on the dice.

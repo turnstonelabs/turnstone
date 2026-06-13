@@ -42,10 +42,18 @@ def _game(tmp_path: Path, clock: object, seed: int = 7) -> Game:
 
 
 def _at_dungeon(game: Game, name: str) -> object:
-    """Place an already-joined player inside the dungeon menu."""
+    """Place an already-joined player inside the dungeon menu, at the deep floor.
+
+    The challenge verb now gates on depth as well as level: the Wyrm will not
+    stir until the hero has plumbed the deep to its floor. These challenge
+    tests exercise the win/lose/flee paths, not the gate, so the helper puts
+    the hero at the bottom (deepest_rung == the rung count). The depth gate
+    itself is exercised by the dedicated tests in test_descend.py.
+    """
     player = game.players[name]
     player.mode = Mode.MENU
     player.at_location = "dungeon"
+    player.deepest_rung = len(game.world.settings.dungeon_tiers)
     return player
 
 
@@ -264,6 +272,97 @@ def test_challenge_loss_bounces_and_heralds(tmp_path: Path, clock: object) -> No
     # Either phrasing of the devouring names the hero and the Wyrm.
     assert "Brak" in devoured.text and "Wyrm" in devoured.text
     assert "lays you low" in out.lower() or "wyrm" in out.lower()
+
+
+def _doomed_wyrm_challenger(game: Game, name: str) -> object:
+    """Stand *name* at the floor, wyrm-eligible, and doomed to a GRINDING loss.
+
+    The stats — modest atk and def, hp 50 below max_hp 80, well off the spawn —
+    make the Wyrm bout a genuine multi-round lethal loss (not a one-shot where
+    no blow lands before the save). hp 50 is none of the potion heal values
+    (15/40/70), so a death-save that sets hp to the potion's heal is unmistakable.
+    """
+    player = _at_dungeon(game, name)
+    player.level = game.world.settings.wyrm_min_level
+    player.x, player.y = 35, 25  # away from the spawn (a save never moves them)
+    player.atk, player.def_, player.hp, player.max_hp = 6, 12, 50, 80
+    return player
+
+
+def test_challenge_loss_with_potion_survives_no_legacy_reset(tmp_path: Path, clock: object) -> None:
+    """A lethal Wyrm bout with a potion is SURVIVED — no bounce, no legacy reset.
+
+    The universal death-save reaches the Wyrm: a carried draught is drunk instead
+    of the devouring. A save is NOT a win, so NOTHING resets — level, gold, and
+    ``deepest_rung`` all stand — and it is NOT the devouring either, so the hero
+    keeps their place at the dungeon. The PUBLIC beat is the survival one
+    (``wyrm_flee``, "driven back, alive but unproven"), NEVER "devoured". The
+    turn is still spent and the draught is consumed.
+    """
+    game = _game(tmp_path, clock)
+    game.join("Brak")
+    player = _doomed_wyrm_challenger(game, "Brak")
+    potion = game.world.item_by_id("greater_potion")
+    assert potion is not None
+    game._satchel_set(player, ["greater_potion"])
+    floor = len(game.world.settings.dungeon_tiers)
+    spawn = game.world.spawn
+    before_turns = player.turns_left
+    before_level, before_gold = player.level, player.gold
+    events_before = len(game.events)
+
+    out = game.action("Brak", "challenge", "", "")
+
+    # Survived standing: hp at the potion's value, no bounce, draught spent.
+    assert player.hp == min(player.max_hp, potion.heal)
+    assert (player.x, player.y) != spawn  # NOT bounced to the spawn
+    assert player.mode is Mode.MENU  # still standing at the dungeon
+    assert game._satchel_list(player) == []  # the draught was spent
+    assert "death's edge" in out.lower()  # the spliced survival line
+    assert player.turns_left == before_turns - 1  # the challenge still cost a turn
+    # No win, so NO legacy reset: level, gold, and depth all stand.
+    assert player.wins == 0
+    assert player.level == before_level
+    assert player.gold == before_gold
+    assert player.deepest_rung == floor  # depth untouched (no reset to 0)
+    # The PUBLIC beat is the survival one, NOT the devouring.
+    assert len(game.events) == events_before + 1
+    beat = game.events[-1]
+    assert beat.kind == "wyrm_flee"
+    assert beat.kind != "wyrm_lose"
+    assert "fled" in beat.text.lower() or "ran" in beat.text.lower()
+
+
+def test_challenge_loss_potion_negative_without_save_devours(
+    tmp_path: Path, clock: object, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """NEGATIVE TEST: with the death-save disabled, the same potion-carrier is devoured.
+
+    The mechanical equivalent of reverting the added ``_death_save`` call in
+    ``_wyrm_lost``: we stub ``_death_save`` to always decline, then run the exact
+    scenario of the survival test. The potion-carrier must now bounce to the
+    spawn at 1 HP with the draught UNSPENT and the PUBLIC beat back to
+    ``wyrm_lose`` (devoured) — proving the death-save (not some other path) is
+    what saves them at the Wyrm. Restoring the real method (automatic when the
+    patch lifts) restores the survival behaviour.
+    """
+    game = _game(tmp_path, clock)
+    game.join("Brak")
+    player = _doomed_wyrm_challenger(game, "Brak")
+    game._satchel_set(player, ["greater_potion"])
+    floor = len(game.world.settings.dungeon_tiers)
+    spawn = game.world.spawn
+
+    monkeypatch.setattr(Game, "_death_save", lambda self, pl, lines: False)
+    out = game.action("Brak", "challenge", "", "")
+
+    assert player.hp == 1  # devoured, not saved
+    assert (player.x, player.y) == spawn
+    assert player.mode is Mode.TILE
+    assert player.deepest_rung == floor  # a defeat keeps depth (no reset, no advance)
+    assert game._satchel_list(player) == ["greater_potion"]  # the draught is UNSPENT
+    assert "death's edge" not in out.lower()  # no save, no dramatic line
+    assert game.events[-1].kind == "wyrm_lose"  # the devouring beat, not the survival one
 
 
 def test_challenge_stalemate_counts_as_flight(tmp_path: Path, clock: object) -> None:
