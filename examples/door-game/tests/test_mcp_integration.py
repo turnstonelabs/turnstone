@@ -32,7 +32,7 @@ from understone import server as understone_server
 if TYPE_CHECKING:
     from pathlib import Path
 
-PACK = str(understone_server._PACKAGED_WORLD)
+PACK = str(understone_server.PACKAGED_WORLD_DIR)
 
 
 def _find_free_port() -> int:

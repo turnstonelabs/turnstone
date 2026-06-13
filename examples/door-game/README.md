@@ -131,6 +131,40 @@ If you bind to `0.0.0.0` to share the world across a network, advertise a host
 that browsers can actually reach (your machine's LAN address or hostname) rather
 than `0.0.0.0` itself — the link is composed from `UNDERSTONE_HOST`.
 
+## Authoring worlds
+
+The Vale of Understone is just the *bundled* world. The whole game — its map,
+monsters, economy, and endgame — is a **content pack**: a directory of six JSON
+files the server loads at start. Nothing about the Vale is privileged; point
+the server at another pack and it runs that world instead. This is the seam
+where the game becomes its own authoring target: a pack is plain data, so a
+person *or an LLM* can write one, and the same zero-setup philosophy that makes
+the game playable with no prompt makes it **authorable with no code**.
+
+The loop has three commands:
+
+```bash
+understone newpack mypack        # scaffold a pack (copies the Vale as a template)
+# ...edit or LLM-generate the JSON in mypack/ to describe your world...
+understone validate mypack       # check it; prints a report or names what's wrong
+UNDERSTONE_WORLD=mypack understone   # serve your world
+```
+
+`newpack` writes a starting template plus an `AUTHORING.md` manual — the
+file-by-file schema, the enforced limits, and design guidance — written to be
+followed cold by a model. `validate` loads the pack through exactly the same
+hardened loader the server uses and either prints a summary ending **"This pack
+is sound. The door stands open."** or fails with one precise line naming the
+file, the row, and the field at fault.
+
+Packs are validated **hard** at load: glyphs may not collide with the frame's
+box-drawing lines or the player markers, dimensions and counts are bounded,
+display names are length-checked, and every cross-reference (a legend
+character, a starting item, the boss monster, a dungeon tier) must resolve.
+Because packs are now routinely untrusted, generated output, those error
+messages are not a nuisance — they are the **feedback loop**. Iterate against
+them until the door stands open.
+
 ## Registering with Turnstone
 
 Understone is an ordinary MCP server, so it plugs into Turnstone's MCP client

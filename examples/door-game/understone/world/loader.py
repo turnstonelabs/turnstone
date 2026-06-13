@@ -36,7 +36,7 @@ from understone.errors import WorldLoadError
 # Sanity bands for economy settings: (min, max) inclusive, or (min, None).
 # heal_cost_per_hp may be 0: in that config ALL healing in the world is free
 # (the healer included), so a free bestow-heal is economically coherent.
-_SETTINGS_BANDS: dict[str, tuple[int, int | None]] = {
+SETTINGS_BANDS: dict[str, tuple[int, int | None]] = {
     "daily_turns": (1, 100),
     "rest_cost": (0, None),
     "heal_cost_per_hp": (0, None),
@@ -50,12 +50,83 @@ _SETTINGS_BANDS: dict[str, tuple[int, int | None]] = {
 }
 
 # Per-kind amount bands for the overworld event table (inclusive).
-_EVENT_AMOUNT_BANDS: dict[str, tuple[int, int]] = {
+EVENT_AMOUNT_BANDS: dict[str, tuple[int, int]] = {
     "gold": (1, 500),
     "trap": (1, 500),
     "heal": (1, 100),
 }
 _EVENT_KINDS = frozenset({"fight", "gold", "heal", "trap", "lore"})
+
+# Map-dimension band (inclusive). The floor keeps a map wide enough to frame a
+# town; the ceiling caps the work a frame redraw and a row-decode must do on
+# untrusted pack input.
+MAP_DIM_MIN = 8
+MAP_DIM_MAX = 256
+
+# Upper bound on each content list, so an oversized (or generated-runaway) pack
+# fails loudly at load rather than ballooning memory.
+MAX_COUNTS: dict[str, int] = {
+    "monsters": 500,
+    "items": 500,
+    "events": 500,
+    "locations": 500,
+    "zones": 500,
+}
+
+# Display names render inside frames, menus, and the Herald, so cap their width.
+MAX_NAME_LEN = 48
+
+# Box-drawing glyphs the frame and Herald renderers own; a map glyph must never
+# be one of these (it would tear the borders) — the double bar is the Herald
+# rule, the rest are the map/menu frame. '@' and '&' are the player and
+# other-player markers, so a map glyph must not impersonate an actor either.
+_BOX_DRAWING_GLYPHS = frozenset("┌┐└┘─│═")
+_ACTOR_GLYPHS = frozenset("@&")
+RESERVED_GLYPHS = _BOX_DRAWING_GLYPHS | _ACTOR_GLYPHS
+
+
+def _check_glyph(glyph: str, where: str, *, role: str = "glyph") -> None:
+    """Validate a single map glyph (terrain, location, or legend key).
+
+    A glyph must be exactly one printable character that is neither a frame
+    box-drawing line nor a player marker, so it cannot tear the rendered
+    border or masquerade as an adventurer. *role* names the field for the
+    author-facing message.
+    """
+    if len(glyph) != 1:
+        raise WorldLoadError(f"{where} {role} must be a single character, got {glyph!r}")
+    if not glyph.isprintable():
+        raise WorldLoadError(f"{where} {role} {glyph!r} must be printable")
+    if glyph in _BOX_DRAWING_GLYPHS:
+        raise WorldLoadError(
+            f"{where} {role} {glyph!r} is a box-drawing character reserved for frame borders"
+        )
+    if glyph in _ACTOR_GLYPHS:
+        raise WorldLoadError(
+            f"{where} {role} {glyph!r} is reserved for player markers ('@' you, '&' others)"
+        )
+
+
+def _check_name(name: str, where: str, *, role: str = "name") -> None:
+    """Validate a display name: printable and within :data:`MAX_NAME_LEN`."""
+    if not name.isprintable():
+        raise WorldLoadError(f"{where} {role} {name!r} must be printable")
+    if len(name) > MAX_NAME_LEN:
+        raise WorldLoadError(
+            f"{where} {role} is {len(name)} characters; the limit is {MAX_NAME_LEN}"
+        )
+
+
+def _check_count(items: list[Any], name: str, where: str) -> None:
+    """Reject a content list longer than its :data:`MAX_COUNTS` cap.
+
+    *name* keys the cap (and is the logical content kind shown in the manual);
+    *where* names the actual JSON source for the author-facing message, since
+    locations and zones live inside ``world.json`` rather than their own file.
+    """
+    cap = MAX_COUNTS[name]
+    if len(items) > cap:
+        raise WorldLoadError(f"{where} defines {len(items)} {name}; the limit is {cap}")
 
 
 def load_world(pack_dir: str | Path) -> World:
@@ -94,12 +165,10 @@ def _load_terrain(root: Path) -> dict[str, TerrainDef]:
         raise WorldLoadError("terrain.json must be an object keyed by legend character")
     out: dict[str, TerrainDef] = {}
     for key, spec in raw.items():
-        if len(key) != 1:
-            raise WorldLoadError(f"terrain.json legend key {key!r} must be a single character")
         where = f"terrain.json[{key!r}]"
+        _check_glyph(key, where, role="legend key")
         glyph = str(_require(spec, "glyph", where))
-        if len(glyph) != 1:
-            raise WorldLoadError(f"{where} glyph must be a single character, got {glyph!r}")
+        _check_glyph(glyph, where)
         rate = float(_require(spec, "encounter_rate", where))
         if not 0.0 <= rate <= 1.0:
             raise WorldLoadError(f"{where} encounter_rate must be within 0.0..1.0, got {rate}")
@@ -119,9 +188,12 @@ def _load_monsters(root: Path) -> list[Monster]:
     raw = _read_json(root, "monsters.json")
     if not isinstance(raw, list):
         raise WorldLoadError("monsters.json must be a list of monster objects")
+    _check_count(raw, "monsters", "monsters.json")
     out: list[Monster] = []
     for i, spec in enumerate(raw):
         where = f"monsters.json[{i}]"
+        name = str(_require(spec, "name", where))
+        _check_name(name, where)
         hp = int(_require(spec, "hp", where))
         if hp < 1:
             raise WorldLoadError(f"{where} hp must be >= 1, got {hp}")
@@ -135,7 +207,7 @@ def _load_monsters(root: Path) -> list[Monster]:
         out.append(
             Monster(
                 tier=int(_require(spec, "tier", where)),
-                name=str(_require(spec, "name", where)),
+                name=name,
                 hp=hp,
                 atk=atk,
                 def_=def_,
@@ -154,9 +226,12 @@ def _load_items(root: Path) -> list[Item]:
     raw = _read_json(root, "items.json")
     if not isinstance(raw, list):
         raise WorldLoadError("items.json must be a list of item objects")
+    _check_count(raw, "items", "items.json")
     out: list[Item] = []
     for i, spec in enumerate(raw):
         where = f"items.json[{i}]"
+        name = str(_require(spec, "name", where))
+        _check_name(name, where)
         slot_raw = str(_require(spec, "slot", where))
         try:
             slot = Slot(slot_raw)
@@ -173,7 +248,7 @@ def _load_items(root: Path) -> list[Item]:
         out.append(
             Item(
                 item_id=str(_require(spec, "id", where)),
-                name=str(_require(spec, "name", where)),
+                name=name,
                 slot=slot,
                 atk=atk,
                 def_=def_,
@@ -193,11 +268,8 @@ def _load_location_kinds(root: Path) -> dict[str, dict[str, Any]]:
     for key, spec in raw.items():
         where = f"locations.json[{key!r}]"
         _require(spec, "kind", where)
-        _require(spec, "name", where)
-        _require(spec, "glyph", where)
-        glyph = str(spec["glyph"])
-        if len(glyph) != 1:
-            raise WorldLoadError(f"{where} glyph must be a single character, got {glyph!r}")
+        _check_name(str(_require(spec, "name", where)), where)
+        _check_glyph(str(_require(spec, "glyph", where)), where)
         _require(spec, "actions", where)
     return raw
 
@@ -216,6 +288,7 @@ def _load_events(root: Path) -> list[WorldEvent]:
     rows = _require(raw, "events", "events.json")
     if not isinstance(rows, list) or not rows:
         raise WorldLoadError("events.json 'events' must be a non-empty list of event objects")
+    _check_count(rows, "events", "events.json")
 
     out: list[WorldEvent] = []
     has_fight = False
@@ -249,7 +322,7 @@ def _decode_event_amount(spec: dict[str, Any], kind: str, where: str) -> tuple[i
     Value-bearing kinds (gold/heal/trap) must declare ``min``/``max`` within
     the per-kind band with ``min <= max``; fight/lore carry no amount.
     """
-    band = _EVENT_AMOUNT_BANDS.get(kind)
+    band = EVENT_AMOUNT_BANDS.get(kind)
     if band is None:
         return 0, 0
     band_lo, band_hi = band
@@ -279,8 +352,11 @@ def _load_map(
     name = str(_require(raw, "name", "world.json"))
     width = int(_require(raw, "width", "world.json"))
     height = int(_require(raw, "height", "world.json"))
-    if width <= 0 or height <= 0:
-        raise WorldLoadError(f"world.json dimensions must be positive, got {width}x{height}")
+    for label, dim in (("width", width), ("height", height)):
+        if not MAP_DIM_MIN <= dim <= MAP_DIM_MAX:
+            raise WorldLoadError(
+                f"world.json {label} = {dim} is out of band ({MAP_DIM_MIN}..{MAP_DIM_MAX})"
+            )
 
     legend = _require(raw, "legend", "world.json")
     if not isinstance(legend, dict):
@@ -380,6 +456,7 @@ def _decode_locations(
     placements = _require(raw, "locations", "world.json")
     if not isinstance(placements, list):
         raise WorldLoadError("world.json locations must be a list of placements")
+    _check_count(placements, "locations", "world.json locations")
     out: list[LocationDef] = []
     seen: set[tuple[int, int]] = set()
     for i, place in enumerate(placements):
@@ -436,6 +513,7 @@ def _decode_zones(
     zones_raw = raw.get("zones", [])
     if not isinstance(zones_raw, list):
         raise WorldLoadError("world.json zones must be a list")
+    _check_count(zones_raw, "zones", "world.json zones")
     tiers = {m.tier for m in monsters}
     out: list[Zone] = []
     for i, spec in enumerate(zones_raw):
@@ -472,7 +550,7 @@ def _decode_settings(raw: dict[str, Any], items: list[Item], monsters: list[Mons
         raise WorldLoadError("world.json settings must be an object")
 
     values: dict[str, int] = {}
-    for field_name, (lo, hi) in _SETTINGS_BANDS.items():
+    for field_name, (lo, hi) in SETTINGS_BANDS.items():
         value = int(_require(spec, field_name, "world.json settings"))
         if value < lo or (hi is not None and value > hi):
             band = f"{lo}..{hi}" if hi is not None else f">= {lo}"

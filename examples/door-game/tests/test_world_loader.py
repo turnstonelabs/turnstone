@@ -322,3 +322,86 @@ def test_wyrm_min_level_out_of_band_rejected(tmp_path: Path) -> None:
     _rewrite(pack / "world.json", mutate)
     with pytest.raises(WorldLoadError, match="wyrm_min_level"):
         load_world(pack)
+
+
+# ---------------------------------------------------------------------------
+# v0.4 loader hardening: glyphs, map size, count caps, and name lengths
+#
+# Packs are now routinely untrusted LLM output, so the loader bands the shapes
+# that could tear a frame, balloon memory, or impersonate a player. Each
+# rejection still names the file and field at fault.
+# ---------------------------------------------------------------------------
+
+
+def test_box_drawing_terrain_glyph_rejected(tmp_path: Path) -> None:
+    """A terrain glyph may not be a frame box-drawing line (it would tear borders)."""
+    pack = _clone_pack(tmp_path)
+
+    def mutate(data: dict[str, Any]) -> None:
+        data["."]["glyph"] = "─"  # the horizontal frame run
+
+    _rewrite(pack / "terrain.json", mutate)
+    with pytest.raises(WorldLoadError, match=r"terrain\.json.* box-drawing"):
+        load_world(pack)
+
+
+def test_player_marker_terrain_glyph_rejected(tmp_path: Path) -> None:
+    """A terrain glyph may not be '@' — that is the player's own marker."""
+    pack = _clone_pack(tmp_path)
+
+    def mutate(data: dict[str, Any]) -> None:
+        data["."]["glyph"] = "@"
+
+    _rewrite(pack / "terrain.json", mutate)
+    with pytest.raises(WorldLoadError, match=r"terrain\.json.* reserved for player markers"):
+        load_world(pack)
+
+
+def test_multichar_location_glyph_rejected(tmp_path: Path) -> None:
+    """A location glyph must be exactly one character."""
+    pack = _clone_pack(tmp_path)
+
+    def mutate(data: dict[str, Any]) -> None:
+        data["inn"]["glyph"] = "In"  # two characters
+
+    _rewrite(pack / "locations.json", mutate)
+    with pytest.raises(WorldLoadError, match=r"locations\.json.* single character"):
+        load_world(pack)
+
+
+def test_oversized_map_rejected(tmp_path: Path) -> None:
+    """A 300x300 map is past the dimension ceiling (8..256)."""
+    pack = _clone_pack(tmp_path)
+
+    def mutate(data: dict[str, Any]) -> None:
+        data["width"] = 300
+        data["height"] = 300
+
+    _rewrite(pack / "world.json", mutate)
+    with pytest.raises(WorldLoadError, match=r"world\.json width = 300 is out of band"):
+        load_world(pack)
+
+
+def test_too_many_events_rejected(tmp_path: Path) -> None:
+    """An event table over the 500-row cap is rejected before it is decoded."""
+    pack = _clone_pack(tmp_path)
+
+    def mutate(data: dict[str, Any]) -> None:
+        filler = {"kind": "lore", "weight": 1, "text": "filler"}
+        data["events"] = [filler.copy() for _ in range(501)]
+
+    _rewrite(pack / "events.json", mutate)
+    with pytest.raises(WorldLoadError, match=r"events\.json defines 501 events; the limit is 500"):
+        load_world(pack)
+
+
+def test_overlong_monster_name_rejected(tmp_path: Path) -> None:
+    """A 49-character monster name is one past the 48-char display limit."""
+    pack = _clone_pack(tmp_path)
+
+    def mutate(data: list[dict[str, Any]]) -> None:
+        data[0]["name"] = "x" * 49
+
+    _rewrite(pack / "monsters.json", mutate)
+    with pytest.raises(WorldLoadError, match=r"monsters\.json\[0\] name is 49 characters"):
+        load_world(pack)

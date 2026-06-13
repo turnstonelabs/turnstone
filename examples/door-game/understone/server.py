@@ -18,6 +18,8 @@ Usage::
 
     understone                 # via entry point (stdio transport)
     python -m understone       # via module
+    understone validate PATH   # check a content pack loads cleanly
+    understone newpack PATH    # scaffold a new pack + authoring manual
 
 Environment variables
 ---------------------
@@ -31,6 +33,7 @@ UNDERSTONE_PATH       HTTP path for the MCP endpoint (default: /mcp)
 
 from __future__ import annotations
 
+import argparse
 import logging
 import os
 from pathlib import Path
@@ -39,10 +42,11 @@ from typing import TYPE_CHECKING
 from mcp.server.fastmcp import FastMCP
 from starlette.responses import HTMLResponse, JSONResponse, Response
 
-from understone import watch
+from understone import cli, watch
 from understone.errors import WorldLoadError
 from understone.game import Game
 from understone.persistence import Store
+from understone.world import PACKAGED_WORLD_DIR
 from understone.world.loader import load_world
 
 if TYPE_CHECKING:
@@ -50,8 +54,6 @@ if TYPE_CHECKING:
     from starlette.requests import Request
 
 log = logging.getLogger(__name__)
-
-_PACKAGED_WORLD = Path(__file__).resolve().parent / "world" / "data"
 
 _PREMISE = (
     "Understone is a shared-world BBS door game played through these tools. "
@@ -164,7 +166,7 @@ _GAME: Game | None = None
 def _build_game(watch_url: str | None = None) -> Game:
     """Construct the module Game from environment configuration."""
     db_path = os.environ.get("UNDERSTONE_DB", "understone.db")
-    world_dir = os.environ.get("UNDERSTONE_WORLD") or str(_PACKAGED_WORLD)
+    world_dir = os.environ.get("UNDERSTONE_WORLD") or str(PACKAGED_WORLD_DIR)
     world = load_world(world_dir)
     store = Store(db_path)
     return Game(world, store, watch_url=watch_url)
@@ -443,18 +445,19 @@ def create_app(
     when given, is the spectator page URL the join banner and help manual
     advertise; ``main`` derives it from the bind host/port.
     """
-    world = load_world(world_dir or str(_PACKAGED_WORLD))
+    world = load_world(world_dir or str(PACKAGED_WORLD_DIR))
     store = Store(db_path)
     _set_game(Game(world, store, watch_url=watch_url))
     return mcp.streamable_http_app()
 
 
-def main() -> None:
-    """Run the Understone MCP server.
+def _serve() -> None:
+    """Serve the Understone MCP world over the configured transport.
 
     Honours UNDERSTONE_TRANSPORT: "stdio" (default) or "streamable-http".
     For http, host/port/path are read from the environment and applied to the
-    FastMCP settings before serving.
+    FastMCP settings before serving. This is the actual transport launch; it is
+    kept separate from argument parsing so the parse step has no side effects.
     """
     logging.basicConfig(level=logging.INFO)
     transport = os.environ.get("UNDERSTONE_TRANSPORT", "stdio")
@@ -484,3 +487,40 @@ def main() -> None:
     except WorldLoadError as exc:
         raise SystemExit(f"failed to load world: {exc}") from exc
     mcp.run(transport="stdio")
+
+
+def _build_parser() -> argparse.ArgumentParser:
+    """Build the ``understone`` argument parser: serve (default), validate, newpack.
+
+    Parsing is deliberately free of side effects — no world load, no port bind —
+    so the resolved subcommand can be inspected without serving anything.
+    """
+    parser = argparse.ArgumentParser(
+        prog="understone",
+        description=(
+            "Understone — a BBS-style ANSI door game served over MCP, plus the "
+            "tools to author its world packs."
+        ),
+    )
+    sub = parser.add_subparsers(dest="cmd")
+    sub.add_parser("serve", help="serve the MCP world (the default with no command)")
+    validate = sub.add_parser("validate", help="validate a content pack and print a report")
+    validate.add_argument("path", type=Path, help="the pack directory to validate")
+    newpack = sub.add_parser("newpack", help="scaffold a new content pack from the bundled world")
+    newpack.add_argument("path", type=Path, help="the directory to create the pack in")
+    return parser
+
+
+def main(argv: list[str] | None = None) -> None:
+    """Run the Understone command line: serve, or author a world pack.
+
+    With no arguments (the entry point and ``python -m understone``) this serves
+    the MCP world exactly as before. ``validate PATH`` and ``newpack PATH`` drive
+    the pack-authoring loop and exit with the verb's status code.
+    """
+    args = _build_parser().parse_args(argv)
+    if args.cmd == "validate":
+        raise SystemExit(cli.cli_validate(args.path))
+    if args.cmd == "newpack":
+        raise SystemExit(cli.cli_newpack(args.path))
+    _serve()
