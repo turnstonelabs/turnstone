@@ -64,6 +64,7 @@ def test_player_round_trip_all_columns(tmp_path: Path) -> None:
         post_day=739_400,
         gambles=2,
         gamble_day=739_400,
+        banked=420,
     )
     store.upsert_player(player)
     store.commit()
@@ -73,6 +74,7 @@ def test_player_round_trip_all_columns(tmp_path: Path) -> None:
     players, _ = reopened.load_all()
     loaded = players["Brandr"]
     assert loaded == player
+    assert loaded.banked == 420
     # Spot-check the fields most prone to silent drop.
     assert loaded.def_ == 4
     assert loaded.turn_day == 739_400
@@ -207,15 +209,17 @@ def test_meta_round_trip(tmp_path: Path) -> None:
     store.close()
 
 
-def test_v0_7_depth_columns_round_trip(tmp_path: Path) -> None:
-    """The four v0.7 columns survive a store reopen: depth, satchel, two plusses."""
+def test_retention_columns_round_trip(tmp_path: Path) -> None:
+    """The retention columns survive a reopen: depth, the v0.10 stack-encoded
+    satchel, the two forged plusses, and the v0.10 banked vault gold."""
     store = _store(tmp_path)
     player = make_player(
         name="Delver",
         deepest_rung=2,
-        satchel="minor_potion,greater_potion",
+        satchel="minor_potion:3,iron_ore:5",  # v0.10 "id:qty" stack encoding
         weapon_plus=2,
         armor_plus=1,
+        banked=300,
     )
     store.upsert_player(player)
     store.commit()
@@ -226,9 +230,10 @@ def test_v0_7_depth_columns_round_trip(tmp_path: Path) -> None:
     loaded = players["Delver"]
     assert loaded == player  # full equality across every column
     assert loaded.deepest_rung == 2
-    assert loaded.satchel == "minor_potion,greater_potion"
+    assert loaded.satchel == "minor_potion:3,iron_ore:5"
     assert loaded.weapon_plus == 2
     assert loaded.armor_plus == 1
+    assert loaded.banked == 300
     reopened.close()
 
 
@@ -259,5 +264,6 @@ def test_v0_7_depth_columns_default_for_legacy_rows(tmp_path: Path) -> None:
     assert old.satchel == ""
     assert old.weapon_plus == 0
     assert old.armor_plus == 0
+    assert old.banked == 0  # the v0.10 vault column defaults too
     assert reopened.get_meta("schema_version") == "1"  # stamp unchanged
     reopened.close()

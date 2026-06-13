@@ -310,6 +310,28 @@ def test_ambush_win_transfers_gold_and_bounces_victim(tmp_path: Path, clock: obj
     assert game.store.has_ambushed("Raider", "Sleeper", _TODAY) is True
 
 
+def test_ambush_steals_only_carried_gold_not_the_vault(tmp_path: Path, clock: object) -> None:
+    """A winning ambush robs carried gold only — banked vault gold is untouched.
+
+    The steal is a slice of ``target.gold`` (gold in hand); the strongbox
+    (``banked``) is safe by design. This pins the vault's whole point: bank your
+    coin before you sleep and a sleeping-robber cannot lift it.
+    """
+    game = _game(tmp_path, clock)
+    attacker, target = _arm_ambush(game, target_gold=40)
+    target.banked = 1000  # a fat vault the raider must not be able to touch
+    attacker.atk = 200  # one-shot the sleeper
+    target.hp = 5
+    pct = game.world.settings.ambush_gold_pct
+    steal = 40 * pct // 100  # a slice of the CARRIED 40, not the banked 1000
+
+    game.action("Raider", "ambush", "Sleeper", "")
+
+    assert target.gold == 40 - steal  # carried gold robbed
+    assert target.banked == 1000  # the vault is wholly untouched
+    assert attacker.gold == game.world.settings.starting_gold + steal
+
+
 def test_ambush_win_applies_attacker_wear(tmp_path: Path, clock: object) -> None:
     """A multi-round win banks the attacker's wear: the log narrates the
     sleeper's counter-blows, so the sheet must show the HP they cost.
@@ -739,3 +761,102 @@ def test_gamble_small_win_is_quiet(tmp_path: Path, clock: object) -> None:
     new = game.events[events_before:]
     assert all(e.kind != "gamble" for e in new)
     assert player.gold == 1010
+
+
+# ---------------------------------------------------------------------------
+# The Vault — deposit/withdraw at the inn (no turn; banked gold is safe)
+# ---------------------------------------------------------------------------
+
+
+def test_deposit_moves_gold_to_the_vault_no_turn(tmp_path: Path, clock: object) -> None:
+    """Deposit moves coin from hand to vault, costs no turn, and is friendly."""
+    game = _game(tmp_path, clock)
+    player = _at_inn(game, "Saver")
+    player.gold = 100
+    turns_before = player.turns_left
+
+    out = game.action("Saver", "deposit", "", "", "", 60)
+
+    assert player.gold == 40
+    assert player.banked == 60
+    assert player.turns_left == turns_before  # banking spends no turn
+    assert "strongbox" in out.lower()
+
+
+def test_withdraw_moves_gold_back_to_hand(tmp_path: Path, clock: object) -> None:
+    """Withdraw moves coin from vault to hand."""
+    game = _game(tmp_path, clock)
+    player = _at_inn(game, "Saver")
+    player.gold = 10
+    player.banked = 90
+
+    game.action("Saver", "withdraw", "", "", "", 50)
+
+    assert player.gold == 60
+    assert player.banked == 40
+
+
+def test_deposit_amount_exceeding_holdings_refused(tmp_path: Path, clock: object) -> None:
+    """Depositing more than you carry is refused without mutation."""
+    game = _game(tmp_path, clock)
+    player = _at_inn(game, "Saver")
+    player.gold = 30
+    player.banked = 0
+
+    out = game.action("Saver", "deposit", "", "", "", 50)
+
+    assert player.gold == 30  # unchanged
+    assert player.banked == 0
+    assert "1 to 30" in out
+
+
+def test_deposit_with_nothing_in_hand_refused(tmp_path: Path, clock: object) -> None:
+    """Depositing with an empty hand is a friendly refusal."""
+    game = _game(tmp_path, clock)
+    player = _at_inn(game, "Saver")
+    player.gold = 0
+
+    out = game.action("Saver", "deposit", "", "", "", 10)
+
+    assert player.banked == 0
+    assert "no coin" in out.lower()
+
+
+def test_withdraw_amount_exceeding_vault_refused(tmp_path: Path, clock: object) -> None:
+    """Withdrawing more than is banked is refused without mutation."""
+    game = _game(tmp_path, clock)
+    player = _at_inn(game, "Saver")
+    player.gold = 0
+    player.banked = 20
+
+    out = game.action("Saver", "withdraw", "", "", "", 50)
+
+    assert player.gold == 0
+    assert player.banked == 20  # unchanged
+    assert "1 to 20" in out
+
+
+def test_withdraw_empty_vault_refused(tmp_path: Path, clock: object) -> None:
+    """Withdrawing from an empty vault is a friendly refusal."""
+    game = _game(tmp_path, clock)
+    player = _at_inn(game, "Saver")
+    player.banked = 0
+
+    out = game.action("Saver", "withdraw", "", "", "", 10)
+
+    assert player.gold == game.world.settings.starting_gold  # unchanged
+    assert "empty" in out.lower()
+
+
+def test_status_shows_carried_and_vault_gold(tmp_path: Path, clock: object) -> None:
+    """door_status reports gold as carried-on-hand plus banked-in-the-vault."""
+    game = _game(tmp_path, clock)
+    game.join("Saver")
+    player = game.players["Saver"]
+    player.gold = 75
+    player.banked = 250
+
+    out = game.status("Saver")
+
+    assert "75 on hand" in out
+    assert "250 in the vault" in out

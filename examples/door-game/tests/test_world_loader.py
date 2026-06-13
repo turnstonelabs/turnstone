@@ -621,6 +621,75 @@ def test_forge_base_cost_out_of_band_rejected(tmp_path: Path) -> None:
         load_world(pack)
 
 
+def test_forge_ore_item_unknown_rejected(tmp_path: Path) -> None:
+    """A forge_ore_item that names no item is rejected with the item-id message."""
+    pack = _clone_pack(tmp_path)
+
+    def mutate(data: dict[str, Any]) -> None:
+        data["settings"]["forge_ore_item"] = "no_such_ore"
+
+    _rewrite(pack / "world.json", mutate)
+    with pytest.raises(WorldLoadError, match="forge_ore_item = 'no_such_ore' is not a known"):
+        load_world(pack)
+
+
+def test_forge_ore_item_non_material_rejected(tmp_path: Path) -> None:
+    """A forge_ore_item that names a non-material (a potion) is rejected.
+
+    Ore is carried in the satchel and spent at the forge, never equipped or
+    quaffed, so a consumable/weapon/armour id is incoherent — the loader pins
+    the slot to ``material`` (mirroring the rare_drop_item consumable check).
+    """
+    pack = _clone_pack(tmp_path)
+
+    def mutate(data: dict[str, Any]) -> None:
+        data["settings"]["forge_ore_item"] = "greater_potion"  # a draught, not ore
+
+    _rewrite(pack / "world.json", mutate)
+    with pytest.raises(
+        WorldLoadError, match="forge_ore_item = 'greater_potion' must be a material"
+    ):
+        load_world(pack)
+
+
+def test_forge_ore_per_plus_out_of_band_rejected(tmp_path: Path) -> None:
+    """forge_ore_per_plus above its 0..10 band is a load error."""
+    pack = _clone_pack(tmp_path)
+
+    def mutate(data: dict[str, Any]) -> None:
+        data["settings"]["forge_ore_per_plus"] = 11
+
+    _rewrite(pack / "world.json", mutate)
+    with pytest.raises(WorldLoadError, match=r"forge_ore_per_plus = 11 is out of band \(0\.\.10\)"):
+        load_world(pack)
+
+
+def test_ore_dungeon_drop_out_of_band_rejected(tmp_path: Path) -> None:
+    """ore_dungeon_drop above its 0..20 band is a load error."""
+    pack = _clone_pack(tmp_path)
+
+    def mutate(data: dict[str, Any]) -> None:
+        data["settings"]["ore_dungeon_drop"] = 21
+
+    _rewrite(pack / "world.json", mutate)
+    with pytest.raises(WorldLoadError, match=r"ore_dungeon_drop = 21 is out of band \(0\.\.20\)"):
+        load_world(pack)
+
+
+def test_ore_forest_chance_out_of_band_rejected(tmp_path: Path) -> None:
+    """ore_forest_chance outside 0.0..1.0 is a load error (it is a probability)."""
+    pack = _clone_pack(tmp_path)
+
+    def mutate(data: dict[str, Any]) -> None:
+        data["settings"]["ore_forest_chance"] = 1.5
+
+    _rewrite(pack / "world.json", mutate)
+    with pytest.raises(
+        WorldLoadError, match=r"ore_forest_chance = 1.5 is out of band \(0.0..1.0\)"
+    ):
+        load_world(pack)
+
+
 def test_monster_zero_weight_rejected(tmp_path: Path) -> None:
     """A monster weight of 0 is rejected (the weighted pick needs a positive total)."""
     pack = _clone_pack(tmp_path)
@@ -648,6 +717,13 @@ def test_shipped_pack_carries_rares_and_weights() -> None:
     assert world.settings.forge_base_cost == 60
     assert world.settings.forge_max_plus == 3
     assert world.settings.dungeon_tiers == (3, 4, 5)
+    # v0.10 ore-forge settings resolve, and the forge ore is a material item.
+    assert world.settings.forge_ore_item == "iron_ore"
+    ore = world.item_by_id(world.settings.forge_ore_item)
+    assert ore is not None and ore.slot.value == "material"
+    assert world.settings.forge_ore_per_plus == 1
+    assert world.settings.ore_dungeon_drop == 2
+    assert world.settings.ore_forest_chance == 0.2
 
 
 def test_monster_weight_and_rare_default_when_omitted(tmp_path: Path) -> None:

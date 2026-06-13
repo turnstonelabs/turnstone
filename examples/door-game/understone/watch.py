@@ -21,6 +21,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 from understone.engine.models import Mode
+from understone.engine.satchel import decode_satchel
 from understone.screen import texture
 
 if TYPE_CHECKING:
@@ -96,6 +97,9 @@ def build_state_payload(game: Game) -> dict[str, object]:
             "hp": p.hp,
             "max_hp": p.max_hp,
             "mode": p.mode.value if isinstance(p.mode, Mode) else str(p.mode),
+            "gold": p.gold,
+            "banked": p.banked,
+            "satchel": _satchel_entries(game, p.satchel),
         }
         for p in game.players.values()
     ]
@@ -117,6 +121,23 @@ def build_state_payload(game: Game) -> dict[str, object]:
         "herald": herald,
         "hall": hall,
     }
+
+
+def _satchel_entries(game: Game, satchel: str) -> list[dict[str, object]]:
+    """Decode a player's ``"id:qty"`` satchel into ``[{"name", "qty"}, ...]``.
+
+    Decodes the bag through the shared
+    :func:`~understone.engine.satchel.decode_satchel` codec, then resolves each
+    stack's id to its display name via the world's item table; an id no longer in
+    the pack (a save edited out from under it) falls back to the raw id, so the
+    lobby TV never shows a blank entry. The Watch is read-only, so it only
+    decodes — the name-resolution is the only work that lives here.
+    """
+    entries: list[dict[str, object]] = []
+    for item_id, qty in decode_satchel(satchel):
+        item = game.world.item_by_id(item_id)
+        entries.append({"name": item.name if item is not None else item_id, "qty": qty})
+    return entries
 
 
 def _recent_events(game: Game) -> list[Event]:
@@ -288,6 +309,7 @@ _WATCH_HTML_TEMPLATE = """\
   ul { margin: 0; padding: 0; list-style: none; }
   li { padding: 2px 0; }
   .muted { color: var(--phosphor-dim); }
+  .subline { font-size: 12px; padding-left: 2px; }
   .adv-name { color: var(--amber); }
   .stars { color: var(--amber); letter-spacing: 1px; }
   .feed li { border-bottom: 1px dotted var(--edge); padding: 4px 0; }
@@ -554,8 +576,31 @@ _WATCH_HTML_TEMPLATE = """\
       rest.className = "muted";
       rest.textContent = "  Lv" + p.level + "  HP " + p.hp + "/" + p.max_hp;
       li.appendChild(rest);
+      // A dim sub-line: gold on hand and (if any) gold in the vault. The whole
+      // shared world is on the lobby TV, so every hero's purse is public here.
+      var gold = document.createElement("div");
+      gold.className = "muted subline";
+      var goldText = (p.gold || 0) + "g";
+      if (p.banked) { goldText += "  +" + p.banked + " vault"; }
+      gold.textContent = goldText;
+      li.appendChild(gold);
+      // A second dim sub-line: the satchel stacks ("Name ×qty"), or empty.
+      var sat = document.createElement("div");
+      sat.className = "muted subline";
+      sat.textContent = satchelText(p.satchel || []);
+      li.appendChild(sat);
       list.appendChild(li);
     }
+  }
+
+  // Render the satchel stacks as a compact dot-joined line, or an empty note.
+  function satchelText(stacks) {
+    if (!stacks.length) { return "satchel empty"; }
+    var parts = [];
+    for (var i = 0; i < stacks.length; i++) {
+      parts.push(stacks[i].name + " \\u00d7" + stacks[i].qty);
+    }
+    return parts.join(" \\u00b7 ");
   }
 
   function renderHall(hall) {

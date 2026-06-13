@@ -7,6 +7,7 @@ fixtures that load the shipped world and build the game façade.
 
 from __future__ import annotations
 
+from collections import Counter
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING
 
@@ -28,6 +29,8 @@ from understone.engine.world import World
 
 if TYPE_CHECKING:
     from collections.abc import Callable
+
+    from understone.game import Game
 
 # ---------------------------------------------------------------------------
 # Terrain kinds for synthetic test worlds
@@ -68,6 +71,10 @@ DEFAULT_SETTINGS = Settings(
     forge_base_cost=60,
     forge_max_plus=3,
     rare_drop_item="minor_potion",
+    forge_ore_item="iron_ore",
+    forge_ore_per_plus=1,
+    ore_dungeon_drop=2,
+    ore_forest_chance=0.2,
     watch_theme="phosphor",
 )
 
@@ -102,6 +109,10 @@ def make_settings(**overrides: object) -> Settings:
         "forge_base_cost": DEFAULT_SETTINGS.forge_base_cost,
         "forge_max_plus": DEFAULT_SETTINGS.forge_max_plus,
         "rare_drop_item": DEFAULT_SETTINGS.rare_drop_item,
+        "forge_ore_item": DEFAULT_SETTINGS.forge_ore_item,
+        "forge_ore_per_plus": DEFAULT_SETTINGS.forge_ore_per_plus,
+        "ore_dungeon_drop": DEFAULT_SETTINGS.ore_dungeon_drop,
+        "ore_forest_chance": DEFAULT_SETTINGS.ore_forest_chance,
         "watch_theme": DEFAULT_SETTINGS.watch_theme,
     }
     base.update(overrides)
@@ -197,6 +208,7 @@ def _default_items() -> list[Item]:
         Item("cloth_tunic", "Cloth Tunic", Slot.ARMOR, 0, 1, 0, 0),
         Item("leather_armor", "Leather Armor", Slot.ARMOR, 0, 3, 0, 50),
         Item("minor_potion", "Minor Potion", Slot.CONSUMABLE, 0, 0, 15, 12),
+        Item("iron_ore", "Iron Ore", Slot.MATERIAL, 0, 0, 0, 0),
     ]
 
 
@@ -212,6 +224,30 @@ def fixed_clock(moment: datetime) -> Callable[[], datetime]:
 def utc(year: int, month: int, day: int, hour: int = 0, minute: int = 0) -> datetime:
     """Construct a tz-aware UTC datetime."""
     return datetime(year, month, day, hour, minute, tzinfo=UTC)
+
+
+# ---------------------------------------------------------------------------
+# Satchel test helpers (the v0.10 stack encoding)
+# ---------------------------------------------------------------------------
+# The satchel is stack-based ("id:qty"); these wrap the game façade's stack
+# helpers so a test can seed/read a bag as a flat id list (duplicate ids
+# collapse to one stack), keeping the assertions readable. Shared by the
+# descend and Wyrm suites.
+
+
+def set_satchel(game: Game, player: object, ids: list[str]) -> None:
+    """Seed *player*'s satchel from a flat id list (duplicates -> one stack qty)."""
+    counts = Counter(ids)
+    stacks = [(item_id, counts[item_id]) for item_id in dict.fromkeys(ids)]
+    game._satchel_set_stacks(player, stacks)  # type: ignore[arg-type]
+
+
+def satchel_ids(game: Game, player: object) -> list[str]:
+    """Return the satchel as a flat id list, each stack expanded by its qty."""
+    out: list[str] = []
+    for item_id, qty in game._satchel_stacks(player):  # type: ignore[arg-type]
+        out.extend([item_id] * qty)
+    return out
 
 
 @pytest.fixture

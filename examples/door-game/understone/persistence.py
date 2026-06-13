@@ -69,6 +69,7 @@ _PLAYER_COLUMNS = (
     "satchel",
     "weapon_plus",
     "armor_plus",
+    "banked",
 )
 
 
@@ -117,7 +118,8 @@ class Store:
                 deepest_rung INTEGER NOT NULL DEFAULT 0,
                 satchel     TEXT NOT NULL DEFAULT '',
                 weapon_plus INTEGER NOT NULL DEFAULT 0,
-                armor_plus  INTEGER NOT NULL DEFAULT 0
+                armor_plus  INTEGER NOT NULL DEFAULT 0,
+                banked      INTEGER NOT NULL DEFAULT 0
             );
 
             CREATE TABLE IF NOT EXISTS events (
@@ -338,6 +340,7 @@ def _player_to_row(player: Player) -> tuple[object, ...]:
         player.satchel,
         player.weapon_plus,
         player.armor_plus,
+        player.banked,
     )
 
 
@@ -373,6 +376,7 @@ def _row_to_player(row: sqlite3.Row) -> Player:
         satchel=row["satchel"],
         weapon_plus=row["weapon_plus"],
         armor_plus=row["armor_plus"],
+        banked=row["banked"],
     )
 
 

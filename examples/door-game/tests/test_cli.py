@@ -150,22 +150,45 @@ def test_cli_newpack_authoring_md_has_width_rule_and_live_palette(tmp_path: Path
         assert f"`{glyph}`" in manual, f"palette glyph {glyph!r} missing from manual"
 
 
-def test_cli_newpack_authoring_md_documents_v07_action_sets(tmp_path: Path) -> None:
-    """AUTHORING.md documents each building's real verb menu, gamble included.
+def test_cli_newpack_authoring_md_documents_action_sets(tmp_path: Path) -> None:
+    """AUTHORING.md documents each building's real verb menu.
 
-    The v0.8 doc fix: the inn's live `gamble` verb was previously absent, and
-    the per-building menus are now an explicit table. This pins the table rows
-    and the "quaff anywhere" note so a doc regression trips.
+    The per-building menus are an explicit table: the inn's `gamble` (v0.8) and
+    the v0.10 vault verbs `deposit`/`withdraw`, the shop's `forge`, and so on.
+    This pins the table rows and the "quaff anywhere" note so a doc regression
+    trips.
     """
     dest = tmp_path / "mypack"
     cli.cli_newpack(dest, out=StringIO(), err=StringIO())
     manual = (dest / "AUTHORING.md").read_text(encoding="utf-8")
 
-    assert "| `inn` | `rest`, `gamble`, `leave` |" in manual
+    assert "| `inn` | `rest`, `deposit`, `withdraw`, `gamble`, `leave` |" in manual
     assert "| `shop` | `buy`, `sell`, `forge`, `leave` |" in manual
     assert "| `healer` | `heal`, `leave` |" in manual
     assert "| `dungeon` | `descend`, `challenge`, `leave` |" in manual
     assert "`quaff`" in manual and "legal **anywhere**" in manual
+    # The vault is described where its verbs are listed.
+    assert "VAULT" in manual and "SAFE from ambush" in manual
+
+
+def test_cli_newpack_authoring_md_documents_ore_forge(tmp_path: Path) -> None:
+    """AUTHORING.md documents the v0.10 ore-gated forge: material slot + settings.
+
+    The forge ore is a `material` item earned in combat; the four ore settings
+    (item, per-plus, dungeon drop, forest chance) are documented, and the band
+    figures are generated from the live loader so they cannot drift.
+    """
+    dest = tmp_path / "mypack"
+    cli.cli_newpack(dest, out=StringIO(), err=StringIO())
+    manual = (dest / "AUTHORING.md").read_text(encoding="utf-8")
+
+    assert "`material`" in manual  # the new slot
+    assert "forge_ore_item" in manual
+    assert "ore_forest_chance" in manual  # the float setting (prose, not the band table)
+    # The two banded ore settings carry their LIVE bands.
+    lo, hi = loader.SETTINGS_BANDS["ore_dungeon_drop"]
+    assert f"`{lo}..{hi}`" in manual
+    assert "earns in combat" in manual or "earned in combat" in manual
 
 
 def test_cli_newpack_authoring_md_states_color_advisory_and_spawn_walkable(
