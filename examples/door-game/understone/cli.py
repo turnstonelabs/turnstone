@@ -271,7 +271,8 @@ The cross-references the loader enforces:
   `locations.json`, and must sit on walkable terrain;
 * `settings.starting_weapon` / `starting_armor` must be ids from
   `items.json`; `settings.boss_monster` must be an id from `monsters.json`
-  that is flagged `"boss": true`;
+  that is flagged `"boss": true`; `settings.rare_drop_item` must be an id from
+  `items.json` whose `slot` is `consumable`;
 * every tier in `settings.dungeon_tiers` must be backed by a NON-boss monster;
 * every zone's tier band must overlap at least one monster tier.
 
@@ -313,6 +314,19 @@ The boss adds an `id` and `"boss": true`, and is referenced by
  "xp": 400, "gold": 250, "boss": true, "id": "wyrm_below"}
 ```
 
+Two optional fields tune random forest encounters. `weight` (default `10`,
+must be `> 0`) biases the weighted draw within a zone band — a low weight
+surfaces seldom — and `rare` (default `false`) marks a named beast that, on
+its kill, fires a public Herald flash and drops the pack's `rare_drop_item`
+into the slayer's satchel. Rung guardians ignore both (a rung always takes the
+FIRST monster of its tier, never a weighted roll), so a rare should not be the
+first entry of a tier that backs a `dungeon_tiers` rung.
+
+```json
+{"tier": 2, "name": "the Gilded Stag", "hp": 16, "atk": 6, "def": 2,
+ "xp": 40, "gold": 60, "weight": 1, "rare": true}
+```
+
 ### `items.json`
 
 A list of equipment and consumables. `slot` is `weapon`, `armor`, or
@@ -335,9 +349,10 @@ An object keyed by location key. Each entry is a building kind with a menu of
 }
 ```
 
-The verbs the engine understands are `rest` (inn), `buy`/`sell` (shop), `heal`
-(healer), `descend`/`challenge` (dungeon), and `leave`. Give each building the
-menu that matches its role.
+The verbs the engine understands are `rest` (inn), `buy`/`sell`/`forge` (shop),
+`heal` (healer), `descend`/`challenge` (dungeon), and `leave`. (`quaff` is legal
+anywhere and needs no menu entry.) Give each building the menu that matches its
+role.
 
 ### `events.json`
 
@@ -434,9 +449,24 @@ boss tier must NOT appear in `settings.dungeon_tiers`: the gauntlet excludes
 boss monsters, so a boss-only rung would be unfillable — back every dungeon
 tier with at least one ordinary monster.
 
+**The deep, the satchel, and the forge.** `dungeon_tiers` is now a RUNG LADDER
+fought one rung per `descend` — list the tiers shallow-to-deep, and make it long
+enough to feel like a journey (the Vale uses three). The Wyrm gates on reaching
+the floor as well as on level. Size the satchel with `satchel_max` (the Vale
+carries 3) — it is the death-save reserve, so keep it small. The forge is the
+late-game gold sink: `forge_base_cost` is the price of a +1 edge and scales up
+each tier (`base * (current_plus + 1)`), capped at `forge_max_plus`; price it so
+a fully-forged piece is a multi-day saving.
+
+**Rare beasts.** A rare monster is a small legend: give it a low `weight` so it
+surfaces seldom, stats and rewards a clear notch above its tier, and remember it
+always drops `rare_drop_item` (a consumable) into the satchel. Keep rares OFF
+the first slot of any `dungeon_tiers` tier, or they would become a fixed rung
+guardian instead of a rare roll.
+
 **Location menus.** Give each building only the actions it can honour. An inn
 that offers `buy` but no shop logic will confuse the narrator; match the menu
-to the building's role.
+to the building's role. The shop verbs are `buy`, `sell`, and `forge`.
 
 ---
 

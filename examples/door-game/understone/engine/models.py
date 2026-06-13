@@ -61,6 +61,14 @@ class Player:
     post_day: int = 0
     gambles: int = 0
     gamble_day: int = 0
+    # v0.7 "depth below" retention columns: how far the dungeon has been
+    # plumbed (0 = never descended; N = cleared rung N, 1-indexed), the
+    # comma-joined carried-potion satchel ('' = empty), and the enhancement
+    # plus on whichever weapon/armour is CURRENTLY equipped in each slot.
+    deepest_rung: int = 0
+    satchel: str = ""
+    weapon_plus: int = 0
+    armor_plus: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -81,6 +89,12 @@ class Monster:
     gold: int
     monster_id: str = ""
     boss: bool = False
+    # v0.7 weighted forest encounters: ``weight`` biases the random pick (a
+    # low weight surfaces seldom), ``rare`` marks a named beast that fires a
+    # public Herald flash and drops a guaranteed draught on the kill. Rung
+    # guardians ignore both (a rung is a fixed foe, never a weighted roll).
+    weight: int = 10
+    rare: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -183,3 +197,10 @@ class Settings:
     post_daily_cap: int
     gamble_max_bet: int
     gamble_daily_cap: int
+    # v0.7 "depth below": the carried-potion satchel size, the forge cost
+    # ladder (base * (current_plus + 1)) and its enhancement ceiling, and the
+    # consumable item a rare beast is guaranteed to drop on its kill.
+    satchel_max: int
+    forge_base_cost: int
+    forge_max_plus: int
+    rare_drop_item: str

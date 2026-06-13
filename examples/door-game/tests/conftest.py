@@ -64,6 +64,10 @@ DEFAULT_SETTINGS = Settings(
     post_daily_cap=5,
     gamble_max_bet=50,
     gamble_daily_cap=5,
+    satchel_max=3,
+    forge_base_cost=60,
+    forge_max_plus=3,
+    rare_drop_item="minor_potion",
 )
 
 
@@ -93,6 +97,10 @@ def make_settings(**overrides: object) -> Settings:
         "post_daily_cap": DEFAULT_SETTINGS.post_daily_cap,
         "gamble_max_bet": DEFAULT_SETTINGS.gamble_max_bet,
         "gamble_daily_cap": DEFAULT_SETTINGS.gamble_daily_cap,
+        "satchel_max": DEFAULT_SETTINGS.satchel_max,
+        "forge_base_cost": DEFAULT_SETTINGS.forge_base_cost,
+        "forge_max_plus": DEFAULT_SETTINGS.forge_max_plus,
+        "rare_drop_item": DEFAULT_SETTINGS.rare_drop_item,
     }
     base.update(overrides)
     return Settings(**base)  # type: ignore[arg-type]

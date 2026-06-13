@@ -36,6 +36,17 @@
     "gold": 9
   },
   {
+    "tier": 2,
+    "name": "the Gilded Stag",
+    "hp": 16,
+    "atk": 6,
+    "def": 2,
+    "xp": 40,
+    "gold": 60,
+    "weight": 1,
+    "rare": true
+  },
+  {
     "tier": 3,
     "name": "Forest Wolf",
     "hp": 20,
@@ -52,6 +63,17 @@
     "def": 2,
     "xp": 38,
     "gold": 16
+  },
+  {
+    "tier": 3,
+    "name": "the Hollow Knight",
+    "hp": 30,
+    "atk": 11,
+    "def": 4,
+    "xp": 80,
+    "gold": 110,
+    "weight": 1,
+    "rare": true
   },
   {
     "tier": 4,

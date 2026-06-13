@@ -205,3 +205,59 @@ def test_meta_round_trip(tmp_path: Path) -> None:
     assert store.get_meta("world_name") == "The Vale of Understone"
     assert store.get_meta("missing") is None
     store.close()
+
+
+def test_v0_7_depth_columns_round_trip(tmp_path: Path) -> None:
+    """The four v0.7 columns survive a store reopen: depth, satchel, two plusses."""
+    store = _store(tmp_path)
+    player = make_player(
+        name="Delver",
+        deepest_rung=2,
+        satchel="minor_potion,greater_potion",
+        weapon_plus=2,
+        armor_plus=1,
+    )
+    store.upsert_player(player)
+    store.commit()
+    store.close()
+
+    reopened = _store(tmp_path)
+    players, _ = reopened.load_all()
+    loaded = players["Delver"]
+    assert loaded == player  # full equality across every column
+    assert loaded.deepest_rung == 2
+    assert loaded.satchel == "minor_potion,greater_potion"
+    assert loaded.weapon_plus == 2
+    assert loaded.armor_plus == 1
+    reopened.close()
+
+
+def test_v0_7_depth_columns_default_for_legacy_rows(tmp_path: Path) -> None:
+    """A row written without the new columns loads them at their defaults.
+
+    The schema mutates in place (no migration, stamp stays 1), so the new
+    columns carry DB-side defaults: a pre-v0.7 player row (inserted with the
+    legacy column set) must read back deepest_rung 0, an empty satchel, and
+    zero plusses rather than erroring.
+    """
+    store = _store(tmp_path)
+    store._conn.execute(
+        "INSERT INTO players "
+        "(name, x, y, hp, max_hp, level, xp, gold, atk, def_, weapon_id, armor_id, "
+        " turns_left, turn_day, mode, at_location, created_at, last_seen, log_cursor, "
+        " bestow_spent, bestow_day) "
+        "VALUES ('Old', 5, 5, 20, 20, 1, 0, 20, 5, 1, 'rusty_dagger', 'cloth_tunic', "
+        " 10, 0, 'tile', '', 't0', 't0', 0, 0, 0)",
+    )
+    store.commit()
+    store.close()
+
+    reopened = _store(tmp_path)
+    players, _ = reopened.load_all()
+    old = players["Old"]
+    assert old.deepest_rung == 0
+    assert old.satchel == ""
+    assert old.weapon_plus == 0
+    assert old.armor_plus == 0
+    assert reopened.get_meta("schema_version") == "1"  # stamp unchanged
+    reopened.close()

@@ -17,11 +17,12 @@
     "name": "Gravel & Sons Outfitters",
     "glyph": "$",
     "color": "town",
-    "actions": ["buy", "sell", "leave"],
+    "actions": ["buy", "sell", "forge", "leave"],
     "flavor": [
       "Racks of steel and leather line the walls.",
       "Buying a weapon or armour equips it at once.",
-      "Potions are quaffed on purchase (no pack to carry).",
+      "Potions go into your satchel, to quaff when the need is dire.",
+      "The forge glows: bring coin to better your blade or your guard.",
       "Old gear sells back for half its price."
     ]
   },

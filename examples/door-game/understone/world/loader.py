@@ -54,6 +54,9 @@ SETTINGS_BANDS: dict[str, tuple[int, int | None]] = {
     "post_daily_cap": (0, 50),
     "gamble_max_bet": (1, 10000),
     "gamble_daily_cap": (0, 100),
+    "satchel_max": (1, 10),
+    "forge_base_cost": (1, 10000),
+    "forge_max_plus": (0, 10),
 }
 
 # Per-kind amount bands for the overworld event table (inclusive).
@@ -215,6 +218,9 @@ def _load_monsters(root: Path) -> list[Monster]:
         for label, val in (("atk", atk), ("def", def_), ("xp", xp), ("gold", gold)):
             if val < 0:
                 raise WorldLoadError(f"{where} {label} must be >= 0, got {val}")
+        weight = int(spec.get("weight", 10))
+        if weight <= 0:
+            raise WorldLoadError(f"{where} weight must be > 0, got {weight}")
         out.append(
             Monster(
                 tier=int(_require(spec, "tier", where)),
@@ -226,6 +232,8 @@ def _load_monsters(root: Path) -> list[Monster]:
                 gold=gold,
                 monster_id=str(spec.get("id", "")),
                 boss=bool(spec.get("boss", False)),
+                weight=weight,
+                rare=bool(spec.get("rare", False)),
             )
         )
     if not out:
@@ -594,6 +602,7 @@ def _decode_settings(raw: dict[str, Any], items: list[Item], monsters: list[Mons
 
     dungeon_tiers = _decode_dungeon_tiers(spec, monsters)
     boss_monster = _decode_boss_monster(spec, monsters)
+    rare_drop_item = _decode_rare_drop_item(spec, items)
 
     return Settings(
         daily_turns=values["daily_turns"],
@@ -619,6 +628,10 @@ def _decode_settings(raw: dict[str, Any], items: list[Item], monsters: list[Mons
         post_daily_cap=values["post_daily_cap"],
         gamble_max_bet=values["gamble_max_bet"],
         gamble_daily_cap=values["gamble_daily_cap"],
+        satchel_max=values["satchel_max"],
+        forge_base_cost=values["forge_base_cost"],
+        forge_max_plus=values["forge_max_plus"],
+        rare_drop_item=rare_drop_item,
     )
 
 
@@ -640,6 +653,29 @@ def _decode_boss_monster(spec: dict[str, Any], monsters: list[Monster]) -> str:
             f'world.json settings.boss_monster = {boss_id!r} must be flagged "boss": true'
         )
     return boss_id
+
+
+def _decode_rare_drop_item(spec: dict[str, Any], items: list[Item]) -> str:
+    """Resolve and validate the item a rare beast drops on its kill.
+
+    The id must name an item in the pack AND that item must be a consumable
+    (it goes straight into the satchel to be quaffed later, so a weapon or
+    armour id would be incoherent). Mirrors the ``starting_weapon`` check but
+    adds the slot constraint.
+    """
+    drop_id = str(_require(spec, "rare_drop_item", "world.json settings"))
+    by_id = {it.item_id: it for it in items}
+    item = by_id.get(drop_id)
+    if item is None:
+        raise WorldLoadError(
+            f"world.json settings.rare_drop_item = {drop_id!r} is not a known item id"
+        )
+    if item.slot is not Slot.CONSUMABLE:
+        raise WorldLoadError(
+            f"world.json settings.rare_drop_item = {drop_id!r} must be a consumable item, "
+            f"not {item.slot.value!r}"
+        )
+    return drop_id
 
 
 def _decode_dungeon_tiers(spec: dict[str, Any], monsters: list[Monster]) -> tuple[int, ...]:

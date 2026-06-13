@@ -632,12 +632,12 @@ def test_bestow_heal_only_at_full_hp_refused(tmp_path: Path, clock: object) -> N
 
 
 # ---------------------------------------------------------------------------
-# Descend gauntlet: survive both tiers, or bounce to spawn on the first
+# Descend the deep: one rung per descent (see test_descend.py for the ladder)
 # ---------------------------------------------------------------------------
 
 
-def test_descend_survives_full_gauntlet(tmp_path: Path, clock: object) -> None:
-    """A strong player clears both tiers: two foes fought, rewards banked."""
+def test_descend_fights_one_rung_and_advances(tmp_path: Path, clock: object) -> None:
+    """A strong player clears the next rung: one foe fought, rewards banked, depth +1."""
     game = _game(tmp_path, clock)
     game.join("Hero")
     player = game.players["Hero"]
@@ -649,16 +649,21 @@ def test_descend_survives_full_gauntlet(tmp_path: Path, clock: object) -> None:
 
     out = game.action("Hero", "descend", "", "")
 
-    # Both ladder rungs were fought (the tier-4 and tier-5 boss names appear).
-    assert "Cave Troll" in out
-    assert "Stone Wyrm" in out
+    # The first rung is the tier-3 guardian (Forest Wolf); deeper rungs do NOT
+    # appear in one descent — the deep is fought a rung at a time now.
+    assert "Forest Wolf" in out
+    assert "Cave Troll" not in out
+    assert player.deepest_rung == 1
     assert player.turns_left == before_turns - 1
     assert player.gold > before_gold
     assert player.xp > before_xp
 
 
 def test_descend_bounces_weak_player_to_spawn(tmp_path: Path, clock: object) -> None:
-    """A fresh weak player falls on the first foe and wakes at the spawn."""
+    """A fresh weak player falls on the first rung and wakes at the spawn.
+
+    Depth is NOT advanced by a loss, but it persists at whatever it was (here 0).
+    """
     game = _game(tmp_path, clock)
     game.join("Weakling")
     player = game.players["Weakling"]
@@ -671,9 +676,9 @@ def test_descend_bounces_weak_player_to_spawn(tmp_path: Path, clock: object) -> 
     assert player.mode is Mode.TILE
     assert player.at_location == ""
     assert (player.x, player.y) == game.world.spawn
-    # Felled by the first rung; the second boss never appears.
-    assert "Cave Troll" in out
-    assert "Stone Wyrm" not in out
+    assert player.deepest_rung == 0  # a loss never advances the deep
+    # Felled by the first rung (the tier-3 Forest Wolf).
+    assert "Forest Wolf" in out
 
 
 # ---------------------------------------------------------------------------

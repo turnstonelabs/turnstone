@@ -6,4 +6,4 @@ import understone
 
 
 def test_version_present() -> None:
-    assert understone.__version__ == "0.6.0"
+    assert understone.__version__ == "0.7.0"

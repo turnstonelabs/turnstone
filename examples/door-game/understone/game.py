@@ -114,6 +114,12 @@ _HERALD_TEMPLATES: dict[str, tuple[str, ...]] = {
         "{name} took the house for {amount} gold at dice!",
         "The dice ran hot for {name} — {amount} gold off the house!",
     ),
+    # A rare named beast has fallen — loud enough for the whole Vale to hear.
+    "rare_kill": (
+        "A rare {monster} has fallen to {name}!",
+        "{name} has slain the rare {monster} — a deed for the songs!",
+        "Word races the Vale: {name} felled the rare {monster}!",
+    ),
     # --- PRIVATE (via _mail): only the named target reads these ---
     "ambushed": ("While you slept: {name} ambushed you — {steal} gold stolen.",),
     "post": ("{name} left word for {target}: {text}",),
@@ -199,6 +205,46 @@ class Game:
         if not _is_narrow_text(cleaned):
             return None
         return cleaned
+
+    # -- the satchel: a tiny carried-potion bag (v0.7) -------------------
+
+    @staticmethod
+    def _satchel_list(player: Player) -> list[str]:
+        """Return the carried potion ids as a list ('' stored = empty bag)."""
+        return [item_id for item_id in player.satchel.split(",") if item_id]
+
+    @staticmethod
+    def _satchel_set(player: Player, ids: list[str]) -> None:
+        """Store *ids* back onto the player as the comma-joined satchel."""
+        player.satchel = ",".join(ids)
+
+    def _strongest_potion(self, ids: list[str]) -> tuple[int, Item] | None:
+        """Return the (index, item) of the highest-heal potion in *ids*, or None.
+
+        Resolves each carried id against the pack and picks the one with the
+        greatest ``heal``; ties keep the earliest. A satchel holding only
+        unknown ids (a pack edited out from under a save) yields ``None``.
+        """
+        best: tuple[int, Item] | None = None
+        for index, item_id in enumerate(ids):
+            item = self.world.item_by_id(item_id)
+            if item is None:
+                continue
+            if best is None or item.heal > best[1].heal:
+                best = (index, item)
+        return best
+
+    def _satchel_blurb(self, player: Player) -> str:
+        """Render the satchel as a status line: contents or an empty note."""
+        ids = self._satchel_list(player)
+        if not ids:
+            return "Satchel: empty"
+        names = []
+        for item_id in ids:
+            item = self.world.item_by_id(item_id)
+            names.append(item.name if item is not None else item_id)
+        cap = self.world.settings.satchel_max
+        return f"Satchel ({len(ids)}/{cap}): " + ", ".join(names)
 
     def _footer(self, player: Player) -> str:
         nxt = leveling.xp_for_level(player.level + 1, self.world.settings)
@@ -450,13 +496,18 @@ class Game:
             return self._unknown(name)
         weapon = self.world.item_by_id(player.weapon_id)
         armor = self.world.item_by_id(player.armor_id)
+        weapon_name = weapon.name if weapon else player.weapon_id
+        armor_name = armor.name if armor else player.armor_id
+        rungs = len(self.world.settings.dungeon_tiers)
         lines = [
             f"Adventurer: {player.name}",
             f"Level {player.level}   XP {player.xp}",
             f"HP {player.hp}/{player.max_hp}   ATK {player.atk}   DEF {player.def_}",
-            f"Weapon: {weapon.name if weapon else player.weapon_id}",
-            f"Armor:  {armor.name if armor else player.armor_id}",
+            f"Weapon: {_with_plus(weapon_name, player.weapon_plus)}",
+            f"Armor:  {_with_plus(armor_name, player.armor_plus)}",
             f"Gold {player.gold}   Turns {player.turns_left}/{self.world.settings.daily_turns}",
+            f"Deep: rung {player.deepest_rung}/{rungs}",
+            self._satchel_blurb(player),
         ]
         return "\n".join(lines) + "\n" + self._footer(player)
 
@@ -558,9 +609,11 @@ class Game:
 
         if verb == "post":
             return self._post(player, target, text)
+        if verb == "quaff":
+            return self._quaff(player)
         if player.mode is Mode.TILE:
             return self._tile_action(player, verb, target)
-        return self._menu_action(player, verb, item, amount)
+        return self._menu_action(player, verb, target, item, amount)
 
     # -- tile-context actions (fight / flee / ambush) --------------------
 
@@ -575,13 +628,22 @@ class Game:
         )
 
     def _pick_monster(self, player: Player) -> Monster | None:
+        """Pick a random forest foe from the player's zone band, WEIGHTED.
+
+        Each non-boss monster in the band is drawn in proportion to its
+        ``weight`` (default 10), so a low-weight rare (weight 1) surfaces
+        seldom among the common foes. Rung guardians do NOT come through here —
+        ``_descend`` takes ``band[0]`` directly, so a rung is a fixed,
+        repeatable guardian rather than a weighted roll.
+        """
         zone = self.world.zone_for(player.x, player.y)
         if zone is None:
             return None
         band = self.world.monsters_for_tier_band(zone.tier_lo, zone.tier_hi)
         if not band:
             return None
-        return band[self.rng.choice_index(len(band))]
+        weights = [m.weight for m in band]
+        return band[self.rng.weighted_index(weights)]
 
     def _resolve_encounter(self, player: Player, verb: str) -> str:
         self._ensure_day(player)
@@ -599,7 +661,7 @@ class Game:
             result = combat.resolve_flee(child, player, monster)
         else:
             result = combat.resolve_fight(child, player, monster)
-        return self._apply_fight(player, result)
+        return self._apply_fight(player, result, monster)
 
     def _apply_xp_with_herald(
         self, player: Player, amount: int, lines: list[str]
@@ -635,7 +697,70 @@ class Game:
             f"The {result.monster_name} falls. +{result.xp_delta} XP, +{result.gold_delta} gold."
         )
 
-    def _apply_fight(self, player: Player, result: combat.FightResult) -> str:
+    _DEATH_SAVE_LINE = (
+        "As the dark closes in, the elixir burns down your throat — "
+        "you stagger back from death's edge."
+    )
+
+    def _death_save(self, player: Player, lines: list[str]) -> bool:
+        """Spend the strongest carried potion to cheat a lethal loss, if able.
+
+        The v0.7 death-save: called on the ACTIVE fighter the instant a fight
+        is about to bounce them to the spawn. If they carry at least one
+        usable potion, the strongest is drunk instead of the bounce — hp is set
+        to that potion's heal (capped at max_hp), the potion leaves the
+        satchel, a dramatic line is spliced into the narration, and the method
+        returns ``True`` so the caller skips the spawn reset. With an empty (or
+        all-unknown) satchel it does nothing and returns ``False``.
+
+        This lives entirely in the façade: ``combat`` only reports the outcome,
+        and the satchel + the survival are decided here.
+        """
+        ids = self._satchel_list(player)
+        best = self._strongest_potion(ids)
+        if best is None:
+            return False
+        index, potion = best
+        del ids[index]
+        self._satchel_set(player, ids)
+        player.hp = min(player.max_hp, potion.heal)
+        lines.append(self._DEATH_SAVE_LINE)
+        return True
+
+    def _satchel_try_add(self, player: Player, item_id: str) -> bool:
+        """Drop *item_id* into the satchel if there is room; return success.
+
+        Returns ``False`` (without mutation) when the bag is already at
+        ``satchel_max``. The single chokepoint for adding to the satchel, so
+        the cap is enforced in exactly one place.
+        """
+        ids = self._satchel_list(player)
+        if len(ids) >= self.world.settings.satchel_max:
+            return False
+        ids.append(item_id)
+        self._satchel_set(player, ids)
+        return True
+
+    def _apply_rare_kill(
+        self, player: Player, monster: Monster, lines: list[str]
+    ) -> list[EventSpec]:
+        """Celebrate a rare kill: a public Herald flash and a guaranteed drop.
+
+        Splices the drop line into *lines* (into the satchel if there is room,
+        else a "no room" note) and returns the public ``rare_kill`` beat for
+        the feed. The drop item is the pack's validated ``rare_drop_item`` (a
+        known consumable), so it is always safe to add by id.
+        """
+        drop_id = self.world.settings.rare_drop_item
+        if self._satchel_try_add(player, drop_id):
+            lines.append("It guarded a draught — into your satchel it goes.")
+        else:
+            lines.append("It guarded a draught — but your satchel had no room.")
+        return [self._herald("rare_kill", player.name, monster=monster.name)]
+
+    def _apply_fight(
+        self, player: Player, result: combat.FightResult, monster: Monster | None = None
+    ) -> str:
         lines = list(result.log)
         events: list[EventSpec] = []
 
@@ -644,8 +769,10 @@ class Game:
             self._append_kill_and_reward(lines, result)
             player.gold += result.gold_delta
             events.extend(self._apply_xp_with_herald(player, result.xp_delta, lines))
+            if monster is not None and monster.rare:
+                events.extend(self._apply_rare_kill(player, monster, lines))
 
-        if result.bounce_to_spawn:
+        if result.bounce_to_spawn and not self._death_save(player, lines):
             player.hp = 1
             player.x, player.y = self.world.spawn
             events.append(self._herald("defeat", player.name, monster=result.monster_name))
@@ -752,9 +879,14 @@ class Game:
             events.append(self._herald("ambush", attacker.name, target=target.name, steal=steal))
             events.append(self._mail("ambushed", attacker.name, target.name, steal=steal))
         elif result.bounce_to_spawn:
-            attacker.hp = 1
-            attacker.x, attacker.y = self.world.spawn
+            # The ATTACKER is the active fighter, so their satchel can save them
+            # from a lethal counter-strike (the sleeping VICTIM never quaffs —
+            # they are asleep). A death-save keeps the attacker standing where
+            # they are; otherwise they bounce to the spawn at 1 HP.
             lines.append(f"{target.name} wakes blade-in-hand and you flee bleeding.")
+            if not self._death_save(attacker, lines):
+                attacker.hp = 1
+                attacker.x, attacker.y = self.world.spawn
             events.append(self._herald("ambush_shame", attacker.name, target=target.name))
         else:
             # A grinding stalemate: no gold moves, but the attacker keeps any
@@ -770,7 +902,7 @@ class Game:
 
     # -- menu-context actions --------------------------------------------
 
-    def _menu_action(self, player: Player, verb: str, item: str, amount: int) -> str:
+    def _menu_action(self, player: Player, verb: str, target: str, item: str, amount: int) -> str:
         loc = self.world.location_by_key(player.at_location)
         if loc is None:
             player.mode = Mode.TILE
@@ -792,6 +924,8 @@ class Game:
             return self._buy(player, item)
         if verb == "sell":
             return self._sell(player)
+        if verb == "forge":
+            return self._forge(player, target)
         if verb == "descend":
             return self._descend(player)
         if verb == "challenge":
@@ -848,32 +982,68 @@ class Game:
                 player,
                 lines=[f"The {item.name} costs {item.price}; you hold {player.gold}."],
             )
+        # A consumable goes into the satchel to carry; a full bag refuses the
+        # sale (no gold spent). Weapons/armour equip immediately as before.
+        if item.slot is Slot.CONSUMABLE and not self._satchel_try_add(player, item.item_id):
+            return self._location_menu(
+                player,
+                lines=["Your satchel bulges — no room for another draught."],
+            )
         player.gold -= item.price
-        line = self._equip_or_quaff(player, item)
+        line = self._equip_or_stow(player, item)
         # Shopping is a private errand; persist without Herald news.
         self._persist(player)
         return self._location_menu(player, lines=[line])
 
-    def _equip_or_quaff(self, player: Player, item: Item) -> str:
+    def _equip_or_stow(self, player: Player, item: Item) -> str:
+        """Equip a weapon/armour (clearing its slot first) or stow a draught.
+
+        Buying gear clears the old slot through the shared unequip helper — which
+        drops the old base bonus AND the forged plus and zeroes the plus, so a +N
+        blade replaced leaves no phantom stat — then adds the new base bonus.
+        Consumables were already placed in the satchel by the caller; this only
+        narrates the stow.
+        """
         if item.slot is Slot.WEAPON:
-            player.atk += item.atk - self._equipped_bonus(player.weapon_id, Slot.WEAPON)
+            self._clear_weapon_slot(player)
+            player.atk += item.atk
             player.weapon_id = item.item_id
             return f"You take up the {item.name}. (-{item.price} gold)"
         if item.slot is Slot.ARMOR:
-            player.def_ += item.def_ - self._equipped_bonus(player.armor_id, Slot.ARMOR)
+            self._clear_armor_slot(player)
+            player.def_ += item.def_
             player.armor_id = item.item_id
             return f"You don the {item.name}. (-{item.price} gold)"
-        before = player.hp
-        player.hp = min(player.max_hp, player.hp + item.heal)
-        return (
-            f"You quaff the {item.name}, recovering {player.hp - before} HP. (-{item.price} gold)"
-        )
+        return f"You stow the {item.name} in your satchel. (-{item.price} gold)"
 
     def _equipped_bonus(self, item_id: str, slot: Slot) -> int:
         item = self.world.item_by_id(item_id)
         if item is None or item.slot is not slot:
             return 0
         return item.atk if slot is Slot.WEAPON else item.def_
+
+    def _clear_weapon_slot(self, player: Player) -> None:
+        """Drop the equipped weapon's base bonus AND forged plus, then zero it.
+
+        The single home for the weapon-slot unequip invariant: a swap, a sell,
+        and the legacy reset all clear the slot through here, so a forged +N can
+        never be left as phantom atk on the next blade. Subtracts the current
+        weapon's base ATK bonus and ``weapon_plus`` from the live stat and zeroes
+        the plus; the caller then equips whatever comes next.
+        """
+        player.atk -= self._equipped_bonus(player.weapon_id, Slot.WEAPON) + player.weapon_plus
+        player.weapon_plus = 0
+
+    def _clear_armor_slot(self, player: Player) -> None:
+        """Drop the equipped armour's base bonus AND forged plus, then zero it.
+
+        The armour twin of :meth:`_clear_weapon_slot` — the one home for the
+        armour-slot unequip invariant, so a forged +N never lingers as phantom
+        DEF. Subtracts the current armour's base DEF bonus and ``armor_plus``
+        from the live stat and zeroes the plus.
+        """
+        player.def_ -= self._equipped_bonus(player.armor_id, Slot.ARMOR) + player.armor_plus
+        player.armor_plus = 0
 
     def _sell(self, player: Player) -> str:
         weapon = self.world.item_by_id(player.weapon_id)
@@ -889,7 +1059,11 @@ class Game:
         player.gold += refund
         starter = self.world.settings.starting_weapon
         fallback = self.world.item_by_id(starter)
-        player.atk -= weapon.atk - (fallback.atk if fallback else 0)
+        # Clear the sold slot through the shared helper (drops the blade's base
+        # bonus AND any forged plus, zeroes the plus), then fall back to the
+        # starter and add its base bonus.
+        self._clear_weapon_slot(player)
+        player.atk += fallback.atk if fallback else 0
         player.weapon_id = starter
         # Selling back gear is a private errand; persist without Herald news.
         self._persist(player)
@@ -907,7 +1081,8 @@ class Game:
                 continue
             stat = self._stat_blurb(item)
             lines.append(f"  {item.item_id:<14} {item.price:>4}g  {item.name} {stat}")
-        lines.append("Buying weapon/armour equips it; potions are drunk at once.")
+        lines.append("Buying weapon/armour equips it; potions go into your satchel.")
+        lines.append("Forge a +1 edge with (F)orge weapon / armour; (Q)uaff a draught anywhere.")
         return lines
 
     @staticmethod
@@ -963,6 +1138,98 @@ class Game:
         self._persist(player, note)
         return self._surface(player, lines=["The innkeep tucks the note above the hearth."])
 
+    # -- quaff: drink the strongest carried potion (anywhere; no turn) ---
+
+    def _quaff(self, player: Player) -> str:
+        """Drink the strongest carried potion (legal anywhere, costs no turn).
+
+        Picks the highest-heal draught in the satchel, heals up to ``max_hp``,
+        and removes it. An empty satchel refuses; quaffing at full HP refuses
+        too, so a draught is never wasted. Renders on the player's current
+        surface (map or menu), like ``post``.
+        """
+        ids = self._satchel_list(player)
+        best = self._strongest_potion(ids)
+        if best is None:
+            return self._surface(player, lines=["Your satchel is empty."])
+        if player.hp >= player.max_hp:
+            return self._surface(
+                player,
+                lines=["You are already hale; the draught stays corked."],
+            )
+        index, potion = best
+        before = player.hp
+        player.hp = min(player.max_hp, player.hp + potion.heal)
+        del ids[index]
+        self._satchel_set(player, ids)
+        self._persist(player)
+        return self._surface(
+            player,
+            lines=[f"You quaff the {potion.name}, recovering {player.hp - before} HP."],
+        )
+
+    # -- forge: spend gold to enhance the equipped weapon or armour ------
+
+    def _forge(self, player: Player, target: str) -> str:
+        """Enhance the equipped weapon or armour by +1, the late-game gold sink.
+
+        ``target`` is "weapon" or "armour"/"armor". Cost is
+        ``forge_base_cost * (current_plus + 1)``, so each tier costs more; the
+        plus is capped at ``forge_max_plus``. On success the gold is deducted,
+        the slot's plus rises, and the LIVE stat rises with it (weapon→atk,
+        armour→def). An unaffordable or capped forge refuses without mutation;
+        a missing/invalid target asks which slot.
+        """
+        slot = target.strip().lower()
+        if slot == "weapon":
+            return self._forge_slot(
+                player, current=player.weapon_plus, label="weapon", apply=self._forge_weapon
+            )
+        if slot in {"armor", "armour"}:
+            return self._forge_slot(
+                player, current=player.armor_plus, label="armour", apply=self._forge_armor
+            )
+        return self._location_menu(player, lines=["Forge what — (weapon) or (armour)?"])
+
+    def _forge_slot(
+        self,
+        player: Player,
+        *,
+        current: int,
+        label: str,
+        apply: Callable[[Player], None],
+    ) -> str:
+        """Shared forge accounting for one slot: cap, cost, deduct, apply."""
+        settings = self.world.settings
+        if current >= settings.forge_max_plus:
+            return self._location_menu(player, lines=[f"Your {label} can take no finer edge."])
+        cost = settings.forge_base_cost * (current + 1)
+        if player.gold < cost:
+            return self._location_menu(
+                player,
+                lines=[
+                    f"The smith wants {cost} gold to better your {label}; you hold {player.gold}."
+                ],
+            )
+        player.gold -= cost
+        apply(player)
+        self._persist(player)
+        new_plus = player.weapon_plus if label == "weapon" else player.armor_plus
+        return self._location_menu(
+            player,
+            lines=[f"The smith works your {label} to +{new_plus}. (-{cost} gold)"],
+        )
+
+    @staticmethod
+    def _forge_weapon(player: Player) -> None:
+        player.weapon_plus += 1
+        player.atk += 1
+
+    @staticmethod
+    def _forge_armor(player: Player) -> None:
+        player.armor_plus += 1
+        player.def_ += 1
+
     # -- the inn dice game: wager against the house ---------------------
 
     def _gamble(self, player: Player, amount: int) -> str:
@@ -1012,27 +1279,63 @@ class Game:
         return self._location_menu(player, lines=[line])
 
     def _descend(self, player: Player) -> str:
-        """Run the dungeon gauntlet: one foe per configured tier, back to back."""
+        """Descend ONE rung of the deep — the next guardian past your deepest.
+
+        The deep is a ladder of ``settings.dungeon_tiers`` rungs, fought one per
+        descent: a descent faces ``dungeon_tiers[deepest_rung]`` (the rung after
+        your deepest), the fixed guardian ``band[0]`` of that tier. A win
+        advances ``deepest_rung``; reaching the last rung opens the Wyrm's door.
+        A loss bounces you to the spawn but PRESERVES ``deepest_rung`` — you
+        re-enter where you left off. Standing already at the bottom, descend
+        costs no turn and simply points you at the challenge.
+        """
+        tiers = self.world.settings.dungeon_tiers
+        floor = len(tiers)
+        if player.deepest_rung >= floor:
+            return self._location_menu(
+                player,
+                lines=[
+                    "You have plumbed the deep to its floor. There is nothing below "
+                    "now but the Wyrm itself — challenge it when you are ready."
+                ],
+            )
+
         self._ensure_day(player)
         if not turns.spend_turn(player):
             return self._location_menu(
                 player,
                 lines=["You're too weary to descend today. Return tomorrow."],
             )
-        lines = ["You descend into the Understone Deep..."]
+
+        # band[0] on purpose: the rung guardian is a fixed, repeatable foe (the
+        # classic fixed-foe convention), never a weighted roll.
+        next_rung = player.deepest_rung  # 0-indexed into the tier ladder
+        tier = tiers[next_rung]
+        band = self.world.monsters_for_tier_band(tier, tier)
+        # The loader guarantees every dungeon tier is backed by a non-boss
+        # monster, so band is non-empty; guard defensively all the same.
+        if not band:
+            return self._location_menu(
+                player, lines=["The way down is choked with rubble; no foe stirs here."]
+            )
+        monster = band[0]
+
+        lines = [f"You descend to the {_ordinal(next_rung + 1)} rung of the Understone Deep..."]
         events: list[EventSpec] = []
-        for tier in self.world.settings.dungeon_tiers:
-            band = self.world.monsters_for_tier_band(tier, tier)
-            if not band:
-                continue
-            # band[0] on purpose: the gauntlet ladder is a fixed, repeatable
-            # encounter (the classic fixed-foe convention), never randomized.
-            monster = band[0]
-            result = combat.resolve_fight(self.rng.child(), player, monster)
-            lines.append("")
-            lines.extend(result.log)
-            player.hp = max(1, player.hp + result.hp_delta)
-            if result.bounce_to_spawn:
+        result = combat.resolve_fight(self.rng.child(), player, monster)
+        lines.append("")
+        lines.extend(result.log)
+        player.hp = max(1, player.hp + result.hp_delta)
+
+        if result.bounce_to_spawn:
+            # A carried draught saves the active fighter in ANY fight, the deep
+            # included: the strongest potion is drunk instead of the bounce. A
+            # save keeps the hero standing at the dungeon — depth UNCHANGED (the
+            # rung was not cleared, but the depth already earned is kept), the
+            # turn still spent. Without a potion it is the standard spawn bounce.
+            # A descent loss is private, so the public defeat herald is written
+            # only on a genuine (un-saved) bounce.
+            if not self._death_save(player, lines):
                 player.hp = 1
                 player.x, player.y = self.world.spawn
                 player.mode = Mode.TILE
@@ -1040,12 +1343,30 @@ class Game:
                 events.append(self._herald("defeat", player.name, monster=monster.name))
                 self._persist(player, *events)
                 return self._overworld_frame(player, lines=lines)
-            if result.outcome is combat.Outcome.WIN:
-                self._append_kill_and_reward(lines, result)
-                player.gold += result.gold_delta
-                events.extend(self._apply_xp_with_herald(player, result.xp_delta, lines))
-        lines.append("")
-        lines.append("You climb back to the surface, victorious and laden.")
+            self._persist(player, *events)
+            return self._location_menu(player, lines=lines)
+
+        if result.outcome is combat.Outcome.WIN:
+            self._append_kill_and_reward(lines, result)
+            player.gold += result.gold_delta
+            events.extend(self._apply_xp_with_herald(player, result.xp_delta, lines))
+            player.deepest_rung = next_rung + 1
+            lines.append("")
+            if player.deepest_rung >= floor:
+                lines.append(
+                    "You stand at the Wyrm's door. The deep has no deeper — only the "
+                    "Wyrm Below remains. Challenge it when you are ready."
+                )
+            else:
+                lines.append(
+                    f"You have reached rung {player.deepest_rung} of {floor}, and climb "
+                    "back to the surface to gather your strength."
+                )
+        else:
+            # A stalemate flight: no rung gained, but the wear taken is kept.
+            lines.append("")
+            lines.append("You break off and climb back to the surface, winded.")
+
         self._persist(player, *events)
         return self._location_menu(player, lines=lines)
 
@@ -1066,6 +1387,17 @@ class Game:
                 lines=[
                     f"The Wyrm Below stirs only for those of the {_ordinal(min_level)} "
                     "circle or beyond. Grow stronger, then return."
+                ],
+            )
+        # The depth gate, checked AFTER the level gate so a low-level shallow
+        # hero hears the level message first: the Wyrm will not stir until the
+        # deep has been plumbed rung by rung to its floor.
+        if player.deepest_rung < len(self.world.settings.dungeon_tiers):
+            return self._location_menu(
+                player,
+                lines=[
+                    "The Wyrm Below will not stir for one who has not yet plumbed "
+                    "the deep to its floor."
                 ],
             )
 
@@ -1119,8 +1451,20 @@ class Game:
         return self._overworld_frame(player, lines=lines)
 
     def _wyrm_lost(self, player: Player, result: combat.FightResult) -> str:
-        """Standard defeat: bounce to spawn at 1 HP, herald the devouring."""
+        """A lethal Wyrm bout: a carried draught saves the hero, else they fall.
+
+        The universal death-save reaches the Wyrm too: a potion in the satchel
+        is drunk instead of the devouring. A save is NOT a win — there is no
+        legacy reset (level/gold/depth all stand) — but it is NOT the devouring
+        either, so the hero keeps their place at the dungeon and the PUBLIC beat
+        is the survival one (the ``wyrm_flee`` "driven back, alive but unproven"
+        herald), never the "devoured" lie. The turn is spent regardless. With no
+        potion it is the standard defeat: bounce to the spawn at 1 HP, devoured.
+        """
         lines = list(result.log)
+        if self._death_save(player, lines):
+            self._persist(player, self._herald("wyrm_flee", player.name))
+            return self._location_menu(player, lines=lines)
         player.hp = 1
         player.x, player.y = self.world.spawn
         player.mode = Mode.TILE
@@ -1148,11 +1492,19 @@ class Game:
 
         Stats, equipment, HP, gold, level/xp and position all return to the
         first-day baseline and ``created_at`` is restamped; ``wins`` rises by
-        one. The daily clock (turns/turn_day), the bestow pool, and the log
-        cursor are deliberately UNTOUCHED — a legacy run is a fresh character,
-        not a fresh day.
+        one. The v0.7 retention state — dungeon depth, forged enhancements, and
+        the satchel — resets too (a reborn hero re-earns the deep and carries
+        nothing forged or bottled). The daily clock (turns/turn_day), the
+        bestow pool, and the log cursor are deliberately UNTOUCHED — a legacy
+        run is a fresh character, not a fresh day.
         """
         settings = self.world.settings
+        # Clear both gear slots through the shared unequip helpers FIRST, so the
+        # forged-plus reset lives in the one place every slot change uses (the
+        # fresh stats below are absolute, but the plus-zeroing invariant stays
+        # centralised rather than hand-copied here).
+        self._clear_weapon_slot(player)
+        self._clear_armor_slot(player)
         atk, def_, max_hp = self._fresh_combat_stats()
         player.wins += 1
         player.level = 1
@@ -1168,6 +1520,11 @@ class Game:
         player.mode = Mode.TILE
         player.at_location = ""
         player.created_at = self._now_iso()
+        # The deep and the satchel are first-day fresh too: a reborn hero must
+        # plumb the deep again and carries no draught across the renewal (the
+        # forged edges were already cleared with the gear slots above).
+        player.deepest_rung = 0
+        player.satchel = ""
 
     # -- tool: log -------------------------------------------------------
 
@@ -1389,3 +1746,8 @@ def _ordinal(n: int) -> str:
     if 0 <= n < len(_ORDINALS):
         return _ORDINALS[n]
     return f"{n}th"
+
+
+def _with_plus(name: str, plus: int) -> str:
+    """Append a ``+N`` enhancement suffix to an item name (blank at zero)."""
+    return f"{name} +{plus}" if plus > 0 else name
