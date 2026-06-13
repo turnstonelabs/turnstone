@@ -636,3 +636,50 @@ def test_event_tail_is_capped_but_log_still_works(tmp_path: Path, clock: object)
     fresh, new_cursor = since(game.events, recent_cursor)
     assert fresh  # there are events past the cursor
     assert new_cursor == game.events[-1].event_id
+
+
+def test_private_mail_survives_tail_eviction(tmp_path: Path, clock: object) -> None:
+    """A private note older than the resident tail is still delivered (durable mail).
+
+    Public history that falls off the in-memory tail is gone by design (the
+    broadsheet does not keep), but mail must not be: a note left while the
+    recipient was away has to surface however many public events have since
+    pushed it out of the tail. A third player — whose cursor also predates the
+    note — must still never see it, because it was never theirs.
+    """
+    from understone.persistence import EVENT_TAIL_KEEP
+
+    db = tmp_path / "game.db"
+    store = Store(db)
+    game = Game(load_world(PACK), store, clock=clock, rng=GameRNG(seed=7))  # type: ignore[arg-type]
+    game.join("Scribe")
+    game.join("Reader")
+    game.join("Bystander")
+    # Scribe leaves Reader a private note; neither Reader nor Bystander reads it.
+    secret = "the cellar key is under the third barrel"
+    game.action("Scribe", "post", "Reader", "", secret)
+
+    # Flood the feed past the tail bound so the note is evicted from memory.
+    for i in range(EVENT_TAIL_KEEP + 20):
+        store.insert_event("t", "sys", "note", f"broadsheet filler {i}")
+    store.commit()
+    store.close()
+
+    # Reopen: only the newest tail is resident, so the note now lives in the gap.
+    reopened = Store(db)
+    revived = Game(load_world(PACK), reopened, clock=clock, rng=GameRNG(seed=7))  # type: ignore[arg-type]
+    note_id = next(
+        e.event_id
+        for e in reopened.targeted_events_since("Reader", 0)  # note: from SQLite, not the tail
+        if secret in e.text
+    )
+    assert note_id < revived.events[0].event_id  # the note really is past the tail
+
+    # The recipient still sees the note, backfilled from SQLite...
+    reader_log = revived.log("Reader")
+    assert secret in reader_log
+    assert "While you were away" in reader_log
+    # ...but a third player never does, even though their cursor predates it too.
+    third_log = revived.log("Bystander")
+    assert secret not in third_log
+    reopened.close()

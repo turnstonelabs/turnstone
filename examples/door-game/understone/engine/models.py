@@ -57,6 +57,10 @@ class Player:
     bestow_spent: int
     bestow_day: int
     wins: int = 0
+    posts_sent: int = 0
+    post_day: int = 0
+    gambles: int = 0
+    gamble_day: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -173,3 +177,9 @@ class Settings:
     dungeon_tiers: tuple[int, ...]
     boss_monster: str
     wyrm_min_level: int
+    ambush_min_level: int
+    ambush_level_band: int
+    ambush_gold_pct: int
+    post_daily_cap: int
+    gamble_max_bet: int
+    gamble_daily_cap: int

@@ -16,8 +16,8 @@ from datetime import UTC, datetime
 from typing import TYPE_CHECKING
 
 from understone.engine import combat, leveling, movement, turns
-from understone.engine.log import Event, since
-from understone.engine.models import Mode, Player, Slot
+from understone.engine.log import Event, since_visible
+from understone.engine.models import Mode, Monster, Player, Slot
 from understone.engine.rank import HallEntry, RankEntry, leaderboard
 from understone.engine.rng import GameRNG
 from understone.persistence import EVENT_TAIL_KEEP
@@ -30,16 +30,23 @@ from understone.screen.viewport import compute_window
 if TYPE_CHECKING:
     from collections.abc import Callable
 
-    from understone.engine.models import Item, LocationDef, Monster
+    from understone.engine.models import Item, LocationDef
     from understone.engine.world import World
     from understone.persistence import Store
 
 VIEW_W = 48
 VIEW_H = 16
 
+# One feed write: ``(kind, actor, text, target)``. An empty target is a PUBLIC
+# Herald beat; a player name is a PRIVATE note only that player reads.
+EventSpec = tuple[str, str, str, str]
+
 # Free-text length ceilings for player-authored input (the sanitizer chokepoint).
 _NAME_MAX_LEN = 24
 _REASON_MAX_LEN = 120
+
+# A dice win at or above this many gold is loud enough to reach the Herald.
+_GAMBLE_HERALD_MIN = 25
 
 _COLOR_BY_NAME = {c.value: c for c in Color}
 
@@ -53,6 +60,7 @@ _HERALD_QUIET = "The Vale is still; the Herald has no fresh word for you."
 # errands stay private. Player names are sanitised at join and monster names come
 # from the validated pack, so interpolation here is safe.
 _HERALD_TEMPLATES: dict[str, tuple[str, ...]] = {
+    # --- PUBLIC (via _herald): everyone reads these on the broadsheet ---
     "join": (
         "{name} has signed the ledger and set out into the Vale.",
         "A new adventurer, {name}, arrives at the western gate.",
@@ -85,6 +93,28 @@ _HERALD_TEMPLATES: dict[str, tuple[str, ...]] = {
         "{name} fled the Wyrm Below, alive but unproven.",
         "{name} broke from the Wyrm Below and ran for the light.",
     ),
+    # Ambush — the asynchronous player-kill. These win/shame/flee beats crow on
+    # the public feed; the victim's own private alert is the "ambushed" kind below.
+    "ambush": (
+        "{name} fell upon {target} as they slept — and made off with {steal} gold!",
+        "Under cover of dawn {name} robbed the sleeping {target} of {steal} gold!",
+        "{target} slept too long; {name} crept in and lifted {steal} gold!",
+    ),
+    "ambush_shame": (
+        "{target} woke blade-in-hand; {name} fled bleeding.",
+        "{name} misjudged the sleeper: {target} woke and sent them running.",
+    ),
+    "ambush_flee": (
+        "{name} crept up on {target} but lost their nerve and slipped away.",
+        "{name} thought better of robbing {target} and melted into the dark.",
+    ),
+    "gamble": (
+        "{name} took the house for {amount} gold at dice!",
+        "The dice ran hot for {name} — {amount} gold off the house!",
+    ),
+    # --- PRIVATE (via _mail): only the named target reads these ---
+    "ambushed": ("While you slept: {name} ambushed you — {steal} gold stolen.",),
+    "post": ("{name} left word for {target}: {text}",),
 }
 
 
@@ -162,29 +192,65 @@ class Game:
         if turns.ensure_day(player, self.clock, self.world.settings.daily_turns):
             player.last_seen = self._now_iso()
 
-    def _herald(self, kind: str, actor: str, **fields: object) -> tuple[str, str, str]:
-        """Build a public feed event for *kind*, picking a phrasing via the RNG.
+    def _spent_for_today(self, player: Player) -> str:
+        """Persist *player* and render the shared overworld 'out of turns' frame.
 
-        Returns the ``(kind, actor, text)`` tuple ``_persist`` expects. The
-        phrasing is chosen from :data:`_HERALD_TEMPLATES` so the broadsheet
-        varies; the choice is deterministic under a seeded RNG.
+        The turn-exhausted refusal for the overworld verbs (fight and ambush):
+        the day-roll has already run and may have mutated state, so commit the
+        player before reporting, then surface the spent line on the map.
+        """
+        self.store.upsert_player(player)
+        self.store.commit()
+        return self._overworld_frame(
+            player,
+            lines=["You're spent for today. Rest at the inn and return tomorrow."],
+        )
+
+    def _herald(self, kind: str, actor: str, **fields: object) -> EventSpec:
+        """Build a PUBLIC feed event for *kind*, picking a phrasing via the RNG.
+
+        Returns the ``(kind, actor, text, target)`` tuple ``_persist`` expects,
+        with an empty target (everyone sees it). The phrasing is chosen from
+        :data:`_HERALD_TEMPLATES` so the broadsheet varies; the choice is
+        deterministic under a seeded RNG.
         """
         phrasings = _HERALD_TEMPLATES[kind]
         text = phrasings[self.rng.choice_index(len(phrasings))].format(name=actor, **fields)
-        return (kind, actor, text)
+        return (kind, actor, text, "")
 
-    def _persist(self, player: Player, *events: tuple[str, str, str]) -> None:
+    def _mail(self, kind: str, actor: str, target: str, **fields: object) -> EventSpec:
+        """Build a PRIVATE note for *kind*, delivered only to *target*.
+
+        Same phrasing machinery as :meth:`_herald`, but the returned tuple
+        carries *target* so only that player reads it in their own catch-up;
+        it never reaches the public broadsheet or the lobby TV. The recipient
+        name is exposed to the template as ``{target}`` (templates that don't
+        reference it simply ignore it), so callers needn't repeat it.
+        """
+        phrasings = _HERALD_TEMPLATES[kind]
+        chosen = phrasings[self.rng.choice_index(len(phrasings))]
+        text = chosen.format(name=actor, target=target, **fields)
+        return (kind, actor, text, target)
+
+    def _persist(self, player: Player, *events: EventSpec, also: Player | None = None) -> None:
         """Update + append in one transaction, then commit (state changes).
 
-        Each event tuple is ``(kind, actor, text)``. New events are appended
-        to the in-memory feed with the id the store assigns.
+        Each event tuple is ``(kind, actor, text, target)``. New events are
+        appended to the in-memory feed with the id the store assigns. When
+        *also* is given (e.g. an ambush victim), that second player's row is
+        upserted in the SAME transaction, so both fighters and their events
+        commit atomically.
         """
         player.last_seen = self._now_iso()
         self.store.upsert_player(player)
+        if also is not None:
+            self.store.upsert_player(also)
         ts = self._now_iso()
-        for kind, actor, text in events:
-            event_id = self.store.insert_event(ts, actor, kind, text)
-            self.events.append(Event(event_id=event_id, ts=ts, kind=kind, actor=actor, text=text))
+        for kind, actor, text, target in events:
+            event_id = self.store.insert_event(ts, actor, kind, text, target)
+            self.events.append(
+                Event(event_id=event_id, ts=ts, kind=kind, actor=actor, text=text, target=target)
+            )
         # Full history lives in SQLite; keep only the recent tail resident.
         if len(self.events) > EVENT_TAIL_KEEP:
             del self.events[:-EVENT_TAIL_KEEP]
@@ -295,6 +361,10 @@ class Game:
             bestow_spent=0,
             bestow_day=today,
             wins=0,
+            posts_sent=0,
+            post_day=today,
+            gambles=0,
+            gamble_day=today,
         )
         self.players[clean] = player
         self._persist(player, self._herald("join", clean))
@@ -421,23 +491,41 @@ class Game:
 
     # -- tool: action ----------------------------------------------------
 
-    def action(self, name: str, action: str, target: str, item: str) -> str:
-        """Dispatch a context verb against the player's current surface."""
+    def action(
+        self,
+        name: str,
+        action: str,
+        target: str,
+        item: str,
+        text: str = "",
+        amount: int = 0,
+    ) -> str:
+        """Dispatch a context verb against the player's current surface.
+
+        Most verbs are surface-bound (fight/flee on the overworld, rest/buy/
+        gamble inside a building). ``post`` (leave a note for another player)
+        is the exception: it works anywhere and costs no turn, so it is handled
+        before the surface branch.
+        """
         player = self._get(name)
         if player is None:
             return self._unknown(name)
         verb = action.strip().lower()
 
+        if verb == "post":
+            return self._post(player, target, text)
         if player.mode is Mode.TILE:
-            return self._tile_action(player, verb)
-        return self._menu_action(player, verb, item)
+            return self._tile_action(player, verb, target)
+        return self._menu_action(player, verb, item, amount)
 
-    # -- tile-context actions (fight / flee) -----------------------------
+    # -- tile-context actions (fight / flee / ambush) --------------------
 
-    def _tile_action(self, player: Player, verb: str) -> str:
+    def _tile_action(self, player: Player, verb: str, target: str) -> str:
         if verb in {"fight", "flee"}:
             return self._resolve_encounter(player, verb)
-        legal = "fight, flee, or move on with door_move"
+        if verb == "ambush":
+            return self._ambush(player, target)
+        legal = "fight, flee, ambush a sleeping rival, or move on with door_move"
         return self._overworld_frame(
             player, lines=[f"There's nothing to '{verb}' out here. You can {legal}."]
         )
@@ -460,12 +548,7 @@ class Game:
             )
 
         if not turns.spend_turn(player):
-            self.store.upsert_player(player)
-            self.store.commit()
-            return self._overworld_frame(
-                player,
-                lines=["You're spent for today. Rest at the inn and return tomorrow."],
-            )
+            return self._spent_for_today(player)
 
         child = self.rng.child()
         if verb == "flee":
@@ -476,7 +559,7 @@ class Game:
 
     def _apply_xp_with_herald(
         self, player: Player, amount: int, lines: list[str]
-    ) -> list[tuple[str, str, str]]:
+    ) -> list[EventSpec]:
         """Award XP, append per-level narration to *lines*, and herald the climb.
 
         Returns the public-feed events to persist: a single ``level_up`` beat at
@@ -510,7 +593,7 @@ class Game:
 
     def _apply_fight(self, player: Player, result: combat.FightResult) -> str:
         lines = list(result.log)
-        events: list[tuple[str, str, str]] = []
+        events: list[EventSpec] = []
 
         player.hp = max(1, player.hp + result.hp_delta)
         if result.outcome is combat.Outcome.WIN:
@@ -526,9 +609,124 @@ class Game:
         self._persist(player, *events)
         return self._overworld_frame(player, lines=lines)
 
+    # -- tile-context action: ambush (asynchronous PvP) ------------------
+
+    def _ambush(self, attacker: Player, target_name: str) -> str:
+        """Fall upon a sleeping rival to rob them — the classic door-game player-kill beat.
+
+        Legal on the overworld only. Eligibility is checked in a fixed order,
+        each with its own in-fiction refusal: the target must exist, not be
+        yourself, both of you must be seasoned (the gatekeeper shields the
+        young), you must be within the level band, and — the SLEEP RULE — the
+        target must not yet have begun their own day (anyone who has acted today
+        is awake and un-ambushable). Then the day rolls and a turn is spent,
+        exactly as a fight. The attempt is spent (recorded) on every outcome.
+        """
+        refusal = self._ambush_refusal(attacker, target_name)
+        if refusal is not None:
+            return self._overworld_frame(attacker, lines=[refusal])
+        target = self.players[target_name.strip()]
+
+        self._ensure_day(attacker)
+        if not turns.spend_turn(attacker):
+            return self._spent_for_today(attacker)
+
+        return self._resolve_ambush(attacker, target)
+
+    def _ambush_refusal(self, attacker: Player, target_name: str) -> str | None:
+        """Return the in-fiction refusal for an illegal ambush, or ``None``.
+
+        Each branch maps to a distinct rule, checked in order so the message
+        names the first thing wrong. The order matters: existence before
+        identity, level gates before the band, and the sleep/once-a-day rules
+        last (they are the live-play defences).
+        """
+        target = self._get(target_name)
+        if target is None:
+            return self._unknown(target_name)
+        if target.name == attacker.name:
+            return "You can hardly ambush yourself, traveller."
+        settings = self.world.settings
+        floor = settings.ambush_min_level
+        if attacker.level < floor or target.level < floor:
+            return f"The gatekeeper shields the young: ambush is barred below level {floor}."
+        if abs(attacker.level - target.level) > settings.ambush_level_band:
+            return (
+                f"{target.name} is too far from your measure to make a fair mark "
+                f"(within {settings.ambush_level_band} levels only)."
+            )
+        if target.turn_day >= self._today_ordinal():
+            return (
+                f"{target.name} is already abroad and watchful today — you cannot "
+                "catch them sleeping."
+            )
+        if target.hp <= 1:
+            # Mercy rule: a freshly-robbed sleeper sits at 1 HP. Pile-on bandits
+            # don't get to kick someone already in the ditch (this is checked
+            # after the sleep rule, so an awake 1-HP rival reports as watchful).
+            return (
+                f"{target.name} already lies battered in the ditch — even bandits have standards."
+            )
+        if self.store.has_ambushed(attacker.name, target.name, self._today_ordinal()):
+            return f"You have already lain in wait for {target.name} today."
+        return None
+
+    def _today_ordinal(self) -> int:
+        """Return the attacker-current UTC ordinal (the sleep-rule boundary)."""
+        return self.clock().toordinal()
+
+    def _resolve_ambush(self, attacker: Player, target: Player) -> str:
+        """Resolve a committed ambush and persist both fighters atomically."""
+        settings = self.world.settings
+        sleeper = Monster(
+            tier=0,
+            name=target.name,
+            hp=target.hp,
+            atk=target.atk,
+            def_=target.def_,
+            xp=0,
+            gold=0,
+        )
+        result = combat.resolve_fight(self.rng.child(), attacker, sleeper)
+        lines = list(result.log)
+        events: list[EventSpec] = []
+        day = self._today_ordinal()
+
+        if result.outcome is combat.Outcome.WIN:
+            # The sleeper still trades blows before falling; bank the attacker's
+            # wear so the narrated counter-strikes match the sheet (mirrors
+            # _apply_fight). A win never drops the attacker below 1 HP.
+            attacker.hp = max(1, attacker.hp + result.hp_delta)
+            steal = max(0, target.gold * settings.ambush_gold_pct // 100)
+            attacker.gold += steal
+            target.gold -= steal
+            target.hp = 1
+            target.x, target.y = self.world.spawn
+            target.mode = Mode.TILE
+            target.at_location = ""
+            lines.append(f"You rob {target.name} of {steal} gold and melt away.")
+            events.append(self._herald("ambush", attacker.name, target=target.name, steal=steal))
+            events.append(self._mail("ambushed", attacker.name, target.name, steal=steal))
+        elif result.bounce_to_spawn:
+            attacker.hp = 1
+            attacker.x, attacker.y = self.world.spawn
+            lines.append(f"{target.name} wakes blade-in-hand and you flee bleeding.")
+            events.append(self._herald("ambush_shame", attacker.name, target=target.name))
+        else:
+            # A grinding stalemate: no gold moves, but the attacker keeps any
+            # wear taken before breaking off (the fight/wyrm-flee convention).
+            attacker.hp = max(1, attacker.hp + result.hp_delta)
+            lines.append(f"Your nerve fails and you slip away from {target.name}.")
+            events.append(self._herald("ambush_flee", attacker.name, target=target.name))
+
+        # The attempt is spent on every outcome; record it inside the txn.
+        self.store.record_ambush(attacker.name, target.name, day)
+        self._persist(attacker, *events, also=target)
+        return self._overworld_frame(attacker, lines=lines)
+
     # -- menu-context actions --------------------------------------------
 
-    def _menu_action(self, player: Player, verb: str, item: str) -> str:
+    def _menu_action(self, player: Player, verb: str, item: str, amount: int) -> str:
         loc = self.world.location_by_key(player.at_location)
         if loc is None:
             player.mode = Mode.TILE
@@ -554,6 +752,8 @@ class Game:
             return self._descend(player)
         if verb == "challenge":
             return self._challenge(player)
+        if verb == "gamble":
+            return self._gamble(player, amount)
         return self._location_menu(player, lines=[f"The '{verb}' option isn't ready."])
 
     def _leave(self, player: Player) -> str:
@@ -674,6 +874,99 @@ class Game:
             return f"(+{item.def_} DEF)"
         return f"(+{item.heal} HP)"
 
+    # -- the inn mailbox: leave word for another player ------------------
+
+    def _surface(self, player: Player, *, lines: list[str]) -> str:
+        """Render *lines* on the player's current surface (map or menu).
+
+        Used by ``post``, which is legal in either mode, so its reply must
+        match whichever surface the player is standing on.
+        """
+        if player.mode is Mode.MENU:
+            return self._location_menu(player, lines=lines)
+        return self._overworld_frame(player, lines=lines)
+
+    def _post(self, player: Player, target_name: str, text: str) -> str:
+        """Leave a private note for another player (legal anywhere; no turn).
+
+        The note is delivered as a PRIVATE event the recipient alone reads in
+        their next ``door_log`` ("While you were away"); the sender gets an
+        in-fiction confirmation. The body runs through the same sanitizer as
+        every other player-authored string, and a small daily cap keeps the
+        hearth from becoming a billboard.
+        """
+        target = self._get(target_name)
+        if target is None:
+            return self._surface(player, lines=[self._unknown(target_name)])
+        if target.name == player.name:
+            return self._surface(player, lines=["You need no note to talk to yourself."])
+        clean = self._sanitize(text, _REASON_MAX_LEN)
+        if clean is None:
+            return self._surface(
+                player,
+                lines=["The innkeep can't make out that scrawl. Plain words, briefly put."],
+            )
+
+        self._ensure_day(player)
+        cap = self.world.settings.post_daily_cap
+        if player.posts_sent >= cap:
+            return self._surface(
+                player,
+                lines=[f"You've left all the word you may today ({cap} notes). Try tomorrow."],
+            )
+        player.posts_sent += 1
+        note = self._mail("post", player.name, target.name, text=clean)
+        self._persist(player, note)
+        return self._surface(player, lines=["The innkeep tucks the note above the hearth."])
+
+    # -- the inn dice game: wager against the house ---------------------
+
+    def _gamble(self, player: Player, amount: int) -> str:
+        """Wager *amount* gold on a single 2d6 roll against the house.
+
+        Inn only (the menu gates the verb). Player and house each roll two
+        dice; higher total wins the stake, a tie pushes (no gold moves) and a
+        loss forfeits it. A daily count cap limits how many times the cup comes
+        out; a push still counts. Costs no turn. A notable win is heralded.
+        """
+        max_bet = self.world.settings.gamble_max_bet
+        if amount < 1 or amount > max_bet:
+            return self._location_menu(
+                player,
+                lines=[f"The house takes wagers of 1 to {max_bet} gold. Name your stake."],
+            )
+        if player.gold < amount:
+            return self._location_menu(
+                player,
+                lines=[f"You can't cover a {amount}-gold wager (you hold {player.gold})."],
+            )
+
+        self._ensure_day(player)
+        cap = self.world.settings.gamble_daily_cap
+        if player.gambles >= cap:
+            return self._location_menu(
+                player,
+                lines=[f"The innkeep waves you off — {cap} games is enough for one day."],
+            )
+        player.gambles += 1
+
+        child = self.rng.child()
+        you = child.randint(1, 6) + child.randint(1, 6)
+        house = child.randint(1, 6) + child.randint(1, 6)
+        events: list[EventSpec] = []
+        if you > house:
+            player.gold += amount
+            line = f"You roll {you}, the house {house}. You win {amount} gold!"
+            if amount >= _GAMBLE_HERALD_MIN:
+                events.append(self._herald("gamble", player.name, amount=amount))
+        elif you < house:
+            player.gold -= amount
+            line = f"You roll {you}, the house {house}. You lose {amount} gold."
+        else:
+            line = f"You roll {you}, the house {house}. A push — your stake stands."
+        self._persist(player, *events)
+        return self._location_menu(player, lines=[line])
+
     def _descend(self, player: Player) -> str:
         """Run the dungeon gauntlet: one foe per configured tier, back to back."""
         self._ensure_day(player)
@@ -683,7 +976,7 @@ class Game:
                 lines=["You're too weary to descend today. Return tomorrow."],
             )
         lines = ["You descend into the Understone Deep..."]
-        events: list[tuple[str, str, str]] = []
+        events: list[EventSpec] = []
         for tier in self.world.settings.dungeon_tiers:
             band = self.world.monsters_for_tier_band(tier, tier)
             if not band:
@@ -834,23 +1127,59 @@ class Game:
 
     # -- tool: log -------------------------------------------------------
 
+    def _backfill_durable_mail(self, player: Player, visible: list[Event]) -> list[Event]:
+        """Merge any private notes that predate the resident tail into *visible*.
+
+        Public history older than the in-memory tail is gone by design (the
+        broadsheet does not keep), but mail is durable: a note left while the
+        recipient was away must still surface however many public events have
+        since evicted it from the resident tail. When the player's cursor lies
+        before the oldest resident event, we pull their targeted rows from
+        SQLite for that gap and splice them in by id, deduped against the rows
+        already shown. The cursor still advances to the highest resident id.
+        """
+        oldest_resident = self.events[0].event_id if self.events else 0
+        # The resident tail already covers everything from oldest_resident on;
+        # a backfill is only needed when the cursor predates that boundary.
+        if player.log_cursor >= oldest_resident - 1:
+            return visible
+        durable = self.store.targeted_events_since(player.name, player.log_cursor)
+        seen = {event.event_id for event in visible}
+        merged = visible + [event for event in durable if event.event_id not in seen]
+        merged.sort(key=lambda event: event.event_id)
+        return merged
+
     def log(self, name: str) -> str:
         """Report events since the player's cursor, then advance it.
 
-        Dressed as the Understone Herald broadsheet: a masthead, the fresh
-        dispatches, then the status footer. Read-path/cursor semantics are
-        unchanged — only the framing is new.
+        Dressed as the Understone Herald broadsheet: a masthead, the public
+        dispatches, any PRIVATE notes left for this player ("While you were
+        away"), then the status footer. Public and private rows ride one id
+        order, so the cursor advances identically whether or not a private note
+        appeared — a note meant for someone else is consumed, never re-shown,
+        and never leaks here.
         """
         player = self._get(name)
         if player is None:
             return self._unknown(name)
-        fresh, new_cursor = since(self.events, player.log_cursor)
-        if not fresh:
+        visible, new_cursor = since_visible(self.events, player.log_cursor, player.name)
+        visible = self._backfill_durable_mail(player, visible)
+        # Advance past every fresh row (visible or not) so private notes for
+        # others are consumed once; persist the new cursor.
+        if new_cursor != player.log_cursor:
+            player.log_cursor = new_cursor
+            self._persist(player)
+        if not visible:
             return f"{_HERALD_HEADER}\n{_HERALD_QUIET}\n" + self._footer(player)
-        lines = [_HERALD_HEADER, "Word from across the Vale since your last visit:"]
-        lines.extend(f"  - {event.text}" for event in fresh)
-        player.log_cursor = new_cursor
-        self._persist(player)
+        public = [e for e in visible if not e.target]
+        private = [e for e in visible if e.target == player.name]
+        lines = [_HERALD_HEADER]
+        if public:
+            lines.append("Word from across the Vale since your last visit:")
+            lines.extend(f"  - {event.text}" for event in public)
+        if private:
+            lines.append("While you were away, word was left for you:")
+            lines.extend(f"  - {event.text}" for event in private)
         return "\n".join(lines) + "\n" + self._footer(player)
 
     # -- tool: rank ------------------------------------------------------

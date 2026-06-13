@@ -116,6 +116,12 @@
     "bestow_daily_budget": 25,
     "dungeon_tiers": [4, 5],
     "boss_monster": "wyrm_below",
-    "wyrm_min_level": 6
+    "wyrm_min_level": 6,
+    "ambush_min_level": 3,
+    "ambush_level_band": 2,
+    "ambush_gold_pct": 25,
+    "post_daily_cap": 5,
+    "gamble_max_bet": 50,
+    "gamble_daily_cap": 5
   }
 }

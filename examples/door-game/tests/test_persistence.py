@@ -60,6 +60,10 @@ def test_player_round_trip_all_columns(tmp_path: Path) -> None:
         log_cursor=42,
         bestow_spent=15,
         bestow_day=739_400,
+        posts_sent=3,
+        post_day=739_400,
+        gambles=2,
+        gamble_day=739_400,
     )
     store.upsert_player(player)
     store.commit()
@@ -76,7 +80,54 @@ def test_player_round_trip_all_columns(tmp_path: Path) -> None:
     assert loaded.bestow_spent == 15
     assert loaded.bestow_day == 739_400
     assert loaded.mode is Mode.MENU
+    # The v0.5 social columns survive the round-trip too.
+    assert loaded.posts_sent == 3
+    assert loaded.post_day == 739_400
+    assert loaded.gambles == 2
+    assert loaded.gamble_day == 739_400
     reopened.close()
+
+
+def test_event_target_round_trips(tmp_path: Path) -> None:
+    """A targeted (private) event keeps its target across a reopen; public is ''."""
+    store = _store(tmp_path)
+    pub = store.insert_event("t1", "Brandr", "join", "set out")
+    priv = store.insert_event("t2", "Sigrun", "ambushed", "robbed in your sleep", "Brandr")
+    store.commit()
+    store.close()
+
+    reopened = _store(tmp_path)
+    _, events = reopened.load_all()
+    by_id = {e.event_id: e for e in events}
+    assert by_id[pub].target == ""  # public stays empty
+    assert by_id[priv].target == "Brandr"  # private keeps its recipient
+    reopened.close()
+
+
+def test_ambush_table_per_day_uniqueness(tmp_path: Path) -> None:
+    """The ambushes PK is (attacker, target, day): one row per pair per day."""
+    store = _store(tmp_path)
+    day = 739_400
+    assert store.has_ambushed("Brandr", "Sigrun", day) is False
+    store.record_ambush("Brandr", "Sigrun", day)
+    store.commit()
+    assert store.has_ambushed("Brandr", "Sigrun", day) is True
+    # A second record for the same pair/day is a no-op (INSERT OR IGNORE):
+    # the duplicate must not raise and must not add a row.
+    store.record_ambush("Brandr", "Sigrun", day)
+    store.commit()
+    rows = store._conn.execute(
+        "SELECT COUNT(*) AS n FROM ambushes WHERE attacker=? AND target=? AND day=?",
+        ("Brandr", "Sigrun", day),
+    ).fetchone()
+    assert rows["n"] == 1
+    # A new day is a fresh attempt; the old day stays recorded.
+    assert store.has_ambushed("Brandr", "Sigrun", day + 1) is False
+    store.record_ambush("Brandr", "Sigrun", day + 1)
+    store.commit()
+    assert store.has_ambushed("Brandr", "Sigrun", day) is True
+    assert store.has_ambushed("Brandr", "Sigrun", day + 1) is True
+    store.close()
 
 
 def test_upsert_updates_existing_row(tmp_path: Path) -> None:
