@@ -1,0 +1,42 @@
+name: Understone example
+
+# The door-game example is a standalone package with no dependency on
+# turnstone core, and the root test suite does not collect it
+# (testpaths=["tests"]). Without this workflow its suite never runs in CI.
+# Path-filtered so it only runs when the example (or this workflow) changes.
+
+on:
+  push:
+    branches: [main, "stable/*"]
+    paths:
+      - "examples/door-game/**"
+      - ".github/workflows/understone-example.yml"
+  pull_request:
+    branches: [main, "stable/*"]
+    paths:
+      - "examples/door-game/**"
+      - ".github/workflows/understone-example.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: examples/door-game
+    strategy:
+      matrix:
+        # Floor and ceiling of the example's requires-python (>=3.11).
+        python-version: ["3.11", "3.13"]
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6
+        with:
+          python-version: ${{ matrix.python-version }}
+      - run: pip install -e ".[test,dev]"
+      - run: pytest tests/ -q
+      - run: ruff check .
+      - run: ruff format --check .
+      - run: mypy understone/
