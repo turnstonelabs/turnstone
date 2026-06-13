@@ -25,14 +25,14 @@
     "glyph": "=",
     "walkable": true,
     "encounter_rate": 0.02,
-    "color": "floor"
+    "color": "road"
   },
   "f": {
     "key": "forest",
     "glyph": "↑",
     "walkable": true,
     "encounter_rate": 0.25,
-    "color": "tree"
+    "color": "forest"
   },
   "#": {
     "key": "wall",

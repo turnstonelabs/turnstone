@@ -3,7 +3,7 @@
     "kind": "inn",
     "name": "The Sleeping Drake",
     "glyph": "⌂",
-    "color": "town",
+    "color": "inn",
     "actions": ["rest", "gamble", "leave"],
     "flavor": [
       "Lamplight pools on worn oak tables.",
@@ -16,7 +16,7 @@
     "kind": "shop",
     "name": "Gravel & Sons Outfitters",
     "glyph": "$",
-    "color": "town",
+    "color": "shop",
     "actions": ["buy", "sell", "forge", "leave"],
     "flavor": [
       "Racks of steel and leather line the walls.",
@@ -30,7 +30,7 @@
     "kind": "healer",
     "name": "The Quiet Shrine",
     "glyph": "✚",
-    "color": "town",
+    "color": "healer",
     "actions": ["heal", "leave"],
     "flavor": [
       "Incense curls beneath a still blue flame.",

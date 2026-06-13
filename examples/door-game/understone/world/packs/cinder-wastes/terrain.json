@@ -4,35 +4,35 @@
     "glyph": "░",
     "walkable": true,
     "encounter_rate": 0.1,
-    "color": "floor"
+    "color": "barren"
   },
   "A": {
     "key": "spire",
     "glyph": "▲",
     "walkable": false,
     "encounter_rate": 0.0,
-    "color": "tree"
+    "color": "wall"
   },
   "~": {
     "key": "slag",
     "glyph": "≈",
     "walkable": false,
     "encounter_rate": 0.0,
-    "color": "water"
+    "color": "lava"
   },
   "=": {
     "key": "basalt",
     "glyph": "=",
     "walkable": true,
     "encounter_rate": 0.02,
-    "color": "floor"
+    "color": "road"
   },
   "c": {
     "key": "cinder",
     "glyph": "▒",
     "walkable": true,
     "encounter_rate": 0.25,
-    "color": "tree"
+    "color": "scrub"
   },
   "#": {
     "key": "caldera",

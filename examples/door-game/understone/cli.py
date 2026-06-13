@@ -203,6 +203,7 @@ def build_authoring_md() -> str:
     """
     md = _AUTHORING_TEMPLATE.replace("{{BANDS}}", _render_bands())
     md = md.replace("{{PALETTE}}", _render_palette())
+    md = md.replace("{{COLOR_ROLES}}", _render_color_roles())
     return md.replace("{{VALIDATE_COVERAGE}}", _render_validate_coverage())
 
 
@@ -291,6 +292,24 @@ def _render_palette() -> str:
         "carry the period BBS / CP437 flavour and are all guaranteed safe:\n\n"
         f"{glyphs}"
     )
+
+
+def _render_color_roles() -> str:
+    """Render the author-assignable colour roles, generated from the Color enum.
+
+    The Watch knows how to paint exactly the roles in ``screen.palette.Color``;
+    ``Color.assignable()`` is the single source for which of those an author may
+    put on terrain or a location (the runtime overlay roles an actor/item wears,
+    and the DEFAULT fallback, are filtered out there). Generated from the enum,
+    so the documented vocabulary can never drift from what the Watch can
+    actually colour — the same can't-drift discipline as the bands and the
+    safe-glyph palette. ``color`` itself stays advisory: the loader does not
+    validate it, so a typo is harmless and an unknown role just paints as the
+    default; these are simply the roles the Watch recognises.
+    """
+    from understone.screen.palette import Color
+
+    return ", ".join(f"`{role.value}`" for role in Color.assignable())
 
 
 def _render_validate_coverage() -> str:
@@ -403,11 +422,13 @@ An object whose keys are the single-character legend symbols used in the map.
 * `encounter_rate` — `0.0`..`1.0`, the per-step chance a walk rolls the event
   table on this terrain.
 * `color` — a palette role string. It is **advisory and not validated**: the
-  loader stores it but the v1 text renderer draws glyphs only, so any string
-  loads and an unrecognised role simply maps to the default at render time. The
-  roles a future colour renderer will recognise are `floor`, `wall`, `water`,
-  `tree`, `town`, and `dungeon`; pick the closest, but a typo here is harmless,
-  not a load error.
+  loader stores it but the text frame draws glyphs only (it is monochrome), so
+  any string loads and an unrecognised role simply maps to the default at render
+  time. Where colour DOES show is the live Watch page, which paints each role a
+  distinct hue. The roles the Watch knows how to paint — pick the closest fit —
+  are: {{COLOR_ROLES}}. A typo here is harmless, not a load error; it just
+  paints as the default. The four runtime overlay colours (the hero, rival
+  players, monsters, dropped items) are set by the engine, not assignable here.
 
 ### `monsters.json`
 
