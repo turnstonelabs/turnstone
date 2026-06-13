@@ -9,9 +9,9 @@ of the pack's JSON files). The slug is the subdirectory name. `understone
 worlds` discovers the Vale plus every pack here that carries a `world.json`,
 loads each one, and reports whether it is sound.
 
-The directory ships effectively empty (this README is the placeholder that keeps
-it under version control); alternate worlds are added here as they are authored.
-To serve one, point the server at it:
+This directory ships with one bundled alternate world — **The Cinder Wastes**
+(`cinder-wastes/`), an ashen volcanic underworld authored against `AUTHORING.md`.
+More are added here as they are written. To serve one, point the server at it:
 
 ```bash
 UNDERSTONE_WORLD=understone/world/packs/<slug> understone

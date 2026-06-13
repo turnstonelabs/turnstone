@@ -828,3 +828,24 @@ def test_single_boss_accepted() -> None:
     bosses = [m for m in world.monsters if m.boss]
     assert len(bosses) == 1
     assert bosses[0].name == "the Wyrm Below"
+
+
+def test_overlapping_zones_rejected(tmp_path: Path) -> None:
+    """Overlapping zone rectangles are a load error.
+
+    ``zone_for`` returns the FIRST matching zone, so two zones sharing any cell
+    would silently shadow one tier band there — exactly the bug a cold-authored
+    pack shipped (a 1-column caldera-edge strip dropped to the low band). Pull
+    the deep zone west so its rect overlaps the near zone and confirm the loader
+    refuses it rather than loading the ambiguity.
+    """
+    pack = _clone_pack(tmp_path)
+
+    def mutate(data: dict[str, Any]) -> None:
+        for zone in data["zones"]:
+            if zone["key"] == "dungeon_deep":
+                zone["rect"][0] = 50  # now overlaps forest_near's x30..60 strip
+
+    _rewrite(pack / "world.json", mutate)
+    with pytest.raises(WorldLoadError, match="overlap"):
+        load_world(pack)
