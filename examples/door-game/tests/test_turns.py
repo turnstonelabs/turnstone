@@ -37,7 +37,16 @@ def test_ensure_day_resets_on_new_day() -> None:
 
 def test_ensure_day_noop_within_same_day() -> None:
     day = utc(2026, 6, 12).toordinal()
-    player = make_player(turns_left=4, turn_day=day, bestow_spent=10, bestow_day=day)
+    # Every day marker is already today, so no allowance (turns, bestow, posts,
+    # dice) is touched — the rollover is a pure no-op.
+    player = make_player(
+        turns_left=4,
+        turn_day=day,
+        bestow_spent=10,
+        bestow_day=day,
+        post_day=day,
+        gamble_day=day,
+    )
     reset = ensure_day(player, fixed_clock(utc(2026, 6, 12, 23, 0)), daily_turns=10)
     assert reset is False
     assert player.turns_left == 4
@@ -66,3 +75,20 @@ def test_bestow_pool_resets_on_the_same_boundary() -> None:
     ensure_day(player, fixed_clock(utc(2026, 6, 13, 0, 1)), daily_turns=10)
     assert player.bestow_spent == 0
     assert player.bestow_day == utc(2026, 6, 13).toordinal()
+
+
+def test_social_caps_reset_on_the_same_boundary() -> None:
+    """Posts and dice counts ride the same UTC rollover as turns and bestow."""
+    yesterday = utc(2026, 6, 12).toordinal()
+    player = make_player(
+        posts_sent=5,
+        post_day=yesterday,
+        gambles=5,
+        gamble_day=yesterday,
+    )
+    reset = ensure_day(player, fixed_clock(utc(2026, 6, 13, 0, 1)), daily_turns=10)
+    assert reset is True
+    assert player.posts_sent == 0
+    assert player.post_day == utc(2026, 6, 13).toordinal()
+    assert player.gambles == 0
+    assert player.gamble_day == utc(2026, 6, 13).toordinal()

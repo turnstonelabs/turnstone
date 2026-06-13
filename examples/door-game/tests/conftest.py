@@ -58,6 +58,12 @@ DEFAULT_SETTINGS = Settings(
     dungeon_tiers=(4, 5),
     boss_monster="wyrm_below",
     wyrm_min_level=6,
+    ambush_min_level=3,
+    ambush_level_band=2,
+    ambush_gold_pct=25,
+    post_daily_cap=5,
+    gamble_max_bet=50,
+    gamble_daily_cap=5,
 )
 
 
@@ -81,6 +87,12 @@ def make_settings(**overrides: object) -> Settings:
         "dungeon_tiers": DEFAULT_SETTINGS.dungeon_tiers,
         "boss_monster": DEFAULT_SETTINGS.boss_monster,
         "wyrm_min_level": DEFAULT_SETTINGS.wyrm_min_level,
+        "ambush_min_level": DEFAULT_SETTINGS.ambush_min_level,
+        "ambush_level_band": DEFAULT_SETTINGS.ambush_level_band,
+        "ambush_gold_pct": DEFAULT_SETTINGS.ambush_gold_pct,
+        "post_daily_cap": DEFAULT_SETTINGS.post_daily_cap,
+        "gamble_max_bet": DEFAULT_SETTINGS.gamble_max_bet,
+        "gamble_daily_cap": DEFAULT_SETTINGS.gamble_daily_cap,
     }
     base.update(overrides)
     return Settings(**base)  # type: ignore[arg-type]
@@ -111,6 +123,10 @@ def make_player(**overrides: object) -> Player:
         "bestow_spent": 0,
         "bestow_day": 0,
         "wins": 0,
+        "posts_sent": 0,
+        "post_day": 0,
+        "gambles": 0,
+        "gamble_day": 0,
     }
     fields.update(overrides)
     return Player(**fields)  # type: ignore[arg-type]

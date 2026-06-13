@@ -2,8 +2,9 @@
 
 Turns refresh lazily: the first action on a new UTC day resets the
 budget rather than relying on a scheduled job. The same rollover resets
-the per-player bestow pool, so both daily allowances share one boundary.
-The clock is injected so tests can cross midnight deterministically.
+the per-player bestow pool and the social daily caps (posts left, dice
+played), so every daily allowance shares one boundary. The clock is
+injected so tests can cross midnight deterministically.
 """
 
 from __future__ import annotations
@@ -25,9 +26,11 @@ def _utc_ordinal(clock: Callable[[], datetime]) -> int:
 def ensure_day(player: Player, clock: Callable[[], datetime], daily_turns: int) -> bool:
     """Refresh daily allowances if the UTC day has advanced.
 
-    Returns ``True`` when a reset occurred. Resets both the turn budget
-    (to *daily_turns*) and the bestow pool (to empty), stamping the current
-    UTC ordinal onto both day markers.
+    Returns ``True`` when a reset occurred. On a new UTC day this resets the
+    turn budget (to *daily_turns*), the bestow pool, the daily post count, and
+    the daily dice count — each back to its baseline — stamping the current UTC
+    ordinal onto every day marker. Each counter is reset independently so a
+    stale stamp on one never suppresses the refresh of another.
     """
     today = _utc_ordinal(clock)
     reset = False
@@ -38,6 +41,14 @@ def ensure_day(player: Player, clock: Callable[[], datetime], daily_turns: int) 
     if player.bestow_day != today:
         player.bestow_spent = 0
         player.bestow_day = today
+        reset = True
+    if player.post_day != today:
+        player.posts_sent = 0
+        player.post_day = today
+        reset = True
+    if player.gamble_day != today:
+        player.gambles = 0
+        player.gamble_day = today
         reset = True
     return reset
 

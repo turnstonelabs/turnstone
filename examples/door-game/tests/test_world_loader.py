@@ -325,6 +325,69 @@ def test_wyrm_min_level_out_of_band_rejected(tmp_path: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
+# v0.5 social settings: ambush / post / gamble economy bands
+# ---------------------------------------------------------------------------
+
+
+def test_ambush_gold_pct_out_of_band_rejected(tmp_path: Path) -> None:
+    """The steal percentage is a 0..100 band; 101 is rejected by name."""
+    pack = _clone_pack(tmp_path)
+
+    def mutate(data: dict[str, Any]) -> None:
+        data["settings"]["ambush_gold_pct"] = 101  # band is 0..100
+
+    _rewrite(pack / "world.json", mutate)
+    with pytest.raises(WorldLoadError, match="ambush_gold_pct"):
+        load_world(pack)
+
+
+def test_ambush_level_band_out_of_band_rejected(tmp_path: Path) -> None:
+    pack = _clone_pack(tmp_path)
+
+    def mutate(data: dict[str, Any]) -> None:
+        data["settings"]["ambush_level_band"] = 11  # band is 0..10
+
+    _rewrite(pack / "world.json", mutate)
+    with pytest.raises(WorldLoadError, match="ambush_level_band"):
+        load_world(pack)
+
+
+def test_gamble_max_bet_out_of_band_rejected(tmp_path: Path) -> None:
+    """A max bet of 0 is below the 1..10000 floor: the house needs a real stake."""
+    pack = _clone_pack(tmp_path)
+
+    def mutate(data: dict[str, Any]) -> None:
+        data["settings"]["gamble_max_bet"] = 0  # band is 1..10000
+
+    _rewrite(pack / "world.json", mutate)
+    with pytest.raises(WorldLoadError, match="gamble_max_bet"):
+        load_world(pack)
+
+
+def test_post_daily_cap_out_of_band_rejected(tmp_path: Path) -> None:
+    pack = _clone_pack(tmp_path)
+
+    def mutate(data: dict[str, Any]) -> None:
+        data["settings"]["post_daily_cap"] = 51  # band is 0..50
+
+    _rewrite(pack / "world.json", mutate)
+    with pytest.raises(WorldLoadError, match="post_daily_cap"):
+        load_world(pack)
+
+
+def test_missing_social_setting_rejected(tmp_path: Path) -> None:
+    """A pack that predates the social settings fails loudly (no silent default)."""
+    pack = _clone_pack(tmp_path)
+
+    def mutate(data: dict[str, Any]) -> None:
+        del data["settings"]["ambush_min_level"]
+
+    _rewrite(pack / "world.json", mutate)
+    with pytest.raises(WorldLoadError, match="ambush_min_level"):
+        load_world(pack)
+
+
+# ---------------------------------------------------------------------------
 # v0.4 loader hardening: glyphs, map size, count caps, and name lengths
 #
 # Packs are now routinely untrusted LLM output, so the loader bands the shapes
