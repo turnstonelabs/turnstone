@@ -30,6 +30,7 @@ from understone.engine.models import (
     WorldEvent,
     Zone,
 )
+from understone.engine.textwidth import is_grid_safe
 from understone.engine.world import World
 from understone.errors import WorldLoadError
 
@@ -84,32 +85,36 @@ MAX_NAME_LEN = 48
 
 # Box-drawing glyphs the frame and Herald renderers own; a map glyph must never
 # be one of these (it would tear the borders) — the double bar is the Herald
-# rule, the rest are the map/menu frame. '@' and '&' are the player and
+# rule, the rest are the map/menu frame. '@' and '☻' are the player and
 # other-player markers, so a map glyph must not impersonate an actor either.
 _BOX_DRAWING_GLYPHS = frozenset("┌┐└┘─│═")
-_ACTOR_GLYPHS = frozenset("@&")
+_ACTOR_GLYPHS = frozenset("@☻")
 RESERVED_GLYPHS = _BOX_DRAWING_GLYPHS | _ACTOR_GLYPHS
 
 
 def _check_glyph(glyph: str, where: str, *, role: str = "glyph") -> None:
     """Validate a single map glyph (terrain, location, or legend key).
 
-    A glyph must be exactly one printable character that is neither a frame
-    box-drawing line nor a player marker, so it cannot tear the rendered
-    border or masquerade as an adventurer. *role* names the field for the
-    author-facing message.
+    A glyph must render as exactly one terminal column (the grid contract in
+    :mod:`understone.engine.textwidth`: one printable code point, no fullwidth
+    runes, no combining marks) and must be neither a frame box-drawing line nor
+    a player marker, so it cannot tear the rendered border or masquerade as an
+    adventurer. *role* names the field for the author-facing message.
     """
     if len(glyph) != 1:
         raise WorldLoadError(f"{where} {role} must be a single character, got {glyph!r}")
-    if not glyph.isprintable():
-        raise WorldLoadError(f"{where} {role} {glyph!r} must be printable")
+    if not is_grid_safe(glyph):
+        raise WorldLoadError(
+            f"{where} {role} {glyph!r} must render exactly one column "
+            "(no emoji, no fullwidth, no combining marks)"
+        )
     if glyph in _BOX_DRAWING_GLYPHS:
         raise WorldLoadError(
             f"{where} {role} {glyph!r} is a box-drawing character reserved for frame borders"
         )
     if glyph in _ACTOR_GLYPHS:
         raise WorldLoadError(
-            f"{where} {role} {glyph!r} is reserved for player markers ('@' you, '&' others)"
+            f"{where} {role} {glyph!r} is reserved for player markers ('@' you, '☻' others)"
         )
 
 

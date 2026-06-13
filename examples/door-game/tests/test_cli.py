@@ -129,6 +129,27 @@ def test_cli_newpack_authoring_md_renders_live_band(tmp_path: Path) -> None:
     assert "daily_turns" in manual
 
 
+def test_cli_newpack_authoring_md_has_width_rule_and_live_palette(tmp_path: Path) -> None:
+    """AUTHORING.md documents the one-column rule and renders the live palette.
+
+    The width section states the Western-monospace assumption, and the safe
+    palette is generated from ``textwidth.SAFE_PALETTE`` (same can't-drift
+    pattern as the bands table) — every glyph appears, in a backticked cell.
+    """
+    from understone.engine.textwidth import SAFE_PALETTE
+
+    dest = tmp_path / "mypack"
+    cli.cli_newpack(dest, out=StringIO(), err=StringIO())
+    manual = (dest / "AUTHORING.md").read_text(encoding="utf-8")
+
+    assert "## Glyph width" in manual
+    assert "exactly one terminal column" in manual
+    assert "Western monospace" in manual  # the stated assumption
+    assert "Safe glyph palette" in manual
+    for glyph in SAFE_PALETTE:
+        assert f"`{glyph}`" in manual, f"palette glyph {glyph!r} missing from manual"
+
+
 def test_cli_newpack_refuses_non_empty_dir(tmp_path: Path) -> None:
     dest = tmp_path / "occupied"
     dest.mkdir()

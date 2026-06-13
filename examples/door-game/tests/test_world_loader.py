@@ -420,6 +420,85 @@ def test_player_marker_terrain_glyph_rejected(tmp_path: Path) -> None:
         load_world(pack)
 
 
+def test_other_player_marker_terrain_glyph_rejected(tmp_path: Path) -> None:
+    """A terrain glyph may not be '☻' — the v0.6 other-player marker."""
+    pack = _clone_pack(tmp_path)
+
+    def mutate(data: dict[str, Any]) -> None:
+        data["."]["glyph"] = "☻"
+
+    _rewrite(pack / "terrain.json", mutate)
+    with pytest.raises(WorldLoadError, match=r"terrain\.json.* reserved for player markers"):
+        load_world(pack)
+
+
+def test_ampersand_terrain_glyph_now_accepted(tmp_path: Path) -> None:
+    """'&' is no longer an actor marker (☻ took that role), so it is pack-legal.
+
+    The load itself is the assertion — it must not raise the actor-marker
+    rejection. A grass cell then carries the new glyph.
+    """
+    pack = _clone_pack(tmp_path)
+
+    def mutate(data: dict[str, Any]) -> None:
+        data["."]["glyph"] = "&"
+
+    _rewrite(pack / "terrain.json", mutate)
+    world = load_world(pack)  # no WorldLoadError: '&' is admitted
+    grass = next(
+        world.terrain_at(x, y)
+        for y in range(world.height)
+        for x in range(world.width)
+        if world.terrain_at(x, y).key == "grass"
+    )
+    assert grass.glyph == "&"
+
+
+def test_wide_cjk_terrain_glyph_rejected(tmp_path: Path) -> None:
+    """A Wide (EAW=W) ideograph would render two columns and tear the frame."""
+    pack = _clone_pack(tmp_path)
+
+    def mutate(data: dict[str, Any]) -> None:
+        data["."]["glyph"] = "龍"
+
+    _rewrite(pack / "terrain.json", mutate)
+    with pytest.raises(WorldLoadError, match=r"terrain\.json.* exactly one column"):
+        load_world(pack)
+
+
+def test_fullwidth_terrain_glyph_rejected(tmp_path: Path) -> None:
+    """A Fullwidth (EAW=F) Latin letter is two columns and is rejected."""
+    pack = _clone_pack(tmp_path)
+
+    def mutate(data: dict[str, Any]) -> None:
+        data["."]["glyph"] = "Ａ"  # U+FF21 FULLWIDTH LATIN CAPITAL LETTER A
+
+    _rewrite(pack / "terrain.json", mutate)
+    with pytest.raises(WorldLoadError, match=r"terrain\.json.* exactly one column"):
+        load_world(pack)
+
+
+def test_reskinned_shipped_pack_glyphs() -> None:
+    """The shipped pack carries the v0.6 re-skin and still loads cleanly.
+
+    The load-bearing guard for the re-skin: water is ≋ and the three lettered
+    buildings became ⌂/✚/∩. If a data edit reverts a glyph, this trips.
+    """
+    world = load_world(SHIPPED)
+    waters = {
+        world.terrain_at(x, y).glyph
+        for y in range(world.height)
+        for x in range(world.width)
+        if world.terrain_at(x, y).key == "water"
+    }
+    assert waters == {"≋"}
+    by_key = {loc.key: loc.glyph for loc in world.locations}
+    assert by_key["inn"] == "⌂"
+    assert by_key["healer"] == "✚"
+    assert by_key["dungeon"] == "∩"
+    assert by_key["shop"] == "$"  # the shop glyph is unchanged
+
+
 def test_multichar_location_glyph_rejected(tmp_path: Path) -> None:
     """A location glyph must be exactly one character."""
     pack = _clone_pack(tmp_path)

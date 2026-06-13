@@ -79,8 +79,8 @@ THE GOLDEN RULE
 
 THE TWO MODES OF PLAY
   1. The overworld (TILE mode). Tools return an ASCII "keyframe": a bordered
-     map window centred on the player. '@' is the player, '&' is another
-     adventurer, letters are buildings (I inn, $ shop, + healer, > dungeon).
+     map window centred on the player. '@' is the player, '☻' is another
+     adventurer, glyphs are buildings (⌂ inn, $ shop, ✚ healer, ∩ dungeon).
      Movement here is FREE — it costs no daily turns.
   2. Location interiors (MENU mode). Stepping onto a building opens a menu of
      options like (R)est, (B)uy, (H)eal, (D)escend, (L)eave.
@@ -286,7 +286,7 @@ def door_look(player: str) -> str:
     """Redraw what the adventurer currently sees (read-only).
 
     On the overworld this is an ASCII map keyframe centred on the player
-    ('@' is you, '&' are other players, letters are buildings). Inside a
+    ('@' is you, '☻' are other players, glyphs are buildings). Inside a
     building it is that location's menu. Present the result verbatim in a
     fenced code block, then narrate.
 

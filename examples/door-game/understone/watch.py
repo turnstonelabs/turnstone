@@ -21,6 +21,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 from understone.engine.models import Mode
+from understone.screen import texture
 
 if TYPE_CHECKING:
     from understone.engine.log import Event
@@ -131,7 +132,10 @@ def _recent_events(game: Game) -> list[Event]:
 # createElement / textContent). The base map is painted once from world.json;
 # players are an absolutely-positioned overlay repainted from state.json every
 # two seconds. On a fetch failure the page dims and shows "SIGNAL LOST".
-WATCH_HTML = """\
+#
+# ``__HASH_EXPR__`` is filled below from the texture-module hash constants, so
+# the JS index formula tracks a Python-side retune (see _build_watch_html).
+_WATCH_HTML_TEMPLATE = """\
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -152,7 +156,7 @@ WATCH_HTML = """\
     margin: 0;
     background: var(--bg);
     color: var(--phosphor);
-    font-family: "DejaVu Sans Mono", "Liberation Mono", "Courier New", monospace;
+    font-family: "Noto Sans Mono", "DejaVu Sans Mono", "Liberation Mono", "Courier New", monospace;
     font-size: 14px;
     line-height: 1.2;
   }
@@ -221,7 +225,23 @@ WATCH_HTML = """\
     overflow: auto;
     max-width: 100%;
     box-shadow: inset 0 0 24px rgba(0, 0, 0, 0.6);
+    transition: filter 1.2s ease;
   }
+  /* Time-of-day wash, toggled from the UTC hour of the state payload. The
+     overlay is non-interactive and sits above the map but below the scanlines.
+     night: a subtle blue dim; dawn/dusk: a faint amber wash; day: nothing. */
+  .map-frame::after {
+    content: "";
+    position: absolute;
+    inset: 0;
+    pointer-events: none;
+    opacity: 0;
+    transition: opacity 1.2s ease, background-color 1.2s ease;
+    z-index: 5;
+  }
+  .map-frame.night { filter: brightness(0.78) saturate(0.85); }
+  .map-frame.night::after { opacity: 1; background-color: rgba(74, 120, 200, 0.16); }
+  .map-frame.twilight::after { opacity: 1; background-color: rgba(255, 180, 77, 0.12); }
   #map {
     position: relative;
     white-space: pre;
@@ -318,6 +338,22 @@ WATCH_HTML = """\
     return PALETTE[name] || PALETTE.default;
   }
 
+  // Deterministic terrain texture. MUST stay in lockstep with
+  // understone.screen.texture: the same base->variants rows and the same
+  // index formula. The formula below is INTERPOLATED from texture._HASH_X /
+  // _HASH_Y at module build time, so a Python-side retune rewrites this line;
+  // only the VARIANTS rows must still be mirrored by hand.
+  var VARIANTS = {
+    ".": ".,'",
+    "\\u224b": "\\u224b\\u2248"
+  };
+
+  function textured(ch, x, y) {
+    var choices = VARIANTS[ch];
+    if (!choices) { return ch; }
+    return choices.charAt((__HASH_EXPR__) % choices.length);
+  }
+
   var overlay = document.getElementById("overlay");
   var mapEl = document.getElementById("map");
   var liveLabel = document.getElementById("live-label");
@@ -351,6 +387,8 @@ WATCH_HTML = """\
       var runColor = null;
       for (var x = 0; x < row.length; x++) {
         var ch = row.charAt(x);
+        // Colour keys off the BASE terrain glyph; the rendered glyph is the
+        // position-keyed variant (a variant shares its terrain's colour).
         var col = colorFor(legend[ch]);
         if (runColor === null) { runColor = col; }
         if (col !== runColor) {
@@ -358,7 +396,7 @@ WATCH_HTML = """\
           runText = "";
           runColor = col;
         }
-        runText += ch;
+        runText += textured(ch, x, y);
       }
       if (runText.length) { rowEl.appendChild(makeSpan(runText, runColor)); }
       mapEl.insertBefore(rowEl, overlay);
@@ -404,7 +442,10 @@ WATCH_HTML = """\
       el.className = "pc";
       el.style.left = "calc(" + p.x + " * 1ch)";
       el.style.top = "calc(" + p.y + " * 1lh)";
-      el.textContent = "@";
+      // Every adventurer on the lobby TV is "another player" (there is no
+      // viewer here), so all wear the other-player marker. Mirrors the '☻'
+      // the game frame paints for rivals.
+      el.textContent = "\\u263b";
       el.title = p.name;
       pcLayer.appendChild(el);
     }
@@ -506,6 +547,26 @@ WATCH_HTML = """\
     }
   }
 
+  var mapFrame = document.querySelector(".map-frame");
+
+  // Tint the map by the UTC hour of the world clock. The bands:
+  //   night    20:00-05:59  -> subtle dim + blue ('night' class)
+  //   dawn     06:00-07:59  -> faint amber wash ('twilight' class)
+  //   dusk     18:00-19:59  -> faint amber wash ('twilight' class)
+  //   day      08:00-17:59  -> no tint
+  // UTC (not local) so every spectator sees the same sky as the game clock.
+  function applyDayPhase(iso) {
+    var d = new Date(iso);
+    mapFrame.classList.remove("night", "twilight");
+    if (isNaN(d.getTime())) { return; }
+    var h = d.getUTCHours();
+    if (h >= 20 || h < 6) {
+      mapFrame.classList.add("night");
+    } else if (h < 8 || h >= 18) {
+      mapFrame.classList.add("twilight");
+    }
+  }
+
   function getJSON(url) {
     return fetch(url, { cache: "no-store" }).then(function (r) {
       if (!r.ok) { throw new Error("HTTP " + r.status); }
@@ -519,6 +580,7 @@ WATCH_HTML = """\
       renderAdventurers(state.players || []);
       renderHall(state.hall || []);
       renderHerald(state.herald || []);
+      applyDayPhase(state.ts);
       setLive(true, state.ts);
     }).catch(function () {
       setLive(false, null);
@@ -546,3 +608,18 @@ WATCH_HTML = """\
 </body>
 </html>
 """
+
+
+def _build_watch_html() -> str:
+    """Fill the texture hash formula into the page template.
+
+    The JS ``textured`` index is interpolated from
+    :data:`~understone.screen.texture._HASH_X` / ``_HASH_Y`` so the page's
+    formula is a derivation of the same two constants the Python renderer uses;
+    a retune of either moves both, and a guard test pins the agreement.
+    """
+    hash_expr = f"x * {texture._HASH_X} + y * {texture._HASH_Y}"
+    return _WATCH_HTML_TEMPLATE.replace("__HASH_EXPR__", hash_expr)
+
+
+WATCH_HTML = _build_watch_html()

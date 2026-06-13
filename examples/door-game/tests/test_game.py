@@ -24,6 +24,7 @@ Negative-test discipline (turn guard and bestow cap):
 
 from __future__ import annotations
 
+import unicodedata
 from pathlib import Path
 
 import pytest
@@ -87,6 +88,29 @@ def test_look_overworld_has_frame(tmp_path: Path, clock: object) -> None:
     assert "@" in out
     assert "┌" in out and "┐" in out
     assert len(out) < 2048
+
+
+def test_overworld_frame_textured_borders_intact(tmp_path: Path, clock: object) -> None:
+    """The textured overworld frame keeps square borders and a single player marker.
+
+    Structural discipline for the v0.6 texture: variants change the GLYPHS but
+    must never change the geometry. The box rows are uniform width, exactly one
+    '@' is painted, and the grass field shows more than one variant in a row
+    (the deterministic stipple, not a flat sheet of '.').
+    """
+    game = _game(tmp_path, clock)
+    game.join("Brandr")
+    frame = game.look("Brandr")
+    lines = frame.split("\n")
+    # Box rows: top border + VIEW_H grid rows + bottom border, all equal width.
+    box = [ln for ln in lines if ln and ln[0] in "┌│└"]
+    widths = {len(ln) for ln in box}
+    assert len(widths) == 1, f"textured frame rows ragged: {widths}"
+    # Exactly one player marker, regardless of the surrounding texture.
+    assert frame.count("@") == 1
+    # The grass texture varies: a body row carries at least two of . , '
+    body = [ln for ln in lines if ln.startswith("│")]
+    assert any(len({ch for ch in ln if ch in ".,'"}) >= 2 for ln in body)
 
 
 def test_look_in_menu_shows_location(tmp_path: Path, clock: object) -> None:
@@ -249,7 +273,7 @@ def test_shared_world_other_player_marker(tmp_path: Path, clock: object) -> None
     brandr = game.players["Brandr"]
     sig.x, sig.y = brandr.x + 1, brandr.y
     out = game.look("Brandr")
-    assert "&" in out  # the other player shows as '&'
+    assert "☻" in out  # the other player shows as '☻'
 
 
 # ---------------------------------------------------------------------------
@@ -460,6 +484,121 @@ def test_join_accepts_max_length_name(tmp_path: Path, clock: object) -> None:
     name = "X" * 24
     game.join(name)
     assert name in game.players
+
+
+# ---------------------------------------------------------------------------
+# Narrow-ledger width rule (the _sanitize one-column clause, v0.6)
+#
+# Names/reasons/mail render inside fixed-width frames and tables, so a glyph
+# that does not fit a single column would shove a column out of true. The
+# sanitizer rejects wide runes and combining marks; a printable-but-wide name
+# gets the dedicated narrow-ledger refusal, not the control-char "runes" line.
+# ---------------------------------------------------------------------------
+
+
+def test_join_rejects_wide_cjk_name(tmp_path: Path, clock: object) -> None:
+    """A CJK ideograph name is refused with the narrow-ledger line; nothing written."""
+    game = _game(tmp_path, clock)
+    out = game.join("龍")
+    assert "columns are narrow" in out
+    assert game.players == {}
+    assert game.events == []
+
+
+def test_join_rejects_emoji_name(tmp_path: Path, clock: object) -> None:
+    """An emoji in a name (🌲x) is wide and refused with the narrow-ledger line."""
+    game = _game(tmp_path, clock)
+    out = game.join("🌲x")
+    assert "columns are narrow" in out
+    assert game.players == {}
+
+
+def test_join_rejects_fullwidth_name(tmp_path: Path, clock: object) -> None:
+    """A fullwidth Latin letter (Ａ) is two columns and refused."""
+    game = _game(tmp_path, clock)
+    out = game.join("Ａ")
+    assert "columns are narrow" in out
+    assert game.players == {}
+
+
+def test_join_rejects_combining_mark_name(tmp_path: Path, clock: object) -> None:
+    """A name with a combining mark (decomposed accent) is refused as wide.
+
+    The name is normalised to NFD so the 'o' carries a separate U+0308
+    combining diaeresis — a zero-width code point that desynchronises the
+    column count. Built explicitly so the source encoding cannot mask it.
+    """
+    game = _game(tmp_path, clock)
+    decomposed = unicodedata.normalize("NFD", "Bj\u00f6rn")
+    assert any(unicodedata.combining(ch) for ch in decomposed)  # genuinely NFD
+    out = game.join(decomposed)
+    assert "columns are narrow" in out
+    assert game.players == {}
+
+
+def test_join_accepts_composed_latin_name(tmp_path: Path, clock: object) -> None:
+    """A precomposed Latin accent (NFC name) is all single-column and accepted."""
+    game = _game(tmp_path, clock)
+    composed = unicodedata.normalize("NFC", "Bj\u00f6rn")
+    game.join(composed)
+    assert composed in game.players
+
+
+def _seed_wide_named_player(db: Path, clock: object, wide_name: str) -> None:
+    """Write a stored adventurer whose name is a now-illegal wide rune.
+
+    Bypasses ``join`` (which would refuse a wide name at creation) by upserting
+    a Player row straight through the Store, so the fixture stands in for a save
+    that predates the narrow-ledger rule. Built by renaming a legitimately-
+    created hero so every other field stays valid.
+    """
+    from dataclasses import replace
+
+    world = load_world(PACK)
+    seed = Store(db)
+    game = Game(world, seed, clock=clock, rng=GameRNG(seed=7))  # type: ignore[arg-type]
+    game.join("Brandr")
+    base = game.players["Brandr"]
+    seed.upsert_player(replace(base, name=wide_name))
+    seed.commit()
+    seed.close()
+
+
+def test_join_resumes_stored_wide_name(tmp_path: Path, clock: object) -> None:
+    """An existing adventurer with a wide-rune name resumes \u2014 identity is never re-gated.
+
+    Resume keys off the exact stored name BEFORE the sanitizer, so a character
+    whose name predates the narrow-ledger rule is welcomed back rather than
+    locked out. This is the resume-by-exact-name invariant.
+    """
+    db = tmp_path / "game.db"
+    wide = "\u9f8d"
+    _seed_wide_named_player(db, clock, wide)
+
+    world = load_world(PACK)
+    game = Game(world, Store(db), clock=clock, rng=GameRNG(seed=7))  # type: ignore[arg-type]
+    out = game.join(wide)
+    assert "Welcome back" in out  # resumed, not refused
+    assert "columns are narrow" not in out
+    assert wide in game.players
+
+
+def test_join_still_refuses_new_wide_name(tmp_path: Path, clock: object) -> None:
+    """Creation is still gated: a NEW wide name with no stored row is refused.
+
+    The resume bypass is exact-name only; a wide name that matches no stored
+    adventurer falls through to the creation gate and gets the narrow-ledger
+    refusal, with nothing written.
+    """
+    db = tmp_path / "game.db"
+    # Seed one wide-named save, then try to CREATE a different wide name.
+    _seed_wide_named_player(db, clock, "\u9f8d")
+
+    world = load_world(PACK)
+    game = Game(world, Store(db), clock=clock, rng=GameRNG(seed=7))  # type: ignore[arg-type]
+    out = game.join("\u7363")  # a different wide rune \u2014 no stored row for it
+    assert "columns are narrow" in out
+    assert "\u7363" not in game.players
 
 
 def test_bestow_rejects_newline_reason_no_persist(tmp_path: Path, clock: object) -> None:

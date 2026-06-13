@@ -118,7 +118,7 @@ http://127.0.0.1:8077/watch
 
 (the host and port follow `UNDERSTONE_HOST` / `UNDERSTONE_PORT`). It is a
 period **CRT spectator console** — a green-and-amber phosphor map of the whole
-world with every adventurer's `@` marker, a live **Understone Herald** feed, the
+world with every adventurer's `☻` marker, a live **Understone Herald** feed, the
 **Hall of Legends**, and a roster of who is currently abroad. It refreshes every
 couple of seconds; if it loses contact it dims and reads `SIGNAL LOST` until the
 server returns.
@@ -130,7 +130,7 @@ keeping with the rest of this easter-egg server (see the safety note below), so
 treat the page as you would the MCP endpoint itself.
 
 > _Screenshot: the Watch console — a phosphor-green overworld map with amber
-> `@` markers, the Herald feed and Hall of Legends down the right-hand rail.
+> `☻` markers, the Herald feed and Hall of Legends down the right-hand rail.
 > (Image placeholder; run the server and open the URL to see it live.)_
 
 When the Watch is up, the `door_join` welcome and the `door_help` manual both
@@ -165,7 +165,9 @@ hardened loader the server uses and either prints a summary ending **"This pack
 is sound. The door stands open."** or fails with one precise line naming the
 file, the row, and the field at fault.
 
-Packs are validated **hard** at load: glyphs may not collide with the frame's
+Packs are validated **hard** at load: every map glyph must render as exactly
+one terminal column (no fullwidth runes, no emoji, no combining marks — the
+frames are box-drawing rectangles) and may not collide with the frame's
 box-drawing lines or the player markers, dimensions and counts are bounded,
 display names are length-checked, and every cross-reference (a legend
 character, a starting item, the boss monster, a dungeon tier) must resolve.
