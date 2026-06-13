@@ -399,6 +399,9 @@ class Pane {
     if (!chunk) return;
     const stripped = stripAnsi(chunk);
     if (!stripped) return;
+    // Capture pin before the chunk grows the stream block — see
+    // announceToolBlock.
+    const stick = this.isNearBottom();
 
     const escapedId = callId ? CSS.escape(callId) : "";
     let el = escapedId
@@ -438,7 +441,7 @@ class Pane {
 
     el.appendChild(document.createTextNode(stripped));
     el.scrollTop = el.scrollHeight;
-    this.scrollToBottom();
+    this.scrollToBottom(stick);
   }
 
   showOutputWarning(evt) {
@@ -2190,6 +2193,13 @@ class Pane {
   announceToolBlock(items) {
     const list = (items || []).filter(Boolean);
     if (!list.length) return;
+    // Re-pin to the bottom only if we were already there — captured BEFORE the
+    // block grows scrollHeight.  A tool batch is a tall one-shot append; if
+    // isNearBottom() were measured after appendChild (as scrollToBottom does on
+    // its own) the freshly-added height would read >80px from the new bottom,
+    // so auto-follow would silently disengage at exactly tool-call time.  Token
+    // streaming stays pinned without this because each append is sub-threshold.
+    const stick = this.isNearBottom();
     // Drop a previous un-consumed announce so shells don't pile up.
     if (this.announcedBlockEl) {
       this.announcedBlockEl.remove();
@@ -2218,7 +2228,7 @@ class Pane {
     });
     this.announcedBlockEl = block;
     this.messagesEl.appendChild(block);
-    this.scrollToBottom();
+    this.scrollToBottom(stick);
     toolAnnounce(_toolAnnounceText(list));
   }
 
@@ -2253,6 +2263,9 @@ class Pane {
   }
 
   showInlineToolBlock(items, autoApproved, judgePending) {
+    // Capture pin before _takeAnnouncedBlock/append change scrollHeight — see
+    // announceToolBlock for why post-append measurement breaks here.
+    const stick = this.isNearBottom();
     // Reuse the early-paint announce shell if it's for this batch (upgrade in
     // place); else build fresh.
     const announced = this._takeAnnouncedBlock(items);
@@ -2330,11 +2343,14 @@ class Pane {
     }
 
     if (!announced) this.messagesEl.appendChild(block);
-    this.scrollToBottom();
+    this.scrollToBottom(stick);
   }
 
   resolveApproval(approved, always, feedback, skipPost) {
     if (!this.approvalBlockEl) return;
+    // Capture pin before the status badge reflows the block — see
+    // announceToolBlock.
+    const stick = this.isNearBottom();
     this.pendingApproval = false;
 
     const actions = this.approvalBlockEl.querySelector(".conv-actions");
@@ -2373,10 +2389,14 @@ class Pane {
       });
     }
 
-    this.scrollToBottom();
+    this.scrollToBottom(stick);
   }
 
   appendToolOutput(callId, name, output, isError) {
+    // Capture pin before the streamEl removal + result insertion change
+    // scrollHeight — see announceToolBlock.  The result block is the other
+    // tall one-shot append in the tool flow (up to 10 lines before collapse).
+    const stick = this.isNearBottom();
     const escapedId = callId ? CSS.escape(callId) : "";
     let target = escapedId
       ? this.messagesEl.querySelector(
@@ -2434,7 +2454,7 @@ class Pane {
       if (media) {
         const embed = buildMediaEmbed(media, stripped);
         target.after(embed);
-        this.scrollToBottom();
+        this.scrollToBottom(stick);
         return;
       }
     }
@@ -2457,7 +2477,7 @@ class Pane {
             this._host.onConsentDetected(s),
           ),
         );
-        this.scrollToBottom();
+        this.scrollToBottom(stick);
         return;
       }
     }
@@ -2479,7 +2499,7 @@ class Pane {
     }
 
     target.after(out);
-    this.scrollToBottom();
+    this.scrollToBottom(stick);
   }
 
   sendMessage() {
