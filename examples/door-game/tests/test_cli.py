@@ -183,6 +183,42 @@ def test_cli_newpack_authoring_md_states_color_advisory_and_spawn_walkable(
     assert "must be on walkable terrain" in manual
 
 
+def test_cli_newpack_authoring_md_color_roles_generated_from_enum(tmp_path: Path) -> None:
+    """AUTHORING.md's colour-role vocabulary is generated from the Color enum.
+
+    The v0.9 fix: the assignable roles were hand-listed (and went stale — road
+    and the per-building roles were missing). They are now generated from
+    ``Color.assignable()`` — the single source for the overlay-vs-assignable
+    split — so the manual lists exactly what the Watch can paint and cannot
+    drift. This asserts the NEW roles appear, that every assignable enum role
+    appears, and that the non-assignable roles (overlays + DEFAULT) are NOT
+    offered as author-assignable.
+    """
+    from understone.screen.palette import Color
+
+    dest = tmp_path / "mypack"
+    cli.cli_newpack(dest, out=StringIO(), err=StringIO())
+    manual = (dest / "AUTHORING.md").read_text(encoding="utf-8")
+
+    # A sampling of the new v0.9 roles is offered in the manual, backticked.
+    for role in ("road", "forest", "lava", "barren", "inn", "shop", "healer"):
+        assert f"`{role}`" in manual, f"new colour role {role!r} missing from manual"
+
+    # EVERY assignable enum role appears (generated, so the full set is present).
+    color_section = manual[manual.index("`color` — a palette role string") :].split("###", 1)[0]
+    for role in Color.assignable():
+        assert f"`{role.value}`" in manual, f"assignable role {role.value!r} missing from manual"
+
+    # The non-assignable roles (runtime overlays + the DEFAULT fallback) are NOT
+    # offered as terrain/location colours.
+    non_assignable = {c for c in Color} - set(Color.assignable())
+    assert Color.DEFAULT in non_assignable  # the fallback is not author-pickable
+    for role in non_assignable:
+        assert f"`{role.value}`" not in color_section, (
+            f"non-assignable role {role.value!r} wrongly offered as author-assignable"
+        )
+
+
 def test_cli_newpack_authoring_md_has_validate_coverage_split(tmp_path: Path) -> None:
     """AUTHORING.md honestly separates machine-enforced rules from eyeball-only.
 

@@ -3,7 +3,7 @@
     "kind": "inn",
     "name": "The Forge-Rest",
     "glyph": "⌂",
-    "color": "town",
+    "color": "inn",
     "actions": ["rest", "gamble", "leave"],
     "flavor": [
       "Heat-bricked walls hold back the ashfall outside.",
@@ -16,7 +16,7 @@
     "kind": "shop",
     "name": "The Slag Market",
     "glyph": "$",
-    "color": "town",
+    "color": "shop",
     "actions": ["buy", "sell", "forge", "leave"],
     "flavor": [
       "Stalls of cooled obsidian and scavenged plate crowd the stone.",
@@ -30,7 +30,7 @@
     "kind": "healer",
     "name": "The Ember Shrine",
     "glyph": "✚",
-    "color": "town",
+    "color": "healer",
     "actions": ["heal", "leave"],
     "flavor": [
       "A still blue pilot-flame burns at the heart of the shrine.",

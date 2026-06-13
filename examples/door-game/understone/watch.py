@@ -380,8 +380,11 @@ _WATCH_HTML_TEMPLATE = """\
     }
   }
 
-  // Palette colour-name -> phosphor-tinted hex. Mirrors understone.screen.palette
-  // Color values; the base map is coloured from this, never from the server.
+  // Palette colour-name -> phosphor-tinted hex. ONE global map, shared by every
+  // world (no per-world or per-theme palettes). Mirrors understone.screen.palette
+  // Color values 1:1 — a guard test asserts every Color role has an entry here,
+  // so a shipped role can never silently fall back to default. The base map is
+  // coloured from this, never from the server.
   var PALETTE = {
     default: "#7dffa0",
     wall: "#5a6b60",
@@ -393,7 +396,16 @@ _WATCH_HTML_TEMPLATE = """\
     water: "#4aa6c8",
     tree: "#3fae6a",
     town: "#ffd089",
-    dungeon: "#c98bff"
+    dungeon: "#c98bff",
+    // v0.9 expanded terrain/location roles, chosen for hue separation:
+    road: "#b89a6a",
+    forest: "#6a9f3f",
+    scrub: "#9c6038",
+    lava: "#ff7a3c",
+    barren: "#9a8b7a",
+    inn: "#ff9d4d",
+    shop: "#ffd24d",
+    healer: "#5fd6b0"
   };
 
   function colorFor(name) {
