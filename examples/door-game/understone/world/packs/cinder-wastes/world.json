@@ -127,6 +127,10 @@
     "forge_base_cost": 60,
     "forge_max_plus": 3,
     "rare_drop_item": "cooling_draught",
+    "forge_ore_item": "slag_iron",
+    "forge_ore_per_plus": 1,
+    "ore_dungeon_drop": 2,
+    "ore_forest_chance": 0.2,
     "watch_theme": "ember"
   }
 }

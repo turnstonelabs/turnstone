@@ -130,10 +130,13 @@ DELVING DEEP (the reasons to come back)
     spawn reset. Play that beat big: the elixir burning down their throat at the
     edge of death. (A sleeping ambush victim never auto-quaffs — they are
     asleep.)
-  * THE FORGE. The shop's forge spends gold to add a +1 edge to the equipped
+  * THE FORGE — GOLD AND ORE. The shop's forge adds a +1 edge to the equipped
     weapon or armour ('forge' target="weapon"/"armour"), up to a cap, each tier
-    dearer than the last — the late-game gold sink. Swapping or selling that
-    piece loses the edge with it.
+    dearer than the last. A step costs gold AND forge ore — a material the hero
+    EARNS in combat, never buys: every cleared dungeon rung drops some, and a won
+    forest fight sometimes turns up a little. So the forge is fed by descending,
+    not just by a fat purse; a hero short of ore is told so. Swapping or selling
+    a forged piece loses the edge with it.
   * RARE BEASTS. A few named beasts prowl the forest, surfacing seldom. Felling
     one is loud — a public Herald flash — and it always guards a draught that
     drops into the satchel (if there is room). Treat a rare kill as a small
@@ -190,6 +193,15 @@ THE SOCIAL LAYER (rivals, mail, and dice)
     is capped per day. A big win is heralded; a quiet one is just a story you
     tell. Remind players the house has no mercy and the odds are even at best.
 
+THE VAULT (banking coin at the inn)
+  The inn keeps a strongbox. DEPOSIT (door_action action="deposit" amount=<gold>)
+  moves coin from the hero's hand into the vault; WITHDRAW (action="withdraw"
+  amount=<gold>) draws it back. Neither costs a turn. Two things make the vault
+  matter: banked gold is SAFE FROM AMBUSH (a sleeping-robber lifts only what the
+  victim carries), so banking before logging off is the way to protect a purse;
+  and banked gold SURVIVES THE WYRM-WIN RESET — it is the one wealth a reborn
+  hero keeps, alongside their ★. Suggest a wary player bank their winnings.
+
 TOOL CHEAT-SHEET
   door_help                      This manual.
   door_join(player)              Sign in (creates or resumes a character).
@@ -198,7 +210,8 @@ TOOL CHEAT-SHEET
   door_move(player, ...)         Walk the overworld (free). steps="NNEE" or
                                  heading="east" + distance=3 (max 8 per call).
   door_action(player, action)    Context verb: fight, flee, ambush (a rival),
-                                 rest, buy, sell, forge (a +1 edge), heal,
+                                 rest, deposit/withdraw (the inn vault), buy,
+                                 sell, forge (a +1 edge, gold + ore), heal,
                                  gamble (dice at the inn), descend (one rung),
                                  challenge (the Wyrm), post (a note), quaff (a
                                  carried potion), leave.
@@ -375,9 +388,12 @@ def door_action(
     robbery in the spirit of the classic door-game player-kill (target=<name>, spends a turn).
     Inside a building: 'rest' (inn), 'buy'/'sell'/'forge' (shop), 'heal'
     (healer), or 'leave'. At the inn you may also 'gamble' a stake of gold at
-    dice (amount=<gold>). Buying a potion now stows it in your satchel rather
-    than drinking it; 'forge' (target="weapon"/"armour", at the shop) spends
-    gold to add a +1 edge to your equipped gear, up to a cap. At the dungeon:
+    dice (amount=<gold>), or bank coin in the vault with 'deposit'/'withdraw'
+    (amount=<gold>) — banked gold is safe from ambush and survives a Wyrm-win
+    reset. Buying a potion now stows it in your satchel rather than drinking it;
+    'forge' (target="weapon"/"armour", at the shop) spends gold AND forge ore
+    (won in the deep) to add a +1 edge to your equipped gear, up to a cap. At
+    the dungeon:
     'descend' ONE rung of the deep — the next guardian past your deepest, one
     per turn — or 'challenge' the Wyrm Below, the endgame boss and the only way
     to win. Descending a rung advances your depth; reaching the floor opens the
@@ -392,13 +408,15 @@ def door_action(
 
     Args:
         player: The adventurer's name.
-        action: The verb to attempt (fight, flee, ambush, rest, buy, sell,
-            forge, heal, gamble, descend, challenge, post, quaff, leave).
+        action: The verb to attempt (fight, flee, ambush, rest, deposit,
+            withdraw, buy, sell, forge, heal, gamble, descend, challenge, post,
+            quaff, leave).
         target: The other player's name for 'ambush'/'post', or the slot
             ("weapon"/"armour") for 'forge'.
         item: For shop 'buy', the item id to purchase.
         text: For 'post', the note left for the target (<= 120 characters).
-        amount: For inn 'gamble', the gold wagered on the dice.
+        amount: For inn 'gamble', the gold wagered on the dice; for the vault
+            'deposit'/'withdraw', the gold moved.
     """
     blank = _guard_name(player)
     if blank is not None:

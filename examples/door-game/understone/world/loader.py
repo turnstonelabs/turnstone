@@ -57,6 +57,11 @@ SETTINGS_BANDS: dict[str, tuple[int, int | None]] = {
     "satchel_max": (1, 10),
     "forge_base_cost": (1, 10000),
     "forge_max_plus": (0, 10),
+    # v0.10 the ore-gated forge: ore per +1 step, and the guaranteed ore drop on
+    # a won dungeon rung. (forge_ore_item is a cross-ref, ore_forest_chance is a
+    # float — both validated below, outside this int-band loop.)
+    "forge_ore_per_plus": (0, 10),
+    "ore_dungeon_drop": (0, 20),
 }
 
 # Per-kind amount bands for the overworld event table (inclusive).
@@ -617,6 +622,8 @@ def _decode_settings(raw: dict[str, Any], items: list[Item], monsters: list[Mons
     dungeon_tiers = _decode_dungeon_tiers(spec, monsters)
     boss_monster = _decode_boss_monster(spec, monsters)
     rare_drop_item = _decode_rare_drop_item(spec, items)
+    forge_ore_item = _decode_forge_ore_item(spec, items)
+    ore_forest_chance = _decode_ore_forest_chance(spec)
     watch_theme = _decode_watch_theme(spec)
 
     return Settings(
@@ -647,6 +654,10 @@ def _decode_settings(raw: dict[str, Any], items: list[Item], monsters: list[Mons
         forge_base_cost=values["forge_base_cost"],
         forge_max_plus=values["forge_max_plus"],
         rare_drop_item=rare_drop_item,
+        forge_ore_item=forge_ore_item,
+        forge_ore_per_plus=values["forge_ore_per_plus"],
+        ore_dungeon_drop=values["ore_dungeon_drop"],
+        ore_forest_chance=ore_forest_chance,
         watch_theme=watch_theme,
     )
 
@@ -692,6 +703,44 @@ def _decode_rare_drop_item(spec: dict[str, Any], items: list[Item]) -> str:
             f"not {item.slot.value!r}"
         )
     return drop_id
+
+
+def _decode_forge_ore_item(spec: dict[str, Any], items: list[Item]) -> str:
+    """Resolve and validate the world's forge ore — the material the forge spends.
+
+    The id must name an item in the pack AND that item must be a ``material``
+    (it is carried in the satchel and spent at the forge, never equipped or
+    quaffed, so a weapon/armour/consumable id would be incoherent). Mirrors the
+    ``rare_drop_item`` check but pins the slot to :attr:`Slot.MATERIAL`.
+    """
+    ore_id = str(_require(spec, "forge_ore_item", "world.json settings"))
+    by_id = {it.item_id: it for it in items}
+    item = by_id.get(ore_id)
+    if item is None:
+        raise WorldLoadError(
+            f"world.json settings.forge_ore_item = {ore_id!r} is not a known item id"
+        )
+    if item.slot is not Slot.MATERIAL:
+        raise WorldLoadError(
+            f"world.json settings.forge_ore_item = {ore_id!r} must be a material item, "
+            f"not {item.slot.value!r}"
+        )
+    return ore_id
+
+
+def _decode_ore_forest_chance(spec: dict[str, Any]) -> float:
+    """Resolve and validate the per-win forest ore chance (a 0.0..1.0 float).
+
+    The chance a won forest fight yields one ore. A float, so it is validated
+    here rather than through the integer :data:`SETTINGS_BANDS` loop, mirroring
+    the ``encounter_rate`` probability check in terrain.
+    """
+    chance = float(_require(spec, "ore_forest_chance", "world.json settings"))
+    if not 0.0 <= chance <= 1.0:
+        raise WorldLoadError(
+            f"world.json settings.ore_forest_chance = {chance} is out of band (0.0..1.0)"
+        )
+    return chance
 
 
 def _decode_watch_theme(spec: dict[str, Any]) -> str:

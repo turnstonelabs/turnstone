@@ -75,5 +75,11 @@
     "slot": "consumable",
     "heal": 70,
     "price": 60
+  },
+  {
+    "id": "iron_ore",
+    "name": "Iron Ore",
+    "slot": "material",
+    "price": 0
   }
 ]

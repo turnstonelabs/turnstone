@@ -75,5 +75,11 @@
     "slot": "consumable",
     "heal": 70,
     "price": 60
+  },
+  {
+    "id": "slag_iron",
+    "name": "Slag-Iron",
+    "slot": "material",
+    "price": 0
   }
 ]

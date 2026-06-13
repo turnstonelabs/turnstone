@@ -24,6 +24,10 @@ class Slot(StrEnum):
     WEAPON = "weapon"
     ARMOR = "armor"
     CONSUMABLE = "consumable"
+    # v0.10 forge ore: a crafting MATERIAL carried in the satchel and spent at
+    # the forge. It is never equipped, never quaffed (no atk/def/heal), and
+    # never sold or bought — ore is earned in combat, not traded.
+    MATERIAL = "material"
 
 
 @dataclass(slots=True)
@@ -63,12 +67,21 @@ class Player:
     gamble_day: int = 0
     # v0.7 "depth below" retention columns: how far the dungeon has been
     # plumbed (0 = never descended; N = cleared rung N, 1-indexed), the
-    # comma-joined carried-potion satchel ('' = empty), and the enhancement
-    # plus on whichever weapon/armour is CURRENTLY equipped in each slot.
+    # carried satchel (see below), and the enhancement plus on whichever
+    # weapon/armour is CURRENTLY equipped in each slot.
     deepest_rung: int = 0
+    # v0.10 STACK-BASED satchel: comma-joined "id:qty" stacks ('' = empty),
+    # e.g. "minor_potion:3,iron_ore:5". ``satchel_max`` caps DISTINCT stacks,
+    # not total items; per-stack qty is unbounded. Replaces the v0.7 flat id
+    # list. The "id:qty" wire format is owned by understone.engine.satchel
+    # (decode_satchel/encode_satchel); every reader goes through that codec.
     satchel: str = ""
     weapon_plus: int = 0
     armor_plus: int = 0
+    # v0.10 the Vault: gold banked at the inn. SAFE from ambush (the steal only
+    # ever touches carried ``gold``) and SURVIVES the Wyrm-win legacy reset (a
+    # small persistent reward across runs, like a win ★).
+    banked: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -204,6 +217,15 @@ class Settings:
     forge_base_cost: int
     forge_max_plus: int
     rare_drop_item: str
+    # v0.10 the ore-gated forge: the world's forge MATERIAL item id (validated
+    # to slot=material), the ore each +1 step costs (need = (plus + 1) *
+    # per_plus), and the two ore sources — a guaranteed drop on a won dungeon
+    # rung and a chance of one ore on a won forest fight. Ore is combat-earned,
+    # never purchasable; the forge spends gold AND ore.
+    forge_ore_item: str
+    forge_ore_per_plus: int
+    ore_dungeon_drop: int
+    ore_forest_chance: float
     # v0.8 "worlds without authors": the Watch's per-world CRT palette. One of
     # the names in WATCH_THEMES; defaults to "phosphor" (the original green), so
     # a pack that omits it looks exactly as the Vale always has.

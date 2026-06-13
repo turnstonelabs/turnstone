@@ -31,6 +31,7 @@ from typing import TYPE_CHECKING, TextIO
 from understone.engine import turns
 from understone.engine.models import Item, Mode, Monster, Player, Slot
 from understone.engine.rng import GameRNG
+from understone.engine.satchel import decode_satchel
 from understone.game import Game
 from understone.persistence import Store
 from understone.world.loader import load_world
@@ -249,12 +250,19 @@ class _Bot:
         return self._errand("shop", "buy", item=target.item_id)
 
     def _stock_satchel(self) -> bool:
-        """Top the satchel up with the strongest affordable potion, if flush."""
+        """Top the satchel up with the strongest affordable potion, if flush.
+
+        Counts POTIONS carried (across consumable stacks), not distinct stacks:
+        the bot wants a small reserve of draughts for the death-save, and since
+        v0.10 potions of one kind stack, the cap is read as "carry up to
+        ``satchel_max`` draughts" — which also bounds the buy loop (buying the
+        same potion bumps one stack, so a stack-count gate would never fill).
+        Ore the bot wins in the deep shares the bag but is not a draught, so it
+        never blocks topping up potions here.
+        """
         if not self._shop_offers("buy"):
             return False
-        player = self._player()
-        carried = [c for c in player.satchel.split(",") if c]
-        if len(carried) >= self.world.settings.satchel_max:
+        if self._potions_carried() >= self.world.settings.satchel_max:
             return False
         potion = self._best_affordable_potion()
         if potion is None:
@@ -262,11 +270,14 @@ class _Bot:
         return self._errand("shop", "buy", item=potion.item_id)
 
     def _forge_edge(self) -> bool:
-        """Forge a +1 edge on weapon then armour when gold is plentiful.
+        """Forge a +1 edge on weapon then armour when gold AND ore are plentiful.
 
         Only fires once the bot is genuinely flush (a forge is the late-game
-        gold sink), and only when its gear is already the best the shop sells,
-        so it never forges a blade it is about to replace.
+        gold sink), only when its gear is already the best the shop sells (so it
+        never forges a blade it is about to replace), and only when it actually
+        holds the ORE the +1 step costs — ore is won in the deep, so the bot
+        forges as the deep feeds it, exactly as real play does. Without the ore
+        for a step it skips it rather than spinning on a forge it cannot pay.
         """
         if not self._shop_offers("forge"):
             return False
@@ -274,6 +285,7 @@ class _Bot:
         player = self._player()
         if not self._gear_is_best():
             return False
+        ore_have = self._satchel_qty(settings.forge_ore_item)
         for current, slot_arg in (
             (player.weapon_plus, "weapon"),
             (player.armor_plus, "armour"),
@@ -281,7 +293,8 @@ class _Bot:
             if current >= settings.forge_max_plus:
                 continue
             cost = settings.forge_base_cost * (current + 1)
-            if not self._can_afford(cost):
+            ore_need = (current + 1) * settings.forge_ore_per_plus
+            if not self._can_afford(cost) or ore_have < ore_need:
                 continue
             return self._errand("shop", "forge", target=slot_arg)
         return False
@@ -650,7 +663,7 @@ class _Bot:
         player = self._player()
         turn_actions = self.fights_fought + self.descents + self.challenges
         fight_share = self.fights_fought / turn_actions if turn_actions else 0.0
-        satchel = tuple(c for c in player.satchel.split(",") if c)
+        satchel = tuple(f"{item_id}×{qty}" for item_id, qty in self._satchel_stacks(player.satchel))
         return BalanceReport(
             days=days,
             seed=seed,
@@ -675,6 +688,34 @@ class _Bot:
 
     def _player(self) -> Player:
         return self.game.players[self.name]
+
+    @staticmethod
+    def _satchel_stacks(satchel: str) -> list[tuple[str, int]]:
+        """Decode the player's ``"id:qty"`` satchel into ``(id, qty)`` stacks.
+
+        Delegates to the shared
+        :func:`~understone.engine.satchel.decode_satchel` codec, so the bot
+        reasons about its own bag (potion reserve, ore on hand) over the same
+        parse the game façade uses — without reaching into private façade helpers.
+        """
+        return decode_satchel(satchel)
+
+    def _satchel_qty(self, item_id: str) -> int:
+        """Return how many of *item_id* the bot carries (0 if none)."""
+        return sum(
+            qty
+            for stack_id, qty in self._satchel_stacks(self._player().satchel)
+            if stack_id == item_id
+        )
+
+    def _potions_carried(self) -> int:
+        """Return the total number of consumable draughts in the satchel."""
+        total = 0
+        for item_id, qty in self._satchel_stacks(self._player().satchel):
+            item = self.world.item_by_id(item_id)
+            if item is not None and item.slot is Slot.CONSUMABLE:
+                total += qty
+        return total
 
     def _turns_left(self) -> int:
         return self._player().turns_left

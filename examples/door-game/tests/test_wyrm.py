@@ -20,7 +20,12 @@ from pathlib import Path
 
 import pytest
 
-from tests.conftest import fixed_clock, utc
+from tests.conftest import (
+    fixed_clock,
+    satchel_ids,
+    set_satchel,
+    utc,
+)
 from understone.engine.models import Mode
 from understone.engine.rng import GameRNG
 from understone.game import Game
@@ -28,6 +33,11 @@ from understone.persistence import Store
 from understone.world.loader import load_world
 
 PACK = Path(__file__).resolve().parents[1] / "understone" / "world" / "data"
+
+# Module-local aliases for the shared satchel helpers, keeping the existing
+# call sites (_set_satchel / _satchel_ids) unchanged.
+_set_satchel = set_satchel
+_satchel_ids = satchel_ids
 
 
 @pytest.fixture
@@ -39,6 +49,10 @@ def _game(tmp_path: Path, clock: object, seed: int = 7) -> Game:
     world = load_world(PACK)
     store = Store(tmp_path / "game.db")
     return Game(world, store, clock=clock, rng=GameRNG(seed=seed))  # type: ignore[arg-type]
+
+
+# The flat-id-list satchel helpers (_set_satchel / _satchel_ids) live in
+# tests/conftest.py now, shared with the descend suite; they are imported above.
 
 
 def _at_dungeon(game: Game, name: str) -> object:
@@ -217,6 +231,42 @@ def test_challenge_win_resets_with_legacy(tmp_path: Path, clock: object) -> None
     assert player.bestow_spent == 7
 
 
+def test_challenge_win_legacy_reset_spares_the_vault(tmp_path: Path, clock: object) -> None:
+    """The vault SURVIVES a Wyrm-win rebirth; carried gold resets to starting.
+
+    Banked gold is the one wealth (besides the ★) a legacy reset does not clear:
+    the strongbox is the inn's, not the reborn hero's. This deposits gold into
+    the vault through the inn, drives a Wyrm WIN, and asserts ``banked`` is
+    UNCHANGED while ``gold`` drops back to ``starting_gold``.
+
+    Negative-check (the revert-and-observe-failure discipline of this module):
+    the implementer temporarily added ``player.banked = 0`` to
+    Game._reset_with_legacy; this test then FAILED on the unchanged-``banked``
+    assertion (the vault was wiped by the rebirth). The line was restored, so
+    this test is the standing regression that the vault outlives the reset.
+    """
+    game = _game(tmp_path, clock)
+    game.join("Brak")
+    player = game.players["Brak"]
+    # Bank some gold through the real inn path, then stand at the dungeon floor.
+    player.gold = 200
+    player.mode = Mode.MENU
+    player.at_location = "inn"
+    game.action("Brak", "deposit", "", "", amount=120)
+    assert player.banked == 120 and player.gold == 80  # vault holds; hand drained
+
+    player = _at_dungeon(game, "Brak")
+    player.level = game.world.settings.wyrm_min_level
+    player.atk, player.def_, player.hp, player.max_hp = 500, 100, 500, 500
+
+    out = game.action("Brak", "challenge", "", "")
+
+    assert "freed the vale" in out.lower()  # a genuine win drove the reset
+    assert player.wins == 1
+    assert player.banked == 120  # the vault is untouched by the rebirth
+    assert player.gold == game.world.settings.starting_gold  # carried wealth resets
+
+
 def test_challenge_win_star_in_rank_and_hall(tmp_path: Path, clock: object) -> None:
     """After a win, door_rank shows the ★ and renders the Hall of Legends."""
     game = _game(tmp_path, clock)
@@ -304,7 +354,7 @@ def test_challenge_loss_with_potion_survives_no_legacy_reset(tmp_path: Path, clo
     player = _doomed_wyrm_challenger(game, "Brak")
     potion = game.world.item_by_id("greater_potion")
     assert potion is not None
-    game._satchel_set(player, ["greater_potion"])
+    _set_satchel(game, player, ["greater_potion"])
     floor = len(game.world.settings.dungeon_tiers)
     spawn = game.world.spawn
     before_turns = player.turns_left
@@ -317,7 +367,7 @@ def test_challenge_loss_with_potion_survives_no_legacy_reset(tmp_path: Path, clo
     assert player.hp == min(player.max_hp, potion.heal)
     assert (player.x, player.y) != spawn  # NOT bounced to the spawn
     assert player.mode is Mode.MENU  # still standing at the dungeon
-    assert game._satchel_list(player) == []  # the draught was spent
+    assert _satchel_ids(game, player) == []  # the draught was spent
     assert "death's edge" in out.lower()  # the spliced survival line
     assert player.turns_left == before_turns - 1  # the challenge still cost a turn
     # No win, so NO legacy reset: level, gold, and depth all stand.
@@ -349,7 +399,7 @@ def test_challenge_loss_potion_negative_without_save_devours(
     game = _game(tmp_path, clock)
     game.join("Brak")
     player = _doomed_wyrm_challenger(game, "Brak")
-    game._satchel_set(player, ["greater_potion"])
+    _set_satchel(game, player, ["greater_potion"])
     floor = len(game.world.settings.dungeon_tiers)
     spawn = game.world.spawn
 
@@ -360,7 +410,7 @@ def test_challenge_loss_potion_negative_without_save_devours(
     assert (player.x, player.y) == spawn
     assert player.mode is Mode.TILE
     assert player.deepest_rung == floor  # a defeat keeps depth (no reset, no advance)
-    assert game._satchel_list(player) == ["greater_potion"]  # the draught is UNSPENT
+    assert _satchel_ids(game, player) == ["greater_potion"]  # the draught is UNSPENT
     assert "death's edge" not in out.lower()  # no save, no dramatic line
     assert game.events[-1].kind == "wyrm_lose"  # the devouring beat, not the survival one
 

@@ -264,6 +264,47 @@ def test_state_payload_includes_joined_player(tmp_path: Path, clock: object) -> 
     assert brandr["hp"] == brandr["max_hp"]
     assert brandr["mode"] == "tile"
     assert (brandr["x"], brandr["y"]) == game.world.spawn
+    # v0.10: a fresh hero shows their starting gold on hand, nothing banked, and
+    # an empty satchel.
+    assert brandr["gold"] == game.world.settings.starting_gold
+    assert brandr["banked"] == 0
+    assert brandr["satchel"] == []
+
+
+def test_state_payload_surfaces_gold_banked_and_satchel(tmp_path: Path, clock: object) -> None:
+    """A joined hero with a stocked satchel and banked gold shows the right values.
+
+    The lobby TV surfaces the whole shared world, so each player's purse (gold
+    on hand + vault) and satchel stacks (name + qty, resolved via the pack) ride
+    the state payload.
+    """
+    game = _game(tmp_path, clock)
+    game.join("Brandr")
+    player = game.players["Brandr"]
+    player.gold = 120
+    player.banked = 300
+    game._satchel_set_stacks(player, [("iron_ore", 5), ("minor_potion", 2)])
+
+    payload = watch.build_state_payload(game)
+    brandr = next(p for p in payload["players"] if p["name"] == "Brandr")  # type: ignore[union-attr]
+    assert brandr["gold"] == 120
+    assert brandr["banked"] == 300
+    # Stacks resolve their display name from the pack, preserving stow order.
+    assert brandr["satchel"] == [
+        {"name": "Iron Ore", "qty": 5},
+        {"name": "Minor Potion", "qty": 2},
+    ]
+
+
+def test_state_payload_satchel_unknown_id_falls_back_to_raw(tmp_path: Path, clock: object) -> None:
+    """A satchel id no longer in the pack falls back to the raw id, never blank."""
+    game = _game(tmp_path, clock)
+    game.join("Brandr")
+    game.players["Brandr"].satchel = "ghost_item:2"  # not in the pack
+
+    payload = watch.build_state_payload(game)
+    brandr = next(p for p in payload["players"] if p["name"] == "Brandr")  # type: ignore[union-attr]
+    assert brandr["satchel"] == [{"name": "ghost_item", "qty": 2}]
 
 
 def test_state_payload_reports_all_players_including_menu(tmp_path: Path, clock: object) -> None:
@@ -471,6 +512,19 @@ def test_watch_html_variants_match_texture_table() -> None:
 def test_watch_html_uses_other_player_marker() -> None:
     """Players on the lobby TV wear the ☻ marker (escaped) — no bare '@' marker paint."""
     assert "\\u263b" in watch.WATCH_HTML
+
+
+def test_watch_html_renders_gold_banked_and_satchel() -> None:
+    """The Adventurers panel JS references each player's gold, vault, and satchel."""
+    html = watch.WATCH_HTML
+    # The roster sub-lines read these state fields by name.
+    assert "p.gold" in html
+    assert "p.banked" in html
+    assert "p.satchel" in html
+    # The satchel line has a dedicated renderer with an empty-bag note.
+    assert "satchelText" in html
+    assert "satchel empty" in html
+    assert "vault" in html
 
 
 def test_watch_html_has_day_phase_machinery() -> None:

@@ -45,9 +45,13 @@ A run is a little RPG loop, played a bit each day:
   depth or bounces you home (your depth persists either way). Carry a few
   **potions in your satchel** — `quaff` the strongest when you choose, and if a
   fight would kill you the satchel saves you automatically, the elixir burning
-  down your throat at death's edge. Spend gold at the shop's **forge** to add a
-  +1 edge to your gear, and watch for the **rare beasts** that prowl the forest:
-  felling one is Herald news and always drops a draught.
+  down your throat at death's edge. Clearing a rung also yields **forge ore**,
+  which rides the satchel (a won forest fight sometimes turns up a little, too).
+- **Forge an edge — with gold AND ore.** At the shop's **forge** you can add a
+  +1 edge to your equipped weapon or armour, up to a cap, each step dearer than
+  the last. A step costs gold *and* the ore you won in the deep — so the forge is
+  fed by descending, not just by a fat purse. Watch, too, for the **rare beasts**
+  that prowl the forest: felling one is Herald news and always drops a draught.
 - **Win the game** by slaying **the Wyrm Below**. Once your hero is seasoned
   enough AND has plumbed the deep to its floor, `challenge` it at the dungeon. A
   victory frees the Vale, carves your run into the **Hall of Legends**, and — in
@@ -65,6 +69,10 @@ A run is a little RPG loop, played a bit each day:
   feed. `post` a private note another player reads on their next visit (it
   never reaches the public Herald). Or `gamble` a little gold at the inn's dice
   against the house. Ambush spends a turn; mail and dice do not.
+- **Bank your coin.** The inn keeps a strongbox: `deposit` gold into the
+  **vault** and `withdraw` it later (no turn either way). Banked gold is **safe
+  from ambush** — a sleeping-robber only ever lifts what you carry — and it is
+  the one thing that **survives a Wyrm-win reset**, carrying wealth across runs.
 
 ## Installation
 
@@ -254,7 +262,7 @@ url = "http://localhost:8077/mcp"
 | `door_status` | The character sheet (read-only). |
 | `door_look` | Redraw the current view — overworld map or location menu. |
 | `door_move` | Walk the overworld (free; no daily turn spent). |
-| `door_action` | Context verbs: fight, flee, ambush (a rival), rest, buy, sell, forge (a +1 edge), heal, gamble (inn dice), descend (one rung), challenge (the Wyrm), post (mail another player), quaff (a carried potion), leave. |
+| `door_action` | Context verbs: fight, flee, ambush (a rival), rest, deposit/withdraw (the inn vault), buy, sell, forge (a +1 edge, gold + ore), heal, gamble (inn dice), descend (one rung), challenge (the Wyrm), post (mail another player), quaff (a carried potion), leave. |
 | `door_log` | The Understone Herald — the shared feed of notable deeds. |
 | `door_rank` | The leaderboard, plus the Hall of Legends (★ marks Wyrm kills). |
 | `door_bestow` | Game-master grant of a little gold/healing for a story beat. |

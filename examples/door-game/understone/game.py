@@ -20,6 +20,7 @@ from understone.engine.log import Event, since_visible
 from understone.engine.models import Mode, Monster, Player, Slot
 from understone.engine.rank import HallEntry, RankEntry, leaderboard
 from understone.engine.rng import GameRNG
+from understone.engine.satchel import decode_satchel, encode_satchel
 from understone.engine.textwidth import is_grid_safe
 from understone.persistence import EVENT_TAIL_KEEP
 from understone.screen.grid import Cell, CellGrid
@@ -206,45 +207,70 @@ class Game:
             return None
         return cleaned
 
-    # -- the satchel: a tiny carried-potion bag (v0.7) -------------------
+    # -- the satchel: a stack-based carried bag (v0.7 potions, v0.10 stacks) ---
 
     @staticmethod
-    def _satchel_list(player: Player) -> list[str]:
-        """Return the carried potion ids as a list ('' stored = empty bag)."""
-        return [item_id for item_id in player.satchel.split(",") if item_id]
+    def _satchel_stacks(player: Player) -> list[tuple[str, int]]:
+        """Return the carried satchel as ordered ``(item_id, qty)`` stacks.
+
+        The game-side façade over :func:`~understone.engine.satchel.decode_satchel`:
+        the codec owns the ``"id:qty"`` wire shape ('' stored = empty bag, order
+        preserved, malformed/zero-qty fragments skipped); the rest of the façade
+        calls this helper by its established name.
+        """
+        return decode_satchel(player.satchel)
 
     @staticmethod
-    def _satchel_set(player: Player, ids: list[str]) -> None:
-        """Store *ids* back onto the player as the comma-joined satchel."""
-        player.satchel = ",".join(ids)
+    def _satchel_set_stacks(player: Player, stacks: list[tuple[str, int]]) -> None:
+        """Store *stacks* back as the comma-joined ``id:qty`` satchel.
 
-    def _strongest_potion(self, ids: list[str]) -> tuple[int, Item] | None:
-        """Return the (index, item) of the highest-heal potion in *ids*, or None.
+        Delegates to :func:`~understone.engine.satchel.encode_satchel`, which
+        drops any qty <= 0 (the single home for the drop-at-empty rule), so
+        callers may decrement freely and let the empty stack fall away.
+        """
+        player.satchel = encode_satchel(stacks)
 
-        Resolves each carried id against the pack and picks the one with the
-        greatest ``heal``; ties keep the earliest. A satchel holding only
-        unknown ids (a pack edited out from under a save) yields ``None``.
+    def _satchel_distinct(self, player: Player) -> int:
+        """Return how many DISTINCT item stacks the satchel currently holds."""
+        return len(self._satchel_stacks(player))
+
+    def _satchel_find(self, player: Player, item_id: str) -> tuple[int, int] | None:
+        """Return the ``(stack index, qty)`` of *item_id*, or ``None`` if absent."""
+        for index, (existing_id, qty) in enumerate(self._satchel_stacks(player)):
+            if existing_id == item_id:
+                return index, qty
+        return None
+
+    def _strongest_potion(self, stacks: list[tuple[str, int]]) -> tuple[int, Item] | None:
+        """Return the (stack index, item) of the highest-heal POTION, or None.
+
+        Resolves each stack's id against the pack and picks the consumable with
+        the greatest ``heal``; ties keep the earliest stack. Non-consumable
+        stacks (ore and other materials) and unknown ids are ignored, so a bag
+        of nothing but ore — or one edited out from under a save — yields
+        ``None``. The index returned is the stack's position, for decrementing.
         """
         best: tuple[int, Item] | None = None
-        for index, item_id in enumerate(ids):
+        for index, (item_id, _qty) in enumerate(stacks):
             item = self.world.item_by_id(item_id)
-            if item is None:
+            if item is None or item.slot is not Slot.CONSUMABLE:
                 continue
             if best is None or item.heal > best[1].heal:
                 best = (index, item)
         return best
 
     def _satchel_blurb(self, player: Player) -> str:
-        """Render the satchel as a status line: contents or an empty note."""
-        ids = self._satchel_list(player)
-        if not ids:
+        """Render the satchel as a status line: ``Name ×qty`` stacks or empty."""
+        stacks = self._satchel_stacks(player)
+        if not stacks:
             return "Satchel: empty"
-        names = []
-        for item_id in ids:
+        parts = []
+        for item_id, qty in stacks:
             item = self.world.item_by_id(item_id)
-            names.append(item.name if item is not None else item_id)
+            name = item.name if item is not None else item_id
+            parts.append(f"{name} ×{qty}")
         cap = self.world.settings.satchel_max
-        return f"Satchel ({len(ids)}/{cap}): " + ", ".join(names)
+        return f"Satchel ({len(stacks)}/{cap}): " + ", ".join(parts)
 
     def _footer(self, player: Player) -> str:
         nxt = leveling.xp_for_level(player.level + 1, self.world.settings)
@@ -505,7 +531,8 @@ class Game:
             f"HP {player.hp}/{player.max_hp}   ATK {player.atk}   DEF {player.def_}",
             f"Weapon: {_with_plus(weapon_name, player.weapon_plus)}",
             f"Armor:  {_with_plus(armor_name, player.armor_plus)}",
-            f"Gold {player.gold}   Turns {player.turns_left}/{self.world.settings.daily_turns}",
+            f"Gold: {player.gold} on hand, {player.banked} in the vault",
+            f"Turns {player.turns_left}/{self.world.settings.daily_turns}",
             f"Deep: rung {player.deepest_rung}/{rungs}",
             self._satchel_blurb(player),
         ]
@@ -716,30 +743,49 @@ class Game:
         This lives entirely in the façade: ``combat`` only reports the outcome,
         and the satchel + the survival are decided here.
         """
-        ids = self._satchel_list(player)
-        best = self._strongest_potion(ids)
+        stacks = self._satchel_stacks(player)
+        best = self._strongest_potion(stacks)
         if best is None:
             return False
         index, potion = best
-        del ids[index]
-        self._satchel_set(player, ids)
+        self._satchel_spend(player, index)
         player.hp = min(player.max_hp, potion.heal)
         lines.append(self._DEATH_SAVE_LINE)
         return True
 
-    def _satchel_try_add(self, player: Player, item_id: str) -> bool:
-        """Drop *item_id* into the satchel if there is room; return success.
+    def _satchel_try_add(self, player: Player, item_id: str, qty: int = 1) -> bool:
+        """Add *qty* of *item_id* into the satchel if there is room; return success.
 
-        Returns ``False`` (without mutation) when the bag is already at
-        ``satchel_max``. The single chokepoint for adding to the satchel, so
-        the cap is enforced in exactly one place.
+        Stack-aware (v0.10): if a stack of *item_id* already exists its qty is
+        bumped (this ALWAYS fits — per-stack qty is unbounded). Otherwise a new
+        stack is appended only while the DISTINCT-stack count is below
+        ``satchel_max``; a full bag refuses without mutation and returns
+        ``False``. The single chokepoint for adding to the satchel, so the
+        distinct-stack cap lives in exactly one place. *qty* must be >= 1.
         """
-        ids = self._satchel_list(player)
-        if len(ids) >= self.world.settings.satchel_max:
+        stacks = self._satchel_stacks(player)
+        for index, (existing_id, existing_qty) in enumerate(stacks):
+            if existing_id == item_id:
+                stacks[index] = (existing_id, existing_qty + qty)
+                self._satchel_set_stacks(player, stacks)
+                return True
+        if len(stacks) >= self.world.settings.satchel_max:
             return False
-        ids.append(item_id)
-        self._satchel_set(player, ids)
+        stacks.append((item_id, qty))
+        self._satchel_set_stacks(player, stacks)
         return True
+
+    def _satchel_spend(self, player: Player, index: int, qty: int = 1) -> None:
+        """Decrement the stack at *index* by *qty*, dropping it when it empties.
+
+        The single home for taking from a stack: used by quaff, the death-save,
+        and the forge (ore). The empty-stack drop is handled by
+        :meth:`_satchel_set_stacks`, so a spent-to-zero stack falls away.
+        """
+        stacks = self._satchel_stacks(player)
+        item_id, have = stacks[index]
+        stacks[index] = (item_id, have - qty)
+        self._satchel_set_stacks(player, stacks)
 
     def _apply_rare_kill(
         self, player: Player, monster: Monster, lines: list[str]
@@ -758,6 +804,26 @@ class Game:
             lines.append("It guarded a draught — but your satchel had no room.")
         return [self._herald("rare_kill", player.name, monster=monster.name)]
 
+    def _grant_ore(self, player: Player, qty: int, lines: list[str]) -> None:
+        """Drop *qty* forge ore into the satchel on a won fight, narrating it.
+
+        The ore goes through the same stack-add chokepoint as every other
+        satchel add, so it bumps an existing ore stack (always fits) or opens a
+        new stack while a distinct slot is free. When the bag can hold no ore
+        (no ore stack AND the distinct-stack cap is full), the ore is simply
+        DROPPED with a "no room" note — never an error, and never a turn lost.
+        A non-positive *qty* (a pack tuned to 0, or an unlucky 0 forest roll) is
+        a no-op, so no empty "you find ore" line is spliced in.
+        """
+        if qty <= 0:
+            return
+        ore = self.world.item_by_id(self.world.settings.forge_ore_item)
+        ore_name = ore.name if ore is not None else self.world.settings.forge_ore_item
+        if self._satchel_try_add(player, self.world.settings.forge_ore_item, qty):
+            lines.append(f"You pry {qty} {ore_name} from the wreck and pocket it.")
+        else:
+            lines.append(f"You spy {ore_name} in the wreck, but you've no room to pocket the ore.")
+
     def _apply_fight(
         self, player: Player, result: combat.FightResult, monster: Monster | None = None
     ) -> str:
@@ -769,6 +835,10 @@ class Game:
             self._append_kill_and_reward(lines, result)
             player.gold += result.gold_delta
             events.extend(self._apply_xp_with_herald(player, result.xp_delta, lines))
+            # A forest kill sometimes turns up forge ore (the deep is the surer
+            # source; here it is an occasional bonus on a won bout).
+            if self.rng.chance(self.world.settings.ore_forest_chance):
+                self._grant_ore(player, 1, lines)
             if monster is not None and monster.rare:
                 events.extend(self._apply_rare_kill(player, monster, lines))
 
@@ -918,6 +988,10 @@ class Game:
             return self._leave(player)
         if verb == "rest":
             return self._rest(player)
+        if verb == "deposit":
+            return self._deposit(player, amount)
+        if verb == "withdraw":
+            return self._withdraw(player, amount)
         if verb == "heal":
             return self._heal(player)
         if verb == "buy":
@@ -950,6 +1024,57 @@ class Game:
             )
         return self._location_menu(
             player, lines=[f"You can't afford the {cost}-gold bed. (You have {player.gold}.)"]
+        )
+
+    # -- the Vault: bank gold at the inn (safe from ambush) --------------
+
+    def _deposit(self, player: Player, amount: int) -> str:
+        """Move *amount* gold from the hand into the inn strongbox (no turn).
+
+        Banked gold is SAFE from ambush and survives the Wyrm-win legacy reset.
+        Refuses without mutation when there is nothing to bank or the amount
+        exceeds the carried gold; both refusals are friendly and in-fiction.
+        """
+        if player.gold <= 0:
+            return self._location_menu(player, lines=["You've no coin in hand to bank."])
+        if amount < 1 or amount > player.gold:
+            return self._location_menu(
+                player,
+                lines=[f"Name an amount from 1 to {player.gold} to set aside."],
+            )
+        player.gold -= amount
+        player.banked += amount
+        self._persist(player)
+        return self._location_menu(
+            player,
+            lines=[
+                f"The innkeep counts your coin into the strongbox. "
+                f"({amount} banked; {player.banked} in the vault, {player.gold} in hand.)"
+            ],
+        )
+
+    def _withdraw(self, player: Player, amount: int) -> str:
+        """Move *amount* gold from the inn strongbox back into the hand (no turn).
+
+        Refuses without mutation when the vault is empty or the amount exceeds
+        what is banked; both refusals are friendly and in-fiction.
+        """
+        if player.banked <= 0:
+            return self._location_menu(player, lines=["Your vault stands empty."])
+        if amount < 1 or amount > player.banked:
+            return self._location_menu(
+                player,
+                lines=[f"You may draw 1 to {player.banked} gold from the vault."],
+            )
+        player.banked -= amount
+        player.gold += amount
+        self._persist(player)
+        return self._location_menu(
+            player,
+            lines=[
+                f"The innkeep counts coin from the strongbox into your hand. "
+                f"({amount} drawn; {player.gold} in hand, {player.banked} in the vault.)"
+            ],
         )
 
     def _heal(self, player: Player) -> str:
@@ -1148,10 +1273,10 @@ class Game:
         too, so a draught is never wasted. Renders on the player's current
         surface (map or menu), like ``post``.
         """
-        ids = self._satchel_list(player)
-        best = self._strongest_potion(ids)
+        stacks = self._satchel_stacks(player)
+        best = self._strongest_potion(stacks)
         if best is None:
-            return self._surface(player, lines=["Your satchel is empty."])
+            return self._surface(player, lines=["Your satchel holds no draught to quaff."])
         if player.hp >= player.max_hp:
             return self._surface(
                 player,
@@ -1160,8 +1285,7 @@ class Game:
         index, potion = best
         before = player.hp
         player.hp = min(player.max_hp, player.hp + potion.heal)
-        del ids[index]
-        self._satchel_set(player, ids)
+        self._satchel_spend(player, index)
         self._persist(player)
         return self._surface(
             player,
@@ -1171,14 +1295,17 @@ class Game:
     # -- forge: spend gold to enhance the equipped weapon or armour ------
 
     def _forge(self, player: Player, target: str) -> str:
-        """Enhance the equipped weapon or armour by +1, the late-game gold sink.
+        """Enhance the equipped weapon or armour by +1 — the late-game gold+ore sink.
 
-        ``target`` is "weapon" or "armour"/"armor". Cost is
-        ``forge_base_cost * (current_plus + 1)``, so each tier costs more; the
-        plus is capped at ``forge_max_plus``. On success the gold is deducted,
+        ``target`` is "weapon" or "armour"/"armor". A +1 step costs
+        ``forge_base_cost * (current_plus + 1)`` GOLD *and*
+        ``(current_plus + 1) * forge_ore_per_plus`` of the world's forge ore
+        (carried in the satchel, won in the deep). The plus is capped at
+        ``forge_max_plus``. On success BOTH the gold and the ore are deducted,
         the slot's plus rises, and the LIVE stat rises with it (weapon→atk,
-        armour→def). An unaffordable or capped forge refuses without mutation;
-        a missing/invalid target asks which slot.
+        armour→def). A forge short of gold or ore refuses without mutation,
+        naming both requirements; a capped slot refuses; a missing/invalid
+        target asks which slot.
         """
         slot = target.strip().lower()
         if slot == "weapon":
@@ -1199,25 +1326,34 @@ class Game:
         label: str,
         apply: Callable[[Player], None],
     ) -> str:
-        """Shared forge accounting for one slot: cap, cost, deduct, apply."""
+        """Shared forge accounting for one slot: cap, gold+ore cost, deduct, apply."""
         settings = self.world.settings
         if current >= settings.forge_max_plus:
             return self._location_menu(player, lines=[f"Your {label} can take no finer edge."])
         cost = settings.forge_base_cost * (current + 1)
-        if player.gold < cost:
+        ore_need = (current + 1) * settings.forge_ore_per_plus
+        ore = self.world.item_by_id(settings.forge_ore_item)
+        ore_name = ore.name if ore is not None else settings.forge_ore_item
+        found = self._satchel_find(player, settings.forge_ore_item)
+        ore_have = found[1] if found is not None else 0
+        if player.gold < cost or ore_have < ore_need:
             return self._location_menu(
                 player,
                 lines=[
-                    f"The smith wants {cost} gold to better your {label}; you hold {player.gold}."
+                    f"The smith wants {cost} gold and {ore_need} {ore_name} to better your "
+                    f"{label} — you hold {player.gold} gold and {ore_have} {ore_name}."
                 ],
             )
         player.gold -= cost
+        if ore_need > 0 and found is not None:
+            self._satchel_spend(player, found[0], ore_need)
         apply(player)
         self._persist(player)
         new_plus = player.weapon_plus if label == "weapon" else player.armor_plus
+        ore_note = f", -{ore_need} {ore_name}" if ore_need > 0 else ""
         return self._location_menu(
             player,
-            lines=[f"The smith works your {label} to +{new_plus}. (-{cost} gold)"],
+            lines=[f"The smith works your {label} to +{new_plus}. (-{cost} gold{ore_note})"],
         )
 
     @staticmethod
@@ -1350,6 +1486,9 @@ class Game:
             self._append_kill_and_reward(lines, result)
             player.gold += result.gold_delta
             events.extend(self._apply_xp_with_herald(player, result.xp_delta, lines))
+            # The deep is the reliable ore source: a cleared rung always yields
+            # forge ore (the forge gate is built to be fed by descending).
+            self._grant_ore(player, self.world.settings.ore_dungeon_drop, lines)
             player.deepest_rung = next_rung + 1
             lines.append("")
             if player.deepest_rung >= floor:
@@ -1490,13 +1629,16 @@ class Game:
     def _reset_with_legacy(self, player: Player) -> None:
         """Reincarnate *player* to fresh-start values, banking the win as legend.
 
-        Stats, equipment, HP, gold, level/xp and position all return to the
-        first-day baseline and ``created_at`` is restamped; ``wins`` rises by
-        one. The v0.7 retention state — dungeon depth, forged enhancements, and
-        the satchel — resets too (a reborn hero re-earns the deep and carries
-        nothing forged or bottled). The daily clock (turns/turn_day), the
-        bestow pool, and the log cursor are deliberately UNTOUCHED — a legacy
-        run is a fresh character, not a fresh day.
+        Stats, equipment, HP, carried gold, level/xp and position all return to
+        the first-day baseline and ``created_at`` is restamped; ``wins`` rises
+        by one. The v0.7 retention state — dungeon depth, forged enhancements,
+        and the satchel — resets too (a reborn hero re-earns the deep and
+        carries nothing forged or bottled). The daily clock (turns/turn_day),
+        the bestow pool, and the log cursor are deliberately UNTOUCHED — a
+        legacy run is a fresh character, not a fresh day. The VAULT (``banked``)
+        SURVIVES, too: it is gold set aside in the strongbox, not on the reborn
+        hero, so it persists across runs as a small standing reward — the only
+        wealth, besides the ★, that a legacy reset does not clear.
         """
         settings = self.world.settings
         # Clear both gear slots through the shared unequip helpers FIRST, so the

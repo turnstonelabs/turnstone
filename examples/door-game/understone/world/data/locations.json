@@ -4,11 +4,12 @@
     "name": "The Sleeping Drake",
     "glyph": "⌂",
     "color": "inn",
-    "actions": ["rest", "gamble", "leave"],
+    "actions": ["rest", "deposit", "withdraw", "gamble", "leave"],
     "flavor": [
       "Lamplight pools on worn oak tables.",
       "The innkeeper nods toward the hearth.",
       "A night's rest restores you fully.",
+      "An iron strongbox by the bar keeps coin safe from sleeping-robbers.",
       "In the corner, a dice cup waits for a wager."
     ]
   },

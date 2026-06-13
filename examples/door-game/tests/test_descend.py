@@ -33,7 +33,14 @@ from pathlib import Path
 
 import pytest
 
-from tests.conftest import fixed_clock, make_monster, make_world, utc
+from tests.conftest import (
+    fixed_clock,
+    make_monster,
+    make_world,
+    satchel_ids,
+    set_satchel,
+    utc,
+)
 from understone.engine.models import Mode, Zone
 from understone.engine.rng import GameRNG
 from understone.game import Game
@@ -41,6 +48,11 @@ from understone.persistence import Store
 from understone.world.loader import load_world
 
 PACK = Path(__file__).resolve().parents[1] / "understone" / "world" / "data"
+
+# Module-local aliases for the shared satchel helpers, keeping the existing
+# call sites (_set_satchel / _satchel_ids) unchanged.
+_set_satchel = set_satchel
+_satchel_ids = satchel_ids
 
 
 @pytest.fixture
@@ -54,6 +66,10 @@ def _game(tmp_path: Path, clock: object, seed: int = 7) -> Game:
     return Game(world, store, clock=clock, rng=GameRNG(seed=seed))  # type: ignore[arg-type]
 
 
+# The flat-id-list satchel helpers (_set_satchel / _satchel_ids) live in
+# tests/conftest.py now, shared with the Wyrm suite; they are imported above.
+
+
 def _strong_at_dungeon(game: Game, name: str) -> object:
     """Join *name*, make them unbeatable, and stand them in the dungeon menu."""
     game.join(name)
@@ -63,6 +79,103 @@ def _strong_at_dungeon(game: Game, name: str) -> object:
     player.mode = Mode.MENU
     player.at_location = "dungeon"
     return player
+
+
+# ---------------------------------------------------------------------------
+# A0) Forge ore — the combat-earned material that feeds the forge
+# ---------------------------------------------------------------------------
+
+
+def test_descend_win_drops_ore_into_satchel(tmp_path: Path, clock: object) -> None:
+    """A won dungeon rung grants ore_dungeon_drop ore into the satchel."""
+    game = _game(tmp_path, clock)
+    player = _strong_at_dungeon(game, "Delver")
+    expect = game.world.settings.ore_dungeon_drop
+    ore_id = game.world.settings.forge_ore_item
+
+    out = game.action("Delver", "descend", "", "")
+
+    assert player.deepest_rung == 1  # the rung was cleared
+    assert game._satchel_find(player, ore_id) == (0, expect)
+    ore = game.world.item_by_id(ore_id)
+    assert ore is not None and ore.name in out  # the find is narrated
+
+
+def test_descend_win_ore_bumps_existing_stack(tmp_path: Path, clock: object) -> None:
+    """A second cleared rung bumps the existing ore stack rather than opening a new one."""
+    game = _game(tmp_path, clock)
+    player = _strong_at_dungeon(game, "Delver")
+    drop = game.world.settings.ore_dungeon_drop
+    ore_id = game.world.settings.forge_ore_item
+
+    game.action("Delver", "descend", "", "")
+    game.action("Delver", "descend", "", "")
+
+    assert player.deepest_rung == 2
+    assert game._satchel_find(player, ore_id) == (0, 2 * drop)  # one stack, doubled
+    assert game._satchel_distinct(player) == 1
+
+
+def test_descend_win_ore_dropped_when_satchel_full(tmp_path: Path, clock: object) -> None:
+    """When the bag has no ore stack AND is full of other kinds, ore is dropped.
+
+    This pins the ore-when-satchel-full edge: the grant goes through the same
+    add-chokepoint, so a full bag (distinct-stack cap reached, no ore stack to
+    bump) cannot take the ore — it is narrated as dropped, NEVER an error, and
+    the cleared rung still stands.
+    """
+    game = _game(tmp_path, clock)
+    player = _strong_at_dungeon(game, "Delver")
+    cap = game.world.settings.satchel_max
+    ore_id = game.world.settings.forge_ore_item
+    # Fill the distinct-stack cap with NON-ore kinds, so an ore drop has no stack
+    # to bump and no free slot to open.
+    _set_satchel(game, player, ["minor_potion", "greater_potion", "elixir_of_the_vale"])
+    assert game._satchel_distinct(player) == cap
+    assert game._satchel_find(player, ore_id) is None
+
+    out = game.action("Delver", "descend", "", "")
+
+    assert player.deepest_rung == 1  # the rung still cleared — no error
+    assert game._satchel_find(player, ore_id) is None  # the ore found no room
+    assert game._satchel_distinct(player) == cap  # bag unchanged
+    assert "no room to pocket the ore" in out.lower()
+
+
+def test_forest_win_drops_ore_on_a_successful_roll(
+    tmp_path: Path, clock: object, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A won forest fight grants one ore when the ore_forest_chance roll succeeds.
+
+    The roll is the injected RNG's ``chance``; forcing it True makes the wiring
+    deterministic (the chance itself is a tuning value, exercised by the sim).
+    """
+    game = _game(tmp_path, clock)
+    game.join("Hunter")
+    player = game.players["Hunter"]
+    player.x, player.y = 35, 25  # forest_near
+    player.atk, player.def_, player.hp, player.max_hp = 200, 100, 500, 500
+    ore_id = game.world.settings.forge_ore_item
+    # Force the forest ore roll to succeed (chance(p) -> True for any p).
+    monkeypatch.setattr(game.rng, "chance", lambda _p: True)
+
+    game.action("Hunter", "fight", "", "")
+
+    assert game._satchel_find(player, ore_id) == (0, 1)  # one ore from the win
+
+
+def test_forest_loss_grants_no_ore(
+    tmp_path: Path, clock: object, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A LOST forest fight grants no ore even if the roll would succeed."""
+    game = _game(tmp_path, clock)
+    player = _doomed_fighter(game, "Doomed")  # will lose (and has no potion)
+    ore_id = game.world.settings.forge_ore_item
+    monkeypatch.setattr(game.rng, "chance", lambda _p: True)
+
+    game.action("Doomed", "fight", "", "")
+
+    assert game._satchel_find(player, ore_id) is None  # ore is a WIN-only reward
 
 
 # ---------------------------------------------------------------------------
@@ -186,7 +299,7 @@ def test_descend_loss_with_potion_survives_keeping_depth(tmp_path: Path, clock: 
     player = _doomed_descender(game, "Delver")
     potion = game.world.item_by_id("greater_potion")
     assert potion is not None
-    game._satchel_set(player, ["greater_potion"])
+    _set_satchel(game, player, ["greater_potion"])
     spawn = game.world.spawn
     before_turns = player.turns_left
     before_events = len(game.events)
@@ -198,7 +311,7 @@ def test_descend_loss_with_potion_survives_keeping_depth(tmp_path: Path, clock: 
     assert (player.x, player.y) != spawn  # NOT bounced to the spawn
     assert player.mode is Mode.MENU  # still standing at the dungeon
     assert player.deepest_rung == 1  # depth kept; the rung was not cleared
-    assert game._satchel_list(player) == []  # the draught was spent
+    assert _satchel_ids(game, player) == []  # the draught was spent
     assert "death's edge" in out.lower()  # the spliced survival line
     assert player.turns_left == before_turns - 1  # the descent still cost a turn
     # A death-save is not a defeat: no public "defeat" beat was heralded.
@@ -343,28 +456,44 @@ def test_buy_potion_stows_into_satchel(tmp_path: Path, clock: object) -> None:
     out = game.action("Buyer", "buy", "", "minor_potion")
 
     assert "satchel" in out.lower()
-    assert game._satchel_list(player) == ["minor_potion"]
+    assert _satchel_ids(game, player) == ["minor_potion"]
     assert player.gold == 100 - item.price
     # The potion was NOT applied on buy (HP unchanged from full).
     assert player.hp == player.max_hp
 
 
-def test_satchel_cap_refuses_without_spending(tmp_path: Path, clock: object) -> None:
-    """A full satchel refuses another draught and spends no gold."""
+def test_satchel_potions_stack_into_one_slot(tmp_path: Path, clock: object) -> None:
+    """Buying three of one potion makes ONE stack of qty 3, not three slots."""
     game = _game(tmp_path, clock)
     player = _at_shop(game, "Buyer")
-    cap = game.world.settings.satchel_max
     player.gold = 10000
-    for _ in range(cap):
+    for _ in range(3):
         game.action("Buyer", "buy", "", "minor_potion")
-    assert len(game._satchel_list(player)) == cap
-    gold_at_cap = player.gold
+    stacks = game._satchel_stacks(player)
+    assert stacks == [("minor_potion", 3)]  # one distinct slot, qty 3
+    assert game._satchel_distinct(player) == 1
 
-    out = game.action("Buyer", "buy", "", "minor_potion")
 
-    assert "bulges" in out.lower()
-    assert len(game._satchel_list(player)) == cap  # still full, not over
-    assert player.gold == gold_at_cap  # the refused buy cost nothing
+def test_satchel_distinct_cap_refuses_fourth_kind_but_tops_up_existing(
+    tmp_path: Path, clock: object
+) -> None:
+    """satchel_max caps DISTINCT stacks: three kinds fill the bag, a fourth kind
+    is refused, but topping up an existing stack still fits."""
+    game = _game(tmp_path, clock)
+    player = _at_shop(game, "Buyer")
+    cap = game.world.settings.satchel_max  # 3
+    player.gold = 10000
+    # Three DISTINCT kinds fill the distinct-stack cap (the shop sells exactly 3).
+    for item_id in ("minor_potion", "greater_potion", "elixir_of_the_vale"):
+        game.action("Buyer", "buy", "", item_id)
+    assert game._satchel_distinct(player) == cap
+    # A FOURTH distinct kind (ore, dropped straight in) is refused — bag full.
+    assert game._satchel_try_add(player, "iron_ore") is False
+    assert game._satchel_distinct(player) == cap
+    # But topping up an EXISTING stack still works (qty is unbounded).
+    assert game._satchel_try_add(player, "minor_potion") is True
+    assert game._satchel_find(player, "minor_potion") == (0, 2)
+    assert game._satchel_distinct(player) == cap  # still three kinds
 
 
 def test_quaff_drinks_strongest_and_caps_at_max_hp(tmp_path: Path, clock: object) -> None:
@@ -373,7 +502,7 @@ def test_quaff_drinks_strongest_and_caps_at_max_hp(tmp_path: Path, clock: object
     game.join("Drinker")
     player = game.players["Drinker"]
     # Carry a weak and a strong potion; the strong one must be chosen.
-    game._satchel_set(player, ["minor_potion", "greater_potion"])
+    _set_satchel(game, player, ["minor_potion", "greater_potion"])
     player.max_hp = 100
     player.hp = 90  # greater_potion heals 40, but the cap clamps the gain to 10
 
@@ -381,7 +510,25 @@ def test_quaff_drinks_strongest_and_caps_at_max_hp(tmp_path: Path, clock: object
 
     assert "greater potion" in out.lower()  # the STRONGEST was drunk
     assert player.hp == 100  # capped at max_hp
-    assert game._satchel_list(player) == ["minor_potion"]  # only the strong one left
+    assert _satchel_ids(game, player) == ["minor_potion"]  # only the strong one left
+
+
+def test_quaff_decrements_stack_and_removes_at_zero(tmp_path: Path, clock: object) -> None:
+    """Quaffing a 2-deep potion stack decrements it; a second quaff empties it."""
+    game = _game(tmp_path, clock)
+    game.join("Drinker")
+    player = game.players["Drinker"]
+    _set_satchel(game, player, ["minor_potion", "minor_potion"])  # one stack, qty 2
+    player.max_hp = 100
+    player.hp = 10
+
+    game.action("Drinker", "quaff", "", "")
+    assert game._satchel_find(player, "minor_potion") == (0, 1)  # decremented, not dropped
+    player.hp = 10
+
+    game.action("Drinker", "quaff", "", "")
+    assert game._satchel_find(player, "minor_potion") is None  # the stack is gone at 0
+    assert game._satchel_stacks(player) == []
 
 
 def test_quaff_empty_satchel_refuses(tmp_path: Path, clock: object) -> None:
@@ -389,7 +536,7 @@ def test_quaff_empty_satchel_refuses(tmp_path: Path, clock: object) -> None:
     game = _game(tmp_path, clock)
     game.join("Drinker")
     out = game.action("Drinker", "quaff", "", "")
-    assert "satchel is empty" in out.lower()
+    assert "no draught" in out.lower()
 
 
 def test_quaff_at_full_hp_refuses_and_keeps_potion(tmp_path: Path, clock: object) -> None:
@@ -397,13 +544,13 @@ def test_quaff_at_full_hp_refuses_and_keeps_potion(tmp_path: Path, clock: object
     game = _game(tmp_path, clock)
     game.join("Drinker")
     player = game.players["Drinker"]
-    game._satchel_set(player, ["minor_potion"])
+    _set_satchel(game, player, ["minor_potion"])
     assert player.hp == player.max_hp
 
     out = game.action("Drinker", "quaff", "", "")
 
     assert "already hale" in out.lower()
-    assert game._satchel_list(player) == ["minor_potion"]  # not wasted
+    assert _satchel_ids(game, player) == ["minor_potion"]  # not wasted
 
 
 def test_satchel_listed_in_status(tmp_path: Path, clock: object) -> None:
@@ -411,7 +558,7 @@ def test_satchel_listed_in_status(tmp_path: Path, clock: object) -> None:
     game = _game(tmp_path, clock)
     game.join("Drinker")
     player = game.players["Drinker"]
-    game._satchel_set(player, ["minor_potion"])
+    _set_satchel(game, player, ["minor_potion"])
 
     out = game.status("Drinker")
     assert "satchel" in out.lower()
@@ -442,7 +589,7 @@ def test_death_save_fight_survives_at_potion_value(tmp_path: Path, clock: object
     player = _doomed_fighter(game, "Doomed")
     potion = game.world.item_by_id("greater_potion")
     assert potion is not None
-    game._satchel_set(player, ["greater_potion"])
+    _set_satchel(game, player, ["greater_potion"])
     spawn = game.world.spawn
     before_events = len(game.events)
 
@@ -452,7 +599,7 @@ def test_death_save_fight_survives_at_potion_value(tmp_path: Path, clock: object
     # spawn bounce, the potion consumed, and the dramatic line present.
     assert player.hp == min(player.max_hp, potion.heal)
     assert (player.x, player.y) != spawn  # never moved to the spawn
-    assert game._satchel_list(player) == []  # the draught was spent
+    assert _satchel_ids(game, player) == []  # the draught was spent
     assert "death's edge" in out.lower()  # the spliced line
     # A death-save is NOT a defeat: no public "defeat" beat was heralded.
     new = game.events[before_events:]
@@ -473,7 +620,7 @@ def test_death_save_negative_without_satchel_check(
     """
     game = _game(tmp_path, clock)
     player = _doomed_fighter(game, "Doomed")
-    game._satchel_set(player, ["greater_potion"])
+    _set_satchel(game, player, ["greater_potion"])
     spawn = game.world.spawn
 
     monkeypatch.setattr(Game, "_death_save", lambda self, pl, lines: False)
@@ -481,7 +628,7 @@ def test_death_save_negative_without_satchel_check(
 
     assert player.hp == 1  # bounced, not saved
     assert (player.x, player.y) == spawn
-    assert game._satchel_list(player) == ["greater_potion"]  # potion NOT spent
+    assert _satchel_ids(game, player) == ["greater_potion"]  # potion NOT spent
     assert "death's edge" not in out.lower()  # no dramatic line
 
 
@@ -491,12 +638,26 @@ def test_death_save_uses_strongest_potion(tmp_path: Path, clock: object) -> None
     player = _doomed_fighter(game, "Doomed")
     elixir = game.world.item_by_id("elixir_of_the_vale")
     assert elixir is not None
-    game._satchel_set(player, ["minor_potion", "elixir_of_the_vale"])
+    _set_satchel(game, player, ["minor_potion", "elixir_of_the_vale"])
 
     game.action("Doomed", "fight", "", "")
 
     assert player.hp == min(player.max_hp, elixir.heal)  # the elixir, not the minor
-    assert game._satchel_list(player) == ["minor_potion"]  # the weak one remains
+    assert _satchel_ids(game, player) == ["minor_potion"]  # the weak one remains
+
+
+def test_death_save_fires_from_a_stacked_potion(tmp_path: Path, clock: object) -> None:
+    """The death-save works off a multi-deep potion stack, decrementing it by one."""
+    game = _game(tmp_path, clock)
+    player = _doomed_fighter(game, "Doomed")
+    potion = game.world.item_by_id("greater_potion")
+    assert potion is not None
+    _set_satchel(game, player, ["greater_potion", "greater_potion", "greater_potion"])
+
+    game.action("Doomed", "fight", "", "")
+
+    assert player.hp == min(player.max_hp, potion.heal)  # saved at the potion's value
+    assert game._satchel_find(player, "greater_potion") == (0, 2)  # one drunk, two left
 
 
 def test_ambush_attacker_death_save(tmp_path: Path, clock: object) -> None:
@@ -519,14 +680,14 @@ def test_ambush_attacker_death_save(tmp_path: Path, clock: object) -> None:
     victim.turn_day = 0  # asleep (has not acted today)
     potion = game.world.item_by_id("greater_potion")
     assert potion is not None
-    game._satchel_set(attacker, ["greater_potion"])
+    _set_satchel(game, attacker, ["greater_potion"])
     spawn = game.world.spawn
 
     game.action("Robber", "ambush", "Sleeper", "")
 
     assert attacker.hp == min(attacker.max_hp, potion.heal)  # saved
     assert (attacker.x, attacker.y) != spawn  # not bounced — stood their ground
-    assert game._satchel_list(attacker) == []  # potion spent
+    assert _satchel_ids(game, attacker) == []  # potion spent
 
 
 def test_ambush_victim_never_quaffs(tmp_path: Path, clock: object) -> None:
@@ -546,13 +707,13 @@ def test_ambush_victim_never_quaffs(tmp_path: Path, clock: object) -> None:
     victim.atk, victim.def_, victim.hp = 1, 0, 3
     victim.gold = 100
     victim.turn_day = 0  # asleep
-    game._satchel_set(victim, ["greater_potion"])
+    _set_satchel(game, victim, ["greater_potion"])
 
     game.action("Robber", "ambush", "Sleeper", "")
 
     assert victim.hp == 1  # robbed and floored, NOT death-saved
     assert (victim.x, victim.y) == game.world.spawn
-    assert game._satchel_list(victim) == ["greater_potion"]  # the sleeper's potion is untouched
+    assert _satchel_ids(game, victim) == ["greater_potion"]  # the sleeper's potion is untouched
 
 
 # ---------------------------------------------------------------------------
@@ -560,12 +721,19 @@ def test_ambush_victim_never_quaffs(tmp_path: Path, clock: object) -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_forge_plus_one_raises_stat_and_costs_scaled_gold(tmp_path: Path, clock: object) -> None:
-    """forge +1 raises atk by 1 and costs base*(0+1); +2 costs base*(1+1)."""
+def _ore_id(game: Game) -> str:
+    return game.world.settings.forge_ore_item
+
+
+def test_forge_plus_one_raises_stat_and_costs_scaled_gold_and_ore(
+    tmp_path: Path, clock: object
+) -> None:
+    """forge +1 raises atk by 1 and costs base*(0+1) gold + 1 ore; +2 costs more of both."""
     game = _game(tmp_path, clock)
     player = _at_shop(game, "Smith")
     base = game.world.settings.forge_base_cost
     player.gold = 10000
+    _set_satchel(game, player, [_ore_id(game)] * 20)
     atk0 = player.atk
 
     out1 = game.action("Smith", "forge", "weapon", "")
@@ -574,12 +742,14 @@ def test_forge_plus_one_raises_stat_and_costs_scaled_gold(tmp_path: Path, clock:
     assert "+1" in out1
     after_first = player.gold
     assert after_first == 10000 - base * 1  # base * (0 + 1)
+    assert game._satchel_find(player, _ore_id(game)) == (0, 19)  # 1 ore spent
 
     out2 = game.action("Smith", "forge", "weapon", "")
     assert player.weapon_plus == 2
     assert player.atk == atk0 + 2
     assert "+2" in out2
     assert player.gold == after_first - base * 2  # base * (1 + 1), dearer
+    assert game._satchel_find(player, _ore_id(game)) == (0, 17)  # 2 more ore spent
 
 
 def test_forge_armor_raises_def(tmp_path: Path, clock: object) -> None:
@@ -587,6 +757,7 @@ def test_forge_armor_raises_def(tmp_path: Path, clock: object) -> None:
     game = _game(tmp_path, clock)
     player = _at_shop(game, "Smith")
     player.gold = 10000
+    _set_satchel(game, player, [_ore_id(game)] * 20)
     def0 = player.def_
 
     game.action("Smith", "forge", "armour", "")
@@ -600,10 +771,12 @@ def test_forge_caps_at_max_plus(tmp_path: Path, clock: object) -> None:
     player = _at_shop(game, "Smith")
     cap = game.world.settings.forge_max_plus
     player.gold = 100000
+    _set_satchel(game, player, [_ore_id(game)] * 50)
     for _ in range(cap):
         game.action("Smith", "forge", "weapon", "")
     assert player.weapon_plus == cap
     atk_at_cap, gold_at_cap = player.atk, player.gold
+    ore_at_cap = game._satchel_find(player, _ore_id(game))
 
     out = game.action("Smith", "forge", "weapon", "")
 
@@ -611,13 +784,15 @@ def test_forge_caps_at_max_plus(tmp_path: Path, clock: object) -> None:
     assert player.weapon_plus == cap  # not over the cap
     assert player.atk == atk_at_cap  # no stat change
     assert player.gold == gold_at_cap  # no gold spent
+    assert game._satchel_find(player, _ore_id(game)) == ore_at_cap  # no ore spent
 
 
-def test_forge_unaffordable_refuses(tmp_path: Path, clock: object) -> None:
-    """A hero who cannot pay the forge price is refused without mutation."""
+def test_forge_unaffordable_gold_refuses(tmp_path: Path, clock: object) -> None:
+    """A hero who cannot pay the forge gold is refused without mutation."""
     game = _game(tmp_path, clock)
     player = _at_shop(game, "Smith")
     player.gold = 1  # far below the base cost
+    _set_satchel(game, player, [_ore_id(game)] * 20)  # ore is fine; gold is not
     atk0 = player.atk
 
     out = game.action("Smith", "forge", "weapon", "")
@@ -625,7 +800,26 @@ def test_forge_unaffordable_refuses(tmp_path: Path, clock: object) -> None:
     assert player.weapon_plus == 0
     assert player.atk == atk0
     assert player.gold == 1
+    assert game._satchel_find(player, _ore_id(game)) == (0, 20)  # ore untouched
     assert "gold" in out.lower()
+
+
+def test_forge_without_ore_refuses_naming_both(tmp_path: Path, clock: object) -> None:
+    """Plenty of gold but no ore: forge is refused, naming the gold AND ore cost."""
+    game = _game(tmp_path, clock)
+    player = _at_shop(game, "Smith")
+    player.gold = 10000  # rich, but the satchel holds no ore
+    atk0 = player.atk
+    ore = game.world.item_by_id(_ore_id(game))
+    assert ore is not None
+
+    out = game.action("Smith", "forge", "weapon", "")
+
+    assert player.weapon_plus == 0  # no mutation
+    assert player.atk == atk0
+    assert player.gold == 10000
+    assert ore.name in out  # the message names the ore requirement
+    assert "0 " + ore.name in out  # and that the hero holds none
 
 
 def test_forge_invalid_target_is_friendly(tmp_path: Path, clock: object) -> None:
@@ -652,6 +846,7 @@ def test_forge_then_buy_zeroes_plus_and_removes_phantom_atk(tmp_path: Path, cloc
     game = _game(tmp_path, clock)
     player = _at_shop(game, "Smith")
     player.gold = 100000
+    _set_satchel(game, player, [_ore_id(game)] * 20)
     # Establish a known starting point: equip the short sword fresh.
     starter = game.world.item_by_id(game.world.settings.starting_weapon)
     short = game.world.item_by_id("short_sword")
@@ -686,6 +881,7 @@ def test_forge_then_sell_zeroes_plus_and_removes_phantom_atk(tmp_path: Path, clo
     game = _game(tmp_path, clock)
     player = _at_shop(game, "Smith")
     player.gold = 100000
+    _set_satchel(game, player, [_ore_id(game)] * 20)
     starter = game.world.item_by_id(game.world.settings.starting_weapon)
     short = game.world.item_by_id("short_sword")
     assert starter is not None and short is not None
@@ -708,6 +904,7 @@ def test_forge_plus_shown_in_status(tmp_path: Path, clock: object) -> None:
     game = _game(tmp_path, clock)
     player = _at_shop(game, "Smith")
     player.gold = 100000
+    _set_satchel(game, player, [_ore_id(game)] * 20)
     game.action("Smith", "buy", "", "iron_sword")
     game.action("Smith", "forge", "weapon", "")
     game.action("Smith", "forge", "weapon", "")
@@ -749,7 +946,7 @@ def test_rare_kill_heralds_and_drops_draught(tmp_path: Path, clock: object) -> N
     # has fallen" flash is a PUBLIC Herald beat (it rides the feed, not the
     # fighter's reply), so it is asserted on the event log below.
     assert "satchel" in out.lower()  # the draught dropped
-    assert drop_id in game._satchel_list(player)
+    assert drop_id in _satchel_ids(game, player)
     new = game.events[before_events:]
     assert any(e.kind == "rare_kill" for e in new)
     rare_beat = next(e for e in new if e.kind == "rare_kill")
@@ -765,7 +962,10 @@ def test_rare_kill_full_satchel_blocks_drop_but_kill_lands(tmp_path: Path, clock
     player.x, player.y = 35, 25
     player.atk, player.def_, player.hp, player.max_hp = 200, 100, 500, 500
     cap = game.world.settings.satchel_max
-    game._satchel_set(player, ["minor_potion"] * cap)  # bag already full
+    # Fill the DISTINCT-stack cap with three different kinds (the rare drop is a
+    # fourth kind, greater_potion, with no stack to bump — so it has no room).
+    _set_satchel(game, player, ["minor_potion", "elixir_of_the_vale", _ore_id(game)])
+    assert game._satchel_distinct(player) == cap
     before_events = len(game.events)
 
     out = ""
@@ -779,7 +979,9 @@ def test_rare_kill_full_satchel_blocks_drop_but_kill_lands(tmp_path: Path, clock
         pytest.fail("no Gilded Stag encounter surfaced in 400 seeded fights")
 
     assert "no room" in out.lower()  # the drop was blocked
-    assert len(game._satchel_list(player)) == cap  # still exactly full
+    assert game._satchel_distinct(player) == cap  # still exactly full (distinct kinds)
+    # The rare drop (a fourth, distinct kind) never landed.
+    assert game._satchel_find(player, game.world.settings.rare_drop_item) is None
     assert player.gold > before_gold  # the kill still paid out
     new = game.events[before_events:]
     assert any(e.kind == "rare_kill" for e in new)  # and still heralded

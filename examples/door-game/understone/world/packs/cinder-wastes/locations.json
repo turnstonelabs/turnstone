@@ -4,11 +4,12 @@
     "name": "The Forge-Rest",
     "glyph": "⌂",
     "color": "inn",
-    "actions": ["rest", "gamble", "leave"],
+    "actions": ["rest", "deposit", "withdraw", "gamble", "leave"],
     "flavor": [
       "Heat-bricked walls hold back the ashfall outside.",
       "The hearthwright stokes a banked forge and nods you toward a cot.",
       "A night beside the coals restores you fully.",
+      "A slag-iron strongbox by the hearth keeps coin safe from sleeping-robbers.",
       "In the corner, a cup of knucklebones rattles for a wager."
     ]
   },

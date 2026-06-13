@@ -269,7 +269,67 @@ def _render_bands() -> str:
         f"error naming the legal set."
     )
 
+    parts.append("\n### The ore-gated forge (`world.json` → `settings`)\n")
+    ore_per = loader.SETTINGS_BANDS["forge_ore_per_plus"]
+    dungeon = loader.SETTINGS_BANDS["ore_dungeon_drop"]
+    parts.append(
+        "Forging a +1 edge now costs both GOLD and ORE — a `material` item the "
+        "hero earns in combat, never buys. Four settings bind it:"
+    )
+    parts.append(
+        "* `forge_ore_item` — REQUIRED. The item id of your world's forge ore; "
+        "it must name an `items.json` entry whose `slot` is `material` (an "
+        "unknown id or a non-material slot is a load error). The Vale uses "
+        "`iron_ore`."
+    )
+    parts.append(
+        f"* `forge_ore_per_plus` — band `{ore_per[0]}..{ore_per[1]}`. Ore per +1 "
+        f"step: a +N forge costs `(current_plus + 1) * forge_ore_per_plus` ore. "
+        f"{_forge_ore_worked_example()}"
+    )
+    parts.append(
+        f"* `ore_dungeon_drop` — band `{dungeon[0]}..{dungeon[1]}`. Ore granted "
+        f"on every WON dungeon rung — the reliable source. The Vale drops 2."
+    )
+    parts.append(
+        "* `ore_forest_chance` — a `0.0`..`1.0` probability (a float, validated "
+        "outside the integer band table). The chance a WON forest fight yields "
+        "one ore — the occasional bonus source. The Vale uses `0.2`."
+    )
+    parts.append(
+        "\nOre rides the satchel as a stack, so it shares the `satchel_max` "
+        "DISTINCT-stack budget with potions (per-stack quantity is unbounded). "
+        "Tune the two sources so a hero who descends steadily earns enough ore "
+        "to forge without grinding — the `simulate` bot will tell you if the "
+        "gate stalls a winnable run."
+    )
+
     return "\n".join(parts)
+
+
+def _forge_ore_worked_example() -> str:
+    """Render the per-step ore costs from the bundled Vale's live forge settings.
+
+    The starter template :func:`cli_newpack` copies IS the bundled Vale, so the
+    worked figures are computed from its actual ``forge_ore_per_plus`` and
+    ``forge_max_plus`` rather than hardcoded — a retune of the template moves
+    the manual with it. The steps are ``per_plus * (i + 1)`` for each ``i`` in
+    ``range(forge_max_plus)``; the total is what it costs to max one slot.
+    """
+    settings = loader.load_world(PACKAGED_WORLD_DIR).settings
+    per_plus = settings.forge_ore_per_plus
+    max_plus = settings.forge_max_plus
+    steps = [per_plus * (i + 1) for i in range(max_plus)]
+    if not steps:
+        return (
+            f"At the template's value of {per_plus}, slots cannot be forged (`forge_max_plus` 0)."
+        )
+    ladder = ", ".join(str(cost) for cost in steps)
+    total = sum(steps)
+    return (
+        f"At the template's value of {per_plus}, the steps cost {ladder} ore "
+        f"({total} ore to max a slot at `forge_max_plus` {max_plus})."
+    )
 
 
 def _reserved_glyph_list() -> list[str]:
@@ -341,8 +401,9 @@ def _render_validate_coverage() -> str:
         "with weights `> 0`, `min <= max`, and amounts in their per-kind band.",
         "* **Cross-references** — `legend` → terrain key, location placements → "
         "`locations.json` keys, `starting_weapon`/`starting_armor` → item ids, "
-        '`boss_monster` → a monster flagged `"boss": true`, and '
-        "`rare_drop_item` → a consumable item id.",
+        '`boss_monster` → a monster flagged `"boss": true`, '
+        "`rare_drop_item` → a consumable item id, and `forge_ore_item` → a "
+        "`material` item id.",
         "* **Zone tiers** — every zone's tier band must overlap at least one monster tier.",
         "* **Dungeon ladder** — every `dungeon_tiers` tier must have a non-boss "
         "monster, and that tier's FIRST monster (its fixed rung guardian) must "
@@ -398,7 +459,8 @@ The cross-references the loader enforces:
 * `settings.starting_weapon` / `starting_armor` must be ids from
   `items.json`; `settings.boss_monster` must be an id from `monsters.json`
   that is flagged `"boss": true`; `settings.rare_drop_item` must be an id from
-  `items.json` whose `slot` is `consumable`;
+  `items.json` whose `slot` is `consumable`; `settings.forge_ore_item` must be
+  an id from `items.json` whose `slot` is `material`;
 * every tier in `settings.dungeon_tiers` must be backed by a NON-boss monster;
 * every zone's tier band must overlap at least one monster tier.
 
@@ -462,11 +524,22 @@ first entry of a tier that backs a `dungeon_tiers` rung.
 
 ### `items.json`
 
-A list of equipment and consumables. `slot` is `weapon`, `armor`, or
-`consumable`. Weapons add `atk`, armour adds `def`, consumables `heal`.
+A list of equipment, consumables, and crafting materials. `slot` is `weapon`,
+`armor`, `consumable`, or `material`. Weapons add `atk`, armour adds `def`,
+consumables `heal`; a `material` carries none of these — it is the forge ORE,
+carried in the satchel and spent at the forge.
 
 ```json
 {"id": "short_sword", "name": "Short Sword", "slot": "weapon", "atk": 5, "price": 40}
+```
+
+The forge ore is a `material` item the player EARNS in combat (not the shop):
+price it `0` — ore is never bought or sold — and point `settings.forge_ore_item`
+at its id. A won dungeon rung always drops `settings.ore_dungeon_drop` of it, and
+a won forest fight has a `settings.ore_forest_chance` chance of one.
+
+```json
+{"id": "iron_ore", "name": "Iron Ore", "slot": "material", "price": 0}
 ```
 
 ### `locations.json`
@@ -487,10 +560,16 @@ the verbs the engine honours inside each are:
 
 | `kind` | actions the engine understands |
 | --- | --- |
-| `inn` | `rest`, `gamble`, `leave` |
+| `inn` | `rest`, `deposit`, `withdraw`, `gamble`, `leave` |
 | `shop` | `buy`, `sell`, `forge`, `leave` |
 | `healer` | `heal`, `leave` |
 | `dungeon` | `descend`, `challenge`, `leave` |
+
+The inn's `deposit`/`withdraw` are the VAULT: a player banks gold into the inn
+strongbox (`deposit amount=<gold>`) and draws it back (`withdraw amount=<gold>`).
+Banked gold is SAFE from ambush — a sleeping-robber only ever lifts gold in hand
+— and it SURVIVES the Wyrm-win legacy reset, so it is the one store of wealth
+that carries across runs. Both cost no turn.
 
 `quaff` (drink a satchel tonic) is legal **anywhere** and needs no menu entry.
 The `actions` list is advisory — it is the menu the narrator offers, NOT a
@@ -598,11 +677,15 @@ tier with at least one ordinary monster.
 **The deep, the satchel, and the forge.** `dungeon_tiers` is now a RUNG LADDER
 fought one rung per `descend` — list the tiers shallow-to-deep, and make it long
 enough to feel like a journey (the Vale uses three). The Wyrm gates on reaching
-the floor as well as on level. Size the satchel with `satchel_max` (the Vale
-carries 3) — it is the death-save reserve, so keep it small. The forge is the
-late-game gold sink: `forge_base_cost` is the price of a +1 edge and scales up
-each tier (`base * (current_plus + 1)`), capped at `forge_max_plus`; price it so
-a fully-forged piece is a multi-day saving.
+the floor as well as on level. Size the satchel with `satchel_max` — it caps the
+DISTINCT stacks the bag holds (potions and ore each take a slot; per-stack
+quantity is unbounded), and it is the death-save reserve, so keep it small (the
+Vale carries 3). The forge is the late-game GOLD-AND-ORE sink: `forge_base_cost`
+is the gold price of a +1 edge and scales up each tier (`base * (current_plus +
+1)`), capped at `forge_max_plus`, and each step ALSO costs ore (see the ore-gated
+forge above). Ore is won in the deep (and seldom in the forest), so the forge is
+fed by descending — price the gold so a fully-forged piece is a multi-day saving,
+and set the ore sources so a steady delver can afford it without a grind.
 
 **Rare beasts.** A rare monster is a small legend: give it a low `weight` so it
 surfaces seldom, stats and rewards a clear notch above its tier, and remember it
