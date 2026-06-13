@@ -1,4 +1,4 @@
-"""MCP server for Understone — the only module that imports ``mcp``.
+"""MCP server for Understone — the only module that imports ``mcp`` (or ``starlette``).
 
 Nine ``door_*`` tools form the entire player interface. Every handler is a
 synchronous ``def`` that takes and returns ``str``; no exception is allowed
@@ -6,6 +6,13 @@ to cross the MCP boundary (each handler catches, logs server-side, and
 returns an in-fiction line). The handlers are thin wrappers over a single
 module-level :class:`~understone.game.Game`; all rules live behind that
 façade.
+
+Three extra HTTP routes (``/watch`` and its two JSON feeds) serve the
+read-only spectator page from :mod:`understone.watch`. They are registered via
+FastMCP's ``custom_route`` and ride inside the streamable-http app; the
+``starlette`` request/response types appear ONLY here, mirroring the MCP SDK's
+own ``custom_route`` examples. The routes are unauthenticated by design and
+strictly read-only — they never mutate or persist world state.
 
 Usage::
 
@@ -30,7 +37,9 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from mcp.server.fastmcp import FastMCP
+from starlette.responses import HTMLResponse, JSONResponse, Response
 
+from understone import watch
 from understone.errors import WorldLoadError
 from understone.game import Game
 from understone.persistence import Store
@@ -38,6 +47,7 @@ from understone.world.loader import load_world
 
 if TYPE_CHECKING:
     from starlette.applications import Starlette
+    from starlette.requests import Request
 
 log = logging.getLogger(__name__)
 
@@ -151,13 +161,13 @@ _BLANK_NAME = 'The gatekeeper squints. "I didn\'t catch your name, traveller."'
 _GAME: Game | None = None
 
 
-def _build_game() -> Game:
+def _build_game(watch_url: str | None = None) -> Game:
     """Construct the module Game from environment configuration."""
     db_path = os.environ.get("UNDERSTONE_DB", "understone.db")
     world_dir = os.environ.get("UNDERSTONE_WORLD") or str(_PACKAGED_WORLD)
     world = load_world(world_dir)
     store = Store(db_path)
-    return Game(world, store)
+    return Game(world, store, watch_url=watch_url)
 
 
 def _game() -> Game:
@@ -195,6 +205,9 @@ def door_help() -> str:
     cheat-sheet. Call door_help before your first session to learn how to run
     the game, then call door_join to begin.
     """
+    watch_line = _game().watch_line()
+    if watch_line:
+        return f"{_DM_MANUAL}\nTHE LOBBY TV\n  {watch_line}\n"
     return _DM_MANUAL
 
 
@@ -388,6 +401,30 @@ def door_bestow(player: str, reason: str, gold: int = 0, heal: int = 0) -> str:
         return _unexpected()
 
 
+# FastMCP.custom_route has no return annotation upstream (mcp 1.27.2), so mypy
+# reads the decorator as untyped; the ignore is scoped to that single gap.
+@mcp.custom_route("/watch", methods=["GET"])  # type: ignore[untyped-decorator]
+async def watch_page(_request: Request) -> Response:
+    """Serve the read-only CRT spectator page (static HTML, no world reads)."""
+    return HTMLResponse(watch.WATCH_HTML)
+
+
+@mcp.custom_route("/watch/world.json", methods=["GET"])  # type: ignore[untyped-decorator]
+async def watch_world(_request: Request) -> Response:
+    """Serve the STATIC map payload (dimensions, coloured rows, locations)."""
+    return JSONResponse(watch.build_world_payload(_game().world))
+
+
+@mcp.custom_route("/watch/state.json", methods=["GET"])  # type: ignore[untyped-decorator]
+async def watch_state(_request: Request) -> Response:
+    """Serve the DYNAMIC snapshot (players, Herald, Hall) — read-only.
+
+    The builder reads the module Game with no ``await`` in between, so each
+    response is a consistent point-in-time snapshot of the shared world.
+    """
+    return JSONResponse(watch.build_state_payload(_game()))
+
+
 def _unexpected() -> str:
     """In-fiction line for an unexpected server-side error."""
     return (
@@ -396,15 +433,19 @@ def _unexpected() -> str:
     )
 
 
-def create_app(db_path: str, world_dir: str | None = None) -> Starlette:
+def create_app(
+    db_path: str, world_dir: str | None = None, watch_url: str | None = None
+) -> Starlette:
     """Build the streamable-HTTP ASGI app backed by a fresh game.
 
     Used by both ``main`` (for the http transport) and the integration tests,
-    so tests can point at a temp DB without environment juggling.
+    so tests can point at a temp DB without environment juggling. ``watch_url``,
+    when given, is the spectator page URL the join banner and help manual
+    advertise; ``main`` derives it from the bind host/port.
     """
     world = load_world(world_dir or str(_PACKAGED_WORLD))
     store = Store(db_path)
-    _set_game(Game(world, store))
+    _set_game(Game(world, store, watch_url=watch_url))
     return mcp.streamable_http_app()
 
 
@@ -419,16 +460,23 @@ def main() -> None:
     transport = os.environ.get("UNDERSTONE_TRANSPORT", "stdio")
 
     if transport == "streamable-http":
-        mcp.settings.host = os.environ.get("UNDERSTONE_HOST", "127.0.0.1")
-        mcp.settings.port = int(os.environ.get("UNDERSTONE_PORT", "8077"))
+        host = os.environ.get("UNDERSTONE_HOST", "127.0.0.1")
+        port = int(os.environ.get("UNDERSTONE_PORT", "8077"))
+        mcp.settings.host = host
+        mcp.settings.port = port
         mcp.settings.streamable_http_path = os.environ.get("UNDERSTONE_PATH", "/mcp")
         mcp.settings.stateless_http = False
-        # Build the game eagerly so a config error surfaces before serving.
-        _game()
+        # The spectator page is only reachable over http, so its URL is composed
+        # here from the bind address. A 0.0.0.0 bind should advertise a host a
+        # browser can actually reach (see the README Watch section).
+        watch_url = f"http://{host}:{port}/watch"
+        # Build the game eagerly (with the watch URL) so a config error surfaces
+        # before serving and the join/help advertisements carry the page link.
         try:
-            mcp.run(transport="streamable-http")
+            _set_game(_build_game(watch_url))
         except WorldLoadError as exc:
             raise SystemExit(f"failed to load world: {exc}") from exc
+        mcp.run(transport="streamable-http")
         return
 
     try:

@@ -14,6 +14,13 @@
     "price": 40
   },
   {
+    "id": "iron_sword",
+    "name": "Iron Sword",
+    "slot": "weapon",
+    "atk": 7,
+    "price": 80
+  },
+  {
     "id": "war_axe",
     "name": "War Axe",
     "slot": "weapon",
@@ -26,6 +33,13 @@
     "slot": "armor",
     "def": 1,
     "price": 0
+  },
+  {
+    "id": "padded_jerkin",
+    "name": "Padded Jerkin",
+    "slot": "armor",
+    "def": 2,
+    "price": 25
   },
   {
     "id": "leather_armor",
@@ -54,5 +68,12 @@
     "slot": "consumable",
     "heal": 40,
     "price": 35
+  },
+  {
+    "id": "elixir_of_the_vale",
+    "name": "Elixir of the Vale",
+    "slot": "consumable",
+    "heal": 70,
+    "price": 60
   }
 ]

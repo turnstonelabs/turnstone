@@ -6,6 +6,11 @@ client: initialize, list_tools (all nine door_* names), join, look. A second
 client session joins a second adventurer in the SAME process and world, and
 the first player's view then shows the '&' other-player marker — proving the
 shared-world, single-process contract over a real wire.
+
+A second test drives the read-only Watch routes that ride inside the same app:
+GET /watch (the HTML page), /watch/world.json (the static map), and
+/watch/state.json (the live snapshot) — confirming the spectator endpoints
+serve real world data alongside a working /mcp without breaking either.
 """
 
 from __future__ import annotations
@@ -16,6 +21,7 @@ import threading
 import time
 from typing import TYPE_CHECKING, Any
 
+import httpx
 import pytest
 import uvicorn
 from mcp import ClientSession
@@ -80,6 +86,12 @@ def live_server(tmp_path: Path) -> Any:
         if understone_server._GAME is not None:
             understone_server._GAME.store.close()
             understone_server._GAME = None
+        # FastMCP caches a StreamableHTTPSessionManager on the module-level mcp
+        # singleton and refuses a second lifespan .run() on the same instance.
+        # Reset it so each fixture instance boots a fresh session manager (the
+        # production server only ever runs one). Without this, a second
+        # fixture-using test fails on "run() can only be called once".
+        understone_server.mcp._session_manager = None
 
 
 async def _call_text(session: ClientSession, name: str, arguments: dict[str, Any]) -> str:
@@ -159,3 +171,69 @@ def test_mcp_end_to_end(live_server: str) -> None:
     # And the leaderboard lists both adventurers (one process, one world).
     assert "Brandr" in obs["rank"]
     assert "Sigrun" in obs["rank"]
+
+
+def _watch_base(mcp_url: str) -> str:
+    """Derive the app root (where /watch lives) from the /mcp endpoint URL."""
+    return mcp_url[: -len("/mcp")] if mcp_url.endswith("/mcp") else mcp_url
+
+
+async def _join_over_mcp(mcp_url: str, name: str) -> None:
+    """Sign one adventurer in over the real MCP wire (so state.json sees them)."""
+    async with (
+        streamable_http_client(mcp_url) as (read, write, _get_session_id),
+        ClientSession(read, write) as session,
+    ):
+        await session.initialize()
+        await _call_text(session, "door_join", {"player": name})
+
+
+def test_watch_routes_serve_world_state(live_server: str) -> None:
+    base = _watch_base(live_server)
+
+    # The MCP join writes the player into the shared world the routes read.
+    asyncio.run(_join_over_mcp(live_server, "Watcher"))
+
+    with httpx.Client(timeout=5.0) as client:
+        page = client.get(f"{base}/watch")
+        world = client.get(f"{base}/watch/world.json")
+        state = client.get(f"{base}/watch/state.json")
+
+    # The page is real HTML carrying the static masthead.
+    assert page.status_code == 200
+    assert page.headers["content-type"].startswith("text/html")
+    assert "Understone — Live Watch" in page.text
+
+    # The static world payload matches the loaded world.
+    assert world.status_code == 200
+    world_body = world.json()
+    assert world_body["width"] == 96
+    assert world_body["height"] == 48
+    assert len(world_body["glyph_rows"]) == world_body["height"]
+    assert all(len(row) == world_body["width"] for row in world_body["glyph_rows"])
+
+    # The live snapshot lists the adventurer who joined over MCP.
+    assert state.status_code == 200
+    state_body = state.json()
+    names = {p["name"] for p in state_body["players"]}
+    assert "Watcher" in names
+
+
+def test_watch_routes_coexist_with_mcp(live_server: str) -> None:
+    """The custom routes don't shadow /mcp: tool calls still work alongside them."""
+    base = _watch_base(live_server)
+
+    async def _drive_both() -> tuple[str, int]:
+        async with (
+            streamable_http_client(live_server) as (read, write, _get_session_id),
+            ClientSession(read, write) as session,
+        ):
+            await session.initialize()
+            joined = await _call_text(session, "door_join", {"player": "Coexist"})
+        with httpx.Client(timeout=5.0) as client:
+            status = client.get(f"{base}/watch/state.json").status_code
+        return joined, status
+
+    joined, watch_status = asyncio.run(_drive_both())
+    assert "@" in joined  # the MCP tool still returns a real frame
+    assert watch_status == 200  # and the watch route still answers

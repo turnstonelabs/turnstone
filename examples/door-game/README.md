@@ -99,6 +99,38 @@ UNDERSTONE_TRANSPORT=streamable-http understone
 | `UNDERSTONE_PORT` | `8077` | Bind port (streamable-http only). |
 | `UNDERSTONE_PATH` | `/mcp` | HTTP path for the MCP endpoint (streamable-http only). |
 
+## The Watch — a live spectator view
+
+When the server runs under the **streamable-http** transport, it also serves a
+read-only **Watch** page: the lobby TV of the Vale. Point a browser at
+
+```
+http://127.0.0.1:8077/watch
+```
+
+(the host and port follow `UNDERSTONE_HOST` / `UNDERSTONE_PORT`). It is a
+period **CRT spectator console** — a green-and-amber phosphor map of the whole
+world with every adventurer's `@` marker, a live **Understone Herald** feed, the
+**Hall of Legends**, and a roster of who is currently abroad. It refreshes every
+couple of seconds; if it loses contact it dims and reads `SIGNAL LOST` until the
+server returns.
+
+The Watch is **strictly read-only**. Input never flows through it — there are no
+controls, no forms, nothing that can change the world. It reads the same shared
+state the tools do and paints it; that is all. There is no authentication, in
+keeping with the rest of this easter-egg server (see the safety note below), so
+treat the page as you would the MCP endpoint itself.
+
+> _Screenshot: the Watch console — a phosphor-green overworld map with amber
+> `@` markers, the Herald feed and Hall of Legends down the right-hand rail.
+> (Image placeholder; run the server and open the URL to see it live.)_
+
+When the Watch is up, the `door_join` welcome and the `door_help` manual both
+print its URL so players (and the assistant narrating for them) know it exists.
+If you bind to `0.0.0.0` to share the world across a network, advertise a host
+that browsers can actually reach (your machine's LAN address or hostname) rather
+than `0.0.0.0` itself — the link is composed from `UNDERSTONE_HOST`.
+
 ## Registering with Turnstone
 
 Understone is an ordinary MCP server, so it plugs into Turnstone's MCP client
