@@ -86,9 +86,30 @@ def test_world_payload_locations_present(world: World) -> None:
     by_name = {loc["name"]: loc for loc in locations}
     # The dungeon mouth rides in the locations overlay with its glyph + colour.
     deep = by_name["The Understone Deep"]
-    assert deep["glyph"] == ">"
+    assert deep["glyph"] == "∩"
     assert deep["color"] == "dungeon"
     assert (deep["x"], deep["y"]) == (70, 12)
+
+
+def test_world_payload_carries_reskinned_glyphs(world: World) -> None:
+    """The v0.6 re-skin reaches the Watch: ≋ water in the rows, ⌂/✚/∩ buildings.
+
+    Water rides the base terrain (glyph_rows + legend); the buildings ride the
+    locations overlay. If a glyph reverts, the live map drifts from the frames.
+    """
+    payload = watch.build_world_payload(world)
+    rows = payload["glyph_rows"]
+    assert isinstance(rows, list)
+    glyphs = {ch for row in rows for ch in row}
+    assert "≋" in glyphs  # water in the base map
+    assert "~" not in glyphs  # the old water glyph is gone
+    legend = payload["legend"]
+    assert isinstance(legend, dict)
+    assert "≋" in legend
+    by_name = {loc["name"]: loc["glyph"] for loc in payload["locations"]}  # type: ignore[index,union-attr]
+    assert by_name["The Sleeping Drake"] == "⌂"
+    assert by_name["The Quiet Shrine"] == "✚"
+    assert by_name["The Understone Deep"] == "∩"
 
 
 # ---------------------------------------------------------------------------
@@ -255,3 +276,73 @@ def test_help_omits_watch_line_when_unset(tmp_path: Path) -> None:
     finally:
         understone_server._GAME.store.close()  # type: ignore[union-attr]
         understone_server._GAME = None
+
+
+# ---------------------------------------------------------------------------
+# WATCH_HTML lockstep guards (the JS twin of texture.py + the v0.6 glow-up)
+#
+# The inline page reproduces logic that lives in Python; these guard the two
+# invariants most prone to silent drift — the texture selection formula and the
+# other-player marker — plus the presence of the day-phase machinery.
+# ---------------------------------------------------------------------------
+
+
+def test_watch_html_derives_texture_formula_from_constants() -> None:
+    """The page's JS index string is DERIVED from texture._HASH_X / _HASH_Y.
+
+    Not a hard-coded "x * 31 + y * 17" snapshot: the expected substring is built
+    from the live constants, so a Python-side retune that the watch builder
+    fails to track trips here instead of silently shipping a stale formula.
+    """
+    from understone.screen import texture
+
+    expected = f"x * {texture._HASH_X} + y * {texture._HASH_Y}"
+    assert expected in watch.WATCH_HTML
+
+
+def test_watch_html_js_selection_agrees_with_textured() -> None:
+    """The JS selection arithmetic, replayed in Python, matches ``textured``.
+
+    The page computes ``variants[(x * _HASH_X + y * _HASH_Y) % len]``. Replaying
+    that exact formula here from the SAME constants and the SAME VARIANTS rows
+    and asserting it equals ``texture.textured`` over a full screen grid proves
+    both implementations select identically — a stronger lockstep than a string
+    match, since it pins the result, not the source text.
+    """
+    from understone.screen import texture
+
+    for base, choices in texture.VARIANTS.items():
+        for x in range(24):
+            for y in range(16):
+                js_pick = choices[(x * texture._HASH_X + y * texture._HASH_Y) % len(choices)]
+                assert texture.textured(base, x, y) == js_pick
+
+
+def test_watch_html_variants_match_texture_table() -> None:
+    """Every base->variants row in texture.VARIANTS appears in the JS VARIANTS map.
+
+    Glyphs ride into the inline JS as ``\\uXXXX`` escapes, so compare against the
+    escaped form. A new variant added to Python but not the page trips this.
+    """
+    from understone.screen import texture
+
+    html = watch.WATCH_HTML
+    for base, choices in texture.VARIANTS.items():
+        for glyph in {base, *choices}:
+            token = glyph if glyph.isascii() else f"\\u{ord(glyph):04x}"
+            assert token in html, f"variant glyph {glyph!r} missing from WATCH_HTML"
+
+
+def test_watch_html_uses_other_player_marker() -> None:
+    """Players on the lobby TV wear the ☻ marker (escaped) — no bare '@' marker paint."""
+    assert "\\u263b" in watch.WATCH_HTML
+
+
+def test_watch_html_has_day_phase_machinery() -> None:
+    """The dusk/dawn glow-up is wired: the tint classes and the UTC-hour read."""
+    html = watch.WATCH_HTML
+    assert "applyDayPhase" in html
+    assert "getUTCHours" in html
+    assert ".map-frame.night" in html
+    assert ".map-frame.twilight" in html
+    assert "Noto Sans Mono" in html

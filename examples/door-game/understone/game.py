@@ -20,11 +20,13 @@ from understone.engine.log import Event, since_visible
 from understone.engine.models import Mode, Monster, Player, Slot
 from understone.engine.rank import HallEntry, RankEntry, leaderboard
 from understone.engine.rng import GameRNG
+from understone.engine.textwidth import is_grid_safe
 from understone.persistence import EVENT_TAIL_KEEP
 from understone.screen.grid import Cell, CellGrid
 from understone.screen.menus import render_menu
 from understone.screen.palette import Color
 from understone.screen.text_renderer import render_frame
+from understone.screen.texture import textured
 from understone.screen.viewport import compute_window
 
 if TYPE_CHECKING:
@@ -118,6 +120,17 @@ _HERALD_TEMPLATES: dict[str, tuple[str, ...]] = {
 }
 
 
+def _is_narrow_text(text: str) -> bool:
+    """Return whether every code point in *text* fits a single ledger column.
+
+    True only when each character is grid-safe — one printable column, no
+    fullwidth rune, no combining mark. Spaces qualify (they are narrow), so
+    multi-word reasons and mail pass; a CJK ideograph, an emoji, a fullwidth
+    letter, or a decomposed accent does not.
+    """
+    return all(is_grid_safe(ch) for ch in text)
+
+
 class Game:
     """Stateful coordinator over a single shared world."""
 
@@ -169,14 +182,21 @@ class Game:
     def _sanitize(text: str, max_len: int) -> str | None:
         """Return *text* stripped, or ``None`` if it fails free-text hygiene.
 
-        Rejects empty input, anything longer than *max_len*, and any string
+        Rejects empty input, anything longer than *max_len*, any string
         carrying a non-printable or control character (``\\n``, ``\\r``,
-        ``\\t`` included — ``str.isprintable`` treats them all as unprintable).
+        ``\\t`` included — ``str.isprintable`` treats them all as unprintable),
+        and any string carrying a glyph that will not fit the narrow ledger:
+        a fullwidth rune or a combining mark (the same one-column contract the
+        map glyphs obey, via :func:`~understone.engine.textwidth.is_grid_safe`).
+        Player names, bestow reasons, and inn mail all render inside fixed-width
+        frames and tables, so a wide rune would shove a column out of true.
         This is the single chokepoint for player-authored free text reaching
         the durable store and the public log.
         """
         cleaned = text.strip()
         if not cleaned or len(cleaned) > max_len or not cleaned.isprintable():
+            return None
+        if not _is_narrow_text(cleaned):
             return None
         return cleaned
 
@@ -263,9 +283,11 @@ class Game:
         color = _COLOR_BY_NAME.get(terrain.color, Color.DEFAULT)
         loc = self.world.location_at(x, y)
         if loc is not None:
+            # Location glyphs are landmarks; never texture them.
             loc_color = _COLOR_BY_NAME.get(loc.color, Color.TOWN)
             return Cell(loc.glyph, loc_color)
-        return Cell(terrain.glyph, color)
+        # Terrain glyphs get a deterministic, position-keyed variant for texture.
+        return Cell(textured(terrain.glyph, x, y), color)
 
     def _paint_viewport(self, player: Player) -> CellGrid:
         x0, y0 = compute_window(
@@ -281,7 +303,7 @@ class Game:
         for other in self.players.values():
             if other.name == player.name or other.mode is not Mode.TILE:
                 continue
-            self._mark(grid, x0, y0, other.x, other.y, Cell("&", Color.OTHER_PLAYER))
+            self._mark(grid, x0, y0, other.x, other.y, Cell("☻", Color.OTHER_PLAYER))
         self._mark(grid, x0, y0, player.x, player.y, Cell("@", Color.PLAYER))
         return grid
 
@@ -320,19 +342,27 @@ class Game:
     # -- tool: join ------------------------------------------------------
 
     def join(self, name: str) -> str:
-        """Create a new adventurer, or resume an existing one by name."""
+        """Create a new adventurer, or resume an existing one by name.
+
+        Resume is identity-preserving and runs FIRST: an exact stripped-name
+        match against a stored adventurer is welcomed back without re-running
+        the name hygiene gate, so a character whose name predates a since-
+        tightened rule (e.g. a wide rune now barred at creation) is never locked
+        out of their own save. The sanitizer therefore governs CREATION only —
+        a NEW name must still pass it.
+        """
+        existing = self.players.get(name.strip())
+        if existing is not None:
+            return self._resume(existing)
+
         clean = self._sanitize(name, _NAME_MAX_LEN)
         if clean is None:
-            if len(name.strip()) > _NAME_MAX_LEN:
+            stripped = name.strip()
+            if len(stripped) > _NAME_MAX_LEN:
                 return "The ledger is narrow — choose a name of 24 letters or fewer."
+            if stripped.isprintable() and not _is_narrow_text(stripped):
+                return "The ledger's columns are narrow — wide runes will not fit."
             return "The gatekeeper squints at those strange runes. Plain letters, traveller."
-        existing = self._get(clean)
-        if existing is not None:
-            self._ensure_day(existing)
-            self.store.upsert_player(existing)
-            self.store.commit()
-            banner = f"Welcome back to {self.world.name}, {existing.name}."
-            return self._overworld_frame(existing, lines=self._with_watch(banner))
 
         settings = self.world.settings
         atk, def_, max_hp = self._fresh_combat_stats()
@@ -373,6 +403,20 @@ class Game:
             "New here? Call door_help to learn how the world is run."
         )
         return self._overworld_frame(player, lines=self._with_watch(banner))
+
+    def _resume(self, existing: Player) -> str:
+        """Welcome a stored adventurer back, rolling their day and persisting.
+
+        The resume path for ``join``: it never re-validates the name (an exact
+        stored identity is admitted as-is, however old the rule it predates),
+        rolls the daily clock, commits, and renders the overworld frame with the
+        'welcome back' banner and the watch line.
+        """
+        self._ensure_day(existing)
+        self.store.upsert_player(existing)
+        self.store.commit()
+        banner = f"Welcome back to {self.world.name}, {existing.name}."
+        return self._overworld_frame(existing, lines=self._with_watch(banner))
 
     def _with_watch(self, banner: str) -> list[str]:
         """Return the join banner as frame lines, plus the watch line if set."""

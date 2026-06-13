@@ -166,8 +166,8 @@ def test_mcp_end_to_end(live_server: str) -> None:
     assert "@" in look_before
     assert "┌" in look_before and "┐" in look_before
 
-    # Shared-world proof: after player two joins next door, player one sees '&'.
-    assert "&" in obs["look_one_after"]
+    # Shared-world proof: after player two joins next door, player one sees '☻'.
+    assert "☻" in obs["look_one_after"]
     # And the leaderboard lists both adventurers (one process, one world).
     assert "Brandr" in obs["rank"]
     assert "Sigrun" in obs["rank"]

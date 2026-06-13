@@ -2,7 +2,7 @@
   "inn": {
     "kind": "inn",
     "name": "The Sleeping Drake",
-    "glyph": "I",
+    "glyph": "⌂",
     "color": "town",
     "actions": ["rest", "gamble", "leave"],
     "flavor": [
@@ -28,7 +28,7 @@
   "healer": {
     "kind": "healer",
     "name": "The Quiet Shrine",
-    "glyph": "+",
+    "glyph": "✚",
     "color": "town",
     "actions": ["heal", "leave"],
     "flavor": [
@@ -39,7 +39,7 @@
   "dungeon": {
     "kind": "dungeon",
     "name": "The Understone Deep",
-    "glyph": ">",
+    "glyph": "∩",
     "color": "dungeon",
     "actions": ["descend", "challenge", "leave"],
     "flavor": [

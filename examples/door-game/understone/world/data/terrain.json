@@ -15,7 +15,7 @@
   },
   "~": {
     "key": "water",
-    "glyph": "~",
+    "glyph": "≋",
     "walkable": false,
     "encounter_rate": 0.0,
     "color": "water"
