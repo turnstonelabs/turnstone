@@ -1,0 +1,102 @@
+{
+  "events": [
+    {
+      "kind": "fight",
+      "weight": 82,
+      "text": "Something molten skitters out of the ash."
+    },
+    {
+      "kind": "gold",
+      "weight": 8,
+      "text": "a slag-fused coin-purse cooling in the cinders",
+      "min": 4,
+      "max": 12
+    },
+    {
+      "kind": "gold",
+      "weight": 7,
+      "text": "a scatter of coins dropped by some scorched prospector",
+      "min": 2,
+      "max": 9
+    },
+    {
+      "kind": "gold",
+      "weight": 2,
+      "text": "a smelt-cache prised from beneath a toppled basalt pillar",
+      "min": 40,
+      "max": 80
+    },
+    {
+      "kind": "heal",
+      "weight": 5,
+      "text": "a cool fumarole venting clean steam",
+      "min": 5,
+      "max": 12
+    },
+    {
+      "kind": "heal",
+      "weight": 5,
+      "text": "a seep of quench-water trapped in black glass",
+      "min": 4,
+      "max": 10
+    },
+    {
+      "kind": "heal",
+      "weight": 5,
+      "text": "a shaded hollow where the ashfall cannot reach",
+      "min": 6,
+      "max": 14
+    },
+    {
+      "kind": "trap",
+      "weight": 5,
+      "text": "a thin crust gives way over a pocket of embers",
+      "min": 3,
+      "max": 9
+    },
+    {
+      "kind": "trap",
+      "weight": 5,
+      "text": "a vent of scalding gas hisses up around your boots",
+      "min": 2,
+      "max": 8
+    },
+    {
+      "kind": "trap",
+      "weight": 5,
+      "text": "a sinkhole of loose cinder swallows you to the knee",
+      "min": 4,
+      "max": 11
+    },
+    {
+      "kind": "lore",
+      "weight": 3,
+      "text": "a scorched waystone, its rune worn to a coiled, serpentine shape."
+    },
+    {
+      "kind": "lore",
+      "weight": 3,
+      "text": "the ground shudders with a low note from the caldera, like something vast turning in its sleep."
+    },
+    {
+      "kind": "lore",
+      "weight": 4,
+      "text": "a soot-drawn sketch pinned to a spire: a stair of glowing rock descending into a great open maw."
+    },
+    {
+      "kind": "lore",
+      "weight": 3,
+      "text": "a ring of fused glass where the ash runs molten, the air above it shimmering."
+    },
+    {
+      "kind": "lore",
+      "weight": 3,
+      "text": "a prospector's cairn marking the caldera road, three blackened skulls set facing the deep as warning."
+    },
+    {
+      "kind": "lore",
+      "weight": 4,
+      "text": "ash-singers swear the slag rivers have no source, and that on still nights they breathe."
+    }
+  ]
+}

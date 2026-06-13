@@ -126,6 +126,7 @@
     "satchel_max": 3,
     "forge_base_cost": 60,
     "forge_max_plus": 3,
-    "rare_drop_item": "greater_potion"
+    "rare_drop_item": "greater_potion",
+    "watch_theme": "phosphor"
   }
 }

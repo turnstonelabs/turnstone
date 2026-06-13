@@ -130,7 +130,9 @@ period **CRT spectator console** — a green-and-amber phosphor map of the whole
 world with every adventurer's `☻` marker, a live **Understone Herald** feed, the
 **Hall of Legends**, and a roster of who is currently abroad. It refreshes every
 couple of seconds; if it loses contact it dims and reads `SIGNAL LOST` until the
-server returns.
+server returns. The console's palette follows the pack: a world may pick its own
+CRT colour with `settings.watch_theme` (`phosphor` green, `amber` gold, `ice`
+blue, `ember` red), defaulting to the Vale's green if it says nothing.
 
 The Watch is **strictly read-only**. Input never flows through it — there are no
 controls, no forms, nothing that can change the world. It reads the same shared
@@ -158,13 +160,15 @@ where the game becomes its own authoring target: a pack is plain data, so a
 person *or an LLM* can write one, and the same zero-setup philosophy that makes
 the game playable with no prompt makes it **authorable with no code**.
 
-The loop has three commands:
+The loop has these commands:
 
 ```bash
 understone newpack mypack        # scaffold a pack (copies the Vale as a template)
 # ...edit or LLM-generate the JSON in mypack/ to describe your world...
 understone validate mypack       # check it; prints a report or names what's wrong
+understone simulate mypack       # play a greedy bot through it and measure the balance
 UNDERSTONE_WORLD=mypack understone   # serve your world
+understone worlds                # list the bundled worlds and whether each is sound
 ```
 
 `newpack` writes a starting template plus an `AUTHORING.md` manual — the
@@ -174,13 +178,37 @@ hardened loader the server uses and either prints a summary ending **"This pack
 is sound. The door stands open."** or fails with one precise line naming the
 file, the row, and the field at fault.
 
+`simulate` is the **balance instrument**: it drives a deliberately simple,
+greedy bot through the *real* game — the same `join`/`move`/`action` calls the
+tools make — over a seeded RNG and an injected clock, then prints a report
+(final level, gold earned, fights fought, rungs cleared, whether and when the
+Wyrm fell). It is a tuning probe, not a player to admire: it answers "is this
+world *shaped* right, and is it *winnable*?". Pass `--days N`, `--seed S`, or
+`--seeds K` for a multi-seed sweep with means and spreads. `worlds` lists every
+bundled world — the default Vale plus any alternate packs shipped under
+`understone/world/packs/` — loading each so it can report it as sound or flawed.
+
+**A second bundled world: The Cinder Wastes.** Understone ships a second world
+alongside the Vale, in `understone/world/packs/cinder-wastes/` — a volcanic
+ash-and-slag map whose Watch page glows ember-red instead of the Vale's green
+phosphor. It is the pipeline's own dogfood: it was authored **by an LLM working
+only from `AUTHORING.md` and the `validate` loop**, with no engine code touched,
+then bundled verbatim. `understone worlds` lists it as sound, and
+`understone simulate understone/world/packs/cinder-wastes --days 50 --seeds 3`
+shows the greedy bot taking its Magma Wyrm — the end-to-end proof that a world
+described purely as data, from the manual alone, is genuinely playable to
+victory. Serve it with
+`UNDERSTONE_WORLD=understone/world/packs/cinder-wastes understone`.
+
 Packs are validated **hard** at load: every map glyph must render as exactly
 one terminal column (no fullwidth runes, no emoji, no combining marks — the
 frames are box-drawing rectangles) and may not collide with the frame's
 box-drawing lines or the player markers, dimensions and counts are bounded,
 display names are length-checked, and every cross-reference (a legend
-character, a starting item, the boss monster, a dungeon tier) must resolve.
-Because packs are now routinely untrusted, generated output, those error
+character, a starting item, the boss monster, a dungeon tier) must resolve. The
+loader also pins the rules that keep the endgame coherent: a world has exactly
+one boss, and a dungeon tier's lead monster (its fixed rung guardian) may not be
+a rare. Because packs are now routinely untrusted, generated output, those error
 messages are not a nuisance — they are the **feedback loop**. Iterate against
 them until the door stands open.
 

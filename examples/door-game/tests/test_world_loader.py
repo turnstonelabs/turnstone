@@ -181,7 +181,7 @@ def test_dungeon_tier_without_monster_rejected(tmp_path: Path) -> None:
         data["settings"]["dungeon_tiers"] = [4, 9]
 
     _rewrite(pack / "world.json", mutate)
-    with pytest.raises(WorldLoadError, match=r"dungeon_tiers\[1\] = 9 has no monster"):
+    with pytest.raises(WorldLoadError, match=r"dungeon_tiers\[1\] = 9 has no non-boss monster"):
         load_world(pack)
 
 
@@ -202,6 +202,9 @@ def test_dungeon_tier_backed_only_by_boss_rejected(tmp_path: Path) -> None:
     Tier 6 in the shipped pack holds only the Wyrm Below (a boss). A gauntlet
     rung at tier 6 would draw from monsters_for_tier_band, which filters bosses
     out, so the rung silently does nothing — the loader must reject it instead.
+    The message says "no NON-boss monster" (not merely "no monster"): the boss
+    is present at that tier, it just cannot fill a rung, and the wording must
+    point the author at exactly that.
     """
     pack = _clone_pack(tmp_path)
 
@@ -209,7 +212,7 @@ def test_dungeon_tier_backed_only_by_boss_rejected(tmp_path: Path) -> None:
         data["settings"]["dungeon_tiers"] = [4, 6]  # 6 is the boss-only tier
 
     _rewrite(pack / "world.json", mutate)
-    with pytest.raises(WorldLoadError, match=r"dungeon_tiers\[1\] = 6 has no monster"):
+    with pytest.raises(WorldLoadError, match=r"dungeon_tiers\[1\] = 6 has no non-boss monster"):
         load_world(pack)
 
 
@@ -657,3 +660,95 @@ def test_monster_weight_and_rare_default_when_omitted(tmp_path: Path) -> None:
     rat = next(m for m in world.monsters if m.name == "Field Rat")
     assert rat.weight == 10  # the default biasing weight
     assert rat.rare is False
+
+
+# ---------------------------------------------------------------------------
+# v0.8 loader hardening: rare-as-rung-guardian and the single-boss invariant
+#
+# AUTHORING states both as rules; v0.8 makes them machine-checked. A rare in
+# the lead slot of a dungeon tier would be silently promoted to a fixed rung
+# guardian (and pulled from the rare pool); a stray second boss would validate
+# clean yet make "the one endgame foe" a lie.
+# ---------------------------------------------------------------------------
+
+
+def test_rare_as_first_dungeon_tier_monster_rejected(tmp_path: Path) -> None:
+    """A rare in the FIRST slot of a dungeon tier becomes a fixed guardian — rejected.
+
+    Tier 3 backs a ``dungeon_tiers`` rung and its first monster (the Forest
+    Wolf) is the rung guardian (``band[0]``). Flagging that lead monster rare
+    would quietly turn the rare into the fixed, repeatable guardian and remove
+    it from the weighted rare roll, so the loader rejects it by name.
+    """
+    pack = _clone_pack(tmp_path)
+
+    def mutate(data: list[dict[str, Any]]) -> None:
+        wolf = next(m for m in data if m["name"] == "Forest Wolf")  # first tier-3
+        wolf["rare"] = True
+
+    _rewrite(pack / "monsters.json", mutate)
+    with pytest.raises(
+        WorldLoadError,
+        match=r"'Forest Wolf' is rare but is the first tier-3 monster.*fixed guardian",
+    ):
+        load_world(pack)
+
+
+def test_rare_after_guardian_in_dungeon_tier_accepted(tmp_path: Path) -> None:
+    """A rare placed AFTER the guardian in the same dungeon tier loads cleanly.
+
+    The shipped pack already does exactly this (the Hollow Knight is the third
+    tier-3 entry, behind the Forest Wolf guardian). Inserting another rare also
+    after the guardian must not trip the new check — only the LEAD slot of a
+    dungeon tier is constrained.
+    """
+    pack = _clone_pack(tmp_path)
+
+    def mutate(data: list[dict[str, Any]]) -> None:
+        # Splice a second tier-3 rare in just before the boss (well after the
+        # tier-3 guardian), so the tier's first non-boss monster is unchanged.
+        extra = {
+            "tier": 3,
+            "name": "the Ashen Stalker",
+            "hp": 26,
+            "atk": 10,
+            "def": 3,
+            "xp": 55,
+            "gold": 75,
+            "weight": 1,
+            "rare": True,
+        }
+        data.insert(len(data) - 1, extra)
+
+    _rewrite(pack / "monsters.json", mutate)
+    world = load_world(pack)  # no WorldLoadError: the rare is not the lead foe
+    tier3 = world.monsters_for_tier_band(3, 3)
+    assert tier3[0].name == "Forest Wolf"  # the guardian is still the non-rare lead
+    assert any(m.name == "the Ashen Stalker" and m.rare for m in tier3)
+
+
+def test_two_bosses_rejected(tmp_path: Path) -> None:
+    """Two ``boss``-flagged monsters are rejected: a world has exactly one boss."""
+    pack = _clone_pack(tmp_path)
+
+    def mutate(data: list[dict[str, Any]]) -> None:
+        # Give the Field Rat the boss flag too; now two monsters claim the role.
+        rat = next(m for m in data if m["name"] == "Field Rat")
+        rat["boss"] = True
+        rat["id"] = "field_rat"
+
+    _rewrite(pack / "monsters.json", mutate)
+    with pytest.raises(WorldLoadError, match=r"flags 2 monsters as .boss.* true"):
+        load_world(pack)
+
+
+def test_single_boss_accepted() -> None:
+    """The shipped pack carries exactly one boss and loads — the single-boss path.
+
+    The positive half of the invariant: the Wyrm Below is the only boss, so the
+    load succeeds and the boss count is exactly one.
+    """
+    world = load_world(SHIPPED)
+    bosses = [m for m in world.monsters if m.boss]
+    assert len(bosses) == 1
+    assert bosses[0].name == "the Wyrm Below"

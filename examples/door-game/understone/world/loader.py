@@ -67,6 +67,13 @@ EVENT_AMOUNT_BANDS: dict[str, tuple[int, int]] = {
 }
 _EVENT_KINDS = frozenset({"fight", "gold", "heal", "trap", "lore"})
 
+# The legal Watch CRT palettes a pack may choose via ``settings.watch_theme``.
+# "phosphor" is the original green and the default; the Watch's JS THEME table
+# (understone.watch) carries the matching CSS custom-property values for each.
+# This is the loader band for watch_theme — an unknown name is a load error.
+WATCH_THEMES = frozenset({"phosphor", "amber", "ice", "ember"})
+DEFAULT_WATCH_THEME = "phosphor"
+
 # Map-dimension band (inclusive). The floor keeps a map wide enough to frame a
 # town; the ceiling caps the work a frame redraw and a row-decode must do on
 # untrusted pack input.
@@ -238,6 +245,13 @@ def _load_monsters(root: Path) -> list[Monster]:
         )
     if not out:
         raise WorldLoadError("monsters.json defines no monsters")
+    bosses = [m for m in out if m.boss]
+    if len(bosses) > 1:
+        names = ", ".join(repr(m.name) for m in bosses)
+        raise WorldLoadError(
+            f'monsters.json flags {len(bosses)} monsters as "boss": true ({names}); '
+            "a world has exactly one boss — the single endgame foe settings.boss_monster names"
+        )
     return out
 
 
@@ -603,6 +617,7 @@ def _decode_settings(raw: dict[str, Any], items: list[Item], monsters: list[Mons
     dungeon_tiers = _decode_dungeon_tiers(spec, monsters)
     boss_monster = _decode_boss_monster(spec, monsters)
     rare_drop_item = _decode_rare_drop_item(spec, items)
+    watch_theme = _decode_watch_theme(spec)
 
     return Settings(
         daily_turns=values["daily_turns"],
@@ -632,6 +647,7 @@ def _decode_settings(raw: dict[str, Any], items: list[Item], monsters: list[Mons
         forge_base_cost=values["forge_base_cost"],
         forge_max_plus=values["forge_max_plus"],
         rare_drop_item=rare_drop_item,
+        watch_theme=watch_theme,
     )
 
 
@@ -678,6 +694,26 @@ def _decode_rare_drop_item(spec: dict[str, Any], items: list[Item]) -> str:
     return drop_id
 
 
+def _decode_watch_theme(spec: dict[str, Any]) -> str:
+    """Resolve and validate the Watch CRT palette name (optional, defaulted).
+
+    ``watch_theme`` is OPTIONAL: a pack that omits it keeps the original
+    :data:`DEFAULT_WATCH_THEME` ("phosphor"), so no author is forced to set it
+    and an existing pack is unchanged. When present it must name one of
+    :data:`WATCH_THEMES`; an unknown palette is a load error naming the legal
+    set, since the Watch's JS would have no variables to apply for it.
+    """
+    raw = spec.get("watch_theme", DEFAULT_WATCH_THEME)
+    theme = str(raw)
+    if theme not in WATCH_THEMES:
+        legal = ", ".join(sorted(WATCH_THEMES))
+        raise WorldLoadError(
+            f"world.json settings.watch_theme = {theme!r} is not a known theme; "
+            f"choose one of: {legal}"
+        )
+    return theme
+
+
 def _decode_dungeon_tiers(spec: dict[str, Any], monsters: list[Monster]) -> tuple[int, ...]:
     """Parse the ordered dungeon-gauntlet tier ladder, one foe per tier.
 
@@ -685,6 +721,13 @@ def _decode_dungeon_tiers(spec: dict[str, Any], monsters: list[Monster]) -> tupl
     the gauntlet would silently skip that rung: the gauntlet draws from
     ``monsters_for_tier_band``, which excludes boss monsters, so a boss-only
     tier loads cleanly yet has no fightable foe at runtime.
+
+    Each tier's *first* non-boss monster in file order is its fixed rung
+    guardian (``monsters_for_tier_band(t, t)[0]``, the engine's deterministic
+    pick), so that monster must NOT be ``rare``: a rare in the lead slot of a
+    dungeon tier would be promoted to a fixed, repeatable guardian and pulled
+    out of the weighted rare pool entirely. The rule is checked here, where the
+    tier ladder and the monster order meet.
     """
     raw_tiers = _require(spec, "dungeon_tiers", "world.json settings")
     if not (isinstance(raw_tiers, list) and raw_tiers):
@@ -695,7 +738,16 @@ def _decode_dungeon_tiers(spec: dict[str, Any], monsters: list[Monster]) -> tupl
         tier = int(value)
         if tier not in available:
             raise WorldLoadError(
-                f"world.json settings.dungeon_tiers[{i}] = {tier} has no monster in the pack"
+                f"world.json settings.dungeon_tiers[{i}] = {tier} has no non-boss monster "
+                "in the pack (the dungeon gauntlet excludes the boss, so a boss-only tier "
+                "leaves the rung unfillable)"
+            )
+        guardian = next(m for m in monsters if m.tier == tier and not m.boss)
+        if guardian.rare:
+            raise WorldLoadError(
+                f"monsters.json: {guardian.name!r} is rare but is the first tier-{tier} "
+                f"monster, so it would become the fixed guardian of dungeon rung tier {tier} "
+                "— put a non-rare monster first in that tier"
             )
         tiers.append(tier)
     return tuple(tiers)

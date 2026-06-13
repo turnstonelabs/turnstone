@@ -1,0 +1,44 @@
+{
+  ".": {
+    "key": "ash",
+    "glyph": "░",
+    "walkable": true,
+    "encounter_rate": 0.1,
+    "color": "floor"
+  },
+  "A": {
+    "key": "spire",
+    "glyph": "▲",
+    "walkable": false,
+    "encounter_rate": 0.0,
+    "color": "tree"
+  },
+  "~": {
+    "key": "slag",
+    "glyph": "≈",
+    "walkable": false,
+    "encounter_rate": 0.0,
+    "color": "water"
+  },
+  "=": {
+    "key": "basalt",
+    "glyph": "=",
+    "walkable": true,
+    "encounter_rate": 0.02,
+    "color": "floor"
+  },
+  "c": {
+    "key": "cinder",
+    "glyph": "▒",
+    "walkable": true,
+    "encounter_rate": 0.25,
+    "color": "tree"
+  },
+  "#": {
+    "key": "caldera",
+    "glyph": "▓",
+    "walkable": false,
+    "encounter_rate": 0.0,
+    "color": "wall"
+  }
+}

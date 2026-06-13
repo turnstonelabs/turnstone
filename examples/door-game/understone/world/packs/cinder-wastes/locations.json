@@ -1,0 +1,52 @@
+{
+  "inn": {
+    "kind": "inn",
+    "name": "The Forge-Rest",
+    "glyph": "⌂",
+    "color": "town",
+    "actions": ["rest", "gamble", "leave"],
+    "flavor": [
+      "Heat-bricked walls hold back the ashfall outside.",
+      "The hearthwright stokes a banked forge and nods you toward a cot.",
+      "A night beside the coals restores you fully.",
+      "In the corner, a cup of knucklebones rattles for a wager."
+    ]
+  },
+  "shop": {
+    "kind": "shop",
+    "name": "The Slag Market",
+    "glyph": "$",
+    "color": "town",
+    "actions": ["buy", "sell", "forge", "leave"],
+    "flavor": [
+      "Stalls of cooled obsidian and scavenged plate crowd the stone.",
+      "Buying a weapon or armour straps it on at once.",
+      "Tonics go into your satchel, to quaff when the heat turns dire.",
+      "The smelter roars: bring slag-coin to temper your edge or your guard.",
+      "Spent gear sells back for half its price."
+    ]
+  },
+  "healer": {
+    "kind": "healer",
+    "name": "The Ember Shrine",
+    "glyph": "✚",
+    "color": "town",
+    "actions": ["heal", "leave"],
+    "flavor": [
+      "A still blue pilot-flame burns at the heart of the shrine.",
+      "The cinder-tender seals your burns for coin, per point of vigour."
+    ]
+  },
+  "dungeon": {
+    "kind": "dungeon",
+    "name": "The Caldera Mouth",
+    "glyph": "∩",
+    "color": "dungeon",
+    "actions": ["descend", "challenge", "leave"],
+    "flavor": [
+      "A throat of glowing rock drops away into furnace-dark.",
+      "To descend is to face a golem, then something far hotter.",
+      "Deeper still, the ash-singers warn, the Magma Wyrm coils and burns."
+    ]
+  }
+}

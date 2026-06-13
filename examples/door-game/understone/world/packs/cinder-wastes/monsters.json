@@ -1,0 +1,125 @@
+[
+  {
+    "tier": 1,
+    "name": "Cinder Mite",
+    "hp": 6,
+    "atk": 3,
+    "def": 0,
+    "xp": 8,
+    "gold": 3
+  },
+  {
+    "tier": 1,
+    "name": "Ash Crawler",
+    "hp": 7,
+    "atk": 5,
+    "def": 0,
+    "xp": 9,
+    "gold": 2
+  },
+  {
+    "tier": 2,
+    "name": "Ember Imp",
+    "hp": 12,
+    "atk": 5,
+    "def": 1,
+    "xp": 18,
+    "gold": 7
+  },
+  {
+    "tier": 2,
+    "name": "Slag Scuttler",
+    "hp": 14,
+    "atk": 6,
+    "def": 1,
+    "xp": 20,
+    "gold": 9
+  },
+  {
+    "tier": 2,
+    "name": "the Gilded Salamander",
+    "hp": 16,
+    "atk": 6,
+    "def": 2,
+    "xp": 40,
+    "gold": 60,
+    "weight": 1,
+    "rare": true
+  },
+  {
+    "tier": 3,
+    "name": "Magma Hound",
+    "hp": 20,
+    "atk": 8,
+    "def": 2,
+    "xp": 35,
+    "gold": 14
+  },
+  {
+    "tier": 3,
+    "name": "Obsidian Lurker",
+    "hp": 22,
+    "atk": 9,
+    "def": 2,
+    "xp": 38,
+    "gold": 16
+  },
+  {
+    "tier": 3,
+    "name": "the Cinder Revenant",
+    "hp": 30,
+    "atk": 11,
+    "def": 4,
+    "xp": 80,
+    "gold": 110,
+    "weight": 1,
+    "rare": true
+  },
+  {
+    "tier": 4,
+    "name": "Basalt Golem",
+    "hp": 38,
+    "atk": 12,
+    "def": 4,
+    "xp": 70,
+    "gold": 30
+  },
+  {
+    "tier": 4,
+    "name": "Ashen Wraith",
+    "hp": 35,
+    "atk": 13,
+    "def": 4,
+    "xp": 65,
+    "gold": 28
+  },
+  {
+    "tier": 5,
+    "name": "Slag Drake",
+    "hp": 60,
+    "atk": 18,
+    "def": 6,
+    "xp": 140,
+    "gold": 60
+  },
+  {
+    "tier": 5,
+    "name": "Caldera Reaver",
+    "hp": 55,
+    "atk": 17,
+    "def": 6,
+    "xp": 130,
+    "gold": 55
+  },
+  {
+    "tier": 6,
+    "name": "the Magma Wyrm",
+    "hp": 120,
+    "atk": 24,
+    "def": 8,
+    "xp": 400,
+    "gold": 250,
+    "boss": true,
+    "id": "magma_wyrm"
+  }
+]

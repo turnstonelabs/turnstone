@@ -204,3 +204,7 @@ class Settings:
     forge_base_cost: int
     forge_max_plus: int
     rare_drop_item: str
+    # v0.8 "worlds without authors": the Watch's per-world CRT palette. One of
+    # the names in WATCH_THEMES; defaults to "phosphor" (the original green), so
+    # a pack that omits it looks exactly as the Vale always has.
+    watch_theme: str = "phosphor"
