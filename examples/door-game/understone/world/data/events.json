@@ -2,7 +2,7 @@
   "events": [
     {
       "kind": "fight",
-      "weight": 55,
+      "weight": 82,
       "text": "Something snarls out of the brush."
     },
     {
@@ -20,6 +20,13 @@
       "max": 9
     },
     {
+      "kind": "gold",
+      "weight": 2,
+      "text": "a hoard-cache prised from beneath a toppled menhir",
+      "min": 40,
+      "max": 80
+    },
+    {
       "kind": "heal",
       "weight": 5,
       "text": "a clearwater spring",
@@ -32,6 +39,13 @@
       "text": "a quiet fae blessing",
       "min": 4,
       "max": 10
+    },
+    {
+      "kind": "heal",
+      "weight": 5,
+      "text": "a moss-bed where weary travellers mend",
+      "min": 6,
+      "max": 14
     },
     {
       "kind": "trap",
@@ -48,6 +62,13 @@
       "max": 8
     },
     {
+      "kind": "trap",
+      "weight": 5,
+      "text": "a hidden pit-deadfall, its cover long rotted through",
+      "min": 4,
+      "max": 11
+    },
+    {
       "kind": "lore",
       "weight": 3,
       "text": "an old waystone, its rune worn to a coiled, scaled shape."
@@ -61,6 +82,21 @@
       "kind": "lore",
       "weight": 4,
       "text": "a charcoal sketch nailed to a tree: a stair of stone descending into a great open mouth."
+    },
+    {
+      "kind": "lore",
+      "weight": 3,
+      "text": "a scorched ring in the grass where no plant grows, the soil still faintly warm."
+    },
+    {
+      "kind": "lore",
+      "weight": 3,
+      "text": "a ranger's cairn marking the dungeon road, three skulls set facing the deep as warning."
+    },
+    {
+      "kind": "lore",
+      "weight": 4,
+      "text": "fishermen swear the vale lake has no bottom, and that on still nights it breathes."
     }
   ]
 }

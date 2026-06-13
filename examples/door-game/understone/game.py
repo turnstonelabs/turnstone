@@ -98,11 +98,15 @@ class Game:
         *,
         clock: Callable[[], datetime] | None = None,
         rng: GameRNG | None = None,
+        watch_url: str | None = None,
     ) -> None:
         self.world = world
         self.store = store
         self.clock = clock or (lambda: datetime.now(UTC))
         self.rng = rng or GameRNG()
+        # When the http transport is up, this is the spectator page URL; the
+        # join banner and the help manual advertise it. None under stdio.
+        self.watch_url = watch_url
         players, events = store.load_all()
         self.players: dict[str, Player] = players
         self.events: list[Event] = events
@@ -116,6 +120,14 @@ class Game:
 
     def _now_iso(self) -> str:
         return self.clock().isoformat()
+
+    def watch_line(self) -> str:
+        """Return the 'Watch the Vale live' advertisement, or '' when no URL.
+
+        Surfaced by ``join`` (appended to its banner) and by the server's
+        ``door_help`` manual. Empty under stdio, where there is no page to view.
+        """
+        return f"Watch the Vale live: {self.watch_url}" if self.watch_url else ""
 
     def _get(self, name: str) -> Player | None:
         return self.players.get(name.strip())
@@ -254,7 +266,7 @@ class Game:
             self.store.upsert_player(existing)
             self.store.commit()
             banner = f"Welcome back to {self.world.name}, {existing.name}."
-            return self._overworld_frame(existing, lines=[banner])
+            return self._overworld_frame(existing, lines=self._with_watch(banner))
 
         settings = self.world.settings
         atk, def_, max_hp = self._fresh_combat_stats()
@@ -290,7 +302,12 @@ class Game:
             f"You arrive in {self.world.name}, {clean}. A road runs east from the town.\n"
             "New here? Call door_help to learn how the world is run."
         )
-        return self._overworld_frame(player, lines=[banner])
+        return self._overworld_frame(player, lines=self._with_watch(banner))
+
+    def _with_watch(self, banner: str) -> list[str]:
+        """Return the join banner as frame lines, plus the watch line if set."""
+        line = self.watch_line()
+        return [banner, line] if line else [banner]
 
     def _fresh_combat_stats(self) -> tuple[int, int, int]:
         """Return the fresh ``(atk, def_, max_hp)`` for the starting kit.
