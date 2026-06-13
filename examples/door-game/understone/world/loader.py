@@ -579,6 +579,22 @@ def _decode_zones(
                 tier_hi=hi,
             )
         )
+    # Zones must not overlap: zone_for returns the FIRST match, so an overlap
+    # would silently shadow one zone's tier band on the shared cells. Reject it
+    # at load so an authored pack can't ship that bug unseen.
+    for i, first in enumerate(out):
+        for second in out[i + 1 :]:
+            if (
+                first.x0 <= second.x1
+                and second.x0 <= first.x1
+                and first.y0 <= second.y1
+                and second.y0 <= first.y1
+            ):
+                raise WorldLoadError(
+                    f"world.json zones {first.key!r} and {second.key!r} overlap; "
+                    "give each zone a distinct rectangle (zone_for takes the first "
+                    "match, so an overlap would silently shadow one tier band)"
+                )
     return out
 
 

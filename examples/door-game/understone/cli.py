@@ -385,29 +385,15 @@ def _render_validate_coverage() -> str:
     settings_count = len(loader.SETTINGS_BANDS)
     reserved = ", ".join(f"`{g}`" for g in _reserved_glyph_list())
     bullets = [
-        f"* **Economy and progression bands** — every one of the {settings_count} "
-        "`settings` fields must sit in its allowed range (the table above), and "
-        "`growth` must be present and non-negative.",
-        "* **Glyph safety** — every terrain, location, and legend glyph must render "
-        f"exactly one column and must not be a reserved marker ({reserved}).",
-        "* **Map integrity** — `width`/`height` in band, every `terrain_rows` row "
-        "exactly `width` long with `height` rows, and every row character in the "
-        "`legend`.",
-        "* **Walkability** — `spawn` and every placed location must sit on walkable "
-        "terrain (and no two locations share a cell).",
-        f"* **Display-name length** — every monster, item, and location name within "
-        f"`{loader.MAX_NAME_LEN}` printable characters; content lists within their caps.",
-        "* **The fight row** — `events.json` must hold at least one `fight` entry, "
-        "with weights `> 0`, `min <= max`, and amounts in their per-kind band.",
-        "* **Cross-references** — `legend` → terrain key, location placements → "
-        "`locations.json` keys, `starting_weapon`/`starting_armor` → item ids, "
-        '`boss_monster` → a monster flagged `"boss": true`, '
-        "`rare_drop_item` → a consumable item id, and `forge_ore_item` → a "
-        "`material` item id.",
+        f"* **Economy and progression bands** — every one of the {settings_count} `settings` fields must sit in its allowed range (the table above), and `growth` must be present and non-negative.",
+        f"* **Glyph safety** — every terrain, location, and legend glyph must render exactly one column and must not be a reserved marker ({reserved}).",
+        "* **Map integrity** — `width`/`height` in band, every `terrain_rows` row exactly `width` long with `height` rows, and every row character in the `legend`.",
+        "* **Walkability** — `spawn` and every placed location must sit on walkable terrain (and no two locations share a cell).",
+        f"* **Display-name length** — every monster, item, and location name within `{loader.MAX_NAME_LEN}` printable characters; content lists within their caps.",
+        "* **The fight row** — `events.json` must hold at least one `fight` entry, with weights `> 0`, `min <= max`, and amounts in their per-kind band.",
+        '* **Cross-references** — `legend` → terrain key, location placements → `locations.json` keys, `starting_weapon`/`starting_armor` → item ids, `boss_monster` → a monster flagged `"boss": true`, `rare_drop_item` → a consumable item id, and `forge_ore_item` → a `material` item id.',
         "* **Zone tiers** — every zone's tier band must overlap at least one monster tier.",
-        "* **Dungeon ladder** — every `dungeon_tiers` tier must have a non-boss "
-        "monster, and that tier's FIRST monster (its fixed rung guardian) must "
-        "not be `rare`.",
+        "* **Dungeon ladder** — every `dungeon_tiers` tier must have a non-boss monster, and that tier's FIRST monster (its fixed rung guardian) must not be `rare`.",
         '* **Exactly one boss** — at most one monster may carry `"boss": true`.',
     ]
     return "\n".join(bullets)
