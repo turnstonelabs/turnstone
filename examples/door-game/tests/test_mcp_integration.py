@@ -237,3 +237,52 @@ def test_watch_routes_coexist_with_mcp(live_server: str) -> None:
     joined, watch_status = asyncio.run(_drive_both())
     assert "@" in joined  # the MCP tool still returns a real frame
     assert watch_status == 200  # and the watch route still answers
+
+
+def test_streamable_http_host_gate_off_localhost() -> None:
+    """A non-localhost bind must accept remote `Host` headers on /mcp.
+
+    REGRESSION: FastMCP freezes DNS-rebinding protection (a localhost-only Host
+    allowlist) at CONSTRUCTION, and ``server`` builds its FastMCP at import with
+    the default 127.0.0.1 host. A 0.0.0.0/LAN bind therefore answered TCP and
+    `/watch` but 421'd `/mcp` for every remote node ("Invalid Host header").
+    ``_serve`` drops the allowlist when bound off localhost; this pins the
+    mechanism — a default instance rejects a foreign Host, a protection-disabled
+    one accepts it (a 421 in the second case is the bug returning).
+
+    Uses fresh FastMCP instances (not the module singleton) so there is no
+    shared-state or app-cache coupling with the live-server tests above.
+    """
+    from mcp.server.fastmcp import FastMCP
+    from mcp.server.transport_security import TransportSecuritySettings
+    from starlette.testclient import TestClient
+
+    foreign = {
+        "Host": "192.168.0.239:8077",
+        "Accept": "application/json, text/event-stream",
+        "Content-Type": "application/json",
+    }
+    init = {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "initialize",
+        "params": {
+            "protocolVersion": "2025-03-26",
+            "capabilities": {},
+            "clientInfo": {"name": "probe", "version": "0"},
+        },
+    }
+
+    # Default (localhost-baked allowlist) — a remote Host is refused.
+    locked = FastMCP("hostgate-locked")
+    with TestClient(locked.streamable_http_app()) as client:
+        assert client.post("/mcp", headers=foreign, json=init).status_code == 421
+
+    # Protection disabled (what _serve does off localhost) — remote Host accepted.
+    opened = FastMCP("hostgate-open")
+    opened.settings.transport_security = TransportSecuritySettings(
+        enable_dns_rebinding_protection=False
+    )
+    with TestClient(opened.streamable_http_app()) as client:
+        resp = client.post("/mcp", headers=foreign, json=init)
+    assert resp.status_code != 421, f"remote Host still rejected: {resp.status_code} {resp.text}"

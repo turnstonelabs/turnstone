@@ -41,6 +41,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from mcp.server.fastmcp import FastMCP
+from mcp.server.transport_security import TransportSecuritySettings
 from starlette.responses import HTMLResponse, JSONResponse, Response
 
 from understone import cli, sim, watch
@@ -563,6 +564,18 @@ def _serve() -> None:
         mcp.settings.port = port
         mcp.settings.streamable_http_path = os.environ.get("UNDERSTONE_PATH", "/mcp")
         mcp.settings.stateless_http = False
+        # FastMCP freezes DNS-rebinding protection (a localhost-only Host
+        # allowlist) at CONSTRUCTION, and this module builds `mcp` at import
+        # with the default 127.0.0.1 host — so a 0.0.0.0/LAN bind would 421
+        # "Invalid Host" on /mcp for every remote node (the multi-node case).
+        # Binding off localhost means we intend to accept other hosts, so drop
+        # the allowlist here (matching the SDK's own default for a non-localhost
+        # bind). These routes are unauthenticated by design — serve only on a
+        # trusted network. UNDERSTONE_HOST controls the bind.
+        if host not in ("127.0.0.1", "localhost", "::1"):
+            mcp.settings.transport_security = TransportSecuritySettings(
+                enable_dns_rebinding_protection=False
+            )
         # The spectator page is only reachable over http, so its URL is composed
         # here from the bind address. A 0.0.0.0 bind should advertise a host a
         # browser can actually reach (see the README Watch section).
