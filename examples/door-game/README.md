@@ -48,6 +48,14 @@ A run is a little RPG loop, played a bit each day:
 - **Read the news.** `door_log` is the **Understone Herald**, a shared
   broadsheet of notable deeds across the whole world — who joined, who rose a
   level, who was dragged home by a goblin, and who freed the Vale.
+- **Make it social.** It is a shared world, so you can touch other players.
+  `ambush` a rival who has not yet acted today — a classic
+  style player-kill that robs a sleeping foe of some gold, except the surest
+  defence is simply to take your own turn (an active player is awake and can't
+  be caught). Lose the ambush and *you* are the one who flees, shamed on the
+  feed. `post` a private note another player reads on their next visit (it
+  never reaches the public Herald). Or `gamble` a little gold at the inn's dice
+  against the house. Ambush spends a turn; mail and dice do not.
 
 ## Installation
 
@@ -207,7 +215,7 @@ url = "http://localhost:8077/mcp"
 | `door_status` | The character sheet (read-only). |
 | `door_look` | Redraw the current view — overworld map or location menu. |
 | `door_move` | Walk the overworld (free; no daily turn spent). |
-| `door_action` | Context verbs: fight, flee, rest, buy, sell, heal, descend, challenge (the Wyrm), leave. |
+| `door_action` | Context verbs: fight, flee, ambush (a rival), rest, buy, sell, heal, gamble (inn dice), descend, challenge (the Wyrm), post (mail another player), leave. |
 | `door_log` | The Understone Herald — the shared feed of notable deeds. |
 | `door_rank` | The leaderboard, plus the Hall of Legends (★ marks Wyrm kills). |
 | `door_bestow` | Game-master grant of a little gold/healing for a story beat. |

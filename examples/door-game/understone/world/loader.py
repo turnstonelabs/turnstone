@@ -47,6 +47,12 @@ SETTINGS_BANDS: dict[str, tuple[int, int | None]] = {
     "xp_base": (1, None),
     "bestow_daily_budget": (0, 500),
     "wyrm_min_level": (1, 50),
+    "ambush_min_level": (1, 50),
+    "ambush_level_band": (0, 10),
+    "ambush_gold_pct": (0, 100),
+    "post_daily_cap": (0, 50),
+    "gamble_max_bet": (1, 10000),
+    "gamble_daily_cap": (0, 100),
 }
 
 # Per-kind amount bands for the overworld event table (inclusive).
@@ -602,6 +608,12 @@ def _decode_settings(raw: dict[str, Any], items: list[Item], monsters: list[Mons
         dungeon_tiers=dungeon_tiers,
         boss_monster=boss_monster,
         wyrm_min_level=values["wyrm_min_level"],
+        ambush_min_level=values["ambush_min_level"],
+        ambush_level_band=values["ambush_level_band"],
+        ambush_gold_pct=values["ambush_gold_pct"],
+        post_daily_cap=values["post_daily_cap"],
+        gamble_max_bet=values["gamble_max_bet"],
+        gamble_daily_cap=values["gamble_daily_cap"],
     )
 
 

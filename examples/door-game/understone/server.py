@@ -138,6 +138,30 @@ BESTOWING FORTUNE (use sparingly)
   Treat it as seasoning, not a salt-shaker: reserve it for the rare, earned
   beat, and never promise a reward you cannot actually deliver within the cap.
 
+THE SOCIAL LAYER (rivals, mail, and dice)
+  Understone is a SHARED world, and three verbs let players touch one another.
+  * AMBUSH (door_action action="ambush" target=<player>, on the overworld).
+    A classic-door-game-style player-kill: you fall upon a RIVAL WHO HAS NOT YET ACTED
+    TODAY and rob them. The SLEEP RULE is the heart of it — a player who has
+    already taken their turn that day is awake and cannot be ambushed, so the
+    surest defence is simply to play. The gatekeeper shields the young (both of
+    you must clear a level floor) and only matches near-equals (a level band).
+    On a win you take a slice of their gold and they wake at the spawn at 1 HP;
+    a public Herald crows the deed and the victim gets a PRIVATE note. But the
+    sleeper may WAKE: lose, and YOU are the one who flees bleeding, shamed on
+    the feed and gaining nothing. You get one attempt per rival per day, win or
+    lose. Narrate ambush as a real betrayal — and losing one as just deserts.
+  * POST (door_action action="post" target=<player> text=<message>, anywhere).
+    Leave a private note at the inn for another player; they read it on their
+    next door_log under "While you were away". It costs no turn, is capped per
+    day, and the note is PRIVATE — it never reaches the public Herald or the
+    lobby TV. Good for taunts after an ambush, alliances, or a kind word.
+  * GAMBLE (door_action action="gamble" amount=<gold>, at the inn).
+    Wager gold on a single throw of 2d6 against the house: roll higher to
+    double your stake, tie to push, roll lower to lose it. It costs no turn but
+    is capped per day. A big win is heralded; a quiet one is just a story you
+    tell. Remind players the house has no mercy and the odds are even at best.
+
 TOOL CHEAT-SHEET
   door_help                      This manual.
   door_join(player)              Sign in (creates or resumes a character).
@@ -145,8 +169,10 @@ TOOL CHEAT-SHEET
   door_look(player)              Redraw the current view (map or menu).
   door_move(player, ...)         Walk the overworld (free). steps="NNEE" or
                                  heading="east" + distance=3 (max 8 per call).
-  door_action(player, action)    Context verb: fight, flee, rest, buy, sell,
-                                 heal, descend, challenge (the Wyrm), leave.
+  door_action(player, action)    Context verb: fight, flee, ambush (a rival),
+                                 rest, buy, sell, heal, gamble (dice at the
+                                 inn), descend, challenge (the Wyrm), post (a
+                                 note for another player), leave.
   door_log(player)               Read the Understone Herald (the shared feed).
   door_rank(player)              The leaderboard + Hall of Legends (★ = wins).
   door_bestow(player, reason...) Grant a little gold/healing for a story beat.
@@ -304,31 +330,45 @@ def door_move(player: str, steps: str = "", heading: str = "", distance: int = 1
 
 
 @mcp.tool()
-def door_action(player: str, action: str, target: str = "", item: str = "") -> str:
+def door_action(
+    player: str,
+    action: str,
+    target: str = "",
+    item: str = "",
+    text: str = "",
+    amount: int = 0,
+) -> str:
     """Take a context-sensitive action in the world.
 
     The legal verbs depend on where the adventurer is. On the overworld:
-    'fight' or 'flee' a wandering monster (fighting spends one daily turn).
-    Inside a building: 'rest' (inn), 'buy'/'sell' (shop), 'heal' (healer),
-    or 'leave'. At the dungeon: 'descend' the gauntlet, or 'challenge' the
+    'fight' or 'flee' a wandering monster (fighting spends one daily turn), or
+    'ambush' a named rival who has not yet acted today — a sleeping-rival
+    robbery in the spirit of the classic door-game player-kill (target=<name>, spends a turn).
+    Inside a building: 'rest' (inn), 'buy'/'sell' (shop), 'heal' (healer), or
+    'leave'. At the inn you may also 'gamble' a stake of gold at dice
+    (amount=<gold>). At the dungeon: 'descend' the gauntlet, or 'challenge' the
     Wyrm Below — the endgame boss and the only way to win. The challenge is
     gated by level (under-level heroes are turned away in-fiction) and, once
     allowed, spends a daily turn and resolves in a single call like a fight:
     a victory frees the Vale and begins a new life (see door_help), a defeat
-    bounces you home. An illegal verb returns the verbs valid right here.
+    bounces you home. Anywhere, 'post' leaves a private note for another player
+    (target=<name>, text=<message>) that they read on their next door_log;
+    posting costs no turn. An illegal verb returns the verbs valid right here.
 
     Args:
         player: The adventurer's name.
-        action: The verb to attempt (fight, flee, rest, buy, sell, heal,
-            descend, challenge, leave).
-        target: Reserved for future targeted actions.
+        action: The verb to attempt (fight, flee, ambush, rest, buy, sell,
+            heal, gamble, descend, challenge, post, leave).
+        target: The other player's name for 'ambush' and 'post'.
         item: For shop 'buy', the item id to purchase.
+        text: For 'post', the note left for the target (<= 120 characters).
+        amount: For inn 'gamble', the gold wagered on the dice.
     """
     blank = _guard_name(player)
     if blank is not None:
         return blank
     try:
-        return _game().action(player, action, target, item)
+        return _game().action(player, action, target, item, text, amount)
     except Exception:
         log.exception("door_action failed for %r action=%r", player, action)
         return _unexpected()

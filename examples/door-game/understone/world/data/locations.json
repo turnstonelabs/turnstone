@@ -4,11 +4,12 @@
     "name": "The Sleeping Drake",
     "glyph": "I",
     "color": "town",
-    "actions": ["rest", "leave"],
+    "actions": ["rest", "gamble", "leave"],
     "flavor": [
       "Lamplight pools on worn oak tables.",
       "The innkeeper nods toward the hearth.",
-      "A night's rest restores you fully."
+      "A night's rest restores you fully.",
+      "In the corner, a dice cup waits for a wager."
     ]
   },
   "shop": {

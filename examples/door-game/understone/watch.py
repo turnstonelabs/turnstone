@@ -114,13 +114,16 @@ def build_state_payload(game: Game) -> dict[str, object]:
 
 
 def _recent_events(game: Game) -> list[Event]:
-    """Return the last :data:`_HERALD_LIMIT` resident events, oldest-first.
+    """Return the last :data:`_HERALD_LIMIT` resident PUBLIC events, oldest-first.
 
-    The façade keeps events in ascending id order, so the list tail IS the
-    newest window — a plain slice is correct even when event ids are sparse
-    (AUTOINCREMENT gaps must not shrink the feed).
+    PRIVATE notes (a non-empty ``target`` — ambush victim alerts, inn mail)
+    are filtered out first: the lobby TV is a public broadsheet and must never
+    show a message addressed to one player. The façade keeps events in
+    ascending id order, so the tail of the public slice IS the newest public
+    window — correct even when AUTOINCREMENT ids are sparse.
     """
-    return game.events[-_HERALD_LIMIT:]
+    public = [event for event in game.events if not event.target]
+    return public[-_HERALD_LIMIT:]
 
 
 # The Watch page. One self-contained document: inline CSS + vanilla JS, no

@@ -28,6 +28,8 @@ from understone.engine.rank import HallEntry, RankEntry
 if TYPE_CHECKING:
     from pathlib import Path
 
+# Pre-1.0 the schema mutates in place and the stamp is not yet meaningful;
+# version discipline (and migrations) begins at 1.0.
 _SCHEMA_VERSION = 1
 
 # How many of the newest events to hydrate at construction. Full history stays
@@ -59,6 +61,10 @@ _PLAYER_COLUMNS = (
     "bestow_spent",
     "bestow_day",
     "wins",
+    "posts_sent",
+    "post_day",
+    "gambles",
+    "gamble_day",
 )
 
 
@@ -99,15 +105,27 @@ class Store:
                 log_cursor  INTEGER NOT NULL,
                 bestow_spent INTEGER NOT NULL,
                 bestow_day  INTEGER NOT NULL,
-                wins        INTEGER NOT NULL DEFAULT 0
+                wins        INTEGER NOT NULL DEFAULT 0,
+                posts_sent  INTEGER NOT NULL DEFAULT 0,
+                post_day    INTEGER NOT NULL DEFAULT 0,
+                gambles     INTEGER NOT NULL DEFAULT 0,
+                gamble_day  INTEGER NOT NULL DEFAULT 0
             );
 
             CREATE TABLE IF NOT EXISTS events (
-                id    INTEGER PRIMARY KEY AUTOINCREMENT,
-                ts    TEXT NOT NULL,
-                actor TEXT NOT NULL,
-                kind  TEXT NOT NULL,
-                text  TEXT NOT NULL
+                id     INTEGER PRIMARY KEY AUTOINCREMENT,
+                ts     TEXT NOT NULL,
+                actor  TEXT NOT NULL,
+                kind   TEXT NOT NULL,
+                text   TEXT NOT NULL,
+                target TEXT NOT NULL DEFAULT ''
+            );
+
+            CREATE TABLE IF NOT EXISTS ambushes (
+                attacker TEXT NOT NULL,
+                target   TEXT NOT NULL,
+                day      INTEGER NOT NULL,
+                PRIMARY KEY (attacker, target, day)
             );
 
             CREATE TABLE IF NOT EXISTS hall_of_fame (
@@ -174,11 +192,15 @@ class Store:
             _player_to_row(player),
         )
 
-    def insert_event(self, ts: str, actor: str, kind: str, text: str) -> int:
-        """Append an event row (no commit) and return its new id."""
+    def insert_event(self, ts: str, actor: str, kind: str, text: str, target: str = "") -> int:
+        """Append an event row (no commit) and return its new id.
+
+        ``target`` is empty for a public event or a player name for a private
+        note that only that player reads in their own catch-up.
+        """
         cur = self._conn.execute(
-            "INSERT INTO events(ts, actor, kind, text) VALUES(?, ?, ?, ?)",
-            (ts, actor, kind, text),
+            "INSERT INTO events(ts, actor, kind, text, target) VALUES(?, ?, ?, ?, ?)",
+            (ts, actor, kind, text, target),
         )
         return int(cur.lastrowid or 0)
 
@@ -189,6 +211,26 @@ class Store:
             (name, win_ts, run_days, level_at_win),
         )
         return int(cur.lastrowid or 0)
+
+    def record_ambush(self, attacker: str, target: str, day: int) -> None:
+        """Mark that *attacker* has spent their ambush on *target* for *day*.
+
+        Idempotent: the ``(attacker, target, day)`` primary key means a repeat
+        write is ignored, so re-recording the same attempt is harmless. No
+        commit — the façade folds this into the per-action transaction.
+        """
+        self._conn.execute(
+            "INSERT OR IGNORE INTO ambushes(attacker, target, day) VALUES(?, ?, ?)",
+            (attacker, target, day),
+        )
+
+    def has_ambushed(self, attacker: str, target: str, day: int) -> bool:
+        """Return whether *attacker* already ambushed *target* on *day*."""
+        row = self._conn.execute(
+            "SELECT 1 FROM ambushes WHERE attacker=? AND target=? AND day=?",
+            (attacker, target, day),
+        ).fetchone()
+        return row is not None
 
     def commit(self) -> None:
         """Commit the current transaction."""
@@ -231,6 +273,21 @@ class Store:
             for row in rows
         ]
 
+    def targeted_events_since(self, viewer: str, cursor: int) -> list[Event]:
+        """Return *viewer*'s private notes past *cursor*, ascending by id.
+
+        Public history older than the resident tail is ephemeral by design (the
+        broadsheet does not keep), but private mail is durable: a note left while
+        the recipient was away must survive however many public events have since
+        pushed it out of the in-memory tail. The façade pulls the recipient's
+        targeted rows from SQLite to backfill that gap before rendering.
+        """
+        rows = self._conn.execute(
+            "SELECT * FROM events WHERE target=? AND id>? ORDER BY id",
+            (viewer, cursor),
+        ).fetchall()
+        return [_row_to_event(row) for row in rows]
+
     def journal_mode(self) -> str:
         """Return the active journal mode (for diagnostics / tests)."""
         row = self._conn.execute("PRAGMA journal_mode").fetchone()
@@ -265,6 +322,10 @@ def _player_to_row(player: Player) -> tuple[object, ...]:
         player.bestow_spent,
         player.bestow_day,
         player.wins,
+        player.posts_sent,
+        player.post_day,
+        player.gambles,
+        player.gamble_day,
     )
 
 
@@ -292,6 +353,10 @@ def _row_to_player(row: sqlite3.Row) -> Player:
         bestow_spent=row["bestow_spent"],
         bestow_day=row["bestow_day"],
         wins=row["wins"],
+        posts_sent=row["posts_sent"],
+        post_day=row["post_day"],
+        gambles=row["gambles"],
+        gamble_day=row["gamble_day"],
     )
 
 
@@ -302,4 +367,5 @@ def _row_to_event(row: sqlite3.Row) -> Event:
         kind=row["kind"],
         actor=row["actor"],
         text=row["text"],
+        target=row["target"],
     )
