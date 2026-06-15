@@ -5097,22 +5097,26 @@ const _MODEL_CAP_KEYS = [
   "supports_tools",
   "supports_streaming",
   "supports_vision",
+  "supports_pdf",
   "supports_web_search",
   "supports_temperature",
   "supports_effort",
   "supports_transcription",
   "supports_speech_synthesis",
+  "supports_audio_input",
   "supports_rerank",
 ];
 const _MODEL_CAP_DEFAULTS = {
   supports_tools: true,
   supports_streaming: true,
   supports_vision: false,
+  supports_pdf: false,
   supports_web_search: false,
   supports_temperature: true,
   supports_effort: false,
   supports_transcription: false,
   supports_speech_synthesis: false,
+  supports_audio_input: false,
   supports_rerank: false,
 };
 let _modelCapsBaseline = {}; // known-model table values (display + delta base)
