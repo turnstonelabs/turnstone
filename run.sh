@@ -333,7 +333,9 @@ prepare_env() {
 TURNSTONE_JWT_SECRET=$jwt
 POSTGRES_USER=turnstone
 POSTGRES_PASSWORD=$pgpw
-POSTGRES_BIND=127.0.0.1
+# Bind published bare-metal ports (Postgres, console ACME, SearxNG) to this
+# interface. 127.0.0.1 = same-host only; set your LAN IP to join from another box.
+TURNSTONE_HOST_IP=127.0.0.1
 POSTGRES_PORT=$PG_PORT
 CONSOLE_HTTPS_PORT=$CADDY_PORT
 EOF

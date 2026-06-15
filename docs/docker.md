@@ -59,9 +59,11 @@ is gone. Everything goes through `https://localhost:8443`.
 
 ## Join a bare-metal host
 
-PostgreSQL is published on `127.0.0.1:5432`, so a `turnstone-server` running
-directly on the same machine — for example to use a local GPU — can join the
-same cluster and show up in the console alongside the containerized nodes.
+PostgreSQL, the console's ACME endpoint (`:8090`), and SearxNG (`:8081`) are
+published on `127.0.0.1`, so a `turnstone-server` running directly on the same
+machine — for example to use a local GPU — can join the same cluster (enrolling
+its mTLS cert and running `web_search`) and show up in the console alongside the
+containerized nodes.
 
 Put the secret and connection settings in `~/.config/turnstone/config.toml`
 (secrets belong in this file, not the process environment — keep it `0600`,
@@ -85,18 +87,28 @@ command line:
 
 ```bash
 chmod 600 ~/.config/turnstone/config.toml
-TURNSTONE_NODE_ID=host-1 TURNSTONE_ADVERTISE_URL=http://host.docker.internal:8080 \
+TURNSTONE_NODE_ID=host-1 \
+  TURNSTONE_ADVERTISE_URL=http://host.docker.internal:8080 \
+  TURNSTONE_CONSOLE_URL=http://localhost:8090 \
+  TURNSTONE_SEARXNG_URL=http://localhost:8081 \
   turnstone-server --host 0.0.0.0 --port 8080
 ```
 
 The host server registers itself in PostgreSQL; the console reaches it back via
-`host.docker.internal`. The `jwt_secret` and DB credentials above are the
-dev-stack defaults — match whatever you set in `.env` if you changed them. To
-let a **different** machine join, start the stack with `POSTGRES_BIND=0.0.0.0`
-and use the host's routable IP in the `url` and `TURNSTONE_ADVERTISE_URL` —
-but **set a strong `POSTGRES_PASSWORD` first**, or you'll expose a database with
-the insecure default password (and every user account + API-token hash in it) to
-your network.
+`host.docker.internal`. `TURNSTONE_CONSOLE_URL` points the node at the console's
+published ACME endpoint so it can enroll its mTLS certificate (needed only when
+the cluster runs mTLS; harmless otherwise), and `TURNSTONE_SEARXNG_URL` points
+`web_search` at the published SearxNG. The `jwt_secret` and DB credentials above
+are the dev-stack defaults — match whatever you set in `.env` if you changed them.
+
+To let a server on a **different** machine join, start the stack with
+`TURNSTONE_HOST_IP=<this host's LAN IP>` — that binds PostgreSQL, the console
+ACME endpoint, and SearxNG to that interface. Then on the remote box set the
+three URLs above to that IP, and set `TURNSTONE_ADVERTISE_URL` to the **remote**
+box's own IP (the address the console dials back). **Set a strong
+`POSTGRES_PASSWORD` first** — `TURNSTONE_HOST_IP` exposes the database (and every
+user account + API-token hash in it), the console API, and the unauthenticated
+SearxNG to your network.
 
 ## Production stack
 
@@ -174,15 +186,18 @@ overrides.
 ### Ports
 
 Both stacks publish Caddy (dashboard) and PostgreSQL; the dev stack additionally
-publishes the SearxNG UI on localhost. Everything else is reached through Caddy or
-proxied by the console:
+publishes the console's ACME endpoint and SearxNG on localhost so a bare-metal
+node can enroll its cert and run `web_search`. Everything else is reached through
+Caddy or proxied by the console:
 
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `CONSOLE_HTTPS_PORT` | `8443` | Host port for Caddy (dashboard HTTPS) |
 | `SEARXNG_HTTPS_PORT` | `8444` | Host port for the SearxNG UI via Caddy (dev: localhost-only; prod: opt-in) |
 | `POSTGRES_PORT` | `5432` | Host port for PostgreSQL (for bare-metal joins) |
-| `POSTGRES_BIND` | `127.0.0.1` | Interface PostgreSQL binds on; set `0.0.0.0` for LAN access |
+| `SEARXNG_API_PORT` | `8081` | Host port for the SearxNG API a bare-metal node's `web_search` dials (dev stack) |
+| `TURNSTONE_HOST_IP` | `127.0.0.1` | Interface PostgreSQL, the console ACME endpoint, and SearxNG bind on (dev stack). Set to this host's LAN IP so a bare-metal node on **another machine** can reach them — set a strong `POSTGRES_PASSWORD` first (it also exposes the DB and the unauthenticated SearxNG to your network). |
+| `POSTGRES_BIND` | `127.0.0.1` | Production stack (`turnstone/deploy/compose.yaml`) only: interface PostgreSQL binds on; set to the host's LAN IP for remote joins. |
 
 ### Channel gateway
 

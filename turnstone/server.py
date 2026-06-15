@@ -4667,6 +4667,11 @@ def main() -> None:
             tls_client = TLSClient(
                 storage=get_storage(),
                 hostnames=hostnames,
+                # A bare-metal node can't resolve the in-network console URL the
+                # services table advertises (http://console:8090), so honor an
+                # explicit override pointing at the published ACME endpoint.
+                # Empty (the in-cluster default) falls back to service discovery.
+                console_url=os.environ.get("TURNSTONE_CONSOLE_URL", ""),
             )
             asyncio.run(tls_client.init(attempts=TLS_INIT_RETRY_ATTEMPTS))
             bundle = tls_client.bundle
