@@ -229,3 +229,40 @@ class TestOpenAIAudioModelsKnown:
         caps = lookup_model_capabilities("openai", "gpt-5") or {}
         assert not caps.get("supports_transcription")
         assert not caps.get("supports_speech_synthesis")
+
+
+class TestTranscribeCached:
+    """The memoized, non-raising transcribe used by the no-native-audio wire
+    fallback.  Caching an STT result is an audio-domain concern, so it lives here
+    next to ``transcribe`` rather than bundled with PDF text extraction."""
+
+    def _result(self, text: str):
+        return audio.TranscriptionResult(transcript=text, model_alias="w", model="m")
+
+    def test_memoizes_by_alias_and_hash(self, monkeypatch):
+        audio._clear_transcript_cache_for_test()
+        calls = []
+
+        def fake(*, registry, alias, data, filename):
+            calls.append(1)
+            return self._result("hello world")
+
+        monkeypatch.setattr(audio, "transcribe", fake)
+        kw = dict(registry=object(), alias="w", content_hash="h1", data=b"x", filename="a.wav")
+        assert audio.transcribe_cached(**kw) == "hello world"
+        assert audio.transcribe_cached(**kw) == "hello world"
+        assert len(calls) == 1  # second served from cache
+
+    def test_backend_failure_returns_empty_and_is_not_cached(self, monkeypatch):
+        audio._clear_transcript_cache_for_test()
+        calls = []
+
+        def boom(*, registry, alias, data, filename):
+            calls.append(1)
+            raise audio.AudioBackendError("down")
+
+        monkeypatch.setattr(audio, "transcribe", boom)
+        kw = dict(registry=object(), alias="w", content_hash="h2", data=b"x", filename="a.wav")
+        assert audio.transcribe_cached(**kw) == ""
+        audio.transcribe_cached(**kw)
+        assert len(calls) == 2  # failure not cached -> retried

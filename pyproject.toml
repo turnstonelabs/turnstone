@@ -42,6 +42,7 @@ dependencies = [
     "cryptography>=42",
     "lacme>=1.0.5",
     "python-frontmatter>=1.0",
+    "pypdfium2>=4",  # PDF text-extract fallback for models without native PDF input (core/attachment_fallback.py)
 ]
 
 [project.urls]
@@ -178,6 +179,10 @@ ignore_missing_imports = true
 
 [[tool.mypy.overrides]]
 module = ["lacme", "lacme.*"]
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = ["pypdfium2", "pypdfium2.*"]
 ignore_missing_imports = true
 
 [[tool.mypy.overrides]]
