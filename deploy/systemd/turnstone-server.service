@@ -1,0 +1,85 @@
+# Run a bare-metal turnstone-server as a systemd service so it joins a cluster
+# (e.g. the docker-compose stack) from outside Docker — typically to use a local
+# GPU. Install steps + the cluster-side prerequisites are in deploy/systemd/README.md
+# and docs/docker.md ("Join a bare-metal host"). Per-host identity + the cluster
+# URLs go in a drop-in (see node.conf.example); secrets go in config.toml.
+[Unit]
+Description=Turnstone server (chat workstreams + LLM gateway)
+Documentation=https://github.com/turnstonelabs/turnstone
+# Postgres is required. After= orders against a colocated postgresql.service
+# when present and silently no-ops otherwise (the cluster DB is usually remote).
+After=network.target postgresql.service
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
+[Service]
+Type=exec
+User=turnstone
+Group=turnstone
+
+# Secrets live in config.toml — JWT secret, Postgres URL+password, LLM API key —
+# kept out of os.environ so a prompt-injected tool can't dump them via `env`.
+Environment=TURNSTONE_CONFIG=/etc/turnstone/config.toml
+Environment=TURNSTONE_LOG_LEVEL=info
+
+Slice=turnstone.slice
+
+# Per-host node identity + cluster wiring (TURNSTONE_NODE_ID / _ADVERTISE_URL /
+# _CONSOLE_URL / _SEARXNG_URL) go in a drop-in, not here — see node.conf.example.
+
+StateDirectory=turnstone
+StateDirectoryMode=0750
+LogsDirectory=turnstone
+LogsDirectoryMode=0750
+WorkingDirectory=/var/lib/turnstone
+
+# --host 0.0.0.0 so the console collector + peer nodes can dial this node back
+# at its advertised address. (A single-node, Caddy-fronted install can use
+# 127.0.0.1 instead.) Rewrite --port if :8080 is already taken on the host.
+ExecStart=/opt/turnstone-venv/bin/turnstone-server --host 0.0.0.0 --port 8080
+
+Restart=on-failure
+RestartSec=5s
+TimeoutStartSec=120
+TimeoutStopSec=30
+KillSignal=SIGTERM
+KillMode=mixed
+
+# --- Resource limits ---
+# SSE keeps an fd per active workstream + outbound LLM stream + MCP stdio pipe.
+LimitNOFILE=65535
+LimitNPROC=8192
+TasksMax=8192
+LimitCORE=0
+
+# --- Hardening ---
+NoNewPrivileges=true
+CapabilityBoundingSet=
+AmbientCapabilities=
+UMask=0027
+PrivateTmp=true
+# PrivateDevices=true  — disabled: GPU access via /sys/class/drm
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+LockPersonality=true
+MemoryDenyWriteExecute=true
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @mount
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=turnstone-server
+
+[Install]
+WantedBy=multi-user.target
