@@ -2930,15 +2930,94 @@ class ChatSession:
 
         The send-time materialization of the by-reference content lane: handed to
         the provider translator, which calls it with the placeholder ids it finds
-        and expands each to the inline ``data:…`` / document part the wire needs.
-        Blobs are batch-fetched from the content-addressed store; a pruned id
-        resolves to nothing and the translator drops its placeholder."""
+        and expands each to the inline part the wire needs.  Blobs are
+        batch-fetched from the content-addressed store; a pruned id resolves to
+        nothing and the translator drops its placeholder.
+
+        Kinds the active model can't ingest natively (pdf without ``supports_pdf``,
+        audio without ``supports_audio_input``) are converted client-side here —
+        see :meth:`_wire_content_part`.  This is the wire path only; the display /
+        export resolvers stay native-only, so no conversion (or external STT call)
+        fires on a history render."""
         if not ids:
             return {}
+        caps = self._get_capabilities()
+        out: dict[str, dict[str, Any]] = {}
+        for att in get_attachments(ids):
+            part = self._wire_content_part(att, caps)
+            if part is not None:
+                out[str(att["attachment_id"])] = part
+        return out
+
+    def _wire_content_part(
+        self, att: dict[str, Any], caps: ModelCapabilities
+    ) -> dict[str, Any] | None:
+        """The active model's inline part for one blob: native where supported,
+        else a client-side fallback for a kind it can't read (pdf -> extracted
+        text, audio -> STT transcript)."""
+        kind = att.get("kind")
+        if kind == "pdf" and not caps.supports_pdf:
+            return self._pdf_text_fallback_part(att)
+        if kind == "audio" and not caps.supports_audio_input:
+            return self._audio_transcript_fallback_part(att)
+        return attachment_to_content_part(att)
+
+    def _pdf_text_fallback_part(self, att: dict[str, Any]) -> dict[str, Any]:
+        """Non-PDF model: extract the PDF's text and carry it as a text document."""
+        from turnstone.core.pdf import extract_pdf_text
+
+        name = str(att.get("filename") or "document.pdf")
+        raw = att.get("content")
+        text = extract_pdf_text(raw) if isinstance(raw, bytes) else ""
+        if not text:
+            return {
+                "type": "text",
+                "text": (
+                    f"[PDF attachment '{name}' — no extractable text; "
+                    "this model cannot read PDFs natively]"
+                ),
+            }
         return {
-            str(att["attachment_id"]): part
-            for att in get_attachments(ids)
-            if (part := attachment_to_content_part(att)) is not None
+            "type": "document",
+            "document": {
+                "name": f"{name} (extracted text)",
+                "media_type": "text/plain",
+                "data": text,
+            },
+        }
+
+    def _audio_transcript_fallback_part(self, att: dict[str, Any]) -> dict[str, Any]:
+        """Non-omni model: transcribe via the STT role and carry the transcript.
+
+        Only engages when an operator has configured an STT role (which may be a
+        local backend) — otherwise a placeholder, never a surprise external call."""
+        from turnstone.core.audio import resolve_role_alias, transcribe_cached
+
+        name = str(att.get("filename") or "audio")
+        raw = att.get("content")
+        alias = resolve_role_alias(
+            config_store=self._config_store, registry=self._registry, role="stt"
+        )
+        if not alias or not isinstance(raw, bytes):
+            return {
+                "type": "text",
+                "text": f"[audio attachment '{name}' — no transcription backend configured]",
+            }
+        transcript = transcribe_cached(
+            registry=self._registry,
+            alias=alias,
+            content_hash=str(att.get("attachment_id")),
+            data=raw,
+            filename=name,
+        )
+        if not transcript:
+            return {
+                "type": "text",
+                "text": f"[audio attachment '{name}' — transcription unavailable]",
+            }
+        return {
+            "type": "text",
+            "text": f"[Transcript of audio attachment '{name}']\n\n{transcript}",
         }
 
     def _prepare_wire_messages(

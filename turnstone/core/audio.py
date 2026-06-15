@@ -15,8 +15,13 @@ backend is surfaced as a typed error the endpoint maps to 503 / 502.
 
 from __future__ import annotations
 
+import threading
 from dataclasses import dataclass
 from typing import Any
+
+from turnstone.core.log import get_logger
+
+log = get_logger(__name__)
 
 # Setting key + capability flag per media role.  Kept deliberately small; the
 # perception/eval roles (vision_eval/av_eval/intent_eval) are a later slice.
@@ -158,6 +163,46 @@ def transcribe(
     except Exception as exc:
         raise AudioBackendError(f"Transcription backend failed: {exc}") from exc
     return TranscriptionResult(transcript=transcript, model_alias=alias, model=model)
+
+
+# -- transcript memoization (no-native-audio wire fallback) -------------------
+# Caching an STT result is an audio-domain concern, so it lives here next to
+# ``transcribe``.  The wire resolver re-materializes every attachment on every
+# send, so without this an audio clip attached early in a conversation would be
+# re-sent to the (external, fallible) STT backend on every subsequent turn.
+_TRANSCRIPT_CACHE_MAX = 256
+_transcript_lock = threading.Lock()
+_transcript_cache: dict[str, str] = {}
+
+
+def _clear_transcript_cache_for_test() -> None:
+    with _transcript_lock:
+        _transcript_cache.clear()
+
+
+def transcribe_cached(
+    *, registry: Any, alias: str, content_hash: str, data: bytes, filename: str
+) -> str:
+    """Memoized, non-raising :func:`transcribe` for the wire fallback.
+
+    Keyed by ``(alias, content_hash)``.  Returns ``""`` on a backend failure (a
+    placeholder is rendered upstream) and does *not* cache failures, so a
+    transient outage doesn't poison the memo.
+    """
+    key = f"{alias}:{content_hash}"
+    with _transcript_lock:
+        if key in _transcript_cache:
+            return _transcript_cache[key]
+    try:
+        text = transcribe(registry=registry, alias=alias, data=data, filename=filename).transcript
+    except (AudioUnavailableError, AudioBackendError) as exc:
+        log.warning("audio transcription fallback failed: %s", exc)
+        return ""
+    with _transcript_lock:
+        if key not in _transcript_cache and len(_transcript_cache) >= _TRANSCRIPT_CACHE_MAX:
+            _transcript_cache.pop(next(iter(_transcript_cache)), None)
+        _transcript_cache[key] = text
+    return text
 
 
 def synthesize(
