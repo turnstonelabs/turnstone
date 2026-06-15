@@ -110,6 +110,9 @@ box's own IP (the address the console dials back). **Set a strong
 user account + API-token hash in it), the console API, and the unauthenticated
 SearxNG to your network.
 
+To run the bare-metal node as a hardened, persistent service instead of by hand,
+use the systemd units in [`deploy/systemd/`](../deploy/systemd/).
+
 ## Production stack
 
 For a real deployment use the bundled stack, which pulls released images

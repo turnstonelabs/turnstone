@@ -1,0 +1,25 @@
+# Per-host node identity + cluster wiring for a bare-metal turnstone-server.
+# Copy to /etc/systemd/system/turnstone-server.service.d/node.conf and edit the
+# addresses, then `systemctl daemon-reload`. Identity + URLs are NOT secrets, so
+# they live here; the JWT secret + DB URL live in /etc/turnstone/config.toml.
+#
+# Addresses below use RFC 5737 documentation IPs — replace them:
+#   <this-host>     = the bare-metal host's own LAN IP (what the console dials back)
+#   <compose-host>  = the host running the cluster / docker-compose stack, started
+#                     with TURNSTONE_HOST_IP=<compose-host> so :8090 and :8081 are
+#                     published on its LAN interface (see docs/docker.md).
+[Service]
+# Unique node id (defaults to the hostname if unset).
+Environment=TURNSTONE_NODE_ID=host-1
+
+# The address peers + the console collector dial back. Auto-upgrades to https://
+# once the node enrolls its mTLS cert.
+Environment=TURNSTONE_ADVERTISE_URL=http://192.0.2.10:8080
+
+# The cluster console's reachable plain-HTTP ACME/API endpoint. A bare-metal node
+# can't resolve the in-cluster name (console:8090), so point it at the published
+# port; turnstone-server honors this for cert enrollment.
+Environment=TURNSTONE_CONSOLE_URL=http://192.0.2.1:8090
+
+# The cluster's published SearxNG, for the web_search tool.
+Environment=TURNSTONE_SEARXNG_URL=http://192.0.2.1:8081

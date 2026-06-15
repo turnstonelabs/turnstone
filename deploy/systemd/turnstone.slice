@@ -1,0 +1,15 @@
+# Shared resource budget for the colocated Turnstone units. Without a slice each
+# unit's MemoryMax= is enforced independently — three units at 85% each can sum
+# to 255% of host RAM before any throttles. Under a shared slice the cap is
+# hierarchical: the slice ceiling is the real limit. (A bare-metal node that runs
+# only turnstone-server still benefits — and keeps the unit's Slice= reference
+# valid.) Adjust if the host runs other meaningful workloads alongside Turnstone.
+[Unit]
+Description=Turnstone services slice (server + console + channel)
+Documentation=https://github.com/turnstonelabs/turnstone
+Before=slices.target
+
+[Slice]
+MemoryHigh=70%
+MemoryMax=85%
+TasksMax=16384
