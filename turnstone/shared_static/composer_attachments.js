@@ -36,6 +36,17 @@ function formatSize(n) {
   return (n / (1024 * 1024)).toFixed(1) + " MB";
 }
 
+function _inferKind(file) {
+  // Optimistic placeholder-chip guess only; the server's classify_upload is
+  // authoritative and the real kind arrives on the upload response.
+  var t = (file.type || "").toLowerCase();
+  var n = (file.name || "").toLowerCase();
+  if (t.indexOf("image/") === 0) return "image";
+  if (t === "application/pdf" || n.endsWith(".pdf")) return "pdf";
+  if (t.indexOf("audio/") === 0) return "audio";
+  return "text";
+}
+
 function _toastError(msg) {
   if (typeof window.toast !== "undefined" && window.toast.error) {
     window.toast.error(msg);
@@ -172,7 +183,7 @@ export function createAttachmentController(opts) {
       filename: file.name,
       size_bytes: file.size,
       mime_type: file.type || "",
-      kind: (file.type || "").indexOf("image/") === 0 ? "image" : "text",
+      kind: _inferKind(file),
       uploading: true,
     };
     pending.set(placeholderId, placeholder);
@@ -299,7 +310,6 @@ export function createAttachmentController(opts) {
     isEmpty: isEmpty,
   };
 }
-
 
 // --- Legacy window bridge ---------------------------------------------------
 // Still-classic consumers reach this as a global at event/boot time (after

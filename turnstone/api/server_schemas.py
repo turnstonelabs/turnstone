@@ -74,7 +74,10 @@ class AttachmentInfo(BaseModel):
     filename: str = Field(description="Original upload filename")
     mime_type: str = Field(description="Canonicalized MIME type")
     size_bytes: int = Field(description="Payload size in bytes")
-    kind: str = Field(description="'image' or 'text'", examples=["image", "text"])
+    kind: str = Field(
+        description="'image', 'text', 'pdf', or 'audio'",
+        examples=["image", "text", "pdf", "audio"],
+    )
 
 
 class UploadAttachmentResponse(AttachmentInfo):

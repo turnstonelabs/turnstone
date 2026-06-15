@@ -35,9 +35,11 @@
  * anywhere onto the pane to attach.
  */
 var ATTACH_DEFAULT_ACCEPT =
-  "image/png,image/jpeg,image/gif,image/webp,text/*," +
+  "image/png,image/jpeg,image/gif,image/webp,application/pdf,text/*," +
+  "audio/wav,audio/mpeg,audio/ogg,audio/flac,audio/mp4,audio/aac,audio/webm," +
   ".md,.py,.js,.ts,.tsx,.jsx,.json,.yaml,.yml,.toml,.html,.css,.sh," +
-  ".rs,.go,.java,.c,.cpp,.h,.hpp,.sql,.xml,.ini,.conf";
+  ".rs,.go,.java,.c,.cpp,.h,.hpp,.sql,.xml,.ini,.conf," +
+  ".pdf,.mp3,.wav,.ogg,.flac,.m4a,.aac,.webm";
 
 var AUTO_RESIZE_MAX_PX = 200;
 
@@ -525,9 +527,7 @@ Composer.prototype._wireEvents = function () {
       });
       this._on(target, "drop", function (e) {
         target.classList.remove(dropClass);
-        var files = Array.from(
-          (e.dataTransfer && e.dataTransfer.files) || [],
-        );
+        var files = Array.from((e.dataTransfer && e.dataTransfer.files) || []);
         if (files.length > 0) {
           e.preventDefault();
           files.forEach(function (f) {
@@ -613,9 +613,7 @@ Composer.prototype.setBusy = function (b) {
   // Placeholder swap applies whenever busy, not only in queue mode —
   // callers that don't set busyPlaceholder see no visible change
   // because it defaults to idlePlaceholder.
-  this.inputEl.placeholder = b
-    ? this._busyPlaceholder
-    : this._idlePlaceholder;
+  this.inputEl.placeholder = b ? this._busyPlaceholder : this._idlePlaceholder;
 
   // Disabled state — composer owns it unless caller opted out.
   if (!opts.externalDisable) {
@@ -805,7 +803,6 @@ Composer.prototype.destroy = function () {
   this._optionFields = {};
   this.el = null;
 };
-
 
 // --- Legacy window bridge ---------------------------------------------------
 // Still-classic consumers reach this as a global at event/boot time (after
