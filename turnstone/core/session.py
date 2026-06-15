@@ -2925,7 +2925,7 @@ class ChatSession:
         via :meth:`_resolve_attachments` — resolution lives at the C layer."""
         return self.system_messages + dicts_from_turns(self.messages)
 
-    def _resolve_attachments(self, ids: list[str]) -> dict[str, dict[str, Any]]:
+    def _resolve_attachments(self, ids: list[str]) -> dict[str, Any]:
         """Resolve content-addressed attachment ids to inline wire content parts.
 
         The send-time materialization of the by-reference content lane: handed to
@@ -2942,7 +2942,7 @@ class ChatSession:
         if not ids:
             return {}
         caps = self._get_capabilities()
-        out: dict[str, dict[str, Any]] = {}
+        out: dict[str, Any] = {}
         for att in get_attachments(ids):
             part = self._wire_content_part(att, caps)
             if part is not None:
@@ -2951,16 +2951,44 @@ class ChatSession:
 
     def _wire_content_part(
         self, att: dict[str, Any], caps: ModelCapabilities
-    ) -> dict[str, Any] | None:
-        """The active model's inline part for one blob: native where supported,
-        else a client-side fallback for a kind it can't read (pdf -> extracted
-        text, audio -> STT transcript)."""
+    ) -> dict[str, Any] | list[dict[str, Any]] | None:
+        """The active model's inline part(s) for one blob: native where
+        supported, else a client-side fallback for a kind it can't read.  PDF →
+        rasterized page images (vision models) or extracted text; audio → STT
+        transcript.  A PDF rasterized to images returns several parts."""
         kind = att.get("kind")
         if kind == "pdf" and not caps.supports_pdf:
+            # Vision models: rasterize pages to images (better fidelity, esp. for
+            # scanned PDFs with no text layer); otherwise extract text.
+            if caps.supports_vision:
+                return self._pdf_rasterize_fallback_parts(att)
             return self._pdf_text_fallback_part(att)
         if kind == "audio" and not caps.supports_audio_input:
             return self._audio_transcript_fallback_part(att)
         return attachment_to_content_part(att)
+
+    def _pdf_rasterize_fallback_parts(
+        self, att: dict[str, Any]
+    ) -> list[dict[str, Any]] | dict[str, Any]:
+        """Vision model without native PDF: render pages to images (one part per
+        page).  Falls back to text extraction if rendering yields nothing."""
+        import base64
+
+        from turnstone.core.pdf import rasterize_pdf
+
+        raw = att.get("content")
+        pages = rasterize_pdf(raw) if isinstance(raw, bytes) else []
+        if not pages:
+            return self._pdf_text_fallback_part(att)
+        return [
+            {
+                "type": "image_url",
+                "image_url": {
+                    "url": f"data:image/png;base64,{base64.b64encode(p).decode('ascii')}"
+                },
+            }
+            for p in pages
+        ]
 
     def _pdf_text_fallback_part(self, att: dict[str, Any]) -> dict[str, Any]:
         """Non-PDF model: extract the PDF's text and carry it as a text document."""

@@ -16,6 +16,7 @@ hold PDFs.  See the attachments design brief; that store is deferred.
 from __future__ import annotations
 
 import contextlib
+import io
 
 from turnstone.core.log import get_logger
 
@@ -59,6 +60,51 @@ def extract_pdf_text(data: bytes) -> str:
     except Exception as exc:
         log.warning("PDF text extraction failed: %s", exc)
         return ""
+    finally:
+        if doc is not None:
+            with contextlib.suppress(Exception):
+                doc.close()
+
+
+# Bound page count + payload for the rasterize fallback (images are far heavier
+# than text).  Re-run per wire build — same no-cache rationale as extract_pdf_text.
+_MAX_RASTER_PAGES = 10
+
+
+def rasterize_pdf(
+    data: bytes, *, max_pages: int = _MAX_RASTER_PAGES, scale: float = 2.0
+) -> list[bytes]:
+    """Render up to ``max_pages`` PDF pages to PNG bytes, one per page.
+
+    For vision-capable models that can't read PDF natively.  Never raises —
+    returns ``[]`` on a parse/render failure (the caller falls back to text
+    extraction).  Needs pypdfium2 (render) + Pillow (PNG encode).
+    """
+    try:
+        import pypdfium2 as pdfium
+    except ImportError:  # pragma: no cover - declared dependency; defensive
+        log.warning("pypdfium2 not installed; PDF rasterize unavailable")
+        return []
+
+    doc = None
+    try:
+        doc = pdfium.PdfDocument(data)
+        pages: list[bytes] = []
+        for i, page in enumerate(doc):
+            if i >= max_pages:
+                page.close()
+                break
+            bitmap = page.render(scale=scale)
+            buf = io.BytesIO()
+            bitmap.to_pil().save(buf, format="PNG")
+            pages.append(buf.getvalue())
+            with contextlib.suppress(Exception):
+                bitmap.close()
+            page.close()
+        return pages
+    except Exception as exc:
+        log.warning("PDF rasterize failed: %s", exc)
+        return []
     finally:
         if doc is not None:
             with contextlib.suppress(Exception):

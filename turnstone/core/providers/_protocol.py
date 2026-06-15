@@ -217,7 +217,7 @@ class LLMProvider(Protocol):
         capabilities: ModelCapabilities | None = None,
         replay_reasoning_to_model: bool = True,
         extra_headers: dict[str, str] | None = None,
-        resolve_attachments: Callable[[list[str]], dict[str, dict[str, Any]]] | None = None,
+        resolve_attachments: Callable[[list[str]], dict[str, Any]] | None = None,
     ) -> Iterator[StreamChunk]:
         """Create a streaming request, yielding normalized StreamChunks.
 
@@ -264,7 +264,7 @@ class LLMProvider(Protocol):
         capabilities: ModelCapabilities | None = None,
         replay_reasoning_to_model: bool = True,
         extra_headers: dict[str, str] | None = None,
-        resolve_attachments: Callable[[list[str]], dict[str, dict[str, Any]]] | None = None,
+        resolve_attachments: Callable[[list[str]], dict[str, Any]] | None = None,
     ) -> CompletionResult:
         """Create a non-streaming request, returning a normalized result.
 

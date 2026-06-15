@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from turnstone.core.pdf import extract_pdf_text
+from turnstone.core.pdf import extract_pdf_text, rasterize_pdf
 
 
 def _minimal_pdf(text: str = "Hello PDF") -> bytes:
@@ -38,3 +38,13 @@ class TestExtractPdfText:
 
     def test_empty_returns_empty(self) -> None:
         assert extract_pdf_text(b"") == ""
+
+
+class TestRasterizePdf:
+    def test_renders_pages_to_png(self) -> None:
+        pages = rasterize_pdf(_minimal_pdf("Hello PDF"))
+        assert len(pages) == 1
+        assert pages[0][:8] == b"\x89PNG\r\n\x1a\n"
+
+    def test_garbage_returns_empty_no_raise(self) -> None:
+        assert rasterize_pdf(b"not a pdf at all") == []
