@@ -483,6 +483,7 @@ class AttachmentHandlers:
     upload: Handler  # POST   {prefix}/{ws_id}/attachments
     list: Handler  # GET    {prefix}/{ws_id}/attachments
     get_content: Handler  # GET    {prefix}/{ws_id}/attachments/{attachment_id}/content
+    thumbnail: Handler  # GET    {prefix}/{ws_id}/attachments/{attachment_id}/thumbnail
     delete: Handler  # DELETE {prefix}/{ws_id}/attachments/{attachment_id}
 
 
@@ -627,6 +628,13 @@ def register_session_routes(
             Route(
                 f"{p}/{{ws_id}}/attachments/{{attachment_id}}/content",
                 a.get_content,
+                methods=["GET"],
+            )
+        )
+        routes.append(
+            Route(
+                f"{p}/{{ws_id}}/attachments/{{attachment_id}}/thumbnail",
+                a.thumbnail,
                 methods=["GET"],
             )
         )
@@ -3816,10 +3824,18 @@ def make_attachment_handlers(cfg: SessionEndpointConfig) -> AttachmentHandlers:
         ]
         return JSONResponse({"attachments": rows})
 
-    async def get_content(request: Request) -> Response:
-        import asyncio
+    async def _resolve_served_blob(
+        request: Request,
+    ) -> tuple[bytes, str, str, str] | Response:
+        """Gate + resolve an attachment blob for serving (content or thumbnail).
 
-        from starlette.responses import Response as _Response
+        Returns ``(body, kind, mime, filename)`` or an error ``Response``.
+        Pending (staged) blobs serve from the buffer scoped to the uploader;
+        committed blobs serve from the store gated by ownership — the requester
+        (already gated to own ``ws_id``) must have a turn whose ref-list names the
+        id.  Cross-user / cross-ws / unreferenced → 404 so existence doesn't leak.
+        """
+        import asyncio
 
         from turnstone.core.attachment_buffer import get_attachment_buffer
         from turnstone.core.memory import attachment_referenced_in_ws, get_attachment
@@ -3834,38 +3850,38 @@ def make_attachment_handlers(cfg: SessionEndpointConfig) -> AttachmentHandlers:
         user_id, err = await _resolve_owner(request, ws_id)
         if err:
             return err
-
-        # Pending (staged) blobs serve straight from the buffer, scoped to the
-        # uploader.  Committed blobs serve from the store, gated by ownership:
-        # the requester (already gated to own ``ws_id``) must have a turn whose
-        # ref-list names the id.  Cross-user / cross-ws / unreferenced → 404 so
-        # existence doesn't leak.
-        kind: str
-        stored_mime: str
-        filename: str
         staged = get_attachment_buffer().get(attachment_id, ws_id=ws_id, user_id=user_id)
         if staged is not None:
-            body: bytes = staged.content
-            kind = staged.kind
-            stored_mime = staged.mime_type or "application/octet-stream"
-            filename = staged.filename or "attachment"
-        else:
-            # Both committed-blob gates are sync DB I/O — the ref check is an
-            # unbounded ws-scoped LIKE scan (O(turns-in-ws)) run on every
-            # committed-image request, so keep it off the event loop.  Matches
-            # the asyncio.to_thread convention used throughout this module.
-            row = await asyncio.to_thread(get_attachment, attachment_id)
-            if not row or not await asyncio.to_thread(
-                attachment_referenced_in_ws, attachment_id, ws_id
-            ):
-                return JSONResponse({"error": "Not found"}, status_code=404)
-            body = row.get("content") or b""
-            kind = row.get("kind") or ""
-            stored_mime = row.get("mime_type") or "application/octet-stream"
-            filename = str(row.get("filename") or "attachment")
+            return (
+                staged.content,
+                staged.kind,
+                staged.mime_type or "application/octet-stream",
+                staged.filename or "attachment",
+            )
+        # Committed-blob gates are sync DB I/O — the ref check is an unbounded
+        # ws-scoped LIKE scan (O(turns-in-ws)), so keep it off the event loop.
+        row = await asyncio.to_thread(get_attachment, attachment_id)
+        if not row or not await asyncio.to_thread(
+            attachment_referenced_in_ws, attachment_id, ws_id
+        ):
+            return JSONResponse({"error": "Not found"}, status_code=404)
+        return (
+            row.get("content") or b"",
+            row.get("kind") or "",
+            row.get("mime_type") or "application/octet-stream",
+            str(row.get("filename") or "attachment"),
+        )
+
+    async def get_content(request: Request) -> Response:
+        from starlette.responses import Response as _Response
+
+        resolved = await _resolve_served_blob(request)
+        if not isinstance(resolved, tuple):
+            return resolved
+        body, kind, stored_mime, filename = resolved
         # Force text/plain for text kinds — avoids same-origin HTML/SVG
-        # rendering if a user uploaded an HTML-ish text file. Images
-        # keep their sniffed MIME (allowlist is strict: png/jpeg/gif/webp).
+        # rendering if a user uploaded an HTML-ish text file.  Images keep their
+        # sniffed MIME (allowlist is strict: png/jpeg/gif/webp).
         response_mime = "text/plain; charset=utf-8" if kind == "text" else stored_mime
         safe_name = filename.replace('"', "").replace("\r", "").replace("\n", "")
         headers = {
@@ -3875,6 +3891,32 @@ def make_attachment_handlers(cfg: SessionEndpointConfig) -> AttachmentHandlers:
             "Cache-Control": "private, no-store",
         }
         return _Response(body, media_type=response_mime, headers=headers)
+
+    async def get_thumbnail(request: Request) -> Response:
+        import asyncio
+
+        from starlette.responses import Response as _Response
+
+        from turnstone.core.thumbnails import make_thumbnail
+
+        resolved = await _resolve_served_blob(request)
+        if not isinstance(resolved, tuple):
+            return resolved
+        body, kind, _mime, _filename = resolved
+        if kind not in ("image", "pdf"):
+            return JSONResponse({"error": "no thumbnail for this attachment kind"}, status_code=415)
+        png = await asyncio.to_thread(make_thumbnail, body, kind)
+        if png is None:
+            return JSONResponse({"error": "thumbnail unavailable"}, status_code=415)
+        return _Response(
+            png,
+            media_type="image/png",
+            headers={
+                "X-Content-Type-Options": "nosniff",
+                "Content-Security-Policy": "default-src 'none'; sandbox",
+                "Cache-Control": "private, max-age=300",
+            },
+        )
 
     async def delete_(request: Request) -> Response:
         from turnstone.core.attachment_buffer import get_attachment_buffer
@@ -3900,6 +3942,7 @@ def make_attachment_handlers(cfg: SessionEndpointConfig) -> AttachmentHandlers:
         upload=upload,
         list=list_pending,
         get_content=get_content,
+        thumbnail=get_thumbnail,
         delete=delete_,
     )
 
