@@ -106,7 +106,10 @@ Generate with: `python -c "import secrets; print(secrets.token_hex(32))"`
 ### Ports / networking
 - `CONSOLE_HTTPS_PORT` — Caddy HTTPS port for the dashboard (default: 8443)
 - `POSTGRES_PORT` — PostgreSQL host port, for joining a bare-metal server (default: 5432)
-- `POSTGRES_BIND` — interface PostgreSQL binds on (default: 127.0.0.1; set 0.0.0.0 for LAN)
+- `TURNSTONE_HOST_IP` — interface the published bare-metal ports (Postgres, console
+  ACME, SearxNG) bind on (default: 127.0.0.1; set your host's LAN IP to join from
+  another machine). The legacy `POSTGRES_BIND` is still honored for Postgres.
+- `SEARXNG_API_PORT` — host port a bare-metal node's web_search dials SearxNG on (default: 8081)
 
 ### Channel Gateway (optional)
 - `TURNSTONE_DISCORD_TOKEN` — Discord bot token

@@ -29,10 +29,11 @@
 # Fewer nodes (lighter machines):
 #     docker compose up postgres console caddy channel node-1 node-2 node-3
 #
-# Join a bare-metal host: Postgres is published on 127.0.0.1:5432, so a
-# turnstone-server running directly on this machine (e.g. to use a local GPU)
-# can join the same cluster. Keep the secret + connection settings in
-# ~/.config/turnstone/config.toml (chmod 0600 — the loader warns otherwise):
+# Join a bare-metal host: a turnstone-server running OUTSIDE compose (e.g. to use
+# a local GPU) can join this cluster. Postgres, the console's ACME endpoint, and
+# SearxNG are published on 127.0.0.1 so a node on THIS machine reaches them via
+# localhost. Keep secrets in ~/.config/turnstone/config.toml (chmod 0600 — the
+# loader warns otherwise):
 #     [auth]
 #     jwt_secret = "dev-only-insecure-jwt-secret-change-me-for-real-deployments"
 #     [database]
@@ -41,10 +42,19 @@
 #     [api]
 #     base_url = "http://localhost:8000/v1"
 #     api_key = "dummy"
+#     [tls]              # only if the cluster runs mTLS
+#     enabled = true
 # then run (node identity isn't a secret, so it stays on the command line):
-#     TURNSTONE_NODE_ID=host-1 TURNSTONE_ADVERTISE_URL=http://host.docker.internal:8080 \
+#     TURNSTONE_NODE_ID=host-1 \
+#       TURNSTONE_ADVERTISE_URL=http://host.docker.internal:8080 \
+#       TURNSTONE_CONSOLE_URL=http://localhost:8090 \
+#       TURNSTONE_SEARXNG_URL=http://localhost:8081 \
 #       turnstone-server --host 0.0.0.0 --port 8080
-# It registers in Postgres and the console reaches it back via host.docker.internal.
+# The node registers in Postgres, auto-enrolls its mTLS cert from the console's
+# ACME endpoint (when the cluster runs mTLS), and the console collector reaches
+# it back via host.docker.internal. To join from ANOTHER machine, set
+# TURNSTONE_HOST_IP to this host's LAN IP and use it in the URLs above (and the
+# node's TURNSTONE_ADVERTISE_URL = the NODE host's IP) — see docs/docker.md.
 # =============================================================================
 
 name: turnstone
@@ -93,13 +103,14 @@ services:
       # INSECURE dev default — override POSTGRES_PASSWORD in .env for real use.
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-turnstone}
       PGDATA: /var/lib/postgresql/data
-    # Published on localhost so a bare-metal turnstone-server running on THIS
-    # host can join the cluster (see "Join a bare-metal host" in the header).
-    # Bound to 127.0.0.1 by default; set POSTGRES_BIND=0.0.0.0 to let another
-    # machine connect — but set a real POSTGRES_PASSWORD first, or you'll expose
-    # a database with the insecure default password to your network.
+    # Published so a bare-metal turnstone-server can join the cluster (see "Join
+    # a bare-metal host" in the header). Bound to 127.0.0.1 by default (same-host
+    # nodes only); set TURNSTONE_HOST_IP to this host's LAN IP to let another
+    # machine connect — but set a real POSTGRES_PASSWORD first, or you'll expose a
+    # database with the insecure default password to your network. (The legacy
+    # POSTGRES_BIND is still honored as a fallback when TURNSTONE_HOST_IP is unset.)
     ports:
-      - "${POSTGRES_BIND:-127.0.0.1}:${POSTGRES_PORT:-5432}:5432"
+      - "${TURNSTONE_HOST_IP:-${POSTGRES_BIND:-127.0.0.1}}:${POSTGRES_PORT:-5432}:5432"
     volumes:
       - postgres-data:/var/lib/postgresql/data
     networks:
@@ -120,10 +131,12 @@ services:
   # turnstone-console — cluster dashboard. Reach it ONLY through Caddy at
   # https://localhost:8443 (see the caddy service below).
   #
-  # The console port (8090) is deliberately NOT published to the host: a plain
-  # HTTP/1.1 origin caps the browser at 6 connections, which starves the
-  # dashboard's per-pane SSE streams. Caddy serves the browser over HTTP/2
-  # (multiplexed) and proxies to console:8090 internally, so the cap is gone.
+  # Browsers must reach the dashboard through Caddy (https://localhost:8443): a
+  # plain HTTP/1.1 origin caps the browser at 6 connections, which starves the
+  # dashboard's per-pane SSE streams, whereas Caddy serves HTTP/2 (multiplexed)
+  # and proxies to console:8090 internally. The console's :8090 is published
+  # below ONLY so bare-metal nodes can reach the plain-HTTP ACME enrollment
+  # endpoint — don't point a browser at it.
   #
   # The single `build:` here produces the turnstone:local image every other
   # service reuses. extra_hosts lets the console reach a bare-metal server
@@ -138,6 +151,14 @@ services:
       - turnstone-console
       - --host=0.0.0.0
       - --port=8090
+    # Publishes the console's plain-HTTP listener so a bare-metal node can reach
+    # the ACME endpoint, fetch the CA, and enroll its cert (the console serves
+    # HTTP here even under mTLS). Bound to 127.0.0.1 by default; setting
+    # TURNSTONE_HOST_IP exposes the WHOLE console HTTP API — including the
+    # cert-issuing ACME endpoint — on that interface, so the JWT secret's
+    # strength is the only gate. Browsers use Caddy :8443, never this port.
+    ports:
+      - "${TURNSTONE_HOST_IP:-127.0.0.1}:8090:8090"
     environment:
       TURNSTONE_JWT_SECRET: *jwt-secret
       TURNSTONE_DB_BACKEND: *db-backend
@@ -219,6 +240,13 @@ services:
   # -------------------------------------------------------------------
   searxng:
     image: searxng/searxng:${SEARXNG_IMAGE_TAG:-latest}
+    # Published so a bare-metal node's web_search can reach it. SearxNG has NO
+    # auth, so it is bound to 127.0.0.1 by default; setting TURNSTONE_HOST_IP
+    # exposes it on that interface — an open search proxy on your LAN, which also
+    # triggers the SearxNG AGPL-3.0 §13 source-offer obligation (see docs/docker.md).
+    # In-compose nodes always use the internal http://searxng:8080 and ignore this.
+    ports:
+      - "${TURNSTONE_HOST_IP:-127.0.0.1}:${SEARXNG_API_PORT:-8081}:8080"
     volumes:
       - ./turnstone/deploy/searxng:/etc/searxng:ro
       - searxng-cache:/var/cache/searxng # favicon + internal SQLite cache (survives restarts)

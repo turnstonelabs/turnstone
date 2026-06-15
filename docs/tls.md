@@ -244,7 +244,10 @@ const client = new TurnstoneServer({
 ### Node Bootstrap Flow
 
 1. Node starts, connects to shared database (plain connection)
-2. Discovers console URL from `services` table
+2. Discovers the console URL from the `services` table — or honors an explicit
+   `TURNSTONE_CONSOLE_URL` (a bare-metal node outside the compose network can't
+   resolve the in-cluster `console` name, so it points this at the console's
+   published ACME endpoint)
 3. Fetches CA root cert from `http://console/acme/ca.pem` (plain HTTP, TOFU)
 4. Requests a service cert via ACME (plain HTTP, JWS-signed). The cert's
    primary domain / SAN is the node's **advertised host** (the host of
@@ -291,7 +294,8 @@ cert's SANs don't include the dialed name.
 
 The console registers itself in the `services` table on startup. If the console
 hasn't started or the registration expired (1 hour TTL), nodes can't discover
-it. Use `--console-url` explicitly.
+it. Set `TURNSTONE_CONSOLE_URL` to a reachable console address (this is also how
+a bare-metal node that can't resolve the in-cluster `console` name enrolls).
 
 ### Browser HTTPS to the console
 
