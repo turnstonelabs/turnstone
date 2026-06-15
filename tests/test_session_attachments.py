@@ -11,6 +11,7 @@ from turnstone.core.memory import (
     get_attachment,
     register_workstream,
 )
+from turnstone.core.providers._protocol import ModelCapabilities
 from turnstone.core.session import ChatSession
 from turnstone.core.trajectory import (
     dicts_from_turns,
@@ -399,3 +400,78 @@ class TestTokenAccounting:
         }
         _t2, _i2, doc2 = ChatSession._msg_text_chars(inline_plus_meta)
         assert doc2 == 4000
+
+
+class TestCapabilityGatedFallback:
+    """The wire resolver routes each blob to a native part or a client-side
+    fallback based on the active model's capabilities — per-kind dispatch, no
+    shared 'fallback' machinery."""
+
+    def _att(self, kind, content=b"x", fn="f", mime="application/octet-stream"):
+        return {
+            "attachment_id": "aX",
+            "filename": fn,
+            "mime_type": mime,
+            "kind": kind,
+            "content": content,
+        }
+
+    def test_pdf_native_when_supported(self, tmp_db, mock_openai_client):
+        s = _make_session(mock_openai_client)
+        part = s._wire_content_part(
+            self._att("pdf", b"%PDF-1.4 x", "r.pdf", "application/pdf"),
+            ModelCapabilities(supports_pdf=True),
+        )
+        assert part["type"] == "document"
+        assert part["document"]["media_type"] == "application/pdf"
+
+    def test_pdf_text_fallback_when_unsupported(self, tmp_db, mock_openai_client, monkeypatch):
+        s = _make_session(mock_openai_client)
+        monkeypatch.setattr("turnstone.core.pdf.extract_pdf_text", lambda data: "EXTRACTED")
+        part = s._wire_content_part(
+            self._att("pdf", b"%PDF", "r.pdf", "application/pdf"),
+            ModelCapabilities(supports_pdf=False),
+        )
+        assert part["type"] == "document"
+        assert part["document"]["media_type"] == "text/plain"
+        assert part["document"]["data"] == "EXTRACTED"
+        assert "extracted text" in part["document"]["name"]
+
+    def test_pdf_empty_extract_is_placeholder(self, tmp_db, mock_openai_client, monkeypatch):
+        s = _make_session(mock_openai_client)
+        monkeypatch.setattr("turnstone.core.pdf.extract_pdf_text", lambda data: "")
+        part = s._wire_content_part(
+            self._att("pdf", b"%PDF", "scan.pdf", "application/pdf"),
+            ModelCapabilities(supports_pdf=False),
+        )
+        assert part["type"] == "text"
+        assert "no extractable text" in part["text"]
+
+    def test_audio_native_when_supported(self, tmp_db, mock_openai_client):
+        s = _make_session(mock_openai_client)
+        part = s._wire_content_part(
+            self._att("audio", b"RIFFxxxxWAVE", "a.wav", "audio/wav"),
+            ModelCapabilities(supports_audio_input=True),
+        )
+        assert part["type"] == "input_audio"
+        assert part["input_audio"]["format"] == "wav"
+
+    def test_audio_fallback_no_stt_is_placeholder(self, tmp_db, mock_openai_client):
+        # _make_session leaves registry / config_store None -> no STT role.
+        s = _make_session(mock_openai_client)
+        part = s._wire_content_part(
+            self._att("audio", b"RIFF", "a.wav", "audio/wav"),
+            ModelCapabilities(supports_audio_input=False),
+        )
+        assert part["type"] == "text"
+        assert "no transcription backend" in part["text"]
+
+    def test_image_not_gated(self, tmp_db, mock_openai_client):
+        # Images are unchanged by this work — still emitted as image_url even to
+        # a no-vision model (pre-existing behavior, left as-is).
+        s = _make_session(mock_openai_client)
+        part = s._wire_content_part(
+            self._att("image", PNG_1x1, "i.png", "image/png"),
+            ModelCapabilities(),
+        )
+        assert part["type"] == "image_url"
