@@ -48,10 +48,7 @@ from turnstone.console.server import (
     coordinator_tasks,
 )
 from turnstone.core.attachments import (
-    classify_text_attachment as _coord_test_classify_text,
-)
-from turnstone.core.attachments import (
-    sniff_image_mime as _coord_test_sniff_image,
+    classify_upload as _coord_test_classify_upload,
 )
 from turnstone.core.auth import AuthResult
 from turnstone.core.session_routes import (
@@ -107,8 +104,7 @@ _coord_endpoint_config = SessionEndpointConfig(
     supports_attachments=True,
     attachment_owner_resolver=_coord_attach_owner,
     attachment_helpers=AttachmentUploadHelpers(
-        sniff_image_mime=_coord_test_sniff_image,
-        classify_text_attachment=_coord_test_classify_text,
+        classify_upload=_coord_test_classify_upload,
     ),
     spawn_metrics=None,
     emit_message_queued=True,

@@ -12834,16 +12834,10 @@ def create_app(
             return "", JSONResponse({"error": "coordinator not found"}, status_code=404)
         return ws.user_id or auth_user_id(request), None
 
-    from turnstone.core.attachments import (
-        classify_text_attachment as _coord_classify_text,
-    )
-    from turnstone.core.attachments import (
-        sniff_image_mime as _coord_sniff_image,
-    )
+    from turnstone.core.attachments import classify_upload as _coord_classify_upload
 
     coord_attachment_helpers = AttachmentUploadHelpers(
-        sniff_image_mime=_coord_sniff_image,
-        classify_text_attachment=_coord_classify_text,
+        classify_upload=_coord_classify_upload,
     )
     coord_endpoint_config = SessionEndpointConfig(
         permission_gate=_require_admin_coordinator,

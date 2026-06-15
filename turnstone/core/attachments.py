@@ -212,6 +212,59 @@ def classify_text_attachment(
     return "text/plain", None
 
 
+@dataclass(frozen=True)
+class UploadRejection:
+    """A rejected upload: client-facing message, machine code, HTTP status.
+
+    The single rejection shape both upload paths (the single-file endpoint and
+    the create-with-attachments batch) render into a JSON error response.
+    """
+
+    message: str
+    code: str
+    status: int
+
+
+def _too_large(label: str, size: int, cap: int) -> UploadRejection:
+    return UploadRejection(
+        f"{label} too large ({size:,} bytes); cap is {cap:,} bytes.", "too_large", 413
+    )
+
+
+def classify_upload(
+    filename: str, claimed_mime: str, data: bytes
+) -> tuple[str | None, str | None, UploadRejection | None]:
+    """Classify one non-empty upload into ``(kind, canonical_mime, rejection)``.
+
+    The single attachment-policy point, shared by the upload endpoint and the
+    create-with-attachments batch.  Sniff order is image → pdf → audio (magic
+    bytes; the client-claimed ``Content-Type`` is never trusted), then UTF-8
+    text by MIME/extension allowlist.  Each kind enforces its own byte cap.
+    Returns ``(kind, mime, None)`` on success, or ``(None, None, rejection)`` on
+    the first failure.  Callers pre-check for empty data.
+    """
+    sniffed_image = sniff_image_mime(data)
+    if sniffed_image is not None:
+        if len(data) > IMAGE_SIZE_CAP:
+            return None, None, _too_large("Image", len(data), IMAGE_SIZE_CAP)
+        return "image", sniffed_image, None
+    if sniff_pdf_mime(data) is not None:
+        if len(data) > PDF_SIZE_CAP:
+            return None, None, _too_large("PDF", len(data), PDF_SIZE_CAP)
+        return "pdf", "application/pdf", None
+    sniffed_audio = sniff_audio_mime(data)
+    if sniffed_audio is not None:
+        if len(data) > AUDIO_SIZE_CAP:
+            return None, None, _too_large("Audio", len(data), AUDIO_SIZE_CAP)
+        return "audio", sniffed_audio, None
+    if len(data) > TEXT_DOC_SIZE_CAP:
+        return None, None, _too_large("Text document", len(data), TEXT_DOC_SIZE_CAP)
+    mime, err = classify_text_attachment(filename, claimed_mime, data)
+    if mime is None:
+        return None, None, UploadRejection(err or "Unsupported file type", "unsupported", 400)
+    return "text", mime, None
+
+
 def validate_and_save_uploaded_files(
     files: list[tuple[str, str, bytes]],
     ws_id: str,
@@ -246,42 +299,13 @@ def validate_and_save_uploaded_files(
     for filename, claimed_mime, data in files:
         if not data:
             return saved_ids, _JSONResponse({"error": "Empty file"}, status_code=400)
-        sniffed_image = sniff_image_mime(data)
-        if sniffed_image is not None:
-            if len(data) > IMAGE_SIZE_CAP:
-                return saved_ids, _JSONResponse(
-                    {
-                        "error": (
-                            f"Image too large ({len(data):,} bytes); "
-                            f"cap is {IMAGE_SIZE_CAP:,} bytes."
-                        ),
-                        "code": "too_large",
-                    },
-                    status_code=413,
-                )
-            kind = "image"
-            mime = sniffed_image
-        else:
-            if len(data) > TEXT_DOC_SIZE_CAP:
-                return saved_ids, _JSONResponse(
-                    {
-                        "error": (
-                            f"Text document too large ({len(data):,} bytes); "
-                            f"cap is {TEXT_DOC_SIZE_CAP:,} bytes."
-                        ),
-                        "code": "too_large",
-                    },
-                    status_code=413,
-                )
-            mime_or_err = classify_text_attachment(filename, claimed_mime, data)
-            if mime_or_err[0] is None:
-                return saved_ids, _JSONResponse(
-                    {"error": mime_or_err[1], "code": "unsupported"},
-                    status_code=400,
-                )
-            kind = "text"
-            mime = mime_or_err[0]
-
+        kind, mime, rejection = classify_upload(filename, claimed_mime, data)
+        if rejection is not None:
+            return saved_ids, _JSONResponse(
+                {"error": rejection.message, "code": rejection.code},
+                status_code=rejection.status,
+            )
+        assert kind is not None and mime is not None  # success ⟹ both set
         staged = buffer.stage(
             ws_id=ws_id,
             user_id=user_id,

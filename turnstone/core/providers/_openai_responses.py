@@ -61,15 +61,34 @@ def convert_content_parts(parts: list[Any]) -> list[dict[str, Any]]:
             converted.append({"type": "input_image", "image_url": url})
         elif ptype == "document":
             d = part.get("document", {})
+            if d.get("media_type") == "application/pdf":
+                # Native PDF: Responses ``input_file`` with an inline base64
+                # data URI (``data`` is already base64 — see
+                # storage/_utils.attachment_to_content_part).
+                converted.append(
+                    {
+                        "type": "input_file",
+                        "filename": d.get("name") or "document.pdf",
+                        "file_data": f"data:application/pdf;base64,{d.get('data', '')}",
+                    }
+                )
+            else:
+                converted.append(
+                    {
+                        "type": "input_text",
+                        "text": format_document_wrapper(
+                            d.get("name", ""),
+                            d.get("media_type", "text/plain"),
+                            d.get("data", ""),
+                        ),
+                    }
+                )
+        elif ptype == "input_audio":
+            # Audio-input is not wired on the Responses lane; until the Phase 3
+            # capability-gated fallback (STT) lands upstream, surface a
+            # placeholder rather than leaking an unhandled part to the API.
             converted.append(
-                {
-                    "type": "input_text",
-                    "text": format_document_wrapper(
-                        d.get("name", ""),
-                        d.get("media_type", "text/plain"),
-                        d.get("data", ""),
-                    ),
-                }
+                {"type": "input_text", "text": "[audio attachment — not supported by this model]"}
             )
         else:
             converted.append(part)

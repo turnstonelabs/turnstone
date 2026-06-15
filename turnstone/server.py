@@ -3746,16 +3746,10 @@ def create_app(
                 ui._ws_messages += 1
                 ui._ws_turn_tool_calls = 0
 
-    from turnstone.core.attachments import (
-        classify_text_attachment as _classify_text_attachment,
-    )
-    from turnstone.core.attachments import (
-        sniff_image_mime as _sniff_image_mime,
-    )
+    from turnstone.core.attachments import classify_upload as _classify_upload
 
     interactive_attachment_helpers = AttachmentUploadHelpers(
-        sniff_image_mime=_sniff_image_mime,
-        classify_text_attachment=_classify_text_attachment,
+        classify_upload=_classify_upload,
     )
     from turnstone.core.memory import (
         get_workstream_display_names as _get_ws_display_names,

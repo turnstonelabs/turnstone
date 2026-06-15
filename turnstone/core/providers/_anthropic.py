@@ -85,6 +85,7 @@ _ANTHROPIC_DEFAULT = ModelCapabilities(
     thinking_mode="manual",
     supports_web_search=True,
     supports_vision=True,
+    supports_pdf=True,
     supports_reasoning_replay=True,
 )
 
@@ -126,6 +127,7 @@ _ANTHROPIC_CAPABILITIES: dict[str, ModelCapabilities] = {
         supports_web_search=True,
         supports_tool_search=True,
         supports_vision=True,
+        supports_pdf=True,
         supports_temperature=False,
         thinking_display="summarized",
         supports_reasoning_replay=True,
@@ -141,6 +143,7 @@ _ANTHROPIC_CAPABILITIES: dict[str, ModelCapabilities] = {
         supports_web_search=True,
         supports_tool_search=True,
         supports_vision=True,
+        supports_pdf=True,
         supports_temperature=False,
         thinking_display="summarized",
         supports_reasoning_replay=True,
@@ -156,6 +159,7 @@ _ANTHROPIC_CAPABILITIES: dict[str, ModelCapabilities] = {
         supports_web_search=True,
         supports_tool_search=True,
         supports_vision=True,
+        supports_pdf=True,
         supports_temperature=False,
         thinking_display="summarized",
         supports_reasoning_replay=True,
@@ -170,6 +174,7 @@ _ANTHROPIC_CAPABILITIES: dict[str, ModelCapabilities] = {
         supports_web_search=True,
         supports_tool_search=True,
         supports_vision=True,
+        supports_pdf=True,
         supports_reasoning_replay=True,
     ),
     "claude-sonnet-4-6": ModelCapabilities(
@@ -182,6 +187,7 @@ _ANTHROPIC_CAPABILITIES: dict[str, ModelCapabilities] = {
         supports_web_search=True,
         supports_tool_search=True,
         supports_vision=True,
+        supports_pdf=True,
         supports_reasoning_replay=True,
     ),
     "claude-haiku-4-5": ModelCapabilities(
@@ -191,6 +197,7 @@ _ANTHROPIC_CAPABILITIES: dict[str, ModelCapabilities] = {
         thinking_mode="manual",
         supports_web_search=True,
         supports_vision=True,
+        supports_pdf=True,
         supports_reasoning_replay=True,
     ),
     "claude-sonnet-4-5": ModelCapabilities(
@@ -200,6 +207,7 @@ _ANTHROPIC_CAPABILITIES: dict[str, ModelCapabilities] = {
         thinking_mode="manual",
         supports_web_search=True,
         supports_vision=True,
+        supports_pdf=True,
         supports_reasoning_replay=True,
     ),
     "claude-opus-4-5": ModelCapabilities(
@@ -211,6 +219,7 @@ _ANTHROPIC_CAPABILITIES: dict[str, ModelCapabilities] = {
         effort_levels=("low", "medium", "high"),
         supports_web_search=True,
         supports_vision=True,
+        supports_pdf=True,
         supports_reasoning_replay=True,
     ),
 }
@@ -643,6 +652,22 @@ class AnthropicProvider:
         for part in parts:
             if part.get("type") == "document":
                 d = part.get("document", {})
+                if d.get("media_type") == "application/pdf":
+                    # Native PDF: base64 document source (Anthropic reads both
+                    # text and page images).  ``data`` is already base64 — see
+                    # storage/_utils.attachment_to_content_part.
+                    pdf_block: dict[str, Any] = {
+                        "type": "document",
+                        "source": {
+                            "type": "base64",
+                            "media_type": "application/pdf",
+                            "data": d.get("data", ""),
+                        },
+                    }
+                    if d.get("name"):
+                        pdf_block["title"] = d["name"]
+                    converted.append(pdf_block)
+                    continue
                 # Anthropic's text-source documents only accept
                 # ``text/plain``; coerce any other text MIME here and fold
                 # the original type into the human-readable title so the
@@ -664,6 +689,14 @@ class AnthropicProvider:
                 elif original_mime != "text/plain":
                     block["title"] = original_mime
                 converted.append(block)
+                continue
+            if part.get("type") == "input_audio":
+                # Anthropic has no audio-input API.  Phase 3 transcribes via the
+                # STT role upstream of this translator; until then surface a
+                # placeholder rather than passing an unsupported block to the API.
+                converted.append(
+                    {"type": "text", "text": "[audio attachment — not supported by this model]"}
+                )
                 continue
             if part.get("type") == "image_url":
                 url = part.get("image_url", {}).get("url", "")
