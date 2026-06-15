@@ -63,7 +63,10 @@ Auth is always enabled. All API endpoints except public paths require a valid to
 Include a token in one of two ways:
 
 - **Bearer header**: `Authorization: Bearer <token>`
-- **Cookie**: `turnstone_auth=<token>` (set automatically by the login endpoint)
+- **Cookie**: the surface-scoped auth cookie — `turnstone_auth_server` on
+  turnstone-server, `turnstone_auth_console` on turnstone-console (set
+  automatically by the login endpoint). The names differ so the two surfaces,
+  when co-hosted on one origin, don't overwrite each other's session.
 
 The server accepts two token types:
 
@@ -102,7 +105,8 @@ Authenticate with credentials and receive a JWT. Accepts two credential formats:
 }
 ```
 
-The response also sets a `turnstone_auth` HttpOnly cookie containing the JWT.
+The response also sets a surface-scoped HttpOnly cookie containing the JWT
+(`turnstone_auth_server` on turnstone-server, `turnstone_auth_console` on turnstone-console).
 
 **Response (failure):** `401`
 
@@ -114,7 +118,8 @@ The response also sets a `turnstone_auth` HttpOnly cookie containing the JWT.
 
 ### `POST /v1/api/auth/logout`
 
-Clears the `turnstone_auth` cookie. No request body required.
+Clears the surface-scoped auth cookie (`turnstone_auth_server` /
+`turnstone_auth_console`). No request body required.
 
 **Response:** `200`
 
@@ -199,7 +204,8 @@ this endpoint.
 }
 ```
 
-The response also sets a `turnstone_auth` HttpOnly cookie containing the JWT.
+The response also sets a surface-scoped HttpOnly cookie containing the JWT
+(`turnstone_auth_server` on turnstone-server, `turnstone_auth_console` on turnstone-console).
 
 **Response (already set up):** `409`
 

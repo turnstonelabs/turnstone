@@ -8,6 +8,9 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from turnstone.core.auth import (
+    AUTH_COOKIE,
+    AUTH_COOKIE_CONSOLE,
+    AUTH_COOKIE_SERVER,
     WRITE_PATHS,
     _extract_bearer,
     _extract_cookie,
@@ -374,48 +377,59 @@ class TestExtractCookie:
 
 class TestMakeSetCookie:
     def test_contains_token(self):
-        val = make_set_cookie("tok_abc")
-        assert "turnstone_auth=tok_abc" in val
+        val = make_set_cookie("tok_abc", AUTH_COOKIE_SERVER)
+        assert "turnstone_auth_server=tok_abc" in val
 
     def test_httponly(self):
-        assert "HttpOnly" in make_set_cookie("tok_abc")
+        assert "HttpOnly" in make_set_cookie("tok_abc", AUTH_COOKIE_SERVER)
 
     def test_samesite_lax(self):
-        assert "SameSite=Lax" in make_set_cookie("tok_abc")
+        assert "SameSite=Lax" in make_set_cookie("tok_abc", AUTH_COOKIE_SERVER)
 
     def test_path(self):
-        assert "Path=/" in make_set_cookie("tok_abc")
+        assert "Path=/" in make_set_cookie("tok_abc", AUTH_COOKIE_SERVER)
 
     def test_max_age_default(self):
-        val = make_set_cookie("tok_abc")
+        val = make_set_cookie("tok_abc", AUTH_COOKIE_SERVER)
         assert "Max-Age=86400" in val  # 24 hours (matches JWT expiry)
 
     def test_max_age_custom(self):
-        val = make_set_cookie("tok_abc", max_age=3600)
+        val = make_set_cookie("tok_abc", AUTH_COOKIE_SERVER, max_age=3600)
         assert "Max-Age=3600" in val
 
     def test_secure_default(self):
-        val = make_set_cookie("tok_abc")
+        val = make_set_cookie("tok_abc", AUTH_COOKIE_SERVER)
         assert "; Secure" in val
 
     def test_secure_false(self):
-        val = make_set_cookie("tok_abc", secure=False)
+        val = make_set_cookie("tok_abc", AUTH_COOKIE_SERVER, secure=False)
         assert "; Secure" not in val
 
     def test_secure_true(self):
-        val = make_set_cookie("tok_abc", secure=True)
+        val = make_set_cookie("tok_abc", AUTH_COOKIE_SERVER, secure=True)
         assert "; Secure" in val
+
+    def test_uses_provided_name(self):
+        # Name is honored verbatim; one surface's name never leaks into the other.
+        val = make_set_cookie("tok_abc", AUTH_COOKIE_CONSOLE)
+        assert "turnstone_auth_console=tok_abc" in val
+        assert "turnstone_auth_server" not in val
 
 
 class TestMakeClearCookie:
     def test_max_age_zero(self):
-        assert "Max-Age=0" in make_clear_cookie()
+        assert "Max-Age=0" in make_clear_cookie(AUTH_COOKIE_SERVER)
 
     def test_empty_value(self):
-        assert "turnstone_auth=;" in make_clear_cookie()
+        assert "turnstone_auth_server=;" in make_clear_cookie(AUTH_COOKIE_SERVER)
 
     def test_httponly(self):
-        assert "HttpOnly" in make_clear_cookie()
+        assert "HttpOnly" in make_clear_cookie(AUTH_COOKIE_SERVER)
+
+    def test_uses_provided_name(self):
+        val = make_clear_cookie(AUTH_COOKIE_CONSOLE)
+        assert "turnstone_auth_console=;" in val
+        assert "Max-Age=0" in val
 
 
 # ---------------------------------------------------------------------------
@@ -437,47 +451,67 @@ class TestCheckRequest:
         return f"Bearer {create_jwt('u1', frozenset({'read', 'write', 'approve'}), 'test', self._SECRET)}"
 
     def test_public_path_no_token_ok(self):
-        allowed, status, msg, _result = check_request("GET", "/health", None)
+        allowed, status, msg, _result = check_request(
+            "GET", "/health", None, cookie_name=AUTH_COOKIE_SERVER
+        )
         assert allowed is True
         assert status == 200
 
     def test_public_root_no_token_ok(self):
-        allowed, status, msg, _result = check_request("GET", "/", None)
+        allowed, status, msg, _result = check_request(
+            "GET", "/", None, cookie_name=AUTH_COOKIE_SERVER
+        )
         assert allowed is True
 
     def test_public_static_no_token_ok(self):
-        allowed, status, msg, _result = check_request("GET", "/static/style.css", None)
+        allowed, status, msg, _result = check_request(
+            "GET", "/static/style.css", None, cookie_name=AUTH_COOKIE_SERVER
+        )
         assert allowed is True
 
     def test_api_no_token_401(self):
-        allowed, status, msg, _result = check_request("GET", "/api/workstreams", None)
+        allowed, status, msg, _result = check_request(
+            "GET", "/api/workstreams", None, cookie_name=AUTH_COOKIE_SERVER
+        )
         assert allowed is False
         assert status == 401
         assert "Unauthorized" in msg
 
     def test_api_invalid_token_401(self):
         allowed, status, msg, _result = check_request(
-            "GET", "/api/workstreams", "Bearer wrong_token"
+            "GET", "/api/workstreams", "Bearer wrong_token", cookie_name=AUTH_COOKIE_SERVER
         )
         assert allowed is False
         assert status == 401
 
     def test_api_read_token_ok(self, read_jwt):
         allowed, status, msg, _result = check_request(
-            "GET", "/api/workstreams", read_jwt, jwt_secret=self._SECRET
+            "GET",
+            "/api/workstreams",
+            read_jwt,
+            jwt_secret=self._SECRET,
+            cookie_name=AUTH_COOKIE_SERVER,
         )
         assert allowed is True
         assert status == 200
 
     def test_api_full_token_ok(self, full_jwt):
         allowed, status, msg, _result = check_request(
-            "GET", "/api/workstreams", full_jwt, jwt_secret=self._SECRET
+            "GET",
+            "/api/workstreams",
+            full_jwt,
+            jwt_secret=self._SECRET,
+            cookie_name=AUTH_COOKIE_SERVER,
         )
         assert allowed is True
 
     def test_write_read_token_403(self, read_jwt):
         allowed, status, msg, _result = check_request(
-            "POST", "/api/workstreams/abc/send", read_jwt, jwt_secret=self._SECRET
+            "POST",
+            "/api/workstreams/abc/send",
+            read_jwt,
+            jwt_secret=self._SECRET,
+            cookie_name=AUTH_COOKIE_SERVER,
         )
         assert allowed is False
         assert status == 403
@@ -485,14 +519,22 @@ class TestCheckRequest:
 
     def test_write_full_token_ok(self, full_jwt):
         allowed, status, msg, _result = check_request(
-            "POST", "/api/workstreams/abc/send", full_jwt, jwt_secret=self._SECRET
+            "POST",
+            "/api/workstreams/abc/send",
+            full_jwt,
+            jwt_secret=self._SECRET,
+            cookie_name=AUTH_COOKIE_SERVER,
         )
         assert allowed is True
         assert status == 200
 
     def test_approve_read_token_403(self, read_jwt):
         allowed, status, msg, _result = check_request(
-            "POST", "/api/workstreams/abc/approve", read_jwt, jwt_secret=self._SECRET
+            "POST",
+            "/api/workstreams/abc/approve",
+            read_jwt,
+            jwt_secret=self._SECRET,
+            cookie_name=AUTH_COOKIE_SERVER,
         )
         assert allowed is False
         assert status == 403
@@ -504,6 +546,7 @@ class TestCheckRequest:
             "/node/node-a/api/workstreams/abc/send",
             read_jwt,
             jwt_secret=self._SECRET,
+            cookie_name=AUTH_COOKIE_SERVER,
         )
         assert allowed is False
         assert status == 403
@@ -515,6 +558,7 @@ class TestCheckRequest:
             "/node/node-a/api/workstreams/abc/send/",
             read_jwt,
             jwt_secret=self._SECRET,
+            cookie_name=AUTH_COOKIE_SERVER,
         )
         assert allowed is False
         assert status == 403
@@ -522,7 +566,11 @@ class TestCheckRequest:
     def test_direct_write_trailing_slash_read_token_403(self, read_jwt):
         """Trailing slash must not bypass write-role check on direct routes."""
         allowed, status, msg, _result = check_request(
-            "POST", "/api/workstreams/abc/send/", read_jwt, jwt_secret=self._SECRET
+            "POST",
+            "/api/workstreams/abc/send/",
+            read_jwt,
+            jwt_secret=self._SECRET,
+            cookie_name=AUTH_COOKIE_SERVER,
         )
         assert allowed is False
         assert status == 403
@@ -534,6 +582,7 @@ class TestCheckRequest:
             "/node/node-a/api/workstreams/abc/send",
             full_jwt,
             jwt_secret=self._SECRET,
+            cookie_name=AUTH_COOKIE_SERVER,
         )
         assert allowed is True
 
@@ -544,6 +593,7 @@ class TestCheckRequest:
             "/node/node-a/v1/api/workstreams/abc/send",
             read_jwt,
             jwt_secret=self._SECRET,
+            cookie_name=AUTH_COOKIE_SERVER,
         )
         assert allowed is False
         assert status == 403
@@ -555,6 +605,7 @@ class TestCheckRequest:
             "/node/node-a/v1/api/workstreams/abc/send",
             full_jwt,
             jwt_secret=self._SECRET,
+            cookie_name=AUTH_COOKIE_SERVER,
         )
         assert allowed is True
 
@@ -565,6 +616,7 @@ class TestCheckRequest:
             "/node/node-a/v1/api/cluster/workstreams/new",
             read_jwt,
             jwt_secret=self._SECRET,
+            cookie_name=AUTH_COOKIE_SERVER,
         )
         assert allowed is False
         assert status == 403
@@ -572,26 +624,40 @@ class TestCheckRequest:
     def test_proxy_read_endpoint_read_token_ok(self, read_jwt):
         """Read tokens can access proxy read endpoints."""
         allowed, status, msg, _result = check_request(
-            "GET", "/node/node-a/api/workstreams", read_jwt, jwt_secret=self._SECRET
+            "GET",
+            "/node/node-a/api/workstreams",
+            read_jwt,
+            jwt_secret=self._SECRET,
+            cookie_name=AUTH_COOKIE_SERVER,
         )
         assert allowed is True
 
     def test_console_create_ws_read_token_403(self, read_jwt):
         """Read tokens cannot create workstreams."""
         allowed, status, msg, _result = check_request(
-            "POST", "/api/cluster/workstreams/new", read_jwt, jwt_secret=self._SECRET
+            "POST",
+            "/api/cluster/workstreams/new",
+            read_jwt,
+            jwt_secret=self._SECRET,
+            cookie_name=AUTH_COOKIE_SERVER,
         )
         assert allowed is False
         assert status == 403
 
     def test_approve_full_token_ok(self, full_jwt):
         allowed, status, msg, _result = check_request(
-            "POST", "/api/workstreams/abc/approve", full_jwt, jwt_secret=self._SECRET
+            "POST",
+            "/api/workstreams/abc/approve",
+            full_jwt,
+            jwt_secret=self._SECRET,
+            cookie_name=AUTH_COOKIE_SERVER,
         )
         assert allowed is True
 
     def test_no_auth_header_string(self):
-        allowed, status, msg, _result = check_request("GET", "/api/dashboard", "")
+        allowed, status, msg, _result = check_request(
+            "GET", "/api/dashboard", "", cookie_name=AUTH_COOKIE_SERVER
+        )
         assert allowed is False
         assert status == 401
 
@@ -619,8 +685,9 @@ class TestCheckRequestWithCookie:
             "GET",
             "/api/workstreams",
             None,
-            cookie_header=f"turnstone_auth={read_jwt}",
+            cookie_header=f"{AUTH_COOKIE_SERVER}={read_jwt}",
             jwt_secret=self._SECRET,
+            cookie_name=AUTH_COOKIE_SERVER,
         )
         assert allowed is True
         assert status == 200
@@ -630,8 +697,9 @@ class TestCheckRequestWithCookie:
             "POST",
             "/api/workstreams/abc/send",
             f"Bearer {full_jwt}",
-            cookie_header=f"turnstone_auth={read_jwt}",
+            cookie_header=f"{AUTH_COOKIE_SERVER}={read_jwt}",
             jwt_secret=self._SECRET,
+            cookie_name=AUTH_COOKIE_SERVER,
         )
         assert allowed is True
 
@@ -640,8 +708,9 @@ class TestCheckRequestWithCookie:
             "GET",
             "/api/workstreams",
             None,
-            cookie_header="turnstone_auth=wrong_token",
+            cookie_header=f"{AUTH_COOKIE_SERVER}=wrong_token",
             jwt_secret=self._SECRET,
+            cookie_name=AUTH_COOKIE_SERVER,
         )
         assert allowed is False
         assert status == 401
@@ -651,8 +720,9 @@ class TestCheckRequestWithCookie:
             "POST",
             "/api/workstreams/abc/send",
             None,
-            cookie_header=f"turnstone_auth={read_jwt}",
+            cookie_header=f"{AUTH_COOKIE_SERVER}={read_jwt}",
             jwt_secret=self._SECRET,
+            cookie_name=AUTH_COOKIE_SERVER,
         )
         assert allowed is False
         assert status == 403
@@ -662,8 +732,9 @@ class TestCheckRequestWithCookie:
             "POST",
             "/api/workstreams/abc/send",
             None,
-            cookie_header=f"turnstone_auth={full_jwt}",
+            cookie_header=f"{AUTH_COOKIE_SERVER}={full_jwt}",
             jwt_secret=self._SECRET,
+            cookie_name=AUTH_COOKIE_SERVER,
         )
         assert allowed is True
 
@@ -673,6 +744,7 @@ class TestCheckRequestWithCookie:
             "/api/workstreams",
             None,
             cookie_header=None,
+            cookie_name=AUTH_COOKIE_SERVER,
         )
         assert allowed is False
         assert status == 401
@@ -682,6 +754,7 @@ class TestCheckRequestWithCookie:
             "POST",
             "/api/auth/login",
             None,
+            cookie_name=AUTH_COOKIE_SERVER,
         )
         assert allowed is True
 
@@ -690,8 +763,55 @@ class TestCheckRequestWithCookie:
             "POST",
             "/api/auth/logout",
             None,
+            cookie_name=AUTH_COOKIE_SERVER,
         )
         assert allowed is True
+
+    # --- Cookie-name isolation (the server/console fix) -----------------------
+
+    def test_legacy_cookie_name_rejected(self, read_jwt):
+        """A pre-isolation ``turnstone_auth`` cookie no longer authenticates once
+        the surface is configured for a scoped name: existing sessions must
+        re-login after the rename (intentional hard cutover, no read-fallback)."""
+        allowed, status, _, _r = check_request(
+            "GET",
+            "/api/workstreams",
+            None,
+            cookie_header=f"{AUTH_COOKIE}={read_jwt}",
+            jwt_secret=self._SECRET,
+            cookie_name=AUTH_COOKIE_SERVER,
+        )
+        assert allowed is False
+        assert status == 401
+
+    def test_console_cookie_name_not_read_by_server(self, read_jwt):
+        """The console's cookie name is invisible to a server-configured surface,
+        so a console session can't satisfy a server request (no cross-read)."""
+        allowed, status, _, _r = check_request(
+            "GET",
+            "/api/workstreams",
+            None,
+            cookie_header=f"{AUTH_COOKIE_CONSOLE}={read_jwt}",
+            jwt_secret=self._SECRET,
+            cookie_name=AUTH_COOKIE_SERVER,
+        )
+        assert allowed is False
+        assert status == 401
+
+    def test_both_cookies_present_no_clobber(self, read_jwt):
+        """With distinct names both surfaces' cookies coexist in one jar; the
+        server reads only its own and authenticates even with a console cookie
+        also present — the core property the rename buys."""
+        allowed, status, _, _r = check_request(
+            "GET",
+            "/api/workstreams",
+            None,
+            cookie_header=f"{AUTH_COOKIE_CONSOLE}=other; {AUTH_COOKIE_SERVER}={read_jwt}",
+            jwt_secret=self._SECRET,
+            cookie_name=AUTH_COOKIE_SERVER,
+        )
+        assert allowed is True
+        assert status == 200
 
 
 # ---------------------------------------------------------------------------
@@ -1020,6 +1140,10 @@ class TestServerLogin:
         assert resp.status_code == 200
         data = resp.json()
         assert "jwt" in data
+        # Server surface sets ITS OWN scoped cookie — not the console's, not the legacy name.
+        set_cookie = resp.headers.get("set-cookie", "")
+        assert AUTH_COOKIE_SERVER in set_cookie
+        assert AUTH_COOKIE_CONSOLE not in set_cookie
 
     def test_cookie_auth_on_api(self):
         # Login to get cookie (TestClient tracks cookies automatically)
@@ -1044,6 +1168,7 @@ class TestServerLogin:
         assert logout_resp.status_code == 200
         cookie = logout_resp.headers.get("set-cookie", "")
         assert "Max-Age=0" in cookie
+        assert AUTH_COOKIE_SERVER in cookie
 
         # API should now fail (cookie cleared)
         resp = self.test_client.get("/v1/api/workstreams")
@@ -1070,8 +1195,6 @@ class TestServerLogin:
 
     def test_refresh_returns_new_jwt_and_cookie(self):
         """POST /api/auth/refresh re-mints the cookie with a fresh exp."""
-        from turnstone.core.auth import AUTH_COOKIE
-
         # Storage needs get_user_permissions for the refresh re-resolve path.
         # Mock is shared across tests in the class — re-arm here in case a
         # prior test left it default.
@@ -1098,7 +1221,7 @@ class TestServerLogin:
         # and refresh produce identical iat/exp claims and therefore an
         # identical token, which is fine: the cookie still gets re-set.
         cookie_hdr = refresh.headers.get("set-cookie", "")
-        assert AUTH_COOKIE in cookie_hdr
+        assert AUTH_COOKIE_SERVER in cookie_hdr
         assert "HttpOnly" in cookie_hdr
 
         # The refreshed cookie must keep working.
@@ -1279,7 +1402,10 @@ class TestConsoleLogin:
             json={"username": "testuser", "password": "testpass"},
         )
         assert resp.status_code == 200
-        assert "turnstone_auth" in resp.headers.get("set-cookie", "")
+        # Exact scoped name (not the legacy prefix) and no server-name bleed.
+        set_cookie = resp.headers.get("set-cookie", "")
+        assert AUTH_COOKIE_CONSOLE in set_cookie
+        assert AUTH_COOKIE_SERVER not in set_cookie
 
     def test_cookie_auth_on_api(self):
         self.test_client.post(
@@ -1559,6 +1685,7 @@ class TestJWTVersionClaim:
             jwt_secret=self.SECRET,
             jwt_audience=JWT_AUD_SERVER,
             jwt_version="1.2",
+            cookie_name=AUTH_COOKIE_SERVER,
         )
         assert allowed
         assert result is not None
@@ -1581,6 +1708,7 @@ class TestJWTVersionClaim:
             jwt_secret=self.SECRET,
             jwt_audience=JWT_AUD_SERVER,
             jwt_version="1.2",
+            cookie_name=AUTH_COOKIE_SERVER,
         )
         assert allowed
 
@@ -1602,6 +1730,7 @@ class TestJWTVersionClaim:
             jwt_secret=self.SECRET,
             jwt_audience=JWT_AUD_SERVER,
             jwt_version="1.2",
+            cookie_name=AUTH_COOKIE_SERVER,
         )
         assert not allowed
         assert status == 401
