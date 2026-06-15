@@ -1191,7 +1191,8 @@ Three hierarchical scopes control endpoint access:
    `/metrics`, `/openapi.json`, `/docs`, `/api/auth/*`, and `/api/auth/setup`
    are always allowed.
 2. **Token extraction** — `Authorization: Bearer <token>` header first, then
-   `turnstone_auth` cookie as fallback.
+   surface-scoped auth cookie (`turnstone_auth_server` on the node server,
+   `turnstone_auth_console` on the console) as fallback.
 3. **Token type detection** — dots in the token indicate JWT; `ts_` prefix
    indicates API token.
 4. **Validation** — JWT signature check or API token hash lookup in storage.

@@ -47,6 +47,7 @@ from turnstone.console.metrics import ConsoleMetrics
 from turnstone.console.router import ConsoleRouter
 from turnstone.core.audit import record_audit
 from turnstone.core.auth import (
+    AUTH_COOKIE_CONSOLE,
     JWT_AUD_CONSOLE,
     JWT_AUD_SERVER,
     AuthMiddleware,
@@ -1574,14 +1575,14 @@ async def auth_login(request: Request) -> Response:
     """Authenticate via username:password or legacy token, return JWT."""
     from turnstone.core.auth import handle_auth_login
 
-    return await handle_auth_login(request, JWT_AUD_CONSOLE)
+    return await handle_auth_login(request, JWT_AUD_CONSOLE, cookie_name=AUTH_COOKIE_CONSOLE)
 
 
 async def auth_logout(request: Request) -> Response:
     """POST /v1/api/auth/logout — clear auth cookie."""
     from turnstone.core.auth import handle_auth_logout
 
-    return await handle_auth_logout(request)
+    return await handle_auth_logout(request, cookie_name=AUTH_COOKIE_CONSOLE)
 
 
 async def auth_status(request: Request) -> Response:
@@ -1595,14 +1596,14 @@ async def auth_setup(request: Request) -> Response:
     """POST /v1/api/auth/setup — create first admin user (public, one-time only)."""
     from turnstone.core.auth import handle_auth_setup
 
-    return await handle_auth_setup(request, JWT_AUD_CONSOLE)
+    return await handle_auth_setup(request, JWT_AUD_CONSOLE, cookie_name=AUTH_COOKIE_CONSOLE)
 
 
 async def auth_whoami(request: Request) -> Response:
     """GET /v1/api/auth/whoami — return authenticated user info."""
     from turnstone.core.auth import handle_auth_whoami
 
-    return await handle_auth_whoami(request)
+    return await handle_auth_whoami(request, cookie_name=AUTH_COOKIE_CONSOLE)
 
 
 async def auth_refresh(request: Request) -> Response:
@@ -1613,7 +1614,7 @@ async def auth_refresh(request: Request) -> Response:
     """
     from turnstone.core.auth import handle_auth_refresh
 
-    return await handle_auth_refresh(request, JWT_AUD_CONSOLE)
+    return await handle_auth_refresh(request, JWT_AUD_CONSOLE, cookie_name=AUTH_COOKIE_CONSOLE)
 
 
 async def oidc_authorize(request: Request) -> Response:
@@ -1627,7 +1628,7 @@ async def oidc_callback(request: Request) -> Response:
     """GET /v1/api/auth/oidc/callback — OIDC callback, exchange code for JWT."""
     from turnstone.core.auth import handle_oidc_callback
 
-    return await handle_oidc_callback(request, JWT_AUD_CONSOLE)
+    return await handle_oidc_callback(request, JWT_AUD_CONSOLE, cookie_name=AUTH_COOKIE_CONSOLE)
 
 
 async def mcp_oauth_authorize(request: Request) -> Response:
@@ -13564,7 +13565,12 @@ def _build_console_middleware(cors_origins: list[str] | None = None) -> list[Mid
 
         stack.append(cors_middleware(cors_origins))
     stack.append(
-        Middleware(AuthMiddleware, jwt_audience=JWT_AUD_CONSOLE, jwt_version=jwt_version_slot())
+        Middleware(
+            AuthMiddleware,
+            jwt_audience=JWT_AUD_CONSOLE,
+            jwt_version=jwt_version_slot(),
+            cookie_name=AUTH_COOKIE_CONSOLE,
+        )
     )
     return stack
 

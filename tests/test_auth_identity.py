@@ -7,6 +7,7 @@ import time
 import pytest
 
 from turnstone.core.auth import (
+    AUTH_COOKIE_SERVER,
     AuthResult,
     _authenticate_token,
     check_request,
@@ -273,6 +274,7 @@ class TestCheckRequestScopes:
             "/api/workstreams/abc/send",
             f"Bearer {jwt_tok}",
             jwt_secret=self._SECRET,
+            cookie_name=AUTH_COOKIE_SERVER,
         )
         assert not allowed
         assert status == 403
@@ -285,6 +287,7 @@ class TestCheckRequestScopes:
             "/api/workstreams/abc/approve",
             f"Bearer {jwt_tok}",
             jwt_secret=self._SECRET,
+            cookie_name=AUTH_COOKIE_SERVER,
         )
         assert not allowed
         assert status == 403
@@ -297,6 +300,7 @@ class TestCheckRequestScopes:
             "/api/workstreams/abc/approve",
             f"Bearer {jwt_tok}",
             jwt_secret=self._SECRET,
+            cookie_name=AUTH_COOKIE_SERVER,
         )
         assert allowed
         assert result is not None
@@ -309,6 +313,7 @@ class TestCheckRequestScopes:
             "/api/workstreams/abc/send",
             f"Bearer {jwt_tok}",
             jwt_secret=self._SECRET,
+            cookie_name=AUTH_COOKIE_SERVER,
         )
         assert allowed
         assert result is not None
@@ -321,6 +326,7 @@ class TestCheckRequestScopes:
             "/api/workstreams/abc/send",
             f"Bearer {jwt_tok}",
             jwt_secret=self._SECRET,
+            cookie_name=AUTH_COOKIE_SERVER,
         )
         assert not allowed
         assert status == 403
@@ -332,6 +338,7 @@ class TestCheckRequestScopes:
             "/v1/api/admin/users",
             f"Bearer {jwt_tok}",
             jwt_secret=self._SECRET,
+            cookie_name=AUTH_COOKIE_SERVER,
         )
         assert not allowed
         assert status == 403

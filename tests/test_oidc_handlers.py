@@ -24,6 +24,8 @@ from turnstone.console.server import (
     admin_list_oidc_identities,
 )
 from turnstone.core.auth import (
+    AUTH_COOKIE_CONSOLE,
+    AUTH_COOKIE_SERVER,
     AuthResult,
     LoginRateLimiter,
     handle_oidc_authorize,
@@ -46,7 +48,7 @@ async def _oidc_authorize(request: Request) -> Response:
 
 
 async def _oidc_callback(request: Request) -> Response:
-    return await handle_oidc_callback(request, "test-audience")
+    return await handle_oidc_callback(request, "test-audience", cookie_name=AUTH_COOKIE_SERVER)
 
 
 # ---------------------------------------------------------------------------
@@ -292,7 +294,8 @@ class TestOIDCCallback:
         assert resp.status_code == 302
         assert "oidc_success=1" in resp.headers["location"]
         assert "set-cookie" in resp.headers
-        assert "turnstone_auth=" in resp.headers["set-cookie"]
+        set_cookie = resp.headers["set-cookie"]
+        assert set_cookie.split(";", 1)[0].partition("=")[0] == AUTH_COOKIE_SERVER
 
     def test_oidc_not_configured_returns_404(self, storage: SQLiteBackend) -> None:
         app = Starlette(
@@ -645,7 +648,9 @@ class TestOIDCCallback:
         # Wire a callback bound to the CONSOLE audience.  After bug-3 the
         # stored audience must take precedence.
         async def _console_callback(request: Request) -> Response:
-            return await handle_oidc_callback(request, "turnstone-console")
+            return await handle_oidc_callback(
+                request, "turnstone-console", cookie_name=AUTH_COOKIE_CONSOLE
+            )
 
         jwt_secret = "test-jwt-secret-key-padded-32b!!"
         app = Starlette(
@@ -670,7 +675,7 @@ class TestOIDCCallback:
         set_cookie = resp.headers["set-cookie"]
         cookie_kv = set_cookie.split(";", 1)[0]
         name, _, token = cookie_kv.partition("=")
-        assert name == "turnstone_auth"
+        assert name == AUTH_COOKIE_CONSOLE
         assert token
 
         # Decoding without audience verification first to inspect the claim.

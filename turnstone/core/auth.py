@@ -54,7 +54,14 @@ log = get_logger(__name__)
 # Constants
 # ---------------------------------------------------------------------------
 
-AUTH_COOKIE = "turnstone_auth"
+AUTH_COOKIE = "turnstone_auth"  # legacy unscoped name (pre-isolation); see per-surface names below
+# Per-surface cookie names. The server (:8080) and console (:8090) are co-hostable
+# on a single origin; cookies ignore port, so distinct *names* keep one surface's
+# session from clobbering the other's. Keyed by role/audience, NOT by node — the
+# cluster shares one JWT identity (same secret + audience), so a token stays
+# portable across nodes and per-instance names would break proxy identity re-mint.
+AUTH_COOKIE_SERVER = "turnstone_auth_server"
+AUTH_COOKIE_CONSOLE = "turnstone_auth_console"
 TOKEN_PREFIX = "ts_"
 TOKEN_BYTES = 32  # 64 hex chars after prefix
 
@@ -801,11 +808,12 @@ def check_request(
     jwt_audience: str = "",
     jwt_version: str = "",
     storage: Any = None,
+    cookie_name: str,
 ) -> tuple[bool, int, str, AuthResult | None]:
     """Validate a request.
 
     Checks ``Authorization: Bearer <token>`` first, then falls back to the
-    ``turnstone_auth`` cookie.  Token types are auto-detected:
+    *cookie_name* cookie.  Token types are auto-detected:
 
     - Contains ``.`` → JWT (validated with *jwt_secret*)
     - Starts with ``ts_`` → API token (looked up in *storage* by hash)
@@ -818,7 +826,7 @@ def check_request(
     # Extract token from header or cookie
     raw_token = _extract_bearer(auth_header)
     if raw_token is None:
-        raw_token = _extract_cookie(cookie_header, AUTH_COOKIE)
+        raw_token = _extract_cookie(cookie_header, cookie_name)
 
     if not raw_token:
         return False, 401, "Unauthorized: missing or invalid token", None
@@ -932,22 +940,26 @@ def _extract_cookie(cookie_header: str | None, name: str) -> str | None:
 # ---------------------------------------------------------------------------
 
 
-def make_set_cookie(token: str, max_age: int = 86400, *, secure: bool | None = None) -> str:
+def make_set_cookie(
+    token: str, cookie_name: str, max_age: int = 86400, *, secure: bool | None = None
+) -> str:
     """Return a ``Set-Cookie`` header value that stores the auth token.
 
+    *cookie_name* selects the per-surface cookie (``AUTH_COOKIE_SERVER`` /
+    ``AUTH_COOKIE_CONSOLE``) so co-hosted surfaces don't share a jar slot.
     When *secure* is ``None`` (default) the ``Secure`` flag is set
     unconditionally.  Pass ``secure=False`` only for plaintext development.
     *max_age* defaults to 24 hours to match the default JWT expiry.
     """
-    val = f"{AUTH_COOKIE}={token}; Path=/; HttpOnly; SameSite=Lax; Max-Age={max_age}"
+    val = f"{cookie_name}={token}; Path=/; HttpOnly; SameSite=Lax; Max-Age={max_age}"
     if secure is None or secure:
         val += "; Secure"
     return val
 
 
-def make_clear_cookie() -> str:
-    """Return a ``Set-Cookie`` header value that expires the auth cookie."""
-    return f"{AUTH_COOKIE}=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0"
+def make_clear_cookie(cookie_name: str) -> str:
+    """Return a ``Set-Cookie`` header value that expires the named auth cookie."""
+    return f"{cookie_name}=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0"
 
 
 def is_secure_request(headers: dict[str, str], scheme: str = "") -> bool:
@@ -1094,10 +1106,18 @@ class AuthMiddleware:
     server (``JWT_AUD_SERVER``) and the console (``JWT_AUD_CONSOLE``).
     """
 
-    def __init__(self, app: ASGIApp, jwt_audience: str = "", jwt_version: str = "") -> None:
+    def __init__(
+        self,
+        app: ASGIApp,
+        jwt_audience: str = "",
+        jwt_version: str = "",
+        *,
+        cookie_name: str,
+    ) -> None:
         self.app = app
         self._jwt_audience = jwt_audience
         self._jwt_version = jwt_version
+        self._cookie_name = cookie_name
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
         if scope["type"] != "http":
@@ -1128,6 +1148,7 @@ class AuthMiddleware:
             jwt_audience=self._jwt_audience,
             jwt_version=self._jwt_version,
             storage=storage,
+            cookie_name=self._cookie_name,
         )
         if not allowed:
             body: dict[str, Any] = {"error": msg}
@@ -1154,7 +1175,7 @@ class AuthMiddleware:
 # ---------------------------------------------------------------------------
 
 
-async def handle_auth_login(request: Request, audience: str) -> Response:
+async def handle_auth_login(request: Request, audience: str, cookie_name: str) -> Response:
     """Shared ``POST /api/auth/login`` handler.
 
     Authenticates via username:password or legacy token exchange, returning
@@ -1257,16 +1278,16 @@ async def handle_auth_login(request: Request, audience: str) -> Response:
     response = JSONResponse(resp_body)
     cookie_value = jwt_token if jwt_token else body.get("token", "")
     if cookie_value:
-        response.headers["Set-Cookie"] = make_set_cookie(cookie_value, secure=secure)
+        response.headers["Set-Cookie"] = make_set_cookie(cookie_value, cookie_name, secure=secure)
     return response
 
 
-async def handle_auth_logout(request: Request) -> Response:
+async def handle_auth_logout(request: Request, cookie_name: str) -> Response:
     """Shared ``POST /api/auth/logout`` handler — clear auth cookie."""
     from starlette.responses import JSONResponse
 
     response = JSONResponse({"status": "ok"})
-    response.headers["Set-Cookie"] = make_clear_cookie()
+    response.headers["Set-Cookie"] = make_clear_cookie(cookie_name)
     return response
 
 
@@ -1300,7 +1321,7 @@ async def handle_auth_status(request: Request) -> Response:
     return JSONResponse(resp)
 
 
-async def handle_auth_setup(request: Request, audience: str) -> Response:
+async def handle_auth_setup(request: Request, audience: str, cookie_name: str) -> Response:
     """Shared ``POST /api/auth/setup`` handler — create first admin user.
 
     Only works when zero users exist.  Returns JWT on success.
@@ -1401,11 +1422,11 @@ async def handle_auth_setup(request: Request, audience: str) -> Response:
     secure = is_secure_request(dict(request.headers), request.url.scheme)
     response = JSONResponse(resp_body)
     if jwt_token:
-        response.headers["Set-Cookie"] = make_set_cookie(jwt_token, secure=secure)
+        response.headers["Set-Cookie"] = make_set_cookie(jwt_token, cookie_name, secure=secure)
     return response
 
 
-async def handle_auth_whoami(request: Request) -> Response:
+async def handle_auth_whoami(request: Request, cookie_name: str) -> Response:
     """Shared ``GET /api/auth/whoami`` handler — return authenticated user info.
 
     Includes the JWT ``exp`` claim (epoch seconds) so the frontend can
@@ -1440,7 +1461,7 @@ async def handle_auth_whoami(request: Request) -> Response:
         resp["permissions"] = ",".join(sorted(auth_result.permissions))
     # Surface the cookie/JWT expiry so the client can schedule refresh.
     # Decoded without re-validating (auth middleware already validated).
-    cookie_token = request.cookies.get(AUTH_COOKIE, "")
+    cookie_token = request.cookies.get(cookie_name, "")
     if cookie_token:
         try:
             import jwt as _jwt
@@ -1455,7 +1476,7 @@ async def handle_auth_whoami(request: Request) -> Response:
     return JSONResponse(resp)
 
 
-async def handle_auth_refresh(request: Request, audience: str) -> Response:
+async def handle_auth_refresh(request: Request, audience: str, cookie_name: str) -> Response:
     """Shared ``POST /api/auth/refresh`` handler — re-mint the auth cookie.
 
     Requires a currently-valid auth cookie (auth middleware enforces).
@@ -1551,7 +1572,7 @@ async def handle_auth_refresh(request: Request, audience: str) -> Response:
 
     response = JSONResponse(resp_body)
     secure = is_secure_request(dict(request.headers), request.url.scheme)
-    response.headers["Set-Cookie"] = make_set_cookie(new_token, secure=secure)
+    response.headers["Set-Cookie"] = make_set_cookie(new_token, cookie_name, secure=secure)
     return response
 
 
@@ -1657,7 +1678,7 @@ async def _refetch_jwks_locked(
         return fresh
 
 
-async def handle_oidc_callback(request: Request, audience: str) -> Response:
+async def handle_oidc_callback(request: Request, audience: str, cookie_name: str) -> Response:
     """Shared ``GET /api/auth/oidc/callback`` handler — exchange code, provision user, issue JWT."""
     from starlette.responses import JSONResponse, RedirectResponse
 
@@ -1808,5 +1829,5 @@ async def handle_oidc_callback(request: Request, audience: str) -> Response:
     response = RedirectResponse("/?oidc_success=1", status_code=302)
     if jwt_token:
         secure = is_secure_request(dict(request.headers), request.url.scheme)
-        response.headers["Set-Cookie"] = make_set_cookie(jwt_token, secure=secure)
+        response.headers["Set-Cookie"] = make_set_cookie(jwt_token, cookie_name, secure=secure)
     return response
