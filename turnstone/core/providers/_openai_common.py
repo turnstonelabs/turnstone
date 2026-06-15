@@ -34,6 +34,7 @@ OPENAI_CAPABILITIES: dict[str, ModelCapabilities] = {
         reasoning_effort_values=("minimal", "low", "medium", "high"),
         default_reasoning_effort="medium",
         supports_vision=True,
+        supports_pdf=True,
         supports_reasoning_replay=True,
     ),
     "gpt-5-mini": ModelCapabilities(
@@ -43,6 +44,7 @@ OPENAI_CAPABILITIES: dict[str, ModelCapabilities] = {
         reasoning_effort_values=("minimal", "low", "medium", "high"),
         default_reasoning_effort="medium",
         supports_vision=True,
+        supports_pdf=True,
         supports_reasoning_replay=True,
     ),
     "gpt-5-nano": ModelCapabilities(
@@ -52,6 +54,7 @@ OPENAI_CAPABILITIES: dict[str, ModelCapabilities] = {
         reasoning_effort_values=("minimal", "low", "medium", "high"),
         default_reasoning_effort="medium",
         supports_vision=True,
+        supports_pdf=True,
         supports_reasoning_replay=True,
     ),
     # GPT-5 pro — high reasoning only, extended output
@@ -62,6 +65,7 @@ OPENAI_CAPABILITIES: dict[str, ModelCapabilities] = {
         reasoning_effort_values=("high",),
         default_reasoning_effort="high",
         supports_vision=True,
+        supports_pdf=True,
         supports_reasoning_replay=True,
     ),
     # GPT-5.1 — temperature OK when reasoning_effort=none (default)
@@ -71,6 +75,7 @@ OPENAI_CAPABILITIES: dict[str, ModelCapabilities] = {
         reasoning_effort_values=("none", "low", "medium", "high"),
         default_reasoning_effort="none",
         supports_vision=True,
+        supports_pdf=True,
         supports_reasoning_replay=True,
     ),
     # GPT-5.2 — adds xhigh
@@ -80,6 +85,7 @@ OPENAI_CAPABILITIES: dict[str, ModelCapabilities] = {
         reasoning_effort_values=("none", "low", "medium", "high", "xhigh"),
         default_reasoning_effort="none",
         supports_vision=True,
+        supports_pdf=True,
         supports_reasoning_replay=True,
     ),
     # GPT-5.2 pro — always-reasoning variant
@@ -90,6 +96,7 @@ OPENAI_CAPABILITIES: dict[str, ModelCapabilities] = {
         reasoning_effort_values=("medium", "high", "xhigh"),
         default_reasoning_effort="medium",
         supports_vision=True,
+        supports_pdf=True,
         supports_reasoning_replay=True,
     ),
     # GPT-5.3 — same capabilities as 5.2 (matches gpt-5.3-chat-latest, codex)
@@ -99,6 +106,7 @@ OPENAI_CAPABILITIES: dict[str, ModelCapabilities] = {
         reasoning_effort_values=("none", "low", "medium", "high", "xhigh"),
         default_reasoning_effort="none",
         supports_vision=True,
+        supports_pdf=True,
         supports_reasoning_replay=True,
     ),
     # GPT-5.4 — 1M context window, native tool search
@@ -109,6 +117,7 @@ OPENAI_CAPABILITIES: dict[str, ModelCapabilities] = {
         default_reasoning_effort="none",
         supports_tool_search=True,
         supports_vision=True,
+        supports_pdf=True,
         supports_reasoning_replay=True,
     ),
     # GPT-5.4 pro — always-reasoning, 1M context, native tool search
@@ -120,6 +129,7 @@ OPENAI_CAPABILITIES: dict[str, ModelCapabilities] = {
         default_reasoning_effort="medium",
         supports_tool_search=True,
         supports_vision=True,
+        supports_pdf=True,
         supports_reasoning_replay=True,
     ),
     # GPT-5.5 — 1M context, native tool search, stronger agentic/tool use
@@ -130,6 +140,7 @@ OPENAI_CAPABILITIES: dict[str, ModelCapabilities] = {
         default_reasoning_effort="none",
         supports_tool_search=True,
         supports_vision=True,
+        supports_pdf=True,
         supports_reasoning_replay=True,
     ),
     # GPT-5.5 pro — always-reasoning, 1M context, native tool search
@@ -141,6 +152,7 @@ OPENAI_CAPABILITIES: dict[str, ModelCapabilities] = {
         default_reasoning_effort="medium",
         supports_tool_search=True,
         supports_vision=True,
+        supports_pdf=True,
         supports_reasoning_replay=True,
     ),
     # O-series reasoning models
@@ -150,6 +162,7 @@ OPENAI_CAPABILITIES: dict[str, ModelCapabilities] = {
         supports_temperature=False,
         supports_streaming=False,
         supports_vision=True,
+        supports_pdf=True,
         supports_reasoning_replay=True,
     ),
     "o1-mini": ModelCapabilities(
@@ -158,6 +171,7 @@ OPENAI_CAPABILITIES: dict[str, ModelCapabilities] = {
         supports_temperature=False,
         supports_streaming=False,
         supports_vision=True,
+        supports_pdf=True,
         supports_reasoning_replay=True,
     ),
     "o3": ModelCapabilities(
@@ -165,6 +179,7 @@ OPENAI_CAPABILITIES: dict[str, ModelCapabilities] = {
         max_output_tokens=100000,
         supports_temperature=False,
         supports_vision=True,
+        supports_pdf=True,
         supports_reasoning_replay=True,
     ),
     "o3-mini": ModelCapabilities(
@@ -172,6 +187,7 @@ OPENAI_CAPABILITIES: dict[str, ModelCapabilities] = {
         max_output_tokens=100000,
         supports_temperature=False,
         supports_vision=True,
+        supports_pdf=True,
         supports_reasoning_replay=True,
     ),
     "o3-pro": ModelCapabilities(
@@ -180,6 +196,7 @@ OPENAI_CAPABILITIES: dict[str, ModelCapabilities] = {
         supports_temperature=False,
         supports_streaming=False,
         supports_vision=True,
+        supports_pdf=True,
         supports_reasoning_replay=True,
     ),
     "o4-mini": ModelCapabilities(
@@ -187,6 +204,7 @@ OPENAI_CAPABILITIES: dict[str, ModelCapabilities] = {
         max_output_tokens=100000,
         supports_temperature=False,
         supports_vision=True,
+        supports_pdf=True,
         supports_reasoning_replay=True,
     ),
     # Search models — always search on every request, no reasoning_effort
@@ -197,6 +215,7 @@ OPENAI_CAPABILITIES: dict[str, ModelCapabilities] = {
         supports_web_search=True,
         reasoning_effort_values=(),
         supports_vision=True,
+        supports_pdf=True,
     ),
     # Audio models — not chat/session models; used only as STT/TTS roles via
     # the /v1/audio/transcriptions and /v1/audio/speech endpoints. Prefixes
@@ -424,16 +443,31 @@ def inline_document_parts(parts: list[Any]) -> list[Any]:
     for part in parts:
         if isinstance(part, dict) and part.get("type") == "document":
             d = part.get("document", {})
-            out.append(
-                {
-                    "type": "text",
-                    "text": format_document_wrapper(
-                        d.get("name", ""),
-                        d.get("media_type", "text/plain"),
-                        d.get("data", ""),
-                    ),
-                }
-            )
+            if d.get("media_type") == "application/pdf":
+                # This lane (OpenAI Chat / Google compat / local servers) has no
+                # native PDF block and ``data`` is base64 — text-wrapping it would
+                # emit garbage.  Surface a placeholder; the Phase 3 capability-
+                # gated fallback (rasterize / text-extract) replaces it.
+                out.append(
+                    {
+                        "type": "text",
+                        "text": (
+                            f"[PDF attachment '{d.get('name') or 'document.pdf'}' — "
+                            "not supported by this model]"
+                        ),
+                    }
+                )
+            else:
+                out.append(
+                    {
+                        "type": "text",
+                        "text": format_document_wrapper(
+                            d.get("name", ""),
+                            d.get("media_type", "text/plain"),
+                            d.get("data", ""),
+                        ),
+                    }
+                )
         else:
             out.append(part)
     return out

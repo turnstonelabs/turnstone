@@ -12,7 +12,9 @@ import base64
 
 from turnstone.core.attachments import (
     AUDIO_MIME_TO_FORMAT,
+    IMAGE_SIZE_CAP,
     Attachment,
+    classify_upload,
     sniff_audio_mime,
     sniff_pdf_mime,
 )
@@ -131,3 +133,38 @@ class TestAudioFormatMap:
         assert AUDIO_MIME_TO_FORMAT["audio/mpeg"] == "mp3"
         assert AUDIO_MIME_TO_FORMAT["audio/wav"] == "wav"
         assert AUDIO_MIME_TO_FORMAT["audio/mp4"] == "m4a"
+
+
+class TestClassifyUpload:
+    def test_image(self) -> None:
+        assert classify_upload("x.png", "image/png", PNG) == ("image", "image/png", None)
+
+    def test_pdf(self) -> None:
+        assert classify_upload("d.pdf", "application/pdf", PDF) == (
+            "pdf",
+            "application/pdf",
+            None,
+        )
+
+    def test_audio(self) -> None:
+        assert classify_upload("a.wav", "audio/wav", WAV) == ("audio", "audio/wav", None)
+
+    def test_text(self) -> None:
+        assert classify_upload("notes.md", "text/markdown", b"# hi") == (
+            "text",
+            "text/markdown",
+            None,
+        )
+
+    def test_unsupported_binary_rejected(self) -> None:
+        kind, _mime, rej = classify_upload(
+            "blob.bin", "application/octet-stream", b"\x00\x01\x02\x03"
+        )
+        assert kind is None
+        assert rej is not None and rej.code == "unsupported" and rej.status == 400
+
+    def test_oversize_rejected(self) -> None:
+        big = PNG + b"\x00" * IMAGE_SIZE_CAP  # > image cap
+        kind, _mime, rej = classify_upload("big.png", "image/png", big)
+        assert kind is None
+        assert rej is not None and rej.code == "too_large" and rej.status == 413

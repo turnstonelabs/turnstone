@@ -276,10 +276,9 @@ class AttachmentUploadHelpers:
     serialize.)
     """
 
-    sniff_image_mime: Callable[[bytes], str | None]
-    classify_text_attachment: Callable[
+    classify_upload: Callable[
         [str, str, bytes],
-        tuple[str | None, str | None],
+        tuple[str | None, str | None, Any],
     ]
 
 
@@ -3731,16 +3730,16 @@ def make_attachment_handlers(cfg: SessionEndpointConfig) -> AttachmentHandlers:
 
     async def upload(request: Request) -> Response:
         from turnstone.core.attachment_buffer import get_attachment_buffer
-        from turnstone.core.attachments import IMAGE_SIZE_CAP, TEXT_DOC_SIZE_CAP
+        from turnstone.core.attachments import PDF_SIZE_CAP
         from turnstone.core.web_helpers import read_multipart_file_or_400
 
-        # Sniffing helpers stay kind-specific because they're tied to
-        # the file-classification policy table; defer to the cfg's
-        # owning module via the upload-helper hook.
+        # The file-classification policy (sniff order, per-kind caps, allowlists)
+        # lives in one place — core.attachments.classify_upload — handed in via
+        # the upload-helper hook so the console surface can wire it without
+        # depending on the node-side server module.
         if cfg.attachment_helpers is None:
             return JSONResponse({"error": "attachment_helpers missing"}, status_code=500)
-        sniff_image = cfg.attachment_helpers.sniff_image_mime
-        classify_text = cfg.attachment_helpers.classify_text_attachment
+        classify = cfg.attachment_helpers.classify_upload
 
         err_gate = await _gate(request)
         if err_gate is not None:
@@ -3754,47 +3753,20 @@ def make_attachment_handlers(cfg: SessionEndpointConfig) -> AttachmentHandlers:
         if err:
             return err
 
-        got = await read_multipart_file_or_400(request, field="file", max_bytes=IMAGE_SIZE_CAP)
+        got = await read_multipart_file_or_400(request, field="file", max_bytes=PDF_SIZE_CAP)
         if isinstance(got, JSONResponse):
             return got
         filename, claimed_mime, data = got
         if not data:
             return JSONResponse({"error": "Empty file"}, status_code=400)
 
-        sniffed_image = sniff_image(data)
-        if sniffed_image is not None:
-            if len(data) > IMAGE_SIZE_CAP:
-                return JSONResponse(
-                    {
-                        "error": (
-                            f"Image too large ({len(data):,} bytes); "
-                            f"cap is {IMAGE_SIZE_CAP:,} bytes."
-                        ),
-                        "code": "too_large",
-                    },
-                    status_code=413,
-                )
-            kind = "image"
-            mime = sniffed_image
-        else:
-            if len(data) > TEXT_DOC_SIZE_CAP:
-                return JSONResponse(
-                    {
-                        "error": (
-                            f"Text document too large ({len(data):,} bytes); "
-                            f"cap is {TEXT_DOC_SIZE_CAP:,} bytes."
-                        ),
-                        "code": "too_large",
-                    },
-                    status_code=413,
-                )
-            mime_or_err = classify_text(filename, claimed_mime, data)
-            if mime_or_err[0] is None:
-                return JSONResponse(
-                    {"error": mime_or_err[1], "code": "unsupported"}, status_code=400
-                )
-            kind = "text"
-            mime = mime_or_err[0]
+        kind, mime, rejection = classify(filename, claimed_mime, data)
+        if rejection is not None:
+            return JSONResponse(
+                {"error": rejection.message, "code": rejection.code},
+                status_code=rejection.status,
+            )
+        assert kind is not None and mime is not None  # success ⟹ both set
 
         # Stage in the per-node upload buffer (content-addressed: the id is the
         # content hash, so re-uploading identical bytes is idempotent).  The

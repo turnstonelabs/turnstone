@@ -347,3 +347,118 @@ class TestOpenAIResponsesDocument:
         assert len(out) == 2
         assert 'name="a.md"' in out[0]["text"]
         assert 'name="b.md"' in out[1]["text"]
+
+
+# ---------------------------------------------------------------------------
+# PDF + audio (Phase 2 native translators / defensive handling)
+# ---------------------------------------------------------------------------
+
+_PDF_B64 = "JVBERi0xLjQK"  # base64 of "%PDF-1.4\n"
+
+
+def _pdf_part(name: str = "report.pdf") -> dict[str, Any]:
+    return {
+        "type": "document",
+        "document": {"name": name, "media_type": "application/pdf", "data": _PDF_B64},
+    }
+
+
+def _audio_part(fmt: str = "wav") -> dict[str, Any]:
+    return {"type": "input_audio", "input_audio": {"data": "AAAA", "format": fmt}}
+
+
+class TestAnthropicPdfAndAudio:
+    def test_pdf_becomes_base64_document(self) -> None:
+        out = AnthropicProvider._convert_content_parts([_pdf_part()])
+        assert out == [
+            {
+                "type": "document",
+                "source": {
+                    "type": "base64",
+                    "media_type": "application/pdf",
+                    "data": _PDF_B64,
+                },
+                "title": "report.pdf",
+            }
+        ]
+
+    def test_pdf_without_name_omits_title(self) -> None:
+        part = {
+            "type": "document",
+            "document": {"media_type": "application/pdf", "data": _PDF_B64},
+        }
+        out = AnthropicProvider._convert_content_parts([part])
+        assert "title" not in out[0]
+        assert out[0]["source"]["type"] == "base64"
+
+    def test_audio_becomes_text_placeholder(self) -> None:
+        out = AnthropicProvider._convert_content_parts([_audio_part()])
+        assert len(out) == 1
+        assert out[0]["type"] == "text"
+        assert "not supported" in out[0]["text"]
+
+    def test_text_document_still_text_source(self) -> None:
+        # Regression: a text doc must NOT take the PDF base64 path.
+        out = AnthropicProvider._convert_content_parts([_doc_part()])
+        assert out[0]["source"]["type"] == "text"
+
+
+class TestOpenAIResponsesPdfAndAudio:
+    def test_pdf_becomes_input_file(self) -> None:
+        out = _responses_convert_content_parts([_pdf_part(name="r.pdf")])
+        assert out == [
+            {
+                "type": "input_file",
+                "filename": "r.pdf",
+                "file_data": f"data:application/pdf;base64,{_PDF_B64}",
+            }
+        ]
+
+    def test_audio_becomes_placeholder(self) -> None:
+        out = _responses_convert_content_parts([_audio_part()])
+        assert out[0]["type"] == "input_text"
+        assert "not supported" in out[0]["text"]
+
+    def test_text_document_still_wrapped(self) -> None:
+        out = _responses_convert_content_parts([_doc_part(name="x.md", data="hi")])
+        assert out[0]["type"] == "input_text"
+        assert "<document" in out[0]["text"]
+
+
+class TestCompatLanePdfAndAudio:
+    def test_inline_document_pdf_is_placeholder_not_base64(self) -> None:
+        out = inline_document_parts([_pdf_part(name="r.pdf")])
+        assert len(out) == 1
+        assert out[0]["type"] == "text"
+        # The base64 payload must NOT be wrapped as a <document> text blob.
+        assert _PDF_B64 not in out[0]["text"]
+        assert "<document" not in out[0]["text"]
+        assert "r.pdf" in out[0]["text"]
+
+    def test_input_audio_passes_through_untouched(self) -> None:
+        # The omni native path: sanitize_messages must not mangle input_audio.
+        msgs = [{"role": "user", "content": [{"type": "text", "text": "hi"}, _audio_part()]}]
+        out = sanitize_messages(msgs)
+        assert out[0]["content"][1] == _audio_part()
+
+
+class TestProviderPdfCapabilities:
+    def test_anthropic_cloud_supports_pdf(self) -> None:
+        caps = AnthropicProvider().get_capabilities("claude-opus-4-8")
+        assert caps.supports_pdf is True
+        assert caps.supports_audio_input is False
+
+    def test_openai_chat_supports_pdf_default_does_not(self) -> None:
+        from turnstone.core.providers._openai_common import (
+            OPENAI_DEFAULT,
+            lookup_openai_capabilities,
+        )
+
+        assert lookup_openai_capabilities("gpt-5").supports_pdf is True
+        # Unknown / local models stay False (PDF → client-side fallback).
+        assert OPENAI_DEFAULT.supports_pdf is False
+
+    def test_anthropic_compat_default_no_pdf(self) -> None:
+        from turnstone.core.providers._anthropic import _ANTHROPIC_COMPAT_DEFAULT
+
+        assert _ANTHROPIC_COMPAT_DEFAULT.supports_pdf is False
