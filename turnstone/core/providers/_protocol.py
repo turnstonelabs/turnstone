@@ -86,6 +86,15 @@ class ModelCapabilities:
     supports_web_search: bool = False
     supports_tool_search: bool = False
     supports_vision: bool = False
+    # Chat-input modalities carried as user-turn attachments — distinct from the
+    # STT/TTS *roles* below.  ``supports_pdf``: native PDF document ingest;
+    # ``supports_audio_input``: native audio ingest (OpenAI ``input_audio`` /
+    # vLLM omni).  When False the wire-build path falls back client-side (PDF →
+    # rasterize/extract, audio → STT transcription) — see core/attachments.py.
+    # ``supports_audio_input`` is orthogonal to ``supports_transcription``: an
+    # omni model has the former and lacks the latter (it has no /audio endpoint).
+    supports_pdf: bool = False
+    supports_audio_input: bool = False
     # Audio I/O roles (STT / TTS) — not chat behavior; consumed by the audio
     # endpoints and the Models -> Roles capability gate (turnstone/core/audio.py).
     supports_transcription: bool = False

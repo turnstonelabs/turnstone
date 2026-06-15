@@ -49,8 +49,11 @@ class AttachmentRef:
     """A reference to attachment bytes held in the content-addressed blob store.
 
     Non-text content is carried *by reference* (never inline bytes): the translator
-    resolves ``attachment_id`` to bytes and expands it to the provider's image /
-    document format at wire time.  ``kind`` is ``"image"`` or ``"document"``.
+    resolves ``attachment_id`` to bytes and expands it to the provider's native
+    format at wire time.  ``kind`` is the by-reference placeholder type —
+    ``"image"``, ``"document"`` (text docs), ``"pdf"``, or ``"audio"``.  The
+    dict-bridge keys off ``attachment_id`` and is kind-agnostic, so new kinds
+    need no change here.
     """
 
     attachment_id: str
