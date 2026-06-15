@@ -42,7 +42,8 @@ dependencies = [
     "cryptography>=42",
     "lacme>=1.0.5",
     "python-frontmatter>=1.0",
-    "pypdfium2>=4",  # PDF text-extract fallback for models without native PDF input (core/attachment_fallback.py)
+    "pypdfium2>=4",  # PDF text-extract + rasterize for models without native PDF input (core/pdf.py)
+    "pillow>=10",  # PNG encoding for the PDF->images rasterize fallback (vision models, core/pdf.py)
 ]
 
 [project.urls]

@@ -475,3 +475,53 @@ class TestCapabilityGatedFallback:
             ModelCapabilities(),
         )
         assert part["type"] == "image_url"
+
+    def test_pdf_rasterize_when_vision(self, tmp_db, mock_openai_client, monkeypatch):
+        # Vision-capable but no native PDF → render pages to images (1 -> N).
+        s = _make_session(mock_openai_client)
+        monkeypatch.setattr("turnstone.core.pdf.rasterize_pdf", lambda data: [b"png-a", b"png-b"])
+        parts = s._wire_content_part(
+            self._att("pdf", b"%PDF", "r.pdf", "application/pdf"),
+            ModelCapabilities(supports_pdf=False, supports_vision=True),
+        )
+        assert isinstance(parts, list)
+        assert len(parts) == 2
+        assert all(p["type"] == "image_url" for p in parts)
+        assert parts[0]["image_url"]["url"].startswith("data:image/png;base64,")
+
+    def test_pdf_rasterize_empty_falls_back_to_text(self, tmp_db, mock_openai_client, monkeypatch):
+        s = _make_session(mock_openai_client)
+        monkeypatch.setattr("turnstone.core.pdf.rasterize_pdf", lambda data: [])
+        monkeypatch.setattr("turnstone.core.pdf.extract_pdf_text", lambda data: "TXT")
+        part = s._wire_content_part(
+            self._att("pdf", b"%PDF", "r.pdf", "application/pdf"),
+            ModelCapabilities(supports_pdf=False, supports_vision=True),
+        )
+        assert isinstance(part, dict)
+        assert part["type"] == "document"
+        assert part["document"]["data"] == "TXT"
+
+    def test_materialize_expands_list_valued_resolution(self):
+        # One placeholder resolving to several parts (the PDF-rasterize 1->N case)
+        # is spliced in order by resolve_attachment_parts.
+        msgs = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "see"},
+                    {"type": "pdf", "attachment_id": "a1"},
+                ],
+            }
+        ]
+
+        def resolve(ids):
+            return {
+                "a1": [
+                    {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAA"}},
+                    {"type": "image_url", "image_url": {"url": "data:image/png;base64,BBB"}},
+                ]
+            }
+
+        out = materialize_attachments(msgs, resolve)
+        types = [p["type"] for p in out[0]["content"]]
+        assert types == ["text", "image_url", "image_url"]

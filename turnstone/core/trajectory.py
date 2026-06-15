@@ -308,14 +308,15 @@ def dicts_from_turns(turns: list[Turn]) -> list[dict[str, Any]]:
 
 
 def resolve_attachment_parts(
-    messages: list[dict[str, Any]], parts_by_id: dict[str, dict[str, Any]]
+    messages: list[dict[str, Any]], parts_by_id: dict[str, Any]
 ) -> list[dict[str, Any]]:
     """Replace by-reference attachment placeholders with resolved inline parts.
 
     The by-reference content lane reaches the wire (and ``/history`` display) as
     ``{type: kind, attachment_id}`` placeholders in a message's list content;
-    *parts_by_id* maps an id to the inline content part (image_url / document)
-    built from the content-addressed blob.  This is the materialization the
+    *parts_by_id* maps an id to its inline content part — or a *list* of parts
+    (one placeholder may expand to several, e.g. a PDF rasterized to one image
+    per page for a vision model) — built from the content-addressed blob.  This is the materialization the
     translator — and reconstruct, for display — runs at its output boundary: a
     placeholder whose blob is missing (pruned) is dropped, so a consumer never
     sees an unresolved reference.  Identity-preserving when no message carries a
@@ -339,7 +340,11 @@ def resolve_attachment_parts(
         for p in content:
             if isinstance(p, dict) and p.get("attachment_id"):
                 resolved = parts_by_id.get(str(p["attachment_id"]))
-                if resolved is not None:
+                if isinstance(resolved, list):
+                    # One placeholder → several parts (e.g. a PDF rasterized to
+                    # one image per page for a vision model).
+                    new_parts.extend(resolved)
+                elif resolved is not None:
                     new_parts.append(resolved)
                 # else: pruned blob — drop the placeholder.
             else:
@@ -350,7 +355,7 @@ def resolve_attachment_parts(
 
 def materialize_attachments(
     messages: list[dict[str, Any]],
-    resolve: Callable[[list[str]], dict[str, dict[str, Any]]] | None,
+    resolve: Callable[[list[str]], dict[str, Any]] | None,
 ) -> list[dict[str, Any]]:
     """Expand by-reference attachment placeholders to inline parts at the wire.
 

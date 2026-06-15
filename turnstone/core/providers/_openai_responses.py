@@ -424,7 +424,7 @@ class OpenAIResponsesProvider:
         # source of truth across providers.
         replay_reasoning_to_model: bool = True,
         extra_headers: dict[str, str] | None = None,
-        resolve_attachments: Callable[[list[str]], dict[str, dict[str, Any]]] | None = None,
+        resolve_attachments: Callable[[list[str]], dict[str, Any]] | None = None,
     ) -> Iterator[StreamChunk]:
         messages = materialize_attachments(messages, resolve_attachments)
         if extra_params:
@@ -613,7 +613,7 @@ class OpenAIResponsesProvider:
         # See create_streaming above for the Phase 3 reasoning-persistence rationale.
         replay_reasoning_to_model: bool = True,
         extra_headers: dict[str, str] | None = None,
-        resolve_attachments: Callable[[list[str]], dict[str, dict[str, Any]]] | None = None,
+        resolve_attachments: Callable[[list[str]], dict[str, Any]] | None = None,
     ) -> CompletionResult:
         messages = materialize_attachments(messages, resolve_attachments)
         if extra_params:
