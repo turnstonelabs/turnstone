@@ -36,7 +36,9 @@ async def _stub(_request: Request) -> JSONResponse:
 
 
 def _attach() -> AttachmentHandlers:
-    return AttachmentHandlers(upload=_stub, list=_stub, get_content=_stub, delete=_stub)
+    return AttachmentHandlers(
+        upload=_stub, list=_stub, get_content=_stub, thumbnail=_stub, delete=_stub
+    )
 
 
 def _route_paths(routes: list[Any]) -> list[tuple[str, frozenset[str]]]:

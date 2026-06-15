@@ -47,6 +47,82 @@ function _inferKind(file) {
   return "text";
 }
 
+function _attachUrl(wsId, id, suffix) {
+  return (
+    "/v1/api/workstreams/" +
+    encodeURIComponent(wsId) +
+    "/attachments/" +
+    encodeURIComponent(id) +
+    suffix
+  );
+}
+
+function _kindIcon(kind) {
+  if (kind === "image") return "🖼";
+  if (kind === "audio") return "🎵";
+  return "📄"; // pdf + text
+}
+
+// Build an inline preview node for a committed attachment (real id), or null.
+// image/pdf → server-rendered thumbnail; audio → <audio> player; text → a lazy
+// snippet.  Auth is cookie-based, so a plain media `src` works same-origin.
+export function buildAttachmentPreview(opts) {
+  var kind = opts.kind,
+    wsId = opts.wsId,
+    id = opts.attachmentId;
+  if (!wsId || !id) return null;
+  if (kind === "image" || kind === "pdf") {
+    var img = document.createElement("img");
+    img.className = "attach-preview attach-preview-thumb";
+    img.loading = "lazy";
+    img.decoding = "async";
+    img.alt = "";
+    img.src = _attachUrl(wsId, id, "/thumbnail");
+    // Drop the node if the thumbnail can't render, so the icon shows instead.
+    img.addEventListener("error", function () {
+      img.remove();
+    });
+    return img;
+  }
+  if (kind === "audio") {
+    var audio = document.createElement("audio");
+    audio.className = "attach-preview attach-preview-audio";
+    audio.controls = true;
+    audio.preload = "none";
+    audio.src = _attachUrl(wsId, id, "/content");
+    return audio;
+  }
+  if (kind === "text") {
+    var snip = document.createElement("span");
+    snip.className = "attach-preview attach-preview-snippet";
+    var fetchFn =
+      (opts && opts.authFetch) ||
+      (typeof window !== "undefined" ? window.authFetch : null);
+    if (typeof fetchFn !== "function") return null;
+    fetchFn(_attachUrl(wsId, id, "/content"), {
+      method: "GET",
+      credentials: "include",
+    })
+      .then(function (r) {
+        return r && r.ok ? r.text() : "";
+      })
+      .then(function (t) {
+        if (!t) {
+          snip.remove();
+          return;
+        }
+        snip.textContent =
+          t.slice(0, 240).replace(/\s+/g, " ").trim() +
+          (t.length > 240 ? "…" : "");
+      })
+      .catch(function () {
+        snip.remove();
+      });
+    return snip;
+  }
+  return null;
+}
+
 function _toastError(msg) {
   if (typeof window.toast !== "undefined" && window.toast.error) {
     window.toast.error(msg);
@@ -89,7 +165,7 @@ export function createAttachmentController(opts) {
     var icon = document.createElement("span");
     icon.className = "composer-chip-icon";
     icon.setAttribute("aria-hidden", "true");
-    icon.textContent = info.kind === "image" ? "🖼" : "📄";
+    icon.textContent = _kindIcon(info.kind);
     chip.appendChild(icon);
 
     var name = document.createElement("span");
@@ -117,8 +193,35 @@ export function createAttachmentController(opts) {
     });
     chip.appendChild(btn);
 
+    _applyPreview(chip, info);
     chipsEl.appendChild(chip);
     return chip;
+  }
+
+  // Insert a committed-attachment preview into a chip (image/pdf thumbnail,
+  // audio player, or a lazy text snippet).  No-op for the in-flight placeholder
+  // (no real id yet); the swap re-applies once the real id lands.
+  function _applyPreview(chip, info) {
+    var idStr = "" + (info.attachment_id || "");
+    if (info.uploading || !idStr || idStr.indexOf("__uploading_") === 0) return;
+    var prev = buildAttachmentPreview({
+      kind: info.kind,
+      wsId: getWsId(),
+      attachmentId: info.attachment_id,
+      authFetch: _authFetch,
+    });
+    var old = chip.querySelector(".attach-preview");
+    if (old) old.remove();
+    if (!prev) return;
+    if (info.kind === "image" || info.kind === "pdf") {
+      var icon = chip.querySelector(".composer-chip-icon");
+      if (icon) icon.replaceWith(prev);
+      else chip.insertBefore(prev, chip.firstChild);
+    } else {
+      var btn = chip.querySelector(".composer-chip-remove");
+      if (btn) chip.insertBefore(prev, btn);
+      else chip.appendChild(prev);
+    }
   }
 
   function _findChip(id) {
@@ -159,6 +262,11 @@ export function createAttachmentController(opts) {
     var chip = _findChip(placeholderId);
     if (chip) {
       chip.dataset.attachmentId = info.attachment_id;
+      // classify_upload on the server is authoritative — adopt its kind for the
+      // chip styling + icon, then render the preview now there's a real id.
+      chip.className = "composer-chip composer-chip-" + (info.kind || "other");
+      var swapIcon = chip.querySelector(".composer-chip-icon");
+      if (swapIcon) swapIcon.textContent = _kindIcon(info.kind);
       var name = chip.querySelector(".composer-chip-name");
       if (name) {
         name.textContent = info.filename || "(unnamed)";
@@ -166,6 +274,7 @@ export function createAttachmentController(opts) {
       }
       var size = chip.querySelector(".composer-chip-size");
       if (size) size.textContent = formatSize(info.size_bytes || 0);
+      _applyPreview(chip, info);
     } else {
       renderChip(info);
     }
@@ -315,3 +424,4 @@ export function createAttachmentController(opts) {
 // Still-classic consumers reach this as a global at event/boot time (after
 // this deferred module evaluated).  New module code imports instead.
 window.createAttachmentController = createAttachmentController;
+window.buildAttachmentPreview = buildAttachmentPreview;

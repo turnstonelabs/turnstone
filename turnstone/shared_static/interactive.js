@@ -366,6 +366,7 @@ class Pane {
     if (Array.isArray(attachments) && attachments.length > 0) {
       const pills = document.createElement("div");
       pills.className = "msg-user-attach";
+      const attachWsId = this.wsId;
       attachments.forEach(function (a) {
         const pill = document.createElement("span");
         pill.className =
@@ -373,13 +374,35 @@ class Pane {
         const icon = document.createElement("span");
         icon.className = "msg-user-attach-icon";
         icon.setAttribute("aria-hidden", "true");
-        icon.textContent = a.kind === "image" ? "\ud83d\uddbc" : "\ud83d\udcc4";
+        icon.textContent =
+          a.kind === "image"
+            ? "\ud83d\uddbc"
+            : a.kind === "audio"
+              ? "\ud83c\udfb5"
+              : "\ud83d\udcc4";
         pill.appendChild(icon);
         const nameEl = document.createElement("span");
         nameEl.className = "msg-user-attach-name";
         nameEl.textContent =
-          a.filename || (a.kind === "image" ? "image" : "document");
+          a.filename ||
+          (a.kind === "image"
+            ? "image"
+            : a.kind === "audio"
+              ? "audio"
+              : "document");
         pill.appendChild(nameEl);
+        const prev =
+          typeof window.buildAttachmentPreview === "function"
+            ? window.buildAttachmentPreview({
+                kind: a.kind,
+                wsId: attachWsId,
+                attachmentId: a.attachment_id,
+              })
+            : null;
+        if (prev) {
+          if (a.kind === "image" || a.kind === "pdf") icon.replaceWith(prev);
+          else pill.appendChild(prev);
+        }
         pills.appendChild(pill);
       });
       el.appendChild(pills);

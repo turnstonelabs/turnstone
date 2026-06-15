@@ -66,6 +66,47 @@
   color: var(--red);
 }
 
+/* --- attachment previews (image/pdf thumbnail · audio player · text snippet) --- */
+.composer-chip {
+  flex-wrap: wrap;
+  max-width: 340px;
+}
+.attach-preview-thumb {
+  width: 28px;
+  height: 28px;
+  object-fit: cover;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--border);
+  background: var(--bg-base);
+  vertical-align: middle;
+  flex: 0 0 auto;
+}
+.attach-preview-audio {
+  height: 30px;
+  max-width: 240px;
+  vertical-align: middle;
+  flex: 1 1 auto;
+}
+.attach-preview-snippet {
+  display: inline-block;
+  color: var(--fg-dim);
+  font-size: 10px;
+  max-width: 240px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  vertical-align: middle;
+  flex: 1 1 auto;
+}
+.msg-user-attach-pill .attach-preview-thumb {
+  width: 44px;
+  height: 44px;
+}
+.msg-user-attach-pill .attach-preview-audio {
+  height: 32px;
+  max-width: 280px;
+}
+
 .composer-row {
   display: flex;
   align-items: flex-end;
