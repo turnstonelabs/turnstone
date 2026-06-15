@@ -3583,6 +3583,10 @@ class ChatSession:
                     parts.append({"type": "image", "attachment_id": att.attachment_id})
                 elif att.is_text:
                     parts.append({"type": "document", "attachment_id": att.attachment_id})
+                elif att.is_pdf:
+                    parts.append({"type": "pdf", "attachment_id": att.attachment_id})
+                elif att.is_audio:
+                    parts.append({"type": "audio", "attachment_id": att.attachment_id})
                 else:
                     log.warning(
                         "attachment id=%s has unknown kind=%r; injecting placeholder",

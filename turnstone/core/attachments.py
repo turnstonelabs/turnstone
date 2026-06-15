@@ -29,19 +29,50 @@ if TYPE_CHECKING:
 # constants live here so the session / tests share the same definitions.
 IMAGE_SIZE_CAP: int = 4 * 1024 * 1024
 TEXT_DOC_SIZE_CAP: int = 512 * 1024
+PDF_SIZE_CAP: int = 32 * 1024 * 1024
+AUDIO_SIZE_CAP: int = 25 * 1024 * 1024
 
 ALLOWED_IMAGE_MIMES: frozenset[str] = frozenset(
     {"image/png", "image/jpeg", "image/gif", "image/webp"}
 )
+
+# Audio MIMEs accepted as chat attachments (sniffed by magic bytes; the
+# client-claimed Content-Type is never trusted alone).  ``AUDIO_MIME_TO_FORMAT``
+# maps each to the OpenAI ``input_audio.format`` token the wire builder emits.
+ALLOWED_AUDIO_MIMES: frozenset[str] = frozenset(
+    {
+        "audio/wav",
+        "audio/x-wav",
+        "audio/mpeg",
+        "audio/mp3",
+        "audio/ogg",
+        "audio/flac",
+        "audio/mp4",
+        "audio/aac",
+        "audio/webm",
+    }
+)
+
+AUDIO_MIME_TO_FORMAT: dict[str, str] = {
+    "audio/wav": "wav",
+    "audio/x-wav": "wav",
+    "audio/mpeg": "mp3",
+    "audio/mp3": "mp3",
+    "audio/ogg": "ogg",
+    "audio/flac": "flac",
+    "audio/mp4": "m4a",
+    "audio/aac": "aac",
+    "audio/webm": "webm",
+}
 
 
 @dataclass(frozen=True)
 class Attachment:
     """An attachment resolved from storage, ready for injection into a turn.
 
-    ``kind`` is ``"image"`` or ``"text"``.  ``content`` is raw bytes — for
-    text attachments, UTF-8 decoded at the point of content-part
-    construction.
+    ``kind`` is ``"image"``, ``"text"``, ``"pdf"``, or ``"audio"``.  ``content``
+    is raw bytes — text attachments are UTF-8 decoded at content-part
+    construction; image/pdf/audio are base64-encoded at the wire boundary.
     """
 
     attachment_id: str
@@ -57,6 +88,14 @@ class Attachment:
     @property
     def is_text(self) -> bool:
         return self.kind == "text"
+
+    @property
+    def is_pdf(self) -> bool:
+        return self.kind == "pdf"
+
+    @property
+    def is_audio(self) -> bool:
+        return self.kind == "audio"
 
 
 # ---------------------------------------------------------------------------
@@ -109,6 +148,35 @@ def sniff_image_mime(data: bytes) -> str | None:
         return "image/gif"
     if data[:4] == b"RIFF" and data[8:12] == b"WEBP":
         return "image/webp"
+    return None
+
+
+def sniff_pdf_mime(data: bytes) -> str | None:
+    """Return ``"application/pdf"`` if ``data`` starts with the PDF magic, else None."""
+    return "application/pdf" if data[:5] == b"%PDF-" else None
+
+
+def sniff_audio_mime(data: bytes) -> str | None:
+    """Return a canonical audio MIME type by inspecting magic bytes.
+
+    Covers WAV, MP3 (ID3 tag or MPEG frame sync), OGG, FLAC, ISO-BMFF
+    (m4a / mp4 audio), and WebM/Matroska.  Returns ``None`` on no match — the
+    client-provided ``Content-Type`` is never trusted alone.
+    """
+    if len(data) < 12:
+        return None
+    if data[:4] == b"RIFF" and data[8:12] == b"WAVE":
+        return "audio/wav"
+    if data[:3] == b"ID3" or data[:2] in (b"\xff\xfb", b"\xff\xf3", b"\xff\xf2"):
+        return "audio/mpeg"
+    if data[:4] == b"OggS":
+        return "audio/ogg"
+    if data[:4] == b"fLaC":
+        return "audio/flac"
+    if data[4:8] == b"ftyp":
+        return "audio/mp4"
+    if data[:4] == b"\x1aE\xdf\xa3":
+        return "audio/webm"
     return None
 
 

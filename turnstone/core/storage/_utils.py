@@ -10,7 +10,7 @@ from typing import Any
 
 import sqlalchemy as sa
 
-from turnstone.core.attachments import unreadable_placeholder
+from turnstone.core.attachments import AUDIO_MIME_TO_FORMAT, unreadable_placeholder
 from turnstone.core.log import get_logger
 from turnstone.core.storage._schema import (
     conversations,
@@ -323,6 +323,30 @@ def attachment_to_content_part(att: dict[str, Any]) -> dict[str, Any] | None:
                 "media_type": mime,
                 "data": text,
             },
+        }
+    if kind == "pdf" and isinstance(raw, bytes):
+        # PDF rides as a ``document`` part discriminated by media_type:
+        # base64 bytes (vs. a text doc's utf-8 ``data``).  Per-provider
+        # translators branch on ``application/pdf`` (Phase 2); the client-side
+        # fallback for non-PDF models lands in Phase 3.
+        b64 = base64.b64encode(raw).decode("ascii")
+        return {
+            "type": "document",
+            "document": {
+                "name": att.get("filename") or "",
+                "media_type": "application/pdf",
+                "data": b64,
+            },
+        }
+    if kind == "audio" and isinstance(raw, bytes):
+        # OpenAI-style ``input_audio`` part — passes through the openai-compat
+        # lane untouched (omni models); other lanes translate / fall back in
+        # Phase 2/3.  ``format`` is the bare codec token derived from the MIME.
+        b64 = base64.b64encode(raw).decode("ascii")
+        fmt = AUDIO_MIME_TO_FORMAT.get(mime) or (mime.split("/", 1)[-1] if "/" in mime else "wav")
+        return {
+            "type": "input_audio",
+            "input_audio": {"data": b64, "format": fmt},
         }
     return None
 
