@@ -407,6 +407,33 @@ class TestCreateMultipart:
         # Drained from the buffer post-commit.
         assert get_attachment_buffer().get(aid, ws_id=ws_id, user_id="userA") is None
 
+    def test_create_drains_staged_synchronously(self, app_client, monkeypatch):
+        """A create-time attachment dispatched on the first turn must be drained
+        by the create handler itself, not only by the async dispatch worker —
+        else the freshly-opened pane's rehydrate races the worker's write-time
+        drain and paints the image as a still-pending composer chip.
+
+        Neuter the worker's drain (stub ``send``) so only the synchronous
+        post-install drain can clear the buffer, then assert it's empty right
+        after the response with NO polling."""
+        from turnstone.core.attachment_buffer import get_attachment_buffer
+
+        client, _sessions, _gq = app_client
+        monkeypatch.setattr(_FakeSession, "send", lambda self, *a, **k: None)
+        meta = {"name": "demo", "initial_message": "describe this image"}
+        resp = client.post(
+            "/v1/api/workstreams/new",
+            data={"meta": json.dumps(meta)},
+            files=[("file", ("tiny.png", PNG_1x1, "image/png"))],
+            headers=_auth("userA"),
+        )
+        assert resp.status_code == 200, resp.text
+        ws_id = resp.json()["ws_id"]
+        aid = resp.json()["attachment_ids"][0]
+        # No poll: the create handler drained it before returning, so the new
+        # pane's rehydrate can't observe it as still-staged.
+        assert get_attachment_buffer().get(aid, ws_id=ws_id, user_id="userA") is None
+
     def test_create_with_attachments_no_initial_message_keeps_staged(self, app_client):
         import hashlib
 
