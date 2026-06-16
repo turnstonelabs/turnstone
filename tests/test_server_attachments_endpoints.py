@@ -22,6 +22,9 @@ PNG_1x1 = (
     b"\xc0\xc0\xc0\x00\x00\x00\x05\x00\x01\xa5\xf6E@\x00\x00\x00\x00IEND\xaeB`\x82"
 )
 
+# Magic-byte-valid minimal WAV (RIFF....WAVE) for audio-kind uploads.
+WAV_12 = b"RIFF\x24\x00\x00\x00WAVEfmt " + b"\x00" * 16
+
 _TEST_JWT_SECRET = "test-jwt-secret-minimum-32-chars!"
 
 
@@ -362,6 +365,65 @@ class TestGetContent:
         )
         assert resp.status_code == 200
         assert resp.content == b"S"
+
+
+class TestGetThumbnail:
+    """The /thumbnail handler + the shared _resolve_served_blob gate it reuses:
+    200+png for image/pdf, 415 for non-thumbnailable kinds or a failed render,
+    and a 404 (no existence leak) for cross-ws / cross-user id access."""
+
+    def _thumb_url(self, ws_id: str, aid: str) -> str:
+        return f"/v1/api/workstreams/{ws_id}/attachments/{aid}/thumbnail"
+
+    def test_image_thumbnail_200_png_with_hardening_headers(self, app_client):
+        client, _ = app_client
+        aid = _upload(client, "ws-A", "userA", "t.png", PNG_1x1, "image/png")
+        resp = client.get(self._thumb_url("ws-A", aid), headers=_auth("userA"))
+        assert resp.status_code == 200
+        assert resp.headers["content-type"].startswith("image/png")
+        assert resp.content[:8] == b"\x89PNG\r\n\x1a\n"
+        assert resp.headers.get("x-content-type-options") == "nosniff"
+        assert "default-src 'none'" in resp.headers.get("content-security-policy", "")
+        assert "max-age=300" in resp.headers.get("cache-control", "")
+
+    def test_audio_thumbnail_415(self, app_client):
+        client, _ = app_client
+        aid = _upload(client, "ws-A", "userA", "a.wav", WAV_12, "audio/wav")
+        resp = client.get(self._thumb_url("ws-A", aid), headers=_auth("userA"))
+        assert resp.status_code == 415
+
+    def test_text_thumbnail_415(self, app_client):
+        client, _ = app_client
+        aid = _upload(client, "ws-A", "userA", "n.md", b"# hi\n", "text/markdown")
+        resp = client.get(self._thumb_url("ws-A", aid), headers=_auth("userA"))
+        assert resp.status_code == 415
+
+    def test_thumbnail_unavailable_returns_415(self, app_client, monkeypatch):
+        # kind is image (reaches make_thumbnail) but the render yields None.
+        client, _ = app_client
+        aid = _upload(client, "ws-A", "userA", "t.png", PNG_1x1, "image/png")
+        monkeypatch.setattr("turnstone.core.thumbnails.make_thumbnail", lambda *a, **k: None)
+        resp = client.get(self._thumb_url("ws-A", aid), headers=_auth("userA"))
+        assert resp.status_code == 415
+
+    def test_thumbnail_cross_workstream_id_404(self, app_client):
+        client, _ = app_client
+        aid = _upload(client, "ws-A", "userA", "t.png", PNG_1x1, "image/png")
+        # userB owns ws-B; the id belongs to ws-A → 404 (no existence leak).
+        resp = client.get(self._thumb_url("ws-B", aid), headers=_auth("userB"))
+        assert resp.status_code == 404
+
+    def test_thumbnail_unowned_ws_user_isolation_404(self, app_client):
+        client, _ = app_client
+        from turnstone.core.memory import register_workstream
+
+        register_workstream("ws-shared-thumb", name="shared")
+        aid = _upload(client, "ws-shared-thumb", "userA", "s.png", PNG_1x1, "image/png")
+        # Blank-owner ws is reachable by userB, but userA's blob must not be.
+        resp = client.get(self._thumb_url("ws-shared-thumb", aid), headers=_auth("userB"))
+        assert resp.status_code == 404
+        resp = client.get(self._thumb_url("ws-shared-thumb", aid), headers=_auth("userA"))
+        assert resp.status_code == 200
 
 
 class TestDelete:
