@@ -179,7 +179,11 @@ class OpenAIResponsesProvider:
                         reasoning_by_assistant_ordinal[ord_pre] = items_to_replay
                 ord_pre += 1
 
-        messages = sanitize_messages(messages)
+        # Skip PDF inlining: this lane has a native ``input_file`` block, so the
+        # ``application/pdf`` document part must survive to ``convert_content_parts``
+        # below.  Without this, ``sanitize_messages`` would replace it with an
+        # unsupported-placeholder before the native translator ever runs.
+        messages = sanitize_messages(messages, skip_pdf_inline=True)
         instructions_parts: list[str] = []
         items: list[dict[str, Any]] = []
         # Track assistant ordinal in the SANITIZED list so the lookup

@@ -431,23 +431,34 @@ def format_document_wrapper(name: str, mime: str, data: str) -> str:
     return f'<document name="{safe_name}" media_type="{safe_mime}">\n{safe_data}\n</document>'
 
 
-def inline_document_parts(parts: list[Any]) -> list[Any]:
+def inline_document_parts(parts: list[Any], *, skip_pdf_inline: bool = False) -> list[Any]:
     """Rewrite internal ``document`` content parts as text parts.
 
     OpenAI Chat Completions and the Google OpenAI-compat endpoint do not
     accept a native ``document`` block type, so we wrap the text payload
     in an escaped delimiter and emit it as a plain text part.  Other
     part types pass through unchanged.
+
+    ``skip_pdf_inline`` leaves ``application/pdf`` document parts untouched so a
+    downstream translator that *does* have a native PDF block (the Responses
+    lane's :func:`~turnstone.core.providers._openai_responses.convert_content_parts`
+    ``input_file``) can emit it.  Without it the PDF would be replaced by an
+    unsupported-placeholder here, before the native translator ever runs —
+    silently killing the native path.
     """
     out: list[Any] = []
     for part in parts:
         if isinstance(part, dict) and part.get("type") == "document":
             d = part.get("document", {})
             if d.get("media_type") == "application/pdf":
+                if skip_pdf_inline:
+                    # A downstream lane emits the native PDF block; pass through.
+                    out.append(part)
+                    continue
                 # This lane (OpenAI Chat / Google compat / local servers) has no
                 # native PDF block and ``data`` is base64 — text-wrapping it would
-                # emit garbage.  Surface a placeholder; the Phase 3 capability-
-                # gated fallback (rasterize / text-extract) replaces it.
+                # emit garbage.  Surface a placeholder; the capability-gated
+                # fallback (rasterize / text-extract) replaces it upstream.
                 out.append(
                     {
                         "type": "text",
@@ -473,16 +484,23 @@ def inline_document_parts(parts: list[Any]) -> list[Any]:
     return out
 
 
-def _inline_documents_in_message(msg: dict[str, Any]) -> dict[str, Any]:
+def _inline_documents_in_message(
+    msg: dict[str, Any], *, skip_pdf_inline: bool = False
+) -> dict[str, Any]:
     """Return ``msg`` with any list-type content's ``document`` parts inlined."""
     content = msg.get("content")
     if isinstance(content, list):
-        return {**msg, "content": inline_document_parts(content)}
+        return {
+            **msg,
+            "content": inline_document_parts(content, skip_pdf_inline=skip_pdf_inline),
+        }
     return msg
 
 
 def sanitize_messages(
     messages: list[dict[str, Any]],
+    *,
+    skip_pdf_inline: bool = False,
 ) -> list[dict[str, Any]]:
     """Sanitize messages for OpenAI-compatible APIs.
 
@@ -521,8 +539,10 @@ def sanitize_messages(
 
     messages = [_clean(m) for m in messages]
     # Inline any internal ``document`` content parts — OpenAI Chat
-    # Completions does not accept a native document block type.
-    messages = [_inline_documents_in_message(m) for m in messages]
+    # Completions does not accept a native document block type.  ``skip_pdf_inline``
+    # (set by the Responses lane) keeps ``application/pdf`` parts intact so its
+    # native ``input_file`` translator downstream can emit them.
+    messages = [_inline_documents_in_message(m, skip_pdf_inline=skip_pdf_inline) for m in messages]
     out: list[dict[str, Any]] = []
     i = 0
     while i < len(messages):
