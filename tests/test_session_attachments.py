@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
 
+from turnstone.core import perception
 from turnstone.core.attachments import Attachment
 from turnstone.core.memory import (
     get_attachment,
@@ -525,3 +527,147 @@ class TestCapabilityGatedFallback:
         out = materialize_attachments(msgs, resolve)
         types = [p["type"] for p in out[0]["content"]]
         assert types == ["text", "image_url", "image_url"]
+
+
+class TestPerceptionFallback:
+    """Universal perception bottom tier: image/PDF/audio for primaries that
+    can't ingest them, when a capable perception model is configured."""
+
+    def _att(self, kind, content=b"x", fn="f", mime="application/octet-stream"):
+        return {
+            "attachment_id": "aP",
+            "filename": fn,
+            "mime_type": mime,
+            "kind": kind,
+            "content": content,
+        }
+
+    def _with_perception(self, s, *, perc_caps, content="DESCRIPTION"):
+        """Wire a stub perception backend onto the session; return the provider mock."""
+        perception._clear_perception_cache_for_test()
+        prov = MagicMock()
+        prov.create_completion.return_value = SimpleNamespace(content=content)
+        s._config_store = MagicMock()
+        s._config_store.get = lambda k, *a: "omni" if k == "perception.model_alias" else ""
+        s._registry = MagicMock()
+        s._registry.has_alias = lambda a: a == "omni"
+        s._registry.resolve = lambda a: (object(), "omni-model", object())
+        s._registry.get_provider = lambda a: prov
+        s._resolve_capabilities = lambda *a, **k: perc_caps  # type: ignore[method-assign]
+        return prov
+
+    def test_image_perception_when_primary_blind(self, tmp_db, mock_openai_client):
+        s = _make_session(mock_openai_client)
+        prov = self._with_perception(s, perc_caps=ModelCapabilities(supports_vision=True))
+        part = s._wire_content_part(
+            self._att("image", PNG_1x1, "i.png", "image/png"),
+            ModelCapabilities(),  # primary: no vision
+        )
+        assert part["type"] == "text"
+        assert "DESCRIPTION" in part["text"]
+        assert "image attachment 'i.png'" in part["text"]
+        prov.create_completion.assert_called_once()
+
+    def test_image_falls_through_to_native_without_perception(self, tmp_db, mock_openai_client):
+        # No perception configured (registry/config_store None) → native image_url:
+        # the pre-existing behavior; perception is purely additive.
+        s = _make_session(mock_openai_client)
+        part = s._wire_content_part(
+            self._att("image", PNG_1x1, "i.png", "image/png"),
+            ModelCapabilities(),
+        )
+        assert part["type"] == "image_url"
+
+    def test_pdf_perception_renders_pages(self, tmp_db, mock_openai_client, monkeypatch):
+        s = _make_session(mock_openai_client)
+        monkeypatch.setattr("turnstone.core.pdf.rasterize_pdf", lambda data: [b"pg1", b"pg2"])
+        prov = self._with_perception(s, perc_caps=ModelCapabilities(supports_vision=True))
+        part = s._wire_content_part(
+            self._att("pdf", b"%PDF", "r.pdf", "application/pdf"),
+            ModelCapabilities(supports_pdf=False),  # primary: no pdf, no vision
+        )
+        assert part["type"] == "text"
+        assert "DESCRIPTION" in part["text"]
+        # the perception model was handed the rasterized pages, not the raw PDF
+        sent = prov.create_completion.call_args.kwargs["messages"][0]["content"]
+        assert [p["type"] for p in sent] == ["text", "image_url", "image_url"]
+
+    def test_audio_perception_when_omni_and_no_stt(self, tmp_db, mock_openai_client):
+        s = _make_session(mock_openai_client)
+        self._with_perception(s, perc_caps=ModelCapabilities(supports_audio_input=True))
+        part = s._wire_content_part(
+            self._att("audio", b"RIFFxxxxWAVE", "a.wav", "audio/wav"),
+            ModelCapabilities(supports_audio_input=False),
+        )
+        assert part["type"] == "text"
+        assert "DESCRIPTION" in part["text"]
+
+    def test_perception_skipped_when_model_lacks_modality(self, tmp_db, mock_openai_client):
+        # Perception model has vision but not audio → audio falls through to the
+        # placeholder rather than calling a model that can't hear.
+        s = _make_session(mock_openai_client)
+        prov = self._with_perception(s, perc_caps=ModelCapabilities(supports_vision=True))
+        part = s._wire_content_part(
+            self._att("audio", b"RIFF", "a.wav", "audio/wav"),
+            ModelCapabilities(supports_audio_input=False),
+        )
+        assert part["type"] == "text"
+        assert "no transcription backend" in part["text"]
+        prov.create_completion.assert_not_called()
+
+
+class TestResolveAttachmentsCapsThreading:
+    """bug-1: the resolver materializes against the caps it is handed (the active
+    attempt's), not the primary session model's."""
+
+    def _att(self):
+        return {
+            "attachment_id": "aT",
+            "filename": "r.pdf",
+            "mime_type": "application/pdf",
+            "kind": "pdf",
+            "content": b"%PDF",
+        }
+
+    def test_resolver_uses_passed_caps(self, tmp_db, mock_openai_client, monkeypatch):
+        s = _make_session(mock_openai_client)
+        monkeypatch.setattr("turnstone.core.session.get_attachments", lambda ids: [self._att()])
+        monkeypatch.setattr("turnstone.core.pdf.rasterize_pdf", lambda data: [b"pg"])
+        # Passed caps (vision, no native PDF) drive rasterize-to-images — not
+        # whatever the primary 'test-model' happens to support.
+        out = s._resolve_attachments(
+            ["aT"], ModelCapabilities(supports_pdf=False, supports_vision=True)
+        )
+        part = out["aT"]
+        assert isinstance(part, list)
+        assert all(p["type"] == "image_url" for p in part)
+
+    def test_resolver_native_with_pdf_caps(self, tmp_db, mock_openai_client, monkeypatch):
+        s = _make_session(mock_openai_client)
+        monkeypatch.setattr("turnstone.core.session.get_attachments", lambda ids: [self._att()])
+        out = s._resolve_attachments(["aT"], ModelCapabilities(supports_pdf=True))
+        assert out["aT"]["type"] == "document"
+        assert out["aT"]["document"]["media_type"] == "application/pdf"
+
+
+class TestByReferenceMediaBudget:
+    """bug-2: by-reference pdf/audio are charged a bounded budget — not zero
+    (over-context), not the full multi-MB source blob (over-trim)."""
+
+    def test_pdf_and_audio_charged_capped(self):
+        msg = {
+            "role": "user",
+            "content": [],
+            "_attachments_meta": [
+                {"kind": "pdf", "size_bytes": 32_000_000},
+                {"kind": "audio", "size_bytes": 25_000_000},
+                {"kind": "text", "size_bytes": 500},
+                {"kind": "image", "size_bytes": 99},
+            ],
+        }
+        _text, images, doc_chars = ChatSession._msg_text_chars(msg)
+        # pdf + audio each capped at 16_000; text counted in full; image excluded
+        # (a real by-reference image is charged a fixed image budget in the
+        # content loop, so counting it here too would double-charge).
+        assert doc_chars == 16_000 + 16_000 + 500
+        assert images == 0

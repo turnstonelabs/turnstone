@@ -619,6 +619,13 @@ _SPEC_ARGUMENTS_LITERAL_RE = re.compile(r"\$ARGUMENTS\b(?!\[)")
 # not its earliest.
 _WATCH_QUEUE_SOFT_CAP = 50
 
+# Bounded budget charge for a by-reference pdf/audio attachment.  Its source
+# blob can be multi-MB, but the form the model actually sees (perception / STT /
+# extracted text, or rasterized pages) is far smaller and its exact size isn't
+# known until wire build — so the trimming budget charges min(size_bytes, this).
+# Sized to the perception describe cap (max_tokens ~4096 -> ~16K chars).
+_DOC_BUDGET_CHAR_CAP = 16_000
+
 _RERANK_TIMEOUT_CAP_S = 15.0  # reranking <=50 short docs is fast; cap so a hung
 # endpoint falls back to BM25 in seconds, not up to tools.timeout (120s default).
 # Per-turn memory rerank makes the long timeout a turn-stall hazard.
@@ -2925,7 +2932,9 @@ class ChatSession:
         via :meth:`_resolve_attachments` — resolution lives at the C layer."""
         return self.system_messages + dicts_from_turns(self.messages)
 
-    def _resolve_attachments(self, ids: list[str]) -> dict[str, Any]:
+    def _resolve_attachments(
+        self, ids: list[str], caps: ModelCapabilities | None = None
+    ) -> dict[str, Any]:
         """Resolve content-addressed attachment ids to inline wire content parts.
 
         The send-time materialization of the by-reference content lane: handed to
@@ -2941,7 +2950,11 @@ class ChatSession:
         fires on a history render."""
         if not ids:
             return {}
-        caps = self._get_capabilities()
+        # caps is the ACTIVE attempt's capabilities, threaded from _try_stream so
+        # a fallback to a model with different media support converts on the
+        # right caps; default to the primary only when called without one.
+        if caps is None:
+            caps = self._get_capabilities()
         out: dict[str, Any] = {}
         for att in get_attachments(ids):
             part = self._wire_content_part(att, caps)
@@ -2953,18 +2966,31 @@ class ChatSession:
         self, att: dict[str, Any], caps: ModelCapabilities
     ) -> dict[str, Any] | list[dict[str, Any]] | None:
         """The active model's inline part(s) for one blob: native where
-        supported, else a client-side fallback for a kind it can't read.  PDF →
-        rasterized page images (vision models) or extracted text; audio → STT
-        transcript.  A PDF rasterized to images returns several parts."""
+        supported, else the fallback ladder for a kind it can't read.
+
+        PDF → rasterized page images (vision primary) → perception → extracted
+        text → placeholder.  Image → native image_url, or perception first when
+        the primary has no vision.  Audio → STT transcript → perception →
+        placeholder.  Perception (the ``perception.model_alias`` role) is the
+        universal bottom tier: it engages only when the primary can't handle the
+        kind and a capable perception model is configured.  A PDF rasterized to
+        images returns several parts."""
         kind = att.get("kind")
         if kind == "pdf" and not caps.supports_pdf:
-            # Vision models: rasterize pages to images (better fidelity, esp. for
-            # scanned PDFs with no text layer); otherwise extract text.
+            # Vision primary: rasterize pages to images (better fidelity, esp.
+            # for scanned PDFs with no text layer).  Non-vision primary:
+            # perception, else extracted text / placeholder.
             if caps.supports_vision:
                 return self._pdf_rasterize_fallback_parts(att)
-            return self._pdf_text_fallback_part(att)
+            return self._pdf_nonvision_part(att)
+        if kind == "image" and not caps.supports_vision:
+            perceived = self._perception_fallback_part(att, "image")
+            if perceived is not None:
+                return perceived
+            # No perception backend configured: emit the native image_url
+            # unchanged (the model may ignore it) — pre-existing behavior.
         if kind == "audio" and not caps.supports_audio_input:
-            return self._audio_transcript_fallback_part(att)
+            return self._audio_fallback_part(att)
         return attachment_to_content_part(att)
 
     def _pdf_rasterize_fallback_parts(
@@ -3014,23 +3040,42 @@ class ChatSession:
             },
         }
 
-    def _audio_transcript_fallback_part(self, att: dict[str, Any]) -> dict[str, Any]:
-        """Non-omni model: transcribe via the STT role and carry the transcript.
+    def _pdf_nonvision_part(self, att: dict[str, Any]) -> dict[str, Any] | list[dict[str, Any]]:
+        """Non-vision primary + PDF: perception (renders pages for a perception
+        model that can see) when configured, else extracted text / placeholder."""
+        perceived = self._perception_fallback_part(att, "pdf")
+        if perceived is not None:
+            return perceived
+        return self._pdf_text_fallback_part(att)
 
-        Only engages when an operator has configured an STT role (which may be a
-        local backend) — otherwise a placeholder, never a surprise external call."""
+    def _audio_fallback_part(self, att: dict[str, Any]) -> dict[str, Any]:
+        """Non-omni primary + audio: STT transcript (preferred), else perception
+        (if the perception model can hear), else a placeholder."""
+        transcript = self._stt_transcript_part(att)
+        if transcript is not None:
+            return transcript
+        perceived = self._perception_fallback_part(att, "audio")
+        if perceived is not None:
+            return perceived
+        name = str(att.get("filename") or "audio")
+        return {
+            "type": "text",
+            "text": f"[audio attachment '{name}' — no transcription backend configured]",
+        }
+
+    def _stt_transcript_part(self, att: dict[str, Any]) -> dict[str, Any] | None:
+        """Transcribe via the STT role, or ``None`` when no STT role is
+        configured or the transcript is empty (caller falls through to
+        perception).  Only engages a configured backend — never a surprise call."""
         from turnstone.core.audio import resolve_role_alias, transcribe_cached
 
-        name = str(att.get("filename") or "audio")
         raw = att.get("content")
         alias = resolve_role_alias(
             config_store=self._config_store, registry=self._registry, role="stt"
         )
         if not alias or not isinstance(raw, bytes):
-            return {
-                "type": "text",
-                "text": f"[audio attachment '{name}' — no transcription backend configured]",
-            }
+            return None
+        name = str(att.get("filename") or "audio")
         transcript = transcribe_cached(
             registry=self._registry,
             alias=alias,
@@ -3039,13 +3084,90 @@ class ChatSession:
             filename=name,
         )
         if not transcript:
-            return {
-                "type": "text",
-                "text": f"[audio attachment '{name}' — transcription unavailable]",
-            }
+            return None
         return {
             "type": "text",
             "text": f"[Transcript of audio attachment '{name}']\n\n{transcript}",
+        }
+
+    def _resolve_perception(
+        self,
+    ) -> tuple[LLMProvider, Any, str, str, ModelCapabilities] | None:
+        """Resolve the perception role → ``(provider, client, model, alias, caps)``.
+
+        ``None`` when no ``perception.model_alias`` is configured / resolvable, so
+        the caller falls through to the next fallback tier."""
+        from turnstone.core.perception import PERCEPTION_SETTING
+
+        if self._config_store is None or self._registry is None:
+            return None
+        alias = (self._config_store.get(PERCEPTION_SETTING) or "").strip()
+        if not alias or not self._registry.has_alias(alias):
+            return None
+        try:
+            client, model, _cfg = self._registry.resolve(alias)
+            provider = self._registry.get_provider(alias)
+            caps = self._resolve_capabilities(provider, model, alias)
+        except Exception as exc:
+            log.warning("perception alias %r not resolvable: %s", alias, exc)
+            return None
+        return provider, client, model, alias, caps
+
+    def _perception_parts(self, att: dict[str, Any], kind: str) -> list[dict[str, Any]]:
+        """Build the OpenAI-shaped parts handed to the perception model: PDF →
+        rasterized page images; image / audio → the native content part."""
+        raw = att.get("content")
+        if not isinstance(raw, bytes):
+            return []
+        if kind == "pdf":
+            import base64
+
+            from turnstone.core.pdf import rasterize_pdf
+
+            return [
+                {
+                    "type": "image_url",
+                    "image_url": {
+                        "url": f"data:image/png;base64,{base64.b64encode(p).decode('ascii')}"
+                    },
+                }
+                for p in rasterize_pdf(raw)
+            ]
+        part = attachment_to_content_part(att)  # image_url / input_audio, native shape
+        return [part] if part is not None else []
+
+    def _perception_fallback_part(self, att: dict[str, Any], kind: str) -> dict[str, Any] | None:
+        """Universal bottom-tier fallback: have the configured perception model
+        perceive the attachment and carry its output as text.  ``None`` when no
+        perception backend is configured, it can't handle this modality, or it
+        produced nothing — the caller falls through."""
+        resolved = self._resolve_perception()
+        if resolved is None:
+            return None
+        provider, client, model, alias, caps = resolved
+        if kind in ("pdf", "image") and not caps.supports_vision:
+            return None
+        if kind == "audio" and not caps.supports_audio_input:
+            return None
+        parts = self._perception_parts(att, kind)
+        if not parts:
+            return None
+        from turnstone.core.perception import describe_cached
+
+        text = describe_cached(
+            provider=provider,
+            client=client,
+            model=model,
+            alias=alias,
+            content_hash=str(att.get("attachment_id")),
+            parts=parts,
+        )
+        if not text:
+            return None
+        name = str(att.get("filename") or kind)
+        return {
+            "type": "text",
+            "text": f"[Perception of {kind} attachment '{name}']\n\n{text}",
         }
 
     def _prepare_wire_messages(
@@ -3575,7 +3697,7 @@ class ChatSession:
                     replay_reasoning_to_model=self._resolve_replay_reasoning_to_model(
                         model_alias, caps=resolved_caps
                     ),
-                    resolve_attachments=self._resolve_attachments,
+                    resolve_attachments=lambda ids: self._resolve_attachments(ids, resolved_caps),
                 )
             except Exception as e:
                 ename = type(e).__name__
@@ -5004,11 +5126,21 @@ class ChatSession:
         if not inline_doc:
             meta = msg.get("_attachments_meta")
             if isinstance(meta, list):
-                doc_chars += sum(
-                    int(e.get("size_bytes") or 0)
-                    for e in meta
-                    if isinstance(e, dict) and e.get("kind") == "text"
-                )
+                for e in meta:
+                    if not isinstance(e, dict):
+                        continue
+                    k = e.get("kind")
+                    sz = int(e.get("size_bytes") or 0)
+                    if k == "text":
+                        doc_chars += sz
+                    elif k in ("pdf", "audio"):
+                        # By-reference media materializes to a much smaller form
+                        # whose exact size isn't known here; charge a bounded
+                        # estimate so the turn is neither budgeted as ~zero
+                        # (over-context) nor as the full source blob (over-trim).
+                        doc_chars += min(sz, _DOC_BUDGET_CHAR_CAP)
+                    # image by-reference is already charged a fixed image budget
+                    # in the content loop above.
         for tc in msg.get("tool_calls", []):
             n += len(tc.get("id", ""))
             n += len(tc.get("function", {}).get("name", ""))

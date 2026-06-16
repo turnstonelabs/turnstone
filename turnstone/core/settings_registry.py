@@ -450,6 +450,21 @@ def _build_registry() -> dict[str, SettingDef]:
             "Degraded backends are deprioritised in the fallback chain but requests are never "
             "blocked. The backend recovers automatically when a request succeeds.",
         ),
+        # -- perception role -----------------------------------------------
+        SettingDef(
+            "perception.model_alias",
+            "str",
+            "",
+            "Model alias for the perception fallback — image/PDF/audio (empty = disabled)",
+            "perception",
+            help="Which registered model perceives attachments a primary model can't ingest "
+            "natively — describing images/PDFs, and (for an omni model) transcribing audio — and "
+            "returns the result as text. Last-resort fallback only: a vision-capable primary still "
+            "gets the actual image / rasterized pages, and a configured speech-to-text model still "
+            "wins for audio; perception fills the remaining gap. Point it at a vision-capable (or "
+            "omni) chat model alias. Empty disables the fallback (such attachments then degrade to "
+            "extracted text or a placeholder).",
+        ),
         # -- audio / voice roles -------------------------------------------
         # Keys are section-prefixed (audio.*) with distinct leaves so the
         # Settings tab (which labels by the key's last segment) doesn't render
