@@ -1022,8 +1022,8 @@ def main() -> None:
         "--judge-timeout",
         dest="judge_timeout",
         type=float,
-        default=60.0,
-        help="LLM judge timeout in seconds (default: 60)",
+        default=120.0,
+        help="LLM judge timeout in seconds (default: 120)",
     )
     judge_group.add_argument(
         "--judge-confidence",

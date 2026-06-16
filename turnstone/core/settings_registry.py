@@ -577,7 +577,7 @@ def _build_registry() -> dict[str, SettingDef]:
         SettingDef(
             "judge.timeout",
             "float",
-            60.0,
+            120.0,
             "Judge evaluation timeout in seconds",
             "judge",
             min_value=5.0,
@@ -641,7 +641,7 @@ def _build_registry() -> dict[str, SettingDef]:
         SettingDef(
             "judge.output_guard_llm_timeout",
             "float",
-            30.0,
+            60.0,
             "Wall-clock budget for the output-guard LLM judge call",
             "judge",
             min_value=1.0,

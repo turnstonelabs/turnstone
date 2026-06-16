@@ -5,7 +5,6 @@ from __future__ import annotations
 import json
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
 from unittest.mock import MagicMock
@@ -120,8 +119,7 @@ class TestVerdictParsing:
             [{"role": "user", "content": "Run echo hello"}],
             callback_results.append,
         )
-        # Wait for daemon thread
-        time.sleep(0.5)
+        _wait_for(callback_results, 1)
 
         assert len(heuristics) == 1
         assert heuristics[0].tier == "heuristic"
@@ -184,14 +182,12 @@ class TestErrorHandling:
         provider = _make_mock_provider(side_effect=RuntimeError("API error"))
         judge = _make_judge(provider)
 
-        with ThreadPoolExecutor(max_workers=1) as pool:
-            result = judge._evaluate_single(
-                _make_item(),
-                [{"role": "user", "content": "test"}],
-                cancel_event=None,
-                executor=pool,
-                client=MagicMock(),
-            )
+        result = judge._evaluate_single(
+            _make_item(),
+            [{"role": "user", "content": "test"}],
+            cancel_event=None,
+            client=MagicMock(),
+        )
         assert result is None
 
     def test_provider_error_heuristic_still_returned(self):
@@ -209,7 +205,7 @@ class TestErrorHandling:
             [{"role": "user", "content": "test"}],
             callback_results.append,
         )
-        time.sleep(0.5)
+        _wait_for(callback_results, 1)
 
         assert len(heuristics) == 1
         assert heuristics[0].tier == "heuristic"
@@ -233,20 +229,19 @@ class TestErrorHandling:
             [{"role": "user", "content": "test"}],
             callback_results.append,
         )
-        time.sleep(0.5)
+        _wait_for(callback_results, 1)
         assert len(callback_results) == 1
         assert callback_results[0].tier == "llm_fallback"
 
-    def test_executor_poison_delivers_fallback(self):
-        """An _ExecutorPoisonedError (a judge-call timeout poisoning the
-        single-worker executor) restarts the executor AND still delivers one
-        fallback for the interrupted item — the twin of the generic-exception
-        path, and load-bearing for Smart Approvals' batch-completeness wait."""
-        from turnstone.core.judge import _ExecutorPoisonedError
-
+    def test_evaluate_single_none_delivers_fallback(self):
+        """A judge-call timeout now surfaces as ``_evaluate_single`` returning
+        None (the executor-poison restart dance is gone); the daemon must still
+        deliver exactly one fallback for that item — Smart Approvals waits on
+        the full verdict set before gating, so a silently-skipped item would
+        block that wait until its timeout."""
         judge = _make_judge()
         judge._evaluate_single = MagicMock(  # type: ignore[method-assign]
-            side_effect=_ExecutorPoisonedError()
+            return_value=None
         )
         callback_results: list[IntentVerdict] = []
         judge.evaluate(
@@ -254,7 +249,7 @@ class TestErrorHandling:
             [{"role": "user", "content": "test"}],
             callback_results.append,
         )
-        time.sleep(0.5)
+        _wait_for(callback_results, 1)
         assert len(callback_results) == 1
         assert callback_results[0].tier == "llm_fallback"
 
@@ -266,14 +261,12 @@ class TestErrorHandling:
         result_mock.content = ""
 
         judge = _make_judge(provider)
-        with ThreadPoolExecutor(max_workers=1) as pool:
-            result = judge._evaluate_single(
-                _make_item(),
-                [{"role": "user", "content": "test"}],
-                cancel_event=None,
-                executor=pool,
-                client=MagicMock(),
-            )
+        result = judge._evaluate_single(
+            _make_item(),
+            [{"role": "user", "content": "test"}],
+            cancel_event=None,
+            client=MagicMock(),
+        )
         assert result is None
 
     def test_empty_content_length_stop_no_retry(self):
@@ -285,14 +278,12 @@ class TestErrorHandling:
         result_mock.finish_reason = "length"
 
         judge = _make_judge(provider)
-        with ThreadPoolExecutor(max_workers=1) as pool:
-            result = judge._evaluate_single(
-                _make_item(),
-                [{"role": "user", "content": "test"}],
-                cancel_event=None,
-                executor=pool,
-                client=MagicMock(),
-            )
+        result = judge._evaluate_single(
+            _make_item(),
+            [{"role": "user", "content": "test"}],
+            cancel_event=None,
+            client=MagicMock(),
+        )
         assert result is None
         # Should have been called exactly once — no retries
         assert provider.create_completion.call_count == 1
@@ -404,14 +395,12 @@ class TestMultiTurnToolUse:
         provider.create_completion.side_effect = [turn1, turn2]
 
         judge = _make_judge(provider)
-        with ThreadPoolExecutor(max_workers=1) as pool:
-            verdict = judge._evaluate_single(
-                _make_item(),
-                [{"role": "user", "content": "test"}],
-                cancel_event=None,
-                executor=pool,
-                client=MagicMock(),
-            )
+        verdict = judge._evaluate_single(
+            _make_item(),
+            [{"role": "user", "content": "test"}],
+            cancel_event=None,
+            client=MagicMock(),
+        )
         assert verdict is not None
         assert verdict.tier == "llm"
         assert provider.create_completion.call_count == 2
@@ -454,14 +443,12 @@ class TestMultiTurnToolUse:
         ]
 
         judge = _make_judge(provider)
-        with ThreadPoolExecutor(max_workers=1) as pool:
-            judge._evaluate_single(
-                _make_item(),
-                [{"role": "user", "content": "test"}],
-                cancel_event=None,
-                executor=pool,
-                client=MagicMock(),
-            )
+        judge._evaluate_single(
+            _make_item(),
+            [{"role": "user", "content": "test"}],
+            cancel_event=None,
+            client=MagicMock(),
+        )
         # Should have called create_completion exactly _JUDGE_MAX_TURNS times
         assert provider.create_completion.call_count == 5
 
@@ -507,7 +494,7 @@ class TestConfidenceArbitration:
             [{"role": "user", "content": "Run echo hello"}],
             callback_results.append,
         )
-        time.sleep(0.5)
+        _wait_for(callback_results, 1)
 
         assert len(heuristics) == 1
         assert heuristics[0].confidence == 0.85
@@ -527,7 +514,7 @@ class TestConfidenceArbitration:
             [{"role": "user", "content": "Run echo hello"}],
             callback_results.append,
         )
-        time.sleep(0.5)
+        _wait_for(callback_results, 1)
 
         assert len(heuristics) == 1
         # LLM verdict is always delivered regardless of confidence comparison
@@ -966,11 +953,7 @@ class TestModelAliasResolution:
             [{"role": "user", "content": "delegate the audit"}],
             callback_results.append,
         )
-        # Wait for daemon thread.
-        for _ in range(20):
-            if callback_results:
-                break
-            time.sleep(0.1)
+        _wait_for(callback_results, 1)
 
         assert callback_results, "judge never delivered a verdict"
         assert callback_results[0].tier == "llm"
