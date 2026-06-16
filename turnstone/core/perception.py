@@ -50,10 +50,6 @@ _DESCRIBE_PROMPT = (
 )
 
 
-class PerceptionUnavailableError(RuntimeError):
-    """No usable perception backend is configured/resolvable (maps to a placeholder)."""
-
-
 class PerceptionBackendError(RuntimeError):
     """A configured perception backend failed during the perceive call."""
 
