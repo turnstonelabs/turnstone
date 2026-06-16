@@ -2889,17 +2889,19 @@ function loadSettings() {
         schemaMap[schemaArr[i].key] = schemaArr[i];
       }
 
-      // Merge values + schema.  Skip role-assignment settings owned by
-      // the Models → Roles sub-tab (judge.* settings still live on the
-      // Judge tab; the model-tab roles render only there).
+      // Merge values + schema.  Skip role-assignment settings owned by the
+      // Models → Roles sub-tab.  Derive the skip-set straight from MODEL_ROLES
+      // (alias + optional effort key) so a newly-added role can't drift back
+      // into this list — perception was exactly that miss, and stt/tts/reranker
+      // had quietly leaked the same way.  judge.* keeps its own prefix skip
+      // below: it covers more than the two judge role aliases (the output-guard
+      // toggle, thresholds, ...), all of which live on the Judge tab.
       const merged = {};
-      const roleKeys = {
-        "coordinator.model_alias": 1,
-        "coordinator.reasoning_effort": 1,
-        "model.task_alias": 1,
-        "model.task_effort": 1,
-        "channels.default_model_alias": 1,
-      };
+      const roleKeys = {};
+      for (let ri = 0; ri < MODEL_ROLES.length; ri++) {
+        roleKeys[MODEL_ROLES[ri].aliasKey] = 1;
+        if (MODEL_ROLES[ri].effortKey) roleKeys[MODEL_ROLES[ri].effortKey] = 1;
+      }
       for (let j = 0; j < valuesArr.length; j++) {
         const v = valuesArr[j];
         if (v.key.startsWith("judge.")) continue;
@@ -5194,7 +5196,7 @@ const MODEL_ROLES = [
   {
     label: "Speech-to-text",
     description:
-      "Transcribes microphone audio in the workstream composer (voice input). Empty disables the mic affordance — there is no audio-capable session fallback.",
+      "Transcribes microphone audio in the workstream composer (voice input), and is the preferred transcript for audio attachments. Empty disables the mic affordance; audio attachments then fall back to the Perception model if one is configured.",
     aliasKey: "audio.stt_model_alias",
     fallbackKind: "disabled",
     mediaCapability: "supports_transcription",
@@ -5210,11 +5212,20 @@ const MODEL_ROLES = [
     mediaRole: "tts",
   },
   {
+    label: "Perception",
+    description:
+      "Bottom-tier fallback for attachments the primary model can't ingest natively (image / PDF / audio): the perception model perceives the attachment and its description is passed to the primary as text. Point at a vision-capable or omni model and enable the matching capabilities on it — supports_vision for image/PDF, supports_audio_input for audio. Empty disables the fallback; native handling and the speech-to-text role still take precedence.",
+    aliasKey: "perception.model_alias",
+    fallbackKind: "disabled",
+    disabledLabel: "(disabled — no fallback)",
+  },
+  {
     label: "Reranker",
     description:
       "Reranks web_search results. Point at a model whose base_url is a Cohere/Jina-compatible /rerank endpoint and whose capabilities include supports_rerank. Empty disables reranking. Enabling a reranker sends web_search results AND BM25 retrieval candidates (tool/skill descriptions and memory content) to this endpoint; self-hosted endpoints keep it on your infrastructure.",
     aliasKey: "tools.reranker_alias",
     fallbackKind: "disabled",
+    disabledLabel: "(disabled — reranking off)",
     mediaCapability: "supports_rerank",
     mediaRole: "rerank",
   },
@@ -5446,7 +5457,7 @@ function _renderModelRoles(container, values, schema) {
     const blank = document.createElement("option");
     blank.value = "";
     if (role.fallbackKind === "disabled") {
-      blank.textContent = "(disabled — voice off)";
+      blank.textContent = role.disabledLabel || "(disabled — voice off)";
     } else if (role.fallbackKind === "inherit") {
       blank.textContent = "(inherit)";
     } else {

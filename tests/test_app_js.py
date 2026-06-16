@@ -631,6 +631,25 @@ def test_no_unsafe_code_sinks_in_static_assets(label: str, path: Path) -> None:
     )
 
 
+def test_perception_role_surfaced_in_admin_and_filtered_from_settings() -> None:
+    """The perception fallback (``perception.model_alias``) landed backend-only —
+    its admin UI was missing.  It must (1) appear as a Models → Roles row so an
+    operator can point it at a vision / omni model, and (2) be filtered OUT of the
+    raw Settings tab.  The Settings filter derives its skip-set from MODEL_ROLES,
+    so no role can quietly drift back into the Settings list again (the original
+    miss — stt/tts/reranker had leaked the same way)."""
+    admin = _CONSOLE_ADMIN_JS.read_text(encoding="utf-8")
+    # (1) Roles sub-tab row.
+    assert 'label: "Perception"' in admin, "the perception role must carry a UX label"
+    assert '"perception.model_alias"' in admin, "perception must have a MODEL_ROLES entry"
+    # (2) Settings filter derives the skip-set from MODEL_ROLES — drift-proof, so
+    # perception (and every other role alias) is excluded, not hand-listed.
+    assert "for (let ri = 0; ri < MODEL_ROLES.length; ri++)" in admin, (
+        "the Settings role-key filter must derive from MODEL_ROLES"
+    )
+    assert "roleKeys[MODEL_ROLES[ri].aliasKey] = 1" in admin
+
+
 def test_shared_utils_defines_set_markdown_helper() -> None:
     """The ``setMarkdown`` helper in ``shared/utils.js`` is the single
     audited entry point for rendering markdown content into a DOM
