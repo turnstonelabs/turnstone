@@ -650,6 +650,22 @@ def test_perception_role_surfaced_in_admin_and_filtered_from_settings() -> None:
     assert "roleKeys[MODEL_ROLES[ri].aliasKey] = 1" in admin
 
 
+def test_audio_roles_gated_to_openai_sdk_providers() -> None:
+    """Voice roles (stt/tts) ride the OpenAI-SDK audio surface — an Anthropic
+    (-compatible) model has no audio content block, so admin must exclude it
+    from those role dropdowns (mirrors ``_provider_carries_audio`` in
+    core/audio.py).  Reranker is a ``/rerank`` endpoint, not audio, so it must
+    NOT be provider-gated."""
+    admin = _CONSOLE_ADMIN_JS.read_text(encoding="utf-8")
+    assert "function _providerCarriesAudio(" in admin, "the provider-audio gate helper must exist"
+    body = admin[admin.index("function _audioModelEligible(") :]
+    body = body[: body.index("\nfunction ")]
+    assert '(mediaRole === "stt" || mediaRole === "tts")' in body, (
+        "only the voice roles are provider-gated (reranker is not an audio role)"
+    )
+    assert "_providerCarriesAudio(md && md.provider)" in body
+
+
 def test_shared_utils_defines_set_markdown_helper() -> None:
     """The ``setMarkdown`` helper in ``shared/utils.js`` is the single
     audited entry point for rendering markdown content into a DOM

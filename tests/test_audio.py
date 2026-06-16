@@ -17,9 +17,12 @@ from turnstone.core import audio
 class _Cfg:
     """Stand-in for ModelConfig — only the fields audio.py reads."""
 
-    def __init__(self, model: str, capabilities: dict | None = None) -> None:
+    def __init__(
+        self, model: str, capabilities: dict | None = None, provider: str = "openai"
+    ) -> None:
         self.model = model
         self.capabilities = capabilities or {}
+        self.provider = provider
 
 
 class _FakeConfigStore:
@@ -78,6 +81,20 @@ class TestModelSupportsRole:
         # Audio *input* alone does not make it a TTS (speech-synthesis) model.
         assert not audio.model_supports_role(
             _Cfg("gemma-omni", {"supports_audio_input": True}), "tts"
+        )
+
+    def test_anthropic_provider_excluded_from_audio_roles(self):
+        # Anthropic(-compatible) has no audio content block, so it can't serve
+        # any audio role — even with a capability flag or a whisper-style name.
+        assert not audio.model_supports_role(
+            _Cfg("gemma-omni", {"supports_audio_input": True}, provider="anthropic-compatible"),
+            "stt",
+        )
+        assert not audio.model_supports_role(
+            _Cfg("whisper-1", provider="anthropic-compatible"), "stt"
+        )
+        assert not audio.model_supports_role(
+            _Cfg("voice", {"supports_speech_synthesis": True}, provider="anthropic"), "tts"
         )
 
     def test_chat_model_not_eligible(self):
@@ -205,6 +222,20 @@ class TestTranscribe:
         parts = client.chat.completions.create.call_args.kwargs["messages"][0]["content"]
         text_part = next(p for p in parts if p["type"] == "text")
         assert text_part["text"] == "custom instruction"
+
+    def test_non_audio_provider_raises_clear_error(self):
+        # A stale config could still point STT at an anthropic-compatible model
+        # (no audio surface): fail with an actionable message, not an opaque
+        # ``'Anthropic' object has no attribute 'chat'``.
+        client = MagicMock()
+        reg = _FakeRegistry(
+            "omni",
+            _Cfg("gemma", {"supports_audio_input": True}, provider="anthropic-compatible"),
+            client,
+        )
+        with pytest.raises(audio.AudioUnavailableError, match="OpenAI-compatible provider"):
+            audio.transcribe(registry=reg, alias="omni", data=b"x", filename="a.webm")
+        client.chat.completions.create.assert_not_called()
 
 
 class TestSynthesize:

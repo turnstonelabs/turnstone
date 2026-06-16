@@ -5244,6 +5244,19 @@ const AUDIO_MODEL_HINTS = {
   tts: ["tts-", "-tts"],
 };
 
+// Providers whose client speaks the OpenAI-SDK audio surface. Mirror
+// _AUDIO_SDK_PROVIDERS / _provider_carries_audio in turnstone/core/audio.py:
+// anthropic(-compatible) has no audio content block, so it can't serve the
+// voice roles regardless of capability flags.
+function _providerCarriesAudio(provider) {
+  return (
+    provider === "openai" ||
+    provider === "openai-compatible" ||
+    provider === "google" ||
+    provider === "xai"
+  );
+}
+
 function _audioModelEligible(md, capFlag, mediaRole) {
   let caps = md && md.capabilities;
   if (typeof caps === "string") {
@@ -5254,6 +5267,16 @@ function _audioModelEligible(md, capFlag, mediaRole) {
     }
   }
   if (!caps || typeof caps !== "object") caps = {};
+  // Voice roles (stt/tts) ride the OpenAI-SDK audio surface; an Anthropic
+  // (-compatible) provider can't serve them even with a capability flag set.
+  // Reranker is NOT an audio role (it hits a /rerank endpoint), so it is not
+  // provider-gated here.
+  if (
+    (mediaRole === "stt" || mediaRole === "tts") &&
+    !_providerCarriesAudio(md && md.provider)
+  ) {
+    return false;
+  }
   // An omni model (chat audio input) can serve STT via the chat transcription
   // path — mirror model_supports_role in turnstone/core/audio.py.
   if (mediaRole === "stt" && caps.supports_audio_input) return true;
