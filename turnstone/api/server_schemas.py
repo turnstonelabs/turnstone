@@ -45,7 +45,7 @@ class SendResponse(BaseModel):
     attached_ids: list[str] = Field(
         default_factory=list,
         description=(
-            "Attachment ids actually reserved onto this turn. Subset of "
+            "Attachment ids actually attached to this turn. Subset of "
             "the request's `attachment_ids` (or the auto-consumed pending "
             "set). Empty when the send carries no attachments."
         ),
@@ -159,7 +159,7 @@ class CreateWorkstreamRequest(BaseModel):
         description=(
             "Optional first user message dispatched as a background turn after "
             "the workstream is created. When attachments are also provided "
-            "(via the multipart variant), they are reserved onto this turn."
+            "(via the multipart variant), they are attached to this turn."
         ),
     )
     ws_id: str = Field(
@@ -201,7 +201,7 @@ class CreateWorkstreamResponse(BaseModel):
         default_factory=list,
         description=(
             "Ids of attachments saved by this request (multipart variant only). "
-            "Already reserved onto the initial_message turn when one was provided; "
+            "Already attached to the initial_message turn when one was provided; "
             "otherwise left pending for a follow-up POST "
             "/v1/api/workstreams/{ws_id}/send."
         ),

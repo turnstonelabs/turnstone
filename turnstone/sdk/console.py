@@ -346,9 +346,9 @@ class AsyncTurnstoneConsole(_BaseClient):
     ) -> dict[str, Any]:
         """Send a message to a coordinator workstream.
 
-        ``attachment_ids`` reserves attachments under the message's
-        ``send_id`` token; pass ``None`` to auto-consume the caller's
-        pending attachments, or ``[]`` to disable auto-consume.
+        ``attachment_ids`` selects which staged uploads to attach to the
+        message; pass ``None`` to auto-consume the caller's pending
+        attachments, or ``[]`` to disable auto-consume.
         """
         body: dict[str, Any] = {"message": message}
         if attachment_ids is not None:

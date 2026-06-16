@@ -1224,7 +1224,7 @@ class CoordinatorSendResponse(BaseModel):
     attached_ids: list[str] = Field(
         default_factory=list,
         description=(
-            "Attachment ids actually reserved onto this turn. Subset of "
+            "Attachment ids actually attached to this turn. Subset of "
             "the request's `attachment_ids` (or the auto-consumed pending "
             "set). Empty when the send carries no attachments."
         ),

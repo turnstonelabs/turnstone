@@ -20,7 +20,7 @@ fix.
 
 This module owns ONLY the dispatch decision and the
 ``_worker_running`` lifecycle. Per-kind concerns — session resolution,
-attachments reservation, error surfacing, UI callbacks,
+attachment resolution, error surfacing, UI callbacks,
 ``GenerationCancelled`` handling — live in the caller's
 ``enqueue`` / ``run`` no-arg closures.
 """

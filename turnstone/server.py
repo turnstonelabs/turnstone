@@ -1917,8 +1917,9 @@ async def _interactive_create_post_install(
     8. Pin the workstream's routing to this node when no caller-
        supplied ``ws_id`` was provided (direct creates).
     9. Spawn the initial-message worker thread when ``initial_message``
-       is set, reserving any uploaded attachments for that first
-       turn.
+       is set, resolving any staged uploads from the buffer onto that
+       first turn (then draining them so a freshly-opened pane's
+       rehydrate can't observe them as still-pending).
 
     Returns ``{resumed, message_count}`` for the response. On the
     no-resume path both default to ``False`` / ``0``.

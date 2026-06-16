@@ -120,7 +120,7 @@ class AsyncTurnstoneServer(_BaseClient):
         field and one ``file`` part per attachment.  A ws_id is
         auto-generated client-side when not supplied so cluster-routed
         callers can bind the body to the owning node up front.  When
-        *initial_message* is also set, the server reserves the
+        *initial_message* is also set, the server resolves the staged
         attachments onto that turn before its background worker
         dispatches.
         """
