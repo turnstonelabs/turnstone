@@ -39,10 +39,12 @@
 .composer-chip {
   display: inline-flex;
   align-items: center;
+  flex-wrap: wrap;
   gap: 4px;
   font-family: var(--font-mono);
   font-size: 11px;
   padding: 2px 6px;
+  max-width: 340px;
   background: var(--bg-elevated);
   border: 1px solid var(--border);
   border-radius: var(--radius-sm);
@@ -66,10 +68,16 @@
   color: var(--red);
 }
 
-/* --- attachment previews (image/pdf thumbnail · audio player · text snippet) --- */
-.composer-chip {
-  flex-wrap: wrap;
-  max-width: 340px;
+/* --- attachment previews — image/pdf thumbnail + lazy text snippet in the
+   chip; audio plays on the sent message, not the composer chip (see
+   composer_attachments.js).  Shared layout (filename clamp, width caps, the
+   snippet/player dropping to their own row) lives here; per-surface theming of
+   the chip/pill chrome stays in each surface's stylesheet. --- */
+.composer-chip-name {
+  max-width: 180px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 .attach-preview-thumb {
   width: 28px;
@@ -77,26 +85,30 @@
   object-fit: cover;
   border-radius: var(--radius-sm);
   border: 1px solid var(--border);
-  background: var(--bg-base);
-  vertical-align: middle;
+  background: var(--bg-surface);
   flex: 0 0 auto;
 }
 .attach-preview-audio {
   height: 30px;
-  max-width: 240px;
-  vertical-align: middle;
+  max-width: min(240px, 100%);
+  min-width: 0;
   flex: 1 1 auto;
 }
 .attach-preview-snippet {
-  display: inline-block;
+  flex: 1 1 100%;
+  order: 1;
+  margin-top: 2px;
+  max-width: 100%;
   color: var(--fg-dim);
   font-size: 10px;
-  max-width: 240px;
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
-  vertical-align: middle;
-  flex: 1 1 auto;
+}
+.msg-user-attach-pill {
+  flex-wrap: wrap;
+  max-width: 100%;
+  min-width: 0;
 }
 .msg-user-attach-pill .attach-preview-thumb {
   width: 44px;
@@ -104,7 +116,8 @@
 }
 .msg-user-attach-pill .attach-preview-audio {
   height: 32px;
-  max-width: 280px;
+  max-width: min(280px, 100%);
+  flex: 1 1 100%;
 }
 
 .composer-row {

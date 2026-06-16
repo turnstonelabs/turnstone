@@ -45,6 +45,19 @@ Shell harness (?split=): right (default) · down · three · none — boots the
   document.title stamps SPLIT-READY-<visible cells> on success and
   SPLIT-FAILED-<reason> when a driven split was denied — judge the focused
   cell's top accent bar, the separators, and the .shown tab marker.
+Attachments harness (/attachments/livepass.html): the composer attachment
+  chips + the sent-message attachment pills, both driven through the REAL
+  code paths — createAttachmentController.rehydrate() builds the chips and
+  Pane.addUserMessage() builds the pills, so the preview nodes (image/pdf
+  thumbnail, <audio> player, lazy text snippet) render exactly as in
+  production.  Committed fixtures cover every kind plus a long filename;
+  thumbnails + the audio clip are served by an in-process fixture route
+  (--serve only), the text snippet flows through the stubbed authFetch.
+  + &theme=light.  document.title stamps ATTACH-READY-<chips>-<pills> on
+  success, ATTACH-FAILED-c<n>-p<n> when a surface came up empty.  Judge the
+  thumbnail crop/size, the native audio-control fit at the constrained
+  height, the snippet contrast, and how a long filename behaves at the
+  340px chip cap.
 
 Rebuild after ANY markup change: the dialog blocks are embedded at build
 time. Assets are symlinked, so CSS/JS edits are live on refresh.
@@ -590,6 +603,245 @@ SHELL_TEMPLATE = """<!doctype html>
 """
 
 
+# --------------------------------------------------------------------------
+# Attachments harness — the composer attachment chips + the sent-message
+# attachment pills.  Both are driven through the REAL code paths so the preview
+# nodes render exactly as production builds them: createAttachmentController's
+# rehydrate() renders the chips (renderChip -> _applyPreview ->
+# buildAttachmentPreview), and Pane.addUserMessage() renders the pills (which
+# call the same window.buildAttachmentPreview).  The page frame is harness-only
+# chrome and not under review; the chips row and the pill row are.
+# --------------------------------------------------------------------------
+ATTACH_TEMPLATE = """<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>attachments livepass</title>
+    <link rel="stylesheet" href="shared/base.css" />
+    <link rel="stylesheet" href="shared/ui-base.css" />
+    <link rel="stylesheet" href="shared/interactive.css" />
+    <link rel="stylesheet" href="shared/chat.css" />
+    <style>
+      /* Harness-only framing (NOT under review) — gives the two real surfaces
+         a plausible page context at a realistic pane width. */
+      body {
+        padding: 24px; margin: 0; display: flex; flex-direction: column;
+        gap: 28px; background: var(--bg); color: var(--fg);
+        font-family: var(--font-sans, system-ui, sans-serif);
+      }
+      .demo-label {
+        font: 11px var(--font-mono, monospace); color: var(--fg-dim);
+        text-transform: uppercase; letter-spacing: 0.08em; margin-bottom: 8px;
+      }
+      .demo-frame {
+        width: 560px; max-width: 100%; border: 1px solid var(--border);
+        border-radius: var(--radius-sm); overflow: hidden;
+        background: var(--bg-surface);
+      }
+      .messages { padding: 16px; }
+      /* Static composer chrome for context; the chips row is built by the
+         REAL createAttachmentController. */
+      .demo-textarea {
+        width: 100%; min-height: 44px; resize: none; background: var(--bg-elevated);
+        color: var(--fg); border: 1px solid var(--border);
+        border-radius: var(--radius-sm); padding: 8px; font: inherit;
+      }
+    </style>
+  </head>
+  <body>
+    <div>
+      <div class="demo-label">composer — attachment chips (real createAttachmentController)</div>
+      <div class="demo-frame">
+        <div class="composer">
+          <div class="composer-chips" id="chips" role="list" aria-label="Attachments"></div>
+          <div class="composer-row">
+            <textarea class="demo-textarea" placeholder="Message…"></textarea>
+          </div>
+        </div>
+      </div>
+    </div>
+    <div>
+      <div class="demo-label">conversation — sent-message attachment pills (real Pane.addUserMessage)</div>
+      <div class="demo-frame">
+        <div class="messages" id="messages"></div>
+      </div>
+    </div>
+    <div id="toast" role="status" aria-live="polite"></div>
+    <script>
+      // Committed-attachment fixtures (no `uploading`, real ids) — one of every
+      // kind plus a deliberately long filename to probe chip truncation/wrap.
+      window.__ATTACH = [
+        { attachment_id: "att-image", kind: "image",
+          filename: "observatory-dome.jpg", size_bytes: 184320 },
+        { attachment_id: "att-pdf", kind: "pdf",
+          filename: "q2-cluster-report.pdf", size_bytes: 529408 },
+        { attachment_id: "att-audio", kind: "audio",
+          filename: "standup-2026-06-15.m4a", size_bytes: 2202009 },
+        { attachment_id: "att-text", kind: "text",
+          filename: "release-notes-1.7.0a2.md", size_bytes: 4317 },
+        { attachment_id: "att-longname", kind: "text",
+          filename: "a-deliberately-long-attachment-filename-that-truncates.md",
+          size_bytes: 8214 },
+      ];
+      window.__SNIPPET =
+        "# Release notes \\u2014 1.7.0a2\\n\\nN-sample consensus voting lands behind " +
+        "a flag; reranker-primary retrieval replaces RRF as the default; " +
+        "coordinator memory is now keyed per user.";
+      // image/pdf thumbnails + the audio clip load via element .src and are
+      // served by the livepass fixture route; the text snippet is the only
+      // preview that flows through authFetch, so the stub answers .../content.
+      // Held under a private name: auth.js's legacy window bridge
+      // (Object.assign(window, {authFetch})) runs at module-import time and
+      // would clobber a plain window.authFetch — the module reinstates it
+      // below, after the imports have evaluated.
+      window.__attachFetch = function (url) {
+        var path = (url || "").split("?")[0];
+        function reply(ok, body, asText) {
+          return Promise.resolve({
+            ok: ok, status: ok ? 200 : 404,
+            json: function () { return Promise.resolve(body || {}); },
+            text: function () {
+              return Promise.resolve(asText != null ? asText : "");
+            },
+          });
+        }
+        if (/\\/attachments$/.test(path))
+          return reply(true, { attachments: window.__ATTACH });
+        // Any text /content gets the snippet (audio /content is served as
+        // bytes by the fixture route, never through authFetch).
+        if (path.indexOf("/content") !== -1)
+          return reply(true, {}, window.__SNIPPET);
+        return reply(true, {});
+      };
+      window.toast = { error: function (m) { console.log("toast:", m); } };
+    </script>
+    <script type="module">
+      import { createAttachmentController } from "./shared/composer_attachments.js";
+      import { InteractivePane } from "./shared/interactive.js";
+      const q = new URLSearchParams(location.search);
+      if (q.get("theme") === "light")
+        document.documentElement.dataset.theme = "light";
+
+      // Reinstate the fixture fetch now the imports (and auth.js's window
+      // bridge) have run — the pills' buildAttachmentPreview reads
+      // window.authFetch directly for the text snippet.
+      window.authFetch = window.__attachFetch;
+
+      // composer chips — drive the REAL controller.  Pass the stub explicitly
+      // so the chip path never depends on window.authFetch timing.
+      const ctl = createAttachmentController({
+        chipsEl: document.getElementById("chips"),
+        getWsId: () => "demo-ws",
+        authFetch: window.__attachFetch,
+      });
+      await ctl.rehydrate();
+
+      // message pills — drive the REAL Pane.addUserMessage; stub only the
+      // host seams (scroll/empty-state/action-row) that need a mounted pane.
+      const pane = new InteractivePane("demo-ws");
+      pane.messagesEl = document.getElementById("messages");
+      pane.removeEmptyState = () => {};
+      pane._addUserMsgActions = () => {};
+      pane.scrollToBottom = () => {};
+      pane.addUserMessage(
+        "Please review the attached report, the dome photo, the standup " +
+          "recording, and the release notes.",
+        window.__ATTACH.slice(0, 4),
+      );
+
+      // Loud failure — a broken harness must not screenshot green.
+      setTimeout(function () {
+        const chips = document.querySelectorAll("#chips .composer-chip").length;
+        const pills = document.querySelectorAll(
+          "#messages .msg-user-attach-pill",
+        ).length;
+        document.title =
+          chips && pills
+            ? "ATTACH-READY-" + chips + "-" + pills
+            : "ATTACH-FAILED-c" + chips + "-p" + pills;
+      }, 800);
+    </script>
+  </body>
+</html>
+"""
+
+
+# Fixture media for the attachments harness.  image/pdf thumbnails and the
+# audio clip load via element .src (NOT authFetch), so the --serve dev server
+# answers those paths directly with representative bytes: a photo-like image,
+# a document-page-like image for the PDF thumbnail, and a short WAV so the
+# native <audio> control chrome renders against the constrained CSS height.
+_FIXTURE_CACHE: dict[str, bytes] = {}
+
+
+def _png_photo() -> bytes:
+    from io import BytesIO
+
+    from PIL import Image, ImageDraw
+
+    img = Image.new("RGB", (320, 320), (24, 27, 31))
+    d = ImageDraw.Draw(img)
+    for y in range(320):  # warm vertical wash so object-fit crop is legible
+        t = y / 320
+        d.line([(0, y), (320, y)], fill=(int(20 + t * 60), int(18 + t * 40), int(26 + t * 70)))
+    d.ellipse([180, 36, 300, 156], fill=(229, 160, 66))  # amber "sun"
+    d.polygon([(0, 320), (130, 170), (250, 320)], fill=(38, 66, 58))  # hill
+    buf = BytesIO()
+    img.save(buf, "PNG")
+    return buf.getvalue()
+
+
+def _png_page() -> bytes:
+    from io import BytesIO
+
+    from PIL import Image, ImageDraw
+
+    img = Image.new("RGB", (320, 414), (250, 250, 248))  # paper white, A4-ish
+    d = ImageDraw.Draw(img)
+    d.rectangle([0, 0, 320, 9], fill=(140, 94, 27))  # header rule
+    y = 30
+    for i, w in enumerate([260, 240, 280, 200, 250, 230, 270, 180, 255, 210, 240]):
+        shade = (40, 44, 54) if i == 0 else (150, 154, 164)
+        d.rectangle([28, y, 28 + w, y + 10], fill=shade)
+        y += 30
+    buf = BytesIO()
+    img.save(buf, "PNG")
+    return buf.getvalue()
+
+
+def _wav() -> bytes:
+    import math
+    import struct
+    import wave
+    from io import BytesIO
+
+    buf = BytesIO()
+    frames = b"".join(
+        struct.pack("<h", int(2600 * math.sin(2 * math.pi * 440 * i / 8000))) for i in range(8000)
+    )
+    with wave.open(buf, "wb") as w:
+        w.setnchannels(1)
+        w.setsampwidth(2)
+        w.setframerate(8000)
+        w.writeframes(frames)
+    return buf.getvalue()
+
+
+def _fixture_for(path: str) -> tuple[bytes, str] | None:
+    """Map a media request path to (bytes, content-type), or None to fall through."""
+    if path.endswith("/thumbnail"):
+        key = "page" if "att-pdf" in path else "photo"
+        if key not in _FIXTURE_CACHE:
+            _FIXTURE_CACHE[key] = _png_page() if key == "page" else _png_photo()
+        return _FIXTURE_CACHE[key], "image/png"
+    if path.endswith("/content") and "att-audio" in path:
+        if "wav" not in _FIXTURE_CACHE:
+            _FIXTURE_CACHE["wav"] = _wav()
+        return _FIXTURE_CACHE["wav"], "audio/wav"
+    return None
+
+
 def build(out: Path) -> None:
     ui = out / "ui"
     con = out / "console"
@@ -625,6 +877,12 @@ def build(out: Path) -> None:
     (sh / "livepass.html").write_text(SHELL_TEMPLATE, encoding="utf-8")
     print(f"{sh}/livepass.html — split-view shell surface")
 
+    att = out / "attachments"
+    att.mkdir(parents=True, exist_ok=True)
+    symlink(att / "shared", ROOT / "turnstone/shared_static")
+    (att / "livepass.html").write_text(ATTACH_TEMPLATE, encoding="utf-8")
+    print(f"{att}/livepass.html — composer chips + message attachment pills")
+
 
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
@@ -636,7 +894,23 @@ def main() -> None:
         import functools
         import http.server
 
-        handler = functools.partial(http.server.SimpleHTTPRequestHandler, directory=str(args.out))
+        class _FixtureHandler(http.server.SimpleHTTPRequestHandler):
+            # The attachments harness loads thumbnails + the audio clip via
+            # element .src; serve those from generated fixtures, fall through
+            # to static for everything else.
+            def do_GET(self) -> None:  # noqa: N802 (stdlib casing)
+                blob = _fixture_for(self.path.split("?")[0])
+                if blob is None:
+                    super().do_GET()
+                    return
+                data, ctype = blob
+                self.send_response(200)
+                self.send_header("Content-Type", ctype)
+                self.send_header("Content-Length", str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+
+        handler = functools.partial(_FixtureHandler, directory=str(args.out))
         print(f"serving {args.out} on http://localhost:{args.serve}/ — Ctrl+C stops")
         http.server.ThreadingHTTPServer(("127.0.0.1", args.serve), handler).serve_forever()
 

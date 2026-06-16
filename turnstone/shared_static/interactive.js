@@ -369,8 +369,7 @@ class Pane {
       const attachWsId = this.wsId;
       attachments.forEach(function (a) {
         const pill = document.createElement("span");
-        pill.className =
-          "msg-user-attach-pill msg-user-attach-pill-" + (a.kind || "other");
+        pill.className = "msg-user-attach-pill";
         const icon = document.createElement("span");
         icon.className = "msg-user-attach-icon";
         icon.setAttribute("aria-hidden", "true");
@@ -397,6 +396,7 @@ class Pane {
                 kind: a.kind,
                 wsId: attachWsId,
                 attachmentId: a.attachment_id,
+                filename: a.filename,
               })
             : null;
         if (prev) {
