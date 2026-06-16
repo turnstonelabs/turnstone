@@ -34,6 +34,15 @@ _ROLE_CAPABILITY: dict[str, str] = {
     "tts": "supports_speech_synthesis",
 }
 
+# Providers whose client speaks the OpenAI-SDK surface audio.py relies on
+# (``client.audio.*`` for the transcription/speech endpoints, ``client.chat.
+# completions.*`` with ``input_audio`` for the omni chat path).  Anthropic and
+# anthropic-compatible (e.g. a vLLM Messages-API endpoint) use a different SDK
+# whose protocol has NO audio content block, so they can't serve audio in ANY
+# role — gated out here.  Mirrors the OpenAI-lane split in
+# turnstone.core.providers and the JS ``_providerCarriesAudio`` in admin.js.
+_AUDIO_SDK_PROVIDERS: frozenset[str] = frozenset({"openai", "openai-compatible", "google", "xai"})
+
 # Known-model-name hints for capability inference. The explicit
 # ``capabilities`` flag is ALWAYS canonical (see ``model_supports_role``); these
 # only fill the gap so a stock OpenAI audio model alias works without an
@@ -113,14 +122,24 @@ def _infer_audio_capability(model: str, role: str) -> bool:
     return any(hint in name for hint in _AUDIO_MODEL_HINTS.get(role, ()))
 
 
+def _provider_carries_audio(cfg: Any) -> bool:
+    """Whether the alias's provider can carry audio over the OpenAI-SDK surface."""
+    return getattr(cfg, "provider", "openai") in _AUDIO_SDK_PROVIDERS
+
+
 def model_supports_role(cfg: Any, role: str) -> bool:
     """Whether the alias's model is eligible for a media *role*.
 
     Explicit ``capabilities[<flag>]`` wins; otherwise fall back to a
-    known-model-name inference for OpenAI audio models.
+    known-model-name inference for OpenAI audio models.  Either way the
+    provider must speak the OpenAI-SDK audio surface (see
+    :data:`_AUDIO_SDK_PROVIDERS`) — an Anthropic(-compatible) model can't carry
+    audio in any role even if a capability flag is ticked.
     """
     flag = _ROLE_CAPABILITY.get(role)
     if not flag:
+        return False
+    if not _provider_carries_audio(cfg):
         return False
     caps = getattr(cfg, "capabilities", None) or {}
     # An omni model (accepts audio in chat) can serve STT via the chat
@@ -215,6 +234,16 @@ def transcribe(
         client, model, cfg = registry.resolve(alias)
     except Exception as exc:  # unknown/removed alias
         raise AudioUnavailableError(f"STT model alias {alias!r} is not available") from exc
+    # Defence in depth: resolve_role_alias already gates this, but a stale
+    # config or a direct caller could still point STT at a non-OpenAI-SDK
+    # provider (Anthropic has no audio surface).  Fail with an actionable
+    # message instead of an opaque ``'Anthropic' object has no attribute 'chat'``.
+    if not _provider_carries_audio(cfg):
+        raise AudioUnavailableError(
+            f"STT model alias {alias!r} (provider "
+            f"{getattr(cfg, 'provider', 'unknown')!r}) can't transcribe audio — "
+            "audio roles require an OpenAI-compatible provider."
+        )
     caps = getattr(cfg, "capabilities", None) or {}
     endpoint = _serves_transcription_endpoint(cfg, model)
     if not endpoint and not caps.get("supports_audio_input"):
