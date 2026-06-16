@@ -181,14 +181,20 @@ def sniff_audio_mime(data: bytes) -> str | None:
     if data[:4] == b"fLaC":
         return "audio/flac"
     # ISO-BMFF: the ``ftyp`` box is shared by MP4/MOV *video* and M4A/M4B
-    # *audio*.  Accept only audio brands (major, or an audio brand in the
-    # compatible-brands list) so a video file can't masquerade as audio.
-    if data[4:8] == b"ftyp" and (
-        data[8:12] in (b"M4A ", b"M4B ", b"F4A ", b"F4B ")
-        or b"M4A " in data[16:40]
-        or b"M4B " in data[16:40]
-    ):
-        return "audio/mp4"
+    # *audio*.  Accept only when an audio brand is the major brand or appears
+    # anywhere in the compatible-brands list — scan the whole ftyp box (its
+    # length is the big-endian uint32 at data[0:4]) so a real .m4a with the
+    # audio brand listed late still passes; a pure-video file carries none.  A
+    # generic-MP4 (isom/mp42) audio stream with no audio brand is
+    # indistinguishable from video by magic bytes alone, so it falls through
+    # (rejected) rather than risk passing a video off as audio.
+    if data[4:8] == b"ftyp":
+        box_end = int.from_bytes(data[0:4], "big")
+        if not 16 <= box_end <= len(data):
+            box_end = len(data)
+        brands = data[8:box_end]  # major brand (8:12) + compatible brands (16:end)
+        if any(b in brands for b in (b"M4A ", b"M4B ", b"F4A ", b"F4B ")):
+            return "audio/mp4"
     if data[:4] == b"\x1aE\xdf\xa3":
         return "audio/webm"
     return None

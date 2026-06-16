@@ -2969,7 +2969,9 @@ class ChatSession:
         # re-rasterized / a blob re-base64'd once per round-trip.  Key on
         # (id, caps-signature): the same stored blob materializes differently per
         # capability set, and a fallback to a different-caps model can resolve
-        # within one send.  ``cache`` is None outside a send → original behavior.
+        # within one send.  The cache is refreshed per send (set in send()); the
+        # wire resolver runs only during a send, so a stale value between sends is
+        # never read.  A None cache disables memoization (the original behavior).
         cache = self._wire_part_cache
         caps_sig = (caps.supports_pdf, caps.supports_vision, caps.supports_audio_input)
         out: dict[str, Any] = {}
