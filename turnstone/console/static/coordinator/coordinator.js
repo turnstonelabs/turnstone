@@ -778,13 +778,38 @@ function createCoordinatorPane(root, wsId, opts) {
       const icon = document.createElement("span");
       icon.className = "msg-user-attach-icon";
       icon.setAttribute("aria-hidden", "true");
-      icon.textContent = kind === "image" ? "🖼" : "📄";
+      icon.textContent =
+        typeof window.kindIcon === "function"
+          ? window.kindIcon(kind)
+          : kind === "image"
+            ? "🖼"
+            : kind === "audio"
+              ? "🎵"
+              : "📄";
       pill.appendChild(icon);
       const name = document.createElement("span");
       name.className = "msg-user-attach-name";
       name.textContent =
-        (a && a.filename) || (kind === "image" ? "image" : "document");
+        (a && a.filename) ||
+        (kind === "image" ? "image" : kind === "audio" ? "audio" : "document");
       pill.appendChild(name);
+      // Inline preview (image/pdf thumbnail, audio player) — the same affordance
+      // the interactive pane renders, shared via the buildAttachmentPreview
+      // window bridge composer_attachments.js installs.  No-ops on history
+      // replay (the /history projection omits attachment_id), matching interactive.
+      const prev =
+        typeof window.buildAttachmentPreview === "function"
+          ? window.buildAttachmentPreview({
+              kind: kind,
+              wsId: wsId,
+              attachmentId: a && a.attachment_id,
+              filename: a && a.filename,
+            })
+          : null;
+      if (prev) {
+        if (kind === "image" || kind === "pdf") icon.replaceWith(prev);
+        else pill.appendChild(prev);
+      }
       pills.appendChild(pill);
     });
     el.appendChild(pills);

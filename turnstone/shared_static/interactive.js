@@ -37,7 +37,10 @@ import {
 import { authFetch } from "./auth.js";
 import { showToast } from "./toast.js";
 import { Composer } from "./composer.js";
-import { createAttachmentController } from "./composer_attachments.js";
+import {
+  createAttachmentController,
+  kindIcon,
+} from "./composer_attachments.js";
 import { createQueueController } from "./composer_queue.js";
 import { StatusBar } from "./status_bar.js";
 import { streamingRender, streamingRenderFinalize } from "./renderer.js";
@@ -373,12 +376,7 @@ class Pane {
         const icon = document.createElement("span");
         icon.className = "msg-user-attach-icon";
         icon.setAttribute("aria-hidden", "true");
-        icon.textContent =
-          a.kind === "image"
-            ? "\ud83d\uddbc"
-            : a.kind === "audio"
-              ? "\ud83c\udfb5"
-              : "\ud83d\udcc4";
+        icon.textContent = kindIcon(a.kind);
         pill.appendChild(icon);
         const nameEl = document.createElement("span");
         nameEl.className = "msg-user-attach-name";
