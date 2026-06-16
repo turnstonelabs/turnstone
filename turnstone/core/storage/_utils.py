@@ -410,11 +410,15 @@ def _reconstruct_attachment_refs(
     if not attachments_by_msg or row_id is None:
         return refs, meta
     for att in attachments_by_msg.get(row_id, []):
-        # AttachmentRef.kind is the by-reference content kind ('image' |
-        # 'document'); the stored blob kind ('image' | 'text') drives the actual
-        # resolution.  'document' (not 'text') keeps the placeholder type from
-        # colliding with a real text content part on the dict round-trip.
-        ref_kind = "image" if str(att.get("kind") or "") == "image" else "document"
+        # AttachmentRef.kind is the by-reference placeholder kind: the stored
+        # blob kind verbatim for image / pdf / audio, else 'document' for a
+        # stored 'text' blob (so the placeholder type can't collide with a real
+        # text content part on the dict round-trip).  The blob kind drives the
+        # actual resolution; preserving pdf / audio here keeps the reloaded
+        # placeholder type ({type:pdf} / {type:audio}) consistent with the live
+        # injection path, which already emits those.
+        kind_str = str(att.get("kind") or "")
+        ref_kind = kind_str if kind_str in ("image", "pdf", "audio") else "document"
         refs.append(
             AttachmentRef(
                 attachment_id=str(att.get("attachment_id") or ""),
