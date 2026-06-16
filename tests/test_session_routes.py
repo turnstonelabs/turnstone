@@ -120,10 +120,10 @@ def test_rewind_retry_register_before_bare_detail() -> None:
     assert "POST" in by_path["/api/workstreams/{ws_id}/retry"]
 
 
-def test_attachment_routes_mount_when_quartet_provided() -> None:
-    """All four attachment routes mount when ``handlers.attachments``
-    is non-``None`` — the type system requires the four-handler
-    quartet to be set together."""
+def test_attachment_routes_mount_when_quintet_provided() -> None:
+    """All five attachment routes mount when ``handlers.attachments``
+    is non-``None`` — the type system requires the five-handler
+    set to be provided together."""
     routes: list[Any] = []
     register_session_routes(
         routes,
@@ -135,6 +135,10 @@ def test_attachment_routes_mount_when_quartet_provided() -> None:
     assert ("/api/workstreams/{ws_id}/attachments", frozenset({"GET", "HEAD"})) in paths
     assert (
         "/api/workstreams/{ws_id}/attachments/{attachment_id}/content",
+        frozenset({"GET", "HEAD"}),
+    ) in paths
+    assert (
+        "/api/workstreams/{ws_id}/attachments/{attachment_id}/thumbnail",
         frozenset({"GET", "HEAD"}),
     ) in paths
     assert (

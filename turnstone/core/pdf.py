@@ -70,6 +70,12 @@ def extract_pdf_text(data: bytes) -> str:
 # than text).  Re-run per wire build — same no-cache rationale as extract_pdf_text.
 _MAX_RASTER_PAGES = 10
 
+# Clamp the rendered bitmap's longest side.  A PDF MediaBox may be up to
+# 14400pt; at scale 2.0 that page renders to ~28800px (a multi-GB bitmap), so an
+# attacker-supplied PDF could OOM the render thread.  Page *count* is bounded
+# above; this bounds per-page *area*.
+_MAX_RENDER_PX = 2000
+
 
 def rasterize_pdf(
     data: bytes, *, max_pages: int = _MAX_RASTER_PAGES, scale: float = 2.0
@@ -94,7 +100,16 @@ def rasterize_pdf(
             if i >= max_pages:
                 page.close()
                 break
-            bitmap = page.render(scale=scale)
+            # Clamp scale per page so the longest rendered side <= _MAX_RENDER_PX;
+            # a normal page (<=~800pt) is unaffected, a giant MediaBox is shrunk.
+            eff_scale = scale
+            try:
+                longest_pt = max(page.get_size())
+                if longest_pt > 0:
+                    eff_scale = min(scale, _MAX_RENDER_PX / longest_pt)
+            except Exception:
+                eff_scale = min(scale, 1.0)  # can't size the page → render small
+            bitmap = page.render(scale=eff_scale)
             buf = io.BytesIO()
             bitmap.to_pil().save(buf, format="PNG")
             pages.append(buf.getvalue())
