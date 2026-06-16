@@ -1892,8 +1892,9 @@ async def create_workstream(request: Request) -> JSONResponse:
         if uploaded_files:
             # Re-frame for the node: create metadata rides one ``meta`` JSON
             # field, each blob a ``file`` part — the shape the node's
-            # read_multipart_create_or_400 expects.  ``user_id`` in the meta is
-            # honoured because the proxy auth header marks a ``console`` source.
+            # read_multipart_create_or_400 expects.  ``ws_body`` already carries
+            # the authenticated user's uid (set above, as on the JSON path); the
+            # caller-supplied meta never overrides the owner.
             files_payload = [("file", (fn, data, ctype)) for (fn, ctype, data) in uploaded_files]
             resp = await client.post(
                 node_url,
