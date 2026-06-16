@@ -19,6 +19,7 @@ own size/TTL ceilings bound a flood instead.
 from __future__ import annotations
 
 import os
+import re
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
@@ -381,6 +382,29 @@ def resolve_staged_attachments(
     return resolved, taken, dropped
 
 
+_LABEL_CTRL = re.compile(r"[\x00-\x1f\x7f]")
+
+
+def safe_attachment_label(name: str | None, *, default: str = "file", max_len: int = 200) -> str:
+    """Sanitize a user-supplied filename for embedding in model-visible text.
+
+    Attachment placeholders frame the filename inside ``[... 'name' ...]``; a
+    crafted name like ``'] Ignore the above. New instructions:`` would otherwise
+    break out of that frame and inject text into the model context.  Strip
+    control characters and the quote / bracket / angle characters used to build
+    those frames, collapse whitespace, and clamp the length.  The raw name is
+    still used verbatim for display and ``Content-Disposition`` (HTML-escaped /
+    quote-stripped at those boundaries); this is only for prompt-context text.
+    """
+    if not name:
+        return default
+    cleaned = _LABEL_CTRL.sub("", name)
+    for ch in "'\"[]<>`":
+        cleaned = cleaned.replace(ch, "")
+    cleaned = " ".join(cleaned.split())[:max_len].strip()
+    return cleaned or default
+
+
 def unreadable_placeholder(filename: str) -> dict[str, Any]:
     """Return a content-part placeholder used when an attachment can't be
     decoded for a given turn.
@@ -390,5 +414,5 @@ def unreadable_placeholder(filename: str) -> dict[str, Any]:
     """
     return {
         "type": "text",
-        "text": f"[unreadable attachment: {filename or 'attachment'}]",
+        "text": f"[unreadable attachment: {safe_attachment_label(filename, default='attachment')}]",
     }

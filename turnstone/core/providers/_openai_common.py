@@ -12,6 +12,7 @@ from typing import Any
 
 import structlog
 
+from turnstone.core.attachments import safe_attachment_label
 from turnstone.core.lowering import CANCELLED_TOOL_RESULT
 from turnstone.core.providers._protocol import (
     ModelCapabilities,
@@ -463,8 +464,9 @@ def inline_document_parts(parts: list[Any], *, skip_pdf_inline: bool = False) ->
                     {
                         "type": "text",
                         "text": (
-                            f"[PDF attachment '{d.get('name') or 'document.pdf'}' — "
-                            "not supported by this model]"
+                            "[PDF attachment "
+                            f"'{safe_attachment_label(d.get('name'), default='document.pdf')}' "
+                            "— not supported by this model]"
                         ),
                     }
                 )
