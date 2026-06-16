@@ -94,6 +94,18 @@ class TestCapabilityTable:
         assert lookup_grok_capabilities("grok-x-unreleased") is _GROK_DEFAULT
         assert lookup_grok_capabilities("") is _GROK_DEFAULT
 
+    def test_pdf_stays_a_rasterize_fallback(self) -> None:
+        # supports_pdf is intentionally False on every Grok row: xAI's document
+        # support is an agentic attachment_search workflow over Files-API uploads
+        # (file_id / file_url), not the inline base64 document ingestion our
+        # native path emits — so Grok PDFs take the rasterize-to-vision fallback.
+        # Flipping this without wiring the Files-API upload flow would send xAI a
+        # wire shape it can't read; see the note above GROK_CAPABILITIES in
+        # _xai.py and docs.x.ai/developers/model-capabilities/files/chat-with-files.
+        for caps in GROK_CAPABILITIES.values():
+            assert caps.supports_pdf is False
+        assert _GROK_DEFAULT.supports_pdf is False
+
 
 # ---------------------------------------------------------------------------
 # resolve_server_side_tools — legacy supports_web_search fold
