@@ -159,9 +159,10 @@ def sniff_pdf_mime(data: bytes) -> str | None:
 def sniff_audio_mime(data: bytes) -> str | None:
     """Return a canonical audio MIME type by inspecting magic bytes.
 
-    Covers WAV, MP3 (ID3 tag or MPEG frame sync), OGG, FLAC, ISO-BMFF
-    (m4a / mp4 audio), and WebM/Matroska.  Returns ``None`` on no match — the
-    client-provided ``Content-Type`` is never trusted alone.
+    Covers WAV, MP3 (ID3 tag or MPEG frame sync), AAC (ADTS), OGG, FLAC,
+    ISO-BMFF audio (m4a / m4b — video brands like mp4 / mov are rejected), and
+    WebM/Matroska.  Returns ``None`` on no match — the client-provided
+    ``Content-Type`` is never trusted alone.
     """
     if len(data) < 12:
         return None
@@ -169,11 +170,23 @@ def sniff_audio_mime(data: bytes) -> str | None:
         return "audio/wav"
     if data[:3] == b"ID3" or data[:2] in (b"\xff\xfb", b"\xff\xf3", b"\xff\xf2"):
         return "audio/mpeg"
+    # ADTS AAC frame sync (0xFFF...): 0xF1 = MPEG-4, 0xF9 = MPEG-2 (no CRC).
+    # Distinct from the MP3 syncs above (FB/F3/F2).  audio/aac is allowed +
+    # format-mapped but was never sniffed, so a raw .aac upload always failed.
+    if data[:2] in (b"\xff\xf1", b"\xff\xf9"):
+        return "audio/aac"
     if data[:4] == b"OggS":
         return "audio/ogg"
     if data[:4] == b"fLaC":
         return "audio/flac"
-    if data[4:8] == b"ftyp":
+    # ISO-BMFF: the ``ftyp`` box is shared by MP4/MOV *video* and M4A/M4B
+    # *audio*.  Accept only audio brands (major, or an audio brand in the
+    # compatible-brands list) so a video file can't masquerade as audio.
+    if data[4:8] == b"ftyp" and (
+        data[8:12] in (b"M4A ", b"M4B ", b"F4A ", b"F4B ")
+        or b"M4A " in data[16:40]
+        or b"M4B " in data[16:40]
+    ):
         return "audio/mp4"
     if data[:4] == b"\x1aE\xdf\xa3":
         return "audio/webm"

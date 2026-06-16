@@ -28,6 +28,12 @@ MP3_SYNC = b"\xff\xfb\x90\x00" + b"\x00" * 8
 OGG = b"OggS\x00\x02" + b"\x00" * 8
 FLAC = b"fLaC\x00\x00\x00\x22" + b"\x00" * 8
 M4A = b"\x00\x00\x00\x20ftypM4A \x00\x00\x00\x00"
+# Major brand mp42 but M4A in the compatible-brands list (common for real .m4a).
+M4A_COMPAT = b"\x00\x00\x00\x20ftypmp42\x00\x00\x00\x00M4A mp42isom"
+# ISO-BMFF *video* / MOV share the ftyp box — must NOT sniff as audio.
+MP4_VIDEO = b"\x00\x00\x00\x20ftypisom\x00\x00\x02\x00isomiso2avc1mp41"
+MOV_VIDEO = b"\x00\x00\x00\x14ftypqt  \x00\x00\x00\x00qt  \x00\x00\x00\x00"
+AAC_ADTS = b"\xff\xf1" + b"\x00" * 10
 WEBM = b"\x1aE\xdf\xa3" + b"\x00" * 8
 PNG = b"\x89PNG\r\n\x1a\n" + b"\x00" * 8
 
@@ -53,11 +59,16 @@ class TestSniffAudio:
         assert sniff_audio_mime(OGG) == "audio/ogg"
         assert sniff_audio_mime(FLAC) == "audio/flac"
         assert sniff_audio_mime(M4A) == "audio/mp4"
+        assert sniff_audio_mime(M4A_COMPAT) == "audio/mp4"
+        assert sniff_audio_mime(AAC_ADTS) == "audio/aac"
         assert sniff_audio_mime(WEBM) == "audio/webm"
 
     def test_rejects_non_audio(self) -> None:
         assert sniff_audio_mime(PNG) is None
         assert sniff_audio_mime(PDF) is None
+        # ISO-BMFF video / MOV share the ftyp box but must not pass as audio.
+        assert sniff_audio_mime(MP4_VIDEO) is None
+        assert sniff_audio_mime(MOV_VIDEO) is None
 
     def test_too_short(self) -> None:
         assert sniff_audio_mime(b"RIFF") is None
