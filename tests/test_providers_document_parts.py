@@ -19,6 +19,9 @@ from turnstone.core.providers._openai_common import (
     sanitize_messages,
 )
 from turnstone.core.providers._openai_responses import (
+    OpenAIResponsesProvider,
+)
+from turnstone.core.providers._openai_responses import (
     convert_content_parts as _responses_convert_content_parts,
 )
 
@@ -414,6 +417,34 @@ class TestOpenAIResponsesPdfAndAudio:
             }
         ]
 
+    def test_convert_messages_pdf_reaches_input_file_end_to_end(self) -> None:
+        # End-to-end regression: the isolated test above masked a real bug.
+        # _convert_messages runs sanitize_messages BEFORE convert_content_parts;
+        # sanitize must skip PDF inlining on this lane so the document survives
+        # to the native input_file translator instead of being downgraded to an
+        # unsupported-placeholder.
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "read this"},
+                    _pdf_part(name="r.pdf"),
+                ],
+            }
+        ]
+        _, items = OpenAIResponsesProvider._convert_messages(messages)
+        user = next(it for it in items if it.get("role") == "user")
+        file_items = [p for p in user["content"] if p.get("type") == "input_file"]
+        assert file_items == [
+            {
+                "type": "input_file",
+                "filename": "r.pdf",
+                "file_data": f"data:application/pdf;base64,{_PDF_B64}",
+            }
+        ]
+        # It must NOT have been downgraded to a placeholder.
+        assert not any("not supported" in p.get("text", "") for p in user["content"])
+
     def test_audio_becomes_placeholder(self) -> None:
         out = _responses_convert_content_parts([_audio_part()])
         assert out[0]["type"] == "input_text"
@@ -440,6 +471,28 @@ class TestCompatLanePdfAndAudio:
         msgs = [{"role": "user", "content": [{"type": "text", "text": "hi"}, _audio_part()]}]
         out = sanitize_messages(msgs)
         assert out[0]["content"][1] == _audio_part()
+
+    def test_sanitize_keeps_pdf_placeholder_by_default(self) -> None:
+        # The Chat / Google-compat lane has no native PDF block, so the default
+        # (skip_pdf_inline=False) must still replace the PDF with the
+        # unsupported-placeholder — never leak base64 into a <document> blob.
+        msgs = [{"role": "user", "content": [_pdf_part(name="r.pdf")]}]
+        out = sanitize_messages(msgs)
+        parts = out[0]["content"]
+        assert len(parts) == 1
+        assert parts[0]["type"] == "text"
+        assert "not supported" in parts[0]["text"]
+        assert _PDF_B64 not in parts[0]["text"]
+
+    def test_sanitize_skip_pdf_inline_preserves_document(self) -> None:
+        # The Responses lane opt-out: the PDF document part passes through
+        # sanitize untouched so its native translator can emit input_file.
+        msgs = [{"role": "user", "content": [_pdf_part(name="r.pdf")]}]
+        out = sanitize_messages(msgs, skip_pdf_inline=True)
+        parts = out[0]["content"]
+        assert len(parts) == 1
+        assert parts[0]["type"] == "document"
+        assert parts[0]["document"]["media_type"] == "application/pdf"
 
 
 class TestProviderPdfCapabilities:
