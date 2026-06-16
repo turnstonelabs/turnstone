@@ -1261,10 +1261,10 @@ CONSOLE_ENDPOINTS: list[EndpointSpec] = [
         "Queue a user message onto the coordinator session",
         description=(
             "Worker thread picks up the message via the session's queue. "
-            "Optional ``attachment_ids`` reserve attachments under the "
-            "message's send_id token (parity with the interactive surface). "
+            "Optional ``attachment_ids`` select staged uploads to attach to "
+            "the message (parity with the interactive surface). "
             "Response carries ``attached_ids`` / ``dropped_attachment_ids`` "
-            "so callers can detect partial reservations and ``priority`` / "
+            "so callers can detect partial attaches and ``priority`` / "
             "``msg_id`` on the queued path. "
             "``status: queue_full`` when the worker queue is full — caller "
             "should back off."
@@ -1284,7 +1284,7 @@ CONSOLE_ENDPOINTS: list[EndpointSpec] = [
             "the interactive surface: magic-byte image sniff, UTF-8 text "
             "decode, per-kind size cap, per-(ws,user) pending cap. "
             "Attachments stay pending until a subsequent ``/send`` "
-            "reserves them under its ``send_id`` token."
+            "attaches them to a message."
         ),
         response_model=UploadAttachmentResponse,
         error_codes=[400, 403, 404, 409, 413, 503],

@@ -3408,8 +3408,8 @@ async def _coord_create_post_install(
     Wired onto :attr:`SessionEndpointConfig.create_post_install`. When
     an ``initial_message`` is provided, dispatches via
     :meth:`CoordinatorAdapter.send`; any uploaded ``attachment_ids``
-    are reserved onto the same ``send_id`` token so the worker's
-    first turn picks them up exactly the way interactive's
+    are resolved from the buffer onto the first turn (and drained) so
+    the worker picks them up exactly the way interactive's
     ``post_install`` worker thread does.
 
     Returns ``{}`` — coord's response carries only the always-include

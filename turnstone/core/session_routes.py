@@ -327,7 +327,7 @@ class SessionEndpointConfig:
     Capability flags (added with the P1.5 ``send`` body lift):
 
     - ``supports_attachments``: when ``True``, the lifted ``send``
-      handler resolves attachment_ids, reserves under a send_id token,
+      handler resolves attachment_ids from the per-node upload buffer
       and threads them through ``ChatSession.send`` /
       ``ChatSession.queue_message``. Both kinds wire ``True`` post-P1.5
       (the storage layer was always kind-agnostic; the gate stays
@@ -2065,8 +2065,8 @@ def make_create_handler(
       the lifted body parses multipart bodies on coord and saves
       attachments through the kind-agnostic storage layer (§ Post-P3
       reckoning item #1). When the same request supplies an
-      ``initial_message``, the uploads are reserved onto the
-      dispatched first turn via ``CoordinatorAdapter.send`` (which
+      ``initial_message``, the uploads are resolved from the buffer onto
+      the dispatched first turn via ``CoordinatorAdapter.send`` (which
       gained ``attachments`` + ``send_id`` kwargs in the same
       release).
     - **No phantom create→close pair on coord rollback.** The lifted
@@ -3416,9 +3416,9 @@ def make_send_handler(cfg: SessionEndpointConfig) -> Handler:
     Capability flags on ``cfg`` toggle the kind-specific behaviour:
 
     - ``supports_attachments``: when ``False``, the entire
-      attachment-resolution block (reservation, fetch, scope-check)
+      attachment-resolution block (buffer peek + scope-check)
       short-circuits and any ``attachment_ids`` in the body are
-      silently ignored — no reservation, no error. Both kinds wire
+      silently ignored — no resolution, no error. Both kinds wire
       ``True`` post-P1.5; the flag exists so a kind that hasn't
       lit up its UI surface yet can defer.
     - ``spawn_metrics``: when set, fires once on the spawn path with
@@ -3490,8 +3490,8 @@ def make_send_handler(cfg: SessionEndpointConfig) -> Handler:
         # ----- Attachment resolution (from the per-node upload buffer) -----
         send_id = ""
         requested_ids: list[str] = []
-        ordered_reserved: list[str] = []
-        reserved_set: set[str] = set()
+        ordered_taken: list[str] = []
+        taken_set: set[str] = set()
         resolved_atts: list[Any] = []
         attach_user_id = ""
 
@@ -3524,18 +3524,10 @@ def make_send_handler(cfg: SessionEndpointConfig) -> Handler:
             # turn the queue rejects can still be retried; the committing
             # ``send`` drains them at write time.  ``resolved`` carries the
             # bytes the session persists content-addressed.
-            resolved_atts, ordered_reserved, _dropped_resolve = resolve_staged_attachments(
+            resolved_atts, ordered_taken, _dropped_resolve = resolve_staged_attachments(
                 requested_ids, ws_id, attach_user_id
             )
-            reserved_set = set(ordered_reserved)
-
-        def _release_reservation_on_fail() -> None:
-            """No-op: the upload buffer is a peek, not a lock.
-
-            Retained as the worker-failure hook so the call sites below read
-            the same as the pre-cutover reservation flow; there is nothing to
-            release — undrained staged bytes simply expire on the buffer TTL.
-            """
+            taken_set = set(ordered_taken)
 
         # If a cancel was just issued, briefly poll for the worker to
         # exit before dispatching — avoids spawning into a stale
@@ -3548,7 +3540,6 @@ def make_send_handler(cfg: SessionEndpointConfig) -> Handler:
                 if not ws._worker_running:
                     break
         if ws.session is None:
-            _release_reservation_on_fail()
             return JSONResponse({"error": "No session"}, status_code=500)
 
         session = ws.session
@@ -3560,7 +3551,7 @@ def make_send_handler(cfg: SessionEndpointConfig) -> Handler:
             try:
                 cleaned, priority, msg_id = session.queue_message(
                     message,
-                    attachment_ids=list(ordered_reserved),
+                    attachment_ids=list(ordered_taken),
                     queue_msg_id=send_id or None,
                 )
             except AttachmentsNotQueueableError:
@@ -3606,16 +3597,13 @@ def make_send_handler(cfg: SessionEndpointConfig) -> Handler:
                 # Safety net — send() normally handles this internally.
                 # If this thread was force-abandoned, ws.worker_thread
                 # was set to None — don't emit spurious events.
-                _release_reservation_on_fail()
                 if ws.worker_thread is me:
                     _emit_ui("on_stream_end")
                     _emit_ui("on_state_change", "idle")
             except Exception:
-                # Release the reservation so attachments don't stay
-                # soft-locked forever on a worker crash before the
-                # consume step. Idempotent: once consume cleared the
-                # token, a follow-up unreserve is a no-op.
-                _release_reservation_on_fail()
+                # Undrained staged uploads aren't locked (the buffer is a peek,
+                # not a reservation) — they expire on the buffer TTL — so the
+                # only cleanup owed here is the UI streaming hook.
                 if ws.worker_thread is me:
                     # ``session.send()`` already fired ``on_error``
                     # (with sanitized text), persisted ``last_error``,
@@ -3634,12 +3622,10 @@ def make_send_handler(cfg: SessionEndpointConfig) -> Handler:
         )
         if not ok:
             # queue.Full or session-disappeared race — surface as
-            # queue_full so clients retry rather than 500. Reservations
-            # released above; ``attached_ids`` is always empty on this
-            # path (the dispatch never took ownership). The empty
-            # arrays preserve the response-shape guarantee so SDK
-            # consumers don't branch on status.
-            _release_reservation_on_fail()
+            # queue_full so clients retry rather than 500. ``attached_ids``
+            # is always empty on this path (the dispatch never took
+            # ownership); the empty arrays preserve the response-shape
+            # guarantee so SDK consumers don't branch on status.
             return JSONResponse(
                 {
                     "status": "queue_full",
@@ -3651,9 +3637,8 @@ def make_send_handler(cfg: SessionEndpointConfig) -> Handler:
         if queue_outcome.get("rejected") == "attachments_busy":
             # Attachments can't ride a queued user turn (see
             # AttachmentsNotQueueableError for the role-ordering reason).
-            # Release reservations and surface to the caller so the
+            # The staged uploads stay in the buffer (peek, not drain) so the
             # client can hold the file and retry once the worker idles.
-            _release_reservation_on_fail()
             return JSONResponse(
                 {
                     "status": "attachments_busy",
@@ -3662,7 +3647,7 @@ def make_send_handler(cfg: SessionEndpointConfig) -> Handler:
                 }
             )
 
-        dropped = [aid for aid in requested_ids if aid not in reserved_set]
+        dropped = [aid for aid in requested_ids if aid not in taken_set]
         if queue_outcome:
             # Reused a live worker; ``queue_message`` succeeded.
             if cfg.emit_message_queued and hasattr(ui, "_enqueue"):
@@ -3679,7 +3664,7 @@ def make_send_handler(cfg: SessionEndpointConfig) -> Handler:
                     "status": "queued",
                     "priority": queue_outcome["priority"],
                     "msg_id": queue_outcome["msg_id"],
-                    "attached_ids": list(ordered_reserved),
+                    "attached_ids": list(ordered_taken),
                     "dropped_attachment_ids": dropped,
                 }
             )
@@ -3697,7 +3682,7 @@ def make_send_handler(cfg: SessionEndpointConfig) -> Handler:
         return JSONResponse(
             {
                 "status": "ok",
-                "attached_ids": list(ordered_reserved),
+                "attached_ids": list(ordered_taken),
                 "dropped_attachment_ids": dropped,
             }
         )

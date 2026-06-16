@@ -6166,7 +6166,7 @@ class ChatSession:
         the current turn to finish before allowing an attached send.
 
         ``queue_msg_id`` lets the caller supply the id (so it matches the
-        attachment-reservation token already taken server-side) — when
+        ``send_id`` tracking token threaded through the send) — when
         omitted, an id is generated.
         """
         from turnstone.core.tool_advisory import parse_priority
@@ -6181,10 +6181,9 @@ class ChatSession:
         # Cap individual message length to prevent context bloat
         if len(cleaned) > 2000:
             cleaned = cleaned[:2000] + "..."
-        # Full UUID hex (128 bits) rather than a truncated prefix — this
-        # id doubles as a cross-table reservation token on
-        # workstream_attachments, and a 48-bit truncation narrows the
-        # birthday bound unnecessarily.
+        # Full UUID hex (128 bits) rather than a truncated prefix — this id is
+        # the ``send_id`` tracking token threaded through the turn, so the wide
+        # space keeps the birthday bound comfortable.
         msg_id = queue_msg_id or uuid.uuid4().hex
         with self._queued_lock:
             if len(self._queued_messages) >= self._QUEUE_MAX:

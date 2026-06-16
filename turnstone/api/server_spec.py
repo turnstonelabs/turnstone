@@ -75,7 +75,7 @@ SERVER_ENDPOINTS: list[EndpointSpec] = [
             "with one `meta` field (JSON-encoded `CreateWorkstreamRequest` shape) "
             "plus zero-or-more `file` parts saves each file as an attachment "
             "under the new workstream. When `initial_message` is also set, "
-            "attachments are reserved onto that turn before the worker thread "
+            "attachments are resolved onto that turn before the worker thread "
             "dispatches; otherwise they remain pending for a follow-up "
             "`POST /v1/api/workstreams/{ws_id}/send`."
         ),
