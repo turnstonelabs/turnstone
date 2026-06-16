@@ -71,6 +71,15 @@ class TestModelSupportsRole:
         assert audio.model_supports_role(_Cfg("gpt-4o-mini-tts"), "tts")
         assert audio.model_supports_role(_Cfg("tts-1"), "tts")
 
+    def test_omni_audio_input_eligible_for_stt(self):
+        # An omni model (chat audio input) qualifies for STT via the chat path,
+        # even with no transcription endpoint and a non-whisper name.
+        assert audio.model_supports_role(_Cfg("gemma-omni", {"supports_audio_input": True}), "stt")
+        # Audio *input* alone does not make it a TTS (speech-synthesis) model.
+        assert not audio.model_supports_role(
+            _Cfg("gemma-omni", {"supports_audio_input": True}), "tts"
+        )
+
     def test_chat_model_not_eligible(self):
         assert not audio.model_supports_role(_Cfg("gpt-5"), "stt")
         # Anthropic has no audio API — gated out of every audio role.
@@ -164,6 +173,38 @@ class TestTranscribe:
         reg = _FakeRegistry("voice", _Cfg("whisper-1"), client)
         with pytest.raises(audio.AudioBackendError):
             audio.transcribe(registry=reg, alias="voice", data=b"x", filename="a.wav")
+
+    def test_omni_model_transcribes_via_chat(self):
+        client = MagicMock()
+        msg = MagicMock(content="  the transcript  ")
+        client.chat.completions.create.return_value = MagicMock(choices=[MagicMock(message=msg)])
+        reg = _FakeRegistry("omni", _Cfg("gemma-omni", {"supports_audio_input": True}), client)
+        res = audio.transcribe(
+            registry=reg, alias="omni", data=b"webmbytes", filename="speech.webm"
+        )
+        assert res.transcript == "the transcript"
+        # The dedicated transcription endpoint is NOT used for an omni model.
+        client.audio.transcriptions.create.assert_not_called()
+        # Audio rides as an input_audio chat part; format comes from the filename.
+        parts = client.chat.completions.create.call_args.kwargs["messages"][0]["content"]
+        audio_part = next(p for p in parts if p["type"] == "input_audio")
+        assert audio_part["input_audio"]["format"] == "webm"
+        # A blank prompt falls back to the omni STT default instruction.
+        text_part = next(p for p in parts if p["type"] == "text")
+        assert "Only output the transcription" in text_part["text"]
+
+    def test_omni_prompt_override_used(self):
+        client = MagicMock()
+        client.chat.completions.create.return_value = MagicMock(
+            choices=[MagicMock(message=MagicMock(content="x"))]
+        )
+        reg = _FakeRegistry("omni", _Cfg("gemma-omni", {"supports_audio_input": True}), client)
+        audio.transcribe(
+            registry=reg, alias="omni", data=b"x", filename="a.wav", prompt="custom instruction"
+        )
+        parts = client.chat.completions.create.call_args.kwargs["messages"][0]["content"]
+        text_part = next(p for p in parts if p["type"] == "text")
+        assert text_part["text"] == "custom instruction"
 
 
 class TestSynthesize:
