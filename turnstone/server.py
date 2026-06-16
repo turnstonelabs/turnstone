@@ -2058,9 +2058,19 @@ async def _interactive_create_post_install(
         send_id = uuid.uuid4().hex
         resolved_atts: list[Any] = []
         if attachment_ids:
-            # Resolve (peek) the staged uploads; the committing send drains
-            # them from the buffer.  No reservation to release on failure.
+            # Resolve (peek) the staged uploads, then drain them from the buffer
+            # now.  The inlined first turn is their only consumer and it always
+            # commits at create (no queue rejection by construction), so leaving
+            # them staged would let the freshly-opened pane's rehydrate race the
+            # worker's write-time drain and paint them as still-pending composer
+            # chips.  ``_append_user_turn``'s own per-id discard then no-ops.
             resolved_atts, _ord, _drop = _resolve_staged(attachment_ids, ws.id, uid)
+            if _ord:
+                from turnstone.core.attachment_buffer import get_attachment_buffer
+
+                _buf = get_attachment_buffer()
+                for _aid in _ord:
+                    _buf.discard(_aid, ws_id=ws.id, user_id=uid)
 
         def _run_initial() -> None:
             try:

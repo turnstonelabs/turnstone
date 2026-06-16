@@ -3434,6 +3434,16 @@ async def _coord_create_post_install(
     resolved_atts: list[Any] = []
     if attachment_ids:
         resolved_atts, _ord, _drop = resolve_staged_attachments(attachment_ids, ws.id, uid)
+        # Drain the staged uploads now: the create-time dispatch is their only
+        # consumer, so leaving them staged would let the new coord pane's
+        # rehydrate race the worker's write-time drain and show them as still-
+        # pending composer chips (the committing send's discard then no-ops).
+        if _ord:
+            from turnstone.core.attachment_buffer import get_attachment_buffer
+
+            _buf = get_attachment_buffer()
+            for _aid in _ord:
+                _buf.discard(_aid, ws_id=ws.id, user_id=uid)
     coord_adapter.send(
         ws.id,
         initial_message,
