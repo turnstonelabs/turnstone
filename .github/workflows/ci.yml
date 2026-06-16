@@ -35,6 +35,9 @@ jobs:
 
   test:
     runs-on: ubuntu-latest
+    # Cap a hung run at 20 min instead of riding GitHub's 6-hour default
+    # (a flaky-hang run otherwise streams -v output for hours).
+    timeout-minutes: 20
     strategy:
       matrix:
         python-version: ["3.11", "3.12", "3.13"]
@@ -63,6 +66,7 @@ jobs:
 
   test-postgres:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     services:
       postgres:
         image: postgres:18
