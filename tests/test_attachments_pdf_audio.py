@@ -75,6 +75,45 @@ class TestSniffAudio:
         assert sniff_audio_mime(b"") is None
 
 
+class TestReconstructAttachmentRefs:
+    def test_preserves_pdf_audio_kind_on_reload(self) -> None:
+        from turnstone.core.storage._utils import _reconstruct_attachment_refs
+
+        atts = {
+            1: [
+                {
+                    "attachment_id": "a1",
+                    "kind": "pdf",
+                    "filename": "r.pdf",
+                    "mime_type": "application/pdf",
+                },
+                {
+                    "attachment_id": "a2",
+                    "kind": "audio",
+                    "filename": "a.wav",
+                    "mime_type": "audio/wav",
+                },
+                {
+                    "attachment_id": "a3",
+                    "kind": "image",
+                    "filename": "i.png",
+                    "mime_type": "image/png",
+                },
+                {
+                    "attachment_id": "a4",
+                    "kind": "text",
+                    "filename": "t.txt",
+                    "mime_type": "text/plain",
+                },
+            ]
+        }
+        refs, meta = _reconstruct_attachment_refs(atts, 1)
+        # pdf/audio/image kept verbatim; only 'text' collapses to 'document'
+        # (so the placeholder type can't collide with a real text content part).
+        assert [r.kind for r in refs] == ["pdf", "audio", "image", "document"]
+        assert [m["kind"] for m in meta] == ["pdf", "audio", "image", "text"]
+
+
 class TestSafeAttachmentLabel:
     def test_strips_frame_breakers(self) -> None:
         from turnstone.core.attachments import safe_attachment_label
