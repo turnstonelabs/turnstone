@@ -125,20 +125,31 @@ export function buildAttachmentPreview(opts) {
     })
       .then(function (r) {
         if (!r || !r.ok) return "";
-        // We only render ~240 chars: read just the first body chunk and cancel
-        // the rest of the transfer instead of downloading the whole blob (text
-        // attachments are capped at 512 KiB, ~2000x the rendered size).  The
-        // first network chunk is always many KB, so 240 chars are available.
+        // We only render ~240 chars: read body chunks until we have enough, then
+        // cancel the rest of the transfer instead of downloading the whole blob
+        // (text attachments are capped at 512 KiB, ~2000x the rendered size).
+        // Accumulate rather than assume one chunk ≥ 240 chars (flush boundaries
+        // can split a large body into small early chunks).
         if (!r.body || typeof r.body.getReader !== "function") return r.text();
         var reader = r.body.getReader();
-        return reader.read().then(function (res) {
-          try {
-            reader.cancel();
-          } catch (e) {
-            /* already closed */
-          }
-          return res && res.value ? new TextDecoder().decode(res.value) : "";
-        });
+        var dec = new TextDecoder();
+        var acc = "";
+        function pump() {
+          return reader.read().then(function (res) {
+            if (res && res.value)
+              acc += dec.decode(res.value, { stream: true });
+            if (res.done || acc.length >= 240) {
+              try {
+                reader.cancel();
+              } catch (e) {
+                /* already closed */
+              }
+              return acc;
+            }
+            return pump();
+          });
+        }
+        return pump();
       })
       .then(function (t) {
         if (!t) {
