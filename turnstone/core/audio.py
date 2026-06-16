@@ -62,6 +62,18 @@ _MEDIA_TYPES: dict[str, str] = {
 
 _DEFAULT_VOICE = "alloy"
 
+# Default instruction for transcribing via an omni *chat* model (one that accepts
+# audio in chat but doesn't serve the dedicated /audio/transcriptions endpoint).
+# Steers the model to emit only the transcript; an operator can override it
+# per-deployment with the ``audio.stt_prompt`` setting.
+_OMNI_STT_PROMPT = (
+    "Transcribe the following speech segment in its original language. Follow these "
+    "specific instructions for formatting the answer:\n"
+    "* Only output the transcription, with no newlines.\n"
+    "* When transcribing numbers, write the digits, i.e. write 1.7 and not one point "
+    "seven, and write 3 instead of three"
+)
+
 
 @dataclass(frozen=True)
 class TranscriptionResult:
@@ -111,6 +123,11 @@ def model_supports_role(cfg: Any, role: str) -> bool:
     if not flag:
         return False
     caps = getattr(cfg, "capabilities", None) or {}
+    # An omni model (accepts audio in chat) can serve STT via the chat
+    # transcription path even without the dedicated /audio/transcriptions
+    # endpoint — see :func:`transcribe`.  Mirrored in admin.js _audioModelEligible.
+    if role == "stt" and caps.get("supports_audio_input"):
+        return True
     if flag in caps:
         return bool(caps.get(flag))
     return _infer_audio_capability(getattr(cfg, "model", ""), role)
@@ -137,29 +154,86 @@ def resolve_role_alias(*, config_store: Any | None, registry: Any | None, role: 
     return alias
 
 
+def _serves_transcription_endpoint(cfg: Any, model: str) -> bool:
+    """Whether the alias serves the dedicated ``/audio/transcriptions`` endpoint
+    (whisper-style), as opposed to an omni chat model that ingests audio inline.
+
+    Explicit ``supports_transcription`` wins; otherwise infer from the model name.
+    """
+    caps = getattr(cfg, "capabilities", None) or {}
+    if "supports_transcription" in caps:
+        return bool(caps["supports_transcription"])
+    return _infer_audio_capability(model, "stt")
+
+
+def _transcribe_via_chat(client: Any, model: str, data: bytes, filename: str, prompt: str) -> str:
+    """Transcribe by handing the clip to an omni *chat* model as ``input_audio``.
+
+    For models that accept audio in chat (``supports_audio_input``) but don't
+    serve ``/audio/transcriptions``.  The instruction ``prompt`` steers the model
+    to emit only the transcript.  The audio format is taken from the upload's
+    filename extension (the same shape the attachment wire path uses).
+    """
+    import base64
+
+    name = filename or "speech.webm"
+    fmt = name.rsplit(".", 1)[-1].lower() if "." in name else "wav"
+    audio_b64 = base64.b64encode(data).decode("ascii")
+    resp = client.chat.completions.create(
+        model=model,
+        messages=[
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": prompt},
+                    {"type": "input_audio", "input_audio": {"data": audio_b64, "format": fmt}},
+                ],
+            }
+        ],
+    )
+    choices = getattr(resp, "choices", None) or []
+    if not choices:
+        return ""
+    return (getattr(choices[0].message, "content", "") or "").strip()
+
+
 def transcribe(
     *, registry: Any, alias: str, data: bytes, filename: str, prompt: str = ""
 ) -> TranscriptionResult:
     """Transcribe ``data`` using the STT role alias's audio backend.
 
-    ``prompt`` (when non-empty) is forwarded as the transcription ``prompt``
-    parameter to bias the model toward domain vocabulary / instructions; it is
-    omitted entirely when blank so backends that don't accept it aren't sent it.
+    A whisper-style alias (``supports_transcription`` / a transcription model
+    name) goes through ``/audio/transcriptions``; an omni alias
+    (``supports_audio_input``) transcribes via chat ``input_audio`` instead.
+
+    ``prompt`` (when non-empty) is forwarded as the transcription ``prompt`` on
+    the endpoint path (vocabulary bias) and as the instruction on the chat path;
+    the chat path falls back to :data:`_OMNI_STT_PROMPT` so a bare omni call still
+    emits a clean transcript rather than a conversational reply.
     """
     try:
-        client, model, _cfg = registry.resolve(alias)
+        client, model, cfg = registry.resolve(alias)
     except Exception as exc:  # unknown/removed alias
         raise AudioUnavailableError(f"STT model alias {alias!r} is not available") from exc
-    kwargs: dict[str, Any] = {
-        "model": model,
-        "file": (filename or "speech.webm", data),
-        "response_format": "json",
-    }
-    if prompt:
-        kwargs["prompt"] = prompt
+    caps = getattr(cfg, "capabilities", None) or {}
+    endpoint = _serves_transcription_endpoint(cfg, model)
+    if not endpoint and not caps.get("supports_audio_input"):
+        raise AudioUnavailableError(f"STT model alias {alias!r} cannot transcribe audio")
     try:
-        resp = client.audio.transcriptions.create(**kwargs)
-        transcript = (getattr(resp, "text", "") or "").strip()
+        if endpoint:
+            kwargs: dict[str, Any] = {
+                "model": model,
+                "file": (filename or "speech.webm", data),
+                "response_format": "json",
+            }
+            if prompt:
+                kwargs["prompt"] = prompt
+            resp = client.audio.transcriptions.create(**kwargs)
+            transcript = (getattr(resp, "text", "") or "").strip()
+        else:
+            transcript = _transcribe_via_chat(
+                client, model, data, filename, prompt or _OMNI_STT_PROMPT
+            )
     except Exception as exc:
         raise AudioBackendError(f"Transcription backend failed: {exc}") from exc
     return TranscriptionResult(transcript=transcript, model_alias=alias, model=model)

@@ -5196,7 +5196,7 @@ const MODEL_ROLES = [
   {
     label: "Speech-to-text",
     description:
-      "Transcribes microphone audio in the workstream composer (voice input), and is the preferred transcript for audio attachments. Empty disables the mic affordance; audio attachments then fall back to the Perception model if one is configured.",
+      "Transcribes microphone audio in the workstream composer (voice input), and is the preferred transcript for audio attachments. Point at a transcription model (Whisper-style) or an audio-capable omni model — the omni path transcribes via chat. Empty disables the mic affordance; audio attachments then fall back to the Perception model if one is configured.",
     aliasKey: "audio.stt_model_alias",
     fallbackKind: "disabled",
     mediaCapability: "supports_transcription",
@@ -5254,6 +5254,9 @@ function _audioModelEligible(md, capFlag, mediaRole) {
     }
   }
   if (!caps || typeof caps !== "object") caps = {};
+  // An omni model (chat audio input) can serve STT via the chat transcription
+  // path — mirror model_supports_role in turnstone/core/audio.py.
+  if (mediaRole === "stt" && caps.supports_audio_input) return true;
   if (Object.prototype.hasOwnProperty.call(caps, capFlag))
     return !!caps[capFlag];
   const name = ((md && md.model) || "").toLowerCase();
