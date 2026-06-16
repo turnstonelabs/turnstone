@@ -54,7 +54,10 @@ def extract_pdf_text(data: bytes) -> str:
             textpage.close()
             page.close()
         text = "\n\n".join(p.strip() for p in parts if p.strip())
-        if truncated:
+        # Only annotate truncation when there's actual text — otherwise a scanned
+        # (no text layer) PDF over the page cap would return just the marker, i.e.
+        # a content-free document part.  Empty stays empty → caller placeholders it.
+        if truncated and text:
             text += f"\n\n[PDF truncated at {_MAX_PAGES} pages]"
         return text
     except Exception as exc:

@@ -96,8 +96,7 @@ export interface AttachmentInfo {
   filename: string;
   mime_type: string;
   size_bytes: number;
-  /** "image", "text", "pdf", or "audio". */
-  kind: string;
+  kind: "image" | "text" | "pdf" | "audio";
 }
 
 export type UploadAttachmentResponse = AttachmentInfo;

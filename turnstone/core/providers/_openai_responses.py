@@ -84,9 +84,10 @@ def convert_content_parts(parts: list[Any]) -> list[dict[str, Any]]:
                     }
                 )
         elif ptype == "input_audio":
-            # Audio-input is not wired on the Responses lane; until the Phase 3
-            # capability-gated fallback (STT) lands upstream, surface a
-            # placeholder rather than leaking an unhandled part to the API.
+            # Audio-input is not wired on the Responses lane.  The capability-gated
+            # fallback (STT / perception) runs upstream of this translator, so by
+            # here any remaining input_audio is a defensive placeholder rather than
+            # an unhandled part leaking to the API.
             converted.append(
                 {"type": "input_text", "text": "[audio attachment — not supported by this model]"}
             )

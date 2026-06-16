@@ -3015,8 +3015,9 @@ class ChatSession:
             perceived = self._perception_fallback_part(att, "image")
             if perceived is not None:
                 return perceived
-            # No perception backend configured: emit the native image_url
-            # unchanged (the model may ignore it) — pre-existing behavior.
+            # No usable perception backend (none configured, or it can't see):
+            # emit the native image_url unchanged — a no-vision model ignores it.
+            # Image is intentionally left ungated here (pre-existing behavior).
         if kind == "audio" and not caps.supports_audio_input:
             return self._audio_fallback_part(att)
         return attachment_to_content_part(att)

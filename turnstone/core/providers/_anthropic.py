@@ -692,9 +692,10 @@ class AnthropicProvider:
                 converted.append(block)
                 continue
             if part.get("type") == "input_audio":
-                # Anthropic has no audio-input API.  Phase 3 transcribes via the
-                # STT role upstream of this translator; until then surface a
-                # placeholder rather than passing an unsupported block to the API.
+                # Anthropic has no audio-input API.  The STT-role fallback runs
+                # upstream of this translator (audio → text transcript when a
+                # model lacks supports_audio_input), so by here any remaining
+                # input_audio is a defensive placeholder, not the live path.
                 converted.append(
                     {"type": "text", "text": "[audio attachment — not supported by this model]"}
                 )
