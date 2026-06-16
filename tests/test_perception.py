@@ -89,3 +89,25 @@ def test_describe_cached_does_not_cache_failures() -> None:
     assert perception.describe_cached(**kw) == ""  # backend down → "" (uncached)
     assert perception.describe_cached(**kw) == "recovered"  # retried, succeeds
     assert prov.calls == 2
+
+
+def test_describe_peek_returns_none_when_absent() -> None:
+    assert perception.describe_peek(alias="omni", content_hash="missing") is None
+
+
+def test_describe_peek_returns_cached_without_recompute() -> None:
+    prov = _StubProvider(content="desc")
+    kw: dict[str, Any] = {
+        "provider": prov,
+        "client": object(),
+        "model": "m",
+        "alias": "omni",
+        "content_hash": "h",
+        "parts": _parts(),
+    }
+    perception.describe_cached(**kw)  # populate the memo
+    assert prov.calls == 1
+    # Peek serves the memoized text and never re-invokes the backend — this is
+    # what lets the wire resolver skip the PDF rasterize on a cross-send hit.
+    assert perception.describe_peek(alias="omni", content_hash="h") == "desc"
+    assert prov.calls == 1

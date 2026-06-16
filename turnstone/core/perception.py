@@ -140,3 +140,15 @@ def describe_cached(
             _cache.pop(next(iter(_cache)), None)
         _cache[key] = text
     return text
+
+
+def describe_peek(*, alias: str, content_hash: str) -> str | None:
+    """Return the memoized description for ``(alias, content_hash)`` without
+    computing, or ``None`` if absent.
+
+    Lets the wire resolver skip the expensive parts build (a PDF rasterize) when
+    the description is already memoized from an earlier send — :func:`describe_cached`
+    ignores ``parts`` on a hit, so building them first would be pure waste.
+    """
+    with _cache_lock:
+        return _cache.get(f"{alias}:{content_hash}")
