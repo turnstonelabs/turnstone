@@ -20,7 +20,7 @@ def _minimal_pdf(text: str = "Hi") -> bytes:
         b"<</Type/Catalog/Pages 2 0 R>>",
         b"<</Type/Pages/Kids[3 0 R]/Count 1>>",
         b"<</Type/Page/Parent 2 0 R/MediaBox[0 0 300 144]"
-        b"/Contents 4 0 R/Resources<</Font<</F1 5 0 R>>>>>>",
+        + b"/Contents 4 0 R/Resources<</Font<</F1 5 0 R>>>>>>",
         b"<</Length %d>>\nstream\n%s\nendstream" % (len(stream), stream),
         b"<</Type/Font/Subtype/Type1/BaseFont/Helvetica>>",
     ]

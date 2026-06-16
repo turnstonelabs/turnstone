@@ -139,6 +139,7 @@ export function buildAttachmentPreview(opts) {
             if (res && res.value)
               acc += dec.decode(res.value, { stream: true });
             if (res.done || acc.length >= 240) {
+              acc += dec.decode(); // flush bytes buffered across a chunk boundary
               try {
                 reader.cancel();
               } catch (e) {

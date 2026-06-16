@@ -2969,9 +2969,9 @@ class ChatSession:
         # re-rasterized / a blob re-base64'd once per round-trip.  Key on
         # (id, caps-signature): the same stored blob materializes differently per
         # capability set, and a fallback to a different-caps model can resolve
-        # within one send.  The cache is refreshed per send (set in send()); the
-        # wire resolver runs only during a send, so a stale value between sends is
-        # never read.  A None cache disables memoization (the original behavior).
+        # within one send.  Set in send() and cleared in its finally, so it is
+        # None outside a send; the wire resolver runs only during a send.  A None
+        # cache disables memoization (the original behavior).
         cache = self._wire_part_cache
         caps_sig = (caps.supports_pdf, caps.supports_vision, caps.supports_audio_input)
         out: dict[str, Any] = {}
@@ -4600,6 +4600,12 @@ class ChatSession:
             self._drain_pending_advisories()
             self._record_fatal_error(exc)
             raise
+        finally:
+            # Release the per-send wire-part memo (it can hold large rasterized
+            # PDF page-images) so it is GC'd at send end rather than retained on
+            # an idle session until the next send.  Restores the "None outside a
+            # send" invariant on every exit (success, cancel, or error).
+            self._wire_part_cache = None
 
     def _drain_pending_advisories(self) -> None:
         """Drop every pending nudge regardless of channel.
