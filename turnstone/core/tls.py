@@ -294,8 +294,6 @@ class TLSClient:
         Discovery, CA fetch, and cert request are all idempotent, so the whole
         sequence is retried as a unit.
         """
-        import asyncio
-
         if attempts < 1:
             # range(1, attempts + 1) would be empty: init() would return
             # "successfully" with no CA and no cert.
@@ -321,7 +319,18 @@ class TLSClient:
                     delay_seconds=delay,
                     error=f"{type(exc).__name__}: {exc}",
                 )
-                await asyncio.sleep(delay)
+                await self._sleep(delay)
+
+    async def _sleep(self, delay: float) -> None:
+        """Backoff sleep behind a seam so tests can stub it in isolation.
+
+        Patching the module-global ``asyncio.sleep`` would also intercept it
+        for every other task sharing the event loop; routing the retry backoff
+        through a method keeps test stubs from corrupting concurrent tasks.
+        """
+        import asyncio
+
+        await asyncio.sleep(delay)
 
     def _discover_console_url(self) -> str:
         """Look up the console URL from the services table."""
