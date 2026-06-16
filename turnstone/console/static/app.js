@@ -1173,11 +1173,28 @@ function _createInteractive(opts) {
   if (judgeModel) body.judge_model = judgeModel;
   if (task) body.initial_message = task;
 
-  authFetch("/v1/api/cluster/workstreams/new", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(body),
-  })
+  // Multipart when files are staged — `meta` JSON + zero-or-more `file`
+  // parts.  The cluster proxy picks the node (node_id in meta) and forwards
+  // the files to its create endpoint; plain JSON stays the default otherwise.
+  const files = Array.isArray(opts.files) ? opts.files : [];
+  let fetchOpts;
+  if (files.length > 0) {
+    const form = new FormData();
+    form.append("meta", JSON.stringify(body));
+    for (let i = 0; i < files.length; i++) {
+      form.append("file", files[i], files[i].name);
+    }
+    // Don't set Content-Type — the browser adds the correct boundary.
+    fetchOpts = { method: "POST", body: form };
+  } else {
+    fetchOpts = {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    };
+  }
+
+  authFetch("/v1/api/cluster/workstreams/new", fetchOpts)
     .then(function (r) {
       return r.json().then(function (data) {
         return { ok: r.ok, status: r.status, data: data };
@@ -1666,13 +1683,10 @@ function submitHomeCoord(textFromComposer) {
     },
   };
   if (kind === "interactive") {
-    // The cluster create proxy is JSON-only; attachments stay coordinator-only.
-    if (files.length > 0) {
-      _homeShowError(
-        "Attachments aren't supported for interactive sessions yet.",
-      );
-      return;
-    }
+    // Create-with-attachments rides multipart through the cluster proxy to the
+    // node (see _createInteractive); the files-need-a-task guard above already
+    // ensures an initial turn to dispatch them on.
+    shared.files = files;
     // Node placement from the launcher's node-strategy picker (interactive-only).
     shared.node_strategy = opts.node_strategy || "auto";
     shared.node_id = (opts.node_id || "").trim();

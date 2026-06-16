@@ -1766,8 +1766,9 @@ async def create_workstream(request: Request) -> JSONResponse:
     - ``node_id`` omitted or ``"auto"`` → console picks the node with most headroom
     - ``node_id`` set to ``"pool"`` → console picks any available node
     """
+    from turnstone.core.attachments import IMAGE_SIZE_CAP
     from turnstone.core.auth import require_any_permission
-    from turnstone.core.web_helpers import read_json_or_400
+    from turnstone.core.web_helpers import read_json_or_400, read_multipart_create_or_400
 
     # Gate on workstreams.create OR admin.coordinator before proxying —
     # keeps the 403 attributed at the console (audit clarity) and avoids
@@ -1779,9 +1780,30 @@ async def create_workstream(request: Request) -> JSONResponse:
     if err is not None:
         return err
 
-    body = await read_json_or_400(request)
-    if isinstance(body, JSONResponse):
-        return body
+    # Create-with-attachments: the launcher sends multipart (a ``meta`` JSON
+    # field + ``file`` parts) instead of JSON.  The node create endpoint already
+    # accepts that shape (create_supports_attachments on interactive_endpoint_config
+    # in turnstone/server.py); the proxy just picks the node as usual and forwards
+    # the files instead of re-serialising JSON.  Caps mirror the node-side parse so
+    # an oversized upload is rejected here, before the cluster hop.
+    content_type = (request.headers.get("content-type") or "").lower()
+    uploaded_files: list[tuple[str, str, bytes]] = []
+    body: dict[str, Any]
+    if content_type.startswith("multipart/form-data"):
+        parsed = await read_multipart_create_or_400(
+            request,
+            max_files=10,
+            max_per_file_bytes=IMAGE_SIZE_CAP,
+            max_total_bytes=10 * IMAGE_SIZE_CAP,
+        )
+        if isinstance(parsed, JSONResponse):
+            return parsed
+        body, uploaded_files = parsed
+    else:
+        json_body = await read_json_or_400(request)
+        if isinstance(json_body, JSONResponse):
+            return json_body
+        body = json_body
 
     collector: ClusterCollector = request.app.state.collector
 
@@ -1865,12 +1887,22 @@ async def create_workstream(request: Request) -> JSONResponse:
 
     client: httpx.AsyncClient = request.app.state.proxy_client
     headers = _proxy_auth_headers(request)
+    node_url = f"{server_url.rstrip('/')}/v1/api/workstreams/new"
     try:
-        resp = await client.post(
-            f"{server_url.rstrip('/')}/v1/api/workstreams/new",
-            json=ws_body,
-            headers=headers,
-        )
+        if uploaded_files:
+            # Re-frame for the node: create metadata rides one ``meta`` JSON
+            # field, each blob a ``file`` part — the shape the node's
+            # read_multipart_create_or_400 expects.  ``user_id`` in the meta is
+            # honoured because the proxy auth header marks a ``console`` source.
+            files_payload = [("file", (fn, data, ctype)) for (fn, ctype, data) in uploaded_files]
+            resp = await client.post(
+                node_url,
+                data={"meta": json.dumps(ws_body)},
+                files=files_payload,
+                headers=headers,
+            )
+        else:
+            resp = await client.post(node_url, json=ws_body, headers=headers)
         resp.raise_for_status()
     except httpx.HTTPError as exc:
         log.warning("Workstream dispatch to %s failed: %s", node_id, exc)

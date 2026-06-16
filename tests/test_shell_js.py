@@ -291,6 +291,27 @@ def test_console_launcher_node_strategy() -> None:
     )
 
 
+def test_console_launcher_interactive_create_carries_attachments() -> None:
+    """Create-time attachments for interactive sessions: the launcher gate is gone
+    and ``_createInteractive`` frames a multipart body (``meta`` JSON + ``file``
+    parts) when files are staged, so the cluster proxy can forward the blobs to
+    the node — mirroring ``_createCoordinator``.  Was previously blocked with
+    "Attachments aren't supported for interactive sessions yet"."""
+    app = _CONSOLE_APP.read_text(encoding="utf-8")
+    assert "Attachments aren't supported for interactive sessions yet." not in app, (
+        "the create-time interactive attachment gate must be removed"
+    )
+    # Scope the multipart-framing assertions to _createInteractive's own body so
+    # they can't be satisfied by _createCoordinator alone.
+    rest = app[app.index("function _createInteractive(") + 1 :]
+    cut = rest.find("\nfunction ")
+    body = rest if cut == -1 else rest[:cut]
+    assert "new FormData()" in body, "_createInteractive must build a multipart body"
+    assert 'form.append("meta"' in body and 'form.append("file"' in body, (
+        "_createInteractive must send meta JSON + file parts"
+    )
+
+
 def test_pane_persists_meta_for_rehydrate() -> None:
     """Workstream-lifecycle bugfix: PaneManager persists a pane's serializable
     open-time meta (the interactive pane's resolved nodeId) and hands it back as

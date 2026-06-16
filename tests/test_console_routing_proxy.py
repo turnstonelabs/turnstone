@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from typing import Any
 from unittest.mock import MagicMock
 
@@ -283,6 +284,67 @@ class TestRouteCreate503Retry:
         assert data["ws_id"] == "retry_ws"
         assert data["node_id"] == "node-b"
         assert post_count == 2
+        client.close()
+
+
+# ---------------------------------------------------------------------------
+# Tests — cluster create (capacity-routed proxy)
+# ---------------------------------------------------------------------------
+
+
+class TestClusterCreate:
+    """POST /v1/api/cluster/workstreams/new — the launcher's create proxy.
+
+    Create-with-attachments rides multipart (a ``meta`` JSON field + ``file``
+    parts) and must forward to the node AS multipart — not collapse to JSON,
+    which would silently drop the files (the pre-fix behaviour, gated in the UI
+    as "Attachments aren't supported for interactive sessions yet")."""
+
+    def _app_with_node(self, mock_post: MagicMock) -> Any:
+        collector = _make_mock_collector()
+        collector.get_node_detail.return_value = {"server_url": "http://a:8080"}
+        app = _make_app(collector=collector)
+        _wire_proxy(app, mock_post)
+        return app
+
+    def test_cluster_create_json_forwards_json(self):
+        mock_post = _make_proxy_post(json_data={"ws_id": "abc123"})
+        client = TestClient(self._app_with_node(mock_post), raise_server_exceptions=False)
+        resp = client.post(
+            "/v1/api/cluster/workstreams/new",
+            json={"node_id": "node-a", "name": "j", "initial_message": "hi"},
+            headers=_TEST_AUTH_HEADERS,
+        )
+        assert resp.status_code == 200
+        assert resp.json()["correlation_id"] == "abc123"
+        kwargs = mock_post.call_args.kwargs
+        assert "json" in kwargs and "files" not in kwargs, "no-file create must stay JSON"
+        assert kwargs["json"]["initial_message"] == "hi"
+        client.close()
+
+    def test_cluster_create_multipart_forwards_files(self):
+        mock_post = _make_proxy_post(json_data={"ws_id": "withfile"})
+        client = TestClient(self._app_with_node(mock_post), raise_server_exceptions=False)
+        meta = {"node_id": "node-a", "name": "i", "initial_message": "describe"}
+        resp = client.post(
+            "/v1/api/cluster/workstreams/new",
+            data={"meta": json.dumps(meta)},
+            files={"file": ("a.txt", b"hello world", "text/plain")},
+            headers=_TEST_AUTH_HEADERS,
+        )
+        assert resp.status_code == 200
+        assert resp.json()["correlation_id"] == "withfile"
+        kwargs = mock_post.call_args.kwargs
+        # Forwarded as multipart: a `meta` JSON field + `file` parts, never json=.
+        assert "json" not in kwargs, "a multipart create must not collapse to JSON"
+        assert kwargs.get("files"), "the blob must be forwarded to the node"
+        forwarded_meta = json.loads(kwargs["data"]["meta"])
+        assert forwarded_meta["initial_message"] == "describe"
+        assert "user_id" in forwarded_meta, "the proxy must inject the owner uid"
+        # The file part carries our blob unchanged: ("file", (name, bytes, ctype)).
+        name, payload = kwargs["files"][0]
+        assert name == "file"
+        assert payload[0] == "a.txt" and payload[1] == b"hello world"
         client.close()
 
 
