@@ -663,7 +663,9 @@ def test_audio_roles_gated_to_openai_sdk_providers() -> None:
     assert '(mediaRole === "stt" || mediaRole === "tts")' in body, (
         "only the voice roles are provider-gated (reranker is not an audio role)"
     )
-    assert "_providerCarriesAudio(md && md.provider)" in body
+    # A blank/unset provider must default to "openai" (matches the backend's
+    # _provider_carries_audio), else a provider-less model is wrongly excluded.
+    assert '_providerCarriesAudio((md && md.provider) || "openai")' in body
 
 
 def test_shared_utils_defines_set_markdown_helper() -> None:

@@ -5269,11 +5269,13 @@ function _audioModelEligible(md, capFlag, mediaRole) {
   if (!caps || typeof caps !== "object") caps = {};
   // Voice roles (stt/tts) ride the OpenAI-SDK audio surface; an Anthropic
   // (-compatible) provider can't serve them even with a capability flag set.
-  // Reranker is NOT an audio role (it hits a /rerank endpoint), so it is not
-  // provider-gated here.
+  // A blank/unset provider defaults to "openai" — matching the backend's
+  // _provider_carries_audio (ModelConfig.provider defaults to "openai") so a
+  // provider-less model isn't wrongly excluded. Reranker is NOT an audio role
+  // (it hits a /rerank endpoint), so it is not provider-gated here.
   if (
     (mediaRole === "stt" || mediaRole === "tts") &&
-    !_providerCarriesAudio(md && md.provider)
+    !_providerCarriesAudio((md && md.provider) || "openai")
   ) {
     return false;
   }
