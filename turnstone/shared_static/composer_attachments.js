@@ -90,11 +90,21 @@ export function buildAttachmentPreview(opts) {
     audio.controls = true;
     audio.preload = "none";
     audio.src = _attachUrl(wsId, id, "/content");
+    // Native control is keyboard-focusable; name it so it isn't announced as a
+    // bare "audio" with no indication of which attachment it plays.
+    audio.setAttribute(
+      "aria-label",
+      "Audio attachment: " + (opts.filename || "audio"),
+    );
     return audio;
   }
   if (kind === "text") {
     var snip = document.createElement("span");
     snip.className = "attach-preview attach-preview-snippet";
+    // Supplementary visual preview only — the filename is the accessible name
+    // (rendered as the adjacent chip/pill name), so keep the snippet out of the
+    // a11y tree rather than double-announcing the attachment.
+    snip.setAttribute("aria-hidden", "true");
     var fetchFn =
       (opts && opts.authFetch) ||
       (typeof window !== "undefined" ? window.authFetch : null);
@@ -158,7 +168,7 @@ export function createAttachmentController(opts) {
 
   function renderChip(info) {
     var chip = document.createElement("span");
-    chip.className = "composer-chip composer-chip-" + (info.kind || "other");
+    chip.className = "composer-chip";
     chip.setAttribute("role", "listitem");
     chip.dataset.attachmentId = info.attachment_id;
 
@@ -198,16 +208,20 @@ export function createAttachmentController(opts) {
     return chip;
   }
 
-  // Insert a committed-attachment preview into a chip (image/pdf thumbnail,
-  // audio player, or a lazy text snippet).  No-op for the in-flight placeholder
-  // (no real id yet); the swap re-applies once the real id lands.
+  // Insert a committed-attachment preview into a chip (image/pdf thumbnail or
+  // a lazy text snippet).  No-op for the in-flight placeholder (no real id
+  // yet); the swap re-applies once the real id lands.  Audio is intentionally
+  // left as icon+name+size here — the native player is too heavy for the chip
+  // scale, so playback lives on the sent message (see buildAttachmentPreview).
   function _applyPreview(chip, info) {
     var idStr = "" + (info.attachment_id || "");
     if (info.uploading || !idStr || idStr.indexOf("__uploading_") === 0) return;
+    if (info.kind === "audio") return;
     var prev = buildAttachmentPreview({
       kind: info.kind,
       wsId: getWsId(),
       attachmentId: info.attachment_id,
+      filename: info.filename,
       authFetch: _authFetch,
     });
     var old = chip.querySelector(".attach-preview");
@@ -263,8 +277,7 @@ export function createAttachmentController(opts) {
     if (chip) {
       chip.dataset.attachmentId = info.attachment_id;
       // classify_upload on the server is authoritative — adopt its kind for the
-      // chip styling + icon, then render the preview now there's a real id.
-      chip.className = "composer-chip composer-chip-" + (info.kind || "other");
+      // chip icon, then render the preview now there's a real id.
       var swapIcon = chip.querySelector(".composer-chip-icon");
       if (swapIcon) swapIcon.textContent = _kindIcon(info.kind);
       var name = chip.querySelector(".composer-chip-name");
