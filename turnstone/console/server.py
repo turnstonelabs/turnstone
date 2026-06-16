@@ -55,6 +55,7 @@ from turnstone.core.auth import (
     jwt_version_slot,
     require_permission,
 )
+from turnstone.core.deadline import DeadlineExceededError, run_with_deadline
 from turnstone.core.rendezvous import NoAvailableNodeError
 from turnstone.core.session_replay import session_replay_preamble
 from turnstone.core.session_routes import (
@@ -11530,16 +11531,15 @@ def _validate_regex_pattern(pattern: str, flags: int = 0) -> str | None:
             compiled.search(s)
 
     try:
-        from concurrent.futures import ThreadPoolExecutor
-        from concurrent.futures import TimeoutError as FuturesTimeout
-
-        pool = ThreadPoolExecutor(max_workers=1)
-        try:
-            pool.submit(_probe).result(timeout=0.5)
-        except FuturesTimeout:
-            return "Regex appears to have catastrophic backtracking"
-        finally:
-            pool.shutdown(wait=False, cancel_futures=True)
+        # Daemon worker: a catastrophically-backtracking regex must be
+        # abandonable without pinning a non-daemon thread that would hang
+        # interpreter exit (a ThreadPoolExecutor worker is joined at exit).
+        # Budget is generous — a legitimately complex pattern can take a second
+        # or two on the probe strings; only exponential blowup (which sails past
+        # any few-second bound) should trip the catastrophic-backtracking guard.
+        run_with_deadline(_probe, timeout=3.0, poll=0.1, thread_name="regex-redos-probe")
+    except DeadlineExceededError:
+        return "Regex appears to have catastrophic backtracking"
     except Exception:
         return "Regex caused an error during test"
     return None

@@ -40,7 +40,7 @@ api_key = ""
 smart_approvals = false       # auto-approve high-confidence "approve" LLM verdicts (opt-in)
 confidence_threshold = 0.95   # Smart Approvals auto-approve bar (LLM recommendation=approve)
 max_context_ratio = 0.5       # max % of judge context window for history
-timeout = 60.0                # seconds (generous for local models)
+timeout = 120.0               # seconds (generous for local models)
 read_only_tools = true        # judge can use read_file/list_directory
 cancel_on_approval = false    # stop judging remaining tool calls once user decides
 ```
@@ -71,7 +71,7 @@ All fields are optional. The judge is enabled by default; use `enabled = false`
 --judge / --no-judge           Enable/disable (default: enabled)
 --judge-model MODEL            Model for judge
 --judge-provider PROVIDER      Provider for judge
---judge-timeout SECONDS        LLM judge timeout (default: 60)
+--judge-timeout SECONDS        LLM judge timeout (default: 120)
 --judge-confidence FLOAT       Confidence threshold, 0-1 (default: 0.95)
 ```
 
@@ -193,9 +193,10 @@ Security hardening blocks access to sensitive paths:
 
 ### Timeout
 
-The `timeout` setting (default 60 seconds) is a total budget across all judge
-turns. Time is decremented after each LLM call. If the budget expires mid-turn,
-the judge attempts to parse whatever partial response is available.
+The `timeout` setting (default 120 seconds) applies **per turn**, not as a total
+budget across turns — each of the up to 5 turns gets a fresh budget, so a slow
+earlier turn doesn't starve later ones. If a turn's budget expires, the judge
+attempts to parse whatever partial response is available.
 
 ---
 

@@ -15,11 +15,16 @@ import re
 import threading
 import time
 import uuid
-from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
+from functools import partial
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+from turnstone.core.deadline import (
+    DeadlineCancelledError,
+    DeadlineExceededError,
+    run_with_deadline,
+)
 from turnstone.core.log import get_logger
 
 if TYPE_CHECKING:
@@ -76,8 +81,8 @@ class JudgeConfig:
     """Configuration for the intent validation judge.
 
     The *timeout* value applies **per turn**, not as a total budget across
-    all turns.  With the default of 60 s and a maximum of 5 turns, a
-    single tool-call evaluation can take up to 300 s in the worst case
+    all turns.  With the default of 120 s and a maximum of 5 turns, a
+    single tool-call evaluation can take up to 600 s in the worst case
     (e.g. a multi-turn tool-use exchange with a slow local model).
     """
 
@@ -86,13 +91,13 @@ class JudgeConfig:
     smart_approvals: bool = False  # auto-approve high-confidence "approve" LLM verdicts
     confidence_threshold: float = 0.95  # Smart Approvals auto-approve bar (recommendation=approve)
     max_context_ratio: float = 0.5
-    timeout: float = 60.0  # per-turn timeout in seconds (see class docstring)
+    timeout: float = 120.0  # per-turn timeout in seconds (see class docstring)
     read_only_tools: bool = True
     output_guard: bool = True
     output_guard_budget_seconds: float = 30.0  # wall-clock budget for output_guard regex scan
     output_guard_llm: bool = False  # enable LLM stage on tool output (issue #560 mitigation #1)
     output_guard_model: str = ""  # alias for the LLM stage; empty = inherit session model
-    output_guard_llm_timeout: float = 30.0  # wall-clock budget for the LLM stage
+    output_guard_llm_timeout: float = 60.0  # wall-clock budget for the LLM stage
     redact_secrets: bool = True
     # True = the approval gate's resolution aborts remaining evaluations
     # (saves inference; undone items degrade to ``llm_fallback`` verdicts
@@ -881,10 +886,6 @@ If you used read_file to check a target, cite what you found."""
 # ---------------------------------------------------------------------------
 
 
-class _ExecutorPoisonedError(Exception):
-    """Raised when a timeout leaves the executor's worker thread stuck."""
-
-
 class IntentJudge:
     """Session-scoped LLM judge for intent validation.
 
@@ -1054,7 +1055,6 @@ class IntentJudge:
         verdicts are delivered.
         """
         client = self._create_client()
-        executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="judge-api")
         try:
             for idx, (item, h_verdict) in enumerate(zip(items, heuristic_verdicts, strict=True)):
                 if cancel_event and cancel_event.is_set():
@@ -1071,7 +1071,6 @@ class IntentJudge:
                         item,
                         messages,
                         cancel_event,
-                        executor,
                         client,
                     )
                     if llm_verdict:
@@ -1116,17 +1115,6 @@ class IntentJudge:
                             "judge cancelled before evaluating this call",
                         )
                         return
-                except _ExecutorPoisonedError:
-                    executor.shutdown(wait=False, cancel_futures=True)
-                    executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="judge-api")
-                    # Deliver a fallback for the interrupted item so every
-                    # call still gets exactly one verdict. Smart Approvals
-                    # waits on the full set before gating; a silently-
-                    # skipped item would otherwise block that wait until
-                    # its timeout (and the advisory UI would miss a chip).
-                    self._deliver_fallbacks(
-                        [item], [h_verdict], callback, "judge executor restarted"
-                    )
                 except Exception:
                     log.exception(
                         "Judge evaluation failed for %s",
@@ -1134,7 +1122,6 @@ class IntentJudge:
                     )
                     self._deliver_fallbacks([item], [h_verdict], callback, "judge evaluation error")
         finally:
-            executor.shutdown(wait=False, cancel_futures=True)
             try:
                 if hasattr(client, "close"):
                     client.close()
@@ -1172,7 +1159,6 @@ class IntentJudge:
         item: dict[str, Any],
         messages: list[dict[str, Any]],
         cancel_event: threading.Event | None,
-        executor: ThreadPoolExecutor,
         client: Any,
     ) -> IntentVerdict | None:
         """Run LLM judge for a single tool call. Returns verdict or None."""
@@ -1237,32 +1223,29 @@ class IntentJudge:
             # models aren't penalised for slow earlier turns.
             per_call_timeout = max(self._config.timeout, 5.0)  # at least 5s
             try:
-                future = executor.submit(
-                    self._provider.create_completion,
-                    client=client,
-                    model=self._model,
-                    messages=judge_messages,
-                    tools=None if is_last_turn else tools,
-                    max_tokens=2048,
-                    temperature=0.0,
-                    reasoning_effort="medium",
+                # Each turn runs on its own daemon worker (1s cancel polling).
+                # A timeout or cancel abandons the call without pinning a
+                # non-daemon thread that would block interpreter exit — the old
+                # single-slot ThreadPoolExecutor left a stuck worker that
+                # poisoned the pool, which is why the restart dance existed.
+                result = run_with_deadline(
+                    partial(
+                        self._provider.create_completion,
+                        client=client,
+                        model=self._model,
+                        messages=judge_messages,
+                        tools=None if is_last_turn else tools,
+                        max_tokens=2048,
+                        temperature=0.0,
+                        reasoning_effort="medium",
+                    ),
+                    timeout=per_call_timeout,
+                    cancel_event=cancel_event,
+                    thread_name="judge-api",
                 )
-                # Poll in 1s increments so we notice cancellation promptly
-                # instead of blocking for the full per_call_timeout.
-                deadline = time.monotonic() + per_call_timeout
-                while True:
-                    remaining = deadline - time.monotonic()
-                    if cancel_event and cancel_event.is_set():
-                        future.cancel()
-                        return None
-                    if remaining <= 0:
-                        raise TimeoutError
-                    try:
-                        result = future.result(timeout=min(remaining, 1.0))
-                        break
-                    except TimeoutError:
-                        pass  # loop back to check remaining/cancel
-            except TimeoutError:
+            except DeadlineCancelledError:
+                return None
+            except DeadlineExceededError:
                 log.info("judge.turn.timeout", turn=turn + 1, timeout=per_call_timeout)
                 # Safety net: if we have a partial result from a previous turn,
                 # try to parse a verdict from it before giving up.
@@ -1277,7 +1260,7 @@ class IntentJudge:
                     if verdict:
                         log.info("judge.verdict.from_partial", turn=turn + 1)
                         return verdict
-                raise _ExecutorPoisonedError from None
+                return None
             except Exception as e:
                 log.info("judge.turn.failed", turn=turn + 1, error=str(e))
                 return None

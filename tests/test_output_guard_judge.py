@@ -220,6 +220,26 @@ class TestEvaluateFailurePaths:
         # Cancel should return promptly, well below the 10s timeout.
         assert elapsed < 2.0, f"cancel returned in {elapsed:.2f}s, expected < 2.0s"
 
+    def test_timeout_leaves_no_nondaemon_straggler(self) -> None:
+        # Regression: evaluate() abandons a slow upstream call on timeout, but
+        # the worker must be a *daemon* so it can never pin interpreter exit.
+        # The old ThreadPoolExecutor worker was non-daemon and got joined by
+        # concurrent.futures' atexit hook, hanging the whole test run at
+        # shutdown.  See turnstone/core/deadline.py.
+        judge = _make_judge(
+            content='{"risk_level":"medium","flags":[],"reasoning":""}',
+            timeout=1.0,
+            delay=5.0,
+        )
+        v = judge.evaluate("payload", call_id="c1")
+        assert v.error == "timeout"
+        stragglers = [
+            t
+            for t in threading.enumerate()
+            if t.name.startswith("output-guard-judge") and not t.daemon
+        ]
+        assert stragglers == [], f"non-daemon worker survived evaluate(): {stragglers}"
+
 
 class TestAliasResolution:
     def test_unknown_alias_falls_back_to_session_model(self) -> None:

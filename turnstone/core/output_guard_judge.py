@@ -13,12 +13,12 @@ Design:
   already in hand.
 - JSON-in-content verdict.  4-strategy parser inlined from
   :class:`IntentJudge` (``judge.py:1603-1659``).
-- ``ThreadPoolExecutor`` + ``future.result(timeout=)`` with 1 s
-  cancel-event polling.  The executor is owned explicitly with
-  ``shutdown(wait=False, cancel_futures=True)`` so a timeout or
-  cancellation returns promptly even if the worker thread is still
-  blocked on the upstream LLM call.  This mirrors
-  :meth:`IntentJudge._run_judge`'s pattern at ``judge.py:1117-1118``.
+- Wall-clock deadline via :func:`turnstone.core.deadline.run_with_deadline`,
+  which runs the call on a *daemon* worker and polls the cancel event each
+  second.  A timeout or cancel abandons the call rather than waiting it out,
+  and the daemon worker can never block process or interpreter exit — unlike
+  a ``ThreadPoolExecutor`` worker, which ``concurrent.futures`` joins from an
+  ``atexit`` hook regardless of ``shutdown(wait=False)``.
 - HTTP client is lazy-init + reused across evaluations on a single
   judge instance.  Session-side model swaps drop the entire
   :class:`OutputGuardJudge` (``session.py:1733``/``:2136``), which
@@ -39,11 +39,15 @@ import json
 import re
 import time
 import uuid
-from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
 from turnstone.core import fence
+from turnstone.core.deadline import (
+    DeadlineCancelledError,
+    DeadlineExceededError,
+    run_with_deadline,
+)
 from turnstone.core.log import get_logger
 
 if TYPE_CHECKING:
@@ -370,9 +374,10 @@ class OutputGuardJudge:
         by :meth:`_user_prompt`.  Callers that don't have a particular
         field leave it at its default — the prompt skips empty sections.
 
-        Timeout enforcement is real wall-clock: the executor is shut
-        down with ``wait=False, cancel_futures=True`` on the timeout /
-        cancel path, so a hung upstream LLM call does not block return.
+        Timeout enforcement is real wall-clock: the upstream call runs on a
+        daemon worker via :func:`~turnstone.core.deadline.run_with_deadline`
+        and is abandoned on the timeout / cancel path, so a hung upstream LLM
+        call neither blocks return nor pins interpreter exit.
         """
         if not output:
             return OutputJudgeVerdict(
@@ -407,15 +412,16 @@ class OutputGuardJudge:
                 verdict_id, call_id, start, f"client_create_failed: {type(e).__name__}"
             )
 
-        # Explicit executor lifetime — the `with ... as ex:` form's
-        # implicit shutdown(wait=True) would block return until the
-        # upstream call completed, defeating the wall-clock timeout.
-        # Mirror IntentJudge's pattern at judge.py:1117-1118.
-        ex = ThreadPoolExecutor(max_workers=1, thread_name_prefix="output-guard-judge")
+        # Run the upstream call on a *daemon* worker bounded by a real
+        # wall-clock deadline: a timeout or cancel abandons the call instead of
+        # waiting it out, and because the worker is a daemon an abandoned call
+        # can never block process or interpreter exit.  (A ThreadPoolExecutor
+        # worker is non-daemon, and concurrent.futures joins it from an atexit
+        # hook regardless of shutdown(wait=False) — so a wedged upstream call
+        # would otherwise hang shutdown.)
         try:
-            try:
-                future = ex.submit(
-                    self._provider.create_completion,
+            result = run_with_deadline(
+                lambda: self._provider.create_completion(
                     client=client,
                     model=self._model,
                     messages=judge_messages,
@@ -423,27 +429,19 @@ class OutputGuardJudge:
                     max_tokens=512,
                     temperature=0.0,
                     reasoning_effort="low",
-                )
-                deadline = time.monotonic() + timeout
-                while True:
-                    if cancel_event is not None and cancel_event.is_set():
-                        future.cancel()
-                        return self._error_verdict(verdict_id, call_id, start, "cancelled")
-                    remaining = deadline - time.monotonic()
-                    if remaining <= 0:
-                        future.cancel()
-                        return self._error_verdict(verdict_id, call_id, start, "timeout")
-                    try:
-                        result = future.result(timeout=min(remaining, 1.0))
-                        break
-                    except TimeoutError:
-                        continue
-            except Exception as e:
-                return self._error_verdict(
-                    verdict_id, call_id, start, f"provider_error: {type(e).__name__}"
-                )
-        finally:
-            ex.shutdown(wait=False, cancel_futures=True)
+                ),
+                timeout=timeout,
+                cancel_event=cancel_event,
+                thread_name="output-guard-judge",
+            )
+        except DeadlineCancelledError:
+            return self._error_verdict(verdict_id, call_id, start, "cancelled")
+        except DeadlineExceededError:
+            return self._error_verdict(verdict_id, call_id, start, "timeout")
+        except Exception as e:
+            return self._error_verdict(
+                verdict_id, call_id, start, f"provider_error: {type(e).__name__}"
+            )
 
         content = (getattr(result, "content", "") or "").strip()
         if not content:

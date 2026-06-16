@@ -51,7 +51,10 @@ jobs:
         with:
           node-version: "24"
       - run: pip install -e ".[test]"
-      - run: pytest tests/ -m "not live" --cov=turnstone --cov-report=term-missing --cov-report=xml -q
+      # -v lists each test id as it starts (pytest prints the nodeid at
+      # logstart), so a hang names the culprit on the last line instead of
+      # riding the job timeout with only a trail of "..." dots.
+      - run: pytest tests/ -m "not live" --cov=turnstone --cov-report=term-missing --cov-report=xml -v
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         if: always()
         with:
@@ -83,7 +86,7 @@ jobs:
         with:
           node-version: "24"
       - run: pip install -e ".[test]"
-      - run: pytest tests/ -m "not live" --storage-backend=postgresql -q
+      - run: pytest tests/ -m "not live" --storage-backend=postgresql -v
         env:
           TURNSTONE_TEST_PG_URL: postgresql+psycopg://postgres:postgres@localhost:5432/turnstone_test
 
