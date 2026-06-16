@@ -1057,6 +1057,14 @@ class ChatSession:
         # many times within a turn, so the injected set is touched at most once
         # per memory per turn.  Cleared alongside the search cache.
         self._touched_memory_keys: set[tuple[str, str, str]] = set()
+        # Per-send memo for the wire attachment resolver (set in send(), None
+        # outside a send).  _resolve_attachments re-runs on every agentic
+        # round-trip, so this caches the materialized part by
+        # (attachment_id, caps-signature) to avoid re-fetching + re-rasterizing +
+        # re-base64'ing the same blob once per round-trip.
+        self._wire_part_cache: (
+            dict[tuple[str, tuple[bool, bool, bool]], dict[str, Any] | list[dict[str, Any]]] | None
+        ) = None
         self._ws_id = ws_id or uuid.uuid4().hex
         self._title_generated = False
         self._read_files: set[str] = set()
@@ -2955,11 +2963,30 @@ class ChatSession:
         # right caps; default to the primary only when called without one.
         if caps is None:
             caps = self._get_capabilities()
+        # Per-send memo (see send()): the wire resolver is re-invoked on every
+        # round-trip and per fallback model, so without this a PDF in history is
+        # re-rasterized / a blob re-base64'd once per round-trip.  Key on
+        # (id, caps-signature): the same stored blob materializes differently per
+        # capability set, and a fallback to a different-caps model can resolve
+        # within one send.  ``cache`` is None outside a send → original behavior.
+        cache = self._wire_part_cache
+        caps_sig = (caps.supports_pdf, caps.supports_vision, caps.supports_audio_input)
         out: dict[str, Any] = {}
-        for att in get_attachments(ids):
-            part = self._wire_content_part(att, caps)
-            if part is not None:
-                out[str(att["attachment_id"])] = part
+        missing: list[str] = []
+        for att_id in ids:
+            hit = cache.get((att_id, caps_sig)) if cache is not None else None
+            if hit is not None:
+                out[att_id] = hit
+            else:
+                missing.append(att_id)
+        if missing:
+            for att in get_attachments(missing):
+                part = self._wire_content_part(att, caps)
+                if part is not None:
+                    aid = str(att["attachment_id"])
+                    out[aid] = part
+                    if cache is not None:
+                        cache[(aid, caps_sig)] = part
         return out
 
     def _wire_content_part(
@@ -3149,19 +3176,26 @@ class ChatSession:
             return None
         if kind == "audio" and not caps.supports_audio_input:
             return None
-        parts = self._perception_parts(att, kind)
-        if not parts:
-            return None
-        from turnstone.core.perception import describe_cached
+        from turnstone.core.perception import describe_cached, describe_peek
 
-        text = describe_cached(
-            provider=provider,
-            client=client,
-            model=model,
-            alias=alias,
-            content_hash=str(att.get("attachment_id")),
-            parts=parts,
-        )
+        # Peek the (alias, content_hash) memo BEFORE building parts: for a PDF,
+        # _perception_parts rasterizes every page, but describe_cached returns a
+        # memoized description without touching parts on a hit — so on a cross-send
+        # hit the rasterize would be pure waste.
+        content_hash = str(att.get("attachment_id"))
+        text = describe_peek(alias=alias, content_hash=content_hash)
+        if text is None:
+            parts = self._perception_parts(att, kind)
+            if not parts:
+                return None
+            text = describe_cached(
+                provider=provider,
+                client=client,
+                model=model,
+                alias=alias,
+                content_hash=content_hash,
+                parts=parts,
+            )
         if not text:
             return None
         name = str(att.get("filename") or kind)
@@ -4084,6 +4118,10 @@ class ChatSession:
         # reference so subprocesses from old generations are still killed.
         self._cancel_event = threading.Event()
         self._cancelled_partial_msg = None
+        # Fresh per-send attachment wire-part memo (see __init__): bounds the
+        # heavy rasterized-page parts to one send and picks up any mid-session
+        # capability / config change.
+        self._wire_part_cache = {}
 
         # Metacognitive nudge: check for correction/completion signals
         # before _append_user_turn so any fired nudge (plus any nudges

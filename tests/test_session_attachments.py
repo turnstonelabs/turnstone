@@ -650,6 +650,73 @@ class TestResolveAttachmentsCapsThreading:
         assert out["aT"]["document"]["media_type"] == "application/pdf"
 
 
+class TestResolveAttachmentsPerSendCache:
+    """The per-send wire-part memo collapses the re-fetch + re-rasterize that the
+    resolver would otherwise repeat on every agentic round-trip within one send."""
+
+    def _att(self):
+        return {
+            "attachment_id": "aT",
+            "filename": "r.pdf",
+            "mime_type": "application/pdf",
+            "kind": "pdf",
+            "content": b"%PDF",
+        }
+
+    def test_cache_collapses_repeat_resolves(self, tmp_db, mock_openai_client, monkeypatch):
+        s = _make_session(mock_openai_client)
+        fetches = {"n": 0}
+        rasters = {"n": 0}
+
+        def _fetch(ids):
+            fetches["n"] += 1
+            return [self._att()] if ids else []
+
+        monkeypatch.setattr("turnstone.core.session.get_attachments", _fetch)
+        monkeypatch.setattr(
+            "turnstone.core.pdf.rasterize_pdf",
+            lambda data: rasters.__setitem__("n", rasters["n"] + 1) or [b"pg"],
+        )
+        caps = ModelCapabilities(supports_pdf=False, supports_vision=True)
+        s._wire_part_cache = {}  # simulate being inside send()
+        first = s._resolve_attachments(["aT"], caps)
+        second = s._resolve_attachments(["aT"], caps)
+        assert first == second
+        assert isinstance(first["aT"], list)
+        # Fetched + rasterized once despite two resolver passes.
+        assert fetches["n"] == 1
+        assert rasters["n"] == 1
+
+    def test_no_cache_outside_send_rematerializes(self, tmp_db, mock_openai_client, monkeypatch):
+        s = _make_session(mock_openai_client)
+        fetches = {"n": 0}
+
+        def _fetch(ids):
+            fetches["n"] += 1
+            return [self._att()]
+
+        monkeypatch.setattr("turnstone.core.session.get_attachments", _fetch)
+        monkeypatch.setattr("turnstone.core.pdf.rasterize_pdf", lambda data: [b"pg"])
+        caps = ModelCapabilities(supports_pdf=False, supports_vision=True)
+        assert s._wire_part_cache is None  # default outside a send → no caching
+        s._resolve_attachments(["aT"], caps)
+        s._resolve_attachments(["aT"], caps)
+        assert fetches["n"] == 2
+
+    def test_cache_keyed_by_caps(self, tmp_db, mock_openai_client, monkeypatch):
+        s = _make_session(mock_openai_client)
+        monkeypatch.setattr("turnstone.core.session.get_attachments", lambda ids: [self._att()])
+        monkeypatch.setattr("turnstone.core.pdf.rasterize_pdf", lambda data: [b"pg"])
+        s._wire_part_cache = {}
+        native = s._resolve_attachments(["aT"], ModelCapabilities(supports_pdf=True))
+        rasterized = s._resolve_attachments(
+            ["aT"], ModelCapabilities(supports_pdf=False, supports_vision=True)
+        )
+        # Different caps → different materialization, not a stale same-id hit.
+        assert native["aT"]["type"] == "document"
+        assert isinstance(rasterized["aT"], list)
+
+
 class TestByReferenceMediaBudget:
     """bug-2: by-reference pdf/audio are charged a bounded budget — not zero
     (over-context), not the full multi-MB source blob (over-trim)."""
