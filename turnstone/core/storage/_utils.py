@@ -302,7 +302,12 @@ def attachment_to_content_part(att: dict[str, Any]) -> dict[str, Any] | None:
     raw = att.get("content")
     mime = att.get("mime_type") or "application/octet-stream"
     if kind == "image" and isinstance(raw, bytes):
-        b64 = base64.b64encode(raw).decode("ascii")
+        from turnstone.core.images import normalize_image_orientation
+
+        # Bake EXIF orientation into the pixels — the model's image decoder, like
+        # Pillow, ignores the orientation tag, so a phone photo would otherwise be
+        # perceived sideways.  Unrotated images pass through untouched.
+        b64 = base64.b64encode(normalize_image_orientation(raw)).decode("ascii")
         return {
             "type": "image_url",
             "image_url": {"url": f"data:{mime};base64,{b64}"},

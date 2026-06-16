@@ -24,7 +24,7 @@ _MAX_IMAGE_PIXELS = 40_000_000
 def make_thumbnail(data: bytes, kind: str, *, max_px: int = _THUMB_MAX_PX) -> bytes | None:
     """Return a small PNG thumbnail for an ``image``/``pdf`` blob, else ``None``."""
     try:
-        from PIL import Image
+        from PIL import Image, ImageOps
     except ImportError:  # pragma: no cover - declared dependency; defensive
         log.warning("Pillow not installed; thumbnails unavailable")
         return None
@@ -44,11 +44,11 @@ def make_thumbnail(data: bytes, kind: str, *, max_px: int = _THUMB_MAX_PX) -> by
             img = Image.open(BytesIO(data))
         else:
             return None
-        # Reject oversized images explicitly before decoding.  Pillow's
+        # Reject oversized images explicitly before any decode.  Pillow's
         # MAX_IMAGE_PIXELS only *raises* above 2x the cap; between the cap and 2x
         # it merely warns and decodes fully (a 40-80M px image → ~480MB RGB),
         # defeating the bound.  The header-declared size is known after open(),
-        # so gate on it before convert() — nothing past the cap is ever decoded.
+        # so gate on it before exif_transpose / convert (both decode the pixels).
         # (Explicit check, not a warnings filter: make_thumbnail runs in a thread
         # and the global warnings state is not thread-safe.)
         px = img.size[0] * img.size[1]
@@ -61,7 +61,11 @@ def make_thumbnail(data: bytes, kind: str, *, max_px: int = _THUMB_MAX_PX) -> by
                 _MAX_IMAGE_PIXELS,
             )
             return None
-        rgb = img.convert("RGB")
+        # Honour EXIF orientation so a phone photo's thumbnail isn't rotated:
+        # Pillow doesn't auto-apply the tag and PNG can't carry it.  No-op for
+        # the rasterized-PDF branch (its pages carry no EXIF).
+        oriented = ImageOps.exif_transpose(img) or img
+        rgb = oriented.convert("RGB")
         rgb.thumbnail((max_px, max_px))
         buf = BytesIO()
         rgb.save(buf, format="PNG")
