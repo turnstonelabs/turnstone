@@ -11,6 +11,7 @@ import logging
 import sys
 from typing import TYPE_CHECKING, Any
 
+from turnstone.core.attachments import safe_attachment_label
 from turnstone.core.providers._protocol import (
     CompletionResult,
     ModelCapabilities,
@@ -665,7 +666,7 @@ class AnthropicProvider:
                         },
                     }
                     if d.get("name"):
-                        pdf_block["title"] = d["name"]
+                        pdf_block["title"] = safe_attachment_label(d["name"])
                     converted.append(pdf_block)
                     continue
                 # Anthropic's text-source documents only accept

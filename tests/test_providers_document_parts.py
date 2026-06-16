@@ -494,6 +494,17 @@ class TestCompatLanePdfAndAudio:
         assert parts[0]["type"] == "document"
         assert parts[0]["document"]["media_type"] == "application/pdf"
 
+    def test_pdf_placeholder_neutralizes_filename(self) -> None:
+        # A crafted filename must not break out of the [PDF attachment '...'] frame.
+        part = {
+            "type": "document",
+            "document": {"media_type": "application/pdf", "data": "x", "name": "'] X ["},
+        }
+        text = inline_document_parts([part])[0]["text"]
+        assert text.count("'") == 2  # only the two frame quotes survive
+        assert text.count("[") == 1 and text.count("]") == 1
+        assert "not supported" in text
+
 
 class TestProviderPdfCapabilities:
     def test_anthropic_cloud_supports_pdf(self) -> None:

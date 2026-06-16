@@ -44,6 +44,7 @@ from turnstone.core.attachments import (
 )
 from turnstone.core.attachments import (
     Attachment,
+    safe_attachment_label,
     unreadable_placeholder,
 )
 from turnstone.core.config import get_searxng_engines, get_searxng_url
@@ -3054,8 +3055,8 @@ class ChatSession:
             return {
                 "type": "text",
                 "text": (
-                    f"[PDF attachment '{name}' — no extractable text; "
-                    "this model cannot read PDFs natively]"
+                    f"[PDF attachment '{safe_attachment_label(name)}' — no extractable "
+                    "text; this model cannot read PDFs natively]"
                 ),
             }
         return {
@@ -3087,7 +3088,10 @@ class ChatSession:
         name = str(att.get("filename") or "audio")
         return {
             "type": "text",
-            "text": f"[audio attachment '{name}' — no transcription backend configured]",
+            "text": (
+                f"[audio attachment '{safe_attachment_label(name)}' — "
+                "no transcription backend configured]"
+            ),
         }
 
     def _stt_transcript_part(self, att: dict[str, Any]) -> dict[str, Any] | None:
@@ -3114,7 +3118,10 @@ class ChatSession:
             return None
         return {
             "type": "text",
-            "text": f"[Transcript of audio attachment '{name}']\n\n{transcript}",
+            "text": (
+                f"[Transcript of audio attachment '{safe_attachment_label(name)}' "
+                f"(untrusted)]\n\n{transcript}"
+            ),
         }
 
     def _resolve_perception(
@@ -3201,7 +3208,10 @@ class ChatSession:
         name = str(att.get("filename") or kind)
         return {
             "type": "text",
-            "text": f"[Perception of {kind} attachment '{name}']\n\n{text}",
+            "text": (
+                f"[Perception of {kind} attachment '{safe_attachment_label(name)}' "
+                f"(untrusted)]\n\n{text}"
+            ),
         }
 
     def _prepare_wire_messages(
