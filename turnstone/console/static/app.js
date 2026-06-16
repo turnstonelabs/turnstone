@@ -943,6 +943,27 @@ function _hasCoordPermission() {
 // loading-state UX (button label swap, composer disabled flag, etc.).
 // On success redirects to /coordinator/{ws_id}; on failure surfaces
 // the server's error text inline through errEl.
+// Build the fetch options for a workstream-create POST: multipart (a `meta`
+// JSON field + one `file` part per staged attachment) when files are present,
+// else plain JSON.  Shared by the coordinator and interactive launchers so the
+// create wire shape lives in one place.
+function _createWorkstreamFetchOpts(body, files) {
+  if (files.length > 0) {
+    const form = new FormData();
+    form.append("meta", JSON.stringify(body));
+    for (let i = 0; i < files.length; i++) {
+      form.append("file", files[i], files[i].name);
+    }
+    // Don't set Content-Type — the browser adds the correct multipart boundary.
+    return { method: "POST", body: form };
+  }
+  return {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  };
+}
+
 function _createCoordinator(opts) {
   const name = (opts.name || "").trim();
   const skill = opts.skill || "";
@@ -967,28 +988,11 @@ function _createCoordinator(opts) {
   if (judgeModel) body.judge_model = judgeModel;
   if (task) body.initial_message = task;
 
-  // Multipart when files are staged — the coord create endpoint
-  // accepts a `meta` JSON field plus zero-or-more `file` parts and
-  // reserves attachments for the very first turn (same flow the
-  // interactive UI's new-ws modal uses against the server).  Plain
-  // JSON stays the default when no files are attached.
+  // Multipart when files are staged (meta JSON + file parts); the coord create
+  // endpoint reserves the attachments for the very first turn.  Plain JSON
+  // otherwise.
   const files = Array.isArray(opts.files) ? opts.files : [];
-  let fetchOpts;
-  if (files.length > 0) {
-    const form = new FormData();
-    form.append("meta", JSON.stringify(body));
-    for (let i = 0; i < files.length; i++) {
-      form.append("file", files[i], files[i].name);
-    }
-    // Don't set Content-Type — the browser adds the correct boundary.
-    fetchOpts = { method: "POST", body: form };
-  } else {
-    fetchOpts = {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(body),
-    };
-  }
+  const fetchOpts = _createWorkstreamFetchOpts(body, files);
 
   authFetch("/v1/api/workstreams/new", fetchOpts)
     .then(function (r) {
@@ -1173,26 +1177,11 @@ function _createInteractive(opts) {
   if (judgeModel) body.judge_model = judgeModel;
   if (task) body.initial_message = task;
 
-  // Multipart when files are staged — `meta` JSON + zero-or-more `file`
-  // parts.  The cluster proxy picks the node (node_id in meta) and forwards
-  // the files to its create endpoint; plain JSON stays the default otherwise.
+  // Multipart when files are staged (meta JSON + file parts); the cluster proxy
+  // picks the node (node_id in meta) and forwards the files to its create
+  // endpoint.  Plain JSON otherwise.
   const files = Array.isArray(opts.files) ? opts.files : [];
-  let fetchOpts;
-  if (files.length > 0) {
-    const form = new FormData();
-    form.append("meta", JSON.stringify(body));
-    for (let i = 0; i < files.length; i++) {
-      form.append("file", files[i], files[i].name);
-    }
-    // Don't set Content-Type — the browser adds the correct boundary.
-    fetchOpts = { method: "POST", body: form };
-  } else {
-    fetchOpts = {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(body),
-    };
-  }
+  const fetchOpts = _createWorkstreamFetchOpts(body, files);
 
   authFetch("/v1/api/cluster/workstreams/new", fetchOpts)
     .then(function (r) {

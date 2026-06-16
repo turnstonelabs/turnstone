@@ -294,21 +294,27 @@ def test_console_launcher_node_strategy() -> None:
 def test_console_launcher_interactive_create_carries_attachments() -> None:
     """Create-time attachments for interactive sessions: the launcher gate is gone
     and ``_createInteractive`` frames a multipart body (``meta`` JSON + ``file``
-    parts) when files are staged, so the cluster proxy can forward the blobs to
-    the node — mirroring ``_createCoordinator``.  Was previously blocked with
-    "Attachments aren't supported for interactive sessions yet"."""
+    parts, via the shared ``_createWorkstreamFetchOpts`` helper) when files are
+    staged, so the cluster proxy can forward the blobs to the node.  Was
+    previously blocked with "Attachments aren't supported for interactive
+    sessions yet"."""
     app = _CONSOLE_APP.read_text(encoding="utf-8")
     assert "Attachments aren't supported for interactive sessions yet." not in app, (
         "the create-time interactive attachment gate must be removed"
     )
-    # Scope the multipart-framing assertions to _createInteractive's own body so
-    # they can't be satisfied by _createCoordinator alone.
+    # The shared create-fetch helper frames multipart (meta JSON + file parts).
+    helper = app[app.index("function _createWorkstreamFetchOpts(") :]
+    helper = helper[: helper.index("\nfunction ")]
+    assert "new FormData()" in helper
+    assert 'form.append("meta"' in helper and 'form.append("file"' in helper, (
+        "the create-fetch helper must send meta JSON + file parts"
+    )
+    # _createInteractive routes through that helper, so staged files are sent.
     rest = app[app.index("function _createInteractive(") + 1 :]
     cut = rest.find("\nfunction ")
-    body = rest if cut == -1 else rest[:cut]
-    assert "new FormData()" in body, "_createInteractive must build a multipart body"
-    assert 'form.append("meta"' in body and 'form.append("file"' in body, (
-        "_createInteractive must send meta JSON + file parts"
+    interactive = rest if cut == -1 else rest[:cut]
+    assert "_createWorkstreamFetchOpts(body, files)" in interactive, (
+        "_createInteractive must build its create body via the shared helper"
     )
 
 
