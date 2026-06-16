@@ -30,6 +30,9 @@ FLAC = b"fLaC\x00\x00\x00\x22" + b"\x00" * 8
 M4A = b"\x00\x00\x00\x20ftypM4A \x00\x00\x00\x00"
 # Major brand mp42 but M4A in the compatible-brands list (common for real .m4a).
 M4A_COMPAT = b"\x00\x00\x00\x20ftypmp42\x00\x00\x00\x00M4A mp42isom"
+# M4A as a LATE compatible brand (offset 40), past the old fixed 16:40 scan window
+# — must still be accepted now that the whole ftyp box is scanned.
+M4A_LATE_BRAND = b"\x00\x00\x00\x2cftypmp42\x00\x00\x00\x00isomiso2mp41avc1dashmp4aM4A "
 # ISO-BMFF *video* / MOV share the ftyp box — must NOT sniff as audio.
 MP4_VIDEO = b"\x00\x00\x00\x20ftypisom\x00\x00\x02\x00isomiso2avc1mp41"
 MOV_VIDEO = b"\x00\x00\x00\x14ftypqt  \x00\x00\x00\x00qt  \x00\x00\x00\x00"
@@ -60,6 +63,7 @@ class TestSniffAudio:
         assert sniff_audio_mime(FLAC) == "audio/flac"
         assert sniff_audio_mime(M4A) == "audio/mp4"
         assert sniff_audio_mime(M4A_COMPAT) == "audio/mp4"
+        assert sniff_audio_mime(M4A_LATE_BRAND) == "audio/mp4"
         assert sniff_audio_mime(AAC_ADTS) == "audio/aac"
         assert sniff_audio_mime(WEBM) == "audio/webm"
 
