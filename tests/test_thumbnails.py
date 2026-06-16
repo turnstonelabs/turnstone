@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import pytest
+
 from turnstone.core.thumbnails import make_thumbnail
 
 PNG_1x1 = (
@@ -49,3 +51,30 @@ class TestMakeThumbnail:
 
     def test_garbage_image_returns_none(self) -> None:
         assert make_thumbnail(b"not an image", "image") is None
+
+    @pytest.mark.filterwarnings("ignore::PIL.Image.DecompressionBombWarning")
+    def test_oversized_image_rejected(self, monkeypatch) -> None:
+        # An image past the pixel cap must be rejected WITHOUT decoding it.  Use a
+        # size in the (cap, 2*cap] window — Pillow only *warns* there and would
+        # decode fully, so this guards the explicit size check, not Pillow's >2x
+        # raise.
+        from io import BytesIO
+
+        from PIL import Image
+
+        monkeypatch.setattr("turnstone.core.thumbnails._MAX_IMAGE_PIXELS", 50)
+        buf = BytesIO()
+        Image.new("RGB", (6, 10)).save(buf, format="PNG")  # 60 px, in (50, 100]
+        assert make_thumbnail(buf.getvalue(), "image") is None
+
+    def test_at_cap_image_still_renders(self, monkeypatch) -> None:
+        # Exactly at the cap is allowed (boundary is strictly greater-than).
+        from io import BytesIO
+
+        from PIL import Image
+
+        monkeypatch.setattr("turnstone.core.thumbnails._MAX_IMAGE_PIXELS", 64)
+        buf = BytesIO()
+        Image.new("RGB", (8, 8)).save(buf, format="PNG")  # 64 px == cap
+        out = make_thumbnail(buf.getvalue(), "image")
+        assert out is not None and out[:8] == _PNG_MAGIC

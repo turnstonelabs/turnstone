@@ -44,6 +44,23 @@ def make_thumbnail(data: bytes, kind: str, *, max_px: int = _THUMB_MAX_PX) -> by
             img = Image.open(BytesIO(data))
         else:
             return None
+        # Reject oversized images explicitly before decoding.  Pillow's
+        # MAX_IMAGE_PIXELS only *raises* above 2x the cap; between the cap and 2x
+        # it merely warns and decodes fully (a 40-80M px image → ~480MB RGB),
+        # defeating the bound.  The header-declared size is known after open(),
+        # so gate on it before convert() — nothing past the cap is ever decoded.
+        # (Explicit check, not a warnings filter: make_thumbnail runs in a thread
+        # and the global warnings state is not thread-safe.)
+        px = img.size[0] * img.size[1]
+        if px > _MAX_IMAGE_PIXELS:
+            log.warning(
+                "thumbnail rejected: %d×%d (%d px) exceeds %d-pixel cap",
+                img.size[0],
+                img.size[1],
+                px,
+                _MAX_IMAGE_PIXELS,
+            )
+            return None
         rgb = img.convert("RGB")
         rgb.thumbnail((max_px, max_px))
         buf = BytesIO()
