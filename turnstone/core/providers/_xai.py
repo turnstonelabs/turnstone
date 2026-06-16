@@ -53,6 +53,17 @@ XAI_DEFAULT_BASE_URL = "https://api.x.ai/v1"
 
 # ---------------------------------------------------------------------------
 # Capability table — chat models from docs.x.ai/developers/models (May 2026).
+#
+# supports_pdf stays unset (False) on every Grok row on purpose, even though
+# Grok "supports files": xAI's document support is an agentic attachment_search
+# server-side tool over files uploaded to the Files API (referenced by file_id /
+# file_url) — NOT the inline base64 document ingestion that OpenAI input_file /
+# Anthropic document blocks use to read a PDF's content directly.  Our native
+# path emits inline base64 (attachment_to_content_part -> document /
+# application/pdf), which xAI's Responses surface does not accept, so Grok PDFs
+# correctly fall back to rasterize-to-vision (Grok is vision-capable).  Wiring
+# native Grok PDF would mean a separate Files-API upload + attachment_search
+# feature.  See docs.x.ai/developers/model-capabilities/files/chat-with-files.
 # ---------------------------------------------------------------------------
 
 GROK_CAPABILITIES: dict[str, ModelCapabilities] = {
