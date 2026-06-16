@@ -1,7 +1,8 @@
 /* composer_attachments.js — shared paperclip / chip / upload pipeline.
  *
  * Used by both:
- *   - turnstone/ui/static/app.js (interactive Pane)
+ *   - turnstone/shared_static/interactive.js (interactive Pane — standalone
+ *     server at the origin, console node-proxied via opts.getBase)
  *   - turnstone/console/static/coordinator/coordinator.js (coord IIFE)
  *
  * Owns: the in-flight `pendingAttachments` Map (insertion-ordered, so
@@ -47,8 +48,14 @@ function _inferKind(file) {
   return "text";
 }
 
-function _attachUrl(wsId, id, suffix) {
+// ``base`` is the node-proxy prefix ("/node/{id}") for a console-hosted
+// interactive pane, or "" for the standalone server / console-local coordinator
+// panes where the attachment routes are mounted at the origin.  Without it a
+// console interactive pane's request lands on the console's own coord route and
+// 404s as "coordinator not found".
+function _attachUrl(base, wsId, id, suffix) {
   return (
+    base +
     "/v1/api/workstreams/" +
     encodeURIComponent(wsId) +
     "/attachments/" +
@@ -70,10 +77,12 @@ export function kindIcon(kind) {
 // Build an inline preview node for a committed attachment (real id), or null.
 // image/pdf → server-rendered thumbnail; audio → <audio> player; text → a lazy
 // snippet.  Auth is cookie-based, so a plain media `src` works same-origin.
+// ``opts.base`` is the node-proxy prefix (see _attachUrl) — "" by default.
 export function buildAttachmentPreview(opts) {
   var kind = opts.kind,
     wsId = opts.wsId,
-    id = opts.attachmentId;
+    id = opts.attachmentId,
+    base = opts.base || "";
   if (!wsId || !id) return null;
   if (kind === "image" || kind === "pdf") {
     var img = document.createElement("img");
@@ -81,7 +90,7 @@ export function buildAttachmentPreview(opts) {
     img.loading = "lazy";
     img.decoding = "async";
     img.alt = "";
-    img.src = _attachUrl(wsId, id, "/thumbnail");
+    img.src = _attachUrl(base, wsId, id, "/thumbnail");
     // If the thumbnail can't render, swap in the kind glyph rather than removing
     // the node: the caller has already replaced the original icon span with this
     // img, so a bare remove() would leave a blank gap (no icon at all).
@@ -99,7 +108,7 @@ export function buildAttachmentPreview(opts) {
     audio.className = "attach-preview attach-preview-audio";
     audio.controls = true;
     audio.preload = "none";
-    audio.src = _attachUrl(wsId, id, "/content");
+    audio.src = _attachUrl(base, wsId, id, "/content");
     // Native control is keyboard-focusable; name it so it isn't announced as a
     // bare "audio" with no indication of which attachment it plays.
     audio.setAttribute(
@@ -119,7 +128,7 @@ export function buildAttachmentPreview(opts) {
       (opts && opts.authFetch) ||
       (typeof window !== "undefined" ? window.authFetch : null);
     if (typeof fetchFn !== "function") return null;
-    fetchFn(_attachUrl(wsId, id, "/content"), {
+    fetchFn(_attachUrl(base, wsId, id, "/content"), {
       method: "GET",
       credentials: "include",
     })
@@ -180,6 +189,11 @@ function _toastError(msg) {
  *   chipsEl: HTMLElement — chips render target (composer.chipsEl).
  *   getWsId: () => string — current workstream id (function so the
  *     interactive pane can swap tabs without re-instantiating).
+ *   getBase: optional () => string — node-proxy prefix ("/node/{id}")
+ *     for a console-hosted interactive pane; "" (default) for the
+ *     standalone server and console-local coordinator panes.  A
+ *     function, like getWsId, so a tab swap to a session on another
+ *     node retargets without re-instantiating the controller.
  *   authFetch: optional override (default window.authFetch).
  *   onError: optional (msg, err) => void — replaces the default toast
  *     for upload failures.
@@ -199,6 +213,11 @@ export function createAttachmentController(opts) {
   function _authFetch(url, init) {
     var fn = opts.authFetch || window.authFetch;
     return fn(url, init);
+  }
+  // Node-proxy prefix for the active tab (see opts.getBase).  Resolved per call
+  // so a tab swap onto a different node retargets every subsequent request.
+  function _base() {
+    return (typeof opts.getBase === "function" && opts.getBase()) || "";
   }
   var pending = new Map();
 
@@ -256,6 +275,7 @@ export function createAttachmentController(opts) {
     var prev = buildAttachmentPreview({
       kind: info.kind,
       wsId: getWsId(),
+      base: _base(),
       attachmentId: info.attachment_id,
       filename: info.filename,
       authFetch: _authFetch,
@@ -348,7 +368,10 @@ export function createAttachmentController(opts) {
     renderChip(placeholder);
 
     _authFetch(
-      "/v1/api/workstreams/" + encodeURIComponent(wsId) + "/attachments",
+      _base() +
+        "/v1/api/workstreams/" +
+        encodeURIComponent(wsId) +
+        "/attachments",
       { method: "POST", credentials: "include", body: fd },
     )
       .then(function (r) {
@@ -381,7 +404,8 @@ export function createAttachmentController(opts) {
     var wsId = getWsId();
     if (!wsId) return;
     _authFetch(
-      "/v1/api/workstreams/" +
+      _base() +
+        "/v1/api/workstreams/" +
         encodeURIComponent(wsId) +
         "/attachments/" +
         encodeURIComponent(attachmentId),
@@ -401,7 +425,10 @@ export function createAttachmentController(opts) {
     var wsId = getWsId();
     if (!wsId) return Promise.resolve();
     return _authFetch(
-      "/v1/api/workstreams/" + encodeURIComponent(wsId) + "/attachments",
+      _base() +
+        "/v1/api/workstreams/" +
+        encodeURIComponent(wsId) +
+        "/attachments",
       { method: "GET", credentials: "include" },
     )
       .then(function (r) {

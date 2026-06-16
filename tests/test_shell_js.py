@@ -642,6 +642,35 @@ def test_tab_menu_dead_controller_prefers_live_node() -> None:
     )
 
 
+def test_attachment_lane_is_base_aware() -> None:
+    """Console regression: an interactive pane is node-proxied, so its attachment
+    upload / list / delete / preview requests must ride the pane's transport base
+    ("/node/{id}").  Without it they hit the console's OWN coord route and 404 as
+    "coordinator not found" (the standalone server, base="", was unaffected —
+    which masked the bug).  Mirrors the base-aware verb lane: the controller
+    resolves a base from ``opts.getBase`` and prefixes every attachment URL;
+    ``buildAttachmentPreview`` takes the base for its thumbnail / content src; the
+    interactive pane wires both."""
+    attach = (_SHARED / "composer_attachments.js").read_text(encoding="utf-8")
+    assert "function _attachUrl(base, wsId, id, suffix)" in attach, (
+        "the per-attachment URL builder must be base-first"
+    )
+    assert "function _base()" in attach and "opts.getBase" in attach, (
+        "the controller must resolve a node base from opts.getBase"
+    )
+    assert "base: _base()" in attach, "committed-chip previews must carry the base"
+    assert "base = opts.base" in attach, "buildAttachmentPreview must consume opts.base"
+    # upload + remove + rehydrate must each base-prefix their collection/row URL.
+    assert attach.count("_base() +") >= 3, (
+        "upload, remove, and rehydrate must each base-prefix their URL"
+    )
+    pane = (_SHARED / "interactive.js").read_text(encoding="utf-8")
+    assert "getBase: () =>" in pane, (
+        "the interactive pane must pass its node base into the attachment controller"
+    )
+    assert "base: attachBase" in pane, "history-pill previews must ride the pane's base too"
+
+
 def test_step7_tab_menu_css_promoted_shared() -> None:
     """Step 7: the dropdown chrome is promoted to the SHARED shell sheet (so both
     deployments render it), recovered from the retired .ws-tab-dropdown design but

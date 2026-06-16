@@ -370,6 +370,7 @@ class Pane {
       const pills = document.createElement("div");
       pills.className = "msg-user-attach";
       const attachWsId = this.wsId;
+      const attachBase = this._base;
       attachments.forEach(function (a) {
         const pill = document.createElement("span");
         pill.className = "msg-user-attach-pill";
@@ -393,6 +394,7 @@ class Pane {
             ? window.buildAttachmentPreview({
                 kind: a.kind,
                 wsId: attachWsId,
+                base: attachBase,
                 attachmentId: a.attachment_id,
                 filename: a.filename,
               })
@@ -750,6 +752,9 @@ class Pane {
       chipsEl: this.composer.chipsEl,
       getWsId: () => {
         return this.wsId;
+      },
+      getBase: () => {
+        return this._base;
       },
       onError: (msg) => {
         showToast(msg);
