@@ -124,7 +124,21 @@ export function buildAttachmentPreview(opts) {
       credentials: "include",
     })
       .then(function (r) {
-        return r && r.ok ? r.text() : "";
+        if (!r || !r.ok) return "";
+        // We only render ~240 chars: read just the first body chunk and cancel
+        // the rest of the transfer instead of downloading the whole blob (text
+        // attachments are capped at 512 KiB, ~2000x the rendered size).  The
+        // first network chunk is always many KB, so 240 chars are available.
+        if (!r.body || typeof r.body.getReader !== "function") return r.text();
+        var reader = r.body.getReader();
+        return reader.read().then(function (res) {
+          try {
+            reader.cancel();
+          } catch (e) {
+            /* already closed */
+          }
+          return res && res.value ? new TextDecoder().decode(res.value) : "";
+        });
       })
       .then(function (t) {
         if (!t) {
