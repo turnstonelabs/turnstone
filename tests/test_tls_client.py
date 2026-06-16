@@ -118,8 +118,15 @@ def _make_flaky_client(monkeypatch, failures: int):
     async def ok_request():
         pass
 
+    real_sleep = asyncio.sleep
+
     async def fake_sleep(delay):
+        # Record the backoff delay and skip the real wait, but still yield to
+        # the loop. An async stub that returns without ever suspending lets the
+        # whole retry run complete in a single event-loop step with no
+        # checkpoint, which is fragile under the async test runner.
         sleeps.append(delay)
+        await real_sleep(0)
 
     monkeypatch.setattr(client, "_fetch_ca_cert", flaky_fetch)
     monkeypatch.setattr(client, "_request_cert", ok_request)
@@ -188,13 +195,18 @@ async def test_init_retries_discovery_failure(monkeypatch):
             raise RuntimeError("No console service found in services table.")
         return "http://console:9999"
 
+    real_sleep = asyncio.sleep
+
     async def ok():
         pass
+
+    async def fake_sleep(_delay):
+        await real_sleep(0)
 
     monkeypatch.setattr(client, "_discover_console_url", flaky_discover)
     monkeypatch.setattr(client, "_fetch_ca_cert", ok)
     monkeypatch.setattr(client, "_request_cert", ok)
-    monkeypatch.setattr(asyncio, "sleep", lambda _: ok())
+    monkeypatch.setattr(asyncio, "sleep", fake_sleep)
 
     await client.init(attempts=2)
     assert attempts == [1, 2]
