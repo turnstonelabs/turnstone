@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from io import BytesIO
+
 import pytest
 
 from turnstone.core.thumbnails import make_thumbnail
@@ -41,6 +43,18 @@ class TestMakeThumbnail:
     def test_image_thumbnail_is_png(self) -> None:
         out = make_thumbnail(PNG_1x1, "image")
         assert out is not None and out[:8] == _PNG_MAGIC
+
+    def test_image_thumbnail_honours_exif_orientation(self) -> None:
+        pil = pytest.importorskip("PIL.Image")
+        src = pil.new("RGB", (40, 20), "red")  # landscape source
+        exif = src.getexif()
+        exif[0x0112] = 6  # "rotate 90° for display" → the thumbnail should be portrait
+        buf = BytesIO()
+        src.save(buf, format="JPEG", exif=exif)
+        out = make_thumbnail(buf.getvalue(), "image")
+        assert out is not None
+        thumb = pil.open(BytesIO(out))
+        assert thumb.height > thumb.width, "thumbnail must reflect the applied EXIF rotation"
 
     def test_pdf_thumbnail_is_png(self) -> None:
         out = make_thumbnail(_minimal_pdf(), "pdf")
