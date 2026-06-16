@@ -57,7 +57,11 @@ function _attachUrl(wsId, id, suffix) {
   );
 }
 
-function _kindIcon(kind) {
+// Canonical kind → glyph mapping.  Exported (and mirrored on `window` below) so
+// the interactive pane and the coordinator pill builder share one source of
+// truth instead of re-deriving it — the audio (🎵) case in particular has
+// drifted before.
+export function kindIcon(kind) {
   if (kind === "image") return "🖼";
   if (kind === "audio") return "🎵";
   return "📄"; // pdf + text
@@ -78,9 +82,15 @@ export function buildAttachmentPreview(opts) {
     img.decoding = "async";
     img.alt = "";
     img.src = _attachUrl(wsId, id, "/thumbnail");
-    // Drop the node if the thumbnail can't render, so the icon shows instead.
+    // If the thumbnail can't render, swap in the kind glyph rather than removing
+    // the node: the caller has already replaced the original icon span with this
+    // img, so a bare remove() would leave a blank gap (no icon at all).
     img.addEventListener("error", function () {
-      img.remove();
+      var fallback = document.createElement("span");
+      fallback.className = "attach-preview attach-preview-icon";
+      fallback.setAttribute("aria-hidden", "true");
+      fallback.textContent = kindIcon(kind);
+      img.replaceWith(fallback);
     });
     return img;
   }
@@ -175,7 +185,7 @@ export function createAttachmentController(opts) {
     var icon = document.createElement("span");
     icon.className = "composer-chip-icon";
     icon.setAttribute("aria-hidden", "true");
-    icon.textContent = _kindIcon(info.kind);
+    icon.textContent = kindIcon(info.kind);
     chip.appendChild(icon);
 
     var name = document.createElement("span");
@@ -279,7 +289,7 @@ export function createAttachmentController(opts) {
       // classify_upload on the server is authoritative — adopt its kind for the
       // chip icon, then render the preview now there's a real id.
       var swapIcon = chip.querySelector(".composer-chip-icon");
-      if (swapIcon) swapIcon.textContent = _kindIcon(info.kind);
+      if (swapIcon) swapIcon.textContent = kindIcon(info.kind);
       var name = chip.querySelector(".composer-chip-name");
       if (name) {
         name.textContent = info.filename || "(unnamed)";
@@ -438,3 +448,4 @@ export function createAttachmentController(opts) {
 // this deferred module evaluated).  New module code imports instead.
 window.createAttachmentController = createAttachmentController;
 window.buildAttachmentPreview = buildAttachmentPreview;
+window.kindIcon = kindIcon;

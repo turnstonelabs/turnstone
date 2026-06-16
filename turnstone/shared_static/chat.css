@@ -88,6 +88,18 @@
   background: var(--bg-surface);
   flex: 0 0 auto;
 }
+/* Fallback when a thumbnail fails to load: the kind glyph in the same slot the
+   thumbnail would have occupied (so layout doesn't jump and no blank gap). */
+.attach-preview-icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 28px;
+  height: 28px;
+  flex: 0 0 auto;
+  font-size: 16px;
+  line-height: 1;
+}
 .attach-preview-audio {
   height: 30px;
   max-width: min(240px, 100%);
@@ -113,6 +125,11 @@
 .msg-user-attach-pill .attach-preview-thumb {
   width: 44px;
   height: 44px;
+}
+.msg-user-attach-pill .attach-preview-icon {
+  width: 44px;
+  height: 44px;
+  font-size: 22px;
 }
 .msg-user-attach-pill .attach-preview-audio {
   height: 32px;
