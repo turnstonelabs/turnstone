@@ -46,6 +46,7 @@ if TYPE_CHECKING:
     from starlette.responses import Response
     from starlette.routing import BaseRoute
 
+    from turnstone.core.attachments import UploadRejection
     from turnstone.core.session_manager import SessionManager
     from turnstone.core.session_ui_base import SessionUIBase
     from turnstone.core.workstream import Workstream, WorkstreamKind
@@ -278,7 +279,7 @@ class AttachmentUploadHelpers:
 
     classify_upload: Callable[
         [str, str, bytes],
-        tuple[str | None, str | None, Any],
+        tuple[str | None, str | None, UploadRejection | None],
     ]
 
 
