@@ -27,7 +27,9 @@ def test_catastrophic_backtracking_returns_message(monkeypatch) -> None:
         raise DeadlineExceededError
 
     monkeypatch.setattr("turnstone.console.server.run_with_deadline", _deadline)
-    assert _validate_regex_pattern(r"(a+)+$") == "Regex appears to have catastrophic backtracking"
+    # The pattern is arbitrary — run_with_deadline is stubbed to raise, so the
+    # probe never runs; a real backtracking literal here would only trip CodeQL.
+    assert _validate_regex_pattern(r"\w+") == "Regex appears to have catastrophic backtracking"
 
 
 def test_probe_error_returns_generic_message(monkeypatch) -> None:

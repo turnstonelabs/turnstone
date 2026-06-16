@@ -12,7 +12,7 @@ Design:
   a static tool result doesn't benefit from multi-turn — the text is
   already in hand.
 - JSON-in-content verdict.  4-strategy parser inlined from
-  :class:`IntentJudge` (``judge.py:1603-1659``).
+  :meth:`IntentJudge._parse_verdict`.
 - Wall-clock deadline via :func:`turnstone.core.deadline.run_with_deadline`,
   which runs the call on a *daemon* worker and polls the cancel event each
   second.  A timeout or cancel abandons the call rather than waiting it out,

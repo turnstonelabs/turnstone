@@ -68,6 +68,18 @@ def run_with_deadline(
 
     deadline = time.monotonic() + timeout
     while True:
+        # Prefer a result that has already arrived over a deadline or cancel
+        # firing in the same scheduling window — otherwise a completed call
+        # could be reported as a spurious timeout/cancel under jitter.
+        try:
+            ok, payload = box.get_nowait()
+        except queue.Empty:
+            pass
+        else:
+            if ok:
+                return payload  # type: ignore[return-value]  # ok=True ⇒ payload is _T
+            raise payload  # type: ignore[misc]  # ok=False ⇒ payload is the raised exc
+
         if cancel_event is not None and cancel_event.is_set():
             raise DeadlineCancelledError
         remaining = deadline - time.monotonic()
@@ -78,5 +90,5 @@ def run_with_deadline(
         except queue.Empty:
             continue
         if ok:
-            return payload  # type: ignore[return-value]  # ok=True ⇒ payload is _T
-        raise payload  # type: ignore[misc]  # ok=False ⇒ payload is the raised exc
+            return payload  # type: ignore[return-value]
+        raise payload  # type: ignore[misc]
