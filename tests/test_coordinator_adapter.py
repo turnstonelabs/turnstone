@@ -123,6 +123,21 @@ def test_emit_created_seeds_resolved_display_name(tmp_path: Any) -> None:
         reset_storage()
 
 
+def test_coord_display_name_skips_uninitialized_storage() -> None:
+    """_coord_display_name runs on a lifecycle-event path and must NOT trip
+    get_storage()'s SQLite auto-init (a stray .turnstone.db in the CWD) when
+    storage isn't initialized — it falls back to the placeholder ws.name and
+    leaves storage untouched."""
+    from turnstone.console.coordinator_adapter import _coord_display_name
+    from turnstone.core.storage import is_storage_initialized, reset_storage
+
+    reset_storage()
+    assert not is_storage_initialized()
+    assert _coord_display_name(_make_ws(name="ws-abcd")) == "ws-abcd"
+    # The resolution did not auto-initialize storage as a side effect.
+    assert not is_storage_initialized()
+
+
 def test_emit_state_calls_collector_state() -> None:
     """Post-rich-payload, emit_state passes tokens / context_ratio /
     activity / activity_state / content kwargs read from ws.ui's

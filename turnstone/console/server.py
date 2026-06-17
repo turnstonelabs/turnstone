@@ -924,6 +924,13 @@ def _coordinator_rows(request: Request) -> list[dict[str, Any]]:
         return m.get("alias") or m.get("title") or m.get("name") or fallback
 
     def _title(ws_id: str) -> str:
+        # Best-effort: the secondary ``title`` field is sourced from the
+        # ``limit=200`` ``meta`` map, so a live coord outside that window
+        # reports ``""`` here. The user-visible ``name`` stays correct
+        # (resolved via the uncapped ``live_display`` above, and the UI
+        # renders ``title || name``); the empty title is harmless and the
+        # window is unreachable in practice (live coords are bounded by
+        # ``max_active`` and sort to the top of ``updated DESC``).
         m = meta.get(ws_id)
         return str(m.get("title") or "") if m is not None else ""
 

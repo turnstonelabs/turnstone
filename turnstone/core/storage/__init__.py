@@ -8,6 +8,7 @@ from turnstone.core.storage._registry import (
     StorageUnavailableError,
     get_storage,
     init_storage,
+    is_storage_initialized,
     reset_storage,
 )
 
@@ -17,5 +18,6 @@ __all__ = [
     "StorageUnavailableError",
     "get_storage",
     "init_storage",
+    "is_storage_initialized",
     "reset_storage",
 ]

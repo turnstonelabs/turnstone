@@ -124,6 +124,19 @@ def get_storage() -> StorageBackend:
     return _storage
 
 
+def is_storage_initialized() -> bool:
+    """Return True when the storage singleton has been initialized.
+
+    Lets callers on lifecycle / early-startup paths consult storage
+    without tripping :func:`get_storage`'s SQLite auto-init side effect
+    (which would create ``.turnstone.db`` in the CWD). Use this to guard
+    a best-effort read that should simply be skipped before the host has
+    called :func:`init_storage` — never as a substitute for the explicit
+    init the app's startup performs.
+    """
+    return _storage is not None
+
+
 def reset_storage() -> None:
     """Close and clear the storage backend singleton (for tests)."""
     global _storage
