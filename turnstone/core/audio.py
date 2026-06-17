@@ -15,11 +15,16 @@ backend is surfaced as a typed error the endpoint maps to 503 / 502.
 
 from __future__ import annotations
 
+import subprocess
 import threading
 from dataclasses import dataclass
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from turnstone.core.log import get_logger
+from turnstone.core.server_compat import merge_server_compat
+
+if TYPE_CHECKING:
+    from collections.abc import Iterator
 
 log = get_logger(__name__)
 
@@ -82,6 +87,22 @@ _OMNI_STT_PROMPT = (
     "* When transcribing numbers, write the digits, i.e. write 1.7 and not one point "
     "seven, and write 3 instead of three"
 )
+
+# Bound the omni STT decode.  Gemma caps audio at 30 s and a 30 s transcript is
+# well under this, so the cap only catches a pathological runaway — it never
+# truncates a real transcript.
+_OMNI_STT_MAX_TOKENS = 1024
+
+# Hard limit on the ffmpeg transcode subprocess (seconds).
+_FFMPEG_TIMEOUT_S = 30
+
+# Cap the decoded audio duration so a crafted clip can't expand into an
+# unbounded decode (the upload itself is already size-capped at the endpoint).
+_MAX_AUDIO_SECONDS = 300
+
+# Per-request timeout for the streaming STT chat call — bounds a hung backend
+# (the whole transcription is ~1 s; this only catches a stalled stream).
+_OMNI_STT_TIMEOUT_S = 60
 
 
 @dataclass(frozen=True)
@@ -185,30 +206,115 @@ def _serves_transcription_endpoint(cfg: Any, model: str) -> bool:
     return _infer_audio_capability(model, "stt")
 
 
-def _transcribe_via_chat(client: Any, model: str, data: bytes, filename: str, prompt: str) -> str:
+def _to_wav_16k_mono(data: bytes) -> bytes:
+    """Decode any ffmpeg-readable audio container to 16 kHz mono PCM WAV.
+
+    Browsers record webm/opus (or ogg/mp4); the omni chat lane — vLLM in
+    particular — only decodes wav/mp3 and sniffs the bytes, so the raw upload is
+    rejected as an "Invalid or unsupported audio file".  ffmpeg reads the
+    container from the byte stream (no reliance on the filename) and resamples to
+    the 16 kHz mono PCM the model documents.  Raises :class:`AudioBackendError`
+    (the endpoint maps it to 502) if ffmpeg is missing or the bytes don't decode.
+    """
+    # ffmpeg reads only the piped bytes (-protocol_whitelist pipe) so a crafted
+    # container can't open file:/http: references (SSRF / local file read); -vn
+    # drops video streams and -t bounds the decode against a decompression bomb.
+    try:
+        proc = subprocess.run(
+            [
+                "ffmpeg",
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-protocol_whitelist",
+                "pipe",
+                "-i",
+                "pipe:0",
+                "-vn",
+                "-t",
+                str(_MAX_AUDIO_SECONDS),
+                "-ac",
+                "1",
+                "-ar",
+                "16000",
+                "-f",
+                "wav",
+                "pipe:1",
+            ],
+            input=data,
+            capture_output=True,
+            timeout=_FFMPEG_TIMEOUT_S,
+        )
+    except FileNotFoundError as exc:
+        raise AudioBackendError("ffmpeg is not installed; cannot transcode audio") from exc
+    except subprocess.TimeoutExpired as exc:
+        raise AudioBackendError("Audio transcode timed out") from exc
+    if proc.returncode != 0 or not proc.stdout:
+        detail = proc.stderr.decode("utf-8", "replace").strip()
+        raise AudioBackendError(f"Audio transcode failed: {detail[-200:] or 'no output'}")
+    return proc.stdout
+
+
+def _omni_chat_extra_body(cfg: Any) -> dict[str, Any]:
+    """Build the chat ``extra_body`` for an omni STT call.
+
+    The STT path calls the raw client, so it bypasses the provider's request
+    shaping.  Reuse ``merge_server_compat`` to forward any operator-stored
+    ``server_compat["extra_body"]``, then force **thinking OFF** via the model's
+    own ``thinking_param``: transcription needs no reasoning, and leaving it on
+    multiplies latency ~10x and (on some chat templates) empties the content.
+    The override is applied last so it wins over any operator thinking flag.
+    """
+    server_compat = getattr(cfg, "server_compat", None)
+    extra = merge_server_compat(None, server_compat) if isinstance(server_compat, dict) else {}
+    caps = getattr(cfg, "capabilities", None) or {}
+    thinking_param = caps.get("thinking_param")
+    if thinking_param and caps.get("thinking_mode") in ("manual", "adaptive"):
+        extra.setdefault("chat_template_kwargs", {})[thinking_param] = False
+    return extra
+
+
+def _omni_chat_messages(prompt: str, audio_b64: str) -> list[dict[str, Any]]:
+    """The single user turn for an omni STT chat call: the prompt precedes the
+    audio part — the order Gemma documents for transcription."""
+    return [
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": prompt},
+                {"type": "input_audio", "input_audio": {"data": audio_b64, "format": "wav"}},
+            ],
+        }
+    ]
+
+
+def _transcribe_via_chat(
+    client: Any,
+    model: str,
+    data: bytes,
+    prompt: str,
+    *,
+    extra_body: dict[str, Any] | None = None,
+    max_tokens: int = _OMNI_STT_MAX_TOKENS,
+) -> str:
     """Transcribe by handing the clip to an omni *chat* model as ``input_audio``.
 
     For models that accept audio in chat (``supports_audio_input``) but don't
-    serve ``/audio/transcriptions``.  The instruction ``prompt`` steers the model
-    to emit only the transcript.  The audio format is taken from the upload's
-    filename extension (the same shape the attachment wire path uses).
+    serve ``/audio/transcriptions``.  The clip is transcoded to 16 kHz mono WAV
+    first (browsers record webm/opus, which the chat lane can't decode).  The
+    instruction ``prompt`` precedes the audio part — the order Gemma documents
+    for transcription — and ``extra_body`` carries the thinking-off / server
+    compat params the raw-client path would otherwise skip.
     """
     import base64
 
-    name = filename or "speech.webm"
-    fmt = name.rsplit(".", 1)[-1].lower() if "." in name else "wav"
-    audio_b64 = base64.b64encode(data).decode("ascii")
+    wav = _to_wav_16k_mono(data)
+    audio_b64 = base64.b64encode(wav).decode("ascii")
     resp = client.chat.completions.create(
         model=model,
-        messages=[
-            {
-                "role": "user",
-                "content": [
-                    {"type": "text", "text": prompt},
-                    {"type": "input_audio", "input_audio": {"data": audio_b64, "format": fmt}},
-                ],
-            }
-        ],
+        messages=_omni_chat_messages(prompt, audio_b64),
+        max_tokens=max_tokens,
+        extra_body=extra_body or None,
     )
     choices = getattr(resp, "choices", None) or []
     if not choices:
@@ -261,11 +367,84 @@ def transcribe(
             transcript = (getattr(resp, "text", "") or "").strip()
         else:
             transcript = _transcribe_via_chat(
-                client, model, data, filename, prompt or _OMNI_STT_PROMPT
+                client,
+                model,
+                data,
+                prompt or _OMNI_STT_PROMPT,
+                extra_body=_omni_chat_extra_body(cfg),
             )
+    except AudioBackendError:
+        # Transcode errors already carry an actionable message — keep it.
+        raise
     except Exception as exc:
         raise AudioBackendError(f"Transcription backend failed: {exc}") from exc
     return TranscriptionResult(transcript=transcript, model_alias=alias, model=model)
+
+
+def _iter_stream_deltas(stream: Any) -> Iterator[str]:
+    """Yield non-empty content deltas from an OpenAI streaming chat response.
+
+    Owns the stream's lifecycle: exhausting or closing this generator releases
+    the underlying HTTP connection, so an abandoned stream can't leak it.
+    """
+    try:
+        for chunk in stream:
+            choices = getattr(chunk, "choices", None) or []
+            if not choices:
+                continue
+            delta = getattr(choices[0].delta, "content", None)
+            if delta:
+                yield delta
+    finally:
+        close = getattr(stream, "close", None)
+        if callable(close):
+            close()
+
+
+def transcribe_stream(*, registry: Any, alias: str, data: bytes, prompt: str = "") -> Iterator[str]:
+    """Stream transcript content deltas for the STT role alias.
+
+    Resolve, transcode, and opening the streaming-chat request all run eagerly
+    (before the returned generator yields its first delta) so the caller can
+    surface a clean 503 / 502; only the token iteration is deferred.  A
+    whisper-style endpoint alias has no chat stream, so it emits the whole
+    transcript as a single chunk.
+    """
+    try:
+        client, model, cfg = registry.resolve(alias)
+    except Exception as exc:  # unknown/removed alias
+        raise AudioUnavailableError(f"STT model alias {alias!r} is not available") from exc
+    if not _provider_carries_audio(cfg):
+        raise AudioUnavailableError(
+            f"STT model alias {alias!r} (provider {getattr(cfg, 'provider', 'unknown')!r}) "
+            "can't transcribe audio — audio roles require an OpenAI-compatible provider."
+        )
+    if _serves_transcription_endpoint(cfg, model):
+        # Whisper-style endpoint: no chat stream — emit the whole transcript once.
+        text = transcribe(
+            registry=registry, alias=alias, data=data, filename="speech.webm", prompt=prompt
+        ).transcript
+        return iter([text] if text else [])
+    caps = getattr(cfg, "capabilities", None) or {}
+    if not caps.get("supports_audio_input"):
+        raise AudioUnavailableError(f"STT model alias {alias!r} cannot transcribe audio")
+
+    import base64
+
+    wav = _to_wav_16k_mono(data)
+    audio_b64 = base64.b64encode(wav).decode("ascii")
+    try:
+        stream = client.chat.completions.create(
+            model=model,
+            messages=_omni_chat_messages(prompt or _OMNI_STT_PROMPT, audio_b64),
+            max_tokens=_OMNI_STT_MAX_TOKENS,
+            extra_body=_omni_chat_extra_body(cfg) or None,
+            stream=True,
+            timeout=_OMNI_STT_TIMEOUT_S,
+        )
+    except Exception as exc:
+        raise AudioBackendError(f"Transcription backend failed: {exc}") from exc
+    return _iter_stream_deltas(stream)
 
 
 # -- transcript memoization (no-native-audio wire fallback) -------------------

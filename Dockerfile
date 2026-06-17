@@ -17,8 +17,10 @@ RUN rm -f /etc/dpkg/dpkg.cfg.d/docker
 # ripgrep is the preferred backend for the search tool — natively bounds
 # per-line, per-file, and per-filesize so pathological inputs (minified
 # bundles, training-data JSONL with multi-MB single records) can't OOM us.
+# ffmpeg transcodes omni STT uploads (browser webm/opus) to the 16 kHz mono
+# WAV the omni chat-audio lane decodes.
 RUN apt-get update && apt-get upgrade -y && apt-get install -y --no-install-recommends \
-    libpq5 git curl jq man-db manpages procps file ripgrep \
+    libpq5 git curl jq man-db manpages procps file ripgrep ffmpeg \
     && rm -rf /var/lib/apt/lists/*
 
 # Node.js LTS (for npx-based MCP servers like @modelcontextprotocol/server-github)

@@ -7,6 +7,7 @@ helper code runs end-to-end without a network call.
 
 from __future__ import annotations
 
+import shutil
 from unittest.mock import MagicMock
 
 import pytest
@@ -18,11 +19,16 @@ class _Cfg:
     """Stand-in for ModelConfig — only the fields audio.py reads."""
 
     def __init__(
-        self, model: str, capabilities: dict | None = None, provider: str = "openai"
+        self,
+        model: str,
+        capabilities: dict | None = None,
+        provider: str = "openai",
+        server_compat: dict | None = None,
     ) -> None:
         self.model = model
         self.capabilities = capabilities or {}
         self.provider = provider
+        self.server_compat = server_compat or {}
 
 
 class _FakeConfigStore:
@@ -191,7 +197,8 @@ class TestTranscribe:
         with pytest.raises(audio.AudioBackendError):
             audio.transcribe(registry=reg, alias="voice", data=b"x", filename="a.wav")
 
-    def test_omni_model_transcribes_via_chat(self):
+    def test_omni_model_transcribes_via_chat(self, monkeypatch):
+        monkeypatch.setattr(audio, "_to_wav_16k_mono", lambda data: data)
         client = MagicMock()
         msg = MagicMock(content="  the transcript  ")
         client.chat.completions.create.return_value = MagicMock(choices=[MagicMock(message=msg)])
@@ -202,15 +209,18 @@ class TestTranscribe:
         assert res.transcript == "the transcript"
         # The dedicated transcription endpoint is NOT used for an omni model.
         client.audio.transcriptions.create.assert_not_called()
-        # Audio rides as an input_audio chat part; format comes from the filename.
         parts = client.chat.completions.create.call_args.kwargs["messages"][0]["content"]
+        # Prompt precedes the audio part — the order Gemma documents for transcription.
+        assert [p["type"] for p in parts] == ["text", "input_audio"]
+        # The clip is transcoded to wav regardless of the upload container.
         audio_part = next(p for p in parts if p["type"] == "input_audio")
-        assert audio_part["input_audio"]["format"] == "webm"
+        assert audio_part["input_audio"]["format"] == "wav"
         # A blank prompt falls back to the omni STT default instruction.
         text_part = next(p for p in parts if p["type"] == "text")
         assert "Only output the transcription" in text_part["text"]
 
-    def test_omni_prompt_override_used(self):
+    def test_omni_prompt_override_used(self, monkeypatch):
+        monkeypatch.setattr(audio, "_to_wav_16k_mono", lambda data: data)
         client = MagicMock()
         client.chat.completions.create.return_value = MagicMock(
             choices=[MagicMock(message=MagicMock(content="x"))]
@@ -338,3 +348,190 @@ class TestTranscribeCached:
         assert audio.transcribe_cached(**kw) == ""
         audio.transcribe_cached(**kw)
         assert len(calls) == 2  # failure not cached -> retried
+
+
+# ---------------------------------------------------------------------------
+# Omni chat request shaping — transcode + thinking-off + token cap
+# ---------------------------------------------------------------------------
+
+
+class TestOmniChatExtraBody:
+    """``_omni_chat_extra_body`` re-applies what the raw-client STT path skips."""
+
+    _THINKING = {"thinking_mode": "manual", "thinking_param": "enable_thinking"}
+
+    def test_disables_thinking_via_model_param(self):
+        cfg = _Cfg("gemma", dict(self._THINKING))
+        assert audio._omni_chat_extra_body(cfg) == {
+            "chat_template_kwargs": {"enable_thinking": False}
+        }
+
+    def test_thinking_off_wins_over_operator_flag(self):
+        cfg = _Cfg(
+            "gemma",
+            dict(self._THINKING),
+            server_compat={"extra_body": {"chat_template_kwargs": {"enable_thinking": True}}},
+        )
+        # STT never wants reasoning, even if an operator stored thinking on.
+        assert audio._omni_chat_extra_body(cfg)["chat_template_kwargs"]["enable_thinking"] is False
+
+    def test_forwards_operator_server_compat_extra_body(self):
+        cfg = _Cfg(
+            "model",
+            dict(self._THINKING),
+            server_compat={"extra_body": {"reasoning_format": "auto"}},
+        )
+        extra = audio._omni_chat_extra_body(cfg)
+        assert extra["reasoning_format"] == "auto"
+        assert extra["chat_template_kwargs"] == {"enable_thinking": False}
+
+    def test_empty_for_non_thinking_model(self):
+        cfg = _Cfg("omni", {"supports_audio_input": True})
+        assert audio._omni_chat_extra_body(cfg) == {}
+
+
+class TestOmniChatCall:
+    """The omni chat call carries the thinking-off extra_body and a token cap."""
+
+    def test_sends_thinking_off_and_token_cap(self, monkeypatch):
+        monkeypatch.setattr(audio, "_to_wav_16k_mono", lambda data: data)
+        client = MagicMock()
+        client.chat.completions.create.return_value = MagicMock(
+            choices=[MagicMock(message=MagicMock(content="hi"))]
+        )
+        cfg = _Cfg(
+            "gemma-omni",
+            {
+                "supports_audio_input": True,
+                "thinking_mode": "manual",
+                "thinking_param": "enable_thinking",
+            },
+        )
+        audio.transcribe(
+            registry=_FakeRegistry("omni", cfg, client),
+            alias="omni",
+            data=b"webmbytes",
+            filename="speech.webm",
+        )
+        kwargs = client.chat.completions.create.call_args.kwargs
+        assert kwargs["extra_body"]["chat_template_kwargs"]["enable_thinking"] is False
+        assert kwargs["max_tokens"] == audio._OMNI_STT_MAX_TOKENS
+
+
+class TestTranscode:
+    """``_to_wav_16k_mono`` normalizes any container to 16 kHz mono WAV via ffmpeg."""
+
+    def _stereo_wav_44k(self) -> bytes:
+        import io
+        import wave
+
+        buf = io.BytesIO()
+        with wave.open(buf, "wb") as w:
+            w.setnchannels(2)
+            w.setsampwidth(2)
+            w.setframerate(44100)
+            w.writeframes(b"\x00\x01\x00\x01" * 4410)  # 0.1 s of stereo
+        return buf.getvalue()
+
+    @pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="ffmpeg not installed")
+    def test_transcodes_to_16k_mono(self):
+        import io
+        import wave
+
+        out = audio._to_wav_16k_mono(self._stereo_wav_44k())
+        with wave.open(io.BytesIO(out), "rb") as w:
+            assert w.getnchannels() == 1
+            assert w.getframerate() == 16000
+
+    @pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="ffmpeg not installed")
+    def test_undecodable_bytes_raise_backend_error(self):
+        with pytest.raises(audio.AudioBackendError):
+            audio._to_wav_16k_mono(b"this is not audio at all")
+
+    def test_missing_ffmpeg_raises_backend_error(self, monkeypatch):
+        def _no_ffmpeg(*a, **k):
+            raise FileNotFoundError("ffmpeg")
+
+        monkeypatch.setattr(audio.subprocess, "run", _no_ffmpeg)
+        with pytest.raises(audio.AudioBackendError, match="ffmpeg is not installed"):
+            audio._to_wav_16k_mono(b"x")
+
+    def test_invokes_ffmpeg_with_hardened_argv(self, monkeypatch):
+        # Covers the argv shaping even on a CI image without ffmpeg installed.
+        captured = {}
+
+        def _fake_run(cmd, **kwargs):
+            captured["cmd"] = cmd
+            captured["input"] = kwargs.get("input")
+            return MagicMock(returncode=0, stdout=b"RIFF....WAVE", stderr=b"")
+
+        monkeypatch.setattr(audio.subprocess, "run", _fake_run)
+        assert audio._to_wav_16k_mono(b"rawclip") == b"RIFF....WAVE"
+        cmd = captured["cmd"]
+        assert cmd[0] == "ffmpeg"
+        assert captured["input"] == b"rawclip"
+        # SSRF/decompression-bomb hardening + the 16 kHz mono normalization.
+        assert cmd[cmd.index("-protocol_whitelist") + 1] == "pipe"
+        assert "-vn" in cmd
+        assert cmd[cmd.index("-ac") + 1] == "1"
+        assert cmd[cmd.index("-ar") + 1] == "16000"
+        assert cmd[cmd.index("-f") + 1] == "wav"
+
+    def test_nonzero_returncode_raises_backend_error(self, monkeypatch):
+        monkeypatch.setattr(
+            audio.subprocess,
+            "run",
+            lambda *a, **k: MagicMock(returncode=1, stdout=b"", stderr=b"boom"),
+        )
+        with pytest.raises(audio.AudioBackendError, match="Audio transcode failed"):
+            audio._to_wav_16k_mono(b"x")
+
+
+def _stream_chunk(content):
+    return MagicMock(choices=[MagicMock(delta=MagicMock(content=content))])
+
+
+class TestTranscribeStream:
+    """``transcribe_stream`` yields content deltas; resolve/transcode are eager."""
+
+    def test_streams_chat_deltas_with_thinking_off(self, monkeypatch):
+        monkeypatch.setattr(audio, "_to_wav_16k_mono", lambda data: data)
+        client = MagicMock()
+        client.chat.completions.create.return_value = iter(
+            [_stream_chunk("and so"), _stream_chunk(None), _stream_chunk(" my fellow americans")]
+        )
+        cfg = _Cfg(
+            "gemma-omni",
+            {
+                "supports_audio_input": True,
+                "thinking_mode": "manual",
+                "thinking_param": "enable_thinking",
+            },
+        )
+        gen = audio.transcribe_stream(
+            registry=_FakeRegistry("omni", cfg, client), alias="omni", data=b"webmbytes"
+        )
+        # Empty/None deltas are skipped; the rest stream through in order.
+        assert list(gen) == ["and so", " my fellow americans"]
+        kwargs = client.chat.completions.create.call_args.kwargs
+        assert kwargs["stream"] is True
+        assert kwargs["extra_body"]["chat_template_kwargs"]["enable_thinking"] is False
+
+    def test_non_audio_provider_raises_before_streaming(self):
+        client = MagicMock()
+        cfg = _Cfg("gemma", {"supports_audio_input": True}, provider="anthropic-compatible")
+        with pytest.raises(audio.AudioUnavailableError, match="OpenAI-compatible provider"):
+            audio.transcribe_stream(
+                registry=_FakeRegistry("omni", cfg, client), alias="omni", data=b"x"
+            )
+        client.chat.completions.create.assert_not_called()
+
+    def test_whisper_alias_emits_single_chunk(self):
+        client = MagicMock()
+        client.audio.transcriptions.create.return_value = MagicMock(text="  full transcript  ")
+        cfg = _Cfg("whisper-1")  # name inference -> dedicated endpoint, no chat stream
+        gen = audio.transcribe_stream(
+            registry=_FakeRegistry("w", cfg, client), alias="w", data=b"x"
+        )
+        assert list(gen) == ["full transcript"]
+        client.chat.completions.create.assert_not_called()
