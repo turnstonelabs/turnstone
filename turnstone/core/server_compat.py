@@ -14,10 +14,12 @@ request shaping.  This module separates three concerns:
    Stored under ``server_compat`` because it's an endpoint property,
    not a model property.
 
-3. **Server workarounds** — ``extra_body`` overrides like
-   ``skip_special_tokens=false`` are properties of the *server* (vLLM
-   bug workaround).  These stay in ``server_compat`` and get merged
-   into the request's ``extra_body`` at call time.
+3. **Server workarounds** — ``extra_body`` overrides like llama.cpp's
+   ``reasoning_format`` are properties of the *server*, not the model.
+   These stay in ``server_compat`` and get merged into the request's
+   ``extra_body`` at call time.  Reserve these for stable server config:
+   bug-workaround flags for fast-moving open models go stale the moment
+   the upstream bug is fixed, so we don't carry them speculatively.
 
 Profiles are *suggestions* only.  The admin UI auto-fills them on
 Detect; the operator has final say, and the stored DB config is what
@@ -45,11 +47,6 @@ _PROFILES: dict[str, dict[str, Any]] = {
         },
         "server_compat": {
             "server_type": "vllm",
-            # Workaround: vLLM strips special tokens before the Gemma4
-            # reasoning parser sees them.  skip_special_tokens=false
-            # preserves <|channel> / <channel|> markers so reasoning
-            # content is extracted correctly.
-            "extra_body": {"skip_special_tokens": False},
         },
     },
     "vllm-qwen-thinking": {

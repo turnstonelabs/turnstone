@@ -1580,32 +1580,62 @@ class Pane {
       this._micBtn.classList.add("is-busy");
     }
     voiceAnnounce("Transcribing…");
+    const resetMic = () => {
+      if (this._micBtn && !this._micDenied) {
+        this._micBtn.disabled = !!this.busy;
+        this._micBtn.classList.remove("is-busy");
+      }
+    };
     authFetch(
       this._base +
         "/v1/api/workstreams/" +
         encodeURIComponent(this.wsId) +
-        "/speech-to-text",
+        "/speech-to-text/stream",
       { method: "POST", body: fd },
     )
-      .then((r) => r.json().then((body) => ({ ok: r.ok, body })))
-      .then((res) => {
-        if (!res.ok) {
-          showToast(
-            (res.body && res.body.error) || "Transcription failed",
-            "error",
-          );
+      .then(async (r) => {
+        if (!r.ok) {
+          let msg = "Transcription failed";
+          try {
+            const body = await r.json();
+            if (body && body.error) msg = body.error;
+          } catch (_e) {
+            /* non-JSON error body */
+          }
+          showToast(msg, "error");
           return;
         }
-        const text = (res.body && res.body.transcript) || "";
-        if (text && this.inputEl) {
-          const cur = this.inputEl.value || "";
-          this.inputEl.value = cur
-            ? cur.replace(/\s*$/, "") + " " + text
-            : text;
+        // Stream transcript deltas into the composer as they arrive (first word
+        // in ~0.3s) instead of waiting for the whole transcript.
+        const reader = r.body.getReader();
+        const decoder = new TextDecoder();
+        let started = false;
+        let got = false;
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          const chunk = decoder.decode(value, { stream: true });
+          if (!chunk || !this.inputEl) continue;
+          got = true;
+          if (!started) {
+            // Read the composer's value now (not before the await) so text the
+            // user typed while transcribing isn't clobbered.
+            const cur = this.inputEl.value || "";
+            this.inputEl.value = cur
+              ? cur.replace(/\s*$/, "") + " " + chunk
+              : chunk;
+            started = true;
+          } else {
+            this.inputEl.value += chunk;
+          }
           // Drive the composer's auto-resize + send-enable listeners.
           this.inputEl.dispatchEvent(new Event("input", { bubbles: true }));
-          this.inputEl.focus();
+        }
+        if (got) {
+          if (this.inputEl) this.inputEl.focus();
           voiceAnnounce("Transcript added to message.");
+        } else {
+          showToast("No speech detected", "error");
         }
       })
       .catch((err) => {
@@ -1614,12 +1644,7 @@ class Pane {
           "error",
         );
       })
-      .finally(() => {
-        if (this._micBtn && !this._micDenied) {
-          this._micBtn.disabled = !!this.busy;
-          this._micBtn.classList.remove("is-busy");
-        }
-      });
+      .finally(resetMic);
   }
 
   _addTtsAction(el) {

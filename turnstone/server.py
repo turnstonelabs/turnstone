@@ -39,7 +39,7 @@ from sse_starlette import EventSourceResponse
 from starlette.applications import Starlette
 from starlette.middleware import Middleware
 from starlette.requests import Request
-from starlette.responses import HTMLResponse, JSONResponse, Response
+from starlette.responses import HTMLResponse, JSONResponse, Response, StreamingResponse
 from starlette.routing import Mount, Route
 from starlette.staticfiles import StaticFiles
 
@@ -1288,6 +1288,100 @@ async def speech_to_text(request: Request) -> JSONResponse:
             "model_alias": result.model_alias,
         }
     )
+
+
+async def speech_to_text_stream(request: Request) -> Response:
+    """POST /v1/api/workstreams/{ws_id}/speech-to-text/stream — stream the
+    transcript as plain-text deltas for lower perceived latency than the JSON
+    ``speech-to-text`` endpoint.  Resolve/transcode failures surface as
+    503 / 502 before any bytes are sent; once streaming begins the body is
+    best-effort (a mid-stream backend error just ends the partial stream)."""
+    from turnstone.core.audio import (
+        AudioBackendError,
+        AudioUnavailableError,
+        resolve_role_alias,
+        transcribe_stream,
+    )
+    from turnstone.core.web_helpers import read_multipart_file_or_400
+
+    ws_id = request.path_params.get("ws_id", "")
+    if not ws_id:
+        return JSONResponse({"error": "ws_id is required"}, status_code=400)
+    _user_id, err = _require_ws_access(request, ws_id)
+    if err:
+        return err
+
+    registry = getattr(request.app.state, "registry", None)
+    config_store = getattr(request.app.state, "config_store", None)
+    alias = resolve_role_alias(config_store=config_store, registry=registry, role="stt")
+    if not alias:
+        return JSONResponse(
+            {
+                "error": (
+                    "Speech-to-text is not configured. Assign an STT model role in Models → Roles."
+                )
+            },
+            status_code=503,
+        )
+
+    got = await read_multipart_file_or_400(request, field="audio", max_bytes=_STT_UPLOAD_CAP)
+    if isinstance(got, JSONResponse):
+        return got
+    _filename, _claimed_mime, data = got
+    if not data:
+        return JSONResponse({"error": "Empty audio upload"}, status_code=400)
+
+    stt_prompt = ""
+    if config_store is not None:
+        stt_prompt = (config_store.get("audio.stt_prompt") or "").strip()
+
+    # Resolve + transcode + open the stream eagerly (off the event loop) so the
+    # common failures map to a clean status before any bytes are sent.
+    try:
+        deltas = await asyncio.to_thread(
+            transcribe_stream, registry=registry, alias=alias, data=data, prompt=stt_prompt
+        )
+    except AudioUnavailableError as exc:
+        return JSONResponse({"error": str(exc)}, status_code=503)
+    except AudioBackendError:
+        log.warning("speech_to_text_stream.backend_failed", exc_info=True)
+        return JSONResponse({"error": "Speech transcription backend failed"}, status_code=502)
+
+    # Drive the blocking stream from one worker thread that owns (and closes)
+    # the upstream connection, handing deltas to the loop via a queue.  A client
+    # disconnect sets ``stop`` so the thread releases the connection promptly
+    # instead of being pinned mid-``next()`` (which can't be cancelled).
+    async def _body() -> AsyncGenerator[bytes, None]:
+        loop = asyncio.get_running_loop()
+        queue: asyncio.Queue[bytes | None] = asyncio.Queue()
+        stop = threading.Event()
+
+        def _pump() -> None:
+            try:
+                for delta in deltas:
+                    if stop.is_set():
+                        break
+                    loop.call_soon_threadsafe(queue.put_nowait, delta.encode("utf-8"))
+            except Exception:
+                # Mid-stream backend failure: end the partial stream (logged).
+                log.warning("speech_to_text_stream.mid_stream_failed", exc_info=True)
+            finally:
+                close = getattr(deltas, "close", None)
+                if callable(close):
+                    close()
+                loop.call_soon_threadsafe(queue.put_nowait, None)
+
+        loop.run_in_executor(None, _pump)
+        try:
+            while True:
+                chunk = await queue.get()
+                if chunk is None:
+                    break
+                yield chunk
+        finally:
+            stop.set()
+
+    return StreamingResponse(_body(), media_type="text/plain; charset=utf-8")
 
 
 async def text_to_speech(request: Request) -> Response:
@@ -3898,6 +3992,13 @@ def create_app(
         Route(
             "/api/workstreams/{ws_id}/speech-to-text",
             speech_to_text,
+            methods=["POST"],
+        )
+    )
+    v1_routes.append(
+        Route(
+            "/api/workstreams/{ws_id}/speech-to-text/stream",
+            speech_to_text_stream,
             methods=["POST"],
         )
     )

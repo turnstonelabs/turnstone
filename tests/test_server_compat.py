@@ -19,7 +19,8 @@ class TestSuggestProfile:
         p = suggest_profile("vllm", "google/gemma-4-31B-it")
         assert p["capabilities"]["thinking_mode"] == "manual"
         assert p["capabilities"]["thinking_param"] == "enable_thinking"
-        assert p["server_compat"]["extra_body"]["skip_special_tokens"] is False
+        # No bug-workaround extra_body — gemma-4 needs only the thinking param.
+        assert "extra_body" not in p["server_compat"]
 
     def test_vllm_gemma3(self) -> None:
         p = suggest_profile("vllm", "google/gemma-3-27b-it")
@@ -147,14 +148,14 @@ class TestMergeServerCompat:
         result = merge_server_compat(None, {"extra_body": {"skip_special_tokens": False}})
         assert result == {"skip_special_tokens": False}
 
-    def test_full_vllm_gemma_compat_no_base(self) -> None:
-        """vLLM workaround forwards on its own."""
+    def test_full_server_compat_extra_body_no_base(self) -> None:
+        """A server workaround (e.g. llama.cpp reasoning_format) forwards on its own."""
         compat = {
-            "server_type": "vllm",
-            "extra_body": {"skip_special_tokens": False},
+            "server_type": "llama.cpp",
+            "extra_body": {"reasoning_format": "auto"},
         }
         result = merge_server_compat(None, compat)
-        assert result == {"skip_special_tokens": False}
+        assert result == {"reasoning_format": "auto"}
 
     def test_operator_chat_template_kwargs_only(self) -> None:
         """Operator can set chat_template_kwargs explicitly without seeding the base."""
@@ -210,21 +211,27 @@ class TestEndToEndRequestShaping:
     """Compose both layers — session builds extra_params, provider applies thinking."""
 
     def test_vllm_gemma_full_flow(self) -> None:
-        """Session forwards server workarounds, provider adds thinking param."""
+        """Gemma now needs only the thinking param — no server workaround."""
         caps = ModelCapabilities(thinking_mode="manual", thinking_param="enable_thinking")
-        server_compat = {
-            "server_type": "vllm",
-            "extra_body": {"skip_special_tokens": False},
-        }
+        server_compat = {"server_type": "vllm"}
         # Step 1: session forwards (no auto-injection of reasoning_effort).
         extra_params = merge_server_compat(None, server_compat)
         # Step 2: provider injects thinking param into chat_template_kwargs.
         extra_body = dict(extra_params)
         OpenAIChatCompletionsProvider._apply_thinking_mode(extra_body, caps)
 
+        assert extra_body == {"chat_template_kwargs": {"enable_thinking": True}}
+
+    def test_server_workaround_composes_with_thinking(self) -> None:
+        """A top-level server workaround forwards alongside the injected thinking param."""
+        caps = ModelCapabilities(thinking_mode="manual", thinking_param="enable_thinking")
+        compat = {"server_type": "llama.cpp", "extra_body": {"reasoning_format": "auto"}}
+        extra_body = dict(merge_server_compat(None, compat))
+        OpenAIChatCompletionsProvider._apply_thinking_mode(extra_body, caps)
+
         assert extra_body == {
             "chat_template_kwargs": {"enable_thinking": True},
-            "skip_special_tokens": False,
+            "reasoning_format": "auto",
         }
 
     def test_granite_thinking_key(self) -> None:
@@ -292,7 +299,7 @@ class TestProbeIntegration:
         assert result["server_type"] == "vllm"
         assert result["suggested_capabilities"]["thinking_mode"] == "manual"
         assert result["suggested_capabilities"]["thinking_param"] == "enable_thinking"
-        assert result["suggested_server_compat"]["extra_body"]["skip_special_tokens"] is False
+        assert "extra_body" not in result["suggested_server_compat"]
 
     def test_detect_non_thinking_no_suggested_capabilities(self) -> None:
         """Non-thinking vLLM model gets server_compat but no capabilities suggestion."""
