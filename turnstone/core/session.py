@@ -2425,10 +2425,15 @@ class ChatSession:
         ws_id = self._ws_id  # Capture before async work
         log.info("ws.title.gen_start", ws_id=ws_id[:8])
         try:
-            # Gather first user message and first assistant reply
+            # Gather first user message and first assistant reply.
+            # Snapshot ``self.messages`` (C-level atomic copy under the
+            # GIL): this runs in a background thread that may now fire
+            # while the main ``send`` loop is still streaming and
+            # appending turns, so iterating the live list directly could
+            # raise "list changed size during iteration".
             user_msg = ""
             asst_msg = ""
-            for m in self.messages:
+            for m in list(self.messages):
                 content = m.text  # joins text blocks; multipart attachments contribute none
                 if m.role is Role.USER and not user_msg:
                     user_msg = content[:300]
@@ -4150,6 +4155,20 @@ class ChatSession:
         # legacy per-message ``_reminders`` side-channel splice.
         self._emit_pending_user_nudges()
 
+        # Auto-title from the opening user message — fire NOW rather than
+        # waiting for the assistant's final tool-call-free turn.  The old
+        # trigger sat in the ``not tool_calls`` branch of the loop below;
+        # coordinators spend nearly every turn in tool calls and may never
+        # reach that terminal text turn, so the title almost never
+        # generated for them.  Gate on a real user message: synthetic wake
+        # sends carry no content and ``_generate_title`` would no-op on the
+        # empty/attachment-only case anyway (it needs first-user-message
+        # text).  The background thread snapshots ``self.messages`` so it is
+        # safe to run concurrently with the streaming turn started below.
+        if not self._title_generated and user_input.strip() and not from_wake:
+            self._title_generated = True
+            threading.Thread(target=self._generate_title, daemon=True).start()
+
         # A fresh session composed its system prefix at __init__ with an empty
         # history, so memory selection fell back to recency (no query, no rerank).
         # Recompose once the first real user message exists so the opening turn
@@ -4292,10 +4311,6 @@ class ChatSession:
                         self._compact_messages(auto=True)
                         # Update status bar with post-compaction token counts
                         self._print_status_line()
-                    # Auto-title session after first exchange
-                    if not self._title_generated:
-                        self._title_generated = True
-                        threading.Thread(target=self._generate_title, daemon=True).start()
                     # Flush any queued messages that weren't injected
                     # (no tool calls → no advisory seam to inject at).
                     # If anything drained, the model hasn't seen those

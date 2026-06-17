@@ -23,6 +23,7 @@ from turnstone.core.child_event_bus import ChildEventBus
 from turnstone.core.child_source import ClusterChildSource
 from turnstone.core.children_registry import ChildrenRegistry
 from turnstone.core.log import get_logger
+from turnstone.core.memory import get_workstream_display_name, get_workstream_display_names
 from turnstone.core.workstream import Workstream, WorkstreamKind, WorkstreamState
 
 if TYPE_CHECKING:
@@ -35,6 +36,19 @@ if TYPE_CHECKING:
     from turnstone.core.session_manager import SessionManager
 
 log = get_logger(__name__)
+
+
+def _coord_display_name(ws: Workstream) -> str:
+    """Resolve a coordinator's display name (``alias > title > name``).
+
+    ``ws.name`` is the synthetic ``ws-xxxx`` placeholder; the persisted
+    auto-title (``update_workstream_title``) and user alias live only in
+    the DB.  Seeding the collector with the resolved name means a
+    rehydrated coordinator shows its title in the live cluster tree
+    immediately, rather than reverting to ``ws-xxxx`` until a (for
+    coordinators, rarely-firing) ``on_rename`` event arrives.
+    """
+    return get_workstream_display_name(ws.id) or ws.name
 
 
 class CoordinatorAdapter:
@@ -132,7 +146,7 @@ class CoordinatorAdapter:
         try:
             self._collector.emit_console_ws_created(
                 ws.id,
-                name=ws.name,
+                name=_coord_display_name(ws),
                 user_id=ws.user_id,
                 kind=ws.kind.value,
                 state=ws.state.value,
@@ -466,11 +480,16 @@ class CoordinatorAdapter:
         # creates happened before the collector was wired up and their
         # rows never showed on the snapshot. (Coord-specific — interactive
         # has no analogous pseudo-node.)
-        for ws in mgr.list_all():
+        coords = mgr.list_all()
+        # One round-trip for every coordinator's display name instead of a
+        # per-``ws`` ``_coord_display_name`` lookup (N+1); cold path, but
+        # the bulk helper is right there.
+        seed_names = get_workstream_display_names([ws.id for ws in coords])
+        for ws in coords:
             try:
                 collector.emit_console_ws_created(
                     ws.id,
-                    name=ws.name,
+                    name=seed_names.get(ws.id) or ws.name,
                     user_id=ws.user_id or "",
                     kind=WorkstreamKind.COORDINATOR.value,
                     state=ws.state.value,
