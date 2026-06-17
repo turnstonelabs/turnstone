@@ -679,7 +679,9 @@ class StorageBackend(Protocol):
         Returns a list of SQLAlchemy ``Row`` objects.  **Prefer dict access
         via ``row._mapping[<col>]``**; positional indexing is brittle against
         future SELECT reorders and against new columns appearing in the
-        tail (the select currently ends with ``user_id``).
+        tail (the select currently ends with ``user_id, title, alias`` —
+        ``title``/``alias`` were appended after ``user_id`` so existing
+        positional fallbacks that index up to row[9] stay valid).
         """
         ...
 

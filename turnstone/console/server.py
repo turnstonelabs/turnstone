@@ -56,6 +56,7 @@ from turnstone.core.auth import (
     require_permission,
 )
 from turnstone.core.deadline import DeadlineExceededError, run_with_deadline
+from turnstone.core.memory import get_workstream_display_names
 from turnstone.core.rendezvous import NoAvailableNodeError
 from turnstone.core.session_replay import session_replay_preamble
 from turnstone.core.session_routes import (
@@ -853,6 +854,14 @@ def _coordinator_rows(request: Request) -> list[dict[str, Any]]:
     In-memory wins on ws_id conflict so live state stays authoritative
     for active sessions.
 
+    Display name resolves ``alias > title > name`` from the persisted
+    row for BOTH lanes.  ``ws.name`` on the in-memory Workstream is the
+    synthetic ``ws-xxxx`` placeholder; the LLM auto-title
+    (``update_workstream_title``) and the user alias
+    (``set_workstream_alias``) live only in the DB, so without the
+    persisted lookup the live lane would show ``ws-xxxx`` and the
+    auto-title would never survive a dashboard refresh.
+
     Trusted-team visibility (post-#400): the cluster dashboard shows
     every coordinator regardless of caller identity; ``user_id`` is
     surfaced on each row as display metadata.
@@ -870,6 +879,54 @@ def _coordinator_rows(request: Request) -> list[dict[str, Any]]:
         val = getattr(sess, name, "") if sess else ""
         return val if isinstance(val, str) else ""
 
+    # Persisted coordinator rows serve two purposes: (1) surface
+    # closed / error / deleted coordinators the manager has already
+    # evicted from ``self._workstreams``, and (2) supply the persisted
+    # display name (``alias > title > name``) for the LIVE coordinators
+    # too — ``ws.name`` is the synthetic placeholder.  Cluster-wide
+    # (trusted-team visibility).  Indexed by ws_id so both lanes resolve
+    # the same way.
+    storage = getattr(request.app.state, "auth_storage", None)
+    persisted: list[Any] = []
+    if storage is not None:
+        try:
+            persisted = storage.list_workstreams(
+                kind=WorkstreamKind.COORDINATOR,
+                user_id=None,
+                limit=200,
+            )
+        except Exception:
+            log.debug("cluster_workstreams.coord_persisted_failed", exc_info=True)
+            persisted = []
+    # SQLAlchemy Row — access via _mapping so future SELECT reorders /
+    # new columns don't silently corrupt the projection (per the
+    # storage-protocol guidance on list_workstreams).  Test doubles must
+    # expose the same ._mapping attribute.
+    meta: dict[str, Any] = {}
+    for row in persisted:
+        m = row._mapping
+        rid = m.get("ws_id") or ""
+        if rid:
+            meta[rid] = m
+
+    # Live coordinators resolve their display name through the bulk
+    # helper keyed on their EXACT ids (one round-trip, no row cap) rather
+    # than the ``limit=200`` ``meta`` map: a live coord that has dropped
+    # below the 200-row ``updated DESC`` window would otherwise revert to
+    # its synthetic ``ws.name``.  Closed/evicted rows (the persisted lane
+    # below) already carry alias/title in their own ``_mapping``.
+    live_display = get_workstream_display_names([ws.id for ws in wss]) if wss else {}
+
+    def _display_name(ws_id: str, fallback: str) -> str:
+        m = meta.get(ws_id)
+        if m is None:
+            return fallback
+        return m.get("alias") or m.get("title") or m.get("name") or fallback
+
+    def _title(ws_id: str) -> str:
+        m = meta.get(ws_id)
+        return str(m.get("title") or "") if m is not None else ""
+
     rows: list[dict[str, Any]] = []
     seen: set[str] = set()
     for ws in wss:
@@ -877,9 +934,9 @@ def _coordinator_rows(request: Request) -> list[dict[str, Any]]:
         rows.append(
             {
                 "id": ws.id,
-                "name": ws.name,
+                "name": live_display.get(ws.id) or ws.name,
                 "state": ws.state.value,
-                "title": "",
+                "title": _title(ws.id),
                 "node": "console",
                 "server_url": "",
                 "model": _str_sess_attr(sess, "model"),
@@ -896,30 +953,7 @@ def _coordinator_rows(request: Request) -> list[dict[str, Any]]:
         )
         seen.add(ws.id)
 
-    # Second lane — persisted coordinator rows, used to surface
-    # closed / error / deleted coordinators the manager has already
-    # evicted from ``self._workstreams``.  Cluster-wide (trusted-team
-    # visibility).
-    storage = getattr(request.app.state, "auth_storage", None)
-    if storage is None:
-        return rows
-    try:
-        persisted = storage.list_workstreams(
-            kind=WorkstreamKind.COORDINATOR,
-            user_id=None,
-            limit=200,
-        )
-    except Exception:
-        log.debug("cluster_workstreams.coord_persisted_failed", exc_info=True)
-        return rows
-
     for row in persisted:
-        # SQLAlchemy Row — access via _mapping so future SELECT reorders
-        # / new columns don't silently corrupt the projection (per the
-        # storage-protocol guidance on list_workstreams).  Test doubles
-        # must expose the same ._mapping attribute; positional indexing
-        # was removed because it hard-coded column offsets that drift
-        # with migrations.
         m = row._mapping
         row_id = m.get("ws_id") or ""
         if not row_id or row_id in seen:
@@ -928,9 +962,9 @@ def _coordinator_rows(request: Request) -> list[dict[str, Any]]:
         rows.append(
             {
                 "id": row_id,
-                "name": m.get("name") or f"coord-{row_id[:4]}",
+                "name": _display_name(row_id, f"coord-{row_id[:4]}"),
                 "state": str(m.get("state") or "idle"),
-                "title": "",
+                "title": _title(row_id),
                 "node": "console",
                 "server_url": "",
                 "model": "",

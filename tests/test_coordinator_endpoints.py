@@ -2433,6 +2433,54 @@ def test_coordinator_rows_persisted_cluster_wide(storage):
         assert {r["name"] for r in rows} == {"alice-closed", "bob-closed", "orphan-closed"}
 
 
+def test_coordinator_rows_surface_persisted_title(storage):
+    """Regression for the coordinator-title-persistence bug.
+
+    The LLM auto-title (``update_workstream_title``) and the user alias
+    (``set_workstream_alias``) live only in ``workstreams.title`` /
+    ``workstreams.alias``.  ``_coordinator_rows`` must resolve the
+    display name ``alias > title > name`` from the persisted row for BOTH
+    lanes — the in-memory ``ws.name`` is the synthetic ``ws-xxxx``
+    placeholder.  Before the fix the read path hardcoded ``title=""`` and
+    used ``ws.name`` / the ``name`` column, so a generated title was
+    written but never read back: it reverted to ``ws-xxxx`` on every
+    dashboard refresh."""
+    from turnstone.console.server import _coordinator_rows
+    from turnstone.core.workstream import WorkstreamKind
+
+    mgr = _build_mgr(storage)
+
+    # In-memory lane: a LIVE coordinator titled after creation.  The
+    # manager assigned the placeholder ``ws.name``; the title is in the DB.
+    live = mgr.create(user_id="alice", name="ws-abcd")
+    storage.update_workstream_title(live.id, "Refactor the auth layer")
+
+    # Persisted lane: a closed coordinator (evicted from the manager)
+    # carrying BOTH a title and a user alias — the alias must win.
+    storage.register_workstream(
+        "f" * 32,
+        node_id="console",
+        user_id="bob",
+        name="ws-f0f0",
+        state="closed",
+        kind=WorkstreamKind.COORDINATOR,
+        parent_ws_id=None,
+    )
+    storage.update_workstream_title("f" * 32, "auto-generated title")
+    assert storage.set_workstream_alias("f" * 32, "Bob's pinned name")
+
+    request = _persisted_rows_request(storage, mgr, "alice", frozenset({"read"}))
+    rows = {r["id"]: r for r in _coordinator_rows(request)}
+
+    live_row = rows[live.id]
+    assert live_row["name"] == "Refactor the auth layer"
+    assert live_row["title"] == "Refactor the auth layer"
+
+    closed_row = rows["f" * 32]
+    assert closed_row["name"] == "Bob's pinned name"  # alias > title > name
+    assert closed_row["title"] == "auto-generated title"
+
+
 # ---------------------------------------------------------------------------
 # Stage 2 P1.5 — coord attachment surface parity with interactive
 # ---------------------------------------------------------------------------

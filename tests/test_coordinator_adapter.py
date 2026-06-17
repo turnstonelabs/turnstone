@@ -85,6 +85,44 @@ def test_emit_created_calls_collector_with_coord_fields() -> None:
     )
 
 
+def test_emit_created_seeds_resolved_display_name(tmp_path: Any) -> None:
+    """The collector seed uses the resolved display name (alias > title >
+    name), not the synthetic ``ws.name``.  A coordinator carrying a
+    persisted LLM auto-title (written by ``update_workstream_title``) then
+    shows that title in the live cluster tree instead of reverting to
+    ``ws-xxxx``.  Regression guard for the adapter half of the
+    coordinator-title-persistence fix — the server-side ``_coordinator_rows``
+    half is pinned in test_coordinator_endpoints.py."""
+    from turnstone.core.storage import init_storage, reset_storage
+
+    reset_storage()
+    backend = init_storage("sqlite", path=str(tmp_path / "adapter.db"), run_migrations=False)
+    try:
+        # Titled coordinator → the title surfaces over the placeholder name.
+        backend.register_workstream(
+            "coord-1",
+            node_id="console",
+            user_id="u1",
+            name="ws-c0c0",
+            kind=WorkstreamKind.COORDINATOR,
+        )
+        backend.update_workstream_title("coord-1", "Investigate the title bug")
+        adapter, collector = _make_adapter()
+        adapter.emit_created(_make_ws(name="ws-c0c0"))
+        assert (
+            collector.emit_console_ws_created.call_args.kwargs["name"]
+            == "Investigate the title bug"
+        )
+
+        # A user alias outranks the auto-title (alias > title > name).
+        assert backend.set_workstream_alias("coord-1", "Pinned name")
+        collector.emit_console_ws_created.reset_mock()
+        adapter._fanout_console_ws_created(_make_ws(name="ws-c0c0"))
+        assert collector.emit_console_ws_created.call_args.kwargs["name"] == "Pinned name"
+    finally:
+        reset_storage()
+
+
 def test_emit_state_calls_collector_state() -> None:
     """Post-rich-payload, emit_state passes tokens / context_ratio /
     activity / activity_state / content kwargs read from ws.ui's
