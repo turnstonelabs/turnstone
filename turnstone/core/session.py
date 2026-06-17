@@ -4163,8 +4163,13 @@ class ChatSession:
         # generated for them.  Gate on a real user message: synthetic wake
         # sends carry no content and ``_generate_title`` would no-op on the
         # empty/attachment-only case anyway (it needs first-user-message
-        # text).  The background thread snapshots ``self.messages`` so it is
-        # safe to run concurrently with the streaming turn started below.
+        # text).  Concurrency: this background thread runs alongside the
+        # streaming turn started below, but safely — it snapshots
+        # ``self.messages`` for iteration, and the only UI it touches is
+        # ``on_aux_usage`` (storage/metrics, no ``_ws_lock`` state) and
+        # ``on_rename`` (queue/locked fan-out), both documented
+        # auxiliary-thread-safe on ``SessionUIBase``; the provider + client
+        # handle concurrent requests (the same path ``task_agent`` uses).
         if not self._title_generated and user_input.strip() and not from_wake:
             self._title_generated = True
             threading.Thread(target=self._generate_title, daemon=True).start()

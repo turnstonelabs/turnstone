@@ -24,6 +24,7 @@ from turnstone.core.child_source import ClusterChildSource
 from turnstone.core.children_registry import ChildrenRegistry
 from turnstone.core.log import get_logger
 from turnstone.core.memory import get_workstream_display_name, get_workstream_display_names
+from turnstone.core.storage import is_storage_initialized
 from turnstone.core.workstream import Workstream, WorkstreamKind, WorkstreamState
 
 if TYPE_CHECKING:
@@ -47,7 +48,16 @@ def _coord_display_name(ws: Workstream) -> str:
     rehydrated coordinator shows its title in the live cluster tree
     immediately, rather than reverting to ``ws-xxxx`` until a (for
     coordinators, rarely-firing) ``on_rename`` event arrives.
+
+    Skips the DB read when storage isn't initialized: this runs on a
+    lifecycle-event path, and a display-name resolution must never trip
+    ``get_storage``'s SQLite auto-init side effect (a stray
+    ``.turnstone.db``) before the host has called ``init_storage`` (the
+    real cluster always does so at startup — this only bites early /
+    test call paths). The placeholder ``ws.name`` is the right fallback.
     """
+    if not is_storage_initialized():
+        return ws.name
     return get_workstream_display_name(ws.id) or ws.name
 
 

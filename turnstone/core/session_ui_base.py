@@ -201,8 +201,18 @@ class SessionUIBase:
     methods (and the approval blocking helpers that live on
     subclasses); HTTP handlers drive ``_register_listener`` /
     ``_unregister_listener`` / ``resolve_approval`` from the event
-    loop. All shared state is guarded by ``_listeners_lock`` or
-    ``threading.Event`` primitives.
+    loop. All shared state is guarded by ``_listeners_lock`` /
+    ``_ws_lock`` or ``threading.Event`` primitives.
+
+    Two ``on_*`` methods are additionally safe to call from a
+    *concurrent* auxiliary thread (e.g. background title generation in
+    ``ChatSession._generate_title``, or ``task_agent`` sub-agents), even
+    while the worker thread is mid-stream: :meth:`on_aux_usage` (a
+    storage ``usage_event`` write + thread-safe metric counters — it
+    touches none of the ``_ws_lock``-guarded inflight state
+    :meth:`on_status`/token writers mutate) and :meth:`on_rename` (a
+    queue / locked fan-out). Keep those two free of unguarded
+    ``_ws_*`` writes so the auxiliary-thread guarantee holds.
     """
 
     def __init__(self, ws_id: str = "", user_id: str = "") -> None:
