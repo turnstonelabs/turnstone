@@ -1209,6 +1209,12 @@ class SQLiteBackend:
                     workstreams.c.skill_id,
                     workstreams.c.skill_version,
                     workstreams.c.user_id,
+                    # Appended after ``user_id`` so positional fallbacks in
+                    # consumers (``_coord_children_row`` et al.) that index
+                    # up to row[9] stay valid; ``_coordinator_rows`` reads
+                    # these by name to surface the persisted display title.
+                    workstreams.c.title,
+                    workstreams.c.alias,
                 )
                 .order_by(workstreams.c.updated.desc())
                 .limit(limit)

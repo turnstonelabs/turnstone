@@ -150,6 +150,27 @@ def _send_with_mocks(session, responses, mock_execute, **extra_patches):
         yield save_msg
 
 
+def _capturing_thread_cls():
+    """Return a no-op ``threading.Thread`` stand-in plus the list it records
+    each constructed thread's ``target`` into.
+
+    Patched over ``session.threading.Thread`` so a test can assert WHICH
+    callable was scheduled (e.g. ``_generate_title``) without the thread
+    actually running — ``start()`` is a no-op, so no background LLM call
+    fires.
+    """
+    started: list = []
+
+    class _CaptureThread:
+        def __init__(self, *a, target=None, **kw):
+            started.append(target)
+
+        def start(self):
+            pass
+
+    return _CaptureThread, started
+
+
 def _user_pending(session) -> list[tuple[str, str]]:
     """Return user-channel queued nudges as ``(type, text)`` tuples.
 
@@ -1009,6 +1030,66 @@ class TestTitleRetry:
         mock_update.assert_not_called()
         # Restore for cleanup
         session._ws_id = original_ws_id
+
+    def test_title_fires_after_send_not_after_tool_free_turn(self, tmp_db):
+        """Auto-title fires right after the user turn is recorded, BEFORE
+        tools run — it no longer waits for a tool-call-free assistant
+        turn.  Coordinators spend nearly every turn in tool calls and may
+        never reach that terminal text turn, so the old end-of-turn
+        trigger almost never fired for them (the timing half of the
+        coordinator-title bug)."""
+        session = _make_session()
+        assert session._title_generated is False
+        # The assistant's opening turn is ALL tool calls — under the old
+        # trigger no title would generate until a later text-only turn.
+        responses = [
+            {
+                "role": "assistant",
+                "content": "working",
+                "tool_calls": [
+                    {
+                        "id": "c1",
+                        "type": "function",
+                        "function": {"name": "echo", "arguments": "{}"},
+                    }
+                ],
+            },
+            {"role": "assistant", "content": "done"},
+        ]
+        capture_cls, started = _capturing_thread_cls()
+
+        def mock_execute(_tool_calls):
+            # The title must already be scheduled by the time tools run.
+            assert session._title_generated is True
+            return [("c1", "ok")], None
+
+        with (
+            _send_with_mocks(session, responses, mock_execute),
+            patch("turnstone.core.session.threading.Thread", capture_cls),
+        ):
+            session.send("refactor the auth layer")
+
+        assert session._title_generated is True
+        assert session._generate_title in started
+
+    def test_title_not_generated_for_blank_or_wake_send(self, tmp_db):
+        """Blank input and synthetic wake sends don't burn the one-shot
+        auto-title — ``_generate_title`` needs first-user-message text,
+        and a wake carries none."""
+        capture_cls, started = _capturing_thread_cls()
+
+        def mock_execute(_tool_calls):
+            return [], None
+
+        for user_input, kwargs in (("   ", {}), ("a real message", {"from_wake": True})):
+            session = _make_session()
+            with (
+                _send_with_mocks(session, [{"role": "assistant", "content": "ok"}], mock_execute),
+                patch("turnstone.core.session.threading.Thread", capture_cls),
+            ):
+                session.send(user_input, **kwargs)
+            assert session._generate_title not in started
+            assert session._title_generated is False
 
 
 class TestLiveConfigUpdate:
