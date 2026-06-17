@@ -837,6 +837,11 @@ async function mountShell() {
         });
         pane.tabMenu = () =>
           convTabMenu(pane, pm, id, {
+            // Coordinators carry titles like interactive workstreams now:
+            // surface Refresh/Edit title. The default base ("") targets the
+            // console origin, where the coord refresh-title / title routes
+            // are mounted (same base coordinator.js posts every verb to).
+            titleVerbs: true,
             closeSession: () => {
               if (pane._ctl && pane._ctl.closeSession) pane._ctl.closeSession();
             },

@@ -493,9 +493,8 @@ class SharedSessionVerbHandlers:
     """Bundle of HTTP handler callables for verbs both kinds expose.
 
     All handlers are optional; ``None`` skips that route. One bundle
-    describes either kind — coord omits ``delete`` / ``refresh_title``
-    / ``set_title`` / attachments; interactive populates every
-    interaction verb post-Stage-2.
+    describes either kind — coord omits ``delete``; interactive
+    populates every interaction verb post-Stage-2.
     """
 
     # Listing
@@ -970,6 +969,122 @@ def make_close_handler(
         return JSONResponse({"status": "ok"})
 
     return close
+
+
+def make_refresh_title_handler(cfg: SessionEndpointConfig) -> Handler:
+    """Lifted body for ``POST {prefix}/{ws_id}/refresh-title``.
+
+    Regenerates the workstream title via a background LLM call
+    (:meth:`ChatSession.request_title_refresh`). Both kinds share the
+    auth → mgr → ws-lookup → request sequence; the session must be live
+    in memory (``mgr.get``, not ``open``) since the refresh runs on the
+    loaded :class:`ChatSession`. The current display name is passed so
+    the generator is steered toward a *different* title on a manual
+    refresh.
+    """
+
+    async def refresh_title(request: Request) -> Response:
+        import asyncio
+
+        from turnstone.core.memory import get_workstream_display_name
+
+        if cfg.permission_gate is not None:
+            err = cfg.permission_gate(request)
+            if err is not None:
+                return err
+        mgr_opt, err503 = cfg.manager_lookup(request)
+        if err503 is not None:
+            return err503
+        # See ``make_approve_handler`` for the cast rationale.
+        mgr = cast("SessionManager", mgr_opt)
+        ws_id = request.path_params.get("ws_id", "")
+
+        if cfg.tenant_check is not None:
+            err_tenant = await asyncio.to_thread(cfg.tenant_check, request, ws_id, mgr)
+            if err_tenant is not None:
+                return err_tenant
+
+        ws = mgr.get(ws_id)
+        if ws is None or ws.session is None:
+            return JSONResponse({"error": cfg.not_found_label}, status_code=404)
+
+        current_title = await asyncio.to_thread(get_workstream_display_name, ws_id) or ""
+        ws.session.request_title_refresh(current_title)
+        return JSONResponse({"status": "ok"})
+
+    return refresh_title
+
+
+def make_set_title_handler(cfg: SessionEndpointConfig) -> Handler:
+    """Lifted body for ``POST {prefix}/{ws_id}/title``.
+
+    Sets a user-chosen title manually. Stored as the workstream *alias*
+    so it outranks the LLM auto-title in the display fallback chain
+    (``alias > title > name``). Both kinds share the auth → validate →
+    ``set_workstream_alias`` → ``on_rename`` sequence. Returns 409 when
+    the name collides with another workstream's alias.
+
+    Behavior matches the pre-lift interactive handler: the alias is set
+    against storage regardless of whether the session is loaded (so a
+    saved/closed workstream can still be renamed), and the live
+    ``on_rename`` broadcast fires only when the session is in memory.
+    """
+
+    async def set_title(request: Request) -> Response:
+        import asyncio
+
+        from turnstone.core.memory import set_workstream_alias
+        from turnstone.core.web_helpers import read_json_or_400
+
+        if cfg.permission_gate is not None:
+            err = cfg.permission_gate(request)
+            if err is not None:
+                return err
+        mgr_opt, err503 = cfg.manager_lookup(request)
+        if err503 is not None:
+            return err503
+        mgr = cast("SessionManager", mgr_opt)
+        ws_id = request.path_params.get("ws_id", "")
+        if not ws_id:
+            return JSONResponse({"error": "ws_id is required"}, status_code=400)
+
+        if cfg.tenant_check is not None:
+            err_tenant = await asyncio.to_thread(cfg.tenant_check, request, ws_id, mgr)
+            if err_tenant is not None:
+                return err_tenant
+
+        # Resolve the workstream BEFORE writing the alias. ``set_workstream_alias``
+        # is a global, kind-unscoped UPDATE keyed on ``ws_id`` alone (it returns
+        # True even on a 0-row match), so a kind that has no ``tenant_check``
+        # storage gate (coord — the in-memory manager is its existence + kind
+        # authority) must 404 here, or an operator could rename a workstream this
+        # manager doesn't own (e.g. an interactive ws via the coord route) and a
+        # bogus id would silently 200. Interactive keeps ``tenant_check`` as its
+        # existence gate, so this stays skipped there and a non-loaded
+        # saved/closed ws still renames.
+        ws = mgr.get(ws_id)
+        if cfg.tenant_check is None and ws is None:
+            return JSONResponse({"error": cfg.not_found_label}, status_code=404)
+
+        body = await read_json_or_400(request)
+        if isinstance(body, JSONResponse):
+            return body
+        title = str(body.get("title", "")).strip()
+        if not title:
+            return JSONResponse({"error": "title is required"}, status_code=400)
+        title = title[:80]
+
+        if not await asyncio.to_thread(set_workstream_alias, ws_id, title):
+            return JSONResponse(
+                {"error": "That name is already used by another workstream"},
+                status_code=409,
+            )
+
+        if ws is not None and ws.session is not None and ws.session.ui is not None:
+            ws.session.ui.on_rename(title)
+        return JSONResponse({"status": "ok", "title": title})
+
+    return set_title
 
 
 CancelAuditEmitter = Callable[

@@ -77,10 +77,12 @@ from turnstone.core.session_routes import (
     make_history_handler,
     make_list_handler,
     make_open_handler,
+    make_refresh_title_handler,
     make_retry_handler,
     make_rewind_handler,
     make_saved_handler,
     make_send_handler,
+    make_set_title_handler,
     register_session_routes,
 )
 from turnstone.core.session_ui_base import (
@@ -2309,74 +2311,6 @@ async def delete_workstream_endpoint(request: Request) -> JSONResponse:
         return JSONResponse({"error": "Delete failed"}, status_code=500)
 
 
-async def refresh_workstream_title(request: Request, ws_id: str = "") -> JSONResponse:
-    """POST /v1/api/workstreams/{ws_id}/refresh-title — regenerate workstream title via LLM."""
-    from turnstone.core.log import get_logger
-    from turnstone.core.memory import get_workstream_display_name
-
-    log = get_logger(__name__)
-    ws_id = request.path_params.get("ws_id", "")
-    log.info("ws.title.refresh_requested", ws_id=ws_id[:8] if ws_id else "empty")
-    mgr = request.app.state.workstreams
-    _owner, err = _require_ws_access(request, ws_id, mgr=mgr)
-    if err:
-        return err
-    ws = mgr.get(ws_id)
-    if not ws or not ws.session:
-        log.warning(
-            "ws.title.refresh_failed",
-            ws_id=ws_id[:8] if ws_id else "empty",
-            reason="workstream_not_found",
-        )
-        return JSONResponse({"error": "Workstream not found or not active"}, status_code=404)
-    # Fetch current title so the LLM can generate something different
-    current_title = get_workstream_display_name(ws_id) or ""
-    log.info("ws.title.refresh_triggered", ws_id=ws_id[:8], current_title=current_title[:50])
-    ws.session.request_title_refresh(current_title)
-    return JSONResponse({"status": "ok"})
-
-
-async def set_workstream_title(request: Request, ws_id: str = "") -> JSONResponse:
-    """POST /v1/api/workstreams/{ws_id}/title — set workstream title manually.
-
-    Stores the user-chosen title as the workstream *alias* so it takes
-    priority over the LLM auto-generated title in the display name
-    fallback chain (alias -> title -> name).
-    """
-    from turnstone.core.log import get_logger
-    from turnstone.core.memory import set_workstream_alias
-    from turnstone.core.web_helpers import read_json_or_400
-
-    log = get_logger(__name__)
-    ws_id = request.path_params.get("ws_id", "")
-    log.info("ws.title.set_requested", ws_id=ws_id[:8] if ws_id else "empty")
-    if not ws_id:
-        return JSONResponse({"error": "ws_id is required"}, status_code=400)
-    mgr = request.app.state.workstreams
-    _owner, err = _require_ws_access(request, ws_id, mgr=mgr)
-    if err:
-        return err
-    body = await read_json_or_400(request)
-    if isinstance(body, JSONResponse):
-        return body
-    title = str(body.get("title", "")).strip()
-    if not title:
-        return JSONResponse({"error": "title is required"}, status_code=400)
-    title = title[:80]
-    if not set_workstream_alias(ws_id, title):
-        log.warning("ws.title.set_alias_conflict", ws_id=ws_id[:8], title=title[:50])
-        return JSONResponse(
-            {"error": "That name is already used by another workstream"},
-            status_code=409,
-        )
-    log.info("ws.title.set_alias_updated", ws_id=ws_id[:8])
-    ws = mgr.get(ws_id)
-    if ws and ws.session and ws.session.ui:
-        ws.session.ui.on_rename(title)
-    log.info("ws.title.set_success", ws_id=ws_id[:8], title=title)
-    return JSONResponse({"status": "ok", "title": title})
-
-
 def _auth_user_id(request: Request) -> str:
     """Return the authenticated user's id (empty string when absent).
 
@@ -3959,6 +3893,8 @@ def create_app(
     history_handler = make_history_handler(interactive_endpoint_config)
     export_handler = make_export_handler(interactive_endpoint_config)
     detail_handler = make_detail_handler(interactive_endpoint_config)
+    refresh_title_handler = make_refresh_title_handler(interactive_endpoint_config)
+    set_title_handler = make_set_title_handler(interactive_endpoint_config)
     v1_routes: list[Any] = [
         Route("/api/events/global", global_events_sse),
     ]
@@ -3973,8 +3909,8 @@ def create_app(
             detail=detail_handler,  # lifted: shared body (interactive feature gain)
             open=open_handler,  # lifted: shared body
             close=close_handler,  # lifted: shared body
-            refresh_title=refresh_workstream_title,
-            set_title=set_workstream_title,
+            refresh_title=refresh_title_handler,  # lifted: shared body
+            set_title=set_title_handler,  # lifted: shared body
             send=send_handler,  # lifted: shared body (P1.5)
             dequeue=dequeue_handler,  # lifted (P1.5) — DELETE /send
             approve=approve_handler,  # lifted: shared body

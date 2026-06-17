@@ -65,8 +65,10 @@ from turnstone.core.session_routes import (
     make_history_handler,
     make_list_handler,
     make_open_handler,
+    make_refresh_title_handler,
     make_saved_handler,
     make_send_handler,
+    make_set_title_handler,
 )
 from turnstone.core.workstream import WorkstreamKind
 
@@ -202,6 +204,16 @@ def _make_client(
                     audit_emit=_audit_close_coordinator,
                     supports_close_reason=False,
                 ),
+                methods=["POST"],
+            ),
+            Route(
+                "/v1/api/workstreams/{ws_id}/refresh-title",
+                make_refresh_title_handler(_coord_endpoint_config),
+                methods=["POST"],
+            ),
+            Route(
+                "/v1/api/workstreams/{ws_id}/title",
+                make_set_title_handler(_coord_endpoint_config),
                 methods=["POST"],
             ),
             Route(
@@ -368,6 +380,114 @@ def test_unresolvable_alias_returns_503(storage):
 
 
 _COORD_HEADERS = {"X-Test-User": "user-1", "X-Test-Perms": "admin.coordinator"}
+
+
+# ---------------------------------------------------------------------------
+# Title verbs — refresh-title (LLM regenerate) + set title (manual alias),
+# ported to coordinators via the lifted make_refresh_title_handler /
+# make_set_title_handler factories so both kinds share one body.
+# ---------------------------------------------------------------------------
+
+
+def test_coord_refresh_title_triggers_regeneration(storage):
+    mgr = _build_mgr(storage)
+    ws = mgr.create(user_id="user-1", name="c1")
+    client = _make_client(storage, coord_mgr=mgr, registry=_fake_registry())
+    resp = client.post(f"/v1/api/workstreams/{ws.id}/refresh-title", headers=_COORD_HEADERS)
+    assert resp.status_code == 200
+    # The lifted handler resolves the current display name and asks the
+    # live session to regenerate a (different) title in the background.
+    ws.session.request_title_refresh.assert_called_once_with("c1")
+
+
+def test_coord_refresh_title_requires_operator_permission(storage):
+    mgr = _build_mgr(storage)
+    ws = mgr.create(user_id="user-1", name="c1")
+    client = _make_client(storage, coord_mgr=mgr, registry=_fake_registry())
+    resp = client.post(
+        f"/v1/api/workstreams/{ws.id}/refresh-title",
+        headers={"X-Test-User": "user-1", "X-Test-Perms": "read"},
+    )
+    assert resp.status_code == 403
+    ws.session.request_title_refresh.assert_not_called()
+
+
+def test_coord_refresh_title_unknown_ws_404(storage):
+    mgr = _build_mgr(storage)
+    client = _make_client(storage, coord_mgr=mgr, registry=_fake_registry())
+    resp = client.post(
+        "/v1/api/workstreams/" + ("0" * 32) + "/refresh-title", headers=_COORD_HEADERS
+    )
+    assert resp.status_code == 404
+
+
+def test_coord_set_title_stores_alias_and_broadcasts(storage):
+    from turnstone.core.memory import get_workstream_display_name
+
+    mgr = _build_mgr(storage)
+    ws = mgr.create(user_id="user-1", name="c1")
+    client = _make_client(storage, coord_mgr=mgr, registry=_fake_registry())
+    resp = client.post(
+        f"/v1/api/workstreams/{ws.id}/title",
+        json={"title": "Nightly migration sweep"},
+        headers=_COORD_HEADERS,
+    )
+    assert resp.status_code == 200
+    assert resp.json()["title"] == "Nightly migration sweep"
+    # Stored as the alias (outranks the auto-title) ...
+    assert get_workstream_display_name(ws.id) == "Nightly migration sweep"
+    # ... and broadcast live to the dashboard via the session UI.
+    ws.session.ui.on_rename.assert_called_once_with("Nightly migration sweep")
+
+
+def test_coord_set_title_empty_400(storage):
+    mgr = _build_mgr(storage)
+    ws = mgr.create(user_id="user-1", name="c1")
+    client = _make_client(storage, coord_mgr=mgr, registry=_fake_registry())
+    resp = client.post(
+        f"/v1/api/workstreams/{ws.id}/title", json={"title": "   "}, headers=_COORD_HEADERS
+    )
+    assert resp.status_code == 400
+
+
+def test_coord_set_title_alias_conflict_409(storage):
+    mgr = _build_mgr(storage)
+    first = mgr.create(user_id="user-1", name="c1")
+    second = mgr.create(user_id="user-1", name="c2")
+    storage.set_workstream_alias(first.id, "taken")
+    client = _make_client(storage, coord_mgr=mgr, registry=_fake_registry())
+    resp = client.post(
+        f"/v1/api/workstreams/{second.id}/title", json={"title": "taken"}, headers=_COORD_HEADERS
+    )
+    assert resp.status_code == 409
+
+
+def test_coord_set_title_rejects_unowned_ws_404(storage):
+    """An admin.coordinator operator can't rename a workstream the coord
+    manager doesn't own (here a cross-kind interactive row) via the coord
+    /title route: set_workstream_alias is a global kind-unscoped UPDATE, so
+    the handler 404s on the in-memory coord lookup BEFORE writing — no
+    silent 200, no cross-kind alias write."""
+    from turnstone.core.memory import get_workstream_display_name
+
+    mgr = _build_mgr(storage)
+    # An interactive-kind row in storage, NOT held by coord_mgr.
+    storage.register_workstream(
+        "i" * 32,
+        node_id="node-1",
+        user_id="user-1",
+        name="interactive-ws",
+        kind=WorkstreamKind.INTERACTIVE,
+    )
+    client = _make_client(storage, coord_mgr=mgr, registry=_fake_registry())
+    resp = client.post(
+        f"/v1/api/workstreams/{'i' * 32}/title",
+        json={"title": "hijacked"},
+        headers=_COORD_HEADERS,
+    )
+    assert resp.status_code == 404
+    # The interactive ws's display name is untouched — the alias write never fired.
+    assert get_workstream_display_name("i" * 32) == "interactive-ws"
 
 
 def test_active_list_row_shape_includes_unified_fields(storage):
