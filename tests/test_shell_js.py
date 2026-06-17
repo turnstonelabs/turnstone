@@ -602,6 +602,27 @@ def test_step7_tab_menu_wired_per_persona() -> None:
     )
 
 
+def test_coordinator_tab_menu_enables_title_verbs() -> None:
+    """Coordinators carry LLM/auto titles like interactive workstreams, so
+    their tab dropdown must surface Refresh/Edit title — convTabMenu's
+    ``titleVerbs`` block, POSTed to the console-origin coord
+    ``refresh-title`` / ``title`` routes via the base-aware lane (default
+    base ""). Scoped to the coordinator registerType block so it can't
+    pass on the interactive pane's long-standing ``titleVerbs``."""
+    shell = _SHELL_JS.read_text(encoding="utf-8")
+    start = shell.index('registerType("coordinator"')
+    tail = shell[start:]
+    nxt = tail.find("registerType(", 1)  # bound at the next pane registration
+    coord_block = tail[:nxt] if nxt != -1 else tail
+    assert "pane._ctl.closeSession()" in coord_block, (
+        "sanity: the extracted block is the coordinator pane"
+    )
+    assert "convTabMenu(" in coord_block, "the coordinator pane must wire a tab menu"
+    assert "titleVerbs: true" in coord_block, (
+        "the coordinator tab menu must enable titleVerbs (Refresh/Edit title)"
+    )
+
+
 def test_tab_menu_base_aware_verb_lane() -> None:
     """Lifecycle round 2: a proxied interactive pane's tab menu must act on the
     pane's OWN transport base, not the console origin — the globals lane only

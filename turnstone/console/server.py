@@ -76,9 +76,11 @@ from turnstone.core.session_routes import (
     make_history_handler,
     make_list_handler,
     make_open_handler,
+    make_refresh_title_handler,
     make_retry_handler,
     make_rewind_handler,
     make_send_handler,
+    make_set_title_handler,
     make_unified_saved_handler,
     register_coord_verbs,
     register_session_routes,
@@ -13020,6 +13022,8 @@ def create_app(
                 audit_emit=_audit_close_coordinator,
                 supports_close_reason=False,
             ),
+            refresh_title=make_refresh_title_handler(coord_endpoint_config),  # lifted: shared body
+            set_title=make_set_title_handler(coord_endpoint_config),  # lifted: shared body
             send=make_send_handler(coord_endpoint_config),  # lifted: shared body (P1.5)
             dequeue=make_dequeue_handler(coord_endpoint_config),  # lifted: shared body
             approve=make_approve_handler(coord_endpoint_config),  # lifted: shared body

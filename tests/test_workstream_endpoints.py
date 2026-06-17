@@ -31,16 +31,17 @@ from turnstone.core.session_routes import (
     make_export_handler,
     make_history_handler,
     make_open_handler,
+    make_refresh_title_handler,
     make_retry_handler,
     make_rewind_handler,
+    make_set_title_handler,
 )
 from turnstone.core.storage._sqlite import SQLiteBackend
 from turnstone.core.workstream import WorkstreamKind
 from turnstone.server import (
+    _interactive_tenant_check,
     delete_workstream_endpoint,
     list_interface_settings,
-    refresh_workstream_title,
-    set_workstream_title,
     update_interface_setting,
 )
 
@@ -113,6 +114,18 @@ def delete_client(_inject_storage):
 
 @pytest.fixture
 def title_client(_inject_storage):
+    # Build the lifted refresh/set-title handlers the same way server.py
+    # wires the interactive bundle — same SessionEndpointConfig
+    # (manager_lookup + _interactive_tenant_check) so the tests exercise
+    # the production resolution path (mgr fast-path → storage ownership).
+    mock_mgr = MagicMock()
+    cfg = SessionEndpointConfig(
+        permission_gate=None,
+        manager_lookup=lambda _r: (mock_mgr, None),
+        tenant_check=_interactive_tenant_check,
+        not_found_label="Workstream not found",
+        audit_action_prefix="workstream",
+    )
     app = Starlette(
         routes=[
             Mount(
@@ -120,12 +133,12 @@ def title_client(_inject_storage):
                 routes=[
                     Route(
                         "/api/workstreams/{ws_id}/title",
-                        set_workstream_title,
+                        make_set_title_handler(cfg),
                         methods=["POST"],
                     ),
                     Route(
                         "/api/workstreams/{ws_id}/refresh-title",
-                        refresh_workstream_title,
+                        make_refresh_title_handler(cfg),
                         methods=["POST"],
                     ),
                 ],
@@ -133,7 +146,6 @@ def title_client(_inject_storage):
         ],
         middleware=[Middleware(_InjectAuthMiddleware)],
     )
-    mock_mgr = MagicMock()
     app.state.workstreams = mock_mgr
     return TestClient(app), mock_mgr
 
