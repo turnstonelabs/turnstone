@@ -54,7 +54,8 @@ class _Handler(http.server.BaseHTTPRequestHandler):
 
 @pytest.fixture
 def serve():
-    """Factory that starts an HTTP(S) server on an ephemeral port and returns it.
+    """Factory that starts an HTTP(S) server on an ephemeral port and returns
+    that port.
 
     Every server it starts is shut down + its serve_forever thread joined at
     teardown, so the thread never outlives the test (which would otherwise bleed
