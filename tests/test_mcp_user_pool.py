@@ -25,7 +25,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from tests.conftest import make_mcp_token_cipher
+from tests.conftest import make_mcp_token_cipher, stop_loop_thread
 from turnstone.core.mcp_client import MCPClientManager, PoolEntryState
 from turnstone.core.mcp_crypto import MCPTokenStore
 from turnstone.core.storage._sqlite import SQLiteBackend
@@ -123,8 +123,7 @@ def running_loop_mgr():
 
         with contextlib.suppress(Exception):
             asyncio.run_coroutine_threadsafe(_drain(mgr), loop).result(timeout=2)
-        loop.call_soon_threadsafe(loop.stop)
-        thread.join(timeout=2)
+        stop_loop_thread(loop, thread)
 
 
 def _run_on_loop(loop: asyncio.AbstractEventLoop, coro: Any) -> Any:
