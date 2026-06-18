@@ -87,7 +87,10 @@ def _no_leaked_threads(request: pytest.FixtureRequest) -> Iterator[None]:
     if request.node.get_closest_marker("allow_thread_leak"):
         yield
         return
-    before = {t.ident for t in threading.enumerate()}
+    # Snapshot the Thread OBJECTS, not their idents: Thread.ident is recycled
+    # after a thread exits, so an ident-based snapshot could mistake a new
+    # leaked thread (reusing an exited thread's ident) for a pre-existing one.
+    before = set(threading.enumerate())
     yield
     main = threading.main_thread()
     current = threading.current_thread()
@@ -97,7 +100,7 @@ def _no_leaked_threads(request: pytest.FixtureRequest) -> Iterator[None]:
     deadline = time.monotonic() + _THREAD_LEAK_GRACE
     leaked = []
     for t in threading.enumerate():
-        if t.ident in before or t is main or t is current or not t.is_alive():
+        if t in before or t is main or t is current or not t.is_alive():
             continue
         t.join(timeout=max(0.0, deadline - time.monotonic()))
         if t.is_alive():
