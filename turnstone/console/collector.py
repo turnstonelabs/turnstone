@@ -94,6 +94,11 @@ class ClusterCollector:
         self._nodes: dict[str, NodeSnapshot] = {}
         self._running = False
         self._threads: list[threading.Thread] = []
+        # Wakes the discovery loop out of its inter-scan sleep so ``stop()``
+        # can join it promptly instead of blocking up to ``discovery_interval``
+        # (a long interval would otherwise leave the thread sleeping past
+        # join's timeout — a leaked background thread).
+        self._discovery_wake = threading.Event()
 
         # SSE fan-out to browser clients
         self._listeners: list[queue.Queue[dict[str, Any]]] = []
@@ -135,6 +140,9 @@ class ClusterCollector:
     def start(self) -> None:
         """Start background threads."""
         self._running = True
+        # Clear the shutdown wake so a restarted collector (stop() set it) sleeps
+        # the full interval again instead of busy-spinning the discovery loop.
+        self._discovery_wake.clear()
         # Subscribe to the ``services`` channel for reactive node discovery.
         # NOTIFY-driven wake-ups bring new-node visibility from up-to-60 s
         # (next discovery tick) down to ~500 ms on Postgres; the 60 s
@@ -161,6 +169,7 @@ class ClusterCollector:
         its ``finally`` cleanup (cancel tasks, close AsyncClient).
         """
         self._running = False
+        self._discovery_wake.set()  # wake the discovery loop out of its sleep
         if self._notify_unsubscribe is not None:
             with contextlib.suppress(Exception):
                 self._notify_unsubscribe()
@@ -417,7 +426,9 @@ class ClusterCollector:
                 pass  # already logged by storage layer
             except Exception:
                 log.exception("Node discovery error")
-            time.sleep(self._discovery_interval)
+            # Interruptible inter-scan sleep — ``stop()`` sets the event to
+            # wake us immediately instead of blocking out the full interval.
+            self._discovery_wake.wait(self._discovery_interval)
 
     def _discover_nodes(self) -> None:
         """Query the service registry and update the node map."""

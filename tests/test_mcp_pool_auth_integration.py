@@ -38,7 +38,7 @@ import uvicorn
 from mcp.server.fastmcp import FastMCP
 from starlette.middleware.base import BaseHTTPMiddleware
 
-from tests.conftest import make_mcp_token_cipher
+from tests.conftest import make_mcp_token_cipher, serve_until_exit, stop_loop_thread
 from turnstone.core.mcp_client import MCPClientManager
 from turnstone.core.mcp_crypto import MCPTokenStore
 from turnstone.core.mcp_oauth import TokenLookupResult
@@ -187,7 +187,14 @@ def _build_server(port: int, behaviour: dict[str, Any]) -> uvicorn.Server:
 
     app = mcp.streamable_http_app()
     app.add_middleware(BehaviorMiddleware, behaviour=behaviour)
-    config = uvicorn.Config(app, host="127.0.0.1", port=port, log_level="warning", access_log=False)
+    config = uvicorn.Config(
+        app,
+        host="127.0.0.1",
+        port=port,
+        log_level="warning",
+        access_log=False,
+        timeout_graceful_shutdown=0,  # don't block teardown on a held-open stream
+    )
     return uvicorn.Server(config)
 
 
@@ -215,9 +222,7 @@ def upstream():
     server = _build_server(port, behaviour)
 
     def _run() -> None:
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        loop.run_until_complete(server.serve())
+        serve_until_exit(server)
 
     t = threading.Thread(target=_run, daemon=True, name="phase6-upstream")
     t.start()
@@ -225,7 +230,11 @@ def upstream():
         _wait_ready(port)
         yield f"http://127.0.0.1:{port}/mcp", behaviour
     finally:
+        # should_exit alone triggers a GRACEFUL shutdown that can wait forever
+        # on a held-open streamable-http stream; force_exit skips that wait so
+        # serve() returns and the upstream thread doesn't leak past the test.
         server.should_exit = True
+        server.force_exit = True
         t.join(timeout=5)
 
 
@@ -311,8 +320,7 @@ def running_loop_mgr():
 
         with contextlib.suppress(Exception):
             asyncio.run_coroutine_threadsafe(_drain(mgr), loop).result(timeout=2)
-        loop.call_soon_threadsafe(loop.stop)
-        thread.join(timeout=2)
+        stop_loop_thread(loop, thread)
 
 
 # ---------------------------------------------------------------------------
