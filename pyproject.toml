@@ -95,7 +95,10 @@ include = [
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-markers = ["live: requires a running LLM backend"]
+markers = [
+    "live: requires a running LLM backend",
+    "allow_thread_leak: test intentionally leaves a background thread running (opts out of the leaked-thread guard)",
+]
 filterwarnings = [
     # mcp v1 deprecates streamablehttp_client for an entry point whose call
     # shape only settles in v2 — adoption rides the deliberate v2 migration

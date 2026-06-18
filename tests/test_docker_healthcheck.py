@@ -52,13 +52,31 @@ class _Handler(http.server.BaseHTTPRequestHandler):
         pass
 
 
-def _serve(handler_cls, ssl_context: ssl.SSLContext | None = None) -> int:
-    """Start a daemon-thread HTTP(S) server on an ephemeral port."""
-    httpd = http.server.HTTPServer(("127.0.0.1", 0), handler_cls)
-    if ssl_context is not None:
-        httpd.socket = ssl_context.wrap_socket(httpd.socket, server_side=True)
-    threading.Thread(target=httpd.serve_forever, daemon=True).start()
-    return httpd.server_address[1]
+@pytest.fixture
+def serve():
+    """Factory that starts an HTTP(S) server on an ephemeral port and returns it.
+
+    Every server it starts is shut down + its serve_forever thread joined at
+    teardown, so the thread never outlives the test (which would otherwise bleed
+    into a later test's captured output / leak the listener).
+    """
+    started: list[tuple[http.server.HTTPServer, threading.Thread]] = []
+
+    def _factory(handler_cls, ssl_context: ssl.SSLContext | None = None) -> int:
+        httpd = http.server.HTTPServer(("127.0.0.1", 0), handler_cls)
+        if ssl_context is not None:
+            httpd.socket = ssl_context.wrap_socket(httpd.socket, server_side=True)
+        thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+        thread.start()
+        started.append((httpd, thread))
+        return httpd.server_address[1]
+
+    yield _factory
+
+    for httpd, thread in started:
+        httpd.shutdown()  # break the serve_forever loop
+        httpd.server_close()  # release the listening socket
+        thread.join(timeout=5)
 
 
 @pytest.fixture
@@ -90,29 +108,29 @@ def mtls_setup(tmp_path):
 # ── Plain HTTP (mTLS disabled — the default deployment) ─────────────────────
 
 
-def test_plain_http_ok():
+def test_plain_http_ok(serve):
     """Default path: plain probe succeeds, PEM dir never consulted."""
-    port = _serve(_Handler)
+    port = serve(_Handler)
     result = run_healthcheck(f"http://127.0.0.1:{port}/health")
     assert result.returncode == 0, result.stderr
 
 
-def test_plain_http_degraded_is_healthy():
+def test_plain_http_degraded_is_healthy(serve):
     """'degraded' (backend down, server up) still counts as container-healthy."""
 
     class Degraded(_Handler):
         payload = {"status": "degraded"}
 
-    port = _serve(Degraded)
+    port = serve(Degraded)
     result = run_healthcheck(f"http://127.0.0.1:{port}/health")
     assert result.returncode == 0, result.stderr
 
 
-def test_plain_http_bad_status_fails():
+def test_plain_http_bad_status_fails(serve):
     class Bad(_Handler):
         payload = {"status": "error"}
 
-    port = _serve(Bad)
+    port = serve(Bad)
     result = run_healthcheck(f"http://127.0.0.1:{port}/health")
     assert result.returncode == 1
     assert "unhealthy payload" in result.stderr
@@ -128,40 +146,40 @@ def test_server_down_fails():
 # ── mTLS (tls.enabled) ───────────────────────────────────────────────────────
 
 
-def test_mtls_probe_with_pem_dir(mtls_setup):
+def test_mtls_probe_with_pem_dir(mtls_setup, serve):
     """The regression case: mTLS node + plain-HTTP probe URL.
 
     The plain attempt is rejected at the socket; the script must fall back
     to HTTPS with the node cert as client cert and report healthy."""
     pem_root, server_ctx = mtls_setup
-    port = _serve(_Handler, ssl_context=server_ctx)
+    port = serve(_Handler, ssl_context=server_ctx)
     result = run_healthcheck(f"http://127.0.0.1:{port}/health", pem_root=pem_root)
     assert result.returncode == 0, result.stderr
 
 
-def test_mtls_probe_without_pems_fails(mtls_setup):
+def test_mtls_probe_without_pems_fails(mtls_setup, serve):
     """mTLS node but no PEM material on disk: the probe must fail."""
     _, server_ctx = mtls_setup
-    port = _serve(_Handler, ssl_context=server_ctx)
+    port = serve(_Handler, ssl_context=server_ctx)
     result = run_healthcheck(f"http://127.0.0.1:{port}/health", pem_root=None)
     assert result.returncode == 1
     assert "Health check failed" in result.stderr
 
 
-def test_mtls_unhealthy_payload_fails(mtls_setup):
+def test_mtls_unhealthy_payload_fails(mtls_setup, serve):
     """A reachable mTLS server with a bad payload is still unhealthy."""
     pem_root, server_ctx = mtls_setup
 
     class Bad(_Handler):
         payload = {"status": "error"}
 
-    port = _serve(Bad, ssl_context=server_ctx)
+    port = serve(Bad, ssl_context=server_ctx)
     result = run_healthcheck(f"http://127.0.0.1:{port}/health", pem_root=pem_root)
     assert result.returncode == 1
     assert "unhealthy payload" in result.stderr
 
 
-def test_mtls_incomplete_pem_dir_fails(mtls_setup, tmp_path):
+def test_mtls_incomplete_pem_dir_fails(mtls_setup, tmp_path, serve):
     """A PEM dir missing the key is skipped, not half-used."""
     _, server_ctx = mtls_setup
     incomplete = tmp_path / "incomplete-root"
@@ -170,7 +188,7 @@ def test_mtls_incomplete_pem_dir_fails(mtls_setup, tmp_path):
     (d / "fullchain.pem").write_text("not a cert")
     (d / "ca.pem").write_text("not a cert")
 
-    port = _serve(_Handler, ssl_context=server_ctx)
+    port = serve(_Handler, ssl_context=server_ctx)
     result = run_healthcheck(f"http://127.0.0.1:{port}/health", pem_root=incomplete)
     assert result.returncode == 1
 
