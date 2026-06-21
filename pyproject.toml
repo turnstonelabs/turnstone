@@ -46,7 +46,7 @@ dependencies = [
     "python-frontmatter>=1.0",
     "pypdfium2>=4",  # PDF text-extract + rasterize for models without native PDF input (core/pdf.py)
     "pillow>=10",  # PNG encoding for the PDF->images rasterize fallback (vision models, core/pdf.py)
-    "altair>=5.4",  # standard viz stack: Vega-Lite spec authoring; one spec renders to static SVG (vl-convert) AND interactive ui:// vega-embed panels. Light: pandas/numpy optional via narwhals.
+    "altair>=6.0",  # standard viz stack: Vega-Lite spec authoring; one spec renders to static SVG (vl-convert) AND interactive ui:// vega-embed panels. Light: pandas/numpy optional via narwhals.
     "vl-convert-python>=1.6",  # Vega-Lite -> SVG/PNG, server-side (bundled Rust renderer; no browser/GDAL/chromium). BSD-3 + fully permissive dep closure (OFL font, BSD/MIT/ISC JS).
 ]
 
