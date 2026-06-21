@@ -1,0 +1,27 @@
+# LiteLLM gateway config — serves BOTH API routes on :4000 at once, each model
+# on the backend protocol its role needs:
+#
+#   /v1/messages          (Anthropic)  -> qwen   (reasoning; vLLM's native
+#                                          /v1/messages beats its OpenAI lane)
+#   /v1/chat/completions  (OpenAI)     -> gemma  (perception: vision + audio;
+#                                          audio `input_audio` has no Anthropic
+#                                          Messages equivalent, so it MUST use
+#                                          the OpenAI chat lane)
+#
+# Turnstone reaches qwen as provider=anthropic-compatible (base_url :4000, no /v1)
+# and gemma as provider=openai-compatible (base_url :4000/v1). The reranker is
+# NOT here — Cohere/Jina /rerank wire format; Turnstone calls it directly.
+model_list:
+  - model_name: qwen3.6-27b
+    litellm_params:
+      model: anthropic/qwen3.6-27b
+      api_base: http://vllm-qwen:8000
+      api_key: dummy
+  - model_name: gemma-4-12b
+    litellm_params:
+      model: openai/gemma-4-12b
+      api_base: http://vllm-gemma:8000/v1
+      api_key: dummy
+
+litellm_settings:
+  drop_params: true        # tolerate params a backend doesn't accept
