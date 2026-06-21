@@ -32,6 +32,8 @@ dependencies = [
     "sse-starlette>=2.0",
     "httpx-sse>=0.4",
     "pydantic>=2.0",
+    "pydantic-settings>=2.14.2",  # GHSA-4xgf-cpjx-pc3j: <2.14.2 advisory; transitive-only, pinned as a security floor for pip-audit
+
     "sqlalchemy>=2.0",
     "alembic>=1.14",
     "psycopg[binary]>=3.2",
