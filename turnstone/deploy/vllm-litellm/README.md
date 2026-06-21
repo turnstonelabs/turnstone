@@ -52,6 +52,7 @@ rationale in *Troubleshooting*):
   - `qwen3.6-27B-FP8/` (NVIDIA) or `qwen3.6-27B/` bf16 (AMD)
   - `gemma-4-12B-it/`
 - `sudo` for `drop_caches`.
+- These examples pass `--trust-remote-code` to vLLM; only use this with trusted model repos (remove the flag if your checkpoint doesn’t require it).
 
 ## Setup — NVIDIA DGX Spark (GB10)   ✅ validated
 
