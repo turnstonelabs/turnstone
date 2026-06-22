@@ -14,6 +14,12 @@ Self-hosted, local-first orchestration for tool-using AI agents. Give LLMs real 
 
 Named after the [Ruddy Turnstone](https://en.wikipedia.org/wiki/Ruddy_turnstone) (*Arenaria interpres*) — a shorebird that flips stones to discover what's hiding underneath.
 
+**What is a harness?**
+
+$$\mathcal{H}:\quad s_{n+1} \sim T(s_n)\ \ \text{for } n < \tau^\star, \qquad T = \rho \circ (M_W \circ \pi,\, E)$$
+
+[**the hypothesis →**](HYPOTHESIS.md)
+
 ### Release Tracks
 
 | Track | Install | Docker | Description |
