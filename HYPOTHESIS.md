@@ -90,3 +90,7 @@ Borrowed theorems are real; the framings are not — keep them separate.
 **Proven (citable).** Foster–Lyapunov drift ⇒ positive recurrence + $\mathbb{E}[\tau]\le V(s_0)/\varepsilon$ (Foster 1953; Meyn & Tweedie, *Markov Chains and Stochastic Stability*, 1993). The minimal $V$ is the expected hitting time, by first-step analysis + optional stopping (Norris, *Markov Chains*, 1997). You verify a candidate $\hat V$ by its measured drift rather than deriving $V^\star$ (neural-Lyapunov: Chang, Roohi & Gao, *Neural Lyapunov Control*, NeurIPS 2019, arXiv:2005.00611). The compiler's $V$ is free because a finite-height lattice is a well-founded descent (Kildall, POPL 1973). Dialect-stack architecture: MLIR (Lattner et al., CGO 2021, arXiv:2002.11054); learned pass-ordering: MLGO (Trofin et al., arXiv:2101.04808). Single-pass constant-depth: the $\mathsf{TC}^0$ transformer-expressivity results (Merrill & Sabharwal).
 
 **Asserted (ours — not theorems).** That the harness is best modeled as nested stopped chains; that $V^\star$ is incompressible (no compression theorem); that "no lattice for $f(\cdot\,;W)$" means none is *known*, not that none exists; and everything under *Where this points*. These organize the design; they are not results.
+
+---
+
+*The ramblings of Claude and Patrick.*
