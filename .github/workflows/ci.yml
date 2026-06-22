@@ -113,9 +113,16 @@ jobs:
             | grep -v '\.py$' | grep -v '\.dist-info' | grep -v '\.pyc' | grep -v '^File$' \
             | sort)
 
-          # Files intentionally excluded from the wheel (one per line)
+          # Files intentionally excluded from the wheel (one per line).
+          # The vllm-litellm/ deploy example ships in the repo, not the wheel
+          # (you clone the repo to run it; the package doesn't reference it).
           ALLOW="
           turnstone/core/storage/migrations/script.py.mako
+          turnstone/deploy/vllm-litellm/.env.example
+          turnstone/deploy/vllm-litellm/README.md
+          turnstone/deploy/vllm-litellm/docker-compose.yml
+          turnstone/deploy/vllm-litellm/gemma.Dockerfile
+          turnstone/deploy/vllm-litellm/litellm-config.yaml
           "
 
           MISSING=$(comm -23 <(echo "$SOURCE") <(echo "$WHEEL") \
