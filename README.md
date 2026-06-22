@@ -16,7 +16,9 @@ Named after the [Ruddy Turnstone](https://en.wikipedia.org/wiki/Ruddy_turnstone)
 
 **What is a harness?**
 
-$$\mathcal{H}:\quad s_{n+1} \sim T(s_n)\ \ \text{for } n < \tau^\star, \qquad T = \rho \circ (M_W \circ \pi,\, E)$$
+```
+ℋ :  s_{n+1} ~ T(s_n)   for n < τ*,    T = ρ ∘ (M_W ∘ π, E)
+```
 
 [**the hypothesis →**](HYPOTHESIS.md)
 
