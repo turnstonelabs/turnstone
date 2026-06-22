@@ -97,11 +97,13 @@ Same compose, with these changes:
    [kyuz0/amd-strix-halo-vllm-toolboxes](https://github.com/kyuz0/amd-strix-halo-vllm-toolboxes)
    or the TheRock-ROCm build in [hec-ovi/vllm-qwen](https://github.com/hec-ovi/vllm-qwen)
    — then set `VLLM_IMAGE` to it.
-2. **Qwen weights** — gfx1151 has no FP8 matmul; recent ROCm/vLLM *can* load an FP8
-   checkpoint but compute falls back to BF16 speed and it's rough. Prefer BF16:
-   `QWEN_MODEL=Qwen/Qwen3.6-27B`, and drop `--max-model-len` toward 131072 (bf16
-   27B weights ≈ 54 GiB, leaving less KV room). `runai_streamer` may not help on
-   ROCm — drop it from the qwen command if it errors.
+2. **Qwen weights & loader** — gfx1151 has no FP8 matmul; recent ROCm/vLLM *can*
+   load an FP8 checkpoint but compute falls back to BF16 speed and it's rough.
+   Prefer BF16: set `QWEN_MODEL=Qwen/Qwen3.6-27B` in `.env`. Then, in the
+   `vllm-qwen` command in `docker-compose.yml`, lower `--max-model-len` toward
+   131072 (bf16 27B weights ≈ 54 GiB, less KV room) and remove the
+   `--load-format runai_streamer` line (it may not help on ROCm; drop it if it
+   errors). Those two are compose literals, not `.env` vars.
 3. **GPU access** — ROCm doesn't use the `deploy:` nvidia reservation. In
    `docker-compose.yml`, **delete the `deploy:` block** on *each* vLLM service and
    replace it with:
