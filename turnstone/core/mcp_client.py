@@ -1585,6 +1585,137 @@ class MCPClientManager:
         self._notify_user_prompt_listeners(user_id)
         return entry
 
+    # -- pool priming ---------------------------------------------------------
+
+    async def _prime_user_server(
+        self, key: tuple[str, str], cfg: dict[str, Any], access_token: str
+    ) -> int:
+        """Proactively connect a pool entry so its catalog populates into
+        ``get_tools(user_id)`` WITHOUT waiting for a tool dispatch.
+
+        ``auth_type='oauth_user'`` tools are per-user and were previously
+        discovered ONLY lazily, on first dispatch (``_dispatch_pool_with_entry``
+        at the ``session is None`` branch). That creates a chicken-and-egg:
+        the model can't emit a call for a tool it can't see, but the tool
+        only appears after a call connects the pool — so the per-user
+        catalog stays empty and the server is stuck "connecting". This
+        connects at a known-good moment (OAuth consent completion), commits
+        the catalog and fires the per-user tool/resource/prompt listeners so
+        any live :class:`ChatSession` refreshes its tool list.
+
+        Idempotent: a no-op if a dispatch (or an earlier prime) already
+        established the session. MUST run on the mcp-loop; takes
+        ``entry.open_lock`` exactly like dispatch so it can't race a
+        concurrent connect/eviction. Returns the discovered tool count.
+        """
+        entry = await self._ensure_pool_entry(key)
+        async with entry.open_lock:
+            if entry.session is not None:
+                return len(entry.tools or [])
+            fresh = await self._connect_one_pool(
+                key,
+                cfg,
+                access_token,
+                auth_capture=entry.auth_capture,
+                auth_fired_event=entry.auth_fired_event,
+            )
+            return len(fresh.tools or [])
+
+    async def prime_user_server(
+        self,
+        *,
+        user_id: str,
+        server_name: str,
+        access_token: str,
+        server_row: dict[str, Any],
+        timeout: float = 20.0,
+    ) -> bool:
+        """Best-effort warm of a ``(user, server)`` pool so the user's tool
+        catalog populates immediately (e.g. right after OAuth consent).
+
+        Returns ``False`` (no-op) for non-``oauth_user`` servers, before the
+        mcp-loop is running, or with no token. NEVER raises: a prime failure
+        must not change the user-observable consent/redirect outcome, and the
+        lazy dispatch path remains the backstop. Schedules the connect onto
+        the mcp-loop (this is called from the request loop) and awaits it
+        without blocking that loop.
+        """
+        if server_name not in self._oauth_user_server_names:
+            return False
+        loop = self._loop
+        if loop is None or not access_token:
+            return False
+        cfg = _pool_cfg_from_row(server_row)
+        key = (user_id, server_name)
+        try:
+            fut = asyncio.run_coroutine_threadsafe(
+                self._prime_user_server(key, cfg, access_token), loop
+            )
+            count = await asyncio.wait_for(asyncio.wrap_future(fut), timeout=timeout)
+            log.info(
+                "mcp pool primed user=%s server=%s tools=%d", user_id, server_name, count
+            )
+            return True
+        except Exception as exc:
+            log.warning(
+                "mcp pool prime failed user=%s server=%s: %s", user_id, server_name, exc
+            )
+            return False
+
+    def prime_user_pools(self, user_id: str) -> None:
+        """Fire-and-forget: warm THIS user's consented ``oauth_user`` pools.
+
+        Called at ChatSession start so a per-user OAuth server's tools are
+        present automatically — no manual reconnect after a reboot/upgrade, and
+        no chicken-and-egg (the model can't dispatch a tool it can't see). Only
+        touches servers the user already has a stored token for; skips servers
+        already connected. Non-blocking: schedules onto the mcp-loop and returns
+        immediately. The per-user tool listeners (registered by ChatSession)
+        deliver the catalog to the live session when each prime completes.
+        """
+        if not user_id or self._loop is None or not self._oauth_user_server_names:
+            return
+        if self._app_state is None or self._storage is None:
+            return
+        # run_coroutine_threadsafe keeps the task referenced by the loop while
+        # it runs, so no strong-ref bookkeeping is needed here.
+        asyncio.run_coroutine_threadsafe(self._prime_user_pools(user_id), self._loop)
+
+    async def _prime_user_pools(self, user_id: str) -> None:
+        """Per-server body of :meth:`prime_user_pools` (runs on the mcp-loop)."""
+        from turnstone.core.mcp_oauth import get_user_access_token_classified
+
+        for server_name in list(self._oauth_user_server_names):
+            try:
+                key = (user_id, server_name)
+                entry = self._user_pool_entries.get(key)
+                if entry is not None and entry.session is not None:
+                    continue  # already connected — nothing to do
+                lookup = await get_user_access_token_classified(
+                    app_state=self._app_state, user_id=user_id, server_name=server_name
+                )
+                if lookup.kind != "token" or not lookup.token:
+                    continue  # no usable token (not consented) — lazy paths handle it
+                server_row = await asyncio.to_thread(
+                    self._storage.get_mcp_server_by_name, server_name
+                )
+                if not server_row:
+                    continue
+                cfg = _pool_cfg_from_row(server_row)
+                await self._prime_user_server(key, cfg, lookup.token)
+                log.info(
+                    "mcp pool auto-primed at session start user=%s server=%s",
+                    user_id,
+                    server_name,
+                )
+            except Exception:
+                log.debug(
+                    "mcp pool auto-prime failed user=%s server=%s",
+                    user_id,
+                    server_name,
+                    exc_info=True,
+                )
+
     # -- pool eviction --------------------------------------------------------
 
     async def _user_pool_eviction_loop(self) -> None:

@@ -1203,6 +1203,17 @@ class ChatSession:
             # for OTHER users do not wake this session.
             self._mcp_prompt_cb = self._on_mcp_prompts_changed
             mcp_client.add_prompt_listener(self._mcp_prompt_cb, user_id=self._mcp_user_id)
+            # Proactively warm this user's per-user OAuth (oauth_user) pools so
+            # their tools are present without a manual reconnect (e.g. after a
+            # reboot/upgrade, or right after consent). Fire-and-forget — the
+            # listeners registered just above deliver the catalog to this
+            # session once each prime completes. No-op for users with no
+            # consented oauth_user servers.
+            if self._mcp_user_id and hasattr(mcp_client, "prime_user_pools"):
+                try:
+                    mcp_client.prime_user_pools(self._mcp_user_id)
+                except Exception:
+                    pass
         else:
             self._tools = INTERACTIVE_TOOLS
             self._task_tools = TASK_AGENT_TOOLS
