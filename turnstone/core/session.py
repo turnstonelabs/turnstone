@@ -1213,7 +1213,11 @@ class ChatSession:
                 try:
                     mcp_client.prime_user_pools(self._mcp_user_id)
                 except Exception:
-                    pass
+                    log.debug(
+                        "prime_user_pools scheduling failed user=%s",
+                        self._mcp_user_id,
+                        exc_info=True,
+                    )
         else:
             self._tools = INTERACTIVE_TOOLS
             self._task_tools = TASK_AGENT_TOOLS

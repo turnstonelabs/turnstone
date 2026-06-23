@@ -1652,13 +1652,15 @@ class MCPClientManager:
                 self._prime_user_server(key, cfg, access_token), loop
             )
             count = await asyncio.wait_for(asyncio.wrap_future(fut), timeout=timeout)
-            log.info(
-                "mcp pool primed user=%s server=%s tools=%d", user_id, server_name, count
-            )
+            log.info("mcp pool primed user=%s server=%s tools=%d", user_id, server_name, count)
             return True
         except Exception as exc:
             log.warning(
-                "mcp pool prime failed user=%s server=%s: %s", user_id, server_name, exc
+                "mcp pool prime failed user=%s server=%s: %s",
+                user_id,
+                server_name,
+                exc,
+                exc_info=True,
             )
             return False
 
@@ -1679,7 +1681,14 @@ class MCPClientManager:
             return
         # run_coroutine_threadsafe keeps the task referenced by the loop while
         # it runs, so no strong-ref bookkeeping is needed here.
-        asyncio.run_coroutine_threadsafe(self._prime_user_pools(user_id), self._loop)
+        try:
+            asyncio.run_coroutine_threadsafe(self._prime_user_pools(user_id), self._loop)
+        except RuntimeError as exc:
+            log.info(
+                "mcp_pool.prime_user_pools scheduling failed user=%s error=%s",
+                user_id,
+                type(exc).__name__,
+            )
 
     async def _prime_user_pools(self, user_id: str) -> None:
         """Per-server body of :meth:`prime_user_pools` (runs on the mcp-loop)."""

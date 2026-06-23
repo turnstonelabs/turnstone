@@ -2379,21 +2379,27 @@ async def _handle_mcp_oauth_callback_inner(request: Request) -> Response:
     # emit a call for a tool it can't yet see, so the catalog stays empty
     # and the server is stuck "connecting". Best-effort: a prime failure
     # does not change consent success; lazy dispatch remains the backstop.
+    # Scheduled as a background task to avoid blocking the redirect response
+    # (prime_user_server can wait up to its default timeout).
     mcp_client = getattr(request.app.state, "mcp_client", None)
     if mcp_client is not None and hasattr(mcp_client, "prime_user_server"):
-        try:
-            await mcp_client.prime_user_server(
-                user_id=user_id,
-                server_name=server_name,
-                access_token=access_token,
-                server_row=server_row,
-            )
-        except Exception:
-            log.debug(
-                "mcp_server.oauth.pool_prime_failed",
-                server_name=server_name,
-                exc_info=True,
-            )
+
+        async def _background_prime() -> None:
+            try:
+                await mcp_client.prime_user_server(
+                    user_id=user_id,
+                    server_name=server_name,
+                    access_token=access_token,
+                    server_row=server_row,
+                )
+            except Exception:
+                log.debug(
+                    "mcp_server.oauth.pool_prime_failed",
+                    server_name=server_name,
+                    exc_info=True,
+                )
+
+        asyncio.create_task(_background_prime())
 
     # Phase 9 — clear any deferred-consent records for this (user,
     # server) now that consent has completed.  Best-effort: a storage

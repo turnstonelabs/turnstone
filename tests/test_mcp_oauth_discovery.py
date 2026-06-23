@@ -624,3 +624,164 @@ class TestASMetadataRevocationEndpoint:
 
         with pytest.raises(MCPOAuthDiscoveryError, match="revocation_endpoint"):
             asyncio.run(_run())
+
+
+# ---------------------------------------------------------------------------
+# OIDC discovery fallback (RFC 8414 -> openid-configuration)
+# ---------------------------------------------------------------------------
+
+
+class TestOIDCDiscoveryFallback:
+    """When the RFC 8414 path 404s, fall back to .well-known/openid-configuration."""
+
+    def test_rfc8414_404_then_oidc_200(self) -> None:
+        """If oauth-authorization-server returns 404, openid-configuration is used."""
+        doc = _good_as_metadata_doc()
+
+        async def _get(url: str, *args: Any, **kwargs: Any) -> MagicMock:
+            if "oauth-authorization-server" in url:
+                return _mk_response(404)
+            if "openid-configuration" in url:
+                return _mk_response(200, doc)
+            raise AssertionError(f"unexpected URL: {url}")
+
+        client = MagicMock(spec=httpx.AsyncClient)
+        client.get = AsyncMock(side_effect=_get)
+        storage = _mk_storage_mock()
+
+        async def _run() -> ASMetadata:
+            with _public_addr_patch():
+                return await discover_authorization_server(
+                    server_name="srv-x",
+                    server_url="https://mcp.example.com/sse",
+                    override_url="https://as.example.com",
+                    cached_issuer=None,
+                    http_client=client,
+                    storage=storage,
+                    server_id="srv-id",
+                    trusted_hosts=frozenset(),
+                )
+
+        meta = asyncio.run(_run())
+        assert isinstance(meta, ASMetadata)
+        assert meta.token_endpoint == "https://as.example.com/token"
+        # Both URLs were attempted
+        called_urls = [c.args[0] for c in client.get.call_args_list]
+        assert any("oauth-authorization-server" in u for u in called_urls)
+        assert any("openid-configuration" in u for u in called_urls)
+
+    def test_rfc8414_200_skips_oidc(self) -> None:
+        """When RFC 8414 succeeds, openid-configuration is never fetched."""
+        doc = _good_as_metadata_doc()
+
+        client = MagicMock(spec=httpx.AsyncClient)
+        client.get = AsyncMock(return_value=_mk_response(200, doc))
+        storage = _mk_storage_mock()
+
+        async def _run() -> ASMetadata:
+            with _public_addr_patch():
+                return await discover_authorization_server(
+                    server_name="srv-x",
+                    server_url="https://mcp.example.com/sse",
+                    override_url="https://as.example.com",
+                    cached_issuer=None,
+                    http_client=client,
+                    storage=storage,
+                    server_id="srv-id",
+                    trusted_hosts=frozenset(),
+                )
+
+        meta = asyncio.run(_run())
+        assert isinstance(meta, ASMetadata)
+        # Only the RFC 8414 URL was hit
+        called_urls = [c.args[0] for c in client.get.call_args_list]
+        assert any("oauth-authorization-server" in u for u in called_urls)
+        assert not any("openid-configuration" in u for u in called_urls)
+
+    def test_both_404_raises(self) -> None:
+        """If both discovery endpoints 404, an error is raised."""
+        client = MagicMock(spec=httpx.AsyncClient)
+        client.get = AsyncMock(return_value=_mk_response(404))
+        storage = _mk_storage_mock()
+
+        async def _run() -> ASMetadata:
+            with _public_addr_patch():
+                return await discover_authorization_server(
+                    server_name="srv-x",
+                    server_url="https://mcp.example.com/sse",
+                    override_url="https://as.example.com",
+                    cached_issuer=None,
+                    http_client=client,
+                    storage=storage,
+                    server_id="srv-id",
+                    trusted_hosts=frozenset(),
+                )
+
+        with pytest.raises(MCPOAuthDiscoveryError, match="HTTP 404"):
+            asyncio.run(_run())
+
+    def test_oidc_doc_omits_code_challenge_methods_assumes_s256(self) -> None:
+        """When OIDC doc lacks code_challenge_methods_supported, S256 is assumed."""
+        doc = _good_as_metadata_doc()
+        del doc["code_challenge_methods_supported"]
+
+        async def _get(url: str, *args: Any, **kwargs: Any) -> MagicMock:
+            if "oauth-authorization-server" in url:
+                return _mk_response(404)
+            if "openid-configuration" in url:
+                return _mk_response(200, doc)
+            raise AssertionError(f"unexpected URL: {url}")
+
+        client = MagicMock(spec=httpx.AsyncClient)
+        client.get = AsyncMock(side_effect=_get)
+        storage = _mk_storage_mock()
+
+        async def _run() -> ASMetadata:
+            with _public_addr_patch():
+                return await discover_authorization_server(
+                    server_name="srv-x",
+                    server_url="https://mcp.example.com/sse",
+                    override_url="https://as.example.com",
+                    cached_issuer=None,
+                    http_client=client,
+                    storage=storage,
+                    server_id="srv-id",
+                    trusted_hosts=frozenset(),
+                )
+
+        # Should succeed — S256 is assumed, not rejected
+        meta = asyncio.run(_run())
+        assert isinstance(meta, ASMetadata)
+        assert "S256" in meta.code_challenge_methods_supported
+
+    def test_nonempty_list_without_s256_still_rejected(self) -> None:
+        """A non-empty code_challenge_methods list missing S256 is a hard refusal."""
+        doc = _good_as_metadata_doc()
+        doc["code_challenge_methods_supported"] = ["plain"]
+
+        async def _get(url: str, *args: Any, **kwargs: Any) -> MagicMock:
+            if "oauth-authorization-server" in url:
+                return _mk_response(404)
+            if "openid-configuration" in url:
+                return _mk_response(200, doc)
+            raise AssertionError(f"unexpected URL: {url}")
+
+        client = MagicMock(spec=httpx.AsyncClient)
+        client.get = AsyncMock(side_effect=_get)
+        storage = _mk_storage_mock()
+
+        async def _run() -> ASMetadata:
+            with _public_addr_patch():
+                return await discover_authorization_server(
+                    server_name="srv-x",
+                    server_url="https://mcp.example.com/sse",
+                    override_url="https://as.example.com",
+                    cached_issuer=None,
+                    http_client=client,
+                    storage=storage,
+                    server_id="srv-id",
+                    trusted_hosts=frozenset(),
+                )
+
+        with pytest.raises(MCPOAuthDiscoveryError, match="S256"):
+            asyncio.run(_run())
