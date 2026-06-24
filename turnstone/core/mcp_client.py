@@ -406,6 +406,12 @@ class PoolEntryState:
     prompts: list[dict[str, Any]] | None = None
     last_used: float = 0.0
     in_flight: int = 0
+    # Access token this session's httpx client was connected with. The bearer is
+    # frozen into the client's STATIC headers at connect (_connect_one_pool), so
+    # when the stored token later refreshes we compare against this to detect a
+    # stale session and reconnect (rebind the current token) proactively —
+    # instead of replaying the stale bearer and eating a guaranteed upstream 401.
+    bound_token: str | None = None
     auth_capture: _AuthCapture = field(default_factory=_AuthCapture)
     # Set by the response hook when the carrier captures a 4xx; awaited
     # by ``_dispatch_pool_with_entry``'s race against ``call_tool``.
@@ -1568,6 +1574,7 @@ class MCPClientManager:
         # recovery path. Same ordering invariant covers resources/prompts
         # (R16).
         entry.session = session
+        entry.bound_token = access_token  # remember the bearer this session carries
         entry.last_used = time.monotonic()
         self._user_pool_last_used[key] = entry.last_used
 
@@ -4845,6 +4852,30 @@ class MCPClientManager:
             entry.auth_capture.www_authenticate = None
             entry.auth_fired_event.clear()
             session = entry.session
+            if (
+                session is not None
+                and entry.bound_token is not None
+                and entry.bound_token != access_token
+            ):
+                # The stored token refreshed since this session connected. The
+                # pooled httpx client's Authorization header is frozen at connect
+                # (_connect_one_pool), so a warm session would replay the now-
+                # stale bearer and eat a guaranteed upstream 401 before the
+                # auth_401 retry could heal it. Proactively reconnect to rebind
+                # the current token: _connect_one_pool pre-closes the old
+                # stack/streams, and entry.tools is retained (catalog intact), so
+                # this is a transparent in-place token rotation — attempt #0 now
+                # carries a valid bearer.
+                #
+                # ``bound_token is not None`` gate: only rotate when this session
+                # was established through ``_connect_one_pool`` (which records the
+                # bearer). A directly-injected session (None bind token) is left
+                # to the existing auth_401 retry path — and is the shape unit
+                # tests use, so this avoids spurious reconnects there.
+                log.debug(
+                    "mcp_pool.token_rotated_reconnect user=%s server=%s", key[0], key[1]
+                )
+                session = None
             if session is None:
                 # Lazy connect — also covers post-eviction recovery.
                 fresh = await self._connect_one_pool(
