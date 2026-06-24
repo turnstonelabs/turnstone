@@ -36,7 +36,7 @@ jobs:
             echo "skip=false" >> "$GITHUB_OUTPUT"
           fi
 
-      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
         if: steps.tag.outputs.skip == 'false'
         with:
           python-version: "3.14"
@@ -49,7 +49,7 @@ jobs:
 
       - name: Create GitHub Release
         if: steps.tag.outputs.skip == 'false'
-        uses: softprops/action-gh-release@b4309332981a82ec1c5618f44dd2e27cc8bfbfda # v3
+        uses: softprops/action-gh-release@718ea10b132b3b2eba29c1007bb80653f286566b # v3
         with:
           tag_name: ${{ steps.tag.outputs.tag }}
           generate_release_notes: true
