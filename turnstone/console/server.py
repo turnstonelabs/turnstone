@@ -3928,12 +3928,12 @@ async def _fanout_on_children(
                 # behaviour parity with the pre-lift outcome.
                 # NOTE: this branch is reachable from the cancel-cascade
                 # caller (``_cascade_cancel_to_children``) but unreachable
-                # from the close-cascade caller (``close_all_children``); the
-                # close handler at ``session_routes.py:852-854`` 404s
-                # for both missing and already-closed-evicted rows and
-                # never emits a 400 "No session". Kept as shared code
-                # rather than gated by caller — the branch is cheap and
-                # the symmetry makes future cascade verbs easier to add.
+                # from the close-cascade caller (``close_all_children``):
+                # ``make_close_handler``'s not-found path 404s for both
+                # missing and already-closed-evicted rows and never emits a
+                # 400 "No session". Kept as shared code rather than gated by
+                # caller — the branch is cheap and the symmetry makes future
+                # cascade verbs easier to add.
                 if result.get("status") == 400 and result.get("error") == "No session":
                     return cid, "skipped"
                 return cid, "failed"

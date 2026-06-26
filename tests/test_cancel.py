@@ -984,9 +984,10 @@ class TestCancelledAgentDisposition:
         assert "no side effects" in out
         assert "UNKNOWN" not in out
 
-    def test_marks_most_recent_action_unknown(self, tmp_db):
+    def test_marks_in_flight_action_unknown(self, tmp_db):
         session = _make_session()
-        # bash completed; web_fetch was in flight (issued, no result yet).
+        # bash completed; web_fetch was in flight (issued, no result yet) —
+        # the first unanswered call is the in-flight boundary.
         msgs = [
             self._assistant("t1", "bash"),
             self._result("t1"),
