@@ -94,7 +94,7 @@ LLM; add model backends from the console UI.
 For production (released images from ghcr.io, real secrets required), use the
 bundled stack: `docker compose -f turnstone/deploy/compose.yaml up`.
 
-See [QUICKSTART.md](QUICKSTART.md) for the bootstrap wizard and [docs/docker.md](docs/docker.md) for Docker configuration.
+See [QUICKSTART.md](QUICKSTART.md) for the install + troubleshooting walkthrough and [docs/docker.md](docs/docker.md) for Docker configuration.
 
 ### Programmatic (SDK)
 
@@ -125,7 +125,7 @@ Built-in tools for shell, files, search, web, memory, notifications, and autonom
 | `turnstone-channel` | Channel gateway (Discord and Slack adapters) |
 | `turnstone-admin` | User/token management CLI |
 | `turnstone-eval` | Eval harness for prompt/tool optimization |
-| `turnstone-bootstrap` | LLM-guided setup wizard |
+| `turnstone-doctor` | LLM-backed cluster diagnostics |
 
 ### Diagrams
 

@@ -1,5 +1,6 @@
 """Bundled deployment templates (compose files, overlays).
 
-These files are included in the wheel so that ``turnstone-bootstrap`` can
-extract them for users who install via pip/pipx and don't have a git clone.
+These files ship in the wheel so a pip/pipx install can run the released
+single-node stack (``docker compose -f turnstone/deploy/compose.yaml up``)
+without a git clone.
 """

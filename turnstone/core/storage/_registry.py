@@ -30,6 +30,7 @@ def init_storage(
     url: str = "",
     pool_size: int = 2,
     run_migrations: bool = True,
+    create_tables: bool | None = None,
     sslmode: str = "",
     sslrootcert: str = "",
     sslcert: str = "",
@@ -44,6 +45,11 @@ def init_storage(
         url: PostgreSQL connection URL (e.g. postgresql+psycopg://user:pass@host/db)
         pool_size: Connection pool size (PostgreSQL only)
         run_migrations: Whether to run Alembic migrations on init
+        create_tables: Whether to emit ``CREATE TABLE`` DDL (``create_all``) on
+            init. ``None`` (default) keeps the historical behaviour — create
+            tables only when migrations are NOT run. Pass ``False`` for a
+            strictly read-only open that must never touch the schema (e.g.
+            ``turnstone-doctor`` inspecting a live DB); pass ``True`` to force it.
         listen_url: Optional dedicated PostgreSQL URL for the dispatcher's
             ``LISTEN`` connection.  Required only when ``url`` points at a
             ``pgbouncer`` running in transaction pooling mode (LISTEN
@@ -54,10 +60,12 @@ def init_storage(
     """
     global _storage
 
-    # When Alembic migrations will run, skip create_all() to avoid
-    # bypassing migration-managed DDL.  Tests pass run_migrations=False
-    # and rely on create_all() instead.
-    create_tables = not run_migrations
+    # When Alembic migrations will run, skip create_all() to avoid bypassing
+    # migration-managed DDL.  Tests pass run_migrations=False and rely on
+    # create_all() instead.  An explicit create_tables overrides this — a
+    # diagnose-only caller passes create_tables=False to never emit DDL.
+    if create_tables is None:
+        create_tables = not run_migrations
 
     if backend == "sqlite":
         from turnstone.core.storage._sqlite import SQLiteBackend

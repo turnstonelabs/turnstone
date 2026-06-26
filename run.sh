@@ -380,6 +380,9 @@ ${GREEN}${BOLD}Turnstone is running${RESET} (${NODE_COUNT} node$([ "$NODE_COUNT"
               ${DIM}$DOCKER compose down${RESET}      stop (add -v to wipe data)
 
   Config      $INSTALL_DIR/.env   (generated secrets + ports)
+
+  Troubleshoot  ${DIM}pipx run --spec turnstone turnstone-doctor --dir $INSTALL_DIR${RESET}
+                LLM-backed diagnostics for this install (read-only; needs Python)
 EOF
 }
 

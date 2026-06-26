@@ -4,7 +4,7 @@
 # Same shape as the dev stack at the repo root (Caddy-fronted console, shared
 # Postgres, channel gateway) but it pulls released images from ghcr.io instead
 # of building, runs a single server node, and requires real secrets. Bundled
-# with the turnstone wheel and written by turnstone-bootstrap.
+# with the turnstone wheel.
 #
 #     docker compose -f turnstone/deploy/compose.yaml up
 #
@@ -16,7 +16,7 @@
 # dashboard's SSE streams).
 #
 # No baked-in secrets: set TURNSTONE_JWT_SECRET and POSTGRES_PASSWORD in .env
-# (turnstone-bootstrap generates them). Pin images with TURNSTONE_IMAGE_TAG
+# (set them yourself, e.g. `openssl rand -hex 32`). Pin images with TURNSTONE_IMAGE_TAG
 # (default: latest).
 #
 # Join a bare-metal host: Postgres is published on 127.0.0.1:5432, so a

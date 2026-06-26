@@ -125,7 +125,7 @@ docker compose -f turnstone/deploy/compose.yaml up
 It's the same shape as the dev stack — Caddy-fronted console, channel, and a
 PostgreSQL all share one database so the console discovers the node — but it
 pulls released images, runs a single server node, and has **no baked-in
-secrets**. Set these in `.env` first (`turnstone-bootstrap` generates them):
+secrets**. Set these in `.env` first (generate with `openssl rand -hex 32`):
 
 ```bash
 TURNSTONE_JWT_SECRET=<python -c "import secrets; print(secrets.token_hex(32))">
@@ -260,7 +260,7 @@ interface, or anyone who can reach it can search through your instance.
 
 Both stacks install all entry points into a single image (`turnstone`,
 `turnstone-server`, `turnstone-console`, `turnstone-channel`, `turnstone-admin`,
-`turnstone-eval`, `turnstone-bootstrap`):
+`turnstone-eval`, `turnstone-doctor`):
 
 ```bash
 docker compose build            # build the dev image

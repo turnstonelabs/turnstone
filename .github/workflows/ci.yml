@@ -146,7 +146,7 @@ jobs:
           /tmp/smoke/bin/turnstone-console --help
           /tmp/smoke/bin/turnstone-admin --help
           /tmp/smoke/bin/turnstone-channel --help
-          /tmp/smoke/bin/turnstone-bootstrap --help
+          /tmp/smoke/bin/turnstone-doctor --help
 
   lock-check:
     runs-on: ubuntu-latest

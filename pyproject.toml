@@ -69,7 +69,7 @@ turnstone-server = "turnstone.server:main"
 turnstone-console = "turnstone.console.server:main"
 turnstone-admin = "turnstone.admin:main"
 turnstone-channel = "turnstone.channels.cli:main"
-turnstone-bootstrap = "turnstone.bootstrap:main"
+turnstone-doctor = "turnstone.doctor:main"
 
 [tool.hatch.build.targets.wheel]
 include = [

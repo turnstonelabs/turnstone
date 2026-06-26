@@ -22,7 +22,7 @@ plugs in.
 | `turnstone-eval` | `turnstone.eval` | `NullUI` | Headless evaluation and prompt optimization |
 | `turnstone-channel` | `turnstone.channels.cli` | ChannelAdapter | Channel gateway (Discord, Slack, etc.) |
 | `turnstone-admin` | `turnstone.admin` | — | Offline user and API token management |
-| `turnstone-bootstrap` | `turnstone.bootstrap` | — | LLM-guided setup wizard |
+| `turnstone-doctor` | `turnstone.doctor` | — | LLM-backed cluster diagnostics |
 
 ---
 
