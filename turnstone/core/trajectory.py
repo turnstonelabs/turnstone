@@ -161,7 +161,10 @@ class Turn:
             return None
         try:
             return EffectStatus(raw)
-        except ValueError:
+        except (ValueError, TypeError):
+            # ValueError: not a known status string. TypeError: a corrupt
+            # non-string value (e.g. a dict survived into the meta). Mirror the
+            # meta decoders and degrade to None rather than crash a consumer.
             return None
 
     # -- construction helpers (blunt the wrapping cost of uniform block content) --
