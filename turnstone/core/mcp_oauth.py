@@ -1429,15 +1429,19 @@ def _token_result(
 def _no_token_result(
     app_state: Any, user_id: str, server_name: str, result: TokenLookupResult
 ) -> TokenLookupResult:
-    """Clear any transient-refresh backoff, then return a non-token *result*.
+    """Drop per-(user, server) refresh state, then return a non-token *result*.
 
     A ``missing`` / ``decrypt_failure`` outcome means the grant is no longer live
-    on this node (token deleted cluster-wide, key rotated), so the
-    per-(user, server) backoff is dropped to keep the dict bounded to live pairs
-    — the mirror of :func:`_token_result` (success) and
-    :func:`_revoke_after_refresh_failure` (revoke). Backoff then survives only
-    the two intentional keep-paths: the transient handler and the cooldown gate.
+    on this node (token deleted cluster-wide, key rotated), so BOTH sibling
+    per-(user, server) dicts are pruned — the refresh lock and the transient
+    backoff — keeping each bounded to live pairs (the mirror of
+    :func:`_token_result` on success and :func:`_revoke_after_refresh_failure`
+    on revoke). The transient keep-path deliberately retains the lock (so
+    concurrent same-key refreshes stay serialized) and the backoff (for the
+    cooldown), so without this prune a token that vanishes after a transient
+    failure would strand both entries.
     """
+    _drop_refresh_lock(app_state, user_id, server_name)
     _clear_refresh_backoff(app_state, user_id, server_name)
     return result
 
@@ -1615,7 +1619,6 @@ async def get_user_access_token_classified(
                 server_name=server_name,
                 exc_info=True,
             )
-            _drop_refresh_lock(app_state, user_id, server_name)
             return _no_token_result(
                 app_state,
                 user_id,

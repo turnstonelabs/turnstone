@@ -378,11 +378,12 @@ class TestRefreshFailureClassification:
         # The cooldown short-circuited the second attempt: exactly one AS POST.
         assert client.post.call_count == 1
 
-    def test_backoff_cleared_when_token_vanishes(self, storage: SQLiteBackend) -> None:
-        """A transient failure records per-(user,server) backoff; if the token is
-        then deleted cluster-wide (another node's permanent revoke), the next
-        lookup returns ``missing`` AND clears this node's now-stale backoff entry,
-        so the dict stays bounded to live pairs."""
+    def test_backoff_and_lock_cleared_when_token_vanishes(self, storage: SQLiteBackend) -> None:
+        """A transient failure retains BOTH sibling per-(user,server) entries — the
+        refresh lock (for serialization) and the backoff (for the cooldown). If
+        the token is then deleted cluster-wide (another node's permanent revoke),
+        the next lookup returns ``missing`` AND prunes both, so neither in-process
+        dict grows unboundedly on the missing path."""
         _seed_server(storage)
         client = MagicMock(spec=httpx.AsyncClient)
         client.get = AsyncMock(return_value=_mk_response(200, _good_as_metadata_doc()))
@@ -392,16 +393,19 @@ class TestRefreshFailureClassification:
         state = _make_app_state(storage, http_client=client)
         _seed_token(state, expires_in_seconds=-1000)
 
-        # First lookup: a transient 503 records a backoff entry.
+        # First lookup: a transient 503 records a backoff entry AND retains the
+        # refresh lock (the keep-path must not drop it — bug-1).
         assert self._lookup(state).kind == "refresh_failed_transient"
         assert ("user-1", "srv-oauth") in state.mcp_oauth_refresh_backoff
+        assert ("user-1", "srv-oauth") in state.mcp_oauth_refresh_locks
 
         # Another node revokes the token cluster-wide (shared Postgres store).
         state.mcp_token_store.delete_user_token("user-1", "srv-oauth")
 
-        # Next lookup sees the row gone -> missing -> the stale entry is cleared.
+        # Next lookup sees the row gone -> missing -> both stale entries cleared.
         assert self._lookup(state).kind == "missing"
         assert ("user-1", "srv-oauth") not in state.mcp_oauth_refresh_backoff
+        assert ("user-1", "srv-oauth") not in state.mcp_oauth_refresh_locks
 
 
 # ---------------------------------------------------------------------------
