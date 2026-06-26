@@ -15,14 +15,17 @@ Known benign flags: E flags the γ,ρ symbol-table row; G2 flags τ_H (it legiti
 owns both a stopping-time/filtration statement and its = inf{…} formula).
 """
 
-import os, re, sys
+import os
+import re
+import sys
 
 PATH = (
     sys.argv[1]
     if len(sys.argv) > 1
     else os.path.join(os.path.dirname(os.path.abspath(__file__)), "HYPOTHESIS.md")
 )
-T = open(PATH, encoding="utf-8").read()
+with open(PATH, encoding="utf-8") as _f:
+    T = _f.read()
 LINES = T.splitlines()
 
 
@@ -52,10 +55,10 @@ print("=" * 70)
 print("A.  BALANCE")
 print("=" * 70)
 nomath = re.sub(r"\$[^$]*\$", "", T)
-print(f"  display $$ : {T.count('$$')}  even={T.count('$$') % 2 == 0}")
-print(
-    f"  inline  $  : {len(re.findall(r'(?<!\$)\$(?!\$)', T))}  even={len(re.findall(r'(?<!\$)\$(?!\$)', T)) % 2 == 0}"
-)
+display = T.count("$$")
+inline = len(re.findall(r"(?<!\$)\$(?!\$)", T))
+print(f"  display $$ : {display}  even={display % 2 == 0}")
+print(f"  inline  $  : {inline}  even={inline % 2 == 0}")
 print(f"  braces {{ }} : net {T.count('{') - T.count('}')}")
 print(f"  bold  **   : {nomath.count('**')}  even={nomath.count('**') % 2 == 0}")
 print(
