@@ -89,7 +89,7 @@ include = [
   "turnstone/shared_static/*.js",
   "turnstone/shared_static/katex-0.17.0/**/*",
   "turnstone/shared_static/hljs-11.11.1/**/*",
-  "turnstone/shared_static/mermaid-11.15.0/**/*",
+  "turnstone/shared_static/mermaid-11.16.0/**/*",
   "turnstone/shared_static/hls-1.6.16/**/*",
   "turnstone/sdk/py.typed",
   "turnstone/deploy/*.yaml",
