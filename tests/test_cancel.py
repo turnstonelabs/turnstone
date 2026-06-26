@@ -888,8 +888,12 @@ class TestSynthesizeCancelledResults:
         # All emitted as errors so the live UI renders them as
         # ``coord-tool-row-result--error``.
         assert all(tr[3] is True for tr in ui.tool_results)
-        # Reason text propagates as the synthetic tool output.
-        assert all(tr[2] == "Cancelled by user." for tr in ui.tool_results)
+        # Reason text propagates as a prefix, now followed by an explicit
+        # UNKNOWN-outcome clause (unknown, never none — see HYPOTHESIS.md):
+        # the call may have begun executing before cancel, so the synthetic
+        # result must not read as "it didn't happen."
+        assert all(tr[2].startswith("Cancelled by user.") for tr in ui.tool_results)
+        assert all("UNKNOWN" in tr[2] for tr in ui.tool_results)
         # And the message list has the synthesized tool entries
         # (preserves the prior contract).
         tool_msgs = [m for m in dicts_from_turns(session.messages) if m.get("role") == "tool"]
@@ -952,3 +956,95 @@ class TestSynthesizeCancelledResults:
 
         tool_msgs = [m for m in dicts_from_turns(session.messages) if m.get("role") == "tool"]
         assert len(tool_msgs) == 1
+
+
+class TestCancelledAgentDisposition:
+    """A cancelled task_agent folds back an honest ledger, not a bare string.
+
+    Regression guard for the HYPOTHESIS.md cancellation appendix: ρ may
+    fabricate the acknowledgment but must not fabricate the outcome —
+    ``unknown``, never ``none``.
+    """
+
+    @staticmethod
+    def _assistant(call_id, name):
+        return {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [{"id": call_id, "function": {"name": name}}],
+        }
+
+    @staticmethod
+    def _result(call_id, text="ok"):
+        return {"role": "tool", "tool_call_id": call_id, "content": text}
+
+    def test_no_actions_reports_no_side_effects(self, tmp_db):
+        session = _make_session()
+        out = session._cancelled_agent_disposition([], "task")
+        assert "no side effects" in out
+        assert "UNKNOWN" not in out
+
+    def test_marks_most_recent_action_unknown(self, tmp_db):
+        session = _make_session()
+        # bash completed; web_fetch was in flight (issued, no result yet).
+        msgs = [
+            self._assistant("t1", "bash"),
+            self._result("t1"),
+            self._assistant("t2", "web_fetch"),
+        ]
+        out = session._cancelled_agent_disposition(msgs, "task")
+        assert out != "(task interrupted by user)"
+        assert "Completed before cancel: bash." in out
+        assert "In flight at cancel: web_fetch" in out
+        assert "UNKNOWN" in out
+
+    def test_partial_result_boundary_still_unknown(self, tmp_db):
+        # A SIGKILL'd bash appends a partial result before the next
+        # checkpoint raises — it is the boundary and must read UNKNOWN,
+        # not as a clean completion.
+        session = _make_session()
+        msgs = [self._assistant("t1", "bash"), self._result("t1", "(killed)")]
+        out = session._cancelled_agent_disposition(msgs, "task")
+        assert "In flight at cancel: bash" in out
+        assert "UNKNOWN" in out
+        assert "Completed before cancel" not in out
+
+    def test_counts_and_not_started(self, tmp_db):
+        session = _make_session()
+        # Two tool_calls in one turn: t1 ran, t2 cancelled before running,
+        # t3 (a later turn's call) is the in-flight boundary.
+        msgs = [
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {"id": "t1", "function": {"name": "bash"}},
+                    {"id": "t2", "function": {"name": "bash"}},
+                ],
+            },
+            self._result("t1"),
+            self._assistant("t3", "search"),
+        ]
+        out = session._cancelled_agent_disposition(msgs, "task")
+        assert "In flight at cancel: search" in out
+        assert "Not started (cancelled first): bash." in out
+
+    def test_exec_task_routes_cancel_to_disposition(self, tmp_db):
+        """_exec_task converts a GenerationCancelled from _run_agent into the
+        honest disposition, reading the in-place-mutated agent_messages."""
+        session = _make_session()
+
+        def fake_run_agent(agent_messages, **kwargs):
+            agent_messages.append(self._assistant("t1", "bash"))
+            agent_messages.append(self._result("t1"))
+            agent_messages.append(self._assistant("t2", "web_fetch"))
+            raise GenerationCancelled()
+
+        with patch.object(session, "_run_agent", side_effect=fake_run_agent):
+            call_id, result = session._exec_task({"call_id": "c1", "prompt": "do x"})
+
+        assert call_id == "c1"
+        assert result != "(task interrupted by user)"
+        assert "UNKNOWN" in result
+        assert "web_fetch" in result  # in-flight boundary
+        assert "bash" in result  # completed

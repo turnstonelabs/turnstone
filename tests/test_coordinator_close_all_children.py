@@ -1,8 +1,7 @@
 """Tests for the coordinator ``close_all_children`` endpoint.
 
-Near-twin of the ``stop_cascade`` tests in
-``test_coordinator_governance.py``.  Keeps the close-cascade surface in
-its own file so PR A's review surface stays tight.
+Keeps the close-cascade surface in its own file so the review surface
+stays tight.
 """
 
 from __future__ import annotations
@@ -219,7 +218,7 @@ def test_close_all_children_404_when_session_not_loaded(storage):
 def test_close_all_children_service_token_cannot_bypass_admin_coordinator(storage):
     """Destructive endpoint — a service token matching the coord owner
     still needs the explicit ``admin.coordinator`` grant.  Mirrors the
-    stop_cascade treatment."""
+    ``restrict`` treatment."""
     mgr = _build_mgr(storage)
     coord = mgr.create(user_id="user-1", name="coord-a")
     coord.session = MagicMock()

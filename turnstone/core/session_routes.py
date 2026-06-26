@@ -16,9 +16,9 @@ Three registrar functions:
   All handlers in :class:`SharedSessionVerbHandlers` are optional;
   ``None`` skips the route, so one bundle describes either kind.
 - :func:`register_coord_verbs` — coord-only verbs (``trust``,
-  ``restrict``, ``stop_cascade``, ``close_all_children``,
-  ``children``, ``tasks``, ``metrics``) that read or mutate state
-  that doesn't exist on interactive workstreams.
+  ``restrict``, ``close_all_children``, ``children``, ``tasks``,
+  ``metrics``) that read or mutate state that doesn't exist on
+  interactive workstreams.
 
 Some verbs in :class:`SharedSessionVerbHandlers` ship as factory-
 returned closures (e.g. :func:`make_approve_handler`,
@@ -546,7 +546,6 @@ class CoordOnlyVerbHandlers:
     metrics: Handler  # GET  {prefix}/{ws_id}/metrics
     trust: Handler  # POST {prefix}/{ws_id}/trust
     restrict: Handler  # POST {prefix}/{ws_id}/restrict
-    stop_cascade: Handler  # POST {prefix}/{ws_id}/stop_cascade
     close_all_children: Handler  # POST {prefix}/{ws_id}/close_all_children
 
 
@@ -672,7 +671,6 @@ def register_coord_verbs(
     routes.append(Route(f"{p}/{{ws_id}}/metrics", handlers.metrics, methods=["GET"]))
     routes.append(Route(f"{p}/{{ws_id}}/trust", handlers.trust, methods=["POST"]))
     routes.append(Route(f"{p}/{{ws_id}}/restrict", handlers.restrict, methods=["POST"]))
-    routes.append(Route(f"{p}/{{ws_id}}/stop_cascade", handlers.stop_cascade, methods=["POST"]))
     routes.append(
         Route(
             f"{p}/{{ws_id}}/close_all_children",
@@ -1092,11 +1090,20 @@ CancelAuditEmitter = Callable[
     None,
 ]
 
+# Optional async step run AFTER the workstream's own cancel sequence
+# (session.cancel + approval resolution + force/SSE + audit), receiving
+# ``(request, ws_id, ws)``.  Coordinator wires this to fan the cancel out
+# to its spawned children (auto-propagation down the subtree); interactive
+# wires ``None`` and the handler is unchanged.  Errors are logged, never
+# surfaced — a cascade failure must not fail the owner's own cancel.
+PostCancelHook = Callable[["Request", str, "Workstream"], Awaitable[None]]
+
 
 def make_cancel_handler(
     cfg: SessionEndpointConfig,
     *,
     audit_emit: CancelAuditEmitter | None = None,
+    post_cancel: PostCancelHook | None = None,
 ) -> Handler:
     """Lifted body for ``POST {prefix}/{ws_id}/cancel``.
 
@@ -1292,6 +1299,21 @@ def make_cancel_handler(
                 # shouldn't surface as HTTP 500. Log + continue.
                 log.warning(
                     "ws.cancel.audit_failed ws=%s",
+                    ws_id[:8] if ws_id else "",
+                    exc_info=True,
+                )
+
+        # Propagate the cancel down the subtree (coordinator only).  Runs
+        # after the owner's own cancel is fully recorded so a cascade error
+        # can't strand the owner half-cancelled.  Cooperative/fire-and-forget
+        # per child — we dispatch the cancels, we don't block on the subtree
+        # draining (that barrier is deferred).
+        if post_cancel is not None:
+            try:
+                await post_cancel(request, ws_id, ws)
+            except Exception:
+                log.warning(
+                    "ws.cancel.cascade_failed ws=%s",
                     ws_id[:8] if ws_id else "",
                     exc_info=True,
                 )

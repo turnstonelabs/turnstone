@@ -1349,33 +1349,6 @@ class CoordinatorRestrictResponse(BaseModel):
     revoked_tools: list[str] = Field(description="Full post-revocation set of revoked tool names.")
 
 
-class CoordinatorStopCascadeResponse(BaseModel):
-    """Response body for POST /v1/api/workstreams/{ws_id}/stop_cascade."""
-
-    status: str = Field(default="ok")
-    cancelled: list[str] = Field(
-        default_factory=list,
-        description="Child ws_ids that accepted the cancel dispatch.",
-    )
-    failed: list[str] = Field(
-        default_factory=list,
-        description=(
-            "Child ws_ids whose cancel dispatch returned an error other "
-            "than an already-gone 404 — the cascade continues on per-"
-            "child failure so a single unreachable node doesn't abort "
-            "the whole batch."
-        ),
-    )
-    skipped: list[str] = Field(
-        default_factory=list,
-        description=(
-            "Child ws_ids that returned 404 on cancel (already gone).  "
-            "Reported separately from ``failed`` so operators can "
-            "distinguish already-done from dispatch-broken."
-        ),
-    )
-
-
 class CoordinatorCloseAllChildrenRequest(BaseModel):
     """Body for POST /v1/api/workstreams/{ws_id}/close_all_children."""
 

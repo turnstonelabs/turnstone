@@ -4680,17 +4680,30 @@ class ChatSession:
             if msg.role is Role.TOOL:
                 answered_ids.add(msg.tool_call_id or "")
 
+        # An orphaned tool_call had no result when cancel landed.  We can't
+        # tell here whether it was mid-execution (outcome unobserved) or
+        # never started, so we mark it UNKNOWN rather than let the bare
+        # reason read as "it didn't happen" — which invites a re-send as
+        # readily as a dropped record causes an orphan (cancellation
+        # appendix, HYPOTHESIS.md: unknown, never none).  ``is_error`` stays
+        # True: it is genuinely not a successful result, and both the SSE
+        # batch completion and the existing UI rendering key on it.
+        detail = (
+            f"{reason} Outcome UNKNOWN — this call may have begun executing "
+            "before the generation was stopped; do not assume it did not run, "
+            "and reconcile before re-issuing it."
+        )
         # Synthesize results for unanswered tool_calls
         for tc in self.messages[assistant_idx].tool_calls:
             tc_id = tc.id
             func_name = tc.name
             if tc_id and tc_id not in answered_ids:
-                self.messages.append(Turn.tool(tc_id, reason, is_error=True))
+                self.messages.append(Turn.tool(tc_id, detail, is_error=True))
                 self._msg_tokens.append(1)
                 save_message(
                     self._ws_id,
                     "tool",
-                    reason,
+                    detail,
                     func_name,
                     tool_call_id=tc_id,
                     event_id=self._ui_event_id(),
@@ -4703,7 +4716,7 @@ class ChatSession:
                 # Defensive: we're already on a cancel/error path, so
                 # a UI hook failure must not compound the problem.
                 try:
-                    self.ui.on_tool_result(tc_id, func_name, reason, is_error=True)
+                    self.ui.on_tool_result(tc_id, func_name, detail, is_error=True)
                 except Exception:
                     log.debug(
                         "session.synthesize_cancelled.ui_emit_failed ws=%s",
@@ -11833,11 +11846,85 @@ class ChatSession:
                 auto_tools=TASK_AUTO_TOOLS,
                 agent_alias=item.get("model_override"),
             )
-        except (KeyboardInterrupt, GenerationCancelled):
+        except GenerationCancelled:
+            # Fold back an honest disposition built from the agent's own
+            # ledger.  ``agent_messages`` is mutated in place by
+            # ``_run_agent`` (it appends every assistant turn and tool
+            # result), so at this catch point it holds the full record of
+            # what the sub-agent did before cancel — including a partial
+            # result from a tool that was SIGKILL'd mid-flight.  The old
+            # bare "(task interrupted by user)" string discarded all of
+            # that and fabricated an *outcome*: downstream it read as
+            # "nothing happened" and invited a re-dispatch / double-send.
+            # See the cancellation appendix in HYPOTHESIS.md ("ρ may
+            # fabricate the acknowledgment but must not fabricate the
+            # outcome … unknown, never none").
+            return call_id, self._cancelled_agent_disposition(agent_messages, "task")
+        except KeyboardInterrupt:
+            # CLI Ctrl-C: keep the terse string and let the outer loop own
+            # propagation (unchanged behavior).
             return call_id, "(task interrupted by user)"
         except Exception as e:
             self.ui.on_info(f"[task error] {e}")
             return call_id, f"Task error: {e}"
+
+    def _cancelled_agent_disposition(self, agent_messages: list[dict[str, Any]], label: str) -> str:
+        """Build an honest, deterministic disposition for a cancelled sub-agent.
+
+        A cancelled agent must not report a fabricated *outcome*.  The bare
+        "(interrupted)" string read downstream as *the task did not happen*
+        — which causes a double-send as readily as a dropped record causes
+        an orphan (cancellation appendix, HYPOTHESIS.md).  Instead we fold
+        back the agent's actual ledger: which tool actions completed, which
+        never started, and an explicit ``UNKNOWN`` flag on the single most
+        recent action — the one that was crossing the gate / executing in
+        the tool when cancel landed, whose side effect may or may not have
+        landed and whose result was never observed.
+
+        Pure string assembly over the in-memory ``agent_messages`` — no
+        model call, because we are on the cancel path and the gate is
+        closed.  The owner (parent / coordinator) reads this to decide what,
+        if anything, to compensate.
+        """
+        answered: set[str] = set()
+        for m in agent_messages:
+            if m.get("role") == "tool" and m.get("tool_call_id"):
+                answered.add(str(m["tool_call_id"]))
+        # Ordered (name, was-answered) for every tool_call the agent issued.
+        issued: list[tuple[str, bool]] = []
+        for m in agent_messages:
+            if m.get("role") != "assistant":
+                continue
+            for tc in m.get("tool_calls") or []:
+                name = ((tc.get("function") or {}).get("name") or "tool").strip()
+                issued.append((name, str(tc.get("id") or "") in answered))
+        if not issued:
+            return f"({label} cancelled by user before any action — no side effects)"
+
+        def _summ(names: list[str]) -> str:
+            counts: dict[str, int] = {}
+            for n in names:
+                counts[n] = counts.get(n, 0) + 1
+            return ", ".join(f"{n}×{c}" if c > 1 else n for n, c in counts.items())
+
+        # The last action issued is the boundary: it was in flight (or about
+        # to run) when cancel was observed, so its outcome is unobserved.
+        # Mark it UNKNOWN rather than implying it did or did not happen.
+        boundary = issued[-1][0]
+        completed = [n for n, ans in issued[:-1] if ans]
+        not_run = [n for n, ans in issued[:-1] if not ans]
+        parts = [f"({label} cancelled by user before completion)"]
+        if completed:
+            parts.append("Completed before cancel: " + _summ(completed) + ".")
+        parts.append(
+            f"In flight at cancel: {boundary} — outcome UNKNOWN. It may have "
+            "completed, partially executed, or caused side effects before the "
+            "agent was stopped; its result was never observed. Do not assume "
+            "it did or did not happen — reconcile before re-running."
+        )
+        if not_run:
+            parts.append("Not started (cancelled first): " + _summ(not_run) + ".")
+        return "\n".join(parts)
 
     def _audit_memory_event(
         self,

@@ -440,9 +440,9 @@ class CoordinatorAdapter:
     def children_snapshot(self, coord_ws_id: str) -> list[str]:
         """Return a snapshot of the coordinator's direct child ws_ids.
 
-        Used by ``stop_cascade`` to iterate children without holding
-        the registry lock during the per-child HTTP dispatch. A
-        mutation racing with the snapshot (child spawned mid-cascade)
+        Used by the cancel cascade and ``close_all_children`` to iterate
+        children without holding the registry lock during the per-child
+        HTTP dispatch. A mutation racing with the snapshot (child spawned mid-cascade)
         either lands before (cancelled) or after (out of scope for
         this batch) — both safe. Returns an empty list for unknown
         coordinators.
