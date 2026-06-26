@@ -372,6 +372,10 @@ audio.media-player {
   color: var(--red);
 }
 
+.mcp-error-card.mcp-error-transient .mcp-error-icon {
+  color: var(--yellow);
+}
+
 .mcp-error-body {
   display: flex;
   flex-direction: column;

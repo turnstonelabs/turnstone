@@ -1699,6 +1699,9 @@ audio.media-player {
 .mcp-error-card.mcp-error-operator .mcp-error-icon {
   color: var(--red);
 }
+.mcp-error-card.mcp-error-transient .mcp-error-icon {
+  color: var(--yellow);
+}
 .mcp-error-body {
   display: flex;
   flex-direction: column;

@@ -701,6 +701,47 @@ class TestDispatcherAuthFlows:
         assert payload["error"]["server"] == "pool-srv"
         assert mgr._consecutive_failures.get("pool-srv", 0) == 0
 
+    def test_dispatch_pool_transient_refresh_emits_retryable_not_consent(
+        self, running_loop_mgr, storage: SQLiteBackend
+    ) -> None:
+        """A TRANSIENT refresh failure on the 401-retry surfaces a retryable
+        ``mcp_refresh_unavailable`` error — NOT a re-consent prompt — and does
+        not tick the breaker."""
+        from unittest.mock import patch
+
+        mgr, loop, _ = running_loop_mgr
+        cipher = make_mcp_token_cipher()
+        _seed_oauth_server(storage, name="pool-srv")
+        _seed_user_token(storage, cipher)
+        self._wire_pool(mgr, storage, cipher)
+
+        from turnstone.core.mcp_oauth import TokenLookupResult
+
+        async def _fake_classified(**kwargs: Any) -> TokenLookupResult:
+            if kwargs.get("force_refresh"):
+                return TokenLookupResult(kind="refresh_failed_transient")
+            return TokenLookupResult(kind="token", token="access-aaa")
+
+        async def _call_tool(name: str, args: dict[str, Any]) -> Any:
+            _populate_active_capture(mgr, status=401, header='Bearer error="invalid_token"')
+            raise RuntimeError("upstream 401")
+
+        self._seed_pool_entry_with_call_tool(mgr, loop, _call_tool)
+
+        with (
+            patch(
+                "turnstone.core.mcp_client.get_user_access_token_classified",
+                side_effect=_fake_classified,
+            ),
+            pytest.raises(RuntimeError) as exc_info,
+        ):
+            mgr.call_tool_sync("mcp__pool-srv__do_thing", {}, user_id="user-1", timeout=5)
+
+        payload = json.loads(str(exc_info.value))
+        assert payload["error"]["code"] == "mcp_refresh_unavailable"
+        assert payload["error"]["server"] == "pool-srv"
+        assert mgr._consecutive_failures.get("pool-srv", 0) == 0
+
     def test_dispatch_pool_401_retry_ceiling_caps_at_one(
         self, running_loop_mgr, storage: SQLiteBackend
     ) -> None:
@@ -1748,6 +1789,55 @@ class TestPoolPrimingAndTokenRotation:
         # Catalog retained across the in-place rotation.
         entry = mgr._user_pool_entries[("user-1", "pool-srv")]
         assert entry.tools == [{"name": "do_thing"}]
+
+    def test_prime_user_pools_skips_when_already_in_flight(
+        self, running_loop_mgr, storage: SQLiteBackend
+    ) -> None:
+        """A concurrent prime already in flight for (user, server) collapses the
+        duplicate before the redundant DB reads."""
+        mgr, loop, _ = running_loop_mgr
+        cipher = make_mcp_token_cipher()
+        _seed_oauth_server(storage, name="pool-srv")
+        _seed_user_token(storage, cipher, expires_in_seconds=3600)
+        self._wire(mgr, storage, cipher)
+        mgr._priming_keys.add(("user-1", "pool-srv"))  # simulate an in-flight prime
+
+        primed: list[tuple[str, str]] = []
+
+        async def _fake_prime(
+            self_inner: MCPClientManager, key: tuple[str, str], cfg: dict[str, Any], token: str
+        ) -> int:
+            primed.append(key)
+            return 0
+
+        mgr._prime_user_server = _fake_prime.__get__(mgr, type(mgr))  # type: ignore[method-assign]
+
+        _run_on_loop(loop, mgr._prime_user_pools("user-1"))
+
+        assert primed == [], "an in-flight prime must collapse the duplicate"
+        # The marker belongs to the other (still-running) prime — left intact.
+        assert ("user-1", "pool-srv") in mgr._priming_keys
+
+    def test_prime_user_pools_clears_in_flight_marker_after(
+        self, running_loop_mgr, storage: SQLiteBackend
+    ) -> None:
+        """The in-flight marker is cleared in ``finally`` once a prime completes."""
+        mgr, loop, _ = running_loop_mgr
+        cipher = make_mcp_token_cipher()
+        _seed_oauth_server(storage, name="pool-srv")
+        _seed_user_token(storage, cipher, expires_in_seconds=3600)
+        self._wire(mgr, storage, cipher)
+
+        async def _fake_prime(
+            self_inner: MCPClientManager, key: tuple[str, str], cfg: dict[str, Any], token: str
+        ) -> int:
+            return 1
+
+        mgr._prime_user_server = _fake_prime.__get__(mgr, type(mgr))  # type: ignore[method-assign]
+
+        _run_on_loop(loop, mgr._prime_user_pools("user-1"))
+
+        assert mgr._priming_keys == set(), "in-flight marker must be cleared in finally"
 
 
 # Suppress unused-import warning for AsyncMock.

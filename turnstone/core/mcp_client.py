@@ -542,6 +542,11 @@ class MCPClientManager:
         # mutated only on the mcp-loop. Sync threads interact via
         # ``asyncio.run_coroutine_threadsafe``.
         self._user_pool_entries: dict[tuple[str, str], PoolEntryState] = {}
+        # (user, server) keys with a session-start prime in flight — collapses
+        # concurrent primes (multiple ChatSession starts) before the redundant
+        # token/server-row DB reads. Mutated only on the single mcp-loop thread,
+        # so no lock is needed.
+        self._priming_keys: set[tuple[str, str]] = set()
         # LRU tracking: monotonic last-access timestamp per pool key.
         self._user_pool_last_used: dict[tuple[str, str], float] = {}
         # Per-key lock guarding open / dispatch / close. Allocated lazily
@@ -1733,40 +1738,48 @@ class MCPClientManager:
         sem = asyncio.Semaphore(_PRIME_MAX_CONCURRENCY)
 
         async def _prime_one(server_name: str) -> None:
-            async with sem:
-                try:
-                    key = (user_id, server_name)
-                    entry = self._user_pool_entries.get(key)
-                    if entry is not None and entry.session is not None:
-                        return  # already connected — nothing to do
-                    # Non-refreshing read — priming must not drive a refresh whose
-                    # transient failure would revoke the token (see docstring).
-                    plain = await asyncio.to_thread(
-                        token_store.get_user_token, user_id, server_name
-                    )
-                    if plain is None or not plain.get("access_token"):
-                        return  # no usable token (not consented) — lazy paths handle it
-                    if _token_needs_refresh(plain.get("expires_at")):
-                        return  # near expiry — let lazy dispatch refresh on actual use
-                    server_row = await asyncio.to_thread(
-                        self._storage.get_mcp_server_by_name, server_name
-                    )
-                    if not server_row:
-                        return
-                    cfg = _pool_cfg_from_row(server_row)
-                    await self._prime_user_server(key, cfg, plain["access_token"])
-                    log.info(
-                        "mcp pool auto-primed at session start user=%s server=%s",
-                        user_id,
-                        server_name,
-                    )
-                except Exception:
-                    log.debug(
-                        "mcp pool auto-prime failed user=%s server=%s",
-                        user_id,
-                        server_name,
-                        exc_info=True,
-                    )
+            key = (user_id, server_name)
+            entry = self._user_pool_entries.get(key)
+            if entry is not None and entry.session is not None:
+                return  # already connected — nothing to do
+            if key in self._priming_keys:
+                return  # a concurrent prime for this (user, server) is in flight
+            # Claim synchronously before any await — the mcp-loop is single-
+            # threaded, so check-then-add can't interleave with another coroutine.
+            self._priming_keys.add(key)
+            try:
+                async with sem:
+                    try:
+                        # Non-refreshing read — priming must not drive a refresh
+                        # whose transient failure would revoke the token.
+                        plain = await asyncio.to_thread(
+                            token_store.get_user_token, user_id, server_name
+                        )
+                        if plain is None or not plain.get("access_token"):
+                            return  # no usable token (not consented) — lazy paths handle it
+                        if _token_needs_refresh(plain.get("expires_at")):
+                            return  # near expiry — let lazy dispatch refresh on actual use
+                        server_row = await asyncio.to_thread(
+                            self._storage.get_mcp_server_by_name, server_name
+                        )
+                        if not server_row:
+                            return
+                        cfg = _pool_cfg_from_row(server_row)
+                        await self._prime_user_server(key, cfg, plain["access_token"])
+                        log.info(
+                            "mcp pool auto-primed at session start user=%s server=%s",
+                            user_id,
+                            server_name,
+                        )
+                    except Exception:
+                        log.debug(
+                            "mcp pool auto-prime failed user=%s server=%s",
+                            user_id,
+                            server_name,
+                            exc_info=True,
+                        )
+            finally:
+                self._priming_keys.discard(key)
 
         await asyncio.gather(*(_prime_one(s) for s in list(self._oauth_user_server_names)))
 
@@ -4269,6 +4282,14 @@ class MCPClientManager:
                     "Operator action required."
                 ),
             )
+        if lookup.kind == "refresh_failed_transient":
+            # Transient refresh failure (AS/network blip) — the token was kept;
+            # a retry may succeed once the AS recovers. Retryable, NOT re-consent.
+            return _structured_error(
+                code="mcp_refresh_unavailable",
+                server=server_name,
+                detail="Token refresh temporarily failed; please retry.",
+            )
         if lookup.kind == "refresh_failed":
             # ``mcp_server.oauth.token_revoked`` audit was already emitted
             # by ``get_user_access_token_classified`` when it deleted the
@@ -4446,6 +4467,14 @@ class MCPClientManager:
                     "Operator action required."
                 ),
             )
+        if lookup.kind == "refresh_failed_transient":
+            # Transient refresh failure (AS/network blip) — the token was kept;
+            # a retry may succeed once the AS recovers. Retryable, NOT re-consent.
+            return _structured_error(
+                code="mcp_refresh_unavailable",
+                server=server_name,
+                detail="Token refresh temporarily failed; please retry.",
+            )
         if lookup.kind == "refresh_failed":
             return _structured_error(
                 code="mcp_consent_required",
@@ -4596,6 +4625,14 @@ class MCPClientManager:
                     "Stored token cannot be decrypted by any installed encryption key. "
                     "Operator action required."
                 ),
+            )
+        if lookup.kind == "refresh_failed_transient":
+            # Transient refresh failure (AS/network blip) — the token was kept;
+            # a retry may succeed once the AS recovers. Retryable, NOT re-consent.
+            return _structured_error(
+                code="mcp_refresh_unavailable",
+                server=server_name,
+                detail="Token refresh temporarily failed; please retry.",
             )
         if lookup.kind == "refresh_failed":
             return _structured_error(

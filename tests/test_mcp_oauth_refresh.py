@@ -173,6 +173,238 @@ def _public_addr_patch():
 
 
 # ---------------------------------------------------------------------------
+# Refresh-failure classification (#714 follow-up + hardening): a TRANSIENT
+# failure (network / 5xx / 429 / operator-fixable code) keeps the token and
+# returns a retryable kind; an explicit dead-grant / re-consent signal
+# (``invalid_grant`` at any 4xx, ``invalid_scope``, an OIDC interaction-required
+# code) revokes consent; and an unclassifiable 400/401 is AMBIGUOUS — kept until
+# a sustained run escalates to re-consent. A per-(user,server) cooldown
+# short-circuits the AS round-trip during an outage. All exercised through the
+# real AS HTTP boundary so an AS/network blip on the live 401-retry path can
+# never revoke a user, while a genuinely dead grant can't strand one forever.
+# ---------------------------------------------------------------------------
+
+
+class TestRefreshFailureClassification:
+    def _lookup(self, state: SimpleNamespace) -> Any:
+        from turnstone.core.mcp_oauth import get_user_access_token_classified
+
+        async def _run() -> Any:
+            with _public_addr_patch():
+                return await get_user_access_token_classified(
+                    app_state=state,
+                    user_id="user-1",
+                    server_name="srv-oauth",
+                    force_refresh=True,
+                )
+
+        return asyncio.run(_run())
+
+    def test_transient_503_keeps_token(self, storage: SQLiteBackend) -> None:
+        """A 503 from the token endpoint is transient: keep the token, retryable kind."""
+        _seed_server(storage)
+        client = MagicMock(spec=httpx.AsyncClient)
+        client.get = AsyncMock(return_value=_mk_response(200, _good_as_metadata_doc()))
+        client.post = AsyncMock(
+            return_value=_mk_response(503, {"error": "temporarily_unavailable"})
+        )
+        state = _make_app_state(storage, http_client=client)
+        _seed_token(state, expires_in_seconds=-1000)
+
+        result = self._lookup(state)
+
+        assert result.kind == "refresh_failed_transient"
+        # Token survives a transient failure — no cluster-wide revoke; self-heals.
+        assert state.mcp_token_store.get_user_token("user-1", "srv-oauth") is not None
+
+    def test_transient_network_error_keeps_token(self, storage: SQLiteBackend) -> None:
+        """A network error (httpx.HTTPError) is transient: keep the token, retryable kind."""
+        _seed_server(storage)
+        client = MagicMock(spec=httpx.AsyncClient)
+        client.get = AsyncMock(return_value=_mk_response(200, _good_as_metadata_doc()))
+        client.post = AsyncMock(side_effect=httpx.ConnectError("connection refused"))
+        state = _make_app_state(storage, http_client=client)
+        _seed_token(state, expires_in_seconds=-1000)
+
+        result = self._lookup(state)
+
+        assert result.kind == "refresh_failed_transient"
+        # Token survives a transient failure — no cluster-wide revoke; self-heals.
+        assert state.mcp_token_store.get_user_token("user-1", "srv-oauth") is not None
+
+    def test_permanent_invalid_grant_revokes(self, storage: SQLiteBackend) -> None:
+        """Contrast: 400 invalid_grant IS permanent — deletion is correct and the
+        eventual fix MUST preserve it."""
+        _seed_server(storage)
+        client = MagicMock(spec=httpx.AsyncClient)
+        client.get = AsyncMock(return_value=_mk_response(200, _good_as_metadata_doc()))
+        client.post = AsyncMock(return_value=_mk_response(400, {"error": "invalid_grant"}))
+        state = _make_app_state(storage, http_client=client)
+        _seed_token(state, expires_in_seconds=-1000)
+
+        result = self._lookup(state)
+
+        assert result.kind == "refresh_failed"
+        assert state.mcp_token_store.get_user_token("user-1", "srv-oauth") is None
+
+    def test_400_invalid_client_keeps_token(self, storage: SQLiteBackend) -> None:
+        """A 400 ``invalid_client`` is operator-fixable, NOT a dead grant: keep
+        the token. Pins the discriminator on the *error code*, not the 4xx
+        status — broadening ``permanent`` to "any 400" would silently revoke
+        consent on a config blip (the regression this guards)."""
+        _seed_server(storage)
+        client = MagicMock(spec=httpx.AsyncClient)
+        client.get = AsyncMock(return_value=_mk_response(200, _good_as_metadata_doc()))
+        client.post = AsyncMock(return_value=_mk_response(400, {"error": "invalid_client"}))
+        state = _make_app_state(storage, http_client=client)
+        _seed_token(state, expires_in_seconds=-1000)
+
+        result = self._lookup(state)
+
+        assert result.kind == "refresh_failed_transient"
+        assert state.mcp_token_store.get_user_token("user-1", "srv-oauth") is not None
+
+    def test_400_unrecognised_body_is_ambiguous_keeps_token(self, storage: SQLiteBackend) -> None:
+        """A single 400 with a non-JSON / no-``error`` body is ambiguous: keep
+        the token — one oddity must not revoke. Escalation only bites after a
+        sustained run (see ``test_ambiguous_streak_escalates_to_revoke``)."""
+        _seed_server(storage)
+        client = MagicMock(spec=httpx.AsyncClient)
+        client.get = AsyncMock(return_value=_mk_response(200, _good_as_metadata_doc()))
+        client.post = AsyncMock(return_value=_mk_response(400, None))
+        state = _make_app_state(storage, http_client=client)
+        _seed_token(state, expires_in_seconds=-1000)
+
+        result = self._lookup(state)
+
+        assert result.kind == "refresh_failed_transient"
+        assert state.mcp_token_store.get_user_token("user-1", "srv-oauth") is not None
+
+    def test_403_invalid_grant_revokes(self, storage: SQLiteBackend) -> None:
+        """``invalid_grant`` is a dead grant at ANY client-error status, not just
+        400/401 — a 403 invalid_grant must still revoke + re-consent."""
+        _seed_server(storage)
+        client = MagicMock(spec=httpx.AsyncClient)
+        client.get = AsyncMock(return_value=_mk_response(200, _good_as_metadata_doc()))
+        client.post = AsyncMock(return_value=_mk_response(403, {"error": "invalid_grant"}))
+        state = _make_app_state(storage, http_client=client)
+        _seed_token(state, expires_in_seconds=-1000)
+
+        result = self._lookup(state)
+
+        assert result.kind == "refresh_failed"
+        assert state.mcp_token_store.get_user_token("user-1", "srv-oauth") is None
+
+    def test_interaction_required_revokes(self, storage: SQLiteBackend) -> None:
+        """An OIDC interaction-required code (Entra surfaces these) means the user
+        must re-consent / re-auth — treat as permanent, revoke."""
+        _seed_server(storage)
+        client = MagicMock(spec=httpx.AsyncClient)
+        client.get = AsyncMock(return_value=_mk_response(200, _good_as_metadata_doc()))
+        client.post = AsyncMock(return_value=_mk_response(401, {"error": "interaction_required"}))
+        state = _make_app_state(storage, http_client=client)
+        _seed_token(state, expires_in_seconds=-1000)
+
+        result = self._lookup(state)
+
+        assert result.kind == "refresh_failed"
+        assert state.mcp_token_store.get_user_token("user-1", "srv-oauth") is None
+
+    def test_ambiguous_streak_escalates_to_revoke(self, storage: SQLiteBackend) -> None:
+        """A *sustained* run of unclassifiable 400s is treated as a dead grant in
+        a non-standard shape: the token survives below the threshold, then the
+        threshold-crossing attempt escalates to re-consent so the user isn't
+        stranded on a retryable error forever."""
+        _seed_server(storage)
+        client = MagicMock(spec=httpx.AsyncClient)
+        client.get = AsyncMock(return_value=_mk_response(200, _good_as_metadata_doc()))
+        client.post = AsyncMock(return_value=_mk_response(400, None))
+        state = _make_app_state(storage, http_client=client)
+        _seed_token(state, expires_in_seconds=-1000)
+
+        with (
+            patch("turnstone.core.mcp_oauth._AMBIGUOUS_ESCALATION_THRESHOLD", 3),
+            patch("turnstone.core.mcp_oauth._REFRESH_TRANSIENT_COOLDOWN_SECONDS", 0.0),
+        ):
+            # Below threshold: the token survives each attempt.
+            for _ in range(2):
+                assert self._lookup(state).kind == "refresh_failed_transient"
+                assert state.mcp_token_store.get_user_token("user-1", "srv-oauth") is not None
+            # The threshold-crossing attempt escalates to a revoke.
+            result = self._lookup(state)
+
+        assert result.kind == "refresh_failed"
+        assert state.mcp_token_store.get_user_token("user-1", "srv-oauth") is None
+
+    def test_sustained_5xx_never_escalates(self, storage: SQLiteBackend) -> None:
+        """Outage safety: infra failures (5xx) never feed the escalation counter,
+        so even a long AS outage — far past the ambiguous threshold — keeps the
+        token. A blip must never revoke consent, however long it lasts."""
+        _seed_server(storage)
+        client = MagicMock(spec=httpx.AsyncClient)
+        client.get = AsyncMock(return_value=_mk_response(200, _good_as_metadata_doc()))
+        client.post = AsyncMock(
+            return_value=_mk_response(503, {"error": "temporarily_unavailable"})
+        )
+        state = _make_app_state(storage, http_client=client)
+        _seed_token(state, expires_in_seconds=-1000)
+
+        with (
+            patch("turnstone.core.mcp_oauth._AMBIGUOUS_ESCALATION_THRESHOLD", 2),
+            patch("turnstone.core.mcp_oauth._REFRESH_TRANSIENT_COOLDOWN_SECONDS", 0.0),
+        ):
+            for _ in range(5):
+                assert self._lookup(state).kind == "refresh_failed_transient"
+                assert state.mcp_token_store.get_user_token("user-1", "srv-oauth") is not None
+
+    def test_transient_cooldown_skips_as_roundtrip(self, storage: SQLiteBackend) -> None:
+        """After a transient failure, a follow-up lookup inside the cooldown
+        window returns the retryable kind WITHOUT a second token-endpoint
+        round-trip — so a down AS isn't hammered once per tool call."""
+        _seed_server(storage)
+        client = MagicMock(spec=httpx.AsyncClient)
+        client.get = AsyncMock(return_value=_mk_response(200, _good_as_metadata_doc()))
+        client.post = AsyncMock(
+            return_value=_mk_response(503, {"error": "temporarily_unavailable"})
+        )
+        state = _make_app_state(storage, http_client=client)
+        _seed_token(state, expires_in_seconds=-1000)
+
+        first = self._lookup(state)
+        second = self._lookup(state)
+
+        assert first.kind == "refresh_failed_transient"
+        assert second.kind == "refresh_failed_transient"
+        # The cooldown short-circuited the second attempt: exactly one AS POST.
+        assert client.post.call_count == 1
+
+    def test_backoff_cleared_when_token_vanishes(self, storage: SQLiteBackend) -> None:
+        """A transient failure records per-(user,server) backoff; if the token is
+        then deleted cluster-wide (another node's permanent revoke), the next
+        lookup returns ``missing`` AND clears this node's now-stale backoff entry,
+        so the dict stays bounded to live pairs."""
+        _seed_server(storage)
+        client = MagicMock(spec=httpx.AsyncClient)
+        client.get = AsyncMock(return_value=_mk_response(200, _good_as_metadata_doc()))
+        client.post = AsyncMock(
+            return_value=_mk_response(503, {"error": "temporarily_unavailable"})
+        )
+        state = _make_app_state(storage, http_client=client)
+        _seed_token(state, expires_in_seconds=-1000)
+
+        # First lookup: a transient 503 records a backoff entry.
+        assert self._lookup(state).kind == "refresh_failed_transient"
+        assert ("user-1", "srv-oauth") in state.mcp_oauth_refresh_backoff
+
+        # Another node revokes the token cluster-wide (shared Postgres store).
+        state.mcp_token_store.delete_user_token("user-1", "srv-oauth")
+
+        # Next lookup sees the row gone -> missing -> the stale entry is cleared.
+        assert self._lookup(state).kind == "missing"
+        assert ("user-1", "srv-oauth") not in state.mcp_oauth_refresh_backoff
+
+
+# ---------------------------------------------------------------------------
 # Happy paths
 # ---------------------------------------------------------------------------
 

@@ -24,6 +24,7 @@ import asyncio
 import base64
 import concurrent.futures
 import contextlib
+import enum
 import hashlib
 import json
 import secrets
@@ -94,12 +95,44 @@ class MCPOAuthExchangeError(MCPOAuthError):
     """Authorization-code exchange failed."""
 
 
-class MCPOAuthRefreshFailed(MCPOAuthError):  # noqa: N818 — name reflects domain semantics
-    """Refresh-token grant failed.
+class _RefreshFailureClass(enum.Enum):
+    """How the caller should react to a failed refresh-token grant.
 
-    Caller should treat this as a re-consent trigger: delete the user
-    token row and emit ``mcp_consent_required``.
+    - ``PERMANENT`` — the AS rejected the grant as dead (``invalid_grant`` /
+      ``invalid_scope`` / an OIDC interaction-required code): revoke the stored
+      token and trigger re-consent.
+    - ``TRANSIENT`` — an infrastructure or operator-fixable blip (network, 5xx,
+      429, ``invalid_client``, malformed body): keep the token and surface a
+      retryable error so a blip can never revoke a user's consent. Never
+      escalates, so even a sustained AS outage can't strand consent.
+    - ``AMBIGUOUS`` — a 400/401 token-endpoint rejection we couldn't pin to a
+      standard code: keep the token, but the caller counts consecutive
+      occurrences and escalates to re-consent past a threshold — so a dead grant
+      delivered in a non-standard shape can't strand the user forever, while a
+      one-off oddity still can't revoke consent.
     """
+
+    PERMANENT = "permanent"
+    TRANSIENT = "transient"
+    AMBIGUOUS = "ambiguous"
+
+
+class MCPOAuthRefreshFailed(MCPOAuthError):  # noqa: N818 — name reflects domain semantics
+    """Refresh-token grant failed; ``failure_class`` tells the caller how to react.
+
+    See :class:`_RefreshFailureClass` for the three handling classes. Defaults to
+    ``TRANSIENT`` — the safe direction, since the caller then keeps the token
+    rather than revoking a user's consent on an unclassified failure.
+    """
+
+    def __init__(
+        self,
+        message: str = "",
+        *,
+        failure_class: _RefreshFailureClass = _RefreshFailureClass.TRANSIENT,
+    ) -> None:
+        super().__init__(message)
+        self.failure_class = failure_class
 
 
 # ---------------------------------------------------------------------------
@@ -606,6 +639,25 @@ async def pop_pending_state(*, storage: StorageBackend, state: str) -> dict[str,
 _AS_ERROR_FIELD_MAX = 80
 
 
+def _as_error_code(resp: httpx.Response) -> str | None:
+    """Return the RFC 6749 ``error`` code from a token-endpoint JSON error body.
+
+    Feeds :func:`_classify_refresh_failure`, which maps the code to a handling
+    class. Returns ``None`` when the body isn't JSON or carries no ``error``
+    field — an absent code is treated as an *ambiguous* rejection, not a
+    permanent one, so a non-standard error shape can't revoke consent outright.
+    """
+    try:
+        doc = resp.json()
+    except ValueError:
+        return None
+    if isinstance(doc, dict):
+        code = doc.get("error")
+        if isinstance(code, str) and code:
+            return code
+    return None
+
+
 def _format_as_error(resp: httpx.Response) -> str:
     """Build a safe, redacted summary of an AS error response.
 
@@ -636,6 +688,61 @@ def _format_as_error(resp: httpx.Response) -> str:
         return sanitize_log_text(resp.text, 200)
     composite = " ".join(parts)
     return sanitize_log_text(redact_credentials(composite), 200)
+
+
+# RFC 6749 / OIDC token-endpoint error codes that mean the grant is genuinely
+# dead and the user must re-consent — the only PERMANENT (revoke) signals.
+_PERMANENT_AS_ERRORS = frozenset(
+    {
+        "invalid_grant",  # refresh token expired/revoked (RFC 6749 §5.2)
+        "invalid_scope",  # requested scope no longer grantable → re-consent
+    }
+)
+# OIDC interaction-required family: the AS needs the user back in the loop
+# (consent / login / account selection) — also a re-consent (PERMANENT) signal.
+_INTERACTION_AS_ERRORS = frozenset(
+    {
+        "interaction_required",
+        "login_required",
+        "consent_required",
+        "account_selection_required",
+    }
+)
+# Operator-fixable or RFC-transient codes: keep the token and never escalate —
+# re-consenting the user won't fix a bad client_secret, and
+# ``temporarily_unavailable`` is explicitly retryable.
+_TRANSIENT_AS_ERRORS = frozenset(
+    {
+        "invalid_client",
+        "invalid_request",
+        "unauthorized_client",
+        "unsupported_grant_type",
+        "temporarily_unavailable",
+    }
+)
+
+
+def _classify_refresh_failure(resp: httpx.Response) -> _RefreshFailureClass:
+    """Classify a non-200 refresh response into a handling class.
+
+    Conservative by construction — the only path to a PERMANENT
+    (consent-revoking) outcome is an explicit dead-grant / re-consent error code
+    at a client-error status. Everything infrastructural (5xx, 429) or
+    operator-fixable (``invalid_client`` …) is TRANSIENT and never escalates, so
+    a sustained AS outage can't revoke consent. A 400/401 carrying an error code
+    we don't recognise (or none at all) is AMBIGUOUS: the caller keeps the token
+    but escalates to re-consent after an uninterrupted run, so a dead grant in a
+    non-standard shape can't strand the user while a one-off can't revoke.
+    """
+    status = resp.status_code
+    code = _as_error_code(resp)
+    if status in (400, 401, 403) and (
+        code in _PERMANENT_AS_ERRORS or code in _INTERACTION_AS_ERRORS
+    ):
+        return _RefreshFailureClass.PERMANENT
+    if status in (400, 401) and code not in _TRANSIENT_AS_ERRORS:
+        return _RefreshFailureClass.AMBIGUOUS
+    return _RefreshFailureClass.TRANSIENT
 
 
 # ---------------------------------------------------------------------------
@@ -813,8 +920,13 @@ async def refresh_token(
         raise MCPOAuthRefreshFailed("refresh endpoint response body exceeds size limit")
 
     if resp.status_code != 200:
+        # Classify the rejection (see _classify_refresh_failure): an explicit
+        # dead-grant / re-consent code revokes consent; infra (5xx/429) and
+        # operator-fixable codes keep the token; an unrecognised 400/401 is
+        # ambiguous and the caller escalates only after a sustained run.
         raise MCPOAuthRefreshFailed(
-            f"refresh endpoint returned HTTP {resp.status_code}: {_format_as_error(resp)}"
+            f"refresh endpoint returned HTTP {resp.status_code}: {_format_as_error(resp)}",
+            failure_class=_classify_refresh_failure(resp),
         )
 
     try:
@@ -1239,9 +1351,126 @@ class TokenLookupResult:
     would be wrong (the user can't fix it; only an operator can).
     """
 
-    kind: Literal["token", "missing", "decrypt_failure", "refresh_failed"] = "missing"
+    kind: Literal[
+        "token", "missing", "decrypt_failure", "refresh_failed", "refresh_failed_transient"
+    ] = "missing"
     token: str | None = None
     decrypt_fingerprints: tuple[str, ...] = field(default_factory=tuple)
+
+
+# In-process (per-node) backoff bookkeeping for transient refresh failures,
+# keyed ``(user_id, server_name)`` on ``app_state.mcp_oauth_refresh_backoff``.
+# The cooldown timer short-circuits the token-endpoint round-trip during a
+# sustained AS outage (perf); the ambiguous streak escalates an
+# unclassifiable-but-persistent rejection to re-consent so a dead grant in a
+# non-standard shape can't strand the user forever.
+_REFRESH_TRANSIENT_COOLDOWN_SECONDS = 30.0
+_AMBIGUOUS_ESCALATION_THRESHOLD = 5
+
+
+@dataclass
+class _RefreshBackoffState:
+    """Per-(user, server) transient-refresh backoff state (see the helpers below)."""
+
+    last_failure_monotonic: float = 0.0
+    ambiguous_streak: int = 0
+
+
+def _refresh_backoff_state(app_state: Any, user_id: str, server_name: str) -> _RefreshBackoffState:
+    """Return (creating if absent) the backoff state for ``(user_id, server_name)``."""
+    states = getattr(app_state, "mcp_oauth_refresh_backoff", None)
+    if states is None:
+        states = {}
+        app_state.mcp_oauth_refresh_backoff = states
+    key = (user_id, server_name)
+    state = states.get(key)
+    if state is None:
+        state = _RefreshBackoffState()
+        states[key] = state
+    return state
+
+
+def _clear_refresh_backoff(app_state: Any, user_id: str, server_name: str) -> None:
+    """Drop the backoff state for ``(user_id, server_name)``.
+
+    Called whenever a usable token is returned or the token is revoked, so a
+    healthy grant resets the cooldown timer + ambiguous streak and the dict
+    stays bounded to live ``(user, server)`` pairs.
+    """
+    states = getattr(app_state, "mcp_oauth_refresh_backoff", None)
+    if isinstance(states, dict):
+        states.pop((user_id, server_name), None)
+
+
+def _refresh_in_cooldown(app_state: Any, user_id: str, server_name: str) -> bool:
+    """Return True while within the post-transient-failure cooldown window."""
+    states = getattr(app_state, "mcp_oauth_refresh_backoff", None)
+    if not isinstance(states, dict):
+        return False
+    state: _RefreshBackoffState | None = states.get((user_id, server_name))
+    if state is None or not state.last_failure_monotonic:
+        return False
+    elapsed = time.monotonic() - state.last_failure_monotonic
+    return elapsed < _REFRESH_TRANSIENT_COOLDOWN_SECONDS
+
+
+def _token_result(
+    app_state: Any, user_id: str, server_name: str, token: str | None
+) -> TokenLookupResult:
+    """Return a ``kind="token"`` result, resetting any transient-refresh backoff.
+
+    A usable token means the grant is healthy, so the cooldown timer and the
+    ambiguous-failure streak are cleared here at the single success choke point.
+    """
+    _clear_refresh_backoff(app_state, user_id, server_name)
+    return TokenLookupResult(kind="token", token=token)
+
+
+def _no_token_result(
+    app_state: Any, user_id: str, server_name: str, result: TokenLookupResult
+) -> TokenLookupResult:
+    """Clear any transient-refresh backoff, then return a non-token *result*.
+
+    A ``missing`` / ``decrypt_failure`` outcome means the grant is no longer live
+    on this node (token deleted cluster-wide, key rotated), so the
+    per-(user, server) backoff is dropped to keep the dict bounded to live pairs
+    — the mirror of :func:`_token_result` (success) and
+    :func:`_revoke_after_refresh_failure` (revoke). Backoff then survives only
+    the two intentional keep-paths: the transient handler and the cooldown gate.
+    """
+    _clear_refresh_backoff(app_state, user_id, server_name)
+    return result
+
+
+async def _revoke_after_refresh_failure(
+    app_state: Any,
+    token_store: MCPTokenStore,
+    user_id: str,
+    server_name: str,
+    server_id_for_audit: str,
+    *,
+    reason: str,
+) -> TokenLookupResult:
+    """Delete the stored token, emit a ``token_revoked`` audit, and drop locks.
+
+    The single revoke choke point for every "the grant is dead" outcome
+    (permanent rejection, ambiguous-streak escalation, expired-with-no-refresh).
+    Drops the per-key refresh lock and backoff state — both safe to call when no
+    entry exists — and returns ``refresh_failed`` so the dispatcher surfaces
+    re-consent.
+    """
+    await asyncio.to_thread(token_store.delete_user_token, user_id, server_name)
+    await _audit_event(
+        app_state,
+        server_id=server_id_for_audit,
+        user_id=user_id,
+        action="mcp_server.oauth.token_revoked",
+        server_name=server_name,
+        detail={"reason": reason},
+    )
+    _drop_refresh_lock(app_state, user_id, server_name)
+    _clear_refresh_backoff(app_state, user_id, server_name)
+    return TokenLookupResult(kind="refresh_failed")
 
 
 async def get_user_access_token(*, app_state: Any, user_id: str, server_name: str) -> str | None:
@@ -1272,9 +1501,12 @@ async def get_user_access_token_classified(
     """Tagged token lookup with refresh-on-expiry.
 
     Walks the token-lookup state machine (token / missing /
-    decrypt_failure / refresh_failed) and returns a tagged result so
-    the dispatcher can map each failure mode to the right user-facing
-    error.
+    decrypt_failure / refresh_failed / refresh_failed_transient) and
+    returns a tagged result so the dispatcher can map each failure mode
+    to the right user-facing error. A transient refresh failure keeps the
+    token and returns ``refresh_failed_transient`` (retryable, no revoke);
+    only a permanent rejection — or a sustained run of ambiguous ones —
+    revokes the stored token and returns ``refresh_failed``.
 
     Multi-node correctness: the refresh path is serialized at two
     layers — an outer ``asyncio.Lock`` from :func:`_refresh_lock_for`
@@ -1318,42 +1550,54 @@ async def get_user_access_token_classified(
             server_name=server_name,
             exc_info=True,
         )
-        return TokenLookupResult(
-            kind="decrypt_failure",
-            decrypt_fingerprints=tuple(exc.key_fingerprints_attempted),
+        return _no_token_result(
+            app_state,
+            user_id,
+            server_name,
+            TokenLookupResult(
+                kind="decrypt_failure",
+                decrypt_fingerprints=tuple(exc.key_fingerprints_attempted),
+            ),
         )
     if plain is None:
-        return TokenLookupResult(kind="missing")
+        return _no_token_result(app_state, user_id, server_name, TokenLookupResult(kind="missing"))
 
     expires_at = plain.get("expires_at")
-    if not force_refresh and not _token_needs_refresh(expires_at):
-        return TokenLookupResult(kind="token", token=plain["access_token"])
+    needs_refresh = _token_needs_refresh(expires_at)
+    if not force_refresh and not needs_refresh:
+        return _token_result(app_state, user_id, server_name, plain["access_token"])
+
+    # perf: during a sustained AS outage, short-circuit the token-endpoint
+    # round-trip for a brief window after a transient failure rather than
+    # re-attempting on every dispatch. Gated on the locally-read token being
+    # itself expired — a force_refresh on a still-fresh-looking token (the 401
+    # retry) falls through so the in-lock race check can still pick up a token a
+    # cluster-mate just refreshed.
+    if needs_refresh and _refresh_in_cooldown(app_state, user_id, server_name):
+        return TokenLookupResult(kind="refresh_failed_transient")
 
     storage = _get_storage(app_state)
     if storage is None:
-        return TokenLookupResult(kind="missing")
+        return _no_token_result(app_state, user_id, server_name, TokenLookupResult(kind="missing"))
 
     # bug-6: load server_row BEFORE the no-refresh-token branch so the
     # pre-lock audit event carries the immutable server_id rather than
     # falling back to a name-keyed lookup that races admin renames.
     server_row = await asyncio.to_thread(storage.get_mcp_server_by_name, server_name)
     if server_row is None:
-        return TokenLookupResult(kind="missing")
+        return _no_token_result(app_state, user_id, server_name, TokenLookupResult(kind="missing"))
     server_id_for_audit = str(server_row.get("server_id") or "")
 
     refresh_value = plain.get("refresh_token")
     if not refresh_value:
-        await asyncio.to_thread(token_store.delete_user_token, user_id, server_name)
-        _drop_refresh_lock(app_state, user_id, server_name)
-        await _audit_event(
+        return await _revoke_after_refresh_failure(
             app_state,
-            server_id=server_id_for_audit,
-            user_id=user_id,
-            action="mcp_server.oauth.token_revoked",
-            server_name=server_name,
-            detail={"reason": "expired_no_refresh"},
+            token_store,
+            user_id,
+            server_name,
+            server_id_for_audit,
+            reason="expired_no_refresh",
         )
-        return TokenLookupResult(kind="refresh_failed")
 
     lock = _refresh_lock_for(app_state, user_id, server_name)
     pg_lock = await _acquire_pg_refresh_lock(storage, user_id, server_name)
@@ -1372,12 +1616,19 @@ async def get_user_access_token_classified(
                 exc_info=True,
             )
             _drop_refresh_lock(app_state, user_id, server_name)
-            return TokenLookupResult(
-                kind="decrypt_failure",
-                decrypt_fingerprints=tuple(exc.key_fingerprints_attempted),
+            return _no_token_result(
+                app_state,
+                user_id,
+                server_name,
+                TokenLookupResult(
+                    kind="decrypt_failure",
+                    decrypt_fingerprints=tuple(exc.key_fingerprints_attempted),
+                ),
             )
         if plain2 is None:
-            return TokenLookupResult(kind="missing")
+            return _no_token_result(
+                app_state, user_id, server_name, TokenLookupResult(kind="missing")
+            )
         expires_at2 = plain2.get("expires_at")
         # Reuse the freshly-refreshed token under two conditions:
         #  1. ``force_refresh=False`` and the cached token is still fresh
@@ -1389,23 +1640,20 @@ async def get_user_access_token_classified(
         #     we lost the race and should reuse rather than refresh again.
         if not _token_needs_refresh(expires_at2):
             if not force_refresh:
-                return TokenLookupResult(kind="token", token=plain2["access_token"])
+                return _token_result(app_state, user_id, server_name, plain2["access_token"])
             last_refreshed = _parse_iso_to_utc(plain2.get("last_refreshed") or "")
             if last_refreshed is not None and last_refreshed >= t_lock_request_started:
-                return TokenLookupResult(kind="token", token=plain2["access_token"])
+                return _token_result(app_state, user_id, server_name, plain2["access_token"])
         refresh_value2 = plain2.get("refresh_token")
         if not refresh_value2:
-            await asyncio.to_thread(token_store.delete_user_token, user_id, server_name)
-            await _audit_event(
+            return await _revoke_after_refresh_failure(
                 app_state,
-                server_id=server_id_for_audit,
-                user_id=user_id,
-                action="mcp_server.oauth.token_revoked",
-                server_name=server_name,
-                detail={"reason": "expired_no_refresh"},
+                token_store,
+                user_id,
+                server_name,
+                server_id_for_audit,
+                reason="expired_no_refresh",
             )
-            _drop_refresh_lock(app_state, user_id, server_name)
-            return TokenLookupResult(kind="refresh_failed")
 
         try:
             new_access, _new_refresh, _new_expires_at = await _refresh_and_persist(
@@ -1418,19 +1666,68 @@ async def get_user_access_token_classified(
                 refresh_value=refresh_value2,
                 existing_scopes=plain2.get("scopes") or "",
             )
-        except MCPOAuthRefreshFailed:
-            await asyncio.to_thread(token_store.delete_user_token, user_id, server_name)
-            await _audit_event(
-                app_state,
-                server_id=server_id_for_audit,
+        except MCPOAuthRefreshFailed as exc:
+            if exc.failure_class is _RefreshFailureClass.PERMANENT:
+                # The AS rejected the grant as dead (invalid_grant / invalid_scope
+                # / an OIDC interaction-required code) — revoke and re-consent.
+                return await _revoke_after_refresh_failure(
+                    app_state,
+                    token_store,
+                    user_id,
+                    server_name,
+                    server_id_for_audit,
+                    reason="refresh_failed",
+                )
+            # Transient or ambiguous: keep the token (a blip must never revoke a
+            # user's consent) and arm the cooldown so a down AS isn't hit on
+            # every later dispatch.
+            backoff = _refresh_backoff_state(app_state, user_id, server_name)
+            backoff.last_failure_monotonic = time.monotonic()
+            if exc.failure_class is _RefreshFailureClass.AMBIGUOUS:
+                backoff.ambiguous_streak += 1
+                if backoff.ambiguous_streak >= _AMBIGUOUS_ESCALATION_THRESHOLD:
+                    # A persistent 400/401 rejection we can't map to a standard
+                    # code most likely IS a dead grant the AS reports in a
+                    # non-standard shape. Escalate to re-consent so the user
+                    # isn't stranded on a retryable error forever. (Infra
+                    # transients never reach here, so an outage can't escalate.)
+                    log.warning(
+                        "mcp_server.oauth.refresh_ambiguous_escalated",
+                        user_id=user_id,
+                        server_name=server_name,
+                        streak=backoff.ambiguous_streak,
+                        error=str(exc),
+                    )
+                    return await _revoke_after_refresh_failure(
+                        app_state,
+                        token_store,
+                        user_id,
+                        server_name,
+                        server_id_for_audit,
+                        reason="refresh_failed_ambiguous_escalated",
+                    )
+            else:
+                # A clean infra/operator-fixable transient breaks any ambiguous
+                # run — only an uninterrupted streak escalates.
+                backoff.ambiguous_streak = 0
+            log.warning(
+                "mcp_server.oauth.refresh_transient_failure",
                 user_id=user_id,
-                action="mcp_server.oauth.token_revoked",
                 server_name=server_name,
-                detail={"reason": "refresh_failed"},
+                failure_class=exc.failure_class.value,
+                ambiguous_streak=backoff.ambiguous_streak,
+                error=str(exc),
             )
-            _drop_refresh_lock(app_state, user_id, server_name)
-            return TokenLookupResult(kind="refresh_failed")
-        return TokenLookupResult(kind="token", token=new_access)
+            # Do NOT drop the refresh lock here: the token is kept, so the
+            # per-key asyncio.Lock must stay registered to keep serializing
+            # concurrent refreshes. Dropping it would let a second concurrent
+            # caller mint a fresh lock and refresh the same token in parallel —
+            # with refresh-token rotation that races to invalid_grant and a
+            # spurious revoke (the exact bug this path prevents). The async-with
+            # still releases the lock on return; the entry is pruned when the
+            # token is later refreshed or revoked.
+            return TokenLookupResult(kind="refresh_failed_transient")
+        return _token_result(app_state, user_id, server_name, new_access)
 
 
 def _token_needs_refresh(expires_at: str | None) -> bool:

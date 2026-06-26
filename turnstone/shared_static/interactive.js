@@ -3091,6 +3091,10 @@ function _mcpErrorCategory(code) {
   ) {
     return "operator";
   }
+  if (code === "mcp_refresh_unavailable") {
+    // Soft, retryable state — a transient refresh failure, not a hard denial.
+    return "transient";
+  }
   // Default for any other mcp_*_forbidden / unrecognised mcp_ code.
   return "forbidden";
 }
@@ -3104,6 +3108,8 @@ function _mcpErrorTitle(err) {
     case "mcp_token_undecryptable_key_unknown":
     case "mcp_oauth_url_insecure":
       return "Operator action required";
+    case "mcp_refresh_unavailable":
+      return "Temporarily unavailable";
     default:
       return "Forbidden";
   }
