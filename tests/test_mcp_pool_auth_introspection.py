@@ -1535,5 +1535,220 @@ def test_call_tool_sync_does_not_wrap_non_structured_string(
     assert result == payload
 
 
+class TestPoolPrimingAndTokenRotation:
+    """Per-user pool priming (PR #706 follow-up) and the bound-token rotation
+    reconnect. Priming must be NON-DESTRUCTIVE — it must never drive a token
+    refresh whose transient failure would revoke consent."""
+
+    def _wire(self, mgr: MCPClientManager, storage: SQLiteBackend, cipher: Any) -> None:
+        mgr.set_storage(storage)
+        mgr.set_app_state(_make_app_state(storage, cipher=cipher))
+        mgr._oauth_user_server_names = {"pool-srv"}
+
+    def test_prime_user_pools_warms_fresh_token_server(
+        self, running_loop_mgr, storage: SQLiteBackend
+    ) -> None:
+        mgr, loop, _ = running_loop_mgr
+        cipher = make_mcp_token_cipher()
+        _seed_oauth_server(storage, name="pool-srv")
+        _seed_user_token(storage, cipher, expires_in_seconds=3600, access_token="bearer-fresh")
+        self._wire(mgr, storage, cipher)
+
+        primed: list[tuple[tuple[str, str], str]] = []
+
+        async def _fake_prime(
+            self_inner: MCPClientManager, key: tuple[str, str], cfg: dict[str, Any], token: str
+        ) -> int:
+            primed.append((key, token))
+            return 3
+
+        mgr._prime_user_server = _fake_prime.__get__(mgr, type(mgr))  # type: ignore[method-assign]
+
+        _run_on_loop(loop, mgr._prime_user_pools("user-1"))
+
+        assert primed == [(("user-1", "pool-srv"), "bearer-fresh")]
+
+    def test_prime_user_pools_skips_near_expiry_without_revoking(
+        self, running_loop_mgr, storage: SQLiteBackend
+    ) -> None:
+        """bug-1 regression: a near-expiry token is skipped (not refreshed), so a
+        transient refresh failure during priming can never revoke the token."""
+        mgr, loop, _ = running_loop_mgr
+        cipher = make_mcp_token_cipher()
+        _seed_oauth_server(storage, name="pool-srv")
+        # Inside the 60s refresh-skew window -> the refreshing lookup would have
+        # driven a refresh here.
+        _seed_user_token(storage, cipher, expires_in_seconds=5, access_token="bearer-stale")
+        self._wire(mgr, storage, cipher)
+
+        primed: list[tuple[str, str]] = []
+
+        async def _fake_prime(
+            self_inner: MCPClientManager, key: tuple[str, str], cfg: dict[str, Any], token: str
+        ) -> int:
+            primed.append(key)
+            return 0
+
+        mgr._prime_user_server = _fake_prime.__get__(mgr, type(mgr))  # type: ignore[method-assign]
+
+        _run_on_loop(loop, mgr._prime_user_pools("user-1"))
+
+        assert primed == [], "near-expiry token must be skipped, not primed (no refresh driven)"
+        # The token row must survive — priming must never revoke.
+        store = MCPTokenStore(storage, cipher, node_id="test")
+        assert store.get_user_token("user-1", "pool-srv") is not None
+
+    def test_prime_user_pools_skips_already_connected(
+        self, running_loop_mgr, storage: SQLiteBackend
+    ) -> None:
+        mgr, loop, _ = running_loop_mgr
+        cipher = make_mcp_token_cipher()
+        _seed_oauth_server(storage, name="pool-srv")
+        _seed_user_token(storage, cipher, expires_in_seconds=3600)
+        self._wire(mgr, storage, cipher)
+
+        async def _seed() -> None:
+            entry = await mgr._ensure_pool_entry(("user-1", "pool-srv"))
+            entry.session = MagicMock()  # already connected
+
+        _run_on_loop(loop, _seed())
+
+        primed: list[tuple[str, str]] = []
+
+        async def _fake_prime(
+            self_inner: MCPClientManager, key: tuple[str, str], cfg: dict[str, Any], token: str
+        ) -> int:
+            primed.append(key)
+            return 0
+
+        mgr._prime_user_server = _fake_prime.__get__(mgr, type(mgr))  # type: ignore[method-assign]
+
+        _run_on_loop(loop, mgr._prime_user_pools("user-1"))
+
+        assert primed == [], "already-connected pool entry must be skipped"
+
+    def test_schedule_prime_user_server_noop_for_non_oauth_user(
+        self, running_loop_mgr, storage: SQLiteBackend
+    ) -> None:
+        mgr, loop, _ = running_loop_mgr
+        cipher = make_mcp_token_cipher()
+        self._wire(mgr, storage, cipher)
+        mgr._oauth_user_server_names = set()  # nothing registered as oauth_user
+
+        ran = threading.Event()
+
+        async def _fake_logged(
+            self_inner: MCPClientManager,
+            key: tuple[str, str],
+            cfg: dict[str, Any],
+            token: str,
+            user_id: str,
+            server_name: str,
+        ) -> None:
+            ran.set()
+
+        mgr._prime_user_server_logged = _fake_logged.__get__(mgr, type(mgr))  # type: ignore[method-assign]
+
+        mgr.schedule_prime_user_server(
+            user_id="user-1", server_name="not-oauth", access_token="t", server_row={}
+        )
+        # Give any erroneously-scheduled coroutine a chance to run.
+        _run_on_loop(loop, asyncio.sleep(0.05))
+        assert not ran.is_set(), "non-oauth_user server must not schedule a prime"
+
+    def test_schedule_prime_user_server_runs_for_oauth_user(
+        self, running_loop_mgr, storage: SQLiteBackend
+    ) -> None:
+        mgr, loop, _ = running_loop_mgr
+        cipher = make_mcp_token_cipher()
+        _seed_oauth_server(storage, name="pool-srv")
+        self._wire(mgr, storage, cipher)
+
+        captured: dict[str, Any] = {}
+        done = threading.Event()
+
+        async def _fake_prime(
+            self_inner: MCPClientManager, key: tuple[str, str], cfg: dict[str, Any], token: str
+        ) -> int:
+            captured["key"] = key
+            captured["token"] = token
+            done.set()
+            return 5
+
+        mgr._prime_user_server = _fake_prime.__get__(mgr, type(mgr))  # type: ignore[method-assign]
+
+        server_row = storage.get_mcp_server_by_name("pool-srv")
+        mgr.schedule_prime_user_server(
+            user_id="user-1",
+            server_name="pool-srv",
+            access_token="bearer-x",
+            server_row=server_row,
+        )
+        assert done.wait(timeout=5), "scheduled prime did not run on the mcp-loop"
+        assert captured["key"] == ("user-1", "pool-srv")
+        assert captured["token"] == "bearer-x"
+
+    def test_dispatch_reconnects_when_bound_token_rotated(
+        self, running_loop_mgr, storage: SQLiteBackend
+    ) -> None:
+        """A warm session bound to a stale bearer is transparently reconnected
+        with the current token; the discovered catalog is retained."""
+        mgr, loop, _ = running_loop_mgr
+        cipher = make_mcp_token_cipher()
+        _seed_oauth_server(storage, name="pool-srv")
+        # The CURRENT stored token the dispatch will resolve.
+        _seed_user_token(storage, cipher, expires_in_seconds=3600, access_token="bearer-new")
+        self._wire(mgr, storage, cipher)
+
+        reconnect_tokens: list[str] = []
+
+        async def _ok_call_tool(name: str, args: dict[str, Any]) -> Any:
+            content = MagicMock()
+            content.text = "ok"
+            res = MagicMock()
+            res.content = [content]
+            res.isError = False
+            return res
+
+        async def _seed() -> None:
+            entry = await mgr._ensure_pool_entry(("user-1", "pool-srv"))
+            sess = MagicMock()
+            sess.call_tool = _ok_call_tool
+            entry.session = sess
+            entry.bound_token = "bearer-old"  # connected with the OLD token
+            entry.tools = [{"name": "do_thing"}]  # catalog already discovered
+
+        _run_on_loop(loop, _seed())
+
+        async def _fake_connect(
+            self_inner: MCPClientManager,
+            key: tuple[str, str],
+            cfg: dict[str, Any],
+            access_token: str,
+            *,
+            auth_capture: Any = None,
+            auth_fired_event: Any = None,
+        ) -> Any:
+            reconnect_tokens.append(access_token)
+            entry = await self_inner._ensure_pool_entry(key)
+            sess = MagicMock()
+            sess.call_tool = _ok_call_tool
+            entry.session = sess
+            entry.bound_token = access_token
+            return entry
+
+        mgr._connect_one_pool = _fake_connect.__get__(mgr, type(mgr))  # type: ignore[method-assign]
+
+        result = mgr.call_tool_sync("mcp__pool-srv__do_thing", {}, user_id="user-1", timeout=5)
+
+        assert result == "ok"
+        # Stale bound token (bearer-old) != resolved token (bearer-new) -> exactly
+        # one reconnect carrying the current bearer.
+        assert reconnect_tokens == ["bearer-new"]
+        # Catalog retained across the in-place rotation.
+        entry = mgr._user_pool_entries[("user-1", "pool-srv")]
+        assert entry.tools == [{"name": "do_thing"}]
+
+
 # Suppress unused-import warning for AsyncMock.
 _ = AsyncMock

@@ -255,23 +255,32 @@ async def _fetch_as_metadata(
     # path — refusing to support them would lock out the most common
     # enterprise AS. Try RFC 8414 first (preferred), then OIDC.
     base = issuer.rstrip("/")
+    # (profile, url): ``profile`` records WHICH discovery document each candidate
+    # is so the S256 PKCE check below can apply the correct per-document
+    # defaulting rule — an absent ``code_challenge_methods_supported`` is only
+    # treated as "S256 supported" for the OIDC document (see below).
     metadata_candidates = (
-        base + "/.well-known/oauth-authorization-server",
-        base + "/.well-known/openid-configuration",
+        ("rfc8414", base + "/.well-known/oauth-authorization-server"),
+        ("oidc", base + "/.well-known/openid-configuration"),
     )
     resp = None
+    winning_profile: str | None = None
     last_status: int | None = None
-    for metadata_url in metadata_candidates:
+    for profile, metadata_url in metadata_candidates:
         try:
             r = await http_client.get(metadata_url, timeout=_DEFAULT_HTTP_TIMEOUT)
         except httpx.HTTPError as exc:
             raise MCPOAuthDiscoveryError(f"AS metadata fetch failed: {exc}") from exc
         if r.status_code == 200:
             resp = r
+            winning_profile = profile
             break
         last_status = r.status_code
     if resp is None:
         raise MCPOAuthDiscoveryError(f"AS metadata returned HTTP {last_status}")
+    # Which discovery profile answered (rfc8414 vs oidc) is the load-bearing
+    # detail when debugging an enterprise AS (e.g. Entra serves only OIDC).
+    log.debug("mcp_server.oauth.as_metadata_discovered", profile=winning_profile)
 
     if len(resp.content) > _MAX_DISCOVERY_BODY_BYTES:
         raise MCPOAuthDiscoveryError("AS metadata response body exceeds size limit")
@@ -336,12 +345,22 @@ async def _fetch_as_metadata(
     if not isinstance(code_methods_raw, list):
         code_methods_raw = []
     code_methods = tuple(str(m) for m in code_methods_raw)
-    if not code_methods:
-        # The OIDC discovery document does not require advertising
-        # code_challenge_methods_supported, and some IdPs (Entra) omit it
-        # despite fully supporting S256. Absence is not a denial — assume
-        # S256 (mandated by OAuth 2.1 / MCP auth) rather than locking the
-        # AS out. A NON-empty list missing S256 is still a hard refusal.
+    if not code_methods and winning_profile == "oidc":
+        # OIDC document (openid-configuration) only: it does not require
+        # advertising code_challenge_methods_supported, and some IdPs (Entra)
+        # omit it despite fully supporting S256, so treat absence as "S256
+        # supported" (mandated by OAuth 2.1 / MCP auth) rather than locking the
+        # AS out.
+        #
+        # For the RFC 8414 oauth-authorization-server document we deliberately
+        # do NOT assume: an omitted field there is taken at face value as "no
+        # PKCE advertised", so code_methods stays empty and the check below
+        # fails closed. The client always sends code_challenge_method=S256, so
+        # this guard is the ONLY pre-flight that the AS actually enforces PKCE;
+        # assuming S256 on a document that omitted it would silently admit a
+        # non-enforcing AS and forfeit code-interception protection on the
+        # on-behalf-of bearer. A NON-empty list missing S256 is always a hard
+        # refusal, for both documents.
         log.info("mcp_server.oauth.s256_assumed_absent_advertisement")
         code_methods = ("S256",)
     if "S256" not in code_methods:
@@ -2380,20 +2399,16 @@ async def _handle_mcp_oauth_callback_inner(request: Request) -> Response:
     # and the server is stuck "connecting". Best-effort: a prime failure
     # does not change consent success; lazy dispatch remains the backstop.
     mcp_client = getattr(request.app.state, "mcp_client", None)
-    if mcp_client is not None and hasattr(mcp_client, "prime_user_server"):
-        try:
-            await mcp_client.prime_user_server(
-                user_id=user_id,
-                server_name=server_name,
-                access_token=access_token,
-                server_row=server_row,
-            )
-        except Exception:
-            log.debug(
-                "mcp_server.oauth.pool_prime_failed",
-                server_name=server_name,
-                exc_info=True,
-            )
+    if mcp_client is not None and hasattr(mcp_client, "schedule_prime_user_server"):
+        # Fire-and-forget so the consent redirect is not held on a slow or
+        # unreachable MCP server; the warm runs on the mcp-loop in the
+        # background and live sessions pick up the catalog via the listeners.
+        mcp_client.schedule_prime_user_server(
+            user_id=user_id,
+            server_name=server_name,
+            access_token=access_token,
+            server_row=server_row,
+        )
 
     # Phase 9 — clear any deferred-consent records for this (user,
     # server) now that consent has completed.  Best-effort: a storage

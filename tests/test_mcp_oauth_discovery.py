@@ -359,6 +359,119 @@ class TestASMetadataValidation:
         client.get.assert_not_called()
 
 
+class TestS256PerDocumentAndOIDCFallback:
+    """PKCE S256 defaulting is per-discovery-document, and OIDC discovery is a
+    fallback to RFC 8414 (PR #706 follow-up).
+
+    The client always sends ``code_challenge_method=S256``, so the AS-metadata
+    check is the only PKCE-enforcement pre-flight. An ABSENT
+    ``code_challenge_methods_supported`` is treated as "S256 supported" ONLY for
+    the OIDC ``openid-configuration`` document (where the field is optional and
+    Entra omits it); for the RFC 8414 ``oauth-authorization-server`` document an
+    absent field fails closed.
+    """
+
+    @staticmethod
+    def _doc_without_code_challenge() -> dict[str, Any]:
+        doc = _good_as_metadata_doc()
+        del doc["code_challenge_methods_supported"]
+        return doc
+
+    def test_absent_field_on_oidc_doc_assumes_s256(self) -> None:
+        # RFC 8414 path 404s; the OIDC doc omits code_challenge_methods_supported
+        # -> assume S256 (Entra's shape) and discovery succeeds.
+        async def _get(url, *args, **kwargs):
+            if url.endswith("/oauth-authorization-server"):
+                return _mk_response(404, json_body=None)
+            if url.endswith("/openid-configuration"):
+                return _mk_response(200, self._doc_without_code_challenge())
+            raise AssertionError(f"unexpected URL: {url}")
+
+        client = MagicMock(spec=httpx.AsyncClient)
+        client.get = AsyncMock(side_effect=_get)
+        storage = _mk_storage_mock()
+
+        async def _run():
+            with _public_addr_patch():
+                return await discover_authorization_server(
+                    server_name="srv-x",
+                    server_url="https://mcp.example.com/sse",
+                    override_url="https://as.example.com",
+                    cached_issuer=None,
+                    http_client=client,
+                    storage=storage,
+                    server_id="srv-id",
+                    trusted_hosts=frozenset(),
+                )
+
+        meta = asyncio.run(_run())
+        assert isinstance(meta, ASMetadata)
+        assert meta.token_endpoint == "https://as.example.com/token"
+
+    def test_absent_field_on_rfc8414_doc_fails_closed(self) -> None:
+        # The RFC 8414 doc is served (200) but omits the field — must NOT assume
+        # S256. Per RFC 8414 an omitted field means "no PKCE advertised", so
+        # discovery fails closed rather than silently downgrading.
+        async def _get(url, *args, **kwargs):
+            if url.endswith("/oauth-authorization-server"):
+                return _mk_response(200, self._doc_without_code_challenge())
+            raise AssertionError(f"unexpected URL: {url}")
+
+        client = MagicMock(spec=httpx.AsyncClient)
+        client.get = AsyncMock(side_effect=_get)
+        storage = _mk_storage_mock()
+
+        async def _run():
+            with _public_addr_patch():
+                await discover_authorization_server(
+                    server_name="srv-x",
+                    server_url="https://mcp.example.com/sse",
+                    override_url="https://as.example.com",
+                    cached_issuer=None,
+                    http_client=client,
+                    storage=storage,
+                    server_id="srv-id",
+                    trusted_hosts=frozenset(),
+                )
+
+        with pytest.raises(MCPOAuthDiscoveryError, match="S256"):
+            asyncio.run(_run())
+
+    def test_rfc8414_404_falls_back_to_openid_configuration(self) -> None:
+        # RFC 8414 path 404s; the OIDC doc (advertising S256) is parsed instead.
+        async def _get(url, *args, **kwargs):
+            if url.endswith("/oauth-authorization-server"):
+                return _mk_response(404, json_body=None)
+            if url.endswith("/openid-configuration"):
+                return _mk_response(200, _good_as_metadata_doc())
+            raise AssertionError(f"unexpected URL: {url}")
+
+        client = MagicMock(spec=httpx.AsyncClient)
+        client.get = AsyncMock(side_effect=_get)
+        storage = _mk_storage_mock()
+
+        async def _run():
+            with _public_addr_patch():
+                return await discover_authorization_server(
+                    server_name="srv-x",
+                    server_url="https://mcp.example.com/sse",
+                    override_url="https://as.example.com",
+                    cached_issuer=None,
+                    http_client=client,
+                    storage=storage,
+                    server_id="srv-id",
+                    trusted_hosts=frozenset(),
+                )
+
+        meta = asyncio.run(_run())
+        assert meta.issuer == "https://as.example.com"
+        assert meta.token_endpoint == "https://as.example.com/token"
+        # Both candidate URLs were tried, RFC 8414 first then OIDC.
+        called = [c.args[0] for c in client.get.call_args_list]
+        assert any("oauth-authorization-server" in u for u in called)
+        assert any("openid-configuration" in u for u in called)
+
+
 # ---------------------------------------------------------------------------
 # Caching
 # ---------------------------------------------------------------------------
