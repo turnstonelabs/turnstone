@@ -48,7 +48,7 @@ from __future__ import annotations
 from typing import Any
 
 from turnstone.core import fence
-from turnstone.core.trajectory import Turn, dicts_from_turns
+from turnstone.core.trajectory import EffectStatus, Turn, dicts_from_turns
 
 # The "you cannot tell whether it ran" clause, shared by every cancel
 # disposition surface (this wire-repair fallback AND the session-layer
@@ -147,7 +147,12 @@ def repair_wire_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]
     # highest down so each splice can't shift an as-yet-unused lower position.
     for insert_at, ids in sorted(orphans, key=lambda pair: pair[0], reverse=True):
         synthetic = dicts_from_turns(
-            [Turn.tool(uid, CANCELLED_TOOL_RESULT, is_error=True) for uid in ids]
+            [
+                Turn.tool(
+                    uid, CANCELLED_TOOL_RESULT, is_error=True, effect_status=EffectStatus.UNKNOWN
+                )
+                for uid in ids
+            ]
         )
         out[insert_at:insert_at] = synthetic
     return out

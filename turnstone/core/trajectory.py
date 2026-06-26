@@ -37,6 +37,26 @@ class Role(StrEnum):
     SYSTEM = "system"
 
 
+class EffectStatus(StrEnum):
+    """The typed disposition of a tool call's *effect* — the machine-readable
+    twin of the prose the result body already carries.
+
+    Rides ``TurnMeta.extra["effect_status"]`` (wire-invisible, like the other
+    side-channel meta): the *model* reads the body, while *deterministic*
+    consumers — a re-issue guard, owner-side compensation — read this. The
+    ``unknown`` vs ``none`` split is the load-bearing one (HYPOTHESIS.md
+    effect-record appendix: *unknown, never none*): an unobserved outcome must
+    not read as "did not happen." ``None`` (the field unset) means an ordinary
+    result that no producer classified — not a fourth status.
+    """
+
+    COMMITTED = "committed"  # ran to completion; effects, if any, landed
+    NONE = "none"  # definitively did nothing (denied / never started)
+    UNKNOWN = "unknown"  # stopped mid-flight; may or may not have acted
+    PARTIAL = "partial"  # ran part-way
+    ROLLED_BACK = "rolled_back"  # ran, then reverted
+
+
 @dataclass(slots=True)
 class TextBlock:
     """Portable text content."""
@@ -130,6 +150,20 @@ class Turn:
         contribute nothing (you cannot full-text-search an image)."""
         return "".join(b.text for b in self.content if isinstance(b, TextBlock))
 
+    @property
+    def effect_status(self) -> EffectStatus | None:
+        """The typed effect disposition recorded on a TOOL turn, or ``None`` if
+        unset (an ordinary, unclassified result). Read by deterministic
+        consumers; never sent to the model. Lenient on a corrupt stored value
+        (returns ``None`` rather than raising), mirroring the meta decoders."""
+        raw = self.meta.extra.get("effect_status")
+        if not raw:
+            return None
+        try:
+            return EffectStatus(raw)
+        except ValueError:
+            return None
+
     # -- construction helpers (blunt the wrapping cost of uniform block content) --
     @classmethod
     def user(cls, text: str) -> Turn:
@@ -151,12 +185,23 @@ class Turn:
         )
 
     @classmethod
-    def tool(cls, tool_call_id: str, text: str, *, is_error: bool = False) -> Turn:
+    def tool(
+        cls,
+        tool_call_id: str,
+        text: str,
+        *,
+        is_error: bool = False,
+        effect_status: EffectStatus | None = None,
+    ) -> Turn:
+        meta = TurnMeta()
+        if effect_status is not None:
+            meta.extra["effect_status"] = effect_status.value
         return cls(
             Role.TOOL,
             (TextBlock(text),) if text else (),
             tool_call_id=tool_call_id,
             is_error=is_error,
+            meta=meta,
         )
 
     @classmethod
@@ -253,6 +298,10 @@ def turn_from_dict(msg: dict[str, Any]) -> Turn:
     sm = msg.get("_source_meta")
     if sm:
         meta.extra["source_meta"] = sm
+    # Typed tool-effect disposition (wire-invisible side channel, like the above).
+    es = msg.get("_effect_status")
+    if es:
+        meta.extra["effect_status"] = es
 
     return Turn(
         role=role,
@@ -296,6 +345,9 @@ def turn_to_dict(turn: Turn) -> dict[str, Any]:
     sm = turn.meta.extra.get("source_meta")
     if sm:
         msg["_source_meta"] = sm
+    es = turn.meta.extra.get("effect_status")
+    if es:
+        msg["_effect_status"] = es
     return msg
 
 

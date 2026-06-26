@@ -134,6 +134,7 @@ from turnstone.core.tools import (
     merge_mcp_tools,
 )
 from turnstone.core.trajectory import (
+    EffectStatus,
     Role,
     Turn,
     dicts_from_turns,
@@ -910,6 +911,14 @@ def _notify_auth_headers() -> dict[str, str]:
     return header
 
 
+def _effect_status_meta(status: EffectStatus | None) -> str | None:
+    """Serialize a tool effect status to the ``conversations.meta`` JSON
+    envelope. Role-exclusive with ``source_meta`` (which rides SYSTEM turns),
+    so a tool row's meta column holds only ``{"effect_status": ...}``; the
+    decode + role routing lives in ``reconstruct_turns``. ``None`` → no meta."""
+    return json.dumps({"effect_status": status.value}) if status is not None else None
+
+
 # ---------------------------------------------------------------------------
 # ChatSession — the core engine
 # ---------------------------------------------------------------------------
@@ -1138,6 +1147,10 @@ class ChatSession:
         self._repeat_detector = RepeatDetector()
         # Tool error tracking: call_id → is_error for message persistence
         self._tool_error_flags: dict[str, bool] = {}
+        # Typed effect disposition: call_id → EffectStatus, set by the producer
+        # (only for non-ordinary outcomes — e.g. UNKNOWN on a timeout/cancel)
+        # and popped at the fold; same lifecycle as ``_tool_error_flags``.
+        self._tool_status: dict[str, EffectStatus] = {}
         # Cooperative cancellation: set from outside to stop generation
         self._cancel_event = threading.Event()
         self._cancel_ref: _CancelRef = _CancelRef(self)  # provider appends SDK stream here
@@ -2345,10 +2358,18 @@ class ChatSession:
         output: str,
         *,
         is_error: bool = False,
+        status: EffectStatus | None = None,
     ) -> None:
-        """Notify the UI and record error flag for message persistence."""
+        """Notify the UI and record error flag for message persistence.
+
+        ``status`` is the typed effect disposition (HYPOTHESIS.md effect-record
+        appendix), set only for non-ordinary outcomes — UNKNOWN on a timeout or
+        mid-flight cancel — and folded onto the persisted tool turn. ``None``
+        leaves the turn unclassified (the ordinary case)."""
         if is_error:
             self._tool_error_flags[call_id] = True
+        if status is not None:
+            self._tool_status[call_id] = status
         self.ui.on_tool_result(call_id, name, output, is_error=is_error)
 
     def _ui_event_id(self) -> int | None:
@@ -4484,6 +4505,9 @@ class ChatSession:
                     tool_is_error = self._tool_error_flags.pop(tc_id, False)
                     if tool_is_error:
                         tool_msg["is_error"] = True
+                    tool_status = self._tool_status.pop(tc_id, None)
+                    if tool_status is not None:
+                        tool_msg["_effect_status"] = tool_status.value
                     self.messages.append(turn_from_dict(tool_msg))
 
                     # Token estimation — image content uses a fixed heuristic
@@ -4525,6 +4549,7 @@ class ChatSession:
                         tool_call_id=tc_id,
                         event_id=self._ui_event_id(),
                         is_error=tool_is_error,
+                        meta=_effect_status_meta(tool_status),
                     )
                     if tool_image_atts and tool_message_id:
                         self._persist_attachment_refs(
@@ -4696,7 +4721,9 @@ class ChatSession:
             tc_id = tc.id
             func_name = tc.name
             if tc_id and tc_id not in answered_ids:
-                self.messages.append(Turn.tool(tc_id, detail, is_error=True))
+                self.messages.append(
+                    Turn.tool(tc_id, detail, is_error=True, effect_status=EffectStatus.UNKNOWN)
+                )
                 self._msg_tokens.append(1)
                 save_message(
                     self._ws_id,
@@ -4706,6 +4733,7 @@ class ChatSession:
                     tool_call_id=tc_id,
                     event_id=self._ui_event_id(),
                     is_error=True,
+                    meta=_effect_status_meta(EffectStatus.UNKNOWN),
                 )
                 # Emit synthetic tool_result so live SSE listeners can
                 # complete the in-DOM tool batch — without this the
@@ -10876,6 +10904,7 @@ class ChatSession:
 
         assert self._mcp_client is not None
         mcp_error = False
+        mcp_status: EffectStatus | None = None
         try:
             output = self._mcp_client.call_tool_sync(
                 func_name,
@@ -10892,6 +10921,7 @@ class ChatSession:
             # with nothing to reconcile.
             output = f"MCP tool timed out after {self.tool_timeout}s. {TIMEOUT_OUTCOME_CLAUSE}"
             mcp_error = True
+            mcp_status = EffectStatus.UNKNOWN
             self.ui.on_error(output)
         except Exception as e:
             output = _format_mcp_dispatch_error("MCP tool error", e)
@@ -10899,7 +10929,7 @@ class ChatSession:
             self.ui.on_error(output)
 
         output = self._truncate_output(output)
-        self._report_tool_result(call_id, func_name, output, is_error=mcp_error)
+        self._report_tool_result(call_id, func_name, output, is_error=mcp_error, status=mcp_status)
         return call_id, output
 
     @staticmethod
@@ -11197,7 +11227,9 @@ class ChatSession:
                 )
                 if partial:
                     msg += "\n\nPartial output before cancel:\n" + self._truncate_output(partial)
-                self._report_tool_result(call_id, "bash", msg, is_error=True)
+                self._report_tool_result(
+                    call_id, "bash", msg, is_error=True, status=EffectStatus.UNKNOWN
+                )
                 return call_id, msg
 
             output = "".join(stdout_parts)
@@ -11232,7 +11264,9 @@ class ChatSession:
             partial = "".join(stdout_parts).strip()
             if partial:
                 msg += "\n\nPartial output before timeout:\n" + self._truncate_output(partial)
-            self._report_tool_result(call_id, "bash", msg, is_error=True)
+            self._report_tool_result(
+                call_id, "bash", msg, is_error=True, status=EffectStatus.UNKNOWN
+            )
             return call_id, msg
         except Exception as e:
             msg = f"Error executing command: {e}"
@@ -11907,6 +11941,7 @@ class ChatSession:
             # See the cancellation appendix in HYPOTHESIS.md ("ρ may
             # fabricate the acknowledgment but must not fabricate the
             # outcome … unknown, never none").
+            self._tool_status[call_id] = self._cancelled_agent_status(agent_messages)
             return call_id, self._cancelled_agent_disposition(agent_messages, "task")
         except KeyboardInterrupt:
             # CLI Ctrl-C: keep the terse string and let the outer loop own
@@ -11915,6 +11950,48 @@ class ChatSession:
         except Exception as e:
             self.ui.on_info(f"[task error] {e}")
             return call_id, f"Task error: {e}"
+
+    @staticmethod
+    def _cancel_ledger(
+        agent_messages: list[dict[str, Any]],
+    ) -> tuple[list[tuple[str, bool]], int | None]:
+        """Read a cancelled sub-agent's ledger: every issued tool call as
+        ``(name, was_answered)`` in order, plus the index of the first in-flight
+        gap (the first issued call with no result), or ``None`` if every call
+        returned.
+
+        ``_run_agent`` runs a turn's tool_calls sequentially (cancel raises at
+        the per-tool checkpoint, or mid-tool for a SIGKILL'd bash), so the first
+        gap is the call that was executing when cancel landed: everything before
+        it returned, everything after never started. (The LAST gap would invert
+        unknown/none on a multi-call turn.) Shared by the disposition string and
+        its typed status so the two can't disagree.
+        """
+        answered: set[str] = set()
+        for m in agent_messages:
+            if m.get("role") == "tool" and m.get("tool_call_id"):
+                answered.add(str(m["tool_call_id"]))
+        issued: list[tuple[str, bool]] = []
+        for m in agent_messages:
+            if m.get("role") != "assistant":
+                continue
+            for tc in m.get("tool_calls") or []:
+                name = ((tc.get("function") or {}).get("name") or "tool").strip()
+                issued.append((name, str(tc.get("id") or "") in answered))
+        first_gap = next((i for i, (_n, ans) in enumerate(issued) if not ans), None)
+        return issued, first_gap
+
+    def _cancelled_agent_status(self, agent_messages: list[dict[str, Any]]) -> EffectStatus:
+        """Typed twin of :meth:`_cancelled_agent_disposition`: ``none`` if the
+        agent never acted, ``unknown`` if a tool was in flight when cancel
+        landed (its effect unobserved), else ``partial`` — every issued call
+        returned, but the agent was stopped before finishing."""
+        issued, first_gap = self._cancel_ledger(agent_messages)
+        if not issued:
+            return EffectStatus.NONE
+        if first_gap is not None:
+            return EffectStatus.UNKNOWN
+        return EffectStatus.PARTIAL
 
     def _cancelled_agent_disposition(self, agent_messages: list[dict[str, Any]], label: str) -> str:
         """Build an honest, deterministic disposition for a cancelled sub-agent.
@@ -11936,18 +12013,7 @@ class ChatSession:
         closed.  The owner (parent / coordinator) reads this to decide what,
         if anything, to compensate.
         """
-        answered: set[str] = set()
-        for m in agent_messages:
-            if m.get("role") == "tool" and m.get("tool_call_id"):
-                answered.add(str(m["tool_call_id"]))
-        # Ordered (name, was-answered) for every tool_call the agent issued.
-        issued: list[tuple[str, bool]] = []
-        for m in agent_messages:
-            if m.get("role") != "assistant":
-                continue
-            for tc in m.get("tool_calls") or []:
-                name = ((tc.get("function") or {}).get("name") or "tool").strip()
-                issued.append((name, str(tc.get("id") or "") in answered))
+        issued, first_gap = self._cancel_ledger(agent_messages)
         if not issued:
             return f"({label} cancelled by user before any action — no side effects)"
 
@@ -11957,15 +12023,6 @@ class ChatSession:
                 counts[n] = counts.get(n, 0) + 1
             return ", ".join(f"{n}×{c}" if c > 1 else n for n, c in counts.items())
 
-        # The in-flight action is the FIRST issued call without a result.
-        # ``_run_agent`` runs a turn's tool_calls sequentially (cancel raises at
-        # the per-tool checkpoint, or mid-tool for a SIGKILL'd bash), so the
-        # first gap is the call that was executing when cancel landed:
-        # everything before it returned, everything after never started.
-        # (Taking the LAST issued call would invert unknown/none on a
-        # multi-call turn — labelling the never-run tail UNKNOWN and the
-        # actually-in-flight call "not started".)
-        first_gap = next((i for i, (_n, ans) in enumerate(issued) if not ans), None)
         parts = [f"({label} cancelled by user before completion)"]
         if first_gap is None:
             # Every issued call returned a result — cancel landed between

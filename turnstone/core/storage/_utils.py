@@ -903,9 +903,17 @@ def reconstruct_turns(
         event_id = int(row[8]) if len(row) > 8 and row[8] is not None else None
         is_error = bool(row[9]) if len(row) > 9 else False
         meta = TurnMeta(event_id=event_id)
-        source_meta = _source_meta_from_json(row[10]) if len(row) > 10 else None
-        if source_meta is not None:
-            meta.extra["source_meta"] = source_meta
+        raw_meta = _source_meta_from_json(row[10]) if len(row) > 10 else None
+        if raw_meta is not None:
+            # The ``meta`` column is role-exclusive: a TOOL row carries the
+            # typed ``{"effect_status": ...}`` envelope; a SYSTEM row carries
+            # operator-context ``source_meta``. Route so a tool's disposition
+            # doesn't land under source_meta (and vice versa). Legacy SYSTEM
+            # rows (bare source_meta dict, no effect_status key) fall through.
+            if role == "tool" and "effect_status" in raw_meta:
+                meta.extra["effect_status"] = raw_meta["effect_status"]
+            else:
+                meta.extra["source_meta"] = raw_meta
         src = str(source) if source else None
 
         if role == "user":

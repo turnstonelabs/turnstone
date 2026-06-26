@@ -1,6 +1,7 @@
 """Tests for generation cancellation (cooperative cancel via threading.Event)."""
 
 import contextlib
+import json
 import threading
 import time
 from dataclasses import dataclass, field
@@ -8,8 +9,13 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from turnstone.core.session import ChatSession, GenerationCancelled, _CancelRef
-from turnstone.core.trajectory import dicts_from_turns, turn_from_dict
+from turnstone.core.session import (
+    ChatSession,
+    GenerationCancelled,
+    _CancelRef,
+    _effect_status_meta,
+)
+from turnstone.core.trajectory import EffectStatus, Role, dicts_from_turns, turn_from_dict
 
 
 class NullUI:
@@ -898,6 +904,9 @@ class TestSynthesizeCancelledResults:
         # (preserves the prior contract).
         tool_msgs = [m for m in dicts_from_turns(session.messages) if m.get("role") == "tool"]
         assert len(tool_msgs) == 2
+        # Typed twin of the prose (Thread A): each synthesized turn is UNKNOWN.
+        tool_turns = [m for m in session.messages if m.role is Role.TOOL]
+        assert tool_turns and all(t.effect_status is EffectStatus.UNKNOWN for t in tool_turns)
 
     def test_skips_calls_already_answered(self, tmp_db):
         ui = self._ui_with_tool_result_tracking()
@@ -976,6 +985,8 @@ class TestTimeoutDisposition:
         assert call_id == "c1"
         assert "timed out" in result.lower()
         assert "UNKNOWN" in result
+        # Typed twin of the prose (Thread A): the producer records UNKNOWN.
+        assert session._tool_status.get("c1") is EffectStatus.UNKNOWN
 
     def test_mcp_tool_timeout_reads_unknown(self):
         """An MCP tool is an opaque action — the server may have run it to
@@ -989,10 +1000,12 @@ class TestTimeoutDisposition:
         assert call_id == "c1"
         assert "timed out" in result.lower()
         assert "UNKNOWN" in result
+        assert session._tool_status.get("c1") is EffectStatus.UNKNOWN
 
     def test_mcp_resource_read_timeout_stays_plain(self):
         """A resource read is an idempotent read with nothing to reconcile, so
-        its timeout stays a plain failure — no UNKNOWN/reconcile advice."""
+        its timeout stays a plain failure — no UNKNOWN/reconcile advice and no
+        typed status."""
         session = _make_session()
         session._mcp_client = MagicMock()
         session._mcp_client.read_resource_sync.side_effect = TimeoutError()
@@ -1002,6 +1015,7 @@ class TestTimeoutDisposition:
         assert call_id == "c1"
         assert "timed out" in result.lower()
         assert "UNKNOWN" not in result
+        assert session._tool_status.get("c1") is None
 
 
 class TestCancelledAgentDisposition:
@@ -1023,6 +1037,24 @@ class TestCancelledAgentDisposition:
     @staticmethod
     def _result(call_id, text="ok"):
         return {"role": "tool", "tool_call_id": call_id, "content": text}
+
+    def test_status_none_when_no_actions(self):
+        """Typed twin of the disposition: a task cancelled before any action is
+        NONE, not UNKNOWN — the complement of the in-flight case."""
+        session = _make_session()
+        assert session._cancelled_agent_status([]) is EffectStatus.NONE
+
+    def test_status_unknown_when_in_flight(self):
+        session = _make_session()
+        msgs = [self._assistant("t1", "bash")]  # issued, no result → in flight
+        assert session._cancelled_agent_status(msgs) is EffectStatus.UNKNOWN
+
+    def test_status_partial_when_all_answered(self):
+        """Every issued call returned but the agent was stopped before finishing
+        — effects are known (not UNKNOWN) yet the task is incomplete: PARTIAL."""
+        session = _make_session()
+        msgs = [self._assistant("t1", "bash"), self._result("t1")]
+        assert session._cancelled_agent_status(msgs) is EffectStatus.PARTIAL
 
     def test_no_actions_reports_no_side_effects(self, tmp_db):
         session = _make_session()
@@ -1140,3 +1172,58 @@ class TestCancelledAgentDisposition:
         assert "UNKNOWN" in result
         assert "web_fetch" in result  # in-flight boundary
         assert "bash" in result  # completed
+        # Thread A: the task call's typed status is UNKNOWN (web_fetch in flight).
+        assert session._tool_status.get("c1") is EffectStatus.UNKNOWN
+
+
+class TestEffectStatusPersistence:
+    """Typed effect status rides the role-exclusive ``meta`` column and
+    round-trips through ``reconstruct_turns`` without disturbing the SYSTEM
+    ``source_meta`` that shares the column (no migration; HYPOTHESIS.md
+    effect-record appendix — the ledger persists for audit)."""
+
+    def test_effect_status_meta_envelope(self):
+        assert _effect_status_meta(None) is None
+        assert json.loads(_effect_status_meta(EffectStatus.UNKNOWN)) == {"effect_status": "unknown"}
+
+    def test_reconstruct_routes_tool_effect_status(self):
+        from turnstone.core.storage._utils import reconstruct_turns
+
+        # row: (id, role, content, tool_name, tc_id, provider_data,
+        #       tool_calls, source, event_id, is_error, meta)
+        tool_row = (
+            1,
+            "tool",
+            "timed out. Outcome UNKNOWN ...",
+            None,
+            "call_a",
+            None,
+            None,
+            None,
+            None,
+            True,
+            json.dumps({"effect_status": "unknown"}),
+        )
+        turns = reconstruct_turns([tool_row], "ws1")
+        assert turns[0].effect_status is EffectStatus.UNKNOWN
+        assert turns[0].is_error is True
+
+    def test_reconstruct_leaves_system_source_meta_untouched(self):
+        from turnstone.core.storage._utils import reconstruct_turns
+
+        sys_row = (
+            2,
+            "system",
+            "watch fired",
+            None,
+            None,
+            None,
+            None,
+            "watch_triggered",
+            None,
+            False,
+            json.dumps({"watch_name": "x"}),
+        )
+        turns = reconstruct_turns([sys_row], "ws1")
+        assert turns[0].meta.extra.get("source_meta") == {"watch_name": "x"}
+        assert turns[0].effect_status is None
