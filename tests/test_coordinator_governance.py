@@ -1,10 +1,10 @@
 """Tests for the coordinator governance endpoints and session hooks.
 
-Covers the three console endpoints that let an operator steer a live
-coordinator session mid-flight (``/trust``, ``/restrict``,
-``/stop_cascade``), the two ``ChatSession`` methods the endpoints
-toggle (``set_trust_send`` / ``revoke_tools``), the audit rows the
-handlers emit, and the ``_prepare_tool`` revocation gate.
+Covers the console endpoints that let an operator steer a live
+coordinator session mid-flight (``/trust``, ``/restrict``), the two
+``ChatSession`` methods the endpoints toggle (``set_trust_send`` /
+``revoke_tools``), the audit rows the handlers emit, and the
+``_prepare_tool`` revocation gate.
 """
 
 from __future__ import annotations
@@ -29,7 +29,6 @@ from tests._coord_test_helpers import (
 )
 from turnstone.console.server import (
     coordinator_restrict,
-    coordinator_stop_cascade,
     coordinator_trust,
 )
 from turnstone.core.auth import AuthResult
@@ -42,7 +41,7 @@ def storage(tmp_path):
 
 
 def _make_client(storage, *, coord_mgr, alias="my-model", registry=None) -> TestClient:
-    """Starlette app exposing only the three governance endpoints."""
+    """Starlette app exposing only the governance endpoints."""
     app = Starlette(
         routes=[
             Route(
@@ -53,11 +52,6 @@ def _make_client(storage, *, coord_mgr, alias="my-model", registry=None) -> Test
             Route(
                 "/v1/api/workstreams/{ws_id}/restrict",
                 coordinator_restrict,
-                methods=["POST"],
-            ),
-            Route(
-                "/v1/api/workstreams/{ws_id}/stop_cascade",
-                coordinator_stop_cascade,
                 methods=["POST"],
             ),
         ],
@@ -161,9 +155,9 @@ def _service_token_client(
     """Build a TestClient whose middleware injects a service-scoped token.
 
     Used to verify that the capability-escalating endpoints (``/trust``,
-    ``/restrict``, ``/stop_cascade``) do NOT honor the normal
-    ``require_permission`` service-scope bypass when the caller lacks
-    the specific grant they need.
+    ``/restrict``) do NOT honor the normal ``require_permission``
+    service-scope bypass when the caller lacks the specific grant they
+    need.
     """
     app = Starlette(
         routes=[
@@ -175,11 +169,6 @@ def _service_token_client(
             Route(
                 "/v1/api/workstreams/{ws_id}/restrict",
                 coordinator_restrict,
-                methods=["POST"],
-            ),
-            Route(
-                "/v1/api/workstreams/{ws_id}/stop_cascade",
-                coordinator_stop_cascade,
                 methods=["POST"],
             ),
         ],
@@ -271,25 +260,6 @@ def test_restrict_service_token_cannot_bypass_admin_coordinator(storage):
     resp = client.post(
         f"/v1/api/workstreams/{coord.id}/restrict",
         json={"revoke": ["bash"]},
-    )
-    assert resp.status_code == 403
-
-
-def test_stop_cascade_service_token_cannot_bypass_admin_coordinator(storage):
-    """/stop_cascade mirrors /restrict — same destructive treatment."""
-    mgr = _build_mgr(storage)
-    coord = mgr.create(user_id="svc-user", name="coord-a")
-    coord.session, _ = _make_session_mock()
-
-    client = _service_token_client(
-        storage,
-        mgr,
-        user_id="svc-user",
-        permissions=frozenset(),
-    )
-    resp = client.post(
-        f"/v1/api/workstreams/{coord.id}/stop_cascade",
-        json={},
     )
     assert resp.status_code == 403
 
@@ -633,137 +603,8 @@ def test_prepare_tool_allows_non_revoked_tool():
 
 
 # ---------------------------------------------------------------------------
-# /stop_cascade endpoint (item 5b)
+# children_snapshot (used by the cancel cascade + close_all_children)
 # ---------------------------------------------------------------------------
-
-
-def test_stop_cascade_cancels_coord_and_each_child(storage):
-    mgr = _build_mgr(storage)
-    coord = mgr.create(user_id="user-1", name="coord-a")
-    _seed_children(mgr._adapter, coord.id, ["child-1", "child-2", "child-3"])
-
-    def _cancel(wid: str) -> dict:
-        if wid == "child-2":
-            return {"error": "gateway_timeout", "status": 502}
-        return {"status": "ok"}
-
-    coord_client = MagicMock()
-    coord_client.cancel.side_effect = _cancel
-    coord.session = MagicMock()
-    coord.session._coord_client = coord_client
-
-    client = _make_client(storage, coord_mgr=mgr, registry=_fake_registry())
-    resp = client.post(
-        f"/v1/api/workstreams/{coord.id}/stop_cascade",
-        json={},
-        headers=_COORD_HEADERS,
-    )
-    assert resp.status_code == 200
-    body = resp.json()
-    assert set(body["cancelled"] + body["failed"] + body["skipped"]) == {
-        "child-1",
-        "child-2",
-        "child-3",
-    }
-    assert body["failed"] == ["child-2"]
-    assert set(body["cancelled"]) == {"child-1", "child-3"}
-    assert body["skipped"] == []
-    assert coord_client.cancel.call_count == 3
-
-    events = [
-        e for e in storage.list_audit_events() if e["action"] == "coordinator.stopped_cascade"
-    ]
-    assert len(events) == 1
-    detail = json.loads(events[0]["detail"])
-    assert set(detail["cancelled"] + detail["failed"] + detail["skipped"]) == {
-        "child-1",
-        "child-2",
-        "child-3",
-    }
-
-
-def test_stop_cascade_routes_404_to_skipped_bucket(storage):
-    """A stale registry entry (child row already deleted from storage)
-    or an upstream-404 on cancel is semantically 'already gone', not a
-    dispatch failure.  Report it in ``skipped`` so operators can tell
-    them apart."""
-    mgr = _build_mgr(storage)
-    coord = mgr.create(user_id="user-1", name="coord-a")
-    _seed_children(mgr._adapter, coord.id, ["stale-child"])
-
-    coord_client = MagicMock()
-    coord_client.cancel.return_value = {
-        "error": "workstream not in coordinator subtree: stale-child",
-        "status": 404,
-    }
-    coord.session = MagicMock()
-    coord.session._coord_client = coord_client
-
-    client = _make_client(storage, coord_mgr=mgr, registry=_fake_registry())
-    resp = client.post(
-        f"/v1/api/workstreams/{coord.id}/stop_cascade",
-        json={},
-        headers=_COORD_HEADERS,
-    )
-    assert resp.status_code == 200
-    body = resp.json()
-    assert body["cancelled"] == []
-    assert body["failed"] == []
-    assert body["skipped"] == ["stale-child"]
-
-
-def test_stop_cascade_empty_children_still_audits(storage):
-    mgr = _build_mgr(storage)
-    coord = mgr.create(user_id="user-1", name="coord-a")
-    coord.session = MagicMock()
-    coord.session._coord_client = MagicMock()
-
-    client = _make_client(storage, coord_mgr=mgr, registry=_fake_registry())
-    resp = client.post(
-        f"/v1/api/workstreams/{coord.id}/stop_cascade",
-        json={},
-        headers=_COORD_HEADERS,
-    )
-    assert resp.status_code == 200
-    body = resp.json()
-    assert body == {"status": "ok", "cancelled": [], "failed": [], "skipped": []}
-    assert [e for e in storage.list_audit_events() if e["action"] == "coordinator.stopped_cascade"]
-
-
-def test_stop_cascade_without_coord_client_marks_all_failed(storage):
-    """If the coord session has no attached coord_client (unexpected
-    state for a loaded session), every child routes to ``failed`` so
-    the operator can investigate."""
-    mgr = _build_mgr(storage)
-    coord = mgr.create(user_id="user-1", name="coord-a")
-    _seed_children(mgr._adapter, coord.id, ["child-a", "child-b"])
-    coord.session = MagicMock()
-    coord.session._coord_client = None
-
-    client = _make_client(storage, coord_mgr=mgr, registry=_fake_registry())
-    resp = client.post(
-        f"/v1/api/workstreams/{coord.id}/stop_cascade",
-        json={},
-        headers=_COORD_HEADERS,
-    )
-    assert resp.status_code == 200
-    body = resp.json()
-    assert body["cancelled"] == []
-    assert body["skipped"] == []
-    assert set(body["failed"]) == {"child-a", "child-b"}
-
-
-def test_stop_cascade_404_when_session_not_loaded(storage):
-    mgr = _build_mgr(storage)
-    coord = mgr.create(user_id="user-1", name="coord-a")
-    coord.session = None
-    client = _make_client(storage, coord_mgr=mgr, registry=_fake_registry())
-    resp = client.post(
-        f"/v1/api/workstreams/{coord.id}/stop_cascade",
-        json={},
-        headers=_COORD_HEADERS,
-    )
-    assert resp.status_code == 404
 
 
 def test_children_snapshot_returns_copy_not_live_set(storage):

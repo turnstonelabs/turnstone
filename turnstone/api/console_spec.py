@@ -35,7 +35,6 @@ from turnstone.api.console_schemas import (
     CoordinatorRestrictResponse,
     CoordinatorSendRequest,
     CoordinatorSendResponse,
-    CoordinatorStopCascadeResponse,
     CoordinatorTaskInfo,
     CoordinatorTasksResponse,
     CoordinatorTrustRequest,
@@ -1505,34 +1504,16 @@ CONSOLE_ENDPOINTS: list[EndpointSpec] = [
         tags=["Coordinator"],
     ),
     EndpointSpec(
-        "/v1/api/workstreams/{ws_id}/stop_cascade",
-        "POST",
-        "Cancel the coordinator and every direct child",
-        description=(
-            "Cancels the coordinator's in-flight generation AND dispatches "
-            "``cancel_workstream`` through the routing proxy for every "
-            "direct child in the in-memory registry.  Grandchildren are "
-            "not touched directly — they sit behind their parent's cancel, "
-            "which propagates via the child's SSE stream.  Returns the "
-            "per-child disposition (``cancelled`` / ``failed``) so the UI "
-            "can show which children responded.  Writes "
-            "``coordinator.stopped_cascade`` with the two lists."
-        ),
-        response_model=CoordinatorStopCascadeResponse,
-        error_codes=[400, 403, 404, 503],
-        tags=["Coordinator"],
-    ),
-    EndpointSpec(
         "/v1/api/workstreams/{ws_id}/close_all_children",
         "POST",
         "Soft-close every direct child of the coordinator",
         description=(
             "Reads the in-memory child registry and dispatches "
             "``close_workstream`` via the routing proxy for every direct "
-            "child under a bounded (16-concurrency) semaphore.  Unlike "
-            "``stop_cascade`` this does not touch grandchildren — the "
-            "model-facing tool asks for a bounded teardown of its own "
-            "fan-out.  Returns ``{closed, failed, skipped}`` where "
+            "child under a bounded (16-concurrency) semaphore.  Soft-close "
+            "only — it does not touch grandchildren (the model-facing tool "
+            "asks for a bounded teardown of its own direct fan-out).  "
+            "Returns ``{closed, failed, skipped}`` where "
             "``skipped`` distinguishes already-gone (404) from dispatch-"
             "broken (``failed``).  The optional ``reason`` propagates to "
             "every closed child's audit + workstream_config.  Writes "
@@ -1618,7 +1599,6 @@ _ALL_MODELS: list[type[BaseModel]] = [
     CoordinatorRestrictResponse,
     CoordinatorSendRequest,
     CoordinatorSendResponse,
-    CoordinatorStopCascadeResponse,
     CoordinatorTaskInfo,
     CoordinatorTasksResponse,
     CoordinatorTrustRequest,

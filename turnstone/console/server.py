@@ -3115,7 +3115,7 @@ def _require_admin_coordinator(
 ) -> JSONResponse | None:
     """Gate a coordinator endpoint on the ``admin.coordinator`` permission.
 
-    Destructive endpoints (/restrict, /stop_cascade) pass
+    Destructive endpoints (/restrict, /close_all_children) pass
     ``allow_service_bypass=False`` so a service-scoped caller whose
     ``user_id`` matches the coord owner still needs an explicit grant.
     """
@@ -3869,8 +3869,8 @@ async def coordinator_metrics(request: Request) -> JSONResponse:
 
 _RESTRICT_MAX_TOOLS = 256
 _RESTRICT_MAX_TOOL_NAME_LEN = 128
-# Bounded concurrency on bulk coordinator fan-out (stop_cascade,
-# close_all_children).  Upstream coord_client calls have a 30s timeout;
+# Bounded concurrency on bulk coordinator fan-out (close_all_children,
+# coordinator-cancel cascade).  Upstream coord_client calls have a 30s timeout;
 # a 100-child cascade at this cap finishes in ~200s worst case,
 # comfortably inside typical 300s proxy limits.
 _COORD_FANOUT_MAX_CONCURRENCY = 16
@@ -3926,8 +3926,8 @@ async def _fanout_on_children(
                 # silently no-op'd on placeholders; this keeps cascade
                 # behaviour parity with the pre-lift outcome.
                 # NOTE: this branch is reachable from the cancel-cascade
-                # caller (``stop_cascade``) but unreachable from the
-                # close-cascade caller (``close_all_children``); the
+                # caller (``_cascade_cancel_to_children``) but unreachable
+                # from the close-cascade caller (``close_all_children``); the
                 # close handler at ``session_routes.py:852-854`` 404s
                 # for both missing and already-closed-evicted rows and
                 # never emits a 400 "No session". Kept as shared code
@@ -4132,51 +4132,45 @@ async def coordinator_restrict(request: Request) -> JSONResponse:
     return JSONResponse({"status": "ok", "revoked_tools": sorted(after)})
 
 
-async def coordinator_stop_cascade(request: Request) -> JSONResponse:
-    """POST /v1/api/workstreams/{ws_id}/stop_cascade — cancel the subtree."""
-    resolved = await _resolve_coord_session(request, allow_service_bypass=False)
-    if isinstance(resolved, JSONResponse):
-        return resolved
-    session, storage, user_id, ws_id = resolved
+async def _cascade_cancel_to_children(request: Request, ws_id: str, ws: Any) -> None:
+    """Fan a coordinator's cancel out to its direct children.
 
-    coord_mgr, err503 = _require_coord_mgr(request)
-    if err503 is not None:
-        return err503  # pragma: no cover — _resolve_coord_session already gated this
+    Wired into the coordinator cancel handler via ``post_cancel`` so that
+    cancelling a coordinator propagates down its spawned subtree — the
+    cancellation appendix's "cancel flows down the subtree."  The
+    coordinator's own session is already cancelled by ``make_cancel_handler``
+    before this runs; here we only dispatch the per-child cancels via the
+    same ``children_snapshot`` + ``_fanout_on_children`` path the
+    ``close_all_children`` bulk verb uses.
+
+    Trigger, not drain: each child cancel is itself cooperative and
+    fire-and-forget (it sets the child's cancel flag and returns).  We do
+    not block on the subtree reaching a terminal state — that barrier is
+    deferred.  Children are one level deep today (a coordinator spawns only
+    interactive leaves), so the direct-child fan-out is the whole subtree.
+    """
     coord_adapter = getattr(request.app.state, "coord_adapter", None)
-
-    child_ids = list(coord_adapter.children_snapshot(ws_id)) if coord_adapter is not None else []
-    coord_mgr.cancel(ws_id)
-
-    coord_client: Any = getattr(session, "_coord_client", None)
-    # ``action`` is only called when coord_client is live — the helper
-    # short-circuits on None before invoking it.
-    cancelled, failed, skipped = await _fanout_on_children(
+    if coord_adapter is None:
+        return
+    child_ids = list(coord_adapter.children_snapshot(ws_id))
+    if not child_ids:
+        return
+    session = getattr(ws, "session", None)
+    coord_client: Any = getattr(session, "_coord_client", None) if session is not None else None
+    if coord_client is None:
+        return
+    ok, failed, skipped = await _fanout_on_children(
         child_ids,
         coord_client,
         lambda cid: coord_client.cancel(cid),
-        log_tag="coordinator_stop_cascade",
+        log_tag="coordinator_cancel_cascade",
     )
-
-    await _emit_coord_audit(
-        storage,
-        user_id,
-        "coordinator.stopped_cascade",
-        ws_id,
-        {
-            "src": "coordinator",
-            "cancelled": cancelled,
-            "failed": failed,
-            "skipped": skipped,
-        },
-        request.client.host if request.client else "",
-    )
-    return JSONResponse(
-        {
-            "status": "ok",
-            "cancelled": cancelled,
-            "failed": failed,
-            "skipped": skipped,
-        }
+    log.info(
+        "coordinator.cancel_cascaded ws=%s cancelled=%d failed=%d skipped=%d",
+        ws_id[:8],
+        len(ok),
+        len(failed),
+        len(skipped),
     )
 
 
@@ -4186,12 +4180,10 @@ _CLOSE_ALL_CHILDREN_MAX_REASON_LEN = 512
 async def coordinator_close_all_children(request: Request) -> JSONResponse:
     """POST /v1/api/workstreams/{ws_id}/close_all_children — soft-close the direct children.
 
-    Near-twin of ``coordinator_stop_cascade`` — both fan out over
-    ``children_snapshot`` via ``_fanout_on_children``.  Returns
-    ``{closed, failed, skipped}``.  Unlike ``stop_cascade``, this does
-    NOT recurse into grandchildren (the coordinator's model tool asks
-    for a bounded teardown of its own fan-out; operator-level cascade
-    stays behind ``stop_cascade``).
+    Fans out over ``children_snapshot`` via ``_fanout_on_children`` and
+    returns ``{closed, failed, skipped}``.  Soft-close only: this does NOT
+    recurse into grandchildren (the coordinator's model tool asks for a
+    bounded teardown of its own direct fan-out).
     """
     resolved = await _resolve_coord_session(request, allow_service_bypass=False)
     if isinstance(resolved, JSONResponse):
@@ -4953,8 +4945,8 @@ async def _lifespan(app: Starlette) -> AsyncGenerator[None, None]:
     app.state.dashboard_cache = _NodeDashboardCache()
     # Dedicated small executor for governance audit writes.  Without
     # this, audit dispatches share the default thread pool with
-    # ``coord_client.cancel`` calls from ``stop_cascade`` and any
-    # other ``asyncio.to_thread`` caller — a burst on one path can
+    # ``coord_client.cancel`` calls from the coordinator-cancel cascade
+    # and any other ``asyncio.to_thread`` caller — a burst on one path can
     # starve the other.  4 workers is ample headroom for
     # admin-driven audit traffic.
     audit_exec = ThreadPoolExecutor(max_workers=4, thread_name_prefix="coord-audit")
@@ -13030,6 +13022,10 @@ def create_app(
             cancel=make_cancel_handler(  # lifted: shared body
                 coord_endpoint_config,
                 audit_emit=_audit_cancel_coordinator,
+                # Auto-propagate: cancelling a coordinator fans the cancel
+                # out to its spawned children (see
+                # ``_cascade_cancel_to_children``).
+                post_cancel=_cascade_cancel_to_children,
             ),
             rewind=make_rewind_handler(  # lifted: shared body (#549)
                 coord_endpoint_config,
@@ -13059,7 +13055,6 @@ def create_app(
             metrics=coordinator_metrics,
             trust=coordinator_trust,
             restrict=coordinator_restrict,
-            stop_cascade=coordinator_stop_cascade,
             close_all_children=coordinator_close_all_children,
         ),
     )

@@ -18,7 +18,7 @@ schema changes.
 > auth and the `admin.coordinator` permission.  A session-scoped JWT
 > is minted per login (see [docs/oidc.md](oidc.md) / [docs/security.md](security.md));
 > a service token may call the read paths but destructive governance
-> paths (`/restrict`, `/stop_cascade`, `/close_all_children`) require
+> paths (`/restrict`, `/close_all_children`) require
 > the explicit `admin.coordinator` grant — a service-token owner
 > match isn't enough.
 
@@ -44,7 +44,6 @@ schema changes.
 | 6 | Wait for fan-out             | model-side tool `wait_for_workstream`                       |
 | 7 | Govern                       | `POST /v1/api/workstreams/{ws_id}/trust`                    |
 |   |                              | `POST /v1/api/workstreams/{ws_id}/restrict`                 |
-|   |                              | `POST /v1/api/workstreams/{ws_id}/stop_cascade`             |
 |   |                              | `POST /v1/api/workstreams/{ws_id}/close_all_children`       |
 | 8 | Approve / cancel             | `POST /v1/api/workstreams/{ws_id}/approve`                  |
 |   |                              | `POST /v1/api/workstreams/{ws_id}/cancel`                   |
@@ -53,7 +52,7 @@ schema changes.
 Refer to `/openapi.json` (Swagger UI at `/docs`) on any
 `turnstone-console` process for the authoritative operation ids and
 schemas. Coordinator-only verbs (`/children`, `/trust`, `/restrict`,
-`/stop_cascade`, `/close_all_children`) 404 against `kind=interactive`
+`/close_all_children`) 404 against `kind=interactive`
 rows; the shared verbs (`/send`, `/approve`, `/cancel`, `/events`,
 `/history`, `/open`, `/close`, etc.) work on both kinds.
 
@@ -261,10 +260,10 @@ rounds to a 10× token-efficiency win.
 
 ---
 
-## 7. Governance — trust, restrict, stop_cascade, close_all_children
+## 7. Governance — trust, restrict, close_all_children
 
-These four endpoints let an operator steer a live coordinator session
-mid-flight.  All four emit an audit event tagged
+These three endpoints let an operator steer a live coordinator session
+mid-flight.  All three emit an audit event tagged
 `coordinator.<action>` via the dedicated audit executor so a cascade
 burst can't starve audit writes.
 
@@ -294,28 +293,6 @@ idempotent — calling twice with overlapping lists converges to the
 union.  Revocations don't survive a session close/reopen; operators
 opt in per session.  Cap 256 tool names per request, 128 chars each.
 
-### `POST /stop_cascade` — cancel the subtree
-
-```http
-POST /v1/api/workstreams/{ws_id}/stop_cascade
-{}
-```
-
-Cancels the coordinator's in-flight generation AND dispatches
-`cancel_workstream` through the routing proxy for every direct
-child in the in-memory registry.  Returns:
-
-```json
-{"status": "ok", "cancelled": ["child-1", "child-3"], "failed": [], "skipped": ["child-2"]}
-```
-
-Response uses the [cascade-mutation bulk shape](bulk-endpoints.md):
-`cancelled` = accepted, `failed` = dispatch error worth retrying,
-`skipped` = upstream 404 (already gone — stale registry entry or
-the row was deleted between snapshot and dispatch).  Grandchildren
-aren't touched directly; they sit behind their parent's cancel and
-propagate via the child's SSE stream.
-
 ### `POST /close_all_children` — soft-close the direct fan-out
 
 ```http
@@ -329,16 +306,16 @@ Response:
 {"status": "ok", "closed": ["c-1", "c-2"], "failed": [], "skipped": []}
 ```
 
-Soft-close cascade bounded by the same semaphore as `stop_cascade`.
-The `reason` (up to 512 chars) propagates into each closed child's
-audit + `workstream_config` for postmortem.  Unlike `stop_cascade`
-this does NOT recurse into grandchildren — the model-facing tool
-that pairs with this endpoint asks for a bounded teardown of the
-coordinator's own fan-out.  For a full-subtree teardown, use
-`stop_cascade`.
+Soft-close cascade bounded by a concurrency semaphore.  The `reason`
+(up to 512 chars) propagates into each closed child's audit +
+`workstream_config` for postmortem.  The model-facing tool that
+pairs with this endpoint asks for a bounded teardown of the
+coordinator's own fan-out.  This *soft-closes*; to *cancel* the
+fan-out instead, cancel the coordinator (§8) — a coordinator cancel
+auto-cascades to its direct children.
 
-See [bulk-endpoints.md](bulk-endpoints.md) for why both endpoints
-share the cascade-mutation shape and how it differs from the
+See [bulk-endpoints.md](bulk-endpoints.md) for why `close_all_children`
+uses the cascade-mutation shape and how it differs from the
 `spawn_batch` / `cluster/ws/live` shape.
 
 ---
@@ -356,7 +333,10 @@ POST /v1/api/workstreams/{ws_id}/approve
 {"approved": true, "feedback": null, "always": true}    // always-approve this tool name
 ```
 
-`cancel` drops the in-flight generation but leaves the coordinator
+`cancel` drops the coordinator's in-flight generation and, for a
+coordinator, auto-cascades the cancel to its direct children:
+`cancel_workstream` is dispatched through the routing proxy for
+every direct child in the registry.  The coordinator itself is left
 idle and open for a fresh `send`:
 
 ```http
@@ -373,9 +353,10 @@ POST /v1/api/workstreams/{ws_id}/close
 {}
 ```
 
-Soft-closes the session — state persists, children keep running (use
-`close_all_children` or `stop_cascade` first to wind them down), the
-worker thread exits, SSE streams send a final `stream_end` and
+Soft-closes the session — state persists, children keep running
+(wind them down first with `close_all_children`, or by cancelling
+the coordinator, which cascades the cancel to its direct children),
+the worker thread exits, SSE streams send a final `stream_end` and
 disconnect.  The row is reopenable via
 `POST /v1/api/workstreams/{ws_id}/open` so long as it hasn't been
 deleted.
@@ -390,7 +371,7 @@ deleted.
 - [bulk-endpoints.md](bulk-endpoints.md) — the two bulk-shape
   idioms (`{results, denied, truncated}` vs
   `{<bucket>, failed, skipped}`) used by `cluster/ws/live`,
-  `spawn_batch`, `stop_cascade`, and `close_all_children`.
+  `spawn_batch`, and `close_all_children`.
 - [architecture.md](architecture.md) — cluster-wide architecture
   including how coordinator sessions fit next to node-hosted
   interactive workstreams.

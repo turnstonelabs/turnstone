@@ -12,7 +12,6 @@ Existing bulk endpoints at time of writing:
 |---------------------------------------------------------|--------------------------|------------------------------------------|
 | `GET  /v1/api/cluster/ws/live?ids=a,b,c`                | bulk read                | `{results, denied, truncated}`           |
 | model tool `spawn_batch`                                 | bulk create (per-item)   | `{results, denied}`                      |
-| `POST /v1/api/workstreams/{ws_id}/stop_cascade`          | cascade mutation         | `{cancelled, failed, skipped}`           |
 | `POST /v1/api/workstreams/{ws_id}/close_all_children`    | cascade mutation         | `{closed, failed, skipped}`              |
 
 ---
@@ -146,7 +145,7 @@ consistently-typed across the read and create cases.
 ```
 
 Where `<bucket>` is the endpoint-specific name for "succeeded" —
-`cancelled` for `stop_cascade`, `closed` for `close_all_children`.
+`closed` for `close_all_children`.
 The three buckets partition the input set exactly once:
 
 | Bucket        | Meaning                                                                       |
@@ -161,20 +160,6 @@ be partial.  `skipped` is pre-resolved — the target is already in
 the terminal state the cascade was aiming at, so it's neither a
 win to report nor a fault to fix.
 
-### Example — `stop_cascade`
-
-```json
-{
-  "status": "ok",
-  "cancelled": ["child-1", "child-3"],
-  "failed":    [],
-  "skipped":   ["child-2"]
-}
-```
-
-A subsequent retry would target only `failed` ids, not `skipped`
-ones — the latter are already done.
-
 ### Example — `close_all_children`
 
 ```json
@@ -186,10 +171,12 @@ ones — the latter are already done.
 }
 ```
 
-Same partition, different success-bucket name.  When `coord_client`
-is unavailable (session loaded but no HTTP client attached — a
-construction bug) every id goes to `failed` so the operator notices
-rather than getting a silent all-skipped response.
+Here the success bucket is `closed`.  A subsequent retry would
+target only `failed` ids, not `skipped` ones — the latter are
+already done.  When `coord_client` is unavailable (session loaded
+but no HTTP client attached — a construction bug) every id goes to
+`failed` so the operator notices rather than getting a silent
+all-skipped response.
 
 ---
 
@@ -232,12 +219,12 @@ rather than getting a silent all-skipped response.
 
 - **Phase 6** shipped `cluster/ws/live` as the first Shape A endpoint
   (`{results, denied, truncated}`).
-- **Phase 7** shipped `stop_cascade` as the first Shape B endpoint
-  (`{cancelled, failed, skipped}`).
+- **Phase 7** introduced the Shape B cascade-mutation envelope
+  (`{<bucket>, failed, skipped}`) for the coordinator's
+  cancel-cascade path.
 - **Phase 8 PR A** shipped `spawn_batch` (Shape A, keyed by idx) and
-  `close_all_children` (Shape B, twin of `stop_cascade`), which
-  crystallised the two-shape-per-semantic-category policy codified
-  here.
+  `close_all_children` (Shape B), which crystallised the
+  two-shape-per-semantic-category policy codified here.
 
 Before adding a third shape, read this doc and argue for why the
 new surface doesn't fit either A or B.  Two idioms in the cluster

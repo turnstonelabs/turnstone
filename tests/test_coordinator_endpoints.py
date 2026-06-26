@@ -31,6 +31,7 @@ from tests._coord_test_helpers import (
     _build_mgr_with_factory,
     _fake_registry,
     _FakeConfigStore,
+    _seed_children,
 )
 from turnstone.console.coordinator_ui import ConsoleCoordinatorUI
 from turnstone.console.server import (
@@ -1683,6 +1684,89 @@ def test_cancel_idle_workstream_does_not_broadcast_approval_resolved(storage):
     while not listener.empty():
         seen_types.append(listener.get_nowait().get("type"))
     assert "approval_resolved" not in seen_types
+
+
+def test_coord_cancel_cascades_to_children(storage):
+    """Cancelling a coordinator auto-propagates the cancel down its
+    spawned subtree (HYPOTHESIS.md cancellation appendix: cancel flows
+    down the subtree).  The ``post_cancel`` hook fans ``coord_client.cancel``
+    over the direct children after the coordinator's own session is
+    cancelled."""
+    from unittest.mock import MagicMock
+
+    from starlette.applications import Starlette
+    from starlette.routing import Route
+    from starlette.testclient import TestClient
+
+    from turnstone.console.server import _cascade_cancel_to_children
+    from turnstone.core.session_routes import SessionEndpointConfig, make_cancel_handler
+
+    mgr = _build_mgr(storage)
+    coord = mgr.create(user_id="user-1", name="coord-a")
+    _seed_children(mgr._adapter, coord.id, ["child-1", "child-2"])
+
+    coord_client = MagicMock()
+    coord_client.cancel.return_value = {"status": "ok"}
+    coord.session = MagicMock()
+    coord.session._coord_client = coord_client
+
+    cfg = SessionEndpointConfig(
+        permission_gate=_require_admin_coordinator,
+        manager_lookup=lambda r: (mgr, None),
+        tenant_check=None,
+        not_found_label="coordinator not found",
+        audit_action_prefix="coordinator",
+    )
+    handler = make_cancel_handler(cfg, post_cancel=_cascade_cancel_to_children)
+    app = Starlette(routes=[Route("/v1/api/workstreams/{ws_id}/cancel", handler, methods=["POST"])])
+    app.state.coord_adapter = mgr._adapter
+    app.add_middleware(_AuthMiddleware)
+    client = TestClient(app)
+
+    resp = client.post(f"/v1/api/workstreams/{coord.id}/cancel", headers=_COORD_HEADERS)
+    assert resp.status_code == 200
+    # The coordinator's own session was cancelled (owner first)...
+    coord.session.cancel.assert_called_once()
+    # ...and every direct child received a cancel (subtree propagation).
+    cascaded = {c.args[0] for c in coord_client.cancel.call_args_list}
+    assert cascaded == {"child-1", "child-2"}
+
+
+def test_coord_cancel_cascade_failure_does_not_fail_owner_cancel(storage):
+    """A cascade error must not strand the owner half-cancelled: the
+    ``post_cancel`` exception is swallowed and the owner's cancel still
+    returns 200 (the owner's own session was already cancelled)."""
+    from unittest.mock import MagicMock
+
+    from starlette.applications import Starlette
+    from starlette.routing import Route
+    from starlette.testclient import TestClient
+
+    from turnstone.core.session_routes import SessionEndpointConfig, make_cancel_handler
+
+    mgr = _build_mgr(storage)
+    coord = mgr.create(user_id="user-1", name="coord-a")
+    coord.session = MagicMock()
+
+    async def _boom(request, ws_id, ws):  # noqa: ARG001
+        raise RuntimeError("cascade blew up")
+
+    cfg = SessionEndpointConfig(
+        permission_gate=_require_admin_coordinator,
+        manager_lookup=lambda r: (mgr, None),
+        tenant_check=None,
+        not_found_label="coordinator not found",
+        audit_action_prefix="coordinator",
+    )
+    handler = make_cancel_handler(cfg, post_cancel=_boom)
+    app = Starlette(routes=[Route("/v1/api/workstreams/{ws_id}/cancel", handler, methods=["POST"])])
+    app.add_middleware(_AuthMiddleware)
+    client = TestClient(app)
+
+    resp = client.post(f"/v1/api/workstreams/{coord.id}/cancel", headers=_COORD_HEADERS)
+    assert resp.status_code == 200
+    assert resp.json()["status"] == "ok"
+    coord.session.cancel.assert_called_once()
 
 
 # ---------------------------------------------------------------------------

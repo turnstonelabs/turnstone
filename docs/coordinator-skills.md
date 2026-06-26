@@ -351,7 +351,7 @@ persona drift without a real LLM in the loop.
   `spawn_batch` and `close_all_children` use, so your skill can
   parse results / denied arrays correctly.
 - [governance.md](governance.md) — the broader governance surface
-  (`/trust`, `/restrict`, `/stop_cascade`, role-based permissions)
+  (`/trust`, `/restrict`, role-based permissions)
   that wraps every coord session.
 - [settings.md](settings.md) — `coordinator.model_alias` and
   `coordinator.reasoning_effort` settings that gate which LLM runs

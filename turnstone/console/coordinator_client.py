@@ -818,7 +818,7 @@ class CoordinatorClient:
     def close_all_children(self, reason: str = "") -> dict[str, Any]:
         """Soft-close every direct child of this coordinator (console-side fan-out).
 
-        Returns ``{closed, failed, skipped}`` — mirrors ``stop_cascade``.
+        Returns ``{closed, failed, skipped}``.
         The console does the Semaphore-bounded gather so the model-side
         tool call stays a single HTTP round-trip regardless of fan-out
         size.  No tenant guard here: ownership is enforced on the

@@ -11,8 +11,7 @@ Action-name conventions (non-exhaustive — grep
                         ``.cancel``) plus governance sub-prefixes
                         (``coordinator.trust.toggled``,
                         ``coordinator.send.auto_approved``,
-                        ``coordinator.restricted``,
-                        ``coordinator.stopped_cascade``).
+                        ``coordinator.restricted``).
 
     route.*             multi-node routing proxy hops
                         (``route.workstream.create`` / ``.send`` /

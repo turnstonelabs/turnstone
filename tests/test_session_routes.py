@@ -188,7 +188,6 @@ def test_register_coord_verbs_mounts_seven_paths() -> None:
             metrics=_stub,
             trust=_stub,
             restrict=_stub,
-            stop_cascade=_stub,
             close_all_children=_stub,
         ),
     )
@@ -199,7 +198,6 @@ def test_register_coord_verbs_mounts_seven_paths() -> None:
         ("/api/workstreams/{ws_id}/metrics", frozenset({"GET", "HEAD"})),
         ("/api/workstreams/{ws_id}/trust", frozenset({"POST"})),
         ("/api/workstreams/{ws_id}/restrict", frozenset({"POST"})),
-        ("/api/workstreams/{ws_id}/stop_cascade", frozenset({"POST"})),
         ("/api/workstreams/{ws_id}/close_all_children", frozenset({"POST"})),
     }
 
