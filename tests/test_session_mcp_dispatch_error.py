@@ -105,7 +105,11 @@ def _record_outputs(session) -> list[tuple[str, str, str, bool]]:
     """Patch ``_report_tool_result`` to capture (call_id, name, output, is_error)."""
     captures: list[tuple[str, str, str, bool]] = []
 
-    def _capture(call_id: str, name: str, output: str, *, is_error: bool = False) -> None:
+    def _capture(
+        call_id: str, name: str, output: str, *, is_error: bool = False, **_: object
+    ) -> None:
+        # ``**_`` swallows the typed ``status`` kwarg (and any future ones) so
+        # the stub stays signature-compatible with ``_report_tool_result``.
         captures.append((call_id, name, output, is_error))
 
     session._report_tool_result = _capture  # type: ignore[method-assign]

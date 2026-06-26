@@ -126,6 +126,9 @@ def test_repair_synthesizes_trailing_orphan() -> None:
         "tool_call_id": "c1",
         "content": CANCELLED_TOOL_RESULT,
         "is_error": True,
+        # The unobserved synth carries the typed disposition (wire-invisible
+        # side channel, stripped by the translator before the provider wire).
+        "_effect_status": "unknown",
     }
 
 
