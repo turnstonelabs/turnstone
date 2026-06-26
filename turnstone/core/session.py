@@ -54,6 +54,7 @@ from turnstone.core.history_decoration import (
 )
 from turnstone.core.log import get_logger
 from turnstone.core.lowering import (
+    UNOBSERVED_OUTCOME_CLAUSE,
     drop_empty_user_turns,
     fold_system_turns,
     repair_wire_messages,
@@ -4688,11 +4689,7 @@ class ChatSession:
         # appendix, HYPOTHESIS.md: unknown, never none).  ``is_error`` stays
         # True: it is genuinely not a successful result, and both the SSE
         # batch completion and the existing UI rendering key on it.
-        detail = (
-            f"{reason} Outcome UNKNOWN — this call may have begun executing "
-            "before the generation was stopped; do not assume it did not run, "
-            "and reconcile before re-issuing it."
-        )
+        detail = f"{reason} {UNOBSERVED_OUTCOME_CLAUSE}"
         # Synthesize results for unanswered tool_calls
         for tc in self.messages[assistant_idx].tool_calls:
             tc_id = tc.id
@@ -11912,10 +11909,12 @@ class ChatSession:
         — which causes a double-send as readily as a dropped record causes
         an orphan (cancellation appendix, HYPOTHESIS.md).  Instead we fold
         back the agent's actual ledger: which tool actions completed, which
-        never started, and an explicit ``UNKNOWN`` flag on the single most
-        recent action — the one that was crossing the gate / executing in
-        the tool when cancel landed, whose side effect may or may not have
-        landed and whose result was never observed.
+        never started, and an explicit ``UNKNOWN`` flag on the in-flight
+        action — the FIRST issued call without a result.  ``_run_agent``
+        executes a turn's tool_calls sequentially, so on cancel everything
+        before the first gap completed, the gap itself was executing (its
+        side effect may or may not have landed, its result never observed),
+        and everything after it never ran.
 
         Pure string assembly over the in-memory ``agent_messages`` — no
         model call, because we are on the cancel path and the gate is
@@ -11943,13 +11942,26 @@ class ChatSession:
                 counts[n] = counts.get(n, 0) + 1
             return ", ".join(f"{n}×{c}" if c > 1 else n for n, c in counts.items())
 
-        # The last action issued is the boundary: it was in flight (or about
-        # to run) when cancel was observed, so its outcome is unobserved.
-        # Mark it UNKNOWN rather than implying it did or did not happen.
-        boundary = issued[-1][0]
-        completed = [n for n, ans in issued[:-1] if ans]
-        not_run = [n for n, ans in issued[:-1] if not ans]
+        # The in-flight action is the FIRST issued call without a result.
+        # ``_run_agent`` runs a turn's tool_calls sequentially (cancel raises at
+        # the per-tool checkpoint, or mid-tool for a SIGKILL'd bash), so the
+        # first gap is the call that was executing when cancel landed:
+        # everything before it returned, everything after never started.
+        # (Taking the LAST issued call would invert unknown/none on a
+        # multi-call turn — labelling the never-run tail UNKNOWN and the
+        # actually-in-flight call "not started".)
+        first_gap = next((i for i, (_n, ans) in enumerate(issued) if not ans), None)
         parts = [f"({label} cancelled by user before completion)"]
+        if first_gap is None:
+            # Every issued call returned a result — cancel landed between
+            # turns, nothing in flight.  Each result already carries its own
+            # disposition (a SIGKILL'd tool's row reads UNKNOWN); just
+            # summarise what completed.
+            parts.append("Completed before cancel: " + _summ([n for n, _ in issued]) + ".")
+            return "\n".join(parts)
+        boundary = issued[first_gap][0]
+        completed = [n for n, _ in issued[:first_gap]]
+        not_run = [n for n, _ in issued[first_gap + 1 :]]
         if completed:
             parts.append("Completed before cancel: " + _summ(completed) + ".")
         parts.append(

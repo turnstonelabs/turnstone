@@ -42,6 +42,7 @@ from turnstone.core.log import get_logger
 from turnstone.core.session_ui_base import AutoApproveReason
 
 if TYPE_CHECKING:
+    from starlette.background import BackgroundTask
     from starlette.requests import Request
     from starlette.responses import Response
     from starlette.routing import BaseRoute
@@ -1092,11 +1093,14 @@ CancelAuditEmitter = Callable[
 
 # Optional async step run AFTER the workstream's own cancel sequence
 # (session.cancel + approval resolution + force/SSE + audit), receiving
-# ``(request, ws_id, ws)``.  Coordinator wires this to fan the cancel out
-# to its spawned children (auto-propagation down the subtree); interactive
-# wires ``None`` and the handler is unchanged.  Errors are logged, never
-# surfaced — a cascade failure must not fail the owner's own cancel.
-PostCancelHook = Callable[["Request", str, "Workstream"], Awaitable[None]]
+# ``(request, ws_id, ws)``.  Coordinator wires this to authorize + prepare the
+# cancel fan-out to its spawned children (auto-propagation down the subtree);
+# interactive wires ``None`` and the handler is unchanged.  It RETURNS a
+# ``BackgroundTask`` (or ``None``) which the handler attaches to its response,
+# so the actual per-child fan-out runs AFTER the 200 is sent — the owner's
+# cancel is never blocked on child HTTP.  Errors are logged, never surfaced —
+# a cascade failure must not fail the owner's own cancel.
+PostCancelHook = Callable[["Request", str, "Workstream"], Awaitable["BackgroundTask | None"]]
 
 
 def make_cancel_handler(
@@ -1305,12 +1309,14 @@ def make_cancel_handler(
 
         # Propagate the cancel down the subtree (coordinator only).  Runs
         # after the owner's own cancel is fully recorded so a cascade error
-        # can't strand the owner half-cancelled.  Cooperative/fire-and-forget
-        # per child — we dispatch the cancels, we don't block on the subtree
-        # draining (that barrier is deferred).
+        # can't strand the owner half-cancelled.  ``post_cancel`` authorizes
+        # and prepares the fan-out, returning a BackgroundTask we attach to the
+        # response: the per-child dispatch runs AFTER the 200 is sent, so the
+        # owner's cancel never blocks on child HTTP (and we don't drain).
+        cancel_background: BackgroundTask | None = None
         if post_cancel is not None:
             try:
-                await post_cancel(request, ws_id, ws)
+                cancel_background = await post_cancel(request, ws_id, ws)
             except Exception:
                 log.warning(
                     "ws.cancel.cascade_failed ws=%s",
@@ -1318,7 +1324,7 @@ def make_cancel_handler(
                     exc_info=True,
                 )
 
-        return JSONResponse({"status": "ok", "dropped": dropped})
+        return JSONResponse({"status": "ok", "dropped": dropped}, background=cancel_background)
 
     return cancel
 

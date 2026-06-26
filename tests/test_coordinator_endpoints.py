@@ -1692,6 +1692,7 @@ def test_coord_cancel_cascades_to_children(storage):
     down the subtree).  The ``post_cancel`` hook fans ``coord_client.cancel``
     over the direct children after the coordinator's own session is
     cancelled."""
+    import json
     from unittest.mock import MagicMock
 
     from starlette.applications import Starlette
@@ -1720,6 +1721,7 @@ def test_coord_cancel_cascades_to_children(storage):
     handler = make_cancel_handler(cfg, post_cancel=_cascade_cancel_to_children)
     app = Starlette(routes=[Route("/v1/api/workstreams/{ws_id}/cancel", handler, methods=["POST"])])
     app.state.coord_adapter = mgr._adapter
+    app.state.auth_storage = storage  # for the cascade audit (sec-2)
     app.add_middleware(_AuthMiddleware)
     client = TestClient(app)
 
@@ -1727,9 +1729,77 @@ def test_coord_cancel_cascades_to_children(storage):
     assert resp.status_code == 200
     # The coordinator's own session was cancelled (owner first)...
     coord.session.cancel.assert_called_once()
-    # ...and every direct child received a cancel (subtree propagation).
+    # ...and every direct child received a cancel (subtree propagation). The
+    # fan-out runs as the response BackgroundTask (perf-1: it does not block
+    # the cancel response); the TestClient drives it before returning.
     cascaded = {c.args[0] for c in coord_client.cancel.call_args_list}
     assert cascaded == {"child-1", "child-2"}
+    # sec-2: the cascade records a forensic audit row with the child lists.
+    events = [
+        e for e in storage.list_audit_events() if e["action"] == "coordinator.cancel_cascaded"
+    ]
+    assert len(events) == 1
+    assert set(json.loads(events[0]["detail"])["cancelled"]) == {"child-1", "child-2"}
+
+
+def test_coord_cancel_cascade_denied_for_service_token_without_grant(storage):
+    """sec-1 regression: the destructive subtree cascade is gated at
+    ``allow_service_bypass=False`` (the bar the removed stop_cascade held).
+    A service-scoped token without ``admin.coordinator`` can still cancel the
+    coordinator's own turn (the cancel route allows the service bypass) but
+    must NOT trigger the child cascade."""
+    from unittest.mock import MagicMock
+
+    from starlette.applications import Starlette
+    from starlette.middleware import Middleware
+    from starlette.middleware.base import BaseHTTPMiddleware
+    from starlette.routing import Route
+    from starlette.testclient import TestClient
+
+    from turnstone.console.server import _cascade_cancel_to_children
+    from turnstone.core.auth import AuthResult
+    from turnstone.core.session_routes import SessionEndpointConfig, make_cancel_handler
+
+    mgr = _build_mgr(storage)
+    coord = mgr.create(user_id="svc-user", name="coord-a")
+    _seed_children(mgr._adapter, coord.id, ["child-1", "child-2"])
+    coord_client = MagicMock()
+    coord_client.cancel.return_value = {"status": "ok"}
+    coord.session = MagicMock()
+    coord.session._coord_client = coord_client
+
+    class _ServiceAuth(BaseHTTPMiddleware):
+        async def dispatch(self, request, call_next):
+            request.state.auth_result = AuthResult(
+                user_id="svc-user",
+                scopes=frozenset({"read", "write", "approve", "service"}),
+                token_source="test",
+                permissions=frozenset(),  # NO admin.coordinator grant
+            )
+            return await call_next(request)
+
+    cfg = SessionEndpointConfig(
+        permission_gate=_require_admin_coordinator,
+        manager_lookup=lambda r: (mgr, None),
+        tenant_check=None,
+        not_found_label="coordinator not found",
+        audit_action_prefix="coordinator",
+    )
+    handler = make_cancel_handler(cfg, post_cancel=_cascade_cancel_to_children)
+    app = Starlette(
+        routes=[Route("/v1/api/workstreams/{ws_id}/cancel", handler, methods=["POST"])],
+        middleware=[Middleware(_ServiceAuth)],
+    )
+    app.state.coord_adapter = mgr._adapter
+    app.state.auth_storage = storage
+    client = TestClient(app)
+
+    resp = client.post(f"/v1/api/workstreams/{coord.id}/cancel", json={})
+    # Owner's own cancel still succeeds (cancel route allows the service bypass)…
+    assert resp.status_code == 200
+    coord.session.cancel.assert_called_once()
+    # …but the destructive cascade is withheld — no child was cancelled.
+    assert coord_client.cancel.call_count == 0
 
 
 def test_coord_cancel_cascade_failure_does_not_fail_owner_cancel(storage):

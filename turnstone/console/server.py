@@ -33,6 +33,7 @@ from typing import TYPE_CHECKING, Any
 import httpx
 from sse_starlette import EventSourceResponse
 from starlette.applications import Starlette
+from starlette.background import BackgroundTask
 from starlette.middleware import Middleware
 from starlette.responses import HTMLResponse, JSONResponse, Response, StreamingResponse
 from starlette.routing import Mount, Route
@@ -4132,46 +4133,80 @@ async def coordinator_restrict(request: Request) -> JSONResponse:
     return JSONResponse({"status": "ok", "revoked_tools": sorted(after)})
 
 
-async def _cascade_cancel_to_children(request: Request, ws_id: str, ws: Any) -> None:
+async def _cascade_cancel_to_children(
+    request: Request, ws_id: str, ws: Any
+) -> BackgroundTask | None:
     """Fan a coordinator's cancel out to its direct children.
 
     Wired into the coordinator cancel handler via ``post_cancel`` so that
     cancelling a coordinator propagates down its spawned subtree — the
     cancellation appendix's "cancel flows down the subtree."  The
     coordinator's own session is already cancelled by ``make_cancel_handler``
-    before this runs; here we only dispatch the per-child cancels via the
-    same ``children_snapshot`` + ``_fanout_on_children`` path the
-    ``close_all_children`` bulk verb uses.
+    before this runs; here we authorize + prepare the per-child fan-out and
+    hand it back as a ``BackgroundTask``.
 
-    Trigger, not drain: each child cancel is itself cooperative and
-    fire-and-forget (it sets the child's cancel flag and returns).  We do
-    not block on the subtree reaching a terminal state — that barrier is
-    deferred.  Children are one level deep today (a coordinator spawns only
-    interactive leaves), so the direct-child fan-out is the whole subtree.
+    Returns a ``BackgroundTask`` (run AFTER the 200 is sent) or ``None``.
+    Returning it rather than awaiting it inline is the "trigger, not drain"
+    contract: the owner's cancel response is never blocked on the child HTTP
+    round-trips (which can each hit a 30s timeout under a 16-wide semaphore).
+    Each child cancel is itself cooperative; we do not wait on the subtree
+    reaching a terminal state.  Children are one level deep today (a
+    coordinator spawns only interactive leaves), so the direct-child fan-out
+    is the whole subtree.
+
+    Authorization: the destructive subtree cancel is gated at
+    ``allow_service_bypass=False`` — matching the bar the removed
+    ``stop_cascade`` held and that ``/restrict`` / ``/close_all_children``
+    still use.  A plain cancel by an under-privileged service token still
+    cancels the coordinator's own turn (the handler already did that) but does
+    NOT cascade.
     """
+    if _require_admin_coordinator(request, allow_service_bypass=False) is not None:
+        log.debug("coordinator.cancel_cascade.skipped_unauthorized ws=%s", ws_id[:8])
+        return None
     coord_adapter = getattr(request.app.state, "coord_adapter", None)
     if coord_adapter is None:
-        return
+        return None
     child_ids = list(coord_adapter.children_snapshot(ws_id))
     if not child_ids:
-        return
+        return None
     session = getattr(ws, "session", None)
     coord_client: Any = getattr(session, "_coord_client", None) if session is not None else None
     if coord_client is None:
-        return
-    ok, failed, skipped = await _fanout_on_children(
-        child_ids,
-        coord_client,
-        lambda cid: coord_client.cancel(cid),
-        log_tag="coordinator_cancel_cascade",
-    )
-    log.info(
-        "coordinator.cancel_cascaded ws=%s cancelled=%d failed=%d skipped=%d",
-        ws_id[:8],
-        len(ok),
-        len(failed),
-        len(skipped),
-    )
+        return None
+    # Capture the audit inputs now, while the request is fresh — the task
+    # below runs after the response is sent.
+    storage, _storage_err = require_storage_or_503(request)
+    user_id = _auth_user_id(request)
+    client_host = request.client.host if request.client else ""
+
+    async def _run_cascade() -> None:
+        ok, failed, skipped = await _fanout_on_children(
+            child_ids,
+            coord_client,
+            lambda cid: coord_client.cancel(cid),
+            log_tag="coordinator_cancel_cascade",
+        )
+        # Restore the per-child forensic record the removed stop_cascade
+        # wrote (the coordinator's own cancel is audited separately).
+        if storage is not None:
+            await _emit_coord_audit(
+                storage,
+                user_id,
+                "coordinator.cancel_cascaded",
+                ws_id,
+                {"src": "coordinator", "cancelled": ok, "failed": failed, "skipped": skipped},
+                client_host,
+            )
+        log.info(
+            "coordinator.cancel_cascaded ws=%s cancelled=%d failed=%d skipped=%d",
+            ws_id[:8],
+            len(ok),
+            len(failed),
+            len(skipped),
+        )
+
+    return BackgroundTask(_run_cascade)
 
 
 _CLOSE_ALL_CHILDREN_MAX_REASON_LEN = 512

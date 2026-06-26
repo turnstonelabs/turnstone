@@ -2187,7 +2187,14 @@ async def _interactive_create_post_install(
                 except Exception:
                     log.warning("notify_completion.hook_error", ws_id=ws.id, exc_info=True)
                 with ws._lock:
-                    ws._worker_running = False
+                    # Only clear the flag if THIS thread is still the current
+                    # worker — a force-cancel abandons this thread and a
+                    # follow-up send may already have spawned a successor; an
+                    # abandoned initial-send worker finishing late must not
+                    # clobber that successor's running flag (mirrors the guard
+                    # in session_worker._runner).
+                    if ws.worker_thread is threading.current_thread():
+                        ws._worker_running = False
 
         # Inlined rather than via ``session_worker.send`` because at
         # workstream creation no live worker can exist by

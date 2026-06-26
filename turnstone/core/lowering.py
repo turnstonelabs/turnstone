@@ -50,6 +50,16 @@ from typing import Any
 from turnstone.core import fence
 from turnstone.core.trajectory import Turn, dicts_from_turns
 
+# The "you cannot tell whether it ran" clause, shared by every cancel
+# disposition surface (this wire-repair fallback AND the session-layer
+# synthesis in ChatSession) so they can't drift apart.  Public so session.py
+# can import it rather than re-type the sentence — the new tests assert only
+# the ``UNKNOWN`` token, so silent wording drift would otherwise be invisible.
+UNOBSERVED_OUTCOME_CLAUSE = (
+    "Outcome UNKNOWN — this call may have begun executing before the generation "
+    "was stopped; do not assume it did not run, and reconcile before re-issuing it."
+)
+
 # The synthetic result body for a tool call that never produced output (the
 # last-resort wire-repair for an orphan the session layer didn't synthesize —
 # e.g. a force-abandoned worker).  The neutral turn carries ``is_error=True``;
@@ -57,11 +67,7 @@ from turnstone.core.trajectory import Turn, dicts_from_turns
 # the OpenAI-compatible lanes have no such field and drop it).  The body reads
 # outcome-UNKNOWN, matching the cooperative-cancel disposition: an unobserved
 # call must not read as "did not run" (unknown, never none).
-CANCELLED_TOOL_RESULT = (
-    "Tool execution was cancelled. Outcome UNKNOWN — this call may have begun "
-    "executing before the generation was stopped; do not assume it did not run, "
-    "and reconcile before re-issuing it."
-)
+CANCELLED_TOOL_RESULT = f"Tool execution was cancelled. {UNOBSERVED_OUTCOME_CLAUSE}"
 
 
 def _find_orphaned_tool_calls(

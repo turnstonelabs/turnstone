@@ -998,21 +998,55 @@ class TestCancelledAgentDisposition:
         assert "In flight at cancel: web_fetch" in out
         assert "UNKNOWN" in out
 
-    def test_partial_result_boundary_still_unknown(self, tmp_db):
-        # A SIGKILL'd bash appends a partial result before the next
-        # checkpoint raises — it is the boundary and must read UNKNOWN,
-        # not as a clean completion.
+    def test_unanswered_tool_is_in_flight_unknown(self, tmp_db):
+        # An output-flowing bash SIGKILL'd mid-stream raises (no result row) —
+        # it is the in-flight boundary and must read UNKNOWN, never completed.
         session = _make_session()
-        msgs = [self._assistant("t1", "bash"), self._result("t1", "(killed)")]
+        msgs = [self._assistant("t1", "bash")]  # issued, no result
         out = session._cancelled_agent_disposition(msgs, "task")
         assert "In flight at cancel: bash" in out
         assert "UNKNOWN" in out
         assert "Completed before cancel" not in out
 
-    def test_counts_and_not_started(self, tmp_db):
+    def test_all_answered_reports_completed_no_in_flight(self, tmp_db):
+        # Every issued call returned a result — cancel landed between turns,
+        # nothing in flight. Each result carries its own disposition; the
+        # summary just lists what completed, with no UNKNOWN boundary.
         session = _make_session()
-        # Two tool_calls in one turn: t1 ran, t2 cancelled before running,
-        # t3 (a later turn's call) is the in-flight boundary.
+        msgs = [self._assistant("t1", "bash"), self._result("t1", "(killed)")]
+        out = session._cancelled_agent_disposition(msgs, "task")
+        assert "Completed before cancel: bash." in out
+        assert "In flight at cancel" not in out
+
+    def test_boundary_is_first_unanswered_not_last(self, tmp_db):
+        # Regression (bug-1): a turn issues [bash, web_fetch] executed
+        # sequentially; cancel hits during bash (unanswered, side effects
+        # possible) and web_fetch never runs. The in-flight UNKNOWN must be
+        # bash (the FIRST gap), and web_fetch must read "not started" — NOT
+        # the inverse. The old code took the LAST issued call, labelling the
+        # never-run web_fetch UNKNOWN and the actually-in-flight bash "not
+        # started" — inviting a re-run of the destructive bash.
+        session = _make_session()
+        msgs = [
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {"id": "t1", "function": {"name": "bash"}},
+                    {"id": "t2", "function": {"name": "web_fetch"}},
+                ],
+            }
+        ]  # neither answered: bash raised mid-flight, web_fetch never ran
+        out = session._cancelled_agent_disposition(msgs, "task")
+        assert "In flight at cancel: bash" in out
+        assert "In flight at cancel: web_fetch" not in out
+        assert "Not started (cancelled first): web_fetch." in out
+
+    def test_counts_and_not_started(self, tmp_db):
+        # Turn 1 completes [bash, bash, read_file]; turn 2 issues
+        # [web_fetch (in flight), search (never ran)]. Exercises the ×N
+        # count summary, the first-gap boundary, and not-started.
+        session = _make_session()
         msgs = [
             {
                 "role": "assistant",
@@ -1020,14 +1054,25 @@ class TestCancelledAgentDisposition:
                 "tool_calls": [
                     {"id": "t1", "function": {"name": "bash"}},
                     {"id": "t2", "function": {"name": "bash"}},
+                    {"id": "t3", "function": {"name": "read_file"}},
                 ],
             },
             self._result("t1"),
-            self._assistant("t3", "search"),
+            self._result("t2"),
+            self._result("t3"),
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {"id": "t4", "function": {"name": "web_fetch"}},
+                    {"id": "t5", "function": {"name": "search"}},
+                ],
+            },
         ]
         out = session._cancelled_agent_disposition(msgs, "task")
-        assert "In flight at cancel: search" in out
-        assert "Not started (cancelled first): bash." in out
+        assert "Completed before cancel: bash×2, read_file." in out
+        assert "In flight at cancel: web_fetch" in out
+        assert "Not started (cancelled first): search." in out
 
     def test_exec_task_routes_cancel_to_disposition(self, tmp_db):
         """_exec_task converts a GenerationCancelled from _run_agent into the
