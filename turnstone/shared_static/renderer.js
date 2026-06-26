@@ -894,7 +894,7 @@ function _loadMermaid(callback) {
   if (_mermaidState === "loading") return;
   _mermaidState = "loading";
   var script = document.createElement("script");
-  script.src = "/shared/mermaid-11.15.0/mermaid.min.js";
+  script.src = "/shared/mermaid-11.16.0/mermaid.min.js";
   script.onload = function () {
     _initMermaid();
     _mermaidState = "ready";

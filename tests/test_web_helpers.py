@@ -43,7 +43,7 @@ class TestVersionHtml:
     def test_vendored_mermaid_skipped(self):
         from turnstone.core.web_helpers import version_html
 
-        html = '<script src="/shared/mermaid-11.15.0/mermaid.min.js"></script>'
+        html = '<script src="/shared/mermaid-11.16.0/mermaid.min.js"></script>'
         result = version_html(html)
         assert result == html  # unchanged
 
