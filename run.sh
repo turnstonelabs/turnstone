@@ -369,7 +369,7 @@ ${GREEN}${BOLD}Turnstone is running${RESET} (${NODE_COUNT} node$([ "$NODE_COUNT"
     1. Create the first admin user:
        ${DIM}cd $INSTALL_DIR && $DOCKER compose exec node-1 turnstone-admin create-user --username admin --name "Admin"${RESET}
     2. Open ${url}, log in, and add a model backend in the ${BOLD}Models${RESET} tab —
-       a local server (vLLM / llama.cpp / Ollama) or an OpenAI / Anthropic / Gemini key.
+       a local server (vLLM / llama.cpp) or an OpenAI / Anthropic / Gemini key.
        Nodes boot without a model and pick it up live; no restart needed.
 
   Scale       Running ${scale}
