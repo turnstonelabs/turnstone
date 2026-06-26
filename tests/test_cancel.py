@@ -958,6 +958,52 @@ class TestSynthesizeCancelledResults:
         assert len(tool_msgs) == 1
 
 
+class TestTimeoutDisposition:
+    """A tool stopped at its deadline has unobserved side effects, so its
+    result must read UNKNOWN — the same ``unknown, never none`` discipline as
+    cancellation (HYPOTHESIS.md effect-record appendix), applied to timeouts.
+    Read-only timeouts stay a plain failure: an idempotent read has nothing to
+    reconcile, and "reconcile before re-issuing" would be misleading there.
+    """
+
+    def test_bash_timeout_reads_unknown(self):
+        """A bash command is SIGKILL'd at its deadline — the same mid-flight
+        kill as cancel — so it may have run partially or had side effects and
+        must read UNKNOWN, not a flat 'timed out' that invites a blind re-run."""
+        session = _make_session(tool_timeout=1)
+        # Sleeps silently past the 1s deadline → watchdog SIGKILL → TimeoutExpired.
+        call_id, result = session._exec_bash({"call_id": "c1", "command": "sleep 30"})
+        assert call_id == "c1"
+        assert "timed out" in result.lower()
+        assert "UNKNOWN" in result
+
+    def test_mcp_tool_timeout_reads_unknown(self):
+        """An MCP tool is an opaque action — the server may have run it to
+        completion before we stopped waiting, so the outcome reads UNKNOWN."""
+        session = _make_session()
+        session._mcp_client = MagicMock()
+        session._mcp_client.call_tool_sync.side_effect = TimeoutError()
+        call_id, result = session._exec_mcp_tool(
+            {"call_id": "c1", "mcp_func_name": "send_email", "mcp_args": {}}
+        )
+        assert call_id == "c1"
+        assert "timed out" in result.lower()
+        assert "UNKNOWN" in result
+
+    def test_mcp_resource_read_timeout_stays_plain(self):
+        """A resource read is an idempotent read with nothing to reconcile, so
+        its timeout stays a plain failure — no UNKNOWN/reconcile advice."""
+        session = _make_session()
+        session._mcp_client = MagicMock()
+        session._mcp_client.read_resource_sync.side_effect = TimeoutError()
+        call_id, result = session._exec_read_resource(
+            {"call_id": "c1", "resource_uri": "file:///doc"}
+        )
+        assert call_id == "c1"
+        assert "timed out" in result.lower()
+        assert "UNKNOWN" not in result
+
+
 class TestCancelledAgentDisposition:
     """A cancelled task_agent folds back an honest ledger, not a bare string.
 

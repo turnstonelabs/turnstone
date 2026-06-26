@@ -60,6 +60,20 @@ UNOBSERVED_OUTCOME_CLAUSE = (
     "was stopped; do not assume it did not run, and reconcile before re-issuing it."
 )
 
+# The timeout twin of UNOBSERVED_OUTCOME_CLAUSE.  A tool stopped at its deadline
+# was killed (bash is SIGKILL'd) or abandoned (an MCP action the server may still
+# be running) mid-flight, so its side effects are as unobserved as a cancelled
+# call's — the same "unknown, never none" discipline, a different cause.  Only
+# side-effecting tools use it: read-only timeouts (search, MCP resource/prompt
+# reads) stay a plain "timed out", because an idempotent read has nothing to
+# reconcile and "reconcile before re-issuing" would be misleading there.  Shared
+# (so bash and MCP can't drift) and asserted by the UNKNOWN token in tests.
+TIMEOUT_OUTCOME_CLAUSE = (
+    "Outcome UNKNOWN — the call was stopped at its deadline; it may have run "
+    "partially or had side effects, so do not assume it did not run, and "
+    "reconcile before re-issuing it."
+)
+
 # The synthetic result body for a tool call that never produced output (the
 # last-resort wire-repair for an orphan the session layer didn't synthesize —
 # e.g. a force-abandoned worker).  The neutral turn carries ``is_error=True``;

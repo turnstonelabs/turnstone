@@ -54,6 +54,7 @@ from turnstone.core.history_decoration import (
 )
 from turnstone.core.log import get_logger
 from turnstone.core.lowering import (
+    TIMEOUT_OUTCOME_CLAUSE,
     UNOBSERVED_OUTCOME_CLAUSE,
     drop_empty_user_turns,
     fold_system_turns,
@@ -10884,7 +10885,12 @@ class ChatSession:
                 is_interactive_for_consent=self._is_interactive_for_consent,
             )
         except TimeoutError:
-            output = f"MCP tool timed out after {self.tool_timeout}s"
+            # An MCP tool is an opaque action — the server may have run it to
+            # completion before we stopped waiting, so the outcome is unobserved.
+            # Read UNKNOWN, never none (HYPOTHESIS.md effect-record appendix).
+            # Resource/prompt reads below stay plain: they are idempotent reads
+            # with nothing to reconcile.
+            output = f"MCP tool timed out after {self.tool_timeout}s. {TIMEOUT_OUTCOME_CLAUSE}"
             mcp_error = True
             self.ui.on_error(output)
         except Exception as e:
@@ -11216,7 +11222,16 @@ class ChatSession:
             return call_id, output if output else "(no output)"
 
         except subprocess.TimeoutExpired:
-            msg = f"Command timed out after {timeout}s"
+            # The watchdog SIGKILL'd the command at its deadline — the same
+            # mid-flight kill as the cooperative-cancel branch above, so its
+            # side effects are equally unobserved.  Read UNKNOWN, never a flat
+            # failure that invites a blind re-run (HYPOTHESIS.md effect-record
+            # appendix: unknown, never none).  Keep any partial stdout captured
+            # before the kill, exactly as the cancel path does.
+            msg = f"Command timed out after {timeout}s. {TIMEOUT_OUTCOME_CLAUSE}"
+            partial = "".join(stdout_parts).strip()
+            if partial:
+                msg += "\n\nPartial output before timeout:\n" + self._truncate_output(partial)
             self._report_tool_result(call_id, "bash", msg, is_error=True)
             return call_id, msg
         except Exception as e:
