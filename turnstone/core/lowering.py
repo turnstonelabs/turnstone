@@ -50,11 +50,18 @@ from typing import Any
 from turnstone.core import fence
 from turnstone.core.trajectory import Turn, dicts_from_turns
 
-# The synthetic result body for a tool call that never produced output.  The
-# neutral turn carries ``is_error=True``; each translator renders that per its
-# format (Anthropic ``tool_result.is_error``; the OpenAI-compatible lanes have
-# no such field and drop it).
-CANCELLED_TOOL_RESULT = "Tool execution was cancelled."
+# The synthetic result body for a tool call that never produced output (the
+# last-resort wire-repair for an orphan the session layer didn't synthesize —
+# e.g. a force-abandoned worker).  The neutral turn carries ``is_error=True``;
+# each translator renders that per its format (Anthropic ``tool_result.is_error``;
+# the OpenAI-compatible lanes have no such field and drop it).  The body reads
+# outcome-UNKNOWN, matching the cooperative-cancel disposition: an unobserved
+# call must not read as "did not run" (unknown, never none).
+CANCELLED_TOOL_RESULT = (
+    "Tool execution was cancelled. Outcome UNKNOWN — this call may have begun "
+    "executing before the generation was stopped; do not assume it did not run, "
+    "and reconcile before re-issuing it."
+)
 
 
 def _find_orphaned_tool_calls(

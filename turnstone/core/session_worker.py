@@ -86,7 +86,16 @@ def send(
             log.exception("session_worker.uncaught ws=%s", ws.id[:8])
         finally:
             with ws._lock:
-                ws._worker_running = False
+                # Only clear the flag if THIS thread is still the current
+                # worker.  A force-cancel abandons the worker
+                # (``ws.worker_thread = None``) and a follow-up send may
+                # already have spawned a successor (``ws.worker_thread`` =
+                # the new thread); an abandoned thread finishing late must
+                # not clear the flag out from under that live successor —
+                # else a third send sees ``_worker_running=False`` and
+                # spawns a second concurrent worker on the same session.
+                if ws.worker_thread is threading.current_thread():
+                    ws._worker_running = False
 
     with ws._lock:
         if ws._worker_running:

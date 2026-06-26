@@ -8484,6 +8484,19 @@ class ChatSession:
         denied: list[dict[str, Any]] = []
         for spec in children:
             idx = spec["idx"]
+            # A cancel mid-batch stops creating the REST of the children —
+            # don't keep spawning workstreams the owner asked to stop.
+            # Cooperative: observed at this safe point between spawns, never
+            # mid-spawn.  Children already spawned this batch stay in
+            # ``results`` and are reported below (their ws_ids must survive —
+            # they are live remote workstreams, also durably parent-linked in
+            # storage); the rest are marked not-spawned.  Checked with the
+            # raw flag, not ``_check_cancelled``, so we fall through to the
+            # normal report path rather than raising and dropping the
+            # already-spawned ws_ids.
+            if self._cancel_event.is_set():
+                denied.append({"idx": idx, "reason": "not spawned: cancelled"})
+                continue
             # Validation failures from _prepare surface here as denied
             # rows — partial-success: don't abort the rest of the batch.
             if "_error" in spec:
@@ -10434,6 +10447,16 @@ class ChatSession:
         progress_heartbeat_s = 5.0
 
         def _progress(snap: dict[str, Any], elapsed: float) -> None:
+            # Cooperative cancel seam.  ``wait_for_workstream`` holds no
+            # cancel handle and its wait loop blocks on the ChildEventBus
+            # (woken only by *child* state changes), so without this a
+            # cancelled coordinator parked in a wait stays pinned for up to
+            # WAIT_MAX_TIMEOUT (600s).  The loop calls this callback every
+            # ~2s heartbeat and wraps it in ``except Exception`` — but
+            # ``GenerationCancelled`` is a ``BaseException``, so raising
+            # here propagates cleanly out of the wait into the send() cancel
+            # handler.  ~2s abort instead of up to 600s.
+            self._check_cancelled()
             now = time.monotonic()
             changed = snap != progress_state["last_snap"]
             heartbeat_due = (now - progress_state["last_emit_mono"]) >= progress_heartbeat_s
@@ -11157,8 +11180,21 @@ class ChatSession:
             # Distinguish user cancel from unexpected SIGKILL.
             # Popen.returncode is negative of the signal number when killed.
             if cancel.is_set() and proc.returncode == -signal.SIGKILL:
-                msg = "Cancelled by user."
-                self._report_tool_result(call_id, "bash", msg)
+                # SIGKILL'd mid-flight (the command was parked on a silent
+                # read, so the in-loop cooperative check never fired).  Its
+                # side effects are unobserved: record outcome UNKNOWN and
+                # mark it an error, not a clean empty success — a destructive
+                # command killed here must not read as "did not run" on
+                # replay.  Keep whatever partial stdout we captured.
+                partial = "".join(stdout_parts).strip()
+                msg = (
+                    "Cancelled by user. Outcome UNKNOWN — the command was "
+                    "stopped mid-execution; it may have run partially or had "
+                    "side effects. Do not assume it did not run."
+                )
+                if partial:
+                    msg += "\n\nPartial output before cancel:\n" + self._truncate_output(partial)
+                self._report_tool_result(call_id, "bash", msg, is_error=True)
                 return call_id, msg
 
             output = "".join(stdout_parts)

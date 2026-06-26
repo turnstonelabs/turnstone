@@ -501,6 +501,29 @@ def test_wait_exec_dispatches_raw_args_to_client(coord_session):
     assert parsed["mode"] == "any"
 
 
+def test_wait_exec_progress_callback_observes_cancel(coord_session):
+    """The wait progress heartbeat is the cancel seam.  ``wait_for_workstream``
+    holds no cancel handle, so without this a cancelled coordinator parked in a
+    wait stays pinned for up to WAIT_MAX_TIMEOUT.  A GenerationCancelled raised
+    from the heartbeat callback propagates out of the (otherwise cancel-blind)
+    wait — _exec_wait_for_workstream's ``except Exception`` can't swallow it
+    (GenerationCancelled is a BaseException)."""
+    from turnstone.core.session import GenerationCancelled
+
+    sess, coord, _ui = coord_session
+
+    def _wait(ws_ids, *, timeout, mode, since, progress_callback):
+        # Simulate the wait loop's ~2s heartbeat firing after the owner cancels.
+        sess._cancel_event.set()
+        progress_callback({"a": {"state": "running"}}, 0.1)  # must raise
+        return {"results": {}, "complete": True, "elapsed": 0.1, "mode": mode}
+
+    coord.wait_for_workstream.side_effect = _wait
+    item = sess._prepare_tool(_tc("wait_for_workstream", {"ws_ids": ["a"]}))
+    with pytest.raises(GenerationCancelled):
+        sess._exec_wait_for_workstream(item)
+
+
 def test_wait_exec_default_timeout_when_omitted(coord_session):
     """timeout=None (omitted) becomes 60.0 in exec so the client receives
     a numeric value — explicit ``timeout=0`` is preserved (one-shot
@@ -1383,6 +1406,35 @@ def test_spawn_batch_exec_surfaces_per_item_errors_in_denied(coord_session):
     assert len(body["denied"]) == 1
     assert body["denied"][0]["idx"] == 1
     assert "skill not found" in body["denied"][0]["reason"]
+
+
+def test_spawn_batch_exec_stops_spawning_after_cancel(coord_session):
+    """A cancel mid-batch stops creating the REST of the children.  The
+    already-spawned child stays in ``results`` (it is a live remote
+    workstream); the remainder are marked not-spawned rather than created."""
+    sess, coord, _ui = coord_session
+
+    spawned: list[dict[str, Any]] = []
+
+    def _spawn(**kwargs):
+        n = len(spawned)
+        spawned.append(kwargs)
+        # Owner cancels right after the first child is created.
+        sess._cancel_event.set()
+        return {"ws_id": f"child-{n}", "name": "n", "node_id": "node", "status": 200}
+
+    coord.spawn.side_effect = _spawn
+    item = sess._prepare_tool(_tc("spawn_batch", {"children": _three_children()}))
+    _call_id, output = sess._exec_spawn_batch(item)
+    body = json.loads(output)
+
+    # Only the first child was actually spawned — the cancel halted the rest.
+    assert len(spawned) == 1
+    assert set(body["results"].keys()) == {"0"}
+    assert body["results"]["0"]["child_ws_id"] == "child-0"
+    # The remaining two are reported not-spawned (cancelled), not created.
+    cancelled = [d for d in body["denied"] if "cancelled" in d["reason"].lower()]
+    assert {d["idx"] for d in cancelled} == {1, 2}
 
 
 def test_spawn_batch_exec_continues_past_client_exception(coord_session):

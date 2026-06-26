@@ -16,7 +16,7 @@
     },
     {
       "call_id": "call_1",
-      "output": "Tool execution was cancelled.",
+      "output": "Tool execution was cancelled. Outcome UNKNOWN — this call may have begun executing before the generation was stopped; do not assume it did not run, and reconcile before re-issuing it.",
       "type": "function_call_output"
     }
   ],

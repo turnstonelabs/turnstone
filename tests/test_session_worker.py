@@ -189,6 +189,39 @@ def test_worker_finally_clears_flag_when_run_swallows() -> None:
 # ---------------------------------------------------------------------------
 
 
+def test_abandoned_worker_does_not_clear_successor_running_flag() -> None:
+    """A force-cancel abandons the worker (``ws.worker_thread`` is cleared /
+    reassigned to a successor).  When the abandoned thread finishes late, its
+    ``finally`` must NOT clear ``_worker_running`` out from under the live
+    successor — otherwise a third send sees ``_worker_running=False`` and
+    spawns a second concurrent worker on the same session."""
+    send_gate = threading.Event()
+    session = _SendSession(send_gate=send_gate)
+    ws = _make_ws(session)
+
+    ok = _send_message(ws, session, "hello")
+    assert ok is True
+    abandoned = ws.worker_thread
+    assert abandoned is not None
+
+    # Simulate force-abandon + a successor send claiming ownership while the
+    # original worker is still pinned inside run().
+    sentinel = threading.Thread(target=lambda: None, name="successor")
+    with ws._lock:
+        ws.worker_thread = sentinel
+        ws._worker_running = True
+
+    # Release the abandoned worker; it runs its finally.
+    send_gate.set()
+    abandoned.join(timeout=3.0)
+    assert not abandoned.is_alive()
+
+    # The successor's ownership is intact — the abandoned worker did not
+    # clobber the flag or the thread handle.
+    assert ws._worker_running is True
+    assert ws.worker_thread is sentinel
+
+
 def test_concurrent_send_produces_exactly_one_worker_thread() -> None:
     """Two simultaneous send() calls must land as exactly one worker
     spawn and one queued message — not two parallel workers on the
