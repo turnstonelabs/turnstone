@@ -616,7 +616,7 @@ class TestTouchStructuredMemory:
             memory_id=str(uuid.uuid4()),
             name=name,
             description="test desc",
-            mem_type="project",
+            mem_type="general",
             scope=scope,
             scope_id=scope_id,
             content="test content",

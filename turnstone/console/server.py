@@ -959,6 +959,7 @@ def _coordinator_rows(request: Request) -> list[dict[str, Any]]:
                 "kind": WorkstreamKind.COORDINATOR.value,
                 "parent_ws_id": None,
                 "user_id": ws.user_id or "",
+                "project_id": ws.project_id or "",
             }
         )
         seen.add(ws.id)
@@ -987,6 +988,7 @@ def _coordinator_rows(request: Request) -> list[dict[str, Any]]:
                 "kind": WorkstreamKind.COORDINATOR.value,
                 "parent_ws_id": None,
                 "user_id": row_owner,
+                "project_id": m.get("project_id") or "",
             }
         )
     return rows
@@ -1859,6 +1861,7 @@ async def create_workstream(request: Request) -> JSONResponse:
     raw_initial_message = body.get("initial_message", "")
     raw_skill = body.get("skill", "")
     raw_resume_ws = body.get("resume_ws", "")
+    raw_project_id = body.get("project_id", "")
     if not isinstance(raw_node_id, str):
         raw_node_id = "" if raw_node_id is None else None
     if not isinstance(raw_name, str):
@@ -1873,6 +1876,8 @@ async def create_workstream(request: Request) -> JSONResponse:
         raw_skill = "" if raw_skill is None else None
     if not isinstance(raw_resume_ws, str):
         raw_resume_ws = "" if raw_resume_ws is None else None
+    if not isinstance(raw_project_id, str):
+        raw_project_id = "" if raw_project_id is None else None
     if (
         raw_node_id is None
         or raw_name is None
@@ -1881,10 +1886,11 @@ async def create_workstream(request: Request) -> JSONResponse:
         or raw_initial_message is None
         or raw_skill is None
         or raw_resume_ws is None
+        or raw_project_id is None
     ):
         return JSONResponse(
             {
-                "error": "node_id, name, model, judge_model, initial_message, skill, and resume_ws must be strings"
+                "error": "node_id, name, model, judge_model, initial_message, skill, resume_ws, and project_id must be strings"
             },
             status_code=400,
         )
@@ -1895,6 +1901,7 @@ async def create_workstream(request: Request) -> JSONResponse:
     initial_message = raw_initial_message[:4096]
     skill = raw_skill[:256]
     resume_ws = raw_resume_ws[:64]
+    project_id = raw_project_id[:64]
 
     auth = getattr(getattr(request, "state", None), "auth_result", None)
     uid: str = getattr(auth, "user_id", "") or ""
@@ -1928,6 +1935,7 @@ async def create_workstream(request: Request) -> JSONResponse:
         "skill": skill,
         "resume_ws": resume_ws,
         "user_id": uid,
+        "project_id": project_id,
     }
 
     client: httpx.AsyncClient = request.app.state.proxy_client
@@ -3428,6 +3436,8 @@ def _coord_create_build_kwargs(
     judge_raw = body.get("judge_model")
     model = (model_raw.strip() if isinstance(model_raw, str) else "") or None
     judge_model = (judge_raw.strip() if isinstance(judge_raw, str) else "") or None
+    project_raw = body.get("project_id")
+    project_id = (project_raw.strip() if isinstance(project_raw, str) else "") or None
     return {
         "user_id": uid,
         "name": name,
@@ -3436,6 +3446,7 @@ def _coord_create_build_kwargs(
         "skill_version": applied_skill_version,
         "model": model,
         "judge_model": judge_model,
+        "project_id": project_id,
     }
 
 
@@ -6233,6 +6244,16 @@ _VALID_PERMISSIONS = frozenset(
         "workstreams.create",
         "workstreams.close",
         "conversation.modify",
+        # Projects — shared resource containers.  Granted to builtin-admin via
+        # migration 062; grantable to non-admin users via a custom role.
+        # ``project.read``/``project.write`` compose with the per-project ACL
+        # (owner / member / public) in ``auth.user_can_access_project``.
+        "project.create",
+        "project.read",
+        "project.write",
+        # Project deletion — destroys the container and its scoped memory, so
+        # it is a distinct capability from project.write (admin-default).
+        "project.delete",
     }
 )
 
@@ -8488,6 +8509,46 @@ def _validate_memory_scope_filter(scope: str, scope_id: str) -> JSONResponse | N
     return None
 
 
+def _memory_scope_label(
+    scope: str, scope_id: str, storage: Any, cache: dict[tuple[str, str], str]
+) -> str:
+    """Resolve a memory's ``scope_id`` to a human label — username for user /
+    coordinator scope, workstream title for workstream scope, project name for
+    project scope.  Cached per (scope, scope_id) so a list of 200 memories costs
+    one lookup per distinct target; falls back to the raw id on miss/error."""
+    if not scope_id:
+        return ""
+    key = (scope, scope_id)
+    if key in cache:
+        return cache[key]
+    label = scope_id
+    try:
+        if scope in ("user", "coordinator"):
+            user = storage.get_user(scope_id)
+            label = (user or {}).get("username") or scope_id
+        elif scope == "workstream":
+            ws = storage.get_workstream(scope_id)
+            label = (ws or {}).get("title") or (ws or {}).get("name") or scope_id
+        elif scope == "project":
+            proj = storage.get_project(scope_id)
+            label = (proj or {}).get("name") or scope_id
+    except Exception:
+        label = scope_id
+    cache[key] = label
+    return label
+
+
+def _enrich_memory_scope_labels(rows: list[dict[str, Any]], storage: Any) -> list[dict[str, Any]]:
+    """Stamp a ``scope_label`` (human name for the scope_id) on each memory row
+    so the admin view renders 'project · NC Data Centers' rather than a hex id."""
+    cache: dict[tuple[str, str], str] = {}
+    for row in rows:
+        row["scope_label"] = _memory_scope_label(
+            row.get("scope", ""), row.get("scope_id", ""), storage, cache
+        )
+    return rows
+
+
 async def admin_list_memories(request: Request) -> JSONResponse:
     """GET /v1/api/admin/memories — list structured memories with filters."""
     from turnstone.core.auth import require_permission
@@ -8514,6 +8575,7 @@ async def admin_list_memories(request: Request) -> JSONResponse:
     rows = storage.list_structured_memories(
         mem_type=mem_type, scope=scope, scope_id=scope_id, limit=limit
     )
+    rows = _enrich_memory_scope_labels(rows, storage)
     total = storage.count_structured_memories(mem_type=mem_type, scope=scope, scope_id=scope_id)
     return JSONResponse({"memories": rows, "total": total})
 
@@ -8547,6 +8609,7 @@ async def admin_search_memories(request: Request) -> JSONResponse:
     rows = storage.search_structured_memories(
         query, mem_type=mem_type, scope=scope, scope_id=scope_id, limit=limit
     )
+    rows = _enrich_memory_scope_labels(rows, storage)
     return JSONResponse({"memories": rows, "total": len(rows)})
 
 
@@ -12949,6 +13012,20 @@ def create_app(
 
     from turnstone.core.attachments import classify_upload as _coord_classify_upload
 
+    # Project CRUD handlers are storage-backed and console-identical, so the
+    # console serves the server's handlers verbatim rather than re-deriving them
+    # (local import — the console convention for borrowing server endpoints).
+    from turnstone.server import (
+        add_project_member_endpoint,
+        create_project,
+        delete_project_endpoint,
+        get_project_endpoint,
+        list_project_members_endpoint,
+        list_projects,
+        remove_project_member_endpoint,
+        update_project_endpoint,
+    )
+
     coord_attachment_helpers = AttachmentUploadHelpers(
         classify_upload=_coord_classify_upload,
     )
@@ -13344,6 +13421,35 @@ def create_app(
                     Route(
                         "/api/admin/memories/{memory_id}",
                         admin_delete_memory,
+                        methods=["DELETE"],
+                    ),
+                    # Governance: Projects (resource containers — server handlers
+                    # served verbatim; see the local import in create_app).
+                    Route("/api/projects", list_projects),
+                    Route("/api/projects", create_project, methods=["POST"]),
+                    Route("/api/projects/{project_id}", get_project_endpoint),
+                    Route(
+                        "/api/projects/{project_id}",
+                        update_project_endpoint,
+                        methods=["PATCH"],
+                    ),
+                    Route(
+                        "/api/projects/{project_id}",
+                        delete_project_endpoint,
+                        methods=["DELETE"],
+                    ),
+                    Route(
+                        "/api/projects/{project_id}/members",
+                        list_project_members_endpoint,
+                    ),
+                    Route(
+                        "/api/projects/{project_id}/members",
+                        add_project_member_endpoint,
+                        methods=["POST"],
+                    ),
+                    Route(
+                        "/api/projects/{project_id}/members/{user_id}",
+                        remove_project_member_endpoint,
                         methods=["DELETE"],
                     ),
                     # System: Settings

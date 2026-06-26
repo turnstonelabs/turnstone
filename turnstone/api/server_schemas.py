@@ -188,6 +188,14 @@ class CreateWorkstreamRequest(BaseModel):
             "restart and appears in audit / list views."
         ),
     )
+    project_id: str | None = Field(
+        default=None,
+        description=(
+            "Optional project to attach this workstream to. Drives the shared "
+            "'project' memory scope; coordinator children inherit the parent's "
+            "project."
+        ),
+    )
 
 
 class CreateWorkstreamResponse(BaseModel):
@@ -250,6 +258,7 @@ class WorkstreamInfo(BaseModel):
     kind: WorkstreamKind = WorkstreamKind.INTERACTIVE
     parent_ws_id: str | None = None
     user_id: str = ""
+    project_id: str | None = None
 
 
 class ListWorkstreamsResponse(BaseModel):
@@ -368,6 +377,7 @@ class DashboardWorkstream(BaseModel):
     kind: WorkstreamKind = WorkstreamKind.INTERACTIVE
     parent_ws_id: str | None = None
     user_id: str = ""
+    project_id: str | None = None
     pending_approval_detail: PendingApprovalDetail | None = Field(
         default=None,
         description=(
@@ -556,7 +566,7 @@ class HealthResponse(BaseModel):
 # Memories
 # ---------------------------------------------------------------------------
 
-MemoryType = Literal["user", "project", "feedback", "reference"]
+MemoryType = Literal["user", "general", "feedback", "reference"]
 MemoryScope = Literal["global", "workstream", "user"]
 
 
@@ -564,7 +574,7 @@ class SaveMemoryRequest(BaseModel):
     name: str = Field(description="Memory identifier (normalized to snake_case)")
     content: str = Field(description="Memory content", max_length=65536)
     description: str = Field(default="", description="Short description for relevance matching")
-    type: MemoryType = Field(default="project", description="Memory type")
+    type: MemoryType = Field(default="general", description="Memory type")
     scope: MemoryScope = Field(default="global", description="Memory scope")
     scope_id: str = Field(
         default="",
@@ -598,7 +608,7 @@ class ListMemoriesResponse(BaseModel):
     total: int = 0
 
 
-MemoryTypeFilter = Literal["", "user", "project", "feedback", "reference"]
+MemoryTypeFilter = Literal["", "user", "general", "feedback", "reference"]
 MemoryScopeFilter = Literal["", "global", "workstream", "user"]
 
 

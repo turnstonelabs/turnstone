@@ -164,6 +164,10 @@
             <select id="dashboard-skill">
               <option value="">Use defaults</option>
             </select>
+            <label for="dashboard-project">Project</label>
+            <select id="dashboard-project">
+              <option value="">No project</option>
+            </select>
           </div>
         </div>
         <div class="dash-header">
@@ -358,6 +362,12 @@
         >
         <select id="new-ws-skill">
           <option value="">Use defaults</option>
+        </select>
+        <label for="new-ws-project"
+          >Project <span class="label-hint">optional</span></label
+        >
+        <select id="new-ws-project">
+          <option value="">No project</option>
         </select>
         <label for="new-ws-initial-message"
           >First message <span class="label-hint">optional</span></label
@@ -611,6 +621,8 @@
     <script type="module" src="/shared/utils.js"></script>
     <script type="module" src="/shared/cards.js"></script>
     <script type="module" src="/shared/toast.js"></script>
+    <script type="module" src="/shared/projects.js"></script>
+    <script type="module" src="/shared/project_creator.js"></script>
     <script type="module" src="/shared/composer.js"></script>
     <script type="module" src="/shared/composer_attachments.js"></script>
     <script type="module" src="/shared/composer_queue.js"></script>

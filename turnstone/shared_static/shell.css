@@ -1237,6 +1237,43 @@
   font-weight: 600;
 }
 
+/* ===== Project groups in the Workspaces tree (rail.js renderWorkspaces) —
+   collapsible buckets that nest a project's sessions under a header.  Reuse the
+   Manage `.grp-head` header look (chevron + name + count) for one collapsible
+   vocabulary, but the body holds full session `.row`s, so it gets its OWN items
+   wrapper rather than `.grp-items` (whose `.row` restyle dims the Manage tabs).
+   Sessions with no resolvable project stay at the top level; these groups follow
+   them, so a deployment not using projects sees the unchanged flat tree. ===== */
+.proj-grp {
+  /* A hairline + breathing room separates each project bucket (and the first
+     bucket from the unattached top-level list above it). */
+  margin-top: 4px;
+  padding-top: 4px;
+  border-top: 1px solid var(--hair);
+}
+.proj-grp:not(.open) .proj-grp-items {
+  display: none;
+}
+.proj-grp-items {
+  /* a slight inset reads the sessions as belonging to the project head above,
+     without the deeper indent (+ left rule) the coord-children list carries */
+  padding-left: 8px;
+}
+/* Lift the project header to its rows' brightness — the Manage `.grp-head` it
+   borrows is tuned for equally-dim Manage rows, so over full-brightness session
+   rows the default --ink-3 recedes behind its own content.  The ▣ mark stays in
+   ink (--ink-4), NOT amber: the rail's only amber is the `.row.open` active-tab
+   accent, which the grouping must not compete with. */
+.proj-grp .grp-head .gname {
+  color: var(--ink-2);
+  font-weight: 500;
+}
+.proj-grp .grp-head .gmark {
+  flex: none;
+  color: var(--ink-4);
+  font-size: 11px;
+}
+
 /* ===== Admin pane — adopts #view-admin (the 18 tabpanels).  The in-pane
    sidebar is retired (the rail's Manage groups navigate), so #view-admin fills
    the pane body and the content host renders full-width. ===== */
@@ -1355,6 +1392,18 @@
   }
   .app.rail-collapsed .manage-glyph {
     display: flex;
+  }
+  /* Project groups: drop the text header in the glyph strip (it needs text to
+     read) and force the project's sessions visible — the header that would
+     expand a collapsed group is hidden, so the sessions must not be trapped. */
+  .app.rail-collapsed .proj-grp .grp-head {
+    display: none;
+  }
+  .app.rail-collapsed .proj-grp-items {
+    padding-left: 0;
+  }
+  .app.rail-collapsed .proj-grp:not(.open) .proj-grp-items {
+    display: block;
   }
   /* footer stacks: theme toggle above the avatar-only user chip */
   .app.rail-collapsed .rail-foot {

@@ -50,6 +50,7 @@ const ADMIN_IA = [
   {
     group: "Governance",
     tabs: [
+      { tab: "projects", label: "Projects", perm: "project.read" },
       { tab: "roles", label: "Roles", perm: "admin.roles" },
       { tab: "policies", label: "Policies", perm: "admin.policies" },
       {
@@ -189,6 +190,7 @@ function switchAdminTab(tab) {
     "channels",
     "schedules",
     "watches",
+    "projects",
     "roles",
     "policies",
     "skills",
@@ -222,6 +224,7 @@ function switchAdminTab(tab) {
   if (tab === "channels") _populateChannelUserSelect();
   if (tab === "schedules") loadAdminSchedules();
   if (tab === "watches") loadAdminWatches();
+  if (tab === "projects") loadAdminProjects();
   if (tab === "roles") loadGovRoles();
   if (tab === "policies") loadGovPolicies();
   if (tab === "skills") loadGovSkills();
@@ -2473,6 +2476,423 @@ function submitCreateUser() {
     .catch(function (err) {
       window.TurnstoneHatch.setBusy(shelf, false);
       _showModalError(errEl, err.message || "Failed to create user");
+    });
+}
+
+// ---------------------------------------------------------------------------
+// Projects (resource containers) — list + create/edit + member whitelist.
+// Clones the Users tab (loadAdminUsers / showCreateUserModal / _renderUsers).
+// The tab gates on project.read; the server re-gates each mutation on
+// project.{create,write,delete} + per-project ownership, so a read-only viewer
+// sees the list but every action 403s (surfaced inline / as a toast).
+// ---------------------------------------------------------------------------
+let _adminProjects = [];
+let _projectShelfWired = false;
+let _projectMembersWired = false;
+
+function loadAdminProjects() {
+  authFetch("/v1/api/projects?include_archived=1")
+    .then(function (r) {
+      if (!r.ok) throw new Error("Failed to load projects");
+      return r.json();
+    })
+    .then(function (data) {
+      _adminProjects = data.projects || [];
+      _renderProjects(_adminProjects);
+    })
+    .catch(function () {
+      setSafeHtml(
+        document.getElementById("admin-projects-table"),
+        '<div class="dashboard-empty">Failed to load projects</div>',
+      );
+    });
+}
+
+function _renderProjects(projects) {
+  const container = document.getElementById("admin-projects-table");
+  if (!projects.length) {
+    setSafeHtml(
+      container,
+      '<div class="dashboard-empty">No projects yet. Create one to get started.</div>',
+    );
+    return;
+  }
+  let html = "";
+  for (let i = 0; i < projects.length; i++) {
+    const p = projects[i];
+    const archived = p.state === "archived";
+    html +=
+      '<div class="admin-row" role="listitem" data-project-id="' +
+      escapeHtml(p.project_id) +
+      '">' +
+      '<span class="admin-col admin-col-username">' +
+      escapeHtml(p.name) +
+      "</span>" +
+      '<span class="admin-col admin-col-name">' +
+      (p.visibility === "public" ? "Public" : "Private") +
+      "</span>" +
+      '<span class="admin-col admin-col-created">' +
+      (archived ? "Archived" : "Active") +
+      "</span>" +
+      '<span class="admin-col admin-col-actions">' +
+      _kebabMenu([
+        {
+          label: "edit",
+          title: "Rename / visibility",
+          attrs: { "data-edit-project": p.project_id },
+        },
+        {
+          label: "members",
+          title: "Manage members",
+          attrs: { "data-project-members": p.project_id },
+        },
+        {
+          label: archived ? "unarchive" : "archive",
+          title: archived ? "Reactivate project" : "Archive project",
+          attrs: {
+            "data-archive-project": p.project_id,
+            "data-archive-state": archived ? "active" : "archived",
+          },
+        },
+        {
+          label: "delete",
+          kind: "danger",
+          title: "Delete project",
+          attrs: {
+            "data-delete-project": p.project_id,
+            "data-project-name": p.name,
+          },
+        },
+      ]) +
+      "</span>" +
+      "</div>";
+  }
+  setSafeHtml(container, html);
+  _bindProjectRowActions(container);
+}
+
+function _bindProjectRowActions(container) {
+  container.querySelectorAll("[data-edit-project]").forEach(function (b) {
+    b.addEventListener("click", function () {
+      showEditProjectModal(this.getAttribute("data-edit-project"));
+    });
+  });
+  container.querySelectorAll("[data-project-members]").forEach(function (b) {
+    b.addEventListener("click", function () {
+      showProjectMembersModal(this.getAttribute("data-project-members"));
+    });
+  });
+  container.querySelectorAll("[data-archive-project]").forEach(function (b) {
+    b.addEventListener("click", function () {
+      _setProjectState(
+        this.getAttribute("data-archive-project"),
+        this.getAttribute("data-archive-state"),
+      );
+    });
+  });
+  container.querySelectorAll("[data-delete-project]").forEach(function (b) {
+    b.addEventListener("click", function () {
+      confirmDeleteProject(
+        this.getAttribute("data-delete-project"),
+        this.getAttribute("data-project-name"),
+      );
+    });
+  });
+}
+
+function _projectById(pid) {
+  for (let i = 0; i < _adminProjects.length; i++)
+    if (_adminProjects[i].project_id === pid) return _adminProjects[i];
+  return null;
+}
+
+// Refresh the shared picker/rail cache after any project mutation so the
+// launcher dropdowns + the rail's group-by-project pick up the change.
+function _afterProjectMutation() {
+  loadAdminProjects();
+  if (window.TurnstoneProjects) window.TurnstoneProjects.refreshProjects();
+}
+
+function _projectShelfWire() {
+  if (_projectShelfWired) return;
+  _projectShelfWired = true;
+  document
+    .getElementById("cp-submit")
+    .addEventListener("click", submitProjectShelf);
+}
+
+function showCreateProjectModal() {
+  _projectShelfWire();
+  const shelf = document.getElementById("project-shelf");
+  document.getElementById("project-shelf-error").classList.remove("is-visible");
+  document.getElementById("cp-project-id").value = "";
+  document.getElementById("cp-name").value = "";
+  document.getElementById("cp-visibility").value = "private";
+  document.getElementById("project-shelf-title").textContent = "New project";
+  document.getElementById("cp-submit").textContent = "Create";
+  window.TurnstoneHatch.openShelf(shelf);
+  document.getElementById("cp-name").focus();
+}
+
+function showEditProjectModal(pid) {
+  const p = _projectById(pid);
+  if (!p) return;
+  _projectShelfWire();
+  const shelf = document.getElementById("project-shelf");
+  document.getElementById("project-shelf-error").classList.remove("is-visible");
+  document.getElementById("cp-project-id").value = p.project_id;
+  document.getElementById("cp-name").value = p.name;
+  document.getElementById("cp-visibility").value = p.visibility || "private";
+  document.getElementById("project-shelf-title").textContent = "Edit project";
+  document.getElementById("cp-submit").textContent = "Save";
+  window.TurnstoneHatch.openShelf(shelf);
+  document.getElementById("cp-name").focus();
+}
+
+function submitProjectShelf() {
+  const shelf = document.getElementById("project-shelf");
+  const pid = document.getElementById("cp-project-id").value;
+  const name = (document.getElementById("cp-name").value || "").trim();
+  const visibility = document.getElementById("cp-visibility").value;
+  const errEl = document.getElementById("project-shelf-error");
+  if (!name) return _showModalError(errEl, "Name is required");
+
+  errEl.classList.remove("is-visible");
+  window.TurnstoneHatch.setBusy(shelf, true);
+  const editing = !!pid;
+  const url = editing
+    ? "/v1/api/projects/" + encodeURIComponent(pid)
+    : "/v1/api/projects";
+  authFetch(url, {
+    method: editing ? "PATCH" : "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ name: name, visibility: visibility }),
+  })
+    .then(function (r) {
+      if (!r.ok)
+        return r.json().then(function (d) {
+          throw new Error(d.error || "Failed");
+        });
+      return r.json();
+    })
+    .then(function () {
+      window.TurnstoneHatch.setBusy(shelf, false);
+      window.TurnstoneHatch.closeShelf(shelf);
+      showToast(editing ? "Project updated" : "Project '" + name + "' created");
+      _afterProjectMutation();
+    })
+    .catch(function (err) {
+      window.TurnstoneHatch.setBusy(shelf, false);
+      _showModalError(errEl, err.message || "Failed to save project");
+    });
+}
+
+function _setProjectState(pid, state) {
+  authFetch("/v1/api/projects/" + encodeURIComponent(pid), {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ state: state }),
+  })
+    .then(function (r) {
+      if (!r.ok) throw new Error("Failed");
+      showToast(state === "archived" ? "Project archived" : "Project restored");
+      _afterProjectMutation();
+    })
+    .catch(function () {
+      showToast("Failed to update project");
+    });
+}
+
+function confirmDeleteProject(pid, name) {
+  showConfirmModal(
+    "Delete project",
+    "Delete project ‘" +
+      name +
+      "’ and its scoped memory? Conversations stay but lose their project link. This cannot be undone.",
+    "Delete",
+    function () {
+      authFetch("/v1/api/projects/" + encodeURIComponent(pid), {
+        method: "DELETE",
+      })
+        .then(function (r) {
+          if (!r.ok) throw new Error("Failed");
+          showToast("Project deleted");
+          _afterProjectMutation();
+        })
+        .catch(function () {
+          showToast("Failed to delete project");
+        });
+    },
+  );
+}
+
+// --- Members (whitelist users for read+write; "public" visibility above grants
+//     read to any project.read holder — the "* all users" lever). ------------
+function _projectMembersWire() {
+  if (_projectMembersWired) return;
+  _projectMembersWired = true;
+  document
+    .getElementById("pm-add-btn")
+    .addEventListener("click", _addProjectMember);
+}
+
+function showProjectMembersModal(pid) {
+  _projectMembersWire();
+  const shelf = document.getElementById("project-members-shelf");
+  document
+    .getElementById("project-members-shelf-error")
+    .classList.remove("is-visible");
+  document.getElementById("pm-project-id").value = pid;
+  setSafeHtml(
+    document.getElementById("pm-members-container"),
+    '<div class="dashboard-empty">Loading…</div>',
+  );
+  _populateMemberUserSelect();
+  _loadProjectMembers(pid);
+  window.TurnstoneHatch.openShelf(shelf);
+  // Move focus into the shelf (the create/edit shelf focuses its name input;
+  // mirror that here so keyboard users land on the add-member control).
+  document.getElementById("pm-add-user").focus();
+}
+
+function _populateMemberUserSelect() {
+  const sel = document.getElementById("pm-add-user");
+  function fill(users) {
+    let html = '<option value="">Select a user…</option>';
+    for (let i = 0; i < users.length; i++) {
+      html +=
+        '<option value="' +
+        escapeHtml(users[i].user_id) +
+        '">' +
+        escapeHtml(users[i].username) +
+        "</option>";
+    }
+    setSafeHtml(sel, html);
+  }
+  // Reuse the Users tab's already-loaded list when present; else fetch it (an
+  // admin managing projects normally also holds admin.users — if not, the
+  // fetch 403s and the picker stays empty, the documented v1 limitation).
+  if (_adminUsers && _adminUsers.length) {
+    fill(_adminUsers);
+    return;
+  }
+  authFetch("/v1/api/admin/users")
+    .then(function (r) {
+      return r.ok ? r.json() : { users: [] };
+    })
+    .then(function (data) {
+      _adminUsers = data.users || [];
+      fill(_adminUsers);
+    })
+    .catch(function () {
+      fill([]);
+    });
+}
+
+function _loadProjectMembers(pid) {
+  authFetch("/v1/api/projects/" + encodeURIComponent(pid) + "/members")
+    .then(function (r) {
+      return r.ok ? r.json() : { members: [] };
+    })
+    .then(function (data) {
+      _renderProjectMembers(data.members || []);
+    })
+    .catch(function () {
+      setSafeHtml(
+        document.getElementById("pm-members-container"),
+        '<div class="dashboard-empty">Failed to load members</div>',
+      );
+    });
+}
+
+function _userNameFor(uid) {
+  if (_adminUsers)
+    for (let i = 0; i < _adminUsers.length; i++)
+      if (_adminUsers[i].user_id === uid) return _adminUsers[i].username;
+  return uid;
+}
+
+function _renderProjectMembers(members) {
+  const container = document.getElementById("pm-members-container");
+  if (!members.length) {
+    setSafeHtml(
+      container,
+      '<div class="dashboard-empty">No members yet. Add users for write access, or set the project Public for read access.</div>',
+    );
+    return;
+  }
+  let html = "";
+  for (let i = 0; i < members.length; i++) {
+    const uid = members[i];
+    html +=
+      '<div class="admin-row" role="listitem">' +
+      '<span class="admin-col admin-col-username">' +
+      escapeHtml(_userNameFor(uid)) +
+      "</span>" +
+      '<span class="admin-col admin-col-actions">' +
+      '<button class="admin-btn-danger" type="button" data-remove-member="' +
+      escapeHtml(uid) +
+      '" aria-label="Remove ' +
+      escapeHtml(_userNameFor(uid)) +
+      '">Remove</button>' +
+      "</span></div>";
+  }
+  setSafeHtml(container, html);
+  container.querySelectorAll("[data-remove-member]").forEach(function (b) {
+    b.addEventListener("click", function () {
+      _removeProjectMember(this.getAttribute("data-remove-member"));
+    });
+  });
+}
+
+function _addProjectMember() {
+  const pid = document.getElementById("pm-project-id").value;
+  const uid = document.getElementById("pm-add-user").value;
+  const errEl = document.getElementById("project-members-shelf-error");
+  if (!uid) return _showModalError(errEl, "Select a user to add");
+  errEl.classList.remove("is-visible");
+  authFetch("/v1/api/projects/" + encodeURIComponent(pid) + "/members", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ user_id: uid }),
+  })
+    .then(function (r) {
+      if (!r.ok)
+        return r.json().then(function (d) {
+          throw new Error(d.error || "Failed");
+        });
+      return r.json();
+    })
+    .then(function (data) {
+      document.getElementById("pm-add-user").value = "";
+      _renderProjectMembers(data.members || []);
+    })
+    .catch(function (err) {
+      _showModalError(errEl, err.message || "Failed to add member");
+    });
+}
+
+function _removeProjectMember(uid) {
+  const pid = document.getElementById("pm-project-id").value;
+  authFetch(
+    "/v1/api/projects/" +
+      encodeURIComponent(pid) +
+      "/members/" +
+      encodeURIComponent(uid),
+    { method: "DELETE" },
+  )
+    .then(function (r) {
+      if (!r.ok)
+        return r.json().then(function (d) {
+          throw new Error(d.error || "Failed");
+        });
+      return r.json();
+    })
+    .then(function (data) {
+      _renderProjectMembers(data.members || []);
+    })
+    .catch(function () {
+      showToast("Failed to remove member");
     });
 }
 

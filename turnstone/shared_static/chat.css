@@ -581,6 +581,28 @@
   border: 1px solid var(--hair);
   border-radius: var(--r-sm);
 }
+/* "Has a project" badge — sits right of the model chip.  Accent border + ink
+   (vs the model chip's recessive --hair / --ink-4) plus the ▣ glyph in the
+   text mark it as a distinct, attention-worthy state (chip-contrast rule:
+   colour paired with a glyph, full-opacity border, not a washed tint).  Long
+   names ellipsize so the composer row never blows out. */
+.composer-project-chip {
+  /* Shrinks before the row overflows (the chip already ellipsizes), so on a
+     narrow pane the chip yields rather than pushing the send button out of the
+     composer box.  Floors at ~3ch to keep the ▣ glyph legible. */
+  flex-shrink: 1;
+  min-width: 3ch;
+  max-width: 22ch;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--accent);
+  font-family: var(--font-ui);
+  font-size: 11px;
+  padding: 2px 7px;
+  border: 1px solid var(--accent);
+  border-radius: var(--r-sm);
+}
 .composer-options-panel {
   display: grid;
   grid-template-columns: auto 1fr;

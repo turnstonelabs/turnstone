@@ -3004,7 +3004,9 @@ class TestPerKindToolVariants:
 
         memory = next(t for t in COORDINATOR_TOOLS if t["function"]["name"] == "memory")
         scope = memory["function"]["parameters"]["properties"]["scope"]
-        assert scope["enum"] == ["coordinator"]
+        # v1.7: a coordinator attached to a project also reads/writes the shared
+        # 'project' scope, alongside its isolated 'coordinator' namespace.
+        assert scope["enum"] == ["coordinator", "project"]
 
     def test_coord_memory_tool_description_mentions_orchestration(self):
         from turnstone.core.tools import COORDINATOR_TOOLS
@@ -3022,7 +3024,8 @@ class TestPerKindToolVariants:
 
         memory = next(t for t in INTERACTIVE_TOOLS if t["function"]["name"] == "memory")
         scope = memory["function"]["parameters"]["properties"]["scope"]
-        assert scope["enum"] == ["global", "workstream", "user"]
+        # v1.7: 'project' is offered (usable when the workstream is attached).
+        assert scope["enum"] == ["global", "workstream", "user", "project"]
 
     def test_ic_memory_tool_description_omits_coord_scope(self):
         from turnstone.core.tools import INTERACTIVE_TOOLS

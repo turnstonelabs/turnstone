@@ -548,6 +548,7 @@ class StorageBackend(Protocol):
         skill_version: int = 0,
         kind: WorkstreamKind | str = "interactive",
         parent_ws_id: str | None = None,
+        project_id: str | None = None,
     ) -> None:
         """Create a workstreams row (no-op if already exists).
 
@@ -555,7 +556,8 @@ class StorageBackend(Protocol):
         (``"interactive"`` / ``"coordinator"``); the storage edge validates
         the value and rejects unknown kinds with ``ValueError``.
         ``parent_ws_id`` is non-NULL for children spawned by a coordinator;
-        the storage edge normalizes the empty string to ``None``.
+        ``project_id`` is the attached project — both are normalized from the
+        empty string to ``None`` at the storage edge.
         """
         ...
 
@@ -2211,6 +2213,57 @@ class StorageBackend(Protocol):
 
     def delete_model_definition(self, definition_id: str) -> bool:
         """Delete a model definition. Returns True if existed."""
+        ...
+
+    # -- Projects --------------------------------------------------------------
+
+    def create_project(
+        self,
+        project_id: str,
+        name: str,
+        owner_id: str,
+        visibility: str = "private",
+        state: str = "active",
+        parent_project_id: str | None = None,
+    ) -> None:
+        """Create a project. No-op if project_id already exists."""
+        ...
+
+    def get_project(self, project_id: str) -> dict[str, Any] | None:
+        """Return project dict or None."""
+        ...
+
+    def list_projects_for_user(
+        self, user_id: str, include_archived: bool = False
+    ) -> list[dict[str, Any]]:
+        """Return projects the user owns, is a member of, or that are public.
+
+        Ordered by name; excludes archived projects unless ``include_archived``.
+        """
+        ...
+
+    def update_project(self, project_id: str, **fields: Any) -> bool:
+        """Update mutable fields on a project. Returns True if a row changed."""
+        ...
+
+    def delete_project(self, project_id: str) -> bool:
+        """Delete a project and its membership rows. Returns True if existed."""
+        ...
+
+    def add_project_member(self, project_id: str, user_id: str) -> None:
+        """Add a member to a project. No-op if already a member."""
+        ...
+
+    def remove_project_member(self, project_id: str, user_id: str) -> bool:
+        """Remove a member. Returns True if the membership existed."""
+        ...
+
+    def list_project_members(self, project_id: str) -> list[str]:
+        """Return the user_ids of a project's members, ordered."""
+        ...
+
+    def is_project_member(self, project_id: str, user_id: str) -> bool:
+        """Return True if user_id is a member of project_id."""
         ...
 
     # -- Prompt policies -------------------------------------------------------

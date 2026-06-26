@@ -26,7 +26,7 @@ import time
 import urllib.parse
 import uuid
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, NamedTuple
 
 if TYPE_CHECKING:
     from starlette.requests import Request
@@ -160,6 +160,97 @@ def user_has_permission(user_id: str, permission: str, *, storage: Any = None) -
     if storage is None:
         return False
     return permission in _load_user_permissions(storage, user_id)
+
+
+class ProjectAccess(NamedTuple):
+    """Resolved access + display fields for one project, from a single fetch.
+
+    ``can_read`` / ``can_write`` are the ACL∧RBAC composition; ``name`` /
+    ``state`` come free from the same ``get_project`` row so the session
+    constructor needn't re-fetch them.  An all-deny result (missing project,
+    empty ids, storage failure) carries ``""`` name/state.
+    """
+
+    can_read: bool
+    can_write: bool
+    name: str
+    state: str  # "active" | "archived"
+
+
+_PROJECT_DENY = ProjectAccess(False, False, "", "")
+
+
+def resolve_project_access(
+    user_id: str,
+    project_id: str,
+    *,
+    storage: Any = None,
+) -> ProjectAccess:
+    """Resolve read/write access + name/state for *project_id* in ONE fetch.
+
+    The single-fetch core behind :func:`user_can_access_project`.  The session
+    constructor calls this directly to avoid three redundant ``get_project``
+    round-trips per construction (read-check, write-check, name) — it gets both
+    access bits, the display name, and the state from one row plus one
+    membership lookup and one permission-set load.
+
+    Composition (identical to the prior two-call form):
+
+    * the project's **owner** reads and writes their own project;
+    * every other access requires the matching capability — ``project.read``
+      for reads, ``project.write`` for writes — AND a per-project grant: an
+      explicit ``project_members`` row, or (read only) ``public`` visibility.
+
+    Fail-closed: empty ids, a missing/unknown project, or a storage failure all
+    return :data:`_PROJECT_DENY`.
+    """
+    if not user_id or not project_id:
+        return _PROJECT_DENY
+    if storage is None:
+        from turnstone.core.storage._registry import get_storage
+
+        storage = get_storage()
+    if storage is None:
+        return _PROJECT_DENY
+    try:
+        project = storage.get_project(project_id)
+        if project is None:
+            return _PROJECT_DENY
+        name = project.get("name", "") or ""
+        state = project.get("state", "active") or "active"
+        if project.get("owner_id") == user_id:
+            return ProjectAccess(True, True, name, state)
+        # One membership lookup + the capability checks, then derive both access
+        # bits from the single project row (vs three get_project round-trips).
+        is_member = bool(storage.is_project_member(project_id, user_id))
+        is_public = project.get("visibility") == "public"
+        can_read = user_has_permission(user_id, "project.read", storage=storage) and (
+            is_member or is_public
+        )
+        can_write = user_has_permission(user_id, "project.write", storage=storage) and is_member
+        return ProjectAccess(can_read, can_write, name, state)
+    except Exception:
+        log.warning("project access check failed for user=%s project=%s", user_id, project_id)
+        return _PROJECT_DENY
+
+
+def user_can_access_project(
+    user_id: str,
+    project_id: str,
+    *,
+    write: bool,
+    storage: Any = None,
+) -> bool:
+    """Return True if *user_id* may read (or write, if ``write``) *project_id*.
+
+    Thin boolean wrapper over :func:`resolve_project_access` — composes the RBAC
+    capability gate with the per-project ACL, safe to call from contexts with no
+    HTTP permission middleware (memory recall, the management route ACL check).
+    Fail-closed via the resolver.  HTTP handlers still gate on
+    :func:`require_permission` first; this adds the per-resource ACL.
+    """
+    acc = resolve_project_access(user_id, project_id, storage=storage)
+    return acc.can_write if write else acc.can_read
 
 
 def _permissions_to_scopes(permissions: set[str]) -> frozenset[str]:

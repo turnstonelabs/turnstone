@@ -2,7 +2,7 @@
   "openapi": "3.1.0",
   "info": {
     "title": "turnstone Console API",
-    "version": "1.6.0a6",
+    "version": "1.7.0a2",
     "description": "Cluster-wide visibility and control across all turnstone nodes."
   },
   "paths": {
@@ -3955,6 +3955,47 @@
         }
       }
     },
+    "/v1/api/admin/model-definitions/{definition_id}/calibrate": {
+      "post": {
+        "summary": "Calibrate a reranker model definition and persist its per-model floor",
+        "operationId": "v1_api_admin_model-definitions_{definition_id}_calibrate_post",
+        "tags": [
+          "Admin"
+        ],
+        "parameters": [
+          {
+            "name": "definition_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Success",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CalibrateModelResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Error 404",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/v1/api/admin/model-capabilities": {
       "get": {
         "summary": "Look up static capabilities for a known model",
@@ -5089,7 +5130,7 @@
         "tags": [
           "Coordinator"
         ],
-        "description": "Worker thread picks up the message via the session's queue. Optional ``attachment_ids`` reserve attachments under the message's send_id token (parity with the interactive surface). Response carries ``attached_ids`` / ``dropped_attachment_ids`` so callers can detect partial reservations and ``priority`` / ``msg_id`` on the queued path. ``status: queue_full`` when the worker queue is full \u2014 caller should back off.",
+        "description": "Worker thread picks up the message via the session's queue. Optional ``attachment_ids`` select staged uploads to attach to the message (parity with the interactive surface). Response carries ``attached_ids`` / ``dropped_attachment_ids`` so callers can detect partial attaches and ``priority`` / ``msg_id`` on the queued path. ``status: queue_full`` when the worker queue is full \u2014 caller should back off.",
         "parameters": [
           {
             "name": "ws_id",
@@ -5191,7 +5232,7 @@
         "tags": [
           "Coordinator"
         ],
-        "description": "Multipart upload (field ``file``). Same validation rules as the interactive surface: magic-byte image sniff, UTF-8 text decode, per-kind size cap, per-(ws,user) pending cap. Attachments stay pending until a subsequent ``/send`` reserves them under its ``send_id`` token.",
+        "description": "Multipart upload (field ``file``). Same validation rules as the interactive surface: magic-byte image sniff, UTF-8 text decode, per-kind size cap, per-(ws,user) pending cap. Attachments stay pending until a subsequent ``/send`` attaches them to a message.",
         "parameters": [
           {
             "name": "ws_id",
@@ -6005,6 +6046,81 @@
         }
       }
     },
+    "/v1/api/workstreams/{ws_id}/export": {
+      "get": {
+        "summary": "Export the coordinator's conversation as OpenAI messages JSON",
+        "operationId": "v1_api_workstreams_{ws_id}_export_get",
+        "tags": [
+          "Coordinator"
+        ],
+        "description": "Returns the coordinator's own conversation as an ``{\"messages\": [...]}`` OpenAI Chat Completions envelope, served as a ``<ws_id>.json`` file download. Conversation-only (children are not bundled over HTTP). Gated on ``admin.coordinator``.",
+        "parameters": [
+          {
+            "name": "ws_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Success"
+          },
+          "400": {
+            "description": "Error 400",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Error 403",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Error 404",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Error 500",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Error 503",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/v1/api/workstreams/{ws_id}/children": {
       "get": {
         "summary": "List the coordinator's spawned child workstreams",
@@ -6323,78 +6439,6 @@
         }
       }
     },
-    "/v1/api/workstreams/{ws_id}/stop_cascade": {
-      "post": {
-        "summary": "Cancel the coordinator and every direct child",
-        "operationId": "v1_api_workstreams_{ws_id}_stop_cascade_post",
-        "tags": [
-          "Coordinator"
-        ],
-        "description": "Cancels the coordinator's in-flight generation AND dispatches ``cancel_workstream`` through the routing proxy for every direct child in the in-memory registry.  Grandchildren are not touched directly \u2014 they sit behind their parent's cancel, which propagates via the child's SSE stream.  Returns the per-child disposition (``cancelled`` / ``failed``) so the UI can show which children responded.  Writes ``coordinator.stopped_cascade`` with the two lists.",
-        "parameters": [
-          {
-            "name": "ws_id",
-            "in": "path",
-            "required": true,
-            "schema": {
-              "type": "string"
-            }
-          }
-        ],
-        "responses": {
-          "200": {
-            "description": "Success",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/CoordinatorStopCascadeResponse"
-                }
-              }
-            }
-          },
-          "400": {
-            "description": "Error 400",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorResponse"
-                }
-              }
-            }
-          },
-          "403": {
-            "description": "Error 403",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorResponse"
-                }
-              }
-            }
-          },
-          "404": {
-            "description": "Error 404",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorResponse"
-                }
-              }
-            }
-          },
-          "503": {
-            "description": "Error 503",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorResponse"
-                }
-              }
-            }
-          }
-        }
-      }
-    },
     "/v1/api/workstreams/{ws_id}/close_all_children": {
       "post": {
         "summary": "Soft-close every direct child of the coordinator",
@@ -6402,7 +6446,7 @@
         "tags": [
           "Coordinator"
         ],
-        "description": "Reads the in-memory child registry and dispatches ``close_workstream`` via the routing proxy for every direct child under a bounded (16-concurrency) semaphore.  Unlike ``stop_cascade`` this does not touch grandchildren \u2014 the model-facing tool asks for a bounded teardown of its own fan-out.  Returns ``{closed, failed, skipped}`` where ``skipped`` distinguishes already-gone (404) from dispatch-broken (``failed``).  The optional ``reason`` propagates to every closed child's audit + workstream_config.  Writes ``coordinator.closed_all_children`` at the coord level.",
+        "description": "Reads the in-memory child registry and dispatches ``close_workstream`` via the routing proxy for every direct child under a bounded (16-concurrency) semaphore.  Soft-close only \u2014 it does not touch grandchildren (the model-facing tool asks for a bounded teardown of its own direct fan-out).  Returns ``{closed, failed, skipped}`` where ``skipped`` distinguishes already-gone (404) from dispatch-broken (``failed``).  The optional ``reason`` propagates to every closed child's audit + workstream_config.  Writes ``coordinator.closed_all_children`` at the coord level.",
         "parameters": [
           {
             "name": "ws_id",
@@ -8072,7 +8116,7 @@
             "type": "string"
           },
           "attached_ids": {
-            "description": "Attachment ids actually reserved onto this turn. Subset of the request's `attachment_ids` (or the auto-consumed pending set). Empty when the send carries no attachments.",
+            "description": "Attachment ids actually attached to this turn. Subset of the request's `attachment_ids` (or the auto-consumed pending set). Empty when the send carries no attachments.",
             "items": {
               "type": "string"
             },
@@ -8118,42 +8162,6 @@
           "status"
         ],
         "title": "CoordinatorSendResponse",
-        "type": "object"
-      },
-      "CoordinatorStopCascadeResponse": {
-        "description": "Response body for POST /v1/api/workstreams/{ws_id}/stop_cascade.",
-        "properties": {
-          "status": {
-            "default": "ok",
-            "title": "Status",
-            "type": "string"
-          },
-          "cancelled": {
-            "description": "Child ws_ids that accepted the cancel dispatch.",
-            "items": {
-              "type": "string"
-            },
-            "title": "Cancelled",
-            "type": "array"
-          },
-          "failed": {
-            "description": "Child ws_ids whose cancel dispatch returned an error other than an already-gone 404 \u2014 the cascade continues on per-child failure so a single unreachable node doesn't abort the whole batch.",
-            "items": {
-              "type": "string"
-            },
-            "title": "Failed",
-            "type": "array"
-          },
-          "skipped": {
-            "description": "Child ws_ids that returned 404 on cancel (already gone).  Reported separately from ``failed`` so operators can distinguish already-done from dispatch-broken.",
-            "items": {
-              "type": "string"
-            },
-            "title": "Skipped",
-            "type": "array"
-          }
-        },
-        "title": "CoordinatorStopCascadeResponse",
         "type": "object"
       },
       "CoordinatorTaskInfo": {
@@ -10930,6 +10938,11 @@
             "default": "",
             "title": "Definition Id",
             "type": "string"
+          },
+          "supports_rerank": {
+            "default": false,
+            "title": "Supports Rerank",
+            "type": "boolean"
           }
         },
         "title": "DetectModelRequest",
@@ -10996,9 +11009,78 @@
             ],
             "default": null,
             "title": "Error"
+          },
+          "capabilities": {
+            "additionalProperties": true,
+            "title": "Capabilities",
+            "type": "object"
+          },
+          "rerank_calibration_note": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Rerank Calibration Note"
           }
         },
         "title": "DetectModelResponse",
+        "type": "object"
+      },
+      "CalibrateModelResponse": {
+        "properties": {
+          "separated": {
+            "default": false,
+            "title": "Separated",
+            "type": "boolean"
+          },
+          "suggested_threshold": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Suggested Threshold"
+          },
+          "raw_scale": {
+            "default": "",
+            "title": "Raw Scale",
+            "type": "string"
+          },
+          "relevant": {
+            "items": {
+              "type": "number"
+            },
+            "title": "Relevant",
+            "type": "array"
+          },
+          "irrelevant": {
+            "items": {
+              "type": "number"
+            },
+            "title": "Irrelevant",
+            "type": "array"
+          },
+          "applied": {
+            "default": false,
+            "title": "Applied",
+            "type": "boolean"
+          },
+          "error": {
+            "default": "",
+            "title": "Error",
+            "type": "string"
+          }
+        },
+        "title": "CalibrateModelResponse",
         "type": "object"
       },
       "ModelCapabilitiesResponse": {
@@ -12857,13 +12939,26 @@
             "type": "string"
           },
           "messages": {
-            "description": "Tail of the workstream's message history, projected to the canonical render shape (flat tool_calls with verdict / output_assessment, top-level source / reminders / attachments, derived denied / is_error / pending). Bounded by the ``limit`` query parameter (default 100, max 500).",
+            "description": "Tail of the workstream's message history, projected to the canonical render shape (``role`` may be ``system`` for operator-context turns; flat tool_calls with verdict / output_assessment; top-level source / attachments / reasoning; derived denied / is_error / pending). Bounded by the ``limit`` query parameter (default 100, max 500).",
             "items": {
               "additionalProperties": true,
               "type": "object"
             },
             "title": "Messages",
             "type": "array"
+          },
+          "cursor": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "SSE resume cursor (a ``Last-Event-ID`` value). Non-null only when the trailing turn is an executing in-flight tool batch that the live ring buffer can replay: ``messages`` then omits that turn and the client opens its initial SSE with this cursor so the existing delta replay fast-forwards the in-flight turn (tool calls, results, prompts) instead of the lossy synthetic snapshot. Null on every other read \u2014 the client connects fresh.",
+            "title": "Cursor"
           }
         },
         "required": [

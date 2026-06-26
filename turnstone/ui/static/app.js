@@ -398,6 +398,19 @@ function showNewWsModal(forkFromWsId) {
       /* ignore */
     });
 
+  // Project picker — populated from the shared projects cache, refreshed on
+  // open so a project created elsewhere appears.  Hidden when forking: a fork
+  // inherits its parent's project.
+  const projLabel = document.querySelector('label[for="new-ws-project"]');
+  const projSelect = document.getElementById("new-ws-project");
+  if (projLabel) projLabel.hidden = !!_forkFromWsId;
+  if (projSelect) projSelect.hidden = !!_forkFromWsId;
+  if (projSelect && !_forkFromWsId && window.TurnstoneProjects) {
+    window.TurnstoneProjects.refreshProjects().then(function () {
+      _populateProjectSelect(projSelect);
+    });
+  }
+
   document.getElementById("new-ws-name").value = "";
   const initEl = document.getElementById("new-ws-initial-message");
   if (initEl) initEl.value = "";
@@ -438,6 +451,57 @@ function hideNewWsModal() {
   if (d.open) d.close();
 }
 
+// Sentinel option that reveals the inline project creator (project_creator.js).
+const _PROJECT_NEW = "__new__";
+
+// Mount the inline "+ New project…" creator once per <select>: it sits right
+// after the select; picking the sentinel resets the select and opens it; on
+// Save it repopulates + selects the new project.
+function _ensureStandaloneProjectCreator(sel) {
+  if (!sel || sel._projCreatorWired || !window.TurnstoneProjectCreator) return;
+  sel._projCreatorWired = true;
+  const creator = window.TurnstoneProjectCreator.make({
+    onCreated: function (proj) {
+      _populateProjectSelect(sel);
+      sel.value = proj.project_id;
+    },
+    onClose: function () {
+      if (sel.value === _PROJECT_NEW) sel.value = "";
+    },
+  });
+  if (sel.parentNode) sel.parentNode.insertBefore(creator.el, sel.nextSibling);
+  sel.addEventListener("change", function () {
+    if (sel.value === _PROJECT_NEW) {
+      sel.value = ""; // reset before opening so the sentinel can't stick
+      creator.open();
+    }
+  });
+}
+
+// Fill a project <select> from the shared projects cache, preserving its first
+// <option> (the "No project" placeholder) and the current selection, and append
+// the "+ New project…" sentinel.  No-op when the projects bridge is absent
+// (project.read denied / still loading).
+function _populateProjectSelect(sel) {
+  if (!sel || !window.TurnstoneProjects) return;
+  _ensureStandaloneProjectCreator(sel);
+  const previous = sel.value;
+  const placeholder = sel.options.length ? sel.options[0] : null;
+  sel.replaceChildren();
+  if (placeholder) sel.appendChild(placeholder);
+  window.TurnstoneProjects.projectChoices().forEach(function (c) {
+    const opt = document.createElement("option");
+    opt.value = c.value;
+    opt.textContent = c.text;
+    sel.appendChild(opt);
+  });
+  const newOpt = document.createElement("option");
+  newOpt.value = _PROJECT_NEW;
+  newOpt.textContent = "+ New project…";
+  sel.appendChild(newOpt);
+  if (previous && previous !== _PROJECT_NEW) sel.value = previous;
+}
+
 function submitNewWs() {
   const dlg = document.getElementById("new-ws-dialog");
   const body = {};
@@ -447,12 +511,17 @@ function submitNewWs() {
     .getElementById("new-ws-judge-model")
     .value.trim();
   const skill = document.getElementById("new-ws-skill").value;
+  const projectEl = document.getElementById("new-ws-project");
+  const project_id = projectEl ? projectEl.value : "";
   const initEl = document.getElementById("new-ws-initial-message");
   const initial_message = initEl ? initEl.value.trim() : "";
   if (name) body.name = name;
   if (model) body.model = model;
   if (judge_model) body.judge_model = judge_model;
   if (skill && !_forkFromWsId) body.skill = skill;
+  // A fork inherits its parent's project (the picker is hidden); only a fresh
+  // create carries an explicit project_id.
+  if (project_id && !_forkFromWsId) body.project_id = project_id;
   if (_forkFromWsId) body.resume_ws = _forkFromWsId;
   if (initial_message) body.initial_message = initial_message;
 
@@ -488,7 +557,13 @@ function submitNewWs() {
         return;
       }
       if (data.ws_id) {
-        workstreams[data.ws_id] = { name: data.name, state: "idle" };
+        // Seed project_id from what we sent so the rail groups it immediately
+        // (the ws_created SSE re-affirms it shortly after).
+        workstreams[data.ws_id] = {
+          name: data.name,
+          state: "idle",
+          project_id: body.project_id || null,
+        };
         _newWsStagedFiles = [];
         hideNewWsModal();
         switchTab(data.ws_id);
@@ -575,7 +650,12 @@ function loadDashboard() {
   const sessP = authFetch("/v1/api/workstreams/saved").then(function (r) {
     return r.json();
   });
-  Promise.all([dashP, sessP])
+  // Refresh the projects cache alongside the table so the per-row project pills
+  // resolve on first paint (deduped with the rail's fetch; never rejects).
+  const projP = window.TurnstoneProjects
+    ? window.TurnstoneProjects.refreshProjects()
+    : Promise.resolve();
+  Promise.all([dashP, sessP, projP])
     .then(function (res) {
       const dashData = res[0];
       const wsList = dashData.workstreams || [];
@@ -653,7 +733,28 @@ function renderDashboardTable(wsList, agg) {
 
     const nameCell = document.createElement("span");
     nameCell.className = "dash-cell-name";
-    nameCell.textContent = liveName;
+    // The name truncates in its own element so the project marker (a flex:none
+    // sibling) stays visible instead of being clipped by the fixed-width cell.
+    const nameTextEl = document.createElement("span");
+    nameTextEl.className = "dash-cell-name-text";
+    nameTextEl.textContent = liveName;
+    nameCell.appendChild(nameTextEl);
+    // A glyph-only project marker (the table grid is a fixed 6 columns, so no
+    // 7th cell; the rail group + composer chip carry the full name) when the ws
+    // is attached to a project the viewer can name.
+    const projName =
+      ws.project_id && window.TurnstoneProjects
+        ? window.TurnstoneProjects.projectName(ws.project_id)
+        : "";
+    if (projName) {
+      const pill = document.createElement("span");
+      pill.className = "dash-project-pill";
+      pill.textContent = "▣";
+      pill.title = "Project: " + projName;
+      pill.setAttribute("role", "img");
+      pill.setAttribute("aria-label", "Project: " + projName);
+      nameCell.appendChild(pill);
+    }
     main.appendChild(nameCell);
 
     const modelCell = document.createElement("span");
@@ -1226,6 +1327,16 @@ function _loadDashboardOptionsLists() {
         /* ignore */
       });
   }
+
+  // Project picker — refresh the shared cache then repaint (also feeds the
+  // rail's group-by-project).  Re-fetched each time the options open so a
+  // project created elsewhere appears without a page reload.
+  const projSel = document.getElementById("dashboard-project");
+  if (projSel && window.TurnstoneProjects) {
+    window.TurnstoneProjects.refreshProjects().then(function () {
+      _populateProjectSelect(projSel);
+    });
+  }
 }
 
 // localStorage key for the dashboard composer's Options-panel disclosure
@@ -1323,9 +1434,12 @@ function dashboardSubmit() {
   const model = document.getElementById("dashboard-model").value.trim();
   const judge = document.getElementById("dashboard-judge-model").value.trim();
   const skill = document.getElementById("dashboard-skill").value;
+  const projEl = document.getElementById("dashboard-project");
+  const project_id = projEl ? projEl.value : "";
   if (model) body.model = model;
   if (judge) body.judge_model = judge;
   if (skill) body.skill = skill;
+  if (project_id) body.project_id = project_id;
   if (text) body.initial_message = text;
 
   input.disabled = true;
@@ -1358,7 +1472,11 @@ function dashboardSubmit() {
         _dashboardError(data.error || "Failed to create workstream");
         return;
       }
-      workstreams[data.ws_id] = { name: data.name, state: "idle" };
+      workstreams[data.ws_id] = {
+        name: data.name,
+        state: "idle",
+        project_id: body.project_id || null,
+      };
       switchTab(data.ws_id);
       hideDashboard();
     })
@@ -1431,6 +1549,9 @@ function connectGlobalSSE() {
       workstreams[data.ws_id] = workstreams[data.ws_id] || {};
       workstreams[data.ws_id].name = data.name || data.ws_id.slice(0, 6);
       workstreams[data.ws_id].state = "idle";
+      // Carry the attached project so the rail groups the new session
+      // without waiting for a roster refetch (null = unattached).
+      workstreams[data.ws_id].project_id = data.project_id || null;
       renderTabBar();
     } else if (data.type === "ws_closed") {
       const wsId = data.ws_id;
@@ -2191,6 +2312,7 @@ function getClusterState() {
       state: w.state || "idle",
       kind: "interactive",
       parent_ws_id: w.parent_ws_id || null,
+      project_id: w.project_id || null,
     });
   }
   return { nodes: { local: { workstreams: list } }, overview: {} };

@@ -782,7 +782,7 @@ export interface SaveMemoryRequest {
   name: string;
   content: string;
   description?: string;
-  type?: "user" | "project" | "feedback" | "reference";
+  type?: "user" | "general" | "feedback" | "reference";
   scope?: "global" | "workstream" | "user";
   scope_id?: string;
 }

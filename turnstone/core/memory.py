@@ -226,6 +226,7 @@ def register_workstream(
     user_id: str | None = None,
     kind: WorkstreamKind | str = WorkstreamKind.INTERACTIVE,
     parent_ws_id: str | None = None,
+    project_id: str | None = None,
 ) -> None:
     """Persist a new workstream (no-op if already exists)."""
     try:
@@ -239,6 +240,7 @@ def register_workstream(
             skill_version=skill_version,
             kind=kind,
             parent_ws_id=parent_ws_id,
+            project_id=project_id,
         )
     except Exception:
         log.warning("Failed to register workstream ws=%s", ws_id, exc_info=True)
@@ -606,7 +608,7 @@ def save_structured_memory(
     name: str,
     content: str,
     description: str = "",
-    mem_type: str = "project",
+    mem_type: str = "general",
     scope: str = "global",
     scope_id: str = "",
 ) -> tuple[str, str | None]:
@@ -635,7 +637,7 @@ def save_structured_memory(
                 updates: dict[str, str] = {"content": content}
                 if description:
                     updates["description"] = description
-                if mem_type != "project":
+                if mem_type != "general":
                     updates["type"] = mem_type
                 storage.update_structured_memory(existing["memory_id"], **updates)
                 return existing["memory_id"], old_content

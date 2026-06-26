@@ -536,10 +536,17 @@ def _format_search_results(
 
 # Memory scopes accepted by the ``memory`` tool's preparer + executor.
 # Single source of truth — every action validator imports this rather
-# than literal-listing the four values, so adding a fifth scope is a
-# one-site change.  ``coordinator`` is COORDINATOR-only (see
+# than literal-listing the values, so adding a scope is a one-site
+# change.  ``coordinator`` is COORDINATOR-only and ``project`` needs the
+# workstream attached to an accessible project (see
 # :meth:`ChatSession._validate_scope`); the others are kind-agnostic.
-_VALID_MEMORY_SCOPES: tuple[str, ...] = ("global", "workstream", "user", "coordinator")
+_VALID_MEMORY_SCOPES: tuple[str, ...] = (
+    "global",
+    "workstream",
+    "user",
+    "coordinator",
+    "project",
+)
 
 # Implicit-scope walk for INTERACTIVE ``memory(action='get'/'delete')``
 # when no scope is specified.  Narrowest → widest so the most
@@ -963,6 +970,7 @@ class ChatSession:
         kind: WorkstreamKind = WorkstreamKind.INTERACTIVE,
         parent_ws_id: str | None = None,
         coord_client: Any = None,
+        project_id: str = "",
     ):
         if kind == WorkstreamKind.COORDINATOR and not user_id:
             # Coordinators carry real authority — they mint child-spawn
@@ -1078,6 +1086,28 @@ class ChatSession:
             dict[tuple[str, tuple[bool, bool, bool]], dict[str, Any] | list[dict[str, Any]]] | None
         ) = None
         self._ws_id = ws_id or uuid.uuid4().hex
+        # Project attachment + access, resolved ONCE here (mid-session attach or
+        # access-revoke takes effect on the next session load — same contract as
+        # user_id / coordinator scope).  ``_project_id`` is set only when the user
+        # can READ the project, so it gates recall in ``_visible_scopes``;
+        # ``_project_writable`` additionally gates the memory(save) path so a
+        # non-member of a *public* project can read but not write its memory.
+        self._project_id = ""
+        self._project_name = ""
+        self._project_writable = False
+        if project_id and self._user_id:
+            from turnstone.core.auth import resolve_project_access
+
+            # One fetch resolves read access, write access, the display name, and
+            # the project state (vs three round-trips).  Recall is gated on READ
+            # access AND a non-archived project: an archived project is "not
+            # recalled" per the schema contract, even though its owner can still
+            # reach it through the management routes (to rename / unarchive).
+            acc = resolve_project_access(self._user_id, project_id)
+            if acc.can_read and acc.state != "archived":
+                self._project_id = project_id
+                self._project_writable = acc.can_write
+                self._project_name = acc.name
         self._title_generated = False
         self._read_files: set[str] = set()
         # The canonical in-memory trajectory.  Wire prep (fold/repair) + the
@@ -2790,6 +2820,7 @@ class ChatSession:
                 current_datetime=now.strftime("%Y-%m-%dT%H:00"),
                 timezone=now.tzname() or "UTC",
                 username=self._username or self._user_id or "unknown",
+                project=self._project_name,
             )
             composed = compose_system_message(
                 client_type=self._client_type,
@@ -7685,6 +7716,8 @@ class ChatSession:
             return self._user_id
         if scope == "coordinator":
             return self._coordinator_scope_id()
+        if scope == "project":
+            return self._project_id
         return ""
 
     def _coordinator_scope_id(self) -> str:
@@ -7735,6 +7768,18 @@ class ChatSession:
                 "needs_approval": False,
                 "error": "Error: 'user' scope requires authenticated user identity",
             }
+        if scope == "project" and not self._project_id:
+            return {
+                "call_id": call_id,
+                "func_name": "memory",
+                "header": "✗ memory: not attached to an accessible project",
+                "preview": "",
+                "needs_approval": False,
+                "error": (
+                    "Error: 'project' scope requires this workstream to be "
+                    "attached to a project you can access."
+                ),
+            }
         if (
             scope == "coordinator"
             and self._kind == WorkstreamKind.COORDINATOR
@@ -7756,7 +7801,10 @@ class ChatSession:
                 "needs_approval": False,
                 "error": "Error: 'coordinator' scope requires authenticated user identity",
             }
-        if self._kind == WorkstreamKind.COORDINATOR and scope != "coordinator":
+        if self._kind == WorkstreamKind.COORDINATOR and scope not in (
+            "coordinator",
+            "project",
+        ):
             return {
                 "call_id": call_id,
                 "func_name": "memory",
@@ -7792,10 +7840,19 @@ class ChatSession:
     def _default_memory_scope(self) -> str:
         """Default ``scope`` for a memory(action='save') with no explicit scope.
 
-        Coord sessions default to ``coordinator`` (the only scope they
-        can write); interactive sessions default to ``global`` to match
-        the existing IC behaviour.
+        An attached, WRITABLE project wins for both kinds: work done inside a
+        project lands in the project bucket by default instead of leaking into
+        the kind default (``global`` / ``coordinator``).  The model can still
+        target another scope explicitly (a genuine cross-project ``user`` fact,
+        say).  A read-only project session keeps the kind default — it can't
+        write the project anyway, so defaulting there would only hit the
+        write-gate.
+
+        Otherwise: coord sessions default to ``coordinator`` (the only scope
+        they can write); interactive sessions default to ``global``.
         """
+        if self._project_id and self._project_writable:
+            return "project"
         if self._kind == WorkstreamKind.COORDINATOR:
             return "coordinator"
         return "global"
@@ -7825,36 +7882,48 @@ class ChatSession:
         """
         if self._kind == WorkstreamKind.COORDINATOR:
             scope_id = self._coordinator_scope_id()
-            if not scope_id:
-                return 0
-            return count_structured_memories(scope="coordinator", scope_id=scope_id)
+            n = 0
+            if scope_id:
+                n += count_structured_memories(scope="coordinator", scope_id=scope_id)
+            if self._project_id:
+                n += count_structured_memories(scope="project", scope_id=self._project_id)
+            return n
         n = count_structured_memories(scope="global")
         n += count_structured_memories(scope="workstream", scope_id=self._ws_id)
         if self._user_id:
             n += count_structured_memories(scope="user", scope_id=self._user_id)
+        if self._project_id:
+            n += count_structured_memories(scope="project", scope_id=self._project_id)
         return n
 
     def _visible_scopes(self) -> list[tuple[str, str]]:
         """Return the (scope, scope_id) pairs visible to this session.
 
-        Coord sessions see ONLY their coord-scope; interactive sessions see
-        global + their workstream + their user (when uid present).  Drives
-        the single-query visibility helpers.
+        Coord sessions see their coord-scope; interactive sessions see global +
+        their workstream + their user (when uid present).  Either kind also sees
+        its attached ``project`` scope when the session resolved read access to a
+        project at construction.  Drives the single-query visibility helpers.
         """
         if self._kind == WorkstreamKind.COORDINATOR:
             scope_id = self._coordinator_scope_id()
-            # Fail-closed on an empty scope_id (unreachable through real
-            # hosts — __init__ refuses anonymous coordinators): the
-            # storage helpers treat a falsy scope_id as "no scope_id
-            # filter" (that's how ``global`` works), so passing
-            # ("coordinator", "") through would read EVERY user's
+            # Fail-closed on an empty scope_id (unreachable through real hosts —
+            # __init__ refuses anonymous coordinators): the storage helpers treat
+            # a falsy scope_id as "no scope_id filter" (that's how ``global``
+            # works), so a ("coordinator", "") pair would read EVERY user's
             # coordinator rows instead of none.
-            if not scope_id:
-                return []
-            return [("coordinator", scope_id)]
+            coord_scopes: list[tuple[str, str]] = []
+            if scope_id:
+                coord_scopes.append(("coordinator", scope_id))
+            # A coordinator attached to a project also recalls the shared project
+            # bucket (read + write), alongside its isolated coordinator scope.
+            if self._project_id:
+                coord_scopes.append(("project", self._project_id))
+            return coord_scopes
         scopes: list[tuple[str, str]] = [("global", ""), ("workstream", self._ws_id)]
         if self._user_id:
             scopes.append(("user", self._user_id))
+        if self._project_id:
+            scopes.append(("project", self._project_id))
         return scopes
 
     def _list_visible_memories(self, mem_type: str = "", limit: int = 50) -> list[dict[str, str]]:
@@ -8321,6 +8390,7 @@ class ChatSession:
         name = (args.get("name") or "").strip()
         model = (args.get("model") or "").strip()
         target_node = (args.get("target_node") or "").strip()
+        project = (args.get("project") or "").strip()
         if initial_message:
             first_line = initial_message.splitlines()[0]
             preview_line = first_line[:120] + ("..." if len(first_line) > 120 else "")
@@ -8347,6 +8417,7 @@ class ChatSession:
             "name": name,
             "model": model,
             "target_node": target_node,
+            "project": project,
         }
 
     def _exec_spawn_workstream(self, item: dict[str, Any]) -> tuple[str, str]:
@@ -8360,6 +8431,7 @@ class ChatSession:
                 name=item["name"],
                 model=item["model"],
                 target_node=item["target_node"],
+                project=item["project"],
             )
         except Exception as e:
             msg = f"Error: spawn_workstream failed: {e}"
@@ -10627,9 +10699,9 @@ class ChatSession:
                     "error": f"Error: content exceeds {self._mem_cfg.max_content} character limit",
                 }
             description = (args.get("description") or "").strip()
-            mem_type = (args.get("type") or "project").strip().lower()
-            if mem_type not in ("user", "project", "feedback", "reference"):
-                mem_type = "project"
+            mem_type = (args.get("type") or "general").strip().lower()
+            if mem_type not in ("user", "general", "feedback", "reference"):
+                mem_type = "general"
             # Default scope is kind-aware: coord sessions default to
             # ``coordinator`` (their only writable scope); IC sessions
             # default to ``global`` (matches pre-fix behaviour).
@@ -10640,6 +10712,18 @@ class ChatSession:
             scope_err = self._validate_scope(scope, call_id)
             if scope_err:
                 return scope_err
+            if scope == "project" and not self._project_writable:
+                return {
+                    "call_id": call_id,
+                    "func_name": "memory",
+                    "header": "\u2717 memory save: project is read-only for you",
+                    "preview": "",
+                    "needs_approval": False,
+                    "error": (
+                        "Error: you have read-only access to this project; you "
+                        "cannot save project-scoped memory."
+                    ),
+                }
             scope_id = self._resolve_scope_id(scope)
             return {
                 "call_id": call_id,
@@ -10735,6 +10819,23 @@ class ChatSession:
                 scope_err = self._validate_scope(explicit_scope, call_id)
                 if scope_err:
                     return scope_err
+                # _validate_scope gates on READ access (_project_id); deleting a
+                # shared project row is a WRITE, so gate it on _project_writable
+                # too — mirrors the save path so a read-only member of a public
+                # project can't destroy project-scoped memory.  (The implicit
+                # walk below never includes project scope, so it needs no gate.)
+                if explicit_scope == "project" and not self._project_writable:
+                    return {
+                        "call_id": call_id,
+                        "func_name": "memory",
+                        "header": "✗ memory delete: project is read-only for you",
+                        "preview": "",
+                        "needs_approval": False,
+                        "error": (
+                            "Error: you have read-only access to this project; you "
+                            "cannot delete project-scoped memory."
+                        ),
+                    }
                 scope_id = self._resolve_scope_id(explicit_scope)
                 scopes_to_try = [(explicit_scope, scope_id)]
             else:
@@ -10761,7 +10862,7 @@ class ChatSession:
         if action == "search":
             query = (args.get("query") or "").strip()
             mem_type = (args.get("type") or "").strip().lower()
-            if mem_type and mem_type not in ("user", "project", "feedback", "reference"):
+            if mem_type and mem_type not in ("user", "general", "feedback", "reference"):
                 mem_type = ""
             scope = (args.get("scope") or "").strip().lower()
             if scope and scope not in _VALID_MEMORY_SCOPES:
@@ -10794,7 +10895,7 @@ class ChatSession:
 
         if action == "list":
             mem_type = (args.get("type") or "").strip().lower()
-            if mem_type and mem_type not in ("user", "project", "feedback", "reference"):
+            if mem_type and mem_type not in ("user", "general", "feedback", "reference"):
                 mem_type = ""
             scope = (args.get("scope") or "").strip().lower()
             if scope and scope not in _VALID_MEMORY_SCOPES:

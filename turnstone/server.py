@@ -791,6 +791,7 @@ def _interactive_open_post_load(request: Request, ws: Workstream) -> None:
                     "kind": ws.kind,
                     "parent_ws_id": ws.parent_ws_id,
                     "user_id": ws.user_id,
+                    "project_id": ws.project_id,
                 }
             )
 
@@ -897,6 +898,7 @@ def _build_node_snapshot(app_state: Any) -> dict[str, Any]:
                 "kind": ws.kind,
                 "parent_ws_id": ws.parent_ws_id,
                 "user_id": ws.user_id,
+                "project_id": ws.project_id,
                 "pending_approval_detail": approval_detail,
             }
         )
@@ -1105,6 +1107,7 @@ async def dashboard(request: Request) -> JSONResponse:
                 "kind": ws.kind,
                 "parent_ws_id": ws.parent_ws_id,
                 "user_id": ws.user_id,
+                "project_id": ws.project_id,
                 "pending_approval_detail": ui.serialize_pending_approval_detail(),
                 # Per-ws ring buffer of recent auto-approves (last 10).
                 # Lets the coord-tree render a "recently auto-approved
@@ -1926,6 +1929,13 @@ async def _interactive_create_validate_request(
                 {"error": "parent_ws_id must reference a coordinator you own"},
                 status_code=403,
             )
+        # Inherit the parent coordinator's project unless the spawn set one
+        # explicitly (the spawn_workstream(project=…) escape hatch), so a child
+        # recalls the same shared project bucket as its coordinator.  Covers
+        # spawn_workstream and spawn_batch, and survives the routing proxy
+        # (which forwards the body verbatim).
+        if not (body.get("project_id") or "") and parent_row.get("project_id"):
+            body["project_id"] = parent_row.get("project_id")
     notify_targets_raw = body.get("notify_targets", "[]")
     if isinstance(notify_targets_raw, list):
         notify_targets_raw = json.dumps(notify_targets_raw)
@@ -1975,6 +1985,7 @@ def _interactive_create_build_kwargs(
         "client_type": body.get("client_type", "") or "",
         "judge_model": body.get("judge_model", "") or None,
         "parent_ws_id": body.get("parent_ws_id") or None,
+        "project_id": body.get("project_id") or None,
     }
 
 
@@ -2425,7 +2436,7 @@ async def cancel_watch(request: Request) -> JSONResponse:
 # Memory endpoints
 # ---------------------------------------------------------------------------
 
-_VALID_MEMORY_TYPES = frozenset({"user", "project", "feedback", "reference"})
+_VALID_MEMORY_TYPES = frozenset({"user", "general", "feedback", "reference"})
 _VALID_MEMORY_SCOPES = frozenset({"global", "workstream", "user"})
 _MAX_MEMORY_CONTENT = 65536  # hard upper bound; server may enforce lower via config
 
@@ -2519,7 +2530,7 @@ async def save_memory(request: Request) -> JSONResponse:
             status_code=400,
         )
     description = str(body.get("description", ""))
-    mem_type = str(body.get("type", "project"))
+    mem_type = str(body.get("type", "general"))
     scope = str(body.get("scope", "global"))
     scope_id = str(body.get("scope_id", ""))
     if mem_type not in _VALID_MEMORY_TYPES:
@@ -2615,6 +2626,260 @@ async def delete_memory_endpoint(request: Request) -> JSONResponse:
     if delete_structured_memory(name, scope, scope_id):
         return JSONResponse({"status": "ok", "name": name})
     return JSONResponse({"error": f"Memory '{name}' not found"}, status_code=404)
+
+
+# ---------------------------------------------------------------------------
+# Project endpoints — shared resource containers (migration 062)
+# ---------------------------------------------------------------------------
+#
+# User-facing CRUD over projects.  Every handler gates first on the RBAC
+# capability (``project.{create,read,write,delete}`` — admin-default) and then,
+# for a specific project, on the per-project ACL via
+# ``auth.user_can_access_project`` (or ownership for destructive / membership
+# ops).  Registered by both the standalone server and the console — projects
+# are global / shared-DB, so the handlers are node-agnostic.
+
+
+def _project_view(row: dict[str, Any]) -> dict[str, Any]:
+    """Public-facing projection of a ``projects`` row."""
+    return {
+        "project_id": row.get("project_id", ""),
+        "name": row.get("name", ""),
+        "owner_id": row.get("owner_id", ""),
+        "visibility": row.get("visibility", "private"),
+        "state": row.get("state", "active"),
+        "created": row.get("created", ""),
+        "updated": row.get("updated", ""),
+    }
+
+
+def _project_request_uid(request: Request) -> tuple[str, JSONResponse | None]:
+    """Return the authenticated user_id, or a 401 JSONResponse."""
+    auth = getattr(getattr(request, "state", None), "auth_result", None)
+    uid: str = getattr(auth, "user_id", "") or ""
+    if not uid:
+        return "", JSONResponse({"error": "authentication required"}, status_code=401)
+    return uid, None
+
+
+async def list_projects(request: Request) -> JSONResponse:
+    """GET /v1/api/projects — projects the caller owns, is a member of, or public."""
+    from turnstone.core.auth import require_permission
+    from turnstone.core.storage import get_storage
+
+    err = require_permission(request, "project.read")
+    if err:
+        return err
+    uid, uerr = _project_request_uid(request)
+    if uerr:
+        return uerr
+    include_archived = request.query_params.get("include_archived", "").lower() in (
+        "1",
+        "true",
+        "yes",
+    )
+    storage = get_storage()
+    rows = storage.list_projects_for_user(uid, include_archived=include_archived) if storage else []
+    return JSONResponse({"projects": [_project_view(r) for r in rows], "total": len(rows)})
+
+
+async def create_project(request: Request) -> JSONResponse:
+    """POST /v1/api/projects — create a project owned by the caller."""
+    import uuid
+
+    from turnstone.core.auth import require_permission
+    from turnstone.core.storage import get_storage
+    from turnstone.core.web_helpers import read_json_or_400
+
+    err = require_permission(request, "project.create")
+    if err:
+        return err
+    uid, uerr = _project_request_uid(request)
+    if uerr:
+        return uerr
+    body = await read_json_or_400(request)
+    if isinstance(body, JSONResponse):
+        return body
+    name = str(body.get("name", "")).strip()
+    if not name or len(name) > 200:
+        return JSONResponse({"error": "name is required (max 200 characters)"}, status_code=400)
+    visibility = str(body.get("visibility", "private")).strip().lower()
+    if visibility not in ("private", "public"):
+        return JSONResponse({"error": "visibility must be 'private' or 'public'"}, status_code=400)
+    storage = get_storage()
+    if storage is None:
+        return JSONResponse({"error": "storage unavailable"}, status_code=503)
+    project_id = uuid.uuid4().hex
+    storage.create_project(project_id, name, uid, visibility=visibility)
+    return JSONResponse(_project_view(storage.get_project(project_id) or {}), status_code=201)
+
+
+async def get_project_endpoint(request: Request) -> JSONResponse:
+    """GET /v1/api/projects/{project_id} — one project the caller can read."""
+    from turnstone.core.auth import require_permission, user_can_access_project
+    from turnstone.core.storage import get_storage
+
+    err = require_permission(request, "project.read")
+    if err:
+        return err
+    uid, uerr = _project_request_uid(request)
+    if uerr:
+        return uerr
+    project_id = request.path_params["project_id"]
+    storage = get_storage()
+    row = storage.get_project(project_id) if storage else None
+    if row is None:
+        return JSONResponse({"error": "project not found"}, status_code=404)
+    if not user_can_access_project(uid, project_id, write=False, storage=storage):
+        return JSONResponse({"error": "forbidden"}, status_code=403)
+    return JSONResponse(_project_view(row))
+
+
+async def update_project_endpoint(request: Request) -> JSONResponse:
+    """PATCH /v1/api/projects/{project_id} — rename / re-visibility / archive."""
+    from turnstone.core.auth import require_permission, user_can_access_project
+    from turnstone.core.storage import get_storage
+    from turnstone.core.web_helpers import read_json_or_400
+
+    err = require_permission(request, "project.write")
+    if err:
+        return err
+    uid, uerr = _project_request_uid(request)
+    if uerr:
+        return uerr
+    project_id = request.path_params["project_id"]
+    storage = get_storage()
+    row = storage.get_project(project_id) if storage else None
+    if storage is None or row is None:
+        return JSONResponse({"error": "project not found"}, status_code=404)
+    if not user_can_access_project(uid, project_id, write=True, storage=storage):
+        return JSONResponse({"error": "forbidden"}, status_code=403)
+    body = await read_json_or_400(request)
+    if isinstance(body, JSONResponse):
+        return body
+    fields: dict[str, Any] = {}
+    if "name" in body:
+        name = str(body.get("name", "")).strip()
+        if not name or len(name) > 200:
+            return JSONResponse({"error": "invalid name"}, status_code=400)
+        fields["name"] = name
+    if "visibility" in body:
+        vis = str(body.get("visibility", "")).strip().lower()
+        if vis not in ("private", "public"):
+            return JSONResponse({"error": "invalid visibility"}, status_code=400)
+        # Visibility is a confidentiality lever — ``public`` opens read to every
+        # project.read holder — so it's owner-only, like delete + member
+        # management.  Write-tier members may still rename / archive.
+        if row.get("owner_id") != uid:
+            return JSONResponse(
+                {"error": "only the project owner may change visibility"},
+                status_code=403,
+            )
+        fields["visibility"] = vis
+    if "state" in body:
+        state = str(body.get("state", "")).strip().lower()
+        if state not in ("active", "archived"):
+            return JSONResponse({"error": "invalid state"}, status_code=400)
+        fields["state"] = state
+    if not fields:
+        return JSONResponse({"error": "no updatable fields provided"}, status_code=400)
+    storage.update_project(project_id, **fields)
+    return JSONResponse(_project_view(storage.get_project(project_id) or {}))
+
+
+async def delete_project_endpoint(request: Request) -> JSONResponse:
+    """DELETE /v1/api/projects/{project_id} — owner-only; destroys the container."""
+    from turnstone.core.auth import require_permission
+    from turnstone.core.storage import get_storage
+
+    err = require_permission(request, "project.delete")
+    if err:
+        return err
+    uid, uerr = _project_request_uid(request)
+    if uerr:
+        return uerr
+    project_id = request.path_params["project_id"]
+    storage = get_storage()
+    row = storage.get_project(project_id) if storage else None
+    if row is None:
+        return JSONResponse({"error": "project not found"}, status_code=404)
+    # Deletion is owner-only — it destroys the container and its scoped memory.
+    if row.get("owner_id") != uid:
+        return JSONResponse({"error": "only the project owner may delete it"}, status_code=403)
+    storage.delete_project(project_id)
+    return JSONResponse({"status": "ok", "project_id": project_id})
+
+
+async def list_project_members_endpoint(request: Request) -> JSONResponse:
+    """GET /v1/api/projects/{project_id}/members — member user_ids."""
+    from turnstone.core.auth import require_permission, user_can_access_project
+    from turnstone.core.storage import get_storage
+
+    err = require_permission(request, "project.read")
+    if err:
+        return err
+    uid, uerr = _project_request_uid(request)
+    if uerr:
+        return uerr
+    project_id = request.path_params["project_id"]
+    storage = get_storage()
+    if storage is None or storage.get_project(project_id) is None:
+        return JSONResponse({"error": "project not found"}, status_code=404)
+    if not user_can_access_project(uid, project_id, write=False, storage=storage):
+        return JSONResponse({"error": "forbidden"}, status_code=403)
+    return JSONResponse({"members": storage.list_project_members(project_id)})
+
+
+async def add_project_member_endpoint(request: Request) -> JSONResponse:
+    """POST /v1/api/projects/{project_id}/members — owner adds a member."""
+    from turnstone.core.auth import require_permission
+    from turnstone.core.storage import get_storage
+    from turnstone.core.web_helpers import read_json_or_400
+
+    err = require_permission(request, "project.write")
+    if err:
+        return err
+    uid, uerr = _project_request_uid(request)
+    if uerr:
+        return uerr
+    project_id = request.path_params["project_id"]
+    storage = get_storage()
+    row = storage.get_project(project_id) if storage else None
+    if row is None:
+        return JSONResponse({"error": "project not found"}, status_code=404)
+    if row.get("owner_id") != uid:
+        return JSONResponse({"error": "only the project owner may manage members"}, status_code=403)
+    body = await read_json_or_400(request)
+    if isinstance(body, JSONResponse):
+        return body
+    member = str(body.get("user_id", "")).strip()
+    if not member:
+        return JSONResponse({"error": "user_id is required"}, status_code=400)
+    storage.add_project_member(project_id, member)
+    return JSONResponse({"status": "ok", "members": storage.list_project_members(project_id)})
+
+
+async def remove_project_member_endpoint(request: Request) -> JSONResponse:
+    """DELETE /v1/api/projects/{project_id}/members/{user_id} — owner removes a member."""
+    from turnstone.core.auth import require_permission
+    from turnstone.core.storage import get_storage
+
+    err = require_permission(request, "project.write")
+    if err:
+        return err
+    uid, uerr = _project_request_uid(request)
+    if uerr:
+        return uerr
+    project_id = request.path_params["project_id"]
+    member = request.path_params["user_id"]
+    storage = get_storage()
+    row = storage.get_project(project_id) if storage else None
+    if row is None:
+        return JSONResponse({"error": "project not found"}, status_code=404)
+    if row.get("owner_id") != uid:
+        return JSONResponse({"error": "only the project owner may manage members"}, status_code=403)
+    storage.remove_project_member(project_id, member)
+    return JSONResponse({"status": "ok", "members": storage.list_project_members(project_id)})
 
 
 async def auth_login(request: Request) -> Response:
@@ -3963,6 +4228,33 @@ def create_app(
                     Route("/api/memories", save_memory, methods=["POST"]),
                     Route("/api/memories/search", search_memories, methods=["POST"]),
                     Route("/api/memories/{name}", delete_memory_endpoint, methods=["DELETE"]),
+                    Route("/api/projects", list_projects),
+                    Route("/api/projects", create_project, methods=["POST"]),
+                    Route("/api/projects/{project_id}", get_project_endpoint),
+                    Route(
+                        "/api/projects/{project_id}",
+                        update_project_endpoint,
+                        methods=["PATCH"],
+                    ),
+                    Route(
+                        "/api/projects/{project_id}",
+                        delete_project_endpoint,
+                        methods=["DELETE"],
+                    ),
+                    Route(
+                        "/api/projects/{project_id}/members",
+                        list_project_members_endpoint,
+                    ),
+                    Route(
+                        "/api/projects/{project_id}/members",
+                        add_project_member_endpoint,
+                        methods=["POST"],
+                    ),
+                    Route(
+                        "/api/projects/{project_id}/members/{user_id}",
+                        remove_project_member_endpoint,
+                        methods=["DELETE"],
+                    ),
                     Route("/api/auth/login", auth_login, methods=["POST"]),
                     Route("/api/auth/logout", auth_logout, methods=["POST"]),
                     Route("/api/auth/status", auth_status),
@@ -4402,6 +4694,7 @@ def main() -> None:
         judge_model: str | None = None,
         kind: WorkstreamKind = WorkstreamKind.INTERACTIVE,
         parent_ws_id: str | None = None,
+        project_id: str = "",
     ) -> ChatSession:
         assert ui is not None
         # Resolve the effective alias once and use it consistently
@@ -4511,6 +4804,7 @@ def main() -> None:
             username=_username,
             kind=kind,
             parent_ws_id=parent_ws_id,
+            project_id=project_id,
         )
 
     # Create WatchRunner (periodic command polling, server-level)

@@ -120,6 +120,9 @@ class Workstream:
     kind: WorkstreamKind = WorkstreamKind.INTERACTIVE
     # Non-None for children spawned by a coordinator.
     parent_ws_id: str | None = None
+    # The project this workstream is attached to (None = none).  Children
+    # inherit the parent's project_id at spawn.
+    project_id: str | None = None
     # Tombstone: set by ``SessionManager.close`` under ``_lock`` so a
     # racing ``set_state`` can detect the close before it overwrites
     # the persisted ``state='closed'`` row. Guarded by ``_lock``.

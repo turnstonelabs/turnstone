@@ -222,6 +222,7 @@ function createCoordinatorPane(root, wsId, opts) {
     sendGlyph: "\u2191",
     layout: "stacked",
     modelChip: true,
+    projectChip: true,
     placeholder: "Message the coordinator\u2026",
     ariaLabel: "Coordinator input",
     attachments: {
@@ -409,6 +410,7 @@ function createCoordinatorPane(root, wsId, opts) {
   let coordModel = "";
   let coordModelAlias = "";
   let coordEffort = "";
+  let coordProjectName = "";
   let lastStatusEvt = null;
 
   let evtSource = null;
@@ -1810,6 +1812,13 @@ function createCoordinatorPane(root, wsId, opts) {
     composer.setModel(alias ? alias + eff : "");
   }
 
+  // Paint the composer's "has a project" badge from the connected event's
+  // project_name ("" = none → hidden).
+  function paintCoordProjectChip() {
+    if (composer && composer.setProject)
+      composer.setProject(coordProjectName || "");
+  }
+
   function coordSend() {
     const text = composer.value;
     const trimmed = (text || "").trim();
@@ -2443,6 +2452,8 @@ function createCoordinatorPane(root, wsId, opts) {
         coordModel = ev.model || "";
         coordModelAlias = ev.model_alias || ev.model || "";
         paintCoordModelChip();
+        coordProjectName = ev.project_name || "";
+        paintCoordProjectChip();
         break;
       case "status":
         // Live token / context / tool / turn counters.  Replayed once

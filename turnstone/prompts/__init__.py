@@ -57,6 +57,7 @@ class SessionContext:
     current_datetime: str  # ISO 8601, required
     timezone: str  # system tz abbreviation, required
     username: str  # users.username, required
+    project: str = ""  # attached project name, rendered only when the ws has one
 
 
 # File-based policy-to-tool gating (defaults).
@@ -75,11 +76,13 @@ _ENV_MAP: dict[ClientType, str] = {
 
 def _build_context(ctx: SessionContext, kind: WorkstreamKind) -> str:
     """Build the CONTEXT module from session variables."""
+    project_line = f"- **Project:** {ctx.project}\n" if ctx.project else ""
     return (
         "## Session Context\n"
         "\n"
         f"- **Current date/time:** {ctx.current_datetime} ({ctx.timezone})\n"
         f"- **User:** {ctx.username}\n"
+        f"{project_line}"
         f"- **Session kind:** {kind.value}"
     )
 

@@ -737,7 +737,10 @@ def test_dashboard_is_the_main_pane_body() -> None:
     body = _INDEX_HTML.read_text(encoding="utf-8")
     assert 'id="main"' in body, "the dashboard content lives in #main (the Dashboard pane body)."
     start = body.index('id="main"')
-    chunk = body[start : start + 4000]
+    # Window spans the launcher (composer + options) through the workstreams
+    # table — it grows as launcher options are added (e.g. the project picker),
+    # so the bound just needs to keep BOTH inside #main, not be tight.
+    chunk = body[start : start + 4500]
     assert 'id="dashboard-input"' in chunk and 'id="dash-ws-table"' in chunk, (
         "#main must hold the new-session launcher + the workstreams table."
     )

@@ -153,7 +153,7 @@ class TestBuildMemoryContext:
         assert build_memory_context([]) == ""
 
     def test_single_memory(self):
-        mems = [{"name": "test", "type": "project", "scope": "global", "content": "hello"}]
+        mems = [{"name": "test", "type": "general", "scope": "global", "content": "hello"}]
         ctx = build_memory_context(mems)
         assert "<memories>" in ctx
         assert "</memories>" in ctx
@@ -164,7 +164,7 @@ class TestBuildMemoryContext:
         mems = [
             {
                 "name": "a<b",
-                "type": "project",
+                "type": "general",
                 "scope": "global",
                 "content": "x & y",
                 "description": 'say "hi"',
@@ -179,7 +179,7 @@ class TestBuildMemoryContext:
         mems = [
             {
                 "name": "long",
-                "type": "project",
+                "type": "general",
                 "scope": "global",
                 "content": "x" * 600,
             }
@@ -193,7 +193,7 @@ class TestBuildMemoryContext:
         mems = [
             {
                 "name": "test",
-                "type": "project",
+                "type": "general",
                 "scope": "global",
                 "content": "data",
                 "description": "some desc",
@@ -203,7 +203,7 @@ class TestBuildMemoryContext:
         assert 'description="some desc"' in ctx
 
     def test_no_description_attribute_when_empty(self):
-        mems = [{"name": "test", "type": "project", "scope": "global", "content": "data"}]
+        mems = [{"name": "test", "type": "general", "scope": "global", "content": "data"}]
         ctx = build_memory_context(mems)
         assert "description=" not in ctx
 
@@ -274,7 +274,7 @@ def _make_mem(name: str, content: str = "", memory_id: str | None = None) -> dic
     return {
         "name": name,
         "memory_id": memory_id or f"mid_{name}",
-        "type": "project",
+        "type": "general",
         "scope": "global",
         "scope_id": "",
         "description": "",

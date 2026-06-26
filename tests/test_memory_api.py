@@ -122,7 +122,7 @@ def _seed_memory(storage, name="test_key", content="test content", **kw):
         mid,
         name,
         kw.get("description", ""),
-        kw.get("mem_type", "project"),
+        kw.get("mem_type", "general"),
         kw.get("scope", "global"),
         kw.get("scope_id", ""),
         content,
@@ -152,7 +152,7 @@ class TestServerListMemories:
 
     def test_filter_by_type(self, server_client, storage):
         _seed_memory(storage, "a", "x", mem_type="user")
-        _seed_memory(storage, "b", "y", mem_type="project")
+        _seed_memory(storage, "b", "y", mem_type="general")
         r = server_client.get("/v1/api/memories?type=user")
         assert r.json()["total"] == 1
         assert r.json()["memories"][0]["name"] == "a"
@@ -185,7 +185,7 @@ class TestServerSaveMemory:
         data = r.json()
         assert data["name"] == "my_key"
         assert data["content"] == "my content"
-        assert data["type"] == "project"
+        assert data["type"] == "general"
         assert data["scope"] == "global"
 
     def test_upsert(self, server_client):
@@ -425,7 +425,7 @@ class TestAdminListMemories:
 
     def test_filter(self, admin_client, storage):
         _seed_memory(storage, "a", "1", mem_type="user")
-        _seed_memory(storage, "b", "2", mem_type="project")
+        _seed_memory(storage, "b", "2", mem_type="general")
         r = admin_client.get("/v1/api/admin/memories?type=user")
         assert r.json()["total"] == 1
 
@@ -500,7 +500,7 @@ class TestAdminDeleteMemory:
 
 class TestDeleteByIdStorage:
     def test_delete_existing(self, storage):
-        storage.create_structured_memory("m1", "k", "d", "project", "global", "", "data")
+        storage.create_structured_memory("m1", "k", "d", "general", "global", "", "data")
         assert storage.delete_structured_memory_by_id("m1")
         assert storage.get_structured_memory("m1") is None
 

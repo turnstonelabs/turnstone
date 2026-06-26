@@ -343,6 +343,7 @@ class SessionManager:
         model: str | None = None,
         client_type: str = "",
         parent_ws_id: str | None = None,
+        project_id: str | None = None,
         defer_emit_created: bool = False,
         **extra_session_kwargs: Any,
     ) -> Workstream:
@@ -384,7 +385,11 @@ class SessionManager:
 
         with self._lock:
             ws, evicted = self._reserve_and_install_locked(
-                ws_id, user_id=user_id, name=effective_name, parent_ws_id=parent_ws_id
+                ws_id,
+                user_id=user_id,
+                name=effective_name,
+                parent_ws_id=parent_ws_id,
+                project_id=project_id,
             )
 
         if evicted is not None:
@@ -404,6 +409,7 @@ class SessionManager:
                 name=ws.name,
                 kind=self.kind,
                 parent_ws_id=parent_ws_id,
+                project_id=project_id,
                 skill_id=skill_id,
                 skill_version=skill_version,
             )
@@ -618,6 +624,7 @@ class SessionManager:
                         user_id=row.get("user_id") or "",
                         name=row.get("name") or f"ws-{ws_id[:4]}",
                         parent_ws_id=row.get("parent_ws_id"),
+                        project_id=row.get("project_id"),
                     )
 
                 if evicted is not None:
@@ -1117,6 +1124,7 @@ class SessionManager:
         user_id: str,
         name: str,
         parent_ws_id: str | None = None,
+        project_id: str | None = None,
     ) -> tuple[Workstream, Workstream | None]:
         """Install a placeholder ``Workstream`` under ``self._lock``.
 
@@ -1167,6 +1175,7 @@ class SessionManager:
         ws.kind = self.kind
         ws.user_id = user_id
         ws.parent_ws_id = parent_ws_id if parent_ws_id else None
+        ws.project_id = project_id if project_id else None
         try:
             ws.ui = self._adapter.build_ui(ws)
         except Exception:

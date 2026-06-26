@@ -185,6 +185,7 @@ Composer.prototype._buildDom = function () {
 
   this._buildAttachButton(actionRow, opts);
   this._buildModelChip(actionRow, opts);
+  this._buildProjectChip(actionRow, opts);
   this._buildInput(textRow, opts);
   this._buildOptionsToggle(actionRow, opts);
   this._buildSendButton(actionRow, opts);
@@ -238,6 +239,38 @@ Composer.prototype._buildModelChip = function (row, opts) {
 // resets it to the em-dash placeholder.  No-op when the chip is disabled.
 Composer.prototype.setModel = function (label) {
   if (this.modelChipEl) this.modelChipEl.textContent = label || "—";
+};
+
+// "Has a project" badge — sits just right of the model chip (matching the mock's
+// `[+] [model · effort] [▣ project] input [↑]`).  DISPLAY ONLY: the caller paints
+// it from the attached project's name; hidden entirely until a name is set, so a
+// projectless session shows nothing.
+Composer.prototype._buildProjectChip = function (row, opts) {
+  if (!opts.projectChip) {
+    this.projectChipEl = null;
+    return;
+  }
+  this.projectChipEl = document.createElement("span");
+  this.projectChipEl.className = "composer-project-chip";
+  // role=img + aria-label is reliably announced (a bare span's aria-label is
+  // not), so the ▣ glyph in the text isn't read out as noise.
+  this.projectChipEl.setAttribute("role", "img");
+  this.projectChipEl.setAttribute("aria-label", "Project");
+  this.projectChipEl.hidden = true; // shown once setProject() gets a name
+  row.appendChild(this.projectChipEl);
+};
+
+// Paint (or clear) the project badge.  A falsy label hides it (no project
+// attached); a name shows "▣ <name>".  No-op when the chip is disabled.
+Composer.prototype.setProject = function (label) {
+  if (!this.projectChipEl) return;
+  var name = label || "";
+  this.projectChipEl.textContent = name ? "▣ " + name : "";
+  this.projectChipEl.setAttribute(
+    "aria-label",
+    name ? "Project: " + name : "Project",
+  );
+  this.projectChipEl.hidden = !name;
 };
 
 // Swap the textarea's idle placeholder — e.g. a launcher that reuses one
@@ -759,6 +792,19 @@ Composer.prototype.setOptionFieldVisible = function (id, visible) {
   if (row) row.style.display = visible ? "" : "none";
 };
 
+// Mount a caller-built element into the options panel, right after the row for
+// `fieldId` (or at the panel end if that field is unknown).  Lets a caller
+// attach an inline affordance — e.g. the project picker's "+ New project…"
+// creator — directly beneath its field.  No-op when options are disabled.
+Composer.prototype.addOptionsRowAfter = function (fieldId, el) {
+  if (!this.optionsPanel || !el) return;
+  var ctrl = this._optionFields && this._optionFields[fieldId];
+  var anchor = ctrl ? ctrl.closest(".composer-options-field") : null;
+  if (anchor && anchor.nextSibling)
+    this.optionsPanel.insertBefore(el, anchor.nextSibling);
+  else this.optionsPanel.appendChild(el);
+};
+
 Composer.prototype._refreshOptionsSummary = function () {
   if (!this.optionsSummaryEl) return;
   var summaryFn = this._opts.options && this._opts.options.summary;
@@ -797,6 +843,7 @@ Composer.prototype.destroy = function () {
   this.attachBtn = null;
   this.attachInput = null;
   this.modelChipEl = null;
+  this.projectChipEl = null;
   this.optionsBtn = null;
   this.optionsPanel = null;
   this.optionsSummaryEl = null;

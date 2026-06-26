@@ -539,6 +539,7 @@ class ClusterCollector:
                     "node_id": node_id,
                     "kind": WorkstreamKind.from_raw(ws.get("kind")),
                     "parent_ws_id": ws.get("parent_ws_id"),
+                    "project_id": ws.get("project_id", "") or "",
                 }
             )
         # Removals
@@ -653,6 +654,7 @@ class ClusterCollector:
                 # doesn't own.  Empty string when the emitter didn't
                 # populate it (older nodes).
                 ws_user = data.get("user_id", "") or ""
+                ws_project = data.get("project_id", "") or ""
                 if ws_id and ws_id not in node.workstreams:
                     node.workstreams[ws_id] = {
                         "id": ws_id,
@@ -671,6 +673,7 @@ class ClusterCollector:
                         "kind": ws_kind,
                         "parent_ws_id": ws_parent,
                         "user_id": ws_user,
+                        "project_id": ws_project,
                     }
                 pending_events.append(
                     {
@@ -682,6 +685,7 @@ class ClusterCollector:
                         "kind": ws_kind,
                         "parent_ws_id": ws_parent,
                         "user_id": ws_user,
+                        "project_id": ws_project,
                     }
                 )
 

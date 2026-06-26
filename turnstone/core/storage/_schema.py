@@ -15,7 +15,7 @@ structured_memories = sa.Table(
     sa.Column("memory_id", sa.Text, primary_key=True),
     sa.Column("name", sa.Text, nullable=False),
     sa.Column("description", sa.Text, nullable=False, server_default=""),
-    sa.Column("type", sa.Text, nullable=False, server_default="project"),
+    sa.Column("type", sa.Text, nullable=False, server_default="general"),
     sa.Column("scope", sa.Text, nullable=False, server_default="global"),
     sa.Column("scope_id", sa.Text, nullable=False, server_default=""),
     sa.Column("content", sa.Text, nullable=False),
@@ -103,6 +103,12 @@ workstreams = sa.Table(
     # top-level workstreams (including the coordinators themselves).  See
     # migration 039.
     sa.Column("parent_ws_id", sa.Text, nullable=True),
+    # project_id: the project this workstream is attached to (NULL = none).
+    # Resolves the ('project', project_id) recall rung; children inherit the
+    # parent's project_id at spawn.  Nullable like parent_ws_id; no FK
+    # constraint (this schema family declares none — see migration 058).
+    # Added in migration 062.
+    sa.Column("project_id", sa.Text, nullable=True),
     sa.Column("created", sa.Text, nullable=False),
     sa.Column("updated", sa.Text, nullable=False),
 )
@@ -113,6 +119,7 @@ sa.Index("idx_workstreams_user_id", workstreams.c.user_id)
 sa.Index("idx_workstreams_alias", workstreams.c.alias)
 sa.Index("idx_workstreams_kind", workstreams.c.kind)
 sa.Index("idx_workstreams_parent", workstreams.c.parent_ws_id)
+sa.Index("idx_workstreams_project", workstreams.c.project_id)
 
 workstream_config = sa.Table(
     "workstream_config",
@@ -122,6 +129,47 @@ workstream_config = sa.Table(
     sa.Column("value", sa.Text),
     sa.PrimaryKeyConstraint("ws_id", "key"),
 )
+
+# ---------------------------------------------------------------------------
+# Projects — governed, shareable resource containers (migration 062)
+# ---------------------------------------------------------------------------
+# A project groups workstreams and owns a ``('project', project_id)`` memory
+# recall rung.  Access = RBAC perm (``project.{create,read,write}``) AND a
+# per-project ACL (owner / member / public).  Thin entity; no FK constraints
+# (schema-family convention — see migration 058).
+
+projects = sa.Table(
+    "projects",
+    metadata,
+    sa.Column("project_id", sa.Text, primary_key=True),
+    sa.Column("name", sa.Text, nullable=False),
+    # owner_id: the creating user (users.user_id).  NOT NULL — a project always
+    # has an authenticated owner; the owner has implicit full access.
+    sa.Column("owner_id", sa.Text, nullable=False),
+    # visibility: "private" (owner + members) | "public" (any project.read holder
+    # may read; writes stay member-gated).
+    sa.Column("visibility", sa.Text, nullable=False, server_default="private"),
+    # state: "active" | "archived" (archived = not recalled, not offered for attach).
+    sa.Column("state", sa.Text, nullable=False, server_default="active"),
+    # parent_project_id: reserved for a future hierarchy; unused in v1.
+    sa.Column("parent_project_id", sa.Text, nullable=True),
+    sa.Column("created", sa.Text, nullable=False),
+    sa.Column("updated", sa.Text, nullable=False),
+)
+
+sa.Index("idx_projects_owner", projects.c.owner_id)
+sa.Index("idx_projects_visibility", projects.c.visibility)
+
+project_members = sa.Table(
+    "project_members",
+    metadata,
+    sa.Column("project_id", sa.Text, nullable=False),
+    sa.Column("user_id", sa.Text, nullable=False),
+    sa.Column("created", sa.Text, nullable=False),
+    sa.PrimaryKeyConstraint("project_id", "user_id"),
+)
+
+sa.Index("idx_project_members_user", project_members.c.user_id)
 
 # ---------------------------------------------------------------------------
 # User identity tables

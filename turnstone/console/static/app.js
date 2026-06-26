@@ -124,13 +124,14 @@ function patchClusterState(data) {
         activity: "",
         activity_state: "",
         tool_calls: 0,
-        // ws_created SSE events carry kind / parent_ws_id / user_id;
-        // preserve them on the in-memory ws so the home-landing
+        // ws_created SSE events carry kind / parent_ws_id / user_id /
+        // project_id; preserve them on the in-memory ws so the home-landing
         // active-coordinators list and the tree grouping both pick up
         // newly-created rows without needing a snapshot refetch.
         kind: data.kind || "interactive",
         parent_ws_id: data.parent_ws_id || null,
         user_id: data.user_id || null,
+        project_id: data.project_id || null,
       });
     }
   } else if (t === "ws_closed") {
@@ -789,7 +790,12 @@ function _renderWsRow(ws, opts, container) {
   const nameCell = document.createElement("span");
   nameCell.className = "dash-cell-name";
   const nameText = ws.name || ws.title || ws.id || "";
-  nameCell.textContent = nameText;
+  // The name truncates in its own element so the trailing markers (child-count,
+  // orphan, project) stay visible instead of being clipped by the fixed cell.
+  const nameTextEl = document.createElement("span");
+  nameTextEl.className = "dash-cell-name-text";
+  nameTextEl.textContent = nameText;
+  nameCell.appendChild(nameTextEl);
   if (opts.isCoordinator && opts.childCount != null && opts.childCount > 0) {
     // Render the "(N children)" summary only when there actually are
     // children — the home view feeds a coordinator-only pool into
@@ -810,6 +816,21 @@ function _renderWsRow(ws, opts, container) {
     orphanBadge.className = "dash-orphan-badge";
     orphanBadge.textContent = " orphan";
     nameCell.appendChild(orphanBadge);
+  }
+  // Project pill (shared .dash-project-pill) when the ws is attached to a
+  // project the viewer can name — rides inside the name cell like the others.
+  const projName =
+    ws.project_id && window.TurnstoneProjects
+      ? window.TurnstoneProjects.projectName(ws.project_id)
+      : "";
+  if (projName) {
+    const pill = document.createElement("span");
+    pill.className = "dash-project-pill";
+    pill.textContent = "▣";
+    pill.title = "Project: " + projName;
+    pill.setAttribute("role", "img");
+    pill.setAttribute("aria-label", "Project: " + projName);
+    nameCell.appendChild(pill);
   }
   main.appendChild(nameCell);
 
@@ -969,6 +990,7 @@ function _createCoordinator(opts) {
   const skill = opts.skill || "";
   const model = (opts.model || "").trim();
   const judgeModel = (opts.judge_model || "").trim();
+  const project = (opts.project_id || "").trim();
   const task = (opts.task || "").trim();
   const errEl = opts.errEl;
   const setBusy = opts.setBusy || function () {};
@@ -986,6 +1008,7 @@ function _createCoordinator(opts) {
   if (skill) body.skill = skill;
   if (model) body.model = model;
   if (judgeModel) body.judge_model = judgeModel;
+  if (project) body.project_id = project;
   if (task) body.initial_message = task;
 
   // Multipart when files are staged (meta JSON + file parts); the coord create
@@ -1034,6 +1057,11 @@ function _hasInteractivePermission() {
 // submit endpoint + redirect differ.
 let _launcherKind = "coordinator";
 
+// Sentinel value for the project picker's "+ New project…" row — selecting it
+// prompts for a name, creates, then re-selects the new project (see
+// _applyLauncherFields' onChange branch).
+const _PROJECT_NEW = "__new__";
+
 function _setLauncherKind(kind, focus) {
   _launcherKind = kind;
   const map = {
@@ -1070,6 +1098,13 @@ function _applyLauncherFields() {
     _homeCoordComposer.getOptionValue("node_strategy") === "node";
   _homeCoordComposer.setOptionFieldVisible("node_id", specific);
   if (specific) _populateLauncherNodes();
+
+  // "+ New project…" — reset the field FIRST so the sentinel can't stick (or
+  // loop on re-entry), then reveal the inline creator beneath the picker.
+  if (_homeCoordComposer.getOptionValue("project") === _PROJECT_NEW) {
+    _homeCoordComposer.setOptionValue("project", "");
+    if (_homeProjectCreator) _homeProjectCreator.open();
+  }
 }
 
 // Populate the launcher's "Specific node" picker from the live Tier-1 snapshot
@@ -1149,6 +1184,7 @@ function _createInteractive(opts) {
   const skill = opts.skill || "";
   const model = (opts.model || "").trim();
   const judgeModel = (opts.judge_model || "").trim();
+  const project = (opts.project_id || "").trim();
   const task = (opts.task || "").trim();
   const errEl = opts.errEl;
   const setBusy = opts.setBusy || function () {};
@@ -1175,6 +1211,7 @@ function _createInteractive(opts) {
   if (skill) body.skill = skill;
   if (model) body.model = model;
   if (judgeModel) body.judge_model = judgeModel;
+  if (project) body.project_id = project;
   if (task) body.initial_message = task;
 
   // Multipart when files are staged (meta JSON + file parts); the cluster proxy
@@ -1410,7 +1447,54 @@ function _ensureHomeComposerInit() {
   _wireLauncherToggle();
   _populateHomeSkillDropdown();
   _populateHomeModelDropdowns();
+  _refreshAndPopulateProjects();
+  _ensureHomeProjectCreator();
   _refreshHomeComposerVisibility();
+}
+
+// Refresh the shared projects cache (window.TurnstoneProjects — also feeds the
+// rail's group-by-project) then repaint the launcher's Project picker.  Safe
+// when the bridge is absent (project.read denied / module still loading): the
+// picker simply keeps its "No project" placeholder.
+function _refreshAndPopulateProjects() {
+  const TP = window.TurnstoneProjects;
+  if (!TP) return;
+  TP.refreshProjects().then(_populateHomeProjectDropdown);
+}
+
+// Populate the launcher's Project picker from the shared cache, preserving the
+// current pick across the rebuild (same reason as _populateLauncherNodes) and
+// always appending the "+ New project…" sentinel after the live list.
+function _populateHomeProjectDropdown() {
+  if (!_homeCoordComposer) return;
+  const TP = window.TurnstoneProjects;
+  if (!TP) return;
+  const previous = _homeCoordComposer.getOptionValue("project");
+  const choices = TP.projectChoices();
+  choices.push({ value: _PROJECT_NEW, text: "+ New project…" });
+  _homeCoordComposer.setOptionChoices("project", choices);
+  if (previous && previous !== _PROJECT_NEW)
+    _homeCoordComposer.setOptionValue("project", previous);
+}
+
+// The inline "+ New project…" creator (project_creator.js), mounted once into
+// the composer's options panel right beneath the Project picker.  On Save it
+// refreshes the shared cache; we then repopulate the dropdown + select the new
+// project.  Replaces the old native window.prompt.  Full management — rename /
+// visibility / members — still lives in the manage shelf.
+let _homeProjectCreator = null;
+
+function _ensureHomeProjectCreator() {
+  if (_homeProjectCreator || !_homeCoordComposer) return;
+  const PC = window.TurnstoneProjectCreator;
+  if (!PC) return;
+  _homeProjectCreator = PC.make({
+    onCreated: function (proj) {
+      _populateHomeProjectDropdown();
+      _homeCoordComposer.setOptionValue("project", proj.project_id);
+    },
+  });
+  _homeCoordComposer.addOptionsRowAfter("project", _homeProjectCreator.el);
 }
 
 function _mountHomeCoordComposer() {
@@ -1439,6 +1523,12 @@ function _mountHomeCoordComposer() {
         if (v.skill) bits.push(v.skill);
         if (v.model) bits.push(v.model);
         if (v.judge_model) bits.push("judge: " + v.judge_model);
+        if (v.project && v.project !== _PROJECT_NEW) {
+          const pn = window.TurnstoneProjects
+            ? window.TurnstoneProjects.projectName(v.project)
+            : "";
+          bits.push("project: " + (pn || v.project));
+        }
         // Node placement is interactive-only; surface it only when a specific
         // node is pinned (the "Least loaded" default needs no summary line).
         if (
@@ -1483,6 +1573,16 @@ function _mountHomeCoordComposer() {
           // resolved judge alias (judge.model when set, otherwise the
           // session model — see IntentJudge.__init__).
           choices: [{ value: "", text: "Default model" }],
+        },
+        {
+          // Attached project — scopes the session's `project` memory + groups
+          // it in the rail.  Placeholder "No project" is preserved by
+          // setOptionChoices; _populateHomeProjectDropdown appends the live
+          // list + a "+ New project…" sentinel (handled in onChange).
+          id: "project",
+          label: "Project",
+          type: "select",
+          choices: [{ value: "", text: "No project" }],
         },
         // Node placement — INTERACTIVE persona only (coordinators run in the
         // console, not on a compute node).  _applyLauncherFields shows/hides
@@ -1660,6 +1760,10 @@ function submitHomeCoord(textFromComposer) {
     skill: opts.skill || "",
     model: opts.model || "",
     judge_model: opts.judge_model || "",
+    // A pending "+ New project…" sentinel never reaches submit (it's reset in
+    // onChange); guard anyway so it can't leak onto the wire as a project_id.
+    project_id:
+      opts.project && opts.project !== _PROJECT_NEW ? opts.project : "",
     task: task,
     errEl: document.getElementById("home-coord-error"),
     setBusy: function (b) {

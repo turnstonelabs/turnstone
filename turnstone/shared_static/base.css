@@ -492,12 +492,100 @@ body {
 .dash-cell-name {
   font-weight: 500;
   color: var(--fg-bright);
+  /* Flex so the name truncates in its own element while trailing markers
+     (child-count, orphan, project) stay visible — a fixed-width cell with the
+     markers appended to a nowrap name would clip them off the right edge. */
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
+.dash-cell-name-text {
+  min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
+.dash-cell-name > :not(.dash-cell-name-text) {
+  flex: none; /* markers never shrink; the name yields */
+}
 .dash-row[data-state="idle"] .dash-cell-name {
   color: var(--fg-dim);
+}
+/* Project marker inside the name cell (the dash grid is fixed-width, so the
+   project rides with the name rather than taking a 7th column).  A glyph-only
+   amber ▣ — compact for a dense row, name in title/aria-label; the rail group +
+   composer chip carry the full name.  Colour + glyph (chip-contrast rule). */
+.dash-project-pill {
+  color: var(--accent);
+  font-size: 12px;
+  line-height: 1;
+}
+
+/* Inline "create a project" widget (project_creator.js) — a name input + Save +
+   Cancel that replaces the native prompt across every "+ New project…" picker.
+   grid-column lets it span both columns when mounted inside the composer's
+   2-col options grid; ignored on the standalone (non-grid) surfaces. */
+.project-creator {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  align-items: center;
+  margin-top: 6px;
+  grid-column: 1 / -1;
+}
+.project-creator[hidden] {
+  /* the class display:flex would otherwise outweigh the UA [hidden] rule */
+  display: none;
+}
+.project-creator-input {
+  flex: 1;
+  min-width: 0;
+  background: var(--bg-surface);
+  color: var(--fg);
+  border: 1px solid var(--border);
+  border-radius: var(--r-sm, 4px);
+  padding: 4px 8px;
+  font: inherit;
+  font-size: 12px;
+}
+.project-creator-input:focus {
+  outline: none;
+  border-color: var(--accent);
+}
+.project-creator-save,
+.project-creator-cancel {
+  flex: none;
+  border-radius: var(--r-sm, 4px);
+  padding: 4px 10px;
+  font: inherit;
+  font-size: 12px;
+  cursor: pointer;
+}
+.project-creator-save {
+  background: var(--accent);
+  /* var(--bg) flips per theme like .sh-btn--primary: dark text on the bright
+     dark-theme amber, light text on the darker light-theme amber. */
+  color: var(--bg);
+  border: 1px solid var(--accent);
+  font-weight: 600;
+}
+.project-creator-save:disabled {
+  opacity: 0.6;
+  cursor: default;
+}
+.project-creator-cancel {
+  background: transparent;
+  color: var(--fg-dim);
+  border: 1px solid var(--border);
+}
+.project-creator-error {
+  flex-basis: 100%;
+  color: var(--red);
+  font-size: 11px;
+}
+.project-creator-error[hidden] {
+  display: none;
 }
 .dash-cell-model {
   color: var(--fg-dim);

@@ -48,6 +48,9 @@ def session_replay_preamble(
         "type": "connected",
         "model": session.model,
         "model_alias": session.model_alias or "",
+        # The attached project's display name (""=none) so the composer can
+        # paint its "has a project" badge on connect, beside the model chip.
+        "project_name": getattr(session, "_project_name", "") or "",
         "skip_permissions": getattr(ui, "auto_approve", False),
     }
 

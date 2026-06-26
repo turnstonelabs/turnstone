@@ -62,7 +62,7 @@ def build_memory_context(memories: list[dict[str, str]]) -> str:
     lines = ["<memories>"]
     for m in memories:
         name = _html_escape(m.get("name", ""))
-        mem_type = _html_escape(m.get("type", "project"))
+        mem_type = _html_escape(m.get("type", "general"))
         scope = _html_escape(m.get("scope", "global"))
         desc = m.get("description", "")
         content = m.get("content", "")

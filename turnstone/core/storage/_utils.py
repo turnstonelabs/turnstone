@@ -636,6 +636,7 @@ MODEL_DEFINITION_MUTABLE = frozenset(
         "replay_reasoning_to_model",
     }
 )
+PROJECT_MUTABLE = frozenset({"name", "visibility", "state", "parent_project_id"})
 PROMPT_POLICY_MUTABLE = frozenset({"name", "content", "tool_gate", "priority", "enabled"})
 HEURISTIC_RULE_MUTABLE = frozenset(
     {

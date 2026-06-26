@@ -763,6 +763,7 @@ class CoordinatorClient:
         name: str = "",
         model: str = "",
         target_node: str = "",
+        project: str = "",
     ) -> dict[str, Any]:
         """Create a child workstream via the routing proxy."""
         body: dict[str, Any] = {
@@ -779,6 +780,8 @@ class CoordinatorClient:
             body["model"] = model
         if target_node:
             body["target_node"] = target_node
+        if project:
+            body["project_id"] = project
         return self._post("spawn", body)
 
     def send(self, ws_id: str, message: str) -> dict[str, Any]:

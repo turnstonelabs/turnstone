@@ -444,7 +444,7 @@ class AsyncTurnstoneServer(_BaseClient):
         content: str,
         *,
         description: str = "",
-        mem_type: str = "project",
+        mem_type: str = "general",
         scope: str = "global",
         scope_id: str = "",
     ) -> MemoryInfo:
@@ -747,7 +747,7 @@ class TurnstoneServer:
         content: str,
         *,
         description: str = "",
-        mem_type: str = "project",
+        mem_type: str = "general",
         scope: str = "global",
         scope_id: str = "",
     ) -> MemoryInfo:

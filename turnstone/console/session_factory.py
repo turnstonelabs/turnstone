@@ -94,6 +94,7 @@ def build_console_session_factory(
         client_type: str = "web",
         kind: WorkstreamKind = WorkstreamKind.COORDINATOR,
         parent_ws_id: str | None = None,
+        project_id: str = "",
         judge_model: str | None = None,
     ) -> ChatSession:
         assert ui is not None, "console session_factory requires a non-None UI"
@@ -223,6 +224,7 @@ def build_console_session_factory(
             username=_username,
             kind=WorkstreamKind.COORDINATOR,
             parent_ws_id=parent_ws_id,
+            project_id=project_id,
             coord_client=coord_client,
         )
 

@@ -195,6 +195,7 @@ class _Row:
     parent_ws_id: str | None = None
     updated: str = ""
     node_id: str | None = None
+    project_id: str | None = None
 
 
 class FakeStorage:
@@ -233,6 +234,7 @@ class FakeStorage:
         name: str = "",
         kind: WorkstreamKind | str = WorkstreamKind.INTERACTIVE,
         parent_ws_id: str | None = None,
+        project_id: str | None = None,
         skill_id: str = "",
         skill_version: int = 0,
         state: str = "idle",
@@ -251,6 +253,7 @@ class FakeStorage:
                 parent_ws_id=parent_ws_id,
                 updated=updated if updated is not None else self._now_iso(),
                 node_id=node_id,
+                project_id=project_id,
             )
 
     def touch_workstream(self, ws_id: str) -> None:

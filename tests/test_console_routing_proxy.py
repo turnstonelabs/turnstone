@@ -347,6 +347,22 @@ class TestClusterCreate:
         assert payload[0] == "a.txt" and payload[1] == b"hello world"
         client.close()
 
+    def test_cluster_create_forwards_project_id(self) -> None:
+        # Phase 6: the launcher's project picker sends project_id; the proxy
+        # selectively REBUILDS the forwarded body (it doesn't pass it through),
+        # so project_id must be explicitly carried or the node never scopes the
+        # session to its project.
+        mock_post = _make_proxy_post(json_data={"ws_id": "p1ws"})
+        client = TestClient(self._app_with_node(mock_post), raise_server_exceptions=False)
+        resp = client.post(
+            "/v1/api/cluster/workstreams/new",
+            json={"node_id": "node-a", "name": "j", "project_id": "proj-42"},
+            headers=_TEST_AUTH_HEADERS,
+        )
+        assert resp.status_code == 200
+        assert mock_post.call_args.kwargs["json"]["project_id"] == "proj-42"
+        client.close()
+
 
 # ---------------------------------------------------------------------------
 # Tests — route_proxy

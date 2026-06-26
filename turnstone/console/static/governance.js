@@ -355,6 +355,15 @@ const _PERMISSION_SECTIONS = [
     ],
   },
   {
+    label: "Projects",
+    permissions: [
+      "project.create",
+      "project.read",
+      "project.write",
+      "project.delete",
+    ],
+  },
+  {
     label: "Coordinator",
     permissions: ["coordinator.trust.send"],
   },
@@ -2954,12 +2963,21 @@ function _renderAdminMemories(items, total) {
     const typeBadge =
       '<span class="' + typeCls + '">' + escapeHtml(m.type) + "</span>";
 
-    // Scope badge
-    let scopeLabel = m.scope;
-    if (m.scope_id) scopeLabel += ":" + m.scope_id;
+    // Scope: a short colored pill (the scope) + the resolved human target —
+    // project / workstream / user NAME (server-supplied scope_label), not the
+    // raw hex id — which truncates so it can't collide with the preview column.
     const scopeCls = "scope-badge mem-scope-" + escapeHtml(m.scope);
-    const scopeBadge =
-      '<span class="' + scopeCls + '">' + escapeHtml(scopeLabel) + "</span>";
+    let scopeBadge =
+      '<span class="' + scopeCls + '">' + escapeHtml(m.scope) + "</span>";
+    const scopeTarget = m.scope_label || m.scope_id || "";
+    if (scopeTarget) {
+      scopeBadge +=
+        '<span class="mem-scope-target" title="' +
+        escapeHtml(scopeTarget) +
+        '">' +
+        escapeHtml(scopeTarget) +
+        "</span>";
+    }
 
     // Description (truncated)
     let desc = m.description || "";

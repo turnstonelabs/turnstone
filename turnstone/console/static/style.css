@@ -480,6 +480,21 @@
   box-shadow: 0 0 0 3px var(--accent-dim);
 }
 
+/* Project-members shelf: the add-member row pairs the user picker with its Add
+   button on one line (the select flexes, the button stays its content width). */
+.pm-add-row {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+}
+.pm-add-row select {
+  flex: 1;
+  min-width: 0;
+}
+.pm-add-row .sh-btn {
+  flex: none;
+}
+
 /* Admin table grid */
 .admin-colheaders {
   display: grid;
@@ -552,6 +567,17 @@
 #admin-tls .admin-colheaders,
 #admin-tls .admin-row {
   grid-template-columns: 160px 1fr 130px 150px 120px;
+}
+/* Projects: NAME | VISIBILITY | STATE | ACTIONS.  ``.admin-row`` is display:grid
+   with no template in the base rule — every tab supplies its own, or the columns
+   stack one per implicit row. */
+#admin-projects .admin-colheaders,
+#admin-projects .admin-row {
+  grid-template-columns: 1fr 110px 100px 80px;
+}
+/* Members list inside the project-members shelf: USER | ACTIONS. */
+#pm-members-container .admin-row {
+  grid-template-columns: 1fr auto;
 }
 .tls-ca-bar {
   display: flex;
@@ -1877,7 +1903,26 @@ h3.skill-spec-heading {
    ========================================================================== */
 #admin-memories .admin-colheaders,
 #admin-memories .admin-row {
-  grid-template-columns: 1.5fr 80px 110px 1fr 100px 80px;
+  grid-template-columns: 1.5fr 80px 140px 1fr 100px 80px;
+}
+/* Scope cell: a fixed scope pill + the resolved target name, which truncates
+   within the cell so a long project/ws/user name can't spill into the preview. */
+.admin-col-mscope {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  min-width: 0;
+}
+.admin-col-mscope .scope-badge {
+  flex: none;
+}
+.mem-scope-target {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--fg-dim);
+  font-size: 11px;
 }
 
 /* Filter toolbar */
@@ -1908,7 +1953,7 @@ h3.skill-spec-heading {
 }
 
 /* Memory type badges */
-.mem-type-project {
+.mem-type-general {
   background: var(--bg-highlight);
   color: var(--cyan);
   border-color: var(--cyan-glow, var(--border));
@@ -1943,6 +1988,17 @@ h3.skill-spec-heading {
   background: var(--bg-highlight);
   color: var(--green);
   border-color: var(--green-glow, var(--border));
+}
+.mem-scope-coordinator {
+  background: var(--bg-highlight);
+  color: var(--magenta);
+  border-color: var(--magenta-glow, var(--border));
+}
+/* Project scope = the amber project vocabulary (▣ chip / rail group / pill). */
+.mem-scope-project {
+  background: var(--bg-highlight);
+  color: var(--accent);
+  border-color: var(--accent);
 }
 
 /* Memory detail modal */

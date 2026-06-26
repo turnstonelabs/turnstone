@@ -1358,6 +1358,12 @@ class TestSkillCatalogDisclosure:
         session._tools = []
         session._client_type = ClientType.CLI
         session._username = ""
+        # _init_system_messages renders the attached project into the Session
+        # Context; this __new__-built session skips __init__'s project resolution,
+        # so seed the (unattached) defaults it reads.
+        session._project_name = ""
+        session._project_id = ""
+        session._project_writable = False
         session._kind = "interactive"
 
         session._memory_config = MagicMock()

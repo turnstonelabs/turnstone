@@ -189,6 +189,7 @@ class Pane {
     this.retryDelay = 1000;
     this.model = "";
     this.modelAlias = "";
+    this.projectName = "";
     this._lastStatusEvt = null;
     this._historyLoadToken = 0;
     this._cancelTimeout = null;
@@ -602,6 +603,13 @@ class Pane {
     this.composer.setModel(alias ? alias + eff : "");
   }
 
+  // Paint the composer's "has a project" badge from the connected event's
+  // project_name ("" = no project → the chip stays hidden).
+  _paintProjectChip() {
+    if (this.composer && this.composer.setProject)
+      this.composer.setProject(this.projectName || "");
+  }
+
   isNearBottom() {
     return (
       this.messagesEl.scrollHeight -
@@ -727,6 +735,7 @@ class Pane {
       sendGlyph: "\u2191",
       layout: "stacked",
       modelChip: true,
+      projectChip: true,
       attachments: {
         onAttach: (file) => {
           this.attachments.upload(file);
@@ -1243,6 +1252,8 @@ class Pane {
         this.model = evt.model || "";
         this.modelAlias = evt.model_alias || evt.model || "";
         this._paintModelChip();
+        this.projectName = evt.project_name || "";
+        this._paintProjectChip();
         if (evt.skip_permissions) {
           const existing = document.querySelector(".skip-permissions-warning");
           if (!existing) {

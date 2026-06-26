@@ -23,6 +23,10 @@
       "target_node": {
         "type": "string",
         "description": "Optional node_id hint. When provided, the routing proxy pins the workstream to that node by generating a ws_id that rendezvous-hashes onto it. Otherwise rendezvous picks deterministically from the live-node set. CAVEAT: pinning is a hard constraint — if the named node has dropped out of the 120s service-registry heartbeat window between your `list_nodes` call and this spawn, the spawn fails with \"No available node for routing\" rather than falling back. Omit `target_node` if you can tolerate landing on any node; pin only when the workload truly requires that specific node's capabilities/region/tenancy."
+      },
+      "project": {
+        "type": "string",
+        "description": "Optional project_id to attach the child to, overriding the project it would otherwise inherit from this coordinator. Omit to inherit the coordinator's project (the common case). The child only gains project access if its owning user can access the project."
       }
     },
     "required": []

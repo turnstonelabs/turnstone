@@ -296,6 +296,33 @@
               </div>
             </div>
 
+            <!-- Projects Tab -->
+            <div id="admin-projects" class="admin-panel" style="display: none">
+              <div class="admin-toolbar">
+                <span class="section-header" style="margin: 0">PROJECTS</span>
+                <button
+                  class="admin-action-btn"
+                  onclick="showCreateProjectModal()"
+                >
+                  + New project
+                </button>
+              </div>
+              <div class="admin-colheaders" aria-hidden="true">
+                <span class="admin-col admin-col-username">NAME</span>
+                <span class="admin-col admin-col-name">VISIBILITY</span>
+                <span class="admin-col admin-col-created">STATE</span>
+                <span class="admin-col admin-col-actions">ACTIONS</span>
+              </div>
+              <div
+                id="admin-projects-table"
+                role="list"
+                aria-label="Projects"
+                aria-live="polite"
+              >
+                <div class="dashboard-empty">Loading projects...</div>
+              </div>
+            </div>
+
             <!-- Tokens Tab -->
             <div id="admin-tokens" class="admin-panel" style="display: none">
               <div class="admin-toolbar">
@@ -924,6 +951,8 @@
                     <option value="global">global</option>
                     <option value="workstream">workstream</option>
                     <option value="user">user</option>
+                    <option value="coordinator">coordinator</option>
+                    <option value="project">project</option>
                   </select>
                   <input
                     id="mem-search"
@@ -1577,7 +1606,9 @@
                     <option value="anthropic">anthropic</option>
                     <option value="google">google</option>
                     <option value="openai-compatible">openai-compatible</option>
-                    <option value="anthropic-compatible">anthropic-compatible</option>
+                    <option value="anthropic-compatible">
+                      anthropic-compatible
+                    </option>
                   </select>
                 </div>
                 <div>
@@ -1809,9 +1840,10 @@
                   ><span class="cap-name">Speech (TTS)</span></label
                 >
                 <label class="cap"
-                  ><input type="checkbox" data-cap="supports_audio_input" /><span
-                    class="cap-led"
-                  ></span
+                  ><input
+                    type="checkbox"
+                    data-cap="supports_audio_input"
+                  /><span class="cap-led"></span
                   ><span class="cap-name">Audio input</span></label
                 >
                 <label class="cap"
@@ -2556,6 +2588,105 @@
               <button id="ur-submit" class="sh-btn sh-btn--primary">
                 Save
               </button>
+            </footer>
+          </dialog>
+
+          <!-- Project create/edit shelf — pane-scoped. The hidden project-id
+               distinguishes create (empty) from edit (set); visibility "public"
+               is the "* all users" read lever. -->
+          <dialog
+            class="hatch hatch--shelf"
+            id="project-shelf"
+            data-kind="create"
+            aria-labelledby="project-shelf-title"
+          >
+            <header class="sh-head">
+              <span class="sh-led" aria-hidden="true"></span>
+              <h2 class="sh-title" id="project-shelf-title">New project</h2>
+              <span class="sh-tag" aria-hidden="true">PRJ-NEW</span>
+              <button class="sh-x" data-close aria-label="Close">✕</button>
+            </header>
+            <div class="sh-body">
+              <div
+                id="project-shelf-error"
+                class="sh-alert"
+                role="alert"
+                aria-live="assertive"
+                aria-atomic="true"
+              ></div>
+              <input id="cp-project-id" type="hidden" />
+              <label for="cp-name">Name</label>
+              <input
+                id="cp-name"
+                type="text"
+                placeholder="Project name"
+                autocomplete="off"
+              />
+              <label for="cp-visibility">Visibility</label>
+              <select id="cp-visibility">
+                <option value="private">Private — members only</option>
+                <option value="public">
+                  Public — any user with project access
+                </option>
+              </select>
+            </div>
+            <footer class="sh-foot">
+              <div class="sh-foot-meta"></div>
+              <button class="sh-btn" data-close>Cancel</button>
+              <button id="cp-submit" class="sh-btn sh-btn--primary">
+                Create
+              </button>
+            </footer>
+          </dialog>
+
+          <!-- Project members shelf — pane-scoped. Whitelist users for
+               read+write; the public read lever lives in the edit shelf. -->
+          <dialog
+            class="hatch hatch--shelf"
+            id="project-members-shelf"
+            data-kind="edit"
+            aria-labelledby="project-members-shelf-title"
+          >
+            <header class="sh-head">
+              <span class="sh-led" aria-hidden="true"></span>
+              <h2 class="sh-title" id="project-members-shelf-title">
+                Project members
+              </h2>
+              <span class="sh-tag" aria-hidden="true">PRJ-MEM</span>
+              <button class="sh-x" data-close aria-label="Close">✕</button>
+            </header>
+            <div class="sh-body">
+              <div
+                id="project-members-shelf-error"
+                class="sh-alert"
+                role="alert"
+                aria-live="assertive"
+                aria-atomic="true"
+              ></div>
+              <input id="pm-project-id" type="hidden" />
+              <label for="pm-add-user">Add member</label>
+              <div class="pm-add-row">
+                <select id="pm-add-user">
+                  <option value="">Select a user…</option>
+                </select>
+                <button
+                  id="pm-add-btn"
+                  class="sh-btn sh-btn--primary"
+                  type="button"
+                >
+                  Add
+                </button>
+              </div>
+              <div
+                id="pm-members-container"
+                role="list"
+                aria-label="Members"
+                aria-live="polite"
+              ></div>
+            </div>
+            <footer class="sh-foot">
+              <div class="sh-foot-meta"></div>
+              <button class="sh-btn" data-close>Done</button>
             </footer>
           </dialog>
 
@@ -3612,6 +3743,8 @@
     <script type="module" src="/shared/auth.js"></script>
     <script type="module" src="/shared/hatch.js"></script>
     <script type="module" src="/shared/kb.js"></script>
+    <script type="module" src="/shared/projects.js"></script>
+    <script type="module" src="/shared/project_creator.js"></script>
     <script type="module" src="/shared/composer.js"></script>
     <!-- coordinator-pane deps (step 4): the controller builds its chrome + uses
          the shared composer/renderer stack; load before the shell module -->

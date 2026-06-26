@@ -46,6 +46,8 @@ from turnstone.core.storage._schema import (
     orgs,
     output_assessments,
     output_guard_patterns,
+    project_members,
+    projects,
     prompt_templates,
     role_permission_overrides,
     roles,
@@ -92,6 +94,9 @@ from turnstone.core.storage._utils import (
 )
 from turnstone.core.storage._utils import (
     POLICY_MUTABLE as _POLICY_MUTABLE,
+)
+from turnstone.core.storage._utils import (
+    PROJECT_MUTABLE as _PROJECT_MUTABLE,
 )
 from turnstone.core.storage._utils import (
     PROMPT_POLICY_MUTABLE as _PROMPT_POLICY_MUTABLE,
@@ -775,6 +780,7 @@ class PostgreSQLBackend:
         skill_version: int = 0,
         kind: WorkstreamKind | str = WorkstreamKind.INTERACTIVE,
         parent_ws_id: str | None = None,
+        project_id: str | None = None,
     ) -> None:
         from sqlalchemy.dialects.postgresql import insert as pg_insert
 
@@ -784,6 +790,7 @@ class PostgreSQLBackend:
         # Normalize empty-string parent to NULL so WHERE parent_ws_id IS NULL
         # filters remain correct.
         norm_parent = parent_ws_id if parent_ws_id else None
+        norm_project = project_id if project_id else None
         # Use ON CONFLICT DO NOTHING to match SQLite's OR IGNORE semantics
         # and close the SELECT-then-INSERT TOCTOU window under concurrent
         # register_workstream calls for the same ws_id.
@@ -799,6 +806,7 @@ class PostgreSQLBackend:
             skill_version=skill_version,
             kind=norm_kind,
             parent_ws_id=norm_parent,
+            project_id=norm_project,
             created=now,
             updated=now,
         )
@@ -1058,6 +1066,9 @@ class PostgreSQLBackend:
                     # these by name to surface the persisted display title.
                     workstreams.c.title,
                     workstreams.c.alias,
+                    # project_id rides at the tail (read by name) so the
+                    # persisted coordinator lane can carry its project group.
+                    workstreams.c.project_id,
                 )
                 .order_by(workstreams.c.updated.desc())
                 .limit(limit)
@@ -3433,6 +3444,7 @@ class PostgreSQLBackend:
                     workstreams.c.parent_ws_id,
                     workstreams.c.created,
                     workstreams.c.updated,
+                    workstreams.c.project_id,
                 ).where(workstreams.c.ws_id.in_(clean))
             ).fetchall()
         for r in rows:
@@ -3450,6 +3462,7 @@ class PostgreSQLBackend:
                 "parent_ws_id": r[10],
                 "created": r[11],
                 "updated": r[12],
+                "project_id": r[13],
             }
         return out
 
@@ -4885,6 +4898,140 @@ class PostgreSQLBackend:
             )
             conn.commit()
             return result.rowcount > 0
+
+    # -- Projects --------------------------------------------------------------
+
+    def create_project(
+        self,
+        project_id: str,
+        name: str,
+        owner_id: str,
+        visibility: str = "private",
+        state: str = "active",
+        parent_project_id: str | None = None,
+    ) -> None:
+        from sqlalchemy.dialects.postgresql import insert as pg_insert
+
+        now = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S")
+        with self._conn() as conn:
+            conn.execute(
+                pg_insert(projects)
+                .values(
+                    project_id=project_id,
+                    name=name,
+                    owner_id=owner_id,
+                    visibility=visibility,
+                    state=state,
+                    parent_project_id=parent_project_id,
+                    created=now,
+                    updated=now,
+                )
+                .on_conflict_do_nothing(index_elements=["project_id"])
+            )
+            conn.commit()
+
+    def get_project(self, project_id: str) -> dict[str, Any] | None:
+        with self._conn() as conn:
+            row = conn.execute(
+                sa.select(projects).where(projects.c.project_id == project_id)
+            ).fetchone()
+            return _row_to_dict(row) if row is not None else None
+
+    def list_projects_for_user(
+        self, user_id: str, include_archived: bool = False
+    ) -> list[dict[str, Any]]:
+        with self._conn() as conn:
+            member_subq = sa.select(project_members.c.project_id).where(
+                project_members.c.user_id == user_id
+            )
+            cond = sa.or_(
+                projects.c.owner_id == user_id,
+                projects.c.visibility == "public",
+                projects.c.project_id.in_(member_subq),
+            )
+            q = sa.select(projects).where(cond)
+            if not include_archived:
+                q = q.where(projects.c.state == "active")
+            rows = conn.execute(q.order_by(projects.c.name)).fetchall()
+            return [_row_to_dict(r) for r in rows]
+
+    def update_project(self, project_id: str, **fields: Any) -> bool:
+        fields = {k: v for k, v in fields.items() if k in _PROJECT_MUTABLE}
+        if not fields:
+            return False
+        fields["updated"] = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S")
+        with self._conn() as conn:
+            result = conn.execute(
+                sa.update(projects).where(projects.c.project_id == project_id).values(**fields)
+            )
+            conn.commit()
+            return result.rowcount > 0
+
+    def delete_project(self, project_id: str) -> bool:
+        with self._conn() as conn:
+            # No FK cascade in the schema family, so purge the project's scoped
+            # memory + member rows explicitly (same transaction) before the
+            # project row — honouring the "destroys the container AND its scoped
+            # memory" contract the endpoint + UI promise.
+            conn.execute(
+                sa.delete(structured_memories).where(
+                    sa.and_(
+                        structured_memories.c.scope == "project",
+                        structured_memories.c.scope_id == project_id,
+                    )
+                )
+            )
+            conn.execute(
+                sa.delete(project_members).where(project_members.c.project_id == project_id)
+            )
+            result = conn.execute(sa.delete(projects).where(projects.c.project_id == project_id))
+            conn.commit()
+            return result.rowcount > 0
+
+    def add_project_member(self, project_id: str, user_id: str) -> None:
+        from sqlalchemy.dialects.postgresql import insert as pg_insert
+
+        now = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S")
+        with self._conn() as conn:
+            conn.execute(
+                pg_insert(project_members)
+                .values(project_id=project_id, user_id=user_id, created=now)
+                .on_conflict_do_nothing(index_elements=["project_id", "user_id"])
+            )
+            conn.commit()
+
+    def remove_project_member(self, project_id: str, user_id: str) -> bool:
+        with self._conn() as conn:
+            result = conn.execute(
+                sa.delete(project_members).where(
+                    project_members.c.project_id == project_id,
+                    project_members.c.user_id == user_id,
+                )
+            )
+            conn.commit()
+            return result.rowcount > 0
+
+    def list_project_members(self, project_id: str) -> list[str]:
+        with self._conn() as conn:
+            rows = conn.execute(
+                sa.select(project_members.c.user_id)
+                .where(project_members.c.project_id == project_id)
+                .order_by(project_members.c.user_id)
+            ).fetchall()
+            return [str(r[0]) for r in rows]
+
+    def is_project_member(self, project_id: str, user_id: str) -> bool:
+        with self._conn() as conn:
+            result = conn.execute(
+                sa.select(sa.literal(1))
+                .select_from(project_members)
+                .where(
+                    project_members.c.project_id == project_id,
+                    project_members.c.user_id == user_id,
+                )
+                .limit(1)
+            ).scalar()
+        return result is not None
 
     # -- OIDC identity ---------------------------------------------------------
 

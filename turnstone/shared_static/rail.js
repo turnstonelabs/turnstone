@@ -11,6 +11,8 @@
    append), NO innerHTML.  State = shape + colour via `ui-base.css .ui-glyph-*`.
    ========================================================================== */
 
+import { projectName, refreshProjects, onProjectsChange } from "./projects.js";
+
 const GLYPH = {
   running: "●",
   thinking: "◐",
@@ -258,6 +260,87 @@ function sessionRow(ws, childCount, isChild, TS, paneManager, active) {
   return li;
 }
 
+// Project-group collapse state — persisted across Tier-1 re-renders (the rail
+// rebuilds on every snapshot), keyed by project_id.  Click a project head to
+// toggle.  Mirrors `_nodesCollapsed` for the Cluster node list.
+const _projCollapsed = new Set();
+
+// Render a flat ws list as a parent-bucketed tree (coordinators with nested
+// children, then orphans) into `nav`.  Shared by the ungrouped top level and
+// each project group so nesting reads identically inside a project.
+function renderSessionTree(nav, list, TS, paneManager, active) {
+  const groups = TS.bucketByParent(list);
+  for (const ws of groups.roots) {
+    const kids = groups.childrenMap[ws.id] || [];
+    const li = sessionRow(ws, kids.length, false, TS, paneManager, active);
+    if (kids.length) {
+      const childUl = document.createElement("ul");
+      childUl.className = "children";
+      for (const k of kids)
+        childUl.append(sessionRow(k, 0, true, TS, paneManager, active));
+      li.append(childUl);
+    }
+    nav.append(li);
+  }
+  for (const ws of groups.orphans)
+    nav.append(sessionRow(ws, 0, false, TS, paneManager, active));
+}
+
+// A collapsible project group: reuses the Manage `.grp-head` header vocabulary
+// (chevron + name + count, keyboard-operable <button>, aria-expanded) over a
+// `.proj-grp-items` body holding the project's session tree.  Returns a
+// detached `.proj-grp` the caller mounts.
+function projectGroup(pid, name, sessions, TS, paneManager, active) {
+  const collapsed = _projCollapsed.has(pid);
+  const grp = document.createElement("div");
+  grp.className = "proj-grp" + (collapsed ? "" : " open");
+
+  const head = document.createElement("button");
+  head.type = "button";
+  head.className = "grp-head";
+  head.title = name; // the collapsed-width rail + ellipsis need the full name
+  head.setAttribute("aria-expanded", collapsed ? "false" : "true");
+  const chev = document.createElement("span");
+  chev.className = "chev";
+  chev.setAttribute("aria-hidden", "true");
+  chev.textContent = collapsed ? "▸" : "▾";
+  // The same ▣ mark the composer chip + dashboard use, so the eye connects the
+  // rail bucket to the badge.  In ink (not amber) — the rail's only amber is the
+  // `.row.open` active-tab accent, which this must not compete with.
+  const mark = document.createElement("span");
+  mark.className = "gmark";
+  mark.setAttribute("aria-hidden", "true");
+  mark.textContent = "▣";
+  const nm = document.createElement("span");
+  nm.className = "gname";
+  nm.textContent = name;
+  const count = document.createElement("span");
+  count.className = "gcount";
+  count.textContent = String(sessions.length);
+  head.append(chev, mark, nm, count);
+
+  const items = document.createElement("div");
+  items.className = "proj-grp-items";
+  items.id = "proj-items-" + pid; // aria-controls target for the header
+  head.setAttribute("aria-controls", items.id);
+  const treeUl = document.createElement("ul");
+  treeUl.className = "nav";
+  renderSessionTree(treeUl, sessions, TS, paneManager, active);
+  items.append(treeUl);
+
+  head.addEventListener("click", () => {
+    const nowCollapsed = !_projCollapsed.has(pid);
+    if (nowCollapsed) _projCollapsed.add(pid);
+    else _projCollapsed.delete(pid);
+    grp.classList.toggle("open", !nowCollapsed);
+    head.setAttribute("aria-expanded", nowCollapsed ? "false" : "true");
+    chev.textContent = nowCollapsed ? "▸" : "▾";
+  });
+
+  grp.append(head, items);
+  return grp;
+}
+
 function renderWorkspaces(root, cs, TS, paneManager) {
   root.replaceChildren();
   const nav = document.createElement("ul");
@@ -291,31 +374,50 @@ function renderWorkspaces(root, cs, TS, paneManager) {
   dashLi.append(dash);
   nav.append(dashLi);
 
-  // Session tree: gather all workstreams (console coordinators + node
-  // interactives), bucket by parent so children nest under their coordinator.
+  // Gather all workstreams (console coordinators + node interactives).
   const all = [];
   if (cs) {
     for (const nid of Object.keys(cs.nodes || {})) {
       for (const ws of cs.nodes[nid].workstreams || []) all.push(ws);
     }
   }
-  const groups = TS.bucketByParent(all);
-  for (const ws of groups.roots) {
-    const kids = groups.childrenMap[ws.id] || [];
-    const li = sessionRow(ws, kids.length, false, TS, paneManager, active);
-    if (kids.length) {
-      const childUl = document.createElement("ul");
-      childUl.className = "children";
-      for (const k of kids)
-        childUl.append(sessionRow(k, 0, true, TS, paneManager, active));
-      li.append(childUl);
-    }
-    nav.append(li);
-  }
-  for (const ws of groups.orphans)
-    nav.append(sessionRow(ws, 0, false, TS, paneManager, active));
 
+  // Partition by attached project.  A ws whose project is unknown or
+  // inaccessible (projectName "" — cache not loaded yet, no access, or a
+  // since-removed project) falls back to ungrouped, so the rail never paints a
+  // headerless or bare-id group.  When NO ws carries a resolvable project the
+  // loop below is empty and the tree renders flat — identical to the
+  // pre-projects layout for deployments not using projects.
+  const ungrouped = [];
+  const byProject = new Map(); // pid -> { name, sessions: [] }
+  for (const ws of all) {
+    const pid = ws.project_id || "";
+    const pname = pid ? projectName(pid) : "";
+    if (pname) {
+      let bucket = byProject.get(pid);
+      if (!bucket) {
+        bucket = { name: pname, sessions: [] };
+        byProject.set(pid, bucket);
+      }
+      bucket.sessions.push(ws);
+    } else {
+      ungrouped.push(ws);
+    }
+  }
+
+  // Ungrouped sessions keep the top level (no header), then project groups
+  // follow, ordered by name so the rail map is stable across snapshots.
+  renderSessionTree(nav, ungrouped, TS, paneManager, active);
   root.append(nav);
+
+  Array.from(byProject.keys())
+    .sort((a, b) => byProject.get(a).name.localeCompare(byProject.get(b).name))
+    .forEach((pid) => {
+      const grp = byProject.get(pid);
+      root.append(
+        projectGroup(pid, grp.name, grp.sessions, TS, paneManager, active),
+      );
+    });
 }
 
 // ---- Mount -----------------------------------------------------------------
@@ -338,6 +440,12 @@ export function mountRail(sections, caps) {
   // tracks the active tab (not just on the next Tier-1 snapshot).
   if (sections.paneManager && sections.paneManager.onActiveChange)
     sections.paneManager.onActiveChange(render);
+  // Group-by-project needs the project id→name map: load it once for the rail
+  // and re-render whenever it changes (a project renamed / created elsewhere).
+  // refreshProjects never rejects (a project.read denial leaves an empty map →
+  // the tree renders flat), so this can't break the rail.
+  onProjectsChange(render);
+  refreshProjects();
   render(); // initial paint (empty until the first snapshot arrives)
 }
 

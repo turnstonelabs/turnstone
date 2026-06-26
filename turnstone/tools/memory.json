@@ -1,6 +1,6 @@
 {
   "name": "memory",
-  "description": "Persistent memory across sessions. Actions: 'save' stores a memory, 'get' retrieves full content by name, 'search' finds memories by query, 'delete' removes a memory, 'list' shows all memories. Use 'get' to read full content — search/list truncate previews to 200 chars. Memories have a type (user/project/feedback/reference) and a scope.",
+  "description": "Persistent memory across sessions. Actions: 'save' stores a memory, 'get' retrieves full content by name, 'search' finds memories by query, 'delete' removes a memory, 'list' shows all memories. Use 'get' to read full content — search/list truncate previews to 200 chars. Memories have a type (user/general/feedback/reference) and a scope.",
   "parameters": {
     "type": "object",
     "properties": {
@@ -23,13 +23,13 @@
       },
       "type": {
         "type": "string",
-        "enum": ["user", "project", "feedback", "reference"],
-        "description": "Memory type. Default: 'project'."
+        "enum": ["user", "general", "feedback", "reference"],
+        "description": "Memory type. Default: 'general'."
       },
       "scope": {
         "type": "string",
-        "enum": ["global", "workstream", "user", "coordinator"],
-        "description": "Memory scope. Default: 'global'. 'workstream' for context private to this workstream, 'user' for context that follows the user across workstreams."
+        "enum": ["global", "workstream", "user", "coordinator", "project"],
+        "description": "Memory scope. 'global' = shared across everything; 'workstream' = private to this workstream; 'user' = follows the user across workstreams; 'project' = the shared bucket of the project this session is attached to (available only when attached, writable only with project write access). Default: the attached project when you can write it, otherwise 'global'."
       },
       "query": {
         "type": "string",
@@ -46,20 +46,20 @@
   "interactive": true,
   "kind_variants": {
     "interactive": {
-      "description": "Persistent memory across sessions. Actions: 'save' stores a memory, 'get' retrieves full content by name, 'search' finds memories by query, 'delete' removes a memory, 'list' shows all memories. Use 'get' to read full content — search/list truncate previews to 200 chars. Memories have a type (user/project/feedback/reference) and scope (global/workstream/user). Default scope is 'global'.",
+      "description": "Persistent memory across sessions. Actions: 'save' stores a memory, 'get' retrieves full content by name, 'search' finds memories by query, 'delete' removes a memory, 'list' shows all memories. Use 'get' to read full content — search/list truncate previews to 200 chars. Memories have a type (user/general/feedback/reference) and a scope: 'global' (shared everywhere), 'workstream' (this workstream only), 'user' (follows you across workstreams), and 'project' (the shared bucket of an attached project). When this workstream is attached to a project you can write, new memories default to the project; otherwise to 'global'.",
       "parameter_overrides": {
         "scope": {
-          "enum": ["global", "workstream", "user"],
-          "description": "Memory scope. Default: 'global'. 'workstream' for context private to this workstream, 'user' for context that follows the user across workstreams."
+          "enum": ["global", "workstream", "user", "project"],
+          "description": "Memory scope. 'global' = shared across everything; 'workstream' = private to this workstream; 'user' = follows the user across workstreams; 'project' = the shared bucket of the project this workstream is attached to (available only when attached, and writable only with project write access). Default: the attached project when you can write it, otherwise 'global'."
         }
       }
     },
     "coordinator": {
-      "description": "Persistent orchestration memory shared by all of your user's coordinator sessions. Actions: 'save' stores a memory, 'get' retrieves full content by name, 'search' finds memories by query, 'delete' removes a memory, 'list' shows all memories. Use 'get' to read full content — search/list truncate previews to 200 chars. Memories have a type (user/project/feedback/reference). Coordinator memories survive across coordinator sessions — save orchestration knowledge worth keeping (recurring procedures, environment facts, lessons from past runs). They are NOT visible to child workstreams.",
+      "description": "Persistent orchestration memory shared by all of your user's coordinator sessions. Actions: 'save' stores a memory, 'get' retrieves full content by name, 'search' finds memories by query, 'delete' removes a memory, 'list' shows all memories. Use 'get' to read full content — search/list truncate previews to 200 chars. Memories have a type (user/general/feedback/reference). Coordinator memories survive across coordinator sessions — save orchestration knowledge worth keeping (recurring procedures, environment facts, lessons from past runs). They are NOT visible to child workstreams.",
       "parameter_overrides": {
         "scope": {
-          "enum": ["coordinator"],
-          "description": "Always 'coordinator' for coord sessions — the per-user orchestration namespace, durable across coordinator sessions. This field can be omitted; it defaults to 'coordinator'."
+          "enum": ["coordinator", "project"],
+          "description": "'coordinator' = the per-user orchestration namespace, durable across coordinator sessions; 'project' = the shared bucket of the project this coordinator is attached to (available only when attached, writable only with project write access). Default: the attached project when you can write it, otherwise 'coordinator'."
         }
       }
     }

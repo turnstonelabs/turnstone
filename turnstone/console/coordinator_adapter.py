@@ -266,6 +266,7 @@ class CoordinatorAdapter:
             skill=skill,
             kind=ws.kind,
             parent_ws_id=ws.parent_ws_id,
+            project_id=ws.project_id or "",
             **extra,
         )
 
