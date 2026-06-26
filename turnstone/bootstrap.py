@@ -72,7 +72,7 @@ The compose.yaml reads these from a `.env` file:
 
 ### LLM Provider (required)
 - `LLM_BASE_URL` — OpenAI-compatible API endpoint (default: http://host.docker.internal:8000/v1). \
-For local models (vLLM, llama.cpp, Ollama), this points to the local server. \
+For local models (vLLM, llama.cpp), this points to the local server. \
 From inside Docker, use `http://host.docker.internal:<port>/v1` to reach the host machine.
 - `OPENAI_API_KEY` — API key for the LLM provider. For local models that don't require \
 authentication, set this to `dummy` (the compose.yaml defaults to `dummy` if unset). \
@@ -202,7 +202,7 @@ ghcr.io images — no local Docker build is needed.
 - If an existing .env is detected, summarize what's configured and ask what to change.
 - The `TURNSTONE_DB_URL` for docker compose internal networking uses the hostname `postgres` \
 (e.g., `postgresql+psycopg://turnstone:<password>@postgres:5432/turnstone`).
-- For local LLM backends (vLLM, llama.cpp, Ollama, etc.), set `OPENAI_API_KEY=dummy` in the \
+- For local LLM backends (vLLM, llama.cpp, etc.), set `OPENAI_API_KEY=dummy` in the \
 .env file — local servers typically don't require authentication. The `LLM_BASE_URL` should \
 use `host.docker.internal` to reach the host machine from inside Docker \
 (e.g., `http://host.docker.internal:8000/v1`).

@@ -35,7 +35,7 @@ See [docs/releasing.md](docs/releasing.md) for the full release process.
 
 Turnstone gives LLMs tools — shell, files, search, web, planning — and orchestrates multi-turn conversations where the model investigates, acts, and reports.
 
-- **Local-first & private** — runs entirely on hardware you control, with no telemetry and no phone-home. Point it at local models (vLLM, llama.cpp, Ollama) or commercial APIs you hold the keys to — your prompts and data never transit a third party you didn't choose.
+- **Local-first & private** — runs entirely on hardware you control, with no telemetry and no phone-home. Point it at local models (vLLM, llama.cpp) or commercial APIs you hold the keys to — your prompts and data never transit a third party you didn't choose.
 - **Bring your own models** — OpenAI-compatible APIs (vLLM, llama.cpp, NIM), the Anthropic Messages API, and Google Gemini, mixed freely per role
 - **Interactive sessions** — terminal CLI or browser UI with parallel workstreams
 - **Cluster dashboard** — real-time view of every node and workstream, with a rendezvous routing proxy
