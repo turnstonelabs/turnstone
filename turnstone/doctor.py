@@ -177,7 +177,17 @@ def _mask_secrets(text: str) -> str:
     """
     out: list[str] = []
     for line in text.split("\n"):
-        out.append(line if line.lstrip().startswith("#") else _mask_line(line))
+        stripped = line.lstrip()
+        if stripped.startswith("#"):
+            # A commented-out assignment can still hold a real secret
+            # (e.g. "# OPENAI_API_KEY=..."), so mask the comment body too,
+            # keeping the indent and leading '#' marker intact. Prose comments
+            # have no KEY=value shape and pass through _mask_line unchanged.
+            indent = line[: len(line) - len(stripped)]
+            hashes = len(stripped) - len(stripped.lstrip("#"))
+            out.append(f"{indent}{stripped[:hashes]}{_mask_line(stripped[hashes:])}")
+        else:
+            out.append(_mask_line(line))
     return "\n".join(out)
 
 
@@ -226,13 +236,16 @@ def _reject_option(value: str) -> str | None:
 # ---------------------------------------------------------------------------
 
 
-def _http_get_json(url: str, timeout: float = 5.0) -> Any:
-    """GET *url* and parse JSON. Raises on network/parse failure or unsafe URL.
+def _assert_safe_http_url(url: str) -> None:
+    """Reject a model-supplied URL that isn't safe to fetch from this host.
 
-    Restricts the scheme to http/https (no ``file://``/``ftp://`` from a
-    model-supplied URL) and blocks the cloud link-local metadata range —
-    loopback and private cluster IPs stay allowed, since probing
-    ``http://localhost:PORT/health`` and private node URLs is the job.
+    Restricts the scheme to http/https (no ``file://``/``ftp://``) and blocks the
+    cloud link-local metadata range (``169.254.0.0/16`` / ``metadata.google.internal``)
+    so an LLM-driven probe can't be steered at the instance-metadata service.
+    Loopback and private cluster IPs stay allowed — probing
+    ``http://localhost:PORT/health`` and private node URLs is the job. Raises
+    ``ValueError`` when the URL is unsafe. Shared by every tool that fetches a
+    model-supplied URL (``http_health``, ``node_health``, ``check_llm_backend``).
     """
     parts = urllib.parse.urlsplit(url)
     if parts.scheme not in ("http", "https"):
@@ -240,6 +253,11 @@ def _http_get_json(url: str, timeout: float = 5.0) -> Any:
     host = (parts.hostname or "").lower()
     if host.startswith("169.254.") or host == "metadata.google.internal":
         raise ValueError(f"refusing link-local/metadata host: {host!r}")
+
+
+def _http_get_json(url: str, timeout: float = 5.0) -> Any:
+    """GET *url* and parse JSON. Raises on network/parse failure or unsafe URL."""
+    _assert_safe_http_url(url)
     req = urllib.request.Request(
         url,
         headers={"Accept": "application/json", "User-Agent": f"turnstone-doctor/{__version__}"},
@@ -503,9 +521,9 @@ def detect_install_profile(project_dir: Path, env: dict[str, str] | None = None)
     env = dict(env if env is not None else os.environ)
     kinds: list[str] = []
 
-    import turnstone as _ts
+    from turnstone import __file__ as _turnstone_file
 
-    pkg_dir = Path(_ts.__file__).resolve().parent
+    pkg_dir = Path(_turnstone_file).resolve().parent
     repo_root = _find_repo_root(pkg_dir.parent)
     if {"site-packages", "dist-packages"} & set(pkg_dir.parts):
         install_source = "site-packages"
@@ -942,12 +960,18 @@ def _read_api_creds(profile: InstallProfile, env: dict[str, str]) -> tuple[str, 
     """Resolve (base_url, api_key) from config.toml [api] then env, for brain seeding.
 
     Reads the ``[api]`` block already parsed into each ``ConfigFileInfo`` at
-    discovery time (first non-empty wins), so the config files aren't re-opened.
+    discovery time (the config files aren't re-opened). The pair is taken from the
+    *first* config file that defines either field, as a unit — so base_url and
+    api_key never get mixed across two different config sources (which would form
+    an endpoint/key pair that exists in no real config). Any field still missing
+    is then filled from the environment, matching Turnstone's config→env order.
     """
     base_url = api_key = ""
     for cf in profile.config_files:
-        base_url = base_url or cf.api.get("base_url", "")
-        api_key = api_key or cf.api.get("api_key", "")
+        if cf.api.get("base_url") or cf.api.get("api_key"):
+            base_url = cf.api.get("base_url", "")
+            api_key = cf.api.get("api_key", "")
+            break
     base_url = base_url or env.get("LLM_BASE_URL", "")
     api_key = api_key or env.get("OPENAI_API_KEY", "") or env.get("ANTHROPIC_API_KEY", "")
     return base_url, api_key
@@ -1215,7 +1239,7 @@ TOOLS: list[dict[str, Any]] = [
                     },
                     "install_type": {
                         "type": "string",
-                        "enum": ["docker-compose", "systemd", "pip", "source"],
+                        "enum": ["docker-compose", "systemd", "pip", "git-source"],
                         "description": (
                             "Override the detected install kind for THIS node — use for "
                             "mixed clusters (e.g. local compose nodes + remote systemd hosts)."
@@ -1404,6 +1428,12 @@ def _tool_check_llm_backend(args: dict[str, Any]) -> str:
     base_url = str(args.get("base_url", ""))
     api_key = str(args.get("api_key", ""))
     model = str(args.get("model", ""))
+    # Same scheme / metadata-host guard as http_health: this URL is model-supplied
+    # too, so refuse file:// and the cloud metadata endpoint before any request.
+    try:
+        _assert_safe_http_url(base_url)
+    except ValueError as exc:
+        return f"Refused: {exc}"
     try:
         res = probe_model_endpoint(provider, base_url, api_key, target_model=model)
     except Exception as exc:  # noqa: BLE001 - report any probe failure to the model
@@ -1446,11 +1476,17 @@ def _tool_node_health(project_dir: Path, primary_kind: str, args: dict[str, Any]
         cmd += ["exec", "-T", node, "python", "-c", _NODE_HEALTH_SNIPPET]
         return _run_readonly(cmd, cwd=project_dir, timeout=20)
 
-    # systemd / pip / source / unknown: the node is a real host reachable at its
-    # advertise URL. Treat `node` as a URL or host[:port] and GET its /health.
-    url = (
-        node if node.startswith(("http://", "https://")) else f"http://{node}:{DEFAULT_SERVER_PORT}"
-    )
+    # systemd / pip / git-source / unknown: the node is a real host reachable at
+    # its advertise URL. Treat `node` as a URL or host[:port] and GET its /health,
+    # only adding the default port when the operator didn't supply one.
+    if node.startswith(("http://", "https://")):
+        url = node
+    else:
+        try:
+            has_port = urllib.parse.urlsplit(f"//{node}").port is not None
+        except ValueError:
+            has_port = False
+        url = f"http://{node}" if has_port else f"http://{node}:{DEFAULT_SERVER_PORT}"
     return _tool_http_health({"url": url})
 
 

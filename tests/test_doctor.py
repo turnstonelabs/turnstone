@@ -115,8 +115,17 @@ class TestMaskSecrets:
         out = _mask_secrets("LLM_BASE_URL=http://localhost:8000/v1")
         assert "http://localhost:8000/v1" in out
 
-    def test_comment_preserved(self) -> None:
-        text = "# OPENAI_API_KEY=sk-1234567890abcdef"
+    def test_commented_secret_still_masked(self) -> None:
+        # A commented-out assignment can still hold a real secret, so its value is
+        # masked even in a comment — the '#' marker and key stay for readability.
+        out = _mask_secrets("# OPENAI_API_KEY=sk-1234567890abcdef")
+        assert out.startswith("# OPENAI_API_KEY=")
+        assert "sk-1234567890abcdef" not in out
+        assert "1234567890abcde" not in out
+
+    def test_prose_comment_preserved(self) -> None:
+        # A prose comment has no KEY=value shape, so it passes through untouched.
+        text = "# Set your API key in the environment before starting."
         assert _mask_secrets(text) == text
 
     def test_non_secret_preserved(self) -> None:
@@ -324,8 +333,6 @@ class TestHttpGetJsonSafety:
 
     def test_allows_loopback(self, monkeypatch: pytest.MonkeyPatch) -> None:
         # loopback must stay allowed (probing localhost /health is the job)
-        import turnstone.doctor as doctor
-
         class _FakeResp:
             def __enter__(self) -> _FakeResp:
                 return self
@@ -336,7 +343,7 @@ class TestHttpGetJsonSafety:
             def read(self) -> bytes:
                 return b'{"ok": true}'
 
-        monkeypatch.setattr(doctor.urllib.request, "urlopen", lambda *a, **k: _FakeResp())
+        monkeypatch.setattr("urllib.request.urlopen", lambda *a, **k: _FakeResp())
         assert _http_get_json("http://localhost:8080/health") == {"ok": True}
 
 
@@ -368,6 +375,26 @@ class TestCheckLlmBackendTool:
         with patch("turnstone.core.model_registry.probe_model_endpoint", return_value=fake):
             out = _tool_check_llm_backend({"provider": "openai", "base_url": "http://x/v1"})
         assert "reachable" in out
+
+    def test_rejects_metadata_base_url(self) -> None:
+        # base_url is model-supplied, so it gets the same guard as http_health:
+        # the cloud metadata endpoint is refused before any probe is attempted.
+        from turnstone.doctor import _tool_check_llm_backend
+
+        with patch("turnstone.core.model_registry.probe_model_endpoint") as probe:
+            out = _tool_check_llm_backend(
+                {"provider": "openai", "base_url": "http://169.254.169.254/v1"}
+            )
+        assert "Refused" in out
+        probe.assert_not_called()
+
+    def test_rejects_non_http_base_url(self) -> None:
+        from turnstone.doctor import _tool_check_llm_backend
+
+        with patch("turnstone.core.model_registry.probe_model_endpoint") as probe:
+            out = _tool_check_llm_backend({"provider": "openai", "base_url": "file:///etc/passwd"})
+        assert "Refused" in out
+        probe.assert_not_called()
 
 
 class TestNodeHealth:
@@ -408,6 +435,22 @@ class TestNodeHealth:
         )
         assert "10.0.0.5:8080/health" in captured["url"]
         assert "1.7.0a2" in out
+
+    def test_host_with_explicit_port_not_double_suffixed(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # A host:port from the model must not get the default port appended again
+        # (regression: "10.0.0.5:8081" → "http://10.0.0.5:8081:8080").
+        captured: dict[str, str] = {}
+
+        def fake_get(url: str, timeout: float = 5.0) -> dict[str, str]:
+            captured["url"] = url
+            return {"status": "ok"}
+
+        monkeypatch.setattr("turnstone.doctor._http_get_json", fake_get)
+        _tool_node_health(tmp_path, "systemd", {"node": "10.0.0.5:8081"})
+        assert "10.0.0.5:8081/health" in captured["url"]
+        assert ":8080" not in captured["url"]
 
     def test_rejects_option_node(self, tmp_path: Path) -> None:
         assert "Error" in _tool_node_health(tmp_path, "docker-compose", {"node": "--rm"})
@@ -620,6 +663,27 @@ class TestPreflightHelpers:
         )
         assert base_url == "http://env/v1"
         assert api_key == "sk-env"
+
+    def test_read_api_creds_pair_from_single_source(self, tmp_path: Path) -> None:
+        # Two config files: the first defines only base_url, the second only
+        # api_key. The pair must come from ONE source (the first that defines
+        # either field) — never a base_url+api_key spliced across both files.
+        cf1 = ConfigFileInfo(
+            path=tmp_path / "a.toml",
+            sections=["api"],
+            db={},
+            api={"base_url": "http://endpoint-a/v1"},
+        )
+        cf2 = ConfigFileInfo(
+            path=tmp_path / "b.toml",
+            sections=["api"],
+            db={},
+            api={"api_key": "sk-from-b"},
+        )
+        profile = _make_profile(tmp_path, config_files=[cf1, cf2])
+        base_url, api_key = _read_api_creds(profile, {})
+        assert base_url == "http://endpoint-a/v1"
+        assert api_key == ""  # not spliced from the unrelated second file
 
     def test_detect_install_profile_classifies_compose(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
