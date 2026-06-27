@@ -997,6 +997,120 @@ class TestTitleRetry:
         # Flag stays True after successful generation
         assert session._title_generated is True
 
+    def test_title_sanitizes_thinking_model_output(self, tmp_db):
+        """A reasoning model's answer can arrive wrapped in an unparsed
+        ``<think>`` span (lanes that don't split it into reasoning_content)
+        plus markdown / quotes. There is no portable switch to disable thinking,
+        so the title pass gives reasoning room (raised max_tokens), reuses
+        ``_strip_reasoning``, and peels wrapping decoration — keeping INTERNAL
+        punctuation (the hyphen survives)."""
+        from turnstone.core.providers._protocol import ModelCapabilities
+        from turnstone.core.session import _TITLE_MAX_TOKENS
+
+        session = _make_session()
+        session._title_generated = True
+        session.messages = turns_from_dicts([{"role": "user", "content": "hi"}])
+        result = MagicMock()
+        result.content = (
+            "<think>The user greets me; a fitting title would be...</think>\n\n"
+            '**"Cluster Routing Deep-Dive"**'
+        )
+        session._provider = MagicMock()
+        session._provider.get_capabilities.return_value = ModelCapabilities()
+        session._provider.create_completion.return_value = result
+
+        captured: dict[str, str] = {}
+        with patch(
+            "turnstone.core.session.update_workstream_title",
+            side_effect=lambda ws_id, title: captured.update(title=title),
+        ):
+            session._generate_title()
+
+        assert captured["title"] == "Cluster Routing Deep-Dive"
+        # Reasoning gets room to finish rather than a 200-token squeeze that
+        # the think pass swallows whole (the empty-content regression); and the
+        # title call forces no temperature — it defers to the session value.
+        _, kw = session._provider.create_completion.call_args
+        assert kw["max_tokens"] == _TITLE_MAX_TOKENS
+        assert kw["temperature"] == session.temperature
+
+    def test_title_skipped_when_reasoning_consumes_whole_budget(self, tmp_db):
+        """If the budget is spent inside an unclosed ``<think>`` (the empty/
+        cut-off content that broke titling), the cleaner yields no words — so
+        nothing is persisted rather than a fragment of reasoning becoming the
+        title."""
+        from turnstone.core.providers._protocol import ModelCapabilities
+
+        session = _make_session()
+        session._title_generated = True
+        session.messages = turns_from_dicts([{"role": "user", "content": "hi"}])
+        result = MagicMock()
+        result.content = "<think>still reasoning, never closed before the cap"
+        session._provider = MagicMock()
+        session._provider.get_capabilities.return_value = ModelCapabilities()
+        session._provider.create_completion.return_value = result
+
+        with patch("turnstone.core.session.update_workstream_title") as upd:
+            session._generate_title()
+
+        upd.assert_not_called()
+
+    def test_title_strips_reasoning_variants(self, tmp_db):
+        """Reasoning reaches ``content`` in several shapes the title pass must
+        survive: an opener-absent ``…</think>`` (templates that pre-inject the
+        opening tag), a paired ``<reasoning>`` block, and a trailing
+        explanation after the title (only the first non-empty line is kept)."""
+        from turnstone.core.providers._protocol import ModelCapabilities
+
+        cases = [
+            ("I should weigh the options here</think>\n\nRendezvous Routing", "Rendezvous Routing"),
+            (
+                "<reasoning>pondering the ask</reasoning>\nCluster Health Digest",
+                "Cluster Health Digest",
+            ),
+            ("Auth Layer Refactor\n\nThis title captures the request well.", "Auth Layer Refactor"),
+        ]
+        for content, expected in cases:
+            session = _make_session()
+            session._title_generated = True
+            session.messages = turns_from_dicts([{"role": "user", "content": "hi"}])
+            result = MagicMock()
+            result.content = content
+            session._provider = MagicMock()
+            session._provider.get_capabilities.return_value = ModelCapabilities()
+            session._provider.create_completion.return_value = result
+
+            captured: dict[str, str] = {}
+            with patch(
+                "turnstone.core.session.update_workstream_title",
+                side_effect=lambda ws_id, title, _c=captured: _c.update(title=title),
+            ):
+                session._generate_title()
+            assert captured.get("title") == expected, (content, captured)
+
+    def test_title_truncates_to_max_chars(self, tmp_db):
+        """The ``[:_TITLE_MAX_CHARS]`` slice is the only length guard now that
+        the persist-time ``title[:80]`` is gone — a long title is bounded."""
+        from turnstone.core.providers._protocol import ModelCapabilities
+        from turnstone.core.session import _TITLE_MAX_CHARS
+
+        session = _make_session()
+        session._title_generated = True
+        session.messages = turns_from_dicts([{"role": "user", "content": "hi"}])
+        result = MagicMock()
+        result.content = "Story " * 40  # 240 chars on one line
+        session._provider = MagicMock()
+        session._provider.get_capabilities.return_value = ModelCapabilities()
+        session._provider.create_completion.return_value = result
+
+        captured: dict[str, str] = {}
+        with patch(
+            "turnstone.core.session.update_workstream_title",
+            side_effect=lambda ws_id, title: captured.update(title=title),
+        ):
+            session._generate_title()
+        assert len(captured["title"]) == _TITLE_MAX_CHARS
+
     def test_title_skipped_after_resume_changes_ws_id(self, tmp_db):
         """If ws_id changes (via resume) during title generation, discard the result."""
         from turnstone.core.providers._protocol import ModelCapabilities
@@ -5431,6 +5545,29 @@ def test_utility_completion_records_aux_usage():
     assert rec["cache_creation_tokens"] == 4
     assert rec["cache_read_tokens"] == 16
     assert rec["model"] == "test-model"
+
+
+def test_utility_completion_defers_temperature_to_session():
+    """Utility calls (title, compaction, web-fetch extraction) must NOT force a
+    temperature: an unset temperature resolves to the session/registry value, so
+    one operator-set ``[models.*]`` temperature governs every lane and code never
+    fights a thinking/no-temp model by hard-coding a constant.  An explicit
+    override still wins for any caller that genuinely needs one."""
+    from turnstone.core.providers._protocol import CompletionResult, ModelCapabilities
+
+    session = _make_session()
+    session.temperature = 0.42
+    session._provider = MagicMock()
+    session._provider.get_capabilities.return_value = ModelCapabilities()
+    session._provider.create_completion.return_value = CompletionResult(content="x")
+
+    session._utility_completion([{"role": "user", "content": "hi"}])
+    _, kw = session._provider.create_completion.call_args
+    assert kw["temperature"] == 0.42  # deferred to the session/registry value
+
+    session._utility_completion([{"role": "user", "content": "hi"}], temperature=0.9)
+    _, kw2 = session._provider.create_completion.call_args
+    assert kw2["temperature"] == 0.9  # explicit override still honored
 
 
 def test_record_aux_usage_skips_when_usage_missing():

@@ -616,6 +616,27 @@ _SKILL_ARG_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 # excludes the ``$ARGUMENTS[N]`` form which is a different placeholder.
 _SPEC_ARGUMENTS_LITERAL_RE = re.compile(r"\$ARGUMENTS\b(?!\[)")
 
+# Auto-title generation runs on the session's own (often thinking-capable)
+# utility model, and there is no portable way to turn reasoning off:
+# ``enable_thinking`` is Qwen-only and commercial providers each differ.  A
+# small ``max_tokens`` lets the reasoning pass swallow the entire budget so the
+# title text never lands (``finish_reason=length``, empty ``content`` → skip).
+# This hits auto-title and refresh alike (shared path) on any thinking model.
+# So give the think pass room (``_TITLE_MAX_TOKENS``), then recover the title
+# from ``content``: reuse :meth:`ChatSession._strip_reasoning` (the canonical
+# ``<think>``/``<reasoning>`` remover, for lanes that leave reasoning inline
+# rather than in ``reasoning_content``), take the first non-empty line (a model
+# that appends an explanation shouldn't fold prose into the title), then peel a
+# ``Title:`` label and wrapping markdown/quote decoration.  Internal punctuation
+# is preserved so ``.NET``, ``CI/CD``, ``v1.6.0`` survive.
+_TITLE_MAX_TOKENS = 2048
+# Match the manual-rename (alias) cap so generated and hand-set titles share
+# one length bound.
+_TITLE_MAX_CHARS = 80
+_TITLE_LABEL_RE = re.compile(r"(?i)^\s*title\s*[:\-—]\s*")
+# Wrapping decoration peeled off both ends of a generated title.
+_TITLE_WRAP_CHARS = "*`\"' "
+
 
 # Soft cap on ``"watch_triggered"`` entries in the per-session NudgeQueue.
 # The pull-model path batches N watch fires into ONE envelope splice on
@@ -2533,8 +2554,11 @@ class ChatSession:
             snippet += "\n\nTitle:"
             log.info("ws.title.llm_call_start", ws_id=ws_id[:8])
 
-            # Use slightly higher temperature for refreshes to encourage variety
-            temp = 0.7 if current_title else 0.3
+            # No temperature override here: defer to the session/registry
+            # temperature (``_utility_completion`` default).  A manual refresh
+            # leans on the prompt's "generate a DIFFERENT title" instruction and
+            # the changing ``current_title`` it feeds in for variety, rather than
+            # forcing a hotter sample on top of the operator's chosen model.
 
             result = self._utility_completion(
                 [
@@ -2551,17 +2575,28 @@ class ChatSession:
                     },
                     {"role": "user", "content": snippet},
                 ],
-                max_tokens=200,
-                temperature=temp,
+                max_tokens=_TITLE_MAX_TOKENS,
             )
-            raw = (result.content or "").strip()
+            raw = result.content or ""
             log.info("ws.title.llm_response", ws_id=ws_id[:8], raw=raw[:200])
-            # Take first line, strip quotes
-            title = raw.split("\n")[0].strip().strip('"').strip("'")
+            # Take the assistant's answer (``content``), never its reasoning.
+            # Reuse the canonical reasoning stripper, then drop a leftover close
+            # tag from lanes that pre-inject the opening ``<think>`` into the
+            # prompt (only ``</think>`` reaches ``content``). See ``_TITLE_*``.
+            stripped = self._strip_reasoning(raw)
+            for _close in ("</think>", "</reasoning>"):
+                _pos = stripped.rfind(_close)
+                if _pos != -1:
+                    stripped = stripped[_pos + len(_close) :]
+            # First non-empty line, with a ``Title:`` label and wrapping
+            # markdown/quote decoration peeled (internal punctuation kept).
+            line = next((ln for ln in stripped.splitlines() if ln.strip()), "")
+            line = _TITLE_LABEL_RE.sub("", line.strip(_TITLE_WRAP_CHARS))
+            title = line.strip(_TITLE_WRAP_CHARS)[:_TITLE_MAX_CHARS]
             if title and self._ws_id == ws_id:
                 log.info("ws.title.updating", ws_id=ws_id[:8], title=title)
-                update_workstream_title(ws_id, title[:80])
-                self.ui.on_rename(title[:80])
+                update_workstream_title(ws_id, title)
+                self.ui.on_rename(title)
                 log.info("ws.title.success", ws_id=ws_id[:8], title=title)
             else:
                 log.info(
@@ -3548,7 +3583,7 @@ class ChatSession:
         messages: list[dict[str, Any]],
         *,
         max_tokens: int = 4096,
-        temperature: float = 0.3,
+        temperature: float | None = None,
         reasoning_effort: str = "low",
     ) -> CompletionResult:
         """Run a lightweight internal completion (title gen, compaction, extraction).
@@ -3557,6 +3592,13 @@ class ChatSession:
         commercial providers) and ``extra_params`` (for local model servers)
         so callers don't need to duplicate it.  ``max_tokens`` is clamped to
         the model's advertised output limit so small models don't error.
+
+        ``temperature`` defaults to the session temperature (``self.temperature``)
+        — the same operator/registry-resolved value the main turn uses — rather
+        than a hard-coded constant: utility calls should not silently override an
+        explicit ``[models.*]`` temperature.  The provider still drops it for
+        models that forbid temperature (GPT-5 base, O-series) or pins it (Claude
+        with thinking), so this only governs models that genuinely accept one.
         """
         caps = self._get_capabilities()
         clamped = min(max_tokens, caps.max_output_tokens) if caps.max_output_tokens else max_tokens
@@ -3566,7 +3608,7 @@ class ChatSession:
             model=self.model,
             messages=messages,
             max_tokens=clamped,
-            temperature=temperature,
+            temperature=self.temperature if temperature is None else temperature,
             reasoning_effort=reasoning_effort,
             extra_params=self._provider_extra_params(),
             capabilities=caps,
@@ -13033,7 +13075,8 @@ class ChatSession:
         # Phase 3: summarization API call.
         # Use a generous max_tokens so thinking models don't starve the
         # visible answer, and pass reasoning_effort="low" to avoid wasting
-        # budget on deep reasoning for a simple extraction task.
+        # budget on deep reasoning for a simple extraction task.  Temperature
+        # is left to the session/registry default rather than overridden here.
         try:
             result = self._utility_completion(
                 [
@@ -13057,7 +13100,6 @@ class ChatSession:
                     },
                 ],
                 max_tokens=8192,
-                temperature=0.2,
             )
             answer = result.content or ""
             if not answer:
