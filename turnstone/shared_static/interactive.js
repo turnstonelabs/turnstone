@@ -774,8 +774,18 @@ class Pane {
       getWsId: () => {
         return this.wsId;
       },
+      // Node-proxy prefix — same seam the attachment controller uses, so
+      // the dequeue DELETE reaches the node owning the session (a proxied
+      // remote-node workstream has base "/node/{id}"; without this the
+      // x-delete hit the console root and silently failed).
+      getBase: () => {
+        return this._base;
+      },
       onAfterDequeue: () => {
         this.attachments.rehydrate();
+      },
+      onNotice: (msg) => {
+        showToast(msg);
       },
       // Idle-edge cleanup of the cancel/force-stop timers — without
       // this they fire on the *next* busy turn, relabel Stop to "Force
@@ -2623,21 +2633,41 @@ class Pane {
     }
     this.composer.clear();
 
-    authFetch(
+    // Bound the send POST with an AbortController + ~15s timeout (mirrors
+    // composer_queue.js _deleteRequest) so a wedged proxied node can't leave a
+    // pre-bind-dismissed card frozen forever — bind/promote/remove only run
+    // off this response, so the .catch must always eventually fire.
+    const sendCtrl =
+      typeof AbortController === "function" ? new AbortController() : null;
+    const sendInit = {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        message: text,
+        attachment_ids: snap.attachment_ids,
+      }),
+    };
+    let sendTimer = null;
+    if (sendCtrl) {
+      sendInit.signal = sendCtrl.signal;
+      sendTimer = setTimeout(() => sendCtrl.abort(), 15000);
+    }
+    let sendReq = authFetch(
       this._base +
         "/v1/api/workstreams/" +
         encodeURIComponent(this.wsId) +
         "/send",
-      {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          message: text,
-          attachment_ids: snap.attachment_ids,
-        }),
-      },
-    )
+      sendInit,
+    );
+    if (sendTimer) sendReq = sendReq.finally(() => clearTimeout(sendTimer));
+    sendReq
       .then((r) => {
+        // A rejected send (4xx/5xx) carries {error}, not {status}; without
+        // this guard it falls through to the "unknown status" branch and gets
+        // promote()'d — a server-refused message shown as delivered (with a
+        // false "already sent" toast if it was dismissed). Route it to the
+        // .catch (removes the bubble + shows the error) instead.
+        if (!r.ok) throw new Error("send_http_" + r.status);
         return r.json();
       })
       .then((data) => {
@@ -2674,6 +2704,12 @@ class Pane {
               "Send a text-only message now, or wait and resend with attachments.",
           );
         } else {
+          // Unknown / "ok" status (e.g. the stale-busy race: the client
+          // optimistically queued but the server ran the send on a fresh
+          // worker). Settle the optimistic bubble as a normal sent message
+          // so a pre-bind × can't strand it in the dismissing state;
+          // promote() notifies "already sent" if it was dismissed.
+          if (queuedEl) this.queue.promote(queuedEl);
           this.attachments.consume(
             data.attached_ids,
             data.dropped_attachment_ids,

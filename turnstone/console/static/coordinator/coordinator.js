@@ -267,6 +267,12 @@ function createCoordinatorPane(root, wsId, opts) {
     onAfterDequeue: function () {
       attachments.rehydrate();
     },
+    // Surface dequeue feedback in the chat log (coord has no toast): the
+    // "already sent" / "couldn't remove" / "no longer available" notices the
+    // controller raises. Reuses the transient "info" row (cf. force-stop).
+    onNotice: function (msg) {
+      appendText("info", msg, { label: "info" });
+    },
     // Idle-edge cleanup of the cancel/force-stop timers — without
     // this they fire on the *next* busy turn, relabel Stop to "Force
     // Stop", and surface a misleading "Cancel didn't complete in
@@ -1849,7 +1855,13 @@ function createCoordinatorPane(root, wsId, opts) {
     }
     composer.clear();
 
-    authFetch("/v1/api/workstreams/" + encodeURIComponent(wsId) + "/send", {
+    // Bound the send POST with an AbortController + ~15s timeout (mirrors
+    // composer_queue.js _deleteRequest) so a wedged proxied node can't leave a
+    // pre-bind-dismissed card frozen forever — bind/promote/remove only run
+    // off this response, so the .catch must always eventually fire.
+    const sendCtrl =
+      typeof AbortController === "function" ? new AbortController() : null;
+    const sendInit = {
       method: "POST",
       credentials: "include",
       headers: { "Content-Type": "application/json" },
@@ -1857,8 +1869,27 @@ function createCoordinatorPane(root, wsId, opts) {
         message: trimmed,
         attachment_ids: snap.attachment_ids,
       }),
-    })
-      .then((r) => r.json())
+    };
+    let sendTimer = null;
+    if (sendCtrl) {
+      sendInit.signal = sendCtrl.signal;
+      sendTimer = setTimeout(() => sendCtrl.abort(), 15000);
+    }
+    let sendReq = authFetch(
+      "/v1/api/workstreams/" + encodeURIComponent(wsId) + "/send",
+      sendInit,
+    );
+    if (sendTimer) sendReq = sendReq.finally(() => clearTimeout(sendTimer));
+    sendReq
+      .then((r) => {
+        // A rejected send (4xx/5xx) carries {error}, not {status}; without
+        // this guard it falls through to the "unknown status" branch and gets
+        // promote()'d — a server-refused message shown as delivered (with a
+        // false "already sent" notice if it was dismissed). Route it to the
+        // .catch (removes the bubble + shows the error) instead.
+        if (!r.ok) throw new Error("send_http_" + r.status);
+        return r.json();
+      })
       .then((data) => {
         if (data && data.status === "queued" && data.msg_id) {
           // Race: server returned queued but the client thought it was
@@ -1895,6 +1926,9 @@ function createCoordinatorPane(root, wsId, opts) {
             { label: "error" },
           );
         } else {
+          // Unknown / "ok" status (stale-busy race): settle the optimistic
+          // bubble so a pre-bind × can't strand it in the dismissing state.
+          if (queuedEl) queue.promote(queuedEl);
           attachments.consume(
             data && data.attached_ids,
             data && data.dropped_attachment_ids,
