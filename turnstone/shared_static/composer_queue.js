@@ -39,9 +39,13 @@
  *               .msg element. Default false to match the historical
  *               interactive shape.
  *   authFetch:  optional override (default window.authFetch).
- *   onAfterDequeue: optional () => void — interactive hooks attachment
- *               re-fetch here. Fires only on a confirmed `removed` (the
- *               only case that released a server-side reservation). Coord omits.
+ *   onAfterDequeue: optional () => void — re-sync the composer's staged
+ *               attachment chips (interactive and coord both wire it to
+ *               attachments.rehydrate). Fires only on a confirmed `removed`
+ *               — the one verdict that mutated server-side queue state;
+ *               `not_found`/error change nothing, so re-fetching would be
+ *               wasted. Queued messages are text-only, so this isn't undoing
+ *               an attachment reservation — there is none.
  *   onNotice:   optional (msg) => void — surfaces a user-facing notice
  *               (e.g. a toast): "already sent" when a dismiss lost the race
  *               to delivery, or "couldn't remove" when the DELETE failed.
@@ -257,7 +261,8 @@ export function createQueueController(opts) {
         var status = data && data.status;
         if (status === "removed") {
           el.remove();
-          // Only a real removal released a server-side reservation.
+          // `removed` is the only verdict that mutated server-side queue
+          // state, so it's the only one worth re-syncing composer state for.
           if (onAfterDequeue) onAfterDequeue();
         } else if (status === "not_found") {
           // Already drained — present it as the sent message it now is;

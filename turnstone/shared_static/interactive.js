@@ -2666,8 +2666,21 @@ class Pane {
         // this guard it falls through to the "unknown status" branch and gets
         // promote()'d — a server-refused message shown as delivered (with a
         // false "already sent" toast if it was dismissed). Route it to the
-        // .catch (removes the bubble + shows the error) instead.
-        if (!r.ok) throw new Error("send_http_" + r.status);
+        // .catch (removes the bubble + shows the error) instead, surfacing the
+        // server's {error} text ("No session", a rate-limit reason, etc.)
+        // rather than a bare status code. A wedged proxy can answer non-JSON
+        // (502/504 HTML); the parse-failure arm falls back to the status code
+        // so that can't surface as an "Unexpected token <" error.
+        if (!r.ok) {
+          return r.json().then(
+            (b) => {
+              throw new Error((b && b.error) || "send_http_" + r.status);
+            },
+            () => {
+              throw new Error("send_http_" + r.status);
+            },
+          );
+        }
         return r.json();
       })
       .then((data) => {

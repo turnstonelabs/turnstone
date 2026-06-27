@@ -259,10 +259,12 @@ function createCoordinatorPane(root, wsId, opts) {
     // Coord chat bubbles wrap content in a .msg-body div (appendMsg
     // below); the queue bubble matches so its border + padding align.
     wrapInBody: true,
-    // Re-fetch attachments after a dequeue so the user can see (and
-    // reuse) any reservations the server-side dequeue released. Trades
-    // a small in-flight-placeholder clobbering window for the strictly
-    // worse alternative of attachments lingering invisibly until the
+    // Re-sync the staged-attachment chips after a confirmed dequeue so the
+    // composer view matches server truth. Queued messages are text-only, so
+    // this isn't reclaiming a reservation (there is none) — it's a cheap
+    // correctness refresh, fired by the controller only on the `removed`
+    // verdict. Trades a small in-flight-placeholder clobbering window for the
+    // strictly worse alternative of attachments lingering invisibly until the
     // next page load.
     onAfterDequeue: function () {
       attachments.rehydrate();
@@ -1886,8 +1888,21 @@ function createCoordinatorPane(root, wsId, opts) {
         // this guard it falls through to the "unknown status" branch and gets
         // promote()'d — a server-refused message shown as delivered (with a
         // false "already sent" notice if it was dismissed). Route it to the
-        // .catch (removes the bubble + shows the error) instead.
-        if (!r.ok) throw new Error("send_http_" + r.status);
+        // .catch (removes the bubble + shows the error) instead, surfacing the
+        // server's {error} text ("No session", a rate-limit reason, etc.)
+        // rather than a bare status code. A wedged proxy can answer non-JSON
+        // (502/504 HTML); the parse-failure arm falls back to the status code
+        // so that can't surface as an "Unexpected token <" error.
+        if (!r.ok) {
+          return r.json().then(
+            (b) => {
+              throw new Error((b && b.error) || "send_http_" + r.status);
+            },
+            () => {
+              throw new Error("send_http_" + r.status);
+            },
+          );
+        }
         return r.json();
       })
       .then((data) => {
