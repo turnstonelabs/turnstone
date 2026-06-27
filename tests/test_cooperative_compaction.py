@@ -47,7 +47,13 @@ def session(tmp_db, mock_openai_client):
 
 class TestEstimatedPromptTokens:
     def test_falls_back_to_local_without_usage(self, session):
-        """Before the first API call there is no provider anchor."""
+        """Before the first API call there is no provider anchor.
+
+        Tools cleared so the fallback is the pure system + message sum; the
+        tool-def augmentation of the same fallback is pinned separately by
+        ``TestProactiveToolDefFallback``.
+        """
+        session._tools = []
         session._last_usage = None
         session._system_tokens = 500
         session._msg_tokens = [100, 200]
@@ -441,6 +447,464 @@ class TestCompactBeforeTruncate:
             c.args == ("mid-turn",) and c.kwargs.get("preserve_tail") == 1
             for c in compact.call_args_list
         ), compact.call_args_list
+
+    def test_pre_attempt_suppresses_second_midturn_compaction(self, session):
+        """q-2: when an owed compaction already fired pre-truncation
+        (``pre_attempted_compact=True``), the post-truncation
+        ``_maybe_compact_midturn`` is skipped — re-running would double the
+        summary work (and could retry-storm a failed summary)."""
+        session.messages = turns_from_dicts([{"role": "user", "content": "task"}])
+        session._msg_tokens = [1]
+        session._title_generated = True
+        tc = {"id": "call_1", "type": "function", "function": {"name": "x", "arguments": "{}"}}
+        n = {"i": 0}
+
+        def stream(*_a, **_k):
+            n["i"] += 1
+            if n["i"] == 1:
+                return {"role": "assistant", "content": "", "tool_calls": [tc]}
+            return {"role": "assistant", "content": "done"}
+
+        with (
+            patch.object(session, "_create_stream_with_retry", return_value=iter([])),
+            patch.object(session, "_stream_response", side_effect=stream),
+            patch.object(session, "_execute_tools", return_value=([("call_1", "out")], "")),
+            patch.object(session, "_full_messages", return_value=[]),
+            patch.object(session, "_update_token_table"),
+            patch.object(session, "_print_status_line"),
+            patch.object(session, "_emit_state"),
+            # Owed on the tool turn → the pre-truncation compaction fires.
+            # _compaction_owed takes an optional ``used`` arg, so accept *a/**k.
+            patch.object(session, "_compaction_owed", side_effect=lambda *a, **k: n["i"] == 1),
+            patch.object(session, "_do_auto_compact") as compact,
+            patch.object(session, "_maybe_compact_midturn") as midturn,
+            patch("turnstone.core.session.save_message"),
+        ):
+            session.send("go")
+
+        # The pre-truncation compaction actually fired (preserve_tail=1)...
+        assert any(
+            c.args == ("mid-turn",) and c.kwargs.get("preserve_tail") == 1
+            for c in compact.call_args_list
+        ), compact.call_args_list
+        # ...so the post-truncation mid-turn compaction is suppressed.
+        midturn.assert_not_called()
+
+    def test_no_pre_attempt_runs_midturn_compaction(self, session):
+        """q-2 sibling: with nothing owed pre-truncation
+        (``pre_attempted_compact=False``), the post-truncation
+        ``_maybe_compact_midturn`` runs once for the tool turn."""
+        session.messages = turns_from_dicts([{"role": "user", "content": "task"}])
+        session._msg_tokens = [1]
+        session._title_generated = True
+        tc = {"id": "call_1", "type": "function", "function": {"name": "x", "arguments": "{}"}}
+        n = {"i": 0}
+
+        def stream(*_a, **_k):
+            n["i"] += 1
+            if n["i"] == 1:
+                return {"role": "assistant", "content": "", "tool_calls": [tc]}
+            return {"role": "assistant", "content": "done"}
+
+        with (
+            patch.object(session, "_create_stream_with_retry", return_value=iter([])),
+            patch.object(session, "_stream_response", side_effect=stream),
+            patch.object(session, "_execute_tools", return_value=([("call_1", "out")], "")),
+            patch.object(session, "_full_messages", return_value=[]),
+            patch.object(session, "_update_token_table"),
+            patch.object(session, "_print_status_line"),
+            patch.object(session, "_emit_state"),
+            # Never owed → no pre-truncation compaction this iteration.
+            patch.object(session, "_compaction_owed", side_effect=lambda *a, **k: False),
+            patch.object(session, "_do_auto_compact") as compact,
+            patch.object(session, "_maybe_compact_midturn") as midturn,
+            patch("turnstone.core.session.save_message"),
+        ):
+            session.send("go")
+
+        # No pre-truncation (preserve_tail) compaction happened...
+        assert not any(c.kwargs.get("preserve_tail") == 1 for c in compact.call_args_list), (
+            compact.call_args_list
+        )
+        # ...so the post-truncation mid-turn compaction runs once for the tool turn.
+        midturn.assert_called_once()
+
+
+# ---------------------------------------------------------------------------
+# Chunked / hierarchical summary compaction
+# ---------------------------------------------------------------------------
+
+
+class TestPackBlocks:
+    """``_pack_blocks`` greedily packs formatted blocks into batches that each
+    fit the budget, in order, with no drops and no reordering."""
+
+    def test_preserves_all_blocks_and_order(self, session):
+        blocks = [f"block-{i}-{'x' * 50}" for i in range(10)]
+        batches = session._pack_blocks(blocks, budget_chars=200)
+        flat = [b for batch in batches for b in batch]
+        assert flat == blocks  # every block present, order preserved
+        assert all(batch for batch in batches)  # never an empty batch
+
+    def test_each_batch_within_budget(self, session):
+        budget = 200
+        blocks = ["a" * 80 for _ in range(12)]
+        batches = session._pack_blocks(blocks, budget_chars=budget)
+        for batch in batches:
+            assert len("\n\n".join(batch)) <= budget
+
+    def test_boundary_block_exactly_at_budget(self, session):
+        budget = 100
+        exact = "y" * budget  # len == budget: fits a batch, not oversized
+        blocks = ["short", exact, "tail"]
+        batches = session._pack_blocks(blocks, budget_chars=budget)
+        flat = [b for batch in batches for b in batch]
+        assert flat == blocks  # order + presence
+        assert exact in flat  # untouched, not truncated
+        for batch in batches:
+            assert len("\n\n".join(batch)) <= budget
+
+    def test_oversized_lone_block_truncated_in_own_batch(self, session):
+        budget = 100
+        huge = "z" * 500  # > budget → its own truncated batch
+        blocks = ["before", huge, "after"]
+        batches = session._pack_blocks(blocks, budget_chars=budget)
+        flat = [b for batch in batches for b in batch]
+        assert flat[0] == "before" and flat[-1] == "after"  # neighbours survive
+        truncated = [b for b in flat if "[truncated]" in b]
+        assert len(truncated) == 1
+        assert len(truncated[0]) <= budget
+        assert truncated[0].startswith("z")  # head preserved
+        for batch in batches:
+            assert len("\n\n".join(batch)) <= budget
+
+
+class TestSummaryInputBudget:
+    """``_summary_input_budget_chars`` derives the per-call input budget from the
+    context window, reserving the output and prompt overhead."""
+
+    def test_scales_with_context_window(self, session):
+        session.compact_max_tokens = 100
+        session.context_window = 20_000
+        smaller = session._summary_input_budget_chars()
+        session.context_window = 40_000
+        larger = session._summary_input_budget_chars()
+        assert larger > smaller
+
+    def test_subtracts_output_reserve(self, session):
+        session.context_window = 50_000
+        session.compact_max_tokens = 100
+        small_reserve = session._summary_input_budget_chars()
+        session.compact_max_tokens = 20_000  # larger output reserve
+        large_reserve = session._summary_input_budget_chars()
+        assert large_reserve < small_reserve  # less room left for input
+
+
+class TestChunkedCompaction:
+    """The chunked driver: one call when it all fits, recursion when it doesn't,
+    and atomicity on a mid-chunk failure."""
+
+    def test_single_batch_is_exactly_one_completion_call(self, session):
+        """When everything fits one batch, compaction is a single model call —
+        preserving today's behavior (and the existing tests that assume it)."""
+        session.compact_max_tokens = 100
+        session._system_tokens = 0
+        session.messages = turns_from_dicts(
+            [
+                {"role": "user", "content": "do the thing"},
+                {"role": "assistant", "content": "did the thing"},
+            ]
+        )
+        session._msg_tokens = [5, 5]
+        summary = SimpleNamespace(content="## Decisions\ndense", finish_reason="stop")
+
+        with patch.object(session, "_utility_completion", return_value=summary) as uc:
+            assert session._compact_messages(auto=True) is True
+
+        assert uc.call_count == 1
+        assert len(session.messages) == 2  # summary_user + summary_asst
+
+    def test_multi_batch_recurses_terminates_and_stays_within_budget(self, session):
+        """Core regression: many messages with a tiny per-message token estimate
+        (the OLD prefix budget would pass them all in one shot) but a formatted
+        size that needs several batches.  Every summary call's body must fit
+        ``_summary_input_budget_chars`` — the overflow the chunking fixes — and
+        the recursion must terminate with a real, shrunk summary."""
+        session.context_window = 5_000
+        session.compact_max_tokens = 4_000  # squeezes the input budget to the floor
+        session._system_tokens = 0
+        budget = session._summary_input_budget_chars()
+
+        session.messages = turns_from_dicts(
+            [
+                {
+                    "role": "user" if i % 2 == 0 else "assistant",
+                    "content": f"msg-{i:02d} " + "c" * 200,
+                }
+                for i in range(30)
+            ]
+        )
+        session._msg_tokens = [1] * 30  # tiny token estimate; OLD code selects all
+
+        recorded: list[int] = []
+
+        def fake_uc(messages, **_kwargs):
+            body = messages[1]["content"]
+            prefix = session._COMPACT_USER_PREFIX
+            if body.startswith(prefix):
+                body = body[len(prefix) :]
+            recorded.append(len(body))
+            return SimpleNamespace(content="PARTIAL", finish_reason="stop")
+
+        with patch.object(session, "_utility_completion", side_effect=fake_uc):
+            result = session._compact_messages(auto=True)
+
+        assert result is True
+        assert len(session.messages) < 30  # genuinely shrank
+        assert len(recorded) > 1  # multi-batch: recursion happened
+        assert all(n <= budget for n in recorded)  # never overflow the summary call
+
+    def test_recursion_depth_ceiling_bails_to_false(self, session):
+        """q-3: the ``depth >= _MAX_SUMMARY_DEPTH`` recursion backstop bails to
+        False (the "too large" path) without fabricating a summary.
+
+        Distinct from ``test_irreducible_input_bails_to_false`` (which bails at
+        depth 0 via the ``len(batches) >= len(blocks)`` arm before any model
+        call): here depth 0 packs into several batches AND reduces, so the level
+        succeeds and recurses; depth 1 still has >1 batch but a strictly smaller
+        count (so the len arm is False), and ``depth >= 1`` fires the bail.  That
+        the depth-0 calls ran first is proven by ``_utility_completion`` being
+        called (≥1) despite the False return.
+        """
+        session.context_window = 5_000
+        session.compact_max_tokens = 4_000  # squeezes the input budget
+        session._system_tokens = 0
+        session._MAX_SUMMARY_DEPTH = 1  # positive, so depth 0 runs before the bail
+        budget = session._summary_input_budget_chars()
+
+        # ~30 messages, each block bigger than 1/6 of the budget → depth 0 packs
+        # into several batches (and len(batches) < len(blocks), so it recurses).
+        session.messages = turns_from_dicts(
+            [
+                {
+                    "role": "user" if i % 2 == 0 else "assistant",
+                    "content": f"msg-{i:02d} " + "c" * 900,
+                }
+                for i in range(30)
+            ]
+        )
+        session._msg_tokens = [1] * 30
+        before = list(session.messages)
+
+        # Each depth-0 partial is 0.4*budget chars: two pack per batch but not
+        # three, so depth 1 reduces the batch count without collapsing to one —
+        # the len arm stays False and the depth ceiling is what bails.
+        partial = "P" * ((budget * 2) // 5)
+        summary = SimpleNamespace(content=partial, finish_reason="stop")
+
+        with patch.object(session, "_utility_completion", return_value=summary) as uc:
+            result = session._compact_messages(auto=True)
+
+        assert result is False
+        assert session.messages == before  # untouched on the bail
+        assert uc.call_count >= 1  # depth-0 ran (depth arm), not the len arm
+
+    def test_irreducible_input_bails_to_false(self, session):
+        """A genuinely irreducible case still bails to False (the "too large"
+        path) rather than fabricate, and without burning a model call.
+
+        Needs a *tiny* window now that Fix 1 keeps the budget healthy on normal
+        windows: at context_window=900 the output reserve (512, the floor) plus
+        the compactor prompt + safety exceed the window, so
+        ``_summary_input_budget_chars`` floors to ``_MIN_SUMMARY_BUDGET_CHARS``
+        (2000).  Each message's content is ~5000 chars, head+tail-capped by
+        ``_format_message_for_summary`` to ~1525 — one block fits the 2000-char
+        budget, but two (1525 + 1525) don't, so ``_pack_blocks`` yields one batch
+        per block: ``len(batches) == len(blocks)`` → irreducible bail at depth 0.
+        """
+        session.context_window = 900
+        session.compact_max_tokens = 900
+        session._system_tokens = 0
+        session.messages = turns_from_dicts(
+            [
+                {"role": "user", "content": "u " + "x" * 5000},
+                {"role": "assistant", "content": "a " + "y" * 5000},
+            ]
+        )
+        session._msg_tokens = [1, 1]
+        before = list(session.messages)
+
+        with patch.object(session, "_utility_completion") as uc:
+            result = session._compact_messages(auto=True)
+
+        assert result is False
+        uc.assert_not_called()  # no reduction at depth 0 → bail before any call
+        assert session.messages == before  # untouched
+
+    def test_default_config_summary_call_fits_window(self, session):
+        """Regression for the keystone bug: at the shipped defaults
+        (context_window == compact_max_tokens == 32768, max_output_tokens 64000)
+        the old ``min(compact_max_tokens, max_output_tokens)`` reserve ate the
+        whole window — the input budget floored to 2000 and the summary call
+        requested 32768 output tokens on a 32768 window, overflowing.  Fix 1
+        bounds the reserve to half the window, so compaction actually runs.
+        """
+        session.context_window = 32768
+        session.compact_max_tokens = 32768
+        # Pin the default-collision scenario regardless of how the fixture's
+        # model happens to resolve caps.
+        from turnstone.core.providers._protocol import ModelCapabilities
+
+        caps = ModelCapabilities(context_window=32768, max_output_tokens=64000)
+        with patch.object(session, "_get_capabilities", return_value=caps):
+            assert session._get_capabilities().max_output_tokens == 64000
+            # Output reserve never claims more than half the window...
+            assert session._summary_output_tokens() <= session.context_window // 2
+            # ...so the input budget is healthy, not floored to 2000.
+            assert session._summary_input_budget_chars() > 10_000
+
+            session._system_tokens = 0
+            session.messages = turns_from_dicts(
+                [
+                    {
+                        "role": "user" if i % 2 == 0 else "assistant",
+                        "content": f"turn-{i:02d}: " + "word " * 40,
+                    }
+                    for i in range(8)
+                ]
+            )
+            session._msg_tokens = [1] * 8
+
+            recorded: list[int] = []
+
+            def fake_uc(messages, *, max_tokens, **_kwargs):
+                recorded.append(max_tokens)
+                return SimpleNamespace(content="## Decisions\ndense", finish_reason="stop")
+
+            with patch.object(session, "_utility_completion", side_effect=fake_uc):
+                assert session._compact_messages(auto=True) is True
+
+        # The summary call's output reserve stayed within half the window, and a
+        # representative input rides comfortably under the full window alongside it.
+        assert recorded  # at least one summary call happened
+        out_tokens = recorded[0]
+        assert out_tokens <= session.context_window // 2
+        rep_input_tokens = session._summary_input_budget_chars() / session._chars_per_token
+        assert out_tokens + rep_input_tokens < session.context_window
+
+    def test_empty_summary_keeps_history(self, session):
+        """If the summary model returns empty/reasoning-only content, compaction
+        must keep the conversation rather than swap in an empty summary and
+        silently discard everything (returning True)."""
+        session.compact_max_tokens = 100  # positive summary budget at ctx=10k
+        session._system_tokens = 0
+        session.messages = turns_from_dicts(
+            [
+                {"role": "user", "content": "do the thing"},
+                {"role": "assistant", "content": "working on it"},
+                {"role": "user", "content": "and the next thing"},
+            ]
+        )
+        session._msg_tokens = [5, 5, 5]
+        before = list(session.messages)
+        empty = SimpleNamespace(content="", finish_reason="stop")
+
+        with patch.object(session, "_utility_completion", return_value=empty):
+            result = session._compact_messages(auto=True)
+
+        assert result is False
+        assert session.messages == before  # no swap, no data loss
+
+    def test_post_compaction_anchor_includes_tool_defs(self, session):
+        """#4/#9: the synthetic ``_last_usage`` written after a successful
+        compaction must fold in tool-def tokens — the same thing the provider
+        counts in ``prompt_tokens`` — so the next ``_remaining_token_budget``
+        doesn't over-state free space by the whole tool-def count."""
+        # A small but non-empty tool set so _tool_def_tokens() > 0 makes the
+        # assertion meaningful.
+        session._tool_search = None
+        session.creative_mode = False
+        session._tools = [
+            {
+                "type": "function",
+                "function": {"name": "noop", "description": "does nothing", "parameters": {}},
+            }
+        ]
+        assert session._tool_def_tokens() > 0  # sanity: tools contribute tokens
+
+        session.compact_max_tokens = 100  # positive summary budget at ctx=10k
+        session._system_tokens = 7
+        session.messages = turns_from_dicts(
+            [
+                {"role": "user", "content": "do the thing"},
+                {"role": "assistant", "content": "did the thing"},
+            ]
+        )
+        session._msg_tokens = [5, 5]
+        session._last_usage = {"prompt_tokens": 9_000, "total_tokens": 9_000}
+        summary = SimpleNamespace(content="## Decisions\ndense", finish_reason="stop")
+
+        with patch.object(session, "_utility_completion", return_value=summary):
+            assert session._compact_messages(auto=True) is True
+
+        expected = session._system_tokens + sum(session._msg_tokens) + session._tool_def_tokens()
+        assert session._last_usage["prompt_tokens"] == expected
+
+    def test_mid_chunk_failure_leaves_messages_untouched(self, session):
+        """Atomicity: batch 1 summarizes, batch 2's call raises non-retryably →
+        no partial swap, returns False, ``self.messages`` / ``_msg_tokens`` intact."""
+        session.context_window = 5_000
+        session.compact_max_tokens = 4_000
+        session._system_tokens = 0
+        session.messages = turns_from_dicts(
+            [
+                {
+                    "role": "user" if i % 2 == 0 else "assistant",
+                    "content": f"m{i:02d} " + "c" * 200,
+                }
+                for i in range(30)
+            ]
+        )
+        session._msg_tokens = [1] * 30
+        before = list(session.messages)
+        before_toks = list(session._msg_tokens)
+
+        calls = {"n": 0}
+
+        def fake_uc(_messages, **_kwargs):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                return SimpleNamespace(content="PARTIAL", finish_reason="stop")
+            raise RuntimeError("summary backend exploded")  # non-retryable
+
+        with patch.object(session, "_utility_completion", side_effect=fake_uc):
+            result = session._compact_messages(auto=True)
+
+        assert result is False
+        assert calls["n"] >= 2  # failed part-way through the batches
+        assert session.messages == before  # no partial swap
+        assert session._msg_tokens == before_toks
+
+
+class TestProactiveToolDefFallback:
+    """The ``_last_usage``-less fallback in ``_estimated_prompt_tokens`` must add a
+    tool-def estimate (tools are resent every request) — otherwise a just-resumed
+    session undercounts and skips proactive compaction."""
+
+    def test_fallback_includes_tool_defs_when_active(self, session):
+        session._last_usage = None
+        session._system_tokens = 100
+        session._msg_tokens = [10, 20]
+        bare = session._system_tokens + sum(session._msg_tokens)
+        assert session._get_active_tools()  # sanity: the default tool set is present
+        assert session._estimated_prompt_tokens() > bare
+
+    def test_fallback_equals_bare_sum_without_tools(self, session):
+        session._tools = []
+        session._last_usage = None
+        session._system_tokens = 100
+        session._msg_tokens = [10, 20]
+        assert session._estimated_prompt_tokens() == 130
 
 
 def test_compaction_advisory_is_registered():
