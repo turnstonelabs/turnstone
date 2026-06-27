@@ -88,6 +88,7 @@ class TestTruncateOutput:
 
 class TestRemainingTokenBudget:
     def test_empty_session(self, session):
+        session._tools = []  # isolate the budget formula from the tool-def estimate
         session._system_tokens = 500
         session._msg_tokens = []
         budget = session._remaining_token_budget()
@@ -95,6 +96,7 @@ class TestRemainingTokenBudget:
         assert budget == 8000
 
     def test_partially_full(self, session):
+        session._tools = []  # isolate the budget formula from the tool-def estimate
         session._system_tokens = 500
         session._msg_tokens = [2000, 3000]
         budget = session._remaining_token_budget()
@@ -123,6 +125,7 @@ class TestRemainingTokenBudget:
             context_window=32_768,
             max_tokens=32_768,
         )
+        s._tools = []  # isolate the budget formula from the tool-def estimate
         s._system_tokens = 500
         s._msg_tokens = [1000]
         budget = s._remaining_token_budget()

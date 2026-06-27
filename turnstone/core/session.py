@@ -210,6 +210,16 @@ class AttachmentsNotQueueableError(Exception):
     """
 
 
+class _CompactionIrreducibleError(Exception):
+    """Raised by ``ChatSession._summarize_blocks`` when chunked summarisation
+    cannot shrink the input — a recursion level fails to reduce the block count,
+    or the depth ceiling is hit.
+
+    ``ChatSession._compact_messages`` turns it into the existing ``return False``
+    bail rather than fabricate a summary (chunking only — no honest degradation).
+    """
+
+
 class _CancelRef(list[Any]):
     """List proxy used for ``ChatSession._cancel_ref``.
 
@@ -2452,6 +2462,15 @@ class ChatSession:
         eid = getattr(self.ui, "_event_id", None)
         return eid if isinstance(eid, int) else None
 
+    def _tool_def_chars(self) -> int:
+        """Total serialized char size of the active tool definitions (resent on
+        every request, folded into the provider's ``prompt_tokens``)."""
+        return sum(len(json.dumps(t)) for t in (self._get_active_tools() or []))
+
+    def _tool_def_tokens(self) -> int:
+        """Estimated token cost of the active tool definitions."""
+        return int(self._tool_def_chars() / self._chars_per_token)
+
     def _estimated_prompt_tokens(self) -> int:
         """Best estimate of the current prompt size, in tokens.
 
@@ -2472,7 +2491,13 @@ class ChatSession:
             # over-slice after compaction or message-list mutations.
             start = min(self._calibrated_msg_count, len(self._msg_tokens))
             return self._last_usage["prompt_tokens"] + sum(self._msg_tokens[start:])
-        return self._system_tokens + sum(self._msg_tokens)
+        # No provider anchor yet (e.g. a just-resumed session before its first
+        # API call): add an estimate for the tool definitions, which are resent
+        # on every request and folded into the provider's prompt_tokens above.
+        # Omitting them here made a resumed session undercount and skip proactive
+        # compaction until the first reply re-anchored the estimate.
+        tool_def_tokens = self._tool_def_tokens()
+        return self._system_tokens + sum(self._msg_tokens) + tool_def_tokens
 
     def _remaining_token_budget(self) -> int:
         """Estimate how many tokens are available for new content.
@@ -2510,7 +2535,7 @@ class ChatSession:
         est = self._estimated_prompt_tokens()
         if self._compaction_owed(est):
             self._do_auto_compact("mid-turn")
-        elif est > self.context_window * self.auto_compact_pct:
+        elif self._over_soft(est):
             self._append_system_turn("compaction_pending", format_nudge("compaction_pending"))
             self._compaction_advised = True
 
@@ -2526,9 +2551,17 @@ class ChatSession:
         """
         if used is None:
             used = self._estimated_prompt_tokens()
-        soft = self.context_window * self.auto_compact_pct
         hard = self.context_window * min(0.95, self.auto_compact_pct + 0.10)
-        return used > hard or (used > soft and self._compaction_advised)
+        return used > hard or (self._over_soft(used) and self._compaction_advised)
+
+    def _over_soft(self, used: int) -> bool:
+        """True when ``used`` tokens exceed the soft auto-compaction threshold.
+
+        Single source for the ``context_window * auto_compact_pct`` predicate
+        shared by the mid-turn policy, :meth:`_compaction_owed`, and the
+        end-of-turn check, so they can't drift.
+        """
+        return used > self.context_window * self.auto_compact_pct
 
     def _do_auto_compact(self, where: str = "", preserve_tail: int = 0) -> bool:
         """Emit the auto-compaction notice, compact, and refresh the status
@@ -3801,6 +3834,13 @@ class ChatSession:
     _MAX_RETRIES = 3
     _RETRY_BASE_DELAY = 1.0  # seconds
 
+    # Chunked-compaction tuning (see _summarize_blocks / _summary_input_budget_chars).
+    _SUMMARY_SAFETY_MARGIN = 0.05  # fraction of context_window held back
+    _SUMMARY_BUDGET_FRACTION = 0.75  # derate for the uncalibrated _chars_per_token
+    _MAX_SUMMARY_DEPTH = 5  # recursion ceiling before bailing
+    _MIN_SUMMARY_BUDGET_CHARS = 2000  # floor so a tiny window still makes progress
+    _MIN_SUMMARY_OUTPUT_TOKENS = 512  # floor on summary output even on a tiny window
+
     def _get_health_tracker(self) -> BackendHealthTracker | None:
         """Get the health tracker for this session's current backend.
 
@@ -4517,18 +4557,25 @@ class ChatSession:
                     # done?  Capture before the reset — it gates the auto-resume.
                     stopped_to_compact = self._compaction_advised
                     self._compaction_advised = False
+                    # A concurrent force-cancel may have started a new generation
+                    # while this turn was finishing; don't run end-of-turn
+                    # compaction or persist a resume turn under it (the mid-turn
+                    # and end-of-loop compaction sites guard the same race).
+                    if self._generation != my_generation:
+                        return
                     # Auto-compact when the context exceeds the threshold, so the
                     # next turn starts with headroom.  Bare-soft check (NOT
                     # _compaction_owed()): the turn already ended, so there's no
                     # model cooperation to wait for and the latch was just
                     # consumed above — compact whenever over soft.  None-safe via
                     # _estimated_prompt_tokens(), so no _last_usage guard.
-                    if (
-                        self._estimated_prompt_tokens()
-                        > self.context_window * self.auto_compact_pct
-                    ):
+                    if self._over_soft(self._estimated_prompt_tokens()):
                         compacted = self._do_auto_compact()
-                        if stopped_to_compact and compacted:
+                        # _do_auto_compact's summary call is slow; unlike the
+                        # mid-turn siblings this site also PERSISTS the resume
+                        # turn, so re-check the generation didn't change during
+                        # the call before writing it into history.
+                        if stopped_to_compact and compacted and self._generation == my_generation:
                             # The model paused mid-task to let us compact, not
                             # because it was finished.  Hand the compacted state
                             # back as a user turn so it resumes instead of being
@@ -5528,8 +5575,7 @@ class ChatSession:
         all_msgs = (
             msgs if msgs is not None else self._prepare_wire_messages(self._full_messages())
         )  # system + self.messages (before append)
-        active_tools = self._get_active_tools() or []
-        tool_def_chars = sum(len(json.dumps(t)) for t in active_tools)
+        tool_def_chars = self._tool_def_chars()
         text_chars = 0
         image_count = 0
         for m in all_msgs:
@@ -5582,9 +5628,77 @@ class ChatSession:
 
     # -- Conversation compaction ------------------------------------------------
 
-    def _format_messages_for_summary(self, messages: list[dict[str, Any]]) -> str:
-        """Format messages into a readable string for the summarization prompt."""
-        # Build tool_call_id → tool_name lookup for labeling tool results
+    # Shared "## Output format" section for both compactor prompts — the section
+    # list plus its trailing blank line.  Single-sourced so the two prompts can't
+    # drift (the merge prompt's "explicitly stated" line had already lost "the
+    # user").
+    _COMPACT_OUTPUT_FORMAT = (
+        "1. **Output format** — use these exact sections, omit any that are empty:\n"
+        "   - **## Decisions**: Choices made (architecture, libraries, approaches).\n"
+        "   - **## Files**: Files read, created, or modified, with brief notes.\n"
+        "   - **## Key code**: Exact function names, class names, variable names, "
+        "and short code snippets the assistant will need. "
+        "Preserve identifiers verbatim — do NOT paraphrase.\n"
+        "   - **## Tool results**: Important tool outputs (errors, search matches, "
+        "file contents) that inform ongoing work.\n"
+        "   - **## Open tasks**: What the user asked for that is not yet done, "
+        "with enough context to continue.\n"
+        "   - **## User preferences**: Workflow preferences, constraints, or "
+        "instructions the user stated.\n"
+        "   - **## Memories to save**: Corrections, preferences, or learnings "
+        "the user expressed that should be persisted across sessions. "
+        "Format each as: `name: description — content`. "
+        "Only include items the user explicitly stated, not inferences.\n\n"
+    )
+
+    # System prompt for the depth-0 summary call (the conversation compactor).
+    _COMPACTOR_SYSTEM_PROMPT = (
+        "# Conversation Compactor\n\n"
+        "Your output REPLACES the conversation history — the assistant "
+        "will continue from your summary with no access to the original messages.\n\n"
+        + _COMPACT_OUTPUT_FORMAT
+        + "2. **Density rules:**\n"
+        "   - Every token should carry information.\n"
+        "   - Preserve exact paths, identifiers, and numbers — never paraphrase these.\n"
+        "   - Omit pleasantries, acknowledgments, and reasoning that led to dead ends.\n"
+        "   - If a tool call's result was an error that was later resolved, "
+        "keep only the resolution.\n\n"
+        "3. **Common mistakes to avoid:**\n"
+        "   - Paraphrasing file paths, function names, or variable names\n"
+        "   - Including dead-end explorations or superseded decisions\n"
+        "   - Omitting the open tasks section when work remains\n"
+        "   - Being verbose — this is a summary, not a transcript"
+    )
+
+    # System prompt for recursion levels (depth > 0): merge partial summaries of
+    # consecutive slices of ONE conversation back into a single summary.
+    _COMPACTOR_MERGE_SYSTEM_PROMPT = (
+        "# Summary Merger\n\n"
+        "You are given several partial summaries of ONE conversation, produced by "
+        "compacting consecutive slices in order. Merge these partial summaries into a "
+        "single summary that REPLACES the conversation history — the assistant will "
+        "continue from your merged summary with no access to the originals.\n\n"
+        + _COMPACT_OUTPUT_FORMAT
+        + "2. **Merge rules:**\n"
+        "   - Preserve every distinct decision, file, identifier, and open task across "
+        "all partials; later partials reflect more recent state, so on conflict prefer "
+        "the later one.\n"
+        "   - Deduplicate: fold repeated items into one, keeping the most specific.\n"
+        "   - Preserve exact paths, identifiers, and numbers — never paraphrase these.\n"
+        "   - Be dense; this is a summary, not a transcript."
+    )
+
+    # User-message wrapper prepended to every summary-call body (all depths).
+    _COMPACT_USER_PREFIX = "Compact the following conversation:\n\n"
+
+    @staticmethod
+    def _summary_tc_names(messages: list[dict[str, Any]]) -> dict[str, str]:
+        """Build a tool_call_id → tool_name lookup for labeling tool results.
+
+        Built over the full message set (not one batch) so a ``tool_use`` and its
+        later ``tool_result`` keep a consistent name even when chunking packs them
+        into different batches.
+        """
         tc_names: dict[str, str] = {}
         for m in messages:
             for tc in m.get("tool_calls", []):
@@ -5592,48 +5706,242 @@ class ChatSession:
                 tc_name = tc.get("function", {}).get("name", "unknown")
                 if tc_id:
                     tc_names[tc_id] = tc_name
+        return tc_names
 
-        parts = []
-        for m in messages:
-            role = m["role"].upper()
-            content = m.get("content") or ""
+    def _format_message_for_summary(
+        self, m: dict[str, Any], tc_names: dict[str, str]
+    ) -> str | None:
+        """Format one message into a summary line, or ``None`` when it carries no
+        renderable content.
 
-            # Flatten list content (image tool results) to text for summary
-            if isinstance(content, list):
-                text_parts = []
-                for p in content:
-                    if p.get("type") == "text":
-                        text_parts.append(p["text"])
-                    elif p.get("type") in ("image_url", "image"):
-                        # by-reference vision placeholder OR resolved inline image
-                        text_parts.append("[image]")
-                content = " ".join(text_parts)
+        ``tc_names`` (tool_call_id → tool_name, built by the caller over the full
+        selected set) labels tool results.  Long content is capped head+tail so a
+        single message can't dominate the summary input.
+        """
+        role = m["role"].upper()
+        content = m.get("content") or ""
 
-            if m.get("tool_calls"):
-                calls = []
-                for tc in m["tool_calls"]:
-                    name = tc.get("function", {}).get("name", "?")
-                    args = tc.get("function", {}).get("arguments", "")
-                    calls.append(f"{name}({args})")
-                content += "\n[Called: " + ", ".join(calls) + "]"
+        # Flatten list content (image tool results) to text for summary
+        if isinstance(content, list):
+            text_parts = []
+            for p in content:
+                if p.get("type") == "text":
+                    text_parts.append(p["text"])
+                elif p.get("type") in ("image_url", "image"):
+                    # by-reference vision placeholder OR resolved inline image
+                    text_parts.append("[image]")
+            content = " ".join(text_parts)
 
-            # Label tool results with the tool name
-            if role == "TOOL":
-                tc_id = m.get("tool_call_id", "")
-                name = tc_names.get(tc_id, "tool")
-                role = f"TOOL[{name}]"
+        if m.get("tool_calls"):
+            calls = []
+            for tc in m["tool_calls"]:
+                name = tc.get("function", {}).get("name", "?")
+                args = tc.get("function", {}).get("arguments", "")
+                calls.append(f"{name}({args})")
+            content += "\n[Called: " + ", ".join(calls) + "]"
 
-            if content:
-                if len(content) > 2000:
-                    content = content[:1000] + "\n...[truncated]...\n" + content[-500:]
-                parts.append(f"{role}: {content}")
-        return "\n\n".join(parts)
+        # Label tool results with the tool name
+        if role == "TOOL":
+            tc_id = m.get("tool_call_id", "")
+            name = tc_names.get(tc_id, "tool")
+            role = f"TOOL[{name}]"
+
+        if content:
+            if len(content) > 2000:
+                content = content[:1000] + "\n...[truncated]...\n" + content[-500:]
+            return f"{role}: {content}"
+        return None
+
+    def _summary_blocks(self, messages: list[dict[str, Any]]) -> list[str]:
+        """Format messages into summary blocks — one string per renderable
+        message, in order (drops messages with no renderable content)."""
+        tc_names = self._summary_tc_names(messages)
+        return [
+            line
+            for m in messages
+            if (line := self._format_message_for_summary(m, tc_names)) is not None
+        ]
+
+    def _format_messages_for_summary(self, messages: list[dict[str, Any]]) -> str:
+        """Format messages into a readable string for the summarization prompt."""
+        return "\n\n".join(self._summary_blocks(messages))
+
+    def _summary_output_tokens(self) -> int:
+        """Output-token reserve for a summary call, bounded so the input (the
+        history being summarized) always keeps the larger share of the window.
+
+        ``compact_max_tokens`` defaults to the full window (32768); clamped only
+        by ``max_output_tokens`` it would reserve the entire context for output
+        and leave no room to send anything to summarize — flooring the input
+        budget and making the summary call overflow (or bail as "irreducible")
+        on a small/default window.  Cap the reserve at half the window so
+        compaction can actually run; large windows are unaffected because
+        ``compact_max_tokens`` stays the binding limit there.
+        """
+        caps = self._get_capabilities()
+        hard_cap = (
+            min(self.compact_max_tokens, caps.max_output_tokens)
+            if caps.max_output_tokens
+            else self.compact_max_tokens
+        )
+        window_cap = max(self._MIN_SUMMARY_OUTPUT_TOKENS, self.context_window // 2)
+        return min(hard_cap, window_cap)
+
+    def _summary_input_budget_chars(self) -> int:
+        """Per-call input budget for a summary completion, in characters.
+
+        The summary runs on ``self.model`` via :meth:`_utility_completion`, so its
+        input + output must fit ``self.context_window``.  Sizing the *selection* by
+        the per-message token estimate (which disagrees with the head+tail-capped
+        formatted text) is what let a long conversation overflow the summary call
+        itself; this measures the call's real budget instead.
+
+        Reserve the output (the bounded :meth:`_summary_output_tokens` reserve),
+        the compactor prompt, and a safety margin; scale the remainder by
+        ``_SUMMARY_BUDGET_FRACTION`` to cover the uncalibrated ``_chars_per_token``
+        on the reactive path (no ``_last_usage`` yet); convert to chars; floor at
+        ``_MIN_SUMMARY_BUDGET_CHARS`` so a tiny window still makes progress.
+        """
+        output_reserve = self._summary_output_tokens()
+        prompt_chars = len(self._COMPACTOR_SYSTEM_PROMPT) + len(self._COMPACT_USER_PREFIX)
+        prompt_tokens = int(prompt_chars / self._chars_per_token)
+        safety = int(self.context_window * self._SUMMARY_SAFETY_MARGIN)
+        input_tokens = self.context_window - output_reserve - prompt_tokens - safety
+        budget_tokens = max(0, int(input_tokens * self._SUMMARY_BUDGET_FRACTION))
+        return max(self._MIN_SUMMARY_BUDGET_CHARS, int(budget_tokens * self._chars_per_token))
+
+    @staticmethod
+    def _truncate_block(block: str, budget: int) -> str:
+        """Hard-truncate a single oversized block to ``budget`` chars, keeping the
+        head and tail around a ``…[truncated]…`` marker.
+
+        Only used for a lone block that can't fit any batch — the one lossy path
+        in chunked compaction.  The result is always ``<= budget``.
+        """
+        marker = "\n…[truncated]…\n"
+        if budget <= len(marker):
+            return block[:budget]
+        keep = budget - len(marker)
+        head = (keep * 2) // 3
+        tail = keep - head
+        return block[:head] + marker + block[-tail:] if tail else block[:head] + marker
+
+    def _pack_blocks(self, blocks: list[str], budget_chars: int) -> list[list[str]]:
+        """Greedily pack formatted blocks into batches that each fit ``budget_chars``.
+
+        In order, no reordering and no drops: blocks accumulate into the current
+        batch until the next one (plus the ``"\\n\\n"`` join) would overflow, then a
+        new batch starts.  A lone block larger than the budget gets its own batch,
+        hard-truncated via :meth:`_truncate_block`.  Never emits an empty batch.
+
+        ``current_len`` tracks ``len("\\n\\n".join(current))`` exactly, so every
+        returned batch's joined length is ``<= budget_chars``.
+        """
+        budget = max(1, budget_chars)
+        sep = len("\n\n")
+        batches: list[list[str]] = []
+        current: list[str] = []
+        current_len = 0
+        for block in blocks:
+            if len(block) > budget:
+                # Oversized lone block: flush the in-progress batch, then emit it
+                # alone, hard-truncated (head + tail preserved).
+                if current:
+                    batches.append(current)
+                    current = []
+                    current_len = 0
+                batches.append([self._truncate_block(block, budget)])
+                continue
+            added = len(block) + (sep if current else 0)
+            if current and current_len + added > budget:
+                batches.append(current)
+                current = [block]
+                current_len = len(block)
+            else:
+                current.append(block)
+                current_len += added
+        if current:
+            batches.append(current)
+        return batches
+
+    def _summarize_once(self, system_prompt: str, body: str) -> str:
+        """Run one summary completion over ``body`` and return the cleaned text.
+
+        Owns the retry loop (transient errors only, exponential backoff) and the
+        reasoning-tag strip.  Raises on a non-retryable error or retry exhaustion
+        so the caller can abort the whole compaction before any message swap.
+        """
+        summary_msgs = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": self._COMPACT_USER_PREFIX + body},
+        ]
+        result: CompletionResult | None = None
+        for attempt in range(self._MAX_RETRIES + 1):
+            try:
+                result = self._utility_completion(
+                    summary_msgs,
+                    max_tokens=self._summary_output_tokens(),
+                )
+                break
+            except Exception as e:
+                ename = type(e).__name__
+                if (
+                    ename not in self._provider.retryable_error_names
+                    or attempt == self._MAX_RETRIES
+                ):
+                    raise
+                delay = self._RETRY_BASE_DELAY * (2**attempt)
+                self.ui.on_info(f"[Compact retrying in {delay:.0f}s: {ename}]")
+                time.sleep(delay)
+        assert result is not None
+        # Strip any <think>/<reasoning> tags the summarizer may emit
+        summary = self._strip_reasoning(result.content or "")
+        if result.finish_reason == "length":
+            self.ui.on_info("[Warning: compaction summary was truncated]")
+        return summary
+
+    def _summarize_blocks(self, blocks: list[str], *, depth: int = 0) -> str:
+        """Summarize ``blocks`` into one dense summary, chunking + recursing so no
+        single model call exceeds :meth:`_summary_input_budget_chars`.
+
+        Base case (everything fits one batch) is a single :meth:`_summarize_once`
+        call — exactly today's behavior, so the common case stays one model call.
+        Otherwise each batch is summarized individually (a partial summary) and the
+        partials are recursively merged one level deeper, until they collapse to a
+        single batch.
+
+        Raises :class:`_CompactionIrreducibleError` when a level fails to reduce the
+        block count (``len(batches) >= len(blocks)``) or recursion would exceed
+        ``_MAX_SUMMARY_DEPTH`` — the caller turns that into a ``return False`` bail
+        rather than fabricate a summary.
+        """
+        batches = self._pack_blocks(blocks, self._summary_input_budget_chars())
+        system_prompt = (
+            self._COMPACTOR_SYSTEM_PROMPT if depth == 0 else self._COMPACTOR_MERGE_SYSTEM_PROMPT
+        )
+        if len(batches) == 1:
+            return self._summarize_once(system_prompt, "\n\n".join(batches[0]))
+
+        # More than one batch: bail rather than loop or over-recurse when this
+        # level can't shrink the count (each block is its own batch) or we've gone
+        # too deep.
+        if len(batches) >= len(blocks) or depth >= self._MAX_SUMMARY_DEPTH:
+            raise _CompactionIrreducibleError
+
+        total = len(batches)
+        summaries: list[str] = []
+        for k, batch in enumerate(batches, start=1):
+            self.ui.on_info(f"[compacting part {k}/{total}…]")
+            summaries.append(self._summarize_once(system_prompt, "\n\n".join(batch)))
+        return self._summarize_blocks(summaries, depth=depth + 1)
 
     def _compact_messages(self, auto: bool = False, preserve_tail: int = 0) -> bool:
         """Compact conversation history by summarizing it into a summary turn.
 
-        Summarizes the conversation via a separate model call, budget-fitted to
-        ``auto_compact_pct`` of the context window.
+        Summarizes the whole selection via :meth:`_summarize_blocks`, which chunks
+        and recursively merges so no single summary call exceeds the model's own
+        window (:meth:`_summary_input_budget_chars`) — the summary call can't
+        overflow, and the most-recent messages are no longer silently dropped.
 
         When auto=True (triggered by context limit), appends a continuation
         hint with the last user message so the model can resume seamlessly.
@@ -5667,105 +5975,34 @@ class ChatSession:
         preserved = self.messages[-preserve_tail:] if preserve_tail > 0 else []
         to_summarize = self.messages[:-preserve_tail] if preserve_tail > 0 else self.messages
 
-        # Budget: fit as many messages as possible into summary request
-        summary_max_tokens = self.compact_max_tokens
-        prompt_budget = (
-            int(self.context_window * self.auto_compact_pct)
-            - summary_max_tokens
-            - self._system_tokens
-        )
-        selected = []
-        running = 0
-        for i, msg in enumerate(to_summarize):
-            msg_tok = (
-                self._msg_tokens[i]
-                if i < len(self._msg_tokens)
-                else max(1, int(self._msg_char_count(msg) / self._chars_per_token))
-            )
-            if running + msg_tok > prompt_budget:
-                break
-            selected.append(msg)
-            running += msg_tok
-
-        if not selected:
-            self.ui.on_info("Messages too large to fit in summary context.")
+        # Build summary blocks from ALL of to_summarize (per-message), then
+        # summarize via chunked/hierarchical compaction.  Sizing by the actual
+        # formatted size (not the per-message token estimate, which disagreed
+        # with the head+tail-capped formatted text) is what bounds the summary
+        # call so it can't overflow self.context_window.  Summarizing the whole
+        # selection — not a fitting prefix — also fixes the latent drop of the
+        # most-recent (unselected) messages.
+        to_summarize_dicts = dicts_from_turns(to_summarize)
+        blocks = self._summary_blocks(to_summarize_dicts)
+        if not blocks:
+            self.ui.on_info("Not enough messages to compact.")
             return False
-
-        # Build summary prompt and call model
-        formatted = self._format_messages_for_summary(dicts_from_turns(selected))
-        summary_msgs = [
-            {
-                "role": "system",
-                "content": (
-                    "# Conversation Compactor\n\n"
-                    "Your output REPLACES the conversation history — the assistant "
-                    "will continue from your summary with no access to the original messages.\n\n"
-                    "1. **Output format** — use these exact sections, omit any that are empty:\n"
-                    "   - **## Decisions**: Choices made (architecture, libraries, approaches).\n"
-                    "   - **## Files**: Files read, created, or modified, with brief notes.\n"
-                    "   - **## Key code**: Exact function names, class names, variable names, "
-                    "and short code snippets the assistant will need. "
-                    "Preserve identifiers verbatim — do NOT paraphrase.\n"
-                    "   - **## Tool results**: Important tool outputs (errors, search matches, "
-                    "file contents) that inform ongoing work.\n"
-                    "   - **## Open tasks**: What the user asked for that is not yet done, "
-                    "with enough context to continue.\n"
-                    "   - **## User preferences**: Workflow preferences, constraints, or "
-                    "instructions the user stated.\n"
-                    "   - **## Memories to save**: Corrections, preferences, or learnings "
-                    "the user expressed that should be persisted across sessions. "
-                    "Format each as: `name: description — content`. "
-                    "Only include items the user explicitly stated, not inferences.\n\n"
-                    "2. **Density rules:**\n"
-                    "   - Every token should carry information.\n"
-                    "   - Preserve exact paths, identifiers, and numbers — never paraphrase these.\n"
-                    "   - Omit pleasantries, acknowledgments, and reasoning that led to dead ends.\n"
-                    "   - If a tool call's result was an error that was later resolved, "
-                    "keep only the resolution.\n\n"
-                    "3. **Common mistakes to avoid:**\n"
-                    "   - Paraphrasing file paths, function names, or variable names\n"
-                    "   - Including dead-end explorations or superseded decisions\n"
-                    "   - Omitting the open tasks section when work remains\n"
-                    "   - Being verbose — this is a summary, not a transcript"
-                ),
-            },
-            {
-                "role": "user",
-                "content": ("Compact the following conversation:\n\n" + formatted),
-            },
-        ]
 
         self.ui.on_thinking_start()
         try:
-            result: CompletionResult | None = None
-            for attempt in range(self._MAX_RETRIES + 1):
-                try:
-                    result = self._utility_completion(
-                        summary_msgs,
-                        max_tokens=summary_max_tokens,
-                    )
-                    break
-                except Exception as e:
-                    ename = type(e).__name__
-                    if (
-                        ename not in self._provider.retryable_error_names
-                        or attempt == self._MAX_RETRIES
-                    ):
-                        raise
-                    delay = self._RETRY_BASE_DELAY * (2**attempt)
-                    self.ui.on_info(f"[Compact retrying in {delay:.0f}s: {ename}]")
-                    time.sleep(delay)
-            assert result is not None
-            summary = result.content or ""
-            # Strip any <think>/<reasoning> tags the summarizer may emit
-            summary = self._strip_reasoning(summary)
-            if result.finish_reason == "length":
-                self.ui.on_info("[Warning: compaction summary was truncated]")
+            summary = self._summarize_blocks(blocks)
+        except _CompactionIrreducibleError:
+            self.ui.on_info("Messages too large to fit in summary context.")
+            return False
         except Exception as e:
             self.ui.on_error(f"Compaction failed: {e}")
             return False
         finally:
             self.ui.on_thinking_stop()
+
+        if not summary.strip():
+            self.ui.on_info("Compaction produced an empty summary; keeping history.")
+            return False
 
         # Append continuation hint for auto-compact
         if last_user_content:
@@ -5779,7 +6016,7 @@ class ChatSession:
             )
 
         # Replace messages — summary, then any preserved tail verbatim.
-        before_tokens = self._system_tokens + sum(self._msg_tokens)
+        before_tokens = self._system_tokens + sum(self._msg_tokens) + self._tool_def_tokens()
         summary_user = {"role": "user", "content": "[Conversation summary]"}
         summary_asst = {"role": "assistant", "content": summary}
         self.messages = turns_from_dicts([summary_user, summary_asst]) + list(preserved)
@@ -5795,7 +6032,7 @@ class ChatSession:
         ]
         self._msg_tokens = [su_tok, sa_tok, *tail_toks]
         self._calibrated_msg_count = len(self.messages)  # anchored to compacted state
-        after_tokens = self._system_tokens + sum(self._msg_tokens)
+        after_tokens = self._system_tokens + sum(self._msg_tokens) + self._tool_def_tokens()
 
         # Update usage estimate so the status bar reflects post-compaction state
         if self._last_usage:
