@@ -26,15 +26,15 @@ const _subs = []; // () => void, fired after each CHANGED refresh
 function _fp(rows) {
   // Cheap signature of the fields subscribers render (id + name + visibility +
   // state) so a refresh returning identical data skips the fan-out (and the
-  // rail's O(workstreams) rebuild).  Fields/rows join on NUL / SOH written as
-  // escapes (NOT raw control bytes — raw bytes make git treat this whole file
-  // as binary); they can't occur in the joined values, so the signature can't
-  // alias across different field layouts.
-  return rows
-    .map(function (p) {
-      return [p.project_id, p.name, p.visibility, p.state].join("\u0000");
-    })
-    .join("\u0001");
+  // rail's O(workstreams) rebuild).  JSON.stringify is collision-proof (it
+  // escapes anything inside a project name) and needs no separator chars; an
+  // earlier version joined on raw control bytes, which made git see this whole
+  // file as binary.
+  return JSON.stringify(
+    rows.map(function (p) {
+      return [p.project_id, p.name, p.visibility, p.state];
+    }),
+  );
 }
 
 function _setCache(rows) {
