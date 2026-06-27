@@ -431,6 +431,17 @@
 .queued-dismiss:hover {
   color: var(--red, var(--err));
 }
+.queued-dismiss[aria-disabled="true"] {
+  cursor: default;
+  color: var(--fg-dim, var(--ink-3));
+  opacity: 0.5;
+}
+/* In-flight dequeue (× clicked, awaiting the server's confirm): dim the
+   card so the "dismissing" state is visible to sighted users, not just
+   exposed via aria-busy to assistive tech. */
+.msg-queued[aria-busy="true"] {
+  opacity: 0.4;
+}
 
 /* ============================================================
    Stacked layout — textarea above, actions row below.
