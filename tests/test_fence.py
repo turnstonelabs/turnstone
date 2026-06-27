@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import pytest
+
 from turnstone.core import fence
 
 
@@ -154,3 +156,12 @@ class TestDetectionPattern:
         assert pat.search("x [  end tool_output_abcd] y")  # leading whitespace
         assert pat.search("x [end  tool_output_abcd] y")  # run after keyword
         assert pat.search("x [start  system-reminder] y")  # bare, run after keyword
+
+    def test_empty_tag_set_rejected(self) -> None:
+        # An empty (or all-empty) tag set would compile to an overly-broad regex
+        # matching any "[start …]"/"[end …]" run — reject it rather than turn the
+        # forgery scanner into a false-positive generator.
+        with pytest.raises(ValueError):
+            fence.detection_pattern(())
+        with pytest.raises(ValueError):
+            fence.detection_pattern(("",))

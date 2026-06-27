@@ -141,8 +141,14 @@ def detection_pattern(tags: Iterable[str]) -> re.Pattern[str]:
     can tell a leaked exact-nonce marker from a bare or wrong-nonce forgery.
     Only the tag prefix is anchored, so a marker is caught whether or not its hex
     matches a real nonce.
+
+    Raises ``ValueError`` on an empty tag set: an empty alternation would compile
+    to ``(?:)`` and match *any* ``[start …]`` / ``[end …]`` run, turning the
+    forgery scanner into a false-positive generator.
     """
-    alt = "|".join(re.escape(t) for t in tags)
+    alt = "|".join(re.escape(t) for t in tags if t)
+    if not alt:
+        raise ValueError("detection_pattern requires at least one non-empty tag")
     return re.compile(
         rf"\[\s*(?:{_OPEN_KW}|{_CLOSE_KW})\s+(?:{alt})(_[0-9a-f]+)?",
         re.IGNORECASE,
