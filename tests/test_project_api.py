@@ -131,7 +131,8 @@ class TestProjectApi:
         assert r.json()["name"] == "Research"
 
     def test_create_requires_name(self, client: TestClient) -> None:
-        assert client.post("/v1/api/projects", json={}).status_code == 400
+        r = client.post("/v1/api/projects", json={})
+        assert r.status_code == 400
 
     def test_create_rejects_bad_visibility(self, client: TestClient) -> None:
         r = client.post("/v1/api/projects", json={"name": "X", "visibility": "bogus"})
@@ -167,7 +168,8 @@ class TestProjectApi:
         # flip visibility (a confidentiality lever the owner did not delegate).
         storage.create_project("bobproj", "Bob's", "bob")
         storage.add_project_member("bobproj", "alice")
-        assert client.patch("/v1/api/projects/bobproj", json={"name": "Renamed"}).status_code == 200
+        r = client.patch("/v1/api/projects/bobproj", json={"name": "Renamed"})
+        assert r.status_code == 200
         r = client.patch("/v1/api/projects/bobproj", json={"visibility": "public"})
         assert r.status_code == 403
 
@@ -176,15 +178,19 @@ class TestProjectApi:
         r = client.post(f"/v1/api/projects/{pid}/members", json={"user_id": "bob"})
         assert r.status_code == 200
         assert "bob" in r.json()["members"]
-        assert client.get(f"/v1/api/projects/{pid}/members").json()["members"] == ["bob"]
+        r = client.get(f"/v1/api/projects/{pid}/members")
+        assert r.json()["members"] == ["bob"]
         r = client.delete(f"/v1/api/projects/{pid}/members/bob")
         assert r.status_code == 200
         assert r.json()["members"] == []
 
     def test_delete(self, client: TestClient) -> None:
         pid = client.post("/v1/api/projects", json={"name": "A"}).json()["project_id"]
-        assert client.delete(f"/v1/api/projects/{pid}").status_code == 200
-        assert client.get(f"/v1/api/projects/{pid}").status_code == 404
+        r = client.delete(f"/v1/api/projects/{pid}")
+        assert r.status_code == 200
+        r = client.get(f"/v1/api/projects/{pid}")
+        assert r.status_code == 404
 
     def test_get_missing_404(self, client: TestClient) -> None:
-        assert client.get("/v1/api/projects/nope").status_code == 404
+        r = client.get("/v1/api/projects/nope")
+        assert r.status_code == 404

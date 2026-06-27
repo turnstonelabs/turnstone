@@ -55,8 +55,14 @@ export function makeProjectCreator(opts) {
   root.append(input, save, cancel, err);
 
   let busy = false;
+  // Bumped on every open/close so a create that's still in flight when the
+  // widget is cancelled or reopened can tell it's stale and drop its result —
+  // otherwise Cancel/Escape mid-create would still fire onCreated and select a
+  // project the user backed out of.
+  let generation = 0;
 
   function close() {
+    generation++;
     root.hidden = true;
     input.value = "";
     err.hidden = true;
@@ -66,6 +72,7 @@ export function makeProjectCreator(opts) {
   }
 
   function open() {
+    generation++;
     err.hidden = true;
     input.value = "";
     busy = false;
@@ -90,21 +97,36 @@ export function makeProjectCreator(opts) {
     busy = true;
     save.disabled = true;
     err.hidden = true;
-    createProject(name).then(function (res) {
-      if (!res.ok || !res.data || !res.data.project_id) {
+    const myGen = generation;
+    createProject(name)
+      .then(function (res) {
+        // Cancelled / reopened while the POST was in flight — drop the result
+        // so we don't select a project the user backed out of.
+        if (myGen !== generation) return;
+        if (!res.ok || !res.data || !res.data.project_id) {
+          busy = false;
+          save.disabled = false;
+          showError((res.data && res.data.error) || "Failed to create project");
+          return;
+        }
+        const created = res.data;
+        // Refresh the shared cache first so the caller's repopulate sees the new
+        // project, then close + hand it back to select.
+        refreshProjects().then(function () {
+          if (myGen !== generation) return;
+          close();
+          onCreated(created);
+        });
+      })
+      .catch(function () {
+        // A network drop, a 401 (authFetch rejects to surface login), or a
+        // non-JSON error body all land here; clear the busy state so the widget
+        // is usable again instead of stuck disabled with no feedback.
+        if (myGen !== generation) return;
         busy = false;
         save.disabled = false;
-        showError((res.data && res.data.error) || "Failed to create project");
-        return;
-      }
-      const created = res.data;
-      // Refresh the shared cache first so the caller's repopulate sees the new
-      // project, then close + hand it back to select.
-      refreshProjects().then(function () {
-        close();
-        onCreated(created);
+        showError("Failed to create project");
       });
-    });
   }
 
   save.addEventListener("click", submit);

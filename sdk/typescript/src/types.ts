@@ -130,6 +130,11 @@ export interface CreateWorkstreamRequest {
   auto_approve?: boolean;
   resume_ws?: string;
   skill?: string;
+  /**
+   * Optional project to attach this workstream to. Drives the shared
+   * `project` memory scope; coordinator children inherit the parent's project.
+   */
+  project_id?: string;
   /** First user message dispatched in a background worker after creation. */
   initial_message?: string;
   /**
@@ -174,6 +179,7 @@ export interface WorkstreamInfo {
   kind: string;
   parent_ws_id: string | null;
   user_id: string;
+  project_id: string | null;
 }
 
 export interface ListWorkstreamsResponse {
@@ -203,6 +209,7 @@ export interface DashboardWorkstream {
   ws_id: string;
   name: string;
   state: string;
+  project_id: string | null;
   title?: string;
   tokens?: number;
   context_ratio?: number;
