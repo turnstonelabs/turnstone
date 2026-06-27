@@ -161,6 +161,35 @@ def test_rest_heals_and_charges(tmp_path: Path, clock: object) -> None:
     assert "full health" in out.lower()
 
 
+def test_rest_when_spent_restores_a_fresh_days_turns(tmp_path: Path, clock: object) -> None:
+    """Sleeping at the inn with no turns left rolls into a fresh day's allowance."""
+    game = _game(tmp_path, clock)
+    game.join("Brandr")
+    player = game.players["Brandr"]
+    daily = game.world.settings.daily_turns
+    player.turns_left = 0  # spent for the day
+    player.hp = 5
+    game.move("Brandr", "", "west", 2)  # step into the inn
+    out = game.action("Brandr", "rest", "", "")
+    assert player.turns_left == daily  # a fresh day's turns restored
+    assert player.hp == player.max_hp  # and fully mended
+    assert f"/{daily} ]" in out  # footer reflects the refreshed budget
+
+
+def test_rest_with_turns_in_hand_never_inflates_the_budget(tmp_path: Path, clock: object) -> None:
+    """Resting mid-day mends but adds no turns — the top-up only fires at zero."""
+    game = _game(tmp_path, clock)
+    game.join("Brandr")
+    player = game.players["Brandr"]
+    daily = game.world.settings.daily_turns
+    player.turns_left = daily - 3  # turns still in hand
+    player.hp = 5
+    game.move("Brandr", "", "west", 2)  # step into the inn
+    game.action("Brandr", "rest", "", "")
+    assert player.turns_left == daily - 3  # unchanged: no farming past the cap
+    assert player.hp == player.max_hp  # but the heal still lands
+
+
 def test_fight_spends_a_turn_and_credits(tmp_path: Path, clock: object) -> None:
     game = _game(tmp_path, clock)
     game.join("Brandr")

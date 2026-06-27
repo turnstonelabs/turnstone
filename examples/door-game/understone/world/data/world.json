@@ -100,8 +100,8 @@
   "settings": {
     "daily_turns": 10,
     "rest_cost": 15,
-    "heal_cost_per_hp": 2,
-    "starting_gold": 20,
+    "heal_cost_per_hp": 1,
+    "starting_gold": 37,
     "starting_weapon": "rusty_dagger",
     "starting_armor": "cloth_tunic",
     "start_hp": 20,

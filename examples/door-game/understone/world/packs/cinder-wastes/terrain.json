@@ -22,7 +22,7 @@
   },
   "=": {
     "key": "basalt",
-    "glyph": "=",
+    "glyph": "▩",
     "walkable": true,
     "encounter_rate": 0.02,
     "color": "road"

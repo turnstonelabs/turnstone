@@ -1015,16 +1015,28 @@ class Game:
         return self._overworld_frame(player, lines=["You step back out into the open air."])
 
     def _rest(self, player: Player) -> str:
+        # Settle any pending day rollover first, so a rest taken as the first act
+        # of a new day is the ordinary refresh, not the spent-turns top-up below.
+        self._ensure_day(player)
         cost = self.world.settings.rest_cost
-        if leveling.rest(player, cost):
-            # A night's rest is a private errand, not Herald news; persist only.
-            self._persist(player)
+        if not leveling.rest(player, cost):
             return self._location_menu(
-                player, lines=[f"You sleep deeply and wake at full health. (-{cost} gold)"]
+                player, lines=[f"You can't afford the {cost}-gold bed. (You have {player.gold}.)"]
             )
-        return self._location_menu(
-            player, lines=[f"You can't afford the {cost}-gold bed. (You have {player.gold}.)"]
-        )
+        # A night at the inn always mends. Once the day's turns are spent it also
+        # rolls the sleeper into a fresh day's allowance, so a spent adventurer can
+        # press on rather than idling until the dawn rollover. The top-up only
+        # fires at zero, so it never banks turns past the daily cap.
+        line = f"You sleep deeply and wake at full health. (-{cost} gold)"
+        if player.turns_left <= 0:
+            player.turns_left = self.world.settings.daily_turns
+            line = (
+                f"You sleep through to a new dawn, waking at full health "
+                f"and ready to venture out anew. (-{cost} gold)"
+            )
+        # A night's rest is a private errand, not Herald news; persist only.
+        self._persist(player)
+        return self._location_menu(player, lines=[line])
 
     # -- the Vault: bank gold at the inn (safe from ambush) --------------
 

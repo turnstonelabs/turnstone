@@ -21,7 +21,7 @@
     "tier": 2,
     "name": "Goblin",
     "hp": 12,
-    "atk": 5,
+    "atk": 4,
     "def": 1,
     "xp": 18,
     "gold": 7
@@ -30,7 +30,7 @@
     "tier": 2,
     "name": "Bandit Scout",
     "hp": 14,
-    "atk": 6,
+    "atk": 5,
     "def": 1,
     "xp": 20,
     "gold": 9
@@ -50,7 +50,7 @@
     "tier": 3,
     "name": "Forest Wolf",
     "hp": 20,
-    "atk": 8,
+    "atk": 7,
     "def": 2,
     "xp": 35,
     "gold": 14
@@ -59,7 +59,7 @@
     "tier": 3,
     "name": "Bog Stalker",
     "hp": 22,
-    "atk": 9,
+    "atk": 8,
     "def": 2,
     "xp": 38,
     "gold": 16
@@ -79,7 +79,7 @@
     "tier": 4,
     "name": "Cave Troll",
     "hp": 38,
-    "atk": 12,
+    "atk": 11,
     "def": 4,
     "xp": 70,
     "gold": 30
@@ -88,7 +88,7 @@
     "tier": 4,
     "name": "Barrow Wight",
     "hp": 35,
-    "atk": 13,
+    "atk": 12,
     "def": 4,
     "xp": 65,
     "gold": 28
