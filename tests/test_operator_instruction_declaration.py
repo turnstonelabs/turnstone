@@ -8,6 +8,7 @@ capability-gated emission in ``ChatSession._init_system_messages``.
 
 from __future__ import annotations
 
+import logging
 from typing import TYPE_CHECKING
 
 from tests._session_helpers import make_session
@@ -194,6 +195,25 @@ class TestFoldSystemTurns:
             )
             == msgs
         )
+
+    def test_operator_turn_after_assistant_warns(self, caplog: pytest.LogCaptureFixture) -> None:
+        # Operator context must follow a user/tool turn, never an assistant output
+        # turn (producers maintain this via the drain seams + the wake turn). If a
+        # future producer ever violates it, the fold warns loudly and degrades to
+        # a fold rather than silently splicing operator markup into the model's
+        # own turn.
+        s = make_session()
+        msgs = [
+            {"role": "user", "content": "do it"},
+            {"role": "assistant", "content": "working on it"},
+            {"role": "system", "_source": "watch_triggered", "content": "fired"},
+        ]
+        with caplog.at_level(logging.WARNING):
+            out = fold_system_turns(
+                msgs, supports_mid_conversation_system=False, nonce=s._envelope_nonce
+            )
+        assert any("assistant" in r.getMessage().lower() for r in caplog.records)
+        assert len(out) == 2  # still folds (degrade, not crash)
 
     def test_operator_turn_without_predecessor_kept_standalone(self) -> None:
         s = make_session()

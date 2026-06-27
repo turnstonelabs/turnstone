@@ -45,10 +45,13 @@ their own.
 
 from __future__ import annotations
 
+import logging
 from typing import Any
 
 from turnstone.core import fence
 from turnstone.core.trajectory import EffectStatus, Turn, dicts_from_turns
+
+logger = logging.getLogger(__name__)
 
 # The "you cannot tell whether it ran" clause, shared by every cancel
 # disposition surface (this wire-repair fallback AND the session-layer
@@ -192,7 +195,11 @@ def fold_system_turns(
     fold onto the shared predecessor in order, so the wire never carries two
     adjacent ``system`` messages.  An operator turn with no predecessor (should
     not occur — they follow the turn they relate to) is kept standalone so
-    nothing is silently dropped.
+    nothing is silently dropped.  An operator turn whose predecessor is an
+    *assistant* turn is a contract violation (operator context must ride a
+    user/tool input turn, not the model's own output): it is logged, not raised —
+    it degrades to a fold, since the nonce still gates trust regardless of host
+    turn.
 
     Returns a transient copy as wire dicts; the input is untouched.  The fold's
     content-merge / host-escape logic keys directly on the wire content shape.
@@ -207,6 +214,23 @@ def fold_system_turns(
             text = raw if isinstance(raw, str) else str(raw or "")
             wrapped = fence.wrap(text, nonce, fence.SYSTEM_REMINDER_TAG)
             if out:
+                if out[-1].get("role") == "assistant":
+                    # Operator context must follow a user/tool *input* turn, never
+                    # an assistant *output* turn: producers maintain this (the
+                    # user/tool drain seams + the synthetic wake turn give every
+                    # nudge a non-assistant predecessor).  Folding onto the model's
+                    # own turn would splice operator markup into its prior output.
+                    # Unreachable today; warn loudly so a future producer that
+                    # breaks the invariant surfaces instead of silently corrupting
+                    # authorship.  Degrade (still fold) rather than crash the turn —
+                    # the harm is OOD voice, not a trust breach (the nonce still
+                    # gates operator trust regardless of host turn).
+                    logger.warning(
+                        "operator-context system turn (_source=%s) is folding onto "
+                        "an assistant turn; operator context should follow a "
+                        "user/tool turn",
+                        msg.get("_source"),
+                    )
                 if not host_escaped:
                     out[-1] = _neutralize_host(out[-1])
                     host_escaped = True
