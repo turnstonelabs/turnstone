@@ -122,6 +122,7 @@ SYSTEM_TURN_SOURCES: Final = frozenset(
         "start",
         "tool_error",
         "repeat",
+        "compaction_pending",
         "idle_children",
         "watch_triggered",
     }

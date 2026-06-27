@@ -31,6 +31,12 @@ class SettingDef:
     reference_url: str = ""  # link to arXiv, docs, or provider reference
 
 
+# Default auto-compaction trigger as a fraction of the context window.  Shared
+# with the ChatSession constructor (default + sub-0.1 coercion fallback) so the
+# "invalid → default" behavior cannot drift between the registry and the engine.
+DEFAULT_AUTO_COMPACT_PCT = 0.8
+
+
 def _build_registry() -> dict[str, SettingDef]:
     """Build the settings registry from declarative definitions."""
     defs: list[SettingDef] = [
@@ -138,10 +144,10 @@ def _build_registry() -> dict[str, SettingDef]:
         SettingDef(
             "session.auto_compact_pct",
             "float",
-            0.8,
-            "Auto-compact at this fraction of context window (0 = disabled)",
+            DEFAULT_AUTO_COMPACT_PCT,
+            "Auto-compact at this fraction of context window",
             "session",
-            min_value=0.0,
+            min_value=0.1,
             max_value=1.0,
             help="Automatically summarize older messages when the conversation fills this percentage "
             "of the context window. For example, 0.8 means compact when 80% full. This prevents "

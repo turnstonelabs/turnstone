@@ -110,6 +110,22 @@ NUDGE_REPEAT = (
     "tool, different arguments, or ask the user for clarification."
 )
 
+NUDGE_COMPACTION = (
+    "The conversation is approaching the context limit and will be compacted "
+    "shortly — older messages will be replaced by a summary. Reach a natural "
+    "stopping point. Before continuing, record in this turn your current goal, "
+    "the tasks that remain, and your intended next steps; anything not written "
+    "down here may be lost when compaction runs. If you can give a final answer "
+    "now, do so — otherwise state clearly where to resume."
+)
+
+NUDGE_COMPACTION_RESUME = (
+    "The conversation was just compacted to free context. If there is remaining "
+    "work, continue from the summary above — pick up the open tasks and next "
+    "steps you recorded and keep going without waiting for further instructions. "
+    "If the task is already complete, give your final answer."
+)
+
 _NUDGE_MAP: dict[str, str] = {
     "correction": NUDGE_CORRECTION,
     "denial": NUDGE_DENIAL,
@@ -118,6 +134,7 @@ _NUDGE_MAP: dict[str, str] = {
     "start": NUDGE_START,
     "tool_error": NUDGE_TOOL_ERROR,
     "repeat": NUDGE_REPEAT,
+    "compaction_pending": NUDGE_COMPACTION,
     # idle_children and watch_triggered carry no static body — the
     # per-fire text comes from a producer (``format_idle_children_nudge``
     # for the former, ``format_watch_message`` + ``sanitize_payload``

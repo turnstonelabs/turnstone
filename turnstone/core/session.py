@@ -99,6 +99,7 @@ from turnstone.core.memory_relevance import (
     score_memories,
 )
 from turnstone.core.metacognition import (
+    NUDGE_COMPACTION_RESUME,
     RepeatDetector,
     detect_completion,
     detect_correction,
@@ -110,6 +111,7 @@ from turnstone.core.nudge_queue import TOOL_DRAIN, USER_DRAIN, NudgeQueue
 from turnstone.core.providers import create_provider
 from turnstone.core.ratelimit import TokenBucket
 from turnstone.core.safety import is_command_blocked, sanitize_command
+from turnstone.core.settings_registry import DEFAULT_AUTO_COMPACT_PCT
 from turnstone.core.skill_field_validation import SKILL_RUNTIME_CONFIG_FIELDS
 from turnstone.core.skill_parser import MAX_SKILL_DESCRIPTION_LEN
 from turnstone.core.storage._registry import get_storage
@@ -967,7 +969,7 @@ class ChatSession:
         reasoning_effort: str = "medium",
         context_window: int = 32768,
         compact_max_tokens: int = 32768,
-        auto_compact_pct: float = 0.8,
+        auto_compact_pct: float = DEFAULT_AUTO_COMPACT_PCT,
         agent_max_turns: int = -1,
         tool_truncation: int = 0,
         mcp_client: MCPClientManager | None = None,
@@ -1036,7 +1038,20 @@ class ChatSession:
         self.reasoning_effort = reasoning_effort
         self.context_window = context_window if context_window > 0 else 32768
         self.compact_max_tokens = compact_max_tokens
-        self.auto_compact_pct = auto_compact_pct
+        # auto_compact_pct < 0.1 is invalid: 0 used to mean "disabled" (no
+        # longer supported), and at 0 the "> context_window * pct" checks become
+        # "> 0" (always true → compact every turn). Coerce to the default, not
+        # the 0.1 floor — someone who set 0 wanted *less* compaction, so 0.8 is
+        # closer to intent than near-constant compaction at 10%. Matches the
+        # settings-registry path, which rejects sub-0.1 stored values and
+        # reverts to this same default.
+        self.auto_compact_pct = (
+            auto_compact_pct if auto_compact_pct >= 0.1 else DEFAULT_AUTO_COMPACT_PCT
+        )
+        # Cooperative-compaction latch: set once the model has been advised to
+        # reach a stopping point under context pressure; if it keeps working
+        # past the advisory the send loop forces a compaction.
+        self._compaction_advised = False
         self.agent_max_turns = agent_max_turns
         self._chars_per_token = 4.0  # calibrated from API usage
         # Tool output truncation: 0 means auto (50% of context_window in chars)
@@ -2437,31 +2452,102 @@ class ChatSession:
         eid = getattr(self.ui, "_event_id", None)
         return eid if isinstance(eid, int) else None
 
+    def _estimated_prompt_tokens(self) -> int:
+        """Best estimate of the current prompt size, in tokens.
+
+        Anchors to the provider-reported ``prompt_tokens`` from the last API
+        call — which already includes tool-definition tokens and the cached
+        prefix (providers fold cached + non-cached into one count at the API
+        boundary; see ``_anthropic.py`` ``total_input``) — and adds a local
+        estimate for only the messages appended since calibration.  Falls
+        back to a pure local estimate before the first API call.
+
+        Single source of truth for "how full is the context": tool-output
+        truncation (via :meth:`_remaining_token_budget`) and the
+        auto-compaction triggers all read it, so they cannot disagree about
+        the fullness of the same state.
+        """
+        if self._last_usage:
+            # Clamp the index: a stale _calibrated_msg_count must not
+            # over-slice after compaction or message-list mutations.
+            start = min(self._calibrated_msg_count, len(self._msg_tokens))
+            return self._last_usage["prompt_tokens"] + sum(self._msg_tokens[start:])
+        return self._system_tokens + sum(self._msg_tokens)
+
     def _remaining_token_budget(self) -> int:
         """Estimate how many tokens are available for new content.
 
-        When provider-reported usage is available, uses the last API
-        call's ``prompt_tokens`` as ground truth and only estimates the
-        delta (messages added since that call).  Falls back to pure
-        local estimates otherwise.
-
         Reserves a response budget (capped at 25% of context window, since
-        ``max_tokens`` is an upper bound, not guaranteed consumption) plus
-        a 5% safety margin.  Returns at least 0.
+        ``max_tokens`` is an upper bound, not guaranteed consumption) plus a
+        5% safety margin.  Returns at least 0.  Context fullness comes from
+        :meth:`_estimated_prompt_tokens` (provider-anchored), shared with the
+        auto-compaction triggers so truncation and compaction agree.
         """
-        used = self._system_tokens + sum(self._msg_tokens)
-        if self._last_usage:
-            # Provider-reported tokens from the last API call
-            base = self._last_usage["prompt_tokens"]
-            # Only estimate tokens for messages added AFTER calibration.
-            # Clamp index to prevent stale _calibrated_msg_count from
-            # over-slicing after compaction or message list mutations.
-            start = min(self._calibrated_msg_count, len(self._msg_tokens))
-            new_msg_tokens = sum(self._msg_tokens[start:])
-            used = base + new_msg_tokens
+        used = self._estimated_prompt_tokens()
         response_reserve = min(self.max_tokens, self.context_window // 4)
         safety_margin = int(self.context_window * 0.05)
         return max(0, self.context_window - used - response_reserve - safety_margin)
+
+    def _maybe_compact_midturn(self) -> None:
+        """Cooperative mid-turn compaction policy.
+
+        Reads the provider-anchored fullness estimate (the same measure
+        tool-output truncation uses, so the two cannot disagree about the
+        same state) and escalates:
+
+        - over the **hard** ceiling — no turn to spare, compact now;
+        - over the **soft** threshold and already advised — the model kept
+          working past the wrap-up advisory, compact;
+        - over the **soft** threshold, first crossing — append a
+          ``compaction_pending`` advisory asking the model to reach a stopping
+          point and record its remaining plan, so the summariser preserves it
+          (a register-spill onto the transcript before the tape is collapsed),
+          and latch ``_compaction_advised``.
+
+        No-op below the soft threshold.  The latch is cleared by
+        :meth:`_compact_messages` and at end-of-turn.
+        """
+        est = self._estimated_prompt_tokens()
+        if self._compaction_owed(est):
+            self._do_auto_compact("mid-turn")
+        elif est > self.context_window * self.auto_compact_pct:
+            self._append_system_turn("compaction_pending", format_nudge("compaction_pending"))
+            self._compaction_advised = True
+
+    def _compaction_owed(self, used: int | None = None) -> bool:
+        """True when fullness mandates compaction now: over the hard ceiling, or
+        over the soft threshold after the model worked past a wrap-up advisory.
+
+        Shared by the compact-before-truncate check in the send loop and
+        :meth:`_maybe_compact_midturn`.  Pass a precomputed ``used`` to avoid a
+        redundant :meth:`_estimated_prompt_tokens` sum.  The hard ceiling sits a
+        band above the soft threshold (capped at 95%); if ``auto_compact_pct`` is
+        set above that, the band collapses and any over-soft state is "owed".
+        """
+        if used is None:
+            used = self._estimated_prompt_tokens()
+        soft = self.context_window * self.auto_compact_pct
+        hard = self.context_window * min(0.95, self.auto_compact_pct + 0.10)
+        return used > hard or (used > soft and self._compaction_advised)
+
+    def _do_auto_compact(self, where: str = "", preserve_tail: int = 0) -> bool:
+        """Emit the auto-compaction notice, compact, and refresh the status
+        line.  Shared by the mid-turn policy (:meth:`_maybe_compact_midturn`)
+        and the end-of-turn check so the notice wording, the percentage, and
+        the post-compaction status refresh stay in lockstep.  ``where`` is an
+        optional qualifier for the notice (e.g. ``"mid-turn"``); ``preserve_tail``
+        is forwarded to :meth:`_compact_messages` (e.g. to keep an in-flight
+        tool-call turn during compact-before-truncate).  Returns whether a
+        summary was actually produced (False if compaction bailed) so callers
+        can avoid acting on a compaction that did not happen."""
+        qualifier = f" {where}" if where else ""
+        pct_display = round(self.auto_compact_pct * 100)
+        self.ui.on_info(
+            f"\n[Auto-compacting{qualifier}: prompt exceeds {pct_display}% of context window]"
+        )
+        compacted = self._compact_messages(auto=True, preserve_tail=preserve_tail)
+        self._print_status_line()
+        return compacted
 
     def _truncate_output(self, output: str, remaining_budget_tokens: int | None = None) -> str:
         """Truncate tool output, keeping head + tail.
@@ -3943,6 +4029,7 @@ class ChatSession:
         send_id: str | None = None,
         *,
         from_wake: bool = False,
+        source: str | None = None,
     ) -> int:
         """Append a user turn (plain or multipart) and persist it.
 
@@ -4004,6 +4091,11 @@ class ChatSession:
             # delivered while a wake is in flight, NOT synthetic, so
             # they must not inherit the wake tag.
             user_msg["_source"] = self._wake_source_tag
+        elif source:
+            # Provenance for other self-prompted turns (e.g. the post-compaction
+            # auto-resume): marks the turn for audit / replay / UI so it isn't
+            # mistaken for real user input.  Stripped at the sanitize boundary.
+            user_msg["_source"] = source
         if attachments:
             # Sibling metadata so live history replay has the same shape
             # as reloaded-from-DB (filenames are not recoverable from an
@@ -4240,6 +4332,12 @@ class ChatSession:
             self._budget_exhausted = False
             self._budget_warned = False
         self._notify_count = 0
+        # Per-send cooperative-compaction latch: each send starts a fresh
+        # advise→compact cycle, so reset here.  This single chokepoint covers
+        # the cancel / error / superseded / resume / clear / new exits that
+        # would otherwise leave the latch set on the long-lived session and
+        # trip a premature, advisory-skipping compaction on the next send.
+        self._compaction_advised = False
         self._generation += 1
         my_generation = self._generation
         # Fresh cancel event per generation.  The old event object stays
@@ -4414,19 +4512,36 @@ class ChatSession:
 
                 tool_calls = assistant_msg.get("tool_calls")
                 if not tool_calls:
-                    # Auto-compact when prompt exceeds threshold
+                    # Did the model stop because we asked it to wind down for a
+                    # compaction (cooperative), or because the task is actually
+                    # done?  Capture before the reset — it gates the auto-resume.
+                    stopped_to_compact = self._compaction_advised
+                    self._compaction_advised = False
+                    # Auto-compact when the context exceeds the threshold, so the
+                    # next turn starts with headroom.  Bare-soft check (NOT
+                    # _compaction_owed()): the turn already ended, so there's no
+                    # model cooperation to wait for and the latch was just
+                    # consumed above — compact whenever over soft.  None-safe via
+                    # _estimated_prompt_tokens(), so no _last_usage guard.
                     if (
-                        self._last_usage
-                        and self._last_usage["prompt_tokens"]
+                        self._estimated_prompt_tokens()
                         > self.context_window * self.auto_compact_pct
                     ):
-                        pct_display = int(self.auto_compact_pct * 100)
-                        self.ui.on_info(
-                            f"\n[Auto-compacting: prompt exceeds {pct_display}% of context window]"
-                        )
-                        self._compact_messages(auto=True)
-                        # Update status bar with post-compaction token counts
-                        self._print_status_line()
+                        compacted = self._do_auto_compact()
+                        if stopped_to_compact and compacted:
+                            # The model paused mid-task to let us compact, not
+                            # because it was finished.  Hand the compacted state
+                            # back as a user turn so it resumes instead of being
+                            # stranded at idle — but only when a summary was
+                            # actually produced (else there's nothing to continue
+                            # from).  The prompt lets a genuinely-finished model
+                            # give its final answer and stop.
+                            self._append_user_turn(
+                                NUDGE_COMPACTION_RESUME,
+                                (),
+                                source="compaction_resume",
+                            )
+                            continue
                     # Flush any queued messages that weren't injected
                     # (no tool calls → no advisory seam to inject at).
                     # If anything drained, the model hasn't seen those
@@ -4469,6 +4584,19 @@ class ChatSession:
                 # without per-output bookkeeping, N parallel tool results
                 # could each claim the full remaining budget and collectively
                 # overflow the prompt.
+                # Compact-before-truncate: if a compaction is already owed (over
+                # the hard ceiling, or the model worked past a wrap-up advisory),
+                # do it BEFORE sizing the truncation budget — preserving the
+                # in-flight assistant tool-call turn (preserve_tail=1) so the
+                # results about to be appended aren't orphaned from their
+                # tool_use.  The freed context then lets the fresh results
+                # through (largely) untruncated instead of snipping them only to
+                # summarise them moments later.  Generation-guarded so an
+                # orphaned thread can't replace history under the active one.
+                pre_attempted_compact = False
+                if self._generation == my_generation and self._compaction_owed():
+                    self._do_auto_compact("mid-turn", preserve_tail=1)
+                    pre_attempted_compact = True
                 truncation_budget = self._remaining_token_budget()
                 _truncated: dict[str, str] = {}
                 for tc_id, output in results:
@@ -4654,17 +4782,22 @@ class ChatSession:
                 # joined to queued items by ``\n\n``.
                 self._flush_queued_messages(prefix=user_feedback or "")
 
-                # Mid-turn compaction: prevent context overflow during long
-                # tool chains.  Uses local estimates since _last_usage reflects
-                # the previous API call, not the tool results just appended.
-                estimated_prompt = self._system_tokens + sum(self._msg_tokens)
-                if estimated_prompt > self.context_window * self.auto_compact_pct:
-                    pct_display = int(self.auto_compact_pct * 100)
-                    self.ui.on_info(
-                        f"\n[Auto-compacting mid-turn: estimated prompt "
-                        f"exceeds {pct_display}% of context window]"
-                    )
-                    self._compact_messages(auto=True)
+                # Don't mutate shared history from an orphaned (superseded)
+                # thread: a force-cancel handoff bumps _generation, and
+                # _maybe_compact_midturn can replace self.messages out from
+                # under the active generation.
+                if self._generation != my_generation:
+                    return
+                # Cooperative mid-turn compaction — advise once under context
+                # pressure so the model can reach a stopping point and spill its
+                # plan, then compact if it keeps working (or immediately over
+                # the hard ceiling).  Skip if a compaction was already attempted
+                # pre-truncation this iteration: re-running would double the work
+                # (and retry-storm on a failed summary); truncation already
+                # bounded the batch, and the next iteration / end-of-turn
+                # re-checks.
+                if not pre_attempted_compact:
+                    self._maybe_compact_midturn()
         except GenerationCancelled:
             # If a newer send() has started (force cancel), this thread is
             # orphaned — skip all message mutations and state changes.
@@ -5496,18 +5629,28 @@ class ChatSession:
                 parts.append(f"{role}: {content}")
         return "\n\n".join(parts)
 
-    def _compact_messages(self, auto: bool = False) -> None:
-        """Compact conversation history by summarizing all messages.
+    def _compact_messages(self, auto: bool = False, preserve_tail: int = 0) -> bool:
+        """Compact conversation history by summarizing it into a summary turn.
 
-        Summarizes the entire conversation via a separate model call,
-        budget-fitted to 80% of the context window.
+        Summarizes the conversation via a separate model call, budget-fitted to
+        ``auto_compact_pct`` of the context window.
 
         When auto=True (triggered by context limit), appends a continuation
         hint with the last user message so the model can resume seamlessly.
+
+        ``preserve_tail`` keeps the last N messages verbatim (re-appended after
+        the summary) instead of summarizing them — used to keep an in-flight
+        assistant tool-call turn so the tool results appended after compaction
+        aren't orphaned from their ``tool_use``.
         """
+        # Clear the cooperative latch on every compaction *attempt*, ahead of
+        # the early-return guards below — a bailed compaction (too few/large
+        # messages, summary error) must fall back to the advisory grace state
+        # next cycle rather than retry-storm on the same over-soft estimate.
+        self._compaction_advised = False
         if len(self.messages) < 2:
             self.ui.on_info("Not enough messages to compact.")
-            return
+            return False
 
         # Find the last user message for the continuation hint
         last_user_content = None
@@ -5517,7 +5660,12 @@ class ChatSession:
                     last_user_content = m.text or ""
                     break
 
-        to_summarize = self.messages
+        # Optionally keep the last ``preserve_tail`` messages verbatim — e.g. an
+        # in-flight assistant tool-call whose results are about to be appended —
+        # so compacting them away can't orphan a tool result.  Re-appended after
+        # the summary, below.
+        preserved = self.messages[-preserve_tail:] if preserve_tail > 0 else []
+        to_summarize = self.messages[:-preserve_tail] if preserve_tail > 0 else self.messages
 
         # Budget: fit as many messages as possible into summary request
         summary_max_tokens = self.compact_max_tokens
@@ -5541,7 +5689,7 @@ class ChatSession:
 
         if not selected:
             self.ui.on_info("Messages too large to fit in summary context.")
-            return
+            return False
 
         # Build summary prompt and call model
         formatted = self._format_messages_for_summary(dicts_from_turns(selected))
@@ -5615,7 +5763,7 @@ class ChatSession:
                 self.ui.on_info("[Warning: compaction summary was truncated]")
         except Exception as e:
             self.ui.on_error(f"Compaction failed: {e}")
-            return
+            return False
         finally:
             self.ui.on_thinking_stop()
 
@@ -5630,19 +5778,22 @@ class ChatSession:
                 f"Continue assisting from where we left off."
             )
 
-        # Replace messages
+        # Replace messages — summary, then any preserved tail verbatim.
         before_tokens = self._system_tokens + sum(self._msg_tokens)
         summary_user = {"role": "user", "content": "[Conversation summary]"}
         summary_asst = {"role": "assistant", "content": summary}
-        self.messages = turns_from_dicts([summary_user, summary_asst])
+        self.messages = turns_from_dicts([summary_user, summary_asst]) + list(preserved)
         # File contents are gone after compaction — force re-read before edit_file
         self._read_files.clear()
         self._repeat_detector.clear()
 
-        # Rebuild token table
+        # Rebuild token table — summary turns + preserved-tail estimates.
         su_tok = max(1, int(self._msg_char_count(summary_user) / self._chars_per_token))
         sa_tok = max(1, int(self._msg_char_count(summary_asst) / self._chars_per_token))
-        self._msg_tokens = [su_tok, sa_tok]
+        tail_toks = [
+            max(1, int(self._msg_char_count(m) / self._chars_per_token)) for m in preserved
+        ]
+        self._msg_tokens = [su_tok, sa_tok, *tail_toks]
         self._calibrated_msg_count = len(self.messages)  # anchored to compacted state
         after_tokens = self._system_tokens + sum(self._msg_tokens)
 
@@ -5661,6 +5812,7 @@ class ChatSession:
             lines.append(f"  {line}")
         lines.append(separator)
         self.ui.on_info("\n".join(lines))
+        return True
 
     # -- Intent validation --------------------------------------------------------
 
