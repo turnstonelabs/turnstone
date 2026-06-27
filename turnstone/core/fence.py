@@ -1,15 +1,16 @@
 """Nonce-delimited fences for trust boundaries at the LLM wire.
 
-A *fence* wraps a span of content in ``<{tag}_{nonce}>...</{tag}_{nonce}>``
-markers whose nonce an adversary cannot reproduce, and neutralises any literal
-marker in adjacent untrusted text so a leaked or guessed nonce alone cannot
-forge or break the boundary.  One mechanism, two trust polarities:
+A *fence* wraps a span of content in ``[start {tag}_{nonce}] ... [end
+{tag}_{nonce}]`` markers whose nonce an adversary cannot reproduce, and
+neutralises any literal marker in adjacent untrusted text so a leaked or guessed
+nonce alone cannot forge or break the boundary.  One mechanism, two trust
+polarities:
 
 * **Output-guard judge** (:mod:`turnstone.core.output_guard_judge`) wraps
   UNTRUSTED tool output before handing it to the judge LLM.  The nonce stops
   that content from breaking *out* of the fence; the judge's system prompt
-  declares the fence *form* (``<tool_output_NONCE>``) as untrusted data, so a
-  fresh per-call nonce is enough.
+  declares the fence *form* (``[start tool_output_NONCE]``) as untrusted data,
+  so a fresh per-call nonce is enough.
 
 * **Operator fold** (``lowering.fold_system_turns``) wraps TRUSTED operator
   instructions folded into a neighbouring turn for models without native
@@ -18,6 +19,14 @@ forge or break the boundary.  One mechanism, two trust polarities:
   (:func:`turnstone.prompts.build_operator_instruction_declaration`) declares
   the fence *exact value* as the sole trusted marker, so the nonce must live in
   the (cached) system prefix — minted once per session, not per fold.
+
+The marker shape is bracketed ``start``/``end`` keywords rather than the prior
+``<{tag}_{nonce}>`` XML form: angle-bracket markup pushed some local models out
+of distribution and toward emitting their own turn-structure tokens.  The chat
+templates most at risk are the ones built around rigid ``<...>``-style
+structural tokens, so a fold marker that resembles them derails the template
+once a few accumulate.  ``start``/``end`` carry no slash — no ``</`` or ``[/``
+closing-tag shape — and read as ordinary text the model has seen everywhere.
 
 The lifecycle difference (per-call form vs. per-session value) belongs to the
 callers; the mint / neutralise / wrap mechanism is shared here so the two
@@ -31,7 +40,10 @@ from __future__ import annotations
 
 import re
 import secrets
-from typing import Final
+from typing import TYPE_CHECKING, Final
+
+if TYPE_CHECKING:
+    from collections.abc import Iterable
 
 # Tag bases for the two fence kinds.  Kept distinct so the two trust
 # declarations never cross-contaminate: ``tool_output`` content is declared
@@ -49,6 +61,16 @@ SYSTEM_REMINDER_TAG: Final = "system-reminder"
 # constant, no per-caller drift.
 _NONCE_BYTES: Final = 8
 
+# Open / close keywords for the bracketed marker — ``[start {tag}_{nonce}]`` /
+# ``[end {tag}_{nonce}]``.  Slash-free by design (see the module docstring): the
+# open/close discriminator is the keyword, not a ``/`` that would re-create the
+# closing-tag shape that derails those models' chat templates.  Both fence
+# kinds share these, so the detection regexes here and in
+# ``output_guard._RE_FENCE_MARKER`` (built via :func:`detection_pattern`) cannot
+# drift from what :func:`wrap` emits.
+_OPEN_KW: Final = "start"
+_CLOSE_KW: Final = "end"
+
 
 def mint_nonce() -> str:
     """Mint a 64-bit unguessable hex nonce for a fence tag."""
@@ -58,44 +80,45 @@ def mint_nonce() -> str:
 def _marker_pattern(tag: str, *, opening: bool) -> re.Pattern[str]:
     """Compile the marker pattern for *tag*.
 
-    ``</tag`` (closing) is always matched — that is how content breaks *out* of
-    a fence wrapping it.  ``<tag`` (opening) is matched too when *opening* is
-    set — that is how surrounding text forges a fake fence to break *in*.
+    ``[end tag`` (closing) is always matched — that is how content breaks *out*
+    of a fence wrapping it.  ``[start tag`` (opening) is matched too when
+    *opening* is set — that is how surrounding text forges a fake fence to break
+    *in*.
 
-    The single capture spans the whole run between ``<`` and the tag — optional
-    whitespace, the slash, more optional whitespace — rather than anchoring the
-    slash right after ``<``.  That defangs whitespace tricks on *both* sides of
-    the slash (``< /tag``, ``<  /tag``, ``</ tag``) and keeps this in lockstep
-    with ``output_guard._RE_FENCE_MARKER`` (``<\\s*/?\\s*tag``) so a marker can
-    never be detected-but-not-defanged.  Only the tag *prefix* is anchored, so a
-    nonce suffix (``<system-reminder_abcd>``) is matched and defanged regardless
+    The single capture spans the run between ``[`` and the tag — optional
+    whitespace, the ``start``/``end`` keyword, the separating whitespace — so the
+    defang (a backslash right after ``[``) lands in front of the keyword and the
+    marker no longer matches.  Built from the same ``start``/``end`` keywords as
+    :func:`wrap` and :func:`detection_pattern`, so a marker can never be
+    emitted-but-not-detected.  Only the tag *prefix* is anchored, so a nonce
+    suffix (``[start system-reminder_abcd]``) is matched and defanged regardless
     of whether the hex matches the real nonce.
     """
-    mid = r"\s*/?\s*" if opening else r"\s*/\s*"
-    return re.compile(rf"<({mid}){re.escape(tag)}", re.IGNORECASE)
+    kw = rf"(?:{_OPEN_KW}|{_CLOSE_KW})" if opening else _CLOSE_KW
+    return re.compile(rf"\[(\s*{kw}\s+){re.escape(tag)}", re.IGNORECASE)
 
 
 def neutralize(text: str, tag: str, *, opening: bool = False) -> str:
     """Defang literal fence markers for *tag* in untrusted *text*.
 
-    Inserts a backslash after ``<`` (``<\\/tag`` / ``<\\tag``) so the sequence
-    stays human-readable in logs but no longer matches the fence's open/close
-    marker — even if the adversary has learned the nonce.  Idempotent: an
-    already-defanged ``<\\tag`` is not re-matched.
+    Inserts a backslash after ``[`` (``[\\end tag`` / ``[\\start tag``) so the
+    sequence stays human-readable in logs but no longer matches the fence's
+    open/close marker — even if the adversary has learned the nonce.
+    Idempotent: an already-defanged ``[\\end tag`` is not re-matched.
 
     By default only the *closing* marker is neutralised (break-out defence, for
     a fence wrapping untrusted content).  Pass ``opening=True`` to also
     neutralise the *opening* marker (forge-in defence, for untrusted text that
     surrounds a trusted fence).
     """
-    if "<" not in text:
+    if "[" not in text:
         return text
     pattern = _marker_pattern(tag, opening=opening)
-    return pattern.sub(lambda m: f"<\\{m.group(1)}{tag}", text)
+    return pattern.sub(lambda m: f"[\\{m.group(1)}{tag}", text)
 
 
 def wrap(content: str, nonce: str, tag: str) -> str:
-    """Wrap *content* in a ``<{tag}_{nonce}>...</{tag}_{nonce}>`` fence.
+    """Wrap *content* in a ``[start {tag}_{nonce}] ... [end {tag}_{nonce}]`` fence.
 
     The body's *closing* marker is neutralised first so content cannot break
     out of the fence even if it knows the nonce.  Forge-in defence
@@ -105,4 +128,22 @@ def wrap(content: str, nonce: str, tag: str) -> str:
     wraps a standalone message.
     """
     body = neutralize(content, tag)
-    return f"<{tag}_{nonce}>\n{body}\n</{tag}_{nonce}>"
+    return f"[{_OPEN_KW} {tag}_{nonce}]\n{body}\n[{_CLOSE_KW} {tag}_{nonce}]"
+
+
+def detection_pattern(tags: Iterable[str]) -> re.Pattern[str]:
+    """Compile an open-or-close marker detector for any of *tags*.
+
+    Single source for the marker *shape* used by forgery / leak scanning
+    (``output_guard._RE_FENCE_MARKER``), so a detector cannot drift from what
+    :func:`wrap` emits.  Matches either the ``start`` or the ``end`` keyword form
+    and captures the ``_<hex>`` nonce suffix (or nothing) as group 1, so a caller
+    can tell a leaked exact-nonce marker from a bare or wrong-nonce forgery.
+    Only the tag prefix is anchored, so a marker is caught whether or not its hex
+    matches a real nonce.
+    """
+    alt = "|".join(re.escape(t) for t in tags)
+    return re.compile(
+        rf"\[\s*(?:{_OPEN_KW}|{_CLOSE_KW})\s+(?:{alt})(_[0-9a-f]+)?",
+        re.IGNORECASE,
+    )

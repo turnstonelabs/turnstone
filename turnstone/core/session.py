@@ -1304,7 +1304,7 @@ class ChatSession:
         self._skill_resources: dict[str, str] = {}
         self._skill_resources_dir: str | None = None
         # Per-session nonce for the operator-instruction fence — the fold
-        # path's ``<system-reminder_{nonce}>`` marker.  Minted once per session,
+        # path's ``[start system-reminder_{nonce}]`` marker.  Minted once per session,
         # declared in the system prompt as the sole trusted marker, and reused by
         # every fold this session (the declaration pins the exact value, so it
         # must stay stable across the cached prefix — see ``fence`` for why the
@@ -2845,7 +2845,7 @@ class ChatSession:
         # Operator-instruction trust anchor — declared only on the fold path.
         # The native mid-conversation-system path (claude-opus-4-8,
         # claude-fable-5) delivers operator turns as real {"role":"system"}
-        # messages with no fence, so no <system-reminder_{nonce}> marker
+        # messages with no fence, so no [start system-reminder_{nonce}] marker
         # appears and no declaration applies.
         if caps is not None and not caps.supports_mid_conversation_system:
             dev_parts.append("\n\n" + build_operator_instruction_declaration(self._envelope_nonce))
@@ -3304,7 +3304,7 @@ class ChatSession:
         folds them for the wire via
         :func:`turnstone.core.lowering.fold_system_turns`: non-native
         models get each turn wrapped as a nonce-delimited
-        ``<system-reminder>`` block on the preceding turn; native
+        ``[start system-reminder]`` block on the preceding turn; native
         mid-conversation-system models (claude-opus-4-8, claude-fable-5)
         keep them inline for the Anthropic converter to emit as real
         ``system`` messages.
@@ -8168,7 +8168,7 @@ class ChatSession:
         ``_source = "system_nudge"`` on the synthetic empty user message),
         then ``_emit_pending_user_nudges`` appends each drained nudge as a
         first-class ``{"role": "system"}`` turn after it.  Those turns are
-        real conversation history — folded to a ``<system-reminder>`` block
+        real conversation history — folded to a ``[start system-reminder]`` block
         on the preceding (empty user) turn for non-native providers, or kept
         inline for native mid-conversation-system models.
 
@@ -9257,7 +9257,7 @@ class ChatSession:
 
         *system_reminder* is guidance for the model's next move (broaden a
         filter, ask the operator for a permission, …).  It is no longer spliced
-        into the tool result as a bare ``<system-reminder>`` block — that marker
+        into the tool result as a bare ``[start system-reminder]`` block — that marker
         is declared *untrusted* on the fold path, which would silently demote the
         hint.  Instead it is queued onto the tool channel via
         :meth:`_queue_tool_advisory` and drained by :meth:`_collect_advisories`
@@ -9268,7 +9268,7 @@ class ChatSession:
 
         *message* is returned verbatim as the tool result.  It needs no escaping:
         it is ordinary tool output (untrusted by nature), and if a call site
-        interpolates a model-controlled value that contains a ``<system-reminder>``
+        interpolates a model-controlled value that contains a ``[start system-reminder]``
         marker, the fold's host-escaping
         (:func:`turnstone.core.lowering._neutralize_host`) defangs it.
         """

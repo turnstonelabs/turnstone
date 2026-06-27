@@ -383,7 +383,7 @@ class TestRepeatDetector:
 
 class TestFormatIdleChildrenNudge:
     """``format_idle_children_nudge`` renders the wake-driven idle_children
-    body — no ``<system-reminder>`` envelope (the side-channel splice
+    body — no ``[start system-reminder]`` envelope (the side-channel splice
     wraps it at the wire boundary).
     """
 
@@ -480,11 +480,11 @@ class TestFormatIdleChildrenNudge:
 
     def test_no_system_reminder_envelope(self):
         # The side-channel ``_apply_reminders_for_provider`` splice
-        # adds ``<system-reminder>`` at the wire boundary; the formatter
+        # adds ``[start system-reminder]`` at the wire boundary; the formatter
         # MUST NOT wrap, or the model would see a doubled envelope.
         text = format_idle_children_nudge([{"ws_id": "ws-x", "name": "y", "state": "running"}])
-        assert "<system-reminder>" not in text
-        assert "</system-reminder>" not in text
+        assert "[start system-reminder]" not in text
+        assert "[end system-reminder]" not in text
 
     def test_format_nudge_returns_empty_for_idle_children(self):
         # The static map's idle_children entry is the empty string by

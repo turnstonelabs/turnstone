@@ -3855,7 +3855,7 @@ class TestMetacognitiveBuffers:
         # Bare raw output — no envelope at all.
         assert saved_text == "raw output"
         assert "<tool_output>" not in saved_text
-        assert "<system-reminder>" not in saved_text
+        assert "[start system-reminder]" not in saved_text
 
     def test_tool_db_row_stores_joined_text_for_list_content(self, tmp_db):
         """Image / structured tool output (list-typed) persists as the
@@ -4773,7 +4773,7 @@ class TestReminderSidechannelIsolation:
         session.messages.append(turn_from_dict({"role": "assistant", "content": "ok"}))
         summary = session._format_messages_for_summary(dicts_from_turns(session.messages))
         assert "SECRET_NUDGE_TEXT" not in summary
-        assert "<system-reminder>" not in summary
+        assert "[start system-reminder]" not in summary
         assert "user said this" in summary
 
     def test_format_messages_for_summary_marks_by_reference_vision_image(self, tmp_db):

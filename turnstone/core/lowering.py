@@ -9,7 +9,7 @@ input and stay a pure format mapping.
 This module owns the two provider-neutral lowering passes:
 
 * **fold** (representation) — operator-context ``system`` turns are folded into
-  the preceding turn as nonce-fenced ``<system-reminder>`` blocks for models
+  the preceding turn as nonce-fenced ``[start system-reminder]`` blocks for models
   without native mid-conversation system support (native models keep them
   inline).  See :func:`fold_system_turns`.
 * **repair** (validity) — synthesizing cancellation results for orphaned client
@@ -173,7 +173,7 @@ def fold_system_turns(
     context (advisories / nudges / interjections — see
     ``tool_advisory.make_system_turn``).  Models WITHOUT native mid-conversation
     system support can't take a ``system`` message mid-array, so each such turn
-    is wrapped in a nonce-delimited ``<system-reminder_{nonce}>`` fence
+    is wrapped in a nonce-delimited ``[start system-reminder_{nonce}]`` fence
     (:func:`turnstone.core.fence.wrap`) — the system prompt declares the exact
     *nonce* as the sole trusted marker via
     ``build_operator_instruction_declaration`` — and appended to the preceding
@@ -181,7 +181,7 @@ def fold_system_turns(
 
     Forgery defence is two-layer: ``fence.wrap`` neutralises the operator body's
     closing marker (break-out), and before the first fold onto a host we
-    neutralise that (untrusted) host turn's ``<system-reminder>`` markers via
+    neutralise that (untrusted) host turn's ``[start system-reminder]`` markers via
     :func:`_neutralize_host` (forge-in).  The host pass runs once per host —
     re-running it would defang the real fences we append afterwards — so a leaked
     or guessed nonce still cannot fabricate a trusted block.
@@ -222,9 +222,9 @@ def fold_system_turns(
 def _neutralize_host(msg: dict[str, Any]) -> dict[str, Any]:
     """Return a copy of *msg* with operator-fence markers defanged in its text.
 
-    Defence-in-depth for the fold path: before a real ``<system-reminder_{nonce}>``
+    Defence-in-depth for the fold path: before a real ``[start system-reminder_{nonce}]``
     block is appended to this (untrusted) host turn, any literal
-    ``<system-reminder>`` marker already in its content is neutralised via
+    ``[start system-reminder]`` marker already in its content is neutralised via
     :func:`turnstone.core.fence.neutralize` (opening + closing) so a leaked or
     guessed nonce cannot be used to forge a trusted block here.  Never mutates
     *msg* — the fold holds the read-only contract.

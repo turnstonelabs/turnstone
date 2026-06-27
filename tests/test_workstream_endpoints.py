@@ -1452,7 +1452,7 @@ class TestBuildHistorySystemTurnPropagation:
         """Assistant output may legitimately reference the tag (e.g. when
         the model is explaining the reminder system itself).  No
         transformation should ever apply to assistant content."""
-        content = "Here is a <system-reminder> tag in assistant output."
+        content = "Here is a [start system-reminder] tag in assistant output."
         history = project_history_messages([{"role": "assistant", "content": content}])
         assert history[0]["content"] == content
 

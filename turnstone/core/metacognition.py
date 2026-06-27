@@ -210,7 +210,7 @@ def sanitize_payload(text: str) -> str:
     ``watch_triggered`` nudge body.
 
     The wire-boundary fence escaping (``fence.neutralize`` at fold time)
-    only defangs the ``<system-reminder>`` operator marker; other
+    only defangs the ``[start system-reminder]`` operator marker; other
     angle-bracketed markers (``</thinking>``, ``<answer>``,
     ``<artifact>``, …) and Unicode steering vectors (RTL override,
     zero-width chars, tag chars) can still steer some models.  Strip
@@ -237,7 +237,7 @@ def format_idle_children_nudge(children: list[dict[str, str]]) -> str:
     keys — the row-mapping shape coordinator-side storage exposes.
     Returns raw text *without* any envelope; the nudge is emitted as a
     first-class ``{"role": "system"}`` turn whose content is this text
-    (folded to a ``<system-reminder>`` block at the wire boundary on
+    (folded to a ``[start system-reminder]`` block at the wire boundary on
     non-native models).
 
     User-controlled ``name`` strings get sanitized via

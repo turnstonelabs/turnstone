@@ -116,7 +116,7 @@ class TestEnqueueShape:
 class TestSanitisation:
     """``sanitize_payload`` runs producer-side over the formatted message
     before it ever reaches the queue.  The wire-boundary fence escaping
-    (``fence.neutralize`` at fold time) only defangs ``<system-reminder>``
+    (``fence.neutralize`` at fold time) only defangs ``[start system-reminder]``
     markers; this producer layer covers everything else.
     """
 
