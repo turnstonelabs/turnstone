@@ -1658,6 +1658,110 @@ class TestAgentChildRegistration:
         session.ui.note_agent_child.assert_called_once_with("task-1::call_1", "task-1")
 
 
+class TestRunAgentDenialMessage:
+    """A denied sub-tool must surface the SPECIFIC denial reason that
+    ``approve_tools`` already stamped (operator feedback / matched policy),
+    not a flat "Denied by user" — so the sub-agent can adapt.  The pre-fix
+    code clobbered ``denial_msg`` unconditionally and dropped the feedback
+    returned as ``approve_tools``'s second value."""
+
+    def _run_with_denial(self, approve_side_effect):
+        from turnstone.core.providers._openai_chat import OpenAIChatCompletionsProvider
+        from turnstone.core.trajectory import Turn
+
+        session = _make_session()
+        session._provider = OpenAIChatCompletionsProvider()
+
+        call_count = [0]
+
+        def fake_create(**_kwargs):
+            call_count[0] += 1
+            resp = MagicMock()
+            choice = MagicMock()
+            if call_count[0] == 1:
+                choice.finish_reason = "tool_calls"
+                tc = MagicMock()
+                tc.id = "call_1"
+                tc.function.name = "notify"
+                tc.function.arguments = '{"message": "hi"}'
+                choice.message.tool_calls = [tc]
+                choice.message.content = None
+            else:
+                choice.finish_reason = "stop"
+                choice.message.tool_calls = None
+                choice.message.content = "done"
+            resp.choices = [choice]
+            resp.usage = MagicMock(prompt_tokens=10, completion_tokens=5)
+            return resp
+
+        session.client.chat.completions.create = fake_create
+        # approve_tools is the real two-phase gate: on denial it stamps a
+        # specific denial_msg on the item AND returns the reason as its 2nd
+        # value.  The sub-agent must honour both, not overwrite them.
+        session.ui.approve_tools = MagicMock(side_effect=approve_side_effect)
+
+        def fake_prepare(tc_dict, **_kwargs):
+            return {
+                "call_id": tc_dict["id"],
+                "func_name": "notify",
+                "needs_approval": True,
+                # Must NOT run — a denied tool never executes.
+                "execute": lambda p: (p["call_id"], "EXECUTED — should not happen"),
+            }
+
+        agent_turns: list[Turn] = [Turn.user("x")]
+        with patch.object(session, "_prepare_tool", side_effect=fake_prepare):
+            session._run_agent(
+                agent_turns,
+                tools=[{"type": "function", "function": {"name": "notify"}}],
+                auto_tools=set(),  # nothing auto -> notify routes through approval
+                label="task",
+                parent_call_id="task-1",
+            )
+        tool_turns = [t for t in agent_turns if t.role.value == "tool"]
+        assert tool_turns, "expected a tool turn for the denied sub-tool"
+        return tool_turns[-1].text
+
+    def test_human_feedback_preserved(self):
+        def approve(items):
+            items[0]["denied"] = True
+            items[0]["denial_msg"] = "Denied by user: use /tmp instead"
+            return False, "use /tmp instead"
+
+        text = self._run_with_denial(approve)
+        assert text == "Denied by user: use /tmp instead"
+
+    def test_policy_reason_preserved(self):
+        def approve(items):
+            items[0]["denied"] = True
+            items[0]["denial_msg"] = "Blocked by tool policy (pattern match for 'notify')"
+            return False, "Blocked by tool policy"
+
+        text = self._run_with_denial(approve)
+        assert text == "Blocked by tool policy (pattern match for 'notify')"
+
+    def test_default_when_gate_sets_nothing(self):
+        # Defensive: a not-approved result that left no denial_msg still yields
+        # a sensible default rather than executing the tool.
+        def approve(items):
+            return False, None
+
+        text = self._run_with_denial(approve)
+        assert text == "Denied by user"
+
+    def test_cli_policy_block_error_field_preserved(self):
+        # The CLI gate records a policy block in ``error`` (not ``denial_msg``)
+        # and returns approved=True; the specific reason must still reach the
+        # sub-agent rather than collapsing to a flat "Denied by user".
+        def approve(items):
+            items[0]["denied"] = True
+            items[0]["error"] = "Blocked by tool policy ('notify')"
+            return True, None
+
+        text = self._run_with_denial(approve)
+        assert text == "Blocked by tool policy ('notify')"
+
+
 class TestProjectAgentSteps:
     """``_project_agent_steps`` projects a finished sub-agent's trajectory into
     recall step items for the task card — one per tool call, matched to its

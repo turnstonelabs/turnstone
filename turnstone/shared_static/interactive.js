@@ -57,6 +57,18 @@ let _paneCounter = 0;
 // so its voice roles come from THAT node's /v1/api/models (base "/node/{id}"),
 // not the console's; standalone panes use base "" and share one fetch.
 const _voiceRolesPromises = {};
+
+// Max child steps held per task agent while its parent row is unpainted (see
+// InteractivePane._bufferAgentOrphan).  A real agent's whole sub-trajectory is
+// well under this; the cap only bounds a pathological never-arriving parent.
+const _AGENT_ORPHAN_CAP = 256;
+
+// Grace window before a child step whose task_agent row never paints (an id-
+// correlation mismatch, or an agent that aborted before its row painted) is
+// escaped to a top-level row so it stays VISIBLE rather than buffered forever.
+// The ordering race the buffer targets resolves within a frame, far inside it.
+const _AGENT_ORPHAN_GRACE_MS = 500;
+
 function getVoiceRoles(base) {
   base = base || "";
   if (!_voiceRolesPromises[base]) {
@@ -441,6 +453,11 @@ class Pane {
           )
         : null;
       if (!target) {
+        // A namespaced sub-agent child id ("<parent>::<id>") whose row hasn't
+        // nested yet must NOT graft its stream onto the last top-level batch —
+        // that mislabels a sub-tool's output as a main-harness tool's.  Its row
+        // arrives via the orphan flush; skip the chunk until then.
+        if (callId && callId.includes("::")) return;
         const blocks = this.messagesEl.querySelectorAll(".conv-batch");
         if (!blocks.length) return;
         const block = blocks[blocks.length - 1];
@@ -1129,7 +1146,14 @@ class Pane {
         break;
 
       case "tool_info":
-        this.showInlineToolBlock(evt.items, true);
+        // A sub-agent's auto-resolved step (policy / "Always" auto-approval, or
+        // a policy block) arrives as a tool_info with parent_call_id stamped —
+        // route it into the task card like tool_pending / approve_request,
+        // instead of painting a duplicate top-level row.  Top-level tool_info
+        // (no parent_call_id) falls through to the normal inline block.
+        if (!this._routeAgentItems(evt.items, "info")) {
+          this.showInlineToolBlock(evt.items, true);
+        }
         break;
 
       case "approve_request":
@@ -2299,6 +2323,7 @@ class Pane {
     });
     this.announcedBlockEl = block;
     this.messagesEl.appendChild(block);
+    this._relinkAgentCards(list);
     this.scrollToBottom(stick);
     toolAnnounce(_toolAnnounceText(list));
   }
@@ -2414,6 +2439,7 @@ class Pane {
     }
 
     if (!announced) this.messagesEl.appendChild(block);
+    this._relinkAgentCards(items);
     this.scrollToBottom(stick);
   }
 
@@ -2475,7 +2501,20 @@ class Pane {
     const parentId = items[0] && items[0].parent_call_id;
     if (!parentId) return false;
     const card = this._ensureAgentCard(parentId);
-    if (!card) return false; // parent row not painted yet — fall back top-level
+    if (!card) {
+      // Parent task_agent row isn't painted yet: under the 4-wide tool pool a
+      // sub-tool's SSE event can be handled before its task_agent row commits.
+      // Buffer the child step keyed by parent so it nests when the parent row
+      // lands (see _flushAgentOrphans), instead of escaping to a top-level row
+      // that looks like the main harness issued it.  An approval prompt is NOT
+      // buffered — it must stay visible to unblock the gate — so "approve"
+      // falls through to the top-level paint.
+      if (mode !== "approve") {
+        this._bufferAgentOrphan(parentId, items, mode);
+        return true;
+      }
+      return false; // parent row not painted yet — fall back top-level
+    }
     if (mode === "approve") {
       // Cards default to collapsed, but a pending approval is BLOCKING — it
       // can't hide behind the toggle or the turn stalls on a prompt the user
@@ -2533,12 +2572,98 @@ class Pane {
     if (!parentRow) return null;
     if (!this._agentCards) this._agentCards = new Map();
     let card = this._agentCards.get(parentCallId);
-    if (card && parentRow.contains(card.wrap)) return card;
+    if (card) {
+      if (parentRow.contains(card.wrap)) return card;
+      if (!card.wrap.isConnected) {
+        // Same-turn row rebuild: showInlineToolBlock's replaceChildren on the
+        // pending->resolved upgrade detached our card.  Re-attach the SAME card
+        // so its already-rendered steps survive the upgrade.
+        parentRow.appendChild(card.wrap);
+        return card;
+      }
+      // The cached card is still attached to a DIFFERENT (earlier) row — a
+      // call_id reused across turns (some local providers recycle ids).  Fall
+      // through to build a fresh card for THIS row rather than stealing the
+      // prior agent's steps.  (Full cross-turn id correctness is the task-agent
+      // id-consistency follow-up.)
+    }
     card = buildAgentCardBody();
     card.wrap.dataset.state = "running";
     parentRow.appendChild(card.wrap);
     this._agentCards.set(parentCallId, card);
     return card;
+  }
+
+  _bufferAgentOrphan(parentId, items, mode) {
+    // Hold a child step whose task_agent row hasn't painted yet, keyed by
+    // parent, so it nests when the row lands (_flushAgentOrphans).  Bounded two
+    // ways so a parent row that never arrives (an id-correlation mismatch, or
+    // an agent aborted before its row painted) can't leak or hide steps: the
+    // per-parent queue is capped (oldest dropped), and a grace timer escapes
+    // the queue to a top-level row (_escapeAgentOrphans) so the steps stay
+    // VISIBLE rather than buffered forever.
+    if (!this._agentOrphans) this._agentOrphans = new Map();
+    const entry = this._agentOrphans.get(parentId) || {
+      queue: [],
+      timer: null,
+    };
+    entry.queue.push({ items, mode });
+    while (entry.queue.length > _AGENT_ORPHAN_CAP) entry.queue.shift();
+    if (entry.timer == null) {
+      entry.timer = setTimeout(
+        () => this._escapeAgentOrphans(parentId),
+        _AGENT_ORPHAN_GRACE_MS,
+      );
+    }
+    this._agentOrphans.set(parentId, entry);
+  }
+
+  _flushAgentOrphans(parentIds) {
+    // Drain buffered child steps for the just-painted parents (their card now
+    // exists) — targeted by parentId so an unrelated tool paint doesn't replay
+    // every parent's queue.  A step that still can't nest re-buffers (with a
+    // fresh grace timer) for the next paint / escape.
+    if (!this._agentOrphans || !this._agentOrphans.size) return;
+    parentIds.forEach((pid) => {
+      const entry = this._agentOrphans.get(pid);
+      if (!entry) return;
+      this._agentOrphans.delete(pid);
+      if (entry.timer != null) clearTimeout(entry.timer);
+      entry.queue.forEach((o) => this._routeAgentItems(o.items, o.mode));
+    });
+  }
+
+  _escapeAgentOrphans(parentId) {
+    // The parent row never painted within the grace window — render the
+    // buffered steps at top-level so they stay visible (the pre-buffer
+    // behaviour) instead of vanishing.  Batched per mode to avoid the
+    // announce-shell churn of one paint per step.
+    const entry = this._agentOrphans && this._agentOrphans.get(parentId);
+    if (!entry) return;
+    this._agentOrphans.delete(parentId);
+    const pending = [];
+    const info = [];
+    entry.queue.forEach((o) =>
+      (o.mode === "info" ? info : pending).push(...o.items),
+    );
+    if (pending.length) this.announceToolBlock(pending);
+    if (info.length) this.showInlineToolBlock(info, true);
+  }
+
+  _relinkAgentCards(items) {
+    // After a top-level tool row is (re)painted: re-attach any agent card the
+    // rebuild detached, then drain buffered child steps for the parents that
+    // just painted.  Closes the parallel-pool ordering race and keeps a task
+    // agent's nested card intact across its parent's pending->resolved upgrade.
+    const paintedIds = [];
+    (items || []).forEach((it) => {
+      if (!it || !it.call_id) return;
+      paintedIds.push(it.call_id);
+      if (this._agentCards && this._agentCards.has(it.call_id)) {
+        this._ensureAgentCard(it.call_id);
+      }
+    });
+    if (paintedIds.length) this._flushAgentOrphans(paintedIds);
   }
 
   _updateAgentLabel(card) {
@@ -2587,6 +2712,11 @@ class Pane {
         )
       : null;
     if (!target) {
+      // A namespaced sub-agent child id ("<parent>::<id>") whose row hasn't
+      // nested yet must NOT graft its output onto the last top-level batch row
+      // — that mislabels a sub-tool's result as a main-harness tool's.  Its row
+      // arrives via the orphan flush; skip until then.
+      if (callId && callId.includes("::")) return;
       const blocks = this.messagesEl.querySelectorAll(".conv-batch");
       if (!blocks.length) return;
       const block = blocks[blocks.length - 1];

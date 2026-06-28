@@ -7021,9 +7021,17 @@ class ChatSession:
             for item in items:
                 if item.get("needs_approval") and not item.get("error"):
                     item["denied"] = True
-                    item["denial_msg"] = (
-                        f"Denied by user: {user_feedback}" if user_feedback else "Denied by user"
-                    )
+                    if not item.get("denial_msg"):
+                        # approve_tools already stamps the specific reason (the
+                        # matched policy pattern, or the operator's feedback) on
+                        # a denied item; only fill the flat default when it left
+                        # denial_msg unset — never clobber the specific reason
+                        # (mirrors the sub-agent loop's guard).
+                        item["denial_msg"] = (
+                            f"Denied by user: {user_feedback}"
+                            if user_feedback
+                            else "Denied by user"
+                        )
             user_feedback = None  # feedback is in the denial_msg
             if self._mem_cfg.nudges and should_nudge(
                 "denial",
@@ -12572,14 +12580,35 @@ class ChatSession:
                         is_tool_error = self._tool_error_flags.pop(tc_dict["id"], False)
                     # Tools not in auto_tools require user approval.
                     elif "execute" in prepared:
-                        approved, _ = self.ui.approve_tools([prepared])
-                        if not approved:
+                        approved, denial_feedback = self.ui.approve_tools([prepared])
+                        if not approved and not prepared.get("denied"):
+                            # ``approve_tools`` already stamps a SPECIFIC
+                            # denial_msg on a denied item (the matched policy
+                            # pattern, or the operator's feedback) and returns
+                            # the reason as its second value.  Only fill a
+                            # default when some other not-approved path left it
+                            # unset — never clobber the specific reason with a
+                            # flat "Denied by user", and fold the returned
+                            # feedback in so the sub-agent can adapt (mirrors the
+                            # main tool loop's denial handling).
                             prepared["denied"] = True
-                            prepared["denial_msg"] = "Denied by user"
+                            prepared["denial_msg"] = (
+                                f"Denied by user: {denial_feedback}"
+                                if denial_feedback
+                                else "Denied by user"
+                            )
                         if prepared.get("denied"):
                             # A denial is not an execution error — keep is_error
                             # False so recall shows the denial text, not red.
-                            output = prepared.get("denial_msg", "Denied by user")
+                            # The web gate records the reason in ``denial_msg``;
+                            # the CLI gate records a policy block in ``error``
+                            # (and returns approved=True) — honour whichever the
+                            # gate set before the flat default.
+                            output = (
+                                prepared.get("denial_msg")
+                                or prepared.get("error")
+                                or "Denied by user"
+                            )
                         else:
                             _, output = prepared["execute"](prepared)
                             is_tool_error = self._tool_error_flags.pop(tc_dict["id"], False)

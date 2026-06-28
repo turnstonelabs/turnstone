@@ -1589,6 +1589,89 @@ def test_early_paint_tool_pending_wiring() -> None:
     assert "if (!announced) this.messagesEl.appendChild(block);" in body
 
 
+def test_task_agent_steps_never_escape_their_card() -> None:
+    """A task agent's sub-tool steps (``parent_call_id`` stamped) must nest in
+    the task card, never render as top-level rows that look like the main
+    harness issued them.  Two seams keep that true; this guards both against a
+    rename/deletion:
+
+    1. ``tool_info`` routes through ``_routeAgentItems`` first — a sub-tool
+       auto-resolved by policy / "Always" arrives as a ``tool_info`` and must
+       nest, not paint a duplicate top-level block (Copilot review on #732).
+    2. A child step whose ``task_agent`` row hasn't painted yet (the 4-wide
+       tool pool's ordering window) is BUFFERED and flushed when the row lands,
+       instead of escaping to top-level; the card also survives the parent
+       row's pending->resolved rebuild.
+    3. SAFETY VALVE: a buffered step whose parent row NEVER paints (an id-
+       correlation mismatch / aborted agent) is escaped to a top-level row after
+       a grace window, so it stays VISIBLE rather than buffered forever.
+    """
+    body = _INTERACTIVE_JS.read_text(encoding="utf-8")
+    # 1. tool_info nests via the same router as tool_pending / approve_request.
+    info = body[body.index('case "tool_info":') : body.index('case "approve_request":')]
+    assert 'this._routeAgentItems(evt.items, "info")' in info, (
+        "tool_info must route a parent-tagged sub-tool into the task card "
+        "before any top-level showInlineToolBlock fallback."
+    )
+    # 2. _routeAgentItems buffers an orphan child (instead of returning false,
+    #    which escapes it to top-level) when the parent card isn't painted yet.
+    route = body[
+        _pane_method_offset(body, "_routeAgentItems") : _pane_method_offset(
+            body, "_ensureAgentCard"
+        )
+    ]
+    assert "_bufferAgentOrphan(parentId, items, mode)" in route, (
+        "a parent-tagged child with no card yet must buffer, not fall through to a top-level paint."
+    )
+    # The buffer / flush / escape / relink helpers exist.
+    assert "_bufferAgentOrphan(parentId, items, mode) {" in body
+    assert "_flushAgentOrphans(parentIds) {" in body
+    assert "_escapeAgentOrphans(parentId) {" in body
+    assert "_relinkAgentCards(items) {" in body
+    assert body.count("this._relinkAgentCards(") >= 2, (
+        "both announceToolBlock and showInlineToolBlock must relink + flush so "
+        "a buffered step nests as soon as a tool row appears."
+    )
+    # 3. Safety valve: _bufferAgentOrphan arms a grace timer to _escapeAgentOrphans
+    #    so a never-painting parent's steps can't vanish (or leak) — they escape
+    #    back to a visible top-level paint.
+    buf = body[
+        _pane_method_offset(body, "_bufferAgentOrphan") : _pane_method_offset(
+            body, "_flushAgentOrphans"
+        )
+    ]
+    assert "setTimeout(" in buf and "_escapeAgentOrphans(parentId)" in buf, (
+        "a buffered orphan must arm a grace-window escape so it never stays "
+        "buffered (invisible) forever."
+    )
+    escape = body[
+        _pane_method_offset(body, "_escapeAgentOrphans") : _pane_method_offset(
+            body, "_relinkAgentCards"
+        )
+    ]
+    assert "announceToolBlock(" in escape, (
+        "the escape valve must render the steps top-level (visible), the "
+        "pre-buffer behaviour, rather than dropping them."
+    )
+    # Flush is targeted to the just-painted parents, not the whole map.
+    flush = body[
+        _pane_method_offset(body, "_flushAgentOrphans") : _pane_method_offset(
+            body, "_escapeAgentOrphans"
+        )
+    ]
+    assert "parentIds.forEach" in flush
+    # _ensureAgentCard re-attaches a DETACHED card across a parent-row rebuild,
+    # but builds fresh on a still-attached (cross-turn reused) call_id rather
+    # than stealing the prior agent's steps.
+    ensure = body[
+        _pane_method_offset(body, "_ensureAgentCard") : _pane_method_offset(
+            body, "_bufferAgentOrphan"
+        )
+    ]
+    assert "!card.wrap.isConnected" in ensure
+    assert "parentRow.appendChild(card.wrap);" in ensure
+
+
 def test_risk_level_normalized_before_dom_interpolation() -> None:
     """Server-supplied ``risk_level`` lands in className / data-risk strings the
     verdict + warning CSS depend on, so every interpolation must funnel through

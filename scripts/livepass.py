@@ -69,7 +69,13 @@ Task-agent harness (/taskagent/livepass.html): the task_agent card — a task
   2-tool batch, for the rail-bleed rules); &recall=1 (the RECALL path —
   replayHistory rebuilding the card from a /history `agent_steps` overlay, i.e.
   a reload while the ws is in memory); &expand=1 (open every card so a shot
-  shows the nested steps).  document.title stamps TASKAGENT-READY-<steps> on
+  shows the nested steps); &race=1 (child steps emitted BEFORE the task_agent
+  row paints — the parallel-pool ordering window; the orphan buffer must nest
+  them rather than let them escape to top-level); &orphan=1 (child steps whose
+  task_agent row NEVER paints — the safety valve must escape them to visible
+  top-level rows after the grace window, stamping TASKAGENT-ORPHANS-ESCAPED-<n>,
+  not leave them buffered/invisible).  document.title stamps
+  TASKAGENT-READY-<steps> on
   success, TASKAGENT-FAILED-... / TASKAGENT-ERROR when routing breaks, so a
   broken card can't screenshot green.
 
@@ -870,6 +876,50 @@ TASKAGENT_TEMPLATE = """<!doctype html>
             }] },
             { role: "tool", tool_call_id: "task1", content: "resolve_alias has 4 call sites (registry.py:120, session.py:12200, model_registry.py:88, eval.py:54); all pass a validated alias before use." },
           ]);
+        } else if (q.get("race") === "1") {
+          // ?race=1: reproduce the parallel-pool ordering window — each
+          // sub-tool's tool_pending is emitted exactly once (as in production)
+          // but AHEAD of the task_agent row paint, as happens when a pooled
+          // sub-agent's SSE event is handled before its parent row commits.
+          // The orphan buffer must hold them and nest them when the parent row
+          // lands; pre-fix they escaped to top-level rows and the card came up
+          // short (steps < 4 -> TASKAGENT-FAILED), so this can't screenshot
+          // green without the fix.
+          const raceTask = {
+            call_id: "task1", func_name: "task_agent",
+            header: 'task_agent: "Find all call sites of resolve_alias and summarize them"',
+            needs_approval: false,
+          };
+          const childPending = (cid, fn, header) =>
+            ev({ type: "tool_pending", items: [{ call_id: cid, parent_call_id: "task1", func_name: fn, header: header, needs_approval: false }] });
+          // a) Orphan child pendings arrive first — no parent row yet.
+          childPending("task1::c1", "search", 'search: "resolve_alias"');
+          childPending("task1::c2", "read_file", "read_file: core/registry.py");
+          childPending("task1::c3", "bash", "pytest -k registry");
+          childPending("task1::c4", "notify", "notify: post summary to #eng");
+          // b) Parent task_agent row paints (pending -> resolved): must flush the
+          //    buffered orphans into the card AND survive the upgrade rebuild.
+          ev({ type: "tool_pending", items: [raceTask] });
+          ev({ type: "tool_info", items: [Object.assign({ auto_approved: false }, raceTask)] });
+          // c) Results + a streamed chunk follow, nesting into the flushed rows.
+          ev({ type: "tool_result", call_id: "task1::c1", parent_call_id: "task1", name: "search", output: "12 matches across 4 files" });
+          ev({ type: "tool_result", call_id: "task1::c2", parent_call_id: "task1", name: "read_file", output: "4.1 KB read" });
+          ev({ type: "tool_output_chunk", call_id: "task1::c3", parent_call_id: "task1", chunk: "collected 12 items ... " });
+          ev({ type: "tool_result", call_id: "task1::c3", parent_call_id: "task1", name: "bash", output: "12 passed in 1.2s" });
+          ev({ type: "tool_result", call_id: "task1::c4", parent_call_id: "task1", name: "notify", output: "posted to #eng" });
+          ev({ type: "tool_result", call_id: "task1", name: "task_agent", output: "resolve_alias has 4 call sites (registry.py:120, session.py:12200, model_registry.py:88, eval.py:54); all pass a validated alias before use." });
+        } else if (q.get("orphan") === "1") {
+          // ?orphan=1: the SAFETY VALVE — child steps whose task_agent row
+          // NEVER paints (an id-correlation mismatch, or an agent aborted
+          // before its row painted).  They must not vanish: after the grace
+          // window the buffer escapes them to visible top-level rows (the
+          // pre-buffer behaviour) rather than holding them forever.  The parent
+          // task_agent row is deliberately never emitted here.
+          const orphanPending = (cid, fn, header) =>
+            ev({ type: "tool_pending", items: [{ call_id: cid, parent_call_id: "task1", func_name: fn, header: header, needs_approval: false }] });
+          orphanPending("task1::c1", "search", 'search: "resolve_alias"');
+          orphanPending("task1::c2", "read_file", "read_file: core/registry.py");
+          orphanPending("task1::c3", "bash", "pytest -k registry");
         } else {
 
         // 1. Parent paints the task_agent call (a top-level tool row).
@@ -925,7 +975,18 @@ TASKAGENT_TEMPLATE = """<!doctype html>
         }
 
         // Loud failure — broken routing must not screenshot green.
+        const orphanMode = q.get("orphan") === "1";
         setTimeout(function () {
+          if (orphanMode) {
+            // The parent never painted; after the grace window the buffered
+            // steps must have ESCAPED to visible top-level rows, not vanished.
+            const escaped = document.querySelectorAll('.conv-batch .conv-row[data-call-id^="task1::"]').length;
+            const leaked = document.querySelector('.conv-row[data-call-id="task1"] .conv-agent');
+            document.title = escaped >= 3 && !leaked
+              ? "TASKAGENT-ORPHANS-ESCAPED-" + escaped
+              : "TASKAGENT-FAILED-escaped" + escaped + "-card" + (leaked ? 1 : 0);
+            return;
+          }
           const row = document.querySelector('.conv-row[data-call-id="task1"]');
           const card = row && row.querySelector(".conv-agent");
           const steps = card ? card.querySelectorAll(".conv-agent-body .conv-row").length : 0;
@@ -933,7 +994,7 @@ TASKAGENT_TEMPLATE = """<!doctype html>
           document.title = card && steps >= 4 && hasResult
             ? "TASKAGENT-READY-" + steps
             : "TASKAGENT-FAILED-card" + (card ? 1 : 0) + "-steps" + steps + "-result" + (hasResult ? 1 : 0);
-        }, 300);
+        }, orphanMode ? 900 : 300);
       } catch (e) {
         messages.textContent = "HARNESS ERROR: " + e.message + "\\n" + (e.stack || "");
         document.title = "TASKAGENT-ERROR";
