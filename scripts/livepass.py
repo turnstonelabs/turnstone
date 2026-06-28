@@ -64,9 +64,14 @@ Task-agent harness (/taskagent/livepass.html): the task_agent card — a task
   tool_pending/tool_result/tool_output_chunk/approve_request -> task_agent
   tool_result) so the SSE->card routing (_routeAgentItems / _ensureAgentCard,
   and appendToolOutput finding the nested row by call_id) is exercised, not
-  just the leaf builders.  + &theme=light, &collapsed=1.  document.title stamps
-  TASKAGENT-READY-<steps> on success, TASKAGENT-FAILED-... / TASKAGENT-ERROR
-  when routing breaks, so a broken card can't screenshot green.
+  just the leaf builders.  Query flags: &theme=light; &collapsed=1 (all-auto,
+  no approval -> the natural collapse-by-default state); &parallel=1 (card in a
+  2-tool batch, for the rail-bleed rules); &recall=1 (the RECALL path —
+  replayHistory rebuilding the card from a /history `agent_steps` overlay, i.e.
+  a reload while the ws is in memory); &expand=1 (open every card so a shot
+  shows the nested steps).  document.title stamps TASKAGENT-READY-<steps> on
+  success, TASKAGENT-FAILED-... / TASKAGENT-ERROR when routing breaks, so a
+  broken card can't screenshot green.
 
 Rebuild after ANY markup change: the dialog blocks are embedded at build
 time. Assets are symlinked, so CSS/JS edits are live on refresh.
@@ -846,6 +851,27 @@ TASKAGENT_TEMPLATE = """<!doctype html>
         pane.setBusy = () => {};
         const ev = (e) => pane.handleEvent(e);
 
+        // ?recall=1: exercise the RECALL path — replayHistory rebuilding the
+        // card from the /history `agent_steps` overlay (a reload / reopen while
+        // the ws is still in memory), as opposed to the live SSE path below.
+        const recall = q.get("recall") === "1";
+        if (recall) {
+          pane.replayHistory([
+            { role: "user", content: "Find all call sites of resolve_alias and summarize them" },
+            { role: "assistant", tool_calls: [{
+              name: "task_agent", id: "task1",
+              arguments: JSON.stringify({ prompt: "Find call sites of resolve_alias" }),
+              agent_steps: [
+                { id: "task1::c1", name: "search", arguments: JSON.stringify({ query: "resolve_alias" }), output: "12 matches across 4 files", is_error: false },
+                { id: "task1::c2", name: "read_file", arguments: JSON.stringify({ path: "core/registry.py" }), output: "4.1 KB read", is_error: false },
+                { id: "task1::c3", name: "bash", arguments: JSON.stringify({ command: "pytest -k registry" }), output: "12 passed in 1.2s", is_error: false },
+                { id: "task1::c4", name: "notify", arguments: JSON.stringify({ channel: "#eng", message: "post summary" }), output: "posted to #eng", is_error: false },
+              ],
+            }] },
+            { role: "tool", tool_call_id: "task1", content: "resolve_alias has 4 call sites (registry.py:120, session.py:12200, model_registry.py:88, eval.py:54); all pass a validated alias before use." },
+          ]);
+        } else {
+
         // 1. Parent paints the task_agent call (a top-level tool row).
         const taskItem = {
           call_id: "task1", func_name: "task_agent",
@@ -886,6 +912,17 @@ TASKAGENT_TEMPLATE = """<!doctype html>
 
         // 3. The task agent's own synthesis, rendered below the card.
         ev({ type: "tool_result", call_id: "task1", name: "task_agent", output: "resolve_alias has 4 call sites (registry.py:120, session.py:12200, model_registry.py:88, eval.py:54); all pass a validated alias before use." });
+        }
+
+        // ?expand=1: open every card so a screenshot shows the nested steps
+        // (cards collapse by default; recall has no approval to auto-expand).
+        if (q.get("expand") === "1") {
+          document.querySelectorAll(".conv-agent").forEach(function (c) {
+            c.dataset.collapsed = "false";
+            const t = c.querySelector(".conv-agent-toggle");
+            if (t) t.setAttribute("aria-expanded", "true");
+          });
+        }
 
         // Loud failure — broken routing must not screenshot green.
         setTimeout(function () {

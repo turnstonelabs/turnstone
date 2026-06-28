@@ -12,6 +12,7 @@ import base64
 import collections
 import concurrent.futures
 import contextlib
+import contextvars
 import copy
 import dataclasses
 import difflib
@@ -138,6 +139,7 @@ from turnstone.core.tools import (
 from turnstone.core.trajectory import (
     EffectStatus,
     Role,
+    TextBlock,
     ToolCall,
     Turn,
     dicts_from_turns,
@@ -271,6 +273,34 @@ def _encode_image_data_uri(raw: bytes, mime: str) -> str:
 
 # Upper bound on total skill content injected into system messages
 _MAX_SKILL_CONTENT: int = 32768
+
+# Cap on a sub-agent tool's RAW output before it enters the trajectory (the
+# in-loop truncation in _run_agent) — bounds what the sub-agent's own model sees
+# on its next turn.  Distinct from (and larger than) the recall per-step cap.
+_AGENT_TOOL_OUTPUT_CAP: int = 16000
+
+# Per-step output/arguments cap for a recalled task-agent sub-trajectory (the
+# projected step items /history attaches for the card rebuild).  Keeps the
+# recall payload small — the card shows a summary, not the full tool output.
+_AGENT_STEP_OUTPUT_CAP: int = 2000
+
+# Cap on the NUMBER of recalled steps per task agent.  With the per-step output
+# cap above, this bounds each stash entry's size (the LRU caps the agent count,
+# not per-entry bytes), so a 100+-tool agent can't blow the memory budget; the
+# overflow is replaced by one honest "(+N not retained)" marker step.
+_AGENT_STEP_COUNT_CAP: int = 100
+
+# Per-task-agent file-read tracking.  ``_read_files`` (the blind-overwrite guard's
+# memory of "files this agent has read") is a single set on the session, but the
+# parent runs task agents in a 4-wide pool — sharing it lets a sibling's read
+# suppress another agent's overwrite guard (a real blind-overwrite hazard).
+# ``_exec_task`` installs a fresh per-run set in this ContextVar for the sub-
+# agent's duration; ``_current_read_files`` reads it.  ``None`` outside a sub-
+# agent → the main session's set.  A ContextVar (not threading.local) so the
+# set/reset is balanced per ``_exec_task`` call and survives pool-thread reuse.
+_active_read_files: contextvars.ContextVar[set[str] | None] = contextvars.ContextVar(
+    "turnstone_active_read_files", default=None
+)
 
 # Cap on the *content portion* (text after ``path:lineno:``) of an
 # emitted search result line. Defends the context budget against
@@ -7404,6 +7434,15 @@ class ChatSession:
             "stop_on_error": args.get("stop_on_error") is True,
         }
 
+    @property
+    def _current_read_files(self) -> set[str]:
+        """The read-tracking set for the current execution context: a task
+        agent's own per-run set while one is active (so the 4-wide pool can't
+        cross-contaminate the blind-overwrite guard), else the main session's
+        ``_read_files``.  See :data:`_active_read_files`."""
+        active = _active_read_files.get()
+        return active if active is not None else self._read_files
+
     def _prepare_read_file(self, call_id: str, args: dict[str, Any]) -> dict[str, Any]:
         path = args.get("path", "")
         if not path:
@@ -7457,7 +7496,7 @@ class ChatSession:
                 "error": f"Error: limit must be >= 1 (got {limit})",
             }
         # Register early so a same-batch edit_file can pass the read guard.
-        self._read_files.add(resolved)
+        self._current_read_files.add(resolved)
         # Build header showing range if specified
         header = f"\u2699 read_file: {path}"
         if offset is not None or limit is not None:
@@ -7579,7 +7618,7 @@ class ChatSession:
         if mode not in ("overwrite", "append"):
             mode = "overwrite"
         is_append = mode == "append"
-        is_overwrite = exists and resolved not in self._read_files and not is_append
+        is_overwrite = exists and resolved not in self._current_read_files and not is_append
 
         # Build preview
         preview_parts = []
@@ -7729,7 +7768,7 @@ class ChatSession:
         resolved = os.path.realpath(path)
         is_symlink = os.path.abspath(path) != resolved
 
-        if resolved not in self._read_files:
+        if resolved not in self._current_read_files:
             return {
                 "call_id": call_id,
                 "func_name": "edit_file",
@@ -11858,11 +11897,11 @@ class ChatSession:
 
         all_lines, _, err = self._read_text_lines(path)
         if err:
-            self._read_files.discard(resolved)
+            self._current_read_files.discard(resolved)
             self._report_tool_result(call_id, "read_file", err, is_error=True)
             return call_id, err
 
-        self._read_files.add(resolved)
+        self._current_read_files.add(resolved)
         total_lines = len(all_lines)
 
         # Slice if offset/limit specified
@@ -11895,11 +11934,11 @@ class ChatSession:
             try:
                 size = os.path.getsize(resolved)
             except OSError as e:
-                self._read_files.discard(resolved)
+                self._current_read_files.discard(resolved)
                 msg = f"Error: {path}: {e}"
                 self._report_tool_result(call_id, "read_file", msg, is_error=True)
                 return call_id, msg
-            self._read_files.add(resolved)
+            self._current_read_files.add(resolved)
             desc = f"image (no vision, {size:,} bytes)"
             self._report_tool_result(call_id, "read_file", desc)
             return call_id, (
@@ -11911,18 +11950,18 @@ class ChatSession:
             with open(resolved, "rb") as f:
                 raw = f.read()
         except FileNotFoundError:
-            self._read_files.discard(resolved)
+            self._current_read_files.discard(resolved)
             msg = f"Error: {path} not found"
             self._report_tool_result(call_id, "read_file", msg, is_error=True)
             return call_id, msg
         except Exception as e:
-            self._read_files.discard(resolved)
+            self._current_read_files.discard(resolved)
             msg = f"Error reading {path}: {e}"
             self._report_tool_result(call_id, "read_file", msg, is_error=True)
             return call_id, msg
 
         if len(raw) > _IMAGE_SIZE_CAP:
-            self._read_files.discard(resolved)
+            self._current_read_files.discard(resolved)
             size_mb = len(raw) / (1024 * 1024)
             cap_mb = _IMAGE_SIZE_CAP / (1024 * 1024)
             msg = (
@@ -11932,7 +11971,7 @@ class ChatSession:
             self._report_tool_result(call_id, "read_file", msg, is_error=True)
             return call_id, msg
 
-        self._read_files.add(resolved)
+        self._current_read_files.add(resolved)
         mime, _ = mimetypes.guess_type(path)
         if not mime:
             mime = "image/png"
@@ -12121,7 +12160,7 @@ class ChatSession:
         if err:
             self._report_tool_result(call_id, "diff_file", err, is_error=True)
             return call_id, err
-        self._read_files.add(resolved_a)
+        self._current_read_files.add(resolved_a)
 
         if path_b:
             label_b = path_b
@@ -12129,7 +12168,7 @@ class ChatSession:
             if err:
                 self._report_tool_result(call_id, "diff_file", err, is_error=True)
                 return call_id, err
-            self._read_files.add(resolved_b)
+            self._current_read_files.add(resolved_b)
         else:
             label_b = "(provided content)"
             lines_b = (content_b or "").splitlines(keepends=True)
@@ -12201,6 +12240,105 @@ class ChatSession:
         fn = getattr(self.ui, "end_agent_scope", None)
         if fn is not None:
             fn()
+
+    @staticmethod
+    def _clip_with_count(text: str, cap: int) -> str:
+        """Head-clip ``text`` to ``cap`` chars with a uniform truncation marker.
+        The one format for sub-agent output clips — the in-loop 16k clip and the
+        recall per-step cap — distinct from the token-budget-aware
+        :meth:`_truncate_output`."""
+        if len(text) <= cap:
+            return text
+        return text[:cap] + f"\n\n... (truncated from {len(text)} chars)"
+
+    @staticmethod
+    def _iter_agent_tool_results(
+        agent_turns: list[Turn],
+    ) -> Iterator[tuple[ToolCall, Turn | None]]:
+        """Yield ``(tool_call, result_turn_or_None)`` for every sub-tool the
+        sub-agent issued, in order, pairing each call to its result FIFO per
+        call_id — a queue per id consumed once, NOT a last-wins dict, so a local
+        provider that reuses ids across turns (``call_0`` …) can't collapse
+        distinct calls onto one result.  Shared by :meth:`_project_agent_steps`
+        (recall) and :meth:`_cancel_ledger` (cancel disposition)."""
+        pending: dict[str, collections.deque[Turn]] = {}
+        for t in agent_turns:
+            if t.role is Role.TOOL and t.tool_call_id:
+                pending.setdefault(t.tool_call_id, collections.deque()).append(t)
+        for t in agent_turns:
+            if t.role is not Role.ASSISTANT:
+                continue
+            for tc in t.tool_calls:
+                q = pending.get(tc.id)
+                yield tc, (q.popleft() if q else None)
+
+    @staticmethod
+    def _project_agent_steps(agent_turns: list[Turn]) -> list[dict[str, Any]]:
+        """Project a finished sub-agent's trajectory into recall step items for
+        the task card — one per sub-tool call, matched to its result (FIFO per
+        call_id via :meth:`_iter_agent_tool_results`).
+
+        Reads the tool turn's payload directly rather than via ``Turn.text``,
+        which raises on a multimodal ``list[dict]`` result (the deferred-finding
+        landmine); a non-``str`` payload becomes a light placeholder so the
+        recall stays text-only and ``/history`` doesn't carry image bytes.  Each
+        step's output AND arguments are capped (:data:`_AGENT_STEP_OUTPUT_CAP`)
+        and the step COUNT (:data:`_AGENT_STEP_COUNT_CAP`); on overflow the most
+        RECENT steps are kept (a sub-agent's latest edits/writes matter more on
+        recall than its opening searches) behind an honest leading marker — so
+        the stash stays memory-bounded even for a 100+-tool agent and never
+        silently under-reports its step count."""
+        pairs = list(ChatSession._iter_agent_tool_results(agent_turns))
+        dropped = max(0, len(pairs) - _AGENT_STEP_COUNT_CAP)
+        # Build dicts only for the retained tail, not the dropped head.
+        tail = pairs[-_AGENT_STEP_COUNT_CAP:] if dropped else pairs
+        steps: list[dict[str, Any]] = []
+        if dropped:
+            # Leading marker naming how many earlier steps fell out — honest, and
+            # correct now that the RETAINED steps are the recent ones.
+            steps.append(
+                {
+                    "id": "",
+                    "name": "…",
+                    "arguments": "{}",
+                    "output": f"(+{dropped} earlier steps not retained)",
+                    "is_error": False,
+                }
+            )
+        for tc, res in tail:
+            output, is_error = "", False
+            if res is not None:
+                is_error = res.is_error
+                raw = (
+                    res.content[0].text
+                    if res.content and isinstance(res.content[0], TextBlock)
+                    else ""
+                )
+                output = raw if isinstance(raw, str) else "[non-text result]"
+            steps.append(
+                {
+                    "id": tc.id,
+                    "name": tc.name,
+                    # Clip arguments too: a write_file/edit_file call carries full
+                    # file content here, which the per-step output cap alone would
+                    # leave unbounded in the in-memory stash.
+                    "arguments": ChatSession._clip_with_count(tc.arguments, _AGENT_STEP_OUTPUT_CAP),
+                    "output": ChatSession._clip_with_count(output, _AGENT_STEP_OUTPUT_CAP),
+                    "is_error": is_error,
+                }
+            )
+        return steps
+
+    def _stash_agent_trajectory(self, call_id: str | None, agent_turns: list[Turn]) -> None:
+        """Retain a finished task agent's projected sub-trajectory for ``/history``
+        card recall (getattr-guarded → no-op on CLI / eval / fixtures).  Called
+        from ``_exec_task``'s ``finally`` so it captures the full record on
+        success and the partial one on cancel/error — both honest."""
+        if not call_id:
+            return
+        fn = getattr(self.ui, "stash_agent_trajectory", None)
+        if fn is not None:
+            fn(call_id, self._project_agent_steps(agent_turns))
 
     def _run_agent(
         self,
@@ -12399,9 +12537,16 @@ class ChatSession:
                 # output_warning still nests under the task card.
                 self._note_agent_child(tc_dict["id"], parent_call_id)
 
+                # is_error for the recalled step: the guard / prepare / unknown
+                # branches produce explicit error text; the execute paths record
+                # the authoritative flag via ``_report_tool_result`` (consumed
+                # below).  Without this every recalled sub-step reads as success
+                # and a failed sub-tool recalls as a green "done" card.
+                is_tool_error = False
                 # Guard 1: block recursive agent calls.
                 if tool_name == "task_agent":
                     output = "Error: agents cannot spawn further agents"
+                    is_tool_error = True
                 # Guard 2: tool not in this agent's API tool list.
                 elif tool_name not in tool_names:
                     output = (
@@ -12409,11 +12554,13 @@ class ChatSession:
                         f"agent mode. "
                         f"Available: {', '.join(sorted(tool_names))}"
                     )
+                    is_tool_error = True
                 else:
                     prepared = self._prepare_tool(tc_dict)
 
                     if prepared.get("error"):
                         output = prepared["error"]
+                        is_tool_error = True
                     # Auto-execute tools in the auto_tools set.
                     elif tool_name in auto_tools:
                         # Paint the step pending under the task card before it
@@ -12422,6 +12569,7 @@ class ChatSession:
                         # paint via approve_tools instead.
                         self._paint_agent_step(parent_call_id, prepared)
                         _, output = prepared["execute"](prepared)
+                        is_tool_error = self._tool_error_flags.pop(tc_dict["id"], False)
                     # Tools not in auto_tools require user approval.
                     elif "execute" in prepared:
                         approved, _ = self.ui.approve_tools([prepared])
@@ -12429,11 +12577,15 @@ class ChatSession:
                             prepared["denied"] = True
                             prepared["denial_msg"] = "Denied by user"
                         if prepared.get("denied"):
+                            # A denial is not an execution error — keep is_error
+                            # False so recall shows the denial text, not red.
                             output = prepared.get("denial_msg", "Denied by user")
                         else:
                             _, output = prepared["execute"](prepared)
+                            is_tool_error = self._tool_error_flags.pop(tc_dict["id"], False)
                     else:
                         output = f"Unknown tool: {tool_name}"
+                        is_tool_error = True
 
                 # Output guard: evaluate before truncation so the guard
                 # sees full output (credentials split by truncation would
@@ -12449,8 +12601,8 @@ class ChatSession:
                 # Truncate large tool outputs to avoid blowing context limits.
                 # Agents operate autonomously; they can refine their queries
                 # if truncation loses important detail.
-                if isinstance(output, str) and len(output) > 16000:
-                    output = output[:16000] + f"\n\n... (truncated from {len(output)} chars)"
+                if isinstance(output, str) and len(output) > _AGENT_TOOL_OUTPUT_CAP:
+                    output = self._clip_with_count(output, _AGENT_TOOL_OUTPUT_CAP)
 
                 # NOTE: for a vision tool result ``output`` is a list[dict] of
                 # inline content parts (read_file on an image).  It lowers back
@@ -12462,7 +12614,7 @@ class ChatSession:
                 # ``create_completion`` (it currently isn't) plus content-
                 # addressed byte storage — deferred to the recall/persist work
                 # where that attachment path is already in scope.
-                agent_turns.append(Turn.tool(tc_dict["id"], output))
+                agent_turns.append(Turn.tool(tc_dict["id"], output, is_error=is_tool_error))
             turn += 1
 
         # Exhausted tool turns — force a final synthesis response.
@@ -12544,8 +12696,14 @@ class ChatSession:
             Turn.user(prompt),
         ]
         self._begin_agent_scope()
+        # Per-sub-agent file-read tracking.  COPY the parent's current set in (so
+        # the agent can edit a file the parent already read for it — no spurious
+        # "must read before editing"), but as an INDEPENDENT set, so a pool
+        # sibling's reads can't suppress THIS agent's blind-overwrite guard.  The
+        # agent's own reads merge back to the parent in ``finally``.
+        read_token = _active_read_files.set(set(self._current_read_files))
         try:
-            return call_id, self._run_agent(
+            result = self._run_agent(
                 agent_turns,
                 label="task",
                 tools=self._task_tools,
@@ -12553,6 +12711,14 @@ class ChatSession:
                 agent_alias=item.get("model_override"),
                 parent_call_id=call_id,
             )
+            # Self-report the task_agent's OWN result.  The parent run-loop only
+            # reports error/denied/exception results centrally; success results
+            # rely on each tool self-reporting (bash, search, … all do), and the
+            # task_agent never did — so without this the live card has no
+            # completion signal (it stays "running" and the synthesis never
+            # renders live, only on reload).
+            self._report_tool_result(call_id, "task_agent", result)
+            return call_id, result
         except GenerationCancelled:
             # Fold back an honest disposition built from the agent's own
             # ledger.  ``agent_turns`` is mutated in place by
@@ -12567,17 +12733,35 @@ class ChatSession:
             # fabricate the acknowledgment but must not fabricate the
             # outcome … unknown, never none").
             self._tool_status[call_id] = self._cancelled_agent_status(agent_turns)
-            return call_id, self._cancelled_agent_disposition(agent_turns, "task")
+            disposition = self._cancelled_agent_disposition(agent_turns, "task")
+            self._report_tool_result(call_id, "task_agent", disposition)
+            return call_id, disposition
         except KeyboardInterrupt:
             # CLI Ctrl-C: keep the terse string and let the outer loop own
             # propagation (unchanged behavior).
             return call_id, "(task interrupted by user)"
         except Exception as e:
-            self.ui.on_info(f"[task error] {e}")
-            return call_id, f"Task error: {e}"
+            # Report as the task_agent's errored result so the card flips to
+            # "failed" and the message renders (replaces the old on_info, which
+            # was suppressed during the agent scope anyway).
+            msg = f"Task error: {e}"
+            self._report_tool_result(call_id, "task_agent", msg, is_error=True)
+            return call_id, msg
         finally:
+            # Teardown first (cheap + critical): merge the agent's reads back to
+            # the parent, restore the contextvar, drop the scope + child tags —
+            # all BEFORE the best-effort stash, so a stash raise can't leak the
+            # scope depth (phantom card nesting) or the child registry.
+            sub_reads = _active_read_files.get()
+            _active_read_files.reset(read_token)
+            if sub_reads:
+                self._current_read_files.update(sub_reads)
             self._end_agent_scope()
             self._clear_agent_children(call_id)
+            try:
+                self._stash_agent_trajectory(call_id, agent_turns)
+            except Exception:
+                log.debug("task_agent.stash_failed call_id=%s", call_id, exc_info=True)
 
     @staticmethod
     def _cancel_ledger(
@@ -12594,18 +12778,15 @@ class ChatSession:
         it returned, everything after never started. (The LAST gap would invert
         unknown/none on a multi-call turn.) Shared by the disposition string and
         its typed status so the two can't disagree.
+
+        Pairs via :meth:`_iter_agent_tool_results` (FIFO per call_id), so on a
+        provider that reuses ids a half-answered colliding pair is correctly read
+        as one answered + one in-flight gap, not (set-membership) both answered.
         """
-        answered: set[str] = set()
-        for t in agent_turns:
-            if t.role is Role.TOOL and t.tool_call_id:
-                answered.add(t.tool_call_id)
-        issued: list[tuple[str, bool]] = []
-        for t in agent_turns:
-            if t.role is not Role.ASSISTANT:
-                continue
-            for tc in t.tool_calls:
-                name = (tc.name or "tool").strip()
-                issued.append((name, tc.id in answered))
+        issued = [
+            ((tc.name or "tool").strip(), res is not None)
+            for tc, res in ChatSession._iter_agent_tool_results(agent_turns)
+        ]
         first_gap = next((i for i, (_n, ans) in enumerate(issued) if not ans), None)
         return issued, first_gap
 
@@ -13410,7 +13591,7 @@ class ChatSession:
             os.makedirs(os.path.dirname(resolved) or ".", exist_ok=True)
             with open(resolved, "a" if is_append else "w") as f:
                 f.write(content)
-            self._read_files.add(resolved)
+            self._current_read_files.add(resolved)
             verb = "Appended" if is_append else "Wrote"
             msg = f"{verb} {len(content)} chars to {path}"
             self._report_tool_result(call_id, "write_file", msg)

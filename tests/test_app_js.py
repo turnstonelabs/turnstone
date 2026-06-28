@@ -530,15 +530,17 @@ def test_phase8_appendtooloutput_dispatches_mcp_error_before_renderer() -> None:
     end = _pane_method_offset(body, "sendMessage")
     fn = body[start:end]
     parse_idx = fn.find("tryParseMcpError(")
-    render_idx = fn.find("renderToolOutput(")
+    # The plain-output render is the shared renderCollapsibleOutput helper; the
+    # ordering invariant is unchanged — MCP dispatch must precede it.
+    render_idx = fn.find("renderCollapsibleOutput(")
     assert parse_idx >= 0, (
         "appendToolOutput must call tryParseMcpError on the error path "
-        "before renderToolOutput, otherwise the consent card never "
+        "before the plain renderer, otherwise the consent card never "
         "replaces the plain JSON output."
     )
-    assert render_idx >= 0, "renderToolOutput call must remain present"
+    assert render_idx >= 0, "renderCollapsibleOutput call must remain present"
     assert parse_idx < render_idx, (
-        "tryParseMcpError must run BEFORE renderToolOutput so the "
+        "tryParseMcpError must run BEFORE the plain renderer so the "
         "interactive card path takes precedence over plain rendering."
     )
 
