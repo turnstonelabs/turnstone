@@ -766,6 +766,12 @@ def reconstruct_messages(
     the user sees the actual partial state — refreshing during tool execution
     otherwise silently drops the trailing turn from the UI.
     """
+    # Drop compaction checkpoint markers: they are resume-only artifacts (the
+    # persisted summary that lets a reopened session rehydrate a bounded context,
+    # see reconstruct_turns_checkpointed), not real conversation turns, so
+    # /history, export, and search show the true transcript without an injected
+    # summary.
+    rows = [r for r in rows if not _is_compaction_marker(r)]
     turns = reconstruct_turns(rows, ws_id, attachments_by_msg)
     if repair:
         turns = recover_trajectory(turns)
@@ -981,3 +987,92 @@ def recover_trajectory(turns: list[Turn]) -> list[Turn]:
             break
         del turns[asst_idx:]
     return turns
+
+
+# -- Compaction checkpoints ---------------------------------------------------
+#
+# When a live session compacts, it swaps its in-memory history for a summary but
+# leaves the full transcript in storage. A persisted *checkpoint marker* lets a
+# reopened session rehydrate that same bounded view instead of the full history
+# (which can exceed the model window — e.g. a long session, or one switched to a
+# smaller-context model — and deadlock the first send). The marker is one
+# ``assistant`` row tagged ``_source="compaction"`` whose content is the summary
+# and whose ``meta`` carries ``{"watermark": <id>}``: every conversation row with
+# id <= the watermark was folded into the summary; rows after it are still live.
+
+COMPACTION_SOURCE = "compaction"
+COMPACTION_SUMMARY_LABEL = "[Conversation summary]"
+
+
+def _is_compaction_marker(row: Any) -> bool:
+    """True when a stored row is a compaction checkpoint marker (``_source`` = row index 7)."""
+    return len(row) > 7 and row[7] == COMPACTION_SOURCE
+
+
+def _compaction_watermark(row: Any) -> int | None:
+    """Read a marker row's checkpoint watermark from its ``meta`` column (row index 10).
+
+    Returns the boundary conversation id, or ``None`` for a marker that predates
+    the watermark field or whose meta is malformed (caller falls back to the full
+    transcript — never load *less* than is safe)."""
+    meta = _source_meta_from_json(row[10] if len(row) > 10 else None)
+    wm = meta.get("watermark") if meta else None
+    return wm if isinstance(wm, int) and not isinstance(wm, bool) else None
+
+
+def reconstruct_turns_checkpointed(
+    rows: list[Any],
+    ws_id: str,
+    attachments_by_msg: dict[int, list[dict[str, Any]]] | None = None,
+    *,
+    checkpoint: bool = True,
+) -> list[Turn]:
+    """Resume-path reconstruction that honors a persisted compaction checkpoint.
+
+    The full-history twin :func:`reconstruct_turns` rehydrates every row — correct
+    for a session that never compacted, but on a compacted one it reloads the
+    whole pre-compaction transcript the live session had already summarized away,
+    which can overflow the context window on reopen and deadlock the first send.
+
+    If a compaction marker is present, load only ``[summary] + [rows after its
+    watermark]`` — the in-memory view the session held when it compacted. The
+    summarized prefix and any older markers (id <= watermark) are dropped; the
+    full history stays in storage for ``/history``/export/audit. The marker
+    reconstructs as a plain ``assistant`` turn (``reconstruct_turns`` drops
+    ``_source`` for assistant rows), and a synthetic ``[Conversation summary]``
+    user label is prepended to match what ``session._compact_messages`` builds
+    in memory (and to satisfy the leading-user-turn wire contract).
+
+    Falls back to the full reconstruction when there is no marker or its watermark
+    is absent/corrupt, so every pre-checkpoint session loads exactly as before.
+
+    ``checkpoint=False`` (export/audit): return the FULL transcript as Turns —
+    every real row, no watermark slice — but still drop marker rows, since
+    :func:`reconstruct_turns` does not filter them and a leaked marker would land
+    as a stray ``assistant`` summary turn mid-history. This is the Turn-path twin
+    of the marker filter :func:`reconstruct_messages` already applies on the dict
+    (display) path; resume passes the default ``True``.
+    """
+    marker = max((r for r in rows if _is_compaction_marker(r)), key=lambda r: r[0], default=None)
+    watermark = _compaction_watermark(marker) if marker is not None else None
+    if not checkpoint or marker is None or watermark is None:
+        # Full transcript, marker rows dropped — three cases collapse here:
+        # ``checkpoint=False`` (export/audit), no marker, and a malformed/legacy
+        # watermark.  ``reconstruct_turns`` does not filter markers, so a corrupt
+        # marker would otherwise leak its summary as a stray ``assistant`` turn
+        # mid-history (and a malformed marker must NOT slice — losing real
+        # messages is worse than reloading the whole transcript).
+        return reconstruct_turns(
+            [r for r in rows if not _is_compaction_marker(r)], ws_id, attachments_by_msg
+        )
+    # Keep the marker (the summary) plus every non-marker row written after the
+    # watermark — the preserved tail and everything since. Reconstruct the two
+    # slices separately so the summary leads regardless of row-id ordering (a
+    # preserved tail kept verbatim sits at a *lower* id than the marker).
+    tail = [r for r in rows if r[0] > watermark and not _is_compaction_marker(r)]
+    label = Turn(Role.USER, _content_blocks(COMPACTION_SUMMARY_LABEL, []))
+    return [
+        label,
+        *reconstruct_turns([marker], ws_id, attachments_by_msg),
+        *reconstruct_turns(tail, ws_id, attachments_by_msg),
+    ]

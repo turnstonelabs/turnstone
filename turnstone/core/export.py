@@ -99,7 +99,12 @@ def _build_openai_json(storage: StorageBackend, ws_id: str) -> bytes:
             if (part := attachment_to_content_part(att)) is not None
         }
 
-    repaired = repair_wire_messages(dicts_from_turns(storage.load_message_turns(ws_id)))
+    # Export the FULL transcript, not the resume-only checkpoint view: a compacted
+    # workstream must export its complete pre-compaction history (markers dropped),
+    # never the bounded [summary]+[tail] slice load_message_turns returns by default.
+    repaired = repair_wire_messages(
+        dicts_from_turns(storage.load_message_turns(ws_id, checkpointed=False))
+    )
     dicts = materialize_attachments(repaired, _resolve)
     messages = sanitize_messages(_attach_reasoning_content(dicts))
     return json.dumps({"messages": messages}, ensure_ascii=False, indent=2).encode("utf-8")

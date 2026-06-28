@@ -107,17 +107,33 @@ def load_messages(ws_id: str, *, repair: bool = True) -> list[dict[str, Any]]:
         return []
 
 
-def load_message_turns(ws_id: str) -> list[Turn]:
+def load_message_turns(ws_id: str, *, checkpointed: bool = True) -> list[Turn]:
     """Load a workstream's history as canonical ``Turn``s (by-reference content).
 
     The resume path — see :meth:`StorageBackend.load_message_turns`.  Returns an
     empty list on any storage error (a failed resume must not crash the session).
+
+    ``checkpointed=True`` (resume default) returns the bounded ``[summary]+[tail]``
+    view when a compaction marker exists; ``checkpointed=False`` returns the full
+    transcript (markers dropped) for export/audit.
     """
     try:
-        return get_storage().load_message_turns(ws_id)
+        return get_storage().load_message_turns(ws_id, checkpointed=checkpointed)
     except Exception:
         log.warning("Failed to load message turns for ws=%s", ws_id, exc_info=True)
         return []
+
+
+def get_compaction_watermark(ws_id: str, preserve_tail: int = 0) -> int | None:
+    """Boundary id for a compaction checkpoint marker — see
+    :meth:`StorageBackend.get_compaction_watermark`.  Returns ``None`` on any
+    storage error (a failed watermark just skips the checkpoint write — the next
+    reopen reloads more history, the pre-checkpoint behavior, rather than crash)."""
+    try:
+        return get_storage().get_compaction_watermark(ws_id, preserve_tail)
+    except Exception:
+        log.warning("Failed to get compaction watermark for ws=%s", ws_id, exc_info=True)
+        return None
 
 
 # -- Workstream attachments ---------------------------------------------------
@@ -194,6 +210,34 @@ def attachment_referenced_in_ws(attachment_id: str, ws_id: str) -> bool:
     except Exception:
         log.warning("Failed to check attachment reference id=%s", attachment_id, exc_info=True)
         return False
+
+
+def count_messages(ws_id: str) -> int:
+    """Total conversation rows for ``ws_id`` (markers included).
+
+    Returns ``0`` on error — callers that truncate on this count (rewind/retry)
+    must treat ``0`` as "unknown, do not delete" rather than "empty", so a
+    transient count failure never turns into a wrong deletion.
+    """
+    try:
+        return get_storage().count_messages(ws_id)
+    except Exception:
+        log.warning("Failed to count messages for ws=%s", ws_id, exc_info=True)
+        return 0
+
+
+def get_compaction_floor(ws_id: str) -> int:
+    """Rows backing the latest compaction summary that rewind/retry must keep —
+    see :meth:`StorageBackend.get_compaction_floor`.  Returns ``-1`` on error: a
+    sentinel distinct from a legitimate ``0`` (never compacted), because a ``0``
+    floor on a *compacted* ws would let an over-deep trim delete the summary's
+    backing.  Callers that floor a deletion on this (rewind/retry) MUST skip the
+    delete when it is negative."""
+    try:
+        return get_storage().get_compaction_floor(ws_id)
+    except Exception:
+        log.warning("Failed to get compaction floor for ws=%s", ws_id, exc_info=True)
+        return -1
 
 
 def delete_messages_after(ws_id: str, keep_count: int) -> int:

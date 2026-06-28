@@ -61,11 +61,14 @@ from turnstone.core.lowering import (
     repair_wire_messages,
 )
 from turnstone.core.memory import (
+    count_messages,
     count_structured_memories,
     delete_messages_after,
     delete_structured_memory_by_id,
     delete_workstream,
     get_attachments,
+    get_compaction_floor,
+    get_compaction_watermark,
     get_skill_by_name,
     get_structured_memory_by_name,
     get_workstream_display_name,
@@ -116,6 +119,8 @@ from turnstone.core.skill_field_validation import SKILL_RUNTIME_CONFIG_FIELDS
 from turnstone.core.skill_parser import MAX_SKILL_DESCRIPTION_LEN
 from turnstone.core.storage._registry import get_storage
 from turnstone.core.storage._utils import (
+    COMPACTION_SOURCE,
+    COMPACTION_SUMMARY_LABEL,
     attachment_to_content_part,
     normalize_search_terms,
     strip_orphan_client_tool_blocks,
@@ -5011,6 +5016,40 @@ class ChatSession:
         """Return indices of user messages in self.messages (turn start positions)."""
         return [i for i, m in enumerate(self.messages) if m.role is Role.USER]
 
+    def _persist_truncation(self, removed_count: int) -> None:
+        """Mirror a rewind/retry tail-trim into storage, compaction-safe.
+
+        rewind/retry remove turns from the in-memory TAIL, which map 1:1 to the
+        most recent storage rows.  Deleting by *removed-row count* from the
+        storage end — rather than keeping the first ``len(self.messages)`` rows —
+        stays correct after a compaction, where ``self.messages`` holds synthetic
+        summary turns with no 1:1 storage rows while storage still holds the full
+        pre-compaction transcript plus the checkpoint marker.  The keep-count is
+        floored at the compaction boundary (:func:`get_compaction_floor`) so the
+        summary's backing rows and the marker are never deleted.  Identical to the
+        old ``keep = len(self.messages)`` when the ws never compacted (floor 0,
+        total == in-memory length).
+
+        Residual: an over-deep rewind that would cross the summary boundary clamps
+        at the floor in storage, so the in-memory trim can drop more than storage
+        does; a later resume rehydrates ``[summary] + [surviving tail]`` and the
+        two reconcile.
+        """
+        if removed_count <= 0:
+            return
+        total = count_messages(self._ws_id)
+        if total <= 0:
+            # Count unavailable (storage error) — skip the delete rather than risk
+            # a wrong truncation; the in-memory trim holds and resume reconciles.
+            return
+        floor = get_compaction_floor(self._ws_id)
+        if floor < 0:
+            # Floor unavailable (storage error). A 0 here is indistinguishable from
+            # "never compacted", so an over-deep trim could delete the marker and
+            # summarized prefix — skip rather than risk it; resume reconciles.
+            return
+        delete_messages_after(self._ws_id, max(floor, total - removed_count))
+
     def rewind(self, n: int) -> int:
         """Drop the last *n* complete turns from the conversation.
 
@@ -5028,7 +5067,7 @@ class ChatSession:
         removed_count = len(self.messages) - cut_index
         del self.messages[cut_index:]
         del self._msg_tokens[cut_index:]
-        delete_messages_after(self._ws_id, len(self.messages))
+        self._persist_truncation(removed_count)
         return removed_count
 
     def retry(self) -> str | None:
@@ -5048,9 +5087,10 @@ class ChatSession:
             return None
         # Drop everything from (and including) the user message onward;
         # send() will re-append the user message.
+        removed_count = len(self.messages) - last_user_idx
         del self.messages[last_user_idx:]
         del self._msg_tokens[last_user_idx:]
-        delete_messages_after(self._ws_id, len(self.messages))
+        self._persist_truncation(removed_count)
         return content
 
     @staticmethod
@@ -6028,7 +6068,7 @@ class ChatSession:
 
         # Replace messages — summary, then any preserved tail verbatim.
         before_tokens = self._system_tokens + sum(self._msg_tokens) + self._tool_def_tokens()
-        summary_user = {"role": "user", "content": "[Conversation summary]"}
+        summary_user = {"role": "user", "content": COMPACTION_SUMMARY_LABEL}
         summary_asst = {"role": "assistant", "content": summary}
         self.messages = turns_from_dicts([summary_user, summary_asst]) + list(preserved)
         # File contents are gone after compaction — force re-read before edit_file
@@ -6060,6 +6100,28 @@ class ChatSession:
             lines.append(f"  {line}")
         lines.append(separator)
         self.ui.on_info("\n".join(lines))
+
+        # Persist a compaction checkpoint so a reopen rehydrates [summary]+[tail]
+        # instead of the full transcript — which, on a long session or one switched
+        # to a smaller-context model, can exceed the window and deadlock the first
+        # send. Storage keeps the full history for /history/export/audit; this
+        # marker only governs the resume slice (load_message_turns). The watermark
+        # is read BEFORE the marker row is written, so it bounds the summarized
+        # rows and the marker takes the next (higher) id. Best-effort: both calls
+        # swallow storage errors, so a failed marker just means the next reopen
+        # reloads more history (today's behavior) rather than crashing compaction.
+        if self._ws_id:
+            watermark = get_compaction_watermark(self._ws_id, preserve_tail)
+            if watermark is not None:
+                save_message(
+                    self._ws_id,
+                    "assistant",
+                    summary,
+                    source=COMPACTION_SOURCE,
+                    meta=json.dumps({"watermark": watermark}),
+                    event_id=self._ui_event_id(),
+                    producer=self._provider.provider_name if self._provider else None,
+                )
         return True
 
     # -- Intent validation --------------------------------------------------------

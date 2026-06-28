@@ -225,14 +225,19 @@ class StorageBackend(Protocol):
         """
         ...
 
-    def load_message_turns(self, ws_id: str) -> list[Turn]:
-        """Load a workstream's full history as canonical ``Turn``s for resume.
+    def load_message_turns(self, ws_id: str, *, checkpointed: bool = True) -> list[Turn]:
+        """Load a workstream's history as canonical ``Turn``s for resume.
 
         Unlike :meth:`load_messages` this keeps attachments *by reference*
         (:class:`AttachmentRef`) — ``session.messages`` is the canonical Turn
         trajectory and materializes bytes only at each output (wire / display).
         The trailing-incomplete-tool-call strip (``recover_trajectory``) is
         applied; mid-conversation orphans are left for the send-time repair.
+
+        ``checkpointed=True`` (resume default) honors a persisted compaction
+        marker and returns the bounded ``[summary] + [tail]`` view;
+        ``checkpointed=False`` returns the full transcript (markers dropped) for
+        export/audit consumers that must not lose pre-compaction history.
         """
         ...
 
@@ -246,6 +251,30 @@ class StorageBackend(Protocol):
         the per-ws event-id space stays monotonic across process
         restarts / rehydrates (it resets to 0 otherwise, which would
         re-issue ids the ring buffer already handed out).
+        """
+        ...
+
+    def get_compaction_watermark(self, ws_id: str, preserve_tail: int = 0) -> int | None:
+        """Boundary id for a compaction checkpoint marker.
+
+        The max conversation ``id`` among the rows a compaction would
+        summarize: ``max(id)`` when ``preserve_tail=0`` (the auto/overflow
+        path), or the ``(N+1)``-th newest id when ``preserve_tail=N`` keeps
+        the newest ``N`` rows verbatim.  Persisted in the marker's ``meta`` so
+        resume can rehydrate ``[summary] + [rows after the watermark]``.
+        ``None`` when the workstream has no rows.
+        """
+        ...
+
+    def count_messages(self, ws_id: str) -> int:
+        """Total conversation rows for ``ws_id`` (compaction markers included)."""
+        ...
+
+    def get_compaction_floor(self, ws_id: str) -> int:
+        """Rows backing the latest compaction summary that rewind/retry must not
+        delete: every row with ``id <= the latest marker's id`` (summarized
+        prefix + marker).  ``0`` when the workstream never compacted.  Used to
+        floor the rewind/retry truncation so the summary's backing survives.
         """
         ...
 

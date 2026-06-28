@@ -75,6 +75,9 @@ from turnstone.core.storage._schema import (
     prompt_policies as prompt_policies_t,
 )
 from turnstone.core.storage._utils import (
+    COMPACTION_SOURCE as _COMPACTION_SOURCE,
+)
+from turnstone.core.storage._utils import (
     HEURISTIC_RULE_MUTABLE as _HEURISTIC_RULE_MUTABLE,
 )
 from turnstone.core.storage._utils import (
@@ -136,7 +139,7 @@ from turnstone.core.storage._utils import (
     reconstruct_messages as _reconstruct_messages,
 )
 from turnstone.core.storage._utils import (
-    reconstruct_turns as _reconstruct_turns,
+    reconstruct_turns_checkpointed as _reconstruct_turns_checkpointed,
 )
 from turnstone.core.storage._utils import (
     recover_trajectory as _recover_trajectory,
@@ -435,11 +438,19 @@ class PostgreSQLBackend:
         msg_rows, attachments = self._conversation_rows(ws_id, limit)
         return _reconstruct_messages(msg_rows, ws_id, attachments, repair=repair)
 
-    def load_message_turns(self, ws_id: str) -> list[Turn]:
+    def load_message_turns(self, ws_id: str, *, checkpointed: bool = True) -> list[Turn]:
         """Load the conversation as canonical ``Turn``s (unresolved AttachmentRef)
-        for resume; bytes materialize at each output, never here."""
+        for resume; bytes materialize at each output, never here.
+
+        Checkpoint-aware (``checkpointed=True``, resume default): a persisted
+        compaction marker rehydrates only ``[summary] + [rows after its
+        watermark]`` instead of the full pre-compaction transcript (which can
+        overflow the window on reopen).  ``checkpointed=False`` returns the full
+        transcript (markers dropped) for export/audit consumers."""
         msg_rows, attachments = self._conversation_rows(ws_id, None)
-        return _recover_trajectory(_reconstruct_turns(msg_rows, ws_id, attachments))
+        return _recover_trajectory(
+            _reconstruct_turns_checkpointed(msg_rows, ws_id, attachments, checkpoint=checkpointed)
+        )
 
     def _resolve_row_attachments(self, rows: Sequence[Any]) -> dict[int, list[dict[str, Any]]]:
         """Build the ``reconstruct_messages`` attachment map from row ref-lists.
@@ -470,6 +481,61 @@ class PostgreSQLBackend:
                 )
             ).fetchone()
         return int(row[0]) if row is not None and row[0] is not None else None
+
+    def get_compaction_watermark(self, ws_id: str, preserve_tail: int = 0) -> int | None:
+        """Boundary id for a compaction checkpoint: the max conversation ``id``
+        among the rows a compaction would summarize (see the sqlite twin).
+
+        ``preserve_tail=0`` → ``max(id)``; ``preserve_tail=N`` → the ``(N+1)``-th
+        newest id (the newest ``N`` rows are kept verbatim).  ``None`` when empty.
+        """
+        with self._conn() as conn:
+            row = conn.execute(
+                sa.select(conversations.c.id)
+                .where(conversations.c.ws_id == ws_id)
+                .order_by(conversations.c.id.desc())
+                .limit(1)
+                .offset(max(0, preserve_tail))
+            ).fetchone()
+        return int(row[0]) if row is not None else None
+
+    def count_messages(self, ws_id: str) -> int:
+        """Total conversation rows for ``ws_id`` (compaction markers included)."""
+        with self._conn() as conn:
+            n = conn.execute(
+                sa.select(sa.func.count())
+                .select_from(conversations)
+                .where(conversations.c.ws_id == ws_id)
+            ).scalar()
+        return int(n or 0)
+
+    def get_compaction_floor(self, ws_id: str) -> int:
+        """Rows backing the latest compaction summary that must survive rewind/
+        retry: every row with ``id <= the latest marker's id`` (see the sqlite
+        twin).  ``0`` when the ws never compacted.
+        """
+        with self._conn() as conn:
+            marker_id = conn.execute(
+                sa.select(sa.func.max(conversations.c.id)).where(
+                    sa.and_(
+                        conversations.c.ws_id == ws_id,
+                        conversations.c._source == _COMPACTION_SOURCE,
+                    )
+                )
+            ).scalar()
+            if marker_id is None:
+                return 0
+            n = conn.execute(
+                sa.select(sa.func.count())
+                .select_from(conversations)
+                .where(
+                    sa.and_(
+                        conversations.c.ws_id == ws_id,
+                        conversations.c.id <= marker_id,
+                    )
+                )
+            ).scalar()
+        return int(n or 0)
 
     def delete_messages_after(self, ws_id: str, keep_count: int) -> int:
         with self._conn() as conn:
@@ -1140,6 +1206,10 @@ class PostgreSQLBackend:
                             "FROM conversations c "
                             "WHERE to_tsvector('english', COALESCE(c.content, '')) "
                             "   @@ plainto_tsquery('english', :query) "
+                            # Exclude compaction-checkpoint markers (resume-only
+                            # summary artifacts); IS DISTINCT FROM is NULL-safe so
+                            # normal rows (_source NULL) are not dropped.
+                            "AND c._source IS DISTINCT FROM 'compaction' "
                             "ORDER BY ts_rank(to_tsvector('english', COALESCE(c.content, '')), "
                             "   plainto_tsquery('english', :query)) DESC "
                             "LIMIT :limit OFFSET :offset"
@@ -1154,6 +1224,7 @@ class PostgreSQLBackend:
                         sa.text(
                             "SELECT timestamp, ws_id, role, content, tool_name "
                             "FROM conversations WHERE content ILIKE :pattern "
+                            "AND _source IS DISTINCT FROM 'compaction' "
                             "ORDER BY timestamp DESC LIMIT :limit OFFSET :offset"
                         ),
                         {"pattern": f"%{query}%", "limit": capped, "offset": capped_offset},
@@ -1167,7 +1238,9 @@ class PostgreSQLBackend:
                 conn.execute(
                     sa.text(
                         "SELECT timestamp, ws_id, role, content, tool_name "
-                        "FROM conversations ORDER BY timestamp DESC LIMIT :limit"
+                        "FROM conversations "
+                        "WHERE _source IS DISTINCT FROM 'compaction' "
+                        "ORDER BY timestamp DESC LIMIT :limit"
                     ),
                     {"limit": capped},
                 ).fetchall()
