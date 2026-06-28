@@ -31,6 +31,7 @@ import {
   buildConvWarning,
   buildConvActions,
   buildConvStatus,
+  buildAgentCardBody,
   batchKicker,
   indexLabel,
 } from "./conversation.js";
@@ -1121,7 +1122,10 @@ class Pane {
         // so the operator can Stop in an emergency.  The authoritative
         // tool_info / approve_request that follows upgrades THIS block in
         // place (matched by call_id) rather than appending a duplicate.
-        this.announceToolBlock(evt.items);
+        // A sub-agent's steps (parent_call_id set) nest in the task card.
+        if (!this._routeAgentItems(evt.items, "pending")) {
+          this.announceToolBlock(evt.items);
+        }
         break;
 
       case "tool_info":
@@ -1129,7 +1133,9 @@ class Pane {
         break;
 
       case "approve_request":
-        this.showInlineToolBlock(evt.items, false, evt.judge_pending);
+        if (!this._routeAgentItems(evt.items, "approve", evt.judge_pending)) {
+          this.showInlineToolBlock(evt.items, false, evt.judge_pending);
+        }
         break;
 
       case "intent_verdict":
@@ -2464,11 +2470,101 @@ class Pane {
     this.scrollToBottom(stick);
   }
 
+  // --- Task-agent card: nest a sub-agent's sub-tool steps under its row -----
+  // Child events (tool_pending / approve_request) carry parent_call_id; route
+  // them into the task_agent row's collapsible body.  tool_result /
+  // tool_output_chunk / intent_verdict / output_warning need no special-casing
+  // — their handlers find the row by call_id anywhere under messagesEl,
+  // including inside the card body.  Returns true when handled (the caller then
+  // skips the top-level rendering path).
+  _routeAgentItems(items, mode, judgePending) {
+    if (!items || !items.length) return false;
+    const parentId = items[0] && items[0].parent_call_id;
+    if (!parentId) return false;
+    const card = this._ensureAgentCard(parentId);
+    if (!card) return false; // parent row not painted yet — fall back top-level
+    if (mode === "approve") {
+      // Cards default to collapsed, but a pending approval is BLOCKING — it
+      // can't hide behind the toggle or the turn stalls on a prompt the user
+      // never sees.  Force the card open (sync aria with the data attribute).
+      card.wrap.dataset.collapsed = "false";
+      const toggle = card.wrap.querySelector(".conv-agent-toggle");
+      if (toggle) toggle.setAttribute("aria-expanded", "true");
+    }
+    const stick = this.isNearBottom();
+    items.forEach((item) => {
+      if (!item || !item.parent_call_id) return;
+      const escId = item.call_id ? CSS.escape(item.call_id) : "";
+      let row = escId
+        ? card.body.querySelector('.conv-row[data-call-id="' + escId + '"]')
+        : null;
+      if (!row) {
+        row = buildToolDiv(item, "");
+        card.body.appendChild(row);
+      }
+      if (mode === "approve") {
+        const verdict =
+          item.judge_verdict || item.heuristic_verdict || item.verdict;
+        if (verdict) {
+          row.appendChild(buildConvVerdict(verdict, { judgePending }));
+        }
+        const actions = buildConvActions({
+          kbd: { approve: "y", deny: "n" },
+          glowRec: verdict && verdict.recommendation,
+          withFeedback: true,
+          onApprove: () =>
+            this.resolveApproval(true, false, this.getFeedback()),
+          onDeny: () => this.resolveApproval(false, false, this.getFeedback()),
+        });
+        row.appendChild(actions);
+        // Reuse the session-level approval resolution: the backend's
+        // approve_tools blocks on ONE pending decision, so pointing
+        // approvalBlockEl at this nested row is enough for resolveApproval to
+        // POST /approve and unblock it.
+        this.pendingApproval = true;
+        this.approvalBlockEl = row;
+        this.inputEl.disabled = true;
+        this.sendBtn.disabled = true;
+      }
+    });
+    this._updateAgentLabel(card);
+    this.scrollToBottom(stick);
+    return true;
+  }
+
+  _ensureAgentCard(parentCallId) {
+    const escId = parentCallId ? CSS.escape(parentCallId) : "";
+    const parentRow = escId
+      ? this.messagesEl.querySelector('.conv-row[data-call-id="' + escId + '"]')
+      : null;
+    if (!parentRow) return null;
+    if (!this._agentCards) this._agentCards = new Map();
+    let card = this._agentCards.get(parentCallId);
+    if (card && parentRow.contains(card.wrap)) return card;
+    card = buildAgentCardBody();
+    card.wrap.dataset.state = "running";
+    parentRow.appendChild(card.wrap);
+    this._agentCards.set(parentCallId, card);
+    return card;
+  }
+
+  _updateAgentLabel(card) {
+    const n = card.body.querySelectorAll(".conv-row").length;
+    card.label.textContent = n === 1 ? "1 step" : n + " steps";
+  }
+
   appendToolOutput(callId, name, output, isError) {
     // Capture pin before the streamEl removal + result insertion change
     // scrollHeight — see announceToolBlock.  The result block is the other
     // tall one-shot append in the tool flow (up to 10 lines before collapse).
     const stick = this.isNearBottom();
+    // A task_agent's OWN result completing flips its card running -> done/error
+    // (child sub-tool results carry namespaced ids, never keys of _agentCards).
+    if (this._agentCards && this._agentCards.has(callId)) {
+      this._agentCards.get(callId).wrap.dataset.state = isError
+        ? "error"
+        : "done";
+    }
     const escapedId = callId ? CSS.escape(callId) : "";
     let target = escapedId
       ? this.messagesEl.querySelector(

@@ -706,3 +706,126 @@
     font-size: 13px;
   }
 }
+
+/* Task-agent card — a task_agent .conv-row hosts a collapsible body of its
+   sub-tool steps so they nest under the call instead of scattering top-level.
+   Accent rail + inset background read as "inside" the task agent. */
+.conv-agent {
+  margin: 8px 0 2px;
+  border-left: 2px solid color-mix(in srgb, var(--accent) 45%, var(--hair-2));
+  border-radius: var(--r-sm);
+  background: var(--panel-2);
+}
+.conv-agent-toggle {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  width: 100%;
+  min-height: 28px; /* the card's primary control — a real hit target */
+  padding: 4px 10px;
+  background: none;
+  border: 0;
+  font-family: var(--font-mono);
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--ink-3);
+  cursor: pointer;
+  text-align: left;
+}
+.conv-agent-toggle:hover {
+  color: var(--ink-2);
+  background: color-mix(in srgb, var(--ink) 5%, transparent);
+}
+.conv-agent-toggle:focus-visible {
+  /* Match the house focus ring (.conv-btn / .conv-verdict-expand); inset
+     because the toggle is full-width, flush to the card edge. */
+  outline: 2px solid var(--accent);
+  outline-offset: -2px;
+  border-radius: var(--r-sm);
+}
+.conv-agent-caret {
+  display: inline-block;
+  font-size: 11px;
+  color: var(--ink-3);
+  transition: transform 0.12s ease;
+}
+.conv-agent[data-collapsed="true"] .conv-agent-caret {
+  transform: rotate(-90deg); /* ▾ -> ▸, from the one collapse attribute */
+}
+.conv-agent[data-collapsed="true"] .conv-agent-body {
+  display: none;
+}
+@media (prefers-reduced-motion: reduce) {
+  .conv-agent-caret {
+    transition: none;
+  }
+}
+.conv-agent-label {
+  letter-spacing: 0;
+  text-transform: none;
+}
+/* Card-level liveness as a NON-colour cue (WCAG 1.4.1): a text suffix, not just
+   a stripe — in a parallel batch the parent rail belongs to the whole group,
+   not to this one task agent. */
+.conv-agent[data-state="running"] .conv-agent-label::after {
+  content: " · running";
+  color: var(--ink-3);
+}
+.conv-agent[data-state="done"] .conv-agent-label::after {
+  content: " · done";
+  color: color-mix(in srgb, var(--ok) 70%, var(--ink-2));
+}
+.conv-agent[data-state="error"] .conv-agent-label::after {
+  content: " · failed";
+  color: var(--err);
+}
+.conv-agent-body {
+  border-top: 1px solid var(--hair);
+}
+.conv-agent-body:empty {
+  border-top: 0; /* no orphan hairline before the first step paints */
+}
+/* Nested step rows read a touch lighter than top-level tool rows. */
+.conv-agent-body .conv-row {
+  padding: 6px 10px;
+  font-size: 11px;
+}
+.conv-agent-body .conv-row + .conv-row {
+  border-top: 1px solid var(--hair);
+}
+/* The card lives inside a .conv-row; in a PARALLEL batch the rail tick + dot
+   (.conv-batch--parallel .conv-row::before/::after) are descendant rules that
+   would re-draw on every nested step, striking through the names.  Suppress
+   them — the card's own accent rail already signals grouping. */
+.conv-agent-body .conv-row::before,
+.conv-agent-body .conv-row::after {
+  content: none;
+}
+.conv-batch--parallel .conv-agent-body .conv-row {
+  padding-left: 10px;
+}
+/* A nested sub-tool's approval gate binds to ITS step, not the whole card:
+   drop the right-floating spacer so Deny/Approve sit under the step's command. */
+.conv-agent-body .conv-actions {
+  align-items: stretch;
+}
+.conv-agent-body .conv-actions .conv-actions-spacer {
+  display: none;
+}
+/* The streaming-output box is a sibling between nested rows; match the card's
+   type scale + rail, and restore the row separators it sits between. */
+.conv-agent-body .tool-output-stream {
+  font-size: 11px;
+  border-left-color: color-mix(in srgb, var(--accent) 45%, var(--hair-2));
+}
+.conv-agent-body .conv-row + .tool-output-stream,
+.conv-agent-body .tool-output-stream + .conv-row {
+  border-top: 1px solid var(--hair);
+}
+@media (max-width: 700px) {
+  .conv-agent-toggle {
+    min-height: 44px; /* WCAG 2.5.5 touch target */
+  }
+}

@@ -1653,7 +1653,9 @@ class TestAgentChildRegistration:
                 parent_call_id="task-1",
             )
 
-        session.ui.note_agent_child.assert_called_once_with("call_1", "task-1")
+        # Sub-agent tool ids are namespaced by the parent so the UI registry
+        # can't collide across concurrent task agents (local sequential ids).
+        session.ui.note_agent_child.assert_called_once_with("task-1::call_1", "task-1")
 
 
 class TestEvaluateOutputLLMStage:

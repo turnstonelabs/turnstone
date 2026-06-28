@@ -601,3 +601,53 @@ export function buildConvResult(output, opts) {
   block.appendChild(body);
   return block;
 }
+
+// Expandable body for a task_agent row's nested sub-steps (the "agent card").
+// A task agent runs its own sub-tools; this gives that row a collapsible body
+// the pane renders the live step stream into, so the steps nest UNDER the
+// task_agent call instead of scattering at the top level.  The pane appends the
+// returned `wrap` into the task_agent .conv-row and renders step rows (ordinary
+// .conv-row leaves, matched by call_id) into `body`; `label` shows the live
+// step count.  House style: programmatic DOM, textContent only.
+let _agentCardSeq = 0;
+
+export function buildAgentCardBody() {
+  const wrap = document.createElement("div");
+  wrap.className = "conv-agent";
+  // Single source of truth for collapse: the data attribute drives BOTH the
+  // body visibility and the caret rotation (in CSS), so a programmatic toggle
+  // (collapse-by-default here, or the auto-expand-on-approval in the pane) can't
+  // desync caret/aria the way per-node textContent did.
+  //
+  // Collapsed by default: a task agent can run 100+ steps, and the parent often
+  // fans out many in parallel — expanded, that's a wall.  The label carries the
+  // live count + state ("12 steps · running"), so you expand on demand.  The
+  // pane force-expands a card when a nested approval is pending (it's blocking —
+  // it can't hide behind the toggle).
+  wrap.dataset.collapsed = "true";
+  const bodyId = "conv-agent-body-" + (_agentCardSeq += 1);
+  const toggle = document.createElement("button");
+  toggle.type = "button";
+  toggle.className = "conv-agent-toggle";
+  toggle.setAttribute("aria-expanded", "false");
+  toggle.setAttribute("aria-controls", bodyId);
+  toggle.setAttribute("aria-label", "Show or hide sub-agent steps");
+  const caret = document.createElement("span");
+  caret.className = "conv-agent-caret";
+  caret.setAttribute("aria-hidden", "true");
+  caret.textContent = "▾"; // CSS rotates it when collapsed
+  const label = document.createElement("span");
+  label.className = "conv-agent-label";
+  label.textContent = "0 steps";
+  toggle.append(caret, label);
+  const body = document.createElement("div");
+  body.className = "conv-agent-body";
+  body.id = bodyId;
+  toggle.addEventListener("click", () => {
+    const collapsed = wrap.dataset.collapsed === "true";
+    wrap.dataset.collapsed = collapsed ? "false" : "true";
+    toggle.setAttribute("aria-expanded", collapsed ? "true" : "false");
+  });
+  wrap.append(toggle, body);
+  return { wrap, body, label };
+}

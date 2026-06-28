@@ -2160,3 +2160,54 @@ class TestAgentChildTagging:
         ui.clear_agent_children("task-A")
         ui._enqueue({"type": "tool_result", "call_id": "child-B", "name": "x", "output": "y"})
         assert lq.get_nowait()["parent_call_id"] == "task-B"
+
+
+class TestAgentScopeInfoSuppression:
+    """While a task agent runs, its ``on_info`` progress chatter ("[task done] N
+    chars", a tool's "fetched N chars") carries no call_id, so it can't nest
+    under the task card.  The web pane drops it for the duration rather than let
+    it escape to the top level; the depth counter keeps it correct under the
+    parent's parallel task pool."""
+
+    def test_on_info_suppressed_within_scope(self) -> None:
+        ui = _make_ui()
+        lq = ui._register_listener()
+        ui.begin_agent_scope()
+        ui.on_info("fetched 5663 chars, extracting...")
+        ui.end_agent_scope()
+        assert lq.empty()
+
+    def test_on_info_passes_through_outside_scope(self) -> None:
+        ui = _make_ui()
+        lq = ui._register_listener()
+        ui.on_info("top-level status")
+        assert lq.get_nowait() == {
+            "type": "info",
+            "message": "top-level status",
+            "ws_id": "ws-1",
+            "_event_id": 1,
+        }
+
+    def test_nested_scopes_need_matching_exits(self) -> None:
+        """Parallel task agents: info stays suppressed until the LAST one
+        leaves (the depth returns to zero)."""
+        ui = _make_ui()
+        lq = ui._register_listener()
+        ui.begin_agent_scope()
+        ui.begin_agent_scope()
+        ui.end_agent_scope()
+        ui.on_info("still inside a sibling task agent")
+        assert lq.empty()
+        ui.end_agent_scope()
+        ui.on_info("now top-level again")
+        assert lq.get_nowait()["message"] == "now top-level again"
+
+    def test_end_scope_floored_at_zero(self) -> None:
+        """An unmatched ``end_agent_scope`` can't drive the depth negative and
+        wedge suppression off."""
+        ui = _make_ui()
+        lq = ui._register_listener()
+        ui.end_agent_scope()
+        ui.begin_agent_scope()
+        ui.on_info("suppressed")
+        assert lq.empty()

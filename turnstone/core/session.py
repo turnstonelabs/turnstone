@@ -12176,6 +12176,32 @@ class ChatSession:
         if fn is not None:
             fn(parent_call_id)
 
+    def _paint_agent_step(self, parent_call_id: str | None, item: dict[str, Any]) -> None:
+        """Paint a sub-agent's auto-tool step (web pending row / CLI leg) — the
+        typed successor to the old per-turn ``on_info`` leg.  No-op without a
+        parent or on a UI that doesn't render agent steps (eval / fixtures)."""
+        if not parent_call_id:
+            return
+        fn = getattr(self.ui, "on_agent_step", None)
+        if fn is not None:
+            fn(parent_call_id, item)
+
+    def _begin_agent_scope(self) -> None:
+        """Mark a task agent as in flight so the web pane drops its ``on_info``
+        progress chatter (it can't nest under the card — no call_id).  Bracketed
+        with :meth:`_end_agent_scope`; getattr-guarded → no-op on the CLI (keeps
+        its info lines) and on eval / fixtures."""
+        fn = getattr(self.ui, "begin_agent_scope", None)
+        if fn is not None:
+            fn()
+
+    def _end_agent_scope(self) -> None:
+        """Leave a task agent's scope — getattr-guarded twin of
+        :meth:`_begin_agent_scope`."""
+        fn = getattr(self.ui, "end_agent_scope", None)
+        if fn is not None:
+            fn()
+
     def _run_agent(
         self,
         agent_turns: list[Turn],
@@ -12336,6 +12362,17 @@ class ChatSession:
             agent_tool_calls: tuple[ToolCall, ...] = ()
             if result.tool_calls:
                 self._ensure_tool_call_ids(result.tool_calls)
+                # Namespace sub-agent tool ids by the parent task_agent so the
+                # UI nesting registry can't collide across concurrent task
+                # agents whose (local) provider reuses sequential ids ("call_0").
+                # Tool-call ids are opaque correlation tokens — a provider
+                # validates only intra-request assistant/tool consistency on
+                # replay, never against its own prior generation — so rewriting
+                # them in this ephemeral sub-conversation is wire-safe.  Skipped
+                # for a top-level run (no parent → no nesting).
+                if parent_call_id:
+                    for tc in result.tool_calls:
+                        tc["id"] = f"{parent_call_id}::{tc['id']}"
                 agent_tool_calls = tuple(
                     ToolCall(
                         id=tc["id"],
@@ -12375,13 +12412,15 @@ class ChatSession:
                 else:
                     prepared = self._prepare_tool(tc_dict)
 
-                    lbl = prepared.get("header", tool_name)
-                    self.ui.on_info(f"[{label} turn {turn + 1}] {lbl}")
-
                     if prepared.get("error"):
                         output = prepared["error"]
                     # Auto-execute tools in the auto_tools set.
                     elif tool_name in auto_tools:
+                        # Paint the step pending under the task card before it
+                        # runs (web) / print the leg (CLI) — the typed successor
+                        # to the old on_info turn-leg.  Approval-gated tools
+                        # paint via approve_tools instead.
+                        self._paint_agent_step(parent_call_id, prepared)
                         _, output = prepared["execute"](prepared)
                     # Tools not in auto_tools require user approval.
                     elif "execute" in prepared:
@@ -12504,6 +12543,7 @@ class ChatSession:
             Turn.system(base + "\n\n" + identity),
             Turn.user(prompt),
         ]
+        self._begin_agent_scope()
         try:
             return call_id, self._run_agent(
                 agent_turns,
@@ -12536,6 +12576,7 @@ class ChatSession:
             self.ui.on_info(f"[task error] {e}")
             return call_id, f"Task error: {e}"
         finally:
+            self._end_agent_scope()
             self._clear_agent_children(call_id)
 
     @staticmethod

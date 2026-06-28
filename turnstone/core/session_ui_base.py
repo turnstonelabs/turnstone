@@ -262,6 +262,16 @@ class SessionUIBase:
         # own lock so the hot fan-out path never serializes on ``_listeners_lock``.
         self._agent_children: dict[str, str] = {}
         self._agent_children_lock = threading.Lock()
+        # Sub-agent scope depth.  A task agent's progress chatter reaches the UI
+        # as ``on_info`` lines ("[task done] N chars", a tool's "fetched N
+        # chars, extracting...") that carry no call_id — so they can't nest under
+        # the task card and would escape to the top level.  While any ``_run_agent``
+        # is in flight this is > 0 and the web pane drops those info lines (the
+        # card already shows the steps + result).  A depth, not a flag, so the
+        # parent's 4-wide parallel task pool nests correctly; guarded by
+        # ``_agent_children_lock``.  The CLI overrides ``on_info`` and is
+        # unaffected (it has no card, so the lines are its only signal).
+        self._agent_scope_depth = 0
         # Approval blocking — the worker thread calls approve_tools
         # which waits on _approval_event; the /approve endpoint sets
         # it via resolve_approval.
@@ -515,14 +525,11 @@ class SessionUIBase:
         with ``parent_call_id``.  Called by the session for each sub-tool a
         ``_run_agent`` issues, before the tool emits anything.
 
-        KNOWN LIMITATION (to be closed with the chunk-3 nesting consumer): the
-        registry keys on ``child_call_id`` alone — unique for commercial
-        providers (``call_<hash>`` / ``toolu_…``) but NOT for local servers that
-        assign per-response sequential ids (``call_0``).  Two task agents in the
-        parent's 4-wide pool can then collide and mis-nest steps.  The fix
-        (namespacing child ids by parent, verified against each provider's
-        id-replay rules) lands with the frontend consumer that renders the
-        nesting — until then the tag is wire-invisible and unconsumed."""
+        The session namespaces each sub-agent's child ids by parent
+        (``f"{parent_call_id}::{tc_id}"``) before registering them here, so the
+        key is unique even for local servers that assign per-response sequential
+        ids (``call_0``) — two task agents in the parent's 4-wide pool can't
+        collide and mis-nest steps."""
         if not child_call_id or not parent_call_id:
             return
         with self._agent_children_lock:
@@ -536,6 +543,28 @@ class SessionUIBase:
         with self._agent_children_lock:
             for c in [c for c, p in self._agent_children.items() if p == parent_call_id]:
                 del self._agent_children[c]
+
+    def on_agent_step(self, parent_call_id: str, item: dict[str, Any]) -> None:
+        """Paint a sub-agent's auto-executed tool step as pending under its
+        parent card so it shows live before it completes.  (Approval-gated
+        sub-tools paint via :meth:`approve_tools`.)  The child is already
+        registered via ``note_agent_child``, so ``_enqueue`` stamps
+        ``parent_call_id`` onto this ``tool_pending``."""
+        self._enqueue({"type": "tool_pending", "items": self._serialize_approval_items([item])})
+
+    def begin_agent_scope(self) -> None:
+        """Enter a task agent's execution.  Until the matching
+        :meth:`end_agent_scope`, the web pane drops ``on_info`` lines (the task
+        card carries the sub-agent's visible output, so the info chatter would
+        only escape to the top level).  Depth-counted for the parent's parallel
+        task pool; the session brackets each ``_run_agent`` with this pair."""
+        with self._agent_children_lock:
+            self._agent_scope_depth += 1
+
+    def end_agent_scope(self) -> None:
+        """Leave a task agent's execution (see :meth:`begin_agent_scope`)."""
+        with self._agent_children_lock:
+            self._agent_scope_depth = max(0, self._agent_scope_depth - 1)
 
     def _register_listener(
         self, maxsize: int = _DEFAULT_LISTENER_QUEUE_MAX
@@ -2475,6 +2504,13 @@ class SessionUIBase:
             log.warning("Failed to record usage event", exc_info=True)
 
     def on_info(self, message: str) -> None:
+        # Inside a task agent, progress chatter ("[task done] N chars", a tool's
+        # "fetched N chars, extracting...") carries no call_id, so it can't nest
+        # under the task card — drop it on the web pane rather than let it escape
+        # to the top level.  The card shows the steps + result; the CLI overrides
+        # this method and keeps the lines (no card there).
+        if self._agent_scope_depth > 0:
+            return
         self._enqueue({"type": "info", "message": message})
 
     def on_error(self, message: str) -> None:

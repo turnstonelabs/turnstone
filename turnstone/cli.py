@@ -285,6 +285,12 @@ class TerminalUI(SessionUI):
     def on_tool_output_chunk(self, call_id: str, chunk: str) -> None:
         pass  # Terminal shows spinner during tool execution
 
+    def on_agent_step(self, parent_call_id: str, item: dict[str, Any]) -> None:
+        # CLI keeps an inline "leg" per sub-agent step — the structured nesting
+        # card is web-only.
+        hdr = item.get("header") or item.get("func_name") or "tool"
+        print(f"{DIM}  - {hdr}{RESET}")
+
     def on_status(self, usage: dict[str, Any], context_window: int, effort: str) -> None:
         total_tok = usage["prompt_tokens"] + usage["completion_tokens"]
         pct = total_tok / context_window * 100 if context_window > 0 else 0

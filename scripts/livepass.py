@@ -58,6 +58,15 @@ Attachments harness (/attachments/livepass.html): the composer attachment
   thumbnail crop/size, the native audio-control fit at the constrained
   height, the snippet contrast, and how a long filename behaves at the
   340px chip cap.
+Task-agent harness (/taskagent/livepass.html): the task_agent card — a task
+  agent's sub-tool steps nested under its conversation row, driven through the
+  REAL InteractivePane.handleEvent (parent tool_pending/tool_info -> child
+  tool_pending/tool_result/tool_output_chunk/approve_request -> task_agent
+  tool_result) so the SSE->card routing (_routeAgentItems / _ensureAgentCard,
+  and appendToolOutput finding the nested row by call_id) is exercised, not
+  just the leaf builders.  + &theme=light, &collapsed=1.  document.title stamps
+  TASKAGENT-READY-<steps> on success, TASKAGENT-FAILED-... / TASKAGENT-ERROR
+  when routing breaks, so a broken card can't screenshot green.
 
 Rebuild after ANY markup change: the dialog blocks are embedded at build
 time. Assets are symlinked, so CSS/JS edits are live on refresh.
@@ -767,6 +776,137 @@ ATTACH_TEMPLATE = """<!doctype html>
 """
 
 
+# --------------------------------------------------------------------------
+# Task-agent harness — the task_agent card: a task agent's sub-tool steps
+# nested under its conversation row.  Driven through the REAL
+# InteractivePane.handleEvent so the SSE->card ROUTING (_routeAgentItems /
+# _ensureAgentCard, plus appendToolOutput finding the nested row by call_id)
+# is exercised, not just the leaf builders.  The page frame is harness-only
+# chrome; the .conv-batch / task_agent card is what's under review.
+# --------------------------------------------------------------------------
+TASKAGENT_TEMPLATE = """<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>task_agent livepass</title>
+    <link rel="stylesheet" href="shared/base.css" />
+    <link rel="stylesheet" href="shared/ui-base.css" />
+    <link rel="stylesheet" href="shared/chat.css" />
+    <link rel="stylesheet" href="shared/conversation.css" />
+    <link rel="stylesheet" href="shared/cards.css" />
+    <link rel="stylesheet" href="shared/interactive.css" />
+    <style>
+      /* Harness-only framing (NOT under review) — a plausible pane context. */
+      body {
+        padding: 24px; margin: 0; background: var(--bg); color: var(--ink);
+        font-family: var(--font-sans, system-ui, sans-serif);
+      }
+      .demo-frame { max-width: 720px; margin: 0 auto; }
+      .demo-label {
+        font: 11px var(--font-mono, monospace); color: var(--ink-3);
+        text-transform: uppercase; letter-spacing: 0.08em; margin: 0 0 8px;
+      }
+    </style>
+  </head>
+  <body>
+    <div class="demo-frame">
+      <div class="demo-label">conversation — task_agent card (real InteractivePane.handleEvent)</div>
+      <div class="messages" id="messages"></div>
+    </div>
+    <script>
+      // interactive.js reads window.toast / window.authFetch; the static render
+      // never POSTs, so no-op stubs are enough.
+      window.toast = { error: function (m) { console.log("toast:", m); } };
+      window.authFetch = function () {
+        return Promise.resolve({
+          ok: true,
+          json: function () { return Promise.resolve({}); },
+          text: function () { return Promise.resolve(""); },
+        });
+      };
+    </script>
+    <script type="module">
+      import { InteractivePane } from "./shared/interactive.js";
+      const q = new URLSearchParams(location.search);
+      if (q.get("theme") === "light")
+        document.documentElement.dataset.theme = "light";
+
+      const messages = document.getElementById("messages");
+      try {
+        // Drive the REAL pane; stub only the host seams a mounted pane provides.
+        const pane = new InteractivePane("demo-ws");
+        pane.messagesEl = messages;
+        pane.inputEl = document.createElement("textarea");
+        pane.sendBtn = document.createElement("button");
+        pane.isNearBottom = () => false;
+        pane.scrollToBottom = () => {};
+        pane.removeEmptyState = () => {};
+        pane.removeThinkingIndicator = () => {};
+        pane.setBusy = () => {};
+        const ev = (e) => pane.handleEvent(e);
+
+        // 1. Parent paints the task_agent call (a top-level tool row).
+        const taskItem = {
+          call_id: "task1", func_name: "task_agent",
+          header: 'task_agent: "Find all call sites of resolve_alias and summarize them"',
+          needs_approval: false,
+        };
+        // ?parallel=1 puts the task_agent in a 2-tool parallel batch so the
+        // nested-step rail-bleed fix can be verified against the rail rules.
+        const parentItems = q.get("parallel") === "1"
+          ? [taskItem, { call_id: "sib1", func_name: "bash", header: "git status", needs_approval: false }]
+          : [taskItem];
+        ev({ type: "tool_pending", items: parentItems });
+        ev({ type: "tool_info", items: parentItems.map((it) => Object.assign({ auto_approved: false }, it)) });
+        if (parentItems.length > 1)
+          ev({ type: "tool_result", call_id: "sib1", name: "bash", output: "clean" });
+
+        // 2. Sub-agent steps tagged parent_call_id="task1" — exercises routing.
+        function stepRow(cid, fn, header, result) {
+          ev({ type: "tool_pending", items: [{ call_id: cid, parent_call_id: "task1", func_name: fn, header: header, needs_approval: false }] });
+          if (result != null)
+            ev({ type: "tool_result", call_id: cid, parent_call_id: "task1", name: fn, output: result });
+        }
+        stepRow("task1::c1", "search", 'search: "resolve_alias"', "12 matches across 4 files");
+        stepRow("task1::c2", "read_file", "read_file: core/registry.py", "4.1 KB read");
+        ev({ type: "tool_pending", items: [{ call_id: "task1::c3", parent_call_id: "task1", func_name: "bash", header: "pytest -k registry", needs_approval: false }] });
+        ev({ type: "tool_output_chunk", call_id: "task1::c3", parent_call_id: "task1", chunk: "collected 12 items ... " });
+        ev({ type: "tool_result", call_id: "task1::c3", parent_call_id: "task1", name: "bash", output: "12 passed in 1.2s" });
+        // 4th step.  Default: a nested sub-tool approval (notify is not
+        // auto-approved) — the pane must auto-expand the collapse-by-default
+        // card so the blocking prompt is visible.  ?collapsed=1: a plain
+        // completed step instead, so nothing forces the card open and the
+        // screenshot shows the natural collapsed state (the common case).
+        if (q.get("collapsed") === "1") {
+          stepRow("task1::c4", "notify", "notify: post summary to #eng", "posted to #eng");
+        } else {
+          ev({ type: "approve_request", judge_pending: false, items: [{ call_id: "task1::c4", parent_call_id: "task1", func_name: "notify", header: "notify: post summary to #eng", needs_approval: true }] });
+        }
+
+        // 3. The task agent's own synthesis, rendered below the card.
+        ev({ type: "tool_result", call_id: "task1", name: "task_agent", output: "resolve_alias has 4 call sites (registry.py:120, session.py:12200, model_registry.py:88, eval.py:54); all pass a validated alias before use." });
+
+        // Loud failure — broken routing must not screenshot green.
+        setTimeout(function () {
+          const row = document.querySelector('.conv-row[data-call-id="task1"]');
+          const card = row && row.querySelector(".conv-agent");
+          const steps = card ? card.querySelectorAll(".conv-agent-body .conv-row").length : 0;
+          const hasResult = !!(row && /call sites/.test(row.textContent || ""));
+          document.title = card && steps >= 4 && hasResult
+            ? "TASKAGENT-READY-" + steps
+            : "TASKAGENT-FAILED-card" + (card ? 1 : 0) + "-steps" + steps + "-result" + (hasResult ? 1 : 0);
+        }, 300);
+      } catch (e) {
+        messages.textContent = "HARNESS ERROR: " + e.message + "\\n" + (e.stack || "");
+        document.title = "TASKAGENT-ERROR";
+      }
+    </script>
+  </body>
+</html>
+"""
+
+
 # Fixture media for the attachments harness.  image/pdf thumbnails and the
 # audio clip load via element .src (NOT authFetch), so the --serve dev server
 # answers those paths directly with representative bytes: a photo-like image,
@@ -882,6 +1022,12 @@ def build(out: Path) -> None:
     symlink(att / "shared", ROOT / "turnstone/shared_static")
     (att / "livepass.html").write_text(ATTACH_TEMPLATE, encoding="utf-8")
     print(f"{att}/livepass.html — composer chips + message attachment pills")
+
+    ta = out / "taskagent"
+    ta.mkdir(parents=True, exist_ok=True)
+    symlink(ta / "shared", ROOT / "turnstone/shared_static")
+    (ta / "livepass.html").write_text(TASKAGENT_TEMPLATE, encoding="utf-8")
+    print(f"{ta}/livepass.html — task_agent card (real Pane.handleEvent routing)")
 
 
 def main() -> None:

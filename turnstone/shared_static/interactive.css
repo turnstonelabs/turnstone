@@ -139,6 +139,11 @@
   max-height: 400px;
   animation: stream-pulse 2s ease-in-out infinite;
 }
+@media (prefers-reduced-motion: reduce) {
+  .tool-output-stream {
+    animation: none;
+  }
+}
 
 .tool-output.collapsed {
   max-height: 150px;
