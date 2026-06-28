@@ -58,6 +58,19 @@ class TestWatermark:
         # Keep the newest 2 verbatim → boundary is the 3rd-newest id.
         assert st.get_compaction_watermark(ws, 2) == ids[-3]
 
+    def test_preserve_tail_ignores_existing_markers(self, storage_backend):
+        # A compaction marker is saved as a NEW row but is not part of the
+        # preserved in-memory tail, so it must not shift the (preserve_tail+1)
+        # boundary — without the exclusion, this returns ids[-1] (the marker
+        # consumes an offset slot) and resume would drop a real tail row.
+        st = storage_backend
+        ws = _register(st)
+        ids = [st.save_message(ws, "user", f"m{i}") for i in range(5)]
+        st.save_message(ws, "assistant", "SUM", source="compaction", meta=_marker_meta(max(ids)))
+        st.save_message(ws, "user", "m5")
+        # Real rows newest-first: m5, m4, m3, ... → 3rd-newest real row is m3.
+        assert st.get_compaction_watermark(ws, 2) == ids[-2]
+
     def test_empty_workstream_is_none(self, storage_backend):
         st = storage_backend
         ws = _register(st)

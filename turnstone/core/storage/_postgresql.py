@@ -486,13 +486,23 @@ class PostgreSQLBackend:
         """Boundary id for a compaction checkpoint: the max conversation ``id``
         among the rows a compaction would summarize (see the sqlite twin).
 
-        ``preserve_tail=0`` → ``max(id)``; ``preserve_tail=N`` → the ``(N+1)``-th
-        newest id (the newest ``N`` rows are kept verbatim).  ``None`` when empty.
+        The ``(N+1)``-th newest id counting REAL rows; compaction markers are
+        excluded (summary artifacts, never part of the preserved tail — counting
+        them would skew the boundary and drop real tail rows on resume).  ``None``
+        when empty.
         """
         with self._conn() as conn:
             row = conn.execute(
                 sa.select(conversations.c.id)
-                .where(conversations.c.ws_id == ws_id)
+                .where(
+                    sa.and_(
+                        conversations.c.ws_id == ws_id,
+                        sa.or_(
+                            conversations.c._source.is_(None),
+                            conversations.c._source != _COMPACTION_SOURCE,
+                        ),
+                    )
+                )
                 .order_by(conversations.c.id.desc())
                 .limit(1)
                 .offset(max(0, preserve_tail))
@@ -1209,12 +1219,17 @@ class PostgreSQLBackend:
                             # Exclude compaction-checkpoint markers (resume-only
                             # summary artifacts); IS DISTINCT FROM is NULL-safe so
                             # normal rows (_source NULL) are not dropped.
-                            "AND c._source IS DISTINCT FROM 'compaction' "
+                            "AND c._source IS DISTINCT FROM :compaction_source "
                             "ORDER BY ts_rank(to_tsvector('english', COALESCE(c.content, '')), "
                             "   plainto_tsquery('english', :query)) DESC "
                             "LIMIT :limit OFFSET :offset"
                         ),
-                        {"query": query, "limit": capped, "offset": capped_offset},
+                        {
+                            "query": query,
+                            "compaction_source": _COMPACTION_SOURCE,
+                            "limit": capped,
+                            "offset": capped_offset,
+                        },
                     ).fetchall()
                 )
             except Exception:
@@ -1224,10 +1239,15 @@ class PostgreSQLBackend:
                         sa.text(
                             "SELECT timestamp, ws_id, role, content, tool_name "
                             "FROM conversations WHERE content ILIKE :pattern "
-                            "AND _source IS DISTINCT FROM 'compaction' "
+                            "AND _source IS DISTINCT FROM :compaction_source "
                             "ORDER BY timestamp DESC LIMIT :limit OFFSET :offset"
                         ),
-                        {"pattern": f"%{query}%", "limit": capped, "offset": capped_offset},
+                        {
+                            "pattern": f"%{query}%",
+                            "compaction_source": _COMPACTION_SOURCE,
+                            "limit": capped,
+                            "offset": capped_offset,
+                        },
                     ).fetchall()
                 )
 
@@ -1239,10 +1259,10 @@ class PostgreSQLBackend:
                     sa.text(
                         "SELECT timestamp, ws_id, role, content, tool_name "
                         "FROM conversations "
-                        "WHERE _source IS DISTINCT FROM 'compaction' "
+                        "WHERE _source IS DISTINCT FROM :compaction_source "
                         "ORDER BY timestamp DESC LIMIT :limit"
                     ),
-                    {"limit": capped},
+                    {"limit": capped, "compaction_source": _COMPACTION_SOURCE},
                 ).fetchall()
             )
 

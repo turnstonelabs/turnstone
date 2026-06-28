@@ -557,16 +557,25 @@ class SQLiteBackend:
         among the rows a compaction would summarize.
 
         With ``preserve_tail=0`` (the auto/overflow path) every current row is
-        summarized, so this is ``max(id)``.  With ``preserve_tail=N`` the newest
-        ``N`` rows are kept verbatim, so the boundary is the ``(N+1)``-th newest
-        id — counting storage rows from the newest, which the preserved in-memory
-        tail maps onto even after prior compactions (the synthetic summary turns
-        sit at the front, never in the tail).  ``None`` when there are no rows.
+        summarized, so this is the newest real id.  With ``preserve_tail=N`` the
+        newest ``N`` rows are kept verbatim, so the boundary is the ``(N+1)``-th
+        newest id — counting REAL rows from the newest.  Compaction markers are
+        excluded: they are summary artifacts written as new rows but never part
+        of the preserved in-memory tail, so counting them would skew the boundary
+        and drop real tail rows on resume.  ``None`` when there are no rows.
         """
         with self._conn() as conn:
             row = conn.execute(
                 sa.select(conversations.c.id)
-                .where(conversations.c.ws_id == ws_id)
+                .where(
+                    sa.and_(
+                        conversations.c.ws_id == ws_id,
+                        sa.or_(
+                            conversations.c._source.is_(None),
+                            conversations.c._source != _COMPACTION_SOURCE,
+                        ),
+                    )
+                )
                 .order_by(conversations.c.id.desc())
                 .limit(1)
                 .offset(max(0, preserve_tail))
@@ -1384,10 +1393,15 @@ class SQLiteBackend:
                             # Exclude compaction-checkpoint markers (resume-only
                             # summary artifacts); normal rows store _source NULL,
                             # so the filter must be NULL-safe or it drops everything.
-                            "AND (c._source IS NULL OR c._source <> 'compaction') "
+                            "AND (c._source IS NULL OR c._source <> :compaction_source) "
                             "ORDER BY f.rank ASC LIMIT :limit OFFSET :offset"
                         ),
-                        {"query": _fts5_query(query), "limit": capped, "offset": capped_offset},
+                        {
+                            "query": _fts5_query(query),
+                            "compaction_source": _COMPACTION_SOURCE,
+                            "limit": capped,
+                            "offset": capped_offset,
+                        },
                     ).fetchall()
                 )
             return list(
@@ -1395,11 +1409,12 @@ class SQLiteBackend:
                     sa.text(
                         "SELECT timestamp, ws_id, role, content, tool_name "
                         "FROM conversations WHERE content LIKE :pattern ESCAPE '\\' "
-                        "AND (_source IS NULL OR _source <> 'compaction') "
+                        "AND (_source IS NULL OR _source <> :compaction_source) "
                         "ORDER BY timestamp DESC LIMIT :limit OFFSET :offset"
                     ),
                     {
                         "pattern": f"%{_escape_like(query)}%",
+                        "compaction_source": _COMPACTION_SOURCE,
                         "limit": capped,
                         "offset": capped_offset,
                     },
@@ -1414,10 +1429,10 @@ class SQLiteBackend:
                     sa.text(
                         "SELECT timestamp, ws_id, role, content, tool_name "
                         "FROM conversations "
-                        "WHERE (_source IS NULL OR _source <> 'compaction') "
+                        "WHERE (_source IS NULL OR _source <> :compaction_source) "
                         "ORDER BY timestamp DESC LIMIT :limit"
                     ),
-                    {"limit": capped},
+                    {"limit": capped, "compaction_source": _COMPACTION_SOURCE},
                 ).fetchall()
             )
 
