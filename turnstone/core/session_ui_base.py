@@ -251,6 +251,17 @@ class SessionUIBase:
         # in :meth:`_enqueue`); the snapshot helper for the in-progress
         # replay path captures it under ``_listeners_lock`` too.
         self._event_id: int = 0
+        # Sub-agent step tagging: child tool call_id -> parent task_agent
+        # call_id.  ``_enqueue`` reads it to stamp ``parent_call_id`` on every
+        # child event (tool_pending / approve_request / tool_result /
+        # tool_output_chunk / output_warning) so the UI can nest a task agent's
+        # steps under its card.  Written by ``note_agent_child`` /
+        # ``clear_agent_children`` (the session brackets each ``_run_agent``);
+        # keyed on the immutable call_id so it stays correct under the parent's
+        # 4-wide parallel tool pool (several task agents in flight at once).  Its
+        # own lock so the hot fan-out path never serializes on ``_listeners_lock``.
+        self._agent_children: dict[str, str] = {}
+        self._agent_children_lock = threading.Lock()
         # Approval blocking — the worker thread calls approve_tools
         # which waits on _approval_event; the /approve endpoint sets
         # it via resolve_approval.
@@ -445,6 +456,11 @@ class SessionUIBase:
         """
         if "ws_id" not in data:
             data = {**data, "ws_id": self.ws_id}
+        # Only events that can carry a child step — a top-level ``call_id`` or an
+        # ``items`` list — need the parent-tag lookup; skip the lock+scan for the
+        # high-frequency rest (content / reasoning / status / info / …).
+        if self._agent_children and ("call_id" in data or "items" in data):
+            data = self._stamp_agent_parent(data)
         with self._listeners_lock:
             self._event_id += 1
             event_id = self._event_id
@@ -461,6 +477,65 @@ class SessionUIBase:
             with contextlib.suppress(queue.Full):
                 lq.put_nowait(data)
         return event_id
+
+    def _stamp_agent_parent(self, data: dict[str, Any]) -> dict[str, Any]:
+        """Stamp ``parent_call_id`` on a sub-agent's child event.
+
+        A task agent's sub-tool events flow through the same emit path as
+        top-level tool events; the only thing marking them as a *child* is the
+        ``call_id`` registered in ``_agent_children`` by the session running
+        ``_run_agent``.  Stamping at this one fan-out choke point (rather than at
+        each call site) also catches events emitted from a tool's own background
+        thread — a streaming bash's ``tool_output_chunk`` — which an ambient
+        context var set on the worker thread would miss.  Returns a shallow copy
+        when it stamps; the input dict is never mutated."""
+        with self._agent_children_lock:
+            if not self._agent_children:
+                return data
+            cid = data.get("call_id")
+            if isinstance(cid, str) and cid in self._agent_children:
+                data = {**data, "parent_call_id": self._agent_children[cid]}
+            items = data.get("items")
+            if isinstance(items, list) and any(
+                isinstance(it, dict) and it.get("call_id") in self._agent_children for it in items
+            ):
+                data = {
+                    **data,
+                    "items": [
+                        {**it, "parent_call_id": self._agent_children[it["call_id"]]}
+                        if isinstance(it, dict) and it.get("call_id") in self._agent_children
+                        else it
+                        for it in items
+                    ],
+                }
+        return data
+
+    def note_agent_child(self, child_call_id: str, parent_call_id: str) -> None:
+        """Register a sub-agent's child tool call so ``_enqueue`` tags its events
+        with ``parent_call_id``.  Called by the session for each sub-tool a
+        ``_run_agent`` issues, before the tool emits anything.
+
+        KNOWN LIMITATION (to be closed with the chunk-3 nesting consumer): the
+        registry keys on ``child_call_id`` alone — unique for commercial
+        providers (``call_<hash>`` / ``toolu_…``) but NOT for local servers that
+        assign per-response sequential ids (``call_0``).  Two task agents in the
+        parent's 4-wide pool can then collide and mis-nest steps.  The fix
+        (namespacing child ids by parent, verified against each provider's
+        id-replay rules) lands with the frontend consumer that renders the
+        nesting — until then the tag is wire-invisible and unconsumed."""
+        if not child_call_id or not parent_call_id:
+            return
+        with self._agent_children_lock:
+            self._agent_children[child_call_id] = parent_call_id
+
+    def clear_agent_children(self, parent_call_id: str) -> None:
+        """Drop every child registered under ``parent_call_id`` (the task agent
+        finished).  Bounds the registry to in-flight task agents.  Deletes in
+        place rather than reallocating the whole dict, so one agent completing
+        doesn't churn other in-flight agents' entries."""
+        with self._agent_children_lock:
+            for c in [c for c, p in self._agent_children.items() if p == parent_call_id]:
+                del self._agent_children[c]
 
     def _register_listener(
         self, maxsize: int = _DEFAULT_LISTENER_QUEUE_MAX

@@ -15,7 +15,14 @@ from turnstone.core.session import (
     _CancelRef,
     _effect_status_meta,
 )
-from turnstone.core.trajectory import EffectStatus, Role, dicts_from_turns, turn_from_dict
+from turnstone.core.trajectory import (
+    EffectStatus,
+    Role,
+    ToolCall,
+    Turn,
+    dicts_from_turns,
+    turn_from_dict,
+)
 
 
 class NullUI:
@@ -1028,15 +1035,11 @@ class TestCancelledAgentDisposition:
 
     @staticmethod
     def _assistant(call_id, name):
-        return {
-            "role": "assistant",
-            "content": "",
-            "tool_calls": [{"id": call_id, "function": {"name": name}}],
-        }
+        return Turn.assistant("", tool_calls=(ToolCall(id=call_id, name=name, arguments=""),))
 
     @staticmethod
     def _result(call_id, text="ok"):
-        return {"role": "tool", "tool_call_id": call_id, "content": text}
+        return Turn.tool(call_id, text)
 
     def test_status_none_when_no_actions(self):
         """Typed twin of the disposition: a task cancelled before any action is
@@ -1107,14 +1110,13 @@ class TestCancelledAgentDisposition:
         # started" — inviting a re-run of the destructive bash.
         session = _make_session()
         msgs = [
-            {
-                "role": "assistant",
-                "content": "",
-                "tool_calls": [
-                    {"id": "t1", "function": {"name": "bash"}},
-                    {"id": "t2", "function": {"name": "web_fetch"}},
-                ],
-            }
+            Turn.assistant(
+                "",
+                tool_calls=(
+                    ToolCall(id="t1", name="bash", arguments=""),
+                    ToolCall(id="t2", name="web_fetch", arguments=""),
+                ),
+            )
         ]  # neither answered: bash raised mid-flight, web_fetch never ran
         out = session._cancelled_agent_disposition(msgs, "task")
         assert "In flight at cancel: bash" in out
@@ -1127,26 +1129,24 @@ class TestCancelledAgentDisposition:
         # count summary, the first-gap boundary, and not-started.
         session = _make_session()
         msgs = [
-            {
-                "role": "assistant",
-                "content": "",
-                "tool_calls": [
-                    {"id": "t1", "function": {"name": "bash"}},
-                    {"id": "t2", "function": {"name": "bash"}},
-                    {"id": "t3", "function": {"name": "read_file"}},
-                ],
-            },
+            Turn.assistant(
+                "",
+                tool_calls=(
+                    ToolCall(id="t1", name="bash", arguments=""),
+                    ToolCall(id="t2", name="bash", arguments=""),
+                    ToolCall(id="t3", name="read_file", arguments=""),
+                ),
+            ),
             self._result("t1"),
             self._result("t2"),
             self._result("t3"),
-            {
-                "role": "assistant",
-                "content": "",
-                "tool_calls": [
-                    {"id": "t4", "function": {"name": "web_fetch"}},
-                    {"id": "t5", "function": {"name": "search"}},
-                ],
-            },
+            Turn.assistant(
+                "",
+                tool_calls=(
+                    ToolCall(id="t4", name="web_fetch", arguments=""),
+                    ToolCall(id="t5", name="search", arguments=""),
+                ),
+            ),
         ]
         out = session._cancelled_agent_disposition(msgs, "task")
         assert "Completed before cancel: bash×2, read_file." in out
@@ -1155,13 +1155,13 @@ class TestCancelledAgentDisposition:
 
     def test_exec_task_routes_cancel_to_disposition(self, tmp_db):
         """_exec_task converts a GenerationCancelled from _run_agent into the
-        honest disposition, reading the in-place-mutated agent_messages."""
+        honest disposition, reading the in-place-mutated agent_turns."""
         session = _make_session()
 
-        def fake_run_agent(agent_messages, **kwargs):
-            agent_messages.append(self._assistant("t1", "bash"))
-            agent_messages.append(self._result("t1"))
-            agent_messages.append(self._assistant("t2", "web_fetch"))
+        def fake_run_agent(agent_turns, **kwargs):
+            agent_turns.append(self._assistant("t1", "bash"))
+            agent_turns.append(self._result("t1"))
+            agent_turns.append(self._assistant("t2", "web_fetch"))
             raise GenerationCancelled()
 
         with patch.object(session, "_run_agent", side_effect=fake_run_agent):

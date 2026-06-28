@@ -15,6 +15,7 @@ from turnstone.core.model_registry import (
     detect_model,
     load_model_registry,
 )
+from turnstone.core.trajectory import Turn
 
 # ---------------------------------------------------------------------------
 # ModelConfig
@@ -1244,8 +1245,8 @@ class TestSessionAgentModel:
         agent_client.chat.completions.create = fake_create
 
         agent_msgs = [
-            {"role": "developer", "content": "You are an agent."},
-            {"role": "user", "content": "Do something."},
+            Turn.system("You are an agent."),
+            Turn.user("Do something."),
         ]
         session._run_agent(agent_msgs)
         assert captured_model == "agent-model"
@@ -1335,14 +1336,14 @@ class TestSessionAgentModel:
         reg = self._three_model_registry(agent_model="smart", task_model="fast")
         session = _make_session(registry=reg, model_alias="main")
         captured = self._capture(reg, "fast")
-        session._run_agent([{"role": "user", "content": "x"}], label="task")
+        session._run_agent([Turn.user("x")], label="task")
         assert captured["model"] == "fast-model"
 
     def test_plan_falls_back_to_agent_model(self) -> None:
         reg = self._three_model_registry(agent_model="fast")
         session = _make_session(registry=reg, model_alias="main")
         captured = self._capture(reg, "fast")
-        session._run_agent([{"role": "user", "content": "x"}], label="plan")
+        session._run_agent([Turn.user("x")], label="plan")
         assert captured["model"] == "fast-model"
 
     def test_plan_uses_session_model_when_no_overrides(self) -> None:
@@ -1351,7 +1352,7 @@ class TestSessionAgentModel:
         reg = self._three_model_registry()
         session = _make_session(registry=reg, model_alias="main")
         captured = self._capture_on(session.client)
-        session._run_agent([{"role": "user", "content": "x"}], label="plan")
+        session._run_agent([Turn.user("x")], label="plan")
         assert captured["model"] == "test-model"
 
     def test_task_effort_inherits_session_when_unset(self) -> None:
@@ -1362,7 +1363,7 @@ class TestSessionAgentModel:
         reg = self._three_model_registry()
         session = _make_session(registry=reg, model_alias="main", reasoning_effort="low")
         captured = self._capture_on(session.client)
-        session._run_agent([{"role": "user", "content": "x"}], label="task")
+        session._run_agent([Turn.user("x")], label="task")
         assert self._captured_effort(captured) == "low"
 
     def test_agent_model_routes_both_plan_and_task(self) -> None:
@@ -1372,20 +1373,18 @@ class TestSessionAgentModel:
         session = _make_session(registry=reg, model_alias="main")
 
         plan_captured = self._capture(reg, "fast")
-        session._run_agent([{"role": "user", "content": "x"}], label="plan")
+        session._run_agent([Turn.user("x")], label="plan")
         assert plan_captured["model"] == "fast-model"
 
         task_captured = self._capture(reg, "fast")
-        session._run_agent([{"role": "user", "content": "y"}], label="task")
+        session._run_agent([Turn.user("y")], label="task")
         assert task_captured["model"] == "fast-model"
 
     def test_explicit_effort_wins_over_registry(self) -> None:
         reg = self._three_model_registry(task_effort="low")
         session = _make_session(registry=reg, model_alias="main")
         captured = self._capture_on(session.client)
-        session._run_agent(
-            [{"role": "user", "content": "x"}], label="task", reasoning_effort="minimal"
-        )
+        session._run_agent([Turn.user("x")], label="task", reasoning_effort="minimal")
         assert self._captured_effort(captured) == "minimal"
 
     # -- per-call agent_alias override (LLM passes model="<alias>") ----------
@@ -1395,7 +1394,7 @@ class TestSessionAgentModel:
         reg = self._three_model_registry()
         session = _make_session(registry=reg, model_alias="main")
         captured = self._capture(reg, "fast")
-        session._run_agent([{"role": "user", "content": "x"}], label="task", agent_alias="fast")
+        session._run_agent([Turn.user("x")], label="task", agent_alias="fast")
         assert captured["model"] == "fast-model"
 
     def test_session_fallback_inherits_primary_alias_for_caps(self) -> None:
@@ -1426,7 +1425,7 @@ class TestSessionAgentModel:
         session._resolve_capabilities = spy_resolve  # type: ignore[method-assign]
 
         self._capture_on(session.client)  # patch client.chat.completions.create
-        session._run_agent([{"role": "user", "content": "x"}], label="plan")
+        session._run_agent([Turn.user("x")], label="plan")
 
         assert captured_extra_alias and captured_extra_alias[-1] == "main", (
             f"agent fallback path did not inherit primary alias for extra_params: "
@@ -1443,9 +1442,7 @@ class TestSessionAgentModel:
         reg = self._three_model_registry()
         session = _make_session(registry=reg, model_alias="main")
         with pytest.raises(ValueError, match="Unknown agent_alias"):
-            session._run_agent(
-                [{"role": "user", "content": "x"}], label="plan", agent_alias="bogus"
-            )
+            session._run_agent([Turn.user("x")], label="plan", agent_alias="bogus")
 
 
 # ---------------------------------------------------------------------------

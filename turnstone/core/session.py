@@ -138,6 +138,7 @@ from turnstone.core.tools import (
 from turnstone.core.trajectory import (
     EffectStatus,
     Role,
+    ToolCall,
     Turn,
     dicts_from_turns,
     turn_from_dict,
@@ -12155,19 +12156,43 @@ class ChatSession:
         self._report_tool_result(call_id, "diff_file", desc)
         return call_id, output
 
+    def _note_agent_child(self, child_call_id: str, parent_call_id: str | None) -> None:
+        """Register a sub-agent tool call under its parent task_agent call so the
+        UI can nest the step (see ``SessionUIBase.note_agent_child``).  No-op when
+        there's no parent (a top-level ``_run_agent``) or the UI doesn't support
+        it (CLI / eval / fixtures)."""
+        if not parent_call_id:
+            return
+        fn = getattr(self.ui, "note_agent_child", None)
+        if fn is not None:
+            fn(child_call_id, parent_call_id)
+
+    def _clear_agent_children(self, parent_call_id: str | None) -> None:
+        """Drop a finished task agent's child registrations — getattr-guarded
+        twin of :meth:`_note_agent_child`."""
+        if not parent_call_id:
+            return
+        fn = getattr(self.ui, "clear_agent_children", None)
+        if fn is not None:
+            fn(parent_call_id)
+
     def _run_agent(
         self,
-        agent_messages: list[dict[str, Any]],
+        agent_turns: list[Turn],
         label: str = "agent",
         tools: list[dict[str, Any]] | None = None,
         auto_tools: set[str] | None = None,
         reasoning_effort: str | None = None,
         agent_alias: str | None = None,
+        parent_call_id: str | None = None,
     ) -> str:
         """Run an autonomous agent loop.
 
         Args:
-            agent_messages: Pre-built message list (system + developer + user).
+            agent_turns: Pre-built sub-harness trajectory (system + user) as
+                neutral ``Turn`` objects, lowered to wire dicts at the API
+                boundary.  Mutated in place — every assistant turn and tool
+                result is appended as the loop runs.
             label: Display prefix for progress lines (e.g. "task").
             tools: Tool definitions to send to the API. Defaults to the
                 session's task tool set.
@@ -12179,6 +12204,9 @@ class ChatSession:
                 the registry's per-kind resolution when set.  Caller is
                 expected to have validated the alias against the registry;
                 an unknown alias here raises ``ValueError``.
+            parent_call_id: The task_agent call_id this sub-agent runs under,
+                threaded so each sub-tool's events get tagged for UI nesting.
+                ``None`` for a top-level run (no nesting).
 
         Returns:
             Final content string from the agent.
@@ -12228,7 +12256,7 @@ class ChatSession:
         )
 
         def _api_call(
-            messages: list[dict[str, Any]],
+            turns: list[Turn],
             _tools: list[dict[str, Any]] | None = tools,
         ) -> CompletionResult:
             # NOTE: Phase 5 vLLM ``reasoning`` field replay is intentionally
@@ -12238,13 +12266,17 @@ class ChatSession:
             # every turn anyway.  Task agents are excluded from the
             # persistence/replay contract — their conversation history
             # is in-memory and rebuilt per ``_run_agent`` invocation.
+            # Lower the trajectory once, not once per retry attempt — ``turns``
+            # is invariant across attempts (the retry path only sleeps and
+            # re-sends the same messages).
+            wire = dicts_from_turns(turns)
             last_err: Exception | None = None
             for attempt in range(self._MAX_RETRIES + 1):
                 try:
                     agent_result = agent_provider.create_completion(
                         client=agent_client,
                         model=agent_model,
-                        messages=messages,
+                        messages=wire,
                         tools=_tools,
                         max_tokens=self.max_tokens,
                         temperature=self.temperature,
@@ -12278,7 +12310,7 @@ class ChatSession:
         while max_tool_turns < 0 or turn < max_tool_turns:
             self._check_cancelled()
             try:
-                result = _api_call(agent_messages)
+                result = _api_call(agent_turns)
             except Exception as e:
                 # Context-exceeded or other non-retryable API error.
                 # Return what we have so far rather than crashing.
@@ -12286,9 +12318,9 @@ class ChatSession:
                 if "context" in err_str or "token" in err_str:
                     self.ui.on_info(f"[{label}] context limit reached, stopping early")
                     # Find the last assistant content we have
-                    for msg in reversed(agent_messages):
-                        if msg.get("role") == "assistant" and msg.get("content"):
-                            return self._guard_subagent_synthesis(str(msg["content"]), label)
+                    for t in reversed(agent_turns):
+                        if t.role is Role.ASSISTANT and t.text:
+                            return self._guard_subagent_synthesis(t.text, label)
                     return f"({label} stopped: context limit exceeded)"
                 raise
 
@@ -12300,15 +12332,19 @@ class ChatSession:
                 self.ui.on_info(f"[{label}] blocked by content filter")
                 return "(content filter)"
 
-            # Build message dict for agent history
-            msg_dict: dict[str, Any] = {
-                "role": "assistant",
-                "content": result.content or "",
-            }
+            # Append the assistant turn to the sub-harness trajectory.
+            agent_tool_calls: tuple[ToolCall, ...] = ()
             if result.tool_calls:
                 self._ensure_tool_call_ids(result.tool_calls)
-                msg_dict["tool_calls"] = result.tool_calls
-            agent_messages.append(msg_dict)
+                agent_tool_calls = tuple(
+                    ToolCall(
+                        id=tc["id"],
+                        name=tc.get("function", {}).get("name", ""),
+                        arguments=tc.get("function", {}).get("arguments", ""),
+                    )
+                    for tc in result.tool_calls
+                )
+            agent_turns.append(Turn.assistant(result.content or "", tool_calls=agent_tool_calls))
 
             if not result.tool_calls:
                 content = result.content or "(no output)"
@@ -12321,6 +12357,10 @@ class ChatSession:
             for tc_dict in result.tool_calls:
                 self._check_cancelled()
                 tool_name = tc_dict["function"]["name"].strip()
+                # Register every issued sub-tool under its parent task_agent —
+                # not only the execute path — so a guard-branch error's
+                # output_warning still nests under the task card.
+                self._note_agent_child(tc_dict["id"], parent_call_id)
 
                 # Guard 1: block recursive agent calls.
                 if tool_name == "task_agent":
@@ -12373,28 +12413,29 @@ class ChatSession:
                 if isinstance(output, str) and len(output) > 16000:
                     output = output[:16000] + f"\n\n... (truncated from {len(output)} chars)"
 
-                agent_messages.append(
-                    {
-                        "role": "tool",
-                        "tool_call_id": tc_dict["id"],
-                        "content": output,
-                    }
-                )
+                # NOTE: for a vision tool result ``output`` is a list[dict] of
+                # inline content parts (read_file on an image).  It lowers back
+                # to the same inline list on the wire (behaviour preserved), but
+                # it is NOT a valid ``TextBlock`` — ``Turn.text`` would raise on
+                # it.  No consumer evaluates ``.text`` on a sub-agent tool turn
+                # today.  The proper by-reference representation needs the
+                # attachment resolver wired into this sub-agent's
+                # ``create_completion`` (it currently isn't) plus content-
+                # addressed byte storage — deferred to the recall/persist work
+                # where that attachment path is already in scope.
+                agent_turns.append(Turn.tool(tc_dict["id"], output))
             turn += 1
 
         # Exhausted tool turns — force a final synthesis response.
         self.ui.on_info(f"[{label}] turn limit reached, requesting synthesis...")
-        agent_messages.append(
-            {
-                "role": "user",
-                "content": (
-                    "You have reached the tool call limit. "
-                    "Provide your complete response now using "
-                    "the information you have gathered so far."
-                ),
-            }
+        agent_turns.append(
+            Turn.user(
+                "You have reached the tool call limit. "
+                "Provide your complete response now using "
+                "the information you have gathered so far."
+            )
         )
-        result = _api_call(agent_messages, _tools=[])
+        result = _api_call(agent_turns, _tools=[])
         content = result.content or "(no output)"
         self.ui.on_info(f"[{label} done] {len(content)} chars")
         return self._guard_subagent_synthesis(content, label)
@@ -12459,21 +12500,22 @@ class ChatSession:
         # history — it's an autonomous sub-agent. Merged to avoid
         # multi-system-message errors on models like Qwen.
         base = self._agent_system_messages[0]["content"] if self._agent_system_messages else ""
-        agent_messages = [
-            {"role": "system", "content": base + "\n\n" + identity},
-            {"role": "user", "content": prompt},
+        agent_turns: list[Turn] = [
+            Turn.system(base + "\n\n" + identity),
+            Turn.user(prompt),
         ]
         try:
             return call_id, self._run_agent(
-                agent_messages,
+                agent_turns,
                 label="task",
                 tools=self._task_tools,
                 auto_tools=TASK_AUTO_TOOLS,
                 agent_alias=item.get("model_override"),
+                parent_call_id=call_id,
             )
         except GenerationCancelled:
             # Fold back an honest disposition built from the agent's own
-            # ledger.  ``agent_messages`` is mutated in place by
+            # ledger.  ``agent_turns`` is mutated in place by
             # ``_run_agent`` (it appends every assistant turn and tool
             # result), so at this catch point it holds the full record of
             # what the sub-agent did before cancel — including a partial
@@ -12484,8 +12526,8 @@ class ChatSession:
             # See the cancellation appendix in HYPOTHESIS.md ("ρ may
             # fabricate the acknowledgment but must not fabricate the
             # outcome … unknown, never none").
-            self._tool_status[call_id] = self._cancelled_agent_status(agent_messages)
-            return call_id, self._cancelled_agent_disposition(agent_messages, "task")
+            self._tool_status[call_id] = self._cancelled_agent_status(agent_turns)
+            return call_id, self._cancelled_agent_disposition(agent_turns, "task")
         except KeyboardInterrupt:
             # CLI Ctrl-C: keep the terse string and let the outer loop own
             # propagation (unchanged behavior).
@@ -12493,10 +12535,12 @@ class ChatSession:
         except Exception as e:
             self.ui.on_info(f"[task error] {e}")
             return call_id, f"Task error: {e}"
+        finally:
+            self._clear_agent_children(call_id)
 
     @staticmethod
     def _cancel_ledger(
-        agent_messages: list[dict[str, Any]],
+        agent_turns: list[Turn],
     ) -> tuple[list[tuple[str, bool]], int | None]:
         """Read a cancelled sub-agent's ledger: every issued tool call as
         ``(name, was_answered)`` in order, plus the index of the first in-flight
@@ -12511,32 +12555,32 @@ class ChatSession:
         its typed status so the two can't disagree.
         """
         answered: set[str] = set()
-        for m in agent_messages:
-            if m.get("role") == "tool" and m.get("tool_call_id"):
-                answered.add(str(m["tool_call_id"]))
+        for t in agent_turns:
+            if t.role is Role.TOOL and t.tool_call_id:
+                answered.add(t.tool_call_id)
         issued: list[tuple[str, bool]] = []
-        for m in agent_messages:
-            if m.get("role") != "assistant":
+        for t in agent_turns:
+            if t.role is not Role.ASSISTANT:
                 continue
-            for tc in m.get("tool_calls") or []:
-                name = ((tc.get("function") or {}).get("name") or "tool").strip()
-                issued.append((name, str(tc.get("id") or "") in answered))
+            for tc in t.tool_calls:
+                name = (tc.name or "tool").strip()
+                issued.append((name, tc.id in answered))
         first_gap = next((i for i, (_n, ans) in enumerate(issued) if not ans), None)
         return issued, first_gap
 
-    def _cancelled_agent_status(self, agent_messages: list[dict[str, Any]]) -> EffectStatus:
+    def _cancelled_agent_status(self, agent_turns: list[Turn]) -> EffectStatus:
         """Typed twin of :meth:`_cancelled_agent_disposition`: ``none`` if the
         agent never acted, ``unknown`` if a tool was in flight when cancel
         landed (its effect unobserved), else ``partial`` — every issued call
         returned, but the agent was stopped before finishing."""
-        issued, first_gap = self._cancel_ledger(agent_messages)
+        issued, first_gap = self._cancel_ledger(agent_turns)
         if not issued:
             return EffectStatus.NONE
         if first_gap is not None:
             return EffectStatus.UNKNOWN
         return EffectStatus.PARTIAL
 
-    def _cancelled_agent_disposition(self, agent_messages: list[dict[str, Any]], label: str) -> str:
+    def _cancelled_agent_disposition(self, agent_turns: list[Turn], label: str) -> str:
         """Build an honest, deterministic disposition for a cancelled sub-agent.
 
         A cancelled agent must not report a fabricated *outcome*.  The bare
@@ -12551,12 +12595,12 @@ class ChatSession:
         side effect may or may not have landed, its result never observed),
         and everything after it never ran.
 
-        Pure string assembly over the in-memory ``agent_messages`` — no
+        Pure string assembly over the in-memory ``agent_turns`` — no
         model call, because we are on the cancel path and the gate is
         closed.  The owner (parent / coordinator) reads this to decide what,
         if anything, to compensate.
         """
-        issued, first_gap = self._cancel_ledger(agent_messages)
+        issued, first_gap = self._cancel_ledger(agent_turns)
         if not issued:
             return f"({label} cancelled by user before any action — no side effects)"
 

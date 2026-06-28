@@ -13,6 +13,7 @@ import pytest
 
 from turnstone.core.session import _IMAGE_EXTENSIONS, _IMAGE_SIZE_CAP, ChatSession
 from turnstone.core.trajectory import (
+    Turn,
     dicts_from_turns,
     turn_from_dict,
     turn_to_dict,
@@ -291,7 +292,7 @@ class TestTaskExec:
 
         with patch.object(session, "_run_agent", side_effect=fake_run_agent):
             session._exec_task(item)
-        return captured["messages"][0]["content"]
+        return captured["messages"][0].text
 
     def test_known_skill_renders_into_system_message(self, tmp_db) -> None:
         """Validated skill content (with template vars resolved) replaces
@@ -1346,7 +1347,7 @@ class TestAgentOutputGuard:
 
             with patch.object(session, "_prepare_tool", side_effect=fake_prepare):
                 session._run_agent(
-                    [{"role": "user", "content": "test"}],
+                    [Turn.user("test")],
                     tools=[{"type": "function", "function": {"name": "read_file"}}],
                     label="test",
                 )
@@ -1409,7 +1410,7 @@ class TestAgentOutputGuard:
 
             with patch.object(session, "_prepare_tool", side_effect=fake_prepare):
                 session._run_agent(
-                    [{"role": "user", "content": "test"}],
+                    [Turn.user("test")],
                     tools=[{"type": "function", "function": {"name": "read_file"}}],
                     label="test",
                 )
@@ -1449,7 +1450,7 @@ class TestAgentOutputGuard:
             session.client.chat.completions.create = fake_create
 
             result = session._run_agent(
-                [{"role": "user", "content": "test"}],
+                [Turn.user("test")],
                 tools=[{"type": "function", "function": {"name": "read_file"}}],
                 label="plan",
             )
@@ -1487,7 +1488,7 @@ class TestAgentOutputGuard:
 
             session.client.chat.completions.create = fake_create
             result = session._run_agent(
-                [{"role": "user", "content": "test"}],
+                [Turn.user("test")],
                 tools=[{"type": "function", "function": {"name": "read_file"}}],
                 label="task",
             )
@@ -1522,8 +1523,8 @@ class TestAgentOutputGuard:
             session.client.chat.completions.create = fake_create
             result = session._run_agent(
                 [
-                    {"role": "user", "content": "test"},
-                    {"role": "assistant", "content": prior},
+                    Turn.user("test"),
+                    Turn.assistant(prior),
                 ],
                 tools=[{"type": "function", "function": {"name": "read_file"}}],
                 label="plan",
@@ -1587,7 +1588,7 @@ class TestAgentOutputGuard:
 
             with patch.object(session, "_prepare_tool", side_effect=fake_prepare):
                 result = session._run_agent(
-                    [{"role": "user", "content": "test"}],
+                    [Turn.user("test")],
                     tools=[{"type": "function", "function": {"name": "read_file"}}],
                     label="task",
                 )
@@ -1599,6 +1600,60 @@ class TestAgentOutputGuard:
             assert synth_args[0].startswith("agent_synth_task_")
             assert synth_args[1] == forced
             assert synth_args[2] == "task_agent_synthesis"
+
+
+class TestAgentChildRegistration:
+    """_run_agent registers each sub-tool under the task's parent_call_id so the
+    UI can nest the step (the producer side of the SessionUIBase tagging)."""
+
+    def test_sub_tool_registered_under_parent(self):
+        from turnstone.core.providers._openai_chat import OpenAIChatCompletionsProvider
+
+        session = _make_session()
+        session._provider = OpenAIChatCompletionsProvider()
+        session.ui.note_agent_child = MagicMock()
+
+        call_count = [0]
+
+        def fake_create(**_kwargs):
+            call_count[0] += 1
+            resp = MagicMock()
+            choice = MagicMock()
+            if call_count[0] == 1:
+                choice.finish_reason = "tool_calls"
+                tc = MagicMock()
+                tc.id = "call_1"
+                tc.function.name = "read_file"
+                tc.function.arguments = '{"path": "/tmp/x"}'
+                choice.message.tool_calls = [tc]
+                choice.message.content = None
+            else:
+                choice.finish_reason = "stop"
+                choice.message.tool_calls = None
+                choice.message.content = "done"
+            resp.choices = [choice]
+            resp.usage = MagicMock(prompt_tokens=10, completion_tokens=5)
+            return resp
+
+        session.client.chat.completions.create = fake_create
+
+        def fake_prepare(tc_dict, **_kwargs):
+            return {
+                "call_id": tc_dict["id"],
+                "func_name": "read_file",
+                "needs_approval": False,
+                "execute": lambda p: ("call_1", "contents"),
+            }
+
+        with patch.object(session, "_prepare_tool", side_effect=fake_prepare):
+            session._run_agent(
+                [Turn.user("x")],
+                tools=[{"type": "function", "function": {"name": "read_file"}}],
+                label="task",
+                parent_call_id="task-1",
+            )
+
+        session.ui.note_agent_child.assert_called_once_with("call_1", "task-1")
 
 
 class TestEvaluateOutputLLMStage:

@@ -2089,3 +2089,74 @@ def test_tool_pending_precedes_smart_approval_gate() -> None:
 
     assert approved is True
     assert captured and captured[0] == "tool_pending", captured
+
+
+# ---------------------------------------------------------------------------
+# Sub-agent step tagging (task_agent child events nest under the parent card)
+# ---------------------------------------------------------------------------
+
+
+class TestAgentChildTagging:
+    """``note_agent_child`` makes ``_enqueue`` stamp ``parent_call_id`` on a
+    sub-tool's events so the UI can nest a task agent's steps under its card.
+    Keyed on the immutable child call_id (correct under the parent's parallel
+    tool pool); cleared when the task agent finishes."""
+
+    def test_registered_child_event_is_stamped(self) -> None:
+        ui = _make_ui()
+        lq = ui._register_listener()
+        ui.note_agent_child("child-1", "task-A")
+        ui._enqueue({"type": "tool_result", "call_id": "child-1", "name": "bash", "output": "ok"})
+        assert lq.get_nowait()["parent_call_id"] == "task-A"
+
+    def test_unregistered_call_id_is_not_stamped(self) -> None:
+        ui = _make_ui()
+        lq = ui._register_listener()
+        ui.note_agent_child("child-1", "task-A")
+        ui._enqueue({"type": "tool_result", "call_id": "other", "name": "x", "output": "y"})
+        assert "parent_call_id" not in lq.get_nowait()
+
+    def test_no_registry_no_stamp(self) -> None:
+        """Empty registry short-circuits — events pass through untouched."""
+        ui = _make_ui()
+        lq = ui._register_listener()
+        ui._enqueue({"type": "tool_result", "call_id": "child-1", "name": "x", "output": "y"})
+        assert "parent_call_id" not in lq.get_nowait()
+
+    def test_items_payload_is_stamped_per_entry(self) -> None:
+        """approve_request / tool_pending carry an ``items`` list; each child
+        entry is tagged independently, leaving non-child entries alone."""
+        ui = _make_ui()
+        lq = ui._register_listener()
+        ui.note_agent_child("child-1", "task-A")
+        ui._enqueue(
+            {
+                "type": "tool_pending",
+                "items": [
+                    {"call_id": "child-1", "func_name": "bash"},
+                    {"call_id": "top-level", "func_name": "search"},
+                ],
+            }
+        )
+        items = lq.get_nowait()["items"]
+        assert items[0]["parent_call_id"] == "task-A"
+        assert "parent_call_id" not in items[1]
+
+    def test_clear_agent_children_stops_stamping(self) -> None:
+        ui = _make_ui()
+        lq = ui._register_listener()
+        ui.note_agent_child("child-1", "task-A")
+        ui.clear_agent_children("task-A")
+        ui._enqueue({"type": "tool_result", "call_id": "child-1", "name": "x", "output": "y"})
+        assert "parent_call_id" not in lq.get_nowait()
+
+    def test_clear_is_scoped_to_one_parent(self) -> None:
+        """Two task agents in flight: clearing one leaves the other's children
+        tagged — the parallel-pool invariant."""
+        ui = _make_ui()
+        lq = ui._register_listener()
+        ui.note_agent_child("child-A", "task-A")
+        ui.note_agent_child("child-B", "task-B")
+        ui.clear_agent_children("task-A")
+        ui._enqueue({"type": "tool_result", "call_id": "child-B", "name": "x", "output": "y"})
+        assert lq.get_nowait()["parent_call_id"] == "task-B"
