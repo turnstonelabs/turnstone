@@ -599,6 +599,28 @@ class TestSummaryInputBudget:
         large_reserve = session._summary_input_budget_chars()
         assert large_reserve < small_reserve  # less room left for input
 
+    def test_budget_never_exceeds_true_input_capacity(self, session):
+        """Review (Copilot): the _MIN_SUMMARY_BUDGET_CHARS floor must not push the
+        budget above what actually fits — output reserve + budgeted input + prompt
+        must stay within context_window, or the summary call overflows on a tiny
+        window instead of bailing.  Without the cap the floor (2000 chars) exceeds
+        capacity here and the call would overflow."""
+        session.context_window = 1200
+        session.compact_max_tokens = 1200
+        session._system_tokens = 0
+        budget_chars = session._summary_input_budget_chars()
+        prompt_tokens = int(
+            (len(session._COMPACTOR_SYSTEM_PROMPT) + len(session._COMPACT_USER_PREFIX))
+            / session._chars_per_token
+        )
+        # The full summary call (output reserve + budgeted input + prompt) fits.
+        total = (
+            session._summary_output_tokens()
+            + budget_chars / session._chars_per_token
+            + prompt_tokens
+        )
+        assert total <= session.context_window
+
 
 class TestChunkedCompaction:
     """The chunked driver: one call when it all fits, recursion when it doesn't,
@@ -714,13 +736,12 @@ class TestChunkedCompaction:
         path) rather than fabricate, and without burning a model call.
 
         Needs a *tiny* window now that Fix 1 keeps the budget healthy on normal
-        windows: at context_window=900 the output reserve (512, the floor) plus
-        the compactor prompt + safety exceed the window, so
-        ``_summary_input_budget_chars`` floors to ``_MIN_SUMMARY_BUDGET_CHARS``
-        (2000).  Each message's content is ~5000 chars, head+tail-capped by
-        ``_format_message_for_summary`` to ~1525 — one block fits the 2000-char
-        budget, but two (1525 + 1525) don't, so ``_pack_blocks`` yields one batch
-        per block: ``len(batches) == len(blocks)`` → irreducible bail at depth 0.
+        windows: at context_window=900 the output reserve + compactor prompt +
+        safety already exceed the window, so the true input capacity is negative
+        and ``_summary_input_budget_chars`` caps the budget to 0.  Each ~5000-char
+        message head+tail-caps to ~1525, far over the 0/1-char budget, so
+        ``_pack_blocks`` truncates each into its own batch:
+        ``len(batches) == len(blocks)`` → irreducible bail at depth 0, no model call.
         """
         session.context_window = 900
         session.compact_max_tokens = 900

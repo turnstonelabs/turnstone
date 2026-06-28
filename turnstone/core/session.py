@@ -216,7 +216,9 @@ class _CompactionIrreducibleError(Exception):
     or the depth ceiling is hit.
 
     ``ChatSession._compact_messages`` turns it into the existing ``return False``
-    bail rather than fabricate a summary (chunking only — no honest degradation).
+    bail rather than fabricate a summary.  (Chunked compaction never drops or
+    fabricates whole turns; its one lossy path is ``_truncate_block`` head/tail-
+    truncating a single oversized block as summary *input*.)
     """
 
 
@@ -5800,7 +5802,10 @@ class ChatSession:
         the compactor prompt, and a safety margin; scale the remainder by
         ``_SUMMARY_BUDGET_FRACTION`` to cover the uncalibrated ``_chars_per_token``
         on the reactive path (no ``_last_usage`` yet); convert to chars; floor at
-        ``_MIN_SUMMARY_BUDGET_CHARS`` so a tiny window still makes progress.
+        ``_MIN_SUMMARY_BUDGET_CHARS`` so a usable window still makes progress, but
+        never above the true input capacity — flooring past what actually fits
+        would reintroduce a summary-call overflow on a pathologically small
+        window (the call bails as "irreducible" instead).
         """
         output_reserve = self._summary_output_tokens()
         prompt_chars = len(self._COMPACTOR_SYSTEM_PROMPT) + len(self._COMPACT_USER_PREFIX)
@@ -5808,7 +5813,13 @@ class ChatSession:
         safety = int(self.context_window * self._SUMMARY_SAFETY_MARGIN)
         input_tokens = self.context_window - output_reserve - prompt_tokens - safety
         budget_tokens = max(0, int(input_tokens * self._SUMMARY_BUDGET_FRACTION))
-        return max(self._MIN_SUMMARY_BUDGET_CHARS, int(budget_tokens * self._chars_per_token))
+        budget_chars = max(
+            self._MIN_SUMMARY_BUDGET_CHARS, int(budget_tokens * self._chars_per_token)
+        )
+        # Cap the floor at the true input capacity: on a pathologically small
+        # window the floor would otherwise push the summary call (input + output
+        # reserve + prompt) past context_window instead of letting it bail.
+        return min(budget_chars, max(0, int(input_tokens * self._chars_per_token)))
 
     @staticmethod
     def _truncate_block(block: str, budget: int) -> str:
