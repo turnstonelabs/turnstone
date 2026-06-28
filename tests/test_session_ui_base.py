@@ -18,6 +18,8 @@ import threading
 from typing import Any
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 from turnstone.core.session_ui_base import SessionUIBase
 
 
@@ -2166,8 +2168,19 @@ class TestAgentScopeInfoSuppression:
     """While a task agent runs, its ``on_info`` progress chatter ("[task done] N
     chars", a tool's "fetched N chars") carries no call_id, so it can't nest
     under the task card.  The web pane drops it for the duration rather than let
-    it escape to the top level; the depth counter keeps it correct under the
-    parent's parallel task pool."""
+    it escape to the top level; the per-thread contextvar keeps it correct under
+    the parent's parallel task pool (siblings in other threads aren't suppressed)."""
+
+    @pytest.fixture(autouse=True)
+    def _reset_scope(self):
+        # The scope depth is a module-level contextvar that persists across tests
+        # in the same thread; reset it around each so an unbalanced test (or a
+        # leak from elsewhere) can't bleed suppression into another test.
+        from turnstone.core.session_ui_base import _agent_scope_var
+
+        token = _agent_scope_var.set(0)
+        yield
+        _agent_scope_var.reset(token)
 
     def test_on_info_suppressed_within_scope(self) -> None:
         ui = _make_ui()
@@ -2211,3 +2224,42 @@ class TestAgentScopeInfoSuppression:
         ui.begin_agent_scope()
         ui.on_info("suppressed")
         assert lq.empty()
+
+
+class TestAgentTrajectoryStash:
+    """The recall store retains a finished task agent's projected sub-trajectory
+    keyed by call_id, LRU-bounded.  A miss is the honest "not retained" signal —
+    /history then renders the flat parent record, never a fabricated 0-step card."""
+
+    def test_stash_and_get_roundtrip(self) -> None:
+        ui = _make_ui()
+        steps = [
+            {"id": "t1::c1", "name": "search", "arguments": "{}", "output": "ok", "is_error": False}
+        ]
+        ui.stash_agent_trajectory("t1", steps)
+        assert ui.get_agent_trajectory("t1") == steps
+
+    def test_missing_returns_none(self) -> None:
+        assert _make_ui().get_agent_trajectory("nope") is None
+
+    def test_empty_call_id_ignored(self) -> None:
+        ui = _make_ui()
+        ui.stash_agent_trajectory("", [{"id": "x"}])
+        assert ui.get_agent_trajectory("") is None
+
+    def test_restash_updates_value(self) -> None:
+        ui = _make_ui()
+        ui.stash_agent_trajectory("k", [{"id": "v1"}])
+        ui.stash_agent_trajectory("k", [{"id": "v2"}])
+        assert ui.get_agent_trajectory("k") == [{"id": "v2"}]
+
+    def test_lru_evicts_oldest(self) -> None:
+        from turnstone.core.session_ui_base import _AGENT_TRAJECTORY_CAP
+
+        ui = _make_ui()
+        for i in range(_AGENT_TRAJECTORY_CAP + 3):
+            ui.stash_agent_trajectory(f"t{i}", [{"id": f"t{i}"}])
+        # The three oldest fell out → honest None; the newest is retained.
+        assert ui.get_agent_trajectory("t0") is None
+        assert ui.get_agent_trajectory("t2") is None
+        assert ui.get_agent_trajectory(f"t{_AGENT_TRAJECTORY_CAP + 2}") is not None

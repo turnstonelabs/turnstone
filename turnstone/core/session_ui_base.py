@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import collections
 import contextlib
+import contextvars
 import copy
 import json
 import math
@@ -43,6 +44,25 @@ log = get_logger(__name__)
 # UI's ``_LISTENER_QUEUE_MAX``. Per-queue cap keeps a slow SSE consumer
 # from bloating memory.
 _DEFAULT_LISTENER_QUEUE_MAX = 500
+
+# Recall: how many finished task agents' projected sub-trajectories to retain
+# in memory for /history card rebuilds.  LRU-bounded so a marathon workstream
+# can't grow it without limit; eviction (and a cold reopen, which starts empty)
+# recalls honestly as "not retained" rather than a fabricated 0-step card.
+_AGENT_TRAJECTORY_CAP = 256
+
+# Sub-agent scope, PER-THREAD.  A task agent's progress chatter reaches the UI as
+# ``on_info`` lines ("[task done] N chars", a tool's "fetched N chars") that
+# carry no call_id — they can't nest under the task card and would escape to the
+# top level, so the web pane drops them while a sub-agent runs.  A contextvar,
+# not a session-global counter, so the suppression follows the sub-agent's OWN
+# thread: a parallel sibling tool running in another pool thread keeps its info
+# lines.  Incremented/decremented by begin_/end_agent_scope around each
+# ``_run_agent``; the CLI overrides ``on_info`` and is unaffected (no card → the
+# lines are its only signal).
+_agent_scope_var: contextvars.ContextVar[int] = contextvars.ContextVar(
+    "turnstone_agent_scope_depth", default=0
+)
 
 
 def _resolve_event_buffer_max() -> int:
@@ -262,16 +282,20 @@ class SessionUIBase:
         # own lock so the hot fan-out path never serializes on ``_listeners_lock``.
         self._agent_children: dict[str, str] = {}
         self._agent_children_lock = threading.Lock()
-        # Sub-agent scope depth.  A task agent's progress chatter reaches the UI
-        # as ``on_info`` lines ("[task done] N chars", a tool's "fetched N
-        # chars, extracting...") that carry no call_id — so they can't nest under
-        # the task card and would escape to the top level.  While any ``_run_agent``
-        # is in flight this is > 0 and the web pane drops those info lines (the
-        # card already shows the steps + result).  A depth, not a flag, so the
-        # parent's 4-wide parallel task pool nests correctly; guarded by
-        # ``_agent_children_lock``.  The CLI overrides ``on_info`` and is
-        # unaffected (it has no card, so the lines are its only signal).
-        self._agent_scope_depth = 0
+        # Recall store: a finished task agent's projected sub-trajectory (step
+        # items: id/name/arguments/output/is_error), keyed by its (parent)
+        # call_id, so /history can rebuild the collapsible card after a fresh
+        # connect / reopen while the workstream is still in memory.  LRU-bounded
+        # (oldest evicted past the cap); IN-MEMORY ONLY — durable persistence is
+        # deferred, so a cold reopen (new session) finds it empty and renders the
+        # flat parent record.  Guarded by ``_agent_children_lock`` (same low-rate
+        # agent-state path).  [[HYPOTHESIS]] the sub-trajectory is the ledger;
+        # an absent one is unknown ("not retained"), never none ("0 steps").
+        self._agent_trajectories: collections.OrderedDict[str, list[dict[str, Any]]] = (
+            collections.OrderedDict()
+        )
+        # (Sub-agent ``on_info`` suppression is per-thread via the module-level
+        # ``_agent_scope_var`` contextvar — no instance field.)
         # Approval blocking — the worker thread calls approve_tools
         # which waits on _approval_event; the /approve endpoint sets
         # it via resolve_approval.
@@ -554,17 +578,40 @@ class SessionUIBase:
 
     def begin_agent_scope(self) -> None:
         """Enter a task agent's execution.  Until the matching
-        :meth:`end_agent_scope`, the web pane drops ``on_info`` lines (the task
-        card carries the sub-agent's visible output, so the info chatter would
-        only escape to the top level).  Depth-counted for the parent's parallel
-        task pool; the session brackets each ``_run_agent`` with this pair."""
-        with self._agent_children_lock:
-            self._agent_scope_depth += 1
+        :meth:`end_agent_scope`, the web pane drops ``on_info`` lines from THIS
+        thread (the task card carries the sub-agent's visible output, so the info
+        chatter would only escape to the top level).  Per-thread via
+        :data:`_agent_scope_var` so a parallel SIBLING tool in another pool
+        thread isn't suppressed; depth-counted for safety though task agents
+        don't nest.  The session brackets each ``_run_agent`` with this pair."""
+        _agent_scope_var.set(_agent_scope_var.get() + 1)
 
     def end_agent_scope(self) -> None:
         """Leave a task agent's execution (see :meth:`begin_agent_scope`)."""
+        _agent_scope_var.set(max(0, _agent_scope_var.get() - 1))
+
+    def stash_agent_trajectory(self, call_id: str, steps: list[dict[str, Any]]) -> None:
+        """Retain a finished task agent's projected sub-trajectory (step items)
+        keyed by its call_id so ``/history`` can rebuild the card on a fresh
+        connect / reopen while the workstream is in memory.  LRU-bounded; the
+        newest write is most-recently-used, oldest evicted past the cap.  See
+        :data:`_AGENT_TRAJECTORY_CAP` and the field comment in ``__init__``."""
+        if not call_id:
+            return
         with self._agent_children_lock:
-            self._agent_scope_depth = max(0, self._agent_scope_depth - 1)
+            self._agent_trajectories[call_id] = steps
+            self._agent_trajectories.move_to_end(call_id)
+            while len(self._agent_trajectories) > _AGENT_TRAJECTORY_CAP:
+                self._agent_trajectories.popitem(last=False)
+
+    def get_agent_trajectory(self, call_id: str) -> list[dict[str, Any]] | None:
+        """Read a stashed sub-trajectory, or ``None`` if not retained (evicted,
+        or a cold reopen with an empty store).  ``None`` is the honest "unknown"
+        signal — the caller renders the flat parent record, never a 0-step card."""
+        if not call_id:
+            return None
+        with self._agent_children_lock:
+            return self._agent_trajectories.get(call_id)
 
     def _register_listener(
         self, maxsize: int = _DEFAULT_LISTENER_QUEUE_MAX
@@ -2504,12 +2551,13 @@ class SessionUIBase:
             log.warning("Failed to record usage event", exc_info=True)
 
     def on_info(self, message: str) -> None:
-        # Inside a task agent, progress chatter ("[task done] N chars", a tool's
-        # "fetched N chars, extracting...") carries no call_id, so it can't nest
-        # under the task card — drop it on the web pane rather than let it escape
-        # to the top level.  The card shows the steps + result; the CLI overrides
-        # this method and keeps the lines (no card there).
-        if self._agent_scope_depth > 0:
+        # Inside a task agent (on THIS thread), progress chatter ("[task done] N
+        # chars", a tool's "fetched N chars") carries no call_id, so it can't
+        # nest under the task card — drop it on the web pane rather than let it
+        # escape to the top level.  Per-thread, so a parallel sibling tool's info
+        # still shows.  The card shows the steps + result; the CLI overrides this
+        # method and keeps the lines (no card there).
+        if _agent_scope_var.get() > 0:
             return
         self._enqueue({"type": "info", "message": message})
 

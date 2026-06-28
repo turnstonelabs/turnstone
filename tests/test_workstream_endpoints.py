@@ -1117,6 +1117,77 @@ class TestExportInteractive:
         assert "should not leak" not in r.text
 
 
+class TestHistoryAgentStepsOverlay:
+    """The history handler attaches a live task agent's stashed sub-trajectory to
+    its ``task_agent`` tool_call (``agent_steps``) so the client rebuilds the
+    card.  A cold ws / evicted entry has none → no overlay (honest flat row)."""
+
+    def _save_task_agent_turn(self, storage, ws_id):
+        storage.register_workstream(ws_id, kind="interactive", user_id="test-user")
+        storage.save_message(ws_id, "user", "kick off")
+        tc_json = json.dumps(
+            [
+                {
+                    "id": "task1",
+                    "type": "function",
+                    "function": {
+                        "name": "task_agent",
+                        "arguments": '{"prompt":"find call sites"}',
+                    },
+                }
+            ]
+        )
+        storage.save_message(ws_id, "assistant", "Working", tool_calls=tc_json)
+        storage.save_message(ws_id, "tool", "4 call sites found", tool_call_id="task1")
+
+    def test_attaches_agent_steps_from_live_stash(self, _inject_storage):
+        ws_id = "ws-recall-warm"
+        self._save_task_agent_turn(_inject_storage, ws_id)
+        steps = [
+            {
+                "id": "task1::c1",
+                "name": "search",
+                "arguments": "{}",
+                "output": "12 matches",
+                "is_error": False,
+            }
+        ]
+        mock_ws = MagicMock()
+        mock_ws.id = ws_id
+        mock_ws.ui._pending_approval = None
+        mock_ws.ui.get_agent_trajectory = lambda cid: steps if cid == "task1" else None
+        mock_mgr = MagicMock()
+        mock_mgr.get.return_value = mock_ws
+
+        r = _build_history_app(mock_mgr, _inject_storage).get(
+            f"/v1/api/workstreams/{ws_id}/history"
+        )
+        assert r.status_code == 200
+        assistant = next(m for m in r.json()["messages"] if m.get("role") == "assistant")
+        tc = assistant["tool_calls"][0]
+        assert tc["id"] == "task1"
+        assert tc["agent_steps"] == steps
+
+    def test_no_overlay_when_not_retained(self, _inject_storage):
+        # Cold / evicted: get_agent_trajectory returns None → no agent_steps key,
+        # so the client renders the flat parent record (never a 0-step card).
+        ws_id = "ws-recall-cold"
+        self._save_task_agent_turn(_inject_storage, ws_id)
+        mock_ws = MagicMock()
+        mock_ws.id = ws_id
+        mock_ws.ui._pending_approval = None
+        mock_ws.ui.get_agent_trajectory = lambda cid: None
+        mock_mgr = MagicMock()
+        mock_mgr.get.return_value = mock_ws
+
+        r = _build_history_app(mock_mgr, _inject_storage).get(
+            f"/v1/api/workstreams/{ws_id}/history"
+        )
+        assert r.status_code == 200
+        assistant = next(m for m in r.json()["messages"] if m.get("role") == "assistant")
+        assert "agent_steps" not in assistant["tool_calls"][0]
+
+
 class TestHistoryInteractive:
     """Interactive parity for the lifted ``GET /v1/api/workstreams/{ws_id}/history``."""
 

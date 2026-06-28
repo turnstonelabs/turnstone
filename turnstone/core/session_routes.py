@@ -3240,6 +3240,29 @@ def make_history_handler(cfg: SessionEndpointConfig) -> Handler:
                 messages = await asyncio.to_thread(
                     project_history_messages, to_project, awaiting_approval
                 )
+                # Task-agent recall: attach each task_agent tool_call's stashed
+                # sub-trajectory (projected step items) so the client's
+                # ``replayHistory`` can rebuild the collapsible card.  Live
+                # in-memory session only — a cold/closed ws, or an entry evicted
+                # past the LRU cap, has none, so the card renders the flat parent
+                # record ("not retained"), never a fabricated 0-step card.
+                # [[HYPOTHESIS]] an unobserved sub-trajectory is unknown, not none.
+                get_traj = getattr(getattr(live_session, "ui", None), "get_agent_trajectory", None)
+                if get_traj is not None:
+                    for msg in messages:
+                        for tc in msg.get("tool_calls") or ():
+                            # Only task_agent calls ever stash — skip the rest so
+                            # we don't take the agent-state lock once per tool_call
+                            # on a long history for ids that can never match.
+                            if tc.get("name") != "task_agent":
+                                continue
+                            steps = get_traj(tc.get("id") or "")
+                            # Attach only a well-formed, non-empty list — the
+                            # ``get_agent_trajectory`` contract is ``list | None``,
+                            # and the guard keeps a malformed result out of the
+                            # JSON payload (a non-list can't be serialized).
+                            if isinstance(steps, list) and steps:
+                                tc["agent_steps"] = steps
             except Exception:
                 # Operationally interesting: a persistent decoration
                 # failure (missing migration, driver mismatch, schema

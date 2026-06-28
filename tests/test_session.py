@@ -1658,6 +1658,310 @@ class TestAgentChildRegistration:
         session.ui.note_agent_child.assert_called_once_with("task-1::call_1", "task-1")
 
 
+class TestProjectAgentSteps:
+    """``_project_agent_steps`` projects a finished sub-agent's trajectory into
+    recall step items for the task card — one per tool call, matched to its
+    result by call_id, landmine-safe on a multimodal result."""
+
+    def test_calls_matched_to_results_in_order(self):
+        from turnstone.core.trajectory import ToolCall, Turn
+
+        turns = [
+            Turn.system("sys"),
+            Turn.user("go"),
+            Turn.assistant(
+                tool_calls=(ToolCall(id="c1", name="search", arguments='{"query":"x"}'),)
+            ),
+            Turn.tool("c1", "12 matches"),
+            Turn.assistant(
+                tool_calls=(ToolCall(id="c2", name="bash", arguments='{"command":"ls"}'),)
+            ),
+            Turn.tool("c2", "boom", is_error=True),
+        ]
+        steps = ChatSession._project_agent_steps(turns)
+        assert [s["id"] for s in steps] == ["c1", "c2"]
+        assert steps[0] == {
+            "id": "c1",
+            "name": "search",
+            "arguments": '{"query":"x"}',
+            "output": "12 matches",
+            "is_error": False,
+        }
+        assert steps[1]["is_error"] is True
+        assert steps[1]["output"] == "boom"
+
+    def test_multimodal_result_placeholdered_not_crashed(self):
+        # A vision tool result is a list[dict] mis-stored as TextBlock.text; the
+        # projection must NOT call Turn.text (would TypeError) — it reads the
+        # payload directly and placeholders a non-str so /history stays text-only.
+        from turnstone.core.trajectory import ToolCall, Turn
+
+        turns = [
+            Turn.assistant(
+                tool_calls=(ToolCall(id="c1", name="read_file", arguments='{"path":"a.png"}'),)
+            ),
+            Turn.tool("c1", [{"type": "image_url"}]),
+        ]
+        steps = ChatSession._project_agent_steps(turns)
+        assert steps[0]["output"] == "[non-text result]"
+
+    def test_output_capped(self):
+        from turnstone.core.session import _AGENT_STEP_OUTPUT_CAP
+        from turnstone.core.trajectory import ToolCall, Turn
+
+        big = "a" * (_AGENT_STEP_OUTPUT_CAP + 500)
+        turns = [
+            Turn.assistant(tool_calls=(ToolCall(id="c1", name="bash", arguments="{}"),)),
+            Turn.tool("c1", big),
+        ]
+        steps = ChatSession._project_agent_steps(turns)
+        assert len(steps[0]["output"]) < len(big)
+        assert "truncated from 2500 chars" in steps[0]["output"]
+
+    def test_unanswered_call_has_empty_output(self):
+        # A tool call with no matching result (cancelled mid-flight) recalls
+        # honestly as empty, not dropped.
+        from turnstone.core.trajectory import ToolCall, Turn
+
+        turns = [Turn.assistant(tool_calls=(ToolCall(id="c1", name="bash", arguments="{}"),))]
+        steps = ChatSession._project_agent_steps(turns)
+        assert steps == [
+            {"id": "c1", "name": "bash", "arguments": "{}", "output": "", "is_error": False}
+        ]
+
+    def test_colliding_ids_paired_fifo_not_last_wins(self):
+        # A local provider reuses id "call_0" across turns; FIFO pairing gives
+        # each call its OWN result, not last-wins (which would show out-B twice).
+        from turnstone.core.trajectory import ToolCall, Turn
+
+        turns = [
+            Turn.assistant(
+                tool_calls=(ToolCall(id="call_0", name="bash", arguments='{"command":"a"}'),)
+            ),
+            Turn.tool("call_0", "out-A"),
+            Turn.assistant(
+                tool_calls=(ToolCall(id="call_0", name="bash", arguments='{"command":"b"}'),)
+            ),
+            Turn.tool("call_0", "out-B"),
+        ]
+        steps = ChatSession._project_agent_steps(turns)
+        assert [s["output"] for s in steps] == ["out-A", "out-B"]
+
+    def test_step_count_capped_with_honest_marker(self):
+        from turnstone.core.session import _AGENT_STEP_COUNT_CAP
+        from turnstone.core.trajectory import ToolCall, Turn
+
+        turns = []
+        for i in range(_AGENT_STEP_COUNT_CAP + 5):
+            turns.append(
+                Turn.assistant(tool_calls=(ToolCall(id=f"c{i}", name="bash", arguments="{}"),))
+            )
+            turns.append(Turn.tool(f"c{i}", f"out{i}"))
+        steps = ChatSession._project_agent_steps(turns)
+        # Capped + one honest LEADING marker, keeping the most RECENT steps (the
+        # tail) — not the earliest — and naming how many earlier ones fell out.
+        assert len(steps) == _AGENT_STEP_COUNT_CAP + 1
+        assert steps[0]["name"] == "…"
+        assert "5 earlier steps not retained" in steps[0]["output"]
+        # c0..c4 dropped; c5 is the first retained, the newest call is last.
+        assert steps[1]["id"] == "c5"
+        assert steps[-1]["id"] == f"c{_AGENT_STEP_COUNT_CAP + 4}"
+
+
+class TestAgentTrajectoryStashWiring:
+    """``_stash_agent_trajectory`` projects + forwards to the UI, getattr-guarded."""
+
+    def test_projects_and_forwards(self):
+        from turnstone.core.trajectory import ToolCall, Turn
+
+        session = _make_session()
+        session.ui = MagicMock()
+        turns = [
+            Turn.assistant(tool_calls=(ToolCall(id="c1", name="bash", arguments="{}"),)),
+            Turn.tool("c1", "ok"),
+        ]
+        session._stash_agent_trajectory("task1", turns)
+        session.ui.stash_agent_trajectory.assert_called_once()
+        cid, steps = session.ui.stash_agent_trajectory.call_args[0]
+        assert cid == "task1"
+        assert steps == [
+            {"id": "c1", "name": "bash", "arguments": "{}", "output": "ok", "is_error": False}
+        ]
+
+    def test_noop_without_call_id(self):
+        session = _make_session()
+        session.ui = MagicMock()
+        session._stash_agent_trajectory(None, [])
+        session.ui.stash_agent_trajectory.assert_not_called()
+
+    def test_noop_on_ui_without_support(self):
+        # NullUI has no stash_agent_trajectory → getattr None → no-op, no raise.
+        _make_session()._stash_agent_trajectory("task1", [])
+
+
+class TestReadFilesIsolation:
+    """A task agent's file-read tracking is isolated from the main session and
+    its pool siblings via ``_active_read_files`` so the blind-overwrite guard
+    can't be cross-contaminated (a sibling's read suppressing another's guard)."""
+
+    def test_defaults_to_main_set(self):
+        session = _make_session()
+        assert session._current_read_files is session._read_files
+
+    def test_active_contextvar_overrides_then_restores(self):
+        from turnstone.core.session import _active_read_files
+
+        session = _make_session()
+        sub: set[str] = set()
+        token = _active_read_files.set(sub)
+        try:
+            assert session._current_read_files is sub
+        finally:
+            _active_read_files.reset(token)
+        assert session._current_read_files is session._read_files
+
+    def test_empty_active_set_is_used_not_main(self):
+        # The resolver guards on `is not None`, not truthiness — an EMPTY
+        # per-agent set must be used, NOT fall through to the main set, or a
+        # fresh agent would inherit the main session's reads and mis-suppress
+        # its own blind-overwrite guard.
+        from turnstone.core.session import _active_read_files
+
+        session = _make_session()
+        session._read_files.add("/main/file")
+        token = _active_read_files.set(set())
+        try:
+            assert session._current_read_files == set()
+        finally:
+            _active_read_files.reset(token)
+
+    def test_exec_task_copies_parent_reads_and_merges_back(self):
+        # Drive the REAL _exec_task wiring (not a hand-rolled contextvar dance):
+        # it copies the parent's reads into an INDEPENDENT per-agent set (so the
+        # agent can edit a file the parent read for it, without leaking mid-run
+        # to a sibling) and merges the agent's own reads back on completion.
+        session = _make_session()
+        session._agent_system_messages = []
+        session._task_tools = []
+        session._read_files.add("/parent/read")
+        seen = {}
+
+        def fake_run_agent(agent_turns, **_kwargs):
+            seen["sees_parent"] = "/parent/read" in session._current_read_files
+            session._current_read_files.add("/child/read")
+            seen["child_isolated"] = "/child/read" not in session._read_files
+            return "done"
+
+        with patch.object(session, "_run_agent", side_effect=fake_run_agent):
+            cid, out = session._exec_task({"call_id": "t1", "prompt": "go"})
+
+        assert (cid, out) == ("t1", "done")
+        assert seen["sees_parent"] is True  # copy-on-spawn: inherits parent's reads
+        assert seen["child_isolated"] is True  # independent set mid-run (no leak)
+        assert "/child/read" in session._read_files  # merged back on completion
+        assert session._current_read_files is session._read_files  # contextvar reset
+
+
+class TestSubAgentErrorRecall:
+    """_run_agent stamps is_error on a sub-tool's Turn from the authoritative
+    _tool_error_flags, so a failed sub-tool recalls styled as an error rather
+    than a green 'done' step (the most serious review finding)."""
+
+    def test_errored_sub_tool_turn_marked_is_error(self):
+        from turnstone.core.providers._openai_chat import OpenAIChatCompletionsProvider
+        from turnstone.core.trajectory import Role
+
+        session = _make_session()
+        session._provider = OpenAIChatCompletionsProvider()
+        calls = [0]
+
+        def fake_create(**_kwargs):
+            calls[0] += 1
+            resp = MagicMock()
+            choice = MagicMock()
+            if calls[0] == 1:
+                choice.finish_reason = "tool_calls"
+                tc = MagicMock()
+                tc.id = "call_1"
+                tc.function.name = "bash"
+                tc.function.arguments = '{"command":"false"}'
+                choice.message.tool_calls = [tc]
+                choice.message.content = None
+            else:
+                choice.finish_reason = "stop"
+                choice.message.tool_calls = None
+                choice.message.content = "done"
+            resp.choices = [choice]
+            resp.usage = MagicMock(prompt_tokens=10, completion_tokens=5)
+            return resp
+
+        session.client.chat.completions.create = fake_create
+
+        def fake_prepare(tc_dict, **_kwargs):
+            cid = tc_dict["id"]
+
+            def _exec(p):
+                # Simulate an errored tool: the real exec records is_error via
+                # _report_tool_result, which sets _tool_error_flags.
+                session._tool_error_flags[p["call_id"]] = True
+                return cid, "boom"
+
+            return {
+                "call_id": cid,
+                "func_name": "bash",
+                "needs_approval": False,
+                "execute": _exec,
+            }
+
+        turns = [Turn.user("run it")]
+        with patch.object(session, "_prepare_tool", side_effect=fake_prepare):
+            session._run_agent(
+                turns,
+                tools=[{"type": "function", "function": {"name": "bash"}}],
+                label="task",
+                auto_tools={"bash"},
+                parent_call_id="t1",
+            )
+
+        tool_turns = [t for t in turns if t.role is Role.TOOL]
+        assert tool_turns, "expected a tool result turn"
+        assert tool_turns[-1].is_error is True
+        # And it carries through the projection to the recalled step.
+        assert ChatSession._project_agent_steps(turns)[-1]["is_error"] is True
+
+
+class TestExecTaskReporting:
+    """_exec_task self-reports the task_agent's OWN result — the live card's
+    only completion signal (the parent loop reports error/denied results
+    centrally but relies on each tool self-reporting its success result)."""
+
+    def _bare_session(self):
+        session = _make_session()
+        session._agent_system_messages = []
+        session._task_tools = []
+        return session
+
+    def test_success_reports_result(self):
+        session = self._bare_session()
+        with (
+            patch.object(session, "_run_agent", return_value="the synthesis"),
+            patch.object(session, "_report_tool_result") as rpt,
+        ):
+            cid, out = session._exec_task({"call_id": "t1", "prompt": "go"})
+        assert (cid, out) == ("t1", "the synthesis")
+        rpt.assert_called_once_with("t1", "task_agent", "the synthesis")
+
+    def test_error_reports_is_error(self):
+        session = self._bare_session()
+        with (
+            patch.object(session, "_run_agent", side_effect=RuntimeError("boom")),
+            patch.object(session, "_report_tool_result") as rpt,
+        ):
+            cid, out = session._exec_task({"call_id": "t1", "prompt": "go"})
+        assert out == "Task error: boom"
+        rpt.assert_called_once_with("t1", "task_agent", "Task error: boom", is_error=True)
+
+
 class TestEvaluateOutputLLMStage:
     """End-to-end coverage of _evaluate_output with the LLM judge stage."""
 

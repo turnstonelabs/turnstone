@@ -1979,6 +1979,10 @@ class Pane {
     // Replaces a JSON.stringify→dataset→JSON.parse round-trip with an
     // in-memory map keyed by call_id.
     const pendingAssessments = {};
+    // Task-agent recall: call_id -> card .conv-agent wrap, so the tool-result
+    // branch can flip the card's done/error state from the task's own result
+    // (mirroring the live appendToolOutput), not from sub-step errors.
+    const agentCardWraps = {};
     let lastToolBlock = null;
     for (let i = 0; i < messages.length; i++) {
       const msg = messages[i];
@@ -2054,30 +2058,8 @@ class Pane {
             msg.tool_calls.forEach((tc, idx) => {
               // Synthesize the live `item` shape from the stored tool_call so
               // replay renders the SAME .conv-row as the live path.
-              let header = "";
-              try {
-                const args = JSON.parse(tc.arguments);
-                if (tc.name === "bash") {
-                  header = String(Object.values(args)[0] || "");
-                } else {
-                  const parts = [];
-                  const keys = Object.keys(args);
-                  for (let k = 0; k < keys.length; k++) {
-                    const val = args[keys[k]];
-                    let valStr =
-                      val === null || val === undefined ? "null" : String(val);
-                    if (valStr.length > 80)
-                      valStr = valStr.substring(0, 77) + "...";
-                    parts.push(keys[k] + ": " + valStr);
-                  }
-                  header = parts.join("\n");
-                }
-              } catch (e) {
-                header = String(tc.arguments || "").substring(0, 100);
-              }
-              const item = { func_name: tc.name, call_id: tc.id || "", header };
               const row = buildToolDiv(
-                item,
+                synthToolItem(tc),
                 indexLabel(idx, msg.tool_calls.length),
               );
               // Verdict anchored to THIS row; replay verdicts are final.
@@ -2087,6 +2069,13 @@ class Pane {
                 );
               }
               block.appendChild(row);
+              // Task-agent recall: rebuild the collapsible card under this row
+              // from its stashed sub-trajectory (the /history `agent_steps`
+              // overlay).  Absent ⇒ flat parent row (cold / not-retained).
+              if (tc.agent_steps && tc.agent_steps.length) {
+                const wrap = this._replayAgentCard(row, tc.agent_steps);
+                if (tc.id) agentCardWraps[tc.id] = wrap;
+              }
               // Output-guard finding — deferred until the tool result lands so
               // it anchors under the output (mirrors live showOutputWarning).
               if (
@@ -2152,11 +2141,7 @@ class Pane {
             if (media) {
               insertChained(buildMediaEmbed(media, stripped));
             } else {
-              const out = renderToolOutput(stripped, isToolError);
-              if (out.textContent.split("\n").length > 10) {
-                makeCollapsible(out);
-              }
-              insertChained(out);
+              insertChained(renderCollapsibleOutput(stripped, isToolError));
             }
           }
           if (
@@ -2176,6 +2161,14 @@ class Pane {
               insertChained(_buildOutputWarningEl(pending.assessment));
               delete pendingAssessments[msg.tool_call_id];
             }
+          }
+          // Task-agent recall: flip its card done/error from the task's OWN
+          // result (matching the live appendToolOutput) — NOT from sub-step
+          // errors, since a sub-tool can fail and the agent still synthesize.
+          if (msg.tool_call_id && agentCardWraps[msg.tool_call_id]) {
+            agentCardWraps[msg.tool_call_id].dataset.state = msg.is_error
+              ? "error"
+              : "done";
           }
         }
       } else if (msg.role === "system") {
@@ -2553,6 +2546,28 @@ class Pane {
     card.label.textContent = n === 1 ? "1 step" : n + " steps";
   }
 
+  _replayAgentCard(row, steps) {
+    // Rebuild a finished task agent's card from its recalled step items
+    // (/history `agent_steps`), mirroring the live _routeAgentItems nesting so a
+    // reload looks identical: a collapsed body of step rows, each with its
+    // result.  Recall is terminal — no live approval affordances.  Card state
+    // defaults to "done"; the caller flips it to "error" from the task's OWN
+    // result (the role==="tool" branch), matching the live path — sub-step
+    // errors don't decide it (an agent can recover and synthesize fine).
+    const card = buildAgentCardBody();
+    steps.forEach((step) => {
+      card.body.appendChild(buildToolDiv(synthToolItem(step), ""));
+      const out = stripAnsi(String(step.output || "")).trim();
+      if (out) {
+        card.body.appendChild(renderCollapsibleOutput(out, !!step.is_error));
+      }
+    });
+    card.wrap.dataset.state = "done";
+    this._updateAgentLabel(card);
+    row.appendChild(card.wrap);
+    return card.wrap;
+  }
+
   appendToolOutput(callId, name, output, isError) {
     // Capture pin before the streamEl removal + result insertion change
     // scrollHeight — see announceToolBlock.  The result block is the other
@@ -2650,7 +2665,10 @@ class Pane {
       }
     }
 
-    const out = renderToolOutput(stripped, isError);
+    // The media / MCP-error dispatch above both early-return, so by here it's
+    // the plain-output path — the shared helper applies (test_app_js pins that
+    // tryParseMcpError precedes this renderer call).
+    const out = renderCollapsibleOutput(stripped, isError);
 
     // Mark the parent approval block as errored
     if (
@@ -2660,10 +2678,6 @@ class Pane {
     ) {
       parentBlock.classList.add("conv-batch--error");
       appendToolErrorBadge(parentBlock);
-    }
-
-    if (out.textContent.split("\n").length > 10) {
-      makeCollapsible(out);
     }
 
     target.after(out);
@@ -3314,6 +3328,35 @@ function buildToolDiv(item, indexLabel) {
   return row;
 }
 
+// Synthesize the live `item` shape ({func_name, call_id, header}) from a stored
+// tool_call ({name, id, arguments}) so /history replay AND task-agent card
+// recall render the SAME .conv-row as the live path.  Header derivation mirrors
+// the live serialize: bash shows the command; other tools show `key: value`
+// lines, values clipped at 80 chars; unparseable args fall back to a raw clip.
+function synthToolItem(tc) {
+  tc = tc || {};
+  let header = "";
+  try {
+    const args = JSON.parse(tc.arguments);
+    if (tc.name === "bash") {
+      header = String(Object.values(args)[0] || "");
+    } else {
+      const parts = [];
+      const keys = Object.keys(args);
+      for (let k = 0; k < keys.length; k++) {
+        const val = args[keys[k]];
+        let valStr = val === null || val === undefined ? "null" : String(val);
+        if (valStr.length > 80) valStr = valStr.substring(0, 77) + "...";
+        parts.push(keys[k] + ": " + valStr);
+      }
+      header = parts.join("\n");
+    }
+  } catch (e) {
+    header = String(tc.arguments || "").substring(0, 100);
+  }
+  return { func_name: tc.name, call_id: tc.id || "", header };
+}
+
 function renderVerdictBadge(verdict, judgePending) {
   // Thin wrapper over the shared builder (returns a fragment [badge, detail]).
   return buildConvVerdict(verdict, { judgePending });
@@ -3378,6 +3421,16 @@ function renderToolOutput(stripped, isError) {
     }
   }
   out.textContent = _redactApiKeys(stripped);
+  return out;
+}
+
+// Shared recipe: render tool output and auto-collapse past 10 lines.  The one
+// source for the live appendToolOutput's plain-output path, the /history
+// tool-result replay, and the task-agent card recall — so the collapse
+// threshold can't drift between them.
+function renderCollapsibleOutput(stripped, isError) {
+  const out = renderToolOutput(stripped, isError);
+  if (out.textContent.split("\n").length > 10) makeCollapsible(out);
   return out;
 }
 
