@@ -13,8 +13,6 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any
 
-import sqlalchemy as sa
-
 from turnstone.core.log import get_logger
 from turnstone.core.storage import get_storage
 from turnstone.core.workstream import WorkstreamKind
@@ -651,44 +649,34 @@ def search_history_recent(limit: int = 20) -> list[Any]:
 def save_structured_memory(
     name: str,
     content: str,
-    description: str = "",
-    mem_type: str = "general",
+    description: str | None = None,
+    mem_type: str | None = None,
     scope: str = "global",
     scope_id: str = "",
-) -> tuple[str, str | None]:
-    """Save a structured memory (upsert by name+scope+scope_id).
+) -> tuple[dict[str, str] | None, bool]:
+    """Save a structured memory as a single atomic upsert by name+scope+scope_id.
 
-    Returns (memory_id, old_content_or_None).  Uses create-first to
-    avoid TOCTOU races under concurrent access.
+    Returns ``(row, was_update)`` where ``row`` is the full saved record (or
+    ``None`` on failure).  The write is exactly one
+    ``INSERT ... ON CONFLICT DO UPDATE ... RETURNING`` statement (see
+    :meth:`StorageBackend.upsert_structured_memory`) -- no preceding read, no
+    IntegrityError round-trip, no TOCTOU window.  ``(row, was_update)`` comes
+    straight from that upsert (this passes a fresh ``memory_id``, so a differing
+    returned id means an existing row was updated in place).  A ``None``
+    description / ``mem_type`` means "leave unset" -- the column default applies
+    on insert and the stored value is kept on conflict.
     """
     import uuid
 
     name = normalize_key(name)
     try:
-        storage = get_storage()
-        # Try create first — if it hits the unique constraint, fall back to update
-        memory_id = str(uuid.uuid4())
-        try:
-            storage.create_structured_memory(
-                memory_id, name, description, mem_type, scope, scope_id, content
-            )
-            return memory_id, None
-        except sa.exc.IntegrityError:
-            # Unique constraint violation — row already exists, update it
-            existing = storage.get_structured_memory_by_name(name, scope, scope_id)
-            if existing:
-                old_content = existing["content"]
-                updates: dict[str, str] = {"content": content}
-                if description:
-                    updates["description"] = description
-                if mem_type != "general":
-                    updates["type"] = mem_type
-                storage.update_structured_memory(existing["memory_id"], **updates)
-                return existing["memory_id"], old_content
-            return "", None
+        row, was_update = get_storage().upsert_structured_memory(
+            str(uuid.uuid4()), name, description, mem_type, scope, scope_id, content
+        )
+        return (row, was_update) if row else (None, False)
     except Exception:
         log.warning("Failed to save structured memory name=%s", name, exc_info=True)
-        return "", None
+        return None, False
 
 
 def get_structured_memory_by_name(

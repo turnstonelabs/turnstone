@@ -111,9 +111,6 @@ from turnstone.core.storage._utils import (
     SKILL_MUTABLE as _SKILL_MUTABLE,
 )
 from turnstone.core.storage._utils import (
-    STRUCTURED_MEMORY_MUTABLE as _SMEM_MUTABLE,
-)
-from turnstone.core.storage._utils import (
     VERDICT_MUTABLE as _VERDICT_MUTABLE,
 )
 from turnstone.core.storage._utils import (
@@ -3996,6 +3993,56 @@ class PostgreSQLBackend:
             )
             conn.commit()
 
+    def upsert_structured_memory(
+        self,
+        memory_id: str,
+        name: str,
+        description: str | None,
+        mem_type: str | None,
+        scope: str,
+        scope_id: str,
+        content: str,
+    ) -> tuple[dict[str, str], bool]:
+        from sqlalchemy.dialects.postgresql import insert as pg_insert
+
+        now = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S")
+        insert_stmt = pg_insert(structured_memories).values(
+            memory_id=memory_id,
+            name=name,
+            description="" if description is None else description,
+            type="general" if mem_type is None else mem_type,
+            scope=scope,
+            scope_id=scope_id,
+            content=content,
+            created=now,
+            updated=now,
+            last_accessed=now,
+            access_count=0,
+        )
+        # On conflict, refresh content + timestamps.  description/type are
+        # overwritten only when the caller supplied them; None means "unset" ->
+        # keep the stored value.  created and access_count are left untouched.
+        set_: dict[str, Any] = {
+            "content": insert_stmt.excluded.content,
+            "updated": now,
+            "last_accessed": now,
+        }
+        if description is not None:
+            set_["description"] = insert_stmt.excluded.description
+        if mem_type is not None:
+            set_["type"] = insert_stmt.excluded.type
+        stmt = insert_stmt.on_conflict_do_update(
+            index_elements=["name", "scope", "scope_id"],
+            set_=set_,
+        ).returning(structured_memories)
+        with self._conn() as conn:
+            row = conn.execute(stmt).fetchone()
+            conn.commit()
+            if row is None:  # unreachable: ON CONFLICT DO UPDATE returns one row
+                return {}, False
+            result = dict(row._mapping)
+            return result, result["memory_id"] != memory_id
+
     def get_structured_memory(self, memory_id: str) -> dict[str, str] | None:
         with self._conn() as conn:
             row = conn.execute(
@@ -4017,22 +4064,6 @@ class PostgreSQLBackend:
                 )
             ).fetchone()
             return dict(row._mapping) if row else None
-
-    def update_structured_memory(self, memory_id: str, **fields: str) -> bool:
-        fields = {k: v for k, v in fields.items() if k in _SMEM_MUTABLE}
-        if not fields:
-            return False
-        now = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S")
-        fields["updated"] = now
-        fields["last_accessed"] = now
-        with self._conn() as conn:
-            result = conn.execute(
-                sa.update(structured_memories)
-                .where(structured_memories.c.memory_id == memory_id)
-                .values(**fields)
-            )
-            conn.commit()
-            return result.rowcount > 0
 
     def delete_structured_memory(
         self, name: str, scope: str = "global", scope_id: str = ""

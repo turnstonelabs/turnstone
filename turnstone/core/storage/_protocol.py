@@ -474,6 +474,33 @@ class StorageBackend(Protocol):
         """Create a structured memory record."""
         ...
 
+    def upsert_structured_memory(
+        self,
+        memory_id: str,
+        name: str,
+        description: str | None,
+        mem_type: str | None,
+        scope: str,
+        scope_id: str,
+        content: str,
+    ) -> tuple[dict[str, str], bool]:
+        """Insert a structured memory, or update it in place on a
+        ``(name, scope, scope_id)`` conflict.
+
+        Atomic ``INSERT ... ON CONFLICT DO UPDATE ... RETURNING`` — no
+        IntegrityError round-trip, race-safe under concurrent saves of the same
+        key.  ``description`` / ``mem_type`` of ``None`` mean "unset": the
+        column default ("" / "general") is used on insert and the stored value
+        is kept on conflict; a non-``None`` value (including "" or "general") is
+        written.
+
+        Returns ``(row, was_update)`` (like Django's ``update_or_create``): the
+        full saved row, and ``True`` when an existing row was updated rather
+        than inserted.  ``was_update`` is the supplied ``memory_id`` differing
+        from the returned row's id, so pass a fresh unique id to detect inserts.
+        """
+        ...
+
     def get_structured_memory(self, memory_id: str) -> dict[str, str] | None:
         """Return structured memory dict or None."""
         ...
@@ -482,10 +509,6 @@ class StorageBackend(Protocol):
         self, name: str, scope: str = "global", scope_id: str = ""
     ) -> dict[str, str] | None:
         """Lookup structured memory by (name, scope, scope_id). Returns dict or None."""
-        ...
-
-    def update_structured_memory(self, memory_id: str, **fields: str) -> bool:
-        """Update specified fields on a structured memory. Returns True if found."""
         ...
 
     def delete_structured_memory(

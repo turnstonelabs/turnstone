@@ -3934,6 +3934,72 @@ class TestMemoryAccessTouch:
         )
         assert '<memory name="kafka_scaling"' in recomposed
 
+    def test_save_through_tool_preserves_omitted_overwrites_explicit(self, tmp_db):
+        """The None-sentinel flows through _prepare_memory -> _exec_memory: a
+        content-only re-save keeps the stored type/description, while an
+        explicit field overwrites it.  Guards the _prepare_memory omit->None
+        logic that the storage-level tests don't exercise."""
+        from turnstone.core.memory import get_structured_memory_by_name
+
+        session = self._empty_session()
+        item = session._prepare_memory(
+            "c1",
+            {
+                "action": "save",
+                "name": "digest",
+                "content": "v1",
+                "type": "reference",
+                "description": "daily digest",
+                "scope": "global",
+            },
+        )
+        assert "error" not in item
+        session._exec_memory(item)
+
+        # Content-only re-save (omits type/description) -> both preserved.
+        item2 = session._prepare_memory(
+            "c2", {"action": "save", "name": "digest", "content": "v2", "scope": "global"}
+        )
+        session._exec_memory(item2)
+        mem = get_structured_memory_by_name("digest", "global", "")
+        assert mem is not None
+        assert mem["content"] == "v2"
+        assert mem["type"] == "reference"
+        assert mem["description"] == "daily digest"
+
+        # An invalid/typo'd type is treated as unset -> stored type preserved,
+        # not silently downgraded to "general".
+        item_bad = session._prepare_memory(
+            "c2b",
+            {
+                "action": "save",
+                "name": "digest",
+                "content": "v2b",
+                "type": "nonsense",
+                "scope": "global",
+            },
+        )
+        session._exec_memory(item_bad)
+        mem = get_structured_memory_by_name("digest", "global", "")
+        assert mem is not None
+        assert mem["type"] == "reference"  # invalid type ignored, not downgraded
+
+        # An explicit field -> overwrites (the behaviour the None-sentinel enables).
+        item3 = session._prepare_memory(
+            "c3",
+            {
+                "action": "save",
+                "name": "digest",
+                "content": "v3",
+                "type": "general",
+                "scope": "global",
+            },
+        )
+        session._exec_memory(item3)
+        mem = get_structured_memory_by_name("digest", "global", "")
+        assert mem is not None
+        assert mem["type"] == "general"
+
 
 class TestMetacognitiveBuffers:
     """Nudges drain through advisory channels, not the system message."""

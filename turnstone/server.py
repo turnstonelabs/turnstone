@@ -2529,11 +2529,15 @@ async def save_memory(request: Request) -> JSONResponse:
             {"error": f"content exceeds {_MAX_MEMORY_CONTENT} character limit"},
             status_code=400,
         )
-    description = str(body.get("description", ""))
-    mem_type = str(body.get("type", "general"))
+    # None (field omitted) means "leave unset": the upsert keeps the stored
+    # value on update and defaults on insert; an explicit value overwrites.
+    raw_desc = body.get("description")
+    description = None if raw_desc is None else str(raw_desc)
+    raw_type = body.get("type")
+    mem_type = None if raw_type is None else str(raw_type)
     scope = str(body.get("scope", "global"))
     scope_id = str(body.get("scope_id", ""))
-    if mem_type not in _VALID_MEMORY_TYPES:
+    if mem_type is not None and mem_type not in _VALID_MEMORY_TYPES:
         return JSONResponse(
             {"error": f"invalid type: {mem_type}; must be one of {sorted(_VALID_MEMORY_TYPES)}"},
             status_code=400,
@@ -2550,26 +2554,13 @@ async def save_memory(request: Request) -> JSONResponse:
     err = _validate_scope_scope_id(scope, scope_id, require_scope_id=True)
     if err:
         return err
-    # save_structured_memory normalises the name internally
-    from turnstone.core.memory import normalize_key
-
-    normalized_name = normalize_key(name)
-    memory_id, old_content = save_structured_memory(
+    # The upsert RETURNINGs the full saved row, so no follow-up read is needed.
+    row, was_update = save_structured_memory(
         name, content, description=description, mem_type=mem_type, scope=scope, scope_id=scope_id
     )
-    if not memory_id:
+    if not row:
         return JSONResponse({"error": "Failed to save memory"}, status_code=500)
-    from turnstone.core.storage._registry import get_storage
-
-    storage = get_storage()
-    mem = storage.get_structured_memory(memory_id) if storage else None
-    if not mem:
-        return JSONResponse(
-            {"memory_id": memory_id, "name": normalized_name, "status": "saved"},
-            status_code=201,
-        )
-    status_code = 200 if old_content is not None else 201
-    return JSONResponse(mem, status_code=status_code)
+    return JSONResponse(row, status_code=200 if was_update else 201)
 
 
 async def search_memories(request: Request) -> JSONResponse:

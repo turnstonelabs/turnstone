@@ -13,15 +13,17 @@ from turnstone.core.memory import (
 
 class TestSaveStructuredMemory:
     def test_save_new(self, tmp_db):
-        mid, old = save_structured_memory("test_key", "hello world")
-        assert mid != ""
-        assert old is None
+        row, was_update = save_structured_memory("test_key", "hello world")
+        assert row and row["memory_id"]
+        assert was_update is False
 
     def test_save_upsert(self, tmp_db):
-        save_structured_memory("test_key", "first")
-        mid, old = save_structured_memory("test_key", "second")
-        assert old == "first"
-        assert mid != ""
+        row1, was_update1 = save_structured_memory("test_key", "first")
+        row2, was_update2 = save_structured_memory("test_key", "second")
+        assert was_update1 is False
+        assert was_update2 is True
+        assert row2 and row1 and row2["memory_id"] == row1["memory_id"]  # same row
+        assert row2["content"] == "second"
 
     def test_save_normalizes_key(self, tmp_db):
         save_structured_memory("My-Key", "value")

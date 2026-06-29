@@ -28,29 +28,80 @@ class TestCreateAndGet:
         assert w["content"] == "w"
 
 
-class TestUpdate:
-    def test_update_content(self, backend):
-        backend.create_structured_memory("m1", "k", "d", "general", "global", "", "old")
-        assert backend.update_structured_memory("m1", content="new")
-        mem = backend.get_structured_memory("m1")
-        assert mem["content"] == "new"
+class TestSaveUpsert:
+    """``save_structured_memory`` upserts by (name, scope, scope_id).
 
-    def test_update_nonexistent(self, backend):
-        assert not backend.update_structured_memory("nope", content="x")
+    A second save of the same key must UPDATE in place, not surface the
+    ``uq_smem_name_scope`` unique-constraint violation.  These run on whichever
+    backend ``--storage-backend`` selects, so the PostgreSQL path is covered in
+    CI -- the session-level memory tests only exercise SQLite (via ``tmp_db``),
+    which is where this path previously had no cross-backend coverage.
+    """
 
-    def test_update_no_fields(self, backend):
-        backend.create_structured_memory("m1", "k", "d", "general", "global", "", "data")
-        assert not backend.update_structured_memory("m1", bogus="val")
+    def test_duplicate_create_raises_integrity_error(self, backend):
+        """The unique constraint the upsert's ON CONFLICT targets actually fires."""
+        import pytest
+        import sqlalchemy as sa
 
-    def test_update_bumps_timestamp(self, backend):
-        backend.create_structured_memory("m1", "k", "d", "general", "global", "", "data")
-        old = backend.get_structured_memory("m1")["updated"]
-        import time
+        backend.create_structured_memory("m1", "dup", "", "general", "global", "", "a")
+        with pytest.raises(sa.exc.IntegrityError):
+            backend.create_structured_memory("m2", "dup", "", "general", "global", "", "b")
 
-        time.sleep(0.01)
-        backend.update_structured_memory("m1", content="new")
-        new = backend.get_structured_memory("m1")["updated"]
-        assert new >= old
+    def test_save_same_key_updates_in_place(self, backend):
+        from turnstone.core.memory import save_structured_memory
+
+        row1, was_update1 = save_structured_memory("upsert_key", "v1", scope="global")
+        assert row1 and was_update1 is False  # inserted
+
+        row2, was_update2 = save_structured_memory("upsert_key", "v2", scope="global")
+        assert row2 and was_update2 is True  # updated in place
+        assert row2["memory_id"] == row1["memory_id"]  # same row, not a duplicate
+        assert row2["content"] == "v2"
+        names = [r["name"] for r in backend.list_structured_memories(scope="global")]
+        assert names.count("upsert_key") == 1
+
+    def test_save_same_key_preserves_description_and_type_on_default_resave(self, backend):
+        from turnstone.core.memory import save_structured_memory
+
+        save_structured_memory(
+            "meta_key", "c1", description="orig desc", mem_type="fact", scope="global"
+        )
+        # A re-save that omits description/type (defaults) must not clobber them.
+        save_structured_memory("meta_key", "c2", scope="global")
+        row = backend.get_structured_memory_by_name("meta_key", "global", "")
+        assert row["content"] == "c2"
+        assert row["description"] == "orig desc"
+        assert row["type"] == "fact"
+
+    def test_upsert_method_updates_in_place_no_raise(self, backend):
+        """The atomic storage primitive updates in place on a key conflict and
+        returns (row, was_update) carrying the existing row's id -- no
+        IntegrityError (which a second create_structured_memory would raise)."""
+        backend.create_structured_memory("m1", "k", "desc", "fact", "global", "", "v1")
+        row, was_update = backend.upsert_structured_memory(
+            "m2", "k", "newdesc", "note", "global", "", "v2"
+        )
+        assert was_update is True
+        assert row["memory_id"] == "m1"  # existing row id, not the supplied "m2"
+        assert row["content"] == "v2"
+        assert row["description"] == "newdesc"
+        assert row["type"] == "note"
+        names = [r["name"] for r in backend.list_structured_memories(scope="global")]
+        assert names.count("k") == 1
+
+    def test_upsert_none_preserves_explicit_overwrites(self, backend):
+        """None description/type keep the stored value on conflict; an explicit
+        value (including "" / "general") overwrites it."""
+        backend.create_structured_memory("m1", "k", "keepdesc", "fact", "global", "", "v1")
+        # None -> preserve stored description/type (a content-only save).
+        row, _ = backend.upsert_structured_memory("m2", "k", None, None, "global", "", "v2")
+        assert row["content"] == "v2"
+        assert row["description"] == "keepdesc"
+        assert row["type"] == "fact"
+        # Explicit "" / "general" -> overwrite.
+        row2, _ = backend.upsert_structured_memory("m3", "k", "", "general", "global", "", "v3")
+        assert row2["description"] == ""
+        assert row2["type"] == "general"
 
 
 class TestDelete:

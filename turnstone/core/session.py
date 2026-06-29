@@ -11250,10 +11250,20 @@ class ChatSession:
                     "needs_approval": False,
                     "error": f"Error: content exceeds {self._mem_cfg.max_content} character limit",
                 }
-            description = (args.get("description") or "").strip()
-            mem_type = (args.get("type") or "general").strip().lower()
-            if mem_type not in ("user", "general", "feedback", "reference"):
-                mem_type = "general"
+            # None (field omitted) means "leave unset": the upsert keeps the
+            # stored value on update and defaults on insert; an explicit value
+            # (including "" / "general") overwrites.
+            description = args.get("description")
+            if description is not None:
+                description = str(description).strip()
+            mem_type = args.get("type")
+            if mem_type is not None:
+                mem_type = str(mem_type).strip().lower()
+                if mem_type not in ("user", "general", "feedback", "reference"):
+                    # An unrecognized type (e.g. a typo) is treated as unset
+                    # (preserve the stored type on update / default on insert)
+                    # rather than silently overwriting it with "general".
+                    mem_type = None
             # Default scope is kind-aware: coord sessions default to
             # ``coordinator`` (their only writable scope); IC sessions
             # default to ``global`` (matches pre-fix behaviour).
@@ -13003,7 +13013,7 @@ class ChatSession:
 
         try:
             if action == "save":
-                memory_id, old = save_structured_memory(
+                row, was_update = save_structured_memory(
                     item["name"],
                     item["content"],
                     description=item["description"],
@@ -13011,7 +13021,7 @@ class ChatSession:
                     scope=item["scope"],
                     scope_id=item["scope_id"],
                 )
-                if not memory_id:
+                if not row:
                     msg = f"Error: failed to save memory '{item['name']}'"
                     self._report_tool_result(call_id, "memory", msg, is_error=True)
                     return call_id, msg
@@ -13025,17 +13035,15 @@ class ChatSession:
                 # (skill/model/MCP/resume/compaction) or the next session.
                 self._invalidate_memory_cache()
                 self._audit_memory_event(
-                    "memory.update" if old is not None else "memory.save",
-                    memory_id,
-                    name=item["name"],
-                    scope=item["scope"],
-                    scope_id=item["scope_id"],
-                    mem_type=item["mem_type"],
+                    "memory.update" if was_update else "memory.save",
+                    row["memory_id"],
+                    name=row["name"],
+                    scope=row["scope"],
+                    scope_id=row["scope_id"],
+                    mem_type=row["type"],
                 )
-                if old is not None:
-                    msg = f"Updated memory '{item['name']}' (type={item['mem_type']}, scope={item['scope']})"
-                else:
-                    msg = f"Saved memory '{item['name']}' (type={item['mem_type']}, scope={item['scope']})"
+                verb = "Updated" if was_update else "Saved"
+                msg = f"{verb} memory '{row['name']}' (type={row['type']}, scope={row['scope']})"
                 self._report_tool_result(call_id, "memory", msg)
                 return call_id, msg
 
