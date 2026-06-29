@@ -3874,18 +3874,65 @@ class TestMemoryAccessTouch:
         assert self._access_count("kafka_runbook") == 0
 
     def test_save_action_does_not_touch_access_count(self, tmp_db):
-        """The save action handler itself must not bump ``access_count`` —
-        that counter is read traffic only.  (The recompose a save triggers
-        may surface the row via the composition path; that is exercised by
-        the composition tests.  Suppressed here to isolate the handler.)"""
+        """The save action handler must not bump ``access_count`` — that counter
+        is read traffic only, and save no longer recomposes the system prefix
+        (see ``_exec_memory``), so the saved row is never surfaced as an injected
+        memory by the handler.  Composition-path touches are exercised by the
+        ``test_composition_*`` tests."""
         session = self._empty_session()
         item = session._prepare_memory(
             "call_1",
             {"action": "save", "name": "kafka_runbook", "content": "x", "scope": "global"},
         )
-        with patch.object(session, "_init_system_messages"):
-            session._exec_memory(item)
+        session._exec_memory(item)
         assert self._access_count("kafka_runbook") == 0
+
+    def test_save_through_exec_does_not_recompose_prefix(self, tmp_db):
+        """End-to-end through ``_exec_memory``: a memory(save) must NOT rebuild
+        the system prefix -- injected memories ride in the cached system block,
+        so re-initing on every write would bust the prompt cache.  The write
+        still (a) invalidates the per-turn search cache so an in-turn
+        memory(search) sees the new row, and (b) folds into the prefix at the
+        next natural recompose.  Exercises the real call chain (no patching of
+        ``_init_system_messages``), which the other memory tests stub out."""
+        session = self._empty_session()
+        self._save("kafka_runbook", "restart the kafka broker pods")
+        self._compose_turn(session, "restart kafka broker pods status")
+        before = "\n".join(m["content"] for m in session.system_messages if m["role"] == "system")
+        assert '<memory name="kafka_runbook"' in before  # composition sanity
+
+        # Prime the per-turn search cache with a probe that excludes the
+        # not-yet-saved row, so a stale cache would be observable below.
+        probe = "scale the broker pods cluster"
+        assert "kafka_scaling" not in {m["name"] for m in session._search_visible_memories(probe)}
+
+        item = session._prepare_memory(
+            "call_1",
+            {
+                "action": "save",
+                "name": "kafka_scaling",
+                "content": "restart kafka and scale the broker pods cluster",
+                "scope": "global",
+            },
+        )
+        assert "error" not in item
+        session._exec_memory(item)
+
+        # 1. Prefix byte-for-byte unchanged -> no prompt-cache bust.
+        after = "\n".join(m["content"] for m in session.system_messages if m["role"] == "system")
+        assert after == before
+        assert '<memory name="kafka_scaling"' not in after
+
+        # 2. The save invalidated the search cache: the SAME probe now returns
+        #    the new row (a stale cache would still omit it).
+        assert "kafka_scaling" in {m["name"] for m in session._search_visible_memories(probe)}
+
+        # 3. The next natural recompose folds the new memory into the prefix.
+        self._compose_turn(session, "how do I scale the kafka broker pods cluster")
+        recomposed = "\n".join(
+            m["content"] for m in session.system_messages if m["role"] == "system"
+        )
+        assert '<memory name="kafka_scaling"' in recomposed
 
 
 class TestMetacognitiveBuffers:

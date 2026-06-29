@@ -13015,8 +13015,15 @@ class ChatSession:
                     msg = f"Error: failed to save memory '{item['name']}'"
                     self._report_tool_result(call_id, "memory", msg, is_error=True)
                     return call_id, msg
+                # Invalidate the per-turn search cache so an in-turn
+                # memory(search)/(list) reflects this write.  Deliberately do NOT
+                # recompose the system prefix here: injected memories ride in the
+                # cached system block, so re-initing on every save/update busts
+                # the prompt cache (a full system + history re-write) — for a
+                # memory the model already holds via this tool result.  The write
+                # folds into the prefix at the next natural recompose
+                # (skill/model/MCP/resume/compaction) or the next session.
                 self._invalidate_memory_cache()
-                self._init_system_messages()
                 self._audit_memory_event(
                     "memory.update" if old is not None else "memory.save",
                     memory_id,
@@ -14118,7 +14125,10 @@ class ChatSession:
                 value = aliases.get(arg.lower(), arg.lower())
                 if value in valid:
                     self.reasoning_effort = value
-                    self._init_system_messages()
+                    # No system-prefix recompose here: reasoning effort rides in
+                    # request kwargs (output_config / thinking), not the composed
+                    # prompt, so re-initing would only re-pay the compose for an
+                    # identical prefix.
                     self._save_config()
                     self.ui.on_info(f"Reasoning effort set to {cyan(self.reasoning_effort)}")
                 else:
