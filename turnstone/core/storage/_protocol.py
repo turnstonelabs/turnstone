@@ -496,8 +496,9 @@ class StorageBackend(Protocol):
 
         Returns ``(row, was_update)`` (like Django's ``update_or_create``): the
         full saved row, and ``True`` when an existing row was updated rather
-        than inserted.  ``was_update`` is the supplied ``memory_id`` differing
-        from the returned row's id, so pass a fresh unique id to detect inserts.
+        than inserted.  Callers MUST supply a fresh unique ``memory_id`` — it is
+        compared against the returned row's id to tell INSERT from UPDATE, so a
+        reused id would report ``was_update=False`` on a real update.
         """
         ...
 
