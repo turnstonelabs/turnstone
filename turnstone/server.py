@@ -3191,8 +3191,14 @@ def internal_mcp_status(request: Request) -> JSONResponse:
     # Scope oauth_user server status to the requesting user — their per-user pool
     # catalog (and its existence) must not leak to other read-scoped callers.
     # _auth_user_id returns "" when unauthenticated, which the manager treats as
-    # "no user context" (oauth_user servers then report not-connected).
-    all_status = mcp_mgr.get_all_server_status(_auth_user_id(request))
+    # "no user context" (oauth_user servers then report not-connected). Callers
+    # holding admin.mcp (the console cluster-health view, whose proxy forwards
+    # the admin's permissions) get the cross-user aggregate instead — they are
+    # already trusted to see consent counts + server config, so it is no new
+    # disclosure and it keeps the operator "in use by anyone" pill working.
+    auth_result = getattr(getattr(request, "state", None), "auth_result", None)
+    is_admin = auth_result is not None and auth_result.has_permission("admin.mcp")
+    all_status = mcp_mgr.get_all_server_status(_auth_user_id(request), aggregate=is_admin)
     return JSONResponse(
         {
             "servers": {
