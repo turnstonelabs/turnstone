@@ -1953,34 +1953,71 @@ class TestPoolPrimingAndTokenRotation:
 
 
 class TestOAuthUserServerStatus:
-    """``get_server_status`` for ``auth_type='oauth_user'`` servers reflects
-    per-user pool warmth instead of a permanent global "connecting" — so the
-    console pill flips to connected once a pool is primed (the third leg of the
-    OBO fix set)."""
+    """``get_server_status`` for ``auth_type='oauth_user'`` servers reflects the
+    REQUESTING user's pool warmth (scoped by user_id), never another user's — so
+    the console pill flips to connected once that user's pool is primed, without
+    leaking one user's catalog to another."""
 
-    def test_oauth_user_status_connected_when_pool_warm(self) -> None:
+    @staticmethod
+    def _warm(mgr: MCPClientManager, user_id: str, server: str, n_tools: int = 1) -> None:
         from turnstone.core.mcp_client import PoolEntryState
 
+        entry = PoolEntryState(key=(user_id, server), open_lock=MagicMock())
+        entry.session = MagicMock()
+        entry.tools = [{"function": {"name": f"mcp__{server}__t{i}"}} for i in range(n_tools)]
+        mgr._user_pool_entries[(user_id, server)] = entry
+
+    def test_oauth_user_status_connected_for_own_warm_pool(self) -> None:
         mgr = MCPClientManager({})
         mgr._oauth_user_server_names = {"pool-srv"}
-        entry = PoolEntryState(key=("user-1", "pool-srv"), open_lock=MagicMock())
-        entry.session = MagicMock()
-        entry.tools = [{"function": {"name": "mcp__pool-srv__do"}}]
-        mgr._user_pool_entries[("user-1", "pool-srv")] = entry
+        self._warm(mgr, "user-1", "pool-srv", n_tools=1)
 
-        st = mgr.get_server_status("pool-srv")
+        st = mgr.get_server_status("pool-srv", user_id="user-1")
         assert st["connected"] is True
         assert st["tools"] == 1
         assert st["auth_type"] == "oauth_user"
         assert st["user_pools"] == 1
         # Also surfaced in the all-servers map (oauth_user is absent from
         # _server_configs, so this exercises the explicit union).
-        assert "pool-srv" in mgr.get_all_server_status()
+        assert "pool-srv" in mgr.get_all_server_status(user_id="user-1")
+
+    def test_oauth_user_status_does_not_leak_other_users_pool(self) -> None:
+        """#4 regression: user B must NOT see user A's warm pool — neither the
+        connected flag nor the catalog count. Before scoping, status was derived
+        from warm[0] (an arbitrary user), leaking A's catalog size to B over the
+        read-scoped /mcp-status endpoint."""
+        mgr = MCPClientManager({})
+        mgr._oauth_user_server_names = {"pool-srv"}
+        self._warm(mgr, "user-A", "pool-srv", n_tools=5)
+
+        own = mgr.get_server_status("pool-srv", user_id="user-A")
+        assert own["connected"] is True
+        assert own["tools"] == 5
+
+        other = mgr.get_server_status("pool-srv", user_id="user-B")
+        assert other["connected"] is False, "user B must not see user A's pool as connected"
+        assert other["tools"] == 0, "user B must not see user A's catalog size"
+        assert other["user_pools"] == 0
+
+    def test_oauth_user_status_no_user_context_is_not_connected(self) -> None:
+        """A request with no user context (user_id falsy — e.g. an operator
+        refresh/reconnect) reports not-connected rather than an arbitrary
+        user's pool."""
+        mgr = MCPClientManager({})
+        mgr._oauth_user_server_names = {"pool-srv"}
+        self._warm(mgr, "user-A", "pool-srv", n_tools=3)
+
+        for uid in (None, ""):
+            st = mgr.get_server_status("pool-srv", user_id=uid)
+            assert st["connected"] is False, f"user_id={uid!r} must not see a pool"
+            assert st["tools"] == 0
+            assert st["user_pools"] == 0
+            assert st["auth_type"] == "oauth_user"
 
     def test_oauth_user_status_connecting_when_no_warm_pool(self) -> None:
         mgr = MCPClientManager({})
         mgr._oauth_user_server_names = {"pool-srv"}
-        st = mgr.get_server_status("pool-srv")
+        st = mgr.get_server_status("pool-srv", user_id="user-1")
         assert st["connected"] is False
         assert st["tools"] == 0
         assert st["user_pools"] == 0

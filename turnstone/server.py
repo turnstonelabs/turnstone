@@ -3188,11 +3188,15 @@ def internal_mcp_status(request: Request) -> JSONResponse:
     if mcp_mgr is None:
         return JSONResponse({"servers": {}})
 
+    # Scope oauth_user server status to the requesting user — their per-user pool
+    # catalog (and its existence) must not leak to other read-scoped callers.
+    # _auth_user_id returns "" when unauthenticated, which the manager treats as
+    # "no user context" (oauth_user servers then report not-connected).
+    all_status = mcp_mgr.get_all_server_status(_auth_user_id(request))
     return JSONResponse(
         {
             "servers": {
-                name: _strip_server_status_for_read(status)
-                for name, status in mcp_mgr.get_all_server_status().items()
+                name: _strip_server_status_for_read(status) for name, status in all_status.items()
             }
         }
     )
