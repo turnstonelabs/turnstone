@@ -31,6 +31,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal
 
+import anyio
 import httpx
 import mcp.types as mcp_types
 from mcp import ClientSession, McpError, StdioServerParameters
@@ -143,6 +144,56 @@ _MAX_PROMPTS_PER_SERVER = 1000
 # but capped so a deployment with many oauth_user servers doesn't fire a
 # thundering herd of connects on every session start.
 _PRIME_MAX_CONCURRENCY = 4
+
+
+def _is_dead_transport(exc: BaseException) -> bool:
+    """True when *exc* means the MCP session's transport is dead and the
+    session must be torn down and rebuilt (vs a protocol-level rejection
+    from a still-healthy connection).
+
+    The streamable-http SDK holds the session over anyio in-memory streams.
+    Three distinct death modes all mean "reconnect me", not "the server
+    rejected my request":
+
+    1. **Local stream torn down** — the GET/SSE or POST stream died (idle close,
+       peer reset, keep-alive expiry) and the ``ClientSession`` object survives
+       with a closed write stream, so ``list_tools``/``call_tool`` raises
+       :class:`anyio.ClosedResourceError` / :class:`anyio.BrokenResourceError`.
+    2. **Transport-swallowed** — the SDK's ``post_writer`` swallows the upstream
+       error and the caller sees ``McpError(CONNECTION_CLOSED)`` (-32000); or the
+       underlying httpx connection is simply gone (server down / peer closed
+       mid-response → ``httpx.ConnectError`` / ``httpx.RemoteProtocolError``).
+    3. **Server-side session lost** — the MCP server RESTARTED and dropped its
+       session map, so our held ``mcp-session-id`` is unknown. The server returns
+       HTTP 404 and the SDK surfaces ``McpError(code=32600, "Session terminated")``
+       (see ``streamable_http._send_session_terminated_error``). The session-id is
+       dead server-side; only a fresh ``initialize`` (full reconnect) recovers it —
+       reusing it 404s forever (the restart-hang). Matched by message because the
+       SDK's code (32600) is not a documented MCP constant.
+
+    The raw-socket variants (``BrokenPipeError`` / ``ConnectionResetError`` /
+    ``EOFError``) are kept for the stdio transport and defense-in-depth.
+    """
+    if isinstance(
+        exc,
+        anyio.ClosedResourceError
+        | anyio.BrokenResourceError
+        | BrokenPipeError
+        | ConnectionResetError
+        | EOFError
+        | httpx.ConnectError
+        | httpx.ConnectTimeout
+        | httpx.RemoteProtocolError,
+    ):
+        return True
+    if isinstance(exc, McpError):
+        err = exc.error
+        if getattr(err, "code", None) == mcp_types.CONNECTION_CLOSED:
+            return True
+        msg = (getattr(err, "message", "") or "").lower()
+        if "session terminated" in msg or "session not found" in msg:
+            return True
+    return False
 
 
 @dataclass
@@ -1722,16 +1773,20 @@ class MCPClientManager:
     async def _prime_user_pools(self, user_id: str) -> None:
         """Warm THIS user's consented ``oauth_user`` pools (runs on the mcp-loop).
 
-        Best-effort and NON-DESTRUCTIVE: each token is read directly (NOT via the
-        refresh state machine) and missing/near-expiry tokens are skipped, so a
-        transient AS/network failure during priming can never delete a token and
-        force re-consent — a refresh that may fail belongs on the lazy dispatch
-        path, driven by actual use. Servers are primed concurrently under
-        ``_PRIME_MAX_CONCURRENCY`` so one slow/unreachable upstream can't stall
-        the rest.
+        Best-effort and transient-safe: each token is resolved via the SAME
+        guarded refresh state machine the lazy-dispatch path uses
+        (:func:`get_user_access_token_classified`). That refreshes an expired /
+        near-expiry access token and persists it, but a TRANSIENT AS/network
+        failure keeps the token (``kind=refresh_failed_transient``, no revoke)
+        and is simply skipped here — only a genuinely PERMANENT rejection (the
+        user must re-consent anyway) clears it. This closes the chicken-and-egg
+        where an expired token made priming skip the server, its tools never
+        entered the per-user catalog, and lazy dispatch — the only OTHER refresh
+        trigger — could therefore never fire, leaving the pool permanently cold
+        and stuck "connecting" with no token. Servers are primed concurrently
+        under ``_PRIME_MAX_CONCURRENCY`` so one slow/unreachable upstream can't
+        stall the rest.
         """
-        from turnstone.core.mcp_oauth import _token_needs_refresh
-
         token_store = getattr(self._app_state, "mcp_token_store", None)
         if token_store is None:
             return
@@ -1750,22 +1805,24 @@ class MCPClientManager:
             try:
                 async with sem:
                     try:
-                        # Non-refreshing read — priming must not drive a refresh
-                        # whose transient failure would revoke the token.
-                        plain = await asyncio.to_thread(
-                            token_store.get_user_token, user_id, server_name
+                        # Guarded resolve: refreshes an expired/near-expiry token
+                        # and persists it, but a transient failure keeps the token
+                        # (kind=refresh_failed_transient) so priming can never
+                        # revoke a live grant. Only kind == "token" warms the pool.
+                        lookup = await get_user_access_token_classified(
+                            app_state=self._app_state,
+                            user_id=user_id,
+                            server_name=server_name,
                         )
-                        if plain is None or not plain.get("access_token"):
-                            return  # no usable token (not consented) — lazy paths handle it
-                        if _token_needs_refresh(plain.get("expires_at")):
-                            return  # near expiry — let lazy dispatch refresh on actual use
+                        if lookup.kind != "token" or not lookup.token:
+                            return  # not consented / undecryptable / refresh failed — lazy paths handle it
                         server_row = await asyncio.to_thread(
                             self._storage.get_mcp_server_by_name, server_name
                         )
                         if not server_row:
                             return
                         cfg = _pool_cfg_from_row(server_row)
-                        await self._prime_user_server(key, cfg, plain["access_token"])
+                        await self._prime_user_server(key, cfg, lookup.token)
                         log.info(
                             "mcp pool auto-primed at session start user=%s server=%s",
                             user_id,
@@ -1948,9 +2005,15 @@ class MCPClientManager:
                 return "auth_401"
             if status == 403:
                 return "auth_403"
+        # A closed/broken transport must be classified BEFORE the McpError
+        # branch: the SDK surfaces a dead connection as McpError(CONNECTION_CLOSED),
+        # which would otherwise be mistaken for a healthy protocol rejection and
+        # leave the dead pool entry in place forever (no rebuild).
+        if _is_dead_transport(exc):
+            return "transport"
         if isinstance(exc, McpError):
             return "protocol"
-        if isinstance(exc, BrokenPipeError | ConnectionResetError | EOFError | TimeoutError):
+        if isinstance(exc, TimeoutError):
             return "transport"
         return "other"
 
@@ -2434,6 +2497,17 @@ class MCPClientManager:
                 log.warning("Refresh failed for MCP server '%s'", name, exc_info=True)
                 self._set_error(name, f"Refresh failed: {exc}")
                 results[name] = ([], [])
+                # A dead transport leaves a non-None but unusable session, so
+                # the reconnect branch at the top of this loop (gated on
+                # ``session is None``) would never fire and we would re-probe
+                # the corpse on every tick forever — the exact failure that
+                # required a full process restart to clear. Evicting the
+                # session here makes the NEXT refresh tick reconnect, turning
+                # this periodic refresh into a self-healing liveness probe.
+                if _is_dead_transport(exc):
+                    dead_state = self._static_servers.get(name)
+                    if dead_state is not None:
+                        dead_state.session = None
                 # Overwrite unconditionally with the freshest observed
                 # outcome.  Two cases produce the write:
                 # (1) Reconnect branch: ``_connect_one`` raised before
@@ -3256,6 +3330,13 @@ class MCPClientManager:
 
     def get_server_status(self, name: str) -> dict[str, Any]:
         """Return live status for a single server, including config details."""
+        # auth_type='oauth_user' servers hold NO process-global session — they
+        # are warmed per-user into the pool — so the static-session check below
+        # would always report them "connecting". Derive their status from warm
+        # per-user pool entries instead, so the console pill reflects real
+        # per-user reachability once a pool is primed.
+        if name in self._oauth_user_server_names:
+            return self._oauth_user_server_status(name)
         state = self._static_servers.get(name)
         connected = state is not None and state.session is not None
         cfg = self._server_configs.get(name, {})
@@ -3284,11 +3365,55 @@ class MCPClientManager:
             "last_refresh_outcome": last_refresh[1] if last_refresh is not None else None,
         }
 
+    def _oauth_user_server_status(self, name: str) -> dict[str, Any]:
+        """Live status for an ``auth_type='oauth_user'`` server.
+
+        These have no global session (stripped from ``_server_configs`` /
+        ``_static_servers``); they connect per-user into ``_user_pool_entries``.
+        Report ``connected=True`` when at least one user has a warm pool entry,
+        with a representative catalog count and the number of warm user pools —
+        so the console stops showing a permanent "connecting"/``---`` for a
+        server that is in fact reachable and in use.
+        """
+        warm = [
+            entry
+            for (uid, sname), entry in self._user_pool_entries.items()
+            if sname == name and entry.session is not None
+        ]
+        rep = warm[0] if warm else None
+        cb_deadline = self._circuit_open_until.get(name)
+        cb_open = cb_deadline is not None and time.monotonic() < cb_deadline
+        last_refresh = self._last_refresh.get(name)
+        return {
+            "connected": bool(warm),
+            "tools": len(rep.tools) if rep is not None and rep.tools else 0,
+            "resources": len(rep.resources) if rep is not None and rep.resources else 0,
+            "prompts": len(rep.prompts) if rep is not None and rep.prompts else 0,
+            "error": self._last_error.get(name, ""),
+            "transport": "streamable-http",
+            "command": "",
+            "url": "",
+            "circuit_open": cb_open,
+            "consecutive_failures": self._consecutive_failures.get(name, 0),
+            "auth_type": "oauth_user",
+            "user_pools": len(warm),
+            "last_refresh_at": last_refresh[0] if last_refresh is not None else None,
+            "last_refresh_outcome": last_refresh[1] if last_refresh is not None else None,
+        }
+
     def get_all_server_status(self) -> dict[str, dict[str, Any]]:
-        """Return live status for all configured servers."""
+        """Return live status for all configured servers.
+
+        Includes ``oauth_user`` servers (which are absent from
+        ``_server_configs``) so the console list reports their real per-user
+        pool status instead of falling back to a DB-only "connecting" default.
+        """
         result: dict[str, dict[str, Any]] = {}
         for name in list(self._server_configs):
             result[name] = self.get_server_status(name)
+        for name in list(self._oauth_user_server_names):
+            if name not in result:
+                result[name] = self.get_server_status(name)
         return result
 
     def reconcile_sync(self, storage: Any, timeout: int = 30) -> dict[str, Any]:
@@ -3722,12 +3847,19 @@ class MCPClientManager:
         except Exception as exc:
             # Protocol errors (McpError) come from a healthy connection that
             # rejected the request — only transport errors trip the breaker.
-            if not isinstance(exc, McpError):
+            # A dead transport (anyio Closed/BrokenResourceError, or the
+            # SDK-swallowed McpError(CONNECTION_CLOSED)) IS a transport failure
+            # even though it is an McpError, so it must trip the breaker AND
+            # evict the session.
+            dead = _is_dead_transport(exc)
+            if dead or not isinstance(exc, McpError):
                 self._cb_record_failure(server_name)
-            if isinstance(exc, BrokenPipeError | ConnectionResetError | EOFError):
+            if dead:
                 # Evict the session only — leave stack/streams behind so the
                 # stale-session-and-stack guard in _connect_one cleans them up
-                # on the next connect attempt.
+                # on the next connect attempt. Eviction is what lets the next
+                # dispatch's ``session is None`` check fire _cb_auto_reconnect
+                # instead of re-using the corpse forever.
                 evict = self._static_servers.get(server_name)
                 if evict is not None:
                     evict.session = None

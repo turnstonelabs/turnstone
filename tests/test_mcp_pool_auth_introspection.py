@@ -1609,16 +1609,60 @@ class TestPoolPrimingAndTokenRotation:
 
         assert primed == [(("user-1", "pool-srv"), "bearer-fresh")]
 
-    def test_prime_user_pools_skips_near_expiry_without_revoking(
+    def test_prime_user_pools_refreshes_expired_token_and_warms(
         self, running_loop_mgr, storage: SQLiteBackend
     ) -> None:
-        """bug-1 regression: a near-expiry token is skipped (not refreshed), so a
-        transient refresh failure during priming can never revoke the token."""
+        """An expired/near-expiry token is now REFRESHED (via the guarded
+        classified resolver) and the pool is warmed with the fresh token —
+        closing the chicken-and-egg where an expired token left the pool
+        permanently cold ("connecting" / no tools / never-refreshed)."""
+        from unittest.mock import patch
+
+        from turnstone.core.mcp_oauth import TokenLookupResult
+
         mgr, loop, _ = running_loop_mgr
         cipher = make_mcp_token_cipher()
         _seed_oauth_server(storage, name="pool-srv")
-        # Inside the 60s refresh-skew window -> the refreshing lookup would have
-        # driven a refresh here.
+        _seed_user_token(storage, cipher, expires_in_seconds=5, access_token="bearer-stale")
+        self._wire(mgr, storage, cipher)
+
+        primed: list[tuple[tuple[str, str], str]] = []
+
+        async def _fake_prime(
+            self_inner: MCPClientManager, key: tuple[str, str], cfg: dict[str, Any], token: str
+        ) -> int:
+            primed.append((key, token))
+            return 3
+
+        mgr._prime_user_server = _fake_prime.__get__(mgr, type(mgr))  # type: ignore[method-assign]
+
+        async def _fake_classified(**_kwargs: Any) -> TokenLookupResult:
+            # The resolver refreshed the expired token and returns the fresh one.
+            return TokenLookupResult(kind="token", token="bearer-refreshed")
+
+        with patch(
+            "turnstone.core.mcp_client.get_user_access_token_classified",
+            side_effect=_fake_classified,
+        ):
+            _run_on_loop(loop, mgr._prime_user_pools("user-1"))
+
+        assert primed == [(("user-1", "pool-srv"), "bearer-refreshed")], (
+            "expired token must be refreshed and the pool warmed with the fresh token"
+        )
+
+    def test_prime_user_pools_transient_refresh_failure_skips_without_revoking(
+        self, running_loop_mgr, storage: SQLiteBackend
+    ) -> None:
+        """Safety invariant preserved: a TRANSIENT refresh failure during priming
+        does not warm the pool AND does not revoke — the classified resolver keeps
+        the token (kind=refresh_failed_transient) and lazy dispatch retries later."""
+        from unittest.mock import patch
+
+        from turnstone.core.mcp_oauth import TokenLookupResult
+
+        mgr, loop, _ = running_loop_mgr
+        cipher = make_mcp_token_cipher()
+        _seed_oauth_server(storage, name="pool-srv")
         _seed_user_token(storage, cipher, expires_in_seconds=5, access_token="bearer-stale")
         self._wire(mgr, storage, cipher)
 
@@ -1632,10 +1676,17 @@ class TestPoolPrimingAndTokenRotation:
 
         mgr._prime_user_server = _fake_prime.__get__(mgr, type(mgr))  # type: ignore[method-assign]
 
-        _run_on_loop(loop, mgr._prime_user_pools("user-1"))
+        async def _fake_classified(**_kwargs: Any) -> TokenLookupResult:
+            return TokenLookupResult(kind="refresh_failed_transient")
 
-        assert primed == [], "near-expiry token must be skipped, not primed (no refresh driven)"
-        # The token row must survive — priming must never revoke.
+        with patch(
+            "turnstone.core.mcp_client.get_user_access_token_classified",
+            side_effect=_fake_classified,
+        ):
+            _run_on_loop(loop, mgr._prime_user_pools("user-1"))
+
+        assert primed == [], "transient refresh failure must not warm the pool"
+        # The token row must survive — priming must never revoke on a transient blip.
         store = MCPTokenStore(storage, cipher, node_id="test")
         assert store.get_user_token("user-1", "pool-srv") is not None
 
@@ -1838,6 +1889,41 @@ class TestPoolPrimingAndTokenRotation:
         _run_on_loop(loop, mgr._prime_user_pools("user-1"))
 
         assert mgr._priming_keys == set(), "in-flight marker must be cleared in finally"
+
+
+class TestOAuthUserServerStatus:
+    """``get_server_status`` for ``auth_type='oauth_user'`` servers reflects
+    per-user pool warmth instead of a permanent global "connecting" — so the
+    console pill flips to connected once a pool is primed (the third leg of the
+    OBO fix set)."""
+
+    def test_oauth_user_status_connected_when_pool_warm(self) -> None:
+        from turnstone.core.mcp_client import PoolEntryState
+
+        mgr = MCPClientManager({})
+        mgr._oauth_user_server_names = {"pool-srv"}
+        entry = PoolEntryState(key=("user-1", "pool-srv"), open_lock=MagicMock())
+        entry.session = MagicMock()
+        entry.tools = [{"function": {"name": "mcp__pool-srv__do"}}]
+        mgr._user_pool_entries[("user-1", "pool-srv")] = entry
+
+        st = mgr.get_server_status("pool-srv")
+        assert st["connected"] is True
+        assert st["tools"] == 1
+        assert st["auth_type"] == "oauth_user"
+        assert st["user_pools"] == 1
+        # Also surfaced in the all-servers map (oauth_user is absent from
+        # _server_configs, so this exercises the explicit union).
+        assert "pool-srv" in mgr.get_all_server_status()
+
+    def test_oauth_user_status_connecting_when_no_warm_pool(self) -> None:
+        mgr = MCPClientManager({})
+        mgr._oauth_user_server_names = {"pool-srv"}
+        st = mgr.get_server_status("pool-srv")
+        assert st["connected"] is False
+        assert st["tools"] == 0
+        assert st["user_pools"] == 0
+        assert st["auth_type"] == "oauth_user"
 
 
 # Suppress unused-import warning for AsyncMock.

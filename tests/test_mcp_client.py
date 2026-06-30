@@ -2487,6 +2487,133 @@ class TestCircuitBreaker:
         # Circuit should NOT have recorded a failure
         assert mgr._consecutive_failures.get("test", 0) == 0
 
+    def test_closed_resource_error_evicts_session_and_trips_circuit(self):
+        """Regression: the MCP SDK's streamable-http transport raises
+        ``anyio.ClosedResourceError`` (NOT BrokenPipeError) when its write
+        stream is dead. That must evict the session AND trip the breaker —
+        otherwise the corpse session is re-used on every call forever and
+        only a full process restart recovers it."""
+        import anyio
+
+        mgr = MCPClientManager({"test": {"type": "stdio", "command": "echo"}})
+        mock_session = MagicMock()
+        mock_session.call_tool = MagicMock(return_value="sentinel")
+        _seed_static_state(mgr, "test", session=mock_session)
+        mgr._loop = MagicMock()
+        mgr._tool_map["mcp__test__ping"] = ("test", "ping")
+        mock_future = MagicMock()
+        mock_future.result.side_effect = anyio.ClosedResourceError()
+        with (
+            patch("asyncio.run_coroutine_threadsafe", new=_dispatch_stub(mock_future)),
+            pytest.raises(anyio.ClosedResourceError),
+        ):
+            mgr.call_tool_sync("mcp__test__ping", {}, timeout=5)
+        assert mgr._static_servers["test"].session is None
+        assert mgr._consecutive_failures.get("test", 0) == 1
+
+    def test_session_terminated_mcperror_evicts_and_trips_circuit(self):
+        """Regression: when the MCP SERVER restarts and loses its session map, our
+        held mcp-session-id is stale; the server returns HTTP 404 and the SDK
+        surfaces McpError(code=32600, 'Session terminated'). That is NOT a healthy
+        protocol rejection — the session must be evicted so the next dispatch
+        reconnects with a fresh initialize; reusing it 404s forever (restart-hang)."""
+        from mcp import McpError
+        from mcp.types import ErrorData
+
+        mgr = MCPClientManager({"test": {"type": "stdio", "command": "echo"}})
+        mock_session = MagicMock()
+        mock_session.call_tool = MagicMock(return_value="sentinel")
+        _seed_static_state(mgr, "test", session=mock_session)
+        mgr._loop = MagicMock()
+        mgr._tool_map["mcp__test__ping"] = ("test", "ping")
+        mock_future = MagicMock()
+        # Exactly what the streamable-http SDK injects on a 404 stale session.
+        mock_future.result.side_effect = McpError(
+            ErrorData(code=32600, message="Session terminated")
+        )
+        with (
+            patch("asyncio.run_coroutine_threadsafe", new=_dispatch_stub(mock_future)),
+            pytest.raises(McpError),
+        ):
+            mgr.call_tool_sync("mcp__test__ping", {}, timeout=5)
+        assert mgr._static_servers["test"].session is None
+        assert mgr._consecutive_failures.get("test", 0) == 1
+
+    def test_httpx_connect_error_evicts_session(self):
+        """A dead underlying httpx connection (server down mid-call) is transport
+        death, not a protocol rejection — evict so the next call reconnects."""
+        import httpx
+
+        mgr = MCPClientManager({"test": {"type": "stdio", "command": "echo"}})
+        mock_session = MagicMock()
+        mock_session.call_tool = MagicMock(return_value="sentinel")
+        _seed_static_state(mgr, "test", session=mock_session)
+        mgr._loop = MagicMock()
+        mgr._tool_map["mcp__test__ping"] = ("test", "ping")
+        mock_future = MagicMock()
+        mock_future.result.side_effect = httpx.ConnectError("connection refused")
+        with (
+            patch("asyncio.run_coroutine_threadsafe", new=_dispatch_stub(mock_future)),
+            pytest.raises(httpx.ConnectError),
+        ):
+            mgr.call_tool_sync("mcp__test__ping", {}, timeout=5)
+        assert mgr._static_servers["test"].session is None
+        assert mgr._consecutive_failures.get("test", 0) == 1
+
+    def test_connection_closed_mcperror_evicts_and_trips_circuit(self):
+        """Regression: when the SDK's ``post_writer`` swallows the transport
+        error, a dead connection surfaces as ``McpError(CONNECTION_CLOSED)``.
+        Unlike a genuine protocol rejection, this MUST evict + trip the
+        breaker so the next dispatch reconnects instead of looping."""
+        from mcp import McpError
+        from mcp.types import CONNECTION_CLOSED, ErrorData
+
+        mgr = MCPClientManager({"test": {"type": "stdio", "command": "echo"}})
+        mock_session = MagicMock()
+        mock_session.call_tool = MagicMock(return_value="sentinel")
+        _seed_static_state(mgr, "test", session=mock_session)
+        mgr._loop = MagicMock()
+        mgr._tool_map["mcp__test__ping"] = ("test", "ping")
+        mock_future = MagicMock()
+        mock_future.result.side_effect = McpError(
+            ErrorData(code=CONNECTION_CLOSED, message="connection closed")
+        )
+        with (
+            patch("asyncio.run_coroutine_threadsafe", new=_dispatch_stub(mock_future)),
+            pytest.raises(McpError),
+        ):
+            mgr.call_tool_sync("mcp__test__ping", {}, timeout=5)
+        assert mgr._static_servers["test"].session is None
+        assert mgr._consecutive_failures.get("test", 0) == 1
+
+    def test_refresh_all_evicts_dead_session_so_next_tick_reconnects(self):
+        """Regression: a periodic refresh that hits a dead-but-non-None
+        session must null the session so the reconnect branch (gated on
+        ``session is None``) fires on the NEXT tick. Without this the
+        refresh re-probes the corpse forever — the bug that required a
+        full restart."""
+        import anyio
+
+        async def _run() -> None:
+            mgr = MCPClientManager({})
+            mgr._server_configs["test"] = {"type": "stdio", "command": "x"}
+            dead = anyio.ClosedResourceError()
+            mock_session = MagicMock()
+            mock_session.list_tools = AsyncMock(side_effect=dead)
+            mock_session.list_resources = AsyncMock(side_effect=dead)
+            mock_session.list_resource_templates = AsyncMock(side_effect=dead)
+            mock_session.list_prompts = AsyncMock(side_effect=dead)
+            _seed_static_state(mgr, "test", session=mock_session)
+
+            await mgr._refresh_all("test")
+
+            # Dead session evicted → next refresh tick / dispatch reconnects.
+            assert mgr._static_servers["test"].session is None
+            ts, outcome = mgr._last_refresh["test"]
+            assert outcome == "error:ClosedResourceError"
+
+        asyncio.run(_run())
+
 
 # ---------------------------------------------------------------------------
 # Fix 3: Safe transport stream pre-close
