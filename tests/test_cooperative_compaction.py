@@ -996,6 +996,21 @@ def test_is_ctx_overflow_detection(message, expected):
     assert _is_ctx_overflow(RuntimeError(message)) is expected
 
 
+def test_is_ctx_overflow_excludes_recognized_rate_limit_class():
+    """A 429 RateLimitError whose token-quota text contains an overflow phrase must
+    NOT be classified as overflow.  _stop_retrying calls _is_ctx_overflow with no
+    class gate of its own, so without this a retryable rate-limit ("… maximum number
+    of tokens allowed per minute …") would be made non-retryable.  The SAME text in
+    an unrecognized class is still overflow — proving it's the class gate at work."""
+
+    class RateLimitError(Exception):  # name is in _BACKEND_RATE_LIMIT_EXC_NAMES
+        pass
+
+    msg = "exceeds the maximum number of tokens allowed per minute"
+    assert _is_ctx_overflow(RateLimitError(msg)) is False  # retryable, not overflow
+    assert _is_ctx_overflow(RuntimeError(msg)) is True  # unknown class → text decides
+
+
 def test_format_backend_error_renders_overflow(session):
     """The text-first overflow branch in _format_backend_error renders a clear
     "Context window exceeded" message (with a raw tail) for an exception class

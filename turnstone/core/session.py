@@ -873,22 +873,31 @@ _BACKEND_KNOWN_EXC_NAMES: frozenset[str] = (
 def _is_ctx_overflow(exc: BaseException) -> bool:
     """True when *exc* looks like a context-window overflow from any backend.
 
-    Detection is by message *text*, not exception class: vLLM surfaces the SAME
-    overflow as HTTP 400 ``BadRequestError`` on the OpenAI endpoint but HTTP 500
-    ``InternalServerError`` on the Anthropic (``/v1/messages``) endpoint, so
-    class-based matching would miss one of them.  A free function (not a method)
-    so the fatal-error formatter — which is unit-tested with a stand-in ``self``
-    — and the per-call retry gates, the send-loop recovery, and the chunker can
-    all share one definition.
+    Detection is by message *text* AMONG classes that aren't already a recognized
+    backend error: vLLM surfaces the SAME overflow as HTTP 400 ``BadRequestError``
+    on the OpenAI endpoint but HTTP 500 ``InternalServerError`` on the Anthropic
+    (``/v1/messages``) endpoint — neither is in ``_BACKEND_KNOWN_EXC_NAMES`` — so
+    text matching is what unifies them.  The class gate is the safety rail: an
+    overflow is never a recognized error, so excluding known classes can't suppress
+    a real overflow, but it keeps a retryable 429 ``RateLimitError`` — whose
+    token-quota text can read "… maximum number of tokens allowed per minute …" —
+    from being misread as a deterministic overflow.  That matters because EVERY
+    caller (the retry gates via ``_stop_retrying``, the send-loop recovery, the
+    chunker, the task_agent loop, the fatal-error formatter) routes an overflow to
+    a non-retryable / compaction path; a false positive on a 429 would turn a
+    transient rate-limit into a hard failure.  Centralizing the gate here keeps all
+    those callers consistent without each re-checking the class.
 
-    The phrases are deliberately overflow-*specific* and cover the core providers
+    A free function (not a method) so the fatal-error formatter — unit-tested with
+    a stand-in ``self`` — and the other callers can share one definition.
+
+    The phrases are deliberately overflow-specific and cover the core providers
     (OpenAI/vLLM "maximum context length"; Anthropic "exceed context limit,
     decrease input length"; Google/Gemini "exceeds the maximum number of tokens
-    allowed").  They must NOT match a retryable rate-limit, whose body can mention
-    token quotas ("… input tokens per minute …") — these gates make a match
-    non-retryable, so a false positive would turn a transient 429 into a hard,
-    mislabeled failure (hence no bare "input tokens" / "too many tokens").
+    allowed").
     """
+    if type(exc).__name__ in _BACKEND_KNOWN_EXC_NAMES:
+        return False
     text = str(exc).lower()
     return any(
         s in text
@@ -3679,15 +3688,13 @@ class ChatSession:
 
         name = type(exc).__name__
 
-        # Context overflow — matched by text, not class, because it arrives as
-        # BadRequestError (OpenAI 400) OR InternalServerError (Anthropic-compat 500),
-        # which would otherwise render as an opaque class name with no hint that the
-        # prompt was simply too large.  Gated on "not a known class" so a recognized
-        # error (e.g. a RateLimitError whose quota text happens to mention a token
-        # maximum) still falls through to its own specific message below rather than
-        # being mislabeled as overflow.  The overflow classes are not in
-        # ``_BACKEND_KNOWN_EXC_NAMES``, so this still catches them.
-        if name not in _BACKEND_KNOWN_EXC_NAMES and _is_ctx_overflow(exc):
+        # Context overflow — matched by text, because it arrives as BadRequestError
+        # (OpenAI 400) OR InternalServerError (Anthropic-compat 500), which would
+        # otherwise render as an opaque class name with no hint that the prompt was
+        # simply too large.  _is_ctx_overflow self-gates on "not a known class", so a
+        # recognized error (e.g. a RateLimitError whose quota text mentions a token
+        # maximum) returns False here and falls through to its own specific message.
+        if _is_ctx_overflow(exc):
             return (
                 f"Context window exceeded for model={model_label}: the conversation "
                 f"is too large to send. Auto-compaction should shrink it and retry; "
