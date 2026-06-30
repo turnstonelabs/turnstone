@@ -1839,14 +1839,19 @@ class MCPClientManager:
             try:
                 async with sem:
                     try:
-                        # Guarded resolve: refreshes an expired/near-expiry token
-                        # and persists it, but a transient failure keeps the token
-                        # (kind=refresh_failed_transient) so priming can never
-                        # revoke a live grant. Only kind == "token" warms the pool.
+                        # Non-destructive resolve: refreshes an expired/near-expiry
+                        # token and persists it, but NEVER revokes a grant here
+                        # (revoke_on_dead_grant=False). Priming runs for every
+                        # consented server, so a single (possibly misclassified) AS
+                        # hiccup must not strand one the user may not even be using
+                        # this session; a dead grant is deferred to the lazy-dispatch
+                        # path, which revokes when the user actually invokes the
+                        # tool. Only kind == "token" warms the pool.
                         lookup = await get_user_access_token_classified(
                             app_state=self._app_state,
                             user_id=user_id,
                             server_name=server_name,
+                            revoke_on_dead_grant=False,
                         )
                         if lookup.kind != "token" or not lookup.token:
                             return  # not consented / undecryptable / refresh failed — lazy paths handle it

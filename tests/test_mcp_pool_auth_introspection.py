@@ -1687,8 +1687,69 @@ class TestPoolPrimingAndTokenRotation:
 
         assert primed == [], "transient refresh failure must not warm the pool"
         # The token row must survive — priming must never revoke on a transient blip.
+        # NOTE: the resolver is stubbed here, so this only covers _prime_user_pools'
+        # handling of a transient result; the actual revoke-vs-keep decision under
+        # the flag prime passes is exercised by
+        # test_non_destructive_resolve_keeps_dead_grant_default_revokes below.
         store = MCPTokenStore(storage, cipher, node_id="test")
         assert store.get_user_token("user-1", "pool-srv") is not None
+
+    @pytest.mark.anyio
+    async def test_non_destructive_resolve_keeps_dead_grant_default_revokes(
+        self, storage: SQLiteBackend
+    ) -> None:
+        """Priming resolves with revoke_on_dead_grant=False, so a PERMANENT refresh
+        rejection (invalid_grant) must KEEP the token — the authoritative revoke is
+        deferred to lazy dispatch. Drives the REAL get_user_access_token_classified
+        (only the AS round-trip is stubbed), pinning both directions of the gate the
+        prior prime test left mocked-out."""
+        from unittest.mock import patch
+
+        from turnstone.core.mcp_oauth import (
+            MCPOAuthRefreshFailed,
+            _RefreshFailureClass,
+            get_user_access_token_classified,
+        )
+
+        cipher = make_mcp_token_cipher()
+        _seed_oauth_server(storage, name="srv-oauth")
+        state = _make_app_state(storage, cipher=cipher)
+        # Expired token WITH a refresh token → reaches the refresh path (not the
+        # expired-no-refresh shortcut), where a PERMANENT failure would revoke.
+        _seed_user_token(
+            storage, cipher, user_id="user-1", server_name="srv-oauth", expires_in_seconds=-10
+        )
+        store = MCPTokenStore(storage, cipher, node_id="test")
+
+        async def _permanent_fail(**_kwargs: Any) -> tuple[str, str | None, str | None]:
+            raise MCPOAuthRefreshFailed(
+                "invalid_grant", failure_class=_RefreshFailureClass.PERMANENT
+            )
+
+        with patch("turnstone.core.mcp_oauth._refresh_and_persist", side_effect=_permanent_fail):
+            kept = await get_user_access_token_classified(
+                app_state=state,
+                user_id="user-1",
+                server_name="srv-oauth",
+                revoke_on_dead_grant=False,
+            )
+        assert kept.kind == "refresh_failed_transient"
+        assert store.get_user_token("user-1", "srv-oauth") is not None, (
+            "non-destructive prime must NOT delete a grant on a permanent refresh "
+            "failure — the revoke is deferred to lazy dispatch"
+        )
+
+        # Control: the DEFAULT (lazy-dispatch) resolve still revokes the same grant.
+        with patch("turnstone.core.mcp_oauth._refresh_and_persist", side_effect=_permanent_fail):
+            revoked = await get_user_access_token_classified(
+                app_state=state,
+                user_id="user-1",
+                server_name="srv-oauth",
+            )
+        assert revoked.kind == "refresh_failed"
+        assert store.get_user_token("user-1", "srv-oauth") is None, (
+            "default (lazy-dispatch) resolve must still revoke a permanently-dead grant"
+        )
 
     def test_prime_user_pools_skips_already_connected(
         self, running_loop_mgr, storage: SQLiteBackend
