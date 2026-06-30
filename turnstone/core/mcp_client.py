@@ -3367,12 +3367,15 @@ class MCPClientManager:
         clean = msg.replace("\n", " ").replace("\r", "")
         self._last_error[name] = clean[: self._MAX_ERROR_LEN]
 
-    def get_server_status(self, name: str, user_id: str | None = None) -> dict[str, Any]:
+    def get_server_status(
+        self, name: str, user_id: str | None = None, *, aggregate: bool = False
+    ) -> dict[str, Any]:
         """Return live status for a single server, including config details.
 
-        For ``auth_type='oauth_user'`` servers the result is scoped to *user_id*
-        (see :meth:`_oauth_user_server_status`). ``user_id`` is ignored for
-        static servers, whose session is process-global.
+        For ``auth_type='oauth_user'`` servers the result is scoped to *user_id*,
+        or aggregated across all users when ``aggregate=True`` (see
+        :meth:`_oauth_user_server_status`). Both are ignored for static servers,
+        whose session is process-global.
         """
         # auth_type='oauth_user' servers hold NO process-global session — they
         # are warmed per-user into the pool — so the static-session check below
@@ -3380,7 +3383,7 @@ class MCPClientManager:
         # REQUESTING user's warm pool entry instead, so the console pill reflects
         # that user's real reachability once their pool is primed.
         if name in self._oauth_user_server_names:
-            return self._oauth_user_server_status(name, user_id)
+            return self._oauth_user_server_status(name, user_id, aggregate=aggregate)
         state = self._static_servers.get(name)
         connected = state is not None and state.session is not None
         cfg = self._server_configs.get(name, {})
@@ -3409,7 +3412,9 @@ class MCPClientManager:
             "last_refresh_outcome": last_refresh[1] if last_refresh is not None else None,
         }
 
-    def _oauth_user_server_status(self, name: str, user_id: str | None) -> dict[str, Any]:
+    def _oauth_user_server_status(
+        self, name: str, user_id: str | None, *, aggregate: bool = False
+    ) -> dict[str, Any]:
         """Live status for an ``auth_type='oauth_user'`` server, scoped to *user_id*.
 
         These have no global session (stripped from ``_server_configs`` /
@@ -3421,21 +3426,32 @@ class MCPClientManager:
         other user's pool would leak that user's catalog (and its existence) to
         anyone with read scope. A request with no user context (``user_id``
         falsy, e.g. an operator refresh/reconnect) reports ``connected=False``.
+
+        ``aggregate=True`` is the admin cluster-health view: ``connected`` and a
+        representative catalog count reflect ANY user's warm pool. It is gated at
+        the endpoint on the ``admin.mcp`` permission, whose holders already see
+        cross-user MCP state (consent counts, server config), so it is not a new
+        disclosure — it restores the "in use by anyone" pill for operators
+        without exposing one user's pool to another read-scoped user.
         """
         # Snapshot with list(): the mcp-loop thread mutates _user_pool_entries
         # (prime insert / idle eviction) concurrently with status polls from the
         # console/server thread, and iterating a live dict that changes size
         # raises RuntimeError mid-comprehension. The sibling get_all_server_status
         # and the eviction loop snapshot the same way.
-        warm = (
-            [
-                entry
-                for (uid, sname), entry in list(self._user_pool_entries.items())
-                if sname == name and uid == user_id and entry.session is not None
+        entries = list(self._user_pool_entries.items())
+        if aggregate:
+            warm = [e for (uid, sname), e in entries if sname == name and e.session is not None]
+        elif user_id:
+            warm = [
+                e
+                for (uid, sname), e in entries
+                if sname == name and uid == user_id and e.session is not None
             ]
-            if user_id
-            else []
-        )
+        else:
+            warm = []
+        # rep is the first warm entry (insertion order): the requester's own pool
+        # when scoped, or a representative catalog for the aggregate operator view.
         rep = warm[0] if warm else None
         cb_deadline = self._circuit_open_until.get(name)
         cb_open = cb_deadline is not None and time.monotonic() < cb_deadline
@@ -3457,20 +3473,23 @@ class MCPClientManager:
             "last_refresh_outcome": last_refresh[1] if last_refresh is not None else None,
         }
 
-    def get_all_server_status(self, user_id: str | None = None) -> dict[str, dict[str, Any]]:
+    def get_all_server_status(
+        self, user_id: str | None = None, *, aggregate: bool = False
+    ) -> dict[str, dict[str, Any]]:
         """Return live status for all configured servers.
 
         Includes ``oauth_user`` servers (which are absent from
         ``_server_configs``) so the console list reports their real per-user
         pool status instead of falling back to a DB-only "connecting" default.
-        Their status is scoped to *user_id* (see :meth:`get_server_status`).
+        Their status is scoped to *user_id*, or aggregated across users when
+        ``aggregate=True`` (see :meth:`get_server_status`).
         """
         result: dict[str, dict[str, Any]] = {}
         for name in list(self._server_configs):
-            result[name] = self.get_server_status(name, user_id)
+            result[name] = self.get_server_status(name, user_id, aggregate=aggregate)
         for name in list(self._oauth_user_server_names):
             if name not in result:
-                result[name] = self.get_server_status(name, user_id)
+                result[name] = self.get_server_status(name, user_id, aggregate=aggregate)
         return result
 
     def reconcile_sync(self, storage: Any, timeout: int = 30) -> dict[str, Any]:

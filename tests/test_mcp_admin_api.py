@@ -1936,3 +1936,27 @@ class TestInternalMcpStatusEndpoint:
         r = c.get("/v1/api/_internal/mcp-status")
         assert r.status_code == 200
         assert r.json() == {"servers": {}}
+
+    def test_status_aggregate_gated_on_admin_mcp_permission(self, storage: SQLiteBackend) -> None:
+        """oauth_user status is cross-user-aggregated ONLY for callers holding
+        admin.mcp (the console cluster-health view). A read/approve user without
+        it gets aggregate=False — strictly their own pool, the leak guard."""
+
+        def _aggregate_arg(middleware_cls: type) -> Any:
+            mgr = MagicMock()
+            mgr.get_all_server_status.return_value = {}
+            app = Starlette(
+                routes=_routes_with_internal(),
+                middleware=[Middleware(middleware_cls)],
+            )
+            app.state.auth_storage = storage
+            app.state.mcp_client = mgr
+            client = TestClient(app, raise_server_exceptions=False)
+            assert client.get("/v1/api/_internal/mcp-status").status_code == 200
+            return mgr.get_all_server_status.call_args
+
+        admin_call = _aggregate_arg(_InjectAuthMiddleware)
+        assert admin_call.kwargs.get("aggregate") is True
+
+        user_call = _aggregate_arg(_InjectAuthNoMcpMiddleware)
+        assert user_call.kwargs.get("aggregate") is False

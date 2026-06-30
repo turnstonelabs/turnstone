@@ -2023,6 +2023,25 @@ class TestOAuthUserServerStatus:
         assert st["user_pools"] == 0
         assert st["auth_type"] == "oauth_user"
 
+    def test_oauth_user_status_aggregate_sees_any_user_pool(self) -> None:
+        """Admin cluster-health view (aggregate=True, gated on admin.mcp at the
+        endpoint): connected + a representative catalog reflect ANY user's warm
+        pool, so the operator "in use by anyone" pill works — while a non-admin
+        caller (aggregate=False) still sees only their own pool."""
+        mgr = MCPClientManager({})
+        mgr._oauth_user_server_names = {"pool-srv"}
+        self._warm(mgr, "user-A", "pool-srv", n_tools=4)
+
+        # Aggregate: a different (or absent) user still sees the server in use.
+        agg = mgr.get_server_status("pool-srv", user_id="user-B", aggregate=True)
+        assert agg["connected"] is True
+        assert agg["tools"] == 4
+        assert agg["user_pools"] == 1
+        assert mgr.get_server_status("pool-srv", user_id=None, aggregate=True)["connected"] is True
+
+        # Non-aggregate stays strictly per-user (no cross-user disclosure).
+        assert mgr.get_server_status("pool-srv", user_id="user-B")["connected"] is False
+
 
 # Suppress unused-import warning for AsyncMock.
 _ = AsyncMock
