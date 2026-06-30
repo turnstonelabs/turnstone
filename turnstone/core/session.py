@@ -870,6 +870,41 @@ _BACKEND_KNOWN_EXC_NAMES: frozenset[str] = (
 )
 
 
+def _is_ctx_overflow(exc: BaseException) -> bool:
+    """True when *exc* looks like a context-window overflow from any backend.
+
+    Detection is by message *text*, not exception class: vLLM surfaces the SAME
+    overflow as HTTP 400 ``BadRequestError`` on the OpenAI endpoint but HTTP 500
+    ``InternalServerError`` on the Anthropic (``/v1/messages``) endpoint, so
+    class-based matching would miss one of them.  A free function (not a method)
+    so the fatal-error formatter — which is unit-tested with a stand-in ``self``
+    — and the per-call retry gates, the send-loop recovery, and the chunker can
+    all share one definition.
+
+    The phrases are deliberately overflow-*specific* and cover the core providers
+    (OpenAI/vLLM "maximum context length"; Anthropic "exceed context limit,
+    decrease input length"; Google/Gemini "exceeds the maximum number of tokens
+    allowed").  They must NOT match a retryable rate-limit, whose body can mention
+    token quotas ("… input tokens per minute …") — these gates make a match
+    non-retryable, so a false positive would turn a transient 429 into a hard,
+    mislabeled failure (hence no bare "input tokens" / "too many tokens").
+    """
+    text = str(exc).lower()
+    return any(
+        s in text
+        for s in (
+            "context length",
+            "maximum context",
+            "context window",
+            "context limit",
+            "prompt is too long",
+            "input is too long",
+            "reduce the length of the input",
+            "maximum number of tokens",
+        )
+    )
+
+
 class SessionUI(Protocol):
     def on_turn_start(self) -> None: ...
     def on_turn_committed(self) -> None: ...
@@ -2551,7 +2586,7 @@ class ChatSession:
         safety_margin = int(self.context_window * 0.05)
         return max(0, self.context_window - used - response_reserve - safety_margin)
 
-    def _maybe_compact_midturn(self) -> None:
+    def _maybe_compact_midturn(self, my_generation: int = 0) -> None:
         """Cooperative mid-turn compaction policy.
 
         Reads the provider-anchored fullness estimate (the same measure
@@ -2572,7 +2607,7 @@ class ChatSession:
         """
         est = self._estimated_prompt_tokens()
         if self._compaction_owed(est):
-            self._do_auto_compact("mid-turn")
+            self._do_auto_compact("mid-turn", my_generation=my_generation)
         elif self._over_soft(est):
             self._append_system_turn("compaction_pending", format_nudge("compaction_pending"))
             self._compaction_advised = True
@@ -2589,8 +2624,7 @@ class ChatSession:
         """
         if used is None:
             used = self._estimated_prompt_tokens()
-        hard = self.context_window * min(0.95, self.auto_compact_pct + 0.10)
-        return used > hard or (self._over_soft(used) and self._compaction_advised)
+        return self._over_hard(used) or (self._over_soft(used) and self._compaction_advised)
 
     def _over_soft(self, used: int) -> bool:
         """True when ``used`` tokens exceed the soft auto-compaction threshold.
@@ -2601,22 +2635,39 @@ class ChatSession:
         """
         return used > self.context_window * self.auto_compact_pct
 
-    def _do_auto_compact(self, where: str = "", preserve_tail: int = 0) -> bool:
+    def _over_hard(self, used: int) -> bool:
+        """True when ``used`` tokens exceed the hard ceiling — a band above the
+        soft threshold (capped at 95%).
+
+        The "compact now, no turn to spare" line.  Single source shared by
+        :meth:`_compaction_owed` and the proactive pre-send guard; the latter uses
+        it ALONE (not ``_compaction_owed``, whose advised-soft arm belongs to the
+        cooperative mid/end-of-turn wind-down, not to a pre-send emergency).
+        """
+        return used > self.context_window * min(0.95, self.auto_compact_pct + 0.10)
+
+    def _do_auto_compact(
+        self, where: str = "", preserve_tail: int = 0, my_generation: int = 0
+    ) -> bool:
         """Emit the auto-compaction notice, compact, and refresh the status
         line.  Shared by the mid-turn policy (:meth:`_maybe_compact_midturn`)
         and the end-of-turn check so the notice wording, the percentage, and
         the post-compaction status refresh stay in lockstep.  ``where`` is an
         optional qualifier for the notice (e.g. ``"mid-turn"``); ``preserve_tail``
         is forwarded to :meth:`_compact_messages` (e.g. to keep an in-flight
-        tool-call turn during compact-before-truncate).  Returns whether a
-        summary was actually produced (False if compaction bailed) so callers
-        can avoid acting on a compaction that did not happen."""
+        tool-call turn during compact-before-truncate); ``my_generation`` is
+        forwarded so the message swap aborts if a newer send supersedes this one
+        mid-compaction (0 = the manual /compact path, which has no generation).
+        Returns whether a summary was actually produced (False if compaction
+        bailed) so callers can avoid acting on a compaction that did not happen."""
         qualifier = f" {where}" if where else ""
         pct_display = round(self.auto_compact_pct * 100)
         self.ui.on_info(
             f"\n[Auto-compacting{qualifier}: prompt exceeds {pct_display}% of context window]"
         )
-        compacted = self._compact_messages(auto=True, preserve_tail=preserve_tail)
+        compacted = self._compact_messages(
+            auto=True, preserve_tail=preserve_tail, my_generation=my_generation
+        )
         self._print_status_line()
         return compacted
 
@@ -2681,7 +2732,11 @@ class ChatSession:
             asst_msg = ""
             for m in list(self.messages):
                 content = m.text  # joins text blocks; multipart attachments contribute none
-                if m.role is Role.USER and not user_msg:
+                # Skip the synthetic [Conversation summary] turn: after a compaction
+                # it is messages[0], and titling from the bare label yields a
+                # meaningless title (the same summary-turn-as-real-turn hazard
+                # _find_turn_boundaries guards for retry/rewind).
+                if m.role is Role.USER and not user_msg and content != COMPACTION_SUMMARY_LABEL:
                     user_msg = content[:300]
                 elif m.role is Role.ASSISTANT and not asst_msg:
                     asst_msg = content[:200]
@@ -3598,8 +3653,10 @@ class ChatSession:
 
         Returns ``None`` for exceptions outside the recognised set so the
         caller falls back to the bare ``f"{type(exc).__name__}: {exc}"``
-        shape.  Matching is by class name (see the
-        ``_BACKEND_*_EXC_NAMES`` sets above) so the same helper covers
+        shape.  A context-window overflow is matched first by message *text* (it
+        can arrive as several exception classes); everything else is matched by
+        class name (see the ``_BACKEND_*_EXC_NAMES`` sets above) so the same
+        helper covers
         httpx ``ReadTimeout`` / ``ConnectError``, OpenAI SDK
         ``APITimeoutError`` / ``APIConnectionError`` /
         ``NotFoundError`` / ``RateLimitError`` / ``AuthenticationError``,
@@ -3612,7 +3669,31 @@ class ChatSession:
         :func:`sanitize_error_text` in the caller, so credentials in the
         base URL are redacted before display / persist.
         """
+        # Backend identity shared by every branch — model label + raw tail.
+        # Hoisted so the context-overflow branch and the class-name branches use
+        # one derivation.  self.model/_model_alias are plain __init__ attributes
+        # (always set), so reading them here can't raise on the fatal path.
+        model_label = self.model or self._model_alias or "?"
+        raw_msg = str(exc).strip()
+        raw_tail = f" raw={raw_msg!r}" if raw_msg else ""
+
         name = type(exc).__name__
+
+        # Context overflow — matched by text, not class, because it arrives as
+        # BadRequestError (OpenAI 400) OR InternalServerError (Anthropic-compat 500),
+        # which would otherwise render as an opaque class name with no hint that the
+        # prompt was simply too large.  Gated on "not a known class" so a recognized
+        # error (e.g. a RateLimitError whose quota text happens to mention a token
+        # maximum) still falls through to its own specific message below rather than
+        # being mislabeled as overflow.  The overflow classes are not in
+        # ``_BACKEND_KNOWN_EXC_NAMES``, so this still catches them.
+        if name not in _BACKEND_KNOWN_EXC_NAMES and _is_ctx_overflow(exc):
+            return (
+                f"Context window exceeded for model={model_label}: the conversation "
+                f"is too large to send. Auto-compaction should shrink it and retry; "
+                f"seeing this means compaction could not reduce it enough.{raw_tail}"
+            )
+
         if name not in _BACKEND_KNOWN_EXC_NAMES:
             return None
 
@@ -3637,14 +3718,6 @@ class ChatSession:
             )
         except Exception:
             log.debug("session.fatal.provider_lookup_failed", exc_info=True)
-        model_label = self.model or self._model_alias or "?"
-        # Original exception text (often empty for httpx.ReadTimeout —
-        # the message is on the class name alone) — included as a
-        # "raw=" tail so operators reading logs can still grep the
-        # underlying SDK error.
-        raw_msg = str(exc).strip()
-        raw_tail = f" raw={raw_msg!r}" if raw_msg else ""
-
         if name in _BACKEND_TIMEOUT_EXC_NAMES:
             return (
                 f"Backend timeout ({name}): no response from {provider_label} "
@@ -3971,6 +4044,17 @@ class ChatSession:
             self.ui.on_info(f"[Fallback {alias} also failed: {fb_err}]")
             return None
 
+    def _stop_retrying(self, exc: BaseException, attempt: int, provider: LLMProvider) -> bool:
+        """Terminal-retry predicate shared by every API retry loop (stream, summary,
+        task_agent): stop on a non-retryable error class, a deterministic
+        context-overflow (retrying an identical oversized payload is pointless), or
+        retry exhaustion."""
+        return (
+            type(exc).__name__ not in provider.retryable_error_names
+            or _is_ctx_overflow(exc)
+            or attempt == self._MAX_RETRIES
+        )
+
     def _try_stream(
         self,
         client: Any,
@@ -4051,7 +4135,10 @@ class ChatSession:
                     self._MAX_RETRIES + 1,
                     exc_info=True,
                 )
-                if ename not in prov.retryable_error_names or attempt == self._MAX_RETRIES:
+                if self._stop_retrying(e, attempt, prov):
+                    # Non-retryable class, deterministic overflow (the send-loop
+                    # compact-and-retry handles it), or retries exhausted — raise
+                    # immediately rather than burn backoff sleeps.
                     raise
                 last_err = e
                 delay = self._RETRY_BASE_DELAY * (2**attempt)
@@ -4477,6 +4564,41 @@ class ChatSession:
             self._init_system_messages()
 
         try:
+            # Bail an orphaned/superseded send BEFORE the pre-send compaction below
+            # can mutate history.  The old code's first in-try act was the loop-top
+            # _check_cancelled(my_generation); the new pre-send layer sits ahead of
+            # the loop, so without this guard a stale thread (a newer send already
+            # bumped _generation and installed a fresh, clear cancel event) would
+            # sail past the event-only checks inside compaction and compact-and-swap
+            # the live generation's history.  A stale thread raises here and the
+            # except-GenerationCancelled handler returns without touching state.
+            self._check_cancelled(my_generation)
+
+            # Proactive pre-send compaction (Layer A): a rehydrated resume — or a
+            # session that never compacted under a larger-window model before a
+            # switch to a smaller one — can arrive already over the window before
+            # the FIRST send.  The mid-turn and end-of-turn triggers only fire AFTER
+            # a successful call, so without this the first post-resume send goes out
+            # blind.  Gate on the HARD ceiling alone (NOT _compaction_owed, whose
+            # advised-soft arm is the cooperative wind-down the model must still get
+            # to act on), run it ONCE here, and preserve from the last USER turn to
+            # the end — the just-sent message plus any nudge _emit_pending_user_nudges
+            # appended after it — so it isn't summarized out from under its own reply.
+            # Sits INSIDE the try so a raise (or a cooperative cancel) lands in the
+            # fatal/cancel handlers like every other compaction site.  Passes
+            # my_generation so the swap inside compaction also aborts if a newer send
+            # starts DURING the (slow) summary call.  Best-effort prevention, not a
+            # guarantee: the char-based estimate under-counts dense/CJK history on an
+            # uncalibrated resume, so the send-loop compact-and-retry below stays the
+            # backstop.
+            if self._over_hard(self._estimated_prompt_tokens()):
+                boundaries = self._find_turn_boundaries()
+                preserve = len(self.messages) - boundaries[-1] if boundaries else 1
+                self._do_auto_compact(
+                    "pre-send", preserve_tail=preserve, my_generation=my_generation
+                )
+                if self._generation != my_generation:
+                    return
             while True:
                 self._check_cancelled(my_generation)
                 msgs = self._prepare_wire_messages(self._full_messages())
@@ -4500,18 +4622,7 @@ class ChatSession:
                         # Context overflow recovery: if the API rejects the
                         # request due to exceeding the context window, compact
                         # the conversation and retry once.
-                        err_text = str(ctx_err).lower()
-                        is_ctx_overflow = any(
-                            s in err_text
-                            for s in (
-                                "context length",
-                                "maximum context",
-                                "too many tokens",
-                                "prompt is too long",
-                                "input tokens",
-                            )
-                        )
-                        if not is_ctx_overflow:
+                        if not _is_ctx_overflow(ctx_err):
                             raise
                         log.warning(
                             "Context overflow detected (%s), compacting and retrying",
@@ -4608,7 +4719,7 @@ class ChatSession:
                     # consumed above — compact whenever over soft.  None-safe via
                     # _estimated_prompt_tokens(), so no _last_usage guard.
                     if self._over_soft(self._estimated_prompt_tokens()):
-                        compacted = self._do_auto_compact()
+                        compacted = self._do_auto_compact(my_generation=my_generation)
                         # _do_auto_compact's summary call is slow; unlike the
                         # mid-turn siblings this site also PERSISTS the resume
                         # turn, so re-check the generation didn't change during
@@ -4680,7 +4791,7 @@ class ChatSession:
                 # orphaned thread can't replace history under the active one.
                 pre_attempted_compact = False
                 if self._generation == my_generation and self._compaction_owed():
-                    self._do_auto_compact("mid-turn", preserve_tail=1)
+                    self._do_auto_compact("mid-turn", preserve_tail=1, my_generation=my_generation)
                     pre_attempted_compact = True
                 truncation_budget = self._remaining_token_budget()
                 _truncated: dict[str, str] = {}
@@ -4882,7 +4993,7 @@ class ChatSession:
                 # bounded the batch, and the next iteration / end-of-turn
                 # re-checks.
                 if not pre_attempted_compact:
-                    self._maybe_compact_midturn()
+                    self._maybe_compact_midturn(my_generation)
         except GenerationCancelled:
             # If a newer send() has started (force cancel), this thread is
             # orphaned — skip all message mutations and state changes.
@@ -4959,6 +5070,15 @@ class ChatSession:
             # an idle session until the next send.  Restores the "None outside a
             # send" invariant on every exit (success, cancel, or error).
             self._wire_part_cache = None
+            # Consume this generation's cancel signal on exit so a cancel that
+            # targeted THIS send can't later abort an unrelated idle operation
+            # (e.g. a manual /compact between sends would otherwise inherit the
+            # still-set event).  Only when still the active generation — a newer
+            # send owns a fresh event we must not clear out from under it.  This is
+            # why a manual /compact no longer needs to reset the event itself
+            # (which would have disarmed a cancel aimed at a concurrent send).
+            if self._generation == my_generation:
+                self._cancel_event.clear()
 
     def _drain_pending_advisories(self) -> None:
         """Drop every pending nudge regardless of channel.
@@ -5044,8 +5164,22 @@ class ChatSession:
     # -- Rewind / retry -------------------------------------------------------
 
     def _find_turn_boundaries(self) -> list[int]:
-        """Return indices of user messages in self.messages (turn start positions)."""
-        return [i for i, m in enumerate(self.messages) if m.role is Role.USER]
+        """Return indices of real user messages in self.messages (turn starts).
+
+        Excludes the synthetic ``[Conversation summary]`` user turn that
+        :meth:`_compact_messages` injects ahead of a summary.  It is a compaction
+        artifact, not a real turn: as a retry/rewind target it would re-send the
+        bare label and regenerate over it (clobbering the summary), and as the
+        pre-send ``preserve_tail`` anchor it would preserve the label instead of
+        the real question.  (A user who literally types the label leaves no real
+        boundary — retry/rewind then correctly no-op, and the pre-send caller's
+        own ``else`` fallback keeps the trailing turn.)
+        """
+        return [
+            i
+            for i, m in enumerate(self.messages)
+            if m.role is Role.USER and (m.text or "") != COMPACTION_SUMMARY_LABEL
+        ]
 
     def _persist_truncation(self, removed_count: int) -> None:
         """Mirror a rewind/retry tail-trim into storage, compaction-safe.
@@ -5900,6 +6034,11 @@ class ChatSession:
         Only used for a lone block that can't fit any batch — the one lossy path
         in chunked compaction.  The result is always ``<= budget``.
         """
+        if len(block) <= budget:
+            # Already fits — return as-is.  Without this, a budget wider than the
+            # block makes the head slice ``block[:head]`` and tail slice
+            # ``block[-tail:]`` overlap and DUPLICATE content around the marker.
+            return block
         marker = "\n…[truncated]…\n"
         if budget <= len(marker):
             return block[:budget]
@@ -5967,10 +6106,9 @@ class ChatSession:
                 break
             except Exception as e:
                 ename = type(e).__name__
-                if (
-                    ename not in self._provider.retryable_error_names
-                    or attempt == self._MAX_RETRIES
-                ):
+                if self._stop_retrying(e, attempt, self._provider):
+                    # Overflow is deterministic — let _summarize_batch subdivide
+                    # instead of retrying an identical oversized call.
                     raise
                 delay = self._RETRY_BASE_DELAY * (2**attempt)
                 self.ui.on_info(f"[Compact retrying in {delay:.0f}s: {ename}]")
@@ -5984,46 +6122,111 @@ class ChatSession:
 
     def _summarize_blocks(self, blocks: list[str], *, depth: int = 0) -> str:
         """Summarize ``blocks`` into one dense summary, chunking + recursing so no
-        single model call exceeds :meth:`_summary_input_budget_chars`.
+        single model call exceeds the model window.
 
-        Base case (everything fits one batch) is a single :meth:`_summarize_once`
-        call — exactly today's behavior, so the common case stays one model call.
-        Otherwise each batch is summarized individually (a partial summary) and the
-        partials are recursively merged one level deeper, until they collapse to a
-        single batch.
+        Blocks are packed to the char budget (:meth:`_summary_input_budget_chars`)
+        and each batch is summarized; the partials are recursively merged one level
+        deeper until they collapse to a single summary.  That char budget is only an
+        *estimate* — it divides by the uncalibrated ``_chars_per_token`` (which sits
+        at an optimistic 4.0 on resume) — so a batch that fits by chars can still
+        overflow the *token* window.  :meth:`_summarize_batch` absorbs that: an
+        over-window multi-block batch is split in half and each half summarized
+        (recursing as needed), then the partials merged (chunking, not truncation),
+        and only a lone block that overflows by itself is head/tail-truncated.
 
-        Raises :class:`_CompactionIrreducibleError` when a level fails to reduce the
-        block count (``len(batches) >= len(blocks)``) or recursion would exceed
-        ``_MAX_SUMMARY_DEPTH`` — the caller turns that into a ``return False`` bail
-        rather than fabricate a summary.
+        Bails with :class:`_CompactionIrreducibleError` only at the recursion
+        ceiling ``_MAX_SUMMARY_DEPTH`` (or when a floored lone block still overflows)
+        — the caller turns that into a ``return False`` rather than fabricate a
+        summary.
         """
-        batches = self._pack_blocks(blocks, self._summary_input_budget_chars())
         system_prompt = (
             self._COMPACTOR_SYSTEM_PROMPT if depth == 0 else self._COMPACTOR_MERGE_SYSTEM_PROMPT
         )
-        if len(batches) == 1:
-            return self._summarize_once(system_prompt, "\n\n".join(batches[0]))
-
-        # More than one batch: bail rather than loop or over-recurse when this
-        # level can't shrink the count (each block is its own batch) or we've gone
-        # too deep.
-        if len(batches) >= len(blocks) or depth >= self._MAX_SUMMARY_DEPTH:
+        # Recursion ceiling FIRST — before packing and the single-batch base case —
+        # so it also bounds the per-block-split merge, which can re-pack into one
+        # batch and would otherwise recurse without ever consulting the ceiling.
+        if depth >= self._MAX_SUMMARY_DEPTH:
             raise _CompactionIrreducibleError
+        batches = self._pack_blocks(blocks, self._summary_input_budget_chars())
+        if len(batches) == 1:
+            return self._summarize_batch(system_prompt, batches[0], depth)
 
+        # More than one batch: recurse-merge the per-batch summaries.  A block-count
+        # guard would be wrong here — _summarize_batch's binary subdivision can
+        # legitimately leave one batch per block — so termination rides the depth
+        # ceiling above plus the progressive-shrink-to-floor bail in _summarize_batch.
         total = len(batches)
         summaries: list[str] = []
         for k, batch in enumerate(batches, start=1):
             self.ui.on_info(f"[compacting part {k}/{total}…]")
-            summaries.append(self._summarize_once(system_prompt, "\n\n".join(batch)))
+            summaries.append(self._summarize_batch(system_prompt, batch, depth))
         return self._summarize_blocks(summaries, depth=depth + 1)
 
-    def _compact_messages(self, auto: bool = False, preserve_tail: int = 0) -> bool:
+    def _summarize_batch(self, system_prompt: str, batch: list[str], depth: int) -> str:
+        """Summarize one packed batch, subdividing on a token-window overflow.
+
+        The char budget that produced ``batch`` is only an estimate, so the model
+        call can overflow the real token window.  When a multi-block batch overflows,
+        it is split in HALF and each half summarized (recursing if a half still
+        overflows), then the two partials merged — binary subdivision, so an
+        over-window batch of N blocks costs ~log2(N) levels and a near-optimal number
+        of leaf calls, NOT N per-block calls (which on a wide rehydrated resume meant
+        hundreds of serial summaries).  A lone block that overflows even by itself is
+        head/tail-truncated progressively (halving the budget down to the floor, the
+        single-block analogue of the binary subdivision above) so it keeps as much as
+        the window allows; only if even the floor still overflows is the window too
+        small to compact anything and we bail irreducible.
+        """
+        # Cooperative cancellation: a cancel mid-compaction aborts here.  It raises
+        # GenerationCancelled (a BaseException), so _compact_messages' ``except
+        # Exception`` can't swallow it and the message-swap below never runs — the
+        # history is left untouched.
+        self._check_cancelled()
+        try:
+            return self._summarize_once(system_prompt, "\n\n".join(batch))
+        except Exception as e:
+            if not _is_ctx_overflow(e):
+                raise
+            if len(batch) > 1:
+                # Token-overflow despite the char budget: split the batch in HALF
+                # and summarize each (each half recurses + halves again if it still
+                # overflows), then merge.  Binary subdivision keeps each leaf as full
+                # as fits — a wide over-window batch costs ~log2(N) calls, not one
+                # model call per block.
+                mid = len(batch) // 2
+                left = self._summarize_batch(system_prompt, batch[:mid], depth)
+                right = self._summarize_batch(system_prompt, batch[mid:], depth)
+                return self._summarize_blocks([left, right], depth=depth + 1)
+            # A lone block overflows by itself: the char budget over-estimated how
+            # many tokens it holds.  Shrink progressively — halve the truncation
+            # budget and retry, keeping as much of the message as the real window
+            # allows — mirroring the multi-block binary subdivision above rather than
+            # slamming straight to the 2 000-char floor (which would discard far more
+            # than the window actually forces).  Bail irreducible only once even the
+            # floor still overflows.
+            budget = max(self._MIN_SUMMARY_BUDGET_CHARS, len(batch[0]) // 2)
+            while True:
+                try:
+                    return self._summarize_once(
+                        system_prompt, self._truncate_block(batch[0], budget)
+                    )
+                except Exception as e2:
+                    if not _is_ctx_overflow(e2):
+                        raise
+                    if budget <= self._MIN_SUMMARY_BUDGET_CHARS:
+                        raise _CompactionIrreducibleError from e2
+                    budget = max(self._MIN_SUMMARY_BUDGET_CHARS, budget // 2)
+
+    def _compact_messages(
+        self, auto: bool = False, preserve_tail: int = 0, my_generation: int = 0
+    ) -> bool:
         """Compact conversation history by summarizing it into a summary turn.
 
-        Summarizes the whole selection via :meth:`_summarize_blocks`, which chunks
-        and recursively merges so no single summary call exceeds the model's own
-        window (:meth:`_summary_input_budget_chars`) — the summary call can't
-        overflow, and the most-recent messages are no longer silently dropped.
+        Summarizes the whole selection via :meth:`_summarize_blocks`, which packs
+        to the char-budget estimate and, when a batch still overflows the real token
+        window, binary-subdivides it (:meth:`_summarize_batch`) — so the summary call
+        recovers from an under-estimate by chunking rather than overflowing, and the
+        most-recent messages are no longer silently dropped.
 
         When auto=True (triggered by context limit), appends a continuation
         hint with the last user message so the model can resume seamlessly.
@@ -6042,20 +6245,28 @@ class ChatSession:
             self.ui.on_info("Not enough messages to compact.")
             return False
 
-        # Find the last user message for the continuation hint
-        last_user_content = None
-        if auto:
-            for m in reversed(self.messages):
-                if m.role is Role.USER:
-                    last_user_content = m.text or ""
-                    break
-
         # Optionally keep the last ``preserve_tail`` messages verbatim — e.g. an
-        # in-flight assistant tool-call whose results are about to be appended —
-        # so compacting them away can't orphan a tool result.  Re-appended after
-        # the summary, below.
+        # in-flight assistant tool-call whose results are about to be appended, or
+        # the just-sent user turn on the pre-send path — so compacting them away
+        # can't orphan a tool result or drop the current question.  Re-appended
+        # after the summary, below.
         preserved = self.messages[-preserve_tail:] if preserve_tail > 0 else []
         to_summarize = self.messages[:-preserve_tail] if preserve_tail > 0 else self.messages
+
+        # Continuation hint: re-inject the user's last REAL message ONLY when it is
+        # being summarized away.  When preserve_tail keeps it verbatim (the pre-send
+        # path), the preserved tail already carries it — adding the hint would
+        # duplicate the message and frame a fresh ask as "continue where we left
+        # off".  Use _find_turn_boundaries so the synthetic [Conversation summary]
+        # turn is excluded: when an already-compacted history is re-compacted, the
+        # last "user" turn is that label, and quoting it would hand the model a
+        # content-free "The user's last message was: [Conversation summary]".
+        last_user_content = None
+        if auto:
+            split = len(to_summarize)  # preserved == self.messages[split:]
+            real_users = self._find_turn_boundaries()
+            if real_users and real_users[-1] < split:  # summarized, not preserved
+                last_user_content = self.messages[real_users[-1]].text or ""
 
         # Build summary blocks from ALL of to_summarize (per-message), then
         # summarize via chunked/hierarchical compaction.  Sizing by the actual
@@ -6096,6 +6307,15 @@ class ChatSession:
                 f"The user's last message was: {last_user_content}\n"
                 f"Continue assisting from where we left off."
             )
+
+        # Honor a cancel — or a newer generation that superseded this send DURING
+        # the (possibly only, possibly slow) summary call — before we mutate state.
+        # GenerationCancelled is a BaseException, so it propagates past the
+        # except-clauses above and leaves self.messages untouched.  Passing
+        # my_generation here is what stops an orphaned send from swapping the live
+        # generation's history after its summary call returns (the event arm alone
+        # can't see it: a newer send installed a fresh, clear event).
+        self._check_cancelled(my_generation)
 
         # Replace messages — summary, then any preserved tail verbatim.
         before_tokens = self._system_tokens + sum(self._msg_tokens) + self._tool_def_tokens()
@@ -12538,10 +12758,9 @@ class ChatSession:
                     return agent_result
                 except Exception as e:
                     ename = type(e).__name__
-                    if (
-                        ename not in agent_provider.retryable_error_names
-                        or attempt == self._MAX_RETRIES
-                    ):
+                    if self._stop_retrying(e, attempt, agent_provider):
+                        # Overflow is deterministic — raise straight to the
+                        # context-limit handler below, no backoff.
                         raise
                     last_err = e
                     delay = self._RETRY_BASE_DELAY * (2**attempt)
@@ -12556,15 +12775,26 @@ class ChatSession:
             try:
                 result = _api_call(agent_turns)
             except Exception as e:
-                # Context-exceeded or other non-retryable API error.
-                # Return what we have so far rather than crashing.
-                err_str = str(e).lower()
-                if "context" in err_str or "token" in err_str:
+                # Terminal API error: overflow, or any non-retryable error that
+                # escaped the retry loop above.  Salvage the sub-agent's partial work
+                # rather than crash the whole task — losing a substantial synthesis to
+                # a late failure is worse than returning it with a note.  (This must
+                # NOT be narrowed to overflow only: a non-overflow terminal error used
+                # to be salvaged too, via the old "context"/"token" text gate, and
+                # narrowing it discarded partial work on e.g. a persistent timeout.)
+                # GenerationCancelled is a BaseException, so a real cancel still
+                # propagates past this ``except Exception``.
+                overflow = _is_ctx_overflow(e)
+                note = "context limit reached" if overflow else f"error ({type(e).__name__})"
+                for t in reversed(agent_turns):
+                    if t.role is Role.ASSISTANT and t.text:
+                        self.ui.on_info(f"[{label}] {note}, returning partial work")
+                        return self._guard_subagent_synthesis(t.text, label)
+                # No partial work to salvage: surface overflow as a calm stop message,
+                # but re-raise any other terminal error so the real failure isn't
+                # masked as an empty success.
+                if overflow:
                     self.ui.on_info(f"[{label}] context limit reached, stopping early")
-                    # Find the last assistant content we have
-                    for t in reversed(agent_turns):
-                        if t.role is Role.ASSISTANT and t.text:
-                            return self._guard_subagent_synthesis(t.text, label)
                     return f"({label} stopped: context limit exceeded)"
                 raise
 
@@ -14143,7 +14373,13 @@ class ChatSession:
                     self.ui.on_info(f"Invalid. Choose from: {', '.join(valid)}")
 
         elif cmd == "/compact":
-            self._compact_messages()
+            try:
+                self._compact_messages()
+            except GenerationCancelled:
+                # Ctrl-C during a manual compaction aborts cleanly — the message
+                # swap never ran (the cancel-check precedes it), so history is
+                # intact, exactly like cancelling a send.
+                self.ui.on_info("Compaction cancelled.")
 
         elif cmd == "/creative":
             self.creative_mode = not self.creative_mode

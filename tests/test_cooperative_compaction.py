@@ -15,11 +15,17 @@ the harness collapses the transcript:
 from __future__ import annotations
 
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 
 from tests._session_helpers import make_session
+from turnstone.core.session import (
+    COMPACTION_SUMMARY_LABEL,
+    GenerationCancelled,
+    _CompactionIrreducibleError,
+    _is_ctx_overflow,
+)
 from turnstone.core.trajectory import dicts_from_turns, turns_from_dicts
 
 
@@ -128,8 +134,9 @@ class TestMidturnCompactionPolicy:
             patch.object(session, "_do_auto_compact") as compact,
             patch.object(session, "_append_system_turn") as advise,
         ):
-            session._maybe_compact_midturn()
-        compact.assert_called_once_with("mid-turn")
+            session._maybe_compact_midturn(my_generation=7)
+        # my_generation threads through so the compaction swap stays generation-guarded.
+        compact.assert_called_once_with("mid-turn", my_generation=7)
         advise.assert_not_called()
 
     def test_hard_ceiling_compacts_without_advisory(self, session):
@@ -141,8 +148,8 @@ class TestMidturnCompactionPolicy:
             patch.object(session, "_do_auto_compact") as compact,
             patch.object(session, "_append_system_turn") as advise,
         ):
-            session._maybe_compact_midturn()
-        compact.assert_called_once_with("mid-turn")
+            session._maybe_compact_midturn(my_generation=7)
+        compact.assert_called_once_with("mid-turn", my_generation=7)
         advise.assert_not_called()
 
     def test_do_auto_compact_rounds_percentage(self, session):
@@ -155,7 +162,7 @@ class TestMidturnCompactionPolicy:
             patch.object(session.ui, "on_info") as on_info,
         ):
             session._do_auto_compact("mid-turn")
-        compact.assert_called_once_with(auto=True, preserve_tail=0)
+        compact.assert_called_once_with(auto=True, preserve_tail=0, my_generation=0)
         msg = on_info.call_args.args[0]
         assert "58%" in msg
         assert "mid-turn" in msg
@@ -263,7 +270,11 @@ class TestEndOfTurnAutoResume:
             patch.object(session, "_update_token_table"),
             patch.object(session, "_print_status_line"),
             patch.object(session, "_emit_state") as emit_state,
-            patch.object(session, "_estimated_prompt_tokens", return_value=9_999),
+            # Over soft (8000) but UNDER hard (9000): isolates the end-of-turn
+            # trigger this test targets.  A value over hard would ALSO trip the
+            # proactive pre-send compaction (covered by TestProactivePreSend),
+            # double-counting the mocked compactor.
+            patch.object(session, "_estimated_prompt_tokens", return_value=8_500),
             patch.object(session, "_do_auto_compact") as compact,
             patch.object(session, "_append_user_turn") as resume,
             patch("turnstone.core.session.save_message"),
@@ -690,13 +701,10 @@ class TestChunkedCompaction:
         """q-3: the ``depth >= _MAX_SUMMARY_DEPTH`` recursion backstop bails to
         False (the "too large" path) without fabricating a summary.
 
-        Distinct from ``test_irreducible_input_bails_to_false`` (which bails at
-        depth 0 via the ``len(batches) >= len(blocks)`` arm before any model
-        call): here depth 0 packs into several batches AND reduces, so the level
-        succeeds and recurses; depth 1 still has >1 batch but a strictly smaller
-        count (so the len arm is False), and ``depth >= 1`` fires the bail.  That
-        the depth-0 calls ran first is proven by ``_utility_completion`` being
-        called (≥1) despite the False return.
+        depth 0 packs into several batches and recurses; depth 1 still has >1
+        batch, and ``depth >= 1`` fires the bail.  That the depth-0 calls ran
+        first is proven by ``_utility_completion`` being called (≥1) despite the
+        False return.
         """
         session.context_window = 5_000
         session.compact_max_tokens = 4_000  # squeezes the input budget
@@ -705,7 +713,7 @@ class TestChunkedCompaction:
         budget = session._summary_input_budget_chars()
 
         # ~30 messages, each block bigger than 1/6 of the budget → depth 0 packs
-        # into several batches (and len(batches) < len(blocks), so it recurses).
+        # into several batches and recurses (depth 0 < MAX).
         session.messages = turns_from_dicts(
             [
                 {
@@ -719,8 +727,7 @@ class TestChunkedCompaction:
         before = list(session.messages)
 
         # Each depth-0 partial is 0.4*budget chars: two pack per batch but not
-        # three, so depth 1 reduces the batch count without collapsing to one —
-        # the len arm stays False and the depth ceiling is what bails.
+        # three, so depth 1 still has >1 batch and the depth ceiling bails.
         partial = "P" * ((budget * 2) // 5)
         summary = SimpleNamespace(content=partial, finish_reason="stop")
 
@@ -729,19 +736,16 @@ class TestChunkedCompaction:
 
         assert result is False
         assert session.messages == before  # untouched on the bail
-        assert uc.call_count >= 1  # depth-0 ran (depth arm), not the len arm
+        assert uc.call_count >= 1  # depth-0 ran before the depth-ceiling bail
 
     def test_irreducible_input_bails_to_false(self, session):
-        """A genuinely irreducible case still bails to False (the "too large"
-        path) rather than fabricate, and without burning a model call.
+        """A genuinely irreducible case — where even a floor-truncated lone block
+        still overflows the window — bails to False (the "too large" path) rather
+        than fabricate a summary, leaving the history untouched.
 
-        Needs a *tiny* window now that Fix 1 keeps the budget healthy on normal
-        windows: at context_window=900 the output reserve + compactor prompt +
-        safety already exceed the window, so the true input capacity is negative
-        and ``_summary_input_budget_chars`` caps the budget to 0.  Each ~5000-char
-        message head+tail-caps to ~1525, far over the 0/1-char budget, so
-        ``_pack_blocks`` truncates each into its own batch:
-        ``len(batches) == len(blocks)`` → irreducible bail at depth 0, no model call.
+        With per-block splitting the chunker no longer bails on packing alone; it
+        bails only when a block truncated to ``_MIN_SUMMARY_BUDGET_CHARS`` STILL
+        overflows the model — i.e. no body is small enough to summarize.
         """
         session.context_window = 900
         session.compact_max_tokens = 900
@@ -755,11 +759,15 @@ class TestChunkedCompaction:
         session._msg_tokens = [1, 1]
         before = list(session.messages)
 
-        with patch.object(session, "_utility_completion") as uc:
+        # Every summary call overflows — even a floor-truncated lone block — so no
+        # body is ever small enough to summarize: bail irreducible, history intact.
+        def always_overflow(*_a, **_k):
+            raise RuntimeError("maximum context length is 900 tokens")
+
+        with patch.object(session, "_utility_completion", side_effect=always_overflow):
             result = session._compact_messages(auto=True)
 
         assert result is False
-        uc.assert_not_called()  # no reduction at depth 0 → bail before any call
         assert session.messages == before  # untouched
 
     def test_default_config_summary_call_fits_window(self, session):
@@ -940,3 +948,593 @@ def test_compaction_advisory_is_registered():
     turn = make_system_turn("compaction_pending", text)
     assert turn["role"] == "system"
     assert turn["_source"] == "compaction_pending"
+
+
+# ---------------------------------------------------------------------------
+# Context-overflow handling: detection, proactive pre-send compaction (Layer A),
+# and the closed-loop adaptive chunker — the resume-rehydration overflow fix.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "message,expected",
+    [
+        # Real overflow messages (vLLM / OpenAI / Anthropic) — must match.
+        ("This model's maximum context length is 524288 tokens", True),
+        (
+            "maximum context length is 524288 tokens ... your prompt contains at "
+            "least 523777 input tokens",
+            True,
+        ),
+        ("prompt is too long: 200000 > 100000", True),
+        ("the input is too long for this model", True),
+        ("Please reduce the length of the input prompt", True),
+        ("request exceeds the context window", True),
+        # Anthropic (input + max_tokens) and Google/Gemini wordings — match NONE of
+        # the old phrase set; regression guard for the centralized detector.
+        (
+            "input length and max_tokens exceed context limit: 9000 + 4000 > 8000, "
+            "decrease input length or max_tokens and try again",
+            True,
+        ),
+        (
+            "The input token count (29000) exceeds the maximum number of tokens allowed (28000)",
+            True,
+        ),
+        # Retryable / unrelated — must NOT match (esp. token-quota 429s, which a
+        # bare "input tokens" substring would false-match into a hard failure).
+        ("rate limit exceeded: 40000 input tokens per minute", False),
+        ("This request would exceed your organization's rate limit", False),
+        ("Connection refused", False),
+        ("invalid api key", False),
+    ],
+)
+def test_is_ctx_overflow_detection(message, expected):
+    """Overflow is detected by text, not exception class: vLLM returns the same
+    condition as a 400 ``BadRequestError`` on /v1/chat/completions but a 500
+    ``InternalServerError`` on /v1/messages."""
+    assert _is_ctx_overflow(RuntimeError(message)) is expected
+
+
+def test_format_backend_error_renders_overflow(session):
+    """The text-first overflow branch in _format_backend_error renders a clear
+    "Context window exceeded" message (with a raw tail) for an exception class
+    OUTSIDE _BACKEND_KNOWN_EXC_NAMES — the anthropic-compat 500 case — and a
+    non-overflow unknown class still falls through to None."""
+
+    class InternalServerError(Exception):  # not in _BACKEND_KNOWN_EXC_NAMES
+        pass
+
+    msg = session._format_backend_error(
+        InternalServerError("This model's maximum context length is 524288 tokens")
+    )
+    assert msg is not None
+    assert "Context window exceeded" in msg
+    assert "raw=" in msg
+    assert session._format_backend_error(InternalServerError("boom")) is None
+
+
+def test_generate_title_skips_synthetic_summary_label(session):
+    """After a compaction the first 'user' turn is the synthetic [Conversation
+    summary] label; _generate_title must not title from it — with no real user
+    message it skips regeneration and rebroadcasts the current title, instead of
+    issuing a model call that titles the conversation '[Conversation summary]'."""
+    session.messages = turns_from_dicts(
+        [
+            {"role": "user", "content": COMPACTION_SUMMARY_LABEL},
+            {"role": "assistant", "content": "the dense summary"},
+        ]
+    )
+    with (
+        patch.object(session, "_utility_completion") as uc,
+        patch.object(session, "ui", new=MagicMock()) as ui_mock,
+    ):
+        session._generate_title("Existing Title")
+
+    uc.assert_not_called()  # no real user message → no title model call
+    ui_mock.on_rename.assert_called_once_with("Existing Title")  # current title rebroadcast
+
+
+class TestProactivePreSend:
+    """Layer A: a send whose history already exceeds the window (e.g. a
+    rehydrated resume) compacts BEFORE the first stream call, so an over-window
+    payload is never put on the wire."""
+
+    def test_proactive_pre_send_compaction_runs_before_stream(self, session):
+        session.messages = turns_from_dicts([{"role": "user", "content": "task"}])
+        session._msg_tokens = [1]
+        session._title_generated = True
+        session._compaction_advised = False
+        order: list[str] = []
+        forwarded: dict[str, object] = {}
+
+        def fake_compact(*args, **kwargs):
+            where = args[0] if args else ""
+            order.append(f"compact:{where}")
+            if where == "pre-send":  # capture only the Layer-A call, not end-of-turn
+                forwarded["preserve_tail"] = kwargs.get("preserve_tail")
+            return True
+
+        def fake_stream(*_args, **_kwargs):
+            order.append("stream")
+            return iter([])
+
+        with (
+            # 9999 > hard (9000) → compaction is owed at send time.
+            patch.object(session, "_estimated_prompt_tokens", return_value=9_999),
+            patch.object(session, "_check_metacognitive_nudge", return_value=None),
+            patch.object(session, "_do_auto_compact", side_effect=fake_compact),
+            patch.object(session, "_create_stream_with_retry", side_effect=fake_stream),
+            patch.object(
+                session, "_stream_response", return_value={"role": "assistant", "content": "done"}
+            ),
+            patch.object(session, "_full_messages", return_value=[]),
+            patch.object(session, "_update_token_table"),
+            patch.object(session, "_print_status_line"),
+            patch.object(session, "_emit_state"),
+            patch("turnstone.core.session.save_message"),
+        ):
+            session.send("go")
+
+        assert order[0] == "compact:pre-send", order
+        assert "stream" in order
+        # End-to-end through send(): the pre-existing "task" turn + the just-sent
+        # "go" turn, last USER boundary at index 1 → preserve exactly the trailing
+        # "go" turn (no nudge fired), pinning len(messages) - boundaries[-1].
+        assert forwarded["preserve_tail"] == 1
+
+    def test_pre_send_preserves_user_turn_past_trailing_nudge(self, session):
+        """The just-sent user message survives compaction verbatim even when a
+        system nudge was appended after it — pre-send preserves from the last USER
+        boundary, not messages[-1]."""
+        session.messages = turns_from_dicts(
+            [
+                {"role": "user", "content": "old question"},
+                {"role": "assistant", "content": "old answer"},
+                {"role": "user", "content": "THE ACTUAL QUESTION"},
+                {"role": "system", "_source": "output_guard", "content": "a trailing nudge"},
+            ]
+        )
+        session._msg_tokens = [1, 1, 1, 1]
+        summary = SimpleNamespace(content="SUMMARY", finish_reason="stop")
+
+        # The real pre-send preserve computation, then the real _compact_messages.
+        boundaries = session._find_turn_boundaries()
+        preserve = len(session.messages) - boundaries[-1]
+        # Pin the formula: last USER turn at index 2 → preserve the user msg AND the
+        # trailing nudge (indices 2,3), i.e. exactly 2 — not 1 (which would drop the
+        # user turn under the nudge) and not the whole history.
+        assert preserve == 2
+        with patch.object(session, "_utility_completion", return_value=summary):
+            assert session._do_auto_compact("pre-send", preserve_tail=preserve) is True
+
+        texts = [m.text or "" for m in session.messages]
+        assert any("THE ACTUAL QUESTION" in t for t in texts)  # user msg verbatim
+        assert any("a trailing nudge" in t for t in texts)  # trailing nudge kept too
+        assert not any("old answer" in t for t in texts)  # older turns summarized away
+
+    def test_continuation_hint_references_last_summarized_user_message(self, session):
+        """When the last user turn is summarized away (reactive, preserve_tail=0),
+        the summary carries a ``## Continue`` hint quoting that message so the model
+        knows where to resume."""
+        session.messages = turns_from_dicts(
+            [
+                {"role": "user", "content": "FIRST question"},
+                {"role": "assistant", "content": "first reply"},
+                {"role": "user", "content": "LASTQ the recent ask"},
+                {"role": "assistant", "content": "second reply"},
+            ]
+        )
+        session._msg_tokens = [1, 1, 1, 1]
+        summary = SimpleNamespace(content="DENSE SUMMARY", finish_reason="stop")
+        with patch.object(session, "_utility_completion", return_value=summary):
+            assert session._do_auto_compact("reactive", preserve_tail=0) is True
+
+        summ = session.messages[1].text or ""  # the summary_asst turn
+        assert "## Continue" in summ
+        assert "LASTQ the recent ask" in summ
+
+    def test_continuation_hint_skipped_when_last_user_preserved(self, session):
+        """When preserve_tail keeps the last user turn verbatim (the pre-send path),
+        NO continuation hint is added — the preserved tail already carries the
+        message, so a hint would duplicate it and reframe a fresh ask as 'continue
+        where we left off'."""
+        session.messages = turns_from_dicts(
+            [
+                {"role": "user", "content": "FIRST question"},
+                {"role": "assistant", "content": "first reply"},
+                {"role": "user", "content": "LASTQ the recent ask"},
+            ]
+        )
+        session._msg_tokens = [1, 1, 1]
+        preserve = len(session.messages) - session._find_turn_boundaries()[-1]  # == 1
+        summary = SimpleNamespace(content="DENSE SUMMARY", finish_reason="stop")
+        with patch.object(session, "_utility_completion", return_value=summary):
+            assert session._do_auto_compact("pre-send", preserve_tail=preserve) is True
+
+        summ = session.messages[1].text or ""  # the summary_asst turn
+        assert "## Continue" not in summ  # last user turn preserved, not summarized
+        # The preserved tail carries the message — exactly once across the transcript.
+        texts = [m.text or "" for m in session.messages]
+        assert sum("LASTQ the recent ask" in t for t in texts) == 1
+
+    def test_continuation_hint_skips_synthetic_summary_label(self, session):
+        """Re-compacting an already-bare [Conversation summary] history must not quote
+        the synthetic label as 'the user's last message' — it's a compaction artifact,
+        not a real turn, so _find_turn_boundaries excludes it and no hint is added."""
+        session.messages = turns_from_dicts(
+            [
+                {"role": "user", "content": COMPACTION_SUMMARY_LABEL},
+                {"role": "assistant", "content": "prior dense summary"},
+            ]
+        )
+        session._msg_tokens = [1, 1]
+        summary = SimpleNamespace(content="NEW SUMMARY", finish_reason="stop")
+        with patch.object(session, "_utility_completion", return_value=summary):
+            assert session._do_auto_compact("reactive", preserve_tail=0) is True
+
+        summ = session.messages[1].text or ""  # the new summary_asst turn
+        assert summ == "NEW SUMMARY"  # bare summary, no hint quoting the label
+        assert "## Continue" not in summ
+
+
+class TestChunkerOverflowSplit:
+    """The chunker recovers from a char-budget under-estimate by splitting an
+    over-window batch into per-block summaries — chunking, not truncation, and
+    without re-summarizing completed siblings.  These drive the real
+    _summarize_blocks / _summarize_batch / _pack_blocks path (only the leaf
+    _summarize_once model call is mocked, by body size)."""
+
+    def test_overflowing_batch_subdivides_then_merges(self, session):
+        # All blocks pack into one batch (huge char budget), but the combined body
+        # overflows the *token* window while smaller sub-batches fit.
+        blocks = ["A" * 4000, "B" * 4000, "C" * 4000]
+        bodies: list[int] = []
+
+        def fake_once(_system_prompt, body):
+            bodies.append(len(body))
+            if len(body) > 6_000:  # a multi-block body overflows the token window
+                raise RuntimeError("maximum context length is 524288 tokens")
+            return "S"
+
+        with (
+            patch.object(session, "_summary_input_budget_chars", return_value=100_000),
+            patch.object(session, "_summarize_once", side_effect=fake_once),
+        ):
+            result = session._summarize_blocks(blocks)
+
+        assert result == "S"  # produced a summary, never raised _CompactionIrreducible
+        assert any(n > 6_000 for n in bodies)  # the combined batch overflowed…
+        # …then it was halved until the pieces fit and merged (no whole-list re-run).
+        assert sum(1 for n in bodies if n <= 6_000) >= 3
+
+    def test_overflow_subdivides_not_per_block(self, session):
+        """An over-window batch is halved (binary subdivision), NOT summarized one
+        call per block — so a wide batch costs ~log2(N) calls, not N.  Regression
+        guard for the per-block grind (a ~1000-block batch becoming ~1000 serial
+        summary calls stuck in 'part 1/2')."""
+        # 8 blocks packed into one batch; the model overflows only when a body holds
+        # 5+ blocks, so the 8-block batch must subdivide but 4-block halves fit.
+        blocks = [f"b{i:02d} " + "z" * 500 for i in range(8)]
+        calls: list[str] = []
+
+        def fake_once(_system_prompt, body):
+            calls.append(body)
+            if body.count("\n\n") >= 4:  # a body of 5+ blocks overflows the window
+                raise RuntimeError("maximum context length is 524288 tokens")
+            return "S"
+
+        with (
+            patch.object(session, "_summary_input_budget_chars", return_value=1_000_000),
+            patch.object(session, "_summarize_once", side_effect=fake_once),
+        ):
+            result = session._summarize_blocks(blocks)
+
+        assert result == "S"
+        # Binary subdivision: [8] → two [4] halves that both fit — a handful of calls,
+        # nowhere near 8 (per-block split would be ≥8 leaf calls).
+        assert len(calls) <= 5, len(calls)
+        # It never descended to single blocks (every summarized body is multi-block);
+        # per-block split would have produced 8 single-block bodies.
+        assert all("\n\n" in body for body in calls)
+
+    def test_lone_oversized_block_floored_then_succeeds(self, session):
+        # A single block that overflows even by itself is head/tail-truncated to
+        # the floor and retried once — not bailed.
+        floor = session._MIN_SUMMARY_BUDGET_CHARS
+        calls: list[int] = []
+
+        def fake_once(_system_prompt, body):
+            calls.append(len(body))
+            if len(body) > floor:
+                raise RuntimeError("maximum context length is 524288 tokens")
+            return "S"
+
+        with (
+            patch.object(session, "_summary_input_budget_chars", return_value=50_000),
+            patch.object(session, "_summarize_once", side_effect=fake_once),
+        ):
+            result = session._summarize_blocks(["Z" * 20_000])
+
+        assert result == "S"  # floored block summarized, not bailed
+        assert any(n > floor for n in calls)  # the over-floor call overflowed…
+        assert any(n <= floor for n in calls)  # …then the floored retry fit
+
+    def test_lone_block_shrinks_progressively_not_straight_to_floor(self, session):
+        """A lone over-window block is shrunk by halving (keeping as much as fits),
+        NOT slammed straight to the 2 000-char floor — so when a mid-size truncation
+        already fits the window, far more of the message survives than a floor jump
+        would keep (the single-block analogue of the multi-block binary subdivision)."""
+        floor = session._MIN_SUMMARY_BUDGET_CHARS
+        calls: list[int] = []
+
+        def fake_once(_system_prompt, body):
+            calls.append(len(body))
+            if len(body) > 9_000:  # only bodies well above the floor overflow
+                raise RuntimeError("maximum context length is 524288 tokens")
+            return "S"
+
+        with (
+            patch.object(session, "_summary_input_budget_chars", return_value=50_000),
+            patch.object(session, "_summarize_once", side_effect=fake_once),
+        ):
+            result = session._summarize_blocks(["Z" * 16_000])
+
+        assert result == "S"
+        # First shrink budget is len//2 == 8 000 (< the 9 000 overflow line), so it
+        # fits on the FIRST halving — the surviving body stays far above the floor,
+        # which a straight-to-floor jump (~2 000) would have discarded.
+        fitted = [n for n in calls if n <= 9_000]
+        assert fitted and min(fitted) > 2 * floor
+
+    def test_non_shrinking_merge_bails_at_depth_not_recursionerror(self, session):
+        """If per-block summaries never compress (the merge keeps overflowing),
+        recursion is bounded by the depth ceiling and bails to
+        _CompactionIrreducibleError — NOT an unbounded recurse into RecursionError.
+        Regression for the depth-check-only-on-the-multi-batch-path bug."""
+
+        def no_shrink(_system_prompt, body):
+            if "\n\n" in body:  # any multi-block body overflows the window
+                raise RuntimeError("maximum context length is 524288 tokens")
+            return body  # a single-block 'summary' is the block itself — no shrink
+
+        with (
+            patch.object(session, "_summary_input_budget_chars", return_value=100_000),
+            patch.object(session, "_summarize_once", side_effect=no_shrink),
+            pytest.raises(_CompactionIrreducibleError),
+        ):
+            session._summarize_blocks(["A" * 4000, "B" * 4000, "C" * 4000])
+
+    def test_later_batch_overflow_keeps_completed_siblings(self, session):
+        """A later batch overflowing and splitting does NOT re-summarize earlier
+        completed batches — siblings are retained in the accumulator."""
+        # budget ~4500 packs the 4 blocks into two 2-block batches; only the batch
+        # holding 'C' overflows-and-splits, so the first batch's summary stands.
+        blocks = ["A" * 2000, "B" * 2000, "C" * 2000, "D" * 2000]
+        bodies: list[str] = []
+
+        def fake_once(_system_prompt, body):
+            bodies.append(body)
+            if "CC" in body and "\n\n" in body:  # the multi-block batch holding C
+                raise RuntimeError("maximum context length is 524288 tokens")
+            return "S"
+
+        with (
+            patch.object(session, "_summary_input_budget_chars", return_value=4_500),
+            patch.object(session, "_summarize_once", side_effect=fake_once),
+        ):
+            result = session._summarize_blocks(blocks)
+
+        assert result == "S"
+        # The first batch (A+B) was summarized exactly once, never recomputed after
+        # the later (C+D) batch overflowed and split.
+        assert sum(1 for b in bodies if "AAA" in b and "BBB" in b) == 1
+
+    def test_cancel_mid_compaction_aborts_and_leaves_history(self, session):
+        """A cancel observed during compaction raises GenerationCancelled (a
+        BaseException) out of _summarize_batch before the message-swap, so the
+        history is left untouched and the cancel propagates (not swallowed)."""
+        session.messages = turns_from_dicts(
+            [
+                {"role": "user", "content": "u " + "x" * 3000},
+                {"role": "assistant", "content": "a " + "y" * 3000},
+                {"role": "user", "content": "u2 " + "z" * 3000},
+            ]
+        )
+        session._msg_tokens = [1, 1, 1]
+        before = list(session.messages)
+
+        def cancel_then_summarize(*_a, **_k):
+            # The owner cancels after the first summary call lands.
+            session._cancel_event.set()
+            return SimpleNamespace(content="SUMMARY", finish_reason="stop")
+
+        try:
+            with (
+                patch.object(session, "_summary_input_budget_chars", return_value=3_500),
+                patch.object(session, "_utility_completion", side_effect=cancel_then_summarize),
+                pytest.raises(GenerationCancelled),
+            ):
+                session._compact_messages(auto=True)
+            assert session.messages == before  # history untouched
+        finally:
+            session._cancel_event.clear()
+
+    def test_cancel_during_single_summary_call_aborts_before_swap(self, session):
+        """A cancel that lands DURING the one-and-only summary call is honored by
+        the pre-swap cancel-check — the per-batch check ran before the call, so it
+        could not see it.  Regression guard for a single-batch compaction swapping
+        despite a mid-call cancel."""
+        session.messages = turns_from_dicts(
+            [
+                {"role": "user", "content": "small u"},
+                {"role": "assistant", "content": "small a"},
+                {"role": "user", "content": "small u2"},
+            ]
+        )
+        session._msg_tokens = [1, 1, 1]
+        before = list(session.messages)
+
+        def cancel_during_call(*_a, **_k):
+            session._cancel_event.set()  # cancel lands while the single call runs
+            return SimpleNamespace(content="SUMMARY", finish_reason="stop")
+
+        try:
+            with (
+                # Huge budget → all blocks pack into ONE batch → exactly one call.
+                patch.object(session, "_summary_input_budget_chars", return_value=100_000),
+                patch.object(session, "_utility_completion", side_effect=cancel_during_call),
+                pytest.raises(GenerationCancelled),
+            ):
+                session._compact_messages(auto=True)
+            assert session.messages == before  # swap skipped, history intact
+        finally:
+            session._cancel_event.clear()
+
+    def test_manual_compact_does_not_disarm_concurrent_cancel(self, session):
+        """A manual /compact must NOT reset _cancel_event.  If a cancel is already in
+        flight for a concurrent send worker (the /command handler runs on a separate
+        thread with no worker gate), resetting it would silently disarm the cancel —
+        the worker would never see it and run to completion.  Instead /compact
+        observes the set event and aborts itself, leaving the cancel intact."""
+        session.messages = turns_from_dicts(
+            [
+                {"role": "user", "content": "u one"},
+                {"role": "assistant", "content": "a one"},
+                {"role": "user", "content": "u two"},
+            ]
+        )
+        session._msg_tokens = [1, 1, 1]
+        session._cancel_event.set()  # a concurrent send is mid-cancel
+        before = list(session.messages)
+        try:
+            with (
+                patch.object(session, "_summary_input_budget_chars", return_value=100_000),
+                patch.object(session, "_utility_completion") as uc,
+                pytest.raises(GenerationCancelled),
+            ):
+                session._compact_messages(auto=False)
+            assert session._cancel_event.is_set()  # cancel left INTACT, not disarmed
+            assert session.messages == before  # no swap
+            uc.assert_not_called()  # bailed before issuing a summary call
+        finally:
+            session._cancel_event.clear()
+
+    def test_send_clears_its_cancel_event_on_exit(self, session):
+        """send() consumes its own generation's cancel signal in its finally, so a
+        cancel that targeted a now-finished send can't later block an unrelated idle
+        manual /compact.  A cancel is raised mid-stream here; after send() returns the
+        event is clear."""
+        session.messages = turns_from_dicts([{"role": "user", "content": "hi"}])
+        session._msg_tokens = [1]
+        session._title_generated = True
+
+        def cancel_midstream(*_a, **_k):
+            session._cancel_event.set()
+            raise GenerationCancelled()
+
+        with (
+            patch.object(session, "_estimated_prompt_tokens", return_value=10),  # under hard
+            patch.object(session, "_check_metacognitive_nudge", return_value=None),
+            patch.object(session, "_create_stream_with_retry", side_effect=cancel_midstream),
+            patch.object(session, "_full_messages", return_value=[]),
+            patch.object(session, "_update_token_table"),
+            patch.object(session, "_print_status_line"),
+            patch.object(session, "_emit_state"),
+            patch("turnstone.core.session.save_message"),
+        ):
+            session.send("go")
+
+        assert not session._cancel_event.is_set()  # finally consumed this gen's cancel
+
+    def test_compaction_aborts_swap_when_generation_superseded(self, session):
+        """A stale send thread (a newer generation already started during the slow
+        summary call) must NOT swap history — the pre-swap _check_cancelled(
+        my_generation) raises so self.messages is left intact for the live
+        generation.  Guards the history-corruption hole the pre-send layer opened by
+        sitting ahead of the loop-top generation check."""
+        session.messages = turns_from_dicts(
+            [
+                {"role": "user", "content": "u one"},
+                {"role": "assistant", "content": "a one"},
+                {"role": "user", "content": "u two"},
+            ]
+        )
+        session._msg_tokens = [1, 1, 1]
+        session._generation = 5  # a newer send is the live generation
+        before = list(session.messages)
+        summary = SimpleNamespace(content="SUMMARY", finish_reason="stop")
+        with (
+            patch.object(session, "_summary_input_budget_chars", return_value=100_000),
+            patch.object(session, "_utility_completion", return_value=summary),
+            pytest.raises(GenerationCancelled),
+        ):
+            # This thread belongs to the OLD generation 3 (superseded by 5).
+            session._compact_messages(auto=True, my_generation=3)
+        assert session.messages == before  # swap skipped — history intact for gen 5
+
+
+class TestRetryRewindSkipSummary:
+    """retry()/rewind() must treat the synthetic ``[Conversation summary]`` user
+    turn as a non-target: it is a compaction artifact, not a real turn, so
+    targeting it would re-send the bare label and regenerate over the summary."""
+
+    def test_retry_on_bare_summary_is_noop(self, session):
+        # Reactive compaction left only [summary_user, summary_asst] — no real turn.
+        session.messages = turns_from_dicts(
+            [
+                {"role": "user", "content": COMPACTION_SUMMARY_LABEL},
+                {"role": "assistant", "content": "the dense summary"},
+            ]
+        )
+        session._msg_tokens = [1, 1]
+        before = list(session.messages)
+        assert session.retry() is None  # nothing real to retry
+        assert session.messages == before  # summary left intact
+
+    def test_rewind_on_bare_summary_is_noop(self, session):
+        session.messages = turns_from_dicts(
+            [
+                {"role": "user", "content": COMPACTION_SUMMARY_LABEL},
+                {"role": "assistant", "content": "the dense summary"},
+            ]
+        )
+        session._msg_tokens = [1, 1]
+        before = list(session.messages)
+        assert session.rewind(1) == 0
+        assert session.messages == before  # summary left intact
+
+    def test_retry_targets_real_turn_and_keeps_summary(self, session):
+        session.messages = turns_from_dicts(
+            [
+                {"role": "user", "content": COMPACTION_SUMMARY_LABEL},
+                {"role": "assistant", "content": "the dense summary"},
+                {"role": "user", "content": "a real follow-up"},
+                {"role": "assistant", "content": "the answer"},
+            ]
+        )
+        session._msg_tokens = [1, 1, 1, 1]
+        assert session.retry() == "a real follow-up"
+        # Dropped from the real user turn onward; the summary prefix survives.
+        assert [m.text for m in session.messages] == [
+            COMPACTION_SUMMARY_LABEL,
+            "the dense summary",
+        ]
+
+    def test_rewind_stops_at_summary_boundary(self, session):
+        session.messages = turns_from_dicts(
+            [
+                {"role": "user", "content": COMPACTION_SUMMARY_LABEL},
+                {"role": "assistant", "content": "the dense summary"},
+                {"role": "user", "content": "a real follow-up"},
+                {"role": "assistant", "content": "the answer"},
+            ]
+        )
+        session._msg_tokens = [1, 1, 1, 1]
+        # Even an over-deep rewind can't cross into the summary.
+        removed = session.rewind(5)
+        assert removed == 2  # only the one real turn (user + assistant)
+        assert [m.text for m in session.messages] == [
+            COMPACTION_SUMMARY_LABEL,
+            "the dense summary",
+        ]

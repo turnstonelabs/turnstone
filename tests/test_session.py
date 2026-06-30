@@ -1537,6 +1537,59 @@ class TestAgentOutputGuard:
             assert args[1] == prior
             assert args[2] == "plan_agent_synthesis"
 
+    def test_non_overflow_terminal_error_salvages_partial_work(self):
+        """A NON-overflow terminal API error must still salvage the sub-agent's
+        partial assistant work — regression guard: narrowing the salvage gate to
+        overflow-only discarded a completed synthesis when the final call died on a
+        persistent non-overflow error (e.g. a 5xx/timeout after retries)."""
+        from turnstone.core.judge import JudgeConfig
+        from turnstone.core.providers._openai_chat import OpenAIChatCompletionsProvider
+
+        session = _make_session(judge_config=JudgeConfig(output_guard=True))
+        session._provider = OpenAIChatCompletionsProvider()
+        session._MAX_RETRIES = 0  # fail fast, no backoff
+
+        prior = "Substantial partial synthesis before the backend died."
+
+        with patch.object(
+            session, "_evaluate_output", wraps=lambda cid, o, fn: (o, None)
+        ) as mock_eval:
+
+            def fake_create(**_kwargs):
+                raise RuntimeError("upstream connect error or disconnect/reset (503)")
+
+            session.client.chat.completions.create = fake_create
+            result = session._run_agent(
+                [Turn.user("test"), Turn.assistant(prior)],
+                tools=[{"type": "function", "function": {"name": "read_file"}}],
+                label="task",
+            )
+
+            assert result == prior  # partial work salvaged, not discarded
+            mock_eval.assert_called_once()
+            assert mock_eval.call_args[0][1] == prior
+
+    def test_non_overflow_terminal_error_without_partial_work_reraises(self):
+        """With no partial assistant work to salvage, a non-overflow terminal error
+        re-raises so the real failure surfaces to the coordinator rather than being
+        masked as an empty success."""
+        from turnstone.core.providers._openai_chat import OpenAIChatCompletionsProvider
+
+        session = _make_session()
+        session._provider = OpenAIChatCompletionsProvider()
+        session._MAX_RETRIES = 0
+
+        def fake_create(**_kwargs):
+            raise RuntimeError("upstream connect error or disconnect/reset (503)")
+
+        session.client.chat.completions.create = fake_create
+        with pytest.raises(RuntimeError, match="503"):
+            session._run_agent(
+                [Turn.user("test")],
+                tools=[{"type": "function", "function": {"name": "read_file"}}],
+                label="task",
+            )
+
     def test_turn_limit_forced_synthesis_is_guarded(self):
         """When max_tool_turns is exhausted, the forced synthesis call's
         content flows through the guard."""

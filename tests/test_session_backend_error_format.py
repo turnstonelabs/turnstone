@@ -157,6 +157,19 @@ def test_rate_limit_message():
     assert "limit exceeded" in msg
 
 
+def test_rate_limit_with_overflow_phrasing_is_not_mislabeled_overflow():
+    """A recognized RateLimitError whose quota text happens to contain a
+    context-overflow phrase must still render as rate-limited — the text-based
+    overflow branch is gated on 'not a known class', so it can't hijack a
+    recognized error and mark a transient 429 as a hard 'Context window exceeded'."""
+    msg = _format(
+        _stub(), RateLimitError("exceeds the maximum number of tokens allowed per minute")
+    )
+    assert msg is not None
+    assert "Backend rate-limited" in msg
+    assert "Context window exceeded" not in msg
+
+
 # ---------------------------------------------------------------------------
 # Fall-through + degradation behaviour
 # ---------------------------------------------------------------------------
