@@ -17,6 +17,7 @@ from tests.conftest import _seed_static_state
 from turnstone.core.mcp_client import (
     MCPClientManager,
     _db_servers_to_config,
+    _is_dead_transport,
     _mcp_to_openai,
     load_mcp_config,
 )
@@ -2613,6 +2614,188 @@ class TestCircuitBreaker:
             assert outcome == "error:ClosedResourceError"
 
         asyncio.run(_run())
+
+    def test_read_resource_sync_dead_transport_evicts_and_trips_circuit(self):
+        """Regression (follow-up): read_resource_sync kept the old
+        BrokenPipe/ConnectionReset/EOF-only guard, so a dead streamable-http
+        transport surfacing as McpError(CONNECTION_CLOSED) reused the corpse
+        session forever — the exact restart-hang call_tool_sync already fixes.
+        It must now evict the session AND trip the breaker."""
+        from mcp import McpError
+        from mcp.types import CONNECTION_CLOSED, ErrorData
+
+        mgr = MCPClientManager({"test": {"type": "stdio", "command": "echo"}})
+        mock_session = MagicMock()
+        _seed_static_state(mgr, "test", session=mock_session)
+        mgr._loop = MagicMock()
+        mgr._resource_map = {"file:///x": ("test", "file:///x")}
+        mock_future = MagicMock()
+        mock_future.result.side_effect = McpError(
+            ErrorData(code=CONNECTION_CLOSED, message="connection closed")
+        )
+        with (
+            patch("asyncio.run_coroutine_threadsafe", new=_dispatch_stub(mock_future)),
+            pytest.raises(McpError),
+        ):
+            mgr.read_resource_sync("file:///x", timeout=5)
+        assert mgr._static_servers["test"].session is None
+        assert mgr._consecutive_failures.get("test", 0) == 1
+
+    def test_read_resource_sync_protocol_mcperror_does_not_evict(self):
+        """A healthy protocol rejection (resource not found) must NOT evict the
+        session or trip the breaker on the resource path."""
+        from mcp import McpError
+        from mcp.types import ErrorData
+
+        mgr = MCPClientManager({"test": {"type": "stdio", "command": "echo"}})
+        mock_session = MagicMock()
+        _seed_static_state(mgr, "test", session=mock_session)
+        mgr._loop = MagicMock()
+        mgr._resource_map = {"file:///x": ("test", "file:///x")}
+        mock_future = MagicMock()
+        mock_future.result.side_effect = McpError(
+            ErrorData(code=-32602, message="resource not found")
+        )
+        with (
+            patch("asyncio.run_coroutine_threadsafe", new=_dispatch_stub(mock_future)),
+            pytest.raises(McpError),
+        ):
+            mgr.read_resource_sync("file:///x", timeout=5)
+        assert mgr._static_servers["test"].session is mock_session
+        assert mgr._consecutive_failures.get("test", 0) == 0
+
+    def test_get_prompt_sync_dead_transport_evicts_and_trips_circuit(self):
+        """Regression (follow-up): get_prompt_sync had the same corpse-reuse
+        bug as read_resource_sync. A dead transport (anyio.ClosedResourceError)
+        must evict the session AND trip the breaker."""
+        import anyio
+
+        mgr = MCPClientManager({"test": {"type": "stdio", "command": "echo"}})
+        mock_session = MagicMock()
+        _seed_static_state(mgr, "test", session=mock_session)
+        mgr._loop = MagicMock()
+        mgr._prompt_map = {"mcp__test__p": ("test", "p")}
+        mock_future = MagicMock()
+        mock_future.result.side_effect = anyio.ClosedResourceError()
+        with (
+            patch("asyncio.run_coroutine_threadsafe", new=_dispatch_stub(mock_future)),
+            pytest.raises(anyio.ClosedResourceError),
+        ):
+            mgr.get_prompt_sync("mcp__test__p", timeout=5)
+        assert mgr._static_servers["test"].session is None
+        assert mgr._consecutive_failures.get("test", 0) == 1
+
+    def test_get_prompt_sync_protocol_mcperror_does_not_evict(self):
+        """A healthy protocol rejection must NOT evict on the prompt path."""
+        from mcp import McpError
+        from mcp.types import ErrorData
+
+        mgr = MCPClientManager({"test": {"type": "stdio", "command": "echo"}})
+        mock_session = MagicMock()
+        _seed_static_state(mgr, "test", session=mock_session)
+        mgr._loop = MagicMock()
+        mgr._prompt_map = {"mcp__test__p": ("test", "p")}
+        mock_future = MagicMock()
+        mock_future.result.side_effect = McpError(
+            ErrorData(code=-32602, message="prompt not found")
+        )
+        with (
+            patch("asyncio.run_coroutine_threadsafe", new=_dispatch_stub(mock_future)),
+            pytest.raises(McpError),
+        ):
+            mgr.get_prompt_sync("mcp__test__p", timeout=5)
+        assert mgr._static_servers["test"].session is mock_session
+        assert mgr._consecutive_failures.get("test", 0) == 0
+
+
+class TestIsDeadTransport:
+    """Direct unit tests for ``_is_dead_transport`` — the single shared gate
+    that decides 'tear down and rebuild the session' vs 'healthy protocol
+    rejection' across every session-use site."""
+
+    def test_connection_closed_is_dead(self):
+        from mcp import McpError
+        from mcp.types import CONNECTION_CLOSED, ErrorData
+
+        assert _is_dead_transport(
+            McpError(ErrorData(code=CONNECTION_CLOSED, message="connection closed"))
+        )
+
+    def test_sdk_session_terminated_is_dead(self):
+        """The streamable-http SDK synthesizes EXACTLY code=32600 /
+        'Session terminated' when a held mcp-session-id 404s after a server
+        restart — keyed off the code so it survives a message reword."""
+        from mcp import McpError
+        from mcp.types import ErrorData
+
+        assert _is_dead_transport(McpError(ErrorData(code=32600, message="Session terminated")))
+
+    def test_app_session_not_found_is_not_dead(self):
+        """#2 regression: a HEALTHY session-owning MCP server (game/shell)
+        rejecting a stale id with 'session not found' is a protocol error, NOT
+        transport death. The old bare-substring match wrongly evicted the live
+        session and tripped the shared breaker for every user."""
+        from mcp import McpError
+        from mcp.types import ErrorData
+
+        assert not _is_dead_transport(
+            McpError(ErrorData(code=-32603, message="Backend session not found"))
+        )
+
+    def test_app_session_terminated_superstring_is_not_dead(self):
+        """#2 regression: only the SDK's EXACT 'Session terminated' message (or
+        its 32600 code) is transport death — an application message that merely
+        CONTAINS those words stays a protocol rejection."""
+        from mcp import McpError
+        from mcp.types import ErrorData
+
+        assert not _is_dead_transport(
+            McpError(ErrorData(code=-32603, message="Player session terminated by host"))
+        )
+
+    def test_plain_protocol_mcperror_is_not_dead(self):
+        from mcp import McpError
+        from mcp.types import ErrorData
+
+        assert not _is_dead_transport(McpError(ErrorData(code=-32601, message="method not found")))
+
+    def test_httpx_read_timeout_is_dead(self):
+        """#7: an idle read timeout on a long-lived streamable-http stream is
+        the dominant idle-death mode — and is NOT a builtin TimeoutError, so it
+        must be caught here or it falls through to a healthy 'other'."""
+        import httpx
+
+        assert not issubclass(httpx.ReadTimeout, TimeoutError)  # premise guard
+        assert _is_dead_transport(httpx.ReadTimeout("read timed out"))
+
+    def test_httpx_pool_timeout_is_dead(self):
+        import httpx
+
+        assert _is_dead_transport(httpx.PoolTimeout("pool timed out"))
+
+    def test_httpx_read_error_is_dead(self):
+        """#8: a connection that dies mid-read surfaces as httpx.ReadError (a
+        NetworkError sibling of the already-handled ConnectError)."""
+        import httpx
+
+        assert _is_dead_transport(httpx.ReadError("peer reset"))
+
+    def test_httpx_write_error_is_dead(self):
+        import httpx
+
+        assert _is_dead_transport(httpx.WriteError("broken pipe"))
+
+    def test_httpx_local_protocol_error_is_not_dead(self):
+        """LocalProtocolError is OUR bug (a malformed request we built), not a
+        dead peer — it must NOT be mistaken for transport death."""
+        import httpx
+
+        assert not _is_dead_transport(httpx.LocalProtocolError("bad header"))
+
+    def test_anyio_closed_resource_is_dead(self):
+        import anyio
+
+        assert _is_dead_transport(anyio.ClosedResourceError())
 
 
 # ---------------------------------------------------------------------------
