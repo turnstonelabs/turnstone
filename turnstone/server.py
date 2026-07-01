@@ -3169,7 +3169,12 @@ def _strip_server_status_for_read(full: dict[str, Any]) -> dict[str, Any]:
 
 def _public_server_status(mcp_mgr: Any, name: str) -> dict[str, Any]:
     """Strip ``command``/``url`` from ``get_server_status`` before returning over the wire."""
-    return _strip_server_status(mcp_mgr.get_server_status(name))
+    # aggregate=True: the operator refresh/reconnect endpoints are approve-scoped
+    # cluster actions with no single requesting user, so oauth_user servers report
+    # the any-user warm-pool view (matching the admin console) rather than the
+    # per-user default — which, with user_id=None, would render a warm, in-use
+    # server as disconnected/empty right after a successful refresh.
+    return _strip_server_status(mcp_mgr.get_server_status(name, aggregate=True))
 
 
 def internal_mcp_status(request: Request) -> JSONResponse:

@@ -1695,18 +1695,20 @@ class TestPoolPrimingAndTokenRotation:
         assert store.get_user_token("user-1", "pool-srv") is not None
 
     @pytest.mark.anyio
-    async def test_non_destructive_resolve_keeps_dead_grant_default_revokes(
+    async def test_prime_revokes_permanent_but_defers_ambiguous_escalation(
         self, storage: SQLiteBackend
     ) -> None:
-        """Priming resolves with revoke_on_dead_grant=False, so a PERMANENT refresh
-        rejection (invalid_grant) must KEEP the token — the authoritative revoke is
-        deferred to lazy dispatch. Drives the REAL get_user_access_token_classified
-        (only the AS round-trip is stubbed), pinning both directions of the gate the
-        prior prime test left mocked-out."""
+        """Priming resolves with revoke_ambiguous_escalation=False. A PERMANENT
+        rejection (invalid_grant — a reliable dead-grant signal) is STILL revoked
+        so the catalog isn't stranded cold behind a phantom 'consented' token;
+        only a sustained-UNCLASSIFIABLE (ambiguous) escalation is deferred to lazy
+        dispatch. Drives the REAL resolver (only the AS round-trip is stubbed)."""
         from unittest.mock import patch
 
         from turnstone.core.mcp_oauth import (
+            _AMBIGUOUS_ESCALATION_THRESHOLD,
             MCPOAuthRefreshFailed,
+            _refresh_backoff_state,
             _RefreshFailureClass,
             get_user_access_token_classified,
         )
@@ -1714,41 +1716,74 @@ class TestPoolPrimingAndTokenRotation:
         cipher = make_mcp_token_cipher()
         _seed_oauth_server(storage, name="srv-oauth")
         state = _make_app_state(storage, cipher=cipher)
-        # Expired token WITH a refresh token → reaches the refresh path (not the
-        # expired-no-refresh shortcut), where a PERMANENT failure would revoke.
-        _seed_user_token(
-            storage, cipher, user_id="user-1", server_name="srv-oauth", expires_in_seconds=-10
-        )
         store = MCPTokenStore(storage, cipher, node_id="test")
 
-        async def _permanent_fail(**_kwargs: Any) -> tuple[str, str | None, str | None]:
-            raise MCPOAuthRefreshFailed(
-                "invalid_grant", failure_class=_RefreshFailureClass.PERMANENT
+        def _raiser(cls: _RefreshFailureClass) -> Any:
+            async def _f(**_kwargs: Any) -> tuple[str, str | None, str | None]:
+                raise MCPOAuthRefreshFailed("boom", failure_class=cls)
+
+            return _f
+
+        def _seed(uid: str) -> None:
+            # Expired-with-refresh so each resolve reaches the refresh path.
+            _seed_user_token(
+                storage, cipher, user_id=uid, server_name="srv-oauth", expires_in_seconds=-10
             )
 
-        with patch("turnstone.core.mcp_oauth._refresh_and_persist", side_effect=_permanent_fail):
-            kept = await get_user_access_token_classified(
+        # (1) PERMANENT during prime → REVOKED (genuinely dead → clean re-consent).
+        _seed("perm-user")
+        with patch(
+            "turnstone.core.mcp_oauth._refresh_and_persist",
+            side_effect=_raiser(_RefreshFailureClass.PERMANENT),
+        ):
+            perm = await get_user_access_token_classified(
                 app_state=state,
-                user_id="user-1",
+                user_id="perm-user",
                 server_name="srv-oauth",
-                revoke_on_dead_grant=False,
+                revoke_ambiguous_escalation=False,
             )
-        assert kept.kind == "refresh_failed_transient"
-        assert store.get_user_token("user-1", "srv-oauth") is not None, (
-            "non-destructive prime must NOT delete a grant on a permanent refresh "
-            "failure — the revoke is deferred to lazy dispatch"
+        assert perm.kind == "refresh_failed"
+        assert store.get_user_token("perm-user", "srv-oauth") is None, (
+            "prime must revoke a PERMANENT (reliably-dead) grant, not strand it cold"
         )
 
-        # Control: the DEFAULT (lazy-dispatch) resolve still revokes the same grant.
-        with patch("turnstone.core.mcp_oauth._refresh_and_persist", side_effect=_permanent_fail):
-            revoked = await get_user_access_token_classified(
+        # (2) AMBIGUOUS escalation during prime → DEFERRED (token KEPT).
+        _seed("amb-user")
+        _refresh_backoff_state(state, "amb-user", "srv-oauth").ambiguous_streak = (
+            _AMBIGUOUS_ESCALATION_THRESHOLD - 1
+        )
+        with patch(
+            "turnstone.core.mcp_oauth._refresh_and_persist",
+            side_effect=_raiser(_RefreshFailureClass.AMBIGUOUS),
+        ):
+            amb = await get_user_access_token_classified(
                 app_state=state,
-                user_id="user-1",
+                user_id="amb-user",
+                server_name="srv-oauth",
+                revoke_ambiguous_escalation=False,
+            )
+        assert amb.kind == "refresh_failed_transient"
+        assert store.get_user_token("amb-user", "srv-oauth") is not None, (
+            "prime must DEFER (not revoke) a sustained-ambiguous escalation"
+        )
+
+        # (3) Control: lazy dispatch (default) DOES escalate-revoke the same.
+        _seed("amb-lazy")
+        _refresh_backoff_state(state, "amb-lazy", "srv-oauth").ambiguous_streak = (
+            _AMBIGUOUS_ESCALATION_THRESHOLD - 1
+        )
+        with patch(
+            "turnstone.core.mcp_oauth._refresh_and_persist",
+            side_effect=_raiser(_RefreshFailureClass.AMBIGUOUS),
+        ):
+            lazy = await get_user_access_token_classified(
+                app_state=state,
+                user_id="amb-lazy",
                 server_name="srv-oauth",
             )
-        assert revoked.kind == "refresh_failed"
-        assert store.get_user_token("user-1", "srv-oauth") is None, (
-            "default (lazy-dispatch) resolve must still revoke a permanently-dead grant"
+        assert lazy.kind == "refresh_failed"
+        assert store.get_user_token("amb-lazy", "srv-oauth") is None, (
+            "lazy dispatch must still escalate-revoke a sustained-ambiguous grant"
         )
 
     def test_prime_user_pools_skips_already_connected(
@@ -2041,6 +2076,22 @@ class TestOAuthUserServerStatus:
 
         # Non-aggregate stays strictly per-user (no cross-user disclosure).
         assert mgr.get_server_status("pool-srv", user_id="user-B")["connected"] is False
+
+    def test_public_server_status_uses_aggregate_for_operator_endpoints(self) -> None:
+        """#1 regression: the approve-scoped operator refresh/reconnect endpoints
+        (_public_server_status) must report a warm oauth_user server as connected
+        via the aggregate view — not the per-user default (user_id=None), which
+        would render every in-use oauth_user server disconnected/empty right after
+        a successful refresh."""
+        from turnstone.server import _public_server_status
+
+        mgr = MCPClientManager({})
+        mgr._oauth_user_server_names = {"pool-srv"}
+        self._warm(mgr, "user-A", "pool-srv", n_tools=2)
+
+        status = _public_server_status(mgr, "pool-srv")
+        assert status["connected"] is True
+        assert status["tools"] == 2
 
 
 # Suppress unused-import warning for AsyncMock.

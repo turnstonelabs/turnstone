@@ -1505,7 +1505,7 @@ async def get_user_access_token_classified(
     user_id: str,
     server_name: str,
     force_refresh: bool = False,
-    revoke_on_dead_grant: bool = True,
+    revoke_ambiguous_escalation: bool = True,
 ) -> TokenLookupResult:
     """Tagged token lookup with refresh-on-expiry.
 
@@ -1537,15 +1537,18 @@ async def get_user_access_token_classified(
     the second caller sees ``last_refreshed > t_lock_request_started``
     and reuses the freshly-refreshed token.
 
-    ``revoke_on_dead_grant=False`` makes the lookup NON-DESTRUCTIVE: a grant the
-    classifier would otherwise delete (permanent rejection / ambiguous-streak
-    escalation / expired-with-no-refresh) is instead reported as
-    ``refresh_failed_transient`` with the token left in place. Used by
-    session-start pool priming, which runs for EVERY consented server and must
-    never let a single (possibly misclassified) AS hiccup revoke a grant for a
-    server the user may not even be using this session — the authoritative
-    revoke stays on the lazy-dispatch path, where the user actually invokes the
-    tool.
+    ``revoke_ambiguous_escalation=False`` narrows revocation for background
+    session-start priming. A genuinely-dead grant is STILL revoked so it is
+    cleaned up and the user gets a re-consent affordance: a PERMANENT AS
+    rejection (``invalid_grant`` / ``invalid_scope`` — a reliable dead-grant
+    signal per RFC 6749 §5.2) and an expired-with-no-refresh token both revoke
+    unconditionally. Only the *sustained-ambiguous* escalation — an
+    unclassifiable 400/401 the heuristic would treat as dead after a streak — is
+    deferred: priming runs for EVERY consented server, so an unclassifiable AS
+    hiccup must not revoke consent for a server the user may not even be using
+    this session. The streak + cooldown persist, so the authoritative
+    escalation-revoke happens on the lazy-dispatch path when the user actually
+    invokes the tool.
     """
     token_store: MCPTokenStore | None = getattr(app_state, "mcp_token_store", None)
     if token_store is None:
@@ -1607,23 +1610,18 @@ async def get_user_access_token_classified(
         return _no_token_result(app_state, user_id, server_name, TokenLookupResult(kind="missing"))
     server_id_for_audit = str(server_row.get("server_id") or "")
 
-    async def _dead_grant(reason: str) -> TokenLookupResult:
-        # Non-destructive priming: with revoke_on_dead_grant=False we NEVER
-        # delete a grant here. A misclassified transient (e.g. invalid_grant
-        # emitted during an AS key-rotation window) must not strand a server the
-        # user may not even be using this session. The authoritative revoke is
-        # deferred to the lazy-dispatch path (revoke_on_dead_grant=True), where
-        # the user is actually invoking the tool. Reported as the transient kind
-        # so the token (and its per-key refresh lock) is kept intact.
-        if not revoke_on_dead_grant:
-            return TokenLookupResult(kind="refresh_failed_transient")
-        return await _revoke_after_refresh_failure(
-            app_state, token_store, user_id, server_name, server_id_for_audit, reason=reason
-        )
-
     refresh_value = plain.get("refresh_token")
     if not refresh_value:
-        return await _dead_grant(reason="expired_no_refresh")
+        # Expired token with no refresh token: genuinely unusable, no
+        # misclassification risk (a local check, not an AS response) — revoke.
+        return await _revoke_after_refresh_failure(
+            app_state,
+            token_store,
+            user_id,
+            server_name,
+            server_id_for_audit,
+            reason="expired_no_refresh",
+        )
 
     lock = _refresh_lock_for(app_state, user_id, server_name)
     pg_lock = await _acquire_pg_refresh_lock(storage, user_id, server_name)
@@ -1671,7 +1669,14 @@ async def get_user_access_token_classified(
                 return _token_result(app_state, user_id, server_name, plain2["access_token"])
         refresh_value2 = plain2.get("refresh_token")
         if not refresh_value2:
-            return await _dead_grant(reason="expired_no_refresh")
+            return await _revoke_after_refresh_failure(
+                app_state,
+                token_store,
+                user_id,
+                server_name,
+                server_id_for_audit,
+                reason="expired_no_refresh",
+            )
 
         try:
             new_access, _new_refresh, _new_expires_at = await _refresh_and_persist(
@@ -1687,9 +1692,18 @@ async def get_user_access_token_classified(
         except MCPOAuthRefreshFailed as exc:
             if exc.failure_class is _RefreshFailureClass.PERMANENT:
                 # The AS rejected the grant as dead (invalid_grant / invalid_scope
-                # / an OIDC interaction-required code) — revoke and re-consent
-                # (deferred to lazy dispatch when revoke_on_dead_grant=False).
-                return await _dead_grant(reason="refresh_failed")
+                # / an OIDC interaction-required code): a reliable dead-grant
+                # signal (RFC 6749 §5.2), so revoke unconditionally — even under
+                # background priming. Deferring it would strand the catalog cold
+                # with the token still reading "consented" and no re-consent path.
+                return await _revoke_after_refresh_failure(
+                    app_state,
+                    token_store,
+                    user_id,
+                    server_name,
+                    server_id_for_audit,
+                    reason="refresh_failed",
+                )
             # Transient or ambiguous: keep the token (a blip must never revoke a
             # user's consent) and arm the cooldown so a down AS isn't hit on
             # every later dispatch.
@@ -1703,14 +1717,35 @@ async def get_user_access_token_classified(
                     # non-standard shape. Escalate to re-consent so the user
                     # isn't stranded on a retryable error forever. (Infra
                     # transients never reach here, so an outage can't escalate.)
+                    if revoke_ambiguous_escalation:
+                        log.warning(
+                            "mcp_server.oauth.refresh_ambiguous_escalated",
+                            user_id=user_id,
+                            server_name=server_name,
+                            streak=backoff.ambiguous_streak,
+                            error=str(exc),
+                        )
+                        return await _revoke_after_refresh_failure(
+                            app_state,
+                            token_store,
+                            user_id,
+                            server_name,
+                            server_id_for_audit,
+                            reason="refresh_failed_ambiguous_escalated",
+                        )
+                    # Background priming: an UNCLASSIFIABLE sustained rejection is
+                    # exactly where a bulk prime of servers the user may not be
+                    # using must not revoke consent. Defer the escalation-revoke to
+                    # lazy dispatch — the streak + armed cooldown persist, so it
+                    # escalates on the user's next real call. Falls through to the
+                    # transient return below (token kept, lock retained).
                     log.warning(
-                        "mcp_server.oauth.refresh_ambiguous_escalated",
+                        "mcp_server.oauth.refresh_ambiguous_escalation_deferred",
                         user_id=user_id,
                         server_name=server_name,
                         streak=backoff.ambiguous_streak,
                         error=str(exc),
                     )
-                    return await _dead_grant(reason="refresh_failed_ambiguous_escalated")
             else:
                 # A clean infra/operator-fixable transient breaks any ambiguous
                 # run — only an uninterrupted streak escalates.

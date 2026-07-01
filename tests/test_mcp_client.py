@@ -2742,13 +2742,19 @@ class TestIsDeadTransport:
             McpError(ErrorData(code=-32603, message="Backend session not found"))
         )
 
-    def test_app_session_terminated_superstring_is_not_dead(self):
-        """#2 regression: only the SDK's EXACT 'Session terminated' message (or
-        its 32600 code) is transport death — an application message that merely
-        CONTAINS those words stays a protocol rejection."""
+    def test_app_session_terminated_message_is_not_dead(self):
+        """#8 regression: the message is application-controlled and is NOT matched
+        — only the SDK's synthesized code 32600 is. A healthy session-owning
+        server that returns a protocol error whose message is EXACTLY 'Session
+        terminated' (or a superstring) with a normal code stays breaker-safe."""
         from mcp import McpError
         from mcp.types import ErrorData
 
+        # Exact SDK message but an app protocol code (not 32600) — must NOT be dead.
+        assert not _is_dead_transport(
+            McpError(ErrorData(code=-32603, message="Session terminated"))
+        )
+        # Superstring likewise.
         assert not _is_dead_transport(
             McpError(ErrorData(code=-32603, message="Player session terminated by host"))
         )
@@ -2768,10 +2774,15 @@ class TestIsDeadTransport:
         assert not issubclass(httpx.ReadTimeout, TimeoutError)  # premise guard
         assert _is_dead_transport(httpx.ReadTimeout("read timed out"))
 
-    def test_httpx_pool_timeout_is_dead(self):
+    def test_httpx_pool_timeout_is_not_dead(self):
+        """PoolTimeout is connection-pool saturation, NOT a dead connection:
+        evicting the session can't relieve pool pressure and would trip the
+        shared breaker for all users under transient load. The Connect/Read/Write
+        timeouts (a dead/hung connection) stay dead."""
         import httpx
 
-        assert _is_dead_transport(httpx.PoolTimeout("pool timed out"))
+        assert not _is_dead_transport(httpx.PoolTimeout("pool exhausted"))
+        assert _is_dead_transport(httpx.WriteTimeout("write timed out"))
 
     def test_httpx_read_error_is_dead(self):
         """#8: a connection that dies mid-read surfaces as httpx.ReadError (a

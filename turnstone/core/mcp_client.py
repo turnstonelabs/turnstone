@@ -147,15 +147,16 @@ _PRIME_MAX_CONCURRENCY = 4
 
 
 # ``mcp.client.streamable_http._send_session_terminated_error`` synthesizes this
-# (non-standard, POSITIVE) JSON-RPC code + message *client-side* when a held
+# (non-standard, POSITIVE) JSON-RPC code *client-side* when a held
 # ``mcp-session-id`` 404s after the MCP server restarted and dropped its session
 # map. It is NOT a documented MCP constant, and the SDK deliberately discards the
-# server's own 404 body ("Session not found", code ``-32600``) — so both are
-# pinned here, greppable for the next SDK bump. No spec-compliant server emits a
-# POSITIVE 32600, which is exactly what makes the code a safe dead-transport
-# signal to key off.
+# server's own 404 body ("Session not found", code ``-32600``) — so it is pinned
+# here, greppable for the next SDK bump. No spec-compliant server emits a POSITIVE
+# 32600, which is what makes the code a safe, deterministic dead-transport signal
+# to key off. The application-controlled message is NOT matched: a healthy
+# session-owning server can legitimately return a protocol error whose message is
+# "Session terminated".
 _SDK_SESSION_TERMINATED_CODE = 32600
-_SDK_SESSION_TERMINATED_MSG = "session terminated"
 
 
 def _is_dead_transport(exc: BaseException) -> bool:
@@ -174,20 +175,22 @@ def _is_dead_transport(exc: BaseException) -> bool:
     2. **Transport-swallowed** — the SDK's ``post_writer`` swallows the upstream
        error and the caller sees ``McpError(CONNECTION_CLOSED)`` (-32000); or the
        underlying httpx connection is gone / unrecoverable mid-exchange. Every
-       ``httpx.NetworkError`` ({Connect,Read,Write,Close}Error),
-       ``httpx.TimeoutException`` ({Connect,Read,Write,Pool}Timeout) and
-       ``httpx.RemoteProtocolError`` qualifies — notably a read/idle timeout on a
-       long-lived stream, which is NOT a builtin ``TimeoutError`` and would
-       otherwise be misread as a healthy "other" failure and left in place.
+       ``httpx.NetworkError`` ({Connect,Read,Write,Close}Error), the Connect/Read/
+       Write timeouts, and ``httpx.RemoteProtocolError`` qualify — notably a
+       read/idle timeout on a long-lived stream, which is NOT a builtin
+       ``TimeoutError`` and would otherwise be misread as a healthy "other"
+       failure. ``httpx.PoolTimeout`` is deliberately EXCLUDED: it means
+       connection-pool saturation, not a dead connection — evicting the session
+       wouldn't relieve the pressure and would trip the shared breaker for all
+       users on transient load.
     3. **Server-side session lost** — the MCP server RESTARTED and dropped its
        session map, so our held ``mcp-session-id`` is unknown. The server returns
        HTTP 404 and the SDK synthesizes ``McpError(code=32600, "Session
        terminated")`` (see ``streamable_http._send_session_terminated_error``),
-       discarding the server's own 404 body. Keyed off that exact synthesized
-       code (a positive 32600 no compliant server emits), with the exact message
-       as a forward-compat fallback — NOT a bare substring, so a healthy
-       session-owning server's "...session not found" rejection stays a
-       breaker-safe protocol error rather than a forced teardown.
+       discarding the server's own 404 body. Keyed off that synthesized code
+       ALONE (a positive 32600 no compliant server emits); the message is
+       application-controlled, so a healthy session-owning server that returns a
+       protocol error reading "Session terminated" stays breaker-safe.
 
     The raw-socket variants (``BrokenPipeError`` / ``ConnectionResetError`` /
     ``EOFError``) are kept for the stdio transport and defense-in-depth.
@@ -199,12 +202,15 @@ def _is_dead_transport(exc: BaseException) -> bool:
         | BrokenPipeError
         | ConnectionResetError
         | EOFError
-        # NetworkError == {Connect,Read,Write,Close}Error; TimeoutException ==
-        # {Connect,Read,Write,Pool}Timeout. RemoteProtocolError (peer broke the
-        # framing) is dead too; LocalProtocolError (our own bug) is deliberately
-        # excluded by naming RemoteProtocolError rather than the shared base.
+        # NetworkError == {Connect,Read,Write,Close}Error (connection gone). The
+        # Connect/Read/Write timeouts mean a dead/hung connection; PoolTimeout is
+        # EXCLUDED (pool saturation, not a dead session — eviction can't relieve
+        # it and would trip the shared breaker under load). RemoteProtocolError
+        # (peer broke framing) is dead; LocalProtocolError (our bug) stays out.
         | httpx.NetworkError
-        | httpx.TimeoutException
+        | httpx.ConnectTimeout
+        | httpx.ReadTimeout
+        | httpx.WriteTimeout
         | httpx.RemoteProtocolError,
     ):
         return True
@@ -213,19 +219,16 @@ def _is_dead_transport(exc: BaseException) -> bool:
         code = getattr(err, "code", None)
         if code == mcp_types.CONNECTION_CLOSED:
             return True
-        # Server-restarted-session loss: match the SDK's deterministic
-        # synthesized code, with its EXACT message as a forward-compat fallback.
-        # Exact-match (not substring) is deliberate: a bare "session terminated"
-        # / "session not found" substring also matches a healthy session-owning
-        # server's application-level stale-id rejection, which must stay a
-        # breaker-safe protocol error — evicting it would tear down a live
-        # session and trip the shared per-server breaker for every user. The
-        # client never sees "session not found" for a real dead transport (the
-        # SDK discards the server's 404 body), so exact-match loses no coverage.
-        if (
-            code == _SDK_SESSION_TERMINATED_CODE
-            or (getattr(err, "message", "") or "").strip().lower() == _SDK_SESSION_TERMINATED_MSG
-        ):
+        # Server-restarted-session loss: match the SDK's deterministic synthesized
+        # code ALONE. The message is application-controlled — a healthy
+        # session-owning server (e.g. a game/shell MCP server) can legitimately
+        # reject a stale id with a protocol error whose message is
+        # "Session terminated" / "session not found", and matching on it would
+        # tear down that live session and trip the shared per-server breaker for
+        # every user. The client never sees those messages for a REAL dead
+        # transport (the SDK discards the server's 404 body and synthesizes code
+        # 32600), so keying off the code loses no coverage.
+        if code == _SDK_SESSION_TERMINATED_CODE:
             return True
     return False
 
@@ -1839,19 +1842,20 @@ class MCPClientManager:
             try:
                 async with sem:
                     try:
-                        # Non-destructive resolve: refreshes an expired/near-expiry
-                        # token and persists it, but NEVER revokes a grant here
-                        # (revoke_on_dead_grant=False). Priming runs for every
-                        # consented server, so a single (possibly misclassified) AS
-                        # hiccup must not strand one the user may not even be using
-                        # this session; a dead grant is deferred to the lazy-dispatch
-                        # path, which revokes when the user actually invokes the
-                        # tool. Only kind == "token" warms the pool.
+                        # Resolve via the guarded refresh state machine, but with
+                        # revoke_ambiguous_escalation=False: a genuinely-dead grant
+                        # (permanent AS rejection / expired-no-refresh) is still
+                        # revoked so the catalog isn't left cold behind a phantom
+                        # "consented" token, but a sustained-UNCLASSIFIABLE rejection
+                        # is deferred to lazy dispatch — priming runs for every
+                        # consented server, so an AS hiccup we can't classify must
+                        # not revoke consent for one the user may not be using this
+                        # session. Only kind == "token" warms the pool.
                         lookup = await get_user_access_token_classified(
                             app_state=self._app_state,
                             user_id=user_id,
                             server_name=server_name,
-                            revoke_on_dead_grant=False,
+                            revoke_ambiguous_escalation=False,
                         )
                         if lookup.kind != "token" or not lookup.token:
                             return  # not consented / undecryptable / refresh failed — lazy paths handle it
@@ -3844,6 +3848,28 @@ class MCPClientManager:
         self._loop.call_soon_threadsafe(_schedule_refresh)
         return session
 
+    def _record_and_evict_on_dead_transport(self, server_name: str, exc: BaseException) -> None:
+        """Shared static-dispatch failure handling for ``call_tool_sync`` /
+        ``read_resource_sync`` / ``get_prompt_sync`` (call from their ``except``,
+        then re-raise).
+
+        Protocol errors (``McpError`` from a healthy connection that rejected the
+        request) do NOT trip the breaker. A dead transport — anyio
+        Closed/BrokenResourceError, the SDK-swallowed ``McpError(CONNECTION_CLOSED)``,
+        a server-restarted session, or a gone httpx connection — IS a transport
+        failure even when it is an ``McpError``, so it trips the breaker AND evicts
+        the session (leaving stack/streams for ``_connect_one``'s stale-and-stack
+        guard to reap). Eviction is what lets the next dispatch's ``session is
+        None`` check fire ``_cb_auto_reconnect`` instead of re-using the corpse.
+        """
+        dead = _is_dead_transport(exc)
+        if dead or not isinstance(exc, McpError):
+            self._cb_record_failure(server_name)
+        if dead:
+            evict = self._static_servers.get(server_name)
+            if evict is not None:
+                evict.session = None
+
     def call_tool_sync(
         self,
         func_name: str,
@@ -3921,24 +3947,7 @@ class MCPClientManager:
             self._cb_record_failure(server_name)
             raise TimeoutError(f"MCP tool call timed out after {timeout}s") from None
         except Exception as exc:
-            # Protocol errors (McpError) come from a healthy connection that
-            # rejected the request — only transport errors trip the breaker.
-            # A dead transport (anyio Closed/BrokenResourceError, or the
-            # SDK-swallowed McpError(CONNECTION_CLOSED)) IS a transport failure
-            # even though it is an McpError, so it must trip the breaker AND
-            # evict the session.
-            dead = _is_dead_transport(exc)
-            if dead or not isinstance(exc, McpError):
-                self._cb_record_failure(server_name)
-            if dead:
-                # Evict the session only — leave stack/streams behind so the
-                # stale-session-and-stack guard in _connect_one cleans them up
-                # on the next connect attempt. Eviction is what lets the next
-                # dispatch's ``session is None`` check fire _cb_auto_reconnect
-                # instead of re-using the corpse forever.
-                evict = self._static_servers.get(server_name)
-                if evict is not None:
-                    evict.session = None
+            self._record_and_evict_on_dead_transport(server_name, exc)
             raise
 
         self._cb_record_success(server_name)
@@ -5338,22 +5347,7 @@ class MCPClientManager:
             self._cb_record_failure(server_name)
             raise TimeoutError(f"MCP resource read timed out after {timeout}s") from None
         except Exception as exc:
-            # A dead transport (anyio Closed/BrokenResourceError, the SDK-
-            # swallowed McpError(CONNECTION_CLOSED), a server-restarted session,
-            # or a gone httpx connection) IS a transport failure even when it is
-            # an McpError, so it must trip the breaker AND evict the corpse
-            # session — otherwise read_resource_sync re-probes the same dead
-            # session forever, the restart-hang call_tool_sync already fixes.
-            dead = _is_dead_transport(exc)
-            if dead or not isinstance(exc, McpError):
-                self._cb_record_failure(server_name)
-            if dead:
-                # Evict the session only — leave stack/streams behind so the
-                # stale-session-and-stack guard in _connect_one cleans them up
-                # on the next connect attempt.
-                evict = self._static_servers.get(server_name)
-                if evict is not None:
-                    evict.session = None
+            self._record_and_evict_on_dead_transport(server_name, exc)
             raise
 
         self._cb_record_success(server_name)
@@ -5447,22 +5441,7 @@ class MCPClientManager:
             self._cb_record_failure(server_name)
             raise TimeoutError(f"MCP prompt retrieval timed out after {timeout}s") from None
         except Exception as exc:
-            # A dead transport (anyio Closed/BrokenResourceError, the SDK-
-            # swallowed McpError(CONNECTION_CLOSED), a server-restarted session,
-            # or a gone httpx connection) IS a transport failure even when it is
-            # an McpError, so it must trip the breaker AND evict the corpse
-            # session — otherwise get_prompt_sync re-probes the same dead
-            # session forever, the restart-hang call_tool_sync already fixes.
-            dead = _is_dead_transport(exc)
-            if dead or not isinstance(exc, McpError):
-                self._cb_record_failure(server_name)
-            if dead:
-                # Evict the session only — leave stack/streams behind so the
-                # stale-session-and-stack guard in _connect_one cleans them up
-                # on the next connect attempt.
-                evict = self._static_servers.get(server_name)
-                if evict is not None:
-                    evict.session = None
+            self._record_and_evict_on_dead_transport(server_name, exc)
             raise
 
         self._cb_record_success(server_name)
