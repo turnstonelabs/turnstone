@@ -932,6 +932,7 @@ class ClusterCollector:
         page: int = 1,
         per_page: int = 50,
         extra_rows: list[dict[str, Any]] | None = None,
+        row_filter: Callable[[dict[str, Any]], bool] | None = None,
     ) -> tuple[list[dict[str, Any]], int]:
         """Return filtered, sorted, paginated workstreams + total count.
 
@@ -939,6 +940,10 @@ class ClusterCollector:
         filter / sort / paginate — used by callers that contribute
         console-local rows (e.g. coordinator workstreams) that aren't
         tracked on any node's SSE stream.
+
+        ``row_filter`` (when provided) runs against the merged,
+        UNPAGINATED pool so dropped rows never skew ``total`` or page
+        boundaries — the private-project tenancy filter rides here.
         """
         with self._lock:
             all_ws = []
@@ -954,6 +959,10 @@ class ClusterCollector:
                     all_ws.append(dict(ws))
             if extra_rows:
                 all_ws.extend(dict(r) for r in extra_rows)
+
+        # Row-level tenancy filter first — before pagination math.
+        if row_filter is not None:
+            all_ws = [ws for ws in all_ws if row_filter(ws)]
 
         # Filter
         if state:

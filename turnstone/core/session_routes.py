@@ -2646,12 +2646,20 @@ def make_list_handler(cfg: SessionEndpointConfig) -> Handler:
         resolve_titles = cfg.list_resolve_titles
 
         def _build_rows() -> list[dict[str, Any]]:
+            from turnstone.core.auth import WorkstreamProjectVisibility
+
+            visibility = WorkstreamProjectVisibility.for_request(request)
             wss = mgr.list_all()
             titles: dict[str, str | None] = {}
             if resolve_titles is not None and wss:
                 titles = resolve_titles([ws.id for ws in wss])
             rows: list[dict[str, Any]] = []
             for ws in wss:
+                project_id = getattr(ws, "project_id", "") or ""
+                # Private-project tenancy — drop rows the requester may
+                # not see (same predicate as the saved list).
+                if not visibility.ws_visible(project_id, ws_owner=ws.user_id or ""):
+                    continue
                 title = titles.get(ws.id) or ws.name
                 rows.append(
                     {
@@ -2661,6 +2669,7 @@ def make_list_handler(cfg: SessionEndpointConfig) -> Handler:
                         "kind": ws.kind,
                         "parent_ws_id": ws.parent_ws_id,
                         "user_id": ws.user_id,
+                        "project_id": project_id or None,
                     }
                 )
             return rows
@@ -2720,12 +2729,17 @@ async def _collect_saved_rows(
     # Column order from list_workstreams_with_history (keep in sync with
     # the storage SELECT): ws_id, alias, title, name, created, updated,
     # message_count, node_id, state, kind, model_alias, launch_skill,
-    # child_count, context_tokens, context_window.  The occupancy ratio
-    # is derived here (Python float division) rather than in SQL so the
-    # NULL / zero-window cases stay obvious and identical across backends.
-    # context_window is NULL for model aliases absent from
-    # model_definitions (e.g. config.toml-only models), so context_ratio
-    # degrades to 0.0 there rather than reporting a bogus occupancy.
+    # child_count, context_tokens, context_window, project_id, owner.
+    # The occupancy ratio is derived here (Python float division) rather
+    # than in SQL so the NULL / zero-window cases stay obvious and
+    # identical across backends.  context_window is NULL for model
+    # aliases absent from model_definitions (e.g. config.toml-only
+    # models), so context_ratio degrades to 0.0 there rather than
+    # reporting a bogus occupancy.
+    from turnstone.core.auth import WorkstreamProjectVisibility
+
+    visibility = WorkstreamProjectVisibility.for_request(request)
+
     result: list[dict[str, Any]] = []
     for row in rows:
         (
@@ -2744,8 +2758,14 @@ async def _collect_saved_rows(
             child_count,
             context_tokens,
             context_window,
+            project_id,
+            owner,
         ) = row
         if wid in loaded:
+            continue
+        # Private-project tenancy: rows the requester may not see are
+        # dropped server-side, not hidden client-side.
+        if not visibility.ws_visible(project_id, ws_owner=owner or ""):
             continue
         ctx_tokens = context_tokens or 0
         context_ratio = (
@@ -2768,6 +2788,7 @@ async def _collect_saved_rows(
                 "child_count": child_count or 0,
                 "context_tokens": ctx_tokens,
                 "context_ratio": context_ratio,
+                "project_id": project_id or None,
             }
         )
     return result

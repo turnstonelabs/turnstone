@@ -622,7 +622,7 @@ class PostgreSQLBackend:
                         "(SELECT ue.prompt_tokens FROM usage_events ue "
                         " WHERE ue.ws_id = w.ws_id "
                         " ORDER BY ue.timestamp DESC LIMIT 1), "
-                        "md.context_window "
+                        "md.context_window, w.project_id, w.user_id "
                         "FROM workstreams w "
                         "LEFT JOIN workstream_config wcm "
                         "  ON wcm.ws_id = w.ws_id AND wcm.key = 'model_alias' "

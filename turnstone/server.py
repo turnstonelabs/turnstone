@@ -1065,12 +1065,19 @@ async def global_events_sse(request: Request) -> Response:
 
 async def dashboard(request: Request) -> JSONResponse:
     """GET /v1/api/dashboard — enriched workstream data + aggregate stats."""
+    from turnstone.core.auth import WorkstreamProjectVisibility
     from turnstone.core.memory import get_workstream_display_name
 
     mgr: SessionManager = request.app.state.workstreams
-    # No per-user filter — see list_workstreams above for the rationale
-    # (trusted-team deployment shape; mutations stay owner-gated).
-    wss = mgr.list_all()
+    # No per-user OWNER filter (trusted-team deployment shape) — but
+    # private-project rows are dropped for non-members, same predicate
+    # as every other listing surface.
+    visibility = WorkstreamProjectVisibility.for_request(request)
+    wss = [
+        ws
+        for ws in mgr.list_all()
+        if visibility.ws_visible(getattr(ws, "project_id", "") or "", ws_owner=ws.user_id or "")
+    ]
     total_tokens = 0
     total_tool_calls = 0
     active_count = 0
@@ -1936,6 +1943,20 @@ async def _interactive_create_validate_request(
         # (which forwards the body verbatim).
         if not (body.get("project_id") or "") and parent_row.get("project_id"):
             body["project_id"] = parent_row.get("project_id")
+    # Project attach gate (explicit or parent-inherited): a private
+    # project accepts new workstreams only from its owner/members, and a
+    # nonexistent project_id is a caller error rather than a silent
+    # dangling link. Re-checking the inherited value is deliberate — a
+    # coordinator owner whose membership was revoked fails the child
+    # spawn loudly here instead of minting rows they can no longer see.
+    attach_pid = str(body.get("project_id") or "")
+    if attach_pid:
+        from turnstone.core.auth import ensure_project_attachable
+
+        denied = ensure_project_attachable(uid, attach_pid)
+        if denied is not None:
+            status, message = denied
+            return JSONResponse({"error": message}, status_code=status)
     notify_targets_raw = body.get("notify_targets", "[]")
     if isinstance(notify_targets_raw, list):
         notify_targets_raw = json.dumps(notify_targets_raw)

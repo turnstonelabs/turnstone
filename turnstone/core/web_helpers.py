@@ -316,17 +316,22 @@ def resolve_workstream_owner(
     """Resolve ``ws_id`` to its owner; 404 when the row doesn't exist.
 
     Turnstone is a trusted-team tool: scope-level auth (e.g.
-    ``admin.workstreams`` / ``admin.coordinator``) is the only gate;
-    row-level ownership is not enforced here. Returns
+    ``admin.coordinator``) is the primary gate and row-level OWNERSHIP
+    is still not enforced here. The one row-level check this performs
+    is PROJECT tenancy: a workstream attached to a *private* project is
+    only reachable by the project's owner/members, the workstream's own
+    creator, service-scope callers, and ``admin.cluster.inspect``
+    holders — everyone else gets a 403 (see
+    :class:`turnstone.core.auth.WorkstreamProjectVisibility`). Returns
     ``(owner_user_id, None)`` on success — the persisted owner id,
     which attachments should be filed under so existing storage shape
     is preserved. Falls back to the caller's own uid when the row has
     no recorded owner.
 
     When ``mgr`` is provided and the workstream is live in memory,
-    trust its cached ``user_id`` instead of round-tripping storage —
-    keeps in-memory-only handlers functional during transient DB
-    outages and trims the hot-path by one query.
+    trust its cached ``user_id`` / ``project_id`` instead of
+    round-tripping storage — keeps in-memory-only handlers functional
+    during transient DB outages and trims the hot-path by one query.
 
     ``not_found_label`` is the message body the 404 carries — the
     interactive surface uses "Workstream not found"; coord uses
@@ -334,20 +339,36 @@ def resolve_workstream_owner(
     """
     from starlette.responses import JSONResponse as _JSONResponse
 
+    from turnstone.core.auth import WorkstreamProjectVisibility
+
     caller = auth_user_id(request)
+    owner: str | None = None
+    project_id = ""
 
     if mgr is not None:
         ws_mem = mgr.get(ws_id)
         if ws_mem is not None:
-            return ws_mem.user_id or caller, None
-        # Not in memory — fall through to storage so persisted-but-not-
-        # loaded rows still resolve.
+            owner = ws_mem.user_id or ""
+            project_id = getattr(ws_mem, "project_id", "") or ""
 
-    from turnstone.core.memory import get_workstream_owner
-
-    owner = get_workstream_owner(ws_id)
     if owner is None:
-        return "", _JSONResponse({"error": not_found_label}, status_code=404)
+        # Not in memory — storage resolves persisted-but-not-loaded rows.
+        from turnstone.core.memory import get_workstream_row
+
+        row = get_workstream_row(ws_id)
+        if row is None:
+            return "", _JSONResponse({"error": not_found_label}, status_code=404)
+        owner = row.get("user_id") or ""
+        project_id = row.get("project_id") or ""
+
+    if project_id:
+        visibility = WorkstreamProjectVisibility.for_request(request)
+        if not visibility.ws_visible(project_id, ws_owner=owner):
+            return "", _JSONResponse(
+                {"error": "Forbidden: workstream belongs to a private project"},
+                status_code=403,
+            )
+
     return owner or caller, None
 
 

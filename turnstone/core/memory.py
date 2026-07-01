@@ -614,6 +614,20 @@ def get_workstream_owner(ws_id: str) -> str | None:
         return None
 
 
+def get_workstream_row(ws_id: str) -> dict[str, Any] | None:
+    """Return the full workstreams row dict, or None when missing/unreadable.
+
+    Same fail-soft shape as :func:`get_workstream_owner` — access gates
+    treat ``None`` as not-found, so a storage blip degrades to a 404
+    rather than a 500.
+    """
+    try:
+        return get_storage().get_workstream(ws_id)
+    except Exception:
+        log.warning("Failed to get workstream row ws=%s", ws_id, exc_info=True)
+        return None
+
+
 def update_workstream_title(ws_id: str, title: str) -> None:
     """Set or update the auto-generated title for a workstream."""
     try:

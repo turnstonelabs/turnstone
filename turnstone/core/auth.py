@@ -253,6 +253,156 @@ def user_can_access_project(
     return acc.can_write if write else acc.can_read
 
 
+class WorkstreamProjectVisibility:
+    """Per-request memoized visibility predicate for project-scoped workstreams.
+
+    Answers "may *user_id* see a workstream attached to *project_id*?" for
+    listing filters and the row-access gate. Distinct from
+    :func:`user_can_access_project` on purpose: that composes the RBAC
+    capability (``project.read``, admin-default) with the ACL and gates the
+    project *management* surfaces, whereas workstream visibility is a
+    tenancy question — an explicit ``project_members`` row (or ownership)
+    IS the grant, no capability required, or members without ``project.read``
+    would lose sight of their own shared workstreams.
+
+    Rules (first match wins):
+
+    * ``bypass`` instances see everything — service-scope callers (the
+      collector and other cluster machinery must never be blinded at the
+      node edge; user-facing filtering happens at the console edge) and
+      holders of ``admin.cluster.inspect`` (the existing cluster-wide
+      workstream-inspect surface).
+    * No / dangling ``project_id`` → visible (a deleted project leaves the
+      link behind by design — no row, no privacy to enforce).
+    * Non-private visibility → visible (trusted-team default).
+    * Private → the workstream's own creator, the project owner, or a
+      project member; anonymous callers fail closed.
+    * A storage failure while resolving a project fails closed (treated
+      as private-and-not-a-member) rather than leaking on a blip.
+
+    Project rows and membership verdicts are memoized per instance —
+    construct one per request/connection, not per row.
+    """
+
+    def __init__(self, user_id: str, *, bypass: bool = False, storage: Any = None) -> None:
+        self._user_id = user_id or ""
+        self._bypass = bypass
+        self._storage = storage
+        self._projects: dict[str, dict[str, Any] | None] = {}
+        self._member: dict[str, bool] = {}
+
+    @classmethod
+    def for_request(cls, request: Any, *, storage: Any = None) -> WorkstreamProjectVisibility:
+        """Build a filter for an HTTP request's authenticated principal.
+
+        Service-scoped tokens and ``admin.cluster.inspect`` holders get a
+        bypass instance; everyone else filters as themselves.
+        """
+        auth: AuthResult | None = getattr(getattr(request, "state", None), "auth_result", None)
+        uid = str(getattr(auth, "user_id", "") or "")
+        bypass = bool(
+            auth is not None
+            and (auth.has_scope("service") or auth.has_permission("admin.cluster.inspect"))
+        )
+        return cls(uid, bypass=bypass, storage=storage)
+
+    def _resolve_storage(self) -> Any:
+        if self._storage is None:
+            from turnstone.core.storage._registry import get_storage
+
+            self._storage = get_storage()
+        return self._storage
+
+    def _project(self, project_id: str) -> dict[str, Any] | None:
+        if project_id not in self._projects:
+            storage = self._resolve_storage()
+            if storage is None:
+                raise RuntimeError("storage unavailable for project visibility check")
+            self._projects[project_id] = storage.get_project(project_id)
+        return self._projects[project_id]
+
+    def _is_member(self, project_id: str) -> bool:
+        if project_id not in self._member:
+            storage = self._resolve_storage()
+            self._member[project_id] = bool(
+                storage is not None and storage.is_project_member(project_id, self._user_id)
+            )
+        return self._member[project_id]
+
+    def ws_visible(self, project_id: str | None, ws_owner: str = "") -> bool:
+        """Apply the class rules to one workstream row."""
+        if self._bypass:
+            return True
+        pid = (project_id or "").strip()
+        if not pid:
+            return True
+        if ws_owner and ws_owner == self._user_id:
+            return True
+        try:
+            project = self._project(pid)
+            if project is None:
+                return True
+            if (project.get("visibility") or "private") != "private":
+                return True
+            if not self._user_id:
+                return False
+            if project.get("owner_id") == self._user_id:
+                return True
+            return self._is_member(pid)
+        except Exception:
+            log.warning(
+                "workstream project-visibility check failed user=%s project=%s — failing closed",
+                self._user_id,
+                pid,
+            )
+            return False
+
+
+def ensure_project_attachable(
+    user_id: str,
+    project_id: str,
+    *,
+    storage: Any = None,
+) -> tuple[int, str] | None:
+    """Gate attaching a NEW workstream to *project_id* at create time.
+
+    Returns ``None`` when the attach is allowed, else ``(status_code,
+    message)`` for the handler to surface. Stricter than
+    :meth:`WorkstreamProjectVisibility.ws_visible` in one way — a
+    nonexistent project is a 400 (a dangling link on an EXISTING row is
+    tolerated because project deletion leaves links behind, but minting
+    a fresh dangling link is a caller error) — and shares its tenancy
+    rule: private projects accept workstreams only from their owner or
+    members; public/active-or-archived projects accept from anyone
+    (memory writes stay member-gated at the session layer).
+
+    Fail-closed: empty ``user_id`` or a storage failure denies with 403.
+    """
+    pid = (project_id or "").strip()
+    if not pid:
+        return None
+    if storage is None:
+        from turnstone.core.storage._registry import get_storage
+
+        storage = get_storage()
+    if storage is None:
+        return (403, "project access could not be verified")
+    try:
+        project = storage.get_project(pid)
+        if project is None:
+            return (400, "unknown project_id")
+        if (project.get("visibility") or "private") != "private":
+            return None
+        if user_id and (
+            project.get("owner_id") == user_id or bool(storage.is_project_member(pid, user_id))
+        ):
+            return None
+        return (403, "cannot attach a workstream to a private project you don't belong to")
+    except Exception:
+        log.warning("project attach check failed user=%s project=%s — failing closed", user_id, pid)
+        return (403, "project access could not be verified")
+
+
 def _permissions_to_scopes(permissions: set[str]) -> frozenset[str]:
     """Derive legacy scopes from a granular permission set."""
     scopes: set[str] = set()

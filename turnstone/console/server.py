@@ -995,6 +995,8 @@ def _coordinator_rows(request: Request) -> list[dict[str, Any]]:
 
 
 async def cluster_workstreams(request: Request) -> JSONResponse:
+    from turnstone.core.auth import WorkstreamProjectVisibility
+
     collector: ClusterCollector = request.app.state.collector
     params = dict(request.query_params)
     state = params.get("state")
@@ -1004,6 +1006,7 @@ async def cluster_workstreams(request: Request) -> JSONResponse:
     page = _parse_int(params, "page", 1, minimum=1)
     per_page = _parse_int(params, "per_page", 50, minimum=1, maximum=200)
     extra_rows = _coordinator_rows(request)
+    visibility = WorkstreamProjectVisibility.for_request(request)
     ws_list, total = collector.get_workstreams(
         state=state,
         node=node,
@@ -1012,6 +1015,9 @@ async def cluster_workstreams(request: Request) -> JSONResponse:
         page=page,
         per_page=per_page,
         extra_rows=extra_rows,
+        row_filter=lambda ws: visibility.ws_visible(
+            ws.get("project_id") or "", ws_owner=ws.get("user_id") or ""
+        ),
     )
     pages = math.ceil(total / per_page) if per_page > 0 else 0
     return JSONResponse(
@@ -1506,6 +1512,8 @@ async def cluster_ws_live_bulk(request: Request) -> JSONResponse:
 
 
 async def cluster_node_detail(request: Request) -> JSONResponse:
+    from turnstone.core.auth import WorkstreamProjectVisibility
+
     collector: ClusterCollector = request.app.state.collector
     node_id = request.path_params["node_id"]
     nv = _validate_node_id(node_id)
@@ -1514,6 +1522,13 @@ async def cluster_node_detail(request: Request) -> JSONResponse:
     detail = collector.get_node_detail(node_id)
     if not detail:
         return JSONResponse({"error": "Node not found"}, status_code=404)
+    # Private-project tenancy — same predicate as the cluster list.
+    visibility = WorkstreamProjectVisibility.for_request(request)
+    detail["workstreams"] = [
+        ws
+        for ws in detail.get("workstreams", [])
+        if visibility.ws_visible(ws.get("project_id") or "", ws_owner=ws.get("user_id") or "")
+    ]
 
     # Attach metadata if available
     import json as _nd_json
@@ -1564,11 +1579,60 @@ async def cluster_snapshot(request: Request) -> JSONResponse:
 
 
 async def cluster_events_sse(request: Request) -> Response:
+    from turnstone.core.auth import WorkstreamProjectVisibility
+
     err = _collector_scope_error(request)
     if err is not None:
         return err
     collector: ClusterCollector = request.app.state.collector
     client_queue: queue.Queue[dict[str, Any]] = queue.Queue(maxsize=2000)
+
+    # Per-connection private-project tenancy. The snapshot carries full
+    # rows (project_id + user_id); follow-up events are sparse (usually
+    # just ws_id), so invisible workstreams are recorded in ``hidden``
+    # at snapshot/ws_created time and every later event naming them is
+    # swallowed. Access changes (membership grant/revoke) take effect
+    # on reconnect — same resolve-once precedent as session
+    # construction. The visibility instance memoizes project rows, so
+    # the steady-state per-event cost is a set lookup.
+    visibility = WorkstreamProjectVisibility.for_request(request)
+    hidden: set[str] = set()
+
+    def _row_ws_id(ws: dict[str, Any]) -> str:
+        return str(ws.get("ws_id") or ws.get("id") or "")
+
+    def _filter_snapshot(snap: dict[str, Any]) -> dict[str, Any]:
+        for node in snap.get("nodes", []):
+            kept: list[dict[str, Any]] = []
+            for ws in node.get("workstreams", []):
+                if visibility.ws_visible(
+                    ws.get("project_id") or "", ws_owner=ws.get("user_id") or ""
+                ):
+                    kept.append(ws)
+                else:
+                    wid = _row_ws_id(ws)
+                    if wid:
+                        hidden.add(wid)
+            node["workstreams"] = kept
+        return snap
+
+    def _event_visible(event: dict[str, Any]) -> bool:
+        etype = event.get("type")
+        wid = str(event.get("ws_id") or "")
+        if etype == "ws_created":
+            if not visibility.ws_visible(
+                event.get("project_id") or "", ws_owner=event.get("user_id") or ""
+            ):
+                if wid:
+                    hidden.add(wid)
+                return False
+            hidden.discard(wid)
+            return True
+        if wid and wid in hidden:
+            if etype == "ws_closed":
+                hidden.discard(wid)
+            return False
+        return True
 
     async def event_generator() -> AsyncGenerator[dict[str, str], None]:
         loop = asyncio.get_running_loop()
@@ -1578,6 +1642,9 @@ async def cluster_events_sse(request: Request) -> Response:
                 None, collector.get_snapshot_and_register, client_queue
             )
             snap["type"] = "snapshot"
+            # Executor: the snapshot filter resolves project rows from
+            # storage — never block the event loop on DB I/O.
+            snap = await loop.run_in_executor(None, _filter_snapshot, snap)
             yield {"data": json.dumps(snap)}
 
             while True:
@@ -1585,7 +1652,15 @@ async def cluster_events_sse(request: Request) -> Response:
                     event = await loop.run_in_executor(
                         None, functools.partial(client_queue.get, timeout=5)
                     )
-                    yield {"data": json.dumps(event)}
+                    # Only ws_created can touch storage (project lookup);
+                    # every other event type is a pure set-membership
+                    # check and stays on the loop.
+                    if event.get("type") == "ws_created":
+                        visible = await loop.run_in_executor(None, _event_visible, event)
+                    else:
+                        visible = _event_visible(event)
+                    if visible:
+                        yield {"data": json.dumps(event)}
                 except queue.Empty:
                     pass  # poll timeout, retry
                 if await request.is_disconnected():
@@ -3393,6 +3468,19 @@ async def _coord_create_validate_request(
     """
     if not uid:
         return JSONResponse({"error": "authentication required"}, status_code=401)
+    # Project attach gate — same rule as the interactive validator: a
+    # private project accepts new workstreams only from its owner or
+    # members, and a nonexistent project_id 400s rather than minting a
+    # dangling link.
+    project_raw = body.get("project_id")
+    attach_pid = (project_raw.strip() if isinstance(project_raw, str) else "") or ""
+    if attach_pid:
+        from turnstone.core.auth import ensure_project_attachable
+
+        denied = ensure_project_attachable(uid, attach_pid)
+        if denied is not None:
+            status, message = denied
+            return JSONResponse({"error": message}, status_code=status)
     return None
 
 
