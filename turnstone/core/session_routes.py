@@ -1540,6 +1540,16 @@ def make_retry_handler(
                     ui._enqueue({"type": "busy_error", "message": "Cannot retry while processing."})
                 return JSONResponse({"status": "busy"})
 
+        # A retry is a fresh turn initiated by the authenticated caller —
+        # rebind per-user MCP credential resolution to them before the
+        # re-send dispatches (the per-kind ``dispatch_retry`` closure
+        # calls ``send()`` without identity kwargs).
+        from turnstone.core.web_helpers import auth_user_id
+
+        acting_uid = auth_user_id(request)
+        if acting_uid:
+            session.bind_acting_user(acting_uid)
+
         retry_msg = session.retry()
 
         if hasattr(ui, "_enqueue"):
@@ -3620,7 +3630,7 @@ def make_send_handler(cfg: SessionEndpointConfig) -> Handler:
 
     from turnstone.core import session_worker
     from turnstone.core.session import AttachmentsNotQueueableError, GenerationCancelled
-    from turnstone.core.web_helpers import read_json_or_400
+    from turnstone.core.web_helpers import auth_user_id, read_json_or_400
 
     async def send(request: Request) -> Response:
         if cfg.permission_gate is not None:
@@ -3652,6 +3662,14 @@ def make_send_handler(cfg: SessionEndpointConfig) -> Handler:
         ui = ws.ui
         if ui is None:
             return JSONResponse({"error": "session UI not available"}, status_code=409)
+
+        # The authenticated sender: threaded into the fresh-turn dispatch
+        # below so per-user MCP credentials follow whoever is actually
+        # driving a shared workstream. Deliberately NOT applied on the
+        # live-worker queue path — an interjection folds into the current
+        # turn under the initiator's identity (no mid-turn credential
+        # switch); the next fresh turn rebinds.
+        acting_uid = auth_user_id(request)
 
         # ----- Attachment resolution (from the per-node upload buffer) -----
         send_id = ""
@@ -3758,6 +3776,8 @@ def make_send_handler(cfg: SessionEndpointConfig) -> Handler:
                     kwargs["attachments"] = resolved_atts
                 if send_id:
                     kwargs["send_id"] = send_id
+                if acting_uid:
+                    kwargs["acting_user_id"] = acting_uid
                 session.send(message, **kwargs)
             except GenerationCancelled:
                 # Safety net — send() normally handles this internally.
