@@ -1191,3 +1191,147 @@ class TestMCPToolGating:
         # session's ``user_id`` (sanity-check on the wiring).
         mcp_client.resource_count_for_user.assert_any_call("pool-only-user")
         mcp_client.prompt_count_for_user.assert_any_call("pool-only-user")
+
+
+class TestMCPActingUserBinding:
+    """Per-user MCP credentials follow the acting user on shared workstreams.
+
+    The workstream owner is the fallback identity; an authenticated send
+    rebinds credential resolution (dispatch + catalogs + listeners) to the
+    sender. Prepared tool items pin the identity at prepare time so a
+    pending approval can't execute under a later sender's credentials.
+    """
+
+    def _make(self, mock_openai_client, owner="alice"):
+        mcp_client = MagicMock()
+        mcp_client.get_tools.return_value = []
+        mcp_client.call_tool_sync.return_value = "ok"
+        session = ChatSession(
+            client=mock_openai_client,
+            model="local-model",
+            ui=MagicMock(),
+            instructions=None,
+            temperature=0.5,
+            max_tokens=1000,
+            tool_timeout=10,
+            mcp_client=mcp_client,
+            user_id=owner,
+        )
+        # Capture instead of persisting — same stub idiom as
+        # test_session_mcp_dispatch_error.
+        session._report_tool_result = MagicMock()  # type: ignore[method-assign]
+        return session, mcp_client
+
+    def test_effective_identity_defaults_to_owner(self, tmp_db, mock_openai_client):
+        session, mcp_client = self._make(mock_openai_client)
+        assert session._mcp_effective_user_id == "alice"
+        item = session._prepare_mcp_tool("c1", "mcp__srv__tool", {})
+        session._exec_mcp_tool(item)
+        assert mcp_client.call_tool_sync.call_args.kwargs["user_id"] == "alice"
+
+    def test_bind_rebinds_dispatch_catalog_listeners_and_prime(self, tmp_db, mock_openai_client):
+        session, mcp_client = self._make(mock_openai_client)
+        mcp_client.reset_mock()
+
+        session.bind_acting_user("bob")
+
+        # Dispatch identity follows the acting user.
+        item = session._prepare_mcp_tool("c1", "mcp__srv__tool", {})
+        session._exec_mcp_tool(item)
+        assert mcp_client.call_tool_sync.call_args.kwargs["user_id"] == "bob"
+        # Listener registrations swapped from owner to acting user for
+        # all three catalog kinds — identity is the (user_id, callback)
+        # pair, so the remove must name the OLD uid and the add the new.
+        mcp_client.remove_listener.assert_called_once_with(session._mcp_refresh_cb, user_id="alice")
+        mcp_client.add_listener.assert_called_once_with(session._mcp_refresh_cb, user_id="bob")
+        mcp_client.remove_resource_listener.assert_called_once_with(
+            session._mcp_resource_cb, user_id="alice"
+        )
+        mcp_client.add_resource_listener.assert_called_once_with(
+            session._mcp_resource_cb, user_id="bob"
+        )
+        mcp_client.remove_prompt_listener.assert_called_once_with(
+            session._mcp_prompt_cb, user_id="alice"
+        )
+        mcp_client.add_prompt_listener.assert_called_once_with(
+            session._mcp_prompt_cb, user_id="bob"
+        )
+        # The acting user's oauth_user pools are warmed so their tools
+        # surface without a manual reconnect.
+        mcp_client.prime_user_pools.assert_called_once_with("bob")
+        # Merged tool list rebuilt under the new identity.
+        mcp_client.get_tools.assert_any_call(user_id="bob")
+
+    def test_prepared_item_pins_identity_across_rebind(self, tmp_db, mock_openai_client):
+        session, mcp_client = self._make(mock_openai_client)
+        session.bind_acting_user("bob")
+        item = session._prepare_mcp_tool("c1", "mcp__srv__tool", {})
+        # A different user takes over the session while the item is
+        # pending approval — execution must stay under the requester.
+        session.bind_acting_user("carol")
+        session._exec_mcp_tool(item)
+        assert mcp_client.call_tool_sync.call_args.kwargs["user_id"] == "bob"
+
+    def test_resource_and_prompt_items_pin_identity(self, tmp_db, mock_openai_client):
+        session, mcp_client = self._make(mock_openai_client)
+        session.bind_acting_user("bob")
+        res_item = session._prepare_read_resource("c1", {"uri": "res://x"})
+        mcp_client.is_mcp_prompt.return_value = True
+        prompt_item = session._prepare_use_prompt("c2", {"name": "p"})
+        session.bind_acting_user("carol")
+        assert res_item["mcp_user_id"] == "bob"
+        assert prompt_item["mcp_user_id"] == "bob"
+        # And the prompt-existence gate consults the CURRENT effective
+        # identity (carol) for new preparations.
+        session._prepare_use_prompt("c3", {"name": "p"})
+        assert mcp_client.is_mcp_prompt.call_args.kwargs["user_id"] == "carol"
+
+    def test_bind_noops_on_empty_and_same_user(self, tmp_db, mock_openai_client):
+        session, mcp_client = self._make(mock_openai_client)
+        mcp_client.reset_mock()
+        session.bind_acting_user("")
+        session.bind_acting_user("alice")  # same as owner
+        mcp_client.remove_listener.assert_not_called()
+        mcp_client.add_listener.assert_not_called()
+        mcp_client.prime_user_pools.assert_not_called()
+        assert session._mcp_effective_user_id == "alice"
+
+    def test_send_kwarg_binds_before_turn_starts(self, tmp_db, mock_openai_client):
+        import pytest
+
+        session, _mcp_client = self._make(mock_openai_client)
+
+        class _SentinelError(Exception):
+            pass
+
+        # ``bind_acting_user`` runs before ``_refresh_model_from_registry``
+        # at the top of send() — abort there to prove the ordering without
+        # driving the full agent loop.
+        session._refresh_model_from_registry = MagicMock(  # type: ignore[method-assign]
+            side_effect=_SentinelError
+        )
+        with pytest.raises(_SentinelError):
+            session.send("hi", acting_user_id="bob")
+        assert session._acting_user_id == "bob"
+
+    def test_close_removes_listeners_under_rebound_identity(self, tmp_db, mock_openai_client):
+        session, mcp_client = self._make(mock_openai_client)
+        session.bind_acting_user("bob")
+        refresh_cb = session._mcp_refresh_cb
+        mcp_client.reset_mock()
+        session.close()
+        mcp_client.remove_listener.assert_called_once_with(refresh_cb, user_id="bob")
+
+    def test_bind_without_mcp_client_only_records(self, tmp_db, mock_openai_client):
+        session = ChatSession(
+            client=mock_openai_client,
+            model="local-model",
+            ui=MagicMock(),
+            instructions=None,
+            temperature=0.5,
+            max_tokens=1000,
+            tool_timeout=10,
+            user_id="alice",
+        )
+        session.bind_acting_user("bob")
+        assert session._mcp_effective_user_id == "bob"
