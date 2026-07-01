@@ -1543,12 +1543,14 @@ def make_retry_handler(
         # A retry is a fresh turn initiated by the authenticated caller —
         # rebind per-user MCP credential resolution to them before the
         # re-send dispatches (the per-kind ``dispatch_retry`` closure
-        # calls ``send()`` without identity kwargs).
+        # calls ``send()`` without identity kwargs). getattr-guarded so
+        # per-kind session stubs without the method keep working.
         from turnstone.core.web_helpers import auth_user_id
 
         acting_uid = auth_user_id(request)
-        if acting_uid:
-            session.bind_acting_user(acting_uid)
+        bind_acting = getattr(session, "bind_acting_user", None)
+        if acting_uid and callable(bind_acting):
+            bind_acting(acting_uid)
 
         retry_msg = session.retry()
 
@@ -2655,7 +2657,8 @@ def make_list_handler(cfg: SessionEndpointConfig) -> Handler:
                 titles = resolve_titles([ws.id for ws in wss])
             rows: list[dict[str, Any]] = []
             for ws in wss:
-                project_id = getattr(ws, "project_id", "") or ""
+                raw_pid = getattr(ws, "project_id", "")
+                project_id = raw_pid if isinstance(raw_pid, str) else ""
                 # Private-project tenancy — drop rows the requester may
                 # not see (same predicate as the saved list).
                 if not visibility.ws_visible(project_id, ws_owner=ws.user_id or ""):
@@ -3797,8 +3800,14 @@ def make_send_handler(cfg: SessionEndpointConfig) -> Handler:
                     kwargs["attachments"] = resolved_atts
                 if send_id:
                     kwargs["send_id"] = send_id
-                if acting_uid:
-                    kwargs["acting_user_id"] = acting_uid
+                # Fresh turn: rebind per-user MCP credentials to the
+                # authenticated sender. Bound here (not via a send()
+                # kwarg) so per-kind session stubs with explicit send
+                # signatures keep working; getattr-guarded for the same
+                # reason. The queue path above never rebinds.
+                bind = getattr(session, "bind_acting_user", None)
+                if acting_uid and callable(bind):
+                    bind(acting_uid)
                 session.send(message, **kwargs)
             except GenerationCancelled:
                 # Safety net — send() normally handles this internally.

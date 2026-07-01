@@ -4,7 +4,7 @@ import asyncio
 import json
 import queue
 from typing import Any
-from unittest.mock import MagicMock
+from unittest.mock import ANY, MagicMock
 
 import pytest
 
@@ -1046,6 +1046,8 @@ class TestConsoleHTTPEndpoints:
             page=1,
             per_page=25,
             extra_rows=[],
+            # Per-request private-project tenancy closure — identity varies.
+            row_filter=ANY,
         )
 
     def test_get_workstreams_per_page_capped(self, client, mock_collector):

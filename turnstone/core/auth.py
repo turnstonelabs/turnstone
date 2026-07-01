@@ -333,7 +333,13 @@ class WorkstreamProjectVisibility:
         """Apply the class rules to one workstream row."""
         if self._bypass:
             return True
-        pid = (project_id or "").strip()
+        # Only a real string can name a project — anything else (None,
+        # a test double, a corrupted row) means "no project link", not
+        # "private". Keeps the fail-closed branch for genuine lookup
+        # failures rather than type noise.
+        if not project_id or not isinstance(project_id, str):
+            return True
+        pid = project_id.strip()
         if not pid:
             return True
         if ws_owner and ws_owner == self._user_id:

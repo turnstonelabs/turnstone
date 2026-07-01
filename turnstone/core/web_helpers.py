@@ -349,7 +349,8 @@ def resolve_workstream_owner(
         ws_mem = mgr.get(ws_id)
         if ws_mem is not None:
             owner = ws_mem.user_id or ""
-            project_id = getattr(ws_mem, "project_id", "") or ""
+            raw_pid = getattr(ws_mem, "project_id", "")
+            project_id = raw_pid if isinstance(raw_pid, str) else ""
 
     if owner is None:
         # Not in memory — storage resolves persisted-but-not-loaded rows.

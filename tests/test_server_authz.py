@@ -646,6 +646,7 @@ class TestListWorkstreamsTrustedTeamVisibility:
             "kind",
             "parent_ws_id",
             "user_id",
+            "project_id",
         }
         assert row["kind"] == "interactive"
         assert row["user_id"] == "user-shape"

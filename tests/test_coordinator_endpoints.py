@@ -520,6 +520,7 @@ def test_active_list_row_shape_includes_unified_fields(storage):
         "kind",
         "parent_ws_id",
         "user_id",
+        "project_id",
     }
     assert row["name"] == "lifted-coord"
     assert row["kind"] == "coordinator"
