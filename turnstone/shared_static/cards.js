@@ -59,6 +59,16 @@ function _ctxCell(sess) {
 
 /* NAME cell: ellipsised title + an optional skill chip when the workstream
    launched with a non-default skill (empty for "Use defaults"). */
+/* Resolve a project_id to its display name via the shared projects data
+   layer (window bridge — cards.js also loads in the classic bundles).
+   Unknown / inaccessible ids render empty so callers can show "—". */
+function _projectName(projectId) {
+  if (!projectId) return "";
+  var tp = window.TurnstoneProjects;
+  if (!tp || typeof tp.projectName !== "function") return "";
+  return tp.projectName(projectId) || "";
+}
+
 function _nameCell(sess) {
   var wrap = document.createElement("div");
   wrap.className = "scell-name";
@@ -109,6 +119,20 @@ export var SavedColumns = {
       },
       sort: function (s) {
         return (s.model_alias || "").toLowerCase();
+      },
+    };
+  },
+  project: function () {
+    return {
+      key: "project",
+      label: "PROJECT",
+      width: "120px",
+      hideBelow: true,
+      cell: function (s) {
+        return _projectName(s.project_id) || "—";
+      },
+      sort: function (s) {
+        return (_projectName(s.project_id) || "").toLowerCase();
       },
     };
   },
@@ -279,6 +303,8 @@ export function createSavedTable(opts) {
       (sess.title || "") +
       " " +
       (sess.name || "") +
+      " " +
+      (_projectName(sess.project_id) || "") +
       " " +
       sess.ws_id
     ).toLowerCase();

@@ -25,6 +25,7 @@ from turnstone.server import (
     get_project_endpoint,
     list_project_members_endpoint,
     list_projects,
+    project_resources_endpoint,
     remove_project_member_endpoint,
     update_project_endpoint,
 )
@@ -103,6 +104,10 @@ def client(storage: SQLiteBackend) -> Iterator[TestClient]:
                         "/api/projects/{project_id}/members/{user_id}",
                         remove_project_member_endpoint,
                         methods=["DELETE"],
+                    ),
+                    Route(
+                        "/api/projects/{project_id}/resources",
+                        project_resources_endpoint,
                     ),
                 ],
             ),
@@ -194,3 +199,51 @@ class TestProjectApi:
     def test_get_missing_404(self, client: TestClient) -> None:
         r = client.get("/v1/api/projects/nope")
         assert r.status_code == 404
+
+
+class TestProjectResources:
+    def _seed(self, client: TestClient, storage: SQLiteBackend) -> str:
+        pid: str = client.post("/v1/api/projects", json={"name": "R"}).json()["project_id"]
+        storage.register_workstream("ws-a", name="alpha", user_id="alice", project_id=pid)
+        storage.register_workstream("ws-b", name="beta", user_id="alice", project_id=pid)
+        storage.register_workstream("ws-x", name="other", user_id="alice")
+        mid = storage.save_message("ws-a", "user", "see attached")
+        storage.save_attachment("a" * 64, "notes.txt", "text/plain", 5, "text", b"hello")
+        storage.set_message_attachments("ws-a", mid, ["a" * 64])
+        storage.create_structured_memory("m1", "fact", "d", "general", "project", pid, "body")
+        return pid
+
+    def test_resources_aggregate(self, client: TestClient, storage: SQLiteBackend) -> None:
+        pid = self._seed(client, storage)
+        r = client.get(f"/v1/api/projects/{pid}/resources")
+        assert r.status_code == 200
+        body = r.json()
+        assert body["project_id"] == pid
+        assert body["name"] == "R"
+        ws_ids = [w["ws_id"] for w in body["workstreams"]]
+        assert set(ws_ids) == {"ws-a", "ws-b"}  # ws-x is not in the project
+        atts = body["attachments"]
+        assert len(atts) == 1
+        assert atts[0]["attachment_id"] == "a" * 64
+        assert atts[0]["filename"] == "notes.txt"
+        assert atts[0]["ws_id"] == "ws-a"
+        assert "content" not in atts[0]  # metadata only — never the blob
+        assert body["memory_count"] == 1
+
+    def test_resources_empty_project(self, client: TestClient) -> None:
+        pid = client.post("/v1/api/projects", json={"name": "E"}).json()["project_id"]
+        body = client.get(f"/v1/api/projects/{pid}/resources").json()
+        assert body["workstreams"] == []
+        assert body["attachments"] == []
+        assert body["memory_count"] == 0
+
+    def test_resources_missing_404(self, client: TestClient) -> None:
+        assert client.get("/v1/api/projects/nope/resources").status_code == 404
+
+    def test_resources_private_non_member_403(
+        self, client: TestClient, storage: SQLiteBackend
+    ) -> None:
+        # Owned by someone else, private — alice holds project.read but no
+        # membership, so the per-project ACL denies.
+        storage.create_project("p-zed", "Z", "zed")
+        assert client.get("/v1/api/projects/p-zed/resources").status_code == 403

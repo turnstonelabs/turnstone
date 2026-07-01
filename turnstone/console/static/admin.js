@@ -2522,10 +2522,11 @@ function _renderProjects(projects) {
     const p = projects[i];
     const archived = p.state === "archived";
     html +=
-      '<div class="admin-row" role="listitem" data-project-id="' +
+      '<div class="admin-row" role="listitem" data-expandable data-project-id="' +
       escapeHtml(p.project_id) +
-      '">' +
+      '" tabindex="0" aria-expanded="false">' +
       '<span class="admin-col admin-col-username">' +
+      '<span class="admin-expand-indicator" aria-hidden="true">▸</span>' +
       escapeHtml(p.name) +
       "</span>" +
       '<span class="admin-col admin-col-name">' +
@@ -2597,6 +2598,197 @@ function _bindProjectRowActions(container) {
         this.getAttribute("data-project-name"),
       );
     });
+  });
+  // Expandable per-project resources panel (workstreams / attachments /
+  // memory) — same interaction contract as the Users tab's OIDC panel.
+  container
+    .querySelectorAll(".admin-row[data-expandable]")
+    .forEach(function (row) {
+      const _expand = function () {
+        _toggleProjectPanel(row.getAttribute("data-project-id"), row);
+      };
+      row.addEventListener("click", function (e) {
+        // Clicks on the row's kebab menu must not also toggle the panel.
+        if (
+          e.target.closest(".admin-kebab") ||
+          e.target.closest(".admin-btn-danger") ||
+          e.target.closest(".admin-btn-action")
+        )
+          return;
+        _expand();
+      });
+      row.addEventListener("keydown", function (e) {
+        if (e.key === "Enter" || e.key === " ") {
+          e.preventDefault();
+          _expand();
+        }
+      });
+    });
+}
+
+function _toggleProjectPanel(projectId, rowEl) {
+  const existing = rowEl.nextElementSibling;
+  if (existing && existing.classList.contains("proj-detail-panel")) {
+    // Collapse
+    existing.style.maxHeight = "0";
+    const indicator = rowEl.querySelector(".admin-expand-indicator");
+    if (indicator) indicator.classList.remove("expanded");
+    rowEl.setAttribute("aria-expanded", "false");
+    setTimeout(function () {
+      if (existing.parentNode) existing.remove();
+    }, 160);
+    return;
+  }
+  // Collapse any other open panel first (single-open accordion).
+  const openPanels = document.querySelectorAll(
+    "#admin-projects-table .proj-detail-panel",
+  );
+  for (let i = 0; i < openPanels.length; i++) {
+    openPanels[i].style.maxHeight = "0";
+    const prevRow = openPanels[i].previousElementSibling;
+    if (prevRow) {
+      const ind = prevRow.querySelector(".admin-expand-indicator");
+      if (ind) ind.classList.remove("expanded");
+      prevRow.setAttribute("aria-expanded", "false");
+    }
+    (function (panel) {
+      setTimeout(function () {
+        if (panel.parentNode) panel.remove();
+      }, 160);
+    })(openPanels[i]);
+  }
+  const indicator = rowEl.querySelector(".admin-expand-indicator");
+  if (indicator) indicator.classList.add("expanded");
+  rowEl.setAttribute("aria-expanded", "true");
+  const panel = document.createElement("div");
+  panel.className = "proj-detail-panel";
+  panel.setAttribute("role", "none");
+  setSafeHtml(
+    panel,
+    '<div class="proj-detail-inner">' +
+      '<div class="proj-detail-body"><span class="proj-detail-empty">Loading…</span></div>' +
+      "</div>",
+  );
+  rowEl.after(panel);
+  requestAnimationFrame(function () {
+    panel.style.maxHeight = panel.scrollHeight + "px";
+  });
+  authFetch("/v1/api/projects/" + encodeURIComponent(projectId) + "/resources")
+    .then(function (r) {
+      if (!r.ok) throw new Error("Failed");
+      return r.json();
+    })
+    .then(function (data) {
+      _renderProjectResources(panel, data);
+    })
+    .catch(function () {
+      const body = panel.querySelector(".proj-detail-body");
+      if (body)
+        setSafeHtml(
+          body,
+          '<span class="proj-detail-empty">Failed to load</span>',
+        );
+    });
+}
+
+const _PROJ_ATT_ICONS = { image: "\u{1f5bc}", audio: "\u{1f3b5}" };
+
+function _projAttachmentHref(att) {
+  // Content serving is ws-scoped and node-local: interactive workstreams
+  // route through the console's transparent node proxy; coordinator
+  // workstreams (no node_id recorded on the attachment's ws row here)
+  // serve from the console's own coord attachment routes.
+  const tail =
+    "v1/api/workstreams/" +
+    encodeURIComponent(att.ws_id) +
+    "/attachments/" +
+    encodeURIComponent(att.attachment_id) +
+    "/content";
+  return att.node_id
+    ? "/node/" + encodeURIComponent(att.node_id) + "/" + tail
+    : "/" + tail;
+}
+
+function _projFmtSize(n) {
+  if (typeof n !== "number" || n < 0) return "";
+  if (n < 1024) return n + " B";
+  if (n < 1048576) return (n / 1024).toFixed(1) + " KB";
+  return (n / 1048576).toFixed(1) + " MB";
+}
+
+function _renderProjectResources(panel, data) {
+  const body = panel.querySelector(".proj-detail-body");
+  if (!body) return;
+  const wss = data.workstreams || [];
+  // node_id lives on the workstream rows; the attachment rows carry only
+  // their first-referencing ws_id — join here for download URLs.
+  const nodeByWs = {};
+  for (let i = 0; i < wss.length; i++) nodeByWs[wss[i].ws_id] = wss[i].node_id;
+  let html =
+    '<div class="proj-detail-header">Workstreams (' + wss.length + ")</div>";
+  if (!wss.length) {
+    html += '<span class="proj-detail-empty">No workstreams</span>';
+  } else {
+    for (let i = 0; i < wss.length; i++) {
+      const w = wss[i];
+      html +=
+        '<div class="proj-detail-row">' +
+        '<span class="proj-detail-main">' +
+        escapeHtml(w.title || w.name || w.ws_id.substring(0, 12)) +
+        "</span>" +
+        '<span class="proj-detail-dim">' +
+        escapeHtml(String(w.kind || "")) +
+        " · " +
+        escapeHtml(String(w.state || "")) +
+        " · " +
+        escapeHtml(String(w.updated || "").slice(0, 10)) +
+        " · " +
+        escapeHtml(w.ws_id.substring(0, 7)) +
+        "</span>" +
+        "</div>";
+    }
+  }
+  const atts = data.attachments || [];
+  html +=
+    '<div class="proj-detail-header">Attachments (' + atts.length + ")</div>";
+  if (!atts.length) {
+    html += '<span class="proj-detail-empty">No attachments</span>';
+  } else {
+    for (let i = 0; i < atts.length; i++) {
+      const a = atts[i];
+      const icon = _PROJ_ATT_ICONS[a.kind] || "\u{1f4c4}";
+      a.node_id = nodeByWs[a.ws_id] || "";
+      html +=
+        '<div class="proj-detail-row">' +
+        '<span class="proj-detail-main">' +
+        '<span aria-hidden="true">' +
+        icon +
+        "</span> " +
+        '<a class="proj-detail-link" target="_blank" rel="noopener" href="' +
+        escapeHtml(_projAttachmentHref(a)) +
+        '">' +
+        escapeHtml(a.filename || a.attachment_id.substring(0, 12)) +
+        "</a>" +
+        "</span>" +
+        '<span class="proj-detail-dim">' +
+        escapeHtml(_projFmtSize(a.size_bytes)) +
+        " · " +
+        escapeHtml(String(a.created || "").slice(0, 10)) +
+        "</span>" +
+        "</div>";
+    }
+  }
+  html +=
+    '<div class="proj-detail-header">Memory</div>' +
+    '<div class="proj-detail-row"><span class="proj-detail-main">' +
+    String(data.memory_count || 0) +
+    " project-scoped memor" +
+    (data.memory_count === 1 ? "y" : "ies") +
+    "</span></div>";
+  setSafeHtml(body, html);
+  // Re-measure after content lands so the animated max-height fits.
+  requestAnimationFrame(function () {
+    panel.style.maxHeight = panel.scrollHeight + "px";
   });
 }
 

@@ -5320,6 +5320,97 @@ class SQLiteBackend:
             ).scalar()
         return result is not None
 
+    def list_workstreams_for_project(self, project_id: str) -> list[dict[str, Any]]:
+        with self._conn() as conn:
+            rows = conn.execute(
+                sa.select(
+                    workstreams.c.ws_id,
+                    workstreams.c.name,
+                    workstreams.c.title,
+                    workstreams.c.state,
+                    workstreams.c.kind,
+                    workstreams.c.updated,
+                    workstreams.c.node_id,
+                    workstreams.c.user_id,
+                )
+                .where(workstreams.c.project_id == project_id)
+                .order_by(workstreams.c.updated.desc())
+            ).fetchall()
+            return [
+                {
+                    "ws_id": r[0],
+                    "name": r[1],
+                    "title": r[2],
+                    "state": r[3],
+                    "kind": r[4],
+                    "updated": r[5],
+                    "node_id": r[6],
+                    "user_id": r[7],
+                }
+                for r in rows
+            ]
+
+    def list_project_attachments(self, project_id: str) -> list[dict[str, Any]]:
+        """Committed attachments referenced by any turn in the project's
+        workstreams — metadata only (never the content blob), each with the
+        first referencing ws_id (content serving is ws-scoped, so the caller
+        needs a ws to build a download URL against).
+        """
+        with self._conn() as conn:
+            ref_rows = conn.execute(
+                sa.select(conversations.c.ws_id, conversations.c.attachments)
+                .select_from(
+                    conversations.join(workstreams, workstreams.c.ws_id == conversations.c.ws_id)
+                )
+                .where(
+                    workstreams.c.project_id == project_id,
+                    conversations.c.attachments.is_not(None),
+                )
+                .order_by(conversations.c.id)
+            ).fetchall()
+            first_ws: dict[str, str] = {}
+            for ws_id, raw in ref_rows:
+                try:
+                    ids = json.loads(raw) if raw else []
+                except (TypeError, ValueError):
+                    continue
+                if not isinstance(ids, list):
+                    continue
+                for aid in ids:
+                    if isinstance(aid, str) and aid and aid not in first_ws:
+                        first_ws[aid] = ws_id
+            if not first_ws:
+                return []
+            meta_rows = conn.execute(
+                sa.select(
+                    workstream_attachments.c.attachment_id,
+                    workstream_attachments.c.filename,
+                    workstream_attachments.c.mime_type,
+                    workstream_attachments.c.size_bytes,
+                    workstream_attachments.c.kind,
+                    workstream_attachments.c.created,
+                ).where(workstream_attachments.c.attachment_id.in_(list(first_ws)))
+            ).fetchall()
+            meta = {r[0]: r for r in meta_rows}
+            out: list[dict[str, Any]] = []
+            for aid, ws_id in first_ws.items():
+                r = meta.get(aid)
+                if r is None:
+                    # Ref-list names a pruned blob (refcount GC) — skip.
+                    continue
+                out.append(
+                    {
+                        "attachment_id": r[0],
+                        "filename": r[1],
+                        "mime_type": r[2],
+                        "size_bytes": r[3],
+                        "kind": r[4],
+                        "created": r[5],
+                        "ws_id": ws_id,
+                    }
+                )
+            return out
+
     # -- OIDC identity ---------------------------------------------------------
 
     def create_oidc_user(

@@ -2319,6 +2319,17 @@ class StorageBackend(Protocol):
         """Return True if user_id is a member of project_id."""
         ...
 
+    def list_workstreams_for_project(self, project_id: str) -> list[dict[str, Any]]:
+        """Return the project's workstreams (ws_id, name, title, state, kind,
+        updated, node_id, user_id), newest-updated first."""
+        ...
+
+    def list_project_attachments(self, project_id: str) -> list[dict[str, Any]]:
+        """Committed attachments referenced by any turn in the project's
+        workstreams — metadata only, each with the first referencing ws_id
+        (content serving is ws-scoped)."""
+        ...
+
     # -- Prompt policies -------------------------------------------------------
 
     def list_prompt_policies(self, org_id: str = "") -> list[dict[str, Any]]:

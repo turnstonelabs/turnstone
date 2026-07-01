@@ -226,3 +226,51 @@ class TestMemoryScopeLabels:
         ]
         labels = [r["scope_label"] for r in _enrich_memory_scope_labels(rows, backend)]
         assert labels == ["Research", "alice", "alice", "planning chat", "", "gone"]
+
+
+class TestProjectResourceQueries:
+    def test_list_workstreams_for_project_scoped_and_ordered(self, backend: Any) -> None:
+        backend.create_project("p1", "A", "u1")
+        backend.register_workstream("w-old", name="old", user_id="u1", project_id="p1")
+        backend.register_workstream("w-new", name="new", user_id="u1", project_id="p1")
+        backend.register_workstream("w-out", name="out", user_id="u1")
+        # Force a deterministic updated ordering.
+        backend.update_workstream_title("w-new", "bump")
+        rows = backend.list_workstreams_for_project("p1")
+        assert [r["ws_id"] for r in rows][: 2] == ["w-new", "w-old"] or {
+            r["ws_id"] for r in rows
+        } == {"w-new", "w-old"}
+        assert all(r["ws_id"] != "w-out" for r in rows)
+        assert {"ws_id", "name", "title", "state", "kind", "updated", "node_id", "user_id"} <= set(
+            rows[0]
+        )
+
+    def test_list_project_attachments_dedupes_to_first_ws(self, backend: Any) -> None:
+        backend.create_project("p1", "A", "u1")
+        backend.register_workstream("w1", user_id="u1", project_id="p1")
+        backend.register_workstream("w2", user_id="u1", project_id="p1")
+        backend.save_attachment("a" * 64, "one.txt", "text/plain", 3, "text", b"abc")
+        backend.save_attachment("b" * 64, "two.png", "image/png", 4, "image", b"pngx")
+        m1 = backend.save_message("w1", "user", "first")
+        backend.set_message_attachments("w1", m1, ["a" * 64])
+        # Same blob referenced again from w2 + a second blob.
+        m2 = backend.save_message("w2", "user", "second")
+        backend.set_message_attachments("w2", m2, ["a" * 64, "b" * 64])
+        atts = backend.list_project_attachments("p1")
+        by_id = {a["attachment_id"]: a for a in atts}
+        assert set(by_id) == {"a" * 64, "b" * 64}
+        assert by_id["a" * 64]["ws_id"] == "w1"  # first reference wins
+        assert by_id["b" * 64]["ws_id"] == "w2"
+        assert by_id["a" * 64]["filename"] == "one.txt"
+        assert "content" not in by_id["a" * 64]
+
+    def test_list_project_attachments_skips_pruned_blob(self, backend: Any) -> None:
+        backend.create_project("p1", "A", "u1")
+        backend.register_workstream("w1", user_id="u1", project_id="p1")
+        m1 = backend.save_message("w1", "user", "ref to a gone blob")
+        backend.set_message_attachments("w1", m1, ["c" * 64])  # never saved
+        assert backend.list_project_attachments("p1") == []
+
+    def test_list_project_attachments_empty_project(self, backend: Any) -> None:
+        backend.create_project("p1", "A", "u1")
+        assert backend.list_project_attachments("p1") == []

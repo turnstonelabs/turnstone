@@ -1899,6 +1899,7 @@ function _initSavedCoordTable() {
         return s.kind || "";
       },
     },
+    SavedColumns.project(),
     SavedColumns.model(),
     SavedColumns.count("child_count", "CHILDREN", "92px"),
     SavedColumns.ctx(),
@@ -2010,6 +2011,13 @@ function _initSavedCoordTable() {
       },
     },
   });
+  // The PROJECT column resolves names from the shared projects cache,
+  // which fills asynchronously — re-render once names arrive.
+  if (window.TurnstoneProjects) {
+    window.TurnstoneProjects.onProjectsChange(function () {
+      if (_coordTable) _coordTable.render();
+    });
+  }
 }
 
 // HTML inline-onclick wrappers — keep the global names the markup binds
