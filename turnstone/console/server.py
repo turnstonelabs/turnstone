@@ -1007,7 +1007,10 @@ async def cluster_workstreams(request: Request) -> JSONResponse:
     per_page = _parse_int(params, "per_page", 50, minimum=1, maximum=200)
     extra_rows = _coordinator_rows(request)
     visibility = WorkstreamProjectVisibility.for_request(request)
-    ws_list, total = collector.get_workstreams(
+    # Executor: the tenancy row_filter resolves project rows from storage,
+    # so the whole collect+filter+paginate runs off the event loop.
+    ws_list, total = await asyncio.to_thread(
+        collector.get_workstreams,
         state=state,
         node=node,
         search=search,
@@ -1523,12 +1526,17 @@ async def cluster_node_detail(request: Request) -> JSONResponse:
     if not detail:
         return JSONResponse({"error": "Node not found"}, status_code=404)
     # Private-project tenancy — same predicate as the cluster list.
+    # Executor: the predicate resolves project rows from storage.
     visibility = WorkstreamProjectVisibility.for_request(request)
-    detail["workstreams"] = [
-        ws
-        for ws in detail.get("workstreams", [])
-        if visibility.ws_visible(ws.get("project_id") or "", ws_owner=ws.get("user_id") or "")
-    ]
+
+    def _filter_ws_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        return [
+            ws
+            for ws in rows
+            if visibility.ws_visible(ws.get("project_id") or "", ws_owner=ws.get("user_id") or "")
+        ]
+
+    detail["workstreams"] = await asyncio.to_thread(_filter_ws_rows, detail.get("workstreams", []))
 
     # Attach metadata if available
     import json as _nd_json
@@ -13110,6 +13118,7 @@ def create_app(
         get_project_endpoint,
         list_project_members_endpoint,
         list_projects,
+        project_resources_endpoint,
         remove_project_member_endpoint,
         update_project_endpoint,
     )
@@ -13525,6 +13534,10 @@ def create_app(
                         "/api/projects/{project_id}",
                         delete_project_endpoint,
                         methods=["DELETE"],
+                    ),
+                    Route(
+                        "/api/projects/{project_id}/resources",
+                        project_resources_endpoint,
                     ),
                     Route(
                         "/api/projects/{project_id}/members",

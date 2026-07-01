@@ -2747,6 +2747,49 @@ async def get_project_endpoint(request: Request) -> JSONResponse:
     return JSONResponse(_project_view(row))
 
 
+async def project_resources_endpoint(request: Request) -> JSONResponse:
+    """GET /v1/api/projects/{project_id}/resources — the project's contents.
+
+    Workstreams, referenced attachments (metadata + a ws_id to build the
+    ws-scoped download URL against), and the project-scoped memory count —
+    the aggregate view behind the manage → governance → Projects shelf.
+    Same access gate as ``get_project_endpoint``: ``project.read`` plus the
+    per-project ACL.
+    """
+    import asyncio
+
+    from turnstone.core.auth import require_permission, user_can_access_project
+    from turnstone.core.storage import get_storage
+
+    err = require_permission(request, "project.read")
+    if err:
+        return err
+    uid, uerr = _project_request_uid(request)
+    if uerr:
+        return uerr
+    project_id = request.path_params["project_id"]
+    storage = get_storage()
+    row = storage.get_project(project_id) if storage else None
+    if row is None:
+        return JSONResponse({"error": "project not found"}, status_code=404)
+    if not user_can_access_project(uid, project_id, write=False, storage=storage):
+        return JSONResponse({"error": "forbidden"}, status_code=403)
+
+    def _collect() -> dict[str, Any]:
+        # The attachment scan walks every conversation row in the
+        # project's workstreams — keep the whole collection off the
+        # event loop.
+        return {
+            "project_id": project_id,
+            "name": row.get("name", ""),
+            "workstreams": storage.list_workstreams_for_project(project_id),
+            "attachments": storage.list_project_attachments(project_id),
+            "memory_count": storage.count_structured_memories(scope="project", scope_id=project_id),
+        }
+
+    return JSONResponse(await asyncio.to_thread(_collect))
+
+
 async def update_project_endpoint(request: Request) -> JSONResponse:
     """PATCH /v1/api/projects/{project_id} — rename / re-visibility / archive."""
     from turnstone.core.auth import require_permission, user_can_access_project
@@ -4267,6 +4310,10 @@ def create_app(
                         "/api/projects/{project_id}",
                         delete_project_endpoint,
                         methods=["DELETE"],
+                    ),
+                    Route(
+                        "/api/projects/{project_id}/resources",
+                        project_resources_endpoint,
                     ),
                     Route(
                         "/api/projects/{project_id}/members",

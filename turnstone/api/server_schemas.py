@@ -441,6 +441,7 @@ class SavedWorkstreamInfo(BaseModel):
     child_count: int = 0
     context_tokens: int = 0
     context_ratio: float = 0.0
+    project_id: str | None = None
 
 
 class ListSavedWorkstreamsResponse(BaseModel):

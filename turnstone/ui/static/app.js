@@ -849,6 +849,7 @@ let _wsTable = null;
 function _initSavedWsTable() {
   const WS_COLUMNS = [
     SavedColumns.name(),
+    SavedColumns.project(),
     SavedColumns.model(),
     SavedColumns.count("message_count", "MSGS"),
     SavedColumns.ctx(),
@@ -884,6 +885,13 @@ function _initSavedWsTable() {
       },
     },
   });
+  // The PROJECT column resolves names from the shared projects cache,
+  // which fills asynchronously — re-render once names arrive.
+  if (window.TurnstoneProjects) {
+    window.TurnstoneProjects.onProjectsChange(function () {
+      if (_wsTable) _wsTable.render();
+    });
+  }
 }
 
 // HTML inline-onclick wrappers — keep the global names the existing markup

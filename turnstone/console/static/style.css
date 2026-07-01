@@ -3233,20 +3233,23 @@ h3.skill-spec-heading {
 /* ==========================================================================
    OIDC detail panel (inline expansion below user row)
    ========================================================================== */
-.oidc-detail-panel {
+.oidc-detail-panel,
+.proj-detail-panel {
   max-height: 0;
   overflow: hidden;
   transition: max-height 150ms ease;
   margin: 0 8px 0 24px;
 }
-.oidc-detail-inner {
+.oidc-detail-inner,
+.proj-detail-inner {
   border: 1px dashed var(--border);
   border-radius: var(--radius-sm);
   padding: 12px 16px;
   margin-bottom: 8px;
   background: var(--row-alt);
 }
-.oidc-detail-header {
+.oidc-detail-header,
+.proj-detail-header {
   font-family: var(--font-ui);
   font-size: 10px;
   text-transform: uppercase;
@@ -3254,9 +3257,45 @@ h3.skill-spec-heading {
   color: var(--fg-dim);
   margin-bottom: 8px;
 }
-.oidc-detail-header::before {
+.oidc-detail-header::before,
+.proj-detail-header::before {
   content: "\25c6 ";
   color: var(--accent);
+}
+/* Per-project resources panel rows: name/link left, dim meta right. */
+.proj-detail-header + .proj-detail-header,
+.proj-detail-row + .proj-detail-header {
+  margin-top: 12px;
+}
+.proj-detail-row {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 4px 0;
+  font-size: 12px;
+  align-items: baseline;
+}
+.proj-detail-row + .proj-detail-row {
+  border-top: 1px solid var(--border);
+}
+.proj-detail-main {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.proj-detail-dim {
+  color: var(--fg-dim);
+  font-size: 11px;
+  white-space: nowrap;
+  flex-shrink: 0;
+}
+.proj-detail-link {
+  color: inherit;
+  text-decoration: underline;
+  text-decoration-color: var(--border);
+}
+.proj-detail-link:hover {
+  text-decoration-color: var(--accent);
 }
 .oidc-identity-row {
   display: grid;
@@ -3300,7 +3339,8 @@ h3.skill-spec-heading {
 .oidc-identity-actions .admin-btn-danger {
   font-size: 11px;
 }
-.oidc-detail-empty {
+.oidc-detail-empty,
+.proj-detail-empty {
   color: var(--fg-dim);
   font-size: 12px;
   font-style: italic;
@@ -3340,7 +3380,8 @@ h3.skill-spec-heading {
   .oidc-identity-time {
     display: none;
   }
-  .oidc-detail-panel {
+  .oidc-detail-panel,
+  .proj-detail-panel {
     margin-left: 8px;
   }
 }
@@ -3540,6 +3581,7 @@ h3.skill-spec-heading {
     animation: none;
   }
   .oidc-detail-panel,
+  .proj-detail-panel,
   .admin-expand-indicator {
     transition: none;
   }
