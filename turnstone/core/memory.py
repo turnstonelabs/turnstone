@@ -641,19 +641,28 @@ def update_workstream_title(ws_id: str, title: str) -> None:
 # -- Conversation search -------------------------------------------------------
 
 
-def search_history(query: str, limit: int = 20, offset: int = 0) -> list[Any]:
-    """Search conversation history."""
+def search_history(
+    query: str, limit: int = 20, offset: int = 0, *, user_id: str | None = None
+) -> list[Any]:
+    """Search conversation history.
+
+    ``user_id`` scopes rows by project tenancy (private-project workstreams
+    hidden unless creator/owner/member — see
+    :meth:`StorageBackend.search_history`); ``None`` = unscoped, for
+    single-user lanes only.
+    """
     try:
-        return get_storage().search_history(query, limit, offset)
+        return get_storage().search_history(query, limit, offset, user_id=user_id)
     except Exception:
         log.warning("Failed to search history", exc_info=True)
         return []
 
 
-def search_history_recent(limit: int = 20) -> list[Any]:
-    """Return most recent conversation messages."""
+def search_history_recent(limit: int = 20, *, user_id: str | None = None) -> list[Any]:
+    """Return most recent conversation messages, tenancy-scoped like
+    :func:`search_history`."""
     try:
-        return get_storage().search_history_recent(limit)
+        return get_storage().search_history_recent(limit, user_id=user_id)
     except Exception:
         log.warning("Failed to search recent history", exc_info=True)
         return []

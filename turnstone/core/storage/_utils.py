@@ -1002,6 +1002,38 @@ def recover_trajectory(turns: list[Turn]) -> list[Turn]:
 COMPACTION_SOURCE = "compaction"
 COMPACTION_SUMMARY_LABEL = "[Conversation summary]"
 
+# ---------------------------------------------------------------------------
+# History-search tenancy scope
+# ---------------------------------------------------------------------------
+# SQL mirror of ``WorkstreamProjectVisibility`` (core.auth) — THE statement of
+# who may see a workstream's rows.  A conversation row is hidden from
+# ``:scope_user`` only when its workstream links to an EXISTING project whose
+# visibility is 'private' and the user is neither the workstream creator, the
+# project owner, nor a member.  No project link, a dangling link (project row
+# deleted), and non-private projects all stay visible — the trusted-team
+# default.  ``COALESCE(w.user_id, '')`` makes a NULL creator hide (not leak):
+# plain ``<>`` would go NULL and drop the row from the hide-subquery.  Callers
+# never pass an empty ``:scope_user`` (empty scopes to None = unscoped), so
+# the COALESCE sentinel cannot collide with a real principal.  Portable across
+# SQLite and PostgreSQL; expects the conversations table aliased ``c``.
+# ``tests/test_search_history_visibility.py`` pins parity with the Python
+# predicate — change either side only in lockstep.
+
+HISTORY_VISIBILITY_SCOPE_SQL = (
+    "AND NOT EXISTS ("
+    "    SELECT 1 FROM workstreams w"
+    "    JOIN projects p ON p.project_id = w.project_id"
+    "    WHERE w.ws_id = c.ws_id"
+    "      AND p.visibility = 'private'"
+    "      AND COALESCE(w.user_id, '') <> :scope_user"
+    "      AND p.owner_id <> :scope_user"
+    "      AND NOT EXISTS ("
+    "          SELECT 1 FROM project_members pm"
+    "          WHERE pm.project_id = w.project_id AND pm.user_id = :scope_user"
+    "      )"
+    ") "
+)
+
 
 def _is_compaction_marker(row: Any) -> bool:
     """True when a stored row is a compaction checkpoint marker (``_source`` = row index 7)."""

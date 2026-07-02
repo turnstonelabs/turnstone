@@ -4502,6 +4502,20 @@ class ChatSession:
         """
         return self._acting_user_id or self._mcp_user_id
 
+    def _history_scope_user_id(self) -> str | None:
+        """Identity that scopes conversation-history reads (recall tool,
+        ``/history``).
+
+        The acting user when one is bound — on a shared workstream the
+        search runs with the visibility of whoever is driving the turn —
+        otherwise the session owner.  ``None`` (CLI / eval / internal
+        single-user lanes) leaves history unscoped.  Deliberately no
+        admin/service bypass: the model-facing recall tool always reads as
+        a plain user, even when an admin is driving — bypass is a surface
+        property (cluster inspect), not a principal property.
+        """
+        return self._acting_user_id or self._user_id or None
+
     def bind_acting_user(self, user_id: str) -> None:
         """Bind the authenticated initiator of the current turn.
 
@@ -11862,6 +11876,11 @@ class ChatSession:
             "query": query,
             "limit": max(1, min(limit, 50)),
             "offset": max(0, offset),
+            # Pin the tenancy scope at prepare time: an item that sits in
+            # the queue must search as the user whose turn requested it,
+            # not whoever binds the session later (same discipline as
+            # ``mcp_user_id`` in ``_prepare_mcp_tool``).
+            "scope_user_id": self._history_scope_user_id(),
         }
 
     # -- skill prepare/execute -------------------------------------------------
@@ -13557,11 +13576,13 @@ class ChatSession:
         return call_id, msg
 
     def _exec_recall(self, item: dict[str, Any]) -> tuple[str, str]:
-        """Search conversation history."""
+        """Search conversation history, scoped to the prepare-time user."""
         call_id = item["call_id"]
         query, limit, offset = item["query"], item["limit"], item.get("offset", 0)
 
-        conv_rows = search_history(query, limit, offset)
+        # KeyError on a missing pin is deliberate — an unpinned item must
+        # fail loudly, not fall back to an unscoped (tenant-wide) search.
+        conv_rows = search_history(query, limit, offset, user_id=item["scope_user_id"])
         if conv_rows:
             lines = []
             for ts, sid, role, content, tool_name in conv_rows:
@@ -14399,7 +14420,7 @@ class ChatSession:
         elif cmd == "/history":
             query = arg.strip() if arg else None
             if query:
-                rows = search_history(query, limit=20)
+                rows = search_history(query, limit=20, user_id=self._history_scope_user_id())
                 if not rows:
                     self.ui.on_info(f"No results for {query!r}")
                 else:
@@ -14411,7 +14432,7 @@ class ChatSession:
                     self.ui.on_info("\n".join(lines))
             else:
                 # Show recent conversations (last 20 messages)
-                rows = search_history_recent(limit=20)
+                rows = search_history_recent(limit=20, user_id=self._history_scope_user_id())
                 if not rows:
                     self.ui.on_info("No conversation history yet.")
                 else:

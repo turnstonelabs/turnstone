@@ -777,12 +777,29 @@ class StorageBackend(Protocol):
 
     # -- Conversation search ---------------------------------------------------
 
-    def search_history(self, query: str, limit: int = 20, offset: int = 0) -> list[Any]:
-        """Search conversation history. Returns (timestamp, ws_id, role, content, tool_name)."""
+    def search_history(
+        self, query: str, limit: int = 20, offset: int = 0, *, user_id: str | None = None
+    ) -> list[Any]:
+        """Search conversation history. Returns (timestamp, ws_id, role, content, tool_name).
+
+        ``user_id`` scopes results by project tenancy: rows are dropped when
+        their workstream sits in an existing PRIVATE project and *user_id* is
+        neither the workstream creator, the project owner, nor a member.
+        Everything else — no project link, dangling link, non-private project
+        — stays visible (trusted-team default).  The SQL predicate mirrors
+        ``WorkstreamProjectVisibility`` in ``core.auth`` (THE statement of the
+        rule); ``tests/test_search_history_visibility.py`` pins the parity.
+        ``None`` (default) applies no scoping — correct only for single-user
+        lanes (local CLI); authenticated surfaces MUST pass the acting user.
+        """
         ...
 
-    def search_history_recent(self, limit: int = 20) -> list[Any]:
-        """Return most recent conversation messages."""
+    def search_history_recent(self, limit: int = 20, *, user_id: str | None = None) -> list[Any]:
+        """Return most recent conversation messages.
+
+        ``user_id`` scopes rows by project tenancy exactly as in
+        :meth:`search_history`; ``None`` applies no scoping.
+        """
         ...
 
     # -- User identity operations -----------------------------------------------

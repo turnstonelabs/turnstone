@@ -81,6 +81,9 @@ from turnstone.core.storage._utils import (
     HEURISTIC_RULE_MUTABLE as _HEURISTIC_RULE_MUTABLE,
 )
 from turnstone.core.storage._utils import (
+    HISTORY_VISIBILITY_SCOPE_SQL as _HISTORY_SCOPE_SQL,
+)
+from turnstone.core.storage._utils import (
     LIKE_ESCAPE as _LIKE_ESCAPE,
 )
 from turnstone.core.storage._utils import (
@@ -1199,11 +1202,19 @@ class PostgreSQLBackend:
 
     # -- Conversation search ---------------------------------------------------
 
-    def search_history(self, query: str, limit: int = 20, offset: int = 0) -> list[Any]:
+    def search_history(
+        self, query: str, limit: int = 20, offset: int = 0, *, user_id: str | None = None
+    ) -> list[Any]:
         if not query or not query.strip():
             return []
         capped = min(int(limit), 100)
         capped_offset = max(0, int(offset))
+        # Project-tenancy scope (see HISTORY_VISIBILITY_SCOPE_SQL): applied in
+        # SQL, not post-filtered in Python, so limit/offset pagination stays
+        # honest — a page never silently shrinks because hidden rows were
+        # fetched then dropped.
+        scope_sql = _HISTORY_SCOPE_SQL if user_id is not None else ""
+        scope_params = {"scope_user": user_id} if user_id is not None else {}
         with self._conn() as conn:
             # Use PostgreSQL full-text search if search_vector column exists
             try:
@@ -1218,7 +1229,8 @@ class PostgreSQLBackend:
                             # summary artifacts); IS DISTINCT FROM is NULL-safe so
                             # normal rows (_source NULL) are not dropped.
                             "AND c._source IS DISTINCT FROM :compaction_source "
-                            "ORDER BY ts_rank(to_tsvector('english', COALESCE(c.content, '')), "
+                            + scope_sql
+                            + "ORDER BY ts_rank(to_tsvector('english', COALESCE(c.content, '')), "
                             "   plainto_tsquery('english', :query)) DESC "
                             "LIMIT :limit OFFSET :offset"
                         ),
@@ -1227,6 +1239,7 @@ class PostgreSQLBackend:
                             "compaction_source": _COMPACTION_SOURCE,
                             "limit": capped,
                             "offset": capped_offset,
+                            **scope_params,
                         },
                     ).fetchall()
                 )
@@ -1235,32 +1248,37 @@ class PostgreSQLBackend:
                 return list(
                     conn.execute(
                         sa.text(
-                            "SELECT timestamp, ws_id, role, content, tool_name "
-                            "FROM conversations WHERE content ILIKE :pattern "
-                            "AND _source IS DISTINCT FROM :compaction_source "
-                            "ORDER BY timestamp DESC LIMIT :limit OFFSET :offset"
+                            "SELECT c.timestamp, c.ws_id, c.role, c.content, c.tool_name "
+                            "FROM conversations c WHERE c.content ILIKE :pattern "
+                            "AND c._source IS DISTINCT FROM :compaction_source "
+                            + scope_sql
+                            + "ORDER BY c.timestamp DESC LIMIT :limit OFFSET :offset"
                         ),
                         {
                             "pattern": f"%{query}%",
                             "compaction_source": _COMPACTION_SOURCE,
                             "limit": capped,
                             "offset": capped_offset,
+                            **scope_params,
                         },
                     ).fetchall()
                 )
 
-    def search_history_recent(self, limit: int = 20) -> list[Any]:
+    def search_history_recent(self, limit: int = 20, *, user_id: str | None = None) -> list[Any]:
         capped = min(limit, 100)
+        scope_sql = _HISTORY_SCOPE_SQL if user_id is not None else ""
+        scope_params = {"scope_user": user_id} if user_id is not None else {}
         with self._conn() as conn:
             return list(
                 conn.execute(
                     sa.text(
-                        "SELECT timestamp, ws_id, role, content, tool_name "
-                        "FROM conversations "
-                        "WHERE _source IS DISTINCT FROM :compaction_source "
-                        "ORDER BY timestamp DESC LIMIT :limit"
+                        "SELECT c.timestamp, c.ws_id, c.role, c.content, c.tool_name "
+                        "FROM conversations c "
+                        "WHERE c._source IS DISTINCT FROM :compaction_source "
+                        + scope_sql
+                        + "ORDER BY c.timestamp DESC LIMIT :limit"
                     ),
-                    {"limit": capped, "compaction_source": _COMPACTION_SOURCE},
+                    {"limit": capped, "compaction_source": _COMPACTION_SOURCE, **scope_params},
                 ).fetchall()
             )
 
