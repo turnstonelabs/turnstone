@@ -2103,7 +2103,10 @@ document.addEventListener("keydown", function (e) {
 // missed-ws_closed ghosts heal on the next in-stream snapshot.
 function applyRosterSnapshot(list, opts) {
   const evict = !!(opts && opts.evict);
-  const seen = {};
+  // Null-prototype membership map: a ws id that happened to collide with an
+  // Object.prototype property name would read as always-seen on a plain
+  // object and dodge eviction.
+  const seen = Object.create(null);
   (list || []).forEach(function (ws) {
     if (!ws || !ws.id) return;
     seen[ws.id] = true;
@@ -2116,7 +2119,10 @@ function applyRosterSnapshot(list, opts) {
   });
   if (evict) {
     const pm = window.TS_SHELL && window.TS_SHELL.panes;
-    for (const id in workstreams) {
+    // Stable key snapshot: mutating the roster mid-walk is well-defined for
+    // the currently-visited key, but the snapshot makes the eviction loop
+    // self-evidently order-safe and skips inherited keys.
+    for (const id of Object.keys(workstreams)) {
       if (!seen[id]) {
         // Gap recovery can retire a session the user is LOOKING at — the
         // live ws_closed (and its eviction toast) is exactly what was missed

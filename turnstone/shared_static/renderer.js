@@ -1329,12 +1329,8 @@ function _streamingRenderApply(el, buffer) {
   // Guarded: decoration failures degrade to undecorated markup, never to
   // a broken segment state upstream.
   try {
-    if (typeof postRenderHljs === "function") {
-      postRenderHljs(el);
-    }
-    if (typeof postRenderMermaid === "function") {
-      postRenderMermaid(el);
-    }
+    postRenderHljs(el);
+    postRenderMermaid(el);
   } catch (e) {
     console.warn("renderer: post-render decoration failed", e);
   }
