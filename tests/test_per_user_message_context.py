@@ -252,3 +252,38 @@ def test_shared_banner_declares_participants_and_tool_credentials():
     # single-user: unchanged simple owner line, no shared framing
     assert "- **User:** owner@x" in solo
     assert "SHARED" not in solo
+
+
+# -- workstream / project identifiers in context ------------------------------
+
+
+def test_context_surfaces_workstream_and_project_ids():
+    from turnstone.prompts import SessionContext as SC, WorkstreamKind, _build_context
+
+    out = _build_context(
+        SC(
+            current_datetime="t",
+            timezone="UTC",
+            username="owner@x",
+            project="My Project",
+            project_id="proj-123",
+            ws_id="ws-abc",
+        ),
+        WorkstreamKind.INTERACTIVE,
+    )
+    assert "- **Workstream ID:** ws-abc" in out
+    # project renders both its display name and its stable id
+    assert "My Project" in out
+    assert "proj-123" in out
+
+
+def test_context_omits_ids_when_absent():
+    from turnstone.prompts import SessionContext as SC, WorkstreamKind, _build_context
+
+    out = _build_context(
+        SC(current_datetime="t", timezone="UTC", username="owner@x"),
+        WorkstreamKind.INTERACTIVE,
+    )
+    # no ws_id line and no project line at all when neither is set
+    assert "Workstream ID" not in out
+    assert "**Project:**" not in out

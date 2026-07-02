@@ -3135,6 +3135,8 @@ class ChatSession:
                 username=self._username or self._user_id or "unknown",
                 project=self._project_name,
                 shared=self._shared_workstream,
+                ws_id=self._ws_id,
+                project_id=self._project_id,
             )
             composed = compose_system_message(
                 client_type=self._client_type,
