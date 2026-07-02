@@ -208,6 +208,16 @@ class TestRolePermissionOverrides:
         db.set_role_overrides("r1", {"approve", "model.skills.write"}, {"write"})
         assert db.get_user_permissions("u1") == {"read", "approve", "model.skills.write"}
 
+    def test_get_user_permissions_applies_persona_write_overlay(self, db):
+        # persona.write is admin-default (migration 063), but the override layer
+        # can grant it to any NON-admin builtin role — the grant must flow
+        # through get_user_permissions like any other overlay perm.
+        db.create_role("r1", "editor", "Editor", "read,write", builtin=True, org_id="")
+        db.create_user("u1", "alice", "Alice", "$2b$hash")
+        db.assign_role("u1", "r1")
+        db.set_role_overrides("r1", {"persona.write"}, set())
+        assert db.get_user_permissions("u1") == {"read", "write", "persona.write"}
+
     def test_get_user_permissions_ignores_overlay_on_custom_role(self, db):
         # Overrides only apply to builtin rows.  A custom role with stray
         # override rows (defensive case — should never happen via the API)
