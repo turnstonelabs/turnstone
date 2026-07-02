@@ -7785,6 +7785,12 @@
             "title": "Skill",
             "type": "string"
           },
+          "persona": {
+            "default": "",
+            "description": "Persona slug; resolved and snapshotted at creation, empty = kind default",
+            "title": "Persona",
+            "type": "string"
+          },
           "resume_ws": {
             "default": "",
             "description": "Workstream ID to resume (loads previous conversation)",
@@ -8111,6 +8117,12 @@
             "default": null,
             "description": "Optional skill name to apply to the coordinator session.",
             "title": "Skill"
+          },
+          "persona": {
+            "default": "",
+            "description": "Persona slug; resolved and snapshotted at creation, empty = kind default",
+            "title": "Persona",
+            "type": "string"
           },
           "initial_message": {
             "default": "",
@@ -11232,6 +11244,12 @@
             "default": true,
             "title": "Enabled",
             "type": "boolean"
+          },
+          "org_id": {
+            "default": "",
+            "description": "Owning org (informational; capped at 64)",
+            "title": "Org Id",
+            "type": "string"
           }
         },
         "required": [
@@ -11241,7 +11259,7 @@
         "type": "object"
       },
       "UpdatePersonaRequest": {
-        "description": "PATCH body \u2014 only fields present in the JSON are applied.\n\nArchive = ``{\"enabled\": false}``; default flip = ``{\"is_default\": true}``\non the successor (storage demotes the incumbent atomically).  ``name``\nis immutable; existing workstreams are never affected by edits.",
+        "description": "PATCH body \u2014 absent fields are left unchanged.\n\nExplicit ``null`` is meaningful only on the two resettable fields:\n``base_prompt: null`` clears the override back to the kind's stock\nBASE, and ``tool_allowlist: null`` resets to unrestricted.  ``null``\non the boolean flags or ``applies_to_kinds`` is ignored (treated as\nabsent), so a client serializing unset optionals as null cannot\narchive a persona or flip levers by accident.\n\nArchive = ``{\"enabled\": false}``; default flip = ``{\"is_default\": true}``\non the successor (storage demotes the incumbent atomically).  ``name``\nis immutable; existing workstreams are never affected by edits.",
         "properties": {
           "display_name": {
             "anyOf": [
@@ -11369,6 +11387,17 @@
             },
             "title": "Personas",
             "type": "array"
+          },
+          "tool_inventory": {
+            "additionalProperties": {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "description": "Per-kind builtin tool names (plus the synthetic 'tool_search') for the visibility checklist \u2014 derived server-side so clients never hand-mirror the inventory",
+            "title": "Tool Inventory",
+            "type": "object"
           }
         },
         "required": [

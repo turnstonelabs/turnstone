@@ -1,13 +1,13 @@
 # Writing a coordinator-specific skill
 
-Skills are prompt-level personas that steer a Turnstone session
+A skill is prompt-level framing that steers a Turnstone session
 toward a narrow task.  Most skills target **interactive** sessions —
 the single-workstream "do this thing" surface where the model wields
 `bash`, `edit_file`, `web_fetch`, and the rest of the maker toolset.
 
 A **coordinator skill** is different.  It runs on a session whose job
 is to orchestrate other sessions.  The toolset is smaller and
-narrower, the persona is an orchestrator instead of a maker, and the
+narrower, the role is an orchestrator instead of a maker, and the
 success metric is "did the plan resolve" instead of "did the code
 compile".  This doc covers the differences a skill author has to
 care about.
@@ -22,8 +22,8 @@ migration 044 added the column).  Three values:
 
 | `SkillKind` enum        | Stored as       | Meaning                                                                    |
 |-------------------------|-----------------|----------------------------------------------------------------------------|
-| `SkillKind.INTERACTIVE` | `"interactive"` | Authored for the interactive maker persona (single-workstream "do this"). |
-| `SkillKind.COORDINATOR` | `"coordinator"` | Authored for the orchestrator persona (delegate, monitor, synthesise).    |
+| `SkillKind.INTERACTIVE` | `"interactive"` | Authored for the interactive maker role (single-workstream "do this"). |
+| `SkillKind.COORDINATOR` | `"coordinator"` | Authored for the orchestrator role (delegate, monitor, synthesise).    |
 | `SkillKind.ANY`         | `"any"`         | Either surface (or audience-neutral).  Default on create.                 |
 
 The `kind` field is a `StrEnum` — drop-in `str` compatible — so DB
@@ -96,15 +96,15 @@ for the output.  The coordinator stays the orchestrator.
 
 ---
 
-## Persona differences
+## Framing differences
 
 Interactive skills compose on top of `base_interactive.md` — a
-"maker" persona: get the work done, use the tools, edit the code,
+"maker" framing: get the work done, use the tools, edit the code,
 close the loop.
 
 Coordinator skills compose on top of
 [`base_coordinator.md`](../turnstone/prompts/base_coordinator.md) —
-an "orchestrator" persona: decompose, delegate, monitor, synthesise.
+an "orchestrator" framing: decompose, delegate, monitor, synthesise.
 The base text is short but sets the tone every coordinator skill
 inherits:
 
@@ -339,7 +339,7 @@ For a new coordinator skill:
 A full end-to-end test isn't required for every skill; a
 prepare-step unit test that asserts "given this initial message, the
 first tool call is X with Y args" is usually sufficient to catch
-persona drift without a real LLM in the loop.
+framing drift without a real LLM in the loop.
 
 ---
 

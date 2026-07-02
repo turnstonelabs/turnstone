@@ -12,9 +12,9 @@ A persona is exactly four levers — no more:
 | Lever | What it does |
 |---|---|
 | **Base prompt** | Replaces the BASE module of the composed system message (`base.md` / `base_coordinator.md`). *Only* BASE: ENV, CONTEXT, TOOLS, and POLICIES keep composing, so mandatory [prompt policies](governance.md) ride on top of every persona. Empty = the kind's stock base. |
-| **Tool visibility** | Which tools the session advertises. Tri-state: *unrestricted* (tracks tool growth and MCP catalogs), *no tools* (the TOOLS prompt block self-suppresses and zero definitions go on the wire), or an *exact set* of names. Including `tool_search` in a set makes it **soft** — tools the model discovers through search join the visible set; omitting it makes the set **hard** (the search pathway is disabled entirely). |
+| **Tool visibility** | Which tools the session advertises. Tri-state: *unrestricted* (tracks tool growth and MCP catalogs), *no tools* (the TOOLS prompt block self-suppresses and zero definitions go on the wire), or an *exact set* of names. Including `tool_search` in a set makes it **soft** — tools the model discovers through search join the visible set; omitting it makes the set **hard** (the search pathway is disabled entirely). On commercial providers a soft set costs one prompt-cache re-prime per `tool_search` expansion, since each expansion rewrites the wire tool set and recomposes the prompt. |
 | **MCP** | Whether the workstream talks to MCP at all. **Session-wide**: off means no MCP tools for the persona's own hands *or* for in-process task agents, no resource/prompt catalogs, and no listener registrations. This lever expresses infrastructure intent, not behavior shaping. |
-| **Memory** | Whether the persona's **own hands** get memory: recalled-memory injection into the prompt, memory-directed metacognitive nudges, and the `memory` tool. Task agents keep their own envelope, and compaction spill/markers are session mechanics that are never persona-gated. |
+| **Memory** | Whether the persona's **own hands** get memory: recalled-memory injection into the prompt, memory-directed metacognitive nudges, and the `memory` tool. Task agents keep their own envelope, and compaction spill/markers are session mechanics that are never persona-gated. An exact tool set that hides `memory` also mutes those nudges, and the compaction-resume pointer follows `recall`'s visibility. |
 
 Visibility is behavior shaping, **not** a security boundary: any tool call
 that does reach the wire still clears the same approval, judge, and policy
@@ -29,6 +29,12 @@ reads only the stamp:
 
 - **Editing or archiving a persona never changes an existing workstream.**
   Rehydrate, resume, and post-compaction resume all run from the stamp.
+  A mid-session REPL `/resume` adopts the target workstream's stamp for
+  prompt, tools, and memory; for the MCP lever it can only narrow in
+  place — adopting an MCP-off stamp drops the live MCP surface, while
+  adopting an MCP-on stamp into a session whose persona dropped MCP at
+  construction is refused with an error telling you to reopen the
+  workstream fresh.
 - A workstream outlives its persona — an archived persona keeps labelling
   the workstreams stamped with it.
 - A partial or unparseable stamp is treated as corruption: session
@@ -36,7 +42,10 @@ reads only the stamp:
   envelope the operator never chose.
 - Workstreams created before personas existed carry no stamp and keep
   legacy behavior, byte-identical to the `engineer` / `orchestrator`
-  defaults below.
+  defaults below — with one exception: pre-1.7 workstreams that had
+  `creative_mode` set are converted by migration `063` into full
+  `writer` stamps, so they resume as writing sessions rather than as
+  legacy defaults.
 - Forking (`resume_ws` on create) resumes the source's stamped persona; the
   fork does not re-resolve.
 
@@ -53,7 +62,7 @@ personas existed:
 | `scribe` | interactive | custom (faithful structuring of given material) | none | off | off |
 | `researcher` | interactive | custom (evidence-first, read-only) | `read_file`, `search`, `web_fetch`, `web_search`, `recall`, `memory` (hard) | off | on |
 | `writer` | interactive | custom (creative writing partner — replaces the removed `/creative`) | none | off | on |
-| `executive` | coordinator | custom (delegate, interrogate plans, judge outcomes) | 10 delegation/inspection tools (hard) | off | on |
+| `executive` | coordinator | custom (delegate, interrogate plans, judge outcomes) | spawn/inspect/lifecycle tools plus `memory`: `spawn_workstream`, `spawn_batch`, `send_to_workstream`, `wait_for_workstream`, `inspect_workstream`, `list_workstreams`, `list_nodes`, `close_workstream`, `cancel_workstream`, `memory` (hard) | off | on |
 
 Notes:
 
@@ -82,7 +91,8 @@ seeded):
   startup. `--resume` ignores `--persona` and adopts the resumed
   workstream's stamp.
 - **Coordinator spawn**: `spawn_workstream` / `spawn_batch` take a
-  `persona` argument, validated at prep time (children are always
+  `persona` argument, validated when the coordinator prepares the spawn
+  and re-checked by the node that creates the child (children are always
   interactive-kind). Omitted means the interactive **default** — a child
   never inherits its parent coordinator's persona. Sub-agents spawned via
   `task_agent` have no persona parameter at all; they keep their own
@@ -91,7 +101,7 @@ seeded):
 ## Authoring (console)
 
 Personas are managed in the console's **Manage → Governance → Personas**
-tab. The Service Hatch shelf exposes exactly the four levers plus the kind
+tab. The admin shelf exposes exactly the four levers plus the kind
 list, the default marker, and archive. Rules:
 
 - `name` is an immutable lowercase slug; edit `display_name` instead.

@@ -109,10 +109,11 @@ workstreams = sa.Table(
     # constraint (this schema family declares none — see migration 058).
     # Added in migration 062.
     sa.Column("project_id", sa.Text, nullable=True),
-    # persona: display name of the persona the workstream was created with
-    # (NULL = pre-persona workstream).  Display/forensics only — the full
-    # persona snapshot lives in workstream_config; nothing reads this column
-    # to build a session.  Added in migration 063.
+    # persona: SLUG of the persona the workstream was created with (NULL =
+    # pre-persona workstream) — personas.name, not display_name; clients
+    # resolve the display label.  Display/forensics only — the full persona
+    # snapshot lives in workstream_config; nothing reads this column to
+    # build a session.  Added in migration 063.
     sa.Column("persona", sa.Text, nullable=True),
     sa.Column("created", sa.Text, nullable=False),
     sa.Column("updated", sa.Text, nullable=False),

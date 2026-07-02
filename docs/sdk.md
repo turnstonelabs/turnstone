@@ -69,7 +69,7 @@ Both `TurnstoneServer` (sync) and `AsyncTurnstoneServer` (async) expose:
 |----------|--------|---------|
 | **Workstreams** | `list_workstreams()` | `ListWorkstreamsResponse` |
 | | `dashboard()` | `DashboardResponse` |
-| | `create_workstream(*, name, model, auto_approve, skill, initial_message, attachments)` | `CreateWorkstreamResponse` |
+| | `create_workstream(*, name, model, auto_approve, skill, persona, initial_message, attachments)` | `CreateWorkstreamResponse` |
 | | `close_workstream(ws_id)` | `StatusResponse` |
 | **Attachments** | `upload_attachment(ws_id, filename, data, *, mime_type=...)` | `UploadAttachmentResponse` |
 | | `list_attachments(ws_id)` | `ListAttachmentsResponse` |
@@ -100,7 +100,7 @@ Both `TurnstoneConsole` (sync) and `AsyncTurnstoneConsole` (async) expose:
 | | `workstreams(*, state, node, search, sort, page, per_page)` | `ClusterWorkstreamsResponse` |
 | | `node_detail(node_id)` | `NodeDetailResponse` |
 | | `snapshot()` | `ClusterSnapshotResponse` |
-| | `create_workstream(*, node_id, name, model, initial_message, skill)` | `ConsoleCreateWsResponse` |
+| | `create_workstream(*, node_id, name, model, initial_message, skill, persona)` | `ConsoleCreateWsResponse` |
 | **Schedules** | `list_schedules()` | `ListSchedulesResponse` |
 | | `create_schedule(*, name, schedule_type, initial_message, ...)` | `ScheduleInfo` |
 | | `get_schedule(task_id)` | `ScheduleInfo` |

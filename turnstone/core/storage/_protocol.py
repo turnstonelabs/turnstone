@@ -413,12 +413,15 @@ class StorageBackend(Protocol):
 
         Returns rows of ``(ws_id, alias, title, name, created, updated,
         message_count, node_id, state, kind, model_alias, launch_skill,
-        child_count, context_tokens, context_window)`` ordered by updated
-        DESC.  The trailing enrichment columns feed the saved-list DTO:
-        ``model_alias`` / ``launch_skill`` come from ``workstream_config``;
-        ``context_tokens`` is the most recent ``usage_events`` prompt size
-        and ``context_window`` the model's window (the caller divides them
-        for the occupancy ratio); ``child_count`` counts child workstreams.
+        child_count, context_tokens, context_window, project_id, user_id,
+        persona)`` ordered by updated DESC.  The trailing enrichment columns
+        feed the saved-list DTO: ``model_alias`` / ``launch_skill`` come
+        from ``workstream_config``; ``context_tokens`` is the most recent
+        ``usage_events`` prompt size and ``context_window`` the model's
+        window (the caller divides them for the occupancy ratio);
+        ``child_count`` counts child workstreams.  New columns MUST keep
+        appending at the tail — a full-arity unpack in session_routes
+        consumes this exact tuple.
         """
         ...
 
@@ -765,9 +768,10 @@ class StorageBackend(Protocol):
         Returns a list of SQLAlchemy ``Row`` objects.  **Prefer dict access
         via ``row._mapping[<col>]``**; positional indexing is brittle against
         future SELECT reorders and against new columns appearing in the
-        tail (the select currently ends with ``user_id, title, alias`` —
-        ``title``/``alias`` were appended after ``user_id`` so existing
-        positional fallbacks that index up to row[9] stay valid).
+        tail (the select currently ends with ``user_id, title, alias,
+        project_id, persona`` — appended in that order, so positional
+        fallbacks that index up to row[9] stay valid; new columns MUST
+        keep appending at the tail).
         """
         ...
 
@@ -2421,11 +2425,17 @@ class StorageBackend(Protocol):
     def create_persona(self, persona: dict[str, Any]) -> None:
         """Create a persona.  Requires ``persona_id`` and ``name``; accepts the
         Python-typed dict shape above (JSON serialization is internal).
-        Raises ValueError on duplicate name or invalid ``applies_to_kinds``."""
+        Raises ValueError on: missing ``persona_id``/``name``, duplicate
+        name, invalid ``applies_to_kinds``, oversized fields (caps live in
+        ``_utils.serialize_persona_fields``), or an ``is_default`` persona
+        that is multi-kind or disabled."""
         ...
 
     def update_persona(self, persona_id: str, **fields: Any) -> bool:
-        """Update PERSONA_MUTABLE fields.  Returns True if the persona exists.
+        """Update PERSONA_MUTABLE fields.  Returns True only when the persona
+        exists AND at least one mutable field was supplied — a no-op call on
+        a real row returns False (check existence separately if you need to
+        distinguish "not found" from "nothing to update").
 
         Invariants (raise ValueError): a default persona cannot be archived,
         cannot drop its ``is_default`` flag directly (flip the flag on the

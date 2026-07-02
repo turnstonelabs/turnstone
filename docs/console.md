@@ -379,6 +379,7 @@ Breadcrumb: `Cluster > Running` or `Cluster > db-west-04`. Server-side paginated
 Triggered by the "+ new" header button. A modal dialog with:
 
 - **Node selector** — dropdown with three targeting modes: "Auto (best available)" picks the node with the most headroom, "General pool (any node)" picks a node with available capacity using round-robin, or a specific node from the list (showing capacity).
+- **Persona** — optional dropdown listing the enabled personas for the workstream kind. Sets the system-message composition and capability envelope at creation, snapshotted server-side; empty uses the kind's default. Picking one requires no `persona.*` permission.
 - **Profile** — optional dropdown listing enabled skills. Applies the skill's model, auto-approve policy, token budget, and other behavioral settings at creation time.
 - **Name** — optional text input. Auto-generated if left empty.
 - **Model** — optional text input for a model alias from the target node's registry.
@@ -396,9 +397,9 @@ The browser maintains a local `clusterState` object that mirrors the cluster sna
 
 Accessed via the "admin" button in the header (visible when authenticated
 with `approve` scope). Provides user, API token, channel link, MCP server,
-and skill management with 18 tabs (Users, API Tokens, Channels, Schedules,
-Watches, Roles, Policies, Prompts, Judge, Skills, MCP Servers, Usage,
-Audit, Memories, Models, Nodes, Settings, TLS).  See also
+and skill management with tabs that include Users, API Tokens, Channels,
+Schedules, Watches, Personas, Roles, Policies, Prompts, Judge, Skills,
+MCP Servers, Usage, Audit, Memories, Models, Nodes, Settings, and TLS.  See also
 [Governance](governance.md) for the Roles, Policies, Skills, Usage, and
 Audit tabs, and [Settings](settings.md) for the database-backed
 configuration editor.

@@ -147,6 +147,10 @@ class ConsoleCreateWsRequest(BaseModel):
         default="", description="Optional first message sent after creation"
     )
     skill: str = Field(default="", description="Skill name (replaces default skills)")
+    persona: str = Field(
+        default="",
+        description="Persona slug; resolved and snapshotted at creation, empty = kind default",
+    )
     resume_ws: str = Field(
         default="", description="Workstream ID to resume (loads previous conversation)"
     )
@@ -1085,10 +1089,18 @@ class CreatePersonaRequest(BaseModel):
     applies_to_kinds: list[str] = Field(default_factory=lambda: ["interactive"])
     is_default: bool = False
     enabled: bool = True
+    org_id: str = Field(default="", description="Owning org (informational; capped at 64)")
 
 
 class UpdatePersonaRequest(BaseModel):
-    """PATCH body — only fields present in the JSON are applied.
+    """PATCH body — absent fields are left unchanged.
+
+    Explicit ``null`` is meaningful only on the two resettable fields:
+    ``base_prompt: null`` clears the override back to the kind's stock
+    BASE, and ``tool_allowlist: null`` resets to unrestricted.  ``null``
+    on the boolean flags or ``applies_to_kinds`` is ignored (treated as
+    absent), so a client serializing unset optionals as null cannot
+    archive a persona or flip levers by accident.
 
     Archive = ``{"enabled": false}``; default flip = ``{"is_default": true}``
     on the successor (storage demotes the incumbent atomically).  ``name``
@@ -1108,6 +1120,14 @@ class UpdatePersonaRequest(BaseModel):
 
 class ListPersonasResponse(BaseModel):
     personas: list[PersonaInfo]
+    tool_inventory: dict[str, list[str]] = Field(
+        default_factory=dict,
+        description=(
+            "Per-kind builtin tool names (plus the synthetic 'tool_search') "
+            "for the visibility checklist — derived server-side so clients "
+            "never hand-mirror the inventory"
+        ),
+    )
 
 
 class ModelReloadResponse(BaseModel):
@@ -1242,6 +1262,10 @@ class CoordinatorCreateRequest(BaseModel):
     skill: str | None = Field(
         default=None,
         description="Optional skill name to apply to the coordinator session.",
+    )
+    persona: str = Field(
+        default="",
+        description="Persona slug; resolved and snapshotted at creation, empty = kind default",
     )
     initial_message: str = Field(
         default="",

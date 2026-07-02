@@ -13,9 +13,9 @@ stable, and the experimental line:
 - **`stable/1.6`** — patch-only (`v1.6.x`)
 - **`main`** — experimental (next major)
 
-## [Unreleased — 1.7]
+## [Unreleased]
 
-### Personas
+### Added
 
 - **Personas** (#683) — a named, reusable bundle attached to a workstream
   at creation, controlling system-message composition and the capability
@@ -31,13 +31,19 @@ stable, and the experimental line:
   `turnstone --persona <name>`); authored in the console's new
   Governance → Personas tab (`persona.{create,read,write}` perms,
   archive-only lifecycle). See `docs/personas.md`.
-- **BREAKING: `/creative` removed.** The REPL toggle (and its tab
+
+### Removed
+
+- **`/creative` removed** *(BREAKING)* — the REPL toggle (and its tab
   completion) is gone; the `writer` seed persona replaces it — start a
   session with `turnstone --persona writer` or pick *Writer* in the web
   pickers. Unlike the old fork, the writer persona composes the full
   system message, so session context and mandatory prompt policies now
   apply to prose-only sessions too. The `creative_mode` key in
-  `workstream_config` is no longer read or written.
+  `workstream_config` is no longer read or written. Migration `063`
+  converts existing creative-mode workstreams to the `writer` persona
+  automatically, so they resume as writing sessions rather than as
+  legacy defaults.
 
 ## [1.6.0]
 

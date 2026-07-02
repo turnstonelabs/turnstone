@@ -366,7 +366,7 @@ deleted.
 ## Further reading
 
 - [coordinator-skills.md](coordinator-skills.md) — writing a skill
-  that runs on a coordinator session (orchestrator persona,
+  that runs on a coordinator session (orchestrator framing,
   workflow patterns, `SkillKind` classifier).
 - [bulk-endpoints.md](bulk-endpoints.md) — the two bulk-shape
   idioms (`{results, denied, truncated}` vs

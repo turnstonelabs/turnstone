@@ -75,6 +75,11 @@ This means the model always has its most relevant memories available without
 explicit recall -- but can still use `memory(action='search')` for deeper
 lookup.
 
+The persona memory lever gates this pathway: a workstream whose persona
+turns memory off receives no relevance injection at all -- the steps
+above run only when memory is enabled for the session. See
+[Personas](personas.md).
+
 ### Nudges
 
 The metacognition layer can nudge the model to save memories at appropriate

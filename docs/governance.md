@@ -13,7 +13,7 @@ The permission model has two layers:
 
 1. **Scopes** (legacy) — `read`, `write`, `approve`. Checked by `AuthMiddleware`
    on every request based on URL path classification.
-2. **Permissions** (granular) — 15 permission strings checked per-endpoint by
+2. **Permissions** (granular) — named permission strings checked per-endpoint by
    `require_permission()`.
 
 **Built-in roles** (seeded by migration 008):
@@ -24,7 +24,11 @@ The permission model has two layers:
 | operator | read, write, workstreams.create, workstreams.close |
 | viewer | read |
 
-Custom roles can be created with any subset of the 15 valid permissions.
+Custom roles can be created with any subset of the valid permissions.
+The `persona.create` / `persona.read` / `persona.write` family gates
+persona administration; migration `063` seeds all three onto
+`builtin-admin`, and any role can be granted them through the standard
+role and permission-override editors.
 
 **Auth flow:**
 1. User logs in (password or API token) → `_load_user_permissions()` aggregates
@@ -177,6 +181,7 @@ All under `/v1/api/admin/` (requires `approve` scope + granular permission).
 | Orgs | 3 (list, get, update) | `admin.orgs` |
 | Tool Policies | 4 (CRUD) | `admin.policies` |
 | Skills | 4 (CRUD) | `admin.skills` |
+| Personas | 4 (list, create, get, edit/archive) | `persona.read` / `persona.create` / `persona.write` |
 | Schedules | 6 (CRUD + runs) | `admin.schedules` |
 | Watches | 3 (list, create, cancel) | `admin.watches` |
 | Usage | 1 (aggregated query) | `admin.usage` |
@@ -222,7 +227,7 @@ Both Python and TypeScript console SDKs expose governance methods:
 - **Privilege escalation prevented**: `admin_assign_role` blocks self-assignment
   and requires caller to hold a superset of the target role's permissions
 - **Permission validation**: Role create/update validates permissions against
-  a 15-item allowlist (`_VALID_PERMISSIONS`)
+  the permission allowlist (`_VALID_PERMISSIONS`)
 - **Self-deletion blocked**: `admin_delete_user` rejects attempts to delete
   your own account (matching the self-assignment guard on role endpoints)
 - **Field allowlists**: Storage `update_*` methods filter fields against

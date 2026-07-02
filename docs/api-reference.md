@@ -698,6 +698,42 @@ Each skill summary:
 
 ---
 
+### `GET /v1/api/personas`
+
+Returns the enabled personas offered by the workstream-creation pickers.
+Authenticated for any logged-in user and deliberately gated by **no**
+`persona.*` permission — selecting a persona at creation is a user
+action, while the `persona.*` perms gate authoring. Display fields only;
+the levers (base prompt, tool set, MCP/memory toggles) stay server-side.
+
+**Response:**
+
+```json
+{
+  "personas": [
+    {"name": "engineer", "display_name": "Engineer", "description": "The stock interactive workstream: full tools, MCP, and memory.", "applies_to_kinds": ["interactive"], "is_default": true},
+    {"name": "researcher", "display_name": "Researcher", "description": "Answers questions with evidence, read-only. Never modifies anything.", "applies_to_kinds": ["interactive"], "is_default": false}
+  ],
+  "total": 2
+}
+```
+
+Each persona summary:
+
+| Field              | Type   | Description                                                      |
+|--------------------|--------|------------------------------------------------------------------|
+| `name`             | string | Persona slug (used in the `persona` field on workstream creation) |
+| `display_name`     | string | Human-readable label for pickers                                 |
+| `description`      | string | Short description of the persona's intent                        |
+| `applies_to_kinds` | array  | Workstream kinds the persona applies to (`interactive` / `coordinator`) |
+| `is_default`       | bool   | Whether this is the default persona for its kind                 |
+
+> **Note:** For full persona management (create, edit, archive), use the
+> admin endpoints at `/v1/api/admin/personas` (requires the
+> `persona.{create,read,write}` permissions).
+
+---
+
 ### `POST /v1/api/workstreams/{ws_id}/send`
 
 Sends a user message to a workstream. Spawns a daemon worker thread that calls
@@ -895,6 +931,7 @@ All fields are optional. The body can be empty or an empty JSON object.
 | `auto_approve`   | bool   | false   | Auto-approve all tool calls for this workstream                |
 | `resume_ws`      | string | ""      | Workstream ID to resume atomically during creation (empty = fresh)|
 | `skill`          | string | ""      | Skill name. Applies content (system prompt), model, temperature, reasoning effort, max tokens, auto-approve policy, token budget, and other session config from the skill. Returns 400 if not found or disabled. Ignored when `resume_ws` is set (resumed sessions restore their own skill). |
+| `persona`        | string | ""      | Persona slug. Resolved and snapshotted into the workstream at creation; empty selects the kind's default. |
 | `judge_model`    | string | ""      | Optional model alias for the judge (overrides default judge model for this workstream) |
 
 > **Skill behavior:** When `skill` is specified, the skill's content is injected as a system message and its session config fields (model, temperature, auto-approve, token budget, etc.) override system defaults for the new workstream.

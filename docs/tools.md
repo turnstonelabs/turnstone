@@ -580,6 +580,11 @@ Tool search uses the best available mechanism for each provider:
    `_exec_tool_search()` runs a pure-Python BM25 index over tool names and
    descriptions, then expands the matched tools into the visible set.
 
+A persona with a tool-visibility set overrides this selection: any exact
+set forces tool search into the client-side BM25 mechanism (tier 3)
+regardless of provider, and a **hard** set — one whose visible tools omit
+`tool_search` — disables tool search entirely.
+
 ### Configuration
 
 Tool search is configured in `config.toml` under the `[tools]` section:
