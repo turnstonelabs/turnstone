@@ -345,3 +345,68 @@ def test_per_token_hot_path_avoids_container_scans() -> None:
     assert "ResizeObserver" in body
     for helper in ("_toolRow(callId) {", "_streamEl(callId) {"):
         assert helper in body, f"missing lookup-cache helper: {helper!r}"
+
+
+_INTERACTIVE_CSS = _ROOT / "turnstone/shared_static/interactive.css"
+_UI_STYLE_CSS = _ROOT / "turnstone/ui/static/style.css"
+
+
+def test_transcript_scroller_is_block_flow_with_containment() -> None:
+    """P2 (perf audit): the messages scroller is BLOCK flow — a column
+    flexbox relayouts every row when the streaming row's height changes,
+    O(rows) per token — with native scroll anchoring disabled (the pane owns
+    bottom pinning, and the browser's anchor node lives inside the
+    innerHTML-replaced live bubble).  Off-screen rows carry
+    content-visibility:auto with `auto`-keyword intrinsic sizing; the live
+    tail (last two children) is exempt so the streaming bubble never toggles
+    skip-state mid-stream."""
+    css = _INTERACTIVE_CSS.read_text(encoding="utf-8")
+    rule = css.index(".pane--embedded .pane-messages {")
+    body = css[rule : css.index("}", rule)]
+    assert "display: flex" not in body, "scroller must be block flow"
+    assert "overflow-anchor: none" in body
+    assert ".pane--embedded .pane-messages > * + *" in css, (
+        "inter-row rhythm must come from sibling margins, not flex gap"
+    )
+    assert "content-visibility: auto" in css
+    assert "contain-intrinsic-size: auto" in css
+    assert ":nth-last-child(-n + 2)" in css, "live tail must be exempt"
+    ui = _UI_STYLE_CSS.read_text(encoding="utf-8")
+    ui_rule = ui.index(".pane-messages {")
+    ui_body = ui[ui_rule : ui.index("}", ui_rule)]
+    assert "display: flex" not in ui_body, "ui/static duplicate must match"
+    assert "overflow-anchor: none" in ui_body
+
+
+def test_transcript_is_windowed_with_pager() -> None:
+    """P2 (perf audit): full re-renders paint only the most recent
+    _HISTORY_WINDOW_STEP messages, cut FORWARD to a user-turn boundary so an
+    assistant tool_calls message is never split from the tool results that
+    anchor to it; hidden content sits behind the .msg-history-pager button
+    (click grows the window and refetches with a scroll-anchor restore).
+    Live appends are bounded at the idle edge by _LIVE_ROW_CAP, trimming
+    only while pinned (a scrolled-up user is reading the rows a trim would
+    remove) and sweeping detached agent-card entries."""
+    body = _INTERACTIVE.read_text(encoding="utf-8")
+    assert "const _HISTORY_WINDOW_STEP = 300;" in body
+    assert "const _LIVE_ROW_CAP = 900;" in body
+    replay = body.index("replayHistory(messages) {")
+    seg = body[replay : replay + 4200]
+    assert 'messages[start].role !== "user"' in seg, (
+        "the window cut must land on a user-turn boundary"
+    )
+    assert "_addHistoryPager" in seg
+    assert "for (let i = start; i < messages.length; i++)" in seg
+    assert 'pager.className = "msg-history-pager";' in body
+    assert "this._historyWindow += _HISTORY_WINDOW_STEP;" in body
+    trim = body.index("_trimLiveTranscript() {")
+    trim_seg = body[trim : trim + 2600]
+    assert "if (!this._nearBottom) return;" in trim_seg, (
+        "live trim must only run while pinned to the bottom"
+    )
+    assert "card.wrap.isConnected" in trim_seg, "live trim must sweep detached agent-card entries"
+    # Rewind/edit turn math is tail-relative (counts user rows at-or-AFTER
+    # the clicked one), which is what makes hiding EARLIER rows safe — pin
+    # the tail-relative form so a refactor to absolute indexing fails here
+    # and gets re-checked against windowing.
+    assert body.count("userMsgs.length - idx") >= 2

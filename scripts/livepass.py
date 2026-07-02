@@ -1267,6 +1267,12 @@ PERF_TEMPLATE = """<!doctype html>
       let phase = "mount";
       try {
         const pane = new InteractivePane("perf-ws");
+        // ?window= overrides the pane's transcript window (message count),
+        // e.g. ?window=100000 disables windowing to isolate the
+        // content-visibility/block-flow effect from the windowing effect.
+        // Default (0) measures shipped behavior.
+        const WINDOW = parseInt(q.get("window") || "0", 10);
+        if (WINDOW > 0) pane._historyWindow = WINDOW;
         document.getElementById("mount").appendChild(pane.el);
         const msgs = buildHistory(N);
         report.heap_start = heapBytes();
@@ -1576,7 +1582,14 @@ def _await_report(
 
 
 def _perf_run_one(
-    chrome: str, out: Path, port: int, store: _PerfStore, n: int, turns: int, timeout: float
+    chrome: str,
+    out: Path,
+    port: int,
+    store: _PerfStore,
+    n: int,
+    turns: int,
+    timeout: float,
+    extra_query: str = "",
 ) -> dict[str, object] | None:
     """One headless-Chrome perf pass; returns the page's report or None."""
     base_flags = [
@@ -1602,6 +1615,8 @@ def _perf_run_one(
         url = (
             f"http://127.0.0.1:{port}/perf/livepass.html?n={n}&turns={turns}&post=1&run={run_token}"
         )
+        if extra_query:
+            url += "&" + extra_query.lstrip("&")
         store.event.clear()
         store.data = None
         profile = out / f".chrome-perf-{n}"
@@ -1624,7 +1639,9 @@ def _perf_run_one(
     return None
 
 
-def run_perf(out: Path, sizes: list[int], turns: int, timeout: float) -> bool:
+def run_perf(
+    out: Path, sizes: list[int], turns: int, timeout: float, extra_query: str = ""
+) -> bool:
     """Build, serve, and run the perf page once per history size; print a table."""
     import functools
     import threading
@@ -1644,7 +1661,7 @@ def run_perf(out: Path, sizes: list[int], turns: int, timeout: float) -> bool:
     try:
         for n in sizes:
             print(f"perf: n={n} turns={turns} … ", end="", flush=True)
-            report = _perf_run_one(chrome, out, port, store, n, turns, timeout)
+            report = _perf_run_one(chrome, out, port, store, n, turns, timeout, extra_query)
             if report is None:
                 print("FAILED (no report — timeout or chrome startup failure)")
                 continue
@@ -1721,11 +1738,20 @@ def main() -> None:
     )
     ap.add_argument("--perf-turns", type=int, default=20)
     ap.add_argument("--perf-timeout", type=float, default=420.0)
+    ap.add_argument(
+        "--perf-extra",
+        default="",
+        help="extra query params for the perf page (e.g. 'window=100000' to disable windowing)",
+    )
     args = ap.parse_args()
     build(args.out)
     if args.perf:
         sizes = [int(s) for s in str(args.perf_n).split(",") if s.strip()]
-        raise SystemExit(0 if run_perf(args.out, sizes, args.perf_turns, args.perf_timeout) else 1)
+        raise SystemExit(
+            0
+            if run_perf(args.out, sizes, args.perf_turns, args.perf_timeout, args.perf_extra)
+            else 1
+        )
     if args.serve:
         import functools
 

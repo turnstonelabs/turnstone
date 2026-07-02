@@ -69,6 +69,17 @@ const _AGENT_ORPHAN_CAP = 256;
 // The ordering race the buffer targets resolves within a frame, far inside it.
 const _AGENT_ORPHAN_GRACE_MS = 500;
 
+// Transcript window: a full re-render paints only the most recent
+// _HISTORY_WINDOW_STEP messages (cut forward to a turn boundary) behind a
+// "load earlier" pager; each pager click grows the window by another step
+// and re-fetches.  Live appends are bounded separately: once the rendered
+// row count passes _LIVE_ROW_CAP, the idle-edge trim removes the oldest
+// rows (again to a turn boundary) — trimmed content stays in /history and
+// comes back through the pager.  ~3 rows per message keeps the two caps in
+// the same ballpark.
+const _HISTORY_WINDOW_STEP = 300;
+const _LIVE_ROW_CAP = 900;
+
 function getVoiceRoles(base) {
   base = base || "";
   if (!_voiceRolesPromises[base]) {
@@ -223,6 +234,14 @@ class Pane {
     // Set when replay_truncated arrives mid-stream (refetching then would
     // detach the live bubble); consumed on the next idle edge.
     this._pendingTruncatedResync = false;
+    // Transcript window (messages rendered per replay) — grows by
+    // _HISTORY_WINDOW_STEP per pager click, resets on ws (re)assignment.
+    // _hiddenEarlier counts the messages above the window after a replay;
+    // the approx flag marks live-trim hides, whose message count is unknown
+    // (rows ≠ messages), so the pager label drops the number.
+    this._historyWindow = _HISTORY_WINDOW_STEP;
+    this._hiddenEarlier = 0;
+    this._hiddenEarlierApprox = false;
     this._cancelTimeout = null;
     this._forceTimeout = null;
     this._pendingEditSend = null;
@@ -1048,6 +1067,9 @@ class Pane {
     this._replayQueue = null;
     this._clearAgentTracking();
     this._pendingTruncatedResync = false;
+    this._historyWindow = _HISTORY_WINDOW_STEP;
+    this._hiddenEarlier = 0;
+    this._hiddenEarlierApprox = false;
     // Generation token — a slow refetch (e.g. a large resumed session) must
     // not render its history, reconnect its stream, or fire its resend after
     // the pane has switched to another ws. Newest load wins; older ones drop.
@@ -1152,6 +1174,96 @@ class Pane {
         this.handleEvent(evt);
       } catch (err) {
         console.error("interactive: queued event replay failed", err);
+      }
+    }
+  }
+
+  _historyPagerLabel() {
+    return this._hiddenEarlierApprox || !this._hiddenEarlier
+      ? "Load earlier messages"
+      : "Load earlier messages (" + this._hiddenEarlier + " hidden)";
+  }
+
+  _addHistoryPager(beforeEl) {
+    const pager = document.createElement("button");
+    pager.type = "button";
+    pager.className = "msg-history-pager";
+    pager.textContent = this._historyPagerLabel();
+    pager.addEventListener("click", () => this._loadEarlierHistory());
+    if (beforeEl) this.messagesEl.insertBefore(pager, beforeEl);
+    else this.messagesEl.appendChild(pager);
+  }
+
+  _loadEarlierHistory() {
+    // Grow the window one step and re-render from REST, restoring the scroll
+    // anchor so the rows the user was looking at stay put under the newly
+    // prepended content (scrollHeight-delta restore; content-visibility's
+    // `auto` intrinsic sizing keeps the delta close enough for a pager
+    // click).  The pin scheduled by replayHistory's trailing scrollToBottom
+    // is non-forced and re-checks _nearBottom at fire time, so it skips
+    // while we're mid-transcript — no suppression needed.  Disabled while
+    // busy: an in-flight turn's refetch takes the cursor/omit path, and the
+    // pager's job (older content) can wait for the idle edge.
+    if (this.busy) return;
+    this._historyWindow += _HISTORY_WINDOW_STEP;
+    const token = this._historyLoadToken;
+    const prevScrollHeight = this.messagesEl.scrollHeight;
+    const prevScrollTop = this.messagesEl.scrollTop;
+    this._beginReplayQuiesce(token);
+    this._refetchHistory(this.wsId, token).finally(() => {
+      if (token !== this._historyLoadToken) return;
+      this.messagesEl.scrollTop =
+        this.messagesEl.scrollHeight - prevScrollHeight + prevScrollTop;
+    });
+  }
+
+  _trimLiveTranscript() {
+    // Idle-edge live-append bound: past _LIVE_ROW_CAP rendered rows, drop the
+    // oldest (extending to the next user turn so a turn is never split) and
+    // surface the pager — the content stays in /history.  Only while pinned:
+    // trimming shifts content, and a user scrolled up is READING the rows
+    // this would remove.  Runs at the idle edge, where no streaming refs or
+    // pending approval can point at the trimmed range.
+    if (!this._nearBottom) return;
+    let excess = this.messagesEl.childElementCount - _LIVE_ROW_CAP;
+    if (excess <= 0) return;
+    let node = this.messagesEl.firstElementChild;
+    if (node && node.classList.contains("msg-history-pager")) {
+      node = node.nextElementSibling;
+    }
+    let removed = 0;
+    const hardStop = excess + 200; // bound the boundary walk
+    while (node && removed < excess) {
+      const next = node.nextElementSibling;
+      node.remove();
+      removed++;
+      node = next;
+    }
+    while (
+      node &&
+      removed < hardStop &&
+      !(node.classList.contains("msg") && node.classList.contains("user"))
+    ) {
+      const next = node.nextElementSibling;
+      node.remove();
+      removed++;
+      node = next;
+    }
+    if (!removed) return;
+    // Message-count for the trimmed rows is unknown (rows ≠ messages) — the
+    // pager label drops its number until the next windowed replay.
+    this._hiddenEarlierApprox = true;
+    const first = this.messagesEl.firstElementChild;
+    if (first && first.classList.contains("msg-history-pager")) {
+      first.textContent = this._historyPagerLabel();
+    } else {
+      this._addHistoryPager(first);
+    }
+    // Agent cards inside the trimmed range are now detached; the Map isn't
+    // self-healing (unlike _toolRowIndex/_streamElIndex), so sweep it.
+    if (this._agentCards) {
+      for (const [key, card] of this._agentCards) {
+        if (!card.wrap.isConnected) this._agentCards.delete(key);
       }
     }
   }
@@ -1355,6 +1467,9 @@ class Pane {
             this._beginReplayQuiesce(rsToken);
             this._refetchHistory(this.wsId, rsToken);
           }
+          // Live-append bound — see _trimLiveTranscript.  The idle edge is
+          // the safe trim point: no streaming refs, no pending approval.
+          this._trimLiveTranscript();
           // Only steal focus if this is the active pane and no approval pending.
           if (this._host.isFocused(this) && !this.pendingApproval) {
             this.inputEl.focus();
@@ -2276,8 +2391,26 @@ class Pane {
     // branch can flip the card's done/error state from the task's own result
     // (mirroring the live appendToolOutput), not from sub-step errors.
     const agentCardWraps = {};
+    // Transcript window: render only the most recent _historyWindow messages.
+    // The cut walks FORWARD to the next user turn so it can never split an
+    // assistant tool_calls message from the tool results that anchor to it
+    // via lastToolBlock (both anchors reset at user messages).  Rewind/edit
+    // stay correct under the window: their turn math counts user rows at-or-
+    // AFTER the clicked one, and the window only hides earlier rows.  No
+    // boundary in the tail (pathological) ⇒ render everything.
+    let start = 0;
+    if (messages.length > this._historyWindow) {
+      start = messages.length - this._historyWindow;
+      while (start < messages.length && messages[start].role !== "user") {
+        start++;
+      }
+      if (start >= messages.length) start = 0;
+    }
+    this._hiddenEarlier = start;
+    this._hiddenEarlierApprox = false;
+    if (start > 0) this._addHistoryPager();
     let lastToolBlock = null;
-    for (let i = 0; i < messages.length; i++) {
+    for (let i = start; i < messages.length; i++) {
       const msg = messages[i];
       if (msg.role === "user") {
         if (msg.source === "system_nudge") {
