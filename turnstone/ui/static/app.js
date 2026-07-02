@@ -2193,11 +2193,14 @@ function applyRosterSnapshot(list, opts) {
     cur.state = ws.state || cur.state || "idle";
     cur.parent_ws_id = ws.parent_ws_id || null;
     cur.project_id = ws.project_id || null;
-    // Preserve-on-missing (unlike project_id's hard overwrite): roster
+    // Preserve-on-ABSENT (unlike project_id's hard overwrite): roster
     // snapshots from pre-persona nodes omit the field during a rolling
     // upgrade, and persona is immutable post-create — keeping the known
-    // value beats flapping labels to the slug fallback.
-    cur.persona = ws.persona || cur.persona || "";
+    // value beats flapping labels to the slug fallback.  Key-presence,
+    // not truthiness: an upgraded node sends persona:"" for unstamped
+    // workstreams, and that authoritative empty must not be masked by a
+    // stale in-memory value.
+    cur.persona = "persona" in ws ? ws.persona || "" : cur.persona || "";
     workstreams[ws.id] = cur;
   });
   if (evict) {

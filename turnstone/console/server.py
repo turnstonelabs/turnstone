@@ -11882,8 +11882,6 @@ async def admin_list_personas(request: Request) -> JSONResponse:
     derived from the server's authoritative sets instead of a hand-mirrored
     JS constant that drifts every time a tool ships.
     """
-    import asyncio
-
     from turnstone.core.auth import require_permission
     from turnstone.core.tools import COORDINATOR_TOOLS, INTERACTIVE_TOOLS
     from turnstone.core.web_helpers import require_storage_or_503
@@ -11954,8 +11952,6 @@ async def admin_create_persona(request: Request) -> JSONResponse:
             "created_by": audit_uid,
         }
     )
-    import asyncio
-
     try:
         await asyncio.to_thread(storage.create_persona, fields)
     except ValueError as exc:
@@ -11986,8 +11982,6 @@ async def admin_get_persona(request: Request) -> JSONResponse:
     if err:
         return err
 
-    import asyncio
-
     persona = await asyncio.to_thread(storage.get_persona, request.path_params["persona_id"])
     if persona is None:
         return JSONResponse({"error": "Persona not found"}, status_code=404)
@@ -12011,7 +12005,6 @@ async def admin_update_persona(request: Request) -> JSONResponse:
     if err:
         return err
 
-    import asyncio
     import functools
 
     persona_id = request.path_params["persona_id"]

@@ -204,7 +204,8 @@ class TestRouteContracts:
 
     def test_no_delete_route(self, tmp_db: Any, seeded: str) -> None:
         c = _client(tmp_db, _ALL)
-        assert c.delete("/v1/api/admin/personas/" + seeded).status_code == 405
+        resp = c.delete("/v1/api/admin/personas/" + seeded)
+        assert resp.status_code == 405
 
 
 class TestRbacCrossPerm:

@@ -2490,7 +2490,12 @@ def make_create_handler(
             # engineer/orchestrator defaults.  Resume skips resolution:
             # the resumed session restores its own stamp from config.
             body_persona_raw = body.get("persona") or ""
-            body_persona = body_persona_raw.strip() if isinstance(body_persona_raw, str) else ""
+            # [:64] matches the console proxy's cap: real slugs fit, and an
+            # oversized value must not reach the storage lookup or reflect
+            # into the 400 error text.
+            body_persona = (body_persona_raw.strip() if isinstance(body_persona_raw, str) else "")[
+                :64
+            ]
             persona_snapshot = None
             if isinstance(resume_ws_id_raw, str) and resume_ws_id_raw:
                 # Fork-resume adopts the SOURCE workstream's stamp, resolved
