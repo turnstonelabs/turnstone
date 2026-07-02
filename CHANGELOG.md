@@ -13,6 +13,32 @@ stable, and the experimental line:
 - **`stable/1.6`** — patch-only (`v1.6.x`)
 - **`main`** — experimental (next major)
 
+## [Unreleased — 1.7]
+
+### Personas
+
+- **Personas** (#683) — a named, reusable bundle attached to a workstream
+  at creation, controlling system-message composition and the capability
+  envelope via exactly four levers: base-prompt override, tool visibility
+  set, MCP on/off, and memory on/off. The persona is resolved once and
+  snapshotted into `workstream_config`; editing or archiving a persona
+  never changes an existing workstream. Six seed personas ship with
+  migration `063` (`engineer` and `orchestrator` are the per-kind
+  defaults with no overrides, so zero-touch behavior is unchanged;
+  `scribe`, `researcher`, `writer`, and `executive` are curated
+  envelopes). Selectable on every creation surface (web pickers, the
+  create API/SDKs, coordinator `spawn_workstream` / `spawn_batch`, and
+  `turnstone --persona <name>`); authored in the console's new
+  Governance → Personas tab (`persona.{create,read,write}` perms,
+  archive-only lifecycle). See `docs/personas.md`.
+- **BREAKING: `/creative` removed.** The REPL toggle (and its tab
+  completion) is gone; the `writer` seed persona replaces it — start a
+  session with `turnstone --persona writer` or pick *Writer* in the web
+  pickers. Unlike the old fork, the writer persona composes the full
+  system message, so session context and mandatory prompt policies now
+  apply to prose-only sessions too. The `creative_mode` key in
+  `workstream_config` is no longer read or written.
+
 ## [1.6.0]
 
 The first stable release of the 1.6 line — and the first under Apache 2.0.

@@ -1017,9 +1017,10 @@ reconstructs the OpenAI message format from database rows:
   in the same workstream
 
 **Config persistence:** LLM-affecting parameters (`temperature`,
-`reasoning_effort`, `max_tokens`, `instructions`, `creative_mode`) are
-persisted to the `workstream_config` table on creation and whenever changed
-via slash commands. `resume()` restores these values so resumed workstreams
+`reasoning_effort`, `max_tokens`, `instructions`, and the persona
+snapshot — see `docs/personas.md`) are persisted to the
+`workstream_config` table on creation and whenever changed via slash
+commands. `resume()` restores these values so resumed workstreams
 behave identically to the original.
 
 **`/clear` vs `/new`:** `/clear` wipes in-memory context but preserves
