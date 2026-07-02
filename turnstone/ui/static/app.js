@@ -1527,8 +1527,34 @@ function connectGlobalSSE() {
     if (globalEvtSource && globalEvtSource.lastEventId) {
       globalLastEventId = globalEvtSource.lastEventId;
     }
-    const data = JSON.parse(e.data);
-    if (data.type === "ws_state") {
+    // Guarded parse: the cursor above has already advanced past this frame,
+    // so a parse failure is a permanently-lost roster mutation — resync the
+    // roster from REST instead of silently drifting (a dropped ws_created
+    // renders as a conversation that never appears; a dropped ws_closed as
+    // a ghost row forever).
+    let data = null;
+    try {
+      data = JSON.parse(e.data);
+    } catch (err) {
+      console.warn("global SSE: malformed frame — resyncing roster", err);
+      resyncRoster();
+      return;
+    }
+    if (data.type === "node_snapshot") {
+      // Recovery floor: the server emits this when our resume cursor
+      // predates its ring buffer (fresh connect, or a truncated gap after
+      // hidden-tab/sleep).  The snapshot carries the FULL workstream
+      // inventory — rebuild the roster wholesale; per-ws panes re-sync
+      // through their own Tier-2 streams.  Eviction is safe here (and only
+      // here): the snapshot is serialized with ws_created/ws_closed on the
+      // stream itself.
+      applyRosterSnapshot(data.workstreams || [], { evict: true });
+    } else if (data.type === "replay_truncated") {
+      // Events between our cursor and the buffer head are gone for good.
+      // The node_snapshot that follows rebuilds the roster; refetch too so
+      // recovery doesn't depend on event ordering.
+      resyncRoster();
+    } else if (data.type === "ws_state") {
       updateTabIndicator(data.ws_id, data.state, {
         tokens: data.tokens,
         context_ratio: data.context_ratio,
@@ -2065,6 +2091,87 @@ document.addEventListener("keydown", function (e) {
 //  16. Init
 // ===========================================================================
 
+// Rebuild the roster from a node_snapshot payload (workstream items keyed by
+// ``id`` — the snapshot mirrors the console-collector projection, not the
+// REST list's ``ws_id``).  ``opts.evict``: remove roster entries missing
+// from the list and close their panes.  Eviction is ONLY safe for the
+// in-stream node_snapshot — it is serialized with ws_created/ws_closed on
+// the SSE stream, so it can't race a roster mutation.  An out-of-band REST
+// snapshot (resyncRoster) can be built server-side BEFORE a create whose
+// ws_created the client already consumed; evicting from it would close a
+// live, freshly-opened conversation.  REST resyncs therefore merge only;
+// missed-ws_closed ghosts heal on the next in-stream snapshot.
+function applyRosterSnapshot(list, opts) {
+  const evict = !!(opts && opts.evict);
+  const seen = {};
+  (list || []).forEach(function (ws) {
+    if (!ws || !ws.id) return;
+    seen[ws.id] = true;
+    const cur = workstreams[ws.id] || {};
+    cur.name = ws.name || cur.name || ws.id.slice(0, 6);
+    cur.state = ws.state || cur.state || "idle";
+    cur.parent_ws_id = ws.parent_ws_id || null;
+    cur.project_id = ws.project_id || null;
+    workstreams[ws.id] = cur;
+  });
+  if (evict) {
+    const pm = window.TS_SHELL && window.TS_SHELL.panes;
+    for (const id in workstreams) {
+      if (!seen[id]) {
+        // Gap recovery can retire a session the user is LOOKING at — the
+        // live ws_closed (and its eviction toast) is exactly what was missed
+        // during the gap — so closing the pane wordlessly would yank it
+        // mid-read.  Toast only when an open pane goes away; mass ghost-row
+        // cleanup in the rail stays quiet.
+        const wasOpen = !!(pm && pm.hasPane("interactive", id));
+        const name =
+          (workstreams[id] && workstreams[id].name) || id.slice(0, 6);
+        delete workstreams[id];
+        closeSessionPane(id);
+        if (wasOpen) showToast("Session ended: " + name);
+      }
+    }
+  }
+  fireRender();
+}
+
+// REST fallback for the same recovery (replay_truncated / a malformed frame
+// whose cursor already advanced).  MERGE-ONLY (see applyRosterSnapshot) and
+// gated on r.ok — a 503 during a node restart parses as a JSON error body
+// with no ``workstreams``, which must not read as an authoritative empty
+// roster.  In-flight latch: one resync at a time — repeated triggers during
+// an outage must not stack fetches.
+let _rosterResyncInflight = null;
+function resyncRoster() {
+  if (_rosterResyncInflight) return _rosterResyncInflight;
+  _rosterResyncInflight = authFetch("/v1/api/workstreams")
+    .then(function (r) {
+      if (!r.ok) return null;
+      return r.json();
+    })
+    .then(function (data) {
+      if (!data || !data.workstreams) return;
+      applyRosterSnapshot(
+        data.workstreams.map(function (ws) {
+          return {
+            id: ws.ws_id,
+            name: ws.name,
+            state: ws.state,
+            parent_ws_id: ws.parent_ws_id,
+            project_id: ws.project_id,
+          };
+        }),
+      );
+    })
+    .catch(function () {
+      /* transient — the next snapshot or reconnect heals the roster */
+    })
+    .finally(function () {
+      _rosterResyncInflight = null;
+    });
+  return _rosterResyncInflight;
+}
+
 function initWorkstreams() {
   return authFetch("/v1/api/workstreams")
     .then(function (r) {
@@ -2230,15 +2337,27 @@ window.addEventListener("popstate", function (e) {
 
 // Rail re-render fan-out — the rail subscribes via TS_APP.onRender; every
 // roster mutation calls fireRender() so the Workspaces section stays live.
+// rAF-coalesced: the server emits ws_state at least twice per tool round for
+// EVERY workstream on the node, and each subscriber repaint rebuilds the
+// whole rail (replaceChildren + a listener per row) — uncoalesced, a busy
+// session drove thousands of full rebuilds per hour, O(#workstreams) each.
+// All subscribers are snapshot-driven repaints, so batching to one repaint
+// per frame is lossless.
 const _renderSubs = [];
+let _renderScheduled = false;
 function fireRender() {
-  for (const cb of _renderSubs) {
-    try {
-      cb();
-    } catch (e) {
-      console.error("TS_APP render subscriber failed", e);
+  if (_renderScheduled) return;
+  _renderScheduled = true;
+  requestAnimationFrame(function () {
+    _renderScheduled = false;
+    for (const cb of _renderSubs) {
+      try {
+        cb();
+      } catch (e) {
+        console.error("TS_APP render subscriber failed", e);
+      }
     }
-  }
+  });
 }
 
 // Open / focus an interactive session as a pane (base="" local transport — the

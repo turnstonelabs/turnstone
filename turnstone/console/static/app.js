@@ -21,6 +21,10 @@ window.onLoginSuccess = function () {
   }
 };
 window.onLogout = function () {
+  if (sseReconnectTimer) {
+    clearTimeout(sseReconnectTimer);
+    sseReconnectTimer = null;
+  }
   if (evtSource) {
     evtSource.close();
     evtSource = null;
@@ -67,6 +71,10 @@ let currentView = "home"; // "home" | "overview" | "filtered" | "admin"
 let currentFilter = { state: null, node: null, page: 1, per_page: 50 };
 let evtSource = null;
 let retryDelay = 1000;
+// Pending reconnect handle — tracked so logout (and a fresh connectSSE) can
+// cancel it; an untracked timer fired post-logout and opened a new
+// EventSource that 401s and re-probes in a loop.
+let sseReconnectTimer = null;
 let clusterState = null;
 let _navigatingFromPopstate = false;
 
@@ -346,6 +354,10 @@ function _fireRenderSubs() {
 
 // --- SSE Connection ---
 function connectSSE() {
+  if (sseReconnectTimer) {
+    clearTimeout(sseReconnectTimer);
+    sseReconnectTimer = null;
+  }
   if (evtSource) {
     evtSource.close();
     evtSource = null;
@@ -380,11 +392,11 @@ function connectSSE() {
           showLogin();
           return;
         }
-        setTimeout(connectSSE, retryDelay);
+        sseReconnectTimer = setTimeout(connectSSE, retryDelay);
         retryDelay = Math.min(retryDelay * 2, 30000);
       })
       .catch(function () {
-        setTimeout(connectSSE, retryDelay);
+        sseReconnectTimer = setTimeout(connectSSE, retryDelay);
         retryDelay = Math.min(retryDelay * 2, 30000);
       });
   };

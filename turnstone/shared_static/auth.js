@@ -47,6 +47,15 @@ if (_authChannel) {
   };
 }
 
+// Raw-fetch callers (the SSE-error probes, which must inspect a 401's status
+// without authFetch's throw-on-401 contract) route a version_mismatch body
+// here so the post-re-login reload still picks up the new assets — the same
+// flag+overlay path authFetch takes below.
+export function noteVersionMismatch() {
+  _authUpgradeReload = true;
+  showLogin("upgrade");
+}
+
 export async function authFetch(url, opts) {
   const maxRetries = 2;
   for (let attempt = 0; attempt <= maxRetries; attempt++) {
@@ -813,4 +822,5 @@ Object.assign(window, {
   hideLogin,
   logout,
   initLogin,
+  noteVersionMismatch,
 });

@@ -1735,3 +1735,25 @@ def test_early_paint_screen_reader_announce() -> None:
     assert "toolAnnounce(_toolAnnounceText(list))" in body
     assert 'block.setAttribute("aria-busy", "true")' in body
     assert 'block.removeAttribute("aria-busy")' in body
+
+
+def test_global_stream_recovery_floor_and_render_coalescing() -> None:
+    """Perf-audit P0/P1 for the Tier-1 global stream.  The server's recovery
+    events for a truncated reconnect gap (``node_snapshot`` as the floor,
+    ``replay_truncated`` as the marker) used to fall through the handler
+    silently — workstreams created during a long hidden-tab gap never
+    rendered again, and missed ``ws_closed`` left ghost rows forever.  A
+    malformed frame is the same permanent drift (the cursor advances before
+    the parse), so it resyncs too.  ``fireRender`` is rAF-coalesced: every
+    ``ws_state`` (≥2 per tool round per workstream) used to trigger a
+    synchronous full rail rebuild."""
+    body = _APP_JS.read_text(encoding="utf-8")
+    assert 'data.type === "node_snapshot"' in body
+    assert 'data.type === "replay_truncated"' in body
+    assert "function applyRosterSnapshot(" in body
+    assert "function resyncRoster(" in body
+    assert "malformed frame" in body
+    fire = body.index("function fireRender()")
+    assert "requestAnimationFrame(" in body[fire : fire + 700], (
+        "fireRender must coalesce subscriber repaints to one per frame"
+    )

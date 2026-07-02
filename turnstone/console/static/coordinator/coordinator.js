@@ -2207,31 +2207,64 @@ function createCoordinatorPane(root, wsId, opts) {
       // Transient errors (network blips, intermediary timeouts) just
       // let native reconnect run — no scheduleReconnect needed
       // because the source isn't dead.
-      var probe = typeof authFetch === "function" ? authFetch : fetch;
-      probe("/v1/api/workstreams/" + encodeURIComponent(wsId)).then(
-        function (r) {
-          if (r.status === 401 && typeof showLogin === "function") {
-            try {
-              if (evtSource) evtSource.close();
-            } catch (_) {
-              /* noop */
-            }
-            evtSource = null;
-            // Cancel the pending CLOSED-state recovery timer (set
-            // below).  Without this, 5 s later the timer would
-            // observe ``!evtSource`` and call ``scheduleReconnect``,
-            // which would open a new EventSource that gets 401 again
-            // → infinite reconnect loop while the login overlay is
-            // up.  The login flow re-arms ``connectSSE`` after a
-            // successful sign-in via its own callback path.
-            if (reconnectTimer) {
-              clearTimeout(reconnectTimer);
-              reconnectTimer = null;
-            }
-            showLogin("Session expired. Please sign in to reconnect.");
-          }
-        },
-      );
+      // Raw fetch (not authFetch) — need to inspect status before throwing.
+      // authFetch never RESOLVES with a 401 (it calls showLogin() itself and
+      // throws Error("auth")), so probing through it made this branch dead
+      // code: the close/cancel-timer handling below never ran and the
+      // CLOSED-state recovery kept cycling scheduleReconnect behind the
+      // login overlay — exactly the loop this branch exists to prevent.
+      // Mirrors the app.js dashboard probe.  ``.catch``: a network-dead
+      // probe is the transient case; native/manual reconnect owns it.
+      //
+      // The 401 body is inspected BEFORE the generic-expiry handling: a
+      // code=version_mismatch body must take auth.js's upgrade path
+      // (reload-after-re-login flag + "upgrade" overlay).  The old authFetch
+      // probe did that as a side effect of authFetch's own 401 handling; a
+      // raw fetch must do it explicitly or a server upgrade leaves stale
+      // pre-upgrade JS running after sign-in.  NOTE the positive-form guard
+      // (r.status === 401) directly above the close(): the reconnect-
+      // contract pin (test_app_js._onerror_preserves_native_reconnect) keys
+      // on that marker within a short window to allow a terminal close.
+      fetch("/v1/api/workstreams/" + encodeURIComponent(wsId))
+        .then(function (r) {
+          if (!(r.status === 401 && typeof showLogin === "function")) return;
+          return r
+            .json()
+            .catch(function () {
+              return null;
+            })
+            .then(function (body) {
+              try {
+                if (evtSource) evtSource.close();
+              } catch (_) {
+                /* noop */
+              }
+              evtSource = null;
+              // Cancel the pending CLOSED-state recovery timer (set
+              // below).  Without this, 5 s later the timer would
+              // observe ``!evtSource`` and call ``scheduleReconnect``,
+              // which would open a new EventSource that gets 401 again
+              // → infinite reconnect loop while the login overlay is
+              // up.  The login flow re-arms ``connectSSE`` after a
+              // successful sign-in via its own callback path.
+              if (reconnectTimer) {
+                clearTimeout(reconnectTimer);
+                reconnectTimer = null;
+              }
+              if (
+                body &&
+                body.code === "version_mismatch" &&
+                typeof noteVersionMismatch === "function"
+              ) {
+                noteVersionMismatch();
+              } else {
+                showLogin("Session expired. Please sign in to reconnect.");
+              }
+            });
+        })
+        .catch(function () {
+          /* transient network failure — reconnect machinery handles it */
+        });
       // CLOSED-state recovery: native auto-reconnect covers the
       // transient case (source stays in CONNECTING and eventually
       // re-opens).  But if the browser gives up — hard 4xx after
@@ -3535,13 +3568,7 @@ function createCoordinatorPane(root, wsId, opts) {
     // pending count is maintained incrementally on cache mutations
     // (see ``pendingApprovalIds`` near the cache definition) so this
     // is O(1) per render rather than an O(N) walk over the cache.
-    const pending = pendingApprovalIds.size;
-    childrenCountEl.textContent = rows.length
-      ? "(" +
-        rows.length +
-        (pending > 0 ? " · " + pending + " pending" : "") +
-        ")"
-      : "";
+    _refreshChildrenCount();
     _restoreRowFocus(childrenTreeEl, focusKey);
   }
 
@@ -3562,11 +3589,30 @@ function createCoordinatorPane(root, wsId, opts) {
       const replacement = renderChildRow(entry);
       row.replaceWith(replacement);
       const obs = _getChildObserver();
-      if (obs) obs.observe(replacement);
+      if (obs) {
+        // Release the detached row from the persistent observer — this is
+        // now the hot path (every child_ws_state tick), and observed-but-
+        // detached rows are strong refs that would accumulate without bound
+        // between full renders (which reset targets via disconnect()).
+        obs.unobserve(row);
+        obs.observe(replacement);
+      }
       _restoreRowFocus(replacement, focusKey);
+      // Keep the "(N · x pending)" annotation live on the targeted path —
+      // approval edges arrive as state ticks now that child_ws_state no
+      // longer takes the full render.
+      _refreshChildrenCount();
     } else {
       renderChildren();
     }
+  }
+
+  function _refreshChildrenCount() {
+    const total = childrenState.size;
+    const pending = pendingApprovalIds.size;
+    childrenCountEl.textContent = total
+      ? "(" + total + (pending > 0 ? " · " + pending + " pending" : "") + ")"
+      : "";
   }
 
   function renderTaskRow(task) {
@@ -3855,6 +3901,12 @@ function createCoordinatorPane(root, wsId, opts) {
       ws_id: childId,
       name: "",
     };
+    // Terminal-bucket membership BEFORE the mutation: the tree sort keys on
+    // it (non-terminal first), so a state tick that crosses the boundary
+    // needs the full re-sorting render; everything else takes the targeted
+    // single-row path below.
+    const wasTerminal =
+      existing.state === "closed" || existing.state === "deleted";
     existing.state = ev.state || existing.state;
     existing.activity_state =
       typeof ev.activity_state === "string"
@@ -3924,7 +3976,18 @@ function createCoordinatorPane(root, wsId, opts) {
           ? cached.sseUpdatedAt || 0
           : 0,
     });
-    renderChildren();
+    // child_ws_state is the HIGHEST-frequency child event (a tick per state/
+    // activity change of every child) — route it through the targeted
+    // single-row update instead of the full-tree rebuild.  The full render
+    // (sort + replaceChildren + observer re-observe of every row) is
+    // reserved for membership/sort-order changes: a terminal-bucket
+    // crossing here, and created/closed/rename in their own handlers.
+    // _updateChildRow falls back to renderChildren() itself when the row
+    // isn't painted yet (a brand-new child).
+    const isTerminal =
+      existing.state === "closed" || existing.state === "deleted";
+    if (wasTerminal !== isTerminal) renderChildren();
+    else _updateChildRow(childId);
     // Do NOT invalidateLiveBadge on routine state ticks — that
     // defeats the 5s TTL cache and devolves rate-limiting to the
     // 250ms debouncer.  The TTL check in scheduleLiveFetch handles

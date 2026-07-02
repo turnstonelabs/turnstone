@@ -245,3 +245,103 @@ def test_controller_terminal_dead_state() -> None:
     assert "base: base," in body, "the controller must expose its transport base"
     # Dead controllers don't reconnect on re-auth.
     assert "if (connected && !dead) pane._loadHistoryThenConnect(wsId);" in body
+
+
+def test_stream_pipeline_is_wedge_proof() -> None:
+    """Long-session hardening (perf audit P0): the SSE pipeline must not be
+    able to permanently wedge the pane.  ``onmessage`` guards BOTH the
+    ``JSON.parse`` and the ``handleEvent`` dispatch (an exception escaping it
+    doesn't close the EventSource, so an unguarded throw left the streaming
+    refs poisoned for the rest of the session), and ``stream_end`` resets the
+    segment refs BEFORE the finalize render, with a plain-text fallback —
+    with the old order a finalize throw skipped the clears and every later
+    delta painted into the dead segment."""
+    body = _INTERACTIVE.read_text(encoding="utf-8")
+    assert "dropping malformed SSE frame" in body
+    assert "handleEvent failed for" in body
+    case = body.index('case "stream_end"')
+    seg = body[case : body.index("break;", case)]
+    clears = seg.index("this.currentAssistantBodyEl = null;")
+    finalize = seg.index("streamingRenderFinalize(")
+    assert clears < finalize, (
+        "stream_end must clear segment refs BEFORE finalize — the old "
+        "finalize-first order wedged all later assistant output on a throw."
+    )
+    assert "doneBodyEl.textContent = doneBuffer;" in seg
+
+
+def test_rebuild_quiesces_live_events_and_releases_agent_tracking() -> None:
+    """clear_ui / replay_truncated re-render race (perf audit P0): live SSE
+    events painted between the history snapshot and ``replaceChildren()``
+    were wiped with no redelivery, and streaming refs kept pointing at
+    detached nodes.  Pinned: the quiesce queue sits on the handleEvent hot
+    path, both re-render triggers arm it, ``replayHistory`` resets the
+    streaming refs and clears the agent-card/orphan maps (the detached-DOM
+    retention leak), and the mid-stream guard covers the reasoning bubble."""
+    body = _INTERACTIVE.read_text(encoding="utf-8")
+    assert "this._replayQueue.events.push(evt);" in body
+    assert body.count("this._beginReplayQuiesce(") >= 2, (
+        "both clear_ui and replay_truncated must arm the quiesce"
+    )
+    assert "!this.currentAssistantEl && !this.currentReasoningEl" in body
+    replay = body.index("replayHistory(messages) {")
+    seg = body[replay : replay + 1600]
+    for line in (
+        "this._resetStreamingRefs();",
+        "this._clearAgentTracking();",
+    ):
+        assert line in seg, f"replayHistory must reset: {line!r}"
+    assert "this._agentCards.clear();" in body
+    # Review-hardened lifecycle: the card entry SURVIVES the terminal
+    # tool_result (a late child event finding no Map entry would rebuild a
+    # duplicate empty card beside the finished one), and transport-only
+    # reconnects preserve the maps + any armed quiesce queue — clearing them
+    # in disconnectSSE duplicated cards and dropped buffered orphan steps on
+    # every transient stream blip.  Full-reload cleanup lives in
+    # _loadHistoryThenConnect; terminal cleanup in the factory's destroy().
+    assert "this._agentCards.delete(callId);" not in body
+    disc = body.index("disconnectSSE() {")
+    disc_seg = body[disc : body.index("_loadHistoryThenConnect(wsId) {", disc)]
+    assert "this._clearAgentTracking();" not in disc_seg
+    assert "this._replayQueue = null;" not in disc_seg
+    load = body.index("_loadHistoryThenConnect(wsId) {")
+    load_seg = body[load : load + 2200]
+    assert "this._clearAgentTracking();" in load_seg
+    assert "this._replayQueue = null;" in load_seg
+    # A mid-stream replay_truncated DEFERS the re-sync (flag consumed on the
+    # idle edge) instead of dropping it — skipping left the lost-event gap
+    # unrepaired for the rest of the session.
+    assert "this._pendingTruncatedResync = true;" in body
+    # The refetch FAILURE branch resets streaming refs too — it never reaches
+    # replayHistory, and stale refs there streamed the retried generation's
+    # first segment into a detached bubble.
+    fail = body.index("Failure path never reaches replayHistory")
+    assert "this._resetStreamingRefs();" in body[fail : fail + 400], (
+        "the refetch failure branch must reset streaming refs"
+    )
+
+
+def test_per_token_hot_path_avoids_container_scans() -> None:
+    """P1 (perf audit): per-token work must stay O(1) in transcript length.
+    The thinking indicator is an instance ref (the class-selector miss walked
+    the whole transcript on EVERY content/reasoning delta); near-bottom state
+    comes from the passive scroll listener instead of a forced-layout
+    geometry read per event; the scroll pin is rAF-coalesced; per-tool
+    row/stream lookups resolve through the self-healing caches."""
+    body = _INTERACTIVE.read_text(encoding="utf-8")
+    stripped = _strip_comments(body)
+    assert 'querySelector(".thinking-indicator")' not in stripped, (
+        "thinking indicator must use the instance ref, not a container scan"
+    )
+    assert "this._thinkingEl" in body
+    near = body.index("isNearBottom() {")
+    assert "return this._nearBottom;" in body[near : near + 700]
+    assert "passive: true" in body
+    # The rAF pin re-checks the flag AT FIRE TIME (a user scroll landing in
+    # the schedule→rAF window must win over a stale pin), with force
+    # requests latched across the coalescing window; resizes re-derive the
+    # flag via ResizeObserver since they move the bottom without a scroll.
+    assert "this._scrollPinForce = false;" in body
+    assert "ResizeObserver" in body
+    for helper in ("_toolRow(callId) {", "_streamEl(callId) {"):
+        assert helper in body, f"missing lookup-cache helper: {helper!r}"

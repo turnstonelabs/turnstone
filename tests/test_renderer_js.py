@@ -1511,3 +1511,41 @@ def test_link_url_with_ampersand_not_double_escaped() -> None:
         "Expected single &amp; encoding for `&`; got:\n" + out
     )
     assert "&amp;amp;" not in out
+
+
+def test_render_markdown_depth_capped_and_throw_safe() -> None:
+    """Perf-audit P0: ``renderMarkdown`` recurses for blockquote/callout
+    bodies, and a few KB of nested ``"> "`` used to overflow the call stack
+    mid-render.  The exported wrapper depth-caps the recursion (bailing to
+    escaped text) and keeps the ``_fnDepth`` accounting in a try/finally so a
+    body throw can't strand it elevated (which froze ``_fnScopeId`` and
+    collided footnote ids for every later message)."""
+    body = _RENDERER_JS.read_text(encoding="utf-8")
+    assert "var _MD_MAX_DEPTH" in body
+    assert "_fnDepth >= _MD_MAX_DEPTH" in body
+    wrapper = body.index("export function renderMarkdown(text)")
+    seg = body[wrapper : body.index("function _renderMarkdownBody(text)")]
+    assert "try {" in seg and "finally {" in seg and "_fnDepth--;" in seg, (
+        "depth accounting must ride a try/finally in the wrapper"
+    )
+
+
+def test_streaming_apply_marks_buffer_only_on_success() -> None:
+    """Perf-audit P0: ``_streamingRenderApply`` must set
+    ``el._lastRenderedBuffer`` only AFTER a successful render, with a
+    plain-text fallback on throw.  Marking before the render made an errored
+    frame look done — the finalize short-circuit then pinned the broken DOM
+    forever.  The mermaid chain must also be rejection-proof (a sync throw in
+    a settle handler used to leave every later diagram stuck at 'Loading
+    diagram…')."""
+    body = _RENDERER_JS.read_text(encoding="utf-8")
+    apply_at = body.index("function _streamingRenderApply")
+    seg = body[apply_at : apply_at + 2000]
+    render_at = seg.index("renderMarkdown(buffer)")
+    mark_at = seg.index("el._lastRenderedBuffer = buffer;")
+    assert render_at < mark_at, "buffer must be marked rendered only on success"
+    assert "el.textContent = buffer;" in seg
+    chain_at = body.index("_mermaidRenderChain = _mermaidRenderChain")
+    assert ".catch(function (e) {" in body[chain_at : chain_at + 3500], (
+        "every mermaid chain link must settle back to fulfilled"
+    )

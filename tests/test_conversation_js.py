@@ -150,3 +150,21 @@ def test_warning_and_verdict_normalize_risk() -> None:
     assert "normalizeRiskLevel(a.risk_level)" in body, "warning must normalize"
     assert '"conv-warning conv-warning--" + risk' in body
     assert 'badge.classList.add("conv-verdict--" + risk)' in body
+
+
+def test_unbounded_render_inputs_are_capped() -> None:
+    """Perf-audit P0: the two builders that used to render unbounded input.
+    The diff preview caps rendered lines and appends incrementally — the old
+    single ``diff.append(...nodes)`` spread threw RangeError past engine
+    spread-arity limits, killing the tool card (and the approval gate) for
+    the batch.  The raw result body clamps at RAW_CAP so one multi-MB tool
+    output can't become a multi-MB pre-wrap text node rebuilt on every
+    re-render."""
+    body = _body()
+    assert "MAX_PREVIEW_LINES" in body
+    assert "diff.append(...nodes)" not in body, (
+        "preview nodes must append incrementally, not via one spread call"
+    )
+    assert "more preview lines not shown" in body
+    assert "RAW_CAP" in body
+    assert "truncated for display" in body

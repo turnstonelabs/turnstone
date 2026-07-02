@@ -11,6 +11,15 @@ export function showToast(message, type) {
   const el = document.getElementById("toast");
   if (!el) return;
   if (_toastShowing) {
+    // Coalesce + cap: the queue drains at one toast per ~3.3s, so any
+    // sustained source (verdict toasts during an auto-approved tool storm)
+    // would otherwise grow it for the rest of the session and keep
+    // surfacing hours-stale notices.  Identical consecutive messages
+    // collapse; beyond the cap the OLDEST queued toast drops (newest wins —
+    // it reflects current state).
+    const last = _toastQueue[_toastQueue.length - 1];
+    if (last && last.message === message && last.type === type) return;
+    if (_toastQueue.length >= 5) _toastQueue.shift();
     _toastQueue.push({ message: message, type: type });
     return;
   }

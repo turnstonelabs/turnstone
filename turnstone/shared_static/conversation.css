@@ -293,6 +293,16 @@
 .conv-diff-warn {
   color: var(--warn);
 }
+/* Preview-omission notice — rendered as a SIBLING below the .conv-row-diff
+   scroll box (never inside it, where the 240px fold hides it).  Neutral ink,
+   not --warn: informational omission, and AA-safe on both themes. */
+.conv-diff-omit {
+  margin-top: 2px;
+  padding: 2px 10px;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--ink-3);
+}
 
 /* Verdict badge — interactive's rich shape (risk + rec + conf, expandable
    detail) in the coordinator's neutral idiom.  Risk drives the left-stripe

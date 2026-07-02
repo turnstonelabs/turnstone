@@ -261,11 +261,31 @@ function _langToCssClass(lang) {
 // ---------------------------------------------------------------------------
 //  Main markdown renderer
 // ---------------------------------------------------------------------------
+// Hard cap on renderMarkdown re-entrancy.  Blockquote/callout/list bodies
+// recurse through renderMarkdown; a pathological input (a few KB of nested
+// "> " prefixes) would otherwise overflow the call stack mid-render — an
+// exception the streaming callers can only partially recover from.  Beyond
+// the cap the nested body renders as escaped plain text: degraded, visible.
+var _MD_MAX_DEPTH = 100;
+
 export function renderMarkdown(text) {
-  // Scope footnote IDs per top-level render call (prevents collisions across messages)
+  if (_fnDepth >= _MD_MAX_DEPTH) {
+    return "<p>" + escapeHtml(String(text == null ? "" : text)) + "</p>";
+  }
+  // Scope footnote IDs per top-level render call (prevents collisions across
+  // messages).  Depth accounting rides a try/finally: a throw anywhere in the
+  // body used to strand _fnDepth elevated, freezing _fnScopeId so footnote
+  // anchor ids collided across every later message.
   if (_fnDepth === 0) _fnScopeId++;
   _fnDepth++;
+  try {
+    return _renderMarkdownBody(text);
+  } finally {
+    _fnDepth--;
+  }
+}
 
+function _renderMarkdownBody(text) {
   // Pre-pass: extract blockquote blocks and recursively render.
   // Must run FIRST (before code/math protection) so the recursive call
   // processes raw markdown, not text with outer-scope placeholders.
@@ -742,7 +762,6 @@ export function renderMarkdown(text) {
     return inlineMaths[parseInt(idx)];
   });
 
-  _fnDepth--;
   return result;
 }
 
@@ -1119,37 +1138,72 @@ function _renderMermaidBlock(container, callback) {
     return;
   }
   _mermaidPending.set(source, [container]);
-  _mermaidRenderChain = _mermaidRenderChain.then(function () {
-    var pending = _mermaidPending.get(source) || [];
-    _mermaidPending.delete(source);
-    var id = "mermaid-" + ++_mermaidIdCounter;
-    return mermaid.render(id, source).then(
-      function (result) {
-        _cacheFifoEntry(
-          _mermaidSvgCache,
-          source,
-          { svg: result.svg, bindFunctions: result.bindFunctions },
-          _MERMAID_CACHE_MAX,
-        );
-        for (var i = 0; i < pending.length; i++) {
-          var c = pending[i];
-          if (c.isConnected) {
-            _applyMermaidSvg(c, result.svg, result.bindFunctions);
+  // ``linkPending`` is hoisted to the link's closure so the rejection-proof
+  // .catch below can paint the error on the containers THIS link captured —
+  // by the time it runs, the link already removed them from _mermaidPending,
+  // so without the hoist they'd sit at "Loading diagram…" forever.
+  var linkPending = null;
+  _mermaidRenderChain = _mermaidRenderChain
+    .then(function () {
+      var pending = _mermaidPending.get(source) || [];
+      linkPending = pending;
+      _mermaidPending.delete(source);
+      var id = "mermaid-" + ++_mermaidIdCounter;
+      return mermaid.render(id, source).then(
+        function (result) {
+          _cacheFifoEntry(
+            _mermaidSvgCache,
+            source,
+            { svg: result.svg, bindFunctions: result.bindFunctions },
+            _MERMAID_CACHE_MAX,
+          );
+          for (var i = 0; i < pending.length; i++) {
+            var c = pending[i];
+            if (c.isConnected) {
+              // Per-container guard: one bad apply (a bindFunctions throw)
+              // must not skip the remaining containers for this source.
+              try {
+                _applyMermaidSvg(c, result.svg, result.bindFunctions);
+              } catch (e) {
+                _applyMermaidError(c, source, "diagram apply failed");
+              }
+            }
           }
+        },
+        function (err) {
+          var orphan = document.getElementById(id);
+          if (orphan) orphan.remove();
+          var msg = err && err.message ? err.message : "Diagram error";
+          _cacheFifoEntry(_mermaidErrorCache, source, msg, _MERMAID_CACHE_MAX);
+          for (var i = 0; i < pending.length; i++) {
+            var c = pending[i];
+            if (c.isConnected) _applyMermaidError(c, source, msg);
+          }
+        },
+      );
+    })
+    .catch(function (e) {
+      // Rejection-proof every link: a sync throw escaping the link body
+      // (e.g. mermaid.render throwing on malformed input before returning a
+      // promise) would otherwise reject the shared chain, and every later
+      // diagram would silently sit at "Loading diagram…" forever.  Settle
+      // back to fulfilled and paint the error on the containers this link
+      // had already claimed.  Deliberately NO _mermaidPending.delete(source)
+      // here: the link deleted its own entry up top, and any entry present
+      // NOW belongs to a newer re-entry for the same source — deleting it
+      // would orphan THAT link's containers.
+      var msg = (e && e.message) || "Diagram error";
+      _cacheFifoEntry(_mermaidErrorCache, source, msg, _MERMAID_CACHE_MAX);
+      (linkPending || []).forEach(function (c) {
+        if (!c.isConnected) return;
+        try {
+          _applyMermaidError(c, source, msg);
+        } catch (_) {
+          /* container-level failure — nothing left to degrade to */
         }
-      },
-      function (err) {
-        var orphan = document.getElementById(id);
-        if (orphan) orphan.remove();
-        var msg = err && err.message ? err.message : "Diagram error";
-        _cacheFifoEntry(_mermaidErrorCache, source, msg, _MERMAID_CACHE_MAX);
-        for (var i = 0; i < pending.length; i++) {
-          var c = pending[i];
-          if (c.isConnected) _applyMermaidError(c, source, msg);
-        }
-      },
-    );
-  });
+      });
+      console.warn("renderer: mermaid render chain error", e);
+    });
   if (callback) callback();
 }
 
@@ -1253,19 +1307,36 @@ export function reRenderAllMermaid() {
 // ---------------------------------------------------------------------------
 function _streamingRenderApply(el, buffer) {
   if (el._lastRenderedBuffer === buffer) return;
+  try {
+    el.innerHTML = renderMarkdown(buffer);
+  } catch (e) {
+    // A render failure must not wedge the stream: show THIS frame as plain
+    // text and leave the buffer UN-marked, so the next delta / the finalize
+    // pass re-attempts a full render (partial-input throws heal themselves
+    // once the closing tokens arrive).  Marking before the render used to
+    // make an errored frame look done — the finalize short-circuit then
+    // pinned the stale DOM forever.
+    console.warn("renderer: streaming render failed; plain-text frame", e);
+    el.textContent = buffer;
+    return;
+  }
   el._lastRenderedBuffer = buffer;
-  var html = renderMarkdown(buffer);
-  el.innerHTML = html;
   // Progressive hljs + mermaid render — see comment above. Both are
   // no-ops when the element has no matching code blocks, and their
   // source-keyed caches avoid re-tokenizing / re-rendering for
   // sources we've already processed. Subsequent rAF ticks that
   // re-extract the same closed fence hit the cache synchronously.
-  if (typeof postRenderHljs === "function") {
-    postRenderHljs(el);
-  }
-  if (typeof postRenderMermaid === "function") {
-    postRenderMermaid(el);
+  // Guarded: decoration failures degrade to undecorated markup, never to
+  // a broken segment state upstream.
+  try {
+    if (typeof postRenderHljs === "function") {
+      postRenderHljs(el);
+    }
+    if (typeof postRenderMermaid === "function") {
+      postRenderMermaid(el);
+    }
+  } catch (e) {
+    console.warn("renderer: post-render decoration failed", e);
   }
 }
 

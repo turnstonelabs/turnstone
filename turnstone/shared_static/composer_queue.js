@@ -95,6 +95,9 @@ export function createQueueController(opts) {
     typeof opts.onAfterDequeue === "function" ? opts.onAfterDequeue : null;
   var onIdle = typeof opts.onIdle === "function" ? opts.onIdle : null;
   var onNotice = typeof opts.onNotice === "function" ? opts.onNotice : null;
+  // Live queued bubbles — the idle sweep iterates this instead of querying
+  // the whole messages container (see onIdleEdge).
+  var _liveQueued = new Set();
   // Upper bound on the dequeue DELETE so a wedged proxied node (the exact
   // case this flow targets) can't leave a card stuck "dismissing" forever.
   var DELETE_TIMEOUT_MS = 15000;
@@ -199,6 +202,7 @@ export function createQueueController(opts) {
     host.appendChild(dismiss);
 
     messagesEl.appendChild(el);
+    _liveQueued.add(el);
     _scrollIntoView();
     return el;
   }
@@ -319,6 +323,7 @@ export function createQueueController(opts) {
   }
 
   function remove(el) {
+    _liveQueued.delete(el);
     if (el && el.parentNode) el.remove();
   }
 
@@ -329,6 +334,7 @@ export function createQueueController(opts) {
   // cancelled, so present it as sent. If the user had clicked × first
   // (dismissAttempted), tell them it was too late.
   function _promote(el) {
+    _liveQueued.delete(el);
     var attempted = el.dataset.dismissAttempted;
     el.classList.remove("msg-queued", "msg-queued-important");
     delete el.dataset.msgId;
@@ -351,8 +357,19 @@ export function createQueueController(opts) {
   // onIdle hook so the consumer can run edge-only cleanup (e.g. clearing
   // cancel/force-stop timers).
   function onIdleEdge() {
-    var queued = messagesEl.querySelectorAll(".msg-queued:not([aria-busy])");
-    queued.forEach(_promote);
+    // Sweep the controller-local live set, not the DOM: the old
+    // ".msg-queued:not([aria-busy])" query walked every element under the
+    // messages container (O(transcript) per busy→idle edge) to find the
+    // handful of queued bubbles that always sit in the tail.  Bubbles wiped
+    // by a full re-render prune lazily via the isConnected check.
+    _liveQueued.forEach(function (el) {
+      if (!el.isConnected) {
+        _liveQueued.delete(el);
+        return;
+      }
+      if (el.hasAttribute("aria-busy")) return; // mid-dequeue — let it settle
+      _promote(el);
+    });
     if (onIdle) onIdle();
   }
 

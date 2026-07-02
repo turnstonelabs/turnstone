@@ -205,6 +205,24 @@ class Pane {
     this.projectName = "";
     this._lastStatusEvt = null;
     this._historyLoadToken = 0;
+    // Event backlog while a clear_ui / replay_truncated rebuild is in
+    // flight — see _beginReplayQuiesce.  {token, events[]} or null.
+    this._replayQueue = null;
+    // Hot-path caches — all invalidated by _clearAgentTracking/replayHistory.
+    // _nearBottom mirrors the scroller position via a passive scroll listener
+    // (no per-token geometry reads); the two Maps make per-event row/stream
+    // lookups O(1) instead of whole-transcript attribute-selector scans.
+    this._nearBottom = true;
+    this._scrollPinPending = false;
+    this._scrollPinForce = false;
+    this._thinkingEl = null;
+    this._retryHolderEl = null;
+    this._toolRowIndex = new Map();
+    this._streamElIndex = new Map();
+    this._resizeObs = null;
+    // Set when replay_truncated arrives mid-stream (refetching then would
+    // detach the live bubble); consumed on the next idle edge.
+    this._pendingTruncatedResync = false;
     this._cancelTimeout = null;
     this._forceTimeout = null;
     this._pendingEditSend = null;
@@ -254,6 +272,14 @@ class Pane {
       this.evtSource.close();
       this.evtSource = null;
     }
+    // Deliberately NOT cleared here: _agentCards/_agentOrphans and any armed
+    // _replayQueue.  disconnectSSE also runs for transport-only reconnects
+    // (connectSSE's first line, the host's 5s recovery beat) where the DOM
+    // survives — wiping the card map there made the next child event build a
+    // DUPLICATE agent card beside the still-attached one, and cancelling
+    // orphan grace timers silently dropped buffered steps.  Ws-switch and
+    // full-reload cleanup happens in _loadHistoryThenConnect; terminal
+    // cleanup in the factory's destroy().
     this._stopRecording(true);
     this._stopTTS();
   }
@@ -298,17 +324,22 @@ class Pane {
   }
 
   addThinkingIndicator() {
-    if (this.messagesEl.querySelector(".thinking-indicator")) return;
+    // Instance ref, not a container query: removeThinkingIndicator runs on
+    // EVERY content/reasoning delta, and a class-selector miss walks the
+    // whole transcript subtree — O(N) per streamed token at 5000 messages.
+    if (this._thinkingEl) return;
     const el = document.createElement("div");
     el.className = "thinking-indicator";
     el.textContent = "Thinking";
+    this._thinkingEl = el;
     this.messagesEl.appendChild(el);
     this.scrollToBottom();
   }
 
   removeThinkingIndicator() {
-    const el = this.messagesEl.querySelector(".thinking-indicator");
-    if (el) el.remove();
+    if (!this._thinkingEl) return;
+    this._thinkingEl.remove();
+    this._thinkingEl = null;
   }
 
   addSystemNudgeMarker() {
@@ -440,18 +471,9 @@ class Pane {
     // announceToolBlock.
     const stick = this.isNearBottom();
 
-    const escapedId = callId ? CSS.escape(callId) : "";
-    let el = escapedId
-      ? this.messagesEl.querySelector(
-          '.tool-output-stream[data-call-id="' + escapedId + '"]',
-        )
-      : null;
+    let el = this._streamEl(callId);
     if (!el) {
-      let target = escapedId
-        ? this.messagesEl.querySelector(
-            '.conv-row[data-call-id="' + escapedId + '"]',
-          )
-        : null;
+      let target = this._toolRow(callId);
       if (!target) {
         // A namespaced sub-agent child id ("<parent>::<id>") whose row hasn't
         // nested yet must NOT graft its stream onto the last top-level batch —
@@ -479,19 +501,26 @@ class Pane {
       el.setAttribute("aria-live", "off");
       el.textContent = "";
       target.after(el);
+      if (callId) this._streamElIndex.set(callId, el);
     }
 
     el.appendChild(document.createTextNode(stripped));
-    el.scrollTop = el.scrollHeight;
+    // rAF-coalesced inner pin: the eager scrollTop=scrollHeight after every
+    // text append forced one whole-page reflow per chunk (geometry read on a
+    // just-dirtied layout).  One pin per frame is visually identical.
+    if (!el._pinPending) {
+      el._pinPending = true;
+      requestAnimationFrame(() => {
+        el._pinPending = false;
+        el.scrollTop = el.scrollHeight;
+      });
+    }
     this.scrollToBottom(stick);
   }
 
   showOutputWarning(evt) {
     if (!evt.call_id || evt.risk_level === "none") return;
-    const escapedId = CSS.escape(evt.call_id);
-    const toolDiv = this.messagesEl.querySelector(
-      '.conv-row[data-call-id="' + escapedId + '"]',
-    );
+    const toolDiv = this._toolRow(evt.call_id);
     if (!toolDiv) return;
     // Shared DOM-builder with replayHistory \u2014 single source of truth for
     // role / class / escape semantics.  Argument shape mirrors the
@@ -520,7 +549,15 @@ class Pane {
   updateVerdictBadge(verdict) {
     if (!verdict || !verdict.call_id) return;
     const escapedId = CSS.escape(verdict.call_id);
-    const badge = this.messagesEl.querySelector(
+    // Badges anchor either inside the row (solo verdicts, replay) or at the
+    // batch-block level (judge-pending panels) — scope the query to the
+    // row's batch, which covers both, instead of scanning the whole
+    // transcript per verdict event.  Row-less lookups (row already replaced
+    // by output) fall back to the container scan so the late-verdict toast
+    // path keeps working.
+    const vRow = this._toolRow(verdict.call_id);
+    const vScope = (vRow && vRow.closest(".conv-batch")) || this.messagesEl;
+    const badge = vScope.querySelector(
       '.conv-verdict[data-call-id="' + escapedId + '"]',
     );
     if (!badge) {
@@ -629,18 +666,40 @@ class Pane {
   }
 
   isNearBottom() {
-    return (
-      this.messagesEl.scrollHeight -
-        this.messagesEl.scrollTop -
-        this.messagesEl.clientHeight <
-      80
-    );
+    // Cached from the passive scroll listener (_createDOM) instead of read
+    // from geometry: the old scrollHeight/scrollTop/clientHeight triplet
+    // forced a synchronous layout of the whole transcript, and this runs on
+    // every streamed token and every tool chunk.  Content growth without a
+    // scroll leaves the cache untouched — which is the DESIRED semantics:
+    // "pinned" is a statement about where the user last scrolled to, not
+    // about the current pixel distance (the old post-append measurement is
+    // exactly what used to silently disengage auto-follow at tool time).
+    return this._nearBottom;
   }
 
   scrollToBottom(force) {
-    if (force || this.isNearBottom()) {
-      this.messagesEl.scrollTop = this.messagesEl.scrollHeight;
-    }
+    if (force) this._scrollPinForce = true;
+    else if (!this._nearBottom) return;
+    // rAF-coalesced pin: at most one scrollHeight read + scrollTop write per
+    // frame no matter how many deltas arrived.  The pin re-checks
+    // _nearBottom AT FIRE TIME: a user wheel-scroll can land between the
+    // schedule (when the cached flag was still true) and the rAF — pinning
+    // anyway would yank them back to the bottom, and the programmatic
+    // scroll's own event would re-mark the flag true, trapping them there
+    // for the rest of the stream.  Scroll events fire before rAF callbacks
+    // within a frame, so the re-check sees the user's disengage.  Force
+    // requests latch across the coalescing window (a forced pin must win
+    // even if a non-forced schedule got there first).
+    if (this._scrollPinPending) return;
+    this._scrollPinPending = true;
+    requestAnimationFrame(() => {
+      this._scrollPinPending = false;
+      const forced = this._scrollPinForce;
+      this._scrollPinForce = false;
+      if (forced || this._nearBottom) {
+        this.messagesEl.scrollTop = this.messagesEl.scrollHeight;
+      }
+    });
   }
 
   _createDOM() {
@@ -717,6 +776,35 @@ class Pane {
     this.messagesEl.setAttribute("role", "log");
     this.messagesEl.setAttribute("aria-live", "polite");
     this.messagesEl.setAttribute("aria-label", "Chat messages");
+    // Track "pinned to bottom" from actual scrolls (user or programmatic)
+    // instead of reading scroller geometry per event — see isNearBottom().
+    // Passive: never blocks the compositor thread.
+    this.messagesEl.addEventListener(
+      "scroll",
+      () => {
+        this._nearBottom =
+          this.messagesEl.scrollHeight -
+            this.messagesEl.scrollTop -
+            this.messagesEl.clientHeight <
+          80;
+      },
+      { passive: true },
+    );
+    // Layout changes that move the bottom WITHOUT a scroll event (window
+    // resize, split-drag, orientation change) would leave the cached flag
+    // stale — a user visually back at the bottom after growing the pane
+    // stayed disengaged until they nudged the scroller.  Resizes are rare,
+    // so the geometry read here is off the hot path by construction.
+    if (typeof ResizeObserver === "function") {
+      this._resizeObs = new ResizeObserver(() => {
+        this._nearBottom =
+          this.messagesEl.scrollHeight -
+            this.messagesEl.scrollTop -
+            this.messagesEl.clientHeight <
+          80;
+      });
+      this._resizeObs.observe(this.messagesEl);
+    }
     this.el.appendChild(this.messagesEl);
 
     // Per-workstream status bar (above input)
@@ -885,13 +973,32 @@ class Pane {
       if (this.evtSource && this.evtSource.lastEventId) {
         this._lastEventId = this.evtSource.lastEventId;
       }
-      const data = JSON.parse(e.data);
+      // Guarded parse + dispatch.  onmessage is the pane's whole event
+      // pipeline: an exception escaping it doesn't close the EventSource, so
+      // pre-guard a single malformed frame (or one throwing handler case)
+      // left the streaming refs (currentAssistantEl / contentBuffer) stale
+      // and every later turn painted into the poisoned segment — the
+      // "output stops rendering while the backend is healthy" wedge.
+      let data = null;
+      try {
+        data = JSON.parse(e.data);
+      } catch (err) {
+        console.warn("interactive: dropping malformed SSE frame", err);
+        return;
+      }
       // Tag the event with its own SSE id so the system_turn handler can
       // dedup a turn already painted from /history against the same turn
       // redelivered by an SSE replay.  e.lastEventId is this event's id;
       // buffered events (system_turn included) always carry one.
       if (e.lastEventId) data._event_id = e.lastEventId;
-      this.handleEvent(data);
+      try {
+        this.handleEvent(data);
+      } catch (err) {
+        console.error(
+          "interactive: handleEvent failed for " + (data && data.type),
+          err,
+        );
+      }
     };
 
     this.evtSource.onerror = () => {
@@ -933,6 +1040,14 @@ class Pane {
     // below gets the new ws's full initial state instead.
     this._lastEventId = null;
     this._lastStatusEvt = null;
+    // Full-reload cleanup (NOT in disconnectSSE — transport-only reconnects
+    // must preserve these): a stale quiesce queue would wedge the new load's
+    // events behind a flush that never comes, stale agent tracking points at
+    // the DOM this load is about to replace, and a pending truncated-resync
+    // is superseded by the full refetch below.
+    this._replayQueue = null;
+    this._clearAgentTracking();
+    this._pendingTruncatedResync = false;
     // Generation token — a slow refetch (e.g. a large resumed session) must
     // not render its history, reconnect its stream, or fire its resend after
     // the pane has switched to another ws. Newest load wins; older ones drop.
@@ -977,7 +1092,10 @@ class Pane {
     // Drop a superseded load: a newer _loadHistoryThenConnect (ws switch)
     // bumped the token while this fetch was in flight, so rendering now would
     // paint the wrong ws's history into the pane.
-    if (token !== undefined && token !== this._historyLoadToken) return;
+    if (token !== undefined && token !== this._historyLoadToken) {
+      this._endReplayQuiesce(token);
+      return;
+    }
     if (data) {
       // Fresh-connect fast-forward: when the trailing turn is an
       // executing in-flight tool batch the server can replay, /history
@@ -995,17 +1113,113 @@ class Pane {
       // shape (server-side projection in make_history_handler:
       // flat tool_calls, top-level source/reminders/attachments, collapsed
       // content, derived denied/is_error/pending) — feed it straight to
-      // replayHistory. No client-side normalisation.
-      this.replayHistory(data.messages || []);
+      // replayHistory. No client-side normalisation.  The quiesce release
+      // rides a finally so a loud replay throw (deliberately uncaught, see
+      // above) can't strand the event queue and wedge the pane.
+      try {
+        this.replayHistory(data.messages || []);
+      } finally {
+        this._endReplayQuiesce(token);
+      }
     } else {
+      // Failure path never reaches replayHistory — reset the streaming refs
+      // here too, or the flushed backlog and resumed live events would paint
+      // into the subtree clear_ui already wiped.
+      this._resetStreamingRefs();
       this.showEmptyState();
+      this._endReplayQuiesce(token);
     }
+  }
+
+  _beginReplayQuiesce(token) {
+    // Arm the handleEvent queue for a full re-render (clear_ui /
+    // replay_truncated).  Token-owned: a newer load's quiesce replaces this
+    // one wholesale — events queued before the newer snapshot was fetched
+    // are covered by that snapshot, so dropping them is lossless.
+    this._replayQueue = { token: token, events: [] };
+  }
+
+  _endReplayQuiesce(token) {
+    const q = this._replayQueue;
+    if (!q || q.token !== token) return;
+    this._replayQueue = null;
+    // Replay the backlog in arrival order.  A queued clear_ui re-arms the
+    // quiesce mid-flush and the remainder queues behind ITS rebuild.  Each
+    // dispatch is guarded like onmessage: one bad event must not drop the
+    // rest of the backlog.
+    for (const evt of q.events) {
+      try {
+        this.handleEvent(evt);
+      } catch (err) {
+        console.error("interactive: queued event replay failed", err);
+      }
+    }
+  }
+
+  _clearAgentTracking() {
+    // Release task-agent bookkeeping ahead of (or after) a full rebuild.
+    // Entries left in _agentCards would pin every replaced card subtree as
+    // reachable detached DOM — unbounded growth across an hours-long
+    // session's rewinds/compaction re-syncs — and a stale _agentOrphans
+    // grace timer would escape buffered steps into the rebuilt pane.
+    if (this._agentCards) this._agentCards.clear();
+    if (this._agentOrphans) {
+      for (const entry of this._agentOrphans.values()) {
+        if (entry.timer != null) clearTimeout(entry.timer);
+      }
+      this._agentOrphans.clear();
+    }
+    // The row/stream lookup caches share this exact lifecycle (entries are
+    // DOM refs into the subtree being replaced) — drop them together.
+    if (this._toolRowIndex) this._toolRowIndex.clear();
+    if (this._streamElIndex) this._streamElIndex.clear();
+  }
+
+  _toolRow(callId) {
+    // O(1) call_id → .conv-row resolution with a self-healing cache: a hit
+    // is validated for liveness (isConnected + id match) so a row replaced
+    // by the pending→resolved upgrade or a batch rebuild falls back to one
+    // scoped query and re-caches.  The old per-event attribute-selector
+    // scan walked the whole transcript — O(N) per tool event.
+    if (!callId) return null;
+    let row = this._toolRowIndex.get(callId);
+    if (row && row.isConnected && row.dataset.callId === callId) return row;
+    row = this.messagesEl.querySelector(
+      '.conv-row[data-call-id="' + CSS.escape(callId) + '"]',
+    );
+    if (row) this._toolRowIndex.set(callId, row);
+    else this._toolRowIndex.delete(callId);
+    return row;
+  }
+
+  _streamEl(callId) {
+    // Same cache discipline as _toolRow for the per-tool streaming <pre> —
+    // resolved on every tool_output_chunk, the chattiest event in an agent
+    // session.
+    if (!callId) return null;
+    let el = this._streamElIndex.get(callId);
+    if (el && el.isConnected && el.dataset.callId === callId) return el;
+    el = this.messagesEl.querySelector(
+      '.tool-output-stream[data-call-id="' + CSS.escape(callId) + '"]',
+    );
+    if (el) this._streamElIndex.set(callId, el);
+    else this._streamElIndex.delete(callId);
+    return el;
   }
 
   handleEvent(evt) {
     // Guard: drop events that belong to a different workstream.
     // This prevents cross-contamination during tab switches and reconnects.
     if (evt.ws_id && evt.ws_id !== this.wsId) return;
+    // While a clear_ui / replay_truncated rebuild is in flight, live events
+    // must not paint into a DOM the imminent replaceChildren() will wipe —
+    // anything painted in the [snapshot-fetch → rebuild] window is lost with
+    // no redelivery (the re-render callers never rewind _lastEventId).  Queue
+    // them; _endReplayQuiesce replays the backlog once the rebuild lands.
+    if (this._replayQueue) {
+      this._replayQueue.events.push(evt);
+      return;
+    }
     switch (evt.type) {
       case "thinking_start":
         this.isThinking = true;
@@ -1048,7 +1262,7 @@ class Pane {
         this.scrollToBottom();
         break;
 
-      case "stream_end":
+      case "stream_end": {
         if (this._cancelTimeout) {
           clearTimeout(this._cancelTimeout);
           this._cancelTimeout = null;
@@ -1057,21 +1271,32 @@ class Pane {
           clearTimeout(this._forceTimeout);
           this._forceTimeout = null;
         }
-        // Finalize the current streaming segment's markdown.  This fires
-        // per-segment (between tool calls), NOT per-turn.  Busy state is
-        // managed by state_change events instead.
-        if (this.currentAssistantBodyEl && this.contentBuffer) {
-          streamingRenderFinalize(
-            this.currentAssistantBodyEl,
-            this.contentBuffer,
-          );
-        }
+        // Reset the segment state BEFORE the finalize render, and guard the
+        // render with a plain-text fallback (mirrors coordinator.js).  With
+        // the old order a finalize throw skipped these clears, so every
+        // later content delta appended into the poisoned buffer/bubble and
+        // no new assistant segment ever painted — the permanent-wedge shape
+        // of "output stops rendering while the backend stays healthy".
+        const doneBodyEl = this.currentAssistantBodyEl;
+        const doneBuffer = this.contentBuffer;
         this.currentAssistantBodyEl = null;
         this.currentAssistantEl = null;
         this.currentReasoningEl = null;
         this.contentBuffer = "";
+        // Finalize the completed streaming segment's markdown.  This fires
+        // per-segment (between tool calls), NOT per-turn.  Busy state is
+        // managed by state_change events instead.
+        if (doneBodyEl && doneBuffer) {
+          try {
+            streamingRenderFinalize(doneBodyEl, doneBuffer);
+          } catch (err) {
+            console.warn("interactive: streamingRenderFinalize failed", err);
+            doneBodyEl.textContent = doneBuffer;
+          }
+        }
         this.scrollToBottom(true);
         break;
+      }
 
       case "in_progress_snapshot":
         // One-shot replay of the in-progress turn's reasoning + content
@@ -1120,6 +1345,16 @@ class Pane {
         if (evt.state === "idle" || evt.state === "error") {
           this.setBusy(false);
           this._attachRetryToLastAssistant();
+          // Deferred replay_truncated re-sync: the truncation arrived while
+          // a segment was streaming (refetching then would have detached the
+          // live bubble), so repair the lost-event gap now that the turn is
+          // settled and /history is complete.
+          if (this._pendingTruncatedResync) {
+            this._pendingTruncatedResync = false;
+            const rsToken = this._historyLoadToken;
+            this._beginReplayQuiesce(rsToken);
+            this._refetchHistory(this.wsId, rsToken);
+          }
           // Only steal focus if this is the active pane and no approval pending.
           if (this._host.isFocused(this) && !this.pendingApproval) {
             this.inputEl.focus();
@@ -1315,7 +1550,9 @@ class Pane {
         // the load token so a ws switch mid-flight discards both the
         // re-render and the resend (no cross-ws send).
         const token = this._historyLoadToken;
+        this._beginReplayQuiesce(token);
         this.messagesEl.replaceChildren();
+        this._resetStreamingRefs();
         this._refetchHistory(this.wsId, token)
           .then(() => {
             if (token !== this._historyLoadToken) return;
@@ -1357,9 +1594,19 @@ class Pane {
         // floor's in_progress_snapshot already paints it, and an async
         // refetch's replaceChildren() would detach the live bubble so
         // content deltas render nowhere. Re-syncs on the next clean
-        // (re)connect.
-        if (!this.currentAssistantEl)
-          this._refetchHistory(this.wsId, this._historyLoadToken);
+        // (re)connect.  The guard covers BOTH streaming targets — a
+        // reasoning-only segment (currentReasoningEl without a content
+        // bubble yet) is just as detachable as a content one.  Mid-stream
+        // the resync is DEFERRED, not dropped: skipping outright left the
+        // lost-event gap unrepaired for the rest of the session (no clean
+        // reconnect may come for hours); the idle edge consumes the flag.
+        if (!this.currentAssistantEl && !this.currentReasoningEl) {
+          const rtToken = this._historyLoadToken;
+          this._beginReplayQuiesce(rtToken);
+          this._refetchHistory(this.wsId, rtToken);
+        } else {
+          this._pendingTruncatedResync = true;
+        }
         break;
     }
   }
@@ -1980,8 +2227,30 @@ class Pane {
       });
   }
 
+  _resetStreamingRefs() {
+    // Null every ref that can point into a wiped subtree, so the next event
+    // creates fresh targets instead of writing invisibly into detached
+    // nodes.  Called wherever the transcript DOM is (or is about to be)
+    // replaced — replayHistory, the clear_ui immediate wipe, and the
+    // refetch-FAILURE path (which shows the empty state without ever
+    // reaching replayHistory; leaving refs stale there made the retried
+    // generation's whole first segment stream into a detached bubble).
+    this.currentAssistantEl = null;
+    this.currentAssistantBodyEl = null;
+    this.currentReasoningEl = null;
+    this.contentBuffer = "";
+    this.announcedBlockEl = null;
+    this._thinkingEl = null;
+    this._retryHolderEl = null;
+  }
+
   replayHistory(messages) {
     this.messagesEl.replaceChildren();
+    // The rebuild just orphaned any in-flight streaming targets — reset them,
+    // and release the agent-card/orphan maps whose entries now point at
+    // replaced subtrees (detached-DOM retention).
+    this._resetStreamingRefs();
+    this._clearAgentTracking();
     // Reset the per-pane dedup set: ids of operator-context system turns
     // already painted from /history.  A later SSE replay that redelivers one
     // (resume-cursor overlap) is skipped by the system_turn handler.
@@ -2252,9 +2521,15 @@ class Pane {
   }
 
   _attachRetryToLastAssistant() {
-    // Remove any previous retry buttons
-    const old = this.messagesEl.querySelectorAll(".msg.assistant .msg-actions");
-    for (let i = 0; i < old.length; i++) old[i].parentNode.removeChild(old[i]);
+    // Remove the previous holder's action bar via the tracked ref — the old
+    // whole-transcript ".msg.assistant .msg-actions" sweep was O(N) per
+    // busy→idle edge.  At most one assistant bar exists (this method is its
+    // only writer); a holder detached by a rebuild no-ops harmlessly.
+    if (this._retryHolderEl) {
+      const oldBar = this._retryHolderEl.querySelector(".msg-actions");
+      if (oldBar) oldBar.remove();
+      this._retryHolderEl = null;
+    }
     // Find the last assistant message with content and add retry.
     // Reasoning blocks emit as .msg.reasoning (distinct modifier) so the
     // .msg.assistant selector already excludes them — no extra guard needed.
@@ -2275,13 +2550,25 @@ class Pane {
     if (lastChild && lastChild.classList.contains("conv-batch")) {
       return;
     }
-    const assistants = this.messagesEl.querySelectorAll(".msg.assistant");
-    if (assistants.length) {
-      const lastAssistant = assistants[assistants.length - 1];
+    // Walk backwards from the tail for the last assistant bubble — the
+    // match is at (or near) the end of the transcript, so this touches a
+    // handful of siblings instead of collecting all N assistant rows.
+    let lastAssistant = this.messagesEl.lastElementChild;
+    while (
+      lastAssistant &&
+      !(
+        lastAssistant.classList.contains("msg") &&
+        lastAssistant.classList.contains("assistant")
+      )
+    ) {
+      lastAssistant = lastAssistant.previousElementSibling;
+    }
+    if (lastAssistant) {
       this._addRetryAction(lastAssistant);
       if (this._voiceRoles && this._voiceRoles.tts) {
         this._addTtsAction(lastAssistant);
       }
+      this._retryHolderEl = lastAssistant;
     }
   }
 
@@ -2565,10 +2852,9 @@ class Pane {
   }
 
   _ensureAgentCard(parentCallId) {
-    const escId = parentCallId ? CSS.escape(parentCallId) : "";
-    const parentRow = escId
-      ? this.messagesEl.querySelector('.conv-row[data-call-id="' + escId + '"]')
-      : null;
+    // _toolRow cache: a busy task agent resolves its parent row once per
+    // child event — the uncached scan was O(transcript) per step.
+    const parentRow = this._toolRow(parentCallId);
     if (!parentRow) return null;
     if (!this._agentCards) this._agentCards = new Map();
     let card = this._agentCards.get(parentCallId);
@@ -2700,17 +2986,17 @@ class Pane {
     const stick = this.isNearBottom();
     // A task_agent's OWN result completing flips its card running -> done/error
     // (child sub-tool results carry namespaced ids, never keys of _agentCards).
+    // The entry deliberately SURVIVES the result: a late child event (SSE
+    // replay overlap) re-entering _ensureAgentCard with no Map entry would
+    // build a duplicate empty card beside the finished one.  Entries hold
+    // attached DOM (not a leak); the detached-retention hazard is rebuilds,
+    // which _clearAgentTracking covers in replayHistory.
     if (this._agentCards && this._agentCards.has(callId)) {
       this._agentCards.get(callId).wrap.dataset.state = isError
         ? "error"
         : "done";
     }
-    const escapedId = callId ? CSS.escape(callId) : "";
-    let target = escapedId
-      ? this.messagesEl.querySelector(
-          '.conv-row[data-call-id="' + escapedId + '"]',
-        )
-      : null;
+    let target = this._toolRow(callId);
     if (!target) {
       // A namespaced sub-agent child id ("<parent>::<id>") whose row hasn't
       // nested yet must NOT graft its output onto the last top-level batch row
@@ -2732,18 +3018,17 @@ class Pane {
     if (!target) return;
 
     // Remove the streaming output element for this tool
-    let streamEl = null;
-    if (escapedId) {
-      streamEl = this.messagesEl.querySelector(
-        '.tool-output-stream[data-call-id="' + escapedId + '"]',
-      );
-    } else {
+    let streamEl = this._streamEl(callId);
+    if (!streamEl) {
       const next = target.nextElementSibling;
       if (next && next.classList.contains("tool-output-stream")) {
         streamEl = next;
       }
     }
-    if (streamEl) streamEl.remove();
+    if (streamEl) {
+      streamEl.remove();
+      if (callId) this._streamElIndex.delete(callId);
+    }
 
     const stripped = stripAnsi(output || "").trim();
     if (!stripped) return;
@@ -3885,6 +4170,16 @@ function createInteractivePane(root, wsId, opts) {
         recoverTimer = null;
       }
       pane.disconnectSSE();
+      // Terminal cleanup that transport-only reconnects must NOT do (see
+      // disconnectSSE): cancel orphan grace timers so a post-destroy escape
+      // can't paint into the detached pane / shared announcer, release the
+      // card maps, and stop observing the detached scroller.
+      pane._clearAgentTracking();
+      pane._replayQueue = null;
+      if (pane._resizeObs) {
+        pane._resizeObs.disconnect();
+        pane._resizeObs = null;
+      }
       if (pane.el && pane.el.parentNode) {
         pane.el.parentNode.removeChild(pane.el);
       }

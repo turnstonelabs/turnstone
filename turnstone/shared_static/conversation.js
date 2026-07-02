@@ -273,10 +273,19 @@ export function buildConvCmd(item) {
   if (item.preview) {
     const diff = document.createElement("div");
     diff.className = "conv-row-diff";
-    const lines = stripAnsi(item.preview).split("\n");
-    const nodes = [];
+    // The preview is uncapped upstream (a whole multiline command / one line
+    // per edited line) — cap what we RENDER: past ~400 lines the preview
+    // carries no decision value, the DOM cost is ~2 nodes/line in every
+    // transcript row, and an argument-spread append of an unbounded node
+    // list can throw RangeError mid-paint (engines cap spread arity around
+    // 65k args), killing the tool card — and the approval gate — for the
+    // batch.  Appended incrementally for the same reason.
+    const MAX_PREVIEW_LINES = 400;
+    let lines = stripAnsi(item.preview).split("\n");
+    const omitted = lines.length - MAX_PREVIEW_LINES;
+    if (omitted > 0) lines = lines.slice(0, MAX_PREVIEW_LINES);
     lines.forEach((line, i) => {
-      if (i > 0) nodes.push("\n");
+      if (i > 0) diff.appendChild(document.createTextNode("\n"));
       const trimmed = line.trim();
       let cls = null;
       if (trimmed.startsWith("-")) cls = "conv-diff-del";
@@ -286,13 +295,25 @@ export function buildConvCmd(item) {
         const span = document.createElement("span");
         span.className = cls;
         span.textContent = line;
-        nodes.push(span);
+        diff.appendChild(span);
       } else {
-        nodes.push(line);
+        diff.appendChild(document.createTextNode(line));
       }
     });
-    diff.append(...nodes);
     frag.appendChild(diff);
+    // The omission notice sits BELOW the scroll box as a sibling, not as the
+    // diff's last child: .conv-row-diff is a 240px inner scroller, so an
+    // inline marker would sit thousands of pixels below its fold — invisible
+    // exactly at the approval moment, where the operator must know the
+    // preview is partial.  Its own neutral class (not .conv-diff-warn):
+    // an omission is informational, not a command warning, and raw --warn
+    // fails AA on the light panel background.
+    if (omitted > 0) {
+      const more = document.createElement("div");
+      more.className = "conv-diff-omit";
+      more.textContent = "… " + omitted + " more preview lines not shown";
+      frag.appendChild(more);
+    }
   }
   return frag;
 }
@@ -595,6 +616,20 @@ export function buildConvResult(output, opts) {
         /* not JSON -- fall through to raw text */
       }
     }
+  }
+  // Clamp the rendered body — same rationale as the JSON pretty-print cap
+  // above: the server ships tool output verbatim, and a single multi-MB
+  // result (an agent cat-ing a large file) becomes a multi-MB pre-wrap text
+  // node that stalls layout on insert and is rebuilt on every full
+  // re-render.  The transcript shows the head; the full output stays in
+  // history/storage.
+  const RAW_CAP = 64 * 1024;
+  if (pretty.length > RAW_CAP) {
+    pretty =
+      pretty.slice(0, RAW_CAP) +
+      "\n… (" +
+      pretty.length.toLocaleString() +
+      " chars total — truncated for display)";
   }
   const body = document.createElement("span");
   body.textContent = pretty;
