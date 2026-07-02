@@ -3714,3 +3714,16 @@ h3.skill-spec-heading {
     transition: none;
   }
 }
+
+/* ===== Personas shelf — the tool-visibility checklist (four-lever form).
+   Grid of toggle rows so 16+ tool names don't become a full-height column;
+   the free-text row beneath carries MCP/dynamic names. */
+#pr-tools-checklist {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(190px, 1fr));
+  gap: 2px 14px;
+  margin: 4px 0 10px;
+}
+#pr-tools-picker {
+  margin: 2px 0 6px;
+}

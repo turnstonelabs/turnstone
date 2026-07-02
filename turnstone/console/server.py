@@ -960,6 +960,7 @@ def _coordinator_rows(request: Request) -> list[dict[str, Any]]:
                 "parent_ws_id": None,
                 "user_id": ws.user_id or "",
                 "project_id": ws.project_id or "",
+                "persona": ws.persona or "",
             }
         )
         seen.add(ws.id)
@@ -989,6 +990,7 @@ def _coordinator_rows(request: Request) -> list[dict[str, Any]]:
                 "parent_ws_id": None,
                 "user_id": row_owner,
                 "project_id": m.get("project_id") or "",
+                "persona": m.get("persona") or "",
             }
         )
     return rows

@@ -162,6 +162,7 @@ class CoordinatorAdapter:
                 state=ws.state.value,
                 parent_ws_id=None,
                 project_id=ws.project_id,
+                persona=ws.persona,
             )
         except Exception:
             log.debug("coord_adapter.created_fanout_failed ws=%s", ws.id[:8], exc_info=True)
@@ -530,6 +531,7 @@ class CoordinatorAdapter:
                     state=ws.state.value,
                     parent_ws_id=None,
                     project_id=ws.project_id,
+                    persona=ws.persona,
                 )
             except Exception:
                 log.debug(

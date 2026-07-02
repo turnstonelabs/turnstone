@@ -133,13 +133,14 @@ function patchClusterState(data) {
         activity_state: "",
         tool_calls: 0,
         // ws_created SSE events carry kind / parent_ws_id / user_id /
-        // project_id; preserve them on the in-memory ws so the home-landing
-        // active-coordinators list and the tree grouping both pick up
-        // newly-created rows without needing a snapshot refetch.
+        // project_id / persona; preserve them on the in-memory ws so the
+        // home-landing active-coordinators list and the tree grouping both
+        // pick up newly-created rows without needing a snapshot refetch.
         kind: data.kind || "interactive",
         parent_ws_id: data.parent_ws_id || null,
         user_id: data.user_id || null,
         project_id: data.project_id || null,
+        persona: data.persona || "",
       });
     }
   } else if (t === "ws_closed") {
@@ -1000,6 +1001,7 @@ function _createWorkstreamFetchOpts(body, files) {
 function _createCoordinator(opts) {
   const name = (opts.name || "").trim();
   const skill = opts.skill || "";
+  const persona = (opts.persona || "").trim();
   const model = (opts.model || "").trim();
   const judgeModel = (opts.judge_model || "").trim();
   const project = (opts.project_id || "").trim();
@@ -1018,6 +1020,7 @@ function _createCoordinator(opts) {
   const body = {};
   if (name) body.name = name;
   if (skill) body.skill = skill;
+  if (persona) body.persona = persona;
   if (model) body.model = model;
   if (judgeModel) body.judge_model = judgeModel;
   if (project) body.project_id = project;
@@ -1064,9 +1067,9 @@ function _hasInteractivePermission() {
   return perms.split(",").indexOf("workstreams.create") !== -1;
 }
 
-// Which persona the launcher creates: "coordinator" (console-local) or
-// "interactive" (proxied to a compute node).  The composer is shared; only the
-// submit endpoint + redirect differ.
+// Which workstream KIND the launcher creates: "coordinator" (console-local)
+// or "interactive" (proxied to a compute node).  The composer is shared; only
+// the submit endpoint + redirect differ.
 let _launcherKind = "coordinator";
 
 // Sentinel value for the project picker's "+ New project…" row — selecting it
@@ -1077,8 +1080,8 @@ const _PROJECT_NEW = "__new__";
 function _setLauncherKind(kind, focus) {
   _launcherKind = kind;
   const map = {
-    "persona-coordinator": "coordinator",
-    "persona-interactive": "interactive",
+    "kind-coordinator": "coordinator",
+    "kind-interactive": "interactive",
   };
   Object.keys(map).forEach(function (id) {
     const btn = document.getElementById(id);
@@ -1090,9 +1093,12 @@ function _setLauncherKind(kind, focus) {
     if (on && focus) btn.focus();
   });
   _applyLauncherFields();
+  // The persona shelves are disjoint per kind — swap the picker's choices
+  // (and default preselect) whenever the kind toggles.
+  _populateHomePersonaDropdown();
 }
 
-// Reflect the active persona in the shared launcher composer: the task-prompt
+// Reflect the active kind in the shared launcher composer: the task-prompt
 // hint, and which option fields are relevant.  The node picker is
 // interactive-only (coordinators run in the console, not on a compute node);
 // its node list appears only under the "Specific node" strategy.
@@ -1151,9 +1157,9 @@ function _populateLauncherNodes() {
 }
 
 function _wireLauncherToggle() {
-  const group = document.getElementById("launcher-personas");
-  const coordBtn = document.getElementById("persona-coordinator");
-  const intBtn = document.getElementById("persona-interactive");
+  const group = document.getElementById("launcher-kinds");
+  const coordBtn = document.getElementById("kind-coordinator");
+  const intBtn = document.getElementById("kind-interactive");
   if (coordBtn) {
     coordBtn.addEventListener("click", function () {
       _setLauncherKind("coordinator");
@@ -1194,6 +1200,7 @@ function _wireLauncherToggle() {
 function _createInteractive(opts) {
   const name = (opts.name || "").trim();
   const skill = opts.skill || "";
+  const persona = (opts.persona || "").trim();
   const model = (opts.model || "").trim();
   const judgeModel = (opts.judge_model || "").trim();
   const project = (opts.project_id || "").trim();
@@ -1221,6 +1228,7 @@ function _createInteractive(opts) {
   const body = { node_id: placement };
   if (name) body.name = name;
   if (skill) body.skill = skill;
+  if (persona) body.persona = persona;
   if (model) body.model = model;
   if (judgeModel) body.judge_model = judgeModel;
   if (project) body.project_id = project;
@@ -1460,8 +1468,43 @@ function _ensureHomeComposerInit() {
   _populateHomeSkillDropdown();
   _populateHomeModelDropdowns();
   _refreshAndPopulateProjects();
+  _refreshAndPopulatePersonas();
   _ensureHomeProjectCreator();
   _refreshHomeComposerVisibility();
+}
+
+// Refresh the shared personas cache (window.TurnstonePersonas — also feeds
+// the saved-list / rail labels) then repaint the launcher's Persona picker.
+// Safe when the bridge is absent (module still loading): the picker keeps
+// its "Default" placeholder, which the server resolves to the kind default.
+function _refreshAndPopulatePersonas() {
+  const TP = window.TurnstonePersonas;
+  if (!TP) return;
+  TP.refreshPersonas().then(_populateHomePersonaDropdown);
+}
+
+// Populate the launcher's Persona picker for the ACTIVE kind, preselecting
+// the kind's default so a zero-touch launch behaves exactly like today.
+// Re-run on kind toggle (_applyLauncherFields): the interactive and
+// coordinator shelves are disjoint persona sets.
+function _populateHomePersonaDropdown() {
+  if (!_homeCoordComposer) return;
+  const TP = window.TurnstonePersonas;
+  if (!TP) return;
+  const previous = _homeCoordComposer.getOptionValue("persona");
+  const choices = TP.personaChoices(_launcherKind);
+  _homeCoordComposer.setOptionChoices("persona", choices);
+  const stillValid =
+    previous &&
+    choices.some(function (c) {
+      return c.value === previous;
+    });
+  if (stillValid) {
+    _homeCoordComposer.setOptionValue("persona", previous);
+  } else {
+    const dflt = TP.defaultPersona(_launcherKind);
+    if (dflt) _homeCoordComposer.setOptionValue("persona", dflt.name);
+  }
 }
 
 // Refresh the shared projects cache (window.TurnstoneProjects — also feeds the
@@ -1531,6 +1574,13 @@ function _mountHomeCoordComposer() {
       storageKey: "turnstone.console.home_coord.options_open",
       summary: function (v) {
         const bits = [];
+        // Persona surfaces only when it's a non-default pick — the kind
+        // default is the zero-touch state and needs no summary line.
+        if (v.persona && window.TurnstonePersonas) {
+          const dflt = window.TurnstonePersonas.defaultPersona(_launcherKind);
+          if (!dflt || dflt.name !== v.persona)
+            bits.push(window.TurnstonePersonas.personaLabel(v.persona));
+        }
         if (v.name) bits.push(v.name);
         if (v.skill) bits.push(v.skill);
         if (v.model) bits.push(v.model);
@@ -1557,6 +1607,17 @@ function _mountHomeCoordComposer() {
         _applyLauncherFields();
       },
       fields: [
+        {
+          // Persona — the capability/prompt envelope the workstream is
+          // created with (snapshotted server-side at create; edits to the
+          // persona never touch existing workstreams).  Choices are
+          // kind-filtered and repopulated by _populateHomePersonaDropdown
+          // with the kind's default preselected, so zero-touch = today.
+          id: "persona",
+          label: "Persona",
+          type: "select",
+          choices: [{ value: "", text: "Default" }],
+        },
         {
           id: "name",
           label: "Name",
@@ -1596,9 +1657,9 @@ function _mountHomeCoordComposer() {
           type: "select",
           choices: [{ value: "", text: "No project" }],
         },
-        // Node placement — INTERACTIVE persona only (coordinators run in the
+        // Node placement — INTERACTIVE kind only (coordinators run in the
         // console, not on a compute node).  _applyLauncherFields shows/hides
-        // these per persona.  "auto" → the console picks the least-loaded node;
+        // these per kind.  "auto" → the console picks the least-loaded node;
         // "node" → reveal the live node picker below + pin to the chosen node.
         {
           id: "node_strategy",
@@ -1720,14 +1781,14 @@ function _refreshHomeComposerVisibility() {
   const canCoord = _hasCoordPermission();
   const canInt = _hasInteractivePermission();
   panel.style.display = canCoord || canInt ? "" : "none";
-  const coordBtn = document.getElementById("persona-coordinator");
-  const intBtn = document.getElementById("persona-interactive");
+  const coordBtn = document.getElementById("kind-coordinator");
+  const intBtn = document.getElementById("kind-interactive");
   if (coordBtn) coordBtn.style.display = canCoord ? "" : "none";
   if (intBtn) intBtn.style.display = canInt ? "" : "none";
-  // Hide the toggle when only one persona is available.
-  const personas = document.getElementById("launcher-personas");
-  if (personas) personas.style.display = canCoord && canInt ? "" : "none";
-  // Default to a persona the user can actually create.
+  // Hide the toggle when only one kind is available.
+  const kinds = document.getElementById("launcher-kinds");
+  if (kinds) kinds.style.display = canCoord && canInt ? "" : "none";
+  // Default to a kind the user can actually create.
   if (_launcherKind === "coordinator" && !canCoord && canInt) {
     _setLauncherKind("interactive");
   } else if (_launcherKind === "interactive" && !canInt && canCoord) {
@@ -1770,6 +1831,7 @@ function submitHomeCoord(textFromComposer) {
   const shared = {
     name: opts.name || "",
     skill: opts.skill || "",
+    persona: opts.persona || "",
     model: opts.model || "",
     judge_model: opts.judge_model || "",
     // A pending "+ New project…" sentinel never reaches submit (it's reset in
@@ -1903,7 +1965,7 @@ function _initSavedCoordTable() {
       cell: function (s) {
         const tag = document.createElement("span");
         const coord = s.kind === "coordinator";
-        tag.className = "persona-tag" + (coord ? " coord" : " int");
+        tag.className = "kind-tag" + (coord ? " coord" : " int");
         tag.textContent = coord ? "COORD" : "INT";
         return tag;
       },
@@ -1911,6 +1973,7 @@ function _initSavedCoordTable() {
         return s.kind || "";
       },
     },
+    SavedColumns.persona(),
     SavedColumns.project(),
     SavedColumns.model(),
     SavedColumns.count("child_count", "CHILDREN", "92px"),

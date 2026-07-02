@@ -320,7 +320,7 @@
   font-variant-numeric: tabular-nums;
 }
 .row .tag,
-.persona-tag {
+.kind-tag {
   font-size: 9px;
   letter-spacing: 0.08em;
   font-weight: 600;
@@ -330,7 +330,7 @@
   color: var(--ink-4);
 }
 .row .tag.coord,
-.persona-tag.coord {
+.kind-tag.coord {
   color: var(--accent);
   border-color: color-mix(in srgb, var(--accent) 40%, var(--hair-2));
 }
@@ -748,8 +748,8 @@
   .tab-menu {
     animation: none;
   }
-  .persona-btn,
-  .persona-led {
+  .kind-btn,
+  .kind-led {
     transition: none;
   }
 }
@@ -1040,7 +1040,7 @@
   outline-offset: -2px;
 }
 
-/* ===== Dashboard session launcher — persona toggle (coordinator | interactive).
+/* ===== Dashboard session launcher — kind toggle (coordinator | interactive).
    A console-dashboard control; lives here because the L-shell loads shell.css.
 
    The active option wears its KIND, not a neutral highlight: amber for
@@ -1048,7 +1048,7 @@
    .ptag chips and the rail's session rows, so "which kind am I starting"
    reads at a glance.  Tints are 15% (sub-0.10 washes out at chip size) and
    colour is never alone: the kind LED + label weight carry the state too. */
-.launcher-personas {
+.launcher-kinds {
   display: inline-flex;
   gap: 2px;
   margin-bottom: 10px;
@@ -1057,7 +1057,7 @@
   border-radius: var(--r-sm);
   background: var(--bg); /* recessed track — the .seg precedent */
 }
-.persona-btn {
+.kind-btn {
   display: inline-flex;
   align-items: center;
   gap: 7px;
@@ -1076,10 +1076,10 @@
     background 0.12s,
     color 0.12s;
 }
-.persona-btn:hover {
+.kind-btn:hover {
   color: var(--ink);
 }
-.persona-led {
+.kind-led {
   width: 6px;
   height: 6px;
   border-radius: 50%;
@@ -1091,45 +1091,45 @@
     opacity 0.12s,
     box-shadow 0.12s;
 }
-.persona-btn.active {
+.kind-btn.active {
   font-weight: 600;
 }
-.persona-btn--coord.active {
+.kind-btn--coord.active {
   background: color-mix(in srgb, var(--accent) 15%, transparent);
   color: var(--accent);
 }
-.persona-btn--coord.active .persona-led {
+.kind-btn--coord.active .kind-led {
   background: var(--accent);
   opacity: 1;
   box-shadow: 0 0 6px var(--accent-glow-strong);
 }
-.persona-btn--int.active {
+.kind-btn--int.active {
   background: color-mix(in srgb, var(--cyan) 15%, transparent);
   color: var(--cyan);
 }
-.persona-btn--int.active .persona-led {
+.kind-btn--int.active .kind-led {
   background: var(--cyan);
   opacity: 1;
   box-shadow: 0 0 6px var(--cyan-glow);
 }
-/* persona tag in the saved-sessions table — shares the rail chip base
+/* kind tag in the saved-sessions table — shares the rail chip base
    (.row .tag above); only no-wrap + the INT colour differ. */
-.persona-tag {
+.kind-tag {
   white-space: nowrap;
 }
-.persona-tag.int {
+.kind-tag.int {
   color: var(--cyan);
   border-color: color-mix(in srgb, var(--cyan) 35%, var(--hair-2));
 }
 
-/* Inset focus ring for the rail's interactive rows + the persona toggle — the
+/* Inset focus ring for the rail's interactive rows + the kind toggle — the
    global :focus-visible (base.css) uses outline-offset:2px, which clips against
    the 266px rail edge; inset it like .dash-row:focus-visible (base.css). */
 .cpill:focus-visible,
 .node-row:focus-visible,
 .row:focus-visible,
 .grp-head:focus-visible,
-.persona-btn:focus-visible {
+.kind-btn:focus-visible {
   outline: 2px solid var(--accent);
   outline-offset: -2px;
   border-radius: var(--r-sm);

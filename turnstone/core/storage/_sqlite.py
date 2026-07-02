@@ -778,7 +778,7 @@ class SQLiteBackend:
                         "(SELECT ue.prompt_tokens FROM usage_events ue "
                         " WHERE ue.ws_id = w.ws_id "
                         " ORDER BY ue.timestamp DESC LIMIT 1), "
-                        "md.context_window, w.project_id, w.user_id "
+                        "md.context_window, w.project_id, w.user_id, w.persona "
                         "FROM workstreams w "
                         "LEFT JOIN workstream_config wcm "
                         "  ON wcm.ws_id = w.ws_id AND wcm.key = 'model_alias' "
@@ -1362,9 +1362,11 @@ class SQLiteBackend:
                     # these by name to surface the persisted display title.
                     workstreams.c.title,
                     workstreams.c.alias,
-                    # project_id rides at the tail (read by name) so the
-                    # persisted coordinator lane can carry its project group.
+                    # project_id + persona ride at the tail (read by name) so
+                    # the persisted coordinator lane can carry its project
+                    # group and persona label.
                     workstreams.c.project_id,
+                    workstreams.c.persona,
                 )
                 .order_by(workstreams.c.updated.desc())
                 .limit(limit)
@@ -3799,6 +3801,7 @@ class SQLiteBackend:
                     workstreams.c.created,
                     workstreams.c.updated,
                     workstreams.c.project_id,
+                    workstreams.c.persona,
                 ).where(workstreams.c.ws_id.in_(clean))
             ).fetchall()
         for r in rows:
@@ -3817,6 +3820,7 @@ class SQLiteBackend:
                 "created": r[11],
                 "updated": r[12],
                 "project_id": r[13],
+                "persona": r[14],
             }
         return out
 

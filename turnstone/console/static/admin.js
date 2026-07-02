@@ -51,6 +51,7 @@ const ADMIN_IA = [
     group: "Governance",
     tabs: [
       { tab: "projects", label: "Projects", perm: "project.read" },
+      { tab: "personas", label: "Personas", perm: "persona.read" },
       { tab: "roles", label: "Roles", perm: "admin.roles" },
       { tab: "policies", label: "Policies", perm: "admin.policies" },
       {
@@ -191,6 +192,7 @@ function switchAdminTab(tab) {
     "schedules",
     "watches",
     "projects",
+    "personas",
     "roles",
     "policies",
     "skills",
@@ -225,6 +227,7 @@ function switchAdminTab(tab) {
   if (tab === "schedules") loadAdminSchedules();
   if (tab === "watches") loadAdminWatches();
   if (tab === "projects") loadAdminProjects();
+  if (tab === "personas") loadAdminPersonas();
   if (tab === "roles") loadGovRoles();
   if (tab === "policies") loadGovPolicies();
   if (tab === "skills") loadGovSkills();
@@ -2916,6 +2919,432 @@ function confirmDeleteProject(pid, name) {
         });
     },
   );
+}
+
+// ===========================================================================
+//  Personas — workstream capability/prompt templates (Service Hatch shelf).
+//  Archive-only lifecycle (PATCH enabled=false); no DELETE — a workstream's
+//  stamped provenance stays explicable forever.  Edits never touch existing
+//  workstreams: they run on the snapshot stamped at creation.
+// ===========================================================================
+
+let _adminPersonas = [];
+let _personaShelfWired = false;
+
+// Builtin tool inventories per kind, for the visibility checklist.  Mirrored
+// from turnstone/core/tools.py (INTERACTIVE_TOOLS / COORDINATOR_TOOLS) — keep
+// in sync when a tool is added; unknown/dynamic names ride the free-text row.
+// "tool_search" is synthetic (not a builtin) but listed because its presence
+// decides whether a visibility set is soft (expandable) or hard.
+const _PERSONA_TOOLS = {
+  interactive: [
+    "bash",
+    "diff_file",
+    "edit_file",
+    "memory",
+    "notify",
+    "read_file",
+    "read_resource",
+    "recall",
+    "search",
+    "skills",
+    "task_agent",
+    "tool_search",
+    "use_prompt",
+    "watch",
+    "web_fetch",
+    "web_search",
+    "write_file",
+  ],
+  coordinator: [
+    "cancel_workstream",
+    "close_all_children",
+    "close_workstream",
+    "delete_workstream",
+    "inspect_workstream",
+    "list_nodes",
+    "list_workstreams",
+    "memory",
+    "notify",
+    "send_to_workstream",
+    "skills",
+    "spawn_batch",
+    "spawn_workstream",
+    "tasks",
+    "tool_search",
+    "wait_for_workstream",
+  ],
+};
+
+function loadAdminPersonas() {
+  authFetch("/v1/api/admin/personas")
+    .then(function (r) {
+      if (!r.ok) throw new Error("Failed to load personas");
+      return r.json();
+    })
+    .then(function (data) {
+      _adminPersonas = data.personas || [];
+      _renderPersonas(_adminPersonas);
+    })
+    .catch(function () {
+      setSafeHtml(
+        document.getElementById("admin-personas-table"),
+        '<div class="dashboard-empty">Failed to load personas</div>',
+      );
+    });
+}
+
+// One-line envelope summary for the list: prompt/tools/MCP/memory levers.
+function _personaEnvelope(p) {
+  const bits = [];
+  bits.push(p.base_prompt ? "custom prompt" : "stock prompt");
+  if (p.tool_allowlist === null || p.tool_allowlist === undefined) {
+    bits.push("all tools");
+  } else if (!p.tool_allowlist.length) {
+    bits.push("no tools");
+  } else {
+    bits.push(p.tool_allowlist.length + " tools");
+  }
+  if (!p.mcp_enabled) bits.push("no MCP");
+  if (!p.memory_enabled) bits.push("no memory");
+  return bits.join(", ");
+}
+
+function _renderPersonas(personas) {
+  const container = document.getElementById("admin-personas-table");
+  if (!personas.length) {
+    setSafeHtml(
+      container,
+      '<div class="dashboard-empty">No personas. Run migrations to seed the builtin set, or create one.</div>',
+    );
+    return;
+  }
+  let html = "";
+  for (let i = 0; i < personas.length; i++) {
+    const p = personas[i];
+    const archived = !p.enabled;
+    const label = p.display_name || p.name;
+    html +=
+      '<div class="admin-row" role="listitem" tabindex="0">' +
+      '<span class="admin-col admin-col-username" title="' +
+      escapeHtml(p.description || "") +
+      '">' +
+      escapeHtml(label) +
+      (p.is_default ? ' <span class="label-hint">(default)</span>' : "") +
+      "</span>" +
+      '<span class="admin-col admin-col-name">' +
+      escapeHtml((p.applies_to_kinds || []).join(", ")) +
+      "</span>" +
+      '<span class="admin-col admin-col-created">' +
+      escapeHtml(_personaEnvelope(p)) +
+      "</span>" +
+      '<span class="admin-col admin-col-created">' +
+      (archived ? "Archived" : "Active") +
+      "</span>" +
+      '<span class="admin-col admin-col-actions">' +
+      _kebabMenu(
+        [
+          {
+            label: "edit",
+            title: "Edit levers (existing workstreams keep their stamp)",
+            attrs: { "data-edit-persona": p.persona_id },
+          },
+        ]
+          .concat(
+            p.is_default || archived
+              ? []
+              : [
+                  {
+                    label: "make default",
+                    title:
+                      "Make this the kind default (demotes the incumbent)",
+                    attrs: { "data-default-persona": p.persona_id },
+                  },
+                ],
+          )
+          .concat(
+            p.is_default
+              ? [] // the default is un-archivable — flip the flag elsewhere first
+              : [
+                  {
+                    label: archived ? "unarchive" : "archive",
+                    title: archived
+                      ? "Reactivate persona"
+                      : "Archive persona (existing workstreams unaffected)",
+                    attrs: {
+                      "data-archive-persona": p.persona_id,
+                      "data-archive-enabled": archived ? "1" : "0",
+                    },
+                  },
+                ],
+          ),
+      ) +
+      "</span>" +
+      "</div>";
+  }
+  setSafeHtml(container, html);
+  _bindPersonaRowActions(container);
+}
+
+function _bindPersonaRowActions(container) {
+  container.querySelectorAll("[data-edit-persona]").forEach(function (b) {
+    b.addEventListener("click", function () {
+      showEditPersonaModal(this.getAttribute("data-edit-persona"));
+    });
+  });
+  container.querySelectorAll("[data-default-persona]").forEach(function (b) {
+    b.addEventListener("click", function () {
+      _patchPersona(
+        this.getAttribute("data-default-persona"),
+        { is_default: true },
+        "Default persona updated",
+      );
+    });
+  });
+  container.querySelectorAll("[data-archive-persona]").forEach(function (b) {
+    b.addEventListener("click", function () {
+      const enable = this.getAttribute("data-archive-enabled") === "1";
+      _patchPersona(
+        this.getAttribute("data-archive-persona"),
+        { enabled: enable },
+        enable ? "Persona restored" : "Persona archived",
+      );
+    });
+  });
+}
+
+function _personaById(pid) {
+  for (let i = 0; i < _adminPersonas.length; i++)
+    if (_adminPersonas[i].persona_id === pid) return _adminPersonas[i];
+  return null;
+}
+
+// Refresh the shared picker cache after any persona mutation so the launcher
+// dropdowns + the saved-table labels pick up the change.
+function _afterPersonaMutation() {
+  loadAdminPersonas();
+  if (window.TurnstonePersonas) window.TurnstonePersonas.refreshPersonas();
+}
+
+function _patchPersona(pid, body, okToast) {
+  authFetch("/v1/api/admin/personas/" + encodeURIComponent(pid), {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  })
+    .then(function (r) {
+      if (!r.ok)
+        return r.json().then(function (d) {
+          throw new Error(d.error || "Failed");
+        });
+      showToast(okToast);
+      _afterPersonaMutation();
+    })
+    .catch(function (err) {
+      showToast(err.message || "Failed to update persona");
+    });
+}
+
+function _personaShelfWire() {
+  if (_personaShelfWired) return;
+  _personaShelfWired = true;
+  document
+    .getElementById("pr-submit")
+    .addEventListener("click", submitPersonaShelf);
+  document
+    .getElementById("pr-tools-mode")
+    .addEventListener("change", _personaToolsModeChanged);
+  document.getElementById("pr-kinds").addEventListener("change", function () {
+    // The checklist shows the ACTIVE kind's inventory.
+    _renderPersonaToolChecklist([]);
+  });
+}
+
+function _personaToolsModeChanged() {
+  const mode = document.getElementById("pr-tools-mode").value;
+  document.getElementById("pr-tools-picker").hidden = mode !== "list";
+}
+
+function _renderPersonaToolChecklist(checked) {
+  const kind = document.getElementById("pr-kinds").value || "interactive";
+  const host = document.getElementById("pr-tools-checklist");
+  const names = _PERSONA_TOOLS[kind] || [];
+  host.replaceChildren();
+  names.forEach(function (name) {
+    const label = document.createElement("label");
+    label.className = "toggle-switch";
+    const input = document.createElement("input");
+    input.type = "checkbox";
+    input.value = name;
+    input.checked = checked.indexOf(name) >= 0;
+    input.setAttribute("data-persona-tool", "");
+    const track = document.createElement("span");
+    track.className = "toggle-track";
+    track.setAttribute("aria-hidden", "true");
+    const text = document.createElement("span");
+    text.className = "toggle-label";
+    text.textContent = name;
+    label.append(input, track, text);
+    host.append(label);
+  });
+}
+
+function _personaToolsFromForm() {
+  const mode = document.getElementById("pr-tools-mode").value;
+  if (mode === "all") return null;
+  if (mode === "none") return [];
+  const names = [];
+  document
+    .querySelectorAll("#pr-tools-checklist [data-persona-tool]")
+    .forEach(function (input) {
+      if (input.checked) names.push(input.value);
+    });
+  (document.getElementById("pr-tools-extra").value || "")
+    .split(",")
+    .map(function (s) {
+      return s.trim();
+    })
+    .filter(Boolean)
+    .forEach(function (name) {
+      if (names.indexOf(name) < 0) names.push(name);
+    });
+  return names;
+}
+
+function _personaFillToolsForm(allowlist) {
+  const modeSel = document.getElementById("pr-tools-mode");
+  const extra = document.getElementById("pr-tools-extra");
+  if (allowlist === null || allowlist === undefined) {
+    modeSel.value = "all";
+    _renderPersonaToolChecklist([]);
+    extra.value = "";
+  } else if (!allowlist.length) {
+    modeSel.value = "none";
+    _renderPersonaToolChecklist([]);
+    extra.value = "";
+  } else {
+    modeSel.value = "list";
+    const kind = document.getElementById("pr-kinds").value || "interactive";
+    const known = _PERSONA_TOOLS[kind] || [];
+    _renderPersonaToolChecklist(allowlist);
+    extra.value = allowlist
+      .filter(function (n) {
+        return known.indexOf(n) < 0;
+      })
+      .join(", ");
+  }
+  _personaToolsModeChanged();
+}
+
+function showCreatePersonaModal() {
+  _personaShelfWire();
+  const shelf = document.getElementById("persona-shelf");
+  document.getElementById("persona-shelf-error").classList.remove("is-visible");
+  document.getElementById("pr-persona-id").value = "";
+  document.getElementById("pr-name").value = "";
+  document.getElementById("pr-name").disabled = false;
+  document.getElementById("pr-display-name").value = "";
+  document.getElementById("pr-description").value = "";
+  document.getElementById("pr-kinds").value = "interactive";
+  document.getElementById("pr-base-prompt").value = "";
+  document.getElementById("pr-mcp").checked = true;
+  document.getElementById("pr-memory").checked = true;
+  document.getElementById("pr-default").checked = false;
+  _personaFillToolsForm(null);
+  document.getElementById("persona-shelf-title").textContent = "New persona";
+  document.getElementById("pr-submit").textContent = "Create";
+  window.TurnstoneHatch.openShelf(shelf);
+  document.getElementById("pr-name").focus();
+}
+
+function showEditPersonaModal(pid) {
+  const p = _personaById(pid);
+  if (!p) return;
+  _personaShelfWire();
+  const shelf = document.getElementById("persona-shelf");
+  document.getElementById("persona-shelf-error").classList.remove("is-visible");
+  document.getElementById("pr-persona-id").value = p.persona_id;
+  // The slug is immutable — shown for context, not editable.
+  document.getElementById("pr-name").value = p.name;
+  document.getElementById("pr-name").disabled = true;
+  document.getElementById("pr-display-name").value = p.display_name || "";
+  document.getElementById("pr-description").value = p.description || "";
+  document.getElementById("pr-kinds").value =
+    (p.applies_to_kinds || ["interactive"])[0] || "interactive";
+  document.getElementById("pr-base-prompt").value = p.base_prompt || "";
+  document.getElementById("pr-mcp").checked = !!p.mcp_enabled;
+  document.getElementById("pr-memory").checked = !!p.memory_enabled;
+  document.getElementById("pr-default").checked = !!p.is_default;
+  _personaFillToolsForm(
+    p.tool_allowlist === undefined ? null : p.tool_allowlist,
+  );
+  document.getElementById("persona-shelf-title").textContent = "Edit persona";
+  document.getElementById("pr-submit").textContent = "Save";
+  window.TurnstoneHatch.openShelf(shelf);
+  document.getElementById("pr-display-name").focus();
+}
+
+function submitPersonaShelf() {
+  const shelf = document.getElementById("persona-shelf");
+  const pid = document.getElementById("pr-persona-id").value;
+  const name = (document.getElementById("pr-name").value || "").trim();
+  const errEl = document.getElementById("persona-shelf-error");
+  const editing = !!pid;
+  if (!editing && !name) return _showModalError(errEl, "Name is required");
+
+  const prompt = document.getElementById("pr-base-prompt").value;
+  const wasDefault = editing && !!(_personaById(pid) || {}).is_default;
+  const body = {
+    display_name: (
+      document.getElementById("pr-display-name").value || ""
+    ).trim(),
+    description: (
+      document.getElementById("pr-description").value || ""
+    ).trim(),
+    base_prompt: prompt.trim() ? prompt : null,
+    tool_allowlist: _personaToolsFromForm(),
+    mcp_enabled: document.getElementById("pr-mcp").checked,
+    memory_enabled: document.getElementById("pr-memory").checked,
+    applies_to_kinds: [document.getElementById("pr-kinds").value],
+  };
+  const wantDefault = document.getElementById("pr-default").checked;
+  // is_default is one-way (unset it by flipping the flag on a successor —
+  // the storage layer demotes the incumbent atomically), so only send it
+  // when it's actually turning ON.
+  if (wantDefault && !wasDefault) body.is_default = true;
+  if (!editing) body.name = name;
+  if (editing && wasDefault) {
+    // Storage forbids changing a default persona's kinds — don't send it.
+    delete body.applies_to_kinds;
+  }
+
+  errEl.classList.remove("is-visible");
+  window.TurnstoneHatch.setBusy(shelf, true);
+  const url = editing
+    ? "/v1/api/admin/personas/" + encodeURIComponent(pid)
+    : "/v1/api/admin/personas";
+  authFetch(url, {
+    method: editing ? "PATCH" : "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  })
+    .then(function (r) {
+      if (!r.ok)
+        return r.json().then(function (d) {
+          throw new Error(d.error || "Failed");
+        });
+      return r.json();
+    })
+    .then(function () {
+      window.TurnstoneHatch.setBusy(shelf, false);
+      window.TurnstoneHatch.closeShelf(shelf);
+      showToast(editing ? "Persona updated" : "Persona '" + name + "' created");
+      _afterPersonaMutation();
+    })
+    .catch(function (err) {
+      window.TurnstoneHatch.setBusy(shelf, false);
+      _showModalError(errEl, err.message || "Failed to save persona");
+    });
 }
 
 // --- Members (whitelist users for read+write; "public" visibility above grants

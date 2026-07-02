@@ -411,6 +411,18 @@ function showNewWsModal(forkFromWsId) {
     });
   }
 
+  // Persona picker — hidden when forking (a fork resumes the source's
+  // stamped persona; the create handler skips resolution on resume_ws).
+  const personaLabel = document.querySelector('label[for="new-ws-persona"]');
+  const personaSelect = document.getElementById("new-ws-persona");
+  if (personaLabel) personaLabel.hidden = !!_forkFromWsId;
+  if (personaSelect) personaSelect.hidden = !!_forkFromWsId;
+  if (personaSelect && !_forkFromWsId && window.TurnstonePersonas) {
+    window.TurnstonePersonas.refreshPersonas().then(function () {
+      _populatePersonaSelect(personaSelect);
+    });
+  }
+
   document.getElementById("new-ws-name").value = "";
   const initEl = document.getElementById("new-ws-initial-message");
   if (initEl) initEl.value = "";
@@ -478,6 +490,34 @@ function _ensureStandaloneProjectCreator(sel) {
   });
 }
 
+// Fill the persona <select> from the shared personas cache (interactive kind
+// — this dialog only creates interactive workstreams), preselecting the kind
+// default so a zero-touch create behaves exactly like today.  No-op when the
+// personas bridge is absent (module still loading / pre-seed database).
+function _populatePersonaSelect(sel) {
+  if (!sel || !window.TurnstonePersonas) return;
+  const previous = sel.value;
+  const placeholder = sel.options.length ? sel.options[0] : null;
+  sel.replaceChildren();
+  if (placeholder) sel.appendChild(placeholder);
+  const choices = window.TurnstonePersonas.personaChoices("interactive");
+  choices.forEach(function (c) {
+    const opt = document.createElement("option");
+    opt.value = c.value;
+    opt.textContent = c.text;
+    sel.appendChild(opt);
+  });
+  const stillValid = choices.some(function (c) {
+    return c.value === previous;
+  });
+  if (previous && stillValid) {
+    sel.value = previous;
+  } else {
+    const dflt = window.TurnstonePersonas.defaultPersona("interactive");
+    if (dflt) sel.value = dflt.name;
+  }
+}
+
 // Fill a project <select> from the shared projects cache, preserving its first
 // <option> (the "No project" placeholder) and the current selection, and append
 // the "+ New project…" sentinel.  No-op when the projects bridge is absent
@@ -513,6 +553,8 @@ function submitNewWs() {
   const skill = document.getElementById("new-ws-skill").value;
   const projectEl = document.getElementById("new-ws-project");
   const project_id = projectEl ? projectEl.value : "";
+  const personaEl = document.getElementById("new-ws-persona");
+  const persona = personaEl ? personaEl.value : "";
   const initEl = document.getElementById("new-ws-initial-message");
   const initial_message = initEl ? initEl.value.trim() : "";
   if (name) body.name = name;
@@ -522,6 +564,8 @@ function submitNewWs() {
   // A fork inherits its parent's project (the picker is hidden); only a fresh
   // create carries an explicit project_id.
   if (project_id && !_forkFromWsId) body.project_id = project_id;
+  // Persona likewise — a fork resumes the source's stamped persona.
+  if (persona && !_forkFromWsId) body.persona = persona;
   if (_forkFromWsId) body.resume_ws = _forkFromWsId;
   if (initial_message) body.initial_message = initial_message;
 
@@ -563,6 +607,7 @@ function submitNewWs() {
           name: data.name,
           state: "idle",
           project_id: body.project_id || null,
+          persona: body.persona || "",
         };
         _newWsStagedFiles = [];
         hideNewWsModal();
@@ -849,6 +894,7 @@ let _wsTable = null;
 function _initSavedWsTable() {
   const WS_COLUMNS = [
     SavedColumns.name(),
+    SavedColumns.persona(),
     SavedColumns.project(),
     SavedColumns.model(),
     SavedColumns.count("message_count", "MSGS"),
@@ -1345,6 +1391,15 @@ function _loadDashboardOptionsLists() {
       _populateProjectSelect(projSel);
     });
   }
+
+  // Persona picker — same refresh-on-open policy; kind default preselected
+  // so a zero-touch launch behaves exactly like today.
+  const personaSel = document.getElementById("dashboard-persona");
+  if (personaSel && window.TurnstonePersonas) {
+    window.TurnstonePersonas.refreshPersonas().then(function () {
+      _populatePersonaSelect(personaSel);
+    });
+  }
 }
 
 // localStorage key for the dashboard composer's Options-panel disclosure
@@ -1414,9 +1469,17 @@ function _refreshDashboardOptionsSummary() {
   const summary = document.getElementById("dashboard-options-summary");
   if (!summary) return;
   const bits = [];
+  const personaSel = document.getElementById("dashboard-persona");
   const modelSel = document.getElementById("dashboard-model");
   const judgeSel = document.getElementById("dashboard-judge-model");
   const skillSel = document.getElementById("dashboard-skill");
+  // Persona surfaces only when it's a non-default pick — the kind default
+  // is the zero-touch state and needs no summary line.
+  if (personaSel && personaSel.value && window.TurnstonePersonas) {
+    const dflt = window.TurnstonePersonas.defaultPersona("interactive");
+    if (!dflt || dflt.name !== personaSel.value)
+      bits.push(window.TurnstonePersonas.personaLabel(personaSel.value));
+  }
   if (modelSel && modelSel.value) bits.push(modelSel.value);
   if (judgeSel && judgeSel.value) bits.push("judge: " + judgeSel.value);
   if (skillSel && skillSel.value) bits.push(skillSel.value);
@@ -1444,10 +1507,13 @@ function dashboardSubmit() {
   const skill = document.getElementById("dashboard-skill").value;
   const projEl = document.getElementById("dashboard-project");
   const project_id = projEl ? projEl.value : "";
+  const personaSel = document.getElementById("dashboard-persona");
+  const persona = personaSel ? personaSel.value : "";
   if (model) body.model = model;
   if (judge) body.judge_model = judge;
   if (skill) body.skill = skill;
   if (project_id) body.project_id = project_id;
+  if (persona) body.persona = persona;
   if (text) body.initial_message = text;
 
   input.disabled = true;
@@ -1484,6 +1550,7 @@ function dashboardSubmit() {
         name: data.name,
         state: "idle",
         project_id: body.project_id || null,
+        persona: body.persona || "",
       };
       switchTab(data.ws_id);
       hideDashboard();
@@ -1586,6 +1653,7 @@ function connectGlobalSSE() {
       // Carry the attached project so the rail groups the new session
       // without waiting for a roster refetch (null = unattached).
       workstreams[data.ws_id].project_id = data.project_id || null;
+      workstreams[data.ws_id].persona = data.persona || "";
       renderTabBar();
     } else if (data.type === "ws_closed") {
       const wsId = data.ws_id;
@@ -2115,6 +2183,7 @@ function applyRosterSnapshot(list, opts) {
     cur.state = ws.state || cur.state || "idle";
     cur.parent_ws_id = ws.parent_ws_id || null;
     cur.project_id = ws.project_id || null;
+    cur.persona = ws.persona || cur.persona || "";
     workstreams[ws.id] = cur;
   });
   if (evict) {
@@ -2165,6 +2234,7 @@ function resyncRoster() {
             state: ws.state,
             parent_ws_id: ws.parent_ws_id,
             project_id: ws.project_id,
+            persona: ws.persona || "",
           };
         }),
       );
@@ -2446,6 +2516,7 @@ function getClusterState() {
       kind: "interactive",
       parent_ws_id: w.parent_ws_id || null,
       project_id: w.project_id || null,
+      persona: w.persona || "",
     });
   }
   return { nodes: { local: { workstreams: list } }, overview: {} };

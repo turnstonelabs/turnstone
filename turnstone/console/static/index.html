@@ -111,31 +111,31 @@
            interactive session (proxied to a node).  app.js gates each option
            by scope and hides the toggle when only one is available. -->
           <div
-            id="launcher-personas"
-            class="launcher-personas"
+            id="launcher-kinds"
+            class="launcher-kinds"
             role="radiogroup"
             aria-label="Session kind"
           >
             <button
               type="button"
-              id="persona-coordinator"
-              class="persona-btn persona-btn--coord active"
+              id="kind-coordinator"
+              class="kind-btn kind-btn--coord active"
               role="radio"
               aria-checked="true"
               tabindex="0"
             >
-              <span class="persona-led" aria-hidden="true"></span>
+              <span class="kind-led" aria-hidden="true"></span>
               Coordinator
             </button>
             <button
               type="button"
-              id="persona-interactive"
-              class="persona-btn persona-btn--int"
+              id="kind-interactive"
+              class="kind-btn kind-btn--int"
               role="radio"
               aria-checked="false"
               tabindex="-1"
             >
-              <span class="persona-led" aria-hidden="true"></span>
+              <span class="kind-led" aria-hidden="true"></span>
               Interactive
             </button>
           </div>
@@ -320,6 +320,34 @@
                 aria-live="polite"
               >
                 <div class="dashboard-empty">Loading projects...</div>
+              </div>
+            </div>
+
+            <!-- Personas Tab -->
+            <div id="admin-personas" class="admin-panel" style="display: none">
+              <div class="admin-toolbar">
+                <span class="section-header" style="margin: 0">PERSONAS</span>
+                <button
+                  class="admin-action-btn"
+                  onclick="showCreatePersonaModal()"
+                >
+                  + New persona
+                </button>
+              </div>
+              <div class="admin-colheaders" aria-hidden="true">
+                <span class="admin-col admin-col-username">NAME</span>
+                <span class="admin-col admin-col-name">KINDS</span>
+                <span class="admin-col admin-col-created">ENVELOPE</span>
+                <span class="admin-col admin-col-created">STATE</span>
+                <span class="admin-col admin-col-actions">ACTIONS</span>
+              </div>
+              <div
+                id="admin-personas-table"
+                role="list"
+                aria-label="Personas"
+                aria-live="polite"
+              >
+                <div class="dashboard-empty">Loading personas...</div>
               </div>
             </div>
 
@@ -2639,6 +2667,116 @@
             </footer>
           </dialog>
 
+          <!-- Persona create/edit shelf — pane-scoped. The hidden persona-id
+               distinguishes create (empty) from edit (set).  The form is the
+               four levers: base prompt, tool visibility set, MCP + memory
+               toggles — plus kinds and the default marker.  Edits never touch
+               existing workstreams (they run on their creation-time stamp). -->
+          <dialog
+            class="hatch hatch--shelf"
+            id="persona-shelf"
+            data-kind="create"
+            aria-labelledby="persona-shelf-title"
+          >
+            <header class="sh-head">
+              <span class="sh-led" aria-hidden="true"></span>
+              <h2 class="sh-title" id="persona-shelf-title">New persona</h2>
+              <span class="sh-tag" aria-hidden="true">PRS-NEW</span>
+              <button class="sh-x" data-close aria-label="Close">✕</button>
+            </header>
+            <div class="sh-body">
+              <div
+                id="persona-shelf-error"
+                class="sh-alert"
+                role="alert"
+                aria-live="assertive"
+                aria-atomic="true"
+              ></div>
+              <input id="pr-persona-id" type="hidden" />
+              <label for="pr-name">Name</label>
+              <input
+                id="pr-name"
+                type="text"
+                placeholder="lowercase slug (a-z, 0-9, -, _)"
+                autocomplete="off"
+              />
+              <label for="pr-display-name">Display name</label>
+              <input id="pr-display-name" type="text" autocomplete="off" />
+              <label for="pr-description">Description</label>
+              <input
+                id="pr-description"
+                type="text"
+                placeholder="What this persona is for"
+                autocomplete="off"
+              />
+              <label for="pr-kinds">Applies to</label>
+              <select id="pr-kinds">
+                <option value="interactive">Interactive</option>
+                <option value="coordinator">Coordinator</option>
+              </select>
+              <label for="pr-base-prompt">Base prompt</label>
+              <textarea
+                id="pr-base-prompt"
+                class="sh-mono"
+                rows="8"
+                placeholder="Empty = the kind's stock base prompt"
+              ></textarea>
+              <label for="pr-tools-mode">Tool visibility</label>
+              <select id="pr-tools-mode">
+                <option value="all">All tools (unrestricted)</option>
+                <option value="none">No tools</option>
+                <option value="list">Only the tools listed below</option>
+              </select>
+              <div id="pr-tools-picker" hidden>
+                <div
+                  id="pr-tools-checklist"
+                  role="group"
+                  aria-label="Visible tools"
+                ></div>
+                <label for="pr-tools-extra"
+                  >Extra tool names
+                  <span class="label-hint"
+                    >comma-separated, e.g. MCP tools; include tool_search to
+                    keep the set expandable</span
+                  ></label
+                >
+                <input id="pr-tools-extra" type="text" autocomplete="off" />
+              </div>
+              <div class="toggle-stack">
+                <label class="toggle-switch">
+                  <input id="pr-mcp" type="checkbox" checked />
+                  <span class="toggle-track" aria-hidden="true"></span>
+                  <span class="toggle-label"
+                    >MCP enabled (workstream-wide, including task agents)</span
+                  >
+                </label>
+                <label class="toggle-switch">
+                  <input id="pr-memory" type="checkbox" checked />
+                  <span class="toggle-track" aria-hidden="true"></span>
+                  <span class="toggle-label"
+                    >Memory enabled (recall injection, nudges, memory
+                    tool)</span
+                  >
+                </label>
+                <label class="toggle-switch">
+                  <input id="pr-default" type="checkbox" />
+                  <span class="toggle-track" aria-hidden="true"></span>
+                  <span class="toggle-label"
+                    >Default persona for its kind (demotes the current
+                    default)</span
+                  >
+                </label>
+              </div>
+            </div>
+            <footer class="sh-foot">
+              <div class="sh-foot-meta"></div>
+              <button class="sh-btn" data-close>Cancel</button>
+              <button id="pr-submit" class="sh-btn sh-btn--primary">
+                Create
+              </button>
+            </footer>
+          </dialog>
+
           <!-- Project members shelf — pane-scoped. Whitelist users for
                read+write; the public read lever lives in the edit shelf. -->
           <dialog
@@ -3744,6 +3882,7 @@
     <script type="module" src="/shared/hatch.js"></script>
     <script type="module" src="/shared/kb.js"></script>
     <script type="module" src="/shared/projects.js"></script>
+    <script type="module" src="/shared/personas.js"></script>
     <script type="module" src="/shared/project_creator.js"></script>
     <script type="module" src="/shared/composer.js"></script>
     <!-- coordinator-pane deps (step 4): the controller builds its chrome + uses

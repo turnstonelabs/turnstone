@@ -540,6 +540,7 @@ class ClusterCollector:
                     "kind": WorkstreamKind.from_raw(ws.get("kind")),
                     "parent_ws_id": ws.get("parent_ws_id"),
                     "project_id": ws.get("project_id", "") or "",
+                    "persona": ws.get("persona", "") or "",
                     # Mirror the SSE-relay path: the tenancy filter's
                     # ws-creator shortcut reads this.
                     "user_id": ws.get("user_id", "") or "",
@@ -658,6 +659,7 @@ class ClusterCollector:
                 # populate it (older nodes).
                 ws_user = data.get("user_id", "") or ""
                 ws_project = data.get("project_id", "") or ""
+                ws_persona = data.get("persona", "") or ""
                 if ws_id and ws_id not in node.workstreams:
                     node.workstreams[ws_id] = {
                         "id": ws_id,
@@ -677,6 +679,7 @@ class ClusterCollector:
                         "parent_ws_id": ws_parent,
                         "user_id": ws_user,
                         "project_id": ws_project,
+                        "persona": ws_persona,
                     }
                 pending_events.append(
                     {
@@ -689,6 +692,7 @@ class ClusterCollector:
                         "parent_ws_id": ws_parent,
                         "user_id": ws_user,
                         "project_id": ws_project,
+                        "persona": ws_persona,
                     }
                 )
 
@@ -1174,6 +1178,7 @@ class ClusterCollector:
         state: str = "idle",
         parent_ws_id: str | None = None,
         project_id: str | None = None,
+        persona: str | None = None,
     ) -> None:
         """Record a new coordinator row on the console pseudo-node + fan out.
 
@@ -1208,6 +1213,7 @@ class ClusterCollector:
                     # Tenancy-load-bearing: the per-connection SSE filter
                     # gates on this — a missing project_id fails open.
                     "project_id": project_id or "",
+                    "persona": persona or "",
                     "updated": now,
                 }
             pending.append(
@@ -1221,6 +1227,7 @@ class ClusterCollector:
                     "parent_ws_id": parent_ws_id,
                     "user_id": user_id or "",
                     "project_id": project_id or "",
+                    "persona": persona or "",
                 }
             )
         for event in pending:

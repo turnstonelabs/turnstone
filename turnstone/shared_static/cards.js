@@ -69,6 +69,15 @@ function _projectName(projectId) {
   return tp.projectName(projectId) || "";
 }
 
+function _personaLabel(name) {
+  if (!name) return "";
+  var tp = window.TurnstonePersonas;
+  // The raw slug still labels rows when the data layer hasn't loaded —
+  // an archived persona keeps labelling the workstreams stamped with it.
+  if (!tp || typeof tp.personaLabel !== "function") return name;
+  return tp.personaLabel(name) || name;
+}
+
 function _nameCell(sess) {
   var wrap = document.createElement("div");
   wrap.className = "scell-name";
@@ -133,6 +142,20 @@ export var SavedColumns = {
       },
       sort: function (s) {
         return (_projectName(s.project_id) || "").toLowerCase();
+      },
+    };
+  },
+  persona: function () {
+    return {
+      key: "persona",
+      label: "PERSONA",
+      width: "110px",
+      hideBelow: true,
+      cell: function (s) {
+        return _personaLabel(s.persona) || "—";
+      },
+      sort: function (s) {
+        return (_personaLabel(s.persona) || "").toLowerCase();
       },
     };
   },
