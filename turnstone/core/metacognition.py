@@ -146,6 +146,14 @@ _NUDGE_MAP: dict[str, str] = {
     # consumers recognise the type.
     "idle_children": "",
     "watch_triggered": "",
+    # participant_joined likewise carries no static body — the per-fire text
+    # ("<name> has joined this shared workstream…") is composed by its producer
+    # (``ChatSession._maybe_note_new_participant``) and emitted via
+    # ``_append_system_turn``, never through :func:`format_nudge`.  The entry
+    # exists only to keep this map mirroring ``tool_advisory.SYSTEM_TURN_SOURCES``
+    # (enforced by ``test_vocabulary_mirrors_nudge_map_both_directions``); nothing
+    # calls ``should_nudge("participant_joined", …)`` so it never auto-fires.
+    "participant_joined": "",
 }
 
 

@@ -60,16 +60,30 @@ def _run_send(session: ChatSession, text: str, attachments=None) -> None:
             raise
 
 
+def _assert_plain_text_turn(d: dict) -> None:
+    """A plain-text send (no attachments) must NOT be coerced into the
+    multipart/attachment shape: ``content`` stays the plain string and no
+    ``_attachments_meta`` is emitted.  The per-user-context feature stamps every
+    genuine user turn with a wire-invisible ``_sender`` attribution key (a
+    leading-underscore side channel, stripped by ``sanitize_messages`` before
+    the model call), so it may be present alongside role/content — that is the
+    only addition tolerated here."""
+    assert d["role"] == "user"
+    assert d["content"] == "hello"  # plain string, not a multipart list
+    assert "_attachments_meta" not in d
+    assert set(d) <= {"role", "content", "_sender"}
+
+
 class TestPlainTextUnchanged:
     def test_no_attachments_stores_string_content(self, tmp_db, mock_openai_client):
         s = _make_session(mock_openai_client)
         _run_send(s, "hello")
-        assert turn_to_dict(s.messages[-1]) == {"role": "user", "content": "hello"}
+        _assert_plain_text_turn(turn_to_dict(s.messages[-1]))
 
     def test_empty_attachments_list_stores_string_content(self, tmp_db, mock_openai_client):
         s = _make_session(mock_openai_client)
         _run_send(s, "hello", attachments=[])
-        assert turn_to_dict(s.messages[-1]) == {"role": "user", "content": "hello"}
+        _assert_plain_text_turn(turn_to_dict(s.messages[-1]))
 
 
 class TestMultipartBuild:

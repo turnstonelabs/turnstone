@@ -1369,6 +1369,10 @@ class TestSkillCatalogDisclosure:
         session._memory_config = MagicMock()
         session._memory_config.fetch_limit = 0
         session._user_id = "test-user"
+        # _init_system_messages -> _recompute_shared_state reads the session
+        # owner (_mcp_user_id) to decide shared-workstream framing; __init__
+        # normally sets it from user_id, so seed it here for the __new__ build.
+        session._mcp_user_id = "test-user"
 
         with (
             patch(
