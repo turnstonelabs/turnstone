@@ -46,7 +46,16 @@ jobs:
           PR_NUMBER: ${{ inputs.pr_number }}
         run: |
           if [[ "$GITHUB_EVENT_NAME" == "workflow_dispatch" ]]; then
-            ref=$(gh pr view "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --json headRefName -q .headRefName)
+            # The dispatch input is an arbitrary PR number; refuse fork PRs.
+            # A fork's headRefName is a bare branch name that may collide
+            # with a branch in this repo, and checkout+push would then hit
+            # that unrelated branch ("same-repo PRs only" applies here too).
+            pr_json=$(gh pr view "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --json headRefName,isCrossRepository)
+            if [[ "$(jq -r '.isCrossRepository' <<< "$pr_json")" != "false" ]]; then
+              echo "::error::PR #${PR_NUMBER} head is not a branch in this repository; refusing to complete it."
+              exit 1
+            fi
+            ref=$(jq -r '.headRefName' <<< "$pr_json")
           else
             ref="$HEAD_REF"
           fi
