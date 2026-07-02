@@ -175,7 +175,9 @@ class TestContextOverflowRecovery:
         ):
             session.send("hello")
 
-        compact_mock.assert_called_once_with(auto=True)
+        # my_generation must be the send's own generation — a stale send that
+        # hits overflow must not compact-and-swap a newer generation's history.
+        compact_mock.assert_called_once_with(auto=True, my_generation=session._generation)
         assert call_count == 2
 
     def test_anthropic_prompt_too_long_triggers_compact(self, session):
@@ -206,7 +208,7 @@ class TestContextOverflowRecovery:
         ):
             session.send("hello")
 
-        compact_mock.assert_called_once_with(auto=True)
+        compact_mock.assert_called_once_with(auto=True, my_generation=session._generation)
 
     def test_non_context_error_propagates(self, session):
         session.messages = turns_from_dicts([{"role": "user", "content": "hi"}])

@@ -1069,10 +1069,13 @@ def reconstruct_turns_checkpointed(
     watermark]`` — the in-memory view the session held when it compacted. The
     summarized prefix and any older markers (id <= watermark) are dropped; the
     full history stays in storage for ``/history``/export/audit. The marker
-    reconstructs as a plain ``assistant`` turn (``reconstruct_turns`` drops
-    ``_source`` for assistant rows), and a synthetic ``[Conversation summary]``
-    user label is prepended to match what ``session._compact_messages`` builds
-    in memory (and to satisfy the leading-user-turn wire contract).
+    reconstructs as an ``assistant`` turn re-tagged ``source="compaction"``
+    (``reconstruct_turns`` drops ``_source`` for assistant rows), and a
+    synthetic ``[Conversation summary]`` user label — tagged likewise — is
+    prepended to match what ``session._compact_messages`` builds in memory
+    (and to satisfy the leading-user-turn wire contract).  The tags keep
+    provenance-testing consumers (``_find_turn_boundaries``, title gen)
+    working identically across a reopen.
 
     Falls back to the full reconstruction when there is no marker or its watermark
     is absent/corrupt, so every pre-checkpoint session loads exactly as before.
@@ -1101,9 +1104,12 @@ def reconstruct_turns_checkpointed(
     # slices separately so the summary leads regardless of row-id ordering (a
     # preserved tail kept verbatim sits at a *lower* id than the marker).
     tail = [r for r in rows if r[0] > watermark and not _is_compaction_marker(r)]
-    label = Turn(Role.USER, _content_blocks(COMPACTION_SUMMARY_LABEL, []))
+    label = Turn(Role.USER, _content_blocks(COMPACTION_SUMMARY_LABEL, []), source=COMPACTION_SOURCE)
+    marker_turns = reconstruct_turns([marker], ws_id, attachments_by_msg)
+    for t in marker_turns:
+        t.source = COMPACTION_SOURCE
     return [
         label,
-        *reconstruct_turns([marker], ws_id, attachments_by_msg),
+        *marker_turns,
         *reconstruct_turns(tail, ws_id, attachments_by_msg),
     ]

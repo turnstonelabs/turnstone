@@ -21,6 +21,7 @@ import pytest
 
 from tests._session_helpers import make_session
 from turnstone.core.session import (
+    COMPACTION_SOURCE,
     COMPACTION_SUMMARY_LABEL,
     GenerationCancelled,
     _CompactionIrreducibleError,
@@ -162,7 +163,9 @@ class TestMidturnCompactionPolicy:
             patch.object(session.ui, "on_info") as on_info,
         ):
             session._do_auto_compact("mid-turn")
-        compact.assert_called_once_with(auto=True, preserve_tail=0, my_generation=0)
+        compact.assert_called_once_with(
+            auto=True, preserve_tail=0, my_generation=0, carry_spill=False
+        )
         msg = on_info.call_args.args[0]
         assert "58%" in msg
         assert "mid-turn" in msg
@@ -582,7 +585,7 @@ class TestPackBlocks:
         batches = session._pack_blocks(blocks, budget_chars=budget)
         flat = [b for batch in batches for b in batch]
         assert flat[0] == "before" and flat[-1] == "after"  # neighbours survive
-        truncated = [b for b in flat if "[truncated]" in b]
+        truncated = [b for b in flat if "[truncated" in b]
         assert len(truncated) == 1
         assert len(truncated[0]) <= budget
         assert truncated[0].startswith("z")  # head preserved
@@ -1036,7 +1039,11 @@ def test_generate_title_skips_synthetic_summary_label(session):
     issuing a model call that titles the conversation '[Conversation summary]'."""
     session.messages = turns_from_dicts(
         [
-            {"role": "user", "content": COMPACTION_SUMMARY_LABEL},
+            {
+                "role": "user",
+                "content": COMPACTION_SUMMARY_LABEL,
+                "_source": COMPACTION_SOURCE,
+            },
             {"role": "assistant", "content": "the dense summary"},
         ]
     )
@@ -1179,7 +1186,11 @@ class TestProactivePreSend:
         not a real turn, so _find_turn_boundaries excludes it and no hint is added."""
         session.messages = turns_from_dicts(
             [
-                {"role": "user", "content": COMPACTION_SUMMARY_LABEL},
+                {
+                    "role": "user",
+                    "content": COMPACTION_SUMMARY_LABEL,
+                    "_source": COMPACTION_SOURCE,
+                },
                 {"role": "assistant", "content": "prior dense summary"},
             ]
         )
@@ -1498,7 +1509,11 @@ class TestRetryRewindSkipSummary:
         # Reactive compaction left only [summary_user, summary_asst] — no real turn.
         session.messages = turns_from_dicts(
             [
-                {"role": "user", "content": COMPACTION_SUMMARY_LABEL},
+                {
+                    "role": "user",
+                    "content": COMPACTION_SUMMARY_LABEL,
+                    "_source": COMPACTION_SOURCE,
+                },
                 {"role": "assistant", "content": "the dense summary"},
             ]
         )
@@ -1510,7 +1525,11 @@ class TestRetryRewindSkipSummary:
     def test_rewind_on_bare_summary_is_noop(self, session):
         session.messages = turns_from_dicts(
             [
-                {"role": "user", "content": COMPACTION_SUMMARY_LABEL},
+                {
+                    "role": "user",
+                    "content": COMPACTION_SUMMARY_LABEL,
+                    "_source": COMPACTION_SOURCE,
+                },
                 {"role": "assistant", "content": "the dense summary"},
             ]
         )
@@ -1522,7 +1541,11 @@ class TestRetryRewindSkipSummary:
     def test_retry_targets_real_turn_and_keeps_summary(self, session):
         session.messages = turns_from_dicts(
             [
-                {"role": "user", "content": COMPACTION_SUMMARY_LABEL},
+                {
+                    "role": "user",
+                    "content": COMPACTION_SUMMARY_LABEL,
+                    "_source": COMPACTION_SOURCE,
+                },
                 {"role": "assistant", "content": "the dense summary"},
                 {"role": "user", "content": "a real follow-up"},
                 {"role": "assistant", "content": "the answer"},
@@ -1539,7 +1562,11 @@ class TestRetryRewindSkipSummary:
     def test_rewind_stops_at_summary_boundary(self, session):
         session.messages = turns_from_dicts(
             [
-                {"role": "user", "content": COMPACTION_SUMMARY_LABEL},
+                {
+                    "role": "user",
+                    "content": COMPACTION_SUMMARY_LABEL,
+                    "_source": COMPACTION_SOURCE,
+                },
                 {"role": "assistant", "content": "the dense summary"},
                 {"role": "user", "content": "a real follow-up"},
                 {"role": "assistant", "content": "the answer"},
