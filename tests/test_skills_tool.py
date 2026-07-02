@@ -1373,6 +1373,14 @@ class TestSkillCatalogDisclosure:
         # owner (_mcp_user_id) to decide shared-workstream framing; __init__
         # normally sets it from user_id, so seed it here for the __new__ build.
         session._mcp_user_id = "test-user"
+        # Shared-state fields _recompute_shared_state reads; _db_senders_loaded
+        # True short-circuits the full-history storage read this __new__ build
+        # has no ws for, leaving the in-memory (empty) scan -> not shared.
+        session._shared_workstream = False
+        session._known_senders = set()
+        session._senders_dirty = True
+        session._db_senders_loaded = True
+        session._sender_label_nonce = "testnonce"
 
         with (
             patch(

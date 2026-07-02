@@ -3,8 +3,8 @@
 A *fence* wraps a span of content in ``[start {tag}_{nonce}] ... [end
 {tag}_{nonce}]`` markers whose nonce an adversary cannot reproduce, and
 neutralises any literal marker in adjacent untrusted text so a leaked or guessed
-nonce alone cannot forge or break the boundary.  One mechanism, two trust
-polarities:
+nonce alone cannot forge or break the boundary.  One mechanism, three trust
+boundaries (two polarities):
 
 * **Output-guard judge** (:mod:`turnstone.core.output_guard_judge`) wraps
   UNTRUSTED tool output before handing it to the judge LLM.  The nonce stops
@@ -19,6 +19,14 @@ polarities:
   (:func:`turnstone.prompts.build_operator_instruction_declaration`) declares
   the fence *exact value* as the sole trusted marker, so the nonce must live in
   the (cached) system prefix — minted once per session, not per fold.
+
+* **Sender label** (``ChatSession._inject_sender_labels``) wraps the TRUSTED
+  per-turn ``message from <sender>`` attribution on a shared workstream.  The
+  nonce stops one participant from typing a look-alike marker in their own
+  message to forge another sender's attribution; the declaration
+  (:func:`turnstone.prompts.build_shared_workstream_declaration`) names the
+  exact value as the sole authentic label, so the nonce lives in the (cached)
+  system prefix like the operator fold — minted once per session.
 
 The marker shape is bracketed ``start``/``end`` keywords rather than the prior
 ``<{tag}_{nonce}>`` XML form: angle-bracket markup pushed some local models out
@@ -45,13 +53,16 @@ from typing import TYPE_CHECKING, Final
 if TYPE_CHECKING:
     from collections.abc import Iterable
 
-# Tag bases for the two fence kinds.  Kept distinct so the two trust
-# declarations never cross-contaminate: ``tool_output`` content is declared
-# UNTRUSTED (to the judge), ``system-reminder`` content is declared TRUSTED (to
-# the assistant).  A shared tag would let one declaration's semantics bleed onto
-# the other's markers.
+# Tag bases for the three fence kinds.  Kept distinct so the trust declarations
+# never cross-contaminate: ``tool_output`` content is declared UNTRUSTED (to the
+# judge), while ``system-reminder`` (operator instructions) and ``sender-label``
+# (per-turn shared-workstream attribution) are each declared TRUSTED to the
+# assistant — but under separate declarations, so a forged label can never claim
+# operator authority nor vice versa.  A shared tag would let one declaration's
+# semantics bleed onto the other's markers.
 TOOL_OUTPUT_TAG: Final = "tool_output"
 SYSTEM_REMINDER_TAG: Final = "system-reminder"
+SENDER_LABEL_TAG: Final = "sender-label"
 
 # 8 bytes → 16 hex chars → 64 bits.  An adversary whose payload is fixed before
 # the nonce is minted cannot guess it; and because the fold path also

@@ -161,6 +161,7 @@ from turnstone.prompts import (
     ClientType,
     SessionContext,
     build_operator_instruction_declaration,
+    build_shared_workstream_declaration,
     compose_system_message,
 )
 from turnstone.ui.colors import DIM, GRAY, GREEN, RED, RESET, YELLOW, bold, cyan, dim
@@ -271,26 +272,43 @@ _IMAGE_EXTENSIONS: frozenset[str] = frozenset(
 _IMAGE_SIZE_CAP = _ATTACH_IMAGE_SIZE_CAP
 
 
-def _prefix_sender_label(content: Any, sender: str) -> Any:
-    """Return *content* with a ``[message from <sender>]`` header prepended.
+def _prefix_sender_label(content: Any, sender: str, nonce: str) -> Any:
+    """Return *content* with an authenticated sender-label block prepended.
 
-    Handles both the plain-string user content and the multipart list shape
-    (text + attachment parts): the header is folded into the first text part, or
-    inserted as a leading text part when the content is attachment-only.  Returns
-    a new object; the input is never mutated (the caller works on a transient
-    wire copy, not the canonical ``self.messages``)."""
-    label = f"[message from {sender}]\n"
+    The label ``message from <sender>`` is wrapped in a nonce-delimited
+    ``[start sender-label_{nonce}]`` … ``[end sender-label_{nonce}]`` fence
+    (:func:`turnstone.core.fence.wrap`) whose token lives only in the cached
+    system prefix, so a participant cannot forge another sender's attribution by
+    typing a look-alike marker in their own message; any such marker already in
+    *content* is defanged first (:func:`~turnstone.core.fence.neutralize` with
+    ``opening=True`` — forge-in defence).  ``fence.wrap`` also neutralises the
+    *closing* marker inside the label body, so even a hostile display name
+    cannot break out of the fence.
+
+    Handles the plain-string and multipart (text + attachment) content shapes:
+    every text part is neutralised, and the label rides the first text part (or
+    a new leading text part when the content is attachment-only).  Returns a new
+    object; the input is never mutated (the caller works on a transient wire
+    copy, not the canonical ``self.messages``)."""
+    label = fence.wrap(f"message from {sender}", nonce, fence.SENDER_LABEL_TAG)
+    tag = fence.SENDER_LABEL_TAG
     if isinstance(content, str):
-        return label + content
+        return f"{label}\n{fence.neutralize(content, tag, opening=True)}"
     if isinstance(content, list):
-        out = list(content)
-        for i, part in enumerate(out):
+        out: list[Any] = []
+        labelled = False
+        for part in content:
             if isinstance(part, dict) and part.get("type") == "text":
                 np = dict(part)
-                np["text"] = label + str(np.get("text", ""))
-                out[i] = np
-                return out
-        return [{"type": "text", "text": label.rstrip("\n")}, *out]
+                safe = fence.neutralize(str(np.get("text", "")), tag, opening=True)
+                np["text"] = f"{label}\n{safe}" if not labelled else safe
+                labelled = True
+                out.append(np)
+            else:
+                out.append(part)
+        if not labelled:
+            return [{"type": "text", "text": label}, *out]
+        return out
     return content
 
 
@@ -1497,6 +1515,12 @@ class ChatSession:
         # ``lowering.fold_system_turns``) keep a mid-session leak from forging a
         # block.  Owned here; ``lowering`` borrows it as a parameter.
         self._envelope_nonce = fence.mint_nonce()
+        # Per-session nonce for the sender-label fence (shared workstreams).
+        # Distinct tag + distinct value from the operator nonce so a forged
+        # sender label can never claim operator authority; same lifecycle —
+        # pinned in the cached prefix by ``build_shared_workstream_declaration``
+        # so it must stay stable, and reused by every label this session.
+        self._sender_label_nonce = fence.mint_nonce()
         self._load_skills()
         # Memory selection keys off the recent-user-message query, but a fresh
         # session has no messages yet here -> the first compose would inject
@@ -3195,6 +3219,15 @@ class ChatSession:
         # appears and no declaration applies.
         if caps is not None and not caps.supports_mid_conversation_system:
             dev_parts.append("\n\n" + build_operator_instruction_declaration(self._envelope_nonce))
+        # Shared-workstream trust declaration — pins the authentic sender-label
+        # nonce in the cached prefix so a participant's typed `[message from …]`
+        # look-alike cannot forge another sender's attribution.  Gated on the
+        # (latched) shared flag, so single-user prompts are unchanged and the
+        # prefix flips at most once per workstream.  Applies on every provider
+        # lane (labels ride the wire content, not the fold), unlike the
+        # fold-only operator declaration above.
+        if self._shared_workstream:
+            dev_parts.append("\n\n" + build_shared_workstream_declaration(self._sender_label_nonce))
         # Tool search hint (client-side mode only — native mode needs no hint).
         if self._tool_search and caps is not None and not caps.supports_tool_search:
             dev_parts.append(
@@ -3761,18 +3794,22 @@ class ChatSession:
         if not s or s == owner or s in self._known_senders:
             return
         was_shared = self._shared_workstream
+        # Set state directly (not just via _recompute_shared_state, which is
+        # memoized and may no-op this call): the recompose below and the gate
+        # above both need it now.  _recompute_shared_state later unions rather
+        # than overwrites, so these survive.
         self._known_senders.add(s)
         self._shared_workstream = True
         if not was_shared:
-            # First non-owner sender: recompose so the banner is multi-user.
-            # (_recompute_shared_state re-derives the set from history, which now
-            # includes this sender's just-appended turn — consistent.)
+            # First non-owner sender: recompose so the banner gains the shared
+            # section (and the sender-label trust declaration).
             self._init_system_messages()
         name = self._resolve_display_name(s)
         self._append_system_turn(
             "participant_joined",
-            f"{name} has joined this shared workstream. Their messages are tagged "
-            f"`[message from {name}]` — attribute them to this sender, not the owner.",
+            f"{name} has joined this shared workstream. Their messages carry an "
+            "authenticated sender-label naming them — attribute those messages to this "
+            "sender, not the owner.",
         )
 
     def _inject_sender_labels(self, messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -3804,13 +3841,23 @@ class ChatSession:
             }
             if len(senders) <= 1:
                 return messages
+        # Resolve each distinct sender's display name at most once per call, not
+        # once per turn: _resolve_display_name does a blocking storage lookup
+        # whose error path is deliberately uncached, so per-turn resolution
+        # would re-hit storage for every user turn on every round-trip during an
+        # outage.  A shared workstream has a handful of distinct senders.
+        names: dict[str, str] = {}
         out: list[dict[str, Any]] = []
         for m in messages:
             sender = (m.get("_sender") or "").strip() if m.get("role") == "user" else ""
             if sender:
+                name = names.get(sender)
+                if name is None:
+                    name = self._resolve_display_name(sender)
+                    names[sender] = name
                 nm = dict(m)
                 nm["content"] = _prefix_sender_label(
-                    m.get("content"), self._resolve_display_name(sender)
+                    m.get("content"), name, self._sender_label_nonce
                 )
                 out.append(nm)
             else:
