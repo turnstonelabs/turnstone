@@ -6151,21 +6151,26 @@ class ChatSession:
         message, and the wind-down spill.
 
         A quarter of the window per carry, clamped so ALL concurrent carries
-        fit what the window spares after the summary output reserve: the
-        carried text lands in the same post-compaction turn as the summary,
-        so ``reserve + carries·budget + margin ≤ window`` must hold by
-        construction — sizing each carry independently stacks past the
-        window at default config exactly when spill and hint fire together
-        (the end-of-turn site).  Floored at ``_MIN_CARRY_BUDGET_CHARS`` so
-        small windows still carry something meaningful; on a sub-~1200-token
-        window (no shipped model) the floor exceeds the spare deliberately —
-        carrying something beats carrying nothing, and the overflow backstop
-        absorbs the worst case.  Chars via the calibrated
-        ``_chars_per_token``.
+        fit what the window spares after the summary output reserve AND the
+        fixed prompt overhead (system message + tool definitions — the same
+        terms the ``_estimated_prompt_tokens`` fallback counts, because they
+        ride every request): the carried text lands in the same
+        post-compaction prompt as all of those, so
+        ``overhead + reserve + carries·budget + margin ≤ window`` must hold
+        by construction — sizing carries independently (or ignoring the
+        overhead) stacks past the window at default config exactly when
+        spill and hint fire together, and the overflow backstop would then
+        re-compact WITHOUT the carries.  Floored at
+        ``_MIN_CARRY_BUDGET_CHARS`` so small windows still carry something
+        meaningful; when the floor exceeds the spare (a tiny window, or a
+        system prompt that fills it) the floor wins deliberately — carrying
+        something beats carrying nothing, and the overflow backstop absorbs
+        the worst case.  Chars via the calibrated ``_chars_per_token``.
         """
         reserve = self._summary_output_tokens()
         margin = int(self.context_window * self._SUMMARY_SAFETY_MARGIN)
-        spare = max(0, self.context_window - reserve - margin)
+        overhead = self._system_tokens + self._tool_def_tokens()
+        spare = max(0, self.context_window - reserve - margin - overhead)
         budget_tokens = min(self.context_window // 4, spare // max(1, carries))
         return max(self._MIN_CARRY_BUDGET_CHARS, int(budget_tokens * self._chars_per_token))
 

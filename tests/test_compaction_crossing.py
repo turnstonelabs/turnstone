@@ -154,39 +154,62 @@ class TestCheckpointReconstructionProvenance:
 # ---------------------------------------------------------------------------
 
 
+def _isolate_overhead(s, system_tokens: int = 0) -> None:
+    """Pin the fixed prompt overhead (system + tool defs) for exact budget
+    arithmetic — the real values vary with the composed prompt and registered
+    tools (same isolation pattern as TestRemainingTokenBudget)."""
+    s._system_tokens = system_tokens
+    s._tools = []
+
+
 class TestCarryBudget:
     def test_scales_to_quarter_window(self, session):
-        # reserve=100 (compact_max_tokens), margin=500, spare=9_400;
-        # min(10_000 // 4, 9_400) = 2_500 tokens * 4.0 chars/token.
+        # overhead=0, reserve=100 (compact_max_tokens), margin=500,
+        # spare=9_400; min(10_000 // 4, 9_400) = 2_500 tokens * 4.0 chars/token.
+        _isolate_overhead(session)
         assert session._carry_budget_chars() == 10_000
 
     def test_floors_on_tiny_window(self, tmp_db, mock_openai_client):
         tiny = make_session(client=mock_openai_client, context_window=1_000, tool_timeout=10)
+        _isolate_overhead(tiny)
         assert tiny._carry_budget_chars() == tiny._MIN_CARRY_BUDGET_CHARS
 
     @pytest.mark.parametrize("carries", [1, 2])
-    def test_reserve_plus_all_carries_fit_window_at_shipped_defaults(
+    def test_overhead_reserve_and_carries_fit_window_at_shipped_defaults(
         self, tmp_db, mock_openai_client, carries
     ):
         """The invariant that prevents a carry-induced overflow, pinned at the
-        SHIPPED defaults (budget bugs hide behind test-sized configs) and for
-        BOTH carry counts: the end-of-turn site fires the spill and the hint
-        together, and sizing each independently stacks reserve + 2·carry +
-        margin past the window."""
+        SHIPPED defaults (budget bugs hide behind test-sized configs), for
+        BOTH carry counts, and INCLUDING the fixed prompt overhead: the
+        post-compaction prompt is system + tools + summary + carries, so a
+        budget that ignores the overhead (or sizes carries independently)
+        stacks past the window and the backstop re-compacts the carries
+        away."""
         s = make_session(client=mock_openai_client, tool_timeout=10)
+        _isolate_overhead(s, system_tokens=4_000)  # a chunky composed prompt
         reserve = s._summary_output_tokens()
         per_carry_tokens = s._carry_budget_chars(carries) / s._chars_per_token
         margin = int(s.context_window * s._SUMMARY_SAFETY_MARGIN)
-        assert reserve + carries * per_carry_tokens + margin <= s.context_window
+        assert 4_000 + reserve + carries * per_carry_tokens + margin <= s.context_window
+
+    def test_budget_shrinks_with_prompt_overhead(self, tmp_db, mock_openai_client):
+        """Monotonicity pin: the overhead term is genuinely in the formula —
+        a bigger system prompt leaves less to carry."""
+        s = make_session(client=mock_openai_client, tool_timeout=10)
+        _isolate_overhead(s, system_tokens=0)
+        roomy = s._carry_budget_chars(2)
+        _isolate_overhead(s, system_tokens=8_000)
+        assert s._carry_budget_chars(2) < roomy
 
     def test_double_carry_splits_the_spare(self, tmp_db, mock_openai_client):
-        """At shipped defaults the spare (window − reserve − margin) binds two
-        carries: each gets spare // 2, strictly less than the solo
-        quarter-window allowance."""
+        """At shipped defaults the spare (window − overhead − reserve −
+        margin) binds two carries: each gets spare // 2, strictly less than
+        the solo quarter-window allowance."""
         s = make_session(client=mock_openai_client, tool_timeout=10)
+        _isolate_overhead(s, system_tokens=2_000)
         reserve = s._summary_output_tokens()
         margin = int(s.context_window * s._SUMMARY_SAFETY_MARGIN)
-        spare = s.context_window - reserve - margin
+        spare = s.context_window - reserve - margin - 2_000
         assert s._carry_budget_chars(2) == int((spare // 2) * s._chars_per_token)
         assert s._carry_budget_chars(2) < s._carry_budget_chars(1)
 
