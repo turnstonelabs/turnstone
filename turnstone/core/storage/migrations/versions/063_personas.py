@@ -287,11 +287,58 @@ def upgrade() -> None:
     for perm in _PERSONA_PERMS:
         _append_permission(conn, perm)
 
+    # Convert legacy creative-mode workstreams to the writer stamp so "a
+    # creative workstream resumes as a creative workstream" survives the
+    # /creative removal: pre-063 code persisted creative_mode='True' in
+    # workstream_config; post-063 code reads only the persona keys.  The
+    # writer seed is /creative's designated successor (same prompt lineage,
+    # tools off, MCP off, memory on).  The stale creative_mode key is left
+    # in place — nothing reads it, and downgrade needs it intact.
+    creative_rows = conn.execute(
+        sa.text(
+            "SELECT ws_id FROM workstream_config "
+            "WHERE key = 'creative_mode' AND value = 'True' "
+            "AND ws_id NOT IN "
+            "  (SELECT ws_id FROM workstream_config WHERE key = 'persona')"
+        )
+    ).fetchall()
+    writer_stamp = {
+        "persona": "writer",
+        "persona_prompt": _WRITER_PROMPT,
+        "persona_tools": "[]",
+        "persona_mcp": "0",
+        "persona_memory": "1",
+    }
+    for (ws_id,) in creative_rows:
+        for key, value in writer_stamp.items():
+            conn.execute(
+                sa.text(
+                    "INSERT INTO workstream_config (ws_id, key, value) "
+                    "VALUES (:ws, :k, :v)"
+                ),
+                {"ws": ws_id, "k": key, "v": value},
+            )
+        conn.execute(
+            sa.text("UPDATE workstreams SET persona = 'writer' WHERE ws_id = :ws"),
+            {"ws": ws_id},
+        )
+
 
 def downgrade() -> None:
     conn = op.get_bind()
     for perm in reversed(_PERSONA_PERMS):
         _remove_permission(conn, perm)
+
+    # Remove every persona stamp (including the writer stamps the upgrade
+    # synthesized from creative_mode rows — creative_mode itself was left in
+    # place, so pre-063 code resumes those workstreams as creative again).
+    conn.execute(
+        sa.text(
+            "DELETE FROM workstream_config WHERE key IN "
+            "('persona', 'persona_prompt', 'persona_tools', "
+            "'persona_mcp', 'persona_memory')"
+        )
+    )
 
     op.drop_column("workstreams", "persona")
 

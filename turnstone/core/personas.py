@@ -67,6 +67,25 @@ class PersonaSnapshot:
         }
 
 
+def resolve_persona_for_kind(
+    storage: Any, name: str, kind: str
+) -> tuple[dict[str, Any] | None, str]:
+    """Resolve a persona slug for attaching to a ``kind`` workstream.
+
+    Returns ``(row, "")`` on success or ``(None, error)`` when the name is
+    unknown, disabled, or does not apply to the kind.  ONE shared eligibility
+    rule — the HTTP create handler, the CLI ``--persona`` path, and the
+    coordinator spawn precheck all consume this, so a future rule change
+    (per-org personas, a new kind) cannot leave the surfaces disagreeing.
+    """
+    row = storage.get_persona_by_name(name) if storage else None
+    if not row or not row.get("enabled", False):
+        return None, f"Persona not found or disabled: {name}"
+    if kind not in (row.get("applies_to_kinds") or []):
+        return None, f"Persona {name!r} does not apply to kind {kind!r}"
+    return row, ""
+
+
 def snapshot_from_persona(persona: Mapping[str, Any]) -> PersonaSnapshot:
     """Build the stamp from a storage persona row — the resolve-once moment."""
     tools = persona.get("tool_allowlist")

@@ -873,7 +873,11 @@ def resolve_cli_persona_kwargs(
     an unrestricted session.  A corrupt stamp on the resume target raises
     (``snapshot_from_config``) for the same reason.
     """
-    from turnstone.core.personas import snapshot_from_config, snapshot_from_persona
+    from turnstone.core.personas import (
+        resolve_persona_for_kind,
+        snapshot_from_config,
+        snapshot_from_persona,
+    )
 
     if resume_target and storage is not None:
         if persona_arg:
@@ -883,12 +887,9 @@ def resolve_cli_persona_kwargs(
             return {"persona": snap.name, "persona_snapshot": snap}
         return {}
     if persona_arg:
-        row = storage.get_persona_by_name(persona_arg) if storage else None
-        if not row or not row.get("enabled", False):
-            print(red(f"Persona not found or disabled: {persona_arg}"))
-            sys.exit(1)
-        if "interactive" not in (row.get("applies_to_kinds") or []):
-            print(red(f"Persona '{persona_arg}' does not apply to interactive sessions"))
+        row, err = resolve_persona_for_kind(storage, persona_arg, "interactive")
+        if err or row is None:
+            print(red(err or f"Persona not found or disabled: {persona_arg}"))
             sys.exit(1)
         return {"persona": row["name"], "persona_snapshot": snapshot_from_persona(row)}
     if storage is not None:

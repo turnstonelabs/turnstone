@@ -123,6 +123,11 @@ class ToolSearchManager:
         """Return names of currently expanded (discovered) tools."""
         return list(self._expanded.keys())
 
+    def is_expanded(self, name: str) -> bool:
+        """O(1) membership check for the discovered set — the per-tool
+        visibility filter runs per LLM turn, so no list construction."""
+        return name in self._expanded
+
     def expand_visible(self, tool_names: list[str]) -> list[dict[str, Any]]:
         """Promote discovered tools to the visible set.
 

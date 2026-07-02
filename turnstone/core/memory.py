@@ -269,6 +269,7 @@ def register_workstream(
     kind: WorkstreamKind | str = WorkstreamKind.INTERACTIVE,
     parent_ws_id: str | None = None,
     project_id: str | None = None,
+    persona: str | None = None,
 ) -> None:
     """Persist a new workstream (no-op if already exists)."""
     try:
@@ -283,6 +284,7 @@ def register_workstream(
             kind=kind,
             parent_ws_id=parent_ws_id,
             project_id=project_id,
+            persona=persona,
         )
     except Exception:
         log.warning("Failed to register workstream ws=%s", ws_id, exc_info=True)

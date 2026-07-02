@@ -493,6 +493,7 @@ class TestSavedListPagination:
             None,
             project_id,
             "alice",
+            None,  # persona
         )
 
     def _cfg(self):
