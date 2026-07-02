@@ -163,6 +163,7 @@ class AsyncTurnstoneConsole(_BaseClient):
         model: str = "",
         initial_message: str = "",
         skill: str = "",
+        persona: str = "",
         resume_ws: str = "",
         auto_approve: bool = False,
         auto_approve_tools: str = "",
@@ -179,6 +180,8 @@ class AsyncTurnstoneConsole(_BaseClient):
             body["initial_message"] = initial_message
         if skill:
             body["skill"] = skill
+        if persona:
+            body["persona"] = persona
         if resume_ws:
             body["resume_ws"] = resume_ws
         if auto_approve:
@@ -213,6 +216,7 @@ class AsyncTurnstoneConsole(_BaseClient):
         auto_approve_tools: str = "",
         initial_message: str = "",
         skill: str = "",
+        persona: str = "",
         resume_ws: str = "",
         target_node: str = "",
         user_id: str = "",
@@ -241,6 +245,8 @@ class AsyncTurnstoneConsole(_BaseClient):
             body["initial_message"] = initial_message
         if skill:
             body["skill"] = skill
+        if persona:
+            body["persona"] = persona
         if resume_ws:
             body["resume_ws"] = resume_ws
         if target_node:
@@ -1219,6 +1225,7 @@ class TurnstoneConsole:
         model: str = "",
         initial_message: str = "",
         skill: str = "",
+        persona: str = "",
         resume_ws: str = "",
         auto_approve: bool = False,
         auto_approve_tools: str = "",
@@ -1231,6 +1238,7 @@ class TurnstoneConsole:
                 model=model,
                 initial_message=initial_message,
                 skill=skill,
+                persona=persona,
                 resume_ws=resume_ws,
                 auto_approve=auto_approve,
                 auto_approve_tools=auto_approve_tools,
@@ -1254,6 +1262,7 @@ class TurnstoneConsole:
         auto_approve_tools: str = "",
         initial_message: str = "",
         skill: str = "",
+        persona: str = "",
         resume_ws: str = "",
         target_node: str = "",
         user_id: str = "",
@@ -1269,6 +1278,7 @@ class TurnstoneConsole:
                 auto_approve_tools=auto_approve_tools,
                 initial_message=initial_message,
                 skill=skill,
+                persona=persona,
                 resume_ws=resume_ws,
                 target_node=target_node,
                 user_id=user_id,

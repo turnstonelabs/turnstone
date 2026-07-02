@@ -906,6 +906,7 @@ class PostgreSQLBackend:
         kind: WorkstreamKind | str = WorkstreamKind.INTERACTIVE,
         parent_ws_id: str | None = None,
         project_id: str | None = None,
+        persona: str | None = None,
     ) -> None:
         from sqlalchemy.dialects.postgresql import insert as pg_insert
 
@@ -916,6 +917,7 @@ class PostgreSQLBackend:
         # filters remain correct.
         norm_parent = parent_ws_id if parent_ws_id else None
         norm_project = project_id if project_id else None
+        norm_persona = persona if persona else None
         # Use ON CONFLICT DO NOTHING to match SQLite's OR IGNORE semantics
         # and close the SELECT-then-INSERT TOCTOU window under concurrent
         # register_workstream calls for the same ws_id.
@@ -932,6 +934,7 @@ class PostgreSQLBackend:
             kind=norm_kind,
             parent_ws_id=norm_parent,
             project_id=norm_project,
+            persona=norm_persona,
             created=now,
             updated=now,
         )

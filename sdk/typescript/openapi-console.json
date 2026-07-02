@@ -2,7 +2,7 @@
   "openapi": "3.1.0",
   "info": {
     "title": "turnstone Console API",
-    "version": "1.7.0a2",
+    "version": "1.7.0a6",
     "description": "Cluster-wide visibility and control across all turnstone nodes."
   },
   "paths": {
@@ -4199,6 +4199,166 @@
         "responses": {
           "200": {
             "description": "Success"
+          },
+          "404": {
+            "description": "Error 404",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/api/admin/personas": {
+      "get": {
+        "summary": "List all personas, archived included",
+        "operationId": "v1_api_admin_personas_get",
+        "tags": [
+          "Admin"
+        ],
+        "responses": {
+          "200": {
+            "description": "Success",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ListPersonasResponse"
+                }
+              }
+            }
+          }
+        }
+      },
+      "post": {
+        "summary": "Create a persona",
+        "operationId": "v1_api_admin_personas_post",
+        "tags": [
+          "Admin"
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreatePersonaRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Success",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PersonaInfo"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Error 400",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/api/admin/personas/{persona_id}": {
+      "get": {
+        "summary": "Get a single persona",
+        "operationId": "v1_api_admin_personas_{persona_id}_get",
+        "tags": [
+          "Admin"
+        ],
+        "parameters": [
+          {
+            "name": "persona_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Success",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PersonaInfo"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Error 404",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      },
+      "patch": {
+        "summary": "Update a persona (edit levers, archive/unarchive, flip default)",
+        "operationId": "v1_api_admin_personas_{persona_id}_patch",
+        "tags": [
+          "Admin"
+        ],
+        "parameters": [
+          {
+            "name": "persona_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UpdatePersonaRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Success",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PersonaInfo"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Error 400",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
           },
           "404": {
             "description": "Error 404",
@@ -10894,6 +11054,327 @@
           "models"
         ],
         "title": "ListModelDefinitionsResponse",
+        "type": "object"
+      },
+      "PersonaInfo": {
+        "description": "Full persona row \u2014 the authoring shape (contrast PersonaChoice, the\npicker's display-only projection on the server surface).",
+        "properties": {
+          "persona_id": {
+            "title": "Persona Id",
+            "type": "string"
+          },
+          "name": {
+            "title": "Name",
+            "type": "string"
+          },
+          "display_name": {
+            "default": "",
+            "title": "Display Name",
+            "type": "string"
+          },
+          "description": {
+            "default": "",
+            "title": "Description",
+            "type": "string"
+          },
+          "base_prompt": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "BASE-module override; null = the kind's stock base",
+            "title": "Base Prompt"
+          },
+          "tool_allowlist": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "Tool visibility set: null = unrestricted, [] = no tools, [names] = exact set (include 'tool_search' to keep the set soft/expandable)",
+            "title": "Tool Allowlist"
+          },
+          "mcp_enabled": {
+            "default": true,
+            "title": "Mcp Enabled",
+            "type": "boolean"
+          },
+          "memory_enabled": {
+            "default": true,
+            "title": "Memory Enabled",
+            "type": "boolean"
+          },
+          "applies_to_kinds": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Applies To Kinds",
+            "type": "array"
+          },
+          "is_default": {
+            "default": false,
+            "title": "Is Default",
+            "type": "boolean"
+          },
+          "enabled": {
+            "default": true,
+            "description": "false = archived",
+            "title": "Enabled",
+            "type": "boolean"
+          },
+          "org_id": {
+            "default": "",
+            "title": "Org Id",
+            "type": "string"
+          },
+          "created_by": {
+            "default": "",
+            "title": "Created By",
+            "type": "string"
+          },
+          "created": {
+            "default": "",
+            "title": "Created",
+            "type": "string"
+          },
+          "updated": {
+            "default": "",
+            "title": "Updated",
+            "type": "string"
+          }
+        },
+        "required": [
+          "persona_id",
+          "name"
+        ],
+        "title": "PersonaInfo",
+        "type": "object"
+      },
+      "CreatePersonaRequest": {
+        "properties": {
+          "name": {
+            "description": "Immutable slug (lowercase: a-z, 0-9, '-', '_')",
+            "title": "Name",
+            "type": "string"
+          },
+          "display_name": {
+            "default": "",
+            "title": "Display Name",
+            "type": "string"
+          },
+          "description": {
+            "default": "",
+            "title": "Description",
+            "type": "string"
+          },
+          "base_prompt": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Base Prompt"
+          },
+          "tool_allowlist": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Tool Allowlist"
+          },
+          "mcp_enabled": {
+            "default": true,
+            "title": "Mcp Enabled",
+            "type": "boolean"
+          },
+          "memory_enabled": {
+            "default": true,
+            "title": "Memory Enabled",
+            "type": "boolean"
+          },
+          "applies_to_kinds": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Applies To Kinds",
+            "type": "array"
+          },
+          "is_default": {
+            "default": false,
+            "title": "Is Default",
+            "type": "boolean"
+          },
+          "enabled": {
+            "default": true,
+            "title": "Enabled",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "name"
+        ],
+        "title": "CreatePersonaRequest",
+        "type": "object"
+      },
+      "UpdatePersonaRequest": {
+        "description": "PATCH body \u2014 only fields present in the JSON are applied.\n\nArchive = ``{\"enabled\": false}``; default flip = ``{\"is_default\": true}``\non the successor (storage demotes the incumbent atomically).  ``name``\nis immutable; existing workstreams are never affected by edits.",
+        "properties": {
+          "display_name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Display Name"
+          },
+          "description": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Description"
+          },
+          "base_prompt": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Base Prompt"
+          },
+          "tool_allowlist": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Tool Allowlist"
+          },
+          "mcp_enabled": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Mcp Enabled"
+          },
+          "memory_enabled": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Memory Enabled"
+          },
+          "applies_to_kinds": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Applies To Kinds"
+          },
+          "is_default": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Is Default"
+          },
+          "enabled": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Enabled"
+          }
+        },
+        "title": "UpdatePersonaRequest",
+        "type": "object"
+      },
+      "ListPersonasResponse": {
+        "properties": {
+          "personas": {
+            "items": {
+              "$ref": "#/components/schemas/PersonaInfo"
+            },
+            "title": "Personas",
+            "type": "array"
+          }
+        },
+        "required": [
+          "personas"
+        ],
+        "title": "ListPersonasResponse",
         "type": "object"
       },
       "ModelReloadResponse": {

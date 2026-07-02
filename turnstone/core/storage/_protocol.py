@@ -630,6 +630,7 @@ class StorageBackend(Protocol):
         kind: WorkstreamKind | str = "interactive",
         parent_ws_id: str | None = None,
         project_id: str | None = None,
+        persona: str | None = None,
     ) -> None:
         """Create a workstreams row (no-op if already exists).
 
@@ -637,8 +638,10 @@ class StorageBackend(Protocol):
         (``"interactive"`` / ``"coordinator"``); the storage edge validates
         the value and rejects unknown kinds with ``ValueError``.
         ``parent_ws_id`` is non-NULL for children spawned by a coordinator;
-        ``project_id`` is the attached project — both are normalized from the
-        empty string to ``None`` at the storage edge.
+        ``project_id`` is the attached project; ``persona`` is the slug the
+        workstream was created with (display carrier — the snapshot lives in
+        ``workstream_config``) — all normalized from the empty string to
+        ``None`` at the storage edge.
         """
         ...
 

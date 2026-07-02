@@ -523,7 +523,15 @@ class TestInterruptedWorkstreamRepair:
 
 class TestWorkstreamConfig:
     def test_save_load_roundtrip(self, tmp_db):
-        config = {"temperature": "0.3", "reasoning_effort": "high", "creative_mode": "False"}
+        config = {
+            "temperature": "0.3",
+            "reasoning_effort": "high",
+            "persona": "scribe",
+            "persona_prompt": "You are a scribe.",
+            "persona_tools": "[]",
+            "persona_mcp": "0",
+            "persona_memory": "0",
+        }
         save_workstream_config("s1", config)
         loaded = load_workstream_config("s1")
         assert loaded == config
@@ -566,7 +574,11 @@ class TestWorkstreamConfig:
                 "reasoning_effort": "high",
                 "max_tokens": "2048",
                 "instructions": "be concise",
-                "creative_mode": "True",
+                "persona": "writer",
+                "persona_prompt": "You are a creative writing partner.",
+                "persona_tools": "[]",
+                "persona_mcp": "0",
+                "persona_memory": "1",
             },
         )
 
@@ -581,13 +593,20 @@ class TestWorkstreamConfig:
             tool_timeout=30,
         )
         assert session.temperature == 0.7  # default
+        assert session._persona_name == ""  # unstamped constructor default
         result = session.resume("orig")
         assert result is True
         assert session.temperature == 0.3
         assert session.reasoning_effort == "high"
         assert session.max_tokens == 2048
         assert session.instructions == "be concise"
-        assert session.creative_mode is True
+        # Non-fork resume adopts the target's persona stamp so a later
+        # _save_config can't clobber it with this session's own stamp.
+        assert session._persona_name == "writer"
+        assert session._persona_prompt == "You are a creative writing partner."
+        assert session._persona_tools == frozenset()
+        assert session._persona_mcp is False
+        assert session._persona_memory is True
 
     def test_resume_keeps_defaults_when_alias_unresolvable(self, tmp_db):
         """When the saved alias is empty or no longer in the registry,
@@ -639,8 +658,8 @@ class TestWorkstreamConfig:
         builds a ChatSession with the persisted ws_id; the legacy
         ``__init__`` unconditionally called ``_save_config()`` which is
         ``INSERT OR REPLACE`` per-key — silently resetting model_alias,
-        temperature, reasoning_effort, max_tokens, skill, creative_mode,
-        and instructions to the constructor defaults *before*
+        temperature, reasoning_effort, max_tokens, skill, the persona
+        stamp, and instructions to the constructor defaults *before*
         ``resume()`` got a chance to read them back.
         """
         client = MagicMock()
@@ -660,7 +679,11 @@ class TestWorkstreamConfig:
                 "temperature": "0.2",
                 "reasoning_effort": "high",
                 "max_tokens": "8192",
-                "creative_mode": "True",
+                "persona": "scribe",
+                "persona_prompt": "You are a scribe.",
+                "persona_tools": "[]",
+                "persona_mcp": "0",
+                "persona_memory": "0",
                 "instructions": "preserve me",
             },
         )
@@ -683,7 +706,9 @@ class TestWorkstreamConfig:
         assert loaded["temperature"] == "0.2"
         assert loaded["reasoning_effort"] == "high"
         assert loaded["max_tokens"] == "8192"
-        assert loaded["creative_mode"] == "True"
+        assert loaded["persona"] == "scribe"
+        assert loaded["persona_tools"] == "[]"
+        assert loaded["persona_mcp"] == "0"
         assert loaded["instructions"] == "preserve me"
 
     def test_init_writes_config_on_fresh_create(self, tmp_db):

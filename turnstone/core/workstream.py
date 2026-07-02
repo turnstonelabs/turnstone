@@ -123,6 +123,10 @@ class Workstream:
     # The project this workstream is attached to (None = none).  Children
     # inherit the parent's project_id at spawn.
     project_id: str | None = None
+    # Slug of the persona the workstream was created with ("" = pre-persona).
+    # Display carrier only — the session applies the stamped snapshot from
+    # workstream_config, never this field.
+    persona: str = ""
     # Tombstone: set by ``SessionManager.close`` under ``_lock`` so a
     # racing ``set_state`` can detect the close before it overwrites
     # the persisted ``state='closed'`` row. Guarded by ``_lock``.

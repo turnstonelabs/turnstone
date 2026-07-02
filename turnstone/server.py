@@ -105,6 +105,8 @@ if TYPE_CHECKING:
 
     from starlette.types import ASGIApp, Receive, Scope, Send
 
+    from turnstone.core.personas import PersonaSnapshot
+
 # ---------------------------------------------------------------------------
 # Static assets — loaded once at startup from turnstone/ui/static/
 # ---------------------------------------------------------------------------
@@ -2962,6 +2964,34 @@ async def remove_project_member_endpoint(request: Request) -> JSONResponse:
     return JSONResponse({"status": "ok", "members": storage.list_project_members(project_id)})
 
 
+async def list_personas_endpoint(request: Request) -> JSONResponse:
+    """GET /v1/api/personas — enabled personas for creation pickers.
+
+    Authenticated but deliberately gated by NO ``persona.*`` permission:
+    selecting a persona at creation is a user action, while ``persona.*``
+    perms gate authoring (the console admin CRUD).  Display fields only —
+    the levers (prompt / tools / toggles) stay server-side.
+    """
+    from turnstone.core.storage import get_storage
+
+    _uid, uerr = _project_request_uid(request)
+    if uerr:
+        return uerr
+    storage = get_storage()
+    rows = storage.list_personas() if storage else []
+    personas = [
+        {
+            "name": r["name"],
+            "display_name": r.get("display_name") or "",
+            "description": r.get("description") or "",
+            "applies_to_kinds": r.get("applies_to_kinds") or [],
+            "is_default": bool(r.get("is_default")),
+        }
+        for r in rows
+    ]
+    return JSONResponse({"personas": personas, "total": len(personas)})
+
+
 async def auth_login(request: Request) -> Response:
     """POST /v1/api/auth/login — authenticate and return JWT."""
     from turnstone.core.auth import handle_auth_login
@@ -4354,6 +4384,7 @@ def create_app(
                         remove_project_member_endpoint,
                         methods=["DELETE"],
                     ),
+                    Route("/api/personas", list_personas_endpoint),
                     Route("/api/auth/login", auth_login, methods=["POST"]),
                     Route("/api/auth/logout", auth_logout, methods=["POST"]),
                     Route("/api/auth/status", auth_status),
@@ -4794,6 +4825,7 @@ def main() -> None:
         kind: WorkstreamKind = WorkstreamKind.INTERACTIVE,
         parent_ws_id: str | None = None,
         project_id: str = "",
+        persona_snapshot: PersonaSnapshot | None = None,
     ) -> ChatSession:
         assert ui is not None
         # Resolve the effective alias once and use it consistently
@@ -4904,6 +4936,7 @@ def main() -> None:
             kind=kind,
             parent_ws_id=parent_ws_id,
             project_id=project_id,
+            persona_snapshot=persona_snapshot,
         )
 
     # Create WatchRunner (periodic command polling, server-level)

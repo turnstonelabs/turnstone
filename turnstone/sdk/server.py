@@ -105,6 +105,7 @@ class AsyncTurnstoneServer(_BaseClient):
         auto_approve: bool = False,
         resume_ws: str = "",
         skill: str = "",
+        persona: str = "",
         initial_message: str = "",
         auto_approve_tools: str = "",
         user_id: str = "",
@@ -123,6 +124,9 @@ class AsyncTurnstoneServer(_BaseClient):
         *initial_message* is also set, the server resolves the staged
         attachments onto that turn before its background worker
         dispatches.
+
+        *persona* selects the persona the workstream is created with
+        (resolved and snapshotted server-side; empty = the kind default).
         """
         body: dict[str, Any] = {}
         if name:
@@ -135,6 +139,8 @@ class AsyncTurnstoneServer(_BaseClient):
             body["resume_ws"] = resume_ws
         if skill:
             body["skill"] = skill
+        if persona:
+            body["persona"] = persona
         if initial_message:
             body["initial_message"] = initial_message
         if auto_approve_tools:
@@ -607,6 +613,7 @@ class TurnstoneServer:
         auto_approve: bool = False,
         resume_ws: str = "",
         skill: str = "",
+        persona: str = "",
         initial_message: str = "",
         auto_approve_tools: str = "",
         user_id: str = "",
@@ -622,6 +629,7 @@ class TurnstoneServer:
                 auto_approve=auto_approve,
                 resume_ws=resume_ws,
                 skill=skill,
+                persona=persona,
                 initial_message=initial_message,
                 auto_approve_tools=auto_approve_tools,
                 user_id=user_id,

@@ -27,6 +27,10 @@
       "project": {
         "type": "string",
         "description": "Optional project_id to attach the child to, overriding the project it would otherwise inherit from this coordinator. Omit to inherit the coordinator's project (the common case). The child only gains project access if its owning user can access the project."
+      },
+      "persona": {
+        "type": "string",
+        "description": "Optional persona name for the child (children are always interactive-kind, so the persona must apply to interactive workstreams). The persona is resolved and snapshotted at spawn time. Omit for the interactive default persona — the child never inherits this coordinator's persona."
       }
     },
     "required": []

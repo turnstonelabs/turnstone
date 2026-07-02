@@ -764,6 +764,7 @@ class CoordinatorClient:
         model: str = "",
         target_node: str = "",
         project: str = "",
+        persona: str = "",
     ) -> dict[str, Any]:
         """Create a child workstream via the routing proxy."""
         body: dict[str, Any] = {
@@ -782,6 +783,11 @@ class CoordinatorClient:
             body["target_node"] = target_node
         if project:
             body["project_id"] = project
+        if persona:
+            # Re-resolved and stamped by the receiving node's create
+            # handler at child-creation time.  Omitted = the interactive
+            # kind default — never the parent's persona.
+            body["persona"] = persona
         return self._post("spawn", body)
 
     def send(self, ws_id: str, message: str) -> dict[str, Any]:

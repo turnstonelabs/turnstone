@@ -104,6 +104,7 @@ from turnstone.core.memory_relevance import (
     score_memories,
 )
 from turnstone.core.metacognition import (
+    MEMORY_NUDGE_TYPES,
     NUDGE_COMPACTION_RESUME,
     RepeatDetector,
     detect_completion,
@@ -113,6 +114,7 @@ from turnstone.core.metacognition import (
     should_nudge,
 )
 from turnstone.core.nudge_queue import TOOL_DRAIN, USER_DRAIN, NudgeQueue
+from turnstone.core.personas import PersonaSnapshot, snapshot_from_config
 from turnstone.core.providers import create_provider
 from turnstone.core.ratelimit import TokenBucket
 from turnstone.core.safety import is_command_blocked, sanitize_command
@@ -1146,6 +1148,7 @@ class ChatSession:
         parent_ws_id: str | None = None,
         coord_client: Any = None,
         project_id: str = "",
+        persona_snapshot: PersonaSnapshot | None = None,
     ):
         if kind == WorkstreamKind.COORDINATOR and not user_id:
             # Coordinators carry real authority — they mint child-spawn
@@ -1327,6 +1330,20 @@ class ChatSession:
                 self._project_id = project_id
                 self._project_writable = acc.can_write
                 self._project_name = acc.name
+        # Persona snapshot — the four levers, resolved ONCE at workstream
+        # creation and immutable for the session's lifetime.  Everything
+        # below (tool merge, MCP gate, composition, memory) reads these
+        # attrs, never the personas table: editing or archiving a persona
+        # must not change an existing workstream.  ``None`` = legacy
+        # pre-persona workstream — all levers at their open positions,
+        # byte-identical to today.
+        self._persona_name: str = persona_snapshot.name if persona_snapshot else ""
+        self._persona_prompt: str = persona_snapshot.prompt if persona_snapshot else ""
+        self._persona_tools: frozenset[str] | None = (
+            persona_snapshot.tools if persona_snapshot else None
+        )
+        self._persona_mcp: bool = persona_snapshot.mcp if persona_snapshot else True
+        self._persona_memory: bool = persona_snapshot.memory if persona_snapshot else True
         self._title_generated = False
         self._read_files: set[str] = set()
         # The canonical in-memory trajectory.  Wire prep (fold/repair) + the
@@ -1346,7 +1363,6 @@ class ChatSession:
         self._applied_skill_content: str = ""  # inline prompt from applied skill
         self._assistant_pending_tokens = 0
         self._calibrated_msg_count = 0  # len(messages) at last _update_token_table
-        self.creative_mode = False
         self._notify_count = 0
         # Watch support: server-level runner injected via set_watch_runner()
         self._watch_runner: Any = None  # WatchRunner | None
@@ -1429,8 +1445,14 @@ class ChatSession:
         # with many tools is not throttled.  Reset alongside the judge
         # instance at the model-swap paths.
         self._output_guard_judge_rl = TokenBucket(rate=1.0, burst=60)
-        # MCP tool integration: merge external tools with built-in
-        self._mcp_client = mcp_client
+        # MCP tool integration: merge external tools with built-in.
+        # Persona MCP gate (lever 3) is SESSION-WIDE infrastructure intent —
+        # "this workstream does not talk to MCP" — so an MCP-off persona
+        # drops the client reference outright: no merge into _tools OR
+        # _task_tools, no listeners, no resource/prompt catalogs, and the
+        # refresh callbacks stay inert (they all guard on _mcp_client).
+        # Task agents keep their native tools; only the MCP surface closes.
+        self._mcp_client = mcp_client if self._persona_mcp else None
         self._mcp_refresh_cb: Any = None  # Callable | None (avoid import)
         self._mcp_resource_cb: Any = None
         self._mcp_prompt_cb: Any = None
@@ -1448,34 +1470,36 @@ class ChatSession:
         if kind == WorkstreamKind.COORDINATOR:
             self._tools = list(COORDINATOR_TOOLS)
             self._task_tools = []
-        elif mcp_client:
-            mcp_tools = mcp_client.get_tools(user_id=self._mcp_user_id)
+        elif self._mcp_client:
+            # ``self._mcp_client`` (not the raw kwarg) so an MCP-off persona
+            # falls through to the no-MCP branch below.
+            mcp_tools = self._mcp_client.get_tools(user_id=self._mcp_user_id)
             self._tools = merge_mcp_tools(INTERACTIVE_TOOLS, mcp_tools)
             self._task_tools = merge_mcp_tools(TASK_AGENT_TOOLS, mcp_tools)
             # Register for tool-change notifications from MCP servers.
             # ``user_id`` is the listener identity component — pool-only
             # changes for OTHER users must not fire this callback.
             self._mcp_refresh_cb = self._on_mcp_tools_changed
-            mcp_client.add_listener(self._mcp_refresh_cb, user_id=self._mcp_user_id)
+            self._mcp_client.add_listener(self._mcp_refresh_cb, user_id=self._mcp_user_id)
             # Register for resource-change notifications.
             # ``user_id`` scopes the listener so pool-only resource
             # changes for OTHER users do not wake this session.
             self._mcp_resource_cb = self._on_mcp_resources_changed
-            mcp_client.add_resource_listener(self._mcp_resource_cb, user_id=self._mcp_user_id)
+            self._mcp_client.add_resource_listener(self._mcp_resource_cb, user_id=self._mcp_user_id)
             # Register for prompt-change notifications.
             # ``user_id`` scopes the listener so pool-only prompt changes
             # for OTHER users do not wake this session.
             self._mcp_prompt_cb = self._on_mcp_prompts_changed
-            mcp_client.add_prompt_listener(self._mcp_prompt_cb, user_id=self._mcp_user_id)
+            self._mcp_client.add_prompt_listener(self._mcp_prompt_cb, user_id=self._mcp_user_id)
             # Proactively warm this user's per-user OAuth (oauth_user) pools so
             # their tools are present without a manual reconnect (e.g. after a
             # reboot/upgrade, or right after consent). Fire-and-forget — the
             # listeners registered just above deliver the catalog to this
             # session once each prime completes. No-op for users with no
             # consented oauth_user servers.
-            if self._mcp_user_id and hasattr(mcp_client, "prime_user_pools"):
+            if self._mcp_user_id and hasattr(self._mcp_client, "prime_user_pools"):
                 try:
-                    mcp_client.prime_user_pools(self._mcp_user_id)
+                    self._mcp_client.prime_user_pools(self._mcp_user_id)
                 except Exception:
                     log.debug(
                         "mcp prime_user_pools scheduling failed user=%s",
@@ -1497,7 +1521,13 @@ class ChatSession:
         self._tool_search_threshold = tool_search_threshold
         self._tool_search_max_results = tool_search_max_results
         self._tool_search: ToolSearchManager | None = None
-        if tool_search == "on" or (
+        if self._persona_tool_search_blocked():
+            # Persona visibility set without ``tool_search`` = a HARD set
+            # (locked decision 3): the whole pathway is disabled, including
+            # the provider-native defer_loading mode where there is no
+            # synthetic tool name to filter out.
+            pass
+        elif tool_search == "on" or (
             tool_search == "auto" and len(self._tools) > tool_search_threshold
         ):
             # always_on_names is the set of builtin tools present in
@@ -2026,32 +2056,43 @@ class ChatSession:
 
     def _save_config(self) -> None:
         """Persist LLM-affecting config so resumed workstreams behave identically."""
-        save_workstream_config(
-            self._ws_id,
-            {
-                "model": self.model,
-                "model_alias": self._model_alias or "",
-                "temperature": str(self.temperature),
-                "reasoning_effort": self.reasoning_effort,
-                "max_tokens": str(self.max_tokens),
-                "instructions": self.instructions or "",
-                "creative_mode": str(self.creative_mode),
-                "skill": self._skill_name or "",
-                # SKILL.md spec ``$ARGUMENTS`` payload (#572).  Stored
-                # so a resumed workstream re-renders the skill with the
-                # same args the original load supplied — otherwise the
-                # rehydrate path would silently swap to empty args.
-                "skill_arguments": self._skill_arguments,
-                "token_budget": str(self._token_budget),
-                "applied_skill_id": self._applied_skill_id,
-                "applied_skill_version": str(self._applied_skill_version),
-                # Snapshot isolation: skill content is persisted per-workstream so that
-                # edits to the skill between sessions don't break resume. This duplicates
-                # up to 32KB per active workstream — acceptable trade-off for correctness.
-                "applied_skill_content": self._applied_skill_content,
-                "notify_on_complete": self._notify_on_complete,
-            },
-        )
+        config = {
+            "model": self.model,
+            "model_alias": self._model_alias or "",
+            "temperature": str(self.temperature),
+            "reasoning_effort": self.reasoning_effort,
+            "max_tokens": str(self.max_tokens),
+            "instructions": self.instructions or "",
+            "skill": self._skill_name or "",
+            # SKILL.md spec ``$ARGUMENTS`` payload (#572).  Stored
+            # so a resumed workstream re-renders the skill with the
+            # same args the original load supplied — otherwise the
+            # rehydrate path would silently swap to empty args.
+            "skill_arguments": self._skill_arguments,
+            "token_budget": str(self._token_budget),
+            "applied_skill_id": self._applied_skill_id,
+            "applied_skill_version": str(self._applied_skill_version),
+            # Snapshot isolation: skill content is persisted per-workstream so that
+            # edits to the skill between sessions don't break resume. This duplicates
+            # up to 32KB per active workstream — acceptable trade-off for correctness.
+            "applied_skill_content": self._applied_skill_content,
+            "notify_on_complete": self._notify_on_complete,
+        }
+        # Persona stamp: written only when a persona was resolved at
+        # creation.  Legacy pre-persona workstreams must never get
+        # back-stamped by an incidental _save_config call (/model etc.) —
+        # absence of the keys IS their persona state.
+        if self._persona_name:
+            config.update(
+                PersonaSnapshot(
+                    name=self._persona_name,
+                    prompt=self._persona_prompt,
+                    tools=self._persona_tools,
+                    mcp=self._persona_mcp,
+                    memory=self._persona_memory,
+                ).to_config()
+            )
+        save_workstream_config(self._ws_id, config)
 
     def _load_skills(self) -> None:
         """Load skills from storage.  Called once at init and on /skill."""
@@ -2451,7 +2492,11 @@ class ChatSession:
     def _rebuild_tool_search(self) -> None:
         """Reconstruct ToolSearchManager, preserving expanded tools."""
         old_expanded = self._tool_search.get_expanded_names() if self._tool_search else []
-        if self._tool_search_setting == "on" or (
+        if self._persona_tool_search_blocked():
+            # Hard persona set — the pathway stays disabled across MCP
+            # catalog refreshes too (mirrors the constructor gate).
+            self._tool_search = None
+        elif self._tool_search_setting == "on" or (
             self._tool_search_setting == "auto" and len(self._tools) > self._tool_search_threshold
         ):
             self._tool_search = ToolSearchManager(
@@ -3003,6 +3048,24 @@ class ChatSession:
         )
         # Restore persisted config
         config = load_workstream_config(ws_id)
+        # Adopt the persona stamp of the workstream being resumed — a
+        # non-fork resume adopts the target's identity, so keeping this
+        # session's creation-time stamp would clobber the target's on the
+        # next _save_config.  The prompt/visibility/memory levers reapply
+        # via the _init_system_messages() recompose below and the per-call
+        # visibility filter; the MCP lever is construction-time only (the
+        # startup resume paths — SessionManager.open, CLI --resume —
+        # construct with the stamp, so only a mid-session REPL /resume
+        # keeps the constructing persona's MCP surface).  A fork keeps its
+        # own creation-time stamp.  Corrupt stamps raise — never silently
+        # rewritten.
+        if not fork:
+            snap = snapshot_from_config(config or {})
+            self._persona_name = snap.name if snap else ""
+            self._persona_prompt = snap.prompt if snap else ""
+            self._persona_tools = snap.tools if snap else None
+            self._persona_mcp = snap.mcp if snap else True
+            self._persona_memory = snap.memory if snap else True
         if config:
             # Restore model via registry (same path as /model command)
             saved_alias = config.get("model_alias", "")
@@ -3053,8 +3116,6 @@ class ChatSession:
                 self.max_tokens = int(config["max_tokens"])
             if "instructions" in config:
                 self.instructions = config["instructions"] or None
-            if "creative_mode" in config:
-                self.creative_mode = config["creative_mode"] == "True"
             if "skill" in config or "template" in config:
                 self._skill_name = config.get("skill") or config.get("template") or None
                 # Restore #572's invocation-args payload BEFORE
@@ -3142,7 +3203,7 @@ class ChatSession:
                 message_count=len(self.messages),
             )
 
-        if self._mem_cfg.nudges and should_nudge(
+        if self._nudges_enabled("resume") and should_nudge(
             "resume",
             self._metacog_state,
             message_count=len(self.messages),
@@ -3153,12 +3214,24 @@ class ChatSession:
         self._init_system_messages()
         return True
 
+    def _nudges_enabled(self, nudge_type: str) -> bool:
+        """Config gate + persona lever 4 for metacognitive nudges.
+
+        Memory-directed nudge types (``MEMORY_NUDGE_TYPES``) are suppressed
+        when the persona's memory is off — their copy directs the model at
+        the memory tool the persona hides.  Behavioural nudges (repeat,
+        compaction, idle children, watches) stay on the config gate only.
+        """
+        if not self._mem_cfg.nudges:
+            return False
+        return self._persona_memory or nudge_type not in MEMORY_NUDGE_TYPES
+
     def _init_system_messages(self) -> None:
         """Build the system/developer prefix messages.
 
-        Developer message contains tool patterns (or creative writing
-        instructions when creative_mode is on), plus any user-supplied
-        instructions and memory reminders.
+        Developer message contains the composed system message (persona
+        base override included), plus any user-supplied instructions and
+        memory reminders.
 
         Uses copy-on-write: builds new lists locally, then assigns
         atomically so concurrent readers (e.g. background thread
@@ -3168,78 +3241,57 @@ class ChatSession:
 
         # Refresh shared-workstream state so it stays current (banner, the
         # declaration below, and _maybe_note_new_participant's "already known"
-        # gate) regardless of which developer-message branch renders — a
-        # creative-mode compose must not leave a just-reset (or stale) flag
-        # unrefreshed just because it doesn't render the CONTEXT banner itself.
+        # gate) before the developer message renders.
         self._recompute_shared_state()
 
         # -- Developer message --
-        if self.creative_mode:
-            dev_parts = [
-                "# Instructions",
-                "",
-                (
-                    "You are a creative writing partner. Use the analysis channel to "
-                    "think through structure, voice, and intent before drafting."
-                ),
-                "",
-                "Craft principles:",
-                "- Ground scenes in concrete sensory detail — what is seen, heard, felt.",
-                (
-                    "- Vary rhythm. Short sentences hit hard. Longer ones carry the reader "
-                    "through texture and nuance, building toward something."
-                ),
-                (
-                    "- Dialogue should do at least two things: reveal character AND advance "
-                    "plot or tension. Cut anything that's just exchanging information."
-                ),
-                (
-                    "- Earn your abstractions. Don't say 'she felt sad' — show the thing "
-                    "that makes the reader feel it."
-                ),
-                "- Trust subtext. Leave room for the reader.",
-                "",
-                (
-                    "Match the user's genre and tone. If they want literary fiction, write "
-                    "literary fiction. If they want pulp, write pulp with conviction. "
-                    "Never condescend to the form."
-                ),
-            ]
-        else:
-            # Compose system message from modular components
-            tool_names = frozenset(t["function"]["name"] for t in self._tools if "function" in t)
-            # Load DB prompt policies if storage is available
-            db_policies: list[dict[str, Any]] = []
-            try:
-                storage = get_storage()
-                if storage:
-                    db_policies = storage.list_prompt_policies()
-            except Exception:
-                log.debug("Failed to load prompt policies from storage", exc_info=True)
-            now = datetime.now().astimezone()
-            # Round to the top of the hour. Anthropic and OpenAI both cache the
-            # system prefix; minute-precision time stamps invalidated the cache
-            # on every turn that crossed a minute boundary. Hour-precision still
-            # gives the model time-of-day awareness without paying for a full
-            # prefix recompute every ~60 seconds.
-            ctx = SessionContext(
-                current_datetime=now.strftime("%Y-%m-%dT%H:00"),
-                timezone=now.tzname() or "UTC",
-                username=self._username or self._user_id or "unknown",
-                project=self._project_name,
-                shared=self._shared_workstream,
-                ws_id=self._ws_id,
-                project_id=self._project_id,
-            )
-            composed = compose_system_message(
-                client_type=self._client_type,
-                context=ctx,
-                available_tools=tool_names,
-                policies=["web_search"],
-                db_policies=db_policies,
-                kind=self._kind,
-            )
-            dev_parts = [composed]
+        # Compose system message from modular components.  The name set
+        # runs through the persona visibility filter (levers 2+4) so the
+        # TOOLS block self-suppresses on an empty envelope, tool-gated
+        # policies drop with their tool, and the memory-tool advisory
+        # below disappears when the persona hides ``memory``.
+        tool_names = frozenset(
+            name
+            for t in self._tools
+            if "function" in t and self._persona_tool_visible(name := t["function"]["name"])
+        )
+        # Load DB prompt policies if storage is available
+        db_policies: list[dict[str, Any]] = []
+        try:
+            storage = get_storage()
+            if storage:
+                db_policies = storage.list_prompt_policies()
+        except Exception:
+            log.debug("Failed to load prompt policies from storage", exc_info=True)
+        now = datetime.now().astimezone()
+        # Round to the top of the hour. Anthropic and OpenAI both cache the
+        # system prefix; minute-precision time stamps invalidated the cache
+        # on every turn that crossed a minute boundary. Hour-precision still
+        # gives the model time-of-day awareness without paying for a full
+        # prefix recompute every ~60 seconds.
+        ctx = SessionContext(
+            current_datetime=now.strftime("%Y-%m-%dT%H:00"),
+            timezone=now.tzname() or "UTC",
+            username=self._username or self._user_id or "unknown",
+            project=self._project_name,
+            shared=self._shared_workstream,
+            ws_id=self._ws_id,
+            project_id=self._project_id,
+        )
+        composed = compose_system_message(
+            client_type=self._client_type,
+            context=ctx,
+            available_tools=tool_names,
+            policies=["web_search"],
+            db_policies=db_policies,
+            kind=self._kind,
+            # Persona lever 1: replaces ONLY the BASE module.  ENV /
+            # CONTEXT / TOOLS / POLICIES keep composing, so mandatory
+            # prompt policies ride on top of every persona — unlike the
+            # removed /creative fork, which bypassed composition entirely.
+            base_override=self._persona_prompt or None,
+        )
+        dev_parts = [composed]
         # Capability-gated system-prompt additions.  Resolve caps once here, via
         # _resolve_capabilities (NOT _get_capabilities) so we don't populate
         # self._cached_capabilities during __init__ — that would make later
@@ -3267,8 +3319,15 @@ class ChatSession:
         # fold-only operator declaration above.
         if self._shared_workstream:
             dev_parts.append("\n\n" + build_shared_workstream_declaration(self._sender_label_nonce))
-        # Tool search hint (client-side mode only — native mode needs no hint).
-        if self._tool_search and caps is not None and not caps.supports_tool_search:
+        # Tool search hint (client-side mode only — native mode needs no
+        # hint).  Persona visibility sets force client-side mode even on
+        # native-capable providers (see _get_active_tools), so they get
+        # the hint too.
+        if (
+            self._tool_search
+            and caps is not None
+            and (not caps.supports_tool_search or self._persona_tools is not None)
+        ):
             dev_parts.append(
                 "\n\nAdditional tools are available via tool_search. "
                 "Use it when you need a capability not in your current tool set."
@@ -3386,7 +3445,14 @@ class ChatSession:
             # Composed against a real user-message query at least once; send()
             # uses this to know the deferred first-turn recompose is done.
             self._system_composed_with_context = True
-        visible_mems, candidate_source = self._select_memory_candidates(context)
+        # Persona lever 4 (own hands only): memory-off suppresses recalled-
+        # memory injection here, the nudges at their producer sites, and the
+        # memory tool via the visibility filter.  Task agents keep their own
+        # memory tool (``_task_tools`` is not persona-filtered), and
+        # compaction spill/markers are session mechanics — never gated.
+        visible_mems, candidate_source = (
+            self._select_memory_candidates(context) if self._persona_memory else ([], "")
+        )
         if visible_mems:
             thr = self._bm25_rerank_threshold()
             relevant = score_memories(
@@ -4321,6 +4387,44 @@ class ChatSession:
 
     # -- tool search helpers --------------------------------------------------
 
+    def _persona_tool_search_blocked(self) -> bool:
+        """True when the persona's visibility set is HARD (no ``tool_search``).
+
+        A hard set disables the whole tool-search pathway (locked decision
+        3) — the constructor and ``_rebuild_tool_search`` both skip
+        ToolSearchManager construction, which also covers provider-native
+        defer_loading mode where no synthetic tool name exists to filter.
+        """
+        return self._persona_tools is not None and "tool_search" not in self._persona_tools
+
+    def _persona_tool_visible(self, name: str) -> bool:
+        """Whether the persona's envelope lets ``name`` reach the wire/prompt.
+
+        - memory-off (lever 4) hides the ``memory`` tool from the persona's
+          own hands regardless of the visibility set;
+        - a ``None`` set is unrestricted;
+        - an explicit set is exact, EXCEPT tools the model already loaded
+          through ``tool_search`` (the session's discovered set unions with
+          the allowlist — the escape hatch stays honest: once advertised as
+          loaded, a tool doesn't vanish from the wire).
+        """
+        if not self._persona_memory and name == "memory":
+            return False
+        if self._persona_tools is None:
+            return True
+        if name in self._persona_tools:
+            return True
+        ts = self._tool_search
+        return ts is not None and name in ts.get_expanded_names()
+
+    def _apply_persona_visibility(self, tools: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Filter a tool-definition list to the persona's visible set."""
+        if self._persona_tools is None and self._persona_memory:
+            return tools
+        return [
+            t for t in tools if self._persona_tool_visible(t.get("function", {}).get("name", ""))
+        ]
+
     def _get_active_tools(self) -> list[dict[str, Any]] | None:
         """Return the tool list to send to the LLM.
 
@@ -4337,18 +4441,27 @@ class ChatSession:
 
         MCP tool gating: ``read_resource`` is removed when no MCP servers
         expose resources; ``use_prompt`` is removed when none expose prompts.
+
+        Persona gating (levers 2+4) runs LAST so the wire never advertises
+        a tool the visibility set hides — whatever branch produced the list.
+        With a persona visibility set, tool search always runs in
+        client-side mode (see ``_get_capabilities`` note below): native
+        defer_loading would strip deferred tools here before the provider
+        could offer them for discovery.
         """
-        if self.creative_mode:
-            return None
         caps = self._get_capabilities()
         if not self._tool_search:
             tools = self._tools
         else:
-            if caps.supports_tool_search:
+            if caps.supports_tool_search and self._persona_tools is None:
                 # Provider handles defer_loading — send all tools
                 tools = self._tools
             else:
-                # Client-side fallback: visible tools + search tool
+                # Client-side fallback: visible tools + search tool.
+                # Forced for persona visibility sets — the synthetic
+                # tool_search + expanded-names union is how a soft set
+                # grows, and the persona filter below would otherwise
+                # eat the provider's deferred catalog.
                 visible = self._tool_search.get_visible_tools()
                 tools = visible + [self._tool_search.get_search_tool_definition()]
 
@@ -4369,11 +4482,15 @@ class ChatSession:
         ):
             tools = _without_tool(tools, "use_prompt")
 
-        return tools
+        return self._apply_persona_visibility(tools)
 
     def _get_deferred_names(self) -> frozenset[str] | None:
         """Return names of deferred tools for native provider search, or None."""
         if not self._tool_search:
+            return None
+        if self._persona_tools is not None:
+            # Persona visibility sets force client-side tool search — see
+            # _get_active_tools — so never hand the provider deferred names.
             return None
         caps = self._get_capabilities()
         if not caps.supports_tool_search:
@@ -6200,7 +6317,7 @@ class ChatSession:
             f"{GRAY}[request] model={self.model}  "
             f"max_tokens={self.max_tokens}  temp={self.temperature}  "
             f"reasoning={self.reasoning_effort}  "
-            f"tools={0 if self.creative_mode else len(self._get_active_tools() or [])}"
+            f"tools={len(self._get_active_tools() or [])}"
             f"{' (search)' if self._tool_search else ''}{RESET}"
         )
         lines.append(f"{GRAY}[request] {len(msgs)} messages:{RESET}")
@@ -6976,12 +7093,22 @@ class ChatSession:
 
         # A truncated carry is a cache miss, not a loss: storage keeps the
         # full transcript, so tell the model where the rest lives instead of
-        # leaving a bare cut.
+        # leaving a bare cut.  The recall-tool pointer is emitted only when
+        # the persona's envelope actually shows the recall tool — an
+        # empty-toolset persona must not be pointed at a tool it can't call
+        # (mirrors the memory-advisory gating; compaction itself is never
+        # persona-gated).
         if carry_truncated:
-            summary += (
-                "\n\nTruncated content above is not lost: the full text remains "
-                "in conversation history and the recall tool can retrieve it."
-            )
+            if self._persona_tool_visible("recall"):
+                summary += (
+                    "\n\nTruncated content above is not lost: the full text remains "
+                    "in conversation history and the recall tool can retrieve it."
+                )
+            else:
+                summary += (
+                    "\n\nTruncated content above is not lost: the full text "
+                    "remains in the stored conversation history."
+                )
 
         # Honor a cancel — or a newer generation that superseded this send DURING
         # the (possibly only, possibly slow) summary call — before we mutate state.
@@ -8158,7 +8285,7 @@ class ChatSession:
                             else "Denied by user"
                         )
             user_feedback = None  # feedback is in the denial_msg
-            if self._mem_cfg.nudges and should_nudge(
+            if self._nudges_enabled("denial") and should_nudge(
                 "denial",
                 self._metacog_state,
                 message_count=len(self.messages),
@@ -9662,7 +9789,9 @@ class ChatSession:
         # text changes shouldn't be load-bearing for correctness.
         if self._wake_source_tag:
             return None
-        if not self._mem_cfg.nudges:
+        # Every type this detector emits (start/correction/completion) is
+        # memory-directed, so the persona memory lever gates the whole pass.
+        if not self._nudges_enabled("start"):
             return None
         mem_count = self._visible_memory_count()
         msg_count = len(self.messages) + 1
@@ -9905,7 +10034,7 @@ class ChatSession:
         # the tool batch.  Cooldown gating in should_nudge keeps this to one
         # nudge per batch even with many failing tools.
         if (
-            self._mem_cfg.nudges
+            self._nudges_enabled("tool_error")
             and any(self._tool_error_flags.get(tc_id) for tc_id, _ in results)
             and should_nudge(
                 "tool_error",
@@ -10006,6 +10135,11 @@ class ChatSession:
         model = (args.get("model") or "").strip()
         target_node = (args.get("target_node") or "").strip()
         project = (args.get("project") or "").strip()
+        persona = (args.get("persona") or "").strip()
+        if persona:
+            persona_err = self._validate_child_persona(persona)
+            if persona_err:
+                return self._coord_tool_error(call_id, "spawn_workstream", persona_err)
         if initial_message:
             first_line = initial_message.splitlines()[0]
             preview_line = first_line[:120] + ("..." if len(first_line) > 120 else "")
@@ -10016,6 +10150,8 @@ class ChatSession:
             preview_body = ""
         if skill:
             header_bits.append(f"skill={skill}")
+        if persona:
+            header_bits.append(f"persona={persona}")
         if target_node:
             header_bits.append(f"node={target_node}")
         header = " ".join(header_bits)
@@ -10033,7 +10169,35 @@ class ChatSession:
             "model": model,
             "target_node": target_node,
             "project": project,
+            "persona": persona,
         }
+
+    def _validate_child_persona(self, persona: str) -> str:
+        """Prep-time gate for a spawn's ``persona`` arg.
+
+        Returns an error string (empty = valid).  Children are always
+        ``kind=interactive`` — see ``CoordinatorClient.spawn``.  The
+        receiving node's create handler re-resolves and stamps; this gate
+        just turns an inevitable HTTP 400 into a clean tool error the
+        model can react to.  Best-effort: a storage blip defers the
+        verdict to the create handler rather than blocking the spawn.
+        """
+        try:
+            storage = get_storage()
+            if storage is None:
+                return ""
+            row = storage.get_persona_by_name(persona)
+        except Exception:
+            log.debug("spawn.persona_precheck_failed persona=%s", persona, exc_info=True)
+            return ""
+        if not row or not row.get("enabled", False):
+            return f"unknown or disabled persona: {persona!r}"
+        if "interactive" not in (row.get("applies_to_kinds") or []):
+            return (
+                f"persona {persona!r} does not apply to interactive workstreams "
+                "(spawned children are always interactive)"
+            )
+        return ""
 
     def _exec_spawn_workstream(self, item: dict[str, Any]) -> tuple[str, str]:
         call_id = item["call_id"]
@@ -10047,6 +10211,7 @@ class ChatSession:
                 model=item["model"],
                 target_node=item["target_node"],
                 project=item["project"],
+                persona=item["persona"],
             )
         except Exception as e:
             msg = f"Error: spawn_workstream failed: {e}"
@@ -10134,6 +10299,7 @@ class ChatSession:
             name = self._coord_str_arg(raw, "name").strip()
             model = self._coord_str_arg(raw, "model").strip()
             target_node = self._coord_str_arg(raw, "target_node").strip()
+            persona = self._coord_str_arg(raw, "persona").strip()
             spec: dict[str, Any] = {
                 "idx": idx,
                 "initial_message": initial_message,
@@ -10141,14 +10307,26 @@ class ChatSession:
                 "name": name,
                 "model": model,
                 "target_node": target_node,
+                "persona": persona,
             }
+            if persona:
+                # Same prep-time gate as spawn_workstream, but surfaced as
+                # a per-row denial (partial-success semantics) rather than
+                # failing the whole batch.
+                persona_err = self._validate_child_persona(persona)
+                if persona_err:
+                    spec["_error"] = persona_err
             normalised.append(spec)
-            if initial_message:
+            if spec.get("_error"):
+                preview_rows.append(f"  {idx}. [invalid — {spec['_error']}]")
+            elif initial_message:
                 first_line = initial_message.splitlines()[0]
                 preview_line = first_line[:80] + ("..." if len(first_line) > 80 else "")
                 tag_bits = []
                 if skill:
                     tag_bits.append(f"skill={skill}")
+                if persona:
+                    tag_bits.append(f"persona={persona}")
                 if target_node:
                     tag_bits.append(f"node={target_node}")
                 tags = (" [" + ", ".join(tag_bits) + "]") if tag_bits else ""
@@ -10224,6 +10402,7 @@ class ChatSession:
                     name=spec["name"],
                     model=spec["model"],
                     target_node=spec["target_node"],
+                    persona=spec["persona"],
                 )
             except Exception as e:
                 denied.append({"idx": idx, "reason": f"spawn failed: {e}"})
@@ -15275,23 +15454,10 @@ class ChatSession:
                 self.ui.on_info("Compaction cancelled.")
 
         elif cmd == "/creative":
-            self.creative_mode = not self.creative_mode
-            self._init_system_messages()
-            self._save_config()
-            # Clear history when toggling ON if it contains tool messages,
-            # because the API rejects tool-call history without tool definitions
-            if self.creative_mode and any(
-                m.tool_calls or m.role is Role.TOOL for m in self.messages
-            ):
-                self.messages.clear()
-                self._read_files.clear()
-                self._msg_tokens.clear()
-                self.ui.on_info(
-                    "[history cleared — creative mode is incompatible with tool history]"
-                )
-            state = "on" if self.creative_mode else "off"
+            # Removed in 1.7 — the writer persona replaces it (issue #683).
             self.ui.on_info(
-                f"Creative mode: {bold(state)} (tools {'disabled' if self.creative_mode else 'enabled'})"
+                "/creative was removed. Start a session with the 'writer' "
+                "persona instead: turnstone --persona writer"
             )
 
         elif cmd == "/debug":
@@ -15395,7 +15561,6 @@ class ChatSession:
                         "  /model [alias]         Show/switch model (alias from config)",
                         "  /raw                   Toggle reasoning content display",
                         "  /reason [low|med|high] Set/show reasoning effort",
-                        "  /creative              Toggle creative writing mode (no tools)",
                         "  /debug                 Toggle raw SSE delta logging",
                         "  /mcp [refresh [server]] List or refresh MCP tools, resources, and prompts",
                         "  /help                  Show this help",

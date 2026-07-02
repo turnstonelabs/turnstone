@@ -1027,6 +1027,7 @@ class SQLiteBackend:
         kind: WorkstreamKind | str = WorkstreamKind.INTERACTIVE,
         parent_ws_id: str | None = None,
         project_id: str | None = None,
+        persona: str | None = None,
     ) -> None:
         now = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S")
         # Kind validation at the storage edge — third of three layers
@@ -1040,6 +1041,7 @@ class SQLiteBackend:
         # filters remain correct.
         norm_parent = parent_ws_id if parent_ws_id else None
         norm_project = project_id if project_id else None
+        norm_persona = persona if persona else None
         with self._conn() as conn:
             conn.execute(
                 sa.insert(workstreams).prefix_with("OR IGNORE"),
@@ -1056,6 +1058,7 @@ class SQLiteBackend:
                     "kind": norm_kind,
                     "parent_ws_id": norm_parent,
                     "project_id": norm_project,
+                    "persona": norm_persona,
                     "created": now,
                     "updated": now,
                 },

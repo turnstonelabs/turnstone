@@ -131,6 +131,12 @@ export interface CreateWorkstreamRequest {
   resume_ws?: string;
   skill?: string;
   /**
+   * Persona name (slug) to create the workstream with. Resolved and
+   * snapshotted at creation — later persona edits never affect this
+   * workstream. Empty selects the kind's default persona.
+   */
+  persona?: string;
+  /**
    * Optional project to attach this workstream to. Drives the shared
    * `project` memory scope; coordinator children inherit the parent's project.
    */
@@ -256,6 +262,8 @@ export interface SavedWorkstreamInfo {
   child_count?: number;
   context_tokens?: number;
   context_ratio?: number;
+  /** Persona slug the workstream was created with (empty/absent = pre-persona). */
+  persona?: string | null;
 }
 
 export interface ListSavedWorkstreamsResponse {
@@ -524,6 +532,8 @@ export interface ConsoleCreateWsRequest {
   model?: string;
   initial_message?: string;
   skill?: string;
+  /** Persona slug — resolved and snapshotted at creation. */
+  persona?: string;
   resume_ws?: string;
 }
 

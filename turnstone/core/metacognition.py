@@ -156,6 +156,16 @@ _NUDGE_MAP: dict[str, str] = {
     "participant_joined": "",
 }
 
+# Nudge types whose copy directs the model at the memory tool ("save that
+# as a feedback memory", "use memory(action='search')").  A memory-off
+# persona suppresses these — advertising a tool the persona hides produces
+# the same "I don't have access" apologies the memory-advisory gating
+# fixed — while behavioural nudges (repeat, compaction_pending,
+# idle_children, watch_triggered) keep firing.
+MEMORY_NUDGE_TYPES: frozenset[str] = frozenset(
+    {"correction", "denial", "resume", "completion", "start", "tool_error"}
+)
+
 
 # Display cap for the ``idle_children`` body — list at most this many
 # children inline, append "...and N more" overflow line beyond that.

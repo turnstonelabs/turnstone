@@ -2025,6 +2025,7 @@ async def create_workstream(request: Request) -> JSONResponse:
     raw_judge_model = body.get("judge_model", "")
     raw_initial_message = body.get("initial_message", "")
     raw_skill = body.get("skill", "")
+    raw_persona = body.get("persona", "")
     raw_resume_ws = body.get("resume_ws", "")
     raw_project_id = body.get("project_id", "")
     if not isinstance(raw_node_id, str):
@@ -2039,6 +2040,8 @@ async def create_workstream(request: Request) -> JSONResponse:
         raw_initial_message = "" if raw_initial_message is None else None
     if not isinstance(raw_skill, str):
         raw_skill = "" if raw_skill is None else None
+    if not isinstance(raw_persona, str):
+        raw_persona = "" if raw_persona is None else None
     if not isinstance(raw_resume_ws, str):
         raw_resume_ws = "" if raw_resume_ws is None else None
     if not isinstance(raw_project_id, str):
@@ -2050,12 +2053,13 @@ async def create_workstream(request: Request) -> JSONResponse:
         or raw_judge_model is None
         or raw_initial_message is None
         or raw_skill is None
+        or raw_persona is None
         or raw_resume_ws is None
         or raw_project_id is None
     ):
         return JSONResponse(
             {
-                "error": "node_id, name, model, judge_model, initial_message, skill, resume_ws, and project_id must be strings"
+                "error": "node_id, name, model, judge_model, initial_message, skill, persona, resume_ws, and project_id must be strings"
             },
             status_code=400,
         )
@@ -2065,6 +2069,7 @@ async def create_workstream(request: Request) -> JSONResponse:
     judge_model = raw_judge_model[:128]
     initial_message = raw_initial_message[:4096]
     skill = raw_skill[:256]
+    persona = raw_persona[:64]
     resume_ws = raw_resume_ws[:64]
     project_id = raw_project_id[:64]
 
@@ -2098,6 +2103,7 @@ async def create_workstream(request: Request) -> JSONResponse:
         "judge_model": judge_model,
         "initial_message": initial_message,
         "skill": skill,
+        "persona": persona,
         "resume_ws": resume_ws,
         "user_id": uid,
         "project_id": project_id,
@@ -11803,6 +11809,203 @@ async def admin_delete_prompt_policy(request: Request) -> JSONResponse:
 
 
 # ---------------------------------------------------------------------------
+# Admin: Personas (workstream capability/prompt templates)
+# ---------------------------------------------------------------------------
+# Authoring surface for the personas shelf.  Deliberately no DELETE handler:
+# personas are archived (``enabled=false`` via PATCH), never hard-deleted, so
+# a workstream's stamped provenance stays explicable forever.
+
+_PERSONA_NAME_RE = re.compile(r"^[a-z][a-z0-9_-]*$")
+_PERSONA_PROMPT_CAP = 32768  # same cap as prompt-policy content
+
+
+def _parse_persona_body(body: dict[str, Any]) -> tuple[dict[str, Any] | None, JSONResponse | None]:
+    """Normalize the shared create/update persona fields.
+
+    Returns ``(fields, None)`` on success or ``(None, 400-response)``.
+    Only keys present in the body land in ``fields`` so PATCH stays
+    partial; storage enforces the default-persona invariants.
+    """
+    fields: dict[str, Any] = {}
+    if "display_name" in body:
+        fields["display_name"] = str(body.get("display_name") or "").strip()[:128]
+    if "description" in body:
+        fields["description"] = str(body.get("description") or "").strip()[:1024]
+    if "base_prompt" in body:
+        prompt = body.get("base_prompt")
+        if prompt is not None and not isinstance(prompt, str):
+            return None, JSONResponse(
+                {"error": "base_prompt must be a string or null"}, status_code=400
+            )
+        fields["base_prompt"] = prompt[:_PERSONA_PROMPT_CAP] if prompt else prompt
+    if "tool_allowlist" in body:
+        tools = body.get("tool_allowlist")
+        if tools is not None and (
+            not isinstance(tools, list) or not all(isinstance(t, str) for t in tools)
+        ):
+            return None, JSONResponse(
+                {"error": "tool_allowlist must be a list of tool names or null"},
+                status_code=400,
+            )
+        fields["tool_allowlist"] = tools
+    if "applies_to_kinds" in body:
+        kinds = body.get("applies_to_kinds")
+        if not isinstance(kinds, list) or not all(isinstance(k, str) for k in kinds):
+            return None, JSONResponse(
+                {"error": "applies_to_kinds must be a list of kinds"}, status_code=400
+            )
+        fields["applies_to_kinds"] = kinds
+    for flag in ("mcp_enabled", "memory_enabled", "is_default", "enabled"):
+        if flag in body:
+            fields[flag] = bool(body.get(flag))
+    return fields, None
+
+
+async def admin_list_personas(request: Request) -> JSONResponse:
+    """GET /v1/api/admin/personas — all personas, archived included."""
+    from turnstone.core.auth import require_permission
+    from turnstone.core.web_helpers import require_storage_or_503
+
+    storage, err = require_storage_or_503(request)
+    if err:
+        return err
+    err = require_permission(request, "persona.read")
+    if err:
+        return err
+
+    return JSONResponse({"personas": storage.list_personas(include_disabled=True)})
+
+
+async def admin_create_persona(request: Request) -> JSONResponse:
+    """POST /v1/api/admin/personas — create a persona."""
+    import uuid
+
+    from turnstone.core.audit import record_audit
+    from turnstone.core.auth import require_permission
+    from turnstone.core.web_helpers import read_json_or_400, require_storage_or_503
+
+    storage, err = require_storage_or_503(request)
+    if err:
+        return err
+    err = require_permission(request, "persona.create")
+    if err:
+        return err
+
+    body = await read_json_or_400(request)
+    if isinstance(body, JSONResponse):
+        return body
+
+    name = str(body.get("name", "")).strip()[:64]
+    if not name or not _PERSONA_NAME_RE.match(name):
+        return JSONResponse(
+            {"error": "name is required (lowercase slug: a-z, 0-9, '-', '_')"},
+            status_code=400,
+        )
+    fields, ferr = _parse_persona_body(body)
+    if ferr is not None:
+        return ferr
+    assert fields is not None
+
+    persona_id = uuid.uuid4().hex
+    audit_uid, ip = _audit_context(request)
+    fields.update(
+        {
+            "persona_id": persona_id,
+            "name": name,
+            "org_id": str(body.get("org_id", "")).strip(),
+            "created_by": audit_uid,
+        }
+    )
+    try:
+        storage.create_persona(fields)
+    except ValueError as exc:
+        return JSONResponse({"error": str(exc)}, status_code=400)
+
+    record_audit(
+        storage,
+        audit_uid,
+        "persona.create",
+        "persona",
+        persona_id,
+        {"name": name},
+        ip,
+    )
+
+    return JSONResponse(storage.get_persona(persona_id) or {})
+
+
+async def admin_get_persona(request: Request) -> JSONResponse:
+    """GET /v1/api/admin/personas/{persona_id}."""
+    from turnstone.core.auth import require_permission
+    from turnstone.core.web_helpers import require_storage_or_503
+
+    storage, err = require_storage_or_503(request)
+    if err:
+        return err
+    err = require_permission(request, "persona.read")
+    if err:
+        return err
+
+    persona = storage.get_persona(request.path_params["persona_id"])
+    if persona is None:
+        return JSONResponse({"error": "Persona not found"}, status_code=404)
+    return JSONResponse(persona)
+
+
+async def admin_update_persona(request: Request) -> JSONResponse:
+    """PATCH /v1/api/admin/personas/{persona_id} — edit / archive / default flip.
+
+    Editing a persona NEVER touches existing workstreams: they run on the
+    snapshot stamped at creation.
+    """
+    from turnstone.core.audit import record_audit
+    from turnstone.core.auth import require_permission
+    from turnstone.core.web_helpers import read_json_or_400, require_storage_or_503
+
+    storage, err = require_storage_or_503(request)
+    if err:
+        return err
+    err = require_permission(request, "persona.write")
+    if err:
+        return err
+
+    persona_id = request.path_params["persona_id"]
+    existing = storage.get_persona(persona_id)
+    if existing is None:
+        return JSONResponse({"error": "Persona not found"}, status_code=404)
+
+    body = await read_json_or_400(request)
+    if isinstance(body, JSONResponse):
+        return body
+    fields, ferr = _parse_persona_body(body)
+    if ferr is not None:
+        return ferr
+    assert fields is not None
+    if not fields:
+        return JSONResponse({"error": "no editable fields in body"}, status_code=400)
+
+    try:
+        storage.update_persona(persona_id, **fields)
+    except ValueError as exc:
+        # Storage-enforced invariants: default not archivable / must stay
+        # single-kind / can't unset is_default directly / kinds validation.
+        return JSONResponse({"error": str(exc)}, status_code=400)
+
+    audit_uid, ip = _audit_context(request)
+    record_audit(
+        storage,
+        audit_uid,
+        "persona.update",
+        "persona",
+        persona_id,
+        {"name": existing.get("name", "")},
+        ip,
+    )
+
+    return JSONResponse(storage.get_persona(persona_id) or {})
+
+
+# ---------------------------------------------------------------------------
 # Admin: Judge (heuristic rules, output guard patterns, settings)
 # ---------------------------------------------------------------------------
 
@@ -13199,6 +13402,7 @@ def create_app(
         create_project,
         delete_project_endpoint,
         get_project_endpoint,
+        list_personas_endpoint,
         list_project_members_endpoint,
         list_projects,
         project_resources_endpoint,
@@ -13636,6 +13840,9 @@ def create_app(
                         remove_project_member_endpoint,
                         methods=["DELETE"],
                     ),
+                    # Personas picker feed (server handler served verbatim —
+                    # same borrow as the projects block above).
+                    Route("/api/personas", list_personas_endpoint),
                     # System: Settings
                     Route("/api/admin/settings", admin_list_settings),
                     Route("/api/admin/settings/schema", admin_settings_schema),
@@ -13763,6 +13970,19 @@ def create_app(
                         "/api/admin/prompt-policies/{policy_id}",
                         admin_delete_prompt_policy,
                         methods=["DELETE"],
+                    ),
+                    # Governance: Personas (no DELETE — archive via PATCH)
+                    Route("/api/admin/personas", admin_list_personas),
+                    Route(
+                        "/api/admin/personas",
+                        admin_create_persona,
+                        methods=["POST"],
+                    ),
+                    Route("/api/admin/personas/{persona_id}", admin_get_persona),
+                    Route(
+                        "/api/admin/personas/{persona_id}",
+                        admin_update_persona,
+                        methods=["PATCH"],
                     ),
                     # Governance: Judge Rules
                     Route("/api/admin/judge/settings", admin_list_judge_settings),

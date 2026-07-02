@@ -1,9 +1,9 @@
 """System message composition harness.
 
-Assembles modular system messages from BASE (persona), ENV (client surface),
-CONTEXT (session variables), TOOLS (usage patterns), and POLICIES (behavioral
-rules).  Replaces the monolithic persona+tools section of
-``ChatSession._init_system_messages()``.
+Assembles modular system messages from BASE (kind framing, or a persona's
+base_override), ENV (client surface), CONTEXT (session variables), TOOLS
+(usage patterns), and POLICIES (behavioral rules).  Replaces the monolithic
+base+tools section of ``ChatSession._init_system_messages()``.
 """
 
 from __future__ import annotations
@@ -227,6 +227,7 @@ def compose_system_message(
     policies: list[str] | None = None,
     db_policies: list[dict[str, Any]] | None = None,
     kind: WorkstreamKind = WorkstreamKind.INTERACTIVE,
+    base_override: str | None = None,
 ) -> str:
     """Compose a system message from modular components.
 
@@ -251,6 +252,10 @@ def compose_system_message(
         A coordinator session has a disjoint tool schema (see
         COORDINATOR_TOOLS), so composing it with the IC tools block
         would instruct the model to hallucinate tool calls that fail.
+    base_override:
+        Persona base prompt.  When set it replaces the BASE module and
+        NOTHING else — ENV / CONTEXT / TOOLS / POLICIES keep composing,
+        so mandatory prompt policies ride on top of every persona.
 
     Returns
     -------
@@ -264,12 +269,16 @@ def compose_system_message(
     # either way, but ``.value`` access does not — normalise once here.
     kind = WorkstreamKind.from_raw(kind)
 
-    # 1. BASE — kind-specific persona.  The default base.md frames the
+    # 1. BASE — kind-specific base framing.  The default base.md frames the
     #    model as an IC engineer ("you read before you edit, commits
     #    you make..."); coordinators need an orchestrator framing
     #    instead ("you decompose, delegate, monitor, synthesise").
-    base_module = "base_coordinator.md" if kind == WorkstreamKind.COORDINATOR else "base.md"
-    parts.append(_load(base_module))
+    #    A persona's base_override replaces exactly this module.
+    if base_override is not None:
+        parts.append(base_override)
+    else:
+        base_module = "base_coordinator.md" if kind == WorkstreamKind.COORDINATOR else "base.md"
+        parts.append(_load(base_module))
 
     # 2. ENV — exactly one, selected by client type.  Coordinators
     #    skip ENV: they orchestrate rather than render rich output to

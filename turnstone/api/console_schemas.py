@@ -1045,6 +1045,71 @@ class ListModelDefinitionsResponse(BaseModel):
     models: list[ModelDefinitionInfo]
 
 
+class PersonaInfo(BaseModel):
+    """Full persona row — the authoring shape (contrast PersonaChoice, the
+    picker's display-only projection on the server surface)."""
+
+    persona_id: str
+    name: str
+    display_name: str = ""
+    description: str = ""
+    base_prompt: str | None = Field(
+        default=None, description="BASE-module override; null = the kind's stock base"
+    )
+    tool_allowlist: list[str] | None = Field(
+        default=None,
+        description=(
+            "Tool visibility set: null = unrestricted, [] = no tools, [names] = "
+            "exact set (include 'tool_search' to keep the set soft/expandable)"
+        ),
+    )
+    mcp_enabled: bool = True
+    memory_enabled: bool = True
+    applies_to_kinds: list[str] = Field(default_factory=lambda: ["interactive"])
+    is_default: bool = False
+    enabled: bool = Field(default=True, description="false = archived")
+    org_id: str = ""
+    created_by: str = ""
+    created: str = ""
+    updated: str = ""
+
+
+class CreatePersonaRequest(BaseModel):
+    name: str = Field(description="Immutable slug (lowercase: a-z, 0-9, '-', '_')")
+    display_name: str = ""
+    description: str = ""
+    base_prompt: str | None = None
+    tool_allowlist: list[str] | None = None
+    mcp_enabled: bool = True
+    memory_enabled: bool = True
+    applies_to_kinds: list[str] = Field(default_factory=lambda: ["interactive"])
+    is_default: bool = False
+    enabled: bool = True
+
+
+class UpdatePersonaRequest(BaseModel):
+    """PATCH body — only fields present in the JSON are applied.
+
+    Archive = ``{"enabled": false}``; default flip = ``{"is_default": true}``
+    on the successor (storage demotes the incumbent atomically).  ``name``
+    is immutable; existing workstreams are never affected by edits.
+    """
+
+    display_name: str | None = None
+    description: str | None = None
+    base_prompt: str | None = None
+    tool_allowlist: list[str] | None = None
+    mcp_enabled: bool | None = None
+    memory_enabled: bool | None = None
+    applies_to_kinds: list[str] | None = None
+    is_default: bool | None = None
+    enabled: bool | None = None
+
+
+class ListPersonasResponse(BaseModel):
+    personas: list[PersonaInfo]
+
+
 class ModelReloadResponse(BaseModel):
     status: str = "ok"
     results: dict[str, Any] = Field(default_factory=dict)

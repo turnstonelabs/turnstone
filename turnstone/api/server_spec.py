@@ -32,10 +32,12 @@ from turnstone.api.server_schemas import (
     ListAttachmentsResponse,
     ListAvailableModelsResponse,
     ListMemoriesResponse,
+    ListPersonaChoicesResponse,
     ListSavedWorkstreamsResponse,
     ListSkillSummaryResponse,
     ListWorkstreamsResponse,
     MemoryInfo,
+    PersonaChoice,
     RewindRequest,
     SaveMemoryRequest,
     SearchMemoriesRequest,
@@ -343,6 +345,14 @@ SERVER_ENDPOINTS: list[EndpointSpec] = [
         response_model=ListSkillSummaryResponse,
         tags=["Skills"],
     ),
+    # --- Personas ---
+    EndpointSpec(
+        "/v1/api/personas",
+        "GET",
+        "List enabled personas for the workstream-creation picker",
+        response_model=ListPersonaChoicesResponse,
+        tags=["Personas"],
+    ),
     # --- Models ---
     EndpointSpec(
         "/v1/api/models",
@@ -517,6 +527,8 @@ _ALL_MODELS: list[type[BaseModel]] = [
     SearchMemoriesRequest,
     SkillSummary,
     ListSkillSummaryResponse,
+    PersonaChoice,
+    ListPersonaChoicesResponse,
     AvailableModelInfo,
     ListAvailableModelsResponse,
 ]

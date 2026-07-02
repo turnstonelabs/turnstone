@@ -17,6 +17,7 @@ from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Any, Protocol
 
 from turnstone.core.log import get_logger
+from turnstone.core.personas import snapshot_from_config
 from turnstone.core.workstream import Workstream, WorkstreamKind, WorkstreamState
 
 if TYPE_CHECKING:
@@ -344,6 +345,7 @@ class SessionManager:
         client_type: str = "",
         parent_ws_id: str | None = None,
         project_id: str | None = None,
+        persona: str = "",
         defer_emit_created: bool = False,
         **extra_session_kwargs: Any,
     ) -> Workstream:
@@ -390,6 +392,7 @@ class SessionManager:
                 name=effective_name,
                 parent_ws_id=parent_ws_id,
                 project_id=project_id,
+                persona=persona,
             )
 
         if evicted is not None:
@@ -410,6 +413,7 @@ class SessionManager:
                 kind=self.kind,
                 parent_ws_id=parent_ws_id,
                 project_id=project_id,
+                persona=persona,
                 skill_id=skill_id,
                 skill_version=skill_version,
             )
@@ -625,6 +629,7 @@ class SessionManager:
                         name=row.get("name") or f"ws-{ws_id[:4]}",
                         parent_ws_id=row.get("parent_ws_id"),
                         project_id=row.get("project_id"),
+                        persona=row.get("persona") or "",
                     )
 
                 if evicted is not None:
@@ -660,8 +665,23 @@ class SessionManager:
                     )
                     saved_alias = None
 
+                # Persona snapshot rides the same pre-construction lane as
+                # the saved alias: the constructor applies the four levers
+                # (tool merge, MCP gate, composition) inside __init__, so
+                # the stamp must land as a kwarg — resume() is too late.
+                # A corrupt/partial stamp raises here (loud construction
+                # error), never silently reverting to a default envelope.
+                # No stamp = legacy pre-persona workstream: the kwarg is
+                # omitted entirely so factories that predate it keep working.
+                persona_snapshot = snapshot_from_config(saved_cfg or {})
+                extra_build_kwargs: dict[str, Any] = {}
+                if persona_snapshot is not None:
+                    extra_build_kwargs["persona_snapshot"] = persona_snapshot
+
                 try:
-                    ws.session = self._adapter.build_session(ws, model=saved_alias)
+                    ws.session = self._adapter.build_session(
+                        ws, model=saved_alias, **extra_build_kwargs
+                    )
                 except Exception:
                     # Clean up the UI the adapter built before re-raising
                     # so any listener/lock resources are released.
@@ -1125,6 +1145,7 @@ class SessionManager:
         name: str,
         parent_ws_id: str | None = None,
         project_id: str | None = None,
+        persona: str = "",
     ) -> tuple[Workstream, Workstream | None]:
         """Install a placeholder ``Workstream`` under ``self._lock``.
 
@@ -1176,6 +1197,7 @@ class SessionManager:
         ws.user_id = user_id
         ws.parent_ws_id = parent_ws_id if parent_ws_id else None
         ws.project_id = project_id if project_id else None
+        ws.persona = persona
         try:
             ws.ui = self._adapter.build_ui(ws)
         except Exception:

@@ -521,24 +521,39 @@ class TestMultiTurn:
 class TestSessionConfig:
     """Test session construction and configuration with mocked responses."""
 
-    def test_creative_mode_no_tools(self, tmp_db):
-        """In creative mode, create() is called WITHOUT tools kwarg."""
+    def test_empty_toolset_persona_no_tools_on_wire(self, tmp_db):
+        """Guard: an empty-toolset persona (writer/scribe) sends ZERO tool
+        definitions on the wire — create() is called without a tools kwarg.
+        Replaces the removed /creative fork's equivalent assertion."""
+        from turnstone.core.personas import PersonaSnapshot
+
         client = _mock_client()
         client.chat.completions.create.return_value = make_mock_stream(
             content_tokens=["A haiku about code"],
         )
 
-        session, ui = _make_session(client, "mock-model", tmp_db, max_tokens=256)
+        session, ui = _make_session(
+            client,
+            "mock-model",
+            tmp_db,
+            max_tokens=256,
+            persona_snapshot=PersonaSnapshot(
+                name="writer",
+                prompt="You are a creative writing partner.",
+                tools=frozenset(),
+                mcp=False,
+                memory=True,
+            ),
+        )
         session._title_generated = True
-        session.creative_mode = True
-        # Re-init system messages so creative_mode takes effect
-        session._init_system_messages()
 
         session.send("Write a haiku about code.")
 
         # Verify create() was called without 'tools' in kwargs
         call_kwargs = client.chat.completions.create.call_args
-        assert "tools" not in call_kwargs.kwargs, "tools should not be passed in creative mode"
+        assert "tools" not in call_kwargs.kwargs, (
+            "tools should not be passed under an empty-toolset persona"
+        )
 
         # Should get content back without tool calls
         assert len(ui.full_content) > 0

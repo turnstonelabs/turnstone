@@ -1341,7 +1341,6 @@ class TestSkillCatalogDisclosure:
         session.context_window = 128000
         session.messages = []
         session._config = {}
-        session.creative_mode = False
         session.instructions = ""
         session.system_messages = []
         session._agent_system_messages = []
@@ -1365,6 +1364,13 @@ class TestSkillCatalogDisclosure:
         session._project_id = ""
         session._project_writable = False
         session._kind = "interactive"
+        # Persona snapshot attrs (set by __init__, bypassed here) — legacy
+        # defaults: no override, unrestricted tools, MCP + memory on.
+        session._persona_name = ""
+        session._persona_prompt = ""
+        session._persona_tools = None
+        session._persona_mcp = True
+        session._persona_memory = True
 
         session._memory_config = MagicMock()
         session._memory_config.fetch_limit = 0

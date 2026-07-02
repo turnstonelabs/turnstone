@@ -143,6 +143,16 @@ class CreateWorkstreamRequest(BaseModel):
         description="Workstream ID to resume atomically during creation (empty = fresh start)",
     )
     skill: str = Field(default="", description="Skill name (replaces default skills)")
+    persona: str = Field(
+        default="",
+        description=(
+            "Persona name (slug) to create the workstream with. Resolved and "
+            "snapshotted at creation — later persona edits never affect this "
+            "workstream. Empty selects the kind's default persona; on a "
+            "database with no personas seeded the workstream is created "
+            "with legacy (unrestricted) behavior."
+        ),
+    )
     notify_targets: str | list[dict[str, str]] = Field(
         default="[]",
         description=(
@@ -442,6 +452,7 @@ class SavedWorkstreamInfo(BaseModel):
     context_tokens: int = 0
     context_ratio: float = 0.0
     project_id: str | None = None
+    persona: str | None = None
 
 
 class ListSavedWorkstreamsResponse(BaseModel):
@@ -649,6 +660,27 @@ class SkillSummary(BaseModel):
 
 class ListSkillSummaryResponse(BaseModel):
     skills: list[SkillSummary]
+
+
+class PersonaChoice(BaseModel):
+    """Display fields for the creation picker — the persona's levers
+    (prompt / tool set / toggles) deliberately stay server-side."""
+
+    name: str = Field(description="Persona slug, the value to pass as CreateWorkstreamRequest.persona")
+    display_name: str = Field(default="", description="Human-readable name")
+    description: str = Field(default="", description="What this persona is for")
+    applies_to_kinds: list[str] = Field(
+        default_factory=list,
+        description="Workstream kinds this persona can be attached to",
+    )
+    is_default: bool = Field(
+        default=False, description="Whether an empty persona field resolves to this one"
+    )
+
+
+class ListPersonaChoicesResponse(BaseModel):
+    personas: list[PersonaChoice] = Field(default_factory=list)
+    total: int = 0
 
 
 class AvailableModelInfo(BaseModel):

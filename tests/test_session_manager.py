@@ -196,6 +196,7 @@ class _Row:
     updated: str = ""
     node_id: str | None = None
     project_id: str | None = None
+    persona: str | None = None
 
 
 class FakeStorage:
@@ -235,6 +236,7 @@ class FakeStorage:
         kind: WorkstreamKind | str = WorkstreamKind.INTERACTIVE,
         parent_ws_id: str | None = None,
         project_id: str | None = None,
+        persona: str | None = None,
         skill_id: str = "",
         skill_version: int = 0,
         state: str = "idle",
@@ -254,6 +256,7 @@ class FakeStorage:
                 updated=updated if updated is not None else self._now_iso(),
                 node_id=node_id,
                 project_id=project_id,
+                persona=persona if persona else None,
             )
 
     def touch_workstream(self, ws_id: str) -> None:
@@ -323,6 +326,7 @@ class FakeStorage:
                 "kind": row.kind,
                 "state": row.state,
                 "parent_ws_id": row.parent_ws_id,
+                "persona": row.persona,
             }
 
     def list_workstreams(
@@ -760,7 +764,7 @@ def test_open_threads_saved_model_alias_into_build_session() -> None:
     ``workstream_config`` (INSERT OR REPLACE) → the subsequent
     ``resume()`` restores what is now the default. Net effect: every
     persisted knob (model, temperature, reasoning_effort, max_tokens,
-    skill, creative_mode, instructions, …) silently resets on every
+    skill, the persona stamp, instructions, …) silently resets on every
     reopen and on every service restart.
     """
     mgr, adapter, storage = _make_manager()

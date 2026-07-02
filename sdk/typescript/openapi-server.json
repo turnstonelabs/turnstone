@@ -2,7 +2,7 @@
   "openapi": "3.1.0",
   "info": {
     "title": "turnstone Server API",
-    "version": "1.7.0a2",
+    "version": "1.7.0a6",
     "description": "Single-node workstream management, chat interaction, and real-time streaming."
   },
   "paths": {
@@ -1443,6 +1443,27 @@
         }
       }
     },
+    "/v1/api/personas": {
+      "get": {
+        "summary": "List enabled personas for the workstream-creation picker",
+        "operationId": "v1_api_personas_get",
+        "tags": [
+          "Personas"
+        ],
+        "responses": {
+          "200": {
+            "description": "Success",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ListPersonaChoicesResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/v1/api/models": {
       "get": {
         "summary": "List available model aliases",
@@ -2425,6 +2446,12 @@
             "title": "Skill",
             "type": "string"
           },
+          "persona": {
+            "default": "",
+            "description": "Persona name (slug) to create the workstream with. Resolved and snapshotted at creation \u2014 later persona edits never affect this workstream. Empty selects the kind's default persona; on a database with no personas seeded the workstream is created with legacy (unrestricted) behavior.",
+            "title": "Persona",
+            "type": "string"
+          },
           "notify_targets": {
             "anyOf": [
               {
@@ -3150,6 +3177,30 @@
             "default": 0.0,
             "title": "Context Ratio",
             "type": "number"
+          },
+          "project_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Project Id"
+          },
+          "persona": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Persona"
           }
         },
         "required": [
@@ -3736,6 +3787,65 @@
           "skills"
         ],
         "title": "ListSkillSummaryResponse",
+        "type": "object"
+      },
+      "PersonaChoice": {
+        "description": "Display fields for the creation picker \u2014 the persona's levers\n(prompt / tool set / toggles) deliberately stay server-side.",
+        "properties": {
+          "name": {
+            "description": "Persona slug, the value to pass as CreateWorkstreamRequest.persona",
+            "title": "Name",
+            "type": "string"
+          },
+          "display_name": {
+            "default": "",
+            "description": "Human-readable name",
+            "title": "Display Name",
+            "type": "string"
+          },
+          "description": {
+            "default": "",
+            "description": "What this persona is for",
+            "title": "Description",
+            "type": "string"
+          },
+          "applies_to_kinds": {
+            "description": "Workstream kinds this persona can be attached to",
+            "items": {
+              "type": "string"
+            },
+            "title": "Applies To Kinds",
+            "type": "array"
+          },
+          "is_default": {
+            "default": false,
+            "description": "Whether an empty persona field resolves to this one",
+            "title": "Is Default",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "name"
+        ],
+        "title": "PersonaChoice",
+        "type": "object"
+      },
+      "ListPersonaChoicesResponse": {
+        "properties": {
+          "personas": {
+            "items": {
+              "$ref": "#/components/schemas/PersonaChoice"
+            },
+            "title": "Personas",
+            "type": "array"
+          },
+          "total": {
+            "default": 0,
+            "title": "Total",
+            "type": "integer"
+          }
+        },
+        "title": "ListPersonaChoicesResponse",
         "type": "object"
       },
       "AvailableModelInfo": {

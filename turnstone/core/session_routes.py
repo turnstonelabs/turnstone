@@ -2480,9 +2480,71 @@ def make_create_handler(
                 if skill_data and skill_data.get("template_id")
                 else ""
             )
+
+            # --- Persona resolution (resolve ONCE, stamp forever) --------
+            # Same gate shape as the skill lookup above: an explicit name
+            # must exist, be enabled, and support this kind (400
+            # otherwise); an empty name resolves to the kind's default
+            # persona.  A pre-seed database (no default persona) creates
+            # unstamped — legacy behavior, byte-identical to the
+            # engineer/orchestrator defaults.  Resume skips resolution:
+            # the resumed session restores its own stamp from config.
+            body_persona_raw = body.get("persona") or ""
+            body_persona = (
+                body_persona_raw.strip() if isinstance(body_persona_raw, str) else ""
+            )
+            persona_row: dict[str, Any] | None = None
+            if not (isinstance(resume_ws_id_raw, str) and resume_ws_id_raw):
+                from turnstone.core.storage._registry import get_storage as _get_storage
+
+                if body_persona:
+                    _st = _get_storage()
+                    if _st is None:
+                        return JSONResponse({"error": "storage unavailable"}, status_code=503)
+                    persona_row = await asyncio.to_thread(
+                        _st.get_persona_by_name, body_persona
+                    )
+                    if not persona_row or not persona_row.get("enabled", False):
+                        return JSONResponse(
+                            {"error": f"Persona not found or disabled: {body_persona}"},
+                            status_code=400,
+                        )
+                    if mgr.kind.value not in (persona_row.get("applies_to_kinds") or []):
+                        return JSONResponse(
+                            {
+                                "error": (
+                                    f"Persona {body_persona!r} does not apply to "
+                                    f"kind {mgr.kind.value!r}"
+                                )
+                            },
+                            status_code=400,
+                        )
+                else:
+                    # Default-persona lookup is best-effort: a storage blip
+                    # here degrades to an unstamped (legacy) create, which
+                    # is behavior-identical to the shipped defaults —
+                    # never a reason to fail the create.
+                    try:
+                        _st = _get_storage()
+                        if _st is not None:
+                            persona_row = await asyncio.to_thread(
+                                _st.get_default_persona, mgr.kind.value
+                            )
+                    except Exception:
+                        log.debug("ws.create.default_persona_lookup_failed", exc_info=True)
+                        persona_row = None
+
             kwargs = cfg.create_build_kwargs(
                 request, body, uid, skill_data, skill_id_resolved, applied_skill_version
             )
+            if persona_row is not None:
+                from turnstone.core.personas import snapshot_from_persona
+
+                # ``persona`` is SessionManager.create's explicit param
+                # (Workstream attr + workstreams row); the snapshot rides
+                # **extra_session_kwargs into the session factory.
+                kwargs["persona"] = persona_row["name"]
+                kwargs["persona_snapshot"] = snapshot_from_persona(persona_row)
             # Deferred emit — committed below post-attachment-
             # validation. See handler docstring's Ordering invariants.
             ws = await asyncio.to_thread(mgr.create, defer_emit_created=True, **kwargs)

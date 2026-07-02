@@ -855,7 +855,6 @@ class TestChunkedCompaction:
         # A small but non-empty tool set so _tool_def_tokens() > 0 makes the
         # assertion meaningful.
         session._tool_search = None
-        session.creative_mode = False
         session._tools = [
             {
                 "type": "function",

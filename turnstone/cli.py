@@ -52,6 +52,8 @@ _VERDICT_COLORS: dict[str, str] = {
 if TYPE_CHECKING:
     from collections.abc import Callable
 
+    from turnstone.core.personas import PersonaSnapshot
+
 # ─── Readline ─────────────────────────────────────────────────────────────
 
 SLASH_COMMANDS = [
@@ -67,7 +69,6 @@ SLASH_COMMANDS = [
     "/raw",
     "/reason",
     "/compact",
-    "/creative",
     "/debug",
     "/mcp",
     "/retry",
@@ -886,6 +887,14 @@ def main() -> None:
         help="Skill name (replaces default skills)",
     )
     parser.add_argument(
+        "--persona",
+        default=None,
+        help=(
+            "Persona name for this session (resolved and snapshotted at start; "
+            "default: the interactive default persona)"
+        ),
+    )
+    parser.add_argument(
         "--temperature",
         type=float,
         default=0.5,
@@ -1139,8 +1148,15 @@ def main() -> None:
         client_type: str = "",
         kind: WorkstreamKind = WorkstreamKind.INTERACTIVE,
         parent_ws_id: str | None = None,
+        # ``project_id`` is accepted (and dropped) because the shared
+        # InteractiveAdapter passes it unconditionally — without the
+        # parameter every CLI create/rehydrate TypeErrors.  The CLI has
+        # no project surface, so the value is discarded.
+        project_id: str = "",
+        persona_snapshot: PersonaSnapshot | None = None,
     ) -> ChatSession:
         assert ui is not None, "session_factory requires a non-None UI"
+        del project_id
         r_client, r_model, r_cfg = registry.resolve(model_alias)
         return ChatSession(
             client=r_client,
@@ -1167,6 +1183,7 @@ def main() -> None:
             judge_config=judge_config,
             kind=kind,
             parent_ws_id=parent_ws_id,
+            persona_snapshot=persona_snapshot,
         )
 
     # Create session manager and initial workstream. The InteractiveAdapter
@@ -1188,25 +1205,71 @@ def main() -> None:
         max_active=50,
     )
     cli_adapter.attach(manager)
-    ws = manager.create(user_id="")
+
+    # Resolve the persona stamp BEFORE constructing the session — the four
+    # levers apply inside ``ChatSession.__init__``, so resolution can't wait.
+    # ``--resume`` adopts the TARGET workstream's stamped persona (the
+    # resumed session must run from its stamp, not tonight's default);
+    # otherwise ``--persona`` (or the interactive default persona) resolves
+    # against the shelf.  A database with no personas seeded yields an
+    # unstamped legacy session — byte-identical behavior.
+    from turnstone.core.personas import snapshot_from_config, snapshot_from_persona
+
+    cli_storage = _get_storage()
+    resume_target: str | None = None
+    if args.resume:
+        from turnstone.core.memory import resolve_workstream
+
+        resume_target = resolve_workstream(args.resume)
+        if not resume_target:
+            print(red(f"Workstream not found: {args.resume}"))
+            sys.exit(1)
+
+    persona_kwargs: dict[str, Any] = {}
+    if resume_target and cli_storage is not None:
+        if args.persona:
+            print(yellow("--persona is ignored with --resume (the stamped persona applies)"))
+        # A corrupt stamp raises here — fail loudly at startup rather than
+        # silently running the workstream under a default envelope.
+        snap = snapshot_from_config(cli_storage.load_workstream_config(resume_target) or {})
+        if snap is not None:
+            persona_kwargs = {"persona": snap.name, "persona_snapshot": snap}
+    elif args.persona:
+        row = cli_storage.get_persona_by_name(args.persona) if cli_storage else None
+        if not row or not row.get("enabled", False):
+            print(red(f"Persona not found or disabled: {args.persona}"))
+            sys.exit(1)
+        if "interactive" not in (row.get("applies_to_kinds") or []):
+            print(red(f"Persona '{args.persona}' does not apply to interactive sessions"))
+            sys.exit(1)
+        persona_kwargs = {
+            "persona": row["name"],
+            "persona_snapshot": snapshot_from_persona(row),
+        }
+    elif cli_storage is not None:
+        try:
+            default_row = cli_storage.get_default_persona("interactive")
+        except Exception:
+            default_row = None
+        if default_row:
+            persona_kwargs = {
+                "persona": default_row["name"],
+                "persona_snapshot": snapshot_from_persona(default_row),
+            }
+
+    ws = manager.create(user_id="", **persona_kwargs)
     if args.skip_permissions and isinstance(ws.ui, TerminalUI):
         ws.ui.auto_approve = True
 
     # Handle --resume
-    if args.resume:
-        from turnstone.core.memory import resolve_workstream
-
-        target_id = resolve_workstream(args.resume)
-        if not target_id:
-            print(red(f"Workstream not found: {args.resume}"))
-            sys.exit(1)
+    if resume_target:
         if ws.session is None:
             print(red("No session available."))
             sys.exit(1)
-        if not ws.session.resume(target_id):
+        if not ws.session.resume(resume_target):
             print(red(f"Workstream '{args.resume}' has no messages."))
             sys.exit(1)
-        print(f"Resumed workstream {bold(target_id)} ({len(ws.session.messages)} messages)")
+        print(f"Resumed workstream {bold(resume_target)} ({len(ws.session.messages)} messages)")
 
     # Background attention notification — write to stderr while user types
     def _bg_attention_notify(ws_id: str, state: WorkstreamState) -> None:
