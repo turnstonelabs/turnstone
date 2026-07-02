@@ -6,7 +6,7 @@ for its L-shell dashboard, plus a regression guard for the single-kind
 :func:`turnstone.core.session_routes._collect_saved_rows`.
 
 Storage is mocked (``list_workstreams_with_history`` is patched to
-return synthetic 17-tuples) — no real or dev database is touched. The
+return synthetic 18-tuples) — no real or dev database is touched. The
 request is a :class:`unittest.mock.MagicMock`, matching how the
 body-level coordinator endpoint tests build request stubs; the saved
 path only reads ``request`` to pass it to ``saved_loaded_lookup`` /
@@ -41,7 +41,7 @@ pytestmark = pytest.mark.anyio
 # Column order from list_workstreams_with_history (keep in sync with the
 # storage SELECT): ws_id, alias, title, name, created, updated,
 # message_count, node_id, state, kind, model_alias, launch_skill,
-# child_count, context_tokens, context_window, project_id, owner.
+# child_count, context_tokens, context_window, project_id, owner, persona.
 def _row(
     ws_id: str,
     *,
@@ -51,8 +51,9 @@ def _row(
     name: str | None = None,
     project_id: str | None = None,
     owner: str | None = None,
+    persona: str | None = None,
 ) -> tuple[Any, ...]:
-    """Build a synthetic storage row (17-tuple) for one workstream."""
+    """Build a synthetic storage row (18-tuple) for one workstream."""
     return (
         ws_id,
         None,  # alias
@@ -71,6 +72,7 @@ def _row(
         4000,  # context_window
         project_id,  # project_id
         owner,  # owner user_id
+        persona,  # persona slug
     )
 
 
@@ -352,6 +354,7 @@ async def test_single_kind_saved_unchanged(monkeypatch: pytest.MonkeyPatch) -> N
         "context_tokens",
         "context_ratio",
         "project_id",
+        "persona",
     }
 
 

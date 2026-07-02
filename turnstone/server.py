@@ -800,6 +800,7 @@ def _interactive_open_post_load(request: Request, ws: Workstream) -> None:
                     "parent_ws_id": ws.parent_ws_id,
                     "user_id": ws.user_id,
                     "project_id": ws.project_id,
+                    "persona": ws.persona,
                 }
             )
 
@@ -907,6 +908,7 @@ def _build_node_snapshot(app_state: Any) -> dict[str, Any]:
                 "parent_ws_id": ws.parent_ws_id,
                 "user_id": ws.user_id,
                 "project_id": ws.project_id,
+                "persona": ws.persona,
                 "pending_approval_detail": approval_detail,
             }
         )
@@ -1129,6 +1131,7 @@ async def dashboard(request: Request) -> JSONResponse:
                 "parent_ws_id": ws.parent_ws_id,
                 "user_id": ws.user_id,
                 "project_id": ws.project_id,
+                "persona": ws.persona,
                 "pending_approval_detail": ui.serialize_pending_approval_detail(),
                 # Per-ws ring buffer of recent auto-approves (last 10).
                 # Lets the coord-tree render a "recently auto-approved
@@ -2112,6 +2115,7 @@ async def _interactive_create_post_install(
                 # fail open on live cluster views (its open/resume and
                 # node-snapshot siblings already carry it).
                 "project_id": ws.project_id,
+                "persona": ws.persona,
             }
         )
 

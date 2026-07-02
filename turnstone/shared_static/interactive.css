@@ -28,7 +28,7 @@
 
 /* No embedded pane header — name / persona / state are shown by the tab + rail
    (Workspaces), so the conversation reclaims the full pane height.  The slim
-   header + persona-tag rules were removed here when the embedded header was
+   header + kind-tag rules were removed here when the embedded header was
    dropped; the standalone split-pane header (retired in step 6) styles itself
    from ui/static. */
 

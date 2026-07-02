@@ -152,6 +152,10 @@
             aria-labelledby="dashboard-options-btn"
             hidden
           >
+            <label for="dashboard-persona">Persona</label>
+            <select id="dashboard-persona">
+              <option value="">Default</option>
+            </select>
             <label for="dashboard-model">Model</label>
             <select id="dashboard-model">
               <option value="">Default model</option>
@@ -345,6 +349,12 @@
           autocomplete="off"
           autofocus
         />
+        <label for="new-ws-persona"
+          >Persona <span class="label-hint">optional</span></label
+        >
+        <select id="new-ws-persona">
+          <option value="">Default</option>
+        </select>
         <label for="new-ws-model"
           >Model <span class="label-hint">optional</span></label
         >
@@ -622,6 +632,7 @@
     <script type="module" src="/shared/cards.js"></script>
     <script type="module" src="/shared/toast.js"></script>
     <script type="module" src="/shared/projects.js"></script>
+    <script type="module" src="/shared/personas.js"></script>
     <script type="module" src="/shared/project_creator.js"></script>
     <script type="module" src="/shared/composer.js"></script>
     <script type="module" src="/shared/composer_attachments.js"></script>

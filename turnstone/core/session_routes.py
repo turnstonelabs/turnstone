@@ -2842,7 +2842,8 @@ async def _collect_saved_rows(
     # Column order from list_workstreams_with_history (keep in sync with
     # the storage SELECT): ws_id, alias, title, name, created, updated,
     # message_count, node_id, state, kind, model_alias, launch_skill,
-    # child_count, context_tokens, context_window, project_id, owner.
+    # child_count, context_tokens, context_window, project_id, owner,
+    # persona.
     # The occupancy ratio is derived here (Python float division) rather
     # than in SQL so the NULL / zero-window cases stay obvious and
     # identical across backends.  context_window is NULL for model
@@ -2869,6 +2870,7 @@ async def _collect_saved_rows(
             context_window,
             project_id,
             owner,
+            persona,
         ) = row
         if wid in loaded:
             continue
@@ -2894,6 +2896,7 @@ async def _collect_saved_rows(
                 "context_tokens": ctx_tokens,
                 "context_ratio": context_ratio,
                 "project_id": project_id or None,
+                "persona": persona or None,
             }
         )
     return result

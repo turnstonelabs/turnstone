@@ -390,7 +390,7 @@ def test_coordinator_kind_selects_coord_tools() -> None:
         )
 
 
-def test_coordinator_kind_uses_orchestrator_persona() -> None:
+def test_coordinator_kind_uses_orchestrator_base() -> None:
     """kind='coordinator' swaps in base_coordinator.md."""
     result = compose_system_message(
         ClientType.CLI,
@@ -400,7 +400,7 @@ def test_coordinator_kind_uses_orchestrator_persona() -> None:
     )
     # IC-framing phrases from base.md should NOT appear.
     for ic_phrase in ("read before you edit", "commits you make"):
-        assert ic_phrase not in result, f"coordinator persona leaked IC framing: {ic_phrase!r}"
+        assert ic_phrase not in result, f"coordinator base leaked IC framing: {ic_phrase!r}"
     # Orchestrator-framing phrases from base_coordinator.md should appear.
     assert "orchestrate" in result
     assert "delegate" in result

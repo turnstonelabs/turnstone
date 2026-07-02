@@ -12,6 +12,11 @@
    ========================================================================== */
 
 import { projectName, refreshProjects, onProjectsChange } from "./projects.js";
+import {
+  personaLabel,
+  refreshPersonas,
+  onPersonasChange,
+} from "./personas.js";
 
 const GLYPH = {
   running: "●",
@@ -220,13 +225,25 @@ function sessionRow(ws, childCount, isChild, TS, paneManager, active) {
   // Tier-1 always stamps `kind` (the snapshot defaults it to "interactive");
   // the fallback just mirrors that default for a malformed row.
   const kind = ws.kind || "interactive";
+  // The workstream wears its persona on the hover title + aria label — the
+  // 266px rail row has no room for another chip, and the saved tables carry
+  // the full PERSONA column.  personaLabel falls back to the raw slug for a
+  // since-archived persona, so the label never silently disappears.
+  const persona = personaLabel(ws.persona || "");
   btn.setAttribute(
     "aria-label",
-    (ws.name || ws.title || ws.id) + ", " + (ws.state || "idle") + ", " + kind,
+    (ws.name || ws.title || ws.id) +
+      ", " +
+      (ws.state || "idle") +
+      ", " +
+      kind +
+      (persona ? ", persona " + persona : ""),
   );
   // Hover name — the expanded row ellipsizes long names; the collapsed rail
   // shows only the state glyph, so the title is the whole label there.
-  btn.title = ws.name || ws.title || ws.id || "session";
+  btn.title =
+    (ws.name || ws.title || ws.id || "session") +
+    (persona ? " · " + persona : "");
   btn.append(glyph(ws.state || "idle"));
   const nm = document.createElement("span");
   nm.className = "nm";
@@ -239,7 +256,7 @@ function sessionRow(ws, childCount, isChild, TS, paneManager, active) {
     btn.append(c);
   }
   btn.append(tagFor(kind));
-  // Both personas open as console panes (step 5): a coordinator is console-local;
+  // Both kinds open as console panes (step 5): a coordinator is console-local;
   // an interactive session lives on a node, so its pane is node-PROXIED — pass
   // the owning node as a hint (the shell re-derives it from Tier-1 on rehydrate).
   // Fall back to the legacy full-page node UI only when no pane host is present.
@@ -446,6 +463,10 @@ export function mountRail(sections, caps) {
   // the tree renders flat), so this can't break the rail.
   onProjectsChange(render);
   refreshProjects();
+  // Persona labels ride the same policy: load once, re-render on change,
+  // never-reject (a failed fetch leaves rows labelled by raw slug).
+  onPersonasChange(render);
+  refreshPersonas();
   render(); // initial paint (empty until the first snapshot arrives)
 }
 
