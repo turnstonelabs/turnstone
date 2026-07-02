@@ -132,6 +132,7 @@ from turnstone.core.storage._utils import (
     purge_orphan_conversations,
     release_attachment_refs,
     sanitize_text,
+    senders_from_user_meta,
 )
 from turnstone.core.storage._utils import (
     normalize_search_terms as _normalize_search_terms,
@@ -358,6 +359,22 @@ class PostgreSQLBackend:
             )
             conn.commit()
             return rowid
+
+    def list_message_senders(self, ws_id: str) -> list[str]:
+        # DISTINCT on the raw meta blob: a user row's meta carries only
+        # {"sender": ...}, so distinct blobs ≈ distinct senders and the JSON
+        # parse (shared, backend-neutral) runs on a handful of rows.
+        with self._conn() as conn:
+            rows = conn.execute(
+                sa.select(conversations.c.meta)
+                .distinct()
+                .where(
+                    conversations.c.ws_id == ws_id,
+                    conversations.c.role == "user",
+                    conversations.c.meta.is_not(None),
+                )
+            ).fetchall()
+        return senders_from_user_meta(meta for (meta,) in rows)
 
     def save_messages_bulk(self, rows: list[dict[str, Any]]) -> None:
         if not rows:

@@ -241,6 +241,16 @@ class StorageBackend(Protocol):
         """
         ...
 
+    def list_message_senders(self, ws_id: str) -> list[str]:
+        """Distinct sender user-ids recorded on a workstream's USER rows.
+
+        Reads the full persisted history (``meta`` → ``{"sender": ...}``), not
+        a compaction-bounded view: the participant set drives shared-workstream
+        framing and the one-time join note, so it must survive compaction
+        narrowing the resumable ``[summary] + [tail]`` slice.
+        """
+        ...
+
     def get_max_event_id(self, ws_id: str) -> int | None:
         """Return the highest persisted ``event_id`` for ``ws_id``.
 

@@ -132,6 +132,35 @@ class TestSaveAndLoadMessages:
         assert backend.load_messages("nonexistent") == []
 
 
+class TestListMessageSenders:
+    def test_distinct_senders_from_user_rows_only(self, backend):
+        import json
+
+        backend.register_workstream("s1")
+        backend.save_message("s1", "user", "a", meta=json.dumps({"sender": "alice"}))
+        backend.save_message("s1", "user", "b", meta=json.dumps({"sender": "bob"}))
+        backend.save_message("s1", "user", "c", meta=json.dumps({"sender": "alice"}))
+        backend.save_message("s1", "user", "plain")  # unstamped: meta is NULL
+        # A system row's meta rides the source_meta channel; even a stray
+        # "sender" key there must never count as a participant.
+        backend.save_message(
+            "s1", "system", "note", source="watch_triggered", meta=json.dumps({"sender": "evil"})
+        )
+        backend.register_workstream("s2")
+        backend.save_message("s2", "user", "x", meta=json.dumps({"sender": "carol"}))
+        assert backend.list_message_senders("s1") == ["alice", "bob"]
+        assert backend.list_message_senders("s2") == ["carol"]  # ws-scoped
+        assert backend.list_message_senders("nope") == []
+
+    def test_garbage_meta_is_skipped(self, backend):
+        backend.register_workstream("s1")
+        backend.save_message("s1", "user", "a", meta="not json{")
+        backend.save_message("s1", "user", "b", meta='"just a string"')
+        backend.save_message("s1", "user", "c", meta='{"sender": "   "}')
+        backend.save_message("s1", "user", "d", meta='{"sender": 7}')
+        assert backend.list_message_senders("s1") == []
+
+
 class TestLoadMessagesLimit:
     """Phase 3 added ``limit=N`` so cluster-inspect can avoid reading
     thousands of rows to return a tail-20 preview.  The contract: fetch

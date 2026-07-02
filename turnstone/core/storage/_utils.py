@@ -6,9 +6,12 @@ import base64
 import json
 import re
 from collections import Counter
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import sqlalchemy as sa
+
+if TYPE_CHECKING:
+    from collections.abc import Iterable
 
 from turnstone.core.attachments import AUDIO_MIME_TO_FORMAT, unreadable_placeholder
 from turnstone.core.log import get_logger
@@ -1141,3 +1144,24 @@ def reconstruct_turns_checkpointed(
         *marker_turns,
         *reconstruct_turns(tail, ws_id, attachments_by_msg),
     ]
+
+
+def senders_from_user_meta(metas: Iterable[str | None]) -> list[str]:
+    """Distinct, stripped sender ids from USER-row ``meta`` JSON blobs.
+
+    A user row's ``meta`` column carries only ``{"sender": ...}`` (the
+    role-exclusive routing in :func:`reconstruct_turns`); anything unparsable,
+    non-dict, or sender-less is skipped so one stray blob cannot poison the
+    participant set. Sorted for deterministic output across backends.
+    """
+    senders: set[str] = set()
+    for raw in metas:
+        if not raw:
+            continue
+        try:
+            sender = json.loads(raw).get("sender")
+        except (ValueError, AttributeError):
+            continue
+        if isinstance(sender, str) and sender.strip():
+            senders.add(sender.strip())
+    return sorted(senders)

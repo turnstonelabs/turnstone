@@ -219,13 +219,94 @@ def test_labels_render_resolved_usernames():
 
 def test_recompute_shared_state_from_history():
     s = make_session(user_id="owner")
-    s.messages.append(turn_from_dict({"role": "user", "content": "a", "_sender": "owner"}))
-    s._recompute_shared_state()
-    assert s._shared_workstream is False  # owner alone is not shared
-    s.messages.append(turn_from_dict({"role": "user", "content": "b", "_sender": "alice"}))
-    s._recompute_shared_state()
+    with patch("turnstone.core.session.get_storage", return_value=None):
+        s.messages.append(turn_from_dict({"role": "user", "content": "a", "_sender": "owner"}))
+        s._invalidate_shared_state()  # what _append_user_turn does for stamped turns
+        s._recompute_shared_state()
+        assert s._shared_workstream is False  # owner alone is not shared
+        s.messages.append(turn_from_dict({"role": "user", "content": "b", "_sender": "alice"}))
+        s._invalidate_shared_state()
+        s._recompute_shared_state()
     assert s._shared_workstream is True
     assert s._known_senders == {"owner", "alice"}
+
+
+def test_shared_state_latches_and_senders_never_shrink():
+    # Compaction narrows self.messages to [summary]+[tail]; a participant whose
+    # turns were summarized away must stay known (no duplicate join note) and
+    # the workstream must stay shared (no banner flip, no prefix-cache churn).
+    s = make_session(user_id="owner")
+    with patch("turnstone.core.session.get_storage", return_value=None):
+        s.messages.append(turn_from_dict({"role": "user", "content": "a", "_sender": "alice"}))
+        s._invalidate_shared_state()
+        s._recompute_shared_state()
+        assert s._shared_workstream is True
+        # compaction-style narrowing: alice's turns vanish from the slice
+        s.messages = [turn_from_dict({"role": "user", "content": "s", "_sender": "owner"})]
+        s._invalidate_shared_state()
+        s._recompute_shared_state()
+        assert s._shared_workstream is True  # latched
+        assert "alice" in s._known_senders  # union, never overwrite
+        # ...so the returning participant does not re-fire the join note
+        n = len(s.messages)
+        s._maybe_note_new_participant("alice")
+        assert len(s.messages) == n
+
+
+def test_recompute_unions_persisted_senders_once():
+    # A rehydrating worker sees only the checkpointed slice; the one-time
+    # full-history read recovers participants summarized out of it.
+    s = make_session(user_id="owner")
+    s._reset_shared_state()  # the state resume() leaves behind
+    fake = MagicMock()
+    fake.list_message_senders.return_value = ["alice"]
+    with patch("turnstone.core.session.get_storage", return_value=fake):
+        s._recompute_shared_state()
+        assert s._shared_workstream is True
+        assert "alice" in s._known_senders
+        s._invalidate_shared_state()
+        s._recompute_shared_state()  # second turn: no second full-history read
+    fake.list_message_senders.assert_called_once()
+
+
+def test_persisted_sender_read_retries_after_storage_error():
+    # A transient storage error must not pin an incomplete participant set:
+    # the next recompute (next user turn) retries the full-history read.
+    s = make_session(user_id="owner")
+    s._reset_shared_state()
+    fake = MagicMock()
+    fake.list_message_senders.side_effect = [RuntimeError("storage down"), ["alice"]]
+    with patch("turnstone.core.session.get_storage", return_value=fake):
+        s._recompute_shared_state()  # error -> degraded this turn, not cached
+        assert s._shared_workstream is False
+        s._invalidate_shared_state()  # next user turn
+        s._recompute_shared_state()  # retried, recovered
+    assert s._shared_workstream is True
+    assert fake.list_message_senders.call_count == 2
+
+
+def test_recompute_is_memoized_per_turn():
+    # _init_system_messages fires many times within a turn; between user-turn
+    # appends the recompute is a no-op flag check, not an O(n) rescan.
+    s = make_session(user_id="owner")
+    with patch("turnstone.core.session.get_storage", return_value=None):
+        s._reset_shared_state()
+        s._recompute_shared_state()
+        s.messages.append(turn_from_dict({"role": "user", "content": "b", "_sender": "alice"}))
+        s._recompute_shared_state()  # memoized: append not yet visible
+        assert s._shared_workstream is False
+        s._invalidate_shared_state()  # what _append_user_turn does
+        s._recompute_shared_state()
+        assert s._shared_workstream is True
+
+
+def test_append_user_turn_invalidates_shared_state():
+    s = make_session(user_id="owner")
+    s._acting_user_id = "alice"
+    with patch("turnstone.core.session.save_message", return_value=1):
+        s._senders_dirty = False
+        s._append_user_turn("hello", ())
+    assert s._senders_dirty is True
 
 
 def test_new_participant_flips_shared_and_emits_join_note_once():
@@ -253,6 +334,52 @@ def test_owner_only_never_shared():
         s._maybe_note_new_participant("owner")
     assert s._shared_workstream is False
     recompose.assert_not_called()
+
+
+# -- resume / fork carry attribution across the DB round-trip -----------------
+
+
+def test_resume_resets_shared_state():
+    # resume() can point this session object at a different workstream's
+    # history; the monotonic shared-state guarantees are per workstream.
+    s = make_session(user_id="owner")
+    s._known_senders = {"alice"}
+    s._shared_workstream = True
+    turns = [turn_from_dict({"role": "user", "content": "x", "_sender": "owner"})]
+    with (
+        patch("turnstone.core.session.load_message_turns", return_value=turns),
+        patch("turnstone.core.session.get_storage", return_value=None),
+        patch.object(s, "_reset_shared_state", wraps=s._reset_shared_state) as rst,
+        patch.object(s, "_save_config"),
+        patch.object(s, "_init_system_messages"),
+    ):
+        assert s.resume("ws-other") is True
+    rst.assert_called_once()
+
+
+def test_fork_persists_sender_meta():
+    # The fork bulk-persist must carry the user-turn sender stamp into the
+    # fork's rows (mirroring _append_user_turn), or the fork loses per-user
+    # attribution the first time it is reopened from the DB.
+    s = make_session(user_id="owner")
+    turns = [
+        turn_from_dict({"role": "user", "content": "hi", "_sender": "alice"}),
+        turn_from_dict({"role": "user", "content": "wake", "_source": "wake"}),
+        turn_from_dict({"role": "assistant", "content": "yo"}),
+    ]
+    with (
+        patch("turnstone.core.session.load_message_turns", return_value=turns),
+        patch("turnstone.core.session.save_messages_bulk") as bulk,
+        patch("turnstone.core.session.get_storage", return_value=None),
+        patch.object(s, "_save_config"),
+        patch.object(s, "_init_system_messages"),
+    ):
+        assert s.resume("src-ws", fork=True) is True
+    rows = bulk.call_args.args[0]
+    by_content = {r["content"]: r for r in rows}
+    assert json.loads(by_content["hi"]["meta"]) == {"sender": "alice"}
+    assert by_content["wake"]["meta"] is None  # synthetic: no sender stamped
+    assert by_content["yo"]["meta"] is None  # assistant rows carry no sender
 
 
 # -- Session Context banner (shared vs single-user) ---------------------------

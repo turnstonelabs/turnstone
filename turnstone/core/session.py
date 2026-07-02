@@ -1210,14 +1210,21 @@ class ChatSession:
         # the ``(user_id, callback)`` pair).
         self._acting_user_id: str = ""
         self._mcp_listener_user_id: str | None = user_id or None
-        # Shared-workstream context state (context-identity layer, atop the
-        # acting-user credential fix above): the model must be TOLD when more
-        # than one human is in the room. ``_shared_workstream`` flips True once a
-        # non-owner sender appears (live send OR rehydrated history) and drives
-        # the ``## Session Context`` banner; ``_known_senders`` tracks who has
-        # spoken so a first-time participant gets a one-time "has joined" note.
+        # Shared-workstream context state: the model must be TOLD when more
+        # than one human is in the room. ``_shared_workstream`` flips True once
+        # a non-owner sender appears (live send OR rehydrated history) and
+        # drives the ``## Session Context`` banner; it LATCHES — reverting
+        # would misframe a known-multi-user conversation and churn the
+        # provider-cached prompt prefix. ``_known_senders`` (everyone who has
+        # ever spoken here) gates the one-time "has joined" note and only
+        # grows: deriving it from the in-memory slice alone would forget
+        # participants once compaction narrows history. ``_senders_dirty``
+        # memoizes recomputes per turn (the composer runs many times per
+        # turn); ``_db_senders_loaded`` marks the one-time full-history read.
         self._shared_workstream: bool = False
         self._known_senders: set[str] = set()
+        self._senders_dirty: bool = True
+        self._db_senders_loaded: bool = False
         # user_id -> display username cache for shared-workstream labels / join
         # notes, so senders read as usernames (like the owner banner) not raw
         # id hashes. Resolved lazily via storage; a handful of entries per ws.
@@ -2924,6 +2931,9 @@ class ChatSession:
         if not fork:
             self._ws_id = ws_id
         self.messages = turns
+        # Shared-workstream state is per-workstream: this session object now
+        # points at (possibly different) history, so forget and re-derive.
+        self._reset_shared_state()
         self._read_files.clear()
         self._repeat_detector.clear()
         self._last_usage = None
@@ -3033,11 +3043,21 @@ class ChatSession:
                 except (TypeError, ValueError):
                     pd_str = None
                 src = msg.get("_source")
-                # Operator-context per-kind meta (``_source_meta`` dict) rides
-                # the fork too, so a forked watch-result keeps its structured
-                # card.  Serialized to JSON for the ``conversations.meta`` column.
+                # The ``conversations.meta`` column rides the fork too, so a
+                # forked watch-result keeps its structured card and a forked
+                # user turn keeps its sender attribution. The two sources are
+                # role-exclusive (``_source_meta`` rides SYSTEM turns, the
+                # sender stamp rides USER turns — see ``reconstruct_turns``),
+                # mirroring the live save paths in ``_run_loop`` and
+                # ``_append_user_turn``.
                 sm = msg.get("_source_meta")
-                meta_json = json.dumps(sm) if isinstance(sm, dict) and sm else None
+                sender = msg.get("_sender")
+                if isinstance(sm, dict) and sm:
+                    meta_json = json.dumps(sm)
+                elif isinstance(sender, str) and sender:
+                    meta_json = json.dumps({"sender": sender})
+                else:
+                    meta_json = None
                 bulk_rows.append(
                     {
                         "ws_id": self._ws_id,
@@ -3651,23 +3671,80 @@ class ChatSession:
             log.debug("display-name lookup failed for user=%s", user_id, exc_info=True)
         return name
 
-    def _recompute_shared_state(self) -> None:
-        """Recompute shared-workstream state from the current trajectory.
+    def _invalidate_shared_state(self) -> None:
+        """Mark shared-workstream state for recompute.
 
-        Scans user turns for recorded senders (the ``meta.extra["sender"]``
-        stamped by :meth:`_append_user_turn`). The workstream is *shared* once a
-        sender other than the owner (``_mcp_user_id``) has spoken. Called at
-        system-prompt (re)composition so the ``## Session Context`` banner
-        reflects reality on a fresh compose AND on a worker rehydrating an
-        already-multi-user workstream from history."""
+        The cheap flag half of the per-turn memo in
+        :meth:`_recompute_shared_state`; called when a sender-stamped user turn
+        is appended (the only live event that can change the participant set)."""
+        self._senders_dirty = True
+
+    def _reset_shared_state(self) -> None:
+        """Forget shared-workstream state entirely.
+
+        For :meth:`resume`, which points this session object at (possibly
+        different) history — the monotonic guarantees in
+        :meth:`_recompute_shared_state` hold per *workstream*, not per session
+        object, so carrying senders across a resume would leak one
+        workstream's participant set into another's framing."""
+        self._shared_workstream = False
+        self._known_senders = set()
+        self._db_senders_loaded = False
+        self._senders_dirty = True
+
+    def _load_persisted_senders(self) -> set[str]:
+        """One-time full-history sender read for :meth:`_recompute_shared_state`.
+
+        Compaction narrows ``self.messages`` to a ``[summary] + [tail]`` slice,
+        so scanning it alone forgets participants whose turns were summarized
+        away. The persisted rows keep every sender ever stamped; read them once
+        per workstream. A storage error leaves ``_db_senders_loaded`` unset so
+        the next recompute (at most one per user turn, via the memo) retries
+        instead of pinning an incomplete participant set for the session's
+        lifetime."""
+        try:
+            storage = get_storage()
+            if storage is not None:
+                senders = {s for s in storage.list_message_senders(self._ws_id) if s}
+                self._db_senders_loaded = True
+                return senders
+            # No storage configured (ephemeral session): nothing to read, ever.
+            self._db_senders_loaded = True
+        except Exception:
+            log.debug("persisted-sender load failed for ws=%s", self._ws_id, exc_info=True)
+        return set()
+
+    def _recompute_shared_state(self) -> None:
+        """Refresh shared-workstream state from history — monotonically.
+
+        ``_known_senders`` unions the current trajectory's recorded senders
+        (the ``meta.extra["sender"]`` stamped by :meth:`_append_user_turn`)
+        with a one-time read of the full persisted history; it never shrinks,
+        so a participant summarized out of the compacted slice stays known and
+        cannot re-trigger the one-time join note. ``_shared_workstream`` flips
+        True once any non-owner (``_mcp_user_id``) has spoken and then latches:
+        reverting would misattribute a known-multi-user conversation AND flip
+        the banner bytes, invalidating the provider prompt-prefix cache that
+        the hour-rounded timestamp above exists to protect.
+
+        Memoized per turn via ``_senders_dirty``: system-prompt composition
+        runs many times within a turn (state transitions, MCP refresh, tool
+        results) but the sender set only changes on user-turn append and
+        history (re)load."""
+        if not self._senders_dirty:
+            return
         owner = (self._mcp_user_id or "").strip()
         senders = {
             s
             for t in self.messages
             if t.role is Role.USER and (s := (t.meta.extra.get("sender") or "").strip())
         }
-        self._known_senders = senders
-        self._shared_workstream = any(s != owner for s in senders)
+        if not self._db_senders_loaded:
+            senders |= self._load_persisted_senders()
+        self._known_senders |= senders
+        if not self._shared_workstream:
+            self._shared_workstream = any(s != owner for s in self._known_senders)
+        self._senders_dirty = False
 
     def _maybe_note_new_participant(self, sender_user_id: str | None) -> None:
         """Announce a first-time non-owner sender and flip the ws to shared.
@@ -4498,6 +4575,10 @@ class ChatSession:
                 for a in attachments
             ]
         self.messages.append(turn_from_dict(user_msg))
+        if sender:
+            # A newly recorded sender can change shared-workstream state; let
+            # the next system-prompt compose re-derive it (memoized otherwise).
+            self._invalidate_shared_state()
         self._msg_tokens.append(max(1, int(self._msg_char_count(user_msg) / self._chars_per_token)))
         # DB row stores the raw text only; attachment bytes are written
         # content-addressed into workstream_attachments and the ordered id-list
