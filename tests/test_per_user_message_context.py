@@ -17,11 +17,10 @@ from __future__ import annotations
 import json
 from unittest.mock import MagicMock, patch
 
-from turnstone.core.session import _prefix_sender_label
-from turnstone.core.trajectory import Role, turn_from_dict, turn_to_dict
-from turnstone.core.storage._utils import reconstruct_turns
 from tests._session_helpers import make_session
-
+from turnstone.core.session import _prefix_sender_label
+from turnstone.core.storage._utils import reconstruct_turns
+from turnstone.core.trajectory import Role, turn_from_dict, turn_to_dict
 
 # -- side-channel round-trip --------------------------------------------------
 
@@ -117,6 +116,19 @@ def test_single_sender_not_labeled_same_ref():
     assert s._inject_sender_labels(msgs) is msgs  # allocation-free common case
 
 
+def test_shared_state_labels_even_when_slice_has_single_sender():
+    # Compaction can narrow the wire slice to one participant's turns. On a
+    # known-shared workstream we must still label (the >1-sender count heuristic
+    # alone would skip and let the model misattribute to the owner).
+    s = make_session(user_id="owner")
+    s._shared_workstream = True
+    msgs = [{"role": "user", "content": "only alice remains", "_sender": "alice"}]
+    with patch("turnstone.core.session.get_storage", return_value=None):
+        out = s._inject_sender_labels(msgs)
+    assert out is not msgs
+    assert out[0]["content"] == "[message from alice]\nonly alice remains"
+
+
 def test_shared_labels_every_sender_turn():
     # No storage -> _resolve_display_name falls back to the raw id, so labels
     # carry the id here (username resolution is covered separately below).
@@ -173,6 +185,18 @@ def test_resolve_display_name_falls_back_to_id_when_unknown():
         assert s._resolve_display_name("ghost-id") == "ghost-id"
 
 
+def test_resolve_display_name_retries_after_transient_storage_error():
+    # A storage error must NOT be cached: it falls back to the raw id for this
+    # call but a later call retries and resolves, rather than pinning the id.
+    s = make_session(user_id="owner")
+    fake = MagicMock()
+    fake.get_user.side_effect = [RuntimeError("storage down"), {"username": "alice@example"}]
+    with patch("turnstone.core.session.get_storage", return_value=fake):
+        assert s._resolve_display_name("alice-id") == "alice-id"  # error -> raw id, uncached
+        assert s._resolve_display_name("alice-id") == "alice@example"  # retried, resolved
+    assert fake.get_user.call_count == 2
+
+
 def test_labels_render_resolved_usernames():
     s = make_session(user_id="owner")
     fake = MagicMock()
@@ -207,8 +231,9 @@ def test_recompute_shared_state_from_history():
 def test_new_participant_flips_shared_and_emits_join_note_once():
     s = make_session(user_id="owner")
     s._known_senders = {"owner"}
-    with patch.object(s, "_init_system_messages") as recompose, patch(
-        "turnstone.core.session.get_storage", return_value=None
+    with (
+        patch.object(s, "_init_system_messages") as recompose,
+        patch("turnstone.core.session.get_storage", return_value=None),
     ):
         s._maybe_note_new_participant("alice")
     assert s._shared_workstream is True
@@ -234,14 +259,14 @@ def test_owner_only_never_shared():
 
 
 def test_shared_banner_declares_participants_and_tool_credentials():
-    from turnstone.prompts import SessionContext as SC, WorkstreamKind, _build_context
+    from turnstone.prompts import SessionContext, WorkstreamKind, _build_context
 
     shared = _build_context(
-        SC(current_datetime="t", timezone="UTC", username="owner@x", shared=True),
+        SessionContext(current_datetime="t", timezone="UTC", username="owner@x", shared=True),
         WorkstreamKind.INTERACTIVE,
     )
     solo = _build_context(
-        SC(current_datetime="t", timezone="UTC", username="owner@x", shared=False),
+        SessionContext(current_datetime="t", timezone="UTC", username="owner@x", shared=False),
         WorkstreamKind.INTERACTIVE,
     )
     # shared: multi-user framing + per-message tags + the tool-credential rule
@@ -258,10 +283,10 @@ def test_shared_banner_declares_participants_and_tool_credentials():
 
 
 def test_context_surfaces_workstream_and_project_ids():
-    from turnstone.prompts import SessionContext as SC, WorkstreamKind, _build_context
+    from turnstone.prompts import SessionContext, WorkstreamKind, _build_context
 
     out = _build_context(
-        SC(
+        SessionContext(
             current_datetime="t",
             timezone="UTC",
             username="owner@x",
@@ -278,10 +303,10 @@ def test_context_surfaces_workstream_and_project_ids():
 
 
 def test_context_omits_ids_when_absent():
-    from turnstone.prompts import SessionContext as SC, WorkstreamKind, _build_context
+    from turnstone.prompts import SessionContext, WorkstreamKind, _build_context
 
     out = _build_context(
-        SC(current_datetime="t", timezone="UTC", username="owner@x"),
+        SessionContext(current_datetime="t", timezone="UTC", username="owner@x"),
         WorkstreamKind.INTERACTIVE,
     )
     # no ws_id line and no project line at all when neither is set

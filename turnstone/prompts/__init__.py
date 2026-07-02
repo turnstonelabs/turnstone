@@ -108,9 +108,10 @@ def _build_context(ctx: SessionContext, kind: WorkstreamKind) -> str:
             "here. Each user turn is prefixed `[message from <participant>]` with the "
             "identity of whoever sent it; attribute requests and statements to that sender "
             "and do NOT assume a single user. Tool / MCP calls execute under the "
-            "credentials of the participant who sent the current message (not the owner), "
-            "so the SAME tool can legitimately return DIFFERENT results for different "
-            "senders — that is expected, not an error or inconsistency.\n"
+            "credentials of the participant who initiated the current turn (usually the "
+            "sender, not the owner), so the SAME tool can legitimately return DIFFERENT "
+            "results for different senders — that is expected, not an error or "
+            "inconsistency.\n"
         )
     else:
         who_lines = f"- **User:** {ctx.username}\n"

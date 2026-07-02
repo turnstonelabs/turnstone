@@ -3642,9 +3642,13 @@ class ChatSession:
                 row = storage.get_user(user_id)
                 if row:
                     name = row.get("username") or row.get("display_name") or user_id
+                # Cache hits and definite misses (row is None). A transient
+                # storage error, by contrast, skips the cache and falls through
+                # to return the raw id, so a later call can retry rather than
+                # pinning the sender to their id for the session's lifetime.
+                self._sender_name_cache[user_id] = name
         except Exception:
             log.debug("display-name lookup failed for user=%s", user_id, exc_info=True)
-        self._sender_name_cache[user_id] = name
         return name
 
     def _recompute_shared_state(self) -> None:
@@ -3694,9 +3698,7 @@ class ChatSession:
             f"`[message from {name}]` — attribute them to this sender, not the owner.",
         )
 
-    def _inject_sender_labels(
-        self, messages: list[dict[str, Any]]
-    ) -> list[dict[str, Any]]:
+    def _inject_sender_labels(self, messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
         """Fold per-message sender attribution into user turns for the wire.
 
         The context-layer half of per-user identity: on a genuinely multi-user
@@ -3706,19 +3708,25 @@ class ChatSession:
         considered — synthetic turns (wake, compaction-resume, advisory) carry
         none and stay unlabeled.
 
-        "Shared" is derived from the trajectory itself: more than one distinct
-        sender across the user turns. A single-user workstream returns the input
+        "Shared" is authoritative session state (``_shared_workstream`` — flipped
+        once a non-owner speaks and re-derived when a worker rehydrates history).
+        The per-slice sender count is only a fallback for when that state is still
+        unset/uncomputed: keying off the count alone would drop labels whenever
+        compaction narrows the retained wire slice to a single participant on a
+        known-shared workstream, reintroducing the misattribution the banner tells
+        the model these labels prevent. A single-user workstream returns the input
         unchanged (same object reference — the allocation-free common case
         ``_prepare_wire_messages`` relies on). The label rides the model-visible
         ``content``; the wire-invisible ``_sender`` key is stripped downstream by
         ``sanitize_messages``. ``self.messages`` is never mutated."""
-        senders = {
-            s
-            for m in messages
-            if m.get("role") == "user" and (s := (m.get("_sender") or "").strip())
-        }
-        if len(senders) <= 1:
-            return messages
+        if not self._shared_workstream:
+            senders = {
+                s
+                for m in messages
+                if m.get("role") == "user" and (s := (m.get("_sender") or "").strip())
+            }
+            if len(senders) <= 1:
+                return messages
         out: list[dict[str, Any]] = []
         for m in messages:
             sender = (m.get("_sender") or "").strip() if m.get("role") == "user" else ""
