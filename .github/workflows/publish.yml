@@ -7,7 +7,9 @@ on:
 
 concurrency:
   group: publish-${{ github.event.workflow_run.head_sha }}
-  cancel-in-progress: true
+  # Never cancel a publish mid-upload: a half-uploaded release (sdist up,
+  # wheel missing) cannot be re-run cleanly because PyPI rejects duplicates.
+  cancel-in-progress: false
 
 permissions:
   contents: write
@@ -15,7 +17,16 @@ permissions:
 
 jobs:
   publish:
-    if: github.event.workflow_run.conclusion == 'success'
+    # workflow_run fires for EVERY CI completion — including CI runs for
+    # pull_requests from forks — and always executes here with this repo's
+    # secrets, tokens, and the pypi environment.  Gate to same-repo tag
+    # pushes only: CI's push trigger matches branches main/stable/* and
+    # tags v*, so a head_branch starting with "v" is necessarily a tag run.
+    if: >-
+      github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.event == 'push' &&
+      github.event.workflow_run.head_repository.full_name == github.repository &&
+      startsWith(github.event.workflow_run.head_branch, 'v')
     runs-on: ubuntu-latest
     environment: pypi
     steps:
@@ -23,6 +34,9 @@ jobs:
         with:
           ref: ${{ github.event.workflow_run.head_sha }}
           fetch-depth: 0
+          # python -m build executes the tree's build backend; don't leave
+          # the contents:write token sitting in .git/config while it runs.
+          persist-credentials: false
 
       - name: Resolve release tag
         id: tag

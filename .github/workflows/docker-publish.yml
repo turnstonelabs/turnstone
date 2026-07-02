@@ -7,7 +7,9 @@ on:
 
 concurrency:
   group: docker-${{ github.event.workflow_run.head_sha }}
-  cancel-in-progress: true
+  # Never cancel mid-push: an interrupted multi-tag push can leave the
+  # registry with a partial tag set (e.g. :latest moved, :stable not).
+  cancel-in-progress: false
 
 permissions:
   contents: read
@@ -19,15 +21,24 @@ env:
 
 jobs:
   docker:
+    # Same gate as publish.yml: workflow_run fires for every CI completion
+    # (including fork and same-repo PR runs) with this repo's token and
+    # packages:write.  Only same-repo tag pushes may publish images; CI's
+    # push trigger matches main/stable/* and v* tags, so a head_branch
+    # starting with "v" is necessarily a tag run.
     if: >-
       github.event.workflow_run.conclusion == 'success' &&
-      github.event.workflow_run.head_repository.full_name == github.repository
+      github.event.workflow_run.event == 'push' &&
+      github.event.workflow_run.head_repository.full_name == github.repository &&
+      startsWith(github.event.workflow_run.head_branch, 'v')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
         with:
           ref: ${{ github.event.workflow_run.head_sha }}
           fetch-depth: 0
+          # The docker build only reads the tree; keep the token out of it.
+          persist-credentials: false
 
       - name: Resolve release tag
         id: tag

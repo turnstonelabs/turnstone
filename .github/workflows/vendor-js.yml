@@ -25,18 +25,30 @@ permissions:
 
 jobs:
   vendor-js:
-    if: github.actor == 'renovate[bot]' || github.event_name == 'workflow_dispatch'
+    # Same-repo PRs only: this job checks out the PR head and pushes to it
+    # with contents:write, so it must never act on a fork's branch.
+    # Gate on the PR author (immutable), not github.actor (names whoever
+    # caused the latest event, which can be someone else re-running it).
+    if: >-
+      (github.event_name == 'pull_request' &&
+       github.event.pull_request.user.login == 'renovate[bot]' &&
+       github.event.pull_request.head.repo.full_name == github.repository) ||
+      github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     steps:
       - name: Resolve PR head ref
         id: ref
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Branch names may contain shell metacharacters; pass via env,
+          # never interpolate ${{ }} into the script body.
+          HEAD_REF: ${{ github.head_ref }}
+          PR_NUMBER: ${{ inputs.pr_number }}
         run: |
-          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
-            ref=$(gh pr view "${{ inputs.pr_number }}" --repo "${{ github.repository }}" --json headRefName -q .headRefName)
+          if [[ "$GITHUB_EVENT_NAME" == "workflow_dispatch" ]]; then
+            ref=$(gh pr view "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --json headRefName -q .headRefName)
           else
-            ref="${{ github.head_ref }}"
+            ref="$HEAD_REF"
           fi
           echo "head_ref=${ref}" >> "$GITHUB_OUTPUT"
 
