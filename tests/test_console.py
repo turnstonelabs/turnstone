@@ -531,6 +531,58 @@ class TestCollectorDelta:
         assert event["type"] == "ws_closed"
         assert "ws1" not in c._nodes["node-a"].workstreams
 
+    def test_reconcile_additions_event_carries_tenancy_fields(self):
+        """The poll-diff ws_created must carry user_id + project_id — the
+        console's per-connection tenancy filter gates on them, and a
+        missing field fails open (private leak) or over-hides (creator
+        shortcut can't fire)."""
+        c = _make_collector()
+        node = NodeSnapshot(node_id="node-a", server_url="http://a:8080")
+        c._nodes["node-a"] = node
+
+        pending = c._reconcile_node(
+            "node-a",
+            node,
+            [
+                {
+                    "id": "ws1",
+                    "name": "n",
+                    "state": "idle",
+                    "kind": "interactive",
+                    "user_id": "alice",
+                    "project_id": "p1",
+                }
+            ],
+        )
+
+        created = [e for e in pending if e["type"] == "ws_created"]
+        assert len(created) == 1
+        assert created[0]["user_id"] == "alice"
+        assert created[0]["project_id"] == "p1"
+
+    def test_emit_console_ws_created_carries_project(self):
+        """Console pseudo-node coordinator rows + their ws_created must
+        carry project_id or private-project coordinators leak on the
+        SSE surface (the REST lane filters via _coordinator_rows)."""
+        c = _make_collector()
+        q: queue.Queue[dict] = queue.Queue()
+        c.register_listener(q)
+
+        c.emit_console_ws_created(
+            "cws1",
+            name="C",
+            user_id="alice",
+            kind="coordinator",
+            project_id="p1",
+        )
+
+        event = q.get_nowait()
+        assert event["type"] == "ws_created"
+        assert event["user_id"] == "alice"
+        assert event["project_id"] == "p1"
+        row = c._nodes[c.CONSOLE_PSEUDO_NODE_ID].workstreams["cws1"]
+        assert row["project_id"] == "p1"
+
     def test_apply_delta_ws_rename(self):
         c = _make_collector()
         c._nodes["node-a"] = NodeSnapshot(

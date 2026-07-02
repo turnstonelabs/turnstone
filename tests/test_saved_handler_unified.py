@@ -137,12 +137,16 @@ def _patch_storage(
         kind: Any = None,
         user_id: Any = None,
         state: Any = None,
+        offset: int = 0,
     ) -> list[tuple[Any, ...]]:
         calls.append({"kind": kind, "state": state, "user_id": user_id, "limit": limit})
+        # Honour limit/offset like the real query — the collector pages
+        # with OFFSET until it fills its visibility window, so a fake
+        # that ignored them would return the same batch forever.
         if kind == WorkstreamKind.COORDINATOR:
-            return coord_rows
+            return coord_rows[offset : offset + limit]
         if kind == WorkstreamKind.INTERACTIVE:
-            return interactive_rows
+            return interactive_rows[offset : offset + limit]
         return []
 
     # The handler imports the symbol from turnstone.core.memory at call

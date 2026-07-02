@@ -362,8 +362,13 @@ class StorageBackend(Protocol):
         kind: WorkstreamKind | str | None = None,
         user_id: str | None = None,
         state: str | None = None,
+        offset: int = 0,
     ) -> list[Any]:
         """List workstreams that have messages, ordered by updated DESC.
+
+        ``offset`` skips that many rows before applying ``limit`` — the
+        saved-list collector pages through with it so a post-SQL
+        visibility filter can keep fetching until it fills its window.
 
         ``kind`` filters at the SQL layer — pass ``WorkstreamKind.INTERACTIVE``
         from the interactive "saved workstreams" sidebar so coordinator rows

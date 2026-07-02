@@ -73,7 +73,7 @@ def _make_ws(**overrides: Any) -> Workstream:
 
 def test_emit_created_calls_collector_with_coord_fields() -> None:
     adapter, collector = _make_adapter()
-    ws = _make_ws()
+    ws = _make_ws(project_id="p1")
     adapter.emit_created(ws)
     collector.emit_console_ws_created.assert_called_once_with(
         "coord-1",
@@ -82,6 +82,8 @@ def test_emit_created_calls_collector_with_coord_fields() -> None:
         kind=WorkstreamKind.COORDINATOR.value,
         state=WorkstreamState.IDLE.value,
         parent_ws_id=None,
+        # Tenancy-load-bearing: the console SSE filter gates on this.
+        project_id="p1",
     )
 
 

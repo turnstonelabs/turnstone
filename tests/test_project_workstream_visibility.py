@@ -292,3 +292,253 @@ class TestSavedListFilter:
 
         rows_alice = await _collect_saved_rows(cfg, _request_for("alice"))
         assert {r["ws_id"] for r in rows_alice} == {"ws-plain", "ws-priv", "ws-pub", "ws-own"}
+
+
+class TestTriStateVisibility:
+    def test_undetermined_on_storage_error(self) -> None:
+        storage = MagicMock()
+        storage.get_project.side_effect = RuntimeError("db down")
+        vis = WorkstreamProjectVisibility("bob", storage=storage)
+        assert vis.ws_visibility("p1") is None
+        # The boolean form stays fail-closed.
+        assert vis.ws_visible("p1") is False
+
+    def test_definitive_verdicts(self) -> None:
+        assert (
+            WorkstreamProjectVisibility("bob", storage=_fake_storage(visibility="public"))
+            .ws_visibility("p1")
+            is True
+        )
+        assert WorkstreamProjectVisibility("bob", storage=_fake_storage()).ws_visibility("p1") is False
+
+
+class _ScriptedVis:
+    """ws_visibility stub: per-pid verdict, or a list consumed per call."""
+
+    def __init__(self, verdicts: dict, bypass: bool = False) -> None:
+        self.verdicts = dict(verdicts)
+        self.bypass = bypass
+        self.calls = 0
+
+    def ws_visibility(self, pid, ws_owner=""):
+        self.calls += 1
+        v = self.verdicts.get(pid or "", True)
+        if isinstance(v, list):
+            return v.pop(0) if len(v) > 1 else v[0]
+        return v
+
+
+class TestClusterTenancyFilter:
+    def _snap(self):
+        return {
+            "nodes": [
+                {
+                    "node_id": "node-a",
+                    "workstreams": [
+                        {"ws_id": "w-vis", "state": "running", "project_id": "", "user_id": "a"},
+                        {"ws_id": "w-priv", "state": "running", "project_id": "ph", "user_id": "a"},
+                    ],
+                }
+            ],
+            "overview": {
+                "nodes": 1,
+                "workstreams": 2,
+                "states": {"running": 2, "thinking": 0, "idle": 0},
+            },
+        }
+
+    def test_snapshot_filters_rows_and_rederives_overview(self) -> None:
+        from turnstone.console.server import _ClusterTenancyFilter
+
+        filt = _ClusterTenancyFilter(_ScriptedVis({"ph": False}))
+        snap = filt.filter_snapshot(self._snap())
+        assert [w["ws_id"] for w in snap["nodes"][0]["workstreams"]] == ["w-vis"]
+        # Overview no longer leaks the hidden row's existence or state.
+        assert snap["overview"]["workstreams"] == 1
+        assert snap["overview"]["states"] == {"running": 1, "thinking": 0, "idle": 0}
+        # Later sparse events for the hidden ws are suppressed.
+        assert filt.event_visible({"type": "cluster_state", "ws_id": "w-priv"}) is False
+        assert filt.event_visible({"type": "cluster_state", "ws_id": "w-vis"}) is True
+
+    def test_bypass_leaves_snapshot_untouched(self) -> None:
+        from turnstone.console.server import _ClusterTenancyFilter
+
+        filt = _ClusterTenancyFilter(_ScriptedVis({"ph": False}, bypass=True))
+        snap = filt.filter_snapshot(self._snap())
+        assert len(snap["nodes"][0]["workstreams"]) == 2
+        assert snap["overview"]["workstreams"] == 2  # collector aggregate preserved
+        assert filt.event_visible({"type": "cluster_state", "ws_id": "w-priv"}) is True
+        assert filt.event_touches_storage({"type": "ws_created", "ws_id": "x"}) is False
+
+    def test_ws_created_judged_and_closed_cleans_up(self) -> None:
+        from turnstone.console.server import _ClusterTenancyFilter
+
+        filt = _ClusterTenancyFilter(_ScriptedVis({"ph": False}))
+        created = {"type": "ws_created", "ws_id": "w1", "project_id": "ph", "user_id": "b"}
+        assert filt.event_visible(created) is False
+        assert filt.event_visible({"type": "ws_rename", "ws_id": "w1"}) is False
+        # The close of a never-shown workstream is itself suppressed…
+        assert filt.event_visible({"type": "ws_closed", "ws_id": "w1"}) is False
+        # …and the state is cleaned, so an unrelated later event passes.
+        assert filt.event_visible({"type": "cluster_state", "ws_id": "w1"}) is True
+
+    def test_undetermined_suppresses_then_retries(self) -> None:
+        from turnstone.console.server import _ClusterTenancyFilter
+
+        vis = _ScriptedVis({"pu": [None, True]})
+        filt = _ClusterTenancyFilter(vis)
+        created = {"type": "ws_created", "ws_id": "w1", "project_id": "pu", "user_id": "b"}
+        # Storage blip: suppressed but NOT pinned hidden.
+        assert filt.event_visible(created) is False
+        assert "w1" in filt._unresolved
+        # Within the retry interval later events stay suppressed without
+        # re-hitting storage.
+        calls_before = vis.calls
+        assert filt.event_visible({"type": "cluster_state", "ws_id": "w1"}) is False
+        assert vis.calls == calls_before
+        # Past the interval the row is re-judged and recovers.
+        filt._RETRY_INTERVAL_S = 0.0
+        filt._retry_after["w1"] = 0.0
+        assert filt.event_touches_storage({"type": "cluster_state", "ws_id": "w1"}) is True
+        assert filt.event_visible({"type": "cluster_state", "ws_id": "w1"}) is True
+        assert "w1" not in filt._unresolved
+
+    def test_denied_verdict_pins_hidden(self) -> None:
+        from turnstone.console.server import _ClusterTenancyFilter
+
+        vis = _ScriptedVis({"pu": [None, False]})
+        filt = _ClusterTenancyFilter(vis)
+        filt._RETRY_INTERVAL_S = 0.0
+        assert (
+            filt.event_visible(
+                {"type": "ws_created", "ws_id": "w1", "project_id": "pu", "user_id": "b"}
+            )
+            is False
+        )
+        filt._retry_after["w1"] = 0.0
+        assert filt.event_visible({"type": "cluster_state", "ws_id": "w1"}) is False
+        assert "w1" in filt._hidden and "w1" not in filt._unresolved
+
+
+class TestCreateValidatorProjectGate:
+    """The interactive create validator's attach gate: explicit ids are
+    strict, inherited ids tolerate a deleted project (real ephemeral DB)."""
+
+    async def test_inherited_dangling_project_is_stripped(self, tmp_db: str) -> None:
+        from turnstone.core.memory import register_workstream
+        from turnstone.server import _interactive_create_validate_request
+
+        register_workstream(
+            "coord-1", user_id="alice", kind="coordinator", project_id="p-gone"
+        )
+        body: dict = {"kind": "interactive", "parent_ws_id": "coord-1"}
+        err = await _interactive_create_validate_request(MagicMock(), body, "alice", [])
+        assert err is None
+        assert (body.get("project_id") or "") == ""
+
+    async def test_explicit_unknown_project_still_400s(self, tmp_db: str) -> None:
+        from turnstone.server import _interactive_create_validate_request
+
+        body: dict = {"kind": "interactive", "project_id": "nope"}
+        err = await _interactive_create_validate_request(MagicMock(), body, "alice", [])
+        assert err is not None and err.status_code == 400
+
+    async def test_inherited_private_revoked_membership_403s(self, tmp_db: str) -> None:
+        from turnstone.core.memory import register_workstream
+        from turnstone.core.storage import get_storage
+        from turnstone.server import _interactive_create_validate_request
+
+        get_storage().create_project("p-priv", "P", "zed")
+        register_workstream(
+            "coord-2", user_id="alice", kind="coordinator", project_id="p-priv"
+        )
+        body: dict = {"kind": "interactive", "parent_ws_id": "coord-2"}
+        err = await _interactive_create_validate_request(MagicMock(), body, "alice", [])
+        assert err is not None and err.status_code == 403
+
+    async def test_inherited_accessible_project_passes(self, tmp_db: str) -> None:
+        from turnstone.core.memory import register_workstream
+        from turnstone.core.storage import get_storage
+        from turnstone.server import _interactive_create_validate_request
+
+        storage = get_storage()
+        storage.create_project("p-ok", "P", "zed")
+        storage.add_project_member("p-ok", "alice")
+        register_workstream("coord-3", user_id="alice", kind="coordinator", project_id="p-ok")
+        body: dict = {"kind": "interactive", "parent_ws_id": "coord-3"}
+        err = await _interactive_create_validate_request(MagicMock(), body, "alice", [])
+        assert err is None
+        assert body["project_id"] == "p-ok"
+
+
+class TestSavedListPagination:
+    """The saved-list collector pages past invisible rows instead of
+    letting a post-SQL filter shrink the window."""
+
+    def _row(self, i: int, project_id: str | None) -> tuple:
+        return (
+            f"ws-{i:03d}",
+            None,
+            None,
+            f"n{i}",
+            "2026-01-01T00:00:00",
+            f"{99999 - i}",  # updated: descending with i
+            1,
+            "node-a",
+            "idle",
+            "interactive",
+            None,
+            None,
+            0,
+            0,
+            None,
+            project_id,
+            "alice",
+        )
+
+    def _cfg(self):
+        from turnstone.core.session_routes import SessionEndpointConfig
+        from turnstone.core.workstream import WorkstreamKind
+
+        return SessionEndpointConfig(
+            permission_gate=None,
+            manager_lookup=lambda request: (None, None),
+            tenant_check=None,
+            not_found_label="Workstream not found",
+            audit_action_prefix="workstream",
+            list_kind=WorkstreamKind.INTERACTIVE,
+            saved_state_filter=None,
+            saved_loaded_lookup=None,
+        )
+
+    def _patch(self, monkeypatch: pytest.MonkeyPatch, rows: list) -> None:
+        def _fake(limit=20, *, kind=None, user_id=None, state=None, offset=0):
+            return rows[offset : offset + limit]
+
+        monkeypatch.setattr("turnstone.core.memory.list_workstreams_with_history", _fake)
+        vis = WorkstreamProjectVisibility("bob", storage=_fake_storage())  # denies any pid
+        monkeypatch.setattr(
+            WorkstreamProjectVisibility,
+            "for_request",
+            classmethod(lambda cls, request, storage=None: vis),
+        )
+
+    async def test_pages_past_invisible_rows(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from turnstone.core.session_routes import _collect_saved_rows
+
+        rows = [self._row(i, "ph") for i in range(60)] + [
+            self._row(i, None) for i in range(60, 130)
+        ]
+        self._patch(monkeypatch, rows)
+        result = await _collect_saved_rows(self._cfg(), MagicMock())
+        assert len(result) == 50
+        assert result[0]["ws_id"] == "ws-060"
+        assert result[-1]["ws_id"] == "ws-109"
+
+    async def test_scan_cap_terminates(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from turnstone.core.session_routes import _collect_saved_rows
+
+        rows = [self._row(i, "ph") for i in range(5000)]
+        self._patch(monkeypatch, rows)
+        result = await _collect_saved_rows(self._cfg(), MagicMock())
+        assert result == []

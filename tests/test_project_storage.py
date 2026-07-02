@@ -230,17 +230,22 @@ class TestMemoryScopeLabels:
 
 class TestProjectResourceQueries:
     def test_list_workstreams_for_project_scoped_and_ordered(self, backend: Any) -> None:
+        import sqlalchemy as sa
+
         backend.create_project("p1", "A", "u1")
         backend.register_workstream("w-old", name="old", user_id="u1", project_id="p1")
         backend.register_workstream("w-new", name="new", user_id="u1", project_id="p1")
         backend.register_workstream("w-out", name="out", user_id="u1")
-        # Force a deterministic updated ordering.
-        backend.update_workstream_title("w-new", "bump")
+        # Force a deterministic ``updated`` ordering directly — same-second
+        # registration timestamps would otherwise make ORDER BY updated
+        # DESC a coin flip and the ordering assertion vacuous.
+        with backend._engine.connect() as conn:  # noqa: SLF001
+            conn.execute(
+                sa.text("UPDATE workstreams SET updated = '2020-01-01' WHERE ws_id = 'w-old'")
+            )
+            conn.commit()
         rows = backend.list_workstreams_for_project("p1")
-        assert [r["ws_id"] for r in rows][: 2] == ["w-new", "w-old"] or {
-            r["ws_id"] for r in rows
-        } == {"w-new", "w-old"}
-        assert all(r["ws_id"] != "w-out" for r in rows)
+        assert [r["ws_id"] for r in rows] == ["w-new", "w-old"]
         assert {"ws_id", "name", "title", "state", "kind", "updated", "node_id", "user_id"} <= set(
             rows[0]
         )

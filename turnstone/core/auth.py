@@ -306,6 +306,13 @@ class WorkstreamProjectVisibility:
         )
         return cls(uid, bypass=bypass, storage=storage)
 
+    @property
+    def bypass(self) -> bool:
+        """True when this principal sees everything (service scope /
+        ``admin.cluster.inspect``) — callers that transform payloads
+        (not just drop rows) use this to leave them untouched."""
+        return self._bypass
+
     def _resolve_storage(self) -> Any:
         if self._storage is None:
             from turnstone.core.storage._registry import get_storage
@@ -329,14 +336,36 @@ class WorkstreamProjectVisibility:
             )
         return self._member[project_id]
 
-    def ws_visible(self, project_id: str | None, ws_owner: str = "") -> bool:
-        """Apply the class rules to one workstream row."""
+    def _project_grants(self, project: dict[str, Any]) -> bool:
+        """The tenancy rule for one already-fetched project row.
+
+        THE single statement of who may see a project's workstreams —
+        :meth:`ws_visibility` and :func:`ensure_project_attachable` both
+        route through here so the security decision cannot diverge.
+        """
+        if (project.get("visibility") or "private") != "private":
+            return True
+        if not self._user_id:
+            return False
+        if project.get("owner_id") == self._user_id:
+            return True
+        return self._is_member(str(project.get("project_id") or ""))
+
+    def ws_visibility(self, project_id: str | None, ws_owner: str = "") -> bool | None:
+        """Tri-state form of :meth:`ws_visible`.
+
+        ``True`` visible, ``False`` denied, ``None`` undetermined — the
+        project could not be resolved (storage failure). Callers that
+        can retry later (the SSE event filter) use this to avoid pinning
+        a verdict on a transient blip; everything else goes through
+        :meth:`ws_visible`, which maps ``None`` to fail-closed.
+        """
         if self._bypass:
             return True
         # Only a real string can name a project — anything else (None,
         # a test double, a corrupted row) means "no project link", not
-        # "private". Keeps the fail-closed branch for genuine lookup
-        # failures rather than type noise.
+        # "private". Keeps the undetermined/fail-closed branch for
+        # genuine lookup failures rather than type noise.
         if not project_id or not isinstance(project_id, str):
             return True
         pid = project_id.strip()
@@ -348,20 +377,22 @@ class WorkstreamProjectVisibility:
             project = self._project(pid)
             if project is None:
                 return True
-            if (project.get("visibility") or "private") != "private":
-                return True
-            if not self._user_id:
-                return False
-            if project.get("owner_id") == self._user_id:
-                return True
-            return self._is_member(pid)
+            return self._project_grants(project)
         except Exception:
             log.warning(
-                "workstream project-visibility check failed user=%s project=%s — failing closed",
+                "workstream project-visibility check undetermined user=%s project=%s",
                 self._user_id,
                 pid,
             )
-            return False
+            return None
+
+    def ws_visible(self, project_id: str | None, ws_owner: str = "") -> bool:
+        """Apply the class rules to one workstream row (fail-closed).
+
+        An undetermined verdict (storage failure) hides the row rather
+        than leaking on a blip.
+        """
+        return self.ws_visibility(project_id, ws_owner=ws_owner) is True
 
 
 def ensure_project_attachable(
@@ -397,11 +428,12 @@ def ensure_project_attachable(
         project = storage.get_project(pid)
         if project is None:
             return (400, "unknown project_id")
-        if (project.get("visibility") or "private") != "private":
-            return None
-        if user_id and (
-            project.get("owner_id") == user_id or bool(storage.is_project_member(pid, user_id))
-        ):
+        # One tenancy rule, one place: reuse the visibility predicate's
+        # core (same-module private access; the fetched row is seeded
+        # into the memo so this costs no second get_project).
+        vis = WorkstreamProjectVisibility(user_id, storage=storage)
+        vis._projects[pid] = project
+        if vis._project_grants(project):
             return None
         return (403, "cannot attach a workstream to a private project you don't belong to")
     except Exception:

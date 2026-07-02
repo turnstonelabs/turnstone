@@ -330,8 +330,14 @@ def resolve_workstream_owner(
 
     When ``mgr`` is provided and the workstream is live in memory,
     trust its cached ``user_id`` / ``project_id`` instead of
-    round-tripping storage — keeps in-memory-only handlers functional
-    during transient DB outages and trims the hot-path by one query.
+    round-tripping storage for the ROW — but note the project gate
+    itself may still hit storage (one memoized ``get_project`` +
+    membership lookup when the row names a project), and it fails
+    CLOSED: during a transient DB outage a project-attached workstream
+    403s rather than risking a leak. That is a deliberate trade — a
+    DB outage already degrades sends/persistence, and failing open on
+    a private-tenancy check is the worse failure. Project-less
+    workstreams keep the zero-storage fast path.
 
     ``not_found_label`` is the message body the 404 carries — the
     interactive surface uses "Workstream not found"; coord uses

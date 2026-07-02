@@ -1578,12 +1578,137 @@ def _collector_scope_error(request: Request) -> JSONResponse | None:
     return None
 
 
+class _ClusterTenancyFilter:
+    """Per-connection/request private-project tenancy for cluster payloads.
+
+    Wraps a :class:`WorkstreamProjectVisibility` with the state the
+    cluster surfaces need: the snapshot carries full rows (project_id +
+    user_id) but follow-up SSE events are sparse (usually just ws_id),
+    so invisible workstreams are recorded in ``_hidden`` at
+    snapshot/ws_created time and every later event naming them is
+    swallowed. A row whose project lookup fails transiently lands in
+    ``_unresolved`` instead — suppressed but re-judged (rate-limited) on
+    its later events, so a DB blip neither leaks a private workstream
+    nor pins a public one invisible until reconnect. Access changes
+    (membership grant/revoke) still take effect on reconnect — same
+    resolve-once precedent as session construction. The visibility
+    instance memoizes project rows, so the steady-state per-event cost
+    is a set lookup.
+    """
+
+    _RETRY_INTERVAL_S = 5.0
+
+    def __init__(self, visibility: Any) -> None:
+        self._vis = visibility
+        # Bypass principals (service scope / admin.cluster.inspect) get
+        # the payload UNTOUCHED — no row drops, and crucially no
+        # overview recompute (their header should reflect the
+        # collector's own aggregates).
+        self._bypass = bool(getattr(visibility, "bypass", False))
+        self._hidden: set[str] = set()
+        # wid -> (project_id, ws_owner) awaiting a definitive verdict.
+        self._unresolved: dict[str, tuple[str, str]] = {}
+        self._retry_after: dict[str, float] = {}
+
+    @staticmethod
+    def _row_ws_id(ws: dict[str, Any]) -> str:
+        return str(ws.get("ws_id") or ws.get("id") or "")
+
+    def _judge(self, wid: str, project_id: str, ws_owner: str) -> bool:
+        """Tri-state check folded into the connection state.
+
+        Undetermined (storage blip) suppresses the row/event but leaves
+        it re-judgeable; definitive verdicts settle into shown/hidden.
+        """
+        verdict = self._vis.ws_visibility(project_id, ws_owner=ws_owner)
+        if verdict is None:
+            if wid:
+                self._unresolved[wid] = (project_id, ws_owner)
+                self._retry_after[wid] = time.monotonic() + self._RETRY_INTERVAL_S
+            return False
+        if wid:
+            self._unresolved.pop(wid, None)
+            self._retry_after.pop(wid, None)
+            if verdict:
+                self._hidden.discard(wid)
+            else:
+                self._hidden.add(wid)
+        return bool(verdict)
+
+    def filter_snapshot(self, snap: dict[str, Any]) -> dict[str, Any]:
+        """Drop invisible rows from every node list and re-derive the
+        overview aggregates the collector computed over the UNFILTERED
+        rows — otherwise the header count/state histogram leaks the
+        existence and lifecycle of hidden workstreams."""
+        if self._bypass:
+            return snap
+        total = 0
+        states: dict[str, int] = {}
+        for node in snap.get("nodes", []):
+            kept: list[dict[str, Any]] = []
+            for ws in node.get("workstreams", []):
+                wid = self._row_ws_id(ws)
+                if self._judge(wid, ws.get("project_id") or "", ws.get("user_id") or ""):
+                    kept.append(ws)
+                    state = str(ws.get("state") or "idle")
+                    states[state] = states.get(state, 0) + 1
+                    total += 1
+            node["workstreams"] = kept
+        overview = snap.get("overview")
+        if isinstance(overview, dict):
+            overview["workstreams"] = total
+            prior_states = overview.get("states")
+            if isinstance(prior_states, dict):
+                rebuilt = dict.fromkeys(prior_states, 0)
+                rebuilt.update(states)
+                overview["states"] = rebuilt
+        return snap
+
+    def event_visible(self, event: dict[str, Any]) -> bool:
+        if self._bypass:
+            return True
+        etype = event.get("type")
+        wid = str(event.get("ws_id") or "")
+        if etype == "ws_created":
+            return self._judge(wid, event.get("project_id") or "", event.get("user_id") or "")
+        if etype == "ws_closed" and wid:
+            was_suppressed = wid in self._hidden or wid in self._unresolved
+            self._hidden.discard(wid)
+            self._unresolved.pop(wid, None)
+            self._retry_after.pop(wid, None)
+            return not was_suppressed
+        if wid and wid in self._unresolved:
+            if time.monotonic() >= self._retry_after.get(wid, 0.0):
+                pid, owner = self._unresolved[wid]
+                return self._judge(wid, pid, owner)
+            return False
+        return not (wid and wid in self._hidden)
+
+    def event_touches_storage(self, event: dict[str, Any]) -> bool:
+        """True when judging this event may perform a project lookup —
+        the caller offloads those to the executor."""
+        if self._bypass:
+            return False
+        wid = str(event.get("ws_id") or "")
+        return event.get("type") == "ws_created" or wid in self._unresolved
+
+
 async def cluster_snapshot(request: Request) -> JSONResponse:
+    from turnstone.core.auth import WorkstreamProjectVisibility
+
     err = _collector_scope_error(request)
     if err is not None:
         return err
     collector: ClusterCollector = request.app.state.collector
-    return JSONResponse(collector.get_snapshot())
+    # Same tenancy treatment as the SSE snapshot and the cluster list —
+    # this endpoint served the raw collector state and was the one
+    # remaining unfiltered window into private-project workstreams.
+    tenancy = _ClusterTenancyFilter(WorkstreamProjectVisibility.for_request(request))
+
+    def _collect() -> dict[str, Any]:
+        return tenancy.filter_snapshot(collector.get_snapshot())
+
+    return JSONResponse(await asyncio.to_thread(_collect))
 
 
 async def cluster_events_sse(request: Request) -> Response:
@@ -1595,52 +1720,8 @@ async def cluster_events_sse(request: Request) -> Response:
     collector: ClusterCollector = request.app.state.collector
     client_queue: queue.Queue[dict[str, Any]] = queue.Queue(maxsize=2000)
 
-    # Per-connection private-project tenancy. The snapshot carries full
-    # rows (project_id + user_id); follow-up events are sparse (usually
-    # just ws_id), so invisible workstreams are recorded in ``hidden``
-    # at snapshot/ws_created time and every later event naming them is
-    # swallowed. Access changes (membership grant/revoke) take effect
-    # on reconnect — same resolve-once precedent as session
-    # construction. The visibility instance memoizes project rows, so
-    # the steady-state per-event cost is a set lookup.
-    visibility = WorkstreamProjectVisibility.for_request(request)
-    hidden: set[str] = set()
-
-    def _row_ws_id(ws: dict[str, Any]) -> str:
-        return str(ws.get("ws_id") or ws.get("id") or "")
-
-    def _filter_snapshot(snap: dict[str, Any]) -> dict[str, Any]:
-        for node in snap.get("nodes", []):
-            kept: list[dict[str, Any]] = []
-            for ws in node.get("workstreams", []):
-                if visibility.ws_visible(
-                    ws.get("project_id") or "", ws_owner=ws.get("user_id") or ""
-                ):
-                    kept.append(ws)
-                else:
-                    wid = _row_ws_id(ws)
-                    if wid:
-                        hidden.add(wid)
-            node["workstreams"] = kept
-        return snap
-
-    def _event_visible(event: dict[str, Any]) -> bool:
-        etype = event.get("type")
-        wid = str(event.get("ws_id") or "")
-        if etype == "ws_created":
-            if not visibility.ws_visible(
-                event.get("project_id") or "", ws_owner=event.get("user_id") or ""
-            ):
-                if wid:
-                    hidden.add(wid)
-                return False
-            hidden.discard(wid)
-            return True
-        if wid and wid in hidden:
-            if etype == "ws_closed":
-                hidden.discard(wid)
-            return False
-        return True
+    # Per-connection private-project tenancy — see _ClusterTenancyFilter.
+    tenancy = _ClusterTenancyFilter(WorkstreamProjectVisibility.for_request(request))
 
     async def event_generator() -> AsyncGenerator[dict[str, str], None]:
         loop = asyncio.get_running_loop()
@@ -1652,7 +1733,7 @@ async def cluster_events_sse(request: Request) -> Response:
             snap["type"] = "snapshot"
             # Executor: the snapshot filter resolves project rows from
             # storage — never block the event loop on DB I/O.
-            snap = await loop.run_in_executor(None, _filter_snapshot, snap)
+            snap = await loop.run_in_executor(None, tenancy.filter_snapshot, snap)
             yield {"data": json.dumps(snap)}
 
             while True:
@@ -1660,13 +1741,14 @@ async def cluster_events_sse(request: Request) -> Response:
                     event = await loop.run_in_executor(
                         None, functools.partial(client_queue.get, timeout=5)
                     )
-                    # Only ws_created can touch storage (project lookup);
-                    # every other event type is a pure set-membership
-                    # check and stays on the loop.
-                    if event.get("type") == "ws_created":
-                        visible = await loop.run_in_executor(None, _event_visible, event)
+                    # Judgments that may hit storage (ws_created, or a
+                    # retry of an unresolved row) run on the executor;
+                    # everything else is a pure set-membership check and
+                    # stays on the loop.
+                    if tenancy.event_touches_storage(event):
+                        visible = await loop.run_in_executor(None, tenancy.event_visible, event)
                     else:
-                        visible = _event_visible(event)
+                        visible = tenancy.event_visible(event)
                     if visible:
                         yield {"data": json.dumps(event)}
                 except queue.Empty:

@@ -318,6 +318,7 @@ def list_workstreams_with_history(
     kind: WorkstreamKind | str | None = None,
     user_id: str | None = None,
     state: str | None = None,
+    offset: int = 0,
 ) -> list[Any]:
     """List workstreams that have conversation messages.
 
@@ -342,6 +343,7 @@ def list_workstreams_with_history(
             kind=kind,
             user_id=user_id,
             state=state,
+            offset=offset,
         )
     except Exception:
         log.warning("Failed to list workstreams with history", exc_info=True)

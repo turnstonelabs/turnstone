@@ -593,9 +593,10 @@ class PostgreSQLBackend:
         kind: WorkstreamKind | str | None = None,
         user_id: str | None = None,
         state: str | None = None,
+        offset: int = 0,
     ) -> list[Any]:
         # See SQLite sibling for the rationale on the kind / user_id / state filters.
-        params: dict[str, Any] = {"limit": limit}
+        params: dict[str, Any] = {"limit": limit, "offset": max(0, offset)}
         kind_clause = ""
         user_clause = ""
         state_clause = ""
@@ -634,7 +635,7 @@ class PostgreSQLBackend:
                         f"{kind_clause}"
                         f"{user_clause}"
                         f"{state_clause}"
-                        "ORDER BY w.updated DESC LIMIT :limit"
+                        "ORDER BY w.updated DESC LIMIT :limit OFFSET :offset"
                     ),
                     params,
                 ).fetchall()
@@ -5216,31 +5217,37 @@ class PostgreSQLBackend:
                         first_ws[aid] = ws_id
             if not first_ws:
                 return []
-            meta_rows = conn.execute(
-                sa.select(
-                    workstream_attachments.c.attachment_id,
-                    workstream_attachments.c.filename,
-                    workstream_attachments.c.mime_type,
-                    workstream_attachments.c.size_bytes,
-                    workstream_attachments.c.kind,
-                    workstream_attachments.c.created,
-                ).where(workstream_attachments.c.attachment_id.in_(list(first_ws)))
-            ).fetchall()
-            meta = {r[0]: r for r in meta_rows}
+            # Chunk the IN() — a project can reference more distinct
+            # blobs than the driver's bind-parameter cap.
+            meta: dict[str, Any] = {}
+            ids = list(first_ws)
+            for i in range(0, len(ids), 500):
+                meta_rows = conn.execute(
+                    sa.select(
+                        workstream_attachments.c.attachment_id,
+                        workstream_attachments.c.filename,
+                        workstream_attachments.c.mime_type,
+                        workstream_attachments.c.size_bytes,
+                        workstream_attachments.c.kind,
+                        workstream_attachments.c.created,
+                    ).where(workstream_attachments.c.attachment_id.in_(ids[i : i + 500]))
+                ).fetchall()
+                for r in meta_rows:
+                    meta[r[0]] = r
             out: list[dict[str, Any]] = []
             for aid, ws_id in first_ws.items():
-                r = meta.get(aid)
-                if r is None:
+                m = meta.get(aid)
+                if m is None:
                     # Ref-list names a pruned blob (refcount GC) — skip.
                     continue
                 out.append(
                     {
-                        "attachment_id": r[0],
-                        "filename": r[1],
-                        "mime_type": r[2],
-                        "size_bytes": r[3],
-                        "kind": r[4],
-                        "created": r[5],
+                        "attachment_id": m[0],
+                        "filename": m[1],
+                        "mime_type": m[2],
+                        "size_bytes": m[3],
+                        "kind": m[4],
+                        "created": m[5],
                         "ws_id": ws_id,
                     }
                 )

@@ -2704,15 +2704,54 @@ async def _collect_saved_rows(
     """
     import asyncio
 
+    from turnstone.core.auth import WorkstreamProjectVisibility
     from turnstone.core.memory import list_workstreams_with_history
 
-    rows = await asyncio.to_thread(
-        list_workstreams_with_history,
-        limit=50,
-        kind=cfg.list_kind,
-        user_id=None,
-        state=cfg.saved_state_filter,
-    )
+    visibility = WorkstreamProjectVisibility.for_request(request)
+
+    def _fetch_visible_rows() -> list[Any]:
+        """Page through storage until 50 visible rows (or exhaustion).
+
+        The visibility filter runs post-SQL, so a plain LIMIT-then-filter
+        would silently shrink the window whenever recently-updated rows
+        belong to private projects the caller can't see — their own rows
+        at position 51+ would never surface. Paging with OFFSET restores
+        the 'top-50 most-recent VISIBLE' contract. Runs entirely in the
+        worker thread: both the query and the per-row project lookups
+        are storage I/O. Bounded at 20 pages (1000 rows scanned) as a
+        runaway guard; hitting it is logged, not silent.
+        """
+        visible: list[Any] = []
+        offset = 0
+        page = 50
+        max_pages = 20
+        for _ in range(max_pages):
+            batch = list_workstreams_with_history(
+                limit=page,
+                kind=cfg.list_kind,
+                user_id=None,
+                state=cfg.saved_state_filter,
+                offset=offset,
+            )
+            for row in batch:
+                # project_id / owner are the SELECT tail — see the column
+                # order comment below.
+                if visibility.ws_visible(row[15], ws_owner=row[16] or ""):
+                    visible.append(row)
+                    if len(visible) >= 50:
+                        return visible
+            if len(batch) < page:
+                return visible
+            offset += page
+        log.info(
+            "ws.saved.visibility_scan_capped kind=%s scanned=%d visible=%d",
+            cfg.list_kind,
+            max_pages * page,
+            len(visible),
+        )
+        return visible
+
+    rows = await asyncio.to_thread(_fetch_visible_rows)
 
     # Coord-only: exclude ws_ids currently in the warm pool.
     loaded: set[str] = set()
@@ -2739,10 +2778,6 @@ async def _collect_saved_rows(
     # aliases absent from model_definitions (e.g. config.toml-only
     # models), so context_ratio degrades to 0.0 there rather than
     # reporting a bogus occupancy.
-    from turnstone.core.auth import WorkstreamProjectVisibility
-
-    visibility = WorkstreamProjectVisibility.for_request(request)
-
     result: list[dict[str, Any]] = []
     for row in rows:
         (
@@ -2765,10 +2800,6 @@ async def _collect_saved_rows(
             owner,
         ) = row
         if wid in loaded:
-            continue
-        # Private-project tenancy: rows the requester may not see are
-        # dropped server-side, not hidden client-side.
-        if not visibility.ws_visible(project_id, ws_owner=owner or ""):
             continue
         ctx_tokens = context_tokens or 0
         context_ratio = (
