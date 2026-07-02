@@ -128,6 +128,18 @@ NUDGE_COMPACTION_RESUME = (
     "conversation. If the task is already complete, give your final answer."
 )
 
+# Variant for sessions whose persona hides the recall tool (empty/hard
+# visibility sets): same resume instruction, no pointer at a tool that isn't
+# on the wire — mirrors the compaction summary's own recall-pointer gating.
+NUDGE_COMPACTION_RESUME_NO_RECALL = (
+    "The conversation was just compacted to free context. If there is remaining "
+    "work, continue from the summary above — pick up the open tasks and next "
+    "steps you recorded and keep going without waiting for further instructions. "
+    "The summary is a digest, not the record: the full transcript remains in "
+    "stored conversation history. If the task is already complete, give your "
+    "final answer."
+)
+
 _NUDGE_MAP: dict[str, str] = {
     "correction": NUDGE_CORRECTION,
     "denial": NUDGE_DENIAL,

@@ -11850,22 +11850,35 @@ def _parse_persona_body(body: dict[str, Any]) -> tuple[dict[str, Any] | None, JS
                 status_code=400,
             )
         fields["tool_allowlist"] = tools
-    if "applies_to_kinds" in body:
+    if "applies_to_kinds" in body and body.get("applies_to_kinds") is not None:
         kinds = body.get("applies_to_kinds")
         if not isinstance(kinds, list) or not all(isinstance(k, str) for k in kinds):
             return None, JSONResponse(
                 {"error": "applies_to_kinds must be a list of kinds"}, status_code=400
             )
         fields["applies_to_kinds"] = kinds
+    # Explicit JSON null on a flag means "leave unchanged" (the
+    # UpdatePersonaRequest schema types every flag as boolean|null) —
+    # coercing null with bool() would silently archive a persona as a side
+    # effect of an unrelated PATCH.
     for flag in ("mcp_enabled", "memory_enabled", "is_default", "enabled"):
-        if flag in body:
+        if flag in body and body.get(flag) is not None:
             fields[flag] = bool(body.get(flag))
     return fields, None
 
 
 async def admin_list_personas(request: Request) -> JSONResponse:
-    """GET /v1/api/admin/personas — all personas, archived included."""
+    """GET /v1/api/admin/personas — all personas, archived included.
+
+    Also carries ``tool_inventory``: the per-kind builtin tool names (plus
+    the synthetic ``tool_search``) so the shelf's visibility checklist is
+    derived from the server's authoritative sets instead of a hand-mirrored
+    JS constant that drifts every time a tool ships.
+    """
+    import asyncio
+
     from turnstone.core.auth import require_permission
+    from turnstone.core.tools import COORDINATOR_TOOLS, INTERACTIVE_TOOLS
     from turnstone.core.web_helpers import require_storage_or_503
 
     storage, err = require_storage_or_503(request)
@@ -11875,7 +11888,21 @@ async def admin_list_personas(request: Request) -> JSONResponse:
     if err:
         return err
 
-    return JSONResponse({"personas": storage.list_personas(include_disabled=True)})
+    def _names(tools: list[dict[str, Any]]) -> list[str]:
+        # ``tool_search`` is synthetic (not a builtin) but listed because its
+        # membership decides whether a visibility set is soft or hard.
+        return sorted({t["function"]["name"] for t in tools} | {"tool_search"})
+
+    personas = await asyncio.to_thread(storage.list_personas, include_disabled=True)
+    return JSONResponse(
+        {
+            "personas": personas,
+            "tool_inventory": {
+                "interactive": _names(INTERACTIVE_TOOLS),
+                "coordinator": _names(COORDINATOR_TOOLS),
+            },
+        }
+    )
 
 
 async def admin_create_persona(request: Request) -> JSONResponse:
@@ -11918,8 +11945,10 @@ async def admin_create_persona(request: Request) -> JSONResponse:
             "created_by": audit_uid,
         }
     )
+    import asyncio
+
     try:
-        storage.create_persona(fields)
+        await asyncio.to_thread(storage.create_persona, fields)
     except ValueError as exc:
         return JSONResponse({"error": str(exc)}, status_code=400)
 
@@ -11933,7 +11962,7 @@ async def admin_create_persona(request: Request) -> JSONResponse:
         ip,
     )
 
-    return JSONResponse(storage.get_persona(persona_id) or {})
+    return JSONResponse(await asyncio.to_thread(storage.get_persona, persona_id) or {})
 
 
 async def admin_get_persona(request: Request) -> JSONResponse:
@@ -11948,7 +11977,9 @@ async def admin_get_persona(request: Request) -> JSONResponse:
     if err:
         return err
 
-    persona = storage.get_persona(request.path_params["persona_id"])
+    import asyncio
+
+    persona = await asyncio.to_thread(storage.get_persona, request.path_params["persona_id"])
     if persona is None:
         return JSONResponse({"error": "Persona not found"}, status_code=404)
     return JSONResponse(persona)
@@ -11971,8 +12002,11 @@ async def admin_update_persona(request: Request) -> JSONResponse:
     if err:
         return err
 
+    import asyncio
+    import functools
+
     persona_id = request.path_params["persona_id"]
-    existing = storage.get_persona(persona_id)
+    existing = await asyncio.to_thread(storage.get_persona, persona_id)
     if existing is None:
         return JSONResponse({"error": "Persona not found"}, status_code=404)
 
@@ -11987,7 +12021,7 @@ async def admin_update_persona(request: Request) -> JSONResponse:
         return JSONResponse({"error": "no editable fields in body"}, status_code=400)
 
     try:
-        storage.update_persona(persona_id, **fields)
+        await asyncio.to_thread(functools.partial(storage.update_persona, persona_id, **fields))
     except ValueError as exc:
         # Storage-enforced invariants: default not archivable / must stay
         # single-kind / can't unset is_default directly / kinds validation.
@@ -12004,7 +12038,7 @@ async def admin_update_persona(request: Request) -> JSONResponse:
         ip,
     )
 
-    return JSONResponse(storage.get_persona(persona_id) or {})
+    return JSONResponse(await asyncio.to_thread(storage.get_persona, persona_id) or {})
 
 
 # ---------------------------------------------------------------------------

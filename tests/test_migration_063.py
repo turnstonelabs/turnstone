@@ -145,6 +145,64 @@ class TestMigration063:
         finally:
             engine.dispose()
 
+    def test_converts_legacy_creative_workstreams_to_writer(self, tmp_path: Path) -> None:
+        db_path = tmp_path / "063-creative.db"
+        cfg = _alembic_cfg(db_path)
+        command.upgrade(cfg, "062")
+
+        engine = sa.create_engine(f"sqlite:///{db_path}")
+        try:
+            with engine.begin() as conn:
+                for ws_id, mode in (("ws-creative", "True"), ("ws-plain", "False")):
+                    conn.execute(
+                        sa.text(
+                            "INSERT INTO workstreams (ws_id, name, state, created, updated) "
+                            "VALUES (:ws, :ws, 'closed', '2026-01-01T00:00:00', "
+                            "'2026-01-01T00:00:00')"
+                        ),
+                        {"ws": ws_id},
+                    )
+                    conn.execute(
+                        sa.text(
+                            "INSERT INTO workstream_config (ws_id, key, value) "
+                            "VALUES (:ws, 'creative_mode', :mode)"
+                        ),
+                        {"ws": ws_id, "mode": mode},
+                    )
+
+            command.upgrade(cfg, "063")
+
+            with engine.connect() as conn:
+                stamped = {
+                    str(r[0]): str(r[1])
+                    for r in conn.execute(
+                        sa.text(
+                            "SELECT ws_id, value FROM workstream_config WHERE key='persona'"
+                        )
+                    ).fetchall()
+                }
+                cols = conn.execute(
+                    sa.text(
+                        "SELECT key, value FROM workstream_config "
+                        "WHERE ws_id='ws-creative' AND key LIKE 'persona%'"
+                    )
+                ).fetchall()
+                row_persona = conn.execute(
+                    sa.text("SELECT persona FROM workstreams WHERE ws_id='ws-creative'")
+                ).fetchone()
+            # creative_mode='True' → the full writer stamp (all five keys)…
+            assert stamped == {"ws-creative": "writer"}
+            keys = {str(k): str(v) for k, v in cols}
+            assert keys["persona_tools"] == "[]"
+            assert keys["persona_mcp"] == "0"
+            assert keys["persona_memory"] == "1"
+            assert "creative writing partner" in keys["persona_prompt"]
+            assert row_persona is not None and row_persona[0] == "writer"
+            # …while creative_mode='False' workstreams stay legacy-unstamped.
+            assert "ws-plain" not in stamped
+        finally:
+            engine.dispose()
+
     def test_downgrade_reverses_everything(self, tmp_path: Path) -> None:
         db_path = tmp_path / "063-down.db"
         cfg = _alembic_cfg(db_path)

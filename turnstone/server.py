@@ -2982,7 +2982,9 @@ async def list_personas_endpoint(request: Request) -> JSONResponse:
     if uerr:
         return uerr
     storage = get_storage()
-    rows = storage.list_personas() if storage else []
+    # Off the event loop: the picker feed runs on every page load, and a
+    # slow storage round-trip here would stall all in-flight SSE streams.
+    rows = await asyncio.to_thread(storage.list_personas) if storage else []
     personas = [
         {
             "name": r["name"],
@@ -4980,6 +4982,23 @@ def main() -> None:
     interactive_adapter.attach(manager)
     WebUI._workstream_mgr = manager
 
+    def _resume_persona_kwargs(target_ws_id: str) -> dict[str, Any]:
+        """Pre-read a resume target's persona stamp for ``manager.create``.
+
+        The create-then-resume paths below construct the session BEFORE
+        ``resume()`` runs, and the persona MCP gate is construction-time
+        only — without this, restoring an MCP-off workstream would merge
+        the live MCP catalog back in.  A corrupt stamp raises (ValueError),
+        matching the rehydrate contract; no stamp = legacy, no kwargs.
+        """
+        from turnstone.core.memory import load_workstream_config
+        from turnstone.core.personas import snapshot_from_config
+
+        snap = snapshot_from_config(load_workstream_config(target_ws_id) or {})
+        if snap is None:
+            return {}
+        return {"persona": snap.name, "persona_snapshot": snap}
+
     def _watch_restore_fn(ws_id: str) -> Any:
         """Restore an evicted workstream so a watch can deliver results.
 
@@ -4989,7 +5008,9 @@ def main() -> None:
         :class:`NudgeQueue` without a second pass through ``restore_fn``.
         """
         try:
-            ws = manager.create(user_id="", name="watch-restore")
+            ws = manager.create(
+                user_id="", name="watch-restore", **_resume_persona_kwargs(ws_id)
+            )
             # Restored workstreams run unattended — auto-approve tool calls
             # to avoid blocking forever on approval with no connected user.
             if isinstance(ws.ui, WebUI):
@@ -5000,6 +5021,11 @@ def main() -> None:
                 return _watch_runner.get_dispatch_fn(ws.session._ws_id)
         except RuntimeError:
             log.warning("watch_restore: cannot restore ws %s (all slots active)", ws_id)
+        except ValueError:
+            # Corrupt persona stamp — refuse to run the watch under an
+            # envelope the operator didn't choose (it would be unattended
+            # AND auto-approved); the watch stays queued for a manual open.
+            log.warning("watch_restore: corrupt persona stamp on ws %s", ws_id, exc_info=True)
         return None
 
     _watch_runner = WatchRunner(
@@ -5020,7 +5046,7 @@ def main() -> None:
         if not target_id:
             log.error("Workstream not found: %s", args.resume)
             sys.exit(1)
-        ws = manager.create(user_id="", name="resumed")
+        ws = manager.create(user_id="", name="resumed", **_resume_persona_kwargs(target_id))
         if not isinstance(ws.ui, WebUI):
             raise TypeError(f"Expected WebUI, got {type(ws.ui).__name__}")
         if args.skip_permissions or config_store.get("tools.skip_permissions"):

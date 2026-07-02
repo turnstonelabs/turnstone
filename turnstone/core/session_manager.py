@@ -665,20 +665,24 @@ class SessionManager:
                     )
                     saved_alias = None
 
-                # Persona snapshot rides the same pre-construction lane as
-                # the saved alias: the constructor applies the four levers
-                # (tool merge, MCP gate, composition) inside __init__, so
-                # the stamp must land as a kwarg — resume() is too late.
-                # A corrupt/partial stamp raises here (loud construction
-                # error), never silently reverting to a default envelope.
-                # No stamp = legacy pre-persona workstream: the kwarg is
-                # omitted entirely so factories that predate it keep working.
-                persona_snapshot = snapshot_from_config(saved_cfg or {})
-                extra_build_kwargs: dict[str, Any] = {}
-                if persona_snapshot is not None:
-                    extra_build_kwargs["persona_snapshot"] = persona_snapshot
-
                 try:
+                    # Persona snapshot rides the same pre-construction lane as
+                    # the saved alias: the constructor applies the four levers
+                    # (tool merge, MCP gate, composition) inside __init__, so
+                    # the stamp must land as a kwarg — resume() is too late.
+                    # A corrupt/partial stamp raises here (loud construction
+                    # error), never silently reverting to a default envelope.
+                    # No stamp = legacy pre-persona workstream: the kwarg is
+                    # omitted entirely so factories that predate it keep
+                    # working.  Inside the unwind bracket: a parse raise must
+                    # release the placeholder slot exactly like a
+                    # build_session failure, or the ws_id stays tracked
+                    # forever (pinning a max_active slot and turning every
+                    # later open() into the already-tracked RuntimeError).
+                    persona_snapshot = snapshot_from_config(saved_cfg or {})
+                    extra_build_kwargs: dict[str, Any] = {}
+                    if persona_snapshot is not None:
+                        extra_build_kwargs["persona_snapshot"] = persona_snapshot
                     ws.session = self._adapter.build_session(
                         ws, model=saved_alias, **extra_build_kwargs
                     )

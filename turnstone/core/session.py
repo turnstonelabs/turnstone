@@ -106,6 +106,7 @@ from turnstone.core.memory_relevance import (
 from turnstone.core.metacognition import (
     MEMORY_NUDGE_TYPES,
     NUDGE_COMPACTION_RESUME,
+    NUDGE_COMPACTION_RESUME_NO_RECALL,
     RepeatDetector,
     detect_completion,
     detect_correction,
@@ -1527,8 +1528,16 @@ class ChatSession:
             # the provider-native defer_loading mode where there is no
             # synthetic tool name to filter out.
             pass
-        elif tool_search == "on" or (
-            tool_search == "auto" and len(self._tools) > tool_search_threshold
+        elif (
+            # A persona visibility set that DOES include ``tool_search`` is
+            # a soft set: the author explicitly granted discovery, so the
+            # manager is constructed regardless of the global setting or the
+            # catalog-size threshold — otherwise the authored escape hatch
+            # silently degrades to a hard set on small/tool_search=off
+            # deployments.
+            self._persona_tools is not None
+            or tool_search == "on"
+            or (tool_search == "auto" and len(self._tools) > tool_search_threshold)
         ):
             # always_on_names is the set of builtin tools present in
             # *this* session — kind-aware, so coordinator sessions never
@@ -2496,8 +2505,15 @@ class ChatSession:
             # Hard persona set — the pathway stays disabled across MCP
             # catalog refreshes too (mirrors the constructor gate).
             self._tool_search = None
-        elif self._tool_search_setting == "on" or (
-            self._tool_search_setting == "auto" and len(self._tools) > self._tool_search_threshold
+        elif (
+            # Soft persona set — the authored escape hatch stays live
+            # regardless of the global setting (mirrors the constructor).
+            self._persona_tools is not None
+            or self._tool_search_setting == "on"
+            or (
+                self._tool_search_setting == "auto"
+                and len(self._tools) > self._tool_search_threshold
+            )
         ):
             self._tool_search = ToolSearchManager(
                 self._tools,
@@ -3066,6 +3082,11 @@ class ChatSession:
             self._persona_tools = snap.tools if snap else None
             self._persona_mcp = snap.mcp if snap else True
             self._persona_memory = snap.memory if snap else True
+            # Re-gate tool search under the adopted stamp: a hard set must
+            # drop the ToolSearchManager (else the recomposed prompt keeps
+            # the tool_search hint and the expanded-names escape hatch keeps
+            # since-discovered tools visible), and a soft set must gain one.
+            self._rebuild_tool_search()
         if config:
             # Restore model via registry (same path as /model command)
             saved_alias = config.get("model_alias", "")
@@ -3218,13 +3239,14 @@ class ChatSession:
         """Config gate + persona lever 4 for metacognitive nudges.
 
         Memory-directed nudge types (``MEMORY_NUDGE_TYPES``) are suppressed
-        when the persona's memory is off — their copy directs the model at
-        the memory tool the persona hides.  Behavioural nudges (repeat,
+        whenever the persona's envelope hides the memory tool — the lever
+        being off OR a visibility set that omits ``memory`` — because their
+        copy directs the model at that tool.  Behavioural nudges (repeat,
         compaction, idle children, watches) stay on the config gate only.
         """
         if not self._mem_cfg.nudges:
             return False
-        return self._persona_memory or nudge_type not in MEMORY_NUDGE_TYPES
+        return nudge_type not in MEMORY_NUDGE_TYPES or self._persona_tool_visible("memory")
 
     def _init_system_messages(self) -> None:
         """Build the system/developer prefix messages.
@@ -4415,7 +4437,7 @@ class ChatSession:
         if name in self._persona_tools:
             return True
         ts = self._tool_search
-        return ts is not None and name in ts.get_expanded_names()
+        return ts is not None and ts.is_expanded(name)
 
     def _apply_persona_visibility(self, tools: list[dict[str, Any]]) -> list[dict[str, Any]]:
         """Filter a tool-definition list to the persona's visible set."""
@@ -5426,7 +5448,9 @@ class ChatSession:
                             # from).  The prompt lets a genuinely-finished model
                             # give its final answer and stop.
                             self._append_user_turn(
-                                NUDGE_COMPACTION_RESUME,
+                                NUDGE_COMPACTION_RESUME
+                                if self._persona_tool_visible("recall")
+                                else NUDGE_COMPACTION_RESUME_NO_RECALL,
                                 (),
                                 source="compaction_resume",
                             )
@@ -10177,27 +10201,23 @@ class ChatSession:
 
         Returns an error string (empty = valid).  Children are always
         ``kind=interactive`` — see ``CoordinatorClient.spawn``.  The
-        receiving node's create handler re-resolves and stamps; this gate
+        receiving node's create handler re-resolves through the SAME
+        shared rule (``resolve_persona_for_kind``) and stamps; this gate
         just turns an inevitable HTTP 400 into a clean tool error the
         model can react to.  Best-effort: a storage blip defers the
         verdict to the create handler rather than blocking the spawn.
         """
+        from turnstone.core.personas import resolve_persona_for_kind
+
         try:
             storage = get_storage()
             if storage is None:
                 return ""
-            row = storage.get_persona_by_name(persona)
+            _row, err = resolve_persona_for_kind(storage, persona, "interactive")
         except Exception:
             log.debug("spawn.persona_precheck_failed persona=%s", persona, exc_info=True)
             return ""
-        if not row or not row.get("enabled", False):
-            return f"unknown or disabled persona: {persona!r}"
-        if "interactive" not in (row.get("applies_to_kinds") or []):
-            return (
-                f"persona {persona!r} does not apply to interactive workstreams "
-                "(spawned children are always interactive)"
-            )
-        return ""
+        return err
 
     def _exec_spawn_workstream(self, item: dict[str, Any]) -> tuple[str, str]:
         call_id = item["call_id"]
@@ -10289,6 +10309,9 @@ class ChatSession:
         # poison the other approved spawns.
         normalised: list[dict[str, Any]] = []
         preview_rows: list[str] = []
+        # Persona prechecks hit storage; a fan-out batch usually repeats one
+        # persona across all children, so memoize per prepare call.
+        persona_verdicts: dict[str, str] = {}
         for idx, raw in enumerate(raw_children):
             if not isinstance(raw, dict):
                 normalised.append({"idx": idx, "_error": "child spec must be an object"})
@@ -10313,9 +10336,10 @@ class ChatSession:
                 # Same prep-time gate as spawn_workstream, but surfaced as
                 # a per-row denial (partial-success semantics) rather than
                 # failing the whole batch.
-                persona_err = self._validate_child_persona(persona)
-                if persona_err:
-                    spec["_error"] = persona_err
+                if persona not in persona_verdicts:
+                    persona_verdicts[persona] = self._validate_child_persona(persona)
+                if persona_verdicts[persona]:
+                    spec["_error"] = persona_verdicts[persona]
             normalised.append(spec)
             if spec.get("_error"):
                 preview_rows.append(f"  {idx}. [invalid — {spec['_error']}]")
@@ -15278,7 +15302,14 @@ class ChatSession:
             self._envelope_nonce = fence.mint_nonce()
             self._sender_label_nonce = fence.mint_nonce()
             self._title_generated = False
-            register_workstream(self._ws_id, node_id=self._node_id)
+            # The session keeps its persona across /new (the stamp is
+            # re-written by _save_config below) — carry the display slug
+            # onto the fresh row so projections agree with the config.
+            register_workstream(
+                self._ws_id,
+                node_id=self._node_id,
+                persona=self._persona_name or None,
+            )
             self._save_config()
             self.ui.on_info("New workstream started.")
 
@@ -15288,7 +15319,9 @@ class ChatSession:
                 self.ui.on_info("No saved workstreams.")
             else:
                 lines = ["Workstreams:\n"]
-                for wid, alias, title, _created, updated, count, *_extra in rows:
+                # Column order from the storage SELECT: ws_id, alias, title,
+                # name, created, updated, message_count, … (tail ignored).
+                for wid, alias, title, _name, _created, updated, count, *_extra in rows:
                     display_name = alias or wid
                     display_title = f"  {title}" if title else ""
                     marker = " *" if wid == self._ws_id else "  "

@@ -2931,11 +2931,13 @@ function confirmDeleteProject(pid, name) {
 let _adminPersonas = [];
 let _personaShelfWired = false;
 
-// Builtin tool inventories per kind, for the visibility checklist.  Mirrored
-// from turnstone/core/tools.py (INTERACTIVE_TOOLS / COORDINATOR_TOOLS) — keep
-// in sync when a tool is added; unknown/dynamic names ride the free-text row.
-// "tool_search" is synthetic (not a builtin) but listed because its presence
-// decides whether a visibility set is soft (expandable) or hard.
+// FALLBACK builtin tool inventories per kind, for the visibility checklist.
+// The authoritative sets ride the GET /v1/api/admin/personas response
+// (tool_inventory, derived server-side from core/tools.py) and are cached in
+// _personaToolInventory; this constant only covers the render-before-load
+// window.  "tool_search" is synthetic (not a builtin) but listed because its
+// presence decides whether a visibility set is soft (expandable) or hard.
+let _personaToolInventory = null; // {interactive: [...], coordinator: [...]}
 const _PERSONA_TOOLS = {
   interactive: [
     "bash",
@@ -2984,6 +2986,7 @@ function loadAdminPersonas() {
     })
     .then(function (data) {
       _adminPersonas = data.personas || [];
+      if (data.tool_inventory) _personaToolInventory = data.tool_inventory;
       _renderPersonas(_adminPersonas);
     })
     .catch(function () {
@@ -3168,7 +3171,8 @@ function _personaToolsModeChanged() {
 function _renderPersonaToolChecklist(checked) {
   const kind = document.getElementById("pr-kinds").value || "interactive";
   const host = document.getElementById("pr-tools-checklist");
-  const names = _PERSONA_TOOLS[kind] || [];
+  const inventory = _personaToolInventory || _PERSONA_TOOLS;
+  const names = inventory[kind] || [];
   host.replaceChildren();
   names.forEach(function (name) {
     const label = document.createElement("label");
@@ -3225,7 +3229,7 @@ function _personaFillToolsForm(allowlist) {
   } else {
     modeSel.value = "list";
     const kind = document.getElementById("pr-kinds").value || "interactive";
-    const known = _PERSONA_TOOLS[kind] || [];
+    const known = (_personaToolInventory || _PERSONA_TOOLS)[kind] || [];
     _renderPersonaToolChecklist(allowlist);
     extra.value = allowlist
       .filter(function (n) {
@@ -3293,7 +3297,8 @@ function submitPersonaShelf() {
   if (!editing && !name) return _showModalError(errEl, "Name is required");
 
   const prompt = document.getElementById("pr-base-prompt").value;
-  const wasDefault = editing && !!(_personaById(pid) || {}).is_default;
+  const original = editing ? _personaById(pid) || {} : {};
+  const wasDefault = editing && !!original.is_default;
   const body = {
     display_name: (
       document.getElementById("pr-display-name").value || ""
@@ -3313,9 +3318,20 @@ function submitPersonaShelf() {
   // when it's actually turning ON.
   if (wantDefault && !wasDefault) body.is_default = true;
   if (!editing) body.name = name;
-  if (editing && wasDefault) {
-    // Storage forbids changing a default persona's kinds — don't send it.
-    delete body.applies_to_kinds;
+  if (editing) {
+    const originalKinds = original.applies_to_kinds || [];
+    if (wasDefault) {
+      // Storage forbids changing a default persona's kinds — don't send it.
+      delete body.applies_to_kinds;
+    } else if (
+      originalKinds.length !== 1 &&
+      body.applies_to_kinds[0] === originalKinds[0]
+    ) {
+      // The single-value select can only show one kind; on a multi-kind
+      // persona an unrelated edit must not silently strip the others.
+      // Send kinds only when the operator actually changed the selection.
+      delete body.applies_to_kinds;
+    }
   }
 
   errEl.classList.remove("is-visible");

@@ -2493,32 +2493,51 @@ def make_create_handler(
             body_persona = (
                 body_persona_raw.strip() if isinstance(body_persona_raw, str) else ""
             )
-            persona_row: dict[str, Any] | None = None
-            if not (isinstance(resume_ws_id_raw, str) and resume_ws_id_raw):
+            persona_snapshot = None
+            if isinstance(resume_ws_id_raw, str) and resume_ws_id_raw:
+                # Fork-resume adopts the SOURCE workstream's stamp, resolved
+                # pre-construction so all four levers (including the
+                # construction-time MCP gate) apply to the fork.  The four
+                # levers a fork runs under must be the ones its conversation
+                # was authored under — never a fresh default.  A corrupt
+                # stamp is a loud 400, mirroring the rehydrate contract; an
+                # unstamped (legacy) source forks unstamped.
+                from turnstone.core.memory import resolve_workstream
+                from turnstone.core.personas import snapshot_from_config
                 from turnstone.core.storage._registry import get_storage as _get_storage
 
+                _st = _get_storage()
+                resume_target = await asyncio.to_thread(resolve_workstream, resume_ws_id_raw)
+                if _st is not None and resume_target:
+                    try:
+                        persona_snapshot = snapshot_from_config(
+                            await asyncio.to_thread(
+                                _st.load_workstream_config, resume_target
+                            )
+                            or {}
+                        )
+                    except ValueError as exc:
+                        return JSONResponse(
+                            {"error": f"cannot fork {resume_ws_id_raw}: {exc}"},
+                            status_code=400,
+                        )
+            else:
+                from turnstone.core.personas import (
+                    resolve_persona_for_kind,
+                    snapshot_from_persona,
+                )
+                from turnstone.core.storage._registry import get_storage as _get_storage
+
+                persona_row: dict[str, Any] | None = None
                 if body_persona:
                     _st = _get_storage()
                     if _st is None:
                         return JSONResponse({"error": "storage unavailable"}, status_code=503)
-                    persona_row = await asyncio.to_thread(
-                        _st.get_persona_by_name, body_persona
+                    persona_row, persona_err = await asyncio.to_thread(
+                        resolve_persona_for_kind, _st, body_persona, mgr.kind.value
                     )
-                    if not persona_row or not persona_row.get("enabled", False):
-                        return JSONResponse(
-                            {"error": f"Persona not found or disabled: {body_persona}"},
-                            status_code=400,
-                        )
-                    if mgr.kind.value not in (persona_row.get("applies_to_kinds") or []):
-                        return JSONResponse(
-                            {
-                                "error": (
-                                    f"Persona {body_persona!r} does not apply to "
-                                    f"kind {mgr.kind.value!r}"
-                                )
-                            },
-                            status_code=400,
-                        )
+                    if persona_err:
+                        return JSONResponse({"error": persona_err}, status_code=400)
                 else:
                     # Default-persona lookup is best-effort: a storage blip
                     # here degrades to an unstamped (legacy) create, which
@@ -2533,18 +2552,18 @@ def make_create_handler(
                     except Exception:
                         log.debug("ws.create.default_persona_lookup_failed", exc_info=True)
                         persona_row = None
+                if persona_row is not None:
+                    persona_snapshot = snapshot_from_persona(persona_row)
 
             kwargs = cfg.create_build_kwargs(
                 request, body, uid, skill_data, skill_id_resolved, applied_skill_version
             )
-            if persona_row is not None:
-                from turnstone.core.personas import snapshot_from_persona
-
+            if persona_snapshot is not None:
                 # ``persona`` is SessionManager.create's explicit param
                 # (Workstream attr + workstreams row); the snapshot rides
                 # **extra_session_kwargs into the session factory.
-                kwargs["persona"] = persona_row["name"]
-                kwargs["persona_snapshot"] = snapshot_from_persona(persona_row)
+                kwargs["persona"] = persona_snapshot.name
+                kwargs["persona_snapshot"] = persona_snapshot
             # Deferred emit — committed below post-attachment-
             # validation. See handler docstring's Ordering invariants.
             ws = await asyncio.to_thread(mgr.create, defer_emit_created=True, **kwargs)

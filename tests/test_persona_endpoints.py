@@ -174,6 +174,39 @@ class TestRouteContracts:
         assert resp.status_code == 400
         assert "archived" in resp.json()["error"]
 
+    def test_patch_null_flags_leave_persona_unchanged(self, tmp_db: Any, seeded: str) -> None:
+        # Clients built from UpdatePersonaRequest (every flag boolean|null)
+        # serialize unset fields as explicit null — a rename must not archive
+        # the persona or flip its levers as a side effect.
+        c = _client(tmp_db, _ALL)
+        resp = c.patch(
+            "/v1/api/admin/personas/" + seeded,
+            json={
+                "display_name": "Renamed",
+                "enabled": None,
+                "mcp_enabled": None,
+                "memory_enabled": None,
+                "is_default": None,
+                "applies_to_kinds": None,
+            },
+        )
+        assert resp.status_code == 200
+        row = resp.json()
+        assert row["display_name"] == "Renamed"
+        assert row["enabled"] is True  # NOT archived by the null
+        assert row["mcp_enabled"] is False  # seeded value preserved
+        assert row["applies_to_kinds"] == ["interactive"]
+
+    def test_list_carries_tool_inventory(self, tmp_db: Any, seeded: str) -> None:
+        c = _client(tmp_db, _ALL)
+        inv = c.get("/v1/api/admin/personas").json()["tool_inventory"]
+        assert "read_file" in inv["interactive"]
+        assert "spawn_workstream" in inv["coordinator"]
+        # tool_search is synthetic but listed — its membership decides
+        # whether an authored set is soft or hard.
+        assert "tool_search" in inv["interactive"]
+        assert "tool_search" in inv["coordinator"]
+
     def test_missing_persona_is_404(self, tmp_db: Any) -> None:
         c = _client(tmp_db, _ALL)
         assert c.get("/v1/api/admin/personas/nope").status_code == 404

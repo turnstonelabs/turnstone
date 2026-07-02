@@ -182,28 +182,28 @@ def test_rail_seam_exposed_and_bottom_bar_retired() -> None:
     assert "cluster-status-bar" not in index, "the #cluster-status-bar markup must be deleted"
 
 
-def test_rail_conveys_state_and_persona() -> None:
+def test_rail_conveys_state_and_kind() -> None:
     """rail.js conveys state by shape+colour via the shared ui-base .ui-glyph-*
     vocabulary (not a private glyph class), nests children via the shared bucket
-    helper, and tags sessions by persona (COORD/INT)."""
+    helper, and tags sessions by KIND (COORD/INT)."""
     body = _RAIL_JS.read_text(encoding="utf-8")
     assert "ui-glyph-" in body, "rail must use ui-base .ui-glyph-* for state (shape+colour)"
     assert "bucketByParent" in body, "rail must nest children via the shared bucket helper"
-    assert "COORD" in body and "INT" in body, "rail must tag sessions by persona"
+    assert "COORD" in body and "INT" in body, "rail must tag sessions by kind"
 
 
-def test_console_launcher_routes_by_persona() -> None:
-    """Step 2b: the dashboard launcher carries a persona kind, scope-gates the
-    interactive option, branches submit + create by kind (coordinator =
+def test_console_launcher_routes_by_kind() -> None:
+    """Step 2b: the dashboard launcher carries a workstream kind, scope-gates
+    the interactive option, branches submit + create by kind (coordinator =
     console-local, interactive = node-proxy), routes saved activation to the
     node for interactive rows, and the active-coordinators home table is gone
     (the rail covers it).  Pins the console-JS convention for the new logic."""
     app = _CONSOLE_APP.read_text(encoding="utf-8")
     assert "function _setLauncherKind" in app and "_launcherKind" in app
     assert "function _hasInteractivePermission" in app, (
-        "launcher must scope-gate the interactive persona"
+        "launcher must scope-gate the interactive kind"
     )
-    assert 'kind === "interactive"' in app, "submitHomeCoord must branch by persona kind"
+    assert 'kind === "interactive"' in app, "submitHomeCoord must branch by kind"
     assert "function _createInteractive" in app, "the interactive create path must exist"
     assert '"/v1/api/cluster/workstreams/new"' in app, (
         "interactive create must use the node-proxy endpoint"
@@ -217,11 +217,16 @@ def test_console_launcher_routes_by_persona() -> None:
     assert 'id="active-coordinators"' not in index, (
         "the active-coordinators table must be removed (the rail covers it)"
     )
-    assert 'id="launcher-personas"' in index, "the persona toggle must be in the launcher panel"
+    # "personas" now means the capability-bundle feature; the kind toggle
+    # ids were reclaimed to kind-* (launcher-kinds / kind-coordinator / ...).
+    assert 'id="launcher-kinds"' in index, "the kind toggle must be in the launcher panel"
+    assert 'id="launcher-personas"' not in index, (
+        "the old persona-squatting toggle id must stay gone"
+    )
 
 
 def test_console_launcher_creates_open_panes() -> None:
-    """Workstream-lifecycle bugfix: BOTH launcher personas open the new session as
+    """Workstream-lifecycle bugfix: BOTH launcher kinds open the new session as
     an L-shell PANE (openPane), not a full-page nav — coordinator and interactive
     alike.  Full-page nav survives only as the shell-absent fallback."""
     app = _CONSOLE_APP.read_text(encoding="utf-8")
@@ -258,13 +263,13 @@ def test_console_resolve_interactive_node_seam() -> None:
 def test_console_launcher_node_strategy() -> None:
     """Workstream-lifecycle bugfix: the interactive launcher gains a node-selection
     strategy (Least loaded | Specific node) with a live node picker, and the shared
-    composer's task hint + node fields track the active persona."""
+    composer's task hint + node fields track the active kind."""
     app = _CONSOLE_APP.read_text(encoding="utf-8")
     assert 'id: "node_strategy"' in app and 'id: "node_id"' in app, (
         "launcher must expose the node-strategy + node-picker option fields"
     )
     assert "function _applyLauncherFields" in app, (
-        "persona switch must update the hint + node-field visibility"
+        "kind switch must update the hint + node-field visibility"
     )
     assert "function _populateLauncherNodes" in app, (
         "the specific-node picker must populate from the live cluster snapshot"
