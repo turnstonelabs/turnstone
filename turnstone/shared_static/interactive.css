@@ -38,22 +38,56 @@
   min-height: 0;
   overflow-y: auto;
   padding: 13px;
-  display: flex;
-  flex-direction: column;
-  /* Trimmed from 5px: the .msg turn boxes already carry a 4px margin-bottom, so
-     a 5px flex gap stacked ~9px of dead space between segments ("too thick").
-     2px gap + the 4px element margin lands at a compact ~6px between turns. */
-  gap: 2px;
+  /* BLOCK flow, deliberately not a flex column: a column flexbox relayouts
+     ALL items when the streaming row's height changes — O(rows) per token at
+     long-session scale — where block flow dirties only the appended tail.
+     Block flow also retires the flex min-height:auto squish hazard the old
+     per-child flex-shrink pin existed to suppress.  Inter-row rhythm moves
+     to the sibling margin below (2px + the .msg 4px margin-bottom lands at
+     the same compact ~6px between turns as the old 2px gap). */
+  /* Native scroll anchoring is pure overhead here: the pane owns bottom
+     pinning (isNearBottom + rAF pin), and during streaming the anchor node
+     the browser picks sits inside the innerHTML-replaced live bubble —
+     forcing anchor re-selection every frame and double-adjusting against
+     our pin. */
+  overflow-anchor: none;
 }
-/* The message list is a SCROLLING flex column (overflow-y:auto), so its children
-   must size to content and never shrink.  Without this, an `overflow:hidden`
-   card — the .conv-batch tool block — has its flex `min-height:auto` resolve to
-   0 and gets squished to a ~2px stripe (just its border) once the column fills,
-   while plain .msg blocks (overflow visible) keep their height.  That asymmetry
-   is the "tool calls collapse to an empty stripe" regression; pinning every row
-   makes the column scroll instead. */
-.pane--embedded .pane-messages > * {
-  flex-shrink: 0;
+.pane--embedded .pane-messages > * + * {
+  margin-top: 2px;
+}
+/* Off-screen rows skip style/layout/paint entirely; contain-intrinsic-size's
+   `auto` keyword remembers each row's last-rendered size, so scrollHeight
+   (and the bottom pin) stays stable once a row has painted — the estimate
+   only covers never-rendered rows during upward scrubbing.  The last two
+   children are exempt: the live tail (streaming bubble / filling tool batch)
+   mutates constantly and must never toggle skip-state mid-stream. */
+.pane--embedded .pane-messages > .msg:not(:nth-last-child(-n + 2)) {
+  content-visibility: auto;
+  contain-intrinsic-size: auto 80px;
+}
+.pane--embedded .pane-messages > .conv-batch:not(:nth-last-child(-n + 2)) {
+  content-visibility: auto;
+  contain-intrinsic-size: auto 200px;
+}
+/* "Load earlier" pager — the windowed transcript's top affordance.  A real
+   button (keyboard/AT reachable); quiet dashed chrome so it reads as an
+   affordance, not a message row. */
+.msg-history-pager {
+  display: block;
+  width: 100%;
+  padding: 6px 12px;
+  background: var(--panel-2);
+  color: var(--fg-dim);
+  border: 1px dashed var(--hair);
+  border-radius: var(--r-sm);
+  font-family: var(--font-ui);
+  font-size: 12px;
+  cursor: pointer;
+}
+.msg-history-pager:hover,
+.msg-history-pager:focus-visible {
+  color: var(--fg);
+  border-color: var(--accent);
 }
 .pane--embedded .ws-status-bar {
   flex-shrink: 0;

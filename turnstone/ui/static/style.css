@@ -78,11 +78,13 @@
   min-height: 0;
   overflow-y: auto;
   padding: 16px 12px;
-  display: flex;
-  flex-direction: column;
-  /* No flexbox gap — .msg supplies its own margin-bottom for inter-card
-     spacing.  A 14px gap here was stacking with the 4px card
-     margin-bottom and pushing the per-card spacing to ~18px. */
+  /* Block flow + no native scroll anchoring — mirrors the shared
+     interactive.css scroller (which also carries the per-row
+     content-visibility rules): a flex column relayouts every row on each
+     streaming height change, and native anchoring fights the pane's own
+     bottom pin.  .msg supplies its own margin-bottom for inter-card
+     spacing. */
+  overflow-anchor: none;
 }
 /* .msg (shared_static/chat.css) provides padding / border / radius /
    line-height / word-wrap / margin / background.  The interactive UI
