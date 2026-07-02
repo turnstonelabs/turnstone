@@ -642,20 +642,50 @@ def update_workstream_title(ws_id: str, title: str) -> None:
 
 
 def search_history(
-    query: str, limit: int = 20, offset: int = 0, *, user_id: str | None = None
+    query: str,
+    limit: int = 20,
+    offset: int = 0,
+    *,
+    user_id: str | None = None,
+    exclude_ws_id: str | None = None,
+    exclude_after: int | None = None,
 ) -> list[Any]:
     """Search conversation history.
 
     ``user_id`` scopes rows by project tenancy (private-project workstreams
     hidden unless creator/owner/member — see
     :meth:`StorageBackend.search_history`); ``None`` = unscoped, for
-    single-user lanes only.
+    single-user lanes only.  ``exclude_ws_id``/``exclude_after`` drop the
+    excluded workstream's live segment (rows above its compaction
+    checkpoint; the whole workstream when ``exclude_after`` is ``None``) —
+    the model-facing recall path passes its own ws so results never
+    duplicate what is already in context.
     """
     try:
-        return get_storage().search_history(query, limit, offset, user_id=user_id)
+        return get_storage().search_history(
+            query,
+            limit,
+            offset,
+            user_id=user_id,
+            exclude_ws_id=exclude_ws_id,
+            exclude_after=exclude_after,
+        )
     except Exception:
         log.warning("Failed to search history", exc_info=True)
         return []
+
+
+def get_compaction_checkpoint(ws_id: str) -> int | None:
+    """Latest persisted compaction marker's watermark for ``ws_id`` — see
+    :meth:`StorageBackend.get_compaction_checkpoint`.  Returns ``None`` on any
+    storage error, which callers must read as "the whole workstream is live"
+    (recall then excludes it entirely — degraded to less information, never
+    to duplicated or leaked rows)."""
+    try:
+        return get_storage().get_compaction_checkpoint(ws_id)
+    except Exception:
+        log.warning("Failed to get compaction checkpoint for ws=%s", ws_id, exc_info=True)
+        return None
 
 
 def search_history_recent(limit: int = 20, *, user_id: str | None = None) -> list[Any]:

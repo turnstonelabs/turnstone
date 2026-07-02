@@ -81,6 +81,9 @@ from turnstone.core.storage._utils import (
     HEURISTIC_RULE_MUTABLE as _HEURISTIC_RULE_MUTABLE,
 )
 from turnstone.core.storage._utils import (
+    HISTORY_CONTEXT_EXCLUSION_SQL as _HISTORY_EXCL_SQL,
+)
+from turnstone.core.storage._utils import (
     HISTORY_VISIBILITY_SCOPE_SQL as _HISTORY_SCOPE_SQL,
 )
 from turnstone.core.storage._utils import (
@@ -124,6 +127,7 @@ from turnstone.core.storage._utils import (
 )
 from turnstone.core.storage._utils import (
     find_orphan_conversations,
+    parse_checkpoint_watermark,
     prepare_provider_data_for_save,
     purge_orphan_conversations,
     release_attachment_refs,
@@ -546,6 +550,23 @@ class PostgreSQLBackend:
                 )
             ).scalar()
         return int(n or 0)
+
+    def get_compaction_checkpoint(self, ws_id: str) -> int | None:
+        """Latest persisted marker's watermark — see the protocol docstring.
+        ``None`` = never compacted / malformed meta (whole ws is live)."""
+        with self._conn() as conn:
+            row = conn.execute(
+                sa.select(conversations.c.meta)
+                .where(
+                    sa.and_(
+                        conversations.c.ws_id == ws_id,
+                        conversations.c._source == _COMPACTION_SOURCE,
+                    )
+                )
+                .order_by(conversations.c.id.desc())
+                .limit(1)
+            ).fetchone()
+        return parse_checkpoint_watermark(row[0]) if row is not None else None
 
     def delete_messages_after(self, ws_id: str, keep_count: int) -> int:
         with self._conn() as conn:
@@ -1203,18 +1224,32 @@ class PostgreSQLBackend:
     # -- Conversation search ---------------------------------------------------
 
     def search_history(
-        self, query: str, limit: int = 20, offset: int = 0, *, user_id: str | None = None
+        self,
+        query: str,
+        limit: int = 20,
+        offset: int = 0,
+        *,
+        user_id: str | None = None,
+        exclude_ws_id: str | None = None,
+        exclude_after: int | None = None,
     ) -> list[Any]:
         if not query or not query.strip():
             return []
         capped = min(int(limit), 100)
         capped_offset = max(0, int(offset))
-        # Project-tenancy scope (see HISTORY_VISIBILITY_SCOPE_SQL): applied in
+        # Project-tenancy scope (see HISTORY_VISIBILITY_SCOPE_SQL) and the
+        # live-context exclusion (HISTORY_CONTEXT_EXCLUSION_SQL): applied in
         # SQL, not post-filtered in Python, so limit/offset pagination stays
         # honest — a page never silently shrinks because hidden rows were
         # fetched then dropped.
         scope_sql = _HISTORY_SCOPE_SQL if user_id is not None else ""
-        scope_params = {"scope_user": user_id} if user_id is not None else {}
+        scope_params: dict[str, Any] = {"scope_user": user_id} if user_id is not None else {}
+        if exclude_ws_id is not None:
+            scope_sql += _HISTORY_EXCL_SQL
+            # exclude_after=None → never compacted → the whole ws is live
+            # context; ids start at 1, so -1 excludes every row.
+            scope_params["excl_ws"] = exclude_ws_id
+            scope_params["excl_after"] = -1 if exclude_after is None else exclude_after
         with self._conn() as conn:
             # Use PostgreSQL full-text search if search_vector column exists
             try:

@@ -278,6 +278,19 @@ class StorageBackend(Protocol):
         """
         ...
 
+    def get_compaction_checkpoint(self, ws_id: str) -> int | None:
+        """The latest persisted compaction marker's watermark for ``ws_id``.
+
+        Every row with ``id <=`` the returned boundary was folded into the
+        summary the live session now holds — the summarized-away past; rows
+        above it are the live segment still in the model's context.  Distinct
+        from :meth:`get_compaction_watermark`, which computes the boundary a
+        NEW compaction would use; this reads the one already persisted.
+        ``None`` when the workstream never compacted or the marker's meta is
+        malformed (callers must then treat the WHOLE workstream as live).
+        """
+        ...
+
     # -- Workstream attachments (content-addressed, refcounted) ---------------
     #
     # Pending (uploaded-but-unsent) bytes live in the per-node in-memory
@@ -778,7 +791,14 @@ class StorageBackend(Protocol):
     # -- Conversation search ---------------------------------------------------
 
     def search_history(
-        self, query: str, limit: int = 20, offset: int = 0, *, user_id: str | None = None
+        self,
+        query: str,
+        limit: int = 20,
+        offset: int = 0,
+        *,
+        user_id: str | None = None,
+        exclude_ws_id: str | None = None,
+        exclude_after: int | None = None,
     ) -> list[Any]:
         """Search conversation history. Returns (timestamp, ws_id, role, content, tool_name).
 
@@ -791,6 +811,14 @@ class StorageBackend(Protocol):
         rule); ``tests/test_search_history_visibility.py`` pins the parity.
         ``None`` (default) applies no scoping — correct only for single-user
         lanes (local CLI); authenticated surfaces MUST pass the acting user.
+
+        ``exclude_ws_id`` + ``exclude_after`` drop *exclude_ws_id*'s rows with
+        ``id > exclude_after`` — the live-context exclusion for the
+        model-facing recall tool (rows the model can already see; see
+        ``HISTORY_CONTEXT_EXCLUSION_SQL``).  ``exclude_after=None`` with an
+        ``exclude_ws_id`` set excludes the entire workstream (never
+        compacted → all live).  Both applied in SQL so pagination stays
+        honest.
         """
         ...
 

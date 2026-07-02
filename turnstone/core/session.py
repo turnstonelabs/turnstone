@@ -68,6 +68,7 @@ from turnstone.core.memory import (
     delete_structured_memory_by_id,
     delete_workstream,
     get_attachments,
+    get_compaction_checkpoint,
     get_compaction_floor,
     get_compaction_watermark,
     get_skill_by_name,
@@ -13576,13 +13577,35 @@ class ChatSession:
         return call_id, msg
 
     def _exec_recall(self, item: dict[str, Any]) -> tuple[str, str]:
-        """Search conversation history, scoped to the prepare-time user."""
+        """Search conversation history, scoped to the prepare-time user.
+
+        The session's own workstream is searchable only BELOW its compaction
+        checkpoint: rows above it are the live segment, already in context —
+        returning them would spend result slots on duplicates.  Below it is
+        the summarized-away past, exactly what recall exists to re-derive
+        (the summary is a cache over the originals, not their replacement).
+        The boundary is read fresh at execution, not pinned at prepare, so a
+        compaction that ran while the item was queued is respected.
+
+        Known limit: a FORKED session excludes only its own ws — the parent
+        rows it inherited into context remain searchable under the parent's
+        id (and unlabeled, since they aren't this ws).  Harmless duplication
+        bounded by tenancy, and precise dedup needs a fork-time row cursor;
+        not worth carrying until forks matter here.
+        """
         call_id = item["call_id"]
         query, limit, offset = item["query"], item["limit"], item.get("offset", 0)
 
         # KeyError on a missing pin is deliberate — an unpinned item must
         # fail loudly, not fall back to an unscoped (tenant-wide) search.
-        conv_rows = search_history(query, limit, offset, user_id=item["scope_user_id"])
+        conv_rows = search_history(
+            query,
+            limit,
+            offset,
+            user_id=item["scope_user_id"],
+            exclude_ws_id=self._ws_id or None,
+            exclude_after=(get_compaction_checkpoint(self._ws_id) if self._ws_id else None),
+        )
         if conv_rows:
             lines = []
             for ts, sid, role, content, tool_name in conv_rows:
@@ -13590,7 +13613,8 @@ class ChatSession:
                 text = (content or "")[:2000]
                 if content and len(content) > 2000:
                     text += f"... ({len(content)} chars total)"
-                lines.append(f"[{ts} {sid}] {label}: {text}")
+                own = " (earlier in this conversation, compacted)" if sid == self._ws_id else ""
+                lines.append(f"[{ts} {sid}]{own} {label}: {text}")
             header = f"Conversations ({len(conv_rows)} matches"
             if offset:
                 header += f", offset {offset}"

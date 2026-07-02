@@ -163,7 +163,7 @@ class TestParityWithWsVisible:
 
 class TestRecallScopePlumbing:
     def _recorder(self, calls):
-        def fake_search_history(query, limit=20, offset=0, *, user_id=None):
+        def fake_search_history(query, limit=20, offset=0, *, user_id=None, **kwargs):
             calls.append(user_id)
             return []
 

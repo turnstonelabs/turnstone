@@ -123,7 +123,9 @@ NUDGE_COMPACTION_RESUME = (
     "The conversation was just compacted to free context. If there is remaining "
     "work, continue from the summary above — pick up the open tasks and next "
     "steps you recorded and keep going without waiting for further instructions. "
-    "If the task is already complete, give your final answer."
+    "The summary is a digest, not the record: if it is missing a detail you "
+    "need, the recall tool can search the compacted portion of this "
+    "conversation. If the task is already complete, give your final answer."
 )
 
 _NUDGE_MAP: dict[str, str] = {
