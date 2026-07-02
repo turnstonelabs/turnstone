@@ -855,6 +855,55 @@ def detect_model(client: Any, provider: str = "openai") -> tuple[str, int | None
 # ─── Main ──────────────────────────────────────────────────────────────────
 
 
+def resolve_cli_persona_kwargs(
+    storage: Any,
+    persona_arg: str | None,
+    resume_target: str | None,
+) -> dict[str, Any]:
+    """Resolve the persona stamp for a CLI session, pre-construction.
+
+    ``--resume`` adopts the TARGET workstream's stamped persona (the resumed
+    session must run from its stamp, not tonight's default); otherwise
+    ``--persona`` (or the interactive default persona) resolves against the
+    shelf.  A database with no personas seeded yields ``{}`` — an unstamped
+    legacy session, byte-identical behavior.
+
+    Unknown/disabled/kind-mismatched ``--persona`` names print a clear error
+    and ``sys.exit(1)`` — a startup misconfiguration must not silently start
+    an unrestricted session.  A corrupt stamp on the resume target raises
+    (``snapshot_from_config``) for the same reason.
+    """
+    from turnstone.core.personas import snapshot_from_config, snapshot_from_persona
+
+    if resume_target and storage is not None:
+        if persona_arg:
+            print(yellow("--persona is ignored with --resume (the stamped persona applies)"))
+        snap = snapshot_from_config(storage.load_workstream_config(resume_target) or {})
+        if snap is not None:
+            return {"persona": snap.name, "persona_snapshot": snap}
+        return {}
+    if persona_arg:
+        row = storage.get_persona_by_name(persona_arg) if storage else None
+        if not row or not row.get("enabled", False):
+            print(red(f"Persona not found or disabled: {persona_arg}"))
+            sys.exit(1)
+        if "interactive" not in (row.get("applies_to_kinds") or []):
+            print(red(f"Persona '{persona_arg}' does not apply to interactive sessions"))
+            sys.exit(1)
+        return {"persona": row["name"], "persona_snapshot": snapshot_from_persona(row)}
+    if storage is not None:
+        try:
+            default_row = storage.get_default_persona("interactive")
+        except Exception:
+            default_row = None
+        if default_row:
+            return {
+                "persona": default_row["name"],
+                "persona_snapshot": snapshot_from_persona(default_row),
+            }
+    return {}
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Interactive CLI for OpenAI-compatible models with tool calling.",
@@ -1208,13 +1257,6 @@ def main() -> None:
 
     # Resolve the persona stamp BEFORE constructing the session — the four
     # levers apply inside ``ChatSession.__init__``, so resolution can't wait.
-    # ``--resume`` adopts the TARGET workstream's stamped persona (the
-    # resumed session must run from its stamp, not tonight's default);
-    # otherwise ``--persona`` (or the interactive default persona) resolves
-    # against the shelf.  A database with no personas seeded yields an
-    # unstamped legacy session — byte-identical behavior.
-    from turnstone.core.personas import snapshot_from_config, snapshot_from_persona
-
     cli_storage = _get_storage()
     resume_target: str | None = None
     if args.resume:
@@ -1225,37 +1267,7 @@ def main() -> None:
             print(red(f"Workstream not found: {args.resume}"))
             sys.exit(1)
 
-    persona_kwargs: dict[str, Any] = {}
-    if resume_target and cli_storage is not None:
-        if args.persona:
-            print(yellow("--persona is ignored with --resume (the stamped persona applies)"))
-        # A corrupt stamp raises here — fail loudly at startup rather than
-        # silently running the workstream under a default envelope.
-        snap = snapshot_from_config(cli_storage.load_workstream_config(resume_target) or {})
-        if snap is not None:
-            persona_kwargs = {"persona": snap.name, "persona_snapshot": snap}
-    elif args.persona:
-        row = cli_storage.get_persona_by_name(args.persona) if cli_storage else None
-        if not row or not row.get("enabled", False):
-            print(red(f"Persona not found or disabled: {args.persona}"))
-            sys.exit(1)
-        if "interactive" not in (row.get("applies_to_kinds") or []):
-            print(red(f"Persona '{args.persona}' does not apply to interactive sessions"))
-            sys.exit(1)
-        persona_kwargs = {
-            "persona": row["name"],
-            "persona_snapshot": snapshot_from_persona(row),
-        }
-    elif cli_storage is not None:
-        try:
-            default_row = cli_storage.get_default_persona("interactive")
-        except Exception:
-            default_row = None
-        if default_row:
-            persona_kwargs = {
-                "persona": default_row["name"],
-                "persona_snapshot": snapshot_from_persona(default_row),
-            }
+    persona_kwargs = resolve_cli_persona_kwargs(cli_storage, args.persona, resume_target)
 
     ws = manager.create(user_id="", **persona_kwargs)
     if args.skip_permissions and isinstance(ws.ui, TerminalUI):
