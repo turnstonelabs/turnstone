@@ -305,11 +305,14 @@ class TestTriStateVisibility:
 
     def test_definitive_verdicts(self) -> None:
         assert (
-            WorkstreamProjectVisibility("bob", storage=_fake_storage(visibility="public"))
-            .ws_visibility("p1")
+            WorkstreamProjectVisibility(
+                "bob", storage=_fake_storage(visibility="public")
+            ).ws_visibility("p1")
             is True
         )
-        assert WorkstreamProjectVisibility("bob", storage=_fake_storage()).ws_visibility("p1") is False
+        assert (
+            WorkstreamProjectVisibility("bob", storage=_fake_storage()).ws_visibility("p1") is False
+        )
 
 
 class _ScriptedVis:
@@ -428,9 +431,7 @@ class TestCreateValidatorProjectGate:
         from turnstone.core.memory import register_workstream
         from turnstone.server import _interactive_create_validate_request
 
-        register_workstream(
-            "coord-1", user_id="alice", kind="coordinator", project_id="p-gone"
-        )
+        register_workstream("coord-1", user_id="alice", kind="coordinator", project_id="p-gone")
         body: dict = {"kind": "interactive", "parent_ws_id": "coord-1"}
         err = await _interactive_create_validate_request(MagicMock(), body, "alice", [])
         assert err is None
@@ -449,9 +450,7 @@ class TestCreateValidatorProjectGate:
         from turnstone.server import _interactive_create_validate_request
 
         get_storage().create_project("p-priv", "P", "zed")
-        register_workstream(
-            "coord-2", user_id="alice", kind="coordinator", project_id="p-priv"
-        )
+        register_workstream("coord-2", user_id="alice", kind="coordinator", project_id="p-priv")
         body: dict = {"kind": "interactive", "parent_ws_id": "coord-2"}
         err = await _interactive_create_validate_request(MagicMock(), body, "alice", [])
         assert err is not None and err.status_code == 403

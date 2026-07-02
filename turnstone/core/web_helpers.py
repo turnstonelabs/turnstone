@@ -333,11 +333,22 @@ def resolve_workstream_owner(
     round-tripping storage for the ROW — but note the project gate
     itself may still hit storage (one memoized ``get_project`` +
     membership lookup when the row names a project), and it fails
-    CLOSED: during a transient DB outage a project-attached workstream
-    403s rather than risking a leak. That is a deliberate trade — a
-    DB outage already degrades sends/persistence, and failing open on
-    a private-tenancy check is the worse failure. Project-less
+    CLOSED: a project-attached workstream 403s when that lookup fails
+    rather than risking a leak. That is a deliberate trade — a DB
+    outage already degrades sends/persistence, and failing open on a
+    private-tenancy check is the worse failure. Project-less
     workstreams keep the zero-storage fast path.
+
+    Failure-mode map, precisely: which error a storage outage produces
+    depends on where it strikes. The ROW lookup is fail-soft
+    (:func:`turnstone.core.memory.get_workstream_row` degrades an
+    exception to ``None``), so a storage-path row fetch that fails
+    surfaces as this function's 404 — pre-existing behaviour shared
+    with the old owner lookup. Only once a row IS resolved (from the
+    manager or storage) does the project gate run, and THAT failure is
+    the fail-closed 403 above. In-memory workstreams therefore 403 on
+    a project-gate blip; not-loaded ones typically 404 at the row
+    fetch first.
 
     ``not_found_label`` is the message body the 404 carries — the
     interactive surface uses "Workstream not found"; coord uses
