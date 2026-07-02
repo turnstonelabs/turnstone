@@ -640,6 +640,63 @@ MODEL_DEFINITION_MUTABLE = frozenset(
 )
 PROJECT_MUTABLE = frozenset({"name", "visibility", "state", "parent_project_id"})
 PROMPT_POLICY_MUTABLE = frozenset({"name", "content", "tool_gate", "priority", "enabled"})
+# ``name`` (the slug create requests reference) is deliberately immutable —
+# edit display_name instead.  Workstream snapshots are self-contained so a
+# rename wouldn't break them, but stable slugs keep audit rows and operator
+# muscle memory honest.
+PERSONA_MUTABLE = frozenset(
+    {
+        "display_name",
+        "description",
+        "base_prompt",
+        "tool_allowlist",
+        "mcp_enabled",
+        "memory_enabled",
+        "applies_to_kinds",
+        "is_default",
+        "enabled",
+    }
+)
+
+PERSONA_KINDS = frozenset({"interactive", "coordinator"})
+
+
+def persona_row_to_dict(row: Any) -> dict[str, Any]:
+    """Convert a personas row to the Python-typed dict shape the Protocol
+    documents: JSON columns parsed, 0/1 columns as bool.  ``tool_allowlist``
+    keeps its tri-state — None (unrestricted) vs [] (hard empty) vs [names]."""
+    d = row_to_dict(row, "mcp_enabled", "memory_enabled", "is_default", "enabled")
+    raw = d.get("tool_allowlist")
+    d["tool_allowlist"] = None if raw is None else json.loads(raw)
+    d["applies_to_kinds"] = json.loads(d.get("applies_to_kinds") or '["interactive"]')
+    return d
+
+
+def serialize_persona_fields(fields: dict[str, Any]) -> dict[str, Any]:
+    """Validate + serialize Python-typed persona fields to column values.
+
+    Shared by both backends so the tri-state allowlist encoding and the
+    kinds validation can't drift between them.  Raises ValueError on
+    malformed input; unknown keys pass through (callers filter to the
+    mutable set first where that matters).
+    """
+    out = dict(fields)
+    if "applies_to_kinds" in out:
+        kinds = out["applies_to_kinds"]
+        if not isinstance(kinds, list) or not kinds or not set(kinds) <= PERSONA_KINDS:
+            raise ValueError(
+                f"applies_to_kinds must be a non-empty subset of {sorted(PERSONA_KINDS)}"
+            )
+        out["applies_to_kinds"] = json.dumps(kinds)
+    if "tool_allowlist" in out and out["tool_allowlist"] is not None:
+        tools = out["tool_allowlist"]
+        if not isinstance(tools, list) or not all(isinstance(t, str) for t in tools):
+            raise ValueError("tool_allowlist must be None or a list of tool names")
+        out["tool_allowlist"] = json.dumps(tools)
+    for key in ("mcp_enabled", "memory_enabled", "is_default", "enabled"):
+        if key in out:
+            out[key] = 1 if out[key] else 0
+    return out
 HEURISTIC_RULE_MUTABLE = frozenset(
     {
         "name",

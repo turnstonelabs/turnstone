@@ -46,6 +46,7 @@ from turnstone.core.storage._schema import (
     orgs,
     output_assessments,
     output_guard_patterns,
+    personas,
     project_members,
     projects,
     prompt_templates,
@@ -102,6 +103,9 @@ from turnstone.core.storage._utils import (
     OUTPUT_GUARD_PATTERN_MUTABLE as _OGP_MUTABLE,
 )
 from turnstone.core.storage._utils import (
+    PERSONA_MUTABLE as _PERSONA_MUTABLE,
+)
+from turnstone.core.storage._utils import (
     POLICY_MUTABLE as _POLICY_MUTABLE,
 )
 from turnstone.core.storage._utils import (
@@ -141,6 +145,9 @@ from turnstone.core.storage._utils import (
     parse_attachment_refs as _parse_attachment_refs,
 )
 from turnstone.core.storage._utils import (
+    persona_row_to_dict as _persona_row_to_dict,
+)
+from turnstone.core.storage._utils import (
     reconstruct_messages as _reconstruct_messages,
 )
 from turnstone.core.storage._utils import (
@@ -154,6 +161,9 @@ from turnstone.core.storage._utils import (
 )
 from turnstone.core.storage._utils import (
     scan_skill_content as _scan_skill_content,
+)
+from turnstone.core.storage._utils import (
+    serialize_persona_fields as _serialize_persona_fields,
 )
 from turnstone.core.storage._utils import (
     split_perms as _split_perms,
@@ -5539,6 +5549,157 @@ class PostgreSQLBackend:
             )
             conn.commit()
             return result.rowcount
+
+    # -- Personas ---------------------------------------------------------------
+
+    def list_personas(self, include_disabled: bool = False) -> list[dict[str, Any]]:
+        with self._conn() as conn:
+            q = sa.select(personas).order_by(personas.c.name)
+            if not include_disabled:
+                q = q.where(personas.c.enabled == 1)
+            rows = conn.execute(q).fetchall()
+            return [_persona_row_to_dict(r) for r in rows]
+
+    def get_persona(self, persona_id: str) -> dict[str, Any] | None:
+        with self._conn() as conn:
+            row = conn.execute(
+                sa.select(personas).where(personas.c.persona_id == persona_id)
+            ).fetchone()
+            return _persona_row_to_dict(row) if row is not None else None
+
+    def get_persona_by_name(self, name: str) -> dict[str, Any] | None:
+        with self._conn() as conn:
+            row = conn.execute(sa.select(personas).where(personas.c.name == name)).fetchone()
+            return _persona_row_to_dict(row) if row is not None else None
+
+    def get_default_persona(self, kind: str) -> dict[str, Any] | None:
+        with self._conn() as conn:
+            rows = conn.execute(
+                sa.select(personas).where(
+                    sa.and_(personas.c.is_default == 1, personas.c.enabled == 1)
+                )
+            ).fetchall()
+        for row in rows:
+            d = _persona_row_to_dict(row)
+            if kind in d["applies_to_kinds"]:
+                return d
+        return None
+
+    def create_persona(self, persona: dict[str, Any]) -> None:
+        values = _serialize_persona_fields(persona)
+        if not values.get("persona_id") or not values.get("name"):
+            raise ValueError("persona requires persona_id and name")
+        now = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S")
+        with self._conn() as conn:
+            existing = conn.execute(
+                sa.select(personas.c.persona_id).where(personas.c.name == values["name"])
+            ).fetchone()
+            if existing is not None:
+                raise ValueError(f"persona name already exists: {values['name']}")
+            if values.get("is_default"):
+                self._validate_and_clear_default(
+                    conn,
+                    persona_id=values["persona_id"],
+                    kinds=persona.get("applies_to_kinds") or ["interactive"],
+                    enabled=persona.get("enabled", True),
+                    now=now,
+                )
+            conn.execute(
+                sa.insert(personas),
+                {
+                    "persona_id": values["persona_id"],
+                    "name": values["name"],
+                    "display_name": values.get("display_name", ""),
+                    "description": values.get("description", ""),
+                    "base_prompt": values.get("base_prompt"),
+                    "tool_allowlist": values.get("tool_allowlist"),
+                    "mcp_enabled": values.get("mcp_enabled", 1),
+                    "memory_enabled": values.get("memory_enabled", 1),
+                    "applies_to_kinds": values.get("applies_to_kinds", '["interactive"]'),
+                    "is_default": values.get("is_default", 0),
+                    "enabled": values.get("enabled", 1),
+                    "org_id": values.get("org_id", ""),
+                    "created_by": values.get("created_by", ""),
+                    "created": now,
+                    "updated": now,
+                },
+            )
+            conn.commit()
+
+    def update_persona(self, persona_id: str, **fields: Any) -> bool:
+        fields = {k: v for k, v in fields.items() if k in _PERSONA_MUTABLE}
+        if not fields:
+            return False
+        now = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S")
+        with self._conn() as conn:
+            row = conn.execute(
+                sa.select(personas).where(personas.c.persona_id == persona_id)
+            ).fetchone()
+            if row is None:
+                return False
+            current = _persona_row_to_dict(row)
+            if current["is_default"]:
+                if "enabled" in fields and not fields["enabled"]:
+                    raise ValueError("the default persona cannot be archived")
+                if "is_default" in fields and not fields["is_default"]:
+                    raise ValueError(
+                        "cannot unset is_default directly; set it on the "
+                        "successor persona instead"
+                    )
+                if "applies_to_kinds" in fields and sorted(
+                    fields["applies_to_kinds"] or []
+                ) != sorted(current["applies_to_kinds"]):
+                    raise ValueError("cannot change applies_to_kinds of the default persona")
+            if fields.get("is_default") and not current["is_default"]:
+                self._validate_and_clear_default(
+                    conn,
+                    persona_id=persona_id,
+                    kinds=fields.get("applies_to_kinds", current["applies_to_kinds"]),
+                    enabled=fields.get("enabled", current["enabled"]),
+                    now=now,
+                )
+            values = _serialize_persona_fields(fields)
+            values["updated"] = now
+            conn.execute(
+                sa.update(personas).where(personas.c.persona_id == persona_id).values(**values)
+            )
+            conn.commit()
+            return True
+
+    @staticmethod
+    def _validate_and_clear_default(
+        conn: sa.engine.Connection,
+        *,
+        persona_id: str,
+        kinds: list[str],
+        enabled: Any,
+        now: str,
+    ) -> None:
+        """Enforce the default-persona invariants and demote the previous
+        holder, inside the caller's transaction.
+
+        Exactly one default per kind: a default must be single-kind (a
+        two-kind default would get orphan-cleared when either kind's crown
+        moves) and enabled; the incumbent default for that kind loses the
+        flag in the same transaction.
+        """
+        if len(kinds) != 1:
+            raise ValueError("a default persona must apply to exactly one kind")
+        if not enabled:
+            raise ValueError("a disabled persona cannot be the default")
+        kind = kinds[0]
+        others = conn.execute(
+            sa.select(personas.c.persona_id, personas.c.applies_to_kinds).where(
+                sa.and_(personas.c.is_default == 1, personas.c.persona_id != persona_id)
+            )
+        ).fetchall()
+        for oid, okinds_raw in others:
+            if kind in json.loads(okinds_raw or "[]"):
+                conn.execute(
+                    sa.update(personas)
+                    .where(personas.c.persona_id == oid)
+                    .values(is_default=0, updated=now)
+                )
 
     # -- Prompt policies -------------------------------------------------------
 

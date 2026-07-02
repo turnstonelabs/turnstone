@@ -109,6 +109,11 @@ workstreams = sa.Table(
     # constraint (this schema family declares none — see migration 058).
     # Added in migration 062.
     sa.Column("project_id", sa.Text, nullable=True),
+    # persona: display name of the persona the workstream was created with
+    # (NULL = pre-persona workstream).  Display/forensics only — the full
+    # persona snapshot lives in workstream_config; nothing reads this column
+    # to build a session.  Added in migration 063.
+    sa.Column("persona", sa.Text, nullable=True),
     sa.Column("created", sa.Text, nullable=False),
     sa.Column("updated", sa.Text, nullable=False),
 )
@@ -851,6 +856,48 @@ prompt_policies = sa.Table(
     sa.Column("created", sa.Text, nullable=False),
     sa.Column("updated", sa.Text, nullable=False),
 )
+
+# ---------------------------------------------------------------------------
+# Personas — named capability/prompt bundles stamped onto workstreams at
+# creation (migration 063)
+# ---------------------------------------------------------------------------
+# A persona controls system-message composition and the capability envelope
+# via four levers: base-prompt override, tool visibility set, MCP on/off,
+# memory toggle.  Workstreams snapshot the persona into workstream_config at
+# creation; this table is a template shelf, never read post-create.
+
+personas = sa.Table(
+    "personas",
+    metadata,
+    sa.Column("persona_id", sa.Text, primary_key=True),
+    # name: stable slug used on create requests (`persona=scribe`); unique.
+    sa.Column("name", sa.Text, nullable=False, unique=True),
+    sa.Column("display_name", sa.Text, nullable=False, server_default=""),
+    sa.Column("description", sa.Text, nullable=False, server_default=""),
+    # base_prompt: replaces the BASE module in compose_system_message().
+    # NULL = use the kind's stock base (base.md / base_coordinator.md).
+    sa.Column("base_prompt", sa.Text, nullable=True),
+    # tool_allowlist: JSON, tri-state — NULL = unrestricted (tracks tool
+    # growth + MCP dynamics), "[]" = hard empty, '["name", ...]' = exact
+    # visibility set (tool_search membership decides soft vs hard).
+    sa.Column("tool_allowlist", sa.Text, nullable=True),
+    sa.Column("mcp_enabled", sa.Integer, nullable=False, server_default="1"),
+    sa.Column("memory_enabled", sa.Integer, nullable=False, server_default="1"),
+    # applies_to_kinds: JSON list, subset of ["interactive", "coordinator"].
+    sa.Column("applies_to_kinds", sa.Text, nullable=False, server_default='["interactive"]'),
+    # is_default: exactly one per kind (storage-enforced); defaults are
+    # un-archivable.  The default is what an empty `persona=` resolves to.
+    sa.Column("is_default", sa.Integer, nullable=False, server_default="0"),
+    # enabled: archive = 0.  No hard delete — stamped workstreams stay
+    # explicable forever.
+    sa.Column("enabled", sa.Integer, nullable=False, server_default="1"),
+    sa.Column("org_id", sa.Text, nullable=False, server_default=""),
+    sa.Column("created_by", sa.Text, nullable=False, server_default=""),
+    sa.Column("created", sa.Text, nullable=False),
+    sa.Column("updated", sa.Text, nullable=False),
+)
+
+sa.Index("idx_personas_enabled", personas.c.enabled)
 
 # ---------------------------------------------------------------------------
 # OIDC identity tables

@@ -2390,6 +2390,47 @@ class StorageBackend(Protocol):
         (content serving is ws-scoped)."""
         ...
 
+    # -- Personas ---------------------------------------------------------------
+    # Template shelf only: workstreams snapshot the persona at creation and
+    # never read this table again, so edits/archives don't touch existing
+    # workstreams.  No delete method — archive via update_persona(enabled=False).
+    # Dict shape: ``tool_allowlist`` is ``None`` (unrestricted) or ``list[str]``
+    # (``[]`` = hard empty); ``applies_to_kinds`` is ``list[str]``;
+    # mcp_enabled/memory_enabled/is_default/enabled are ``bool``.
+
+    def list_personas(self, include_disabled: bool = False) -> list[dict[str, Any]]:
+        """Return personas ordered by name; enabled-only unless asked."""
+        ...
+
+    def get_persona(self, persona_id: str) -> dict[str, Any] | None:
+        """Return persona dict or None."""
+        ...
+
+    def get_persona_by_name(self, name: str) -> dict[str, Any] | None:
+        """Return persona dict by slug or None."""
+        ...
+
+    def get_default_persona(self, kind: str) -> dict[str, Any] | None:
+        """Return the enabled default persona for a workstream kind, or None
+        (pre-seed database — callers fall back to unstamped legacy creation)."""
+        ...
+
+    def create_persona(self, persona: dict[str, Any]) -> None:
+        """Create a persona.  Requires ``persona_id`` and ``name``; accepts the
+        Python-typed dict shape above (JSON serialization is internal).
+        Raises ValueError on duplicate name or invalid ``applies_to_kinds``."""
+        ...
+
+    def update_persona(self, persona_id: str, **fields: Any) -> bool:
+        """Update PERSONA_MUTABLE fields.  Returns True if the persona exists.
+
+        Invariants (raise ValueError): a default persona cannot be archived,
+        cannot drop its ``is_default`` flag directly (flip the flag on the
+        successor instead — that clears the old default atomically), and
+        cannot change ``applies_to_kinds``; setting ``is_default=True`` clears
+        the flag on other personas sharing a kind."""
+        ...
+
     # -- Prompt policies -------------------------------------------------------
 
     def list_prompt_policies(self, org_id: str = "") -> list[dict[str, Any]]:
