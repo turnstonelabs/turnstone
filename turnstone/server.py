@@ -2777,8 +2777,6 @@ async def project_resources_endpoint(request: Request) -> JSONResponse:
     Same access gate as ``get_project_endpoint``: ``project.read`` plus the
     per-project ACL.
     """
-    import asyncio
-
     from turnstone.core.auth import require_permission, user_can_access_project
     from turnstone.core.storage import get_storage
 
