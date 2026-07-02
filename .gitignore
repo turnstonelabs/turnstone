@@ -9,7 +9,6 @@ build/
 .venv/
 venv/
 .env
-etc/
 # Local compose overrides (e.g. run.sh's node-count limiter, bootstrap output)
 compose.override.yaml
 compose.override.yml

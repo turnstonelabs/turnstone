@@ -1,15 +1,17 @@
 """Per-user message context (shared-workstream attribution).
 
-The context-identity layer atop upstream's acting-user credential fix: the model
-must be TOLD who sent each user turn on a multi-user workstream, and that must
-survive a worker rehydrating history from the DB. The sender is sourced from the
-acting user (``_mcp_effective_user_id`` = the ``bind_acting_user`` initiator,
-owner fallback); persistence rides ``conversations.meta`` (no migration).
+On a multi-user workstream the model must be TOLD who sent each user turn, and
+that must survive a worker rehydrating history from the DB. The sender is
+sourced from the acting user (``_mcp_effective_user_id`` = the
+``bind_acting_user`` initiator, owner fallback); persistence rides
+``conversations.meta`` (no migration).
 
 Covers: the ``_sender`` side-channel round-trip; DB replay routing; append-time
-stamping from the acting user (and synthetic-turn exclusion); the wire-time
-label injection gated on >1 distinct sender; and the shared-state detection +
-one-time "has joined" note.
+stamping from the acting user (and synthetic-turn exclusion); the monotonic
+shared-state derivation (latch + never-shrinking participant set, seeded from
+full history) and its per-turn memo; nonce-fenced wire-time label injection
+(and defanging of typed look-alikes); resume/fork attribution round-trips; and
+the shared-state detection + one-time "has joined" note.
 """
 
 from __future__ import annotations

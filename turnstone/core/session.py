@@ -3694,6 +3694,10 @@ class ChatSession:
             if storage:
                 row = storage.get_user(user_id)
                 if row:
+                    # username-first (unlike auth.py's display_name-first for the
+                    # UI): sender labels must read as the SAME identity kind the
+                    # owner gets in the banner (``self._username`` = users.username),
+                    # so owner and participants are labelled consistently.
                     name = row.get("username") or row.get("display_name") or user_id
                 # Cache hits and definite misses (row is None). A transient
                 # storage error, by contrast, skips the cache and falls through
@@ -4594,8 +4598,7 @@ class ChatSession:
             # auto-resume): marks the turn for audit / replay / UI so it isn't
             # mistaken for real user input.  Stripped at the sanitize boundary.
             user_msg["_source"] = source
-        # Per-message sender identity for shared-workstream attribution (the
-        # context-identity layer atop upstream's acting-user credential fix).
+        # Per-message sender identity for shared-workstream attribution.
         # Stamp genuine user turns with the ACTING user — the turn initiator
         # bound by ``bind_acting_user`` (owner fallback for CLI/eval/internal).
         # Synthetic turns (wake, compaction-resume, advisory) carry a ``_source``

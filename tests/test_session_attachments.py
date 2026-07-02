@@ -66,12 +66,13 @@ def _assert_plain_text_turn(d: dict) -> None:
     ``_attachments_meta`` is emitted.  The per-user-context feature stamps every
     genuine user turn with a wire-invisible ``_sender`` attribution key (a
     leading-underscore side channel, stripped by ``sanitize_messages`` before
-    the model call), so it may be present alongside role/content — that is the
-    only addition tolerated here."""
+    the model call), deterministically the owner id here — assert its exact
+    value so the shape stays pinned, not merely tolerated."""
     assert d["role"] == "user"
     assert d["content"] == "hello"  # plain string, not a multipart list
     assert "_attachments_meta" not in d
-    assert set(d) <= {"role", "content", "_sender"}
+    assert set(d) == {"role", "content", "_sender"}
+    assert d["_sender"] == "u1"  # owner fallback via _mcp_effective_user_id
 
 
 class TestPlainTextUnchanged:
