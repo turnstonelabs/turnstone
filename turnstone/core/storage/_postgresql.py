@@ -124,6 +124,9 @@ from turnstone.core.storage._utils import (
     VERDICT_MUTABLE as _VERDICT_MUTABLE,
 )
 from turnstone.core.storage._utils import (
+    assert_single_default_persona as _assert_single_default_persona,
+)
+from turnstone.core.storage._utils import (
     build_attachments_by_msg as _build_attachments_by_msg,
 )
 from turnstone.core.storage._utils import (
@@ -167,6 +170,9 @@ from turnstone.core.storage._utils import (
 )
 from turnstone.core.storage._utils import (
     split_perms as _split_perms,
+)
+from turnstone.core.storage._utils import (
+    validate_and_clear_default_persona as _validate_and_clear_default_persona,
 )
 from turnstone.core.workstream import BULK_CLOSE_STATE_VALUES, WorkstreamKind
 
@@ -5603,40 +5609,62 @@ class PostgreSQLBackend:
             ).fetchone()
             if existing is not None:
                 raise ValueError(f"persona name already exists: {values['name']}")
+            default_kinds = persona.get("applies_to_kinds") or ["interactive"]
             if values.get("is_default"):
-                self._validate_and_clear_default(
+                # Serialize default promotions cluster-wide: under READ
+                # COMMITTED two concurrent promotions can each miss the
+                # other's uncommitted flag and commit two defaults.  The
+                # xact-scoped advisory lock releases on commit/rollback.
+                conn.execute(
+                    sa.text("SELECT pg_advisory_xact_lock(hashtext('turnstone_personas_default'))")
+                )
+                _validate_and_clear_default_persona(
                     conn,
+                    personas,
                     persona_id=values["persona_id"],
-                    kinds=persona.get("applies_to_kinds") or ["interactive"],
+                    kinds=default_kinds,
                     enabled=persona.get("enabled", True),
                     now=now,
                 )
-            conn.execute(
-                sa.insert(personas),
-                {
-                    "persona_id": values["persona_id"],
-                    "name": values["name"],
-                    "display_name": values.get("display_name", ""),
-                    "description": values.get("description", ""),
-                    "base_prompt": values.get("base_prompt"),
-                    "tool_allowlist": values.get("tool_allowlist"),
-                    "mcp_enabled": values.get("mcp_enabled", 1),
-                    "memory_enabled": values.get("memory_enabled", 1),
-                    "applies_to_kinds": values.get("applies_to_kinds", '["interactive"]'),
-                    "is_default": values.get("is_default", 0),
-                    "enabled": values.get("enabled", 1),
-                    "org_id": values.get("org_id", ""),
-                    "created_by": values.get("created_by", ""),
-                    "created": now,
-                    "updated": now,
-                },
-            )
+            try:
+                conn.execute(
+                    sa.insert(personas),
+                    {
+                        "persona_id": values["persona_id"],
+                        "name": values["name"],
+                        "display_name": values.get("display_name", ""),
+                        "description": values.get("description", ""),
+                        "base_prompt": values.get("base_prompt"),
+                        "tool_allowlist": values.get("tool_allowlist"),
+                        "mcp_enabled": values.get("mcp_enabled", 1),
+                        "memory_enabled": values.get("memory_enabled", 1),
+                        "applies_to_kinds": values.get("applies_to_kinds", '["interactive"]'),
+                        "is_default": values.get("is_default", 0),
+                        "enabled": values.get("enabled", 1),
+                        "org_id": values.get("org_id", ""),
+                        "created_by": values.get("created_by", ""),
+                        "created": now,
+                        "updated": now,
+                    },
+                )
+            except sa.exc.IntegrityError as exc:
+                # SELECT-then-INSERT loser on unique(name): surface the
+                # same ValueError the pre-check raises so callers map one
+                # error shape (400), not an opaque 500.
+                raise ValueError(f"persona name already exists: {values['name']}") from exc
+            if values.get("is_default"):
+                _assert_single_default_persona(conn, personas, default_kinds[0])
             conn.commit()
 
     def update_persona(self, persona_id: str, **fields: Any) -> bool:
         fields = {k: v for k, v in fields.items() if k in _PERSONA_MUTABLE}
         if not fields:
             return False
+        # Validate/serialize BEFORE the invariant checks so malformed input
+        # (explicit-None kinds, wrong types) surfaces as the serializer's
+        # precise ValueError instead of a TypeError escaping the routes'
+        # 400 mapping as a 500.
+        values = _serialize_persona_fields(fields)
         now = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S")
         with self._conn() as conn:
             row = conn.execute(
@@ -5650,63 +5678,36 @@ class PostgreSQLBackend:
                     raise ValueError("the default persona cannot be archived")
                 if "is_default" in fields and not fields["is_default"]:
                     raise ValueError(
-                        "cannot unset is_default directly; set it on the "
-                        "successor persona instead"
+                        "cannot unset is_default directly; set it on the successor persona instead"
                     )
                 if "applies_to_kinds" in fields and sorted(
                     fields["applies_to_kinds"] or []
                 ) != sorted(current["applies_to_kinds"]):
                     raise ValueError("cannot change applies_to_kinds of the default persona")
-            if fields.get("is_default") and not current["is_default"]:
-                self._validate_and_clear_default(
+            promote = bool(fields.get("is_default")) and not current["is_default"]
+            promote_kinds = fields.get("applies_to_kinds", current["applies_to_kinds"])
+            if promote:
+                # Serialize default promotions cluster-wide (see
+                # create_persona for the READ COMMITTED rationale).
+                conn.execute(
+                    sa.text("SELECT pg_advisory_xact_lock(hashtext('turnstone_personas_default'))")
+                )
+                _validate_and_clear_default_persona(
                     conn,
+                    personas,
                     persona_id=persona_id,
-                    kinds=fields.get("applies_to_kinds", current["applies_to_kinds"]),
+                    kinds=promote_kinds,
                     enabled=fields.get("enabled", current["enabled"]),
                     now=now,
                 )
-            values = _serialize_persona_fields(fields)
             values["updated"] = now
             conn.execute(
                 sa.update(personas).where(personas.c.persona_id == persona_id).values(**values)
             )
+            if promote:
+                _assert_single_default_persona(conn, personas, promote_kinds[0])
             conn.commit()
             return True
-
-    @staticmethod
-    def _validate_and_clear_default(
-        conn: sa.engine.Connection,
-        *,
-        persona_id: str,
-        kinds: list[str],
-        enabled: Any,
-        now: str,
-    ) -> None:
-        """Enforce the default-persona invariants and demote the previous
-        holder, inside the caller's transaction.
-
-        Exactly one default per kind: a default must be single-kind (a
-        two-kind default would get orphan-cleared when either kind's crown
-        moves) and enabled; the incumbent default for that kind loses the
-        flag in the same transaction.
-        """
-        if len(kinds) != 1:
-            raise ValueError("a default persona must apply to exactly one kind")
-        if not enabled:
-            raise ValueError("a disabled persona cannot be the default")
-        kind = kinds[0]
-        others = conn.execute(
-            sa.select(personas.c.persona_id, personas.c.applies_to_kinds).where(
-                sa.and_(personas.c.is_default == 1, personas.c.persona_id != persona_id)
-            )
-        ).fetchall()
-        for oid, okinds_raw in others:
-            if kind in json.loads(okinds_raw or "[]"):
-                conn.execute(
-                    sa.update(personas)
-                    .where(personas.c.persona_id == oid)
-                    .values(is_default=0, updated=now)
-                )
 
     # -- Prompt policies -------------------------------------------------------
 

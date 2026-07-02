@@ -225,6 +225,22 @@ class TestRoles:
         assert resp.status_code == 200, resp.json()
         assert "model.skills.write" in resp.json()["permissions"]
 
+    def test_create_role_with_persona_permissions(self, client):
+        """``persona.{create,read,write}`` (migration 063) are enumerated in
+        ``_VALID_PERMISSIONS`` and pass role-create validation.  Before the fix
+        they 400'd — a custom role could never carry a persona grant."""
+        resp = client.post(
+            "/v1/api/admin/roles",
+            json=_role_payload(
+                name="personaeditor",
+                permissions="read,persona.create,persona.read,persona.write",
+            ),
+        )
+        assert resp.status_code == 200, resp.json()
+        perms = resp.json()["permissions"]
+        for p in ("persona.create", "persona.read", "persona.write"):
+            assert p in perms
+
     def test_permission_sections_js_covers_valid_permissions(self):
         """F-5: ``_PERMISSION_SECTIONS`` in governance.js mirrors
         ``_VALID_PERMISSIONS`` in console/server.py.  A new perm added
@@ -355,6 +371,19 @@ class TestRoles:
         assert role["display_name"] == "Senior Analyst"
         assert role["permissions"] == "read,write,approve"
 
+    def test_update_role_accepts_persona_permissions(self, client):
+        """Editing a custom role to carry ``persona.*`` must validate (they were
+        rejected before 063 added them to ``_VALID_PERMISSIONS``)."""
+        create_resp = client.post("/v1/api/admin/roles", json=_role_payload())
+        role_id = create_resp.json()["role_id"]
+        resp = client.put(
+            f"/v1/api/admin/roles/{role_id}",
+            json={"permissions": "read,persona.read,persona.write"},
+        )
+        assert resp.status_code == 200, resp.json()
+        perms = resp.json()["permissions"]
+        assert "persona.read" in perms and "persona.write" in perms
+
     def test_update_nonexistent_role(self, client):
         resp = client.put(
             "/v1/api/admin/roles/nonexistent",
@@ -450,6 +479,20 @@ class TestRoleOverrides:
         body = resp.json()
         assert "model.skills.write" in body["effective"]
         assert body["grants"] == ["model.skills.write"]
+
+    def test_overrides_grant_persona_write(self, client, storage):
+        # persona.write is admin-default (063) but grantable to any builtin
+        # role via the overrides layer — the endpoint must accept it, not 400
+        # it as an unknown permission.
+        _seed_builtin_admin(storage, "read,write,admin.roles")
+        resp = client.put(
+            "/v1/api/admin/roles/builtin-admin/overrides",
+            json={"grant": ["persona.write"], "revoke": []},
+        )
+        assert resp.status_code == 200, resp.json()
+        body = resp.json()
+        assert "persona.write" in body["effective"]
+        assert body["grants"] == ["persona.write"]
 
     def test_overrides_replace_semantics(self, client, storage):
         _seed_builtin_admin(storage, "read,write,admin.roles")

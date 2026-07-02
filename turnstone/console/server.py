@@ -6441,6 +6441,13 @@ _VALID_PERMISSIONS = frozenset(
         # Project deletion — destroys the container and its scoped memory, so
         # it is a distinct capability from project.write (admin-default).
         "project.delete",
+        # Personas — workstream capability-envelope templates.  Granted to
+        # builtin-admin via migration 063; grantable outward via custom
+        # roles / the overrides editor (selection at workstream creation is
+        # deliberately ungated — these gate authoring and management only).
+        "persona.create",
+        "persona.read",
+        "persona.write",
     }
 )
 
@@ -11941,7 +11948,9 @@ async def admin_create_persona(request: Request) -> JSONResponse:
         {
             "persona_id": persona_id,
             "name": name,
-            "org_id": str(body.get("org_id", "")).strip(),
+            # ``or ""`` guards explicit JSON null (str(None) would persist
+            # the literal "None"); [:64] matches the org-handler caps.
+            "org_id": str(body.get("org_id") or "").strip()[:64],
             "created_by": audit_uid,
         }
     )

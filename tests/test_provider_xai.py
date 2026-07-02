@@ -208,7 +208,26 @@ class TestBuildKwargs:
     def test_web_search_tool_injected_into_tools_list(self, provider: XAIProvider) -> None:
         # The inherited generalised injection in
         # OpenAIResponsesProvider._build_kwargs walks server_side_tools;
-        # grok-4.3 declares `("web_search",)`.
+        # grok-4.3 declares `("web_search",)`.  Injection is replace-only:
+        # it stands in for a client web_search def that survived the
+        # session's visibility filter, so the def must be present.
+        kwargs = provider._build_kwargs(
+            model="grok-4.3",
+            messages=[{"role": "user", "content": "hi"}],
+            tools=[{"type": "function", "function": {"name": "web_search"}}],
+            max_tokens=512,
+            temperature=0.5,
+            reasoning_effort="low",
+            deferred_names=None,
+            capabilities=None,
+            replay_reasoning_to_model=False,
+        )
+        tools = kwargs.get("tools") or []
+        assert {"type": "web_search"} in tools
+
+    def test_web_search_not_injected_without_client_def(self, provider: XAIProvider) -> None:
+        # A request whose envelope hides web_search (persona visibility
+        # set, tool-less utility call) gains no native search.
         kwargs = provider._build_kwargs(
             model="grok-4.3",
             messages=[{"role": "user", "content": "hi"}],
@@ -221,7 +240,7 @@ class TestBuildKwargs:
             replay_reasoning_to_model=False,
         )
         tools = kwargs.get("tools") or []
-        assert {"type": "web_search"} in tools
+        assert {"type": "web_search"} not in tools
 
 
 # ---------------------------------------------------------------------------

@@ -2490,9 +2490,7 @@ def make_create_handler(
             # engineer/orchestrator defaults.  Resume skips resolution:
             # the resumed session restores its own stamp from config.
             body_persona_raw = body.get("persona") or ""
-            body_persona = (
-                body_persona_raw.strip() if isinstance(body_persona_raw, str) else ""
-            )
+            body_persona = body_persona_raw.strip() if isinstance(body_persona_raw, str) else ""
             persona_snapshot = None
             if isinstance(resume_ws_id_raw, str) and resume_ws_id_raw:
                 # Fork-resume adopts the SOURCE workstream's stamp, resolved
@@ -2511,10 +2509,7 @@ def make_create_handler(
                 if _st is not None and resume_target:
                     try:
                         persona_snapshot = snapshot_from_config(
-                            await asyncio.to_thread(
-                                _st.load_workstream_config, resume_target
-                            )
-                            or {}
+                            await asyncio.to_thread(_st.load_workstream_config, resume_target) or {}
                         )
                     except ValueError as exc:
                         return JSONResponse(
@@ -2539,19 +2534,24 @@ def make_create_handler(
                     if persona_err:
                         return JSONResponse({"error": persona_err}, status_code=400)
                 else:
-                    # Default-persona lookup is best-effort: a storage blip
-                    # here degrades to an unstamped (legacy) create, which
-                    # is behavior-identical to the shipped defaults —
-                    # never a reason to fail the create.
-                    try:
-                        _st = _get_storage()
-                        if _st is not None:
+                    # No explicit persona: stamp the kind's default. A clean
+                    # ``None`` (no default configured — pre-seed DB) creates
+                    # unstamped legacy, but a FAILED lookup must not: the
+                    # operator may have promoted a restricted persona to
+                    # default, and degrading to the stock envelope on a
+                    # storage blip would silently widen it.
+                    _st = _get_storage()
+                    if _st is not None:
+                        try:
                             persona_row = await asyncio.to_thread(
                                 _st.get_default_persona, mgr.kind.value
                             )
-                    except Exception:
-                        log.debug("ws.create.default_persona_lookup_failed", exc_info=True)
-                        persona_row = None
+                        except Exception:
+                            log.warning("ws.create.default_persona_lookup_failed", exc_info=True)
+                            return JSONResponse(
+                                {"error": "persona resolution unavailable"},
+                                status_code=503,
+                            )
                 if persona_row is not None:
                     persona_snapshot = snapshot_from_persona(persona_row)
 
@@ -2749,6 +2749,10 @@ def make_list_handler(cfg: SessionEndpointConfig) -> Handler:
             for ws in wss:
                 raw_pid = getattr(ws, "project_id", "")
                 project_id = raw_pid if isinstance(raw_pid, str) else ""
+                # Same guarded read as project_id — test doubles and older
+                # node payloads may lack the attribute.
+                raw_persona = getattr(ws, "persona", "")
+                persona = raw_persona if isinstance(raw_persona, str) else ""
                 # Private-project tenancy — drop rows the requester may
                 # not see (same predicate as the saved list).
                 if not visibility.ws_visible(project_id, ws_owner=ws.user_id or ""):
@@ -2763,6 +2767,7 @@ def make_list_handler(cfg: SessionEndpointConfig) -> Handler:
                         "parent_ws_id": ws.parent_ws_id,
                         "user_id": ws.user_id,
                         "project_id": project_id or None,
+                        "persona": persona or None,
                     }
                 )
             return rows

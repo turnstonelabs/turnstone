@@ -364,6 +364,10 @@ const _PERMISSION_SECTIONS = [
     ],
   },
   {
+    label: "Personas",
+    permissions: ["persona.create", "persona.read", "persona.write"],
+  },
+  {
     label: "Coordinator",
     permissions: ["coordinator.trust.send"],
   },

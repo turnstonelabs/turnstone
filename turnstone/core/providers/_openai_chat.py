@@ -103,10 +103,15 @@ class OpenAIChatCompletionsProvider:
         """
         if not caps.supports_web_search:
             return tools
-        if tools:
-            tools = [t for t in tools if t.get("function", {}).get("name") != "web_search"]
-            if not tools:
-                tools = None
+        # Replace-only: native search stands in for the client ``web_search``
+        # def. When the request never advertised one (persona visibility set,
+        # coordinator toolset), injecting the option would hand the model a
+        # capability its envelope hides.
+        if not tools or not any(t.get("function", {}).get("name") == "web_search" for t in tools):
+            return tools
+        tools = [t for t in tools if t.get("function", {}).get("name") != "web_search"]
+        if not tools:
+            tools = None
         kwargs["web_search_options"] = {}
         return tools
 

@@ -521,11 +521,16 @@ def test_active_list_row_shape_includes_unified_fields(storage):
         "parent_ws_id",
         "user_id",
         "project_id",
+        "persona",
     }
     assert row["name"] == "lifted-coord"
     assert row["kind"] == "coordinator"
     assert row["parent_ws_id"] is None
     assert row["user_id"] == "u1"
+    # mgr.create without a persona kwarg stamps nothing at this layer
+    # (default resolution lives in the HTTP create handler), so the
+    # row carries the null slug — not a fabricated default.
+    assert row["persona"] is None
 
 
 def test_create_returns_ws_id_and_records_audit(storage):

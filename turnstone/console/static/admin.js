@@ -2931,52 +2931,13 @@ function confirmDeleteProject(pid, name) {
 let _adminPersonas = [];
 let _personaShelfWired = false;
 
-// FALLBACK builtin tool inventories per kind, for the visibility checklist.
-// The authoritative sets ride the GET /v1/api/admin/personas response
-// (tool_inventory, derived server-side from core/tools.py) and are cached in
-// _personaToolInventory; this constant only covers the render-before-load
-// window.  "tool_search" is synthetic (not a builtin) but listed because its
-// presence decides whether a visibility set is soft (expandable) or hard.
+// Builtin tool inventories per kind for the visibility checklist ride the
+// GET /v1/api/admin/personas response (tool_inventory, derived server-side
+// from core/tools.py) — deliberately NO hand-mirrored fallback constant
+// here, which would silently drift every time a tool ships.  Until the
+// first list response lands the checklist renders empty; the free-text
+// "extra tools" input still accepts any name in that window.
 let _personaToolInventory = null; // {interactive: [...], coordinator: [...]}
-const _PERSONA_TOOLS = {
-  interactive: [
-    "bash",
-    "diff_file",
-    "edit_file",
-    "memory",
-    "notify",
-    "read_file",
-    "read_resource",
-    "recall",
-    "search",
-    "skills",
-    "task_agent",
-    "tool_search",
-    "use_prompt",
-    "watch",
-    "web_fetch",
-    "web_search",
-    "write_file",
-  ],
-  coordinator: [
-    "cancel_workstream",
-    "close_all_children",
-    "close_workstream",
-    "delete_workstream",
-    "inspect_workstream",
-    "list_nodes",
-    "list_workstreams",
-    "memory",
-    "notify",
-    "send_to_workstream",
-    "skills",
-    "spawn_batch",
-    "spawn_workstream",
-    "tasks",
-    "tool_search",
-    "wait_for_workstream",
-  ],
-};
 
 function loadAdminPersonas() {
   authFetch("/v1/api/admin/personas")
@@ -3059,8 +3020,7 @@ function _renderPersonas(personas) {
               : [
                   {
                     label: "make default",
-                    title:
-                      "Make this the kind default (demotes the incumbent)",
+                    title: "Make this the kind default (demotes the incumbent)",
                     attrs: { "data-default-persona": p.persona_id },
                   },
                 ],
@@ -3158,8 +3118,31 @@ function _personaShelfWire() {
     .getElementById("pr-tools-mode")
     .addEventListener("change", _personaToolsModeChanged);
   document.getElementById("pr-kinds").addEventListener("change", function () {
-    // The checklist shows the ACTIVE kind's inventory.
-    _renderPersonaToolChecklist([]);
+    // Re-render the ACTIVE kind's inventory carrying the checked names
+    // over, so dual-kind tools (memory, notify, skills, tool_search)
+    // survive the flip; checked names outside the new kind's inventory
+    // migrate to the extra field instead of silently dropping from the
+    // allowlist the operator is editing.
+    const kept = [];
+    document
+      .querySelectorAll("#pr-tools-checklist [data-persona-tool]")
+      .forEach(function (input) {
+        if (input.checked) kept.push(input.value);
+      });
+    _renderPersonaToolChecklist(kept);
+    const kind = document.getElementById("pr-kinds").value || "interactive";
+    const known = (_personaToolInventory || {})[kind] || [];
+    const extra = document.getElementById("pr-tools-extra");
+    const extras = (extra.value || "")
+      .split(",")
+      .map(function (s) {
+        return s.trim();
+      })
+      .filter(Boolean);
+    kept.forEach(function (n) {
+      if (known.indexOf(n) < 0 && extras.indexOf(n) < 0) extras.push(n);
+    });
+    extra.value = extras.join(", ");
   });
 }
 
@@ -3171,7 +3154,7 @@ function _personaToolsModeChanged() {
 function _renderPersonaToolChecklist(checked) {
   const kind = document.getElementById("pr-kinds").value || "interactive";
   const host = document.getElementById("pr-tools-checklist");
-  const inventory = _personaToolInventory || _PERSONA_TOOLS;
+  const inventory = _personaToolInventory || {};
   const names = inventory[kind] || [];
   host.replaceChildren();
   names.forEach(function (name) {
@@ -3229,7 +3212,7 @@ function _personaFillToolsForm(allowlist) {
   } else {
     modeSel.value = "list";
     const kind = document.getElementById("pr-kinds").value || "interactive";
-    const known = (_personaToolInventory || _PERSONA_TOOLS)[kind] || [];
+    const known = (_personaToolInventory || {})[kind] || [];
     _renderPersonaToolChecklist(allowlist);
     extra.value = allowlist
       .filter(function (n) {
@@ -3303,9 +3286,7 @@ function submitPersonaShelf() {
     display_name: (
       document.getElementById("pr-display-name").value || ""
     ).trim(),
-    description: (
-      document.getElementById("pr-description").value || ""
-    ).trim(),
+    description: (document.getElementById("pr-description").value || "").trim(),
     base_prompt: prompt.trim() ? prompt : null,
     tool_allowlist: _personaToolsFromForm(),
     mcp_enabled: document.getElementById("pr-mcp").checked,

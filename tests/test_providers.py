@@ -2752,6 +2752,23 @@ class TestOpenAIWebSearch:
         result = self.provider._apply_web_search(kwargs, caps, tools)
         assert result is None
 
+    def test_apply_web_search_no_op_when_client_def_absent(self) -> None:
+        """Replace-only: a search model with a NON-EMPTY toolset that never
+        advertised web_search (a persona visibility set or coordinator
+        toolset) must NOT gain native search — the option stays off and the
+        tools pass through untouched.  Contrast test_apply_web_search_with_
+        no_tools, which covers the tool-less utility-call case."""
+        caps = self.provider.get_capabilities("gpt-5-search-api")
+        assert caps.supports_web_search is True
+        kwargs: dict[str, Any] = {"model": "gpt-5-search-api"}
+        tools: list[dict[str, Any]] = [
+            {"type": "function", "function": {"name": "bash", "description": "Run bash"}},
+            {"type": "function", "function": {"name": "read_file", "description": "Read"}},
+        ]
+        result = self.provider._apply_web_search(kwargs, caps, tools)
+        assert "web_search_options" not in kwargs
+        assert result is tools  # unchanged, not filtered or replaced
+
     def test_format_citations_appends_sources(self) -> None:
         """url_citation annotations should be formatted as footnote sources."""
         ann = MagicMock()
@@ -2810,12 +2827,26 @@ class TestOpenAIWebSearch:
         assert "Sources:" not in result
 
     def test_apply_web_search_with_no_tools(self) -> None:
-        """Search model with tools=None should still inject web_search_options."""
+        """No client web_search def ⇒ no injection (replace-only semantics).
+
+        A request that never advertised the web_search tool — persona
+        visibility set, coordinator toolset, or a tool-less utility call —
+        must not gain native search at the provider layer.
+        """
         caps = self.provider.get_capabilities("gpt-5-search-api")
         kwargs: dict[str, Any] = {}
         result = self.provider._apply_web_search(kwargs, caps, None)
-        assert "web_search_options" in kwargs
+        assert "web_search_options" not in kwargs
         assert result is None
+
+    def test_apply_web_search_replaces_client_def(self) -> None:
+        """With the client def present, it is filtered and the option set."""
+        caps = self.provider.get_capabilities("gpt-5-search-api")
+        kwargs: dict[str, Any] = {}
+        tools = [{"type": "function", "function": {"name": "web_search"}}]
+        result = self.provider._apply_web_search(kwargs, caps, tools)
+        assert "web_search_options" in kwargs
+        assert result is None  # the lone def was filtered away
 
     def test_streaming_creates_with_web_search_options(self) -> None:
         """Streaming with a search model should pass web_search_options."""
@@ -4193,8 +4224,13 @@ class TestResponsesParamBuilding:
         )
         assert kwargs["instructions"] == "Be helpful"
 
-    def test_web_search_injected_with_no_tools(self) -> None:
-        """Search-capable models get web_search tool even when tools=None."""
+    def test_web_search_not_injected_with_no_tools(self) -> None:
+        """No client web_search def ⇒ no server-side web_search entry.
+
+        Replace-only semantics: a request whose envelope hides web_search
+        (persona visibility set, coordinator toolset, tool-less utility
+        call) must not gain native search at the provider layer.
+        """
         kwargs = self.provider._build_kwargs(
             model="gpt-5-search-api",
             messages=[{"role": "user", "content": "Hi"}],
@@ -4204,9 +4240,42 @@ class TestResponsesParamBuilding:
             reasoning_effort="none",
             deferred_names=None,
         )
+        tool_types = [t.get("type") for t in kwargs.get("tools") or []]
+        assert "web_search" not in tool_types
+
+    def test_web_search_injected_with_client_def(self) -> None:
+        """The server-side entry stands in for a surviving client def."""
+        kwargs = self.provider._build_kwargs(
+            model="gpt-5-search-api",
+            messages=[{"role": "user", "content": "Hi"}],
+            tools=[{"type": "function", "function": {"name": "web_search"}}],
+            max_tokens=4096,
+            temperature=0.5,
+            reasoning_effort="none",
+            deferred_names=None,
+        )
         assert "tools" in kwargs
         tool_types = [t.get("type") for t in kwargs["tools"]]
         assert "web_search" in tool_types
+
+    def test_web_search_not_injected_for_nonempty_toolset_without_def(self) -> None:
+        """A non-empty toolset lacking web_search gains no native search.
+
+        Guards the _convert_tools lane: capability alone must not inject —
+        a persona visibility set or the coordinator toolset that hides
+        web_search stays search-free on search-capable models.
+        """
+        kwargs = self.provider._build_kwargs(
+            model="gpt-5-search-api",
+            messages=[{"role": "user", "content": "Hi"}],
+            tools=[{"type": "function", "function": {"name": "read_file"}}],
+            max_tokens=4096,
+            temperature=0.5,
+            reasoning_effort="none",
+            deferred_names=None,
+        )
+        tool_types = [t.get("type") for t in kwargs.get("tools") or []]
+        assert "web_search" not in tool_types
 
 
 class TestResponsesCitationFormat:

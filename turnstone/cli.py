@@ -888,15 +888,20 @@ def resolve_cli_persona_kwargs(
         return {}
     if persona_arg:
         row, err = resolve_persona_for_kind(storage, persona_arg, "interactive")
-        if err or row is None:
-            print(red(err or f"Persona not found or disabled: {persona_arg}"))
+        if row is None:
+            print(red(err))
             sys.exit(1)
         return {"persona": row["name"], "persona_snapshot": snapshot_from_persona(row)}
     if storage is not None:
         try:
             default_row = storage.get_default_persona("interactive")
-        except Exception:
-            default_row = None
+        except Exception as exc:
+            # A failed lookup must not silently start an unrestricted
+            # session — the operator may have promoted a restricted
+            # persona to default.  (A clean None — no default configured —
+            # still yields the unstamped legacy session below.)
+            print(red(f"Default persona lookup failed: {exc}"))
+            sys.exit(1)
         if default_row:
             return {
                 "persona": default_row["name"],

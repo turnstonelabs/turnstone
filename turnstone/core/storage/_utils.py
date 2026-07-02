@@ -664,23 +664,64 @@ PERSONA_KINDS = frozenset({"interactive", "coordinator"})
 def persona_row_to_dict(row: Any) -> dict[str, Any]:
     """Convert a personas row to the Python-typed dict shape the Protocol
     documents: JSON columns parsed, 0/1 columns as bool.  ``tool_allowlist``
-    keeps its tri-state — None (unrestricted) vs [] (hard empty) vs [names]."""
+    keeps its tri-state — None (unrestricted) vs [] (hard empty) vs [names].
+
+    Raises ValueError on a corrupt row: a malformed allowlist or kinds
+    column must fail loudly (mirroring ``snapshot_from_config``), never
+    decode into a garbage envelope or mask a broken invariant.
+    """
     d = row_to_dict(row, "mcp_enabled", "memory_enabled", "is_default", "enabled")
+
+    def _load_json(column: str, raw_value: Any) -> Any:
+        # Re-raise parser errors with the persona named — a bare
+        # JSONDecodeError message doesn't say WHICH row is corrupt.
+        try:
+            return json.loads(raw_value)
+        except ValueError as exc:
+            raise ValueError(f"corrupt {column} on persona {d.get('persona_id')!r}: {exc}") from exc
+
     raw = d.get("tool_allowlist")
-    d["tool_allowlist"] = None if raw is None else json.loads(raw)
-    d["applies_to_kinds"] = json.loads(d.get("applies_to_kinds") or '["interactive"]')
+    if raw is None:
+        d["tool_allowlist"] = None
+    else:
+        tools = _load_json("tool_allowlist", raw)
+        if not isinstance(tools, list) or not all(isinstance(t, str) for t in tools):
+            raise ValueError(f"corrupt tool_allowlist on persona {d.get('persona_id')!r}")
+        d["tool_allowlist"] = tools
+    kinds_raw = d.get("applies_to_kinds")
+    kinds = _load_json("applies_to_kinds", kinds_raw) if kinds_raw else None
+    if not isinstance(kinds, list) or not kinds or not all(isinstance(k, str) for k in kinds):
+        raise ValueError(f"corrupt applies_to_kinds on persona {d.get('persona_id')!r}")
+    d["applies_to_kinds"] = kinds
     return d
+
+
+# Storage-layer size bounds for operator-authored persona fields.  The
+# console route truncates its inputs to the same shape, but the storage
+# edge is the layer every future ingress (SDK-direct, admin CLI) inherits —
+# reject rather than silently truncate here.
+PERSONA_FIELD_CAPS: dict[str, int] = {
+    "display_name": 128,
+    "description": 1024,
+    "base_prompt": 32768,
+}
+PERSONA_ALLOWLIST_MAX_ENTRIES = 512
+PERSONA_ALLOWLIST_MAX_NAME_LEN = 256
 
 
 def serialize_persona_fields(fields: dict[str, Any]) -> dict[str, Any]:
     """Validate + serialize Python-typed persona fields to column values.
 
-    Shared by both backends so the tri-state allowlist encoding and the
-    kinds validation can't drift between them.  Raises ValueError on
-    malformed input; unknown keys pass through (callers filter to the
-    mutable set first where that matters).
+    Shared by both backends so the tri-state allowlist encoding, the kinds
+    validation, and the size bounds can't drift between them.  Raises
+    ValueError on malformed or oversized input; unknown keys pass through
+    (callers filter to the mutable set first where that matters).
     """
     out = dict(fields)
+    for key, cap in PERSONA_FIELD_CAPS.items():
+        val = out.get(key)
+        if val is not None and key in out and len(str(val)) > cap:
+            raise ValueError(f"{key} exceeds {cap} characters")
     if "applies_to_kinds" in out:
         kinds = out["applies_to_kinds"]
         if not isinstance(kinds, list) or not kinds or not set(kinds) <= PERSONA_KINDS:
@@ -692,11 +733,79 @@ def serialize_persona_fields(fields: dict[str, Any]) -> dict[str, Any]:
         tools = out["tool_allowlist"]
         if not isinstance(tools, list) or not all(isinstance(t, str) for t in tools):
             raise ValueError("tool_allowlist must be None or a list of tool names")
+        if len(tools) > PERSONA_ALLOWLIST_MAX_ENTRIES:
+            raise ValueError(f"tool_allowlist exceeds {PERSONA_ALLOWLIST_MAX_ENTRIES} entries")
+        if any(len(t) > PERSONA_ALLOWLIST_MAX_NAME_LEN for t in tools):
+            raise ValueError(
+                f"tool_allowlist entries are capped at {PERSONA_ALLOWLIST_MAX_NAME_LEN} chars"
+            )
         out["tool_allowlist"] = json.dumps(tools)
     for key in ("mcp_enabled", "memory_enabled", "is_default", "enabled"):
         if key in out:
             out[key] = 1 if out[key] else 0
     return out
+
+
+def validate_and_clear_default_persona(
+    conn: Any,
+    personas_table: Any,
+    *,
+    persona_id: str,
+    kinds: list[str],
+    enabled: Any,
+    now: str,
+) -> None:
+    """Enforce the default-persona invariants and demote the incumbent,
+    inside the caller's transaction.
+
+    Shared by both backends (fully dialect-neutral) so the invariants —
+    exactly one default per kind, single-kind, enabled — cannot drift.
+    A corrupt incumbent row raises rather than being skipped: silently
+    not-demoting it would commit two defaults, the exact state this
+    helper exists to prevent.  Concurrency: the PostgreSQL backend
+    serializes promotions with an advisory xact lock before calling this;
+    ``assert_single_default_persona`` runs post-promote as the backstop.
+    """
+    if not isinstance(kinds, list) or len(kinds) != 1:
+        raise ValueError("a default persona must apply to exactly one kind")
+    if not enabled:
+        raise ValueError("a disabled persona cannot be the default")
+    kind = kinds[0]
+    others = conn.execute(
+        sa.select(personas_table.c.persona_id, personas_table.c.applies_to_kinds).where(
+            sa.and_(
+                personas_table.c.is_default == 1,
+                personas_table.c.persona_id != persona_id,
+            )
+        )
+    ).fetchall()
+    for oid, okinds_raw in others:
+        okinds = json.loads(okinds_raw) if okinds_raw else None
+        if not isinstance(okinds, list):
+            raise ValueError(f"corrupt applies_to_kinds on persona {oid!r}")
+        if kind in okinds:
+            conn.execute(
+                sa.update(personas_table)
+                .where(personas_table.c.persona_id == oid)
+                .values(is_default=0, updated=now)
+            )
+
+
+def assert_single_default_persona(conn: Any, personas_table: Any, kind: str) -> None:
+    """Post-promote backstop: raise (rolling back the enclosing
+    transaction) if more than one enabled default applies to *kind* — a
+    concurrent promotion that slipped past serialization must fail loudly,
+    never commit a nondeterministic default."""
+    rows = conn.execute(
+        sa.select(personas_table.c.persona_id, personas_table.c.applies_to_kinds).where(
+            personas_table.c.is_default == 1
+        )
+    ).fetchall()
+    holders = [oid for oid, kr in rows if kind in (json.loads(kr) if kr else [])]
+    if len(holders) > 1:
+        raise ValueError(f"concurrent default-persona change detected for kind {kind!r}; retry")
+
+
 HEURISTIC_RULE_MUTABLE = frozenset(
     {
         "name",

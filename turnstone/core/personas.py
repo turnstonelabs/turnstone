@@ -59,9 +59,7 @@ class PersonaSnapshot:
         return {
             "persona": self.name,
             "persona_prompt": self.prompt,
-            "persona_tools": (
-                json.dumps(sorted(self.tools)) if self.tools is not None else "null"
-            ),
+            "persona_tools": (json.dumps(sorted(self.tools)) if self.tools is not None else "null"),
             "persona_mcp": "1" if self.mcp else "0",
             "persona_memory": "1" if self.memory else "0",
         }
@@ -77,8 +75,12 @@ def resolve_persona_for_kind(
     rule — the HTTP create handler, the CLI ``--persona`` path, and the
     coordinator spawn precheck all consume this, so a future rule change
     (per-org personas, a new kind) cannot leave the surfaces disagreeing.
+    ``storage is None`` reports a distinct storage-unavailable error — a
+    storage outage must never masquerade as "unknown persona".
     """
-    row = storage.get_persona_by_name(name) if storage else None
+    if storage is None:
+        return None, "persona storage unavailable"
+    row = storage.get_persona_by_name(name)
     if not row or not row.get("enabled", False):
         return None, f"Persona not found or disabled: {name}"
     if kind not in (row.get("applies_to_kinds") or []):

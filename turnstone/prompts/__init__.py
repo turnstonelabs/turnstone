@@ -273,8 +273,11 @@ def compose_system_message(
     #    model as an IC engineer ("you read before you edit, commits
     #    you make..."); coordinators need an orchestrator framing
     #    instead ("you decompose, delegate, monitor, synthesise").
-    #    A persona's base_override replaces exactly this module.
-    if base_override is not None:
+    #    A persona's base_override replaces exactly this module.  Truthy
+    #    check, not ``is not None``: the stamp codec documents ``""`` as
+    #    "use the kind's stock BASE", so the empty string must never
+    #    compose an empty BASE regardless of which caller forwards it.
+    if base_override:
         parts.append(base_override)
     else:
         base_module = "base_coordinator.md" if kind == WorkstreamKind.COORDINATOR else "base.md"

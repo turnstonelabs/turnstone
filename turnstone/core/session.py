@@ -115,7 +115,11 @@ from turnstone.core.metacognition import (
     should_nudge,
 )
 from turnstone.core.nudge_queue import TOOL_DRAIN, USER_DRAIN, NudgeQueue
-from turnstone.core.personas import PersonaSnapshot, snapshot_from_config
+from turnstone.core.personas import (
+    PersonaSnapshot,
+    resolve_persona_for_kind,
+    snapshot_from_config,
+)
 from turnstone.core.providers import create_provider
 from turnstone.core.ratelimit import TokenBucket
 from turnstone.core.safety import is_command_blocked, sanitize_command
@@ -1454,6 +1458,11 @@ class ChatSession:
         # refresh callbacks stay inert (they all guard on _mcp_client).
         # Task agents keep their native tools; only the MCP surface closes.
         self._mcp_client = mcp_client if self._persona_mcp else None
+        # True when a real client was withheld by the persona gate (as
+        # opposed to no MCP in the deployment at all).  Mid-session
+        # ``resume()`` refuses to adopt an MCP-on stamp in that case —
+        # the dropped surface cannot be rebuilt post-construction.
+        self._mcp_gated_off = mcp_client is not None and not self._persona_mcp
         self._mcp_refresh_cb: Any = None  # Callable | None (avoid import)
         self._mcp_resource_cb: Any = None
         self._mcp_prompt_cb: Any = None
@@ -2636,6 +2645,39 @@ class ChatSession:
                 log.debug("chat_session.coord_client_close_failed", exc_info=True)
         self._cleanup_skill_resources()
 
+    def _drop_mcp_surface(self) -> None:
+        """Drop the live MCP surface to match an adopted MCP-off stamp.
+
+        Mirror of the constructor's persona MCP gate for the one path that
+        changes the lever after construction: a mid-session ``resume()``
+        adopting an MCP-off stamp.  Deregisters the three listeners (same
+        ``_mcp_listener_user_id`` identity rule as ``close()``), drops the
+        client reference, and resets both toolsets to the builtin lists.
+        Only reachable on interactive sessions — coordinators never hold a
+        client.  The caller rebuilds tool search and recomposes the prompt.
+        """
+        if self._mcp_client is None:
+            return
+        if self._mcp_refresh_cb:
+            self._mcp_client.remove_listener(
+                self._mcp_refresh_cb, user_id=self._mcp_listener_user_id
+            )
+            self._mcp_refresh_cb = None
+        if self._mcp_resource_cb:
+            self._mcp_client.remove_resource_listener(
+                self._mcp_resource_cb, user_id=self._mcp_listener_user_id
+            )
+            self._mcp_resource_cb = None
+        if self._mcp_prompt_cb:
+            self._mcp_client.remove_prompt_listener(
+                self._mcp_prompt_cb, user_id=self._mcp_listener_user_id
+            )
+            self._mcp_prompt_cb = None
+        self._mcp_client = None
+        self._tools = merge_mcp_tools(INTERACTIVE_TOOLS, [])
+        self._task_tools = merge_mcp_tools(TASK_AGENT_TOOLS, [])
+        self._render_agent_tool_descriptions()
+
     def _handle_mcp_refresh(self, arg: str) -> None:
         """Handle ``/mcp refresh [server]``."""
         assert self._mcp_client is not None
@@ -3031,7 +3073,27 @@ class ChatSession:
         turns = load_message_turns(ws_id)
         if not turns:
             return False
+        # Load persisted config and parse the persona stamp BEFORE touching
+        # session identity/history: a corrupt stamp must raise while this
+        # session is still intact — the web /command surface reports the
+        # error and continues on the CURRENT workstream, and a half-adopted
+        # resume would run the corrupt target under this session's envelope,
+        # after which the next _save_config would "repair" the target's
+        # stamp with a persona the operator never chose for it.
+        config = load_workstream_config(ws_id)
+        snap: PersonaSnapshot | None = None
         if not fork:
+            snap = snapshot_from_config(config or {})
+            if (snap.mcp if snap else True) and self._mcp_gated_off:
+                # The MCP lever is construction-time: narrowing is applied
+                # in place during adoption below, but a session whose
+                # persona dropped the client at construction cannot rebuild
+                # it — refuse rather than run out of step with the stamp.
+                raise ValueError(
+                    f"cannot resume {ws_id} in place: its persona enables "
+                    "MCP, which this session's persona dropped at "
+                    "construction — open the workstream fresh instead"
+                )
             self._ws_id = ws_id
             # A non-fork resume repoints this session at a DIFFERENT existing
             # workstream's identity (fork keeps self._ws_id, so its nonces stay
@@ -3062,26 +3124,25 @@ class ChatSession:
             type(self._provider).__name__,
             self.model,
         )
-        # Restore persisted config
-        config = load_workstream_config(ws_id)
+        # Restore persisted config (loaded and stamp-parsed above, before
+        # any session state was touched).
         # Adopt the persona stamp of the workstream being resumed — a
         # non-fork resume adopts the target's identity, so keeping this
         # session's creation-time stamp would clobber the target's on the
         # next _save_config.  The prompt/visibility/memory levers reapply
         # via the _init_system_messages() recompose below and the per-call
-        # visibility filter; the MCP lever is construction-time only (the
-        # startup resume paths — SessionManager.open, CLI --resume —
-        # construct with the stamp, so only a mid-session REPL /resume
-        # keeps the constructing persona's MCP surface).  A fork keeps its
-        # own creation-time stamp.  Corrupt stamps raise — never silently
-        # rewritten.
+        # visibility filter; the MCP lever narrows in place when the
+        # adopted stamp is MCP-off (_drop_mcp_surface below — widening was
+        # refused before adoption).  A fork keeps its own creation-time
+        # stamp.  Corrupt stamps raise — never silently rewritten.
         if not fork:
-            snap = snapshot_from_config(config or {})
             self._persona_name = snap.name if snap else ""
             self._persona_prompt = snap.prompt if snap else ""
             self._persona_tools = snap.tools if snap else None
             self._persona_mcp = snap.mcp if snap else True
             self._persona_memory = snap.memory if snap else True
+            if not self._persona_mcp and self._mcp_client is not None:
+                self._drop_mcp_surface()
             # Re-gate tool search under the adopted stamp: a hard set must
             # drop the ToolSearchManager (else the recomposed prompt keeps
             # the tool_search hint and the expanded-names escape hatch keeps
@@ -3240,9 +3301,10 @@ class ChatSession:
 
         Memory-directed nudge types (``MEMORY_NUDGE_TYPES``) are suppressed
         whenever the persona's envelope hides the memory tool — the lever
-        being off OR a visibility set that omits ``memory`` — because their
-        copy directs the model at that tool.  Behavioural nudges (repeat,
-        compaction, idle children, watches) stay on the config gate only.
+        being off OR an allowlist that hides ``memory`` (a tool_search
+        expansion that re-adds it re-enables them) — because their copy
+        directs the model at that tool.  Every other nudge type passes
+        straight through to the config gate.
         """
         if not self._mem_cfg.nudges:
             return False
@@ -3309,8 +3371,7 @@ class ChatSession:
             kind=self._kind,
             # Persona lever 1: replaces ONLY the BASE module.  ENV /
             # CONTEXT / TOOLS / POLICIES keep composing, so mandatory
-            # prompt policies ride on top of every persona — unlike the
-            # removed /creative fork, which bypassed composition entirely.
+            # prompt policies ride on top of every persona.
             base_override=self._persona_prompt or None,
         )
         dev_parts = [composed]
@@ -3354,8 +3415,12 @@ class ChatSession:
                 "\n\nAdditional tools are available via tool_search. "
                 "Use it when you need a capability not in your current tool set."
             )
-        # MCP resource catalog (lets the model know what's available for read_resource)
-        if self._mcp_client:
+        # MCP resource catalog (lets the model know what's available for
+        # read_resource).  Gated on the tool's visibility, not just the
+        # client: a persona allowlist that hides read_resource must drop
+        # the catalog AND its call instruction — same rule as the memory
+        # advisory — or the prompt instructs calls the wire hides.
+        if self._mcp_client and self._persona_tool_visible("read_resource"):
             # Per-user merge: pool entries for the effective user (acting
             # user on shared workstreams, owner otherwise) are included;
             # other users' pool resources are not.
@@ -3382,8 +3447,9 @@ class ChatSession:
                 lines.append("</mcp-resources>")
                 lines.append("Use read_resource(uri='...') to access the resources listed above.")
                 dev_parts.append("\n".join(lines))
-        # MCP prompt catalog (lets the model know what's available for use_prompt)
-        if self._mcp_client:
+        # MCP prompt catalog (lets the model know what's available for
+        # use_prompt) — visibility-gated like the resource catalog above.
+        if self._mcp_client and self._persona_tool_visible("use_prompt"):
             # Per-user merge: pool entries for the effective user (acting
             # user on shared workstreams, owner otherwise) are included;
             # other users' pool prompts are not.
@@ -4467,7 +4533,7 @@ class ChatSession:
         Persona gating (levers 2+4) runs LAST so the wire never advertises
         a tool the visibility set hides — whatever branch produced the list.
         With a persona visibility set, tool search always runs in
-        client-side mode (see ``_get_capabilities`` note below): native
+        client-side mode (see ``_get_deferred_names``): native
         defer_loading would strip deferred tools here before the provider
         could offer them for discovery.
         """
@@ -7480,8 +7546,8 @@ class ChatSession:
                 # skill_data dict (or ``None``), not the raw string the
                 # LLM passed.  Mirror the ``spawn_workstream`` projection
                 # so heuristic ``arg_pattern`` rules can match on skill
-                # name and the judge / audit row sees which persona and
-                # model override were selected.
+                # name and the judge / audit row sees which skill was
+                # selected.
                 skill_dict = it.get("skill") or {}
                 it["func_args"] = {
                     "prompt": honest_truncate(it.get("prompt") or "", arg_budget),
@@ -7495,6 +7561,7 @@ class ChatSession:
             elif name == "spawn_workstream":
                 it["func_args"] = {
                     "skill": it.get("skill", ""),
+                    "persona": it.get("persona", ""),
                     "initial_message": honest_truncate(it.get("initial_message") or "", arg_budget),
                     "target_node": it.get("target_node", ""),
                     "name": it.get("name", ""),
@@ -7510,7 +7577,9 @@ class ChatSession:
                 # ``initial_message`` is honestly truncated to its share.
                 # ``name`` (cosmetic) and ``model`` (registry alias) skipped
                 # to keep the payload lean; risk-relevant fields are skill,
-                # initial_message, target_node.
+                # persona, initial_message, target_node — a persona swaps the
+                # child's entire base prompt and tool envelope, so the judge
+                # must see it like the human approval header does.
                 children = it.get("children") or []
                 per_child = max(arg_budget // max(len(children), 1), 0)
                 it["func_args"] = {
@@ -7518,6 +7587,7 @@ class ChatSession:
                     "children": [
                         {
                             "skill": c.get("skill", "") if isinstance(c, dict) else "",
+                            "persona": c.get("persona", "") if isinstance(c, dict) else "",
                             "initial_message": (
                                 honest_truncate(c.get("initial_message") or "", per_child)
                                 if isinstance(c, dict)
@@ -9302,7 +9372,15 @@ class ChatSession:
         results = self._tool_search.search(query)
         # Expand discovered tools into the visible set
         names = [t.get("function", {}).get("name", "") for t in results]
-        self._tool_search.expand_visible(names)
+        newly_added = self._tool_search.expand_visible(names)
+        if newly_added and self._persona_tools is not None:
+            # Under a soft persona set the prompt was composed against the
+            # pre-expansion visible names, so tool-gated policy segments
+            # for the just-expanded tools were dropped — recompose so the
+            # operator's guidance lands with the tool.  The wire tools
+            # array changes on expansion anyway (client-side mode), so the
+            # prefix-cache invalidation is already being paid.
+            self._init_system_messages()
         output = self._tool_search.format_search_results(results)
         return item["call_id"], output
 
@@ -10045,7 +10123,7 @@ class ChatSession:
             # Reset so the model gets a clean slate after the warning.
             # If it repeats again, a new warning fires.
             self._repeat_detector.clear()
-            if self._mem_cfg.nudges and should_nudge(
+            if self._nudges_enabled("repeat") and should_nudge(
                 "repeat",
                 self._metacog_state,
                 message_count=len(self.messages),
@@ -10159,7 +10237,12 @@ class ChatSession:
         model = (args.get("model") or "").strip()
         target_node = (args.get("target_node") or "").strip()
         project = (args.get("project") or "").strip()
-        persona = (args.get("persona") or "").strip()
+        # Flatten whitespace and cap before the tag reaches the trusted
+        # approval-header chrome — the value is model-authored and, when
+        # storage is down, reaches the header unvalidated.  Real slugs are
+        # ≤64 chars with no whitespace, so this only reshapes invalid names
+        # (which then fail resolution showing the sanitized string).
+        persona = " ".join((args.get("persona") or "").split())[:64]
         if persona:
             persona_err = self._validate_child_persona(persona)
             if persona_err:
@@ -10207,8 +10290,6 @@ class ChatSession:
         model can react to.  Best-effort: a storage blip defers the
         verdict to the create handler rather than blocking the spawn.
         """
-        from turnstone.core.personas import resolve_persona_for_kind
-
         try:
             storage = get_storage()
             if storage is None:
@@ -14069,18 +14150,18 @@ class ChatSession:
                 "ws_id": self._ws_id,
                 "node_id": self._node_id or "",
             }
-            persona = _render_template(skill_data["content"], context)
-            if len(persona) > _MAX_SKILL_CONTENT:
+            skill_identity = _render_template(skill_data["content"], context)
+            if len(skill_identity) > _MAX_SKILL_CONTENT:
                 log.warning(
                     "skill_content.truncated",
-                    length=len(persona),
+                    length=len(skill_identity),
                     agent="task",
                     skill=skill_data.get("name", ""),
                 )
-                persona = persona[:_MAX_SKILL_CONTENT]
+                skill_identity = skill_identity[:_MAX_SKILL_CONTENT]
         else:
-            persona = self._TASK_DEFAULT_IDENTITY
-        identity = persona + "\n\n" + self._TASK_OPERATING_GUIDANCE
+            skill_identity = self._TASK_DEFAULT_IDENTITY
+        identity = skill_identity + "\n\n" + self._TASK_OPERATING_GUIDANCE
         # Task agent gets the base system prompt (tool patterns) merged
         # with its own identity in a single system message. No conversation
         # history — it's an autonomous sub-agent. Merged to avoid
@@ -15342,15 +15423,24 @@ class ChatSession:
                     self.ui.on_info(f"Workstream not found: {arg.strip()}")
                 elif target_id == self._ws_id:
                     self.ui.on_info("Already in that workstream.")
-                elif self.resume(target_id):
-                    self.ui.on_info(
-                        f"Resumed {bold(target_id)} ({len(self.messages)} messages loaded)"
-                    )
-                    name = get_workstream_display_name(target_id)
-                    if name:
-                        self.ui.on_rename(name)
                 else:
-                    self.ui.on_info(f"Workstream {arg.strip()} has no messages.")
+                    try:
+                        resumed: bool | None = self.resume(target_id)
+                    except ValueError as exc:
+                        # Corrupt stamp or MCP-lever refusal: resume parses
+                        # before mutating, so this session is untouched —
+                        # report and stay on the current workstream.
+                        self.ui.on_error(f"Cannot resume {target_id}: {exc}")
+                        resumed = None
+                    if resumed:
+                        self.ui.on_info(
+                            f"Resumed {bold(target_id)} ({len(self.messages)} messages loaded)"
+                        )
+                        name = get_workstream_display_name(target_id)
+                        if name:
+                            self.ui.on_rename(name)
+                    elif resumed is False:
+                        self.ui.on_info(f"Workstream {arg.strip()} has no messages.")
 
         elif cmd == "/name":
             if not arg:
@@ -15487,11 +15577,17 @@ class ChatSession:
                 self.ui.on_info("Compaction cancelled.")
 
         elif cmd == "/creative":
-            # Removed in 1.7 — the writer persona replaces it (issue #683).
-            self.ui.on_info(
-                "/creative was removed. Start a session with the 'writer' "
-                "persona instead: turnstone --persona writer"
-            )
+            # Recognized but decommissioned: print a live migration pointer
+            # instead of an "unknown command" dead end.  The 'writer' seed
+            # is archivable, so resolve it before advertising it.
+            replacement = "a writing persona (see the personas list)"
+            try:
+                row, _ = resolve_persona_for_kind(get_storage(), "writer", "interactive")
+                if row is not None:
+                    replacement = "the 'writer' persona: turnstone --persona writer"
+            except Exception:
+                log.debug("creative_redirect.writer_resolve_failed", exc_info=True)
+            self.ui.on_info(f"/creative was removed. Start a session with {replacement}.")
 
         elif cmd == "/debug":
             self.debug = not self.debug

@@ -313,8 +313,14 @@ class OpenAIResponsesProvider:
                 item["defer_loading"] = True
             converted.append(item)
 
-        # Inject native web search tool
-        if has_web_search_func or caps.supports_web_search:
+        # Inject native web search — replace-only: it stands in for a client
+        # ``web_search`` def that survived the session's visibility filter.
+        # ``caps.supports_web_search`` alone must NOT inject, or a toolset
+        # whose envelope hides web_search (persona visibility set,
+        # coordinator toolset) gains native search on capable models; the
+        # capability-only lane for def-less requests is handled (and gated
+        # the same way) by the server_side_tools loop in _build_kwargs.
+        if has_web_search_func:
             converted.append({"type": "web_search"})
 
         # Responses API requires a tool_search tool when defer_loading is used
@@ -369,7 +375,16 @@ class OpenAIResponsesProvider:
         # ``{"type": "web_search"}`` appended.  Subclasses (e.g.
         # ``XAIProvider``) opt their own provider-specific server tools
         # into ``caps.server_side_tools`` and inherit this injection.
+        has_client_web_search = any(
+            t.get("function", {}).get("name") == "web_search" for t in tools or []
+        )
         for tool_type in resolve_server_side_tools(caps):
+            # Replace-only: the native web_search entry stands in for the
+            # client def. A request whose envelope hides ``web_search``
+            # (persona visibility set, coordinator toolset) gets no native
+            # search either.
+            if tool_type == "web_search" and not has_client_web_search:
+                continue
             converted_tools = converted_tools or []
             if not any(t.get("type") == tool_type for t in converted_tools):
                 converted_tools.append({"type": tool_type})

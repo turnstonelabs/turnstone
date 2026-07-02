@@ -700,7 +700,12 @@ function loadDashboard() {
   const projP = window.TurnstoneProjects
     ? window.TurnstoneProjects.refreshProjects()
     : Promise.resolve();
-  Promise.all([dashP, sessP, projP])
+  // Same for the personas cache — the PERSONA column falls back to raw
+  // slugs until display names arrive.
+  const persP = window.TurnstonePersonas
+    ? window.TurnstonePersonas.refreshPersonas()
+    : Promise.resolve();
+  Promise.all([dashP, sessP, projP, persP])
     .then(function (res) {
       const dashData = res[0];
       const wsList = dashData.workstreams || [];
@@ -931,10 +936,15 @@ function _initSavedWsTable() {
       },
     },
   });
-  // The PROJECT column resolves names from the shared projects cache,
-  // which fills asynchronously — re-render once names arrive.
+  // The PROJECT and PERSONA columns resolve names from the shared caches,
+  // which fill asynchronously — re-render once names arrive.
   if (window.TurnstoneProjects) {
     window.TurnstoneProjects.onProjectsChange(function () {
+      if (_wsTable) _wsTable.render();
+    });
+  }
+  if (window.TurnstonePersonas) {
+    window.TurnstonePersonas.onPersonasChange(function () {
       if (_wsTable) _wsTable.render();
     });
   }
@@ -2183,6 +2193,10 @@ function applyRosterSnapshot(list, opts) {
     cur.state = ws.state || cur.state || "idle";
     cur.parent_ws_id = ws.parent_ws_id || null;
     cur.project_id = ws.project_id || null;
+    // Preserve-on-missing (unlike project_id's hard overwrite): roster
+    // snapshots from pre-persona nodes omit the field during a rolling
+    // upgrade, and persona is immutable post-create — keeping the known
+    // value beats flapping labels to the slug fallback.
     cur.persona = ws.persona || cur.persona || "";
     workstreams[ws.id] = cur;
   });

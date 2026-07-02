@@ -2086,10 +2086,15 @@ function _initSavedCoordTable() {
       },
     },
   });
-  // The PROJECT column resolves names from the shared projects cache,
-  // which fills asynchronously — re-render once names arrive.
+  // The PROJECT and PERSONA columns resolve names from the shared caches,
+  // which fill asynchronously — re-render once names arrive.
   if (window.TurnstoneProjects) {
     window.TurnstoneProjects.onProjectsChange(function () {
+      if (_coordTable) _coordTable.render();
+    });
+  }
+  if (window.TurnstonePersonas) {
+    window.TurnstonePersonas.onPersonasChange(function () {
       if (_coordTable) _coordTable.render();
     });
   }
