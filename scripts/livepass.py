@@ -79,6 +79,26 @@ Task-agent harness (/taskagent/livepass.html): the task_agent card — a task
   success, TASKAGENT-FAILED-... / TASKAGENT-ERROR when routing breaks, so a
   broken card can't screenshot green.
 
+Perf harness (/perf/livepass.html): long-session performance baseline for the
+  interactive pane — mounts the REAL InteractivePane at real scroll geometry
+  (fixed-height mount, production CSS chain) and drives production-shaped
+  events through pane.handleEvent/replayHistory with rAF yields, measuring:
+  replayHistory wall time at N messages, live event-storm cost per turn on top
+  of that transcript (reasoning/content deltas + tool batches + task_agent
+  cards), tool_output_chunk throughput, busy/idle churn, heap + node count +
+  _agentCards size across repeated replay cycles (leak probe), and longtask
+  counts.  Query params: ?n= (history size) &turns= &chunks= &cycles= &idle=
+  &post=1 (POST the JSON report to /perf/report — the --perf runner captures
+  it).  Results land in <pre id="perf-json"> and document.title stamps
+  PERF-READY-<n> / PERF-FAILED-<phase>.  MEASUREMENT RULES: never run with
+  --virtual-time-budget (it corrupts performance.now) and never pass
+  --force-prefers-reduced-motion (it disables the animations whose cost we
+  measure); the --perf runner passes --js-flags=--expose-gc and
+  --enable-precise-memory-info so heap numbers are stable and real.
+
+    python3 scripts/livepass.py --perf                  # 300 and 3000 msgs
+    python3 scripts/livepass.py --perf --perf-n 5000    # match the field run
+
 Rebuild after ANY markup change: the dialog blocks are embedded at build
 time. Assets are symlinked, so CSS/JS edits are live on refresh.
 """
@@ -86,7 +106,13 @@ time. Assets are symlinked, so CSS/JS edits are live on refresh.
 from __future__ import annotations
 
 import argparse
+import http.server
+import json
 import re
+import shutil
+import subprocess
+import time
+import uuid
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -1005,6 +1031,329 @@ TASKAGENT_TEMPLATE = """<!doctype html>
 """
 
 
+# --------------------------------------------------------------------------
+# Perf harness — long-session performance baseline for the interactive pane.
+# Mounts the REAL InteractivePane (production DOM via _createDOM, production
+# CSS chain) in a fixed-height mount so .pane-messages has REAL scroll
+# geometry — the forced-layout costs under measurement (isNearBottom /
+# scrollToBottom / chunk-append scroll pins) only exist against live layout,
+# which is why nothing here stubs scroll/geometry the way the task-agent
+# harness does.  All timing is real time (see MEASUREMENT RULES in the module
+# docstring).  Workload is deterministic (seeded LCG) so runs are comparable.
+# --------------------------------------------------------------------------
+PERF_TEMPLATE = """<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>perf livepass</title>
+    <link rel="stylesheet" href="shared/base.css" />
+    <link rel="stylesheet" href="shared/ui-base.css" />
+    <link rel="stylesheet" href="shared/chat.css" />
+    <link rel="stylesheet" href="shared/conversation.css" />
+    <link rel="stylesheet" href="shared/cards.css" />
+    <link rel="stylesheet" href="static/style.css" />
+    <link rel="stylesheet" href="shared/interactive.css" />
+    <style>
+      /* Harness-only framing (NOT under review): a fixed-height mount so the
+         pane's .pane-messages scroller has real production geometry. */
+      body { margin: 0; background: var(--bg); color: var(--fg); }
+      #mount { height: 720px; width: 920px; display: flex; overflow: hidden; }
+      #mount > .pane { flex: 1; display: flex; flex-direction: column; min-height: 0; }
+      #perf-json { font: 11px monospace; white-space: pre-wrap; padding: 12px; }
+    </style>
+  </head>
+  <body>
+    <div id="mount"></div>
+    <pre id="perf-json">running…</pre>
+    <script>
+      window.toast = { error: function (m) { console.log("toast:", m); } };
+      // Collect every uncaught error/rejection into the report — a perf run
+      // that silently swallowed a pipeline exception must not read as clean.
+      window.__perfErrors = [];
+      window.onerror = function (msg, src, line) {
+        window.__perfErrors.push(String(msg) + " @ " + (src || "?") + ":" + (line || 0));
+      };
+      window.addEventListener("unhandledrejection", function (e) {
+        window.__perfErrors.push("unhandledrejection: " + String(e && e.reason));
+      });
+      window.__perfFetch = function () {
+        return Promise.resolve({
+          ok: true, status: 200,
+          json: function () { return Promise.resolve({}); },
+          text: function () { return Promise.resolve(""); },
+        });
+      };
+      window.authFetch = window.__perfFetch;
+    </script>
+    <script type="module">
+      import { InteractivePane } from "./shared/interactive.js";
+      // auth.js's legacy window bridge clobbers window.authFetch at module
+      // import time — reinstate the stub now imports have evaluated (same
+      // dance as the attachments harness).
+      window.authFetch = window.__perfFetch;
+
+      const q = new URLSearchParams(location.search);
+      const N = parseInt(q.get("n") || "1000", 10);
+      const TURNS = parseInt(q.get("turns") || "20", 10);
+      const CHUNKS = parseInt(q.get("chunks") || "300", 10);
+      const CYCLES = parseInt(q.get("cycles") || "3", 10);
+      const IDLE = parseInt(q.get("idle") || "20", 10);
+
+      // Long-task accounting across every phase (>50ms main-thread blocks).
+      const lt = { count: 0, total_ms: 0, max_ms: 0 };
+      try {
+        new PerformanceObserver(function (list) {
+          list.getEntries().forEach(function (e) {
+            lt.count += 1;
+            lt.total_ms += Math.round(e.duration);
+            lt.max_ms = Math.max(lt.max_ms, Math.round(e.duration));
+          });
+        }).observe({ type: "longtask", buffered: true });
+      } catch (e) { /* unsupported — longtasks stay zeroed */ }
+
+      // Deterministic workload (seeded LCG) so runs are comparable.
+      let _seed = 42;
+      function rnd() {
+        _seed = (_seed * 1664525 + 1013904223) >>> 0;
+        return _seed / 4294967296;
+      }
+      const WORDS = ("the retry loop grinds the dungeon server while the " +
+        "judge weighs verdicts and the coordinator shuffles children across " +
+        "nodes tokens accumulate compaction folds turns storage keeps the " +
+        "canon and the rail repaints").split(" ");
+      function sentence(w) {
+        const parts = [];
+        for (let i = 0; i < w; i++) parts.push(WORDS[(rnd() * WORDS.length) | 0]);
+        return parts.join(" ");
+      }
+      // Realistic assistant markdown: prose + list + fenced code (varying
+      // content so the hljs cache behaves as in production) + inline code.
+      function mdBody(i) {
+        return (
+          "Turn " + i + ": " + sentence(18) + ".\\n\\n" +
+          "- " + sentence(6) + "\\n- " + sentence(7) + "\\n\\n" +
+          "```python\\n" +
+          "def step_" + i + "(depth):\\n" +
+          "    total = " + ((rnd() * 1000) | 0) + "\\n" +
+          "    for k in range(depth):\\n" +
+          "        total += k * " + (1 + ((rnd() * 9) | 0)) + "\\n" +
+          "    return total\\n" +
+          "```\\n\\n" +
+          sentence(14) + " `inline_" + i + "` " + sentence(8) + "."
+        );
+      }
+      // History in the canonical projected wire shape replayHistory consumes
+      // (user / assistant content / assistant tool_calls / tool result), with
+      // periodic reasoning bubbles and task_agent cards (agent_steps overlay).
+      function buildHistory(n) {
+        const msgs = [];
+        let i = 0;
+        while (msgs.length < n) {
+          i += 1;
+          msgs.push({ role: "user", content: "Request " + i + ": " + sentence(10) + "?" });
+          if (msgs.length >= n) break;
+          if (i % 10 === 0) {
+            msgs.push({ role: "assistant", reasoning: sentence(40) + ".", content: mdBody(i) });
+          } else {
+            msgs.push({ role: "assistant", content: mdBody(i) });
+          }
+          if (msgs.length >= n) break;
+          const callId = "h" + i;
+          if (i % 8 === 0) {
+            msgs.push({ role: "assistant", tool_calls: [{
+              name: "task_agent", id: callId,
+              arguments: JSON.stringify({ prompt: "subtask " + i }),
+              agent_steps: [
+                { id: callId + "::c1", name: "search",
+                  arguments: JSON.stringify({ query: "q" + i }),
+                  output: sentence(8), is_error: false },
+                { id: callId + "::c2", name: "read_file",
+                  arguments: JSON.stringify({ path: "core/f" + i + ".py" }),
+                  output: sentence(6), is_error: false },
+                { id: callId + "::c3", name: "bash",
+                  arguments: JSON.stringify({ command: "pytest -k t" + i }),
+                  output: sentence(7), is_error: false },
+              ],
+            }] });
+          } else {
+            msgs.push({ role: "assistant", tool_calls: [{
+              name: "bash", id: callId,
+              arguments: JSON.stringify({ command: "grep -rn pattern_" + i + " src/" }),
+            }] });
+          }
+          if (msgs.length >= n) break;
+          msgs.push({ role: "tool", tool_call_id: callId,
+            content: "output " + i + ":\\n" + sentence(20) });
+        }
+        return msgs;
+      }
+
+      const tick = () => new Promise((r) => requestAnimationFrame(r));
+      // One live turn, production event mix: thinking indicator, reasoning
+      // deltas, content deltas (yield every few so streamingRender's internal
+      // rAF actually applies frames, as in a real token stream), stream_end,
+      // an auto-approved bash batch with streamed chunks, every 5th turn a
+      // task_agent card with routed children, then the idle edge.
+      async function stormTurn(pane, i) {
+        pane.handleEvent({ type: "state_change", state: "running" });
+        pane.handleEvent({ type: "thinking_start" });
+        const reason = sentence(50);
+        let d = 0;
+        for (let k = 0; k < reason.length; k += 20) {
+          pane.handleEvent({ type: "reasoning", text: reason.slice(k, k + 20) });
+          d += 1;
+          if (d % 4 === 3) await tick();
+        }
+        const body = mdBody(100000 + i);
+        d = 0;
+        for (let k = 0; k < body.length; k += 22) {
+          pane.handleEvent({ type: "content", text: body.slice(k, k + 22) });
+          d += 1;
+          if (d % 6 === 5) await tick();
+        }
+        pane.handleEvent({ type: "stream_end" });
+        const callId = "s" + i;
+        const item = { call_id: callId, func_name: "bash",
+          header: "bash: run step " + i, needs_approval: false };
+        pane.handleEvent({ type: "tool_pending", items: [item] });
+        pane.handleEvent({ type: "tool_info",
+          items: [Object.assign({ auto_approved: true }, item)] });
+        for (let k = 0; k < 24; k++) {
+          pane.handleEvent({ type: "tool_output_chunk", call_id: callId,
+            chunk: "line " + k + ": " + sentence(5) + "\\n" });
+          if (k % 6 === 5) await tick();
+        }
+        pane.handleEvent({ type: "tool_result", call_id: callId, name: "bash",
+          output: "done " + i + "\\n" + sentence(12) });
+        if (i % 5 === 4) {
+          const tid = "sa" + i;
+          const titem = { call_id: tid, func_name: "task_agent",
+            header: 'task_agent: "subtask ' + i + '"', needs_approval: false };
+          pane.handleEvent({ type: "tool_pending", items: [titem] });
+          pane.handleEvent({ type: "tool_info",
+            items: [Object.assign({ auto_approved: true }, titem)] });
+          for (let c = 1; c <= 3; c++) {
+            const cid = tid + "::c" + c;
+            pane.handleEvent({ type: "tool_pending", items: [{
+              call_id: cid, parent_call_id: tid, func_name: "search",
+              header: "search: q" + c, needs_approval: false }] });
+            pane.handleEvent({ type: "tool_result", call_id: cid,
+              parent_call_id: tid, name: "search", output: sentence(6) });
+          }
+          pane.handleEvent({ type: "tool_result", call_id: tid,
+            name: "task_agent", output: sentence(15) });
+          await tick();
+        }
+        pane.handleEvent({ type: "state_change", state: "idle" });
+        await tick();
+      }
+
+      function heapBytes() {
+        // --js-flags=--expose-gc makes this a real floor, not GC noise.
+        if (typeof window.gc === "function") {
+          try { window.gc(); window.gc(); } catch (e) { /* noop */ }
+        }
+        return (performance.memory && performance.memory.usedJSHeapSize) || null;
+      }
+
+      const report = {
+        n: N, turns: TURNS, chunks: CHUNKS, cycles: CYCLES, idle: IDLE,
+        // Echoed run token — the runner validates it so a straggler POST
+        // from a killed prior attempt can't be misattributed to this run.
+        run: q.get("run") || "",
+        errors: window.__perfErrors,
+      };
+      let phase = "mount";
+      try {
+        const pane = new InteractivePane("perf-ws");
+        document.getElementById("mount").appendChild(pane.el);
+        const msgs = buildHistory(N);
+        report.heap_start = heapBytes();
+
+        phase = "replay";
+        let t0 = performance.now();
+        pane.replayHistory(msgs);
+        report.replay_ms = Math.round(performance.now() - t0);
+        await tick();
+        report.nodes_after_replay = pane.messagesEl.querySelectorAll("*").length;
+
+        phase = "storm";
+        t0 = performance.now();
+        for (let i = 0; i < TURNS; i++) await stormTurn(pane, i);
+        report.storm_ms = Math.round(performance.now() - t0);
+        report.storm_ms_per_turn = Math.round(report.storm_ms / TURNS);
+
+        phase = "chunkstorm";
+        const ccItem = { call_id: "cc1", func_name: "bash",
+          header: "bash: tail -f build.log", needs_approval: false };
+        pane.handleEvent({ type: "tool_pending", items: [ccItem] });
+        pane.handleEvent({ type: "tool_info",
+          items: [Object.assign({ auto_approved: true }, ccItem)] });
+        t0 = performance.now();
+        for (let k = 0; k < CHUNKS; k++) {
+          pane.handleEvent({ type: "tool_output_chunk", call_id: "cc1",
+            chunk: "log line " + k + "\\n" });
+          if (k % 6 === 5) await tick();
+        }
+        report.chunk_ms = Math.round(performance.now() - t0);
+        pane.handleEvent({ type: "tool_result", call_id: "cc1", name: "bash",
+          output: "tail done" });
+
+        phase = "idlechurn";
+        t0 = performance.now();
+        for (let k = 0; k < IDLE; k++) {
+          pane.handleEvent({ type: "state_change", state: "running" });
+          pane.handleEvent({ type: "state_change", state: "idle" });
+          if (k % 4 === 3) await tick();
+        }
+        report.idle_ms = Math.round(performance.now() - t0);
+
+        // Leak probe: repeated full replays of the SAME history should
+        // converge to a flat heap/node/agent-card profile; monotonic growth
+        // here is retained-detached-DOM (the _agentCards class of bug).
+        phase = "replaycycles";
+        report.cycle_stats = [];
+        for (let c = 0; c < CYCLES; c++) {
+          t0 = performance.now();
+          pane.replayHistory(msgs);
+          const ms = Math.round(performance.now() - t0);
+          await tick();
+          report.cycle_stats.push({
+            replay_ms: ms,
+            heap: heapBytes(),
+            nodes: pane.messagesEl.querySelectorAll("*").length,
+            agent_cards: pane._agentCards ? pane._agentCards.size : 0,
+          });
+        }
+        report.heap_end = heapBytes();
+        report.longtasks = lt;
+        document.title = "PERF-READY-" + N;
+      } catch (e) {
+        window.__perfErrors.push(
+          "phase " + phase + ": " + (e && e.message ? e.message : String(e)),
+        );
+        report.failed_phase = phase;
+        report.longtasks = lt;
+        document.title = "PERF-FAILED-" + phase;
+      }
+      document.getElementById("perf-json").textContent =
+        JSON.stringify(report, null, 2);
+      if (q.get("post")) {
+        try {
+          await fetch("/perf/report", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(report),
+          });
+        } catch (e) { /* runner captures the timeout instead */ }
+      }
+    </script>
+  </body>
+</html>
+"""
+
+
 # Fixture media for the attachments harness.  image/pdf thumbnails and the
 # audio clip load via element .src (NOT authFetch), so the --serve dev server
 # answers those paths directly with representative bytes: a photo-like image,
@@ -1127,34 +1476,260 @@ def build(out: Path) -> None:
     (ta / "livepass.html").write_text(TASKAGENT_TEMPLATE, encoding="utf-8")
     print(f"{ta}/livepass.html — task_agent card (real Pane.handleEvent routing)")
 
+    pf = out / "perf"
+    pf.mkdir(parents=True, exist_ok=True)
+    symlink(pf / "shared", ROOT / "turnstone/shared_static")
+    symlink(pf / "static", ROOT / "turnstone/ui/static")
+    (pf / "livepass.html").write_text(PERF_TEMPLATE, encoding="utf-8")
+    print(f"{pf}/livepass.html — long-session perf baseline (real InteractivePane)")
+
+
+class _PerfStore:
+    """Rendezvous for the perf page's POSTed JSON report."""
+
+    def __init__(self) -> None:
+        import threading
+
+        self.event = threading.Event()
+        self.data: dict[str, object] | None = None
+
+
+class _HarnessHandler(http.server.SimpleHTTPRequestHandler):
+    """Static file server + attachment media fixtures + perf-report sink.
+
+    The attachments harness loads thumbnails + the audio clip via element
+    .src; serve those from generated fixtures, fall through to static for
+    everything else.  The perf harness POSTs its JSON report to /perf/report
+    when driven with ?post=1 — the --perf runner blocks on ``perf_store``.
+    """
+
+    perf_store: _PerfStore | None = None
+    quiet = False
+
+    def do_GET(self) -> None:  # noqa: N802 (stdlib casing)
+        blob = _fixture_for(self.path.split("?")[0])
+        if blob is None:
+            super().do_GET()
+            return
+        data, ctype = blob
+        self.send_response(200)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+    def do_POST(self) -> None:  # noqa: N802 (stdlib casing)
+        store = type(self).perf_store
+        if self.path.split("?")[0] != "/perf/report" or store is None:
+            self.send_error(404)
+            return
+        length = int(self.headers.get("Content-Length") or 0)
+        body = self.rfile.read(length)
+        try:
+            store.data = json.loads(body)
+        except ValueError:
+            store.data = {"errors": ["runner: unparseable report body"]}
+        store.event.set()
+        self.send_response(204)
+        self.end_headers()
+
+    def log_message(self, format: str, *args: object) -> None:  # noqa: A002 (stdlib signature)
+        if not type(self).quiet:
+            super().log_message(format, *args)
+
+
+def _find_chrome() -> str | None:
+    for name in ("google-chrome", "google-chrome-stable", "chromium", "chromium-browser"):
+        path = shutil.which(name)
+        if path:
+            return path
+    return None
+
+
+def _await_report(
+    store: _PerfStore, proc: subprocess.Popen[bytes], run_token: str, timeout: float
+) -> dict[str, object] | None:
+    """Wait for THIS attempt's report: validated by run token, bailing early
+    when Chrome exits without reporting (the sandbox-startup-failure case —
+    waiting the full timeout there cost minutes before the --no-sandbox
+    fallback could even start).  A straggler POST from a previous attempt
+    (its handler thread can complete after the next attempt cleared the
+    store) carries the wrong token and is discarded instead of being
+    misattributed to this run."""
+    deadline = time.monotonic() + timeout
+    proc_exited_at: float | None = None
+    while time.monotonic() < deadline:
+        if store.event.wait(0.5):
+            data = store.data
+            store.event.clear()
+            store.data = None
+            if isinstance(data, dict) and data.get("run") == run_token:
+                return data
+            continue  # stale straggler from a prior attempt — keep waiting
+        if proc.poll() is not None:
+            now = time.monotonic()
+            if proc_exited_at is None:
+                proc_exited_at = now  # grace: an in-flight POST may still land
+            elif now - proc_exited_at > 3.0:
+                return None  # exited without reporting — try the next attempt
+    return None
+
+
+def _perf_run_one(
+    chrome: str, out: Path, port: int, store: _PerfStore, n: int, turns: int, timeout: float
+) -> dict[str, object] | None:
+    """One headless-Chrome perf pass; returns the page's report or None."""
+    base_flags = [
+        "--headless=new",
+        "--disable-gpu",
+        "--hide-scrollbars",
+        "--window-size=1440,900",
+        "--no-first-run",
+        "--disable-extensions",
+        # Throttled timers/rAF in a backgrounded renderer would corrupt the
+        # measurement — pin the renderer foreground-scheduled.
+        "--disable-background-timer-throttling",
+        "--disable-renderer-backgrounding",
+        "--disable-backgrounding-occluded-windows",
+        # Stable, real heap numbers (heapBytes() calls window.gc() first).
+        "--js-flags=--expose-gc",
+        "--enable-precise-memory-info",
+    ]
+    for attempt, extra in enumerate(
+        ([], ["--no-sandbox"])  # sandboxed first, container fallback second
+    ):
+        run_token = f"n{n}-a{attempt}-{uuid.uuid4().hex[:8]}"
+        url = (
+            f"http://127.0.0.1:{port}/perf/livepass.html?n={n}&turns={turns}&post=1&run={run_token}"
+        )
+        store.event.clear()
+        store.data = None
+        profile = out / f".chrome-perf-{n}"
+        proc = subprocess.Popen(
+            [chrome, *base_flags, *extra, f"--user-data-dir={profile}", url],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        try:
+            report = _await_report(store, proc, run_token, timeout)
+            if report is not None:
+                return report
+        finally:
+            if proc.poll() is None:
+                proc.terminate()
+                try:
+                    proc.wait(10)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+    return None
+
+
+def run_perf(out: Path, sizes: list[int], turns: int, timeout: float) -> bool:
+    """Build, serve, and run the perf page once per history size; print a table."""
+    import functools
+    import threading
+
+    chrome = _find_chrome()
+    if chrome is None:
+        print("perf: no chrome/chromium binary found on PATH")
+        return False
+    store = _PerfStore()
+    _HarnessHandler.perf_store = store
+    _HarnessHandler.quiet = True
+    handler = functools.partial(_HarnessHandler, directory=str(out))
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), handler)
+    port = server.server_address[1]
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    reports: dict[int, dict[str, object]] = {}
+    try:
+        for n in sizes:
+            print(f"perf: n={n} turns={turns} … ", end="", flush=True)
+            report = _perf_run_one(chrome, out, port, store, n, turns, timeout)
+            if report is None:
+                print("FAILED (no report — timeout or chrome startup failure)")
+                continue
+            failed = report.get("failed_phase")
+            errors = report.get("errors") or []
+            status = f"failed in {failed}" if failed else "ok"
+            print(f"{status} ({len(errors) if isinstance(errors, list) else '?'} page errors)")
+            reports[n] = report
+            (out / f"perf-report-n{n}.json").write_text(
+                json.dumps(report, indent=2), encoding="utf-8"
+            )
+    finally:
+        server.shutdown()
+        _HarnessHandler.perf_store = None
+        _HarnessHandler.quiet = False
+    if not reports:
+        return False
+    _print_perf_table(reports)
+    print(f"\nraw reports: {out}/perf-report-n*.json")
+    return True
+
+
+def _print_perf_table(reports: dict[int, dict[str, object]]) -> None:
+    sizes = sorted(reports)
+
+    def cell(n: int, key: str) -> str:
+        value = reports[n].get(key)
+        return "—" if value is None else str(value)
+
+    def mb(value: object) -> str:
+        return f"{value / 1048576:.1f}MB" if isinstance(value, (int, float)) else "—"
+
+    rows: list[tuple[str, list[str]]] = [
+        ("replay_ms (full history build)", [cell(n, "replay_ms") for n in sizes]),
+        ("nodes after replay", [cell(n, "nodes_after_replay") for n in sizes]),
+        ("storm ms/turn (live mix)", [cell(n, "storm_ms_per_turn") for n in sizes]),
+        ("chunk_ms (output chunks)", [cell(n, "chunk_ms") for n in sizes]),
+        ("idle_ms (busy/idle churn)", [cell(n, "idle_ms") for n in sizes]),
+        ("heap start → end", []),
+        ("longtasks count/max_ms", []),
+        ("replay cycles ms", []),
+        ("agent_cards after cycles", []),
+    ]
+    for n in sizes:
+        rep = reports[n]
+        rows[5][1].append(f"{mb(rep.get('heap_start'))} → {mb(rep.get('heap_end'))}")
+        lt = rep.get("longtasks")
+        rows[6][1].append(f"{lt.get('count')}/{lt.get('max_ms')}" if isinstance(lt, dict) else "—")
+        cycles = rep.get("cycle_stats")
+        if isinstance(cycles, list) and cycles:
+            rows[7][1].append(",".join(str(c.get("replay_ms", "?")) for c in cycles))
+            rows[8][1].append(str(cycles[-1].get("agent_cards", "?")))
+        else:
+            rows[7][1].append("—")
+            rows[8][1].append("—")
+
+    label_w = max(len(label) for label, _ in rows)
+    col_w = max(14, *(len(f"n={n}") for n in sizes))
+    header = " " * label_w + "  " + "  ".join(f"n={n}".rjust(col_w) for n in sizes)
+    print("\n" + header)
+    for label, cells in rows:
+        print(label.ljust(label_w) + "  " + "  ".join(c.rjust(col_w) for c in cells))
+
 
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--out", type=Path, default=Path("/tmp/livepass"))
     ap.add_argument("--serve", type=int, metavar="PORT")
+    ap.add_argument("--perf", action="store_true", help="run the perf baseline and exit")
+    ap.add_argument(
+        "--perf-n",
+        default="300,3000",
+        help="comma-separated history sizes for --perf (default: 300,3000)",
+    )
+    ap.add_argument("--perf-turns", type=int, default=20)
+    ap.add_argument("--perf-timeout", type=float, default=420.0)
     args = ap.parse_args()
     build(args.out)
+    if args.perf:
+        sizes = [int(s) for s in str(args.perf_n).split(",") if s.strip()]
+        raise SystemExit(0 if run_perf(args.out, sizes, args.perf_turns, args.perf_timeout) else 1)
     if args.serve:
         import functools
-        import http.server
 
-        class _FixtureHandler(http.server.SimpleHTTPRequestHandler):
-            # The attachments harness loads thumbnails + the audio clip via
-            # element .src; serve those from generated fixtures, fall through
-            # to static for everything else.
-            def do_GET(self) -> None:  # noqa: N802 (stdlib casing)
-                blob = _fixture_for(self.path.split("?")[0])
-                if blob is None:
-                    super().do_GET()
-                    return
-                data, ctype = blob
-                self.send_response(200)
-                self.send_header("Content-Type", ctype)
-                self.send_header("Content-Length", str(len(data)))
-                self.end_headers()
-                self.wfile.write(data)
-
-        handler = functools.partial(_FixtureHandler, directory=str(args.out))
+        handler = functools.partial(_HarnessHandler, directory=str(args.out))
         print(f"serving {args.out} on http://localhost:{args.serve}/ — Ctrl+C stops")
         http.server.ThreadingHTTPServer(("127.0.0.1", args.serve), handler).serve_forever()
 
