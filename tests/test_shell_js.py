@@ -27,6 +27,7 @@ _SHELL_CSS = _SHARED / "shell.css"
 _CONSOLE_INDEX = _ROOT / "turnstone/console/static/index.html"
 _CONSOLE_APP = _ROOT / "turnstone/console/static/app.js"
 _CONSOLE_ADMIN = _ROOT / "turnstone/console/static/admin.js"
+_UI_INDEX = _ROOT / "turnstone/ui/static/index.html"
 
 _RAIL_JS = _SHARED / "rail.js"
 
@@ -157,6 +158,35 @@ def test_console_index_loads_shell_module_and_caps() -> None:
     assert "TURNSTONE_SHELL_CAPS" in body, "console index must set the shell capability flags"
 
 
+def test_persona_picker_surfaces_wired() -> None:
+    """The persona creation/authoring surfaces are wired the same way every
+    other feature is — losing an id or the shared data-layer script tag
+    silently drops the picker without a JS error.
+
+    The standalone server UI carries BOTH creation pickers (the quick-create
+    ``dashboard-persona`` select and the full ``new-ws-persona`` dialog select)
+    plus the shared ``personas.js`` data layer; the console carries the same
+    data layer plus the admin authoring ``persona-shelf`` dialog, mounted by
+    admin.js.  (The console launcher's own picker is a composer OPTION field,
+    not a static id — see test_console_launcher_routes_by_kind.)
+    """
+    ui_index = _UI_INDEX.read_text(encoding="utf-8")
+    assert 'id="new-ws-persona"' in ui_index, "the new-ws dialog must carry the persona select"
+    assert 'id="dashboard-persona"' in ui_index, "the quick-create persona select must exist"
+    assert '<script type="module" src="/shared/personas.js">' in ui_index, (
+        "the standalone UI must load the shared personas data layer"
+    )
+    console_index = _CONSOLE_INDEX.read_text(encoding="utf-8")
+    assert '<script type="module" src="/shared/personas.js">' in console_index, (
+        "the console must load the shared personas data layer"
+    )
+    assert 'id="persona-shelf"' in console_index, "the admin persona authoring shelf must exist"
+    admin = _CONSOLE_ADMIN.read_text(encoding="utf-8")
+    assert "function loadAdminPersonas(" in admin, "admin.js must mount the persona list loader"
+    assert "function submitPersonaShelf(" in admin, "admin.js must wire the persona-shelf submit"
+    assert 'tab: "personas"' in admin, "the Personas admin tab must be in the IA (perm-gated)"
+
+
 def test_console_app_exposes_boot_for_shell() -> None:
     """app.js must expose ``window.TS_APP.boot`` (driven by the shell) rather
     than auto-running init at parse, while keeping ``window.onLoginSuccess`` —
@@ -279,7 +309,7 @@ def test_console_launcher_node_strategy() -> None:
     )
     composer = (_SHARED / "composer.js").read_text(encoding="utf-8")
     assert "Composer.prototype.setPlaceholder" in composer, (
-        "composer must support a per-persona placeholder swap"
+        "composer must support a per-kind placeholder swap"
     )
     assert "Composer.prototype.setOptionFieldVisible" in composer, (
         "composer must support conditionally revealing an option field"
@@ -574,7 +604,7 @@ def test_step7_tab_dropdown_mechanism() -> None:
     assert 'e.key === "Escape"' in body, "Escape must close the open menu"
 
 
-def test_step7_tab_menu_wired_per_persona() -> None:
+def test_step7_tab_menu_wired_per_kind() -> None:
     """Step 7: the shell wires each pane type's tab menu via convTabMenu —
     pane-type AND deployment derived.  The load-bearing recovery: the coordinator
     header's removed Export + end (5e.2e) return here as Export + Close workstream

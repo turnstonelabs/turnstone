@@ -176,9 +176,7 @@ class TestMigration063:
                 stamped = {
                     str(r[0]): str(r[1])
                     for r in conn.execute(
-                        sa.text(
-                            "SELECT ws_id, value FROM workstream_config WHERE key='persona'"
-                        )
+                        sa.text("SELECT ws_id, value FROM workstream_config WHERE key='persona'")
                     ).fetchall()
                 }
                 cols = conn.execute(
@@ -215,5 +213,126 @@ class TestMigration063:
             assert "personas" not in insp.get_table_names()
             assert "persona" not in {c["name"] for c in insp.get_columns("workstreams")}
             assert "persona." not in _admin_perms(engine)
+        finally:
+            engine.dispose()
+
+    def test_downgrade_purges_persona_config_keeps_creative_mode(self, tmp_path: Path) -> None:
+        # The downgrade's load-bearing contract (its own docstring): strip every
+        # persona* stamp the upgrade synthesized from a creative workstream, but
+        # leave creative_mode='True' intact so pre-063 code resumes it as
+        # creative again.
+        db_path = tmp_path / "063-down-creative.db"
+        cfg = _alembic_cfg(db_path)
+        command.upgrade(cfg, "062")
+
+        engine = sa.create_engine(f"sqlite:///{db_path}")
+        try:
+            with engine.begin() as conn:
+                conn.execute(
+                    sa.text(
+                        "INSERT INTO workstreams (ws_id, name, state, created, updated) "
+                        "VALUES ('ws-creative', 'ws-creative', 'closed', "
+                        "'2026-01-01T00:00:00', '2026-01-01T00:00:00')"
+                    )
+                )
+                conn.execute(
+                    sa.text(
+                        "INSERT INTO workstream_config (ws_id, key, value) "
+                        "VALUES ('ws-creative', 'creative_mode', 'True')"
+                    )
+                )
+
+            command.upgrade(cfg, "063")
+            # Sanity: the upgrade actually stamped the five persona keys — else
+            # the downgrade assertion below would pass vacuously.
+            with engine.connect() as conn:
+                stamped = {
+                    str(r[0])
+                    for r in conn.execute(
+                        sa.text("SELECT key FROM workstream_config WHERE ws_id='ws-creative'")
+                    ).fetchall()
+                }
+            assert {
+                "persona",
+                "persona_prompt",
+                "persona_tools",
+                "persona_mcp",
+                "persona_memory",
+            } <= stamped
+
+            command.downgrade(cfg, "062")
+            with engine.connect() as conn:
+                keys = [
+                    str(r[0])
+                    for r in conn.execute(
+                        sa.text("SELECT key FROM workstream_config WHERE ws_id='ws-creative'")
+                    ).fetchall()
+                ]
+                creative = conn.execute(
+                    sa.text(
+                        "SELECT value FROM workstream_config "
+                        "WHERE ws_id='ws-creative' AND key='creative_mode'"
+                    )
+                ).fetchone()
+            # Every persona* key is gone…
+            assert not any(k.startswith("persona") for k in keys)
+            # …while creative_mode='True' survives the round-trip.
+            assert creative is not None and str(creative[0]) == "True"
+        finally:
+            engine.dispose()
+
+    def test_conversion_skips_workstream_with_existing_persona_key(self, tmp_path: Path) -> None:
+        # Idempotency guard (063 ~297-324): the conversion SELECT excludes any
+        # ws that already carries a persona key (NOT IN sub-select).  A ws with
+        # BOTH creative_mode='True' AND a pre-existing persona stamp must upgrade
+        # without a PK collision on workstream_config(ws_id, key), leave exactly
+        # one persona row, and keep that stamp untouched.
+        db_path = tmp_path / "063-idempotent.db"
+        cfg = _alembic_cfg(db_path)
+        command.upgrade(cfg, "062")
+
+        engine = sa.create_engine(f"sqlite:///{db_path}")
+        try:
+            with engine.begin() as conn:
+                conn.execute(
+                    sa.text(
+                        "INSERT INTO workstreams (ws_id, name, state, created, updated) "
+                        "VALUES ('ws-both', 'ws-both', 'closed', "
+                        "'2026-01-01T00:00:00', '2026-01-01T00:00:00')"
+                    )
+                )
+                conn.execute(
+                    sa.text(
+                        "INSERT INTO workstream_config (ws_id, key, value) "
+                        "VALUES ('ws-both', 'creative_mode', 'True')"
+                    )
+                )
+                conn.execute(
+                    sa.text(
+                        "INSERT INTO workstream_config (ws_id, key, value) "
+                        "VALUES ('ws-both', 'persona', 'scribe')"
+                    )
+                )
+
+            # No IntegrityError: the NOT IN guard skips ws-both, so the writer
+            # stamp is never re-INSERTed over the existing persona row.
+            command.upgrade(cfg, "063")
+
+            with engine.connect() as conn:
+                persona_rows = conn.execute(
+                    sa.text(
+                        "SELECT value FROM workstream_config "
+                        "WHERE ws_id='ws-both' AND key='persona'"
+                    )
+                ).fetchall()
+                row_persona = conn.execute(
+                    sa.text("SELECT persona FROM workstreams WHERE ws_id='ws-both'")
+                ).fetchone()
+            # Exactly one stamp, and the pre-existing value is untouched.
+            assert len(persona_rows) == 1
+            assert str(persona_rows[0][0]) == "scribe"
+            # The conversion's UPDATE never ran for this ws (not in creative_rows),
+            # so the row-projection column stays NULL — untouched, not 'writer'.
+            assert row_persona is not None and row_persona[0] is None
         finally:
             engine.dispose()

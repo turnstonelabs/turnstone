@@ -358,6 +358,31 @@ async def test_single_kind_saved_unchanged(monkeypatch: pytest.MonkeyPatch) -> N
     }
 
 
+async def test_saved_row_maps_persona_value(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The saved-row builder must map the persona SLUG through to the row
+    dict — key-presence alone (asserted above) wouldn't catch a positional
+    column mix-up in the 18-tuple unpack.  A distinct project_id/owner/persona
+    triple (adjacent tuple slots 15/16/17) pins the persona value to the
+    right column: an off-by-one onto owner or project_id fails the assert."""
+    coord = [
+        _row(
+            "c" * 32,
+            updated="2026-03-01T00:00:00",
+            kind="coordinator",
+            project_id="proj-x",
+            owner="alice",
+            persona="scribe",
+        )
+    ]
+    _patch_storage(monkeypatch, coord_rows=coord, interactive_rows=[])
+
+    handler = make_saved_handler(_coord_cfg())
+    rows = (await _body(await handler(_request())))["workstreams"]
+    row = rows[0]
+    assert row["persona"] == "scribe"
+    assert row["project_id"] == "proj-x"  # adjacent slot maps distinctly
+
+
 async def test_single_kind_saved_500s_on_missing_list_kind(monkeypatch: pytest.MonkeyPatch) -> None:
     """The single-kind misconfig guard is unchanged by the extraction."""
     _patch_storage(monkeypatch, coord_rows=[], interactive_rows=[])

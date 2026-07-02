@@ -363,6 +363,22 @@ class TestClusterCreate:
         assert mock_post.call_args.kwargs["json"]["project_id"] == "proj-42"
         client.close()
 
+    def test_cluster_create_forwards_persona(self) -> None:
+        # The launcher's persona picker sends persona; the proxy selectively
+        # REBUILDS the forwarded body (it doesn't pass it through), so persona
+        # must be explicitly carried or the receiving node stamps its kind
+        # default instead of the operator's choice.
+        mock_post = _make_proxy_post(json_data={"ws_id": "p1ws"})
+        client = TestClient(self._app_with_node(mock_post), raise_server_exceptions=False)
+        resp = client.post(
+            "/v1/api/cluster/workstreams/new",
+            json={"node_id": "node-a", "name": "j", "persona": "scribe"},
+            headers=_TEST_AUTH_HEADERS,
+        )
+        assert resp.status_code == 200
+        assert mock_post.call_args.kwargs["json"]["persona"] == "scribe"
+        client.close()
+
 
 # ---------------------------------------------------------------------------
 # Tests — route_proxy
