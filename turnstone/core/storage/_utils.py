@@ -1150,18 +1150,18 @@ def senders_from_user_meta(metas: Iterable[str | None]) -> list[str]:
     """Distinct, stripped sender ids from USER-row ``meta`` JSON blobs.
 
     A user row's ``meta`` column carries only ``{"sender": ...}`` (the
-    role-exclusive routing in :func:`reconstruct_turns`); anything unparsable,
-    non-dict, or sender-less is skipped so one stray blob cannot poison the
-    participant set. Sorted for deterministic output across backends.
+    role-exclusive routing in :func:`reconstruct_turns`); reuses
+    :func:`_source_meta_from_json` — this file's one safe-decode-tolerate-
+    garbage helper for this column — so a future change to its tolerance rules
+    (e.g. a new error type to swallow) doesn't need a second, divergent
+    implementation kept in sync here. Anything unparsable, non-dict, or
+    sender-less is skipped so one stray blob cannot poison the participant set.
+    Sorted for deterministic output across backends.
     """
     senders: set[str] = set()
     for raw in metas:
-        if not raw:
-            continue
-        try:
-            sender = json.loads(raw).get("sender")
-        except (ValueError, AttributeError):
-            continue
+        parsed = _source_meta_from_json(raw)
+        sender = parsed.get("sender") if parsed else None
         if isinstance(sender, str) and sender.strip():
             senders.add(sender.strip())
     return sorted(senders)

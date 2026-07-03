@@ -2954,6 +2954,16 @@ class ChatSession:
             return False
         if not fork:
             self._ws_id = ws_id
+            # A non-fork resume repoints this session at a DIFFERENT existing
+            # workstream's identity (fork keeps self._ws_id, so its nonces stay
+            # correctly scoped to the ws they were minted for). The sender-label
+            # and operator-fold nonces are trust anchors declared in that OTHER
+            # workstream's cached system prefix; carrying them across to this
+            # one would let a token that leaked there forge a marker here —
+            # exactly the cross-workstream leak class this remint (and
+            # _reset_shared_state below) closes.
+            self._envelope_nonce = fence.mint_nonce()
+            self._sender_label_nonce = fence.mint_nonce()
         self.messages = turns
         # Shared-workstream state is per-workstream: this session object now
         # points at (possibly different) history, so forget and re-derive.
@@ -3098,6 +3108,13 @@ class ChatSession:
                     }
                 )
             save_messages_bulk(bulk_rows)
+            # The fork just bulk-wrote every row self.messages holds — the
+            # persisted history under this ws_id cannot contain any sender
+            # _recompute_shared_state's in-memory scan won't already find, so
+            # the one-time persisted-sender read (needed for a real compaction-
+            # narrowed resume) would be a pure redundant DB round-trip here.
+            # Mark it already-satisfied; the in-memory scan alone is complete.
+            self._db_senders_loaded = True
             self._save_config()
             self._title_generated = False  # allow auto-title for the fork
             log.info(
@@ -3130,6 +3147,13 @@ class ChatSession:
         callbacks) never see a partially-built system message.
         """
         new_system_messages: list[dict[str, Any]] = []
+
+        # Refresh shared-workstream state so it stays current (banner, the
+        # declaration below, and _maybe_note_new_participant's "already known"
+        # gate) regardless of which developer-message branch renders — a
+        # creative-mode compose must not leave a just-reset (or stale) flag
+        # unrefreshed just because it doesn't render the CONTEXT banner itself.
+        self._recompute_shared_state()
 
         # -- Developer message --
         if self.creative_mode:
@@ -3180,9 +3204,6 @@ class ChatSession:
             # on every turn that crossed a minute boundary. Hour-precision still
             # gives the model time-of-day awareness without paying for a full
             # prefix recompute every ~60 seconds.
-            # Refresh shared-workstream state so the banner matches the current
-            # participant set (fresh compose or rehydrated multi-user history).
-            self._recompute_shared_state()
             ctx = SessionContext(
                 current_datetime=now.strftime("%Y-%m-%dT%H:00"),
                 timezone=now.tzname() or "UTC",
@@ -3517,12 +3538,16 @@ class ChatSession:
                     "text; this model cannot read PDFs natively]"
                 ),
             }
+        # A PDF's extracted text is as untrusted as any other attachment content:
+        # defang look-alike sender-label markers so an uploaded document can't
+        # forge attribution (fence.wrap/_inject_sender_labels only ever cover
+        # message content, not text materialized from attachments afterward).
         return {
             "type": "document",
             "document": {
                 "name": f"{name} (extracted text)",
                 "media_type": "text/plain",
-                "data": text,
+                "data": fence.neutralize(text, fence.SENDER_LABEL_TAG, opening=True),
             },
         }
 
@@ -3574,11 +3599,17 @@ class ChatSession:
         )
         if not transcript:
             return None
+        # Transcribed speech is untrusted the same way typed message content is:
+        # defang look-alike sender-label markers so an uploaded audio clip
+        # can't forge attribution (see the neutralize call in
+        # _pdf_text_fallback_part / _perception_fallback_part for the sibling
+        # attachment-derived-text cases).
         return {
             "type": "text",
             "text": (
                 f"[Transcript of audio attachment '{safe_attachment_label(name)}' "
-                f"(untrusted)]\n\n{transcript}"
+                f"(untrusted)]\n\n"
+                f"{fence.neutralize(transcript, fence.SENDER_LABEL_TAG, opening=True)}"
             ),
         }
 
@@ -3664,11 +3695,15 @@ class ChatSession:
         if not text:
             return None
         name = str(att.get("filename") or kind)
+        # The perception model's description is untrusted the same way typed
+        # message content is: defang look-alike sender-label markers so a
+        # perceived image/PDF/audio can't forge attribution.
         return {
             "type": "text",
             "text": (
                 f"[Perception of {kind} attachment '{safe_attachment_label(name)}' "
-                f"(untrusted)]\n\n{text}"
+                f"(untrusted)]\n\n"
+                f"{fence.neutralize(text, fence.SENDER_LABEL_TAG, opening=True)}"
             ),
         }
 
@@ -3767,9 +3802,19 @@ class ChatSession:
         Memoized per turn via ``_senders_dirty``: system-prompt composition
         runs many times within a turn (state transitions, MCP refresh, tool
         results) but the sender set only changes on user-turn append and
-        history (re)load."""
+        history (re)load.
+
+        ``resume()`` can run concurrently with an MCP background-thread
+        callback that also calls this (:meth:`_init_system_messages` is
+        invoked from the pool listener callbacks registered in ``__init__``,
+        on the client's own thread, not the request thread). A snapshot of
+        ``self._ws_id`` before and after the scan detects the case where
+        ``resume()`` repointed this session at a different workstream mid-scan
+        and discards the now-mixed-workstream result instead of committing it,
+        leaving the flag dirty for a subsequent, consistent recompute."""
         if not self._senders_dirty:
             return
+        ws_id_snapshot = self._ws_id
         owner = (self._mcp_user_id or "").strip()
         senders = {
             s
@@ -3778,10 +3823,24 @@ class ChatSession:
         }
         if not self._db_senders_loaded:
             senders |= self._load_persisted_senders()
+        if self._ws_id != ws_id_snapshot:
+            # resume() swapped workstreams mid-scan; this result mixes old and
+            # new history and must not be committed. Leave dirty so the next
+            # call (this one or resume()'s own trailing compose) redoes the
+            # scan against a consistent (self._ws_id, self.messages) pair.
+            return
         self._known_senders |= senders
         if not self._shared_workstream:
             self._shared_workstream = any(s != owner for s in self._known_senders)
-        self._senders_dirty = False
+        # Only clear dirty once the persisted-sender read has actually landed
+        # (or was never needed): a transient storage error inside
+        # _load_persisted_senders leaves _db_senders_loaded False, and clearing
+        # dirty anyway would silently accept an incomplete participant set for
+        # the rest of this turn instead of retrying on the next
+        # _init_system_messages call within it (dirty otherwise only re-arms on
+        # the next user-turn append, one full turn later).
+        if self._db_senders_loaded:
+            self._senders_dirty = False
 
     def _maybe_note_new_participant(self, sender_user_id: str | None) -> None:
         """Announce a first-time non-owner sender and flip the ws to shared.
@@ -3798,12 +3857,16 @@ class ChatSession:
         if not s or s == owner or s in self._known_senders:
             return
         was_shared = self._shared_workstream
-        # Set state directly (not just via _recompute_shared_state, which is
-        # memoized and may no-op this call): the recompose below and the gate
-        # above both need it now.  _recompute_shared_state later unions rather
-        # than overwrites, so these survive.
-        self._known_senders.add(s)
-        self._shared_workstream = True
+        # Single mutation entrypoint: recompute (not a direct field write)
+        # re-derives state from self.messages, which already carries this
+        # sender's just-appended turn (send() calls this right after
+        # _append_user_turn) -- so this union is exactly "s joined", with no
+        # second hand-synchronized code path to keep in sync. Arm the dirty
+        # flag first: we KNOW a new sender arrived (gate above passed), so the
+        # recompute must not be memo-skipped, independent of whether the
+        # appending caller happened to mark it dirty.
+        self._invalidate_shared_state()
+        self._recompute_shared_state()
         if not was_shared:
             # First non-owner sender: recompose so the banner gains the shared
             # section (and the sender-label trust declaration).
@@ -5675,6 +5738,17 @@ class ChatSession:
         """
         if removed_count <= 0:
             return
+        # The caller already truncated self.messages (rewind/retry both trim
+        # before calling this), so any sender that only appeared in the
+        # dropped tail is no longer derivable from live history — unlike
+        # compaction narrowing (which keeps the full transcript in storage,
+        # exactly why _recompute_shared_state unions in a persisted-sender
+        # read), a rewind/retry deletes those very rows below. Force a full,
+        # fresh re-derivation on the next compose rather than let the
+        # monotonic union/latch keep a departed sender "known" and the
+        # workstream stuck "shared" forever after the only evidence of a
+        # second participant is gone.
+        self._reset_shared_state()
         total = count_messages(self._ws_id)
         if total <= 0:
             # Count unavailable (storage error) — skip the delete rather than risk
@@ -7289,6 +7363,7 @@ class ChatSession:
             budget_seconds=budget,
             patterns=og_patterns,
             trusted_marker_nonce=self._envelope_nonce,
+            trusted_sender_label_nonce=self._sender_label_nonce,
         )
 
         # Stage 2: LLM judge (opt-in, capability-gated).  The rate limiter
@@ -14814,6 +14889,13 @@ class ChatSession:
             self._calibrated_msg_count = 0
             self._msg_tokens = []
             self._ws_id = uuid.uuid4().hex
+            # A brand-new ws_id is the same class of identity change as a
+            # non-fork resume(): the old workstream's participant state must
+            # not leak into this empty one, and its trust nonces must not
+            # carry over (see resume()'s matching reset + remint).
+            self._reset_shared_state()
+            self._envelope_nonce = fence.mint_nonce()
+            self._sender_label_nonce = fence.mint_nonce()
             self._title_generated = False
             register_workstream(self._ws_id, node_id=self._node_id)
             self._save_config()

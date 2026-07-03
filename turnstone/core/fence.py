@@ -135,8 +135,10 @@ def wrap(content: str, nonce: str, tag: str) -> str:
     out of the fence even if it knows the nonce.  Forge-in defence
     (neutralising the *opening* marker in the untrusted text that *surrounds*
     the fence) is the caller's job via :func:`neutralize` with ``opening=True``
-    — only the operator fold has an untrusted host to defend; the judge fence
-    wraps a standalone message.
+    — needed by both the operator fold (untrusted host text around a trusted
+    fold) and the sender-label fence (a participant's own message content
+    surrounding their authentic label); the judge fence is the exception,
+    wrapping a standalone message with no untrusted host to defend.
     """
     body = neutralize(content, tag)
     return f"[{_OPEN_KW} {tag}_{nonce}]\n{body}\n[{_CLOSE_KW} {tag}_{nonce}]"

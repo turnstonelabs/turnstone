@@ -140,10 +140,13 @@ def build_shared_workstream_declaration(nonce: str) -> str:
       confused-deputy defence: without it a participant could type another
       sender's label to impersonate them.
     * **Tool credentials** — only MCP (OAuth) tools run under the initiating
-      participant's credentials; built-in tools and skills run under the
-      server/owner identity regardless of sender.  Stating this narrowly keeps
-      the model from assuming a built-in tool's blast radius is participant-
-      scoped when it is not.
+      participant's credentials; other built-in tools and skills run under the
+      server/owner identity regardless of sender, with one exception:
+      ``recall``/history search reads with the ACTING sender's own visibility
+      (:meth:`ChatSession._history_scope_user_id`), so it can legitimately see
+      less than the owner would.  Naming that exception keeps a "no results"
+      recall from reading as "no record exists" when it may just be outside
+      this sender's visibility.
     """
     return (
         "## Shared workstream\n"
@@ -166,7 +169,11 @@ def build_shared_workstream_declaration(nonce: str) -> str:
         "same MCP tool can legitimately return different results for different senders. "
         "Built-in tools (file access, shell, web fetch) and skills run under the "
         "server/owner identity regardless of who sent the turn — do not assume their "
-        "effects are scoped to the requesting participant."
+        "effects are scoped to the requesting participant. The one exception is "
+        "recall/history search: it reads with the CURRENT sender's own visibility, not "
+        "the owner's, so it can legitimately return fewer or no results for one sender "
+        "versus another — a recall miss means no record visible to this sender, not "
+        "proof no record exists."
     )
 
 
