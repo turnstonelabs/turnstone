@@ -58,6 +58,19 @@ if TYPE_CHECKING:
 
 log = get_logger(__name__)
 
+# Prompt-size guard.  A tool output large enough to overflow the judge model's
+# context window would come back as an opaque provider 400 and fall silently to
+# heuristic-only; we detect it up front instead (see ``evaluate``).
+# ``_CHARS_PER_TOKEN`` mirrors ``judge._CHARS_PER_TOKEN`` — the same token
+# estimate both judges budget with, duplicated to keep this module free of a
+# runtime judge import; keep the two in sync if either is retuned.  ``0.9``
+# leaves headroom for the 512-token response plus estimation error.  The
+# default window is a conservative fallback used only when the provider can't
+# report capabilities — the resolved model's real window is preferred.
+_CHARS_PER_TOKEN = 3.5
+_MAX_PROMPT_RATIO = 0.9
+_DEFAULT_JUDGE_CONTEXT_WINDOW = 32_768
+
 
 # ---------------------------------------------------------------------------
 # Verdict
@@ -259,17 +272,30 @@ class OutputGuardJudge:
         # Alias resolution mirrors IntentJudge.__init__ at judge.py:917-960.
         # An empty / unset alias falls through to the session model silently;
         # a set-but-unknown alias logs a warning and also falls through.
+        # Judge model's context window drives the oversize-output guard in
+        # ``evaluate``.  On the alias path it comes from the registry's
+        # ModelConfig — NOT ``provider.get_capabilities()``, which returns a
+        # static 200000 for every model absent from its table (i.e. every local
+        # / self-hosted judge), so the guard keyed off it would never trip for
+        # the small-window local judges it exists to protect.
         resolved = False
         if config.output_guard_model and model_registry is not None:
             try:
                 if model_registry.has_alias(config.output_guard_model):
-                    client, model_name, _ = model_registry.resolve(config.output_guard_model)
+                    client, model_name, model_cfg = model_registry.resolve(
+                        config.output_guard_model
+                    )
                     self._provider = model_registry.get_provider(config.output_guard_model)
                     self._client_factory_args = self._extract_client_config(
                         client, self._provider.provider_name
                     )
                     self._model = model_name
                     self._judge_model_alias = config.output_guard_model
+                    # getattr guard: a malformed ModelConfig must not abort
+                    # resolution — degrade the window, keep the model.
+                    self._judge_context_window = getattr(
+                        model_cfg, "context_window", _DEFAULT_JUDGE_CONTEXT_WINDOW
+                    )
                     resolved = True
             except Exception:
                 log.debug(
@@ -292,6 +318,15 @@ class OutputGuardJudge:
             )
             self._model = session_model
             self._judge_model_alias = ""
+            # Session-model fallback: no ModelConfig in hand, so use the static
+            # capability table (correct for commercial models; a conservative
+            # default for anything it doesn't know).
+            try:
+                self._judge_context_window = self._provider.get_capabilities(
+                    self._model
+                ).context_window
+            except Exception:
+                self._judge_context_window = _DEFAULT_JUDGE_CONTEXT_WINDOW
 
         # Lazy-init in _create_client(); reused across evaluate() calls.
         # Session swaps the entire OutputGuardJudge on credential / model
@@ -405,6 +440,33 @@ class OutputGuardJudge:
             },
         ]
 
+        # Oversize guard.  The heuristic stage has already run and its verdict
+        # stands regardless; what's at stake here is only the opted-in LLM tier.
+        # A prompt that overflows the judge window returns an opaque provider
+        # 400, which would fall to heuristic-only with no trace that the LLM was
+        # even attempted.  Detect it up front: skip the doomed call, log a
+        # warning, and return a LABELLED error verdict so the skip surfaces as a
+        # distinct ``llm_error`` audit row (reason = "output_too_large…") the
+        # operator can see, rather than a silent no-op.
+        prompt_chars = sum(len(str(m["content"])) for m in judge_messages)
+        est_tokens = int(prompt_chars / _CHARS_PER_TOKEN)
+        if est_tokens > self._judge_context_window * _MAX_PROMPT_RATIO:
+            log.warning(
+                "output_guard_judge.output_too_large",
+                call_id=call_id,
+                func_name=func_name,
+                output_chars=len(output),
+                est_prompt_tokens=est_tokens,
+                judge_context_window=self._judge_context_window,
+            )
+            return self._error_verdict(
+                verdict_id,
+                call_id,
+                start,
+                f"output_too_large_for_judge_window: ~{est_tokens} tok "
+                f"> {self._judge_context_window} window",
+            )
+
         try:
             client = self._create_client()
         except Exception as e:
@@ -513,9 +575,11 @@ class OutputGuardJudge:
         verdict + heuristic annotations) precede the fence.  The system
         prompt classifies each field's trust level: framework-supplied
         fields are TRUSTED; ``tool_args`` is UNTRUSTED (caller-supplied,
-        may contain injection); fenced output is UNTRUSTED.  Tool args
-        are truncated to 500 chars to bound prompt cost while preserving
-        shape.
+        may contain injection); fenced output is UNTRUSTED.  Neither
+        ``tool_args`` nor the fenced output is truncated here — both lower
+        whole.  A pathologically large call is caught by the window backstop in
+        ``evaluate`` (which skips the LLM tier honestly rather than feeding it a
+        silently-clipped prefix), never by a default cap on a normal argument.
         """
         nonce = fence.mint_nonce()
 
@@ -525,8 +589,7 @@ class OutputGuardJudge:
         if tool_description:
             lines.append(f"Description: {tool_description}")
         if tool_args:
-            truncated = tool_args if len(tool_args) <= 500 else tool_args[:500] + "...(truncated)"
-            lines.append(f"Called with: {truncated}")
+            lines.append(f"Called with: {tool_args}")
         if heuristic_risk != "none" or heuristic_flags:
             flags_str = ", ".join(heuristic_flags) if heuristic_flags else "(none)"
             lines.append(
