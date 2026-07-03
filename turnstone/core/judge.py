@@ -831,12 +831,12 @@ def _positive_window(*candidates: Any, floor: int = _DEFAULT_JUDGE_CONTEXT_WINDO
     """First positive-int context window among *candidates*, else *floor*.
 
     A ``context_window`` of 0 or a non-int would zero out every budget and make
-    ``honest_truncate`` drop everything — a silent, total lowering failure.  0
-    is reachable: a config.toml model passes ``context_window`` through without
-    the DB loader's ``0 → inherit`` normalization (model_registry.py:484 vs
-    :400), so the registry can hand back a ModelConfig whose window is 0.  Fall
-    through such values to the next sane candidate (typically the session
-    window), then a conservative floor.
+    ``honest_truncate`` drop everything — a silent, total lowering failure.
+    Defense-in-depth: the registry normalizes the ``0 = auto-detect`` sentinel
+    to the inherited window at load time (both loader paths), so a 0 should not
+    reach here — but a stray non-positive window from any source must never
+    zero a budget.  Fall through such values to the next sane candidate
+    (typically the session window), then a conservative floor.
     """
     for c in candidates:
         if isinstance(c, int) and c > 0:
@@ -1008,11 +1008,10 @@ class IntentJudge:
                     # the budget off it silently over-budgets a small local
                     # judge into overflow.  ModelConfig.context_window is the
                     # operator-configured / auto-detected real window.
-                    # ``_positive_window`` guards both a malformed ModelConfig
-                    # (missing attr → the session ``context_window``) and a
-                    # config.toml ``context_window=0`` (present but unusable →
-                    # the session window, then a floor); either must not abort
-                    # resolution or zero out the budgets.
+                    # ``_positive_window`` is defensive: a malformed ModelConfig
+                    # (missing attr) or any stray non-positive window degrades to
+                    # the session ``context_window`` then a floor, so it neither
+                    # aborts resolution nor zeroes the budgets.
                     self._judge_context_window = _positive_window(
                         getattr(model_cfg, "context_window", None), context_window
                     )
@@ -1035,8 +1034,7 @@ class IntentJudge:
                 session_provider.provider_name,
             )
             self._model = session_model
-            # Coerce here too: the session ``context_window`` can itself be a
-            # config.toml 0 if the session model is misconfigured.
+            # Coerce here too, defensively against a non-positive session window.
             self._judge_context_window = _positive_window(context_window)
 
     # -- Client lifecycle helpers -------------------------------------------

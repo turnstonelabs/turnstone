@@ -330,6 +330,32 @@ class TestLoadModelRegistry:
         _, model, _ = reg.resolve()
         assert model == "gpt-4o"
 
+    def test_config_context_window_zero_inherits_detected(self) -> None:
+        """``context_window = 0`` in a [models.*] entry is the auto-detect
+        sentinel: it must inherit the CLI/detected window, not stay a literal 0
+        (which would zero every downstream budget — judge lowering, session
+        compaction).  The DB loader normalizes 0->inherit; the config path must
+        match it (``.get(k, 0) or context_window``, not ``.get(k, default)``)."""
+        fake_cfg: dict[str, Any] = {
+            "models": {
+                "local": {
+                    "base_url": "http://localhost:8000/v1",
+                    "model": "local-model",
+                    "context_window": 0,  # auto-detect
+                },
+            },
+            "model": {"default": "local"},
+        }
+        with patch("turnstone.core.model_registry.load_config", return_value=fake_cfg):
+            reg = load_model_registry(
+                base_url="http://localhost:8000/v1",
+                api_key="dummy",
+                model="local-model",
+                context_window=40_000,  # the CLI-detected window
+            )
+        _, _, cfg = reg.resolve("local")
+        assert cfg.context_window == 40_000  # inherited, not the literal 0
+
     def test_fallback_from_config(self) -> None:
         fake_cfg: dict[str, Any] = {
             "models": {
