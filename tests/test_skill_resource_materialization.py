@@ -135,9 +135,8 @@ def _create_skill(db: Any, skill_id: str, name: str, content: str, **kw: Any) ->
 
 
 def _sys_content(session: ChatSession) -> str:
-    msgs = [m for m in session.system_messages if m["role"] == "system"]
-    assert msgs
-    return msgs[0]["content"]
+    assert session.system_messages
+    return "\n".join(m["content"] for m in session.system_messages)
 
 
 # ---------------------------------------------------------------------------

@@ -3519,13 +3519,29 @@ class ChatSession:
                     "to invoke the prompts listed above."
                 )
                 dev_parts.append("\n".join(lines))
+        # Applied-skill body is CAPABILITY context, not identity — build it
+        # into its own block, delivered below as a separate (user-role)
+        # message rather than concatenated into the identity system prefix.
+        # Keeping it off that prefix means skills(load) no longer busts the
+        # cached identity block, and the skill never reads as who-the-agent-is.
+        # PRE-MERGE GATE: the model-adherence eval this vs main (design §7 Q1)
+        # is NOT run in-tree — it must clear before this branch merges.
+        skill_context = ""
         if self._skill_content:
             tpl = self._skill_content
             if len(tpl) > _MAX_SKILL_CONTENT:
                 log.warning("skill_content.truncated", length=len(tpl))
                 tpl = tpl[:_MAX_SKILL_CONTENT]
-            dev_parts.append("")
-            dev_parts.append(tpl)
+            if self._skill_name:
+                intro = (
+                    f"The following is the guidance for your active skill "
+                    f"'{self._skill_name}'. Apply it throughout this session."
+                )
+            else:
+                intro = (
+                    "The following is your active skill guidance. Apply it throughout this session."
+                )
+            skill_parts = [intro, "", tpl]
             if self._skill_resources:
                 lines = ["<skill-resources>"]
                 total_size = 0
@@ -3549,7 +3565,8 @@ class ChatSession:
                         "All files are under $SKILL_RESOURCES_DIR."
                     )
                 lines.append("</skill-resources>")
-                dev_parts.append("\n".join(lines))
+                skill_parts.append("\n".join(lines))
+            skill_context = "\n".join(skill_parts)
         # Skill catalog: disclose search-activated skills so the model
         # knows they exist (Agent Skills standard progressive disclosure).
         try:
@@ -3626,10 +3643,18 @@ class ChatSession:
                     "Use memory(action='search') or memory(action='list') for more."
                 )
         new_system_messages.append({"role": "system", "content": "\n".join(dev_parts)})
+        # Agent prefix: the identity system block only (snapshotted BEFORE the
+        # skill block below) — a task_agent supplies its own persona identity
+        # and any skill as capability (see _exec_task), so the parent's applied
+        # skill no longer leaks into the sub-agent base.
+        self._agent_system_messages = list(new_system_messages)
+        # Applied-skill body rides its own capability message, off the cached
+        # identity prefix (see skill_context above).  PRE-MERGE GATE: the
+        # model-adherence eval this-vs-main (design §7 Q1) is not run in-tree.
+        if skill_context:
+            new_system_messages.append({"role": "user", "content": skill_context})
         # Atomic swap — readers see either old or new, never partial
         self.system_messages = new_system_messages
-        # Agent prefix: system + developer only (no memories)
-        self._agent_system_messages = list(new_system_messages)
 
     def _full_messages(self) -> list[dict[str, Any]]:
         """System messages + conversation history as wire dicts.

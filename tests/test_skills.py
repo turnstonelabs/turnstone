@@ -111,10 +111,9 @@ def _make_session(**kwargs):
 
 
 def _sys_content(session: ChatSession) -> str:
-    """Extract the system message content."""
-    msgs = [m for m in session.system_messages if m["role"] == "system"]
-    assert msgs
-    return msgs[0]["content"]
+    """Full prompt prefix: identity system message + any skill context message."""
+    assert session.system_messages
+    return "\n".join(m["content"] for m in session.system_messages)
 
 
 def _create_template(db, template_id, name, content, **kwargs):

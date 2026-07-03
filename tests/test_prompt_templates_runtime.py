@@ -88,10 +88,9 @@ def _make_session(**kwargs):
 
 
 def _sys_content(session: ChatSession) -> str:
-    """Extract the system message content."""
-    msgs = [m for m in session.system_messages if m["role"] == "system"]
-    assert msgs
-    return msgs[0]["content"]
+    """Full prompt prefix: identity system message + any skill context message."""
+    assert session.system_messages
+    return "\n".join(m["content"] for m in session.system_messages)
 
 
 def _create_template(db, template_id, name, content, is_default=False, **kwargs):
@@ -187,17 +186,24 @@ class TestDefaultTemplates:
         content = _sys_content(session)
         assert "Not default." not in content
 
-    def test_templates_before_instructions(self, tmp_db):
+    def test_default_template_delivered_as_context_after_identity(self, tmp_db):
+        """Default templates are CAPABILITY context (step 3): delivered in a
+        separate message after the identity system message (which carries user
+        instructions), not interleaved into the identity block."""
         from turnstone.core.storage import get_storage
 
         db = get_storage()
         _create_template(db, "t1", "tpl", "TEMPLATE_CONTENT", is_default=True)
 
         session = _make_session(instructions="USER_INSTRUCTIONS")
-        content = _sys_content(session)
-        tpl_pos = content.index("TEMPLATE_CONTENT")
-        instr_pos = content.index("USER_INSTRUCTIONS")
-        assert tpl_pos < instr_pos
+        msgs = session.system_messages
+        # Instructions live in the identity system message; the template body
+        # does NOT.
+        assert "USER_INSTRUCTIONS" in msgs[0]["content"]
+        assert "TEMPLATE_CONTENT" not in msgs[0]["content"]
+        # Default template content rides the trailing skill capability message.
+        assert msgs[-1]["role"] == "user"
+        assert "TEMPLATE_CONTENT" in msgs[-1]["content"]
 
 
 # ---------------------------------------------------------------------------

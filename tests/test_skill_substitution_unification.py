@@ -224,3 +224,51 @@ class TestSkillResourceEnvAliases:
             assert "CLAUDE_SKILL_DIR" not in env
         finally:
             session.close()
+
+
+class TestSkillContextPlacement:
+    """Step 3: an applied skill's body rides its own capability context
+    message (user role), separate from the identity system message — so it
+    never occupies the cached identity prefix or reads as identity, and it
+    does not leak into the task_agent base."""
+
+    def test_skill_body_in_context_message_not_identity(self, tmp_db: str) -> None:
+        db = get_storage()
+        _create_skill(db, "s1", "place-skill", "PLACEMENT_MARKER body text")
+
+        session = make_session(skill="place-skill")
+        try:
+            msgs = session.system_messages
+            # Identity system message is first, role=system, and skill-free.
+            assert msgs[0]["role"] == "system"
+            assert "PLACEMENT_MARKER" not in msgs[0]["content"]
+            # Skill rides exactly one separate user-role capability message.
+            skill_msgs = [m for m in msgs if m["role"] == "user"]
+            assert len(skill_msgs) == 1
+            assert "PLACEMENT_MARKER" in skill_msgs[0]["content"]
+            # The intro names the active skill so the model knows what it is.
+            assert "place-skill" in skill_msgs[0]["content"]
+        finally:
+            session.close()
+
+    def test_no_skill_no_context_message(self, tmp_db: str) -> None:
+        # No applied skill and no defaults → only the identity system message.
+        session = make_session()
+        try:
+            assert all(m["role"] == "system" for m in session.system_messages)
+        finally:
+            session.close()
+
+    def test_agent_prefix_excludes_skill_context(self, tmp_db: str) -> None:
+        # task_agent base = the identity system block only; the parent's
+        # applied skill does NOT leak into the sub-agent prefix.
+        db = get_storage()
+        _create_skill(db, "s1", "leak-skill", "SHOULD_NOT_LEAK body")
+
+        session = make_session(skill="leak-skill")
+        try:
+            assert len(session._agent_system_messages) == 1
+            assert session._agent_system_messages[0]["role"] == "system"
+            assert "SHOULD_NOT_LEAK" not in session._agent_system_messages[0]["content"]
+        finally:
+            session.close()
