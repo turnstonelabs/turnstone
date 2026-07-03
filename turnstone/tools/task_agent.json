@@ -1,6 +1,6 @@
 {
   "name": "task_agent",
-  "description": "Delegate a general-purpose task to an autonomous sub-agent. The agent can read, write, edit, search, and run commands but does NOT have access to memory, recall, watch, skill, or task_agent — it cannot save memories, search conversation history, set up watches, switch skills mid-task, or delegate further. All context must be in the prompt. Provide a clear, self-contained task description. Optionally pass `skill=<name>` to run the sub-agent under a specific skill framing (fixed at invocation, cannot be changed mid-task); use `skill(action='search', query='...')` to find an appropriate name first. An empty `skill` value is acceptable — the sub-agent runs as a competent general-purpose task helper.",
+  "description": "Delegate a general-purpose task to an autonomous sub-agent. The agent can read, write, edit, search, and run commands but does NOT have access to memory, recall, watch, skill, or task_agent — it cannot save memories, search conversation history, set up watches, switch skills mid-task, or delegate further. All context must be in the prompt. Provide a clear, self-contained task description. Optionally pass `skill=<name>` to give the sub-agent capability and procedure for the task (reference material, fixed at invocation), and/or `persona=<name>` to set its identity; use `skill(action='search', query='...')` to find a skill name first. Both are optional — the sub-agent runs as a competent general-purpose task helper by default.",
   "parameters": {
     "type": "object",
     "properties": {
@@ -10,7 +10,11 @@
       },
       "skill": {
         "type": "string",
-        "description": "Optional skill name. Sub-agent runs with this skill's content as its system identity. Use `skill(action='search', query='...')` to discover available names. An empty value is acceptable and yields a competent general-purpose task helper."
+        "description": "Optional skill name providing capability and procedure (reference material) the sub-agent applies to the task — NOT its identity. Use `skill(action='search', query='...')` to discover available names. An empty value is acceptable and yields a competent general-purpose task helper."
+      },
+      "persona": {
+        "type": "string",
+        "description": "Optional persona name setting the sub-agent's identity (base system prompt), resolved against interactive-kind personas. Omit for the default autonomous task-agent identity."
       },
       "model": {
         "type": "string",

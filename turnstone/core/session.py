@@ -119,6 +119,7 @@ from turnstone.core.personas import (
     PersonaSnapshot,
     resolve_persona_for_kind,
     snapshot_from_config,
+    snapshot_from_persona,
 )
 from turnstone.core.providers import create_provider
 from turnstone.core.ratelimit import TokenBucket
@@ -9585,6 +9586,29 @@ class ChatSession:
                 "content": skill_data["content"],
                 "risk_level": skill_data.get("risk_level", ""),
             }
+        # Persona = the sub-agent's identity (system prompt).  Validated at
+        # prep against the interactive kind (the general-purpose personas a
+        # worker can adopt) so an invalid name becomes a clean tool error the
+        # model can react to, not a mid-exec surprise.  The resolved BASE text
+        # is frozen into the item; ``_exec_task`` never re-reads storage.
+        # Omitted → the default autonomous task-agent identity.
+        persona_arg = (args.get("persona") or "").strip()
+        persona_prompt = ""
+        if persona_arg:
+            row, perr = resolve_persona_for_kind(get_storage(), persona_arg, "interactive")
+            if perr or row is None:
+                detail = perr or f"unknown persona {persona_arg!r}"
+                return {
+                    "call_id": call_id,
+                    "func_name": "task_agent",
+                    "header": f"✗ task_agent: {detail}",
+                    "preview": "",
+                    "needs_approval": False,
+                    "error": (
+                        f"Error: {detail}. Omit `persona` for the default task-agent identity."
+                    ),
+                }
+            persona_prompt = snapshot_from_persona(row).prompt
         preview_text = prompt[:300] + ("..." if len(prompt) > 300 else "")
         header = "\u2699 task_agent (autonomous agent"
         if skill_data:
@@ -9601,6 +9625,8 @@ class ChatSession:
                     skill=skill_data["name"],
                     risk_level=risk_tier,
                 )
+        if persona_arg:
+            header += f", persona: {persona_arg}"
         header += ")"
         return {
             "call_id": call_id,
@@ -9613,6 +9639,8 @@ class ChatSession:
             "prompt": prompt,
             "model_override": model_override,
             "skill": skill_data,
+            "persona": persona_arg,
+            "persona_prompt": persona_prompt,
         }
 
     def _resolve_scope_id(self, scope: str) -> str:
@@ -14224,61 +14252,62 @@ class ChatSession:
         "3. **Complete the task fully.** Do not ask follow-up "
         "questions — execute the work as described in the prompt."
     )
+    # Framing for a skill delivered to a sub-agent as capability context
+    # (a distinct turn), keeping it clearly separate from the agent's
+    # persona identity.
+    _TASK_SKILL_CAPABILITY_PREAMBLE = (
+        "The following skill provides capability and procedure for the task "
+        "below. Apply it as reference for how to do the work — it is not your "
+        "identity.\n\n"
+    )
 
     def _exec_task(self, item: dict[str, Any]) -> tuple[str, str]:
         """Delegate to a general-purpose autonomous sub-agent."""
         call_id, prompt = item["call_id"], item["prompt"]
         skill_data = item.get("skill")
+        # Identity comes from the persona (resolved at prep) or the default
+        # autonomous task-agent identity — NEVER the skill.  The one-shot,
+        # tool-over-narration operating guidance always layers on top: these
+        # are sub-agent semantics a persona builds on, not replaces.
+        identity = item.get("persona_prompt") or self._TASK_DEFAULT_IDENTITY
+        identity = identity + "\n\n" + self._TASK_OPERATING_GUIDANCE
+        # Task agent gets the base system prompt (tool patterns) merged with
+        # its identity in a single system message. No conversation history —
+        # it's an autonomous sub-agent. Merged to avoid multi-system-message
+        # errors on models like Qwen.
+        base = self._agent_system_messages[0]["content"] if self._agent_system_messages else ""
+        agent_turns: list[Turn] = [Turn.system(base + "\n\n" + identity)]
         if skill_data:
-            # Structured forensic record naming the skill the LLM ran
-            # under.  The approval row captures the choice at consent
-            # time; this log captures it at exec time so post-incident
-            # search ("which sessions ran skill X?") doesn't have to
-            # cross-walk approval and exec tables.
+            # Structured forensic record naming the skill the LLM ran under.
+            # The approval row captures the choice at consent time; this log
+            # captures it at exec time so post-incident search ("which
+            # sessions ran skill X?") doesn't have to cross-walk approval and
+            # exec tables.
             log.info(
                 "task_agent.skill_invoked",
                 skill=skill_data["name"],
                 risk_level=skill_data.get("risk_level", ""),
                 ws_id=self._ws_id,
             )
-            # Route through the shared skill substitution path so a
-            # ``task_agent`` skill resolves ``${TURNSTONE_*}`` env vars
-            # exactly like interactive and spawn loads (previously this ran
-            # ``_render_template`` alone, leaving every ``$``/``${…}`` form
-            # literal — the substitution asymmetry across invocation
-            # contexts).
-            #
-            # A sub-agent gets its task via the prompt, not invocation args,
-            # so ``arguments_str`` is empty: bare ``$ARGUMENTS`` and every
-            # positional ``$N`` / ``$ARGUMENTS[N]`` form resolve to empty —
-            # deliberately identical to the defaults and spawn-child paths,
-            # not the verbatim passthrough the old shortcut happened to give.
-            # ``skill_dir`` is likewise unset here (sub-agent resource
-            # bundles aren't materialized yet), so ``${TURNSTONE_SKILL_DIR}``
-            # stays literal on this path — unchanged from before; a later
-            # step adds sub-agent materialization and a persona-owned
-            # identity so this body becomes pure capability context.
-            skill_identity = self._render_skill_body(skill_data["content"])
-            if len(skill_identity) > _MAX_SKILL_CONTENT:
+            # A skill applied to a task_agent is CAPABILITY, not identity:
+            # delivered as a distinct context turn ahead of the task, never
+            # fused into the system identity.  Substituted through the shared
+            # pipeline — a sub-agent has no invocation args, so ``$ARGUMENTS``
+            # and positional ``$N`` forms resolve to empty (identical to the
+            # defaults and spawn-child paths) and ``${TURNSTONE_*}`` env vars
+            # resolve; ``skill_dir`` is unset (sub-agent bundles aren't
+            # materialized yet), leaving ``${TURNSTONE_SKILL_DIR}`` literal.
+            skill_body = self._render_skill_body(skill_data["content"])
+            if len(skill_body) > _MAX_SKILL_CONTENT:
                 log.warning(
                     "skill_content.truncated",
-                    length=len(skill_identity),
+                    length=len(skill_body),
                     agent="task",
                     skill=skill_data.get("name", ""),
                 )
-                skill_identity = skill_identity[:_MAX_SKILL_CONTENT]
-        else:
-            skill_identity = self._TASK_DEFAULT_IDENTITY
-        identity = skill_identity + "\n\n" + self._TASK_OPERATING_GUIDANCE
-        # Task agent gets the base system prompt (tool patterns) merged
-        # with its own identity in a single system message. No conversation
-        # history — it's an autonomous sub-agent. Merged to avoid
-        # multi-system-message errors on models like Qwen.
-        base = self._agent_system_messages[0]["content"] if self._agent_system_messages else ""
-        agent_turns: list[Turn] = [
-            Turn.system(base + "\n\n" + identity),
-            Turn.user(prompt),
-        ]
+                skill_body = skill_body[:_MAX_SKILL_CONTENT]
+            agent_turns.append(Turn.user(self._TASK_SKILL_CAPABILITY_PREAMBLE + skill_body))
+        agent_turns.append(Turn.user(prompt))
         self._begin_agent_scope()
         # Per-sub-agent file-read tracking.  COPY the parent's current set in (so
         # the agent can edit a file the parent already read for it — no spurious

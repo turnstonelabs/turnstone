@@ -521,16 +521,21 @@ class TestSpawnPersona:
 
 
 # ---------------------------------------------------------------------------
-# Guard 7 — task_agent has no persona parameter (sub-agents keep their own
-# identity; persona is a workstream-level concept).
+# Guard 7 — task_agent HAS a persona parameter: a sub-agent's identity comes
+# from a persona (default = the built-in task-agent identity), validated at
+# prep against the interactive kind.  Revises the original "no persona for
+# task agents" stance now that personas are first-class on every path.
 # ---------------------------------------------------------------------------
 
 
-def test_task_agent_schema_has_no_persona_param() -> None:
+def test_task_agent_schema_has_persona_param() -> None:
     from turnstone.core.tools import TOOLS
 
     task_agent = next(t for t in TOOLS if t["function"]["name"] == "task_agent")
-    assert "persona" not in task_agent["function"]["parameters"]["properties"]
+    props = task_agent["function"]["parameters"]["properties"]
+    assert "persona" in props
+    # skill= is capability now — the description frames it that way.
+    assert "capability" in props["skill"]["description"].lower()
 
 
 # ---------------------------------------------------------------------------

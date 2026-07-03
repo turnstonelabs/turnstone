@@ -272,18 +272,19 @@ class TestChatSessionConstruction:
 
 
 # ---------------------------------------------------------------------------
-# Tests — _exec_task (optional skill substitutes the hardcoded identity)
+# Tests — _exec_task (identity from persona/default; skill = capability turn)
 # ---------------------------------------------------------------------------
 
 
 class TestTaskExec:
-    """Tests for _exec_task: optional skill= replaces the default persona,
-    but operating guidance (one-shot, tool-use over narration, no follow-ups)
-    is always preserved."""
+    """Tests for _exec_task: identity comes from ``persona=`` (or the default
+    task-agent identity), NEVER the skill; a ``skill=`` rides a distinct
+    capability turn.  Operating guidance (one-shot, tool-use over narration,
+    no follow-ups) always layers on top."""
 
     @staticmethod
-    def _capture_exec_messages(session, item):
-        """Run _exec_task with _run_agent patched; return system message text."""
+    def _capture_exec_turns(session, item):
+        """Run _exec_task with _run_agent patched; return the turns list."""
         captured: dict = {}
 
         def fake_run_agent(messages, **kwargs):
@@ -292,27 +293,22 @@ class TestTaskExec:
 
         with patch.object(session, "_run_agent", side_effect=fake_run_agent):
             session._exec_task(item)
-        return captured["messages"][0].text
+        return captured["messages"]
 
-    def test_known_skill_renders_into_system_message(self, tmp_db) -> None:
-        """Validated skill content (with template vars resolved) replaces
-        the default '# Task Agent' persona, but the operating guidance
-        (the numbered list) is preserved — those are sub-agent semantics
-        that a persona should layer on top of, not replace.
-
-        Covers the full prepare→exec round-trip so a future regression
-        in either half (skill not stored on the item, or exec ignoring it)
-        is caught."""
+    def test_skill_delivered_as_capability_turn_not_identity(self, tmp_db) -> None:
+        """A skill= is CAPABILITY, not identity: its body (template vars
+        resolved) rides a distinct turn AFTER the system message, while the
+        default '# Task Agent' identity + operating guidance stay in the
+        system message.  Covers the full prepare→exec round-trip."""
         session = _make_session()
         skill = {
             "name": "research",
-            "content": "# Research Agent\nws={{ws_id}} model={{model}} node={{node_id}}",
+            "content": "# Research Skill\nws={{ws_id}} model={{model}} node={{node_id}}",
         }
         with patch("turnstone.core.session.get_skill_by_name", return_value=skill):
             item = session._prepare_task("c1", {"prompt": "investigate X", "skill": "research"})
 
-        # Item carries the minimized projection — name/content/risk_level
-        # only — not the raw prompt_templates row.
+        # Item carries the minimized projection — name/content/risk_level only.
         assert item["skill"] == {
             "name": "research",
             "content": skill["content"],
@@ -321,35 +317,113 @@ class TestTaskExec:
         assert item.get("needs_approval") is True
         assert "skill: research" in item["header"]
 
-        sys_msg = self._capture_exec_messages(session, item)
-        # Skill persona rendered with template vars resolved
-        assert "# Research Agent" in sys_msg
-        assert f"ws={session._ws_id}" in sys_msg
-        assert f"model={session.model}" in sys_msg
-        # Default persona is gone — skill substitutes for it.
-        assert "# Task Agent" not in sys_msg
-        assert "autonomous task agent with full tool access" not in sys_msg
-        # Operating guidance survives regardless of skill.
+        turns = self._capture_exec_turns(session, item)
+        sys_msg = turns[0].text
+        # Identity stays the DEFAULT — the skill does NOT become identity.
+        assert ChatSession._TASK_DEFAULT_IDENTITY in sys_msg
+        assert "# Task Agent" in sys_msg
         assert ChatSession._TASK_OPERATING_GUIDANCE in sys_msg
+        # Skill body is NOT fused into the identity system message.
+        assert "# Research Skill" not in sys_msg
+        # It rides a distinct capability turn, template vars resolved.
+        capability = turns[1].text
+        assert ChatSession._TASK_SKILL_CAPABILITY_PREAMBLE in capability
+        assert "# Research Skill" in capability
+        assert f"ws={session._ws_id}" in capability
+        assert f"model={session.model}" in capability
+        # Task prompt is the final turn.
+        assert turns[-1].text == "investigate X"
 
-    def test_omitted_skill_uses_hardcoded_identity(self, tmp_db) -> None:
-        """Regression guard: without skill=, the default '# Task Agent'
-        persona AND the operating guidance both appear verbatim.
-
-        Pins the no-skill path so the substitution branch can't
-        accidentally swallow the default case."""
+    def test_omitted_skill_uses_default_identity(self, tmp_db) -> None:
+        """Without skill= or persona=, the default '# Task Agent' identity +
+        operating guidance appear in the system message, and there is NO
+        capability turn — just system + prompt."""
         session = _make_session()
         item = session._prepare_task("c1", {"prompt": "do x"})
 
         assert item["skill"] is None
+        assert item["persona"] == ""
         assert "skill:" not in item["header"]
+        assert "persona:" not in item["header"]
 
-        sys_msg = self._capture_exec_messages(session, item)
+        turns = self._capture_exec_turns(session, item)
+        sys_msg = turns[0].text
         assert ChatSession._TASK_DEFAULT_IDENTITY in sys_msg
         assert ChatSession._TASK_OPERATING_GUIDANCE in sys_msg
-        # Default-persona literals also present (sanity check on the constant).
         assert "# Task Agent" in sys_msg
         assert "autonomous task agent with full tool access" in sys_msg
+        # No skill → no capability turn: just system + prompt.
+        assert len(turns) == 2
+        assert turns[-1].text == "do x"
+
+    def test_persona_sets_identity_skill_stays_capability(self, tmp_db) -> None:
+        """persona= sets the sub-agent identity (base prompt) in place of the
+        default; a skill passed alongside stays a capability turn."""
+        session = _make_session()
+        persona_row = {
+            "name": "engineer",
+            "base_prompt": "# Engineer\nYou are an engineer.",
+            "base_prompt_file": None,
+            "tool_allowlist": None,
+            "mcp_enabled": True,
+            "memory_enabled": True,
+            "enabled": True,
+            "applies_to_kinds": ["interactive"],
+        }
+        skill = {"name": "research", "content": "# Research Skill"}
+        with (
+            patch("turnstone.core.session.get_skill_by_name", return_value=skill),
+            patch("turnstone.core.session.get_storage") as gs,
+        ):
+            gs.return_value.get_persona_by_name.return_value = persona_row
+            item = session._prepare_task(
+                "c1", {"prompt": "do x", "skill": "research", "persona": "engineer"}
+            )
+
+        assert item.get("needs_approval") is True
+        assert item["persona"] == "engineer"
+        assert "persona: engineer" in item["header"]
+        assert "skill: research" in item["header"]
+
+        turns = self._capture_exec_turns(session, item)
+        sys_msg = turns[0].text
+        # Identity = persona, not the default and not the skill.
+        assert "# Engineer" in sys_msg
+        assert ChatSession._TASK_DEFAULT_IDENTITY not in sys_msg
+        assert "# Research Skill" not in sys_msg
+        # Operating guidance still layers on the persona identity.
+        assert ChatSession._TASK_OPERATING_GUIDANCE in sys_msg
+        # Skill remains a capability turn.
+        assert "# Research Skill" in turns[1].text
+
+    def test_unknown_persona_returns_error(self, tmp_db) -> None:
+        """Unknown persona name → clean error item, no approval."""
+        session = _make_session()
+        with patch("turnstone.core.session.get_storage") as gs:
+            gs.return_value.get_persona_by_name.return_value = None
+            item = session._prepare_task("c1", {"prompt": "do x", "persona": "ghost"})
+        assert item.get("needs_approval") is False
+        assert "ghost" in item["error"]
+        assert "Omit `persona`" in item["error"]
+
+    def test_persona_wrong_kind_returns_error(self, tmp_db) -> None:
+        """A coordinator-only persona can't serve as a task-agent identity."""
+        session = _make_session()
+        coord_row = {
+            "name": "orchestrator",
+            "base_prompt": "# Orchestrator",
+            "base_prompt_file": None,
+            "tool_allowlist": None,
+            "mcp_enabled": True,
+            "memory_enabled": True,
+            "enabled": True,
+            "applies_to_kinds": ["coordinator"],
+        }
+        with patch("turnstone.core.session.get_storage") as gs:
+            gs.return_value.get_persona_by_name.return_value = coord_row
+            item = session._prepare_task("c1", {"prompt": "do x", "persona": "orchestrator"})
+        assert item.get("needs_approval") is False
+        assert "interactive" in item["error"]
 
     @pytest.mark.parametrize("skill_value", ["", "   ", "\t\n"])
     def test_prepare_task_empty_or_whitespace_skill_treated_as_omitted(
