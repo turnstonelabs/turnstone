@@ -124,7 +124,8 @@ Built-in tools for shell, files, search, web, memory, notifications, and autonom
 | `turnstone-console` | Cluster dashboard + routing proxy + admin panel |
 | `turnstone-channel` | Channel gateway (Discord and Slack adapters) |
 | `turnstone-admin` | User/token management CLI |
-| `turnstone-eval` | Eval harness for prompt/tool optimization |
+| `turnstone-eval` | Headless measurement — scores tool-use against expected actions |
+| `turnstone-optimizer` | Prompt/tool optimizer (UCB self-modify loop over the eval substrate) |
 | `turnstone-doctor` | LLM-backed cluster diagnostics |
 
 ### Diagrams

@@ -64,7 +64,8 @@ all = ["turnstone[discord,slack]"]
 
 [project.scripts]
 turnstone = "turnstone.cli:main"
-turnstone-eval = "turnstone.eval:main"
+turnstone-eval = "turnstone.eval.cli:main"
+turnstone-optimizer = "turnstone.optimizer:main"
 turnstone-server = "turnstone.server:main"
 turnstone-console = "turnstone.console.server:main"
 turnstone-admin = "turnstone.admin:main"

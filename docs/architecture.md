@@ -19,7 +19,8 @@ plugs in.
 | `turnstone` | `turnstone.cli` | `TerminalUI` | Interactive terminal REPL |
 | `turnstone-server` | `turnstone.server` | `WebUI` | Browser-based chat (HTTP + SSE) |
 | `turnstone-console` | `turnstone.console.server` | ClusterCollector | Cluster dashboard (aggregates all nodes) |
-| `turnstone-eval` | `turnstone.eval` | `NullUI` | Headless evaluation and prompt optimization |
+| `turnstone-eval` | `turnstone.eval.cli` | `NullUI` | Headless measurement (scores tool-use against expected actions) |
+| `turnstone-optimizer` | `turnstone.optimizer` | `NullUI` | Prompt/tool optimization (UCB self-modify loop over the eval substrate) |
 | `turnstone-channel` | `turnstone.channels.cli` | ChannelAdapter | Channel gateway (Discord, Slack, etc.) |
 | `turnstone-admin` | `turnstone.admin` | — | Offline user and API token management |
 | `turnstone-doctor` | `turnstone.doctor` | — | LLM-backed cluster diagnostics |
@@ -267,7 +268,7 @@ the per-workstream events stream in
 |-------|--------|-------|
 | `TerminalUI` | `turnstone.cli` | ANSI colors, `MarkdownRenderer`, `Spinner`, readline-based `input()` for approval |
 | `WebUI` | `turnstone.server` | SSE event queue per workstream + global broadcast, `threading.Event` for blocking on approval. `on_state_change` sends to both per-workstream and global SSE (the browser UI uses per-workstream `state_change` events to manage busy/idle transitions; `stream_end` only finalizes markdown rendering). |
-| `NullUI` | `turnstone.eval` | Discards all output; `approve_tools` always returns `(True, None)` |
+| `NullUI` | `turnstone.eval.core` | Discards all output; `approve_tools` always returns `(True, None)` |
 
 ### WorkstreamTerminalUI
 

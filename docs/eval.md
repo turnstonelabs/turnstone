@@ -1,11 +1,19 @@
-# Evaluation and Prompt Optimization (turnstone-eval)
+# Evaluation and Prompt Optimization (turnstone-eval, turnstone-optimizer)
 
-`turnstone-eval` is the evaluation and prompt optimization system for turnstone. It
-runs test cases against the LLM, scores tool call sequences against expected
-actions, and optionally uses a multi-agent pipeline to optimize the developer
-prompt and tool descriptions.
+Evaluation for turnstone is split into two commands:
 
-Source: `turnstone/eval.py`
+- **`turnstone-eval`** — the measurement substrate. Runs test cases against the LLM
+  and scores tool call sequences against expected actions. A single measurement pass,
+  no self-modification.
+- **`turnstone-optimizer`** — the prompt/tool optimizer. Loops over the measurement
+  substrate, using a multi-agent pipeline (analyst, optimizer, observer, diversifier,
+  tool optimizer) to edit the developer prompt and tool descriptions so more tests pass.
+
+The dependency is strictly one-way: the optimizer consumes the eval substrate; the
+substrate never depends on the optimizer.
+
+Source: `turnstone/eval/core.py` (measurement substrate), `turnstone/eval/cli.py`
+(the `turnstone-eval` CLI), `turnstone/optimizer.py` (the `turnstone-optimizer` CLI).
 
 ---
 
@@ -27,8 +35,8 @@ This approach (inspired by [Learning to Self-Evolve](https://arxiv.org/abs/2603.
 prevents irrecoverable collapse from bad edits — UCB naturally backtracks to
 high-scoring ancestors instead of following a linear chain.
 
-When optimization is disabled (`--no-optimize`), only steps 2-4 execute
-(a single iteration evaluating the root node).
+The `turnstone-eval` command (or `turnstone-optimizer --no-optimize`) executes only
+steps 2-4: a single measurement pass over the root prompt, no optimization.
 
 ---
 
@@ -452,30 +460,46 @@ structure is:
 
 ## CLI Usage
 
-The entry point is `turnstone-eval` (installed as a console script) or
-`python -m turnstone.eval`.
+Two console scripts (installed as entry points), or the equivalent `python -m`
+invocations:
+
+- `turnstone-eval` / `python -m turnstone.eval.cli` — measure only.
+- `turnstone-optimizer` / `python -m turnstone.optimizer` — optimize.
+
+### Measure (`turnstone-eval`)
 
 ```
-turnstone-eval tests.json                          # evaluate + optimize
-turnstone-eval tests.json --no-optimize            # evaluate only (single iteration)
-turnstone-eval tests.json --n-runs 5 --max-iter 10 # more thorough evaluation
-turnstone-eval tests.json --prompt custom.txt      # start from a custom prompt
-turnstone-eval tests.json --optimize-tools         # optimize tool descriptions only
-turnstone-eval tests.json --diversify 10           # test with prompt variants
-turnstone-eval tests.json -v                       # verbose per-turn logging
+turnstone-eval tests.json                     # one measurement pass, print scores
+turnstone-eval tests.json --prompt custom.txt # measure a custom prompt
+turnstone-eval tests.json --n-runs 5          # more runs per case
+turnstone-eval tests.json --parallel 4        # run cases across 4 workers
+turnstone-eval tests.json -v                  # verbose per-turn logging
 ```
 
-### Multi-model setup (local test model, cloud optimizer)
+### Optimize (`turnstone-optimizer`)
 
 ```
-turnstone-eval tests.json \
+turnstone-optimizer tests.json                          # evaluate + optimize
+turnstone-optimizer tests.json --no-optimize            # single pass, no optimization
+turnstone-optimizer tests.json --n-runs 5 --max-iter 10 # more thorough optimization
+turnstone-optimizer tests.json --prompt custom.txt      # start from a custom prompt
+turnstone-optimizer tests.json --optimize-tools         # optimize tool descriptions only
+turnstone-optimizer tests.json --diversify 10           # test with prompt variants
+```
+
+#### Multi-model setup (local test model, cloud optimizer)
+
+```
+turnstone-optimizer tests.json \
   --base-url http://localhost:8000/v1 \
   --optimizer-base-url https://api.anthropic.com \
   --optimizer-model claude-sonnet-4-6 \
   --analyst-model claude-opus-4-6
 ```
 
-### All Options
+### Measurement Options
+
+Accepted by **both** commands.
 
 | Flag                    | Default                    | Description |
 |-------------------------|----------------------------|-------------|
@@ -484,19 +508,26 @@ turnstone-eval tests.json \
 | `--model`               | auto-detect                | Model name. Auto-detected from the API if not specified. |
 | `--prompt`              | turnstone built-in prompt  | Path to initial prompt text file. |
 | `--n-runs`              | from tests.json or 3       | Number of runs per test case. |
-| `--max-iter`            | 5                          | Maximum optimization iterations. |
-| `--no-optimize`         | false                      | Run evaluation only (sets max-iter to 1). |
 | `--temperature`         | 0.7                        | Sampling temperature. |
 | `--max-tokens`          | 32768                      | Max completion tokens. |
 | `--reasoning-effort`    | `medium`                   | Reasoning effort: `low`, `medium`, or `high`. |
 | `--context-window`      | 131072                     | Context window size. |
 | `--output`              | `eval_results.json`        | Output results file path. |
 | `-v`, `--verbose`       | false                      | Show detailed per-turn logging. |
-| `--explore-constant`    | 1.414 (sqrt(2))            | UCB exploration constant C. |
 | `--test-timeout`        | 300                        | Per-test timeout in seconds. |
-| `--suite-timeout`       | 0 (unlimited)              | Total suite timeout in seconds. |
 | `--no-fast-fail`        | false                      | Disable early termination on all-zero initial runs. |
 | `--parallel`            | 1 (serial)                 | Parallel workers (0=auto, N=use N workers). |
+
+### Optimizer Options
+
+Accepted by **`turnstone-optimizer`** only.
+
+| Flag                    | Default                    | Description |
+|-------------------------|----------------------------|-------------|
+| `--max-iter`            | 5                          | Maximum optimization iterations. |
+| `--no-optimize`         | false                      | Run a single measurement pass (sets max-iter to 1). |
+| `--explore-constant`    | 1.414 (sqrt(2))            | UCB exploration constant C. |
+| `--suite-timeout`       | 0 (unlimited)              | Total suite timeout in seconds. |
 | `--optimizer-model`     | same as `--model`          | Model for prompt optimization. |
 | `--optimizer-base-url`  | same as `--base-url`       | Base URL for optimizer model. |
 | `--observer-model`      | same as optimizer           | Model for meta-optimization (observer). |

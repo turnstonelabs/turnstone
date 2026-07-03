@@ -260,7 +260,7 @@ interface, or anyone who can reach it can search through your instance.
 
 Both stacks install all entry points into a single image (`turnstone`,
 `turnstone-server`, `turnstone-console`, `turnstone-channel`, `turnstone-admin`,
-`turnstone-eval`, `turnstone-doctor`):
+`turnstone-eval`, `turnstone-optimizer`, `turnstone-doctor`):
 
 ```bash
 docker compose build            # build the dev image
