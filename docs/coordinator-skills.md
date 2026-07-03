@@ -103,13 +103,13 @@ Interactive skills compose on top of `base_interactive.md` — a
 close the loop.
 
 Coordinator skills compose on top of
-[`base_coordinator.md`](../turnstone/prompts/base_coordinator.md) —
+[`personas/orchestrator.md`](../turnstone/prompts/personas/orchestrator.md) —
 an "orchestrator" framing: decompose, delegate, monitor, synthesise.
 The base text is short but sets the tone every coordinator skill
 inherits:
 
-> You are a coordinator on a small, focused infrastructure team.
-> Your role is to orchestrate work across the cluster...  You do
+> You are a coordinator.  Your role is to orchestrate work across
+> the cluster...  You do
 > not edit files, run shell commands, browse the web, or manipulate
 > the codebase directly.  Children do that.
 

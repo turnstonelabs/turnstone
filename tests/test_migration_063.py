@@ -96,10 +96,14 @@ class TestMigration063:
                 "orchestrator",
                 "executive",
             }
-            # Zero-touch guarantee: the per-kind defaults carry NO overrides.
+            # Every built-in is file-backed: base_prompt NULL, prose in
+            # prompts/personas/<slug>.md (the origin marker + built-in flag).
+            for name in rows:
+                assert rows[name]["base_prompt"] is None, name
+                assert rows[name]["base_prompt_file"] == f"{name}.md", name
+            # Zero-touch guarantee: the per-kind defaults carry no lever overrides.
             for name, kind in (("engineer", "interactive"), ("orchestrator", "coordinator")):
                 p = rows[name]
-                assert p["base_prompt"] is None
                 assert p["tool_allowlist"] is None
                 assert p["mcp_enabled"] == 1
                 assert p["memory_enabled"] == 1
@@ -116,6 +120,7 @@ class TestMigration063:
                 "web_search",
                 "recall",
                 "memory",
+                "tool_search",
             ]
             assert json.loads(rows["writer"]["tool_allowlist"]) == []
             assert rows["writer"]["memory_enabled"] == 1
@@ -124,8 +129,6 @@ class TestMigration063:
             assert "delete_workstream" not in exec_tools
             assert "tool_search" not in exec_tools  # hard set — no escape hatch
             assert json.loads(rows["executive"]["applies_to_kinds"]) == ["coordinator"]
-            # /creative parity: writer folds the old prompt.
-            assert "creative writing partner" in str(rows["writer"]["base_prompt"])
             # All seeds enabled.
             assert all(p["enabled"] == 1 for p in rows.values())
         finally:
@@ -188,16 +191,66 @@ class TestMigration063:
                 row_persona = conn.execute(
                     sa.text("SELECT persona FROM workstreams WHERE ws_id='ws-creative'")
                 ).fetchone()
-            # creative_mode='True' → the full writer stamp (all five keys)…
-            assert stamped == {"ws-creative": "writer"}
+            # creative_mode='True' → the full writer stamp (all five keys), the
+            # persona_prompt frozen from prompts/personas/writer.md…
+            assert stamped["ws-creative"] == "writer"
             keys = {str(k): str(v) for k, v in cols}
             assert keys["persona_tools"] == "[]"
             assert keys["persona_mcp"] == "0"
             assert keys["persona_memory"] == "1"
             assert "creative writing partner" in keys["persona_prompt"]
             assert row_persona is not None and row_persona[0] == "writer"
-            # …while creative_mode='False' workstreams stay legacy-unstamped.
-            assert "ws-plain" not in stamped
+            # …while a non-creative workstream gets its kind default (engineer),
+            # so no workstream is left personaless.
+            assert stamped["ws-plain"] == "engineer"
+        finally:
+            engine.dispose()
+
+    def test_backfill_stamps_plain_workstreams_by_kind(self, tmp_path: Path) -> None:
+        # The load-bearing new behaviour: no workstream is left personaless.
+        # A plain (non-creative) workstream is stamped with its kind's default —
+        # engineer for interactive, orchestrator for coordinator — carrying that
+        # persona's resolved (frozen) base prompt.
+        db_path = tmp_path / "063-backfill.db"
+        cfg = _alembic_cfg(db_path)
+        command.upgrade(cfg, "062")
+        engine = sa.create_engine(f"sqlite:///{db_path}")
+        try:
+            with engine.begin() as conn:
+                for ws_id, kind in (("ws-ic", "interactive"), ("ws-coord", "coordinator")):
+                    conn.execute(
+                        sa.text(
+                            "INSERT INTO workstreams (ws_id, name, state, kind, created, "
+                            "updated) VALUES (:ws, :ws, 'closed', :kind, "
+                            "'2026-01-01T00:00:00', '2026-01-01T00:00:00')"
+                        ),
+                        {"ws": ws_id, "kind": kind},
+                    )
+            command.upgrade(cfg, "063")
+
+            with engine.connect() as conn:
+
+                def _cfg(ws: str, key: str) -> str | None:
+                    r = conn.execute(
+                        sa.text("SELECT value FROM workstream_config WHERE ws_id=:ws AND key=:k"),
+                        {"ws": ws, "k": key},
+                    ).fetchone()
+                    return None if r is None else str(r[0])
+
+                assert _cfg("ws-ic", "persona") == "engineer"
+                assert _cfg("ws-coord", "persona") == "orchestrator"
+                # Frozen resolved text (from the persona's file), not a slug/empty.
+                assert "software engineer" in (_cfg("ws-ic", "persona_prompt") or "")
+                assert "coordinator" in (_cfg("ws-coord", "persona_prompt") or "")
+                # Kind-default envelope: unrestricted tools, MCP + memory on.
+                assert _cfg("ws-ic", "persona_tools") == "null"
+                assert _cfg("ws-ic", "persona_mcp") == "1"
+                assert _cfg("ws-ic", "persona_memory") == "1"
+                # The workstreams.persona projection is set too.
+                row = conn.execute(
+                    sa.text("SELECT persona FROM workstreams WHERE ws_id='ws-coord'")
+                ).fetchone()
+                assert row is not None and row[0] == "orchestrator"
         finally:
             engine.dispose()
 

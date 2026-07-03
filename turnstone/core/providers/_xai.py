@@ -196,8 +196,16 @@ class XAIProvider(OpenAIResponsesProvider):
         effective_tools = resolve_server_side_tools(caps)
         if not effective_tools:
             return kwargs
+        # Only forward a ``<type>_call_output`` include for a server-side tool
+        # the base actually injected.  The base now gates native injection on a
+        # surviving client def (replace-only), so a tool suppressed by a
+        # persona/coordinator visibility set must not leave an orphan include
+        # for a tool absent from ``tools`` (which xAI may reject).
+        injected_types = {t.get("type") for t in (kwargs.get("tools") or []) if isinstance(t, dict)}
         includes = list(kwargs.get("include") or [])
         for tool_type in effective_tools:
+            if tool_type not in injected_types:
+                continue
             output_include = f"{tool_type}_call_output"
             if output_include not in includes:
                 includes.append(output_include)

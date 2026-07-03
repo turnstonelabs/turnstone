@@ -37,7 +37,7 @@ def test_smoke_all_client_types(ct: ClientType) -> None:
         available_tools=_ALL_TOOLS,
     )
     # BASE content present
-    assert "resident engineer" in result
+    assert "software engineer" in result
     # CONTEXT present
     assert "sarah.chen" in result
     assert "2026-03-31" in result
@@ -133,11 +133,16 @@ def test_missing_policy_file() -> None:
 
 
 def test_base_module_isolation() -> None:
-    from turnstone.prompts import _load
+    # EVERY built-in persona file is a BASE module (compose_system_message loads
+    # it as the base), so all must be environment-agnostic — not just engineer.
+    from turnstone.prompts import _PROMPTS_DIR, _load
 
-    base = _load("base.md")
-    for forbidden in ("Mermaid", "KaTeX", "terminal", "monospace", "Slack", "Discord"):
-        assert forbidden not in base, f"BASE must not contain '{forbidden}'"
+    persona_files = sorted(p.name for p in (_PROMPTS_DIR / "personas").glob("*.md"))
+    assert persona_files, "expected built-in persona base files under prompts/personas/"
+    for fname in persona_files:
+        base = _load(f"personas/{fname}")
+        for forbidden in ("Mermaid", "KaTeX", "terminal", "monospace", "Slack", "Discord"):
+            assert forbidden not in base, f"BASE {fname} must not contain '{forbidden}'"
 
 
 # ---------------------------------------------------------------------------
@@ -391,17 +396,17 @@ def test_coordinator_kind_selects_coord_tools() -> None:
 
 
 def test_coordinator_kind_uses_orchestrator_base() -> None:
-    """kind='coordinator' swaps in base_coordinator.md."""
+    """kind='coordinator' swaps in personas/orchestrator.md."""
     result = compose_system_message(
         ClientType.CLI,
         _VALID_CTX,
         frozenset({"spawn_workstream"}),
         kind="coordinator",
     )
-    # IC-framing phrases from base.md should NOT appear.
+    # IC-framing phrases from personas/engineer.md should NOT appear.
     for ic_phrase in ("read before you edit", "commits you make"):
         assert ic_phrase not in result, f"coordinator base leaked IC framing: {ic_phrase!r}"
-    # Orchestrator-framing phrases from base_coordinator.md should appear.
+    # Orchestrator-framing phrases from personas/orchestrator.md should appear.
     assert "orchestrate" in result
     assert "delegate" in result
 

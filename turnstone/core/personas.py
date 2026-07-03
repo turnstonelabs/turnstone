@@ -8,7 +8,9 @@ never changes an existing workstream, and a workstream outlives its persona.
 The five keys (all-or-none — a partial stamp is corruption, not a fallback):
 
 - ``persona``          — the persona's slug (display + forensics)
-- ``persona_prompt``   — BASE-module override; ``""`` = the kind's stock base
+- ``persona_prompt``   — the resolved BASE text, frozen at create (an
+  operator override, else the built-in's file content).  Legacy stamps may
+  carry ``""``; compose then falls back to the kind's default file.
 - ``persona_tools``    — JSON tri-state: ``null`` = unrestricted, ``[]`` =
   hard empty, ``[names]`` = exact visibility set (``tool_search`` membership
   decides soft vs hard)
@@ -45,7 +47,7 @@ class PersonaSnapshot:
     """Immutable, self-contained persona stamp held by a live session."""
 
     name: str
-    prompt: str  # "" = use the kind's stock BASE module
+    prompt: str  # resolved BASE text, frozen at create ("" only in legacy stamps)
     tools: frozenset[str] | None  # None = unrestricted; frozenset() = hard empty
     mcp: bool
     memory: bool
@@ -88,12 +90,39 @@ def resolve_persona_for_kind(
     return row, ""
 
 
+def _resolve_base_prompt(persona: Mapping[str, Any]) -> str:
+    """Coalesce a persona row to its BASE prompt text.
+
+    ``base_prompt ?? load(base_prompt_file)``: an operator's inline override
+    wins; otherwise the built-in's repo file under ``prompts/personas/``.  The
+    storage CHECK guarantees at least one is set, so a row reaching the final
+    branch is corrupt and fails loudly rather than composing an empty BASE.
+    """
+    text = persona.get("base_prompt")
+    if text:
+        return str(text)
+    pfile = persona.get("base_prompt_file")
+    if pfile:
+        from turnstone.prompts import load_persona_prompt  # lazy: avoid import cycle
+
+        return load_persona_prompt(str(pfile))
+    raise ValueError(
+        f"persona {persona.get('name')!r} has no prompt source: "
+        "base_prompt and base_prompt_file are both empty"
+    )
+
+
 def snapshot_from_persona(persona: Mapping[str, Any]) -> PersonaSnapshot:
-    """Build the stamp from a storage persona row — the resolve-once moment."""
+    """Build the stamp from a storage persona row — the resolve-once moment.
+
+    The BASE prompt is resolved to concrete text here (operator override, else
+    the built-in's file) and frozen into the snapshot, so a later edit to the
+    file or the row never changes an already-created workstream.
+    """
     tools = persona.get("tool_allowlist")
     return PersonaSnapshot(
         name=str(persona["name"]),
-        prompt=persona.get("base_prompt") or "",
+        prompt=_resolve_base_prompt(persona),
         tools=None if tools is None else frozenset(tools),
         mcp=bool(persona.get("mcp_enabled", True)),
         memory=bool(persona.get("memory_enabled", True)),

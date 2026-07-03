@@ -875,9 +875,15 @@ personas = sa.Table(
     sa.Column("name", sa.Text, nullable=False, unique=True),
     sa.Column("display_name", sa.Text, nullable=False, server_default=""),
     sa.Column("description", sa.Text, nullable=False, server_default=""),
-    # base_prompt: replaces the BASE module in compose_system_message().
-    # NULL = use the kind's stock base (base.md / base_coordinator.md).
+    # Prompt source is explicit — never inferred in app logic.  base_prompt_file
+    # names a repo file under prompts/personas/ (built-ins only, code-set); it
+    # is the built-in marker and blocks archive.  base_prompt is inline text
+    # (an operator's own prose, or an override layered on a built-in).  The
+    # CHECK requires at least one — resolution is base_prompt ?? load(file),
+    # no NULL/NULL fallthrough.  "Inherit the kind default" is a workstream-
+    # creation act (stamp the is_default persona), not a persona-row state.
     sa.Column("base_prompt", sa.Text, nullable=True),
+    sa.Column("base_prompt_file", sa.Text, nullable=True),
     # tool_allowlist: JSON, tri-state — NULL = unrestricted (tracks tool
     # growth + MCP dynamics), "[]" = hard empty, '["name", ...]' = exact
     # visibility set (tool_search membership decides soft vs hard).
@@ -896,6 +902,10 @@ personas = sa.Table(
     sa.Column("created_by", sa.Text, nullable=False, server_default=""),
     sa.Column("created", sa.Text, nullable=False),
     sa.Column("updated", sa.Text, nullable=False),
+    sa.CheckConstraint(
+        "base_prompt IS NOT NULL OR base_prompt_file IS NOT NULL",
+        name="ck_personas_prompt_source",
+    ),
 )
 
 sa.Index("idx_personas_enabled", personas.c.enabled)

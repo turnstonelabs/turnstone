@@ -155,7 +155,9 @@ class TestBuildKwargs:
         kwargs = provider._build_kwargs(
             model="grok-4.3",
             messages=[{"role": "user", "content": "hi"}],
-            tools=None,
+            # web_search def present → replace-only injection fires → the
+            # call_output include is forwarded (contrast the suppression test).
+            tools=[{"type": "function", "function": {"name": "web_search"}}],
             max_tokens=512,
             temperature=0.5,
             reasoning_effort="low",
@@ -172,7 +174,7 @@ class TestBuildKwargs:
         kwargs = provider._build_kwargs(
             model="grok-4.3",
             messages=[{"role": "user", "content": "hi"}],
-            tools=None,
+            tools=[{"type": "function", "function": {"name": "web_search"}}],
             max_tokens=512,
             temperature=0.5,
             reasoning_effort="low",
@@ -182,9 +184,31 @@ class TestBuildKwargs:
         )
         includes = kwargs.get("include") or []
         assert "reasoning.encrypted_content" not in includes
-        # `*_call_output` still added because xAI hides those outputs
-        # regardless of the replay flag.
+        # `*_call_output` still added (independent of the replay flag) because
+        # the web_search def survived and the native tool was injected.
         assert "web_search_call_output" in includes
+
+    def test_call_output_include_suppressed_when_tool_not_injected(
+        self, provider: XAIProvider
+    ) -> None:
+        # Orphan-include guard: with the web_search client def hidden (persona /
+        # coordinator visibility set), the base does NOT inject the native tool,
+        # so xAI must not forward a web_search_call_output include for a tool
+        # absent from `tools`.
+        kwargs = provider._build_kwargs(
+            model="grok-4.3",
+            messages=[{"role": "user", "content": "hi"}],
+            tools=[{"type": "function", "function": {"name": "read_file"}}],
+            max_tokens=512,
+            temperature=0.5,
+            reasoning_effort="low",
+            deferred_names=None,
+            capabilities=None,
+            replay_reasoning_to_model=True,
+        )
+        includes = kwargs.get("include") or []
+        assert "web_search_call_output" not in includes
+        assert {"type": "web_search"} not in (kwargs.get("tools") or [])
 
     def test_include_omitted_when_no_server_side_tools(self, provider: XAIProvider) -> None:
         # Custom caps row with no server-side tools and no legacy

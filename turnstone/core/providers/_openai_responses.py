@@ -375,15 +375,24 @@ class OpenAIResponsesProvider:
         # ``{"type": "web_search"}`` appended.  Subclasses (e.g.
         # ``XAIProvider``) opt their own provider-specific server tools
         # into ``caps.server_side_tools`` and inherit this injection.
-        has_client_web_search = any(
-            t.get("function", {}).get("name") == "web_search" for t in tools or []
-        )
+        # Replace-only for EVERY server-side tool: inject the native entry only
+        # when a same-named client def survived the session's visibility filter.
+        # This ties server-side tools into the persona / coordinator envelope —
+        # a visibility set that hides (or never allowlisted) the client def also
+        # suppresses the native injection, closing the gap where a provider-
+        # specific server-side tool would otherwise inject past a restricted
+        # persona.  web_search is the only such tool today; a future server-side
+        # tool must ship a client def to be injectable (and thus gateable).
+        # NOTE: the match is by exact string — the caps ``type`` must equal the
+        # client def's ``name`` (true for web_search).  A tool whose native type
+        # differs from its client name (e.g. ``web_search_preview`` vs a
+        # ``web_search`` def) would need an explicit type→name map added here, or
+        # it silently won't inject.
+        client_tool_names = {
+            t.get("function", {}).get("name") for t in tools or [] if "function" in t
+        }
         for tool_type in resolve_server_side_tools(caps):
-            # Replace-only: the native web_search entry stands in for the
-            # client def. A request whose envelope hides ``web_search``
-            # (persona visibility set, coordinator toolset) gets no native
-            # search either.
-            if tool_type == "web_search" and not has_client_web_search:
+            if tool_type not in client_tool_names:
                 continue
             converted_tools = converted_tools or []
             if not any(t.get("type") == tool_type for t in converted_tools):

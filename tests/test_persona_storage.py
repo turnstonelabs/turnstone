@@ -22,6 +22,8 @@ def _mk(backend: Any, name: str, **over: Any) -> dict[str, Any]:
         "name": name,
         "display_name": name.title(),
         "description": "",
+        # Operator personas author inline prose; base_prompt_file is code-only.
+        "base_prompt": "You are a test persona.",
         "applies_to_kinds": ["interactive"],
     }
     row.update(over)
@@ -37,7 +39,8 @@ class TestPersonaCRUD:
         # is name.title(), so a hyphenated slug title-cases each segment.
         p = _mk(backend, "test-scribe")
         assert p["display_name"] == "Test-Scribe"
-        assert p["base_prompt"] is None
+        assert p["base_prompt"] == "You are a test persona."
+        assert p["base_prompt_file"] is None  # operator persona — no file source
         assert p["tool_allowlist"] is None
         assert p["mcp_enabled"] is True
         assert p["memory_enabled"] is True
@@ -60,7 +63,9 @@ class TestPersonaCRUD:
     def test_duplicate_name_rejected(self, backend: Any) -> None:
         _mk(backend, "test-scribe")
         with pytest.raises(ValueError, match="already exists"):
-            backend.create_persona({"persona_id": "other", "name": "test-scribe"})
+            backend.create_persona(
+                {"persona_id": "other", "name": "test-scribe", "base_prompt": "x"}
+            )
 
     def test_missing_identity_rejected(self, backend: Any) -> None:
         with pytest.raises(ValueError, match="persona_id and name"):
@@ -294,7 +299,9 @@ class TestPersonaStorageHardening:
         backend._conn = _racing_conn
         try:
             with pytest.raises(ValueError, match="already exists"):
-                backend.create_persona({"persona_id": "racer-2", "name": "racer"})
+                backend.create_persona(
+                    {"persona_id": "racer-2", "name": "racer", "base_prompt": "x"}
+                )
         finally:
             backend._conn = real_conn
 
@@ -316,7 +323,7 @@ class TestPersonaStorageHardening:
                         "description, base_prompt, tool_allowlist, mcp_enabled, "
                         "memory_enabled, applies_to_kinds, is_default, enabled, "
                         "org_id, created_by, created, updated) VALUES "
-                        "(:pid, :pid, '', '', NULL, NULL, 1, 1, :kinds, 1, 1, "
+                        "(:pid, :pid, '', '', 'base', NULL, 1, 1, :kinds, 1, 1, "
                         "'', '', :now, :now)"
                     ),
                     {"pid": pid, "kinds": '["interactive"]', "now": now},
@@ -333,3 +340,113 @@ class TestPersonaStorageHardening:
         assert backend.get_persona("id-promotee")["is_default"] is False
         assert backend.get_persona("mfg-d1")["is_default"] is True
         assert backend.get_persona("mfg-d2")["is_default"] is True
+
+
+class TestPromptSource:
+    """The explicit prompt-source model: base_prompt (inline) vs
+    base_prompt_file (built-in, code-only), coalesced, never both-NULL."""
+
+    @staticmethod
+    def _insert_builtin(backend: Any, name: str, **over: Any) -> str:
+        """Manufacture a built-in row (base_prompt_file set) directly — the
+        create_persona API never sets base_prompt_file, so a raw insert models
+        what the migration seeds."""
+        pid = f"bi-{name}"
+        cols = {
+            "persona_id": pid,
+            "name": name,
+            "display_name": name.title(),
+            "description": "",
+            "base_prompt": None,
+            "base_prompt_file": f"{name}.md",
+            "tool_allowlist": None,
+            "mcp_enabled": 1,
+            "memory_enabled": 1,
+            "applies_to_kinds": '["interactive"]',
+            "is_default": 0,
+            "enabled": 1,
+            "org_id": "",
+            "created_by": "",
+            "created": "2026-01-01T00:00:00",
+            "updated": "2026-01-01T00:00:00",
+        }
+        cols.update(over)
+        with backend._engine.begin() as conn:
+            conn.execute(
+                sa.text(
+                    "INSERT INTO personas ("
+                    + ", ".join(cols)
+                    + ") VALUES ("
+                    + ", ".join(f":{c}" for c in cols)
+                    + ")"
+                ),
+                cols,
+            )
+        return pid
+
+    def test_create_operator_without_prompt_rejected(self, backend: Any) -> None:
+        with pytest.raises(ValueError, match="requires a base_prompt"):
+            backend.create_persona({"persona_id": "np", "name": "no-prompt"})
+
+    def test_check_rejects_sourceless_row(self, backend: Any) -> None:
+        # Both columns NULL is forbidden at the storage edge, not just in app
+        # logic — a raw insert must trip the CHECK constraint.
+        with pytest.raises(sa.exc.IntegrityError), backend._engine.begin() as conn:
+            conn.execute(
+                sa.text(
+                    "INSERT INTO personas (persona_id, name, display_name, "
+                    "description, base_prompt, base_prompt_file, tool_allowlist, "
+                    "mcp_enabled, memory_enabled, applies_to_kinds, is_default, "
+                    "enabled, org_id, created_by, created, updated) VALUES "
+                    "('x', 'x', '', '', NULL, NULL, NULL, 1, 1, '[\"interactive\"]', "
+                    "0, 1, '', '', :now, :now)"
+                ),
+                {"now": "2026-01-01T00:00:00"},
+            )
+
+    def test_builtin_cannot_be_archived(self, backend: Any) -> None:
+        pid = self._insert_builtin(backend, "bi-scribe")
+        with pytest.raises(ValueError, match="cannot archive a built-in"):
+            backend.update_persona(pid, enabled=False)
+        assert backend.get_persona(pid)["enabled"] is True
+
+    def test_builtin_base_prompt_override_is_editable(self, backend: Any) -> None:
+        # A built-in's inline override IS settable (it wins over the file); the
+        # file source and its undeletable identity are what stay fixed.
+        pid = self._insert_builtin(backend, "bi-eng")
+        assert backend.update_persona(pid, base_prompt="ORG OVERRIDE") is True
+        got = backend.get_persona(pid)
+        assert got["base_prompt"] == "ORG OVERRIDE"
+        assert got["base_prompt_file"] == "bi-eng.md"
+
+    def test_operator_cannot_clear_base_prompt(self, backend: Any) -> None:
+        _mk(backend, "op-persona")  # base_prompt set, no file
+        with pytest.raises(ValueError, match="cannot clear base_prompt"):
+            backend.update_persona("id-op-persona", base_prompt="   ")
+
+    def test_base_prompt_file_is_immutable_via_update(self, backend: Any) -> None:
+        # base_prompt_file is not in PERSONA_MUTABLE — update silently ignores it.
+        pid = self._insert_builtin(backend, "bi-immut")
+        backend.update_persona(pid, base_prompt_file="hijack.md", display_name="X")
+        assert backend.get_persona(pid)["base_prompt_file"] == "bi-immut.md"
+
+    def test_create_with_only_base_prompt_file_reports_missing_base_prompt(
+        self, backend: Any
+    ) -> None:
+        # base_prompt_file is code-only: supplying it via the operator create path
+        # must NOT satisfy the guard (it's dropped before the INSERT), so the
+        # caller gets the clear 'requires a base_prompt' — never the misleading
+        # 'name already exists' the raw CHECK violation would surface.
+        with pytest.raises(ValueError, match="requires a base_prompt"):
+            backend.create_persona(
+                {"persona_id": "ff", "name": "file-only", "base_prompt_file": "scribe.md"}
+            )
+        assert backend.get_persona("ff") is None
+
+    def test_builtin_can_clear_base_prompt_override(self, backend: Any) -> None:
+        # Clearing an operator override on a BUILT-IN reverts to its file — allowed
+        # (an operator persona, with no fallback source, cannot; tested above).
+        pid = self._insert_builtin(backend, "bi-clear", base_prompt="ORG OVERRIDE")
+        assert backend.get_persona(pid)["base_prompt"] == "ORG OVERRIDE"
+        assert backend.update_persona(pid, base_prompt="") is True
+        assert backend.get_persona(pid)["base_prompt"] is None  # reverted to file
