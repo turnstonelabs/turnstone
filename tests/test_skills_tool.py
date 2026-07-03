@@ -1444,3 +1444,56 @@ class TestSkillCatalogDisclosure:
         # human-facing path); the tool-facing path is the new
         # ``skills(action='find')`` flow.
         assert "/skill" in content
+
+
+# ---------------------------------------------------------------------------
+# Tests — model-initiated load risk gate (design §5.5 / Principle 7)
+# ---------------------------------------------------------------------------
+
+
+class TestSkillsLoadRiskGate:
+    """A high/critical-risk skill is PRINCIPAL-load-only: the model cannot
+    activate it through skills(action='load') — that path is denied outright,
+    forcing an explicit operator /skill.  Lower-risk skills load as before.
+    The scanner-computed risk_level is the gate signal (it already escalates
+    for the auto_approve + allowed_tools authority the create path warns about),
+    so no new schema is needed.  The principal path (set_skill via /skill or
+    cli --skill) is not routed through _prepare_skills_load and is not gated."""
+
+    @staticmethod
+    def _load_item(session, name: str, risk: str):
+        row = {"name": name, "risk_level": risk, "enabled": True, "content": "x"}
+        with patch("turnstone.core.session.get_storage") as gs:
+            gs.return_value.get_prompt_template_by_name.return_value = row
+            return session._prepare_skills("c1", {"action": "load", "name": name})
+
+    def test_high_risk_load_denied_for_model(self) -> None:
+        item = self._load_item(_make_session(), "danger", "high")
+        assert item.get("needs_approval") is False
+        assert "/skill danger" in item["error"]
+        assert "high" in item["error"]
+
+    def test_critical_risk_load_denied_for_model(self) -> None:
+        item = self._load_item(_make_session(), "nuke", "critical")
+        assert item.get("needs_approval") is False
+        assert "critical" in item["error"]
+
+    def test_low_risk_load_allowed_for_model(self) -> None:
+        item = self._load_item(_make_session(), "safe", "low")
+        assert item.get("needs_approval") is True
+        assert item["action"] == "load"
+        assert item["name"] == "safe"
+
+    def test_no_risk_load_allowed_for_model(self) -> None:
+        item = self._load_item(_make_session(), "plain", "")
+        assert item.get("needs_approval") is True
+
+    def test_missing_skill_falls_through_to_exec_not_found(self) -> None:
+        # Unknown name → the gate finds no row and passes through; the
+        # not-found error is the exec path's job, so prep still asks for
+        # approval rather than erroring on the gate.
+        session = _make_session()
+        with patch("turnstone.core.session.get_storage") as gs:
+            gs.return_value.get_prompt_template_by_name.return_value = None
+            item = session._prepare_skills("c1", {"action": "load", "name": "ghost"})
+        assert item.get("needs_approval") is True
