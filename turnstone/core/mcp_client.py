@@ -769,6 +769,14 @@ class MCPClientManager:
 
     def start(self) -> None:
         """Launch background event loop and connect to all configured servers."""
+        # Interim shim: the pinned mcp SDK reconnects the GET stream with a flat
+        # 1s delay and only 2 attempts, with no config seam — a routine server
+        # restart permanently drops the stream. Swap in capped exponential
+        # backoff before any transport is built. Idempotent; see _mcp_backoff.
+        from turnstone.core._mcp_backoff import install as _install_reconnect_backoff
+
+        _install_reconnect_backoff()
+
         self._loop = asyncio.new_event_loop()
         self._thread = threading.Thread(target=self._loop.run_forever, daemon=True, name="mcp-loop")
         self._thread.start()
