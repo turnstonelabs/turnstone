@@ -1281,9 +1281,10 @@ class TestMCPActingUserBinding:
         mcp_client.add_prompt_listener.assert_called_once_with(
             session._mcp_prompt_cb, user_id="bob"
         )
-        # The acting user's oauth_user pools are warmed so their tools
-        # surface without a manual reconnect.
-        mcp_client.prime_user_pools.assert_called_once_with("bob")
+        # The acting user's oauth_user pools are warmed BEFORE the turn's first
+        # dispatch via the bounded blocking pre-flight prime (mechanism 2), so
+        # their tools are live rather than racing a fire-and-forget prime.
+        mcp_client.prime_user_pools_sync.assert_called_once_with("bob", timeout=3.0)
         # Merged tool list rebuilt under the new identity.
         mcp_client.get_tools.assert_any_call(user_id="bob")
 
@@ -1318,7 +1319,7 @@ class TestMCPActingUserBinding:
         session.bind_acting_user("alice")  # same as owner
         mcp_client.remove_listener.assert_not_called()
         mcp_client.add_listener.assert_not_called()
-        mcp_client.prime_user_pools.assert_not_called()
+        mcp_client.prime_user_pools_sync.assert_not_called()
         assert session._mcp_effective_user_id == "alice"
 
     def test_send_kwarg_binds_before_turn_starts(self, tmp_db, mock_openai_client):
