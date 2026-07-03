@@ -5008,9 +5008,7 @@ def main() -> None:
         :class:`NudgeQueue` without a second pass through ``restore_fn``.
         """
         try:
-            ws = manager.create(
-                user_id="", name="watch-restore", **_resume_persona_kwargs(ws_id)
-            )
+            ws = manager.create(user_id="", name="watch-restore", **_resume_persona_kwargs(ws_id))
             # Restored workstreams run unattended — auto-approve tool calls
             # to avoid blocking forever on approval with no connected user.
             if isinstance(ws.ui, WebUI):

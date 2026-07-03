@@ -666,7 +666,9 @@ class PersonaChoice(BaseModel):
     """Display fields for the creation picker — the persona's levers
     (prompt / tool set / toggles) deliberately stay server-side."""
 
-    name: str = Field(description="Persona slug, the value to pass as CreateWorkstreamRequest.persona")
+    name: str = Field(
+        description="Persona slug, the value to pass as CreateWorkstreamRequest.persona"
+    )
     display_name: str = Field(default="", description="Human-readable name")
     description: str = Field(default="", description="What this persona is for")
     applies_to_kinds: list[str] = Field(
