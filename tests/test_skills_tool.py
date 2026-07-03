@@ -1529,3 +1529,13 @@ class TestSkillsLoadRiskGate:
         assert denial != ""
         assert "z" in denial
         assert "/skill z" in denial
+
+    def test_risk_gate_fails_closed_on_no_storage(self) -> None:
+        # Storage-unavailable (get_storage() is None) is treated the same as a
+        # lookup fault — DENY, not allow.  A gate that can't verify the risk
+        # tier must not wave the skill through (Copilot review nit).
+        session = _make_session()
+        with patch("turnstone.core.session.get_storage", return_value=None):
+            denial = session._high_risk_skill_denied("z")
+        assert denial != ""
+        assert "/skill z" in denial

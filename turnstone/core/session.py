@@ -11752,16 +11752,22 @@ class ChatSession:
         widen, so it is safe by construction.
         """
         storage = get_storage()
+        row = None
+        lookup_failed = False
         if storage is None:
-            return ""
-        try:
-            row = storage.get_prompt_template_by_name(name)
-        except Exception:
+            lookup_failed = True
+        else:
+            try:
+                row = storage.get_prompt_template_by_name(name)
+            except Exception:
+                log.warning("skill.risk_gate_lookup_failed", skill=name, exc_info=True)
+                lookup_failed = True
+        if lookup_failed:
             # Fail CLOSED: a risk gate that can't read the row must DENY, never
-            # wave the skill through.  Denying (not returning "") also keeps
+            # wave the skill through — for storage-unavailable (None) AND a
+            # lookup fault alike.  Denying (not returning "") also keeps
             # spawn_batch's per-row partial-success intact — one child's lookup
             # fault denies only that child, not the whole batch.
-            log.warning("skill.risk_gate_lookup_failed", skill=name, exc_info=True)
             return (
                 f"skill '{name}' could not be risk-checked (storage unavailable) "
                 f"and was not activated. Retry, or ask the operator to run /skill {name}."
