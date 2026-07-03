@@ -11632,6 +11632,26 @@ class ChatSession:
         name = self._coord_str_arg(args, "name").strip()
         if not name:
             return self._coord_tool_error(call_id, "skills", "load: 'name' is required")
+        # Risk gate (design §5.5 / HYPOTHESIS Principle 7): a high/critical-risk
+        # skill is PRINCIPAL-load-only.  The model must not activate it through
+        # the tools path — an injection-steerable lane that would widen
+        # authority behind a rubber-stampable approval (the scanner escalates
+        # risk precisely for the auto_approve + allowed_tools authority the
+        # create path warns about).  The operator loads such a skill explicitly
+        # with ``/skill``; that path (handle_command / cli --skill) calls
+        # set_skill directly and bypasses this gate.  A narrowing check — it can
+        # only DENY, never widen — so it is safe by construction.
+        storage = get_storage()
+        if storage is not None:
+            row = storage.get_prompt_template_by_name(name)
+            if row and row.get("risk_level") in ("high", "critical"):
+                return self._coord_tool_error(
+                    call_id,
+                    "skills",
+                    f"load: skill '{name}' has risk tier '{row['risk_level']}' and can "
+                    f"only be activated by the operator. Ask the user to run "
+                    f"/skill {name} if they want it — the model cannot load it.",
+                )
         # SKILL.md spec ``$ARGUMENTS`` payload — optional.  Mirror
         # the spec's free-form string shape (``/skill-name a b "c d"``)
         # rather than a list, so the model can pass quoted positional
