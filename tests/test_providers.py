@@ -4197,6 +4197,45 @@ class TestResponsesParamBuilding:
         )
         assert kwargs["store"] is False
 
+    def _kwargs_with(self, tools: list[dict[str, Any]], caps: ModelCapabilities) -> dict[str, Any]:
+        return self.provider._build_kwargs(
+            model="gpt-5.4",
+            messages=[{"role": "user", "content": "Hi"}],
+            tools=tools,
+            max_tokens=4096,
+            temperature=0.5,
+            reasoning_effort="medium",
+            deferred_names=None,
+            capabilities=caps,
+        )
+
+    def test_server_side_web_search_needs_surviving_client_def(self) -> None:
+        caps = ModelCapabilities(supports_web_search=True)
+        # Client def present (unrestricted / allowlisted) → native injected.
+        with_def = self._kwargs_with(
+            [{"type": "function", "function": {"name": "web_search"}}], caps
+        )
+        assert {"type": "web_search"} in (with_def.get("tools") or [])
+        # Client def hidden by the persona/coordinator envelope → suppressed.
+        without_def = self._kwargs_with(
+            [{"type": "function", "function": {"name": "read_file"}}], caps
+        )
+        assert {"type": "web_search"} not in (without_def.get("tools") or [])
+
+    def test_server_side_injection_generalizes_beyond_web_search(self) -> None:
+        # The replace-only rule applies to EVERY server-side tool: a provider-
+        # specific one injects only with a same-named client def, so a restricted
+        # persona that never allowlisted it can't get it injected past the wire.
+        caps = ModelCapabilities(server_side_tools=("code_exec",))
+        without_def = self._kwargs_with(
+            [{"type": "function", "function": {"name": "read_file"}}], caps
+        )
+        assert {"type": "code_exec"} not in (without_def.get("tools") or [])
+        with_def = self._kwargs_with(
+            [{"type": "function", "function": {"name": "code_exec"}}], caps
+        )
+        assert {"type": "code_exec"} in (with_def.get("tools") or [])
+
     def test_cache_retention_for_gpt5(self) -> None:
         kwargs = self.provider._build_kwargs(
             model="gpt-5.4",

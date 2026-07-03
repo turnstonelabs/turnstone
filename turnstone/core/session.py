@@ -1342,13 +1342,15 @@ class ChatSession:
         # must not change an existing workstream.  ``None`` = legacy
         # pre-persona workstream — all levers at their open positions,
         # byte-identical to today.
-        self._persona_name: str = persona_snapshot.name if persona_snapshot else ""
-        self._persona_prompt: str = persona_snapshot.prompt if persona_snapshot else ""
-        self._persona_tools: frozenset[str] | None = (
-            persona_snapshot.tools if persona_snapshot else None
-        )
-        self._persona_mcp: bool = persona_snapshot.mcp if persona_snapshot else True
-        self._persona_memory: bool = persona_snapshot.memory if persona_snapshot else True
+        # Persona levers — declared here for typing, populated from the stamp
+        # (or the open defaults) by the shared helper so construction and resume
+        # adoption can't drift on the default values.
+        self._persona_name: str
+        self._persona_prompt: str
+        self._persona_tools: frozenset[str] | None
+        self._persona_mcp: bool
+        self._persona_memory: bool
+        self._apply_persona_snapshot(persona_snapshot)
         self._title_generated = False
         self._read_files: set[str] = set()
         # The canonical in-memory trajectory.  Wire prep (fold/repair) + the
@@ -2100,16 +2102,9 @@ class ChatSession:
         # creation.  Legacy pre-persona workstreams must never get
         # back-stamped by an incidental _save_config call (/model etc.) —
         # absence of the keys IS their persona state.
-        if self._persona_name:
-            config.update(
-                PersonaSnapshot(
-                    name=self._persona_name,
-                    prompt=self._persona_prompt,
-                    tools=self._persona_tools,
-                    mcp=self._persona_mcp,
-                    memory=self._persona_memory,
-                ).to_config()
-            )
+        snap = self._current_persona_snapshot()
+        if snap is not None:
+            config.update(snap.to_config())
         save_workstream_config(self._ws_id, config)
 
     def _load_skills(self) -> None:
@@ -3136,11 +3131,7 @@ class ChatSession:
         # refused before adoption).  A fork keeps its own creation-time
         # stamp.  Corrupt stamps raise — never silently rewritten.
         if not fork:
-            self._persona_name = snap.name if snap else ""
-            self._persona_prompt = snap.prompt if snap else ""
-            self._persona_tools = snap.tools if snap else None
-            self._persona_mcp = snap.mcp if snap else True
-            self._persona_memory = snap.memory if snap else True
+            self._apply_persona_snapshot(snap)
             if not self._persona_mcp and self._mcp_client is not None:
                 self._drop_mcp_surface()
             # Re-gate tool search under the adopted stamp: a hard set must
@@ -4485,6 +4476,32 @@ class ChatSession:
         """
         return self._persona_tools is not None and "tool_search" not in self._persona_tools
 
+    def _apply_persona_snapshot(self, snap: PersonaSnapshot | None) -> None:
+        """Set the five persona lever attrs from a stamp — or the open defaults
+        when ``snap`` is None (legacy / bare session).  The single owner of the
+        all-or-none snapshot→attr mapping, shared by construction and resume
+        adoption so the defaults can't drift between the two sites.  Callers own
+        any follow-up (MCP-surface drop, tool-search rebuild) themselves."""
+        self._persona_name = snap.name if snap else ""
+        self._persona_prompt = snap.prompt if snap else ""
+        self._persona_tools = snap.tools if snap else None
+        self._persona_mcp = snap.mcp if snap else True
+        self._persona_memory = snap.memory if snap else True
+
+    def _current_persona_snapshot(self) -> PersonaSnapshot | None:
+        """Reconstruct the live persona stamp from the lever attrs, or None for a
+        legacy (never-stamped) workstream — the inverse of
+        :meth:`_apply_persona_snapshot`, consumed by ``_save_config``."""
+        if not self._persona_name:
+            return None
+        return PersonaSnapshot(
+            name=self._persona_name,
+            prompt=self._persona_prompt,
+            tools=self._persona_tools,
+            mcp=self._persona_mcp,
+            memory=self._persona_memory,
+        )
+
     def _persona_tool_visible(self, name: str) -> bool:
         """Whether the persona's envelope lets ``name`` reach the wire/prompt.
 
@@ -4495,6 +4512,14 @@ class ChatSession:
           through ``tool_search`` (the session's discovered set unions with
           the allowlist — the escape hatch stays honest: once advertised as
           loaded, a tool doesn't vanish from the wire).
+
+        The discovered-set union is **per-process only**: ``ToolSearchManager``
+        holds the expanded names in memory and they are not stamped into
+        ``workstream_config``, so a server restart / rehydrate narrows visibility
+        back to the stamped allowlist.  That is the fail-safe direction (a
+        restricted persona re-tightens, never widens), and the model can
+        re-discover on demand; durably persisting the expanded set is a
+        deferred option (see #756), not a promise this predicate makes.
         """
         if not self._persona_memory and name == "memory":
             return False
@@ -10223,6 +10248,15 @@ class ChatSession:
             return bool(val)
         return default
 
+    @staticmethod
+    def _flatten_spawn_arg(value: Any, cap: int) -> str:
+        """Collapse whitespace and cap a model-authored spawn arg before it
+        reaches the trusted approval-header chrome (and the child's stored
+        metadata).  Real slugs/names are short with no interior whitespace, so
+        this only reshapes invalid input — which then fails downstream showing
+        the sanitized value."""
+        return " ".join((value or "").split())[:cap]
+
     def _prepare_spawn_workstream(self, call_id: str, args: dict[str, Any]) -> dict[str, Any]:
         if self._coord_client is None:
             return self._coord_tool_error(
@@ -10232,17 +10266,17 @@ class ChatSession:
         # workstream ready to receive the first turn via
         # send_to_workstream.  The tool JSON advertises this explicitly.
         initial_message = (args.get("initial_message") or "").strip()
-        skill = (args.get("skill") or "").strip()
-        name = (args.get("name") or "").strip()
         model = (args.get("model") or "").strip()
-        target_node = (args.get("target_node") or "").strip()
         project = (args.get("project") or "").strip()
-        # Flatten whitespace and cap before the tag reaches the trusted
-        # approval-header chrome — the value is model-authored and, when
-        # storage is down, reaches the header unvalidated.  Real slugs are
-        # ≤64 chars with no whitespace, so this only reshapes invalid names
-        # (which then fail resolution showing the sanitized string).
-        persona = " ".join((args.get("persona") or "").split())[:64]
+        # Flatten whitespace + cap the fields that reach the trusted approval-
+        # header chrome (skill/persona/target_node) or the child's stored
+        # metadata (name) before they get there — all model-authored and, when
+        # storage is down, reaching unvalidated.  ``model``/``project`` are
+        # validated downstream (registry / project ACL) and don't hit the header.
+        skill = self._flatten_spawn_arg(args.get("skill"), 64)
+        name = self._flatten_spawn_arg(args.get("name"), 120)
+        target_node = self._flatten_spawn_arg(args.get("target_node"), 64)
+        persona = self._flatten_spawn_arg(args.get("persona"), 64)
         if persona:
             persona_err = self._validate_child_persona(persona)
             if persona_err:
@@ -10399,11 +10433,14 @@ class ChatSession:
                 preview_rows.append(f"  {idx}. [invalid — not an object]")
                 continue
             initial_message = self._coord_str_arg(raw, "initial_message").strip()
-            skill = self._coord_str_arg(raw, "skill").strip()
-            name = self._coord_str_arg(raw, "name").strip()
             model = self._coord_str_arg(raw, "model").strip()
-            target_node = self._coord_str_arg(raw, "target_node").strip()
-            persona = self._coord_str_arg(raw, "persona").strip()
+            # Flatten + cap the fields that reach the per-child preview chrome
+            # (skill/persona/target_node) or stored metadata (name) — the same
+            # one-pass treatment spawn_workstream applies.
+            skill = self._flatten_spawn_arg(self._coord_str_arg(raw, "skill"), 64)
+            name = self._flatten_spawn_arg(self._coord_str_arg(raw, "name"), 120)
+            target_node = self._flatten_spawn_arg(self._coord_str_arg(raw, "target_node"), 64)
+            persona = self._flatten_spawn_arg(self._coord_str_arg(raw, "persona"), 64)
             spec: dict[str, Any] = {
                 "idx": idx,
                 "initial_message": initial_message,

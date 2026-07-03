@@ -1082,7 +1082,14 @@ class CreatePersonaRequest(BaseModel):
     name: str = Field(description="Immutable slug (lowercase: a-z, 0-9, '-', '_')")
     display_name: str = ""
     description: str = ""
-    base_prompt: str | None = None
+    base_prompt: str | None = Field(
+        default=None,
+        description=(
+            "Inline BASE override — required. Every persona must name a prompt "
+            "source; built-in file-backed personas are seeded by migration, not "
+            "created here, so an operator-created persona must supply base_prompt."
+        ),
+    )
     tool_allowlist: list[str] | None = None
     mcp_enabled: bool = True
     memory_enabled: bool = True
@@ -1095,12 +1102,13 @@ class CreatePersonaRequest(BaseModel):
 class UpdatePersonaRequest(BaseModel):
     """PATCH body — absent fields are left unchanged.
 
-    Explicit ``null`` is meaningful only on the two resettable fields:
-    ``base_prompt: null`` clears the override back to the kind's stock
-    BASE, and ``tool_allowlist: null`` resets to unrestricted.  ``null``
-    on the boolean flags or ``applies_to_kinds`` is ignored (treated as
-    absent), so a client serializing unset optionals as null cannot
-    archive a persona or flip levers by accident.
+    Explicit ``null`` resets ``tool_allowlist`` to unrestricted, and — on a
+    BUILT-IN persona only — clears ``base_prompt`` (the operator override),
+    reverting to that persona's file-backed prompt.  An OPERATOR persona has no
+    fallback source, so ``base_prompt: null`` on one is rejected: every persona
+    must name a prompt source.  ``null`` on the boolean flags or
+    ``applies_to_kinds`` is ignored (treated as absent), so a client serializing
+    unset optionals as null cannot archive a persona or flip levers by accident.
 
     Archive = ``{"enabled": false}``; default flip = ``{"is_default": true}``
     on the successor (storage demotes the incumbent atomically).  ``name``

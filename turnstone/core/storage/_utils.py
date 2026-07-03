@@ -722,6 +722,12 @@ def serialize_persona_fields(fields: dict[str, Any]) -> dict[str, Any]:
         val = out.get(key)
         if val is not None and key in out and len(str(val)) > cap:
             raise ValueError(f"{key} exceeds {cap} characters")
+    # An empty inline prompt is not a source: normalise "" to NULL so the
+    # storage CHECK (base_prompt OR base_prompt_file) and the coalesce
+    # resolution (base_prompt ?? file) agree on what "unset" means.
+    bp = out.get("base_prompt")
+    if "base_prompt" in out and isinstance(bp, str) and not bp.strip():
+        out["base_prompt"] = None
     if "applies_to_kinds" in out:
         kinds = out["applies_to_kinds"]
         if not isinstance(kinds, list) or not kinds or not set(kinds) <= PERSONA_KINDS:

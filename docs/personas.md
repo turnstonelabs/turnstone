@@ -5,13 +5,13 @@ creation** that controls how its system message is composed and what
 capability envelope it runs with. Personas answer a recurring operational
 complaint: the default composition primes every session for heavy tool use,
 and there was no per-workstream dial to launch a "just write prose" or
-"read-only research" session.
+"evidence-first research" session.
 
 A persona is exactly four levers — no more:
 
 | Lever | What it does |
 |---|---|
-| **Base prompt** | Replaces the BASE module of the composed system message (`base.md` / `base_coordinator.md`). *Only* BASE: ENV, CONTEXT, TOOLS, and POLICIES keep composing, so mandatory [prompt policies](governance.md) ride on top of every persona. Empty = the kind's stock base. |
+| **Base prompt** | Replaces the BASE module of the composed system message. *Only* BASE: ENV, CONTEXT, TOOLS, and POLICIES keep composing, so mandatory [prompt policies](governance.md) ride on top of every persona. Built-in personas source their prose from a repo file; operator personas store it inline — see [Where persona prompts live](#where-persona-prompts-live). |
 | **Tool visibility** | Which tools the session advertises. Tri-state: *unrestricted* (tracks tool growth and MCP catalogs), *no tools* (the TOOLS prompt block self-suppresses and zero definitions go on the wire), or an *exact set* of names. Including `tool_search` in a set makes it **soft** — tools the model discovers through search join the visible set; omitting it makes the set **hard** (the search pathway is disabled entirely). On commercial providers a soft set costs one prompt-cache re-prime per `tool_search` expansion, since each expansion rewrites the wire tool set and recomposes the prompt. |
 | **MCP** | Whether the workstream talks to MCP at all. **Session-wide**: off means no MCP tools for the persona's own hands *or* for in-process task agents, no resource/prompt catalogs, and no listener registrations. This lever expresses infrastructure intent, not behavior shaping. |
 | **Memory** | Whether the persona's **own hands** get memory: recalled-memory injection into the prompt, memory-directed metacognitive nudges, and the `memory` tool. Task agents keep their own envelope, and compaction spill/markers are session mechanics that are never persona-gated. An exact tool set that hides `memory` also mutes those nudges, and the compaction-resume pointer follows `recall`'s visibility. |
@@ -60,7 +60,7 @@ personas existed:
 | `engineer` *(default)* | interactive | stock | unrestricted | on | on |
 | `orchestrator` *(default)* | coordinator | stock | unrestricted | on | on |
 | `scribe` | interactive | custom (faithful structuring of given material) | none | off | off |
-| `researcher` | interactive | custom (evidence-first, read-only) | `read_file`, `search`, `web_fetch`, `web_search`, `recall`, `memory` (hard) | off | on |
+| `researcher` | interactive | custom (evidence-first) | `read_file`, `search`, `web_fetch`, `web_search`, `recall`, `memory`, `tool_search` (soft) | off | on |
 | `writer` | interactive | custom (creative writing partner — replaces the removed `/creative`) | none | off | on |
 | `executive` | coordinator | custom (delegate, interrogate plans, judge outcomes) | spawn/inspect/lifecycle tools plus `memory`: `spawn_workstream`, `spawn_batch`, `send_to_workstream`, `wait_for_workstream`, `inspect_workstream`, `list_workstreams`, `list_nodes`, `close_workstream`, `cancel_workstream`, `memory` (hard) | off | on |
 
@@ -68,12 +68,36 @@ Notes:
 
 - `scribe` turns memory off deliberately: recalled memories would
   contaminate faithful summarization with unrelated context.
-- `researcher`'s set is hard (no `tool_search`) — including the escape
-  hatch would let the model load write tools and break the read-only
-  promise.
+- `researcher`'s set is soft (includes `tool_search`): it starts with
+  read and evidence tools but can pull in others on demand — e.g. load
+  `bash` to run a snippet and verify a calculation. It is evidence-first,
+  not sandboxed; any escalated tool still hits the normal approval path.
 - Coordinator sessions do not merge MCP today, so the MCP lever on
   coordinator personas is forward-compatible bookkeeping; it bites on
   interactive workstreams.
+
+## Where persona prompts live
+
+Prompt source is explicit in the persona row — two nullable columns, never both empty:
+
+| `base_prompt_file` | `base_prompt` | Meaning |
+|---|---|---|
+| set (e.g. `scribe.md`) | — | **built-in**: prose lives in `prompts/personas/<file>`, code-owned and PR-reviewed |
+| set | set | built-in with an **operator override** layered on top (the inline text wins) |
+| — | set | **operator** persona, inline prose |
+
+A `CHECK` forbids the both-empty row, so resolution is a plain coalesce —
+`base_prompt ?? load(base_prompt_file)` — with no implicit "inherit the default"
+branch in application logic. `base_prompt_file` is set only by the migration/code
+(the admin API never exposes it): it marks a persona as built-in and blocks
+archive, so `engineer` and `orchestrator` can't be removed. To customise a
+built-in, set `base_prompt` on it (clear it to revert), or create your own persona.
+
+The resolved prompt is **frozen into the workstream at creation** — later edits to
+a built-in's file or an operator's row never change a running workstream; only new
+ones pick up the change. "No persona" is not a state: every workstream is stamped,
+and an empty `persona=` resolves to the kind's `is_default` (`engineer` /
+`orchestrator`).
 
 ## Choosing a persona
 

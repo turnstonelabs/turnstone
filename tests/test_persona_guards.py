@@ -128,7 +128,7 @@ class TestEmptyToolset:
         )
         prompt = session.system_messages[0]["content"]
         assert "You are a scribe on a guard test." in prompt
-        # base.md's IC framing is REPLACED...
+        # personas/engineer.md's IC framing is REPLACED...
         assert "read before you edit" not in prompt
         # ...but CONTEXT still composes (the removed /creative fork dropped it).
         assert "Current time:" in prompt or "Session context" in prompt or "User:" in prompt
@@ -474,6 +474,7 @@ class TestSpawnPersona:
             {
                 "persona_id": "px",
                 "name": "coord-only",
+                "base_prompt": "C",
                 "applies_to_kinds": ["coordinator"],
             }
         )
@@ -484,7 +485,12 @@ class TestSpawnPersona:
 
     def test_valid_persona_travels_to_spawn_body(self, tmp_db, mock_openai_client) -> None:
         get_storage().create_persona(
-            {"persona_id": "py", "name": "scribe", "applies_to_kinds": ["interactive"]}
+            {
+                "persona_id": "py",
+                "name": "scribe",
+                "base_prompt": "S",
+                "applies_to_kinds": ["interactive"],
+            }
         )
         session = self._coord_session(mock_openai_client)
         item = session._prepare_spawn_workstream("c1", {"persona": "scribe"})
@@ -837,7 +843,12 @@ class TestCliPersona:
 
         storage = get_storage()
         storage.create_persona(
-            {"persona_id": "p2", "name": "exec", "applies_to_kinds": ["coordinator"]}
+            {
+                "persona_id": "p2",
+                "name": "exec",
+                "base_prompt": "E",
+                "applies_to_kinds": ["coordinator"],
+            }
         )
         with pytest.raises(SystemExit):
             resolve_cli_persona_kwargs(storage, "exec", None)
@@ -1079,6 +1090,7 @@ class TestForkAdoptsStamp:
             {
                 "persona_id": "pd",
                 "name": "engineer",
+                "base_prompt": "D",
                 "applies_to_kinds": ["interactive"],
                 "is_default": True,
             }
@@ -1246,7 +1258,13 @@ class TestCreateStampsPersona:
     @staticmethod
     def _seed(name: str, kinds: list[str], **extra: Any) -> None:
         get_storage().create_persona(
-            {"persona_id": "p_" + name, "name": name, "applies_to_kinds": kinds, **extra}
+            {
+                "persona_id": "p_" + name,
+                "name": name,
+                "base_prompt": f"You are {name}.",
+                "applies_to_kinds": kinds,
+                **extra,
+            }
         )
 
     def test_create_stamps_persona_with_create_permission_only(self, _create_app) -> None:

@@ -90,6 +90,7 @@ def seeded(tmp_db: Any) -> str:
             "persona_id": "p1",
             "name": "test-scribe",
             "display_name": "Test Scribe",
+            "base_prompt": "You are a test scribe.",
             "tool_allowlist": [],
             "mcp_enabled": False,
             "applies_to_kinds": ["interactive"],
@@ -252,6 +253,7 @@ class TestArchiveAndDefaultFlipHttp:
                 "persona_id": "p2",
                 "name": "test-eng",
                 "display_name": "Test Eng",
+                "base_prompt": "You are a test engineer.",
                 "applies_to_kinds": ["interactive"],
                 "is_default": True,
             }
@@ -298,7 +300,10 @@ class TestOrgIdGuard:
         from turnstone.core.storage import get_storage
 
         c = _client(tmp_db, _ALL)
-        resp = c.post("/v1/api/admin/personas", json={"name": "test-orgless", "org_id": None})
+        resp = c.post(
+            "/v1/api/admin/personas",
+            json={"name": "test-orgless", "org_id": None, "base_prompt": "O"},
+        )
         assert resp.status_code == 200
         assert resp.json()["org_id"] == ""
         stored = get_storage().get_persona(resp.json()["persona_id"])

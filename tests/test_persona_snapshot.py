@@ -36,11 +36,36 @@ class TestSnapshotFromPersona:
         assert snap.memory is False
 
     def test_null_levers_stay_open(self) -> None:
-        snap = snapshot_from_persona({"name": "engineer", "base_prompt": None})
-        assert snap.prompt == ""
+        # tools NULL, and mcp/memory absent, default to the open envelope.
+        snap = snapshot_from_persona({"name": "p", "base_prompt": "base"})
+        assert snap.prompt == "base"
         assert snap.tools is None
         assert snap.mcp is True
         assert snap.memory is True
+
+    def test_file_backed_prompt_resolves_from_file(self) -> None:
+        # A built-in row (base_prompt NULL, base_prompt_file set) resolves its
+        # BASE from prompts/personas/<file> and freezes it into the stamp.
+        from turnstone.prompts import load_persona_prompt
+
+        snap = snapshot_from_persona(
+            {"name": "scribe", "base_prompt": None, "base_prompt_file": "scribe.md"}
+        )
+        assert snap.prompt == load_persona_prompt("scribe.md")
+        assert snap.prompt.startswith("You turn raw material")
+
+    def test_operator_override_wins_over_file(self) -> None:
+        # base_prompt ?? load(file): an operator override on a built-in row wins.
+        snap = snapshot_from_persona(
+            {"name": "scribe", "base_prompt": "OVERRIDE", "base_prompt_file": "scribe.md"}
+        )
+        assert snap.prompt == "OVERRIDE"
+
+    def test_sourceless_persona_raises(self) -> None:
+        # The storage CHECK forbids this row; if one reaches resolution it must
+        # fail loudly rather than compose an empty BASE.
+        with pytest.raises(ValueError, match="no prompt source"):
+            snapshot_from_persona({"name": "broken", "base_prompt": None})
 
 
 class TestConfigRoundTrip:

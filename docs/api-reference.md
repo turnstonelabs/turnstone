@@ -712,7 +712,7 @@ the levers (base prompt, tool set, MCP/memory toggles) stay server-side.
 {
   "personas": [
     {"name": "engineer", "display_name": "Engineer", "description": "The stock interactive workstream: full tools, MCP, and memory.", "applies_to_kinds": ["interactive"], "is_default": true},
-    {"name": "researcher", "display_name": "Researcher", "description": "Answers questions with evidence, read-only. Never modifies anything.", "applies_to_kinds": ["interactive"], "is_default": false}
+    {"name": "researcher", "display_name": "Researcher", "description": "Answers questions with evidence — reads and cites, loads tools to verify when needed.", "applies_to_kinds": ["interactive"], "is_default": false}
   ],
   "total": 2
 }

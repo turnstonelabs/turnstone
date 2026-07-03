@@ -29,8 +29,28 @@ def _load(relpath: str) -> str:
     """Load and cache a prompt module file."""
     path = _PROMPTS_DIR / relpath
     if path not in _FILE_CACHE:
-        _FILE_CACHE[path] = path.read_text()
+        # Explicit utf-8: prompt modules carry non-ASCII (em-dashes, curly
+        # quotes), and a node in a C/POSIX locale would otherwise decode them
+        # against the ascii default and raise UnicodeDecodeError at compose /
+        # persona-resolve time.
+        _FILE_CACHE[path] = path.read_text(encoding="utf-8")
     return _FILE_CACHE[path]
+
+
+def load_persona_prompt(filename: str) -> str:
+    """Load a built-in persona's base-prompt file from ``prompts/personas/``.
+
+    ``filename`` is a persona row's ``base_prompt_file`` (e.g. ``scribe.md``) —
+    a value only the migration/code sets, never an operator.  We still take
+    ``Path(filename).name`` as defense in depth so no DB value can traverse out
+    of the personas directory.  A missing file raises: a built-in whose prompt
+    file vanished is a deploy error, never a silently empty base.
+    """
+    name = Path(filename).name
+    path = _PROMPTS_DIR / "personas" / name
+    if not path.exists():
+        raise FileNotFoundError(f"persona prompt file not found: personas/{name}")
+    return _load(f"personas/{name}")
 
 
 class ClientType(enum.StrEnum):
@@ -269,18 +289,21 @@ def compose_system_message(
     # either way, but ``.value`` access does not — normalise once here.
     kind = WorkstreamKind.from_raw(kind)
 
-    # 1. BASE — kind-specific base framing.  The default base.md frames the
-    #    model as an IC engineer ("you read before you edit, commits
-    #    you make..."); coordinators need an orchestrator framing
-    #    instead ("you decompose, delegate, monitor, synthesise").
-    #    A persona's base_override replaces exactly this module.  Truthy
-    #    check, not ``is not None``: the stamp codec documents ``""`` as
-    #    "use the kind's stock BASE", so the empty string must never
-    #    compose an empty BASE regardless of which caller forwards it.
+    # 1. BASE — kind-specific base framing.  personas/engineer.md frames the
+    #    model as an IC engineer ("you read before you edit, commits you
+    #    make..."); coordinators get personas/orchestrator.md instead ("you
+    #    decompose, delegate, monitor, synthesise").  A persona's base_override
+    #    replaces exactly this module.  In the persona flow a resolved base is
+    #    always stamped and forwarded here (truthy), so the else branch is a
+    #    bare-caller fallback to the kind's default built-in file.
     if base_override:
         parts.append(base_override)
     else:
-        base_module = "base_coordinator.md" if kind == WorkstreamKind.COORDINATOR else "base.md"
+        base_module = (
+            "personas/orchestrator.md"
+            if kind == WorkstreamKind.COORDINATOR
+            else "personas/engineer.md"
+        )
         parts.append(_load(base_module))
 
     # 2. ENV — exactly one, selected by client type.  Coordinators

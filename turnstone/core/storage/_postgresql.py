@@ -5602,6 +5602,14 @@ class PostgreSQLBackend:
         values = _serialize_persona_fields(persona)
         if not values.get("persona_id") or not values.get("name"):
             raise ValueError("persona requires persona_id and name")
+        # base_prompt_file is code-only — set only by the migration seeds, never
+        # via this operator-facing path.  Drop it so a caller can't smuggle a
+        # file ref past the guard: the INSERT omits the column, so a supplied
+        # base_prompt_file would otherwise satisfy this check yet trip the CHECK,
+        # surfaced as a misleading name-collision.  Operators supply base_prompt.
+        values.pop("base_prompt_file", None)
+        if not values.get("base_prompt"):
+            raise ValueError("persona requires a base_prompt")
         now = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S")
         with self._conn() as conn:
             existing = conn.execute(
@@ -5673,6 +5681,14 @@ class PostgreSQLBackend:
             if row is None:
                 return False
             current = _persona_row_to_dict(row)
+            builtin = bool(current.get("base_prompt_file"))
+            # Built-ins are code-owned: their base_prompt (override) is editable,
+            # but the origin marker blocks archiving them.  Operator personas
+            # have no file to fall back on, so their only source can't be cleared.
+            if builtin and "enabled" in fields and not fields["enabled"]:
+                raise ValueError("cannot archive a built-in persona")
+            if not builtin and "base_prompt" in values and not values.get("base_prompt"):
+                raise ValueError("cannot clear base_prompt on an operator persona")
             if current["is_default"]:
                 if "enabled" in fields and not fields["enabled"]:
                     raise ValueError("the default persona cannot be archived")
