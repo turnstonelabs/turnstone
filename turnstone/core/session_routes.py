@@ -3684,7 +3684,11 @@ def make_send_handler(cfg: SessionEndpointConfig) -> Handler:
     import uuid
 
     from turnstone.core import session_worker
-    from turnstone.core.session import AttachmentsNotQueueableError, GenerationCancelled
+    from turnstone.core.session import (
+        AttachmentsNotQueueableError,
+        CrossUserInterjectionError,
+        GenerationCancelled,
+    )
     from turnstone.core.web_helpers import auth_user_id, read_json_or_400
 
     async def send(request: Request) -> Response:
@@ -3792,9 +3796,17 @@ def make_send_handler(cfg: SessionEndpointConfig) -> Handler:
                     message,
                     attachment_ids=list(ordered_taken),
                     queue_msg_id=send_id or None,
+                    interjector_user_id=acting_uid,
                 )
             except AttachmentsNotQueueableError:
                 queue_outcome["rejected"] = "attachments_busy"
+                return
+            except CrossUserInterjectionError:
+                # A different authenticated participant tried to interject into
+                # someone else's in-flight turn; folding it in would borrow the
+                # initiator's credentials and misattribute the message. Reject
+                # so they resend as a fresh turn once the worker idles.
+                queue_outcome["rejected"] = "cross_user_interjection"
                 return
             queue_outcome["cleaned"] = cleaned
             queue_outcome["priority"] = priority
@@ -3892,6 +3904,24 @@ def make_send_handler(cfg: SessionEndpointConfig) -> Handler:
                     "attached_ids": [],
                     "dropped_attachment_ids": list(requested_ids),
                 }
+            )
+
+        if queue_outcome.get("rejected") == "cross_user_interjection":
+            # A different participant tried to interject into someone else's
+            # in-flight turn (see CrossUserInterjectionError). 409 Conflict so
+            # the client can surface "wait for the current turn" and resend as
+            # a fresh turn under their own identity.
+            return JSONResponse(
+                {
+                    "status": "cross_user_interjection",
+                    "error": (
+                        "Another participant's turn is in progress. Wait for it "
+                        "to finish, then send your message."
+                    ),
+                    "attached_ids": [],
+                    "dropped_attachment_ids": list(requested_ids),
+                },
+                status_code=409,
             )
 
         dropped = [aid for aid in requested_ids if aid not in taken_set]

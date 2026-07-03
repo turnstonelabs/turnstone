@@ -220,6 +220,24 @@ class AttachmentsNotQueueableError(Exception):
     """
 
 
+class CrossUserInterjectionError(Exception):
+    """Raised by ``ChatSession.queue_message`` when a DIFFERENT authenticated
+    user tries to interject into a turn already in flight for another.
+
+    A mid-turn interjection folds into the current turn *under the initiator's
+    identity* — ``bind_acting_user`` deliberately does not rebind mid-turn, so
+    the queued text runs any tools it triggers with the initiator's MCP
+    (oauth_user) credentials, and this feature would stamp it with the
+    initiator's sender label.  For a second participant on a shared workstream
+    both are wrong: it lets user A drive tools under user B's credentials
+    (confused deputy) and misattributes A's words to B.  Rather than fold it
+    in, reject: the interjector waits for the turn to finish, then sends a
+    fresh turn that binds their own identity.  Only triggers when the
+    interjector's authenticated id differs from the current acting user, so
+    self-interjection and single-user workstreams are unaffected.
+    """
+
+
 class _CompactionIrreducibleError(Exception):
     """Raised by ``ChatSession._summarize_blocks`` when chunked summarisation
     cannot shrink the input — a recursion level fails to reduce the block count,
@@ -7658,6 +7676,7 @@ class ChatSession:
         text: str,
         attachment_ids: list[str] | tuple[str, ...] | None = None,
         queue_msg_id: str | None = None,
+        interjector_user_id: str = "",
     ) -> tuple[str, str, str]:
         """Queue a user message for injection at the next tool-result seam.
 
@@ -7671,6 +7690,16 @@ class ChatSession:
         this rejection to the user — interactive UIs typically wait for
         the current turn to finish before allowing an attached send.
 
+        ``interjector_user_id`` is the authenticated id of whoever is
+        queuing (empty on unauthenticated CLI / eval / coordinator lanes).
+        When it is set AND differs from the current acting user, the
+        interjection is rejected with :class:`CrossUserInterjectionError`:
+        a mid-turn interjection runs under the initiator's identity
+        (``bind_acting_user`` does not rebind mid-turn), so a second
+        participant's queued text would borrow the initiator's MCP
+        credentials and be misattributed to them.  The interjector must
+        wait and send a fresh turn under their own identity.
+
         ``queue_msg_id`` lets the caller supply the id (so it matches the
         ``send_id`` tracking token threaded through the send) — when
         omitted, an id is generated.
@@ -7681,6 +7710,17 @@ class ChatSession:
             raise AttachmentsNotQueueableError(
                 "Cannot queue a message with attachments — wait for the "
                 "current turn to finish before sending an attachment."
+            )
+
+        interjector = (interjector_user_id or "").strip()
+        if interjector and interjector != self._mcp_effective_user_id:
+            # Only an authenticated non-acting participant is blocked: the
+            # acting user interjecting their own in-flight turn is fine, and
+            # unauthenticated lanes (empty id) keep the pre-existing behaviour.
+            raise CrossUserInterjectionError(
+                "Another participant's turn is in flight — wait for it to "
+                "finish, then send your message so it runs under your own "
+                "identity and credentials."
             )
 
         cleaned, priority = parse_priority(text)
