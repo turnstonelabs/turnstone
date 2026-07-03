@@ -48,6 +48,11 @@ from turnstone.core.deadline import (
     DeadlineExceededError,
     run_with_deadline,
 )
+from turnstone.core.judge import (
+    _CHARS_PER_TOKEN,
+    _DEFAULT_JUDGE_CONTEXT_WINDOW,
+    _positive_window,
+)
 from turnstone.core.log import get_logger
 
 if TYPE_CHECKING:
@@ -60,16 +65,11 @@ log = get_logger(__name__)
 
 # Prompt-size guard.  A tool output large enough to overflow the judge model's
 # context window would come back as an opaque provider 400 and fall silently to
-# heuristic-only; we detect it up front instead (see ``evaluate``).
-# ``_CHARS_PER_TOKEN`` mirrors ``judge._CHARS_PER_TOKEN`` — the same token
-# estimate both judges budget with, duplicated to keep this module free of a
-# runtime judge import; keep the two in sync if either is retuned.  ``0.9``
-# leaves headroom for the 512-token response plus estimation error.  The
-# default window is a conservative fallback used only when the provider can't
-# report capabilities — the resolved model's real window is preferred.
-_CHARS_PER_TOKEN = 3.5
+# heuristic-only; we detect it up front instead (see ``evaluate``).  The token
+# estimate, window floor, and coercion are shared with the intent judge
+# (imported above) so the two stay in lockstep.  ``0.9`` leaves headroom for
+# the 512-token response plus estimation error.
 _MAX_PROMPT_RATIO = 0.9
-_DEFAULT_JUDGE_CONTEXT_WINDOW = 32_768
 
 
 # ---------------------------------------------------------------------------
@@ -267,17 +267,21 @@ class OutputGuardJudge:
         session_client: Any,
         session_model: str,
         model_registry: Any | None = None,
+        context_window: int = _DEFAULT_JUDGE_CONTEXT_WINDOW,
     ) -> None:
         self._config = config
         # Alias resolution mirrors IntentJudge.__init__ at judge.py:917-960.
         # An empty / unset alias falls through to the session model silently;
         # a set-but-unknown alias logs a warning and also falls through.
         # Judge model's context window drives the oversize-output guard in
-        # ``evaluate``.  On the alias path it comes from the registry's
-        # ModelConfig — NOT ``provider.get_capabilities()``, which returns a
-        # static 200000 for every model absent from its table (i.e. every local
-        # / self-hosted judge), so the guard keyed off it would never trip for
-        # the small-window local judges it exists to protect.
+        # ``evaluate``.  It comes from the registry's ModelConfig on the alias
+        # path and the session's real window (``context_window``, resolved by
+        # the caller from _get_capabilities) on the fallback path — NEVER
+        # ``provider.get_capabilities()``, which returns a static 200000 for
+        # every model absent from its table (i.e. every local / self-hosted
+        # judge), so a guard keyed off it would never trip for the small-window
+        # local judges it exists to protect.  ``_positive_window`` also guards a
+        # config.toml ``context_window=0`` (which would zero out the guard).
         resolved = False
         if config.output_guard_model and model_registry is not None:
             try:
@@ -291,10 +295,8 @@ class OutputGuardJudge:
                     )
                     self._model = model_name
                     self._judge_model_alias = config.output_guard_model
-                    # getattr guard: a malformed ModelConfig must not abort
-                    # resolution — degrade the window, keep the model.
-                    self._judge_context_window = getattr(
-                        model_cfg, "context_window", _DEFAULT_JUDGE_CONTEXT_WINDOW
+                    self._judge_context_window = _positive_window(
+                        getattr(model_cfg, "context_window", None), context_window
                     )
                     resolved = True
             except Exception:
@@ -318,15 +320,12 @@ class OutputGuardJudge:
             )
             self._model = session_model
             self._judge_model_alias = ""
-            # Session-model fallback: no ModelConfig in hand, so use the static
-            # capability table (correct for commercial models; a conservative
-            # default for anything it doesn't know).
-            try:
-                self._judge_context_window = self._provider.get_capabilities(
-                    self._model
-                ).context_window
-            except Exception:
-                self._judge_context_window = _DEFAULT_JUDGE_CONTEXT_WINDOW
+            # Session-model fallback: use the session's real context window
+            # (the caller resolved it from _get_capabilities, config/registry-
+            # aware) — NOT provider.get_capabilities(), which reports 200000 for
+            # a local session model and would leave the guard blind to overflow,
+            # the very failure this fixes.  Mirrors IntentJudge's fallback.
+            self._judge_context_window = _positive_window(context_window)
 
         # Lazy-init in _create_client(); reused across evaluate() calls.
         # Session swaps the entire OutputGuardJudge on credential / model

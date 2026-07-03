@@ -481,6 +481,15 @@ class TestArgBudget:
     judge model's context window; large arguments are honestly truncated to it
     rather than blind-capped."""
 
+    def test_positive_window_coerces_zero_and_non_int(self):
+        from turnstone.core.judge import _DEFAULT_JUDGE_CONTEXT_WINDOW, _positive_window
+
+        assert _positive_window(50_000) == 50_000
+        assert _positive_window(0, 40_000) == 40_000  # 0 falls through to next
+        assert _positive_window(None, 0, 32_000) == 32_000  # None + 0 fall through
+        assert _positive_window(-5, floor=1_000) == 1_000
+        assert _positive_window(0) == _DEFAULT_JUDGE_CONTEXT_WINDOW  # floor default
+
     def test_honest_truncate_verbatim_when_it_fits(self):
         from turnstone.core.judge import honest_truncate
 
@@ -954,6 +963,27 @@ class TestModelAliasResolution:
             model_registry=registry,
         )
         assert judge._judge_context_window == 50_000
+
+    def test_alias_zero_context_window_falls_back_to_session(self):
+        """config.toml can hand back a ModelConfig with context_window=0 (that
+        path lacks the DB loader's 0→inherit normalization); a 0 window would
+        zero every budget and make honest_truncate drop everything, so it must
+        fall back to the session window."""
+        cfg = MagicMock()
+        cfg.context_window = 0
+        registry = MagicMock()
+        registry.has_alias.side_effect = lambda a: a == "judge-mini"
+        registry.resolve.return_value = (MagicMock(base_url="http://a", api_key="k"), "m", cfg)
+        registry.get_provider.return_value = _make_mock_provider()
+        judge = IntentJudge(
+            config=JudgeConfig(enabled=True, model="judge-mini"),
+            session_provider=_make_mock_provider(),
+            session_client=MagicMock(base_url="http://s", api_key="s"),
+            session_model="session-model",
+            context_window=100_000,
+            model_registry=registry,
+        )
+        assert judge._judge_context_window == 100_000  # session window, not 0
 
     def test_unknown_alias_inherits_session_model(self):
         """``judge.model`` is alias-only.  A value that doesn't resolve

@@ -279,24 +279,52 @@ class TestOversizeGuard:
         assert not small.evaluate(payload, call_id="c1").succeeded
         assert big.evaluate(payload, call_id="c1").succeeded
 
-    def test_missing_provider_capabilities_falls_back_to_default_window(self) -> None:
-        """If the provider can't report a context window, construction uses the
-        conservative default rather than crashing or an unbounded window."""
+    def test_session_fallback_uses_passed_window_not_provider_caps(self) -> None:
+        """No output_guard_model → the guard keys off the session's real window
+        (passed in), NOT provider.get_capabilities(), which reports 200000 for a
+        local model and would leave the guard blind to overflow."""
+        provider = _make_provider(content='{"risk_level": "none", "flags": []}')
+        # provider caps report the fictitious 200k; the guard must ignore it.
+        provider.get_capabilities = MagicMock(return_value=MagicMock(context_window=200_000))
+        judge = OutputGuardJudge(
+            config=JudgeConfig(output_guard_llm=True),  # no output_guard_model
+            session_provider=provider,
+            session_client=MagicMock(base_url="http://test", api_key="k"),
+            session_model="test-model",
+            context_window=40_000,  # the session's real window
+        )
+        assert judge._judge_context_window == 40_000
+
+    def test_zero_window_coerced_away_on_both_paths(self) -> None:
+        """A config.toml context_window=0 (present but unusable) must not zero
+        the guard: coerce to the session window (alias path) / the default."""
         from turnstone.core.output_guard_judge import _DEFAULT_JUDGE_CONTEXT_WINDOW
 
-        provider = _make_provider(content='{"risk_level": "none", "flags": []}')
-        provider.get_capabilities = MagicMock(side_effect=RuntimeError("no caps"))
-        config = JudgeConfig(output_guard_llm=True)
-        client = MagicMock()
-        client.base_url = "http://test"
-        client.api_key = "k"
-        judge = OutputGuardJudge(
-            config=config,
-            session_provider=provider,
-            session_client=client,
-            session_model="test-model",
+        # Alias path: ModelConfig.context_window == 0 → session window.
+        cfg = MagicMock()
+        cfg.context_window = 0
+        registry = MagicMock()
+        registry.has_alias.return_value = True
+        registry.resolve.return_value = (MagicMock(base_url="http://a", api_key="k"), "m", cfg)
+        registry.get_provider.return_value = _make_provider()
+        alias_judge = OutputGuardJudge(
+            config=JudgeConfig(output_guard_llm=True, output_guard_model="og"),
+            session_provider=_make_provider(),
+            session_client=MagicMock(base_url="http://s", api_key="s"),
+            session_model="m",
+            model_registry=registry,
+            context_window=64_000,
         )
-        assert judge._judge_context_window == _DEFAULT_JUDGE_CONTEXT_WINDOW
+        assert alias_judge._judge_context_window == 64_000
+
+        # Fallback path: no context_window passed → conservative default, not 0.
+        fallback_judge = OutputGuardJudge(
+            config=JudgeConfig(output_guard_llm=True),
+            session_provider=_make_provider(),
+            session_client=MagicMock(base_url="http://s", api_key="s"),
+            session_model="m",
+        )
+        assert fallback_judge._judge_context_window == _DEFAULT_JUDGE_CONTEXT_WINDOW
 
 
 class TestAliasResolution:
