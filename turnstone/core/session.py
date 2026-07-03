@@ -975,11 +975,6 @@ def _is_ctx_overflow(exc: BaseException) -> bool:
 
 
 class SessionUI(Protocol):
-    # Set by ``_emit_state`` so web UIs can surface the acting user (turn
-    # initiator) to clients; other UIs ignore it. Declared here so the session
-    # can assign it through the ``SessionUI`` protocol type.
-    _acting_user_id: str
-
     def on_turn_start(self) -> None: ...
     def on_turn_committed(self) -> None: ...
     def on_thinking_start(self) -> None: ...
@@ -3796,17 +3791,28 @@ class ChatSession:
         per workstream. A storage error leaves ``_db_senders_loaded`` unset so
         the next recompute (at most one per user turn, via the memo) retries
         instead of pinning an incomplete participant set for the session's
-        lifetime."""
+        lifetime.
+
+        ``_db_senders_loaded`` is latched True only if ``self._ws_id`` is still
+        the workstream this read queried: a concurrent :meth:`resume` can
+        repoint it between the query and the flag write, and marking the read
+        "done" for the NEW workstream (whose senders we never loaded) would let
+        a later recompute skip its persisted seed and misframe it. When they
+        diverge, the caller's own ws_id-snapshot guard discards the returned
+        set, and the flag stays False so the correct workstream is read next."""
+        ws_id = self._ws_id
         try:
             storage = get_storage()
             if storage is not None:
-                senders = {s for s in storage.list_message_senders(self._ws_id) if s}
-                self._db_senders_loaded = True
+                senders = {s for s in storage.list_message_senders(ws_id) if s}
+                if self._ws_id == ws_id:
+                    self._db_senders_loaded = True
                 return senders
             # No storage configured (ephemeral session): nothing to read, ever.
-            self._db_senders_loaded = True
+            if self._ws_id == ws_id:
+                self._db_senders_loaded = True
         except Exception:
-            log.debug("persisted-sender load failed for ws=%s", self._ws_id, exc_info=True)
+            log.debug("persisted-sender load failed for ws=%s", ws_id, exc_info=True)
         return set()
 
     def _recompute_shared_state(self) -> None:
@@ -4029,8 +4035,14 @@ class ChatSession:
         # gate cross-user sends on a shared workstream — the UX complement to
         # the CrossUserInterjectionError server-side block. Just the id (a uuid
         # the client compares against its own /whoami id); no display name, no
-        # storage lookup on this hot path.
-        self.ui._acting_user_id = self._acting_user_id or self._user_id or ""
+        # storage lookup on this hot path. Only the web-fanout UIs
+        # (``SessionUIBase`` subclasses — WebUI, ConsoleCoordinatorUI) carry the
+        # field and emit it; CLI / eval UIs neither have nor need it, so this is
+        # narrowed rather than declared on the ``SessionUI`` protocol contract.
+        from turnstone.core.session_ui_base import SessionUIBase
+
+        if isinstance(self.ui, SessionUIBase):
+            self.ui._acting_user_id = self._acting_user_id or self._user_id or ""
         self.ui.on_state_change(state)
 
     def _record_fatal_error(self, exc: BaseException) -> None:

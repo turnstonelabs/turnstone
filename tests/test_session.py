@@ -4253,14 +4253,30 @@ class TestMetacognitiveBuffers:
 
     def test_emit_state_surfaces_acting_user_to_ui(self, tmp_db):
         """_emit_state pushes the acting user (turn initiator, owner fallback)
-        onto the UI so web clients can gate cross-user sends. This is the state
-        the WebUI serializes into the state_change event's acting_user_id."""
-        session = _make_session(user_id="owner")
+        onto a SessionUIBase-derived UI (the web-fanout UIs — WebUI,
+        ConsoleCoordinatorUI) so web clients can gate cross-user sends. This is
+        the state those UIs serialize into the state_change event's
+        acting_user_id."""
+        from turnstone.core.session_ui_base import SessionUIBase
+
+        class _WebUI(SessionUIBase):
+            def on_state_change(self, state: str) -> None:
+                pass
+
+        session = _make_session(user_id="owner", ui=_WebUI())
         session._emit_state("running")
         assert session.ui._acting_user_id == "owner"  # owner fallback
         session._acting_user_id = "alice"  # a member drives the turn
         session._emit_state("thinking")
         assert session.ui._acting_user_id == "alice"
+
+    def test_emit_state_skips_non_sessionuibase_ui(self, tmp_db):
+        """A CLI/eval UI that is not a SessionUIBase neither has nor needs the
+        acting-user field — _emit_state must not touch it (the isinstance
+        narrow that keeps _acting_user_id off the SessionUI protocol contract)."""
+        session = _make_session(user_id="owner")  # bare NullUI, not SessionUIBase
+        session._emit_state("running")  # must not raise
+        assert not hasattr(session.ui, "_acting_user_id")
 
     def test_empty_interjection_dropped_on_drain(self, tmp_db):
         """A queued message that reduces to empty — e.g. a bare ``!!!`` whose

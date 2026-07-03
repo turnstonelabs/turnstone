@@ -292,8 +292,10 @@ function createCoordinatorPane(root, wsId, opts) {
   });
   let busy = false;
   // Acting user (turn initiator) of the in-flight turn, from state_change
-  // events; drives the shared-workstream cross-user send gate. null when idle
-  // or single-user. Mirrors the interactive pane.
+  // events; drives the shared-workstream cross-user send gate. Carries the
+  // owner id even single-user (the gate just no-ops — it equals this viewer);
+  // null when idle/error or when the backend sends no acting id
+  // (unauthenticated / older backend). Mirrors the interactive pane.
   let actingUserId = null;
   // Edit-and-resend latch (#549): set by _editAndResend, consumed by the
   // clear_ui SSE handler once the rewind's truncated history is re-fetched.

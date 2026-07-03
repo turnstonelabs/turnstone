@@ -241,8 +241,10 @@ class SessionUIBase:
         # Acting user of the current/last turn (the ``bind_acting_user``
         # initiator, owner fallback) — pushed by ``ChatSession._emit_state``
         # so web clients can gate cross-user sends on a shared workstream
-        # (disable send when busy AND this id != the viewer's own). Empty on
-        # single-user / unauthenticated lanes.
+        # (disable send when busy AND this id != the viewer's own). Carries the
+        # owner id even on a single-user authenticated session (the gate just
+        # no-ops there — it equals the viewer); empty only on unauthenticated
+        # lanes or before the session has emitted any state.
         self._acting_user_id: str = ""
         # SSE listener fan-out — one queue per connected browser tab.
         self._listeners: list[queue.Queue[dict[str, Any]]] = []

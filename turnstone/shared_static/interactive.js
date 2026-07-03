@@ -195,8 +195,10 @@ class Pane {
     this.busy = false;
     this.isThinking = false;
     // Acting user (turn initiator) of the in-flight turn, from state_change
-    // events; drives the shared-workstream cross-user send gate. null when idle
-    // or single-user.
+    // events; drives the shared-workstream cross-user send gate. Carries the
+    // owner id even single-user (the gate just no-ops — it equals this viewer);
+    // null when idle/error or when the backend sends no acting id
+    // (unauthenticated / older backend).
     this._actingUserId = null;
     this.pendingApproval = false;
     this.approvalBlockEl = null;

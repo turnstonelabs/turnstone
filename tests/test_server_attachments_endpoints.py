@@ -645,10 +645,13 @@ class TestQueuedSendWithAttachments:
 
         captured: dict = {}
 
-        def fake_queue_message(text, attachment_ids=None, queue_msg_id=None):
+        def fake_queue_message(
+            text, attachment_ids=None, queue_msg_id=None, interjector_user_id=""
+        ):
             captured["text"] = text
             captured["attachment_ids"] = list(attachment_ids or ())
             captured["queue_msg_id"] = queue_msg_id
+            captured["interjector_user_id"] = interjector_user_id
             # Return the supplied id so server-side tracking is coherent
             return text, "notice", queue_msg_id or "q-msg-1"
 
