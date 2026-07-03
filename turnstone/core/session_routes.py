@@ -2043,15 +2043,24 @@ def make_events_handler(cfg: SessionEndpointConfig) -> Handler:
                     try:
                         cur_state = getattr(ws.state, "value", None)
                         if isinstance(cur_state, str) and cur_state:
-                            yield {
-                                "data": json.dumps(
-                                    {
-                                        "type": "state_change",
-                                        "state": cur_state,
-                                        "ws_id": ws_id,
-                                    }
-                                )
+                            state_evt: dict[str, Any] = {
+                                "type": "state_change",
+                                "state": cur_state,
+                                "ws_id": ws_id,
                             }
+                            # A client connecting mid-turn learns who holds it,
+                            # so it can gate its send button (matches the live
+                            # state_change emitted from server.WebUI).
+                            sess = getattr(ws, "session", None)
+                            acting = (
+                                getattr(sess, "_acting_user_id", "")
+                                or getattr(sess, "_user_id", "")
+                                if sess is not None
+                                else ""
+                            )
+                            if acting:
+                                state_evt["acting_user_id"] = acting
+                            yield {"data": json.dumps(state_evt)}
                     except Exception:
                         log.debug(
                             "ws.events.state_change_replay_failed ws=%s",

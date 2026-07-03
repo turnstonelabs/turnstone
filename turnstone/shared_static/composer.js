@@ -127,6 +127,12 @@ export function Composer(mount, opts) {
   this._opts = opts;
   this._mount = mount;
   this._busy = false;
+  // Independent hard-block axis, reconciled with busy in _reconcileDisabled.
+  // Set via setSendBlocked() when send must be disabled regardless of the
+  // queueWhileBusy affordance — e.g. a shared workstream where another
+  // participant's turn is in flight (their credentials, not this viewer's,
+  // would run any tool the interjection triggers).
+  this._sendBlocked = false;
   this._destroyed = false;
   this._listeners = []; // [{el, type, fn}, ...] for clean detach
   this._autoResizeEnabled = opts.autoResize !== false;
@@ -648,10 +654,10 @@ Composer.prototype.setBusy = function (b) {
   // because it defaults to idlePlaceholder.
   this.inputEl.placeholder = b ? this._busyPlaceholder : this._idlePlaceholder;
 
-  // Disabled state — composer owns it unless caller opted out.
-  if (!opts.externalDisable) {
-    this.sendBtn.disabled = !!b && !opts.queueWhileBusy;
-  }
+  // Disabled state — composer owns it unless caller opted out. Routed through
+  // the reconciler so the busy axis and the hard-block axis (setSendBlocked)
+  // combine consistently.
+  this._reconcileDisabled();
 
   // Paperclip is disabled whenever busy, even in queueWhileBusy mode:
   // attachments can't ride a queued user turn (would inject a `user`
@@ -674,6 +680,38 @@ Composer.prototype.setBusy = function (b) {
     this.stopBtn.textContent = this._stopLabel;
     this.stopBtn.setAttribute("aria-label", "Stop generation");
     delete this.stopBtn.dataset.forceCancel;
+  }
+};
+
+// Combine the busy axis and the hard-block axis into sendBtn.disabled.
+// Busy alone disables only outside queueWhileBusy mode (queue mode keeps a
+// clickable "Queue" button); a hard block disables unconditionally. Skipped
+// entirely when the caller opted into externalDisable (owns the flag itself).
+Composer.prototype._reconcileDisabled = function () {
+  var opts = this._opts;
+  if (opts.externalDisable) return;
+  var busyDisables = this._busy && !opts.queueWhileBusy;
+  this.sendBtn.disabled = busyDisables || this._sendBlocked;
+};
+
+// Hard-block send independent of busy/queue state, with an optional hint
+// shown as the input placeholder + send-button title. Idempotent; call with
+// (false) to clear. Used for the shared-workstream cross-user gate.
+Composer.prototype.setSendBlocked = function (blocked, hint) {
+  blocked = !!blocked;
+  if (blocked === this._sendBlocked && !hint) return;
+  this._sendBlocked = blocked;
+  this._reconcileDisabled();
+  var msg = hint || "";
+  if (blocked && msg) {
+    this.inputEl.placeholder = msg;
+    this.sendBtn.title = msg;
+  } else {
+    // Restore the busy/idle placeholder the current state implies.
+    this.inputEl.placeholder = this._busy
+      ? this._busyPlaceholder
+      : this._idlePlaceholder;
+    this.sendBtn.removeAttribute("title");
   }
 };
 

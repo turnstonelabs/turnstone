@@ -194,6 +194,10 @@ class Pane {
     this.contentBuffer = "";
     this.busy = false;
     this.isThinking = false;
+    // Acting user (turn initiator) of the in-flight turn, from state_change
+    // events; drives the shared-workstream cross-user send gate. null when idle
+    // or single-user.
+    this._actingUserId = null;
     this.pendingApproval = false;
     this.approvalBlockEl = null;
     // Early-paint shell from a ``tool_pending`` event, awaiting its
@@ -296,6 +300,9 @@ class Pane {
     this.messagesEl.dataset.busy = next ? "true" : "false";
     const edge = next !== this.busy;
     this.busy = next;
+    // Re-evaluate the shared-workstream cross-user send gate on every busy
+    // edge (the acting-user id is tracked from state_change events).
+    this._reconcileSendBlock();
     if (edge && !next) this.queue.onIdleEdge();
     // The mic produces composer input the user can only send when idle — keep
     // it in lockstep with the send button (which composer.setBusy gates).
@@ -307,6 +314,31 @@ class Pane {
         this._micBtn.disabled = false;
       }
     }
+  }
+
+  // Shared-workstream send gate: while another participant's turn is in flight,
+  // disable this viewer's send. A mid-turn interjection would run under the
+  // initiator's identity (their MCP credentials, not this viewer's) and be
+  // misattributed to them, so the server rejects it with a 409 — this is the
+  // proactive UX half. No-ops on a single-user workstream (the acting user is
+  // this viewer) or when the acting id is unknown (older backend). Compares
+  // opaque user_id uuids: the acting id from state_change vs the viewer's own
+  // id retained from /whoami (ts.user_id).
+  _reconcileSendBlock() {
+    let me = null;
+    try {
+      me = sessionStorage.getItem("ts.user_id");
+    } catch (_e) {
+      me = null;
+    }
+    const blocked =
+      !!this.busy && !!this._actingUserId && !!me && this._actingUserId !== me;
+    this.composer.setSendBlocked(
+      blocked,
+      blocked
+        ? "Another participant's turn is in progress - wait for it to finish."
+        : "",
+    );
   }
 
   showEmptyState() {
@@ -1342,6 +1374,15 @@ class Pane {
         break;
 
       case "state_change":
+        // Track who holds the in-flight turn (acting user) so the send gate
+        // can compare against this viewer. Present on busy transitions from a
+        // shared workstream; absent on single-user / older backends (then the
+        // gate simply never engages). Cleared when the turn settles.
+        if (evt.state === "idle" || evt.state === "error") {
+          this._actingUserId = null;
+        } else if (evt.acting_user_id) {
+          this._actingUserId = evt.acting_user_id;
+        }
         if (evt.state === "idle" || evt.state === "error") {
           this.setBusy(false);
           this._attachRetryToLastAssistant();
@@ -3197,6 +3238,20 @@ class Pane {
         // (502/504 HTML); the parse-failure arm falls back to the status code
         // so that can't surface as an "Unexpected token <" error.
         if (!r.ok) {
+          // 409 = the server-side cross-user interjection block (another
+          // participant's turn is in flight). Convert to a handled status
+          // object so it routes to the clean branch below instead of the
+          // generic "Connection error" catch — this is the reactive fallback
+          // for the race where the button wasn't yet disabled.
+          if (r.status === 409) {
+            return r.json().then(
+              (b) => ({
+                status: "cross_user_interjection",
+                error: (b && b.error) || "",
+              }),
+              () => ({ status: "cross_user_interjection", error: "" }),
+            );
+          }
           return r.json().then(
             (b) => {
               throw new Error((b && b.error) || "send_http_" + r.status);
@@ -3241,6 +3296,18 @@ class Pane {
             "Attachments can't be sent while the assistant is working. " +
               "Send a text-only message now, or wait and resend with attachments.",
           );
+        } else if (data.status === "cross_user_interjection") {
+          // Another participant's turn is in flight; the server refused the
+          // interjection so it can't run under their credentials or be
+          // misattributed. The send gate normally disables the button first;
+          // this handles the race where the click beat the state_change.
+          if (queuedEl) this.queue.remove(queuedEl);
+          this.addErrorMessage(
+            data.error ||
+              "Another participant's turn is in progress. Wait for it to " +
+                "finish, then send your message.",
+          );
+          if (!isBusy) this.setBusy(false);
         } else {
           // Unknown / "ok" status (e.g. the stale-busy race: the client
           // optimistically queued but the server ran the send on a fresh

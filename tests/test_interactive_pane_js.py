@@ -15,6 +15,8 @@ from pathlib import Path
 
 _ROOT = Path(__file__).resolve().parent.parent
 _INTERACTIVE = _ROOT / "turnstone/shared_static/interactive.js"
+_COMPOSER = _ROOT / "turnstone/shared_static/composer.js"
+_AUTH = _ROOT / "turnstone/shared_static/auth.js"
 _APP = _ROOT / "turnstone/ui/static/app.js"
 _UI_INDEX = _ROOT / "turnstone/ui/static/index.html"
 
@@ -345,3 +347,65 @@ def test_per_token_hot_path_avoids_container_scans() -> None:
     assert "ResizeObserver" in body
     for helper in ("_toolRow(callId) {", "_streamEl(callId) {"):
         assert helper in body, f"missing lookup-cache helper: {helper!r}"
+
+
+# -- Shared-workstream cross-user send gate -----------------------------------
+#
+# The UX complement to the server-side CrossUserInterjectionError (a 409): while
+# another participant's turn is in flight, this viewer's send button is disabled
+# so they can't interject under the initiator's credentials / be misattributed.
+# The wiring spans three modules; these string-presence guards catch the silent
+# one-line regression the way the rest of this file does (no JS test framework).
+
+
+def test_composer_exposes_hard_send_block() -> None:
+    """The composer has an independent hard-block axis, reconciled with busy,
+    so a caller can disable send even in queueWhileBusy (queue) mode."""
+    body = _COMPOSER.read_text(encoding="utf-8")
+    assert "Composer.prototype.setSendBlocked = function" in body
+    assert "Composer.prototype._reconcileDisabled = function" in body
+    assert "this._sendBlocked = false;" in body
+    # setBusy must route the disabled write through the reconciler (not clobber
+    # the block with a direct sendBtn.disabled assignment).
+    stripped = _strip_comments(body)
+    setbusy = stripped.index("Composer.prototype.setBusy = function")
+    setbusy_end = stripped.index("Composer.prototype._reconcileDisabled")
+    assert "this._reconcileDisabled();" in stripped[setbusy:setbusy_end]
+    assert "this.sendBtn.disabled =" not in stripped[setbusy:setbusy_end], (
+        "setBusy must not write sendBtn.disabled directly — reconcile owns it"
+    )
+
+
+def test_auth_retains_user_id_for_gate() -> None:
+    """whoami's opaque user_id is retained (separately from the display
+    username) so the pane can compare it against the acting-user id."""
+    body = _AUTH.read_text(encoding="utf-8")
+    assert 'sessionStorage.setItem("ts.user_id", data.user_id);' in body
+    assert 'sessionStorage.removeItem("ts.user_id");' in body
+
+
+def test_pane_gates_send_on_cross_user_busy() -> None:
+    """The pane tracks the acting user from state_change, compares it against
+    the viewer's own id, and blocks send while another participant is busy."""
+    body = _INTERACTIVE.read_text(encoding="utf-8")
+    assert "_reconcileSendBlock() {" in body
+    # tracks the acting user from the state_change event...
+    assert "this._actingUserId = evt.acting_user_id;" in body
+    assert "this._actingUserId = null;" in body  # cleared when the turn settles
+    # ...compares against the viewer's own id from /whoami...
+    assert 'sessionStorage.getItem("ts.user_id")' in body
+    assert "this._actingUserId !== me" in body
+    # ...and drives the composer's hard block, re-run on every busy edge.
+    assert "this.composer.setSendBlocked(" in body
+    stripped = _strip_comments(body)
+    setbusy = stripped.index("setBusy(b) {")
+    assert "this._reconcileSendBlock();" in stripped[setbusy : setbusy + 600]
+
+
+def test_pane_handles_cross_user_409() -> None:
+    """The reactive fallback: a 409 (button not yet disabled) surfaces a clean
+    message, not the generic 'Connection error' catch."""
+    body = _INTERACTIVE.read_text(encoding="utf-8")
+    assert "r.status === 409" in body
+    assert 'status: "cross_user_interjection"' in body
+    assert 'data.status === "cross_user_interjection"' in body

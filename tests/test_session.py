@@ -4251,6 +4251,17 @@ class TestMetacognitiveBuffers:
         session.queue_message("internal", interjector_user_id="", queue_msg_id="q1")
         assert "q1" in session._queued_messages
 
+    def test_emit_state_surfaces_acting_user_to_ui(self, tmp_db):
+        """_emit_state pushes the acting user (turn initiator, owner fallback)
+        onto the UI so web clients can gate cross-user sends. This is the state
+        the WebUI serializes into the state_change event's acting_user_id."""
+        session = _make_session(user_id="owner")
+        session._emit_state("running")
+        assert session.ui._acting_user_id == "owner"  # owner fallback
+        session._acting_user_id = "alice"  # a member drives the turn
+        session._emit_state("thinking")
+        assert session.ui._acting_user_id == "alice"
+
     def test_empty_interjection_dropped_on_drain(self, tmp_db):
         """A queued message that reduces to empty — e.g. a bare ``!!!`` whose
         priority prefix ``parse_priority`` strips to "" — produces no

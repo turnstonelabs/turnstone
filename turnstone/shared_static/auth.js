@@ -737,12 +737,20 @@ function _storePermissions(data) {
   // returns the human `username` (display name) alongside the opaque user_id;
   // the shell reads ts.username via displayNameFor and repaints once it lands.
   // Cleared in lockstep with permissions so the chip never shows a stale user
-  // after logout / revocation.  NO fallback to user_id — that's a uuid, worse
-  // than the generic placeholder.
+  // after logout / revocation.  NO fallback to user_id for DISPLAY — that's a
+  // uuid, worse than the generic placeholder.
   if (data && data.username) {
     sessionStorage.setItem("ts.username", data.username);
   } else {
     sessionStorage.removeItem("ts.username");
+  }
+  // Retain the opaque user_id (uuid) separately — not for display, but so the
+  // chat pane can compare it against a shared workstream's acting-user id and
+  // disable its send button while another participant's turn is in flight.
+  if (data && data.user_id) {
+    sessionStorage.setItem("ts.user_id", data.user_id);
+  } else {
+    sessionStorage.removeItem("ts.user_id");
   }
 }
 

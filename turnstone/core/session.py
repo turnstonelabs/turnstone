@@ -975,6 +975,11 @@ def _is_ctx_overflow(exc: BaseException) -> bool:
 
 
 class SessionUI(Protocol):
+    # Set by ``_emit_state`` so web UIs can surface the acting user (turn
+    # initiator) to clients; other UIs ignore it. Declared here so the session
+    # can assign it through the ``SessionUI`` protocol type.
+    _acting_user_id: str
+
     def on_turn_start(self) -> None: ...
     def on_turn_committed(self) -> None: ...
     def on_thinking_start(self) -> None: ...
@@ -4020,6 +4025,12 @@ class ChatSession:
 
             clear_last_error(self._ws_id)
             self._has_persisted_error = False
+        # Surface the acting user (turn initiator) to the UI so web clients can
+        # gate cross-user sends on a shared workstream — the UX complement to
+        # the CrossUserInterjectionError server-side block. Just the id (a uuid
+        # the client compares against its own /whoami id); no display name, no
+        # storage lookup on this hot path.
+        self.ui._acting_user_id = self._acting_user_id or self._user_id or ""
         self.ui.on_state_change(state)
 
     def _record_fatal_error(self, exc: BaseException) -> None:

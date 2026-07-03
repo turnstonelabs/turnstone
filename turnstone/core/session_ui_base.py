@@ -238,6 +238,12 @@ class SessionUIBase:
     def __init__(self, ws_id: str = "", user_id: str = "") -> None:
         self.ws_id = ws_id
         self._user_id = user_id
+        # Acting user of the current/last turn (the ``bind_acting_user``
+        # initiator, owner fallback) — pushed by ``ChatSession._emit_state``
+        # so web clients can gate cross-user sends on a shared workstream
+        # (disable send when busy AND this id != the viewer's own). Empty on
+        # single-user / unauthenticated lanes.
+        self._acting_user_id: str = ""
         # SSE listener fan-out — one queue per connected browser tab.
         self._listeners: list[queue.Queue[dict[str, Any]]] = []
         self._listeners_lock = threading.Lock()

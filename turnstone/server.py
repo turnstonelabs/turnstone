@@ -384,7 +384,13 @@ class WebUI(SessionUIBase):
         self._broadcast_state(state)
         # Also send to per-workstream listeners so the browser UI can track
         # busy/idle transitions (stream_end fires per-segment, not per-turn).
-        self._enqueue({"type": "state_change", "state": state})
+        # ``acting_user_id`` (when known) lets a shared-workstream client
+        # disable its send button while another participant's turn is in
+        # flight — the UX complement to the server-side cross-user block.
+        evt: dict[str, Any] = {"type": "state_change", "state": state}
+        if self._acting_user_id:
+            evt["acting_user_id"] = self._acting_user_id
+        self._enqueue(evt)
 
     def on_rename(self, name: str) -> None:
         """Update the workstream's display name and broadcast to all clients."""
