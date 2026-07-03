@@ -711,7 +711,7 @@ _SPEC_PLACEHOLDER_RE = re.compile(
     r"""
     \$ARGUMENTS\[(?P<idx_bracket>\d+)\]            # $ARGUMENTS[N]
     | \$ARGUMENTS\b(?!\[)                             # $ARGUMENTS (bare)
-    | \$\{(?P<env>CLAUDE_[A-Z_]+)\}                   # ${CLAUDE_*}
+    | \$\{(?P<env>(?:CLAUDE|TURNSTONE)_[A-Z_]+)\}     # ${TURNSTONE_*} / ${CLAUDE_*}
     | \$(?P<idx_short>\d+)\b                          # $N
     | \$(?P<named>[A-Za-z_][A-Za-z0-9_]*)\b           # $name
     """,
@@ -805,12 +805,11 @@ def _substitute_skill_args(
     arg_names: list[str],
     ws_id: str,
     effort: str,
+    skill_dir: str = "",
 ) -> str:
     """Apply SKILL.md spec placeholder substitution.
 
-    Handles every spec form except ``${CLAUDE_SKILL_DIR}`` (which
-    requires a filesystem-shaped skill layout Turnstone doesn't have
-    yet — see #572 for the deferral note):
+    Handles every spec placeholder form:
 
     * ``$ARGUMENTS`` — full argument string as the user typed it
     * ``$ARGUMENTS[N]`` / ``$N`` — Nth positional arg (0-indexed),
@@ -819,8 +818,17 @@ def _substitute_skill_args(
     * ``$<name>`` — named arg from the SKILL.md ``arguments:``
       frontmatter list, paired with the positional arg at the same
       index
-    * ``${CLAUDE_SESSION_ID}`` — current workstream id
-    * ``${CLAUDE_EFFORT}`` — current reasoning_effort
+    * ``${TURNSTONE_SESSION_ID}`` / ``${CLAUDE_SESSION_ID}`` — current
+      workstream id.  ``TURNSTONE_`` is canonical (Turnstone is
+      multi-provider); the ``CLAUDE_`` spelling is a permanent
+      back-compat alias so skills imported from Claude Code / skills.sh
+      keep resolving.  Both map to the same value.
+    * ``${TURNSTONE_EFFORT}`` / ``${CLAUDE_EFFORT}`` — reasoning_effort
+    * ``${TURNSTONE_SKILL_DIR}`` / ``${CLAUDE_SKILL_DIR}`` — absolute
+      path of the materialized resource bundle, resolved when *skill_dir*
+      is supplied (the caller materializes resources BEFORE substituting)
+      and left literal otherwise, so a skill that bundles no resources
+      degrades gracefully rather than emitting an empty path.
 
     Single-pass: a value containing a placeholder token (e.g.
     ``$0='$ARGUMENTS'``) does not get re-expanded.  Matches the
@@ -847,7 +855,16 @@ def _substitute_skill_args(
         positional = arguments_str.split() if arguments_str else []
 
     name_to_idx = {name: i for i, name in enumerate(arg_names)}
-    env = {"CLAUDE_SESSION_ID": ws_id, "CLAUDE_EFFORT": effort}
+    # ``TURNSTONE_*`` canonical + ``CLAUDE_*`` back-compat alias, same value.
+    env = {
+        "TURNSTONE_SESSION_ID": ws_id,
+        "CLAUDE_SESSION_ID": ws_id,
+        "TURNSTONE_EFFORT": effort,
+        "CLAUDE_EFFORT": effort,
+    }
+    if skill_dir:
+        env["TURNSTONE_SKILL_DIR"] = skill_dir
+        env["CLAUDE_SKILL_DIR"] = skill_dir
 
     def _at(idx_str: str) -> str:
         idx = int(idx_str)  # regex guarantees digits
@@ -2107,81 +2124,108 @@ class ChatSession:
             config.update(snap.to_config())
         save_workstream_config(self._ws_id, config)
 
-    def _load_skills(self) -> None:
-        """Load skills from storage.  Called once at init and on /skill."""
+    def _render_skill_body(
+        self,
+        content: str,
+        *,
+        arguments_str: str = "",
+        arg_names: list[str] | None = None,
+        skill_dir: str | None = None,
+    ) -> str:
+        """Render one skill body through the single substitution path.
+
+        Two passes, order load-bearing: legacy ``{{var}}`` first (against
+        the immutable skill source), then the SKILL.md spec pass
+        (``$ARGUMENTS`` / ``${TURNSTONE_*}``).  Rendering ``{{…}}`` first
+        means a user-supplied arg value that happens to contain
+        ``{{model}}`` cannot be re-expanded against the live context; the
+        spec pass writes its substituted values in last, and
+        :func:`_substitute_skill_args` is itself single-pass, so those
+        values are never swept again.
+
+        Every invocation context routes through here — interactive load,
+        default skills, and ``task_agent`` sub-agents — so a skill reading
+        ``${TURNSTONE_EFFORT}`` or ``$ARGUMENTS`` resolves identically
+        wherever it runs, instead of rendering literally in some paths.
+        """
         context = {
             "model": self.model,
             "ws_id": self._ws_id,
             "node_id": self._node_id or "",
         }
         effort = getattr(self, "reasoning_effort", "") or ""
+        rendered = _render_template(content, context)
+        return _substitute_skill_args(
+            rendered,
+            arguments_str=arguments_str,
+            arg_names=arg_names or [],
+            ws_id=self._ws_id,
+            effort=effort,
+            skill_dir=skill_dir or "",
+        )
+
+    def _load_skills(self) -> None:
+        """Load the active skill (or defaults) from storage into context.
+
+        Called once at init and on ``/skill``.  Resources are loaded and
+        materialized to disk BEFORE the body is substituted, so
+        ``${TURNSTONE_SKILL_DIR}`` resolves to the concrete on-disk path
+        rather than a dangling placeholder.  All bodies go through
+        :meth:`_render_skill_body` — the one substitution path, shared
+        with ``task_agent``.
+        """
+        skill_data: dict[str, Any] | None = None
         if self._skill_name:
             skill_data = get_skill_by_name(self._skill_name)
             if skill_data:
-                # Two-pass render — legacy ``{{model}}`` first, spec
-                # ``$ARGUMENTS`` second.  Order is load-bearing: user-
-                # supplied arg values may legitimately contain
-                # ``{{...}}`` patterns (literal text the model wanted to
-                # quote), and running ``_render_template`` AFTER the
-                # spec substitution would silently re-expand them
-                # against the live context.  Running it FIRST resolves
-                # the curly-brace placeholders against the immutable
-                # skill source, then the spec pass writes substituted
-                # values in last — those values can't be re-expanded
-                # because the curly-brace renderer has already
-                # finished.
-                arg_names = self._skill_arg_names(skill_data)
-                content = _render_template(skill_data["content"], context)
-                self._skill_content = _substitute_skill_args(
-                    content,
-                    arguments_str=self._skill_arguments,
-                    arg_names=arg_names,
-                    ws_id=self._ws_id,
-                    effort=effort,
-                )
-                self._check_skill_budget(skill_data)
                 self._skill_resources = self._load_skill_resources(
                     skill_data.get("template_id", "")
                 )
-                if skill_data.get("risk_level") in ("high", "critical"):
-                    risk_tier = skill_data["risk_level"]
-                    log.warning(
-                        "skill.high_risk_loaded",
-                        skill=skill_data["name"],
-                        risk_level=risk_tier,
-                    )
-                    self.ui.on_info(
-                        f"⚠ Skill '{skill_data['name']}' has risk level: {risk_tier}. "
-                        f"Review scan report in admin panel before enabling in production."
-                    )
             else:
                 log.warning("skill.not_found", name=self._skill_name)
-                self._skill_content = None
                 self._skill_resources = {}
+        else:
+            self._skill_resources = {}
+
+        # Materialize first: the body substitution below reads
+        # ``self._skill_resources_dir`` to resolve ``${TURNSTONE_SKILL_DIR}``.
+        # A no-op that clears any stale dir on the not-found / defaults /
+        # no-skill paths.
+        self._materialize_skill_resources()
+
+        if skill_data:
+            self._skill_content = self._render_skill_body(
+                skill_data["content"],
+                arguments_str=self._skill_arguments,
+                arg_names=self._skill_arg_names(skill_data),
+                skill_dir=self._skill_resources_dir,
+            )
+            self._check_skill_budget(skill_data)
+            if skill_data.get("risk_level") in ("high", "critical"):
+                risk_tier = skill_data["risk_level"]
+                log.warning(
+                    "skill.high_risk_loaded",
+                    skill=skill_data["name"],
+                    risk_level=risk_tier,
+                )
+                self.ui.on_info(
+                    f"⚠ Skill '{skill_data['name']}' has risk level: {risk_tier}. "
+                    f"Review scan report in admin panel before enabling in production."
+                )
+        elif self._skill_name:
+            # Named skill not found — resources already cleared above.
+            self._skill_content = None
         else:
             defaults = list_default_skills()
             if defaults:
-                # ``arg_names`` and ``arguments_str`` are empty for the
-                # default-skill path — defaults are always-on and don't
-                # take user-supplied invocation args — but env subs
-                # (``${CLAUDE_SESSION_ID}`` / ``${CLAUDE_EFFORT}``)
-                # still resolve.  Same render-then-substitute order as
-                # the explicit-skill branch (see comment above).
-                parts = [
-                    _substitute_skill_args(
-                        _render_template(t["content"], context),
-                        arguments_str="",
-                        arg_names=[],
-                        ws_id=self._ws_id,
-                        effort=effort,
-                    )
-                    for t in defaults
-                ]
+                # Defaults are always-on and take no invocation args, but env
+                # subs (``${TURNSTONE_SESSION_ID}`` / ``${TURNSTONE_EFFORT}``)
+                # still resolve.  Defaults carry no per-skill resource bundle,
+                # so ``skill_dir`` is omitted.
+                parts = [self._render_skill_body(t["content"]) for t in defaults]
                 self._skill_content = "\n\n".join(parts)
             else:
                 self._skill_content = None
-            self._skill_resources = {}
-        self._materialize_skill_resources()
         self._validate_skill_resources()
 
     @staticmethod
@@ -2309,10 +2353,25 @@ class ChatSession:
         )
 
     def _skill_resource_env(self) -> dict[str, str]:
-        """Return extra env vars for bash when skill resources are materialized."""
+        """Return extra env vars for bash when skill resources are materialized.
+
+        The bundle dir is exported as canonical ``TURNSTONE_SKILL_DIR`` and
+        the original ``SKILL_RESOURCES_DIR`` (back-compat for existing skills
+        and the ``$SKILL_RESOURCES_DIR`` disclosure hint), both pointing at
+        the same directory.  ``CLAUDE_SKILL_DIR`` is added as a portability
+        alias for imported Claude Code / skills.sh skills, but ONLY when the
+        host hasn't already set it: ``CLAUDE_SKILL_DIR`` is another vendor's
+        namespace, and turnstone running as a node inside Claude Code must
+        not shadow the host's real value.
+        """
         if not self._skill_resources_dir:
             return {}
-        env: dict[str, str] = {"SKILL_RESOURCES_DIR": self._skill_resources_dir}
+        env: dict[str, str] = {
+            "SKILL_RESOURCES_DIR": self._skill_resources_dir,
+            "TURNSTONE_SKILL_DIR": self._skill_resources_dir,
+        }
+        if "CLAUDE_SKILL_DIR" not in os.environ:
+            env["CLAUDE_SKILL_DIR"] = self._skill_resources_dir
         scripts_dir = os.path.join(self._skill_resources_dir, "scripts")
         if os.path.isdir(scripts_dir):
             current_path = os.environ.get("PATH")
@@ -14182,12 +14241,24 @@ class ChatSession:
                 risk_level=skill_data.get("risk_level", ""),
                 ws_id=self._ws_id,
             )
-            context = {
-                "model": self.model,
-                "ws_id": self._ws_id,
-                "node_id": self._node_id or "",
-            }
-            skill_identity = _render_template(skill_data["content"], context)
+            # Route through the shared skill substitution path so a
+            # ``task_agent`` skill resolves ``${TURNSTONE_*}`` env vars
+            # exactly like interactive and spawn loads (previously this ran
+            # ``_render_template`` alone, leaving every ``$``/``${…}`` form
+            # literal — the substitution asymmetry across invocation
+            # contexts).
+            #
+            # A sub-agent gets its task via the prompt, not invocation args,
+            # so ``arguments_str`` is empty: bare ``$ARGUMENTS`` and every
+            # positional ``$N`` / ``$ARGUMENTS[N]`` form resolve to empty —
+            # deliberately identical to the defaults and spawn-child paths,
+            # not the verbatim passthrough the old shortcut happened to give.
+            # ``skill_dir`` is likewise unset here (sub-agent resource
+            # bundles aren't materialized yet), so ``${TURNSTONE_SKILL_DIR}``
+            # stays literal on this path — unchanged from before; a later
+            # step adds sub-agent materialization and a persona-owned
+            # identity so this body becomes pure capability context.
+            skill_identity = self._render_skill_body(skill_data["content"])
             if len(skill_identity) > _MAX_SKILL_CONTENT:
                 log.warning(
                     "skill_content.truncated",

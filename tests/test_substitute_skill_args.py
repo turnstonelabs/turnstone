@@ -1,10 +1,13 @@
 """Unit tests for ``_substitute_skill_args`` — SKILL.md spec placeholder
 substitution applied to skill bodies at load time.
 
-Covers every placeholder form Turnstone implements (``${CLAUDE_SKILL_DIR}``
-is deferred — see #572) plus the spec's "append ARGUMENTS at end if no
-placeholder" rule and the single-pass guarantee against re-expansion of
-user-supplied values that happen to contain placeholder syntax.
+Covers every placeholder form Turnstone implements — including the
+``${TURNSTONE_*}`` canonical env vars and their ``${CLAUDE_*}``
+back-compat aliases, and ``${TURNSTONE_SKILL_DIR}`` / ``${CLAUDE_SKILL_DIR}``
+resolution when the caller supplies a materialized bundle path — plus the
+spec's "append ARGUMENTS at end if no placeholder" rule and the
+single-pass guarantee against re-expansion of user-supplied values that
+happen to contain placeholder syntax.
 """
 
 from __future__ import annotations
@@ -134,6 +137,60 @@ class TestEnvironment:
 
     def test_unknown_env_left_as_literal(self) -> None:
         assert _sub("${CLAUDE_UNKNOWN_FOO}") == "${CLAUDE_UNKNOWN_FOO}"
+
+
+class TestEnvironmentAliases:
+    """``TURNSTONE_*`` is the canonical, vendor-neutral spelling;
+    ``CLAUDE_*`` is a permanent back-compat alias so skills imported from
+    Claude Code / skills.sh keep resolving.  Both map to one value."""
+
+    def test_turnstone_session_id(self) -> None:
+        assert _sub("session ${TURNSTONE_SESSION_ID}") == "session ws-abc"
+
+    def test_turnstone_effort(self) -> None:
+        assert _sub("effort ${TURNSTONE_EFFORT}") == "effort high"
+
+    def test_canonical_and_alias_agree(self) -> None:
+        assert _sub("${CLAUDE_SESSION_ID}") == _sub("${TURNSTONE_SESSION_ID}") == "ws-abc"
+        assert _sub("${CLAUDE_EFFORT}") == _sub("${TURNSTONE_EFFORT}") == "high"
+
+    def test_unknown_turnstone_var_left_as_literal(self) -> None:
+        assert _sub("${TURNSTONE_UNKNOWN_FOO}") == "${TURNSTONE_UNKNOWN_FOO}"
+
+
+class TestSkillDir:
+    """``${TURNSTONE_SKILL_DIR}`` / ``${CLAUDE_SKILL_DIR}`` resolve to the
+    materialized bundle path when the caller supplies one (it materializes
+    resources BEFORE substituting), and degrade to a literal placeholder
+    when the skill bundles no resources."""
+
+    def test_turnstone_skill_dir_resolves(self) -> None:
+        out = _substitute_skill_args(
+            "cd ${TURNSTONE_SKILL_DIR}/scripts",
+            arguments_str="",
+            arg_names=[],
+            ws_id="ws-abc",
+            effort="high",
+            skill_dir="/tmp/skill-xyz",
+        )
+        assert out == "cd /tmp/skill-xyz/scripts"
+
+    def test_claude_skill_dir_alias_resolves(self) -> None:
+        out = _substitute_skill_args(
+            "cd ${CLAUDE_SKILL_DIR}",
+            arguments_str="",
+            arg_names=[],
+            ws_id="ws-abc",
+            effort="high",
+            skill_dir="/tmp/skill-xyz",
+        )
+        assert out == "cd /tmp/skill-xyz"
+
+    def test_skill_dir_left_literal_when_unset(self) -> None:
+        # Default skill_dir="" → placeholder stays literal (graceful),
+        # not an empty path.
+        assert _sub("${TURNSTONE_SKILL_DIR}") == "${TURNSTONE_SKILL_DIR}"
+        assert _sub("${CLAUDE_SKILL_DIR}") == "${CLAUDE_SKILL_DIR}"
 
 
 class TestSinglePassGuarantee:

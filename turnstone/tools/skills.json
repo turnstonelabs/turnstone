@@ -23,7 +23,7 @@
       },
       "arguments": {
         "type": "string",
-        "description": "For `load`: optional invocation arguments for SKILL.md `$ARGUMENTS` / `$N` / `$<name>` substitution in the skill body. Free-form string parsed with shell-style quoting via `shlex.split` — quotes are stripped, so `\"hello world\" second` yields $0=hello world, $1=second (no surrounding quotes in the substituted value). Skills declaring `arguments: [issue, branch]` in their frontmatter expose `$issue` and `$branch` bound by position. Omit or pass an empty string when the skill has no `$ARGUMENTS`/`$N`/`$<name>` placeholders; `${CLAUDE_SESSION_ID}` / `${CLAUDE_EFFORT}` env-var substitution still runs regardless."
+        "description": "For `load`: optional invocation arguments for SKILL.md `$ARGUMENTS` / `$N` / `$<name>` substitution in the skill body. Free-form string parsed with shell-style quoting via `shlex.split` — quotes are stripped, so `\"hello world\" second` yields $0=hello world, $1=second (no surrounding quotes in the substituted value). Skills declaring `arguments: [issue, branch]` in their frontmatter expose `$issue` and `$branch` bound by position. Omit or pass an empty string when the skill has no `$ARGUMENTS`/`$N`/`$<name>` placeholders; `${TURNSTONE_SESSION_ID}` / `${TURNSTONE_EFFORT}` env-var substitution (with `${CLAUDE_*}` accepted as a back-compat alias) still runs regardless."
       },
       "query": {
         "type": "string",
