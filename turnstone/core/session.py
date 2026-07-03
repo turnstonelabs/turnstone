@@ -7139,6 +7139,44 @@ class ChatSession:
                 return desc if isinstance(desc, str) else ""
         return ""
 
+    @staticmethod
+    def _project_edits_for_judge(edits: list[Any], budget: int) -> list[dict[str, Any]]:
+        """Project an ``edit_file`` edits list into the judge's argument view,
+        FIFO-truncated to *budget* characters of old/new text.
+
+        Each entry keeps ``old_string`` / ``new_string`` (each honestly
+        truncated when huge) and ``near_line``.  Once the budget is spent, the
+        remaining edits collapse to a single ``{"omitted_edits": N}`` marker so
+        the judge knows more edits follow rather than silently seeing a prefix.
+        The common case — a handful of small edits — fits the budget whole and
+        is projected verbatim, which is the fix for the incident where a
+        legitimate multi-edit call reached the judge as ``{"path": ...}`` alone.
+        """
+        from turnstone.core.judge import honest_truncate
+
+        projected: list[dict[str, Any]] = []
+        remaining = budget
+        for i, e in enumerate(edits):
+            if not isinstance(e, dict):
+                continue
+            # Always project the first edit (truncated if it alone exceeds the
+            # budget); collapse the tail only once the budget is exhausted.
+            if remaining <= 0 and projected:
+                projected.append({"omitted_edits": len(edits) - i})
+                break
+            old = str(e.get("old_string", ""))
+            new = str(e.get("new_string", ""))
+            per = max(remaining // 2, 0)
+            projected.append(
+                {
+                    "old_string": honest_truncate(old, per),
+                    "new_string": honest_truncate(new, per),
+                    "near_line": e.get("near_line"),
+                }
+            )
+            remaining -= len(old) + len(new)
+        return projected
+
     def _evaluate_intent(
         self,
         items: list[dict[str, Any]],
@@ -7168,97 +7206,165 @@ class ChatSession:
         if not pending:
             return None
 
-        # Build func_args from tool-specific item keys so the heuristic
-        # engine can pattern-match on argument content.
+        # Build func_args: the model-visible LOWERING of the pending call's
+        # arguments into the judge's context.  The full args always remain in
+        # the trajectory (the tool call itself); this dict is only the view the
+        # judge reasons over, and it is read by BOTH tiers with different needs
+        # — the heuristic engine regex-matches a narrow field (``_get_arg_text``
+        # reads only ``command`` for bash, ``path`` for write/edit_file), while
+        # the LLM judge sees this dict as its ENTIRE argument view
+        # (``judge._prepare_context`` serialises it straight into the prompt).
+        # Getting the lowering RIGHT is the whole fix: a path-only ``edit_file``
+        # projection made a live judge rule a legitimate multi-edit call
+        # "malformed — missing old_string/new_string" and deny it at 95%.
+        #
+        # Truncation here is a BACKSTOP, not a default.  Args lower whole; a
+        # field is honestly truncated (with a dropped-char marker) only when it
+        # genuinely exceeds ``arg_budget`` — the judge model's real context
+        # window (registry-sourced, not the static 200k caps default).  Normal
+        # args are never clipped; the record/stream copy carries its own OH CRAP
+        # backstop in judge.py, and the untruncated args stay in the trajectory.
+        from turnstone.core.judge import honest_truncate
+
+        arg_budget = judge.arg_budget_chars()
         for it in pending:
             name = it.get("func_name", "")
             if name == "bash":
-                it["func_args"] = {"command": it.get("command", "")}
-            elif name in ("write_file", "edit_file", "read_file"):
+                it["func_args"] = {
+                    "command": it.get("command", ""),
+                    "timeout": it.get("timeout"),
+                    "stop_on_error": bool(it.get("stop_on_error")),
+                }
+            elif name == "write_file":
+                it["func_args"] = {
+                    "path": it.get("path", ""),
+                    "content": honest_truncate(it.get("content") or "", arg_budget),
+                    "append": bool(it.get("append")),
+                }
+            elif name == "edit_file":
+                it["func_args"] = {
+                    "path": it.get("path", ""),
+                    "edits": self._project_edits_for_judge(it.get("edits") or [], arg_budget),
+                    "replace_all": bool(it.get("replace_all")),
+                }
+            elif name == "read_file":
                 it["func_args"] = {"path": it.get("path", "")}
             elif name == "web_fetch":
                 it["func_args"] = {"url": it.get("url", ""), "question": it.get("question", "")}
             elif name == "web_search":
                 it["func_args"] = {"query": it.get("query", ""), "category": it.get("category", "")}
             elif name == "skills":
-                # Projection for judge / audit on the model-facing skills
-                # tool. Mutating actions surface name + action + a snippet
-                # of the proposed content / fields so a heuristic rule can
-                # match on suspicious patterns (e.g. allowed_tools
-                # expansion).  Long fields are capped for verdict-row size.
+                # Projection for the judge / audit on the model-facing skills
+                # tool.  ``fa`` MUST be assigned back to the item at the end of
+                # this branch — an earlier revision built it and never did,
+                # leaving the judge to rule on every skills mutation with an
+                # empty ``{}`` argument view.  find/get/load are read-only
+                # (needs_approval=False) and never reach this loop; the
+                # create/update/enable/disable set does.
                 action_val = it.get("action", "")
                 fa: dict[str, Any] = {"action": action_val, "name": it.get("name", "")}
-                if action_val in ("find", "get"):
-                    pass
-                elif action_val == "load":
-                    pass  # name only — covers the surface
-                elif action_val == "create":
+                if action_val == "create":
                     fa["category"] = it.get("category", "")
                     fa["kind"] = it.get("kind", "")
-                    fa["description"] = (it.get("description") or "")[:200]
-                    fa["content"] = (it.get("content") or "")[:400]
+                    # Both lower whole up to the judge window; the projection
+                    # only truncates when a field genuinely exceeds it.  (The
+                    # two fields sharing the budget is bounded by the window:
+                    # each ≤ window·ratio, and _prepare_context shrinks history
+                    # to fit whatever the args consume.)
+                    fa["description"] = honest_truncate(it.get("description") or "", arg_budget)
+                    fa["content"] = honest_truncate(it.get("content") or "", arg_budget)
                     fa["projected_risk"] = it.get("projected_risk", "")
+                    # allowed_tools + auto_approve are THE self-escalation risk
+                    # signal for a model-authored skill (auto_approve + a tool
+                    # allowlist means those tools auto-fire when the skill later
+                    # loads).  The approval card already warns on it; the judge
+                    # was blind to it.
+                    sf = it.get("session_fields")
+                    if isinstance(sf, dict):
+                        if sf.get("allowed_tools") and sf.get("allowed_tools") != "[]":
+                            fa["allowed_tools"] = sf.get("allowed_tools")
+                        if sf.get("auto_approve"):
+                            fa["auto_approve"] = True
+                        if sf.get("activation"):
+                            fa["activation"] = sf.get("activation")
                 elif action_val == "update":
                     upd = it.get("updates") or {}
                     fa["updated_fields"] = sorted(upd.keys()) if isinstance(upd, dict) else []
-                    if isinstance(upd, dict) and "content" in upd:
-                        fa["content"] = (upd.get("content") or "")[:400]
+                    if isinstance(upd, dict):
+                        if "content" in upd:
+                            fa["content"] = honest_truncate(upd.get("content") or "", arg_budget)
+                        if upd.get("allowed_tools") and upd.get("allowed_tools") != "[]":
+                            fa["allowed_tools"] = upd.get("allowed_tools")
+                        if "auto_approve" in upd:
+                            fa["auto_approve"] = bool(upd.get("auto_approve"))
                     fa["projected_risk"] = it.get("projected_risk", "")
                     fa["current_risk"] = it.get("current_risk", "")
                 elif action_val in ("enable", "disable"):
-                    pass  # name + action is the auditable surface
+                    # Re-enabling a model-planted high/critical skill is the
+                    # attack this projection must expose: surface the existing
+                    # skill's stored risk tier + auto_approve (stashed by
+                    # ``_prepare_skills_toggle``) so the judge weighs WHAT is
+                    # being re-enabled, not just its name.
+                    if it.get("risk_level"):
+                        fa["risk_level"] = it.get("risk_level")
+                    if it.get("auto_approve"):
+                        fa["auto_approve"] = True
+                it["func_args"] = fa
             elif name == "watch":
                 it["func_args"] = {
                     "action": it.get("action", ""),
                     "command": it.get("command", ""),
                     "name": it.get("watch_name", ""),
+                    "stop_on": it.get("stop_on"),
+                    "max_polls": it.get("max_polls"),
+                    "interval_secs": it.get("interval_secs"),
                 }
-            elif name == "notify":
-                it["func_args"] = {"message": (it.get("message") or "")[:200]}
             elif name == "task_agent":
                 # Pending items reach this point already shaped by
                 # ``_prepare_task``, so ``it["skill"]`` is the resolved
                 # skill_data dict (or ``None``), not the raw string the
                 # LLM passed.  Mirror the ``spawn_workstream`` projection
                 # so heuristic ``arg_pattern`` rules can match on skill
-                # name and the judge / audit row sees which persona was
-                # selected.
+                # name and the judge / audit row sees which persona and
+                # model override were selected.
                 skill_dict = it.get("skill") or {}
                 it["func_args"] = {
-                    "prompt": (it.get("prompt") or "")[:200],
+                    "prompt": honest_truncate(it.get("prompt") or "", arg_budget),
                     "skill": skill_dict.get("name", "") if isinstance(skill_dict, dict) else "",
+                    "model_override": it.get("model_override") or "",
                 }
             # Coordinator tool args — only the ``needs_approval=True`` set
             # reaches this point (read-only inspect / list_* / wait
             # tools are filtered above), so this matches the auditable
-            # surface 1:1. Free-form fields capped to keep the verdict
-            # row size bounded.
+            # surface 1:1. Free-form fields truncated to the judge window.
             elif name == "spawn_workstream":
                 it["func_args"] = {
                     "skill": it.get("skill", ""),
-                    "initial_message": (it.get("initial_message") or "")[:200],
+                    "initial_message": honest_truncate(it.get("initial_message") or "", arg_budget),
                     "target_node": it.get("target_node", ""),
                     "name": it.get("name", ""),
                     "model": it.get("model", ""),
+                    "project": it.get("project", ""),
                 }
             elif name == "spawn_batch":
                 # Project every child so the judge sees the full fan-out.
                 # First-child-only projection (the prior shape) hid a
                 # malicious mid-batch entry from both heuristic and LLM
-                # tiers. Tool schema caps ``children`` at 10, so worst
-                # case is ~3 KiB of JSON in the verdict row — comparable
-                # to the existing ``reasoning`` / ``evidence`` fields.
-                # ``name`` (cosmetic) and ``model`` (registry alias)
-                # skipped to keep the payload lean; risk-relevant fields
-                # are skill, initial_message, target_node.
+                # tiers.  The judge window is split evenly across children so
+                # the total stays bounded regardless of child count; each
+                # ``initial_message`` is honestly truncated to its share.
+                # ``name`` (cosmetic) and ``model`` (registry alias) skipped
+                # to keep the payload lean; risk-relevant fields are skill,
+                # initial_message, target_node.
                 children = it.get("children") or []
+                per_child = max(arg_budget // max(len(children), 1), 0)
                 it["func_args"] = {
                     "child_count": len(children),
                     "children": [
                         {
                             "skill": c.get("skill", "") if isinstance(c, dict) else "",
                             "initial_message": (
-                                (c.get("initial_message") or "")[:200]
+                                honest_truncate(c.get("initial_message") or "", per_child)
                                 if isinstance(c, dict)
                                 else ""
                             ),
@@ -7272,31 +7378,55 @@ class ChatSession:
             elif name == "send_to_workstream":
                 it["func_args"] = {
                     "ws_id": it.get("ws_id", ""),
-                    "message": (it.get("message") or "")[:200],
+                    "message": honest_truncate(it.get("message") or "", arg_budget),
                 }
             elif name == "close_workstream":
                 it["func_args"] = {
                     "ws_id": it.get("ws_id", ""),
-                    "reason": (it.get("reason") or "")[:200],
+                    "reason": honest_truncate(it.get("reason") or "", arg_budget),
                 }
             elif name == "close_all_children":
-                it["func_args"] = {"reason": (it.get("reason") or "")[:200]}
+                it["func_args"] = {"reason": honest_truncate(it.get("reason") or "", arg_budget)}
             elif name in ("cancel_workstream", "delete_workstream"):
                 it["func_args"] = {"ws_id": it.get("ws_id", "")}
             elif name == "tasks":
-                # ``title`` is optional on update — _prepare_tasks stores
-                # ``None`` when omitted, so dict.get(x, "") returns None
-                # (not the default) and slicing crashes.  Collapse via
-                # ``or ""`` so absent and explicit-None both fall back to
-                # empty string.  The other projections above use the same
-                # pattern defensively — a future preparer that stores
-                # None for any of these fields shouldn't take down the
-                # whole batch (every sibling tool call gets reported as
-                # cancelled) on a single missing optional field.
+                # ``reorder`` carries the full ordering; add/update/remove carry
+                # a task_id + the fields being set.  ``title``/``status``/
+                # ``child_ws_id`` are optional on update — _prepare_tasks stores
+                # ``None`` when omitted.  Never slice a maybe-None field (a
+                # single missing optional once crashed the whole batch, marking
+                # every sibling call cancelled): title collapses via ``or ""``
+                # before truncation; status/child_ws_id pass through as-is so a
+                # ``null`` honestly reads as "unchanged" rather than "set empty".
+                action_val = it.get("action", "")
+                fa_tasks: dict[str, Any] = {"action": action_val}
+                if action_val == "reorder":
+                    fa_tasks["task_ids"] = it.get("task_ids") or []
+                else:
+                    fa_tasks["task_id"] = it.get("task_id", "")
+                    fa_tasks["title"] = honest_truncate(it.get("title") or "", arg_budget)
+                    if "status" in it:
+                        fa_tasks["status"] = it.get("status")
+                    if "child_ws_id" in it:
+                        fa_tasks["child_ws_id"] = it.get("child_ws_id")
+                it["func_args"] = fa_tasks
+            elif name == "read_resource":
+                # Gated MCP resource read.  The URI is the risk surface
+                # (file:///etc/shadow, an SSRF-shaped http URI) and is what
+                # both tiers must see — without this branch the item carries
+                # only ``resource_uri``/``mcp_user_id`` (no ``mcp_args``), so it
+                # fell past the fallback below and reached the judge as ``{}``.
+                it["func_args"] = {"uri": it.get("resource_uri", "")}
+            elif name == "use_prompt":
+                # Gated MCP prompt invocation.  Name + arguments are the surface
+                # (a prompt can carry injection through its arguments); same
+                # empty-{} starvation as read_resource without this branch.
                 it["func_args"] = {
-                    "action": it.get("action", ""),
-                    "task_id": it.get("task_id", ""),
-                    "title": (it.get("title") or "")[:100],
+                    "prompt_name": it.get("prompt_name", ""),
+                    "prompt_arguments": honest_truncate(
+                        json.dumps(it.get("prompt_arguments") or {}, ensure_ascii=False),
+                        arg_budget,
+                    ),
                 }
             elif it.get("mcp_args"):
                 it["func_args"] = it["mcp_args"]
@@ -11646,6 +11776,11 @@ class ChatSession:
             "action": verb,
             "name": name,
             "template_id": existing["template_id"],
+            # Surfaced to the judge's func_args projection: re-enabling a
+            # model-planted high/critical (or auto_approve) skill is the attack
+            # the intent judge must be able to see, not just the name.
+            "risk_level": existing_risk,
+            "auto_approve": bool(existing.get("auto_approve")),
         }
 
     def _exec_skills_toggle(self, item: dict[str, Any], *, enable: bool) -> tuple[str, str]:

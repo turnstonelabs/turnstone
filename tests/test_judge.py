@@ -476,6 +476,65 @@ class TestContextPreparation:
         assert "Conversation context:" in result[1]["content"]
 
 
+class TestArgBudget:
+    """The projected ``func_args`` and the conversation transcript share the
+    judge model's context window; large arguments are honestly truncated to it
+    rather than blind-capped."""
+
+    def test_honest_truncate_verbatim_when_it_fits(self):
+        from turnstone.core.judge import honest_truncate
+
+        assert honest_truncate("short", 100) == "short"
+
+    def test_honest_truncate_reports_exact_omitted_count(self):
+        from turnstone.core.judge import honest_truncate
+
+        out = honest_truncate("A" * 5000, 1000)
+        assert out.startswith("A" * 1000)
+        assert "4,000 of 5,000 chars omitted" in out
+
+    def test_arg_budget_scales_with_context_window_uncapped(self):
+        """The judge-prompt budget scales with the real window and is NOT
+        ceilinged — a big-window judge gets a proportionally big budget so args
+        lower whole; only a genuine overflow truncates."""
+        from turnstone.core.judge import _ARG_CONTEXT_RATIO, _CHARS_PER_TOKEN
+
+        judge = _make_judge()
+        judge._judge_context_window = 40_000
+        small = judge.arg_budget_chars()
+        judge._judge_context_window = 200_000
+        big = judge.arg_budget_chars()
+        assert small == int(40_000 * _ARG_CONTEXT_RATIO * _CHARS_PER_TOKEN)
+        assert big == int(200_000 * _ARG_CONTEXT_RATIO * _CHARS_PER_TOKEN)  # no ceiling
+
+    def test_verdict_record_copy_is_capped_by_oh_crap_backstop(self):
+        """The func_args stored on the verdict (persisted + streamed) is bounded
+        by _VERDICT_ARG_CAP even when the args are enormous — the judge PROMPT
+        is bounded separately by the window, not by this cap."""
+        from turnstone.core.judge import _VERDICT_ARG_CAP, evaluate_heuristic
+
+        v = evaluate_heuristic("write_file", {"content": "Z" * 40_000}, "write_file", "c1")
+        assert len(v.func_args) <= _VERDICT_ARG_CAP + 80  # payload + honest marker
+        assert "chars omitted" in v.func_args
+
+    def test_large_args_shrink_the_history_they_share_the_window_with(self):
+        """A big write/edit must eat into the transcript budget, not push the
+        prompt past the window."""
+        judge = _make_judge()
+        # One anchor user turn (the judge trims to the last user message
+        # onward), then many assistant turns that compete for the budget.
+        messages: list[dict[str, Any]] = [{"role": "user", "content": "anchor"}]
+        messages += [{"role": "assistant", "content": "x" * 1000} for _ in range(50)]
+
+        small = judge._prepare_context(_make_item(func_args={"command": "ls"}), messages)
+        big = judge._prepare_context(
+            _make_item(func_name="write_file", func_args={"content": "Z" * 200_000}), messages
+        )
+        # Each included history turn renders one "ASSISTANT:" line; the
+        # big-argument call fits strictly fewer of them.
+        assert big[1]["content"].count("ASSISTANT:") < small[1]["content"].count("ASSISTANT:")
+
+
 # ---------------------------------------------------------------------------
 # Confidence arbitration
 # ---------------------------------------------------------------------------
@@ -874,6 +933,27 @@ class TestModelAliasResolution:
         assert judge._client_factory_args["base_url"] == "https://alias.example/v1"
         assert judge._client_factory_args["api_key"] == "alias-key"
         assert judge._client_factory_args["provider_name"] == "openai"
+
+    def test_alias_window_comes_from_registry_config_not_provider_caps(self):
+        """The judge window must come from the registry's ModelConfig
+        (cfg.context_window=50_000 here), NOT provider.get_capabilities(), which
+        returns a static 200000 for every local model and would over-budget a
+        small local judge into overflow."""
+        alias_provider = _make_mock_provider()
+        alias_provider.provider_name = "openai"
+        # If the code (wrongly) consulted caps, it'd read this fictitious 200k.
+        alias_provider.get_capabilities = MagicMock(return_value=MagicMock(context_window=200_000))
+        alias_client = MagicMock(base_url="https://alias/v1", api_key="k")
+        registry = self._make_alias_registry("judge-mini", alias_provider, alias_client, "local-9b")
+        judge = IntentJudge(
+            config=JudgeConfig(enabled=True, model="judge-mini"),
+            session_provider=_make_mock_provider(),
+            session_client=MagicMock(base_url="https://s/v1", api_key="s"),
+            session_model="session-model",
+            context_window=100_000,
+            model_registry=registry,
+        )
+        assert judge._judge_context_window == 50_000
 
     def test_unknown_alias_inherits_session_model(self):
         """``judge.model`` is alias-only.  A value that doesn't resolve

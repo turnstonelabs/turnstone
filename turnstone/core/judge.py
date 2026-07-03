@@ -725,10 +725,15 @@ def evaluate_heuristic(
 
     arg_text = _get_arg_text(func_name, func_args)
     arg_snippet = _summarize_args(func_args)
+    # Rule matching runs against the FULL args (arg_text / the func_args dict);
+    # only the copy stored on the verdict — persisted + streamed, frontend-
+    # unread — carries the OH CRAP backstop.  The judge prompt is unaffected.
     try:
-        func_args_json = json.dumps(func_args, ensure_ascii=False, separators=(",", ":"))
+        func_args_json = honest_truncate(
+            json.dumps(func_args, ensure_ascii=False, separators=(",", ":")), _VERDICT_ARG_CAP
+        )
     except (TypeError, ValueError):
-        func_args_json = str(func_args)
+        func_args_json = honest_truncate(str(func_args), _VERDICT_ARG_CAP)
 
     for rule in rules if rules is not None else _HEURISTIC_RULES:
         if _match_rule(rule, func_name, func_args, approval_label, arg_text):
@@ -797,6 +802,48 @@ _JUDGE_MAX_TURNS = 5
 
 # Approximate characters per token for context budget estimation
 _CHARS_PER_TOKEN = 3.5
+
+# Fraction of the judge model's context window given to the pending call's
+# argument surface (``func_args``) in the judge PROMPT.  Args get this slice
+# (0.25); the conversation transcript gets ``max_context_ratio`` (0.5); and
+# ``_prepare_context`` deducts the rendered args from the transcript budget so
+# the two never jointly overrun the window.  Sized so a small-window local
+# judge (a 9B model at ~40k → ~35 KB of args) still sees whole normal arguments
+# and a 200k judge sees whole large file bodies — the budget scales with the
+# model rather than a fixed cap that would starve one and overflow another;
+# truncation happens only on genuine overflow of the real window.
+_ARG_CONTEXT_RATIO = 0.25
+
+# "OH CRAP" backstop on the argument copy that rides the VERDICT — persisted to
+# ``intent_verdicts.func_args`` and streamed over SSE.  This is NOT the judge's
+# view: the judge prompt lowers args whole up to its real context window (see
+# ``arg_budget_chars`` / the projection in ``_evaluate_intent``).  This cap
+# bounds only the record + stream, and only against a model emitting an insane
+# payload — 16 KB is far above any realistic argument; beyond it the frontend
+# never reads the field anyway, and the FULL args remain in the trajectory.
+_VERDICT_ARG_CAP = 16384
+
+
+def honest_truncate(text: str, budget: int) -> str:
+    """Return *text* untouched when it fits *budget* characters, otherwise the
+    leading ``budget`` characters followed by an explicit note of exactly how
+    many characters were dropped.
+
+    The judge reasons about the argument surface it is shown; a silent
+    ``text[:400]`` slice reads to the model as *the whole argument*, which is
+    how a legitimate 5-KB file write gets judged as if it were 400 bytes.  The
+    marker makes the omission legible — the judge knows content continues and
+    can weigh the truncation into its verdict rather than treating the fragment
+    as complete.  Reason-neutral, since the same helper bounds both the judge
+    prompt (fit the window) and the verdict record (the OH CRAP backstop).
+    """
+    if budget < 0:
+        budget = 0
+    if len(text) <= budget:
+        return text
+    omitted = len(text) - budget
+    return f"{text[:budget]}…[{omitted:,} of {len(text):,} chars omitted]"
+
 
 _JUDGE_TOOL_SCHEMAS: list[dict[str, Any]] = [
     {
@@ -927,15 +974,25 @@ class IntentJudge:
         if config.model and model_registry is not None:
             try:
                 if model_registry.has_alias(config.model):
-                    client, model_name, _ = model_registry.resolve(config.model)
+                    client, model_name, model_cfg = model_registry.resolve(config.model)
                     self._provider = model_registry.get_provider(config.model)
                     self._client_factory_args = self._extract_client_config(
                         client,
                         self._provider.provider_name,
                     )
                     self._model = model_name
-                    caps = self._provider.get_capabilities(self._model)
-                    self._judge_context_window = caps.context_window
+                    # Use the registry's per-model context window, NOT
+                    # ``provider.get_capabilities().context_window``: the static
+                    # capability table returns 200000 for every model absent
+                    # from it (i.e. every local / self-hosted judge), so keying
+                    # the budget off it silently over-budgets a small local
+                    # judge into overflow.  ModelConfig.context_window is the
+                    # operator-configured / auto-detected real window.  getattr
+                    # guard: a malformed ModelConfig degrades the window, it must
+                    # not abort resolution.
+                    self._judge_context_window = getattr(
+                        model_cfg, "context_window", context_window
+                    )
                     resolved = True
             except Exception:
                 log.debug("Model alias resolution failed for %r, falling back", config.model)
@@ -1171,10 +1228,15 @@ class IntentJudge:
             except (json.JSONDecodeError, TypeError):
                 func_args = {}
         call_id = item.get("call_id", item.get("tool_call_id", ""))
+        # ``func_args_json`` is the verdict's record copy (persisted + streamed,
+        # frontend-unread) — OH CRAP backstop only.  The judge PROMPT gets the
+        # full window-scaled projection via ``_prepare_context(item, ...)``.
         try:
-            func_args_json = json.dumps(func_args, ensure_ascii=False, separators=(",", ":"))
+            func_args_json = honest_truncate(
+                json.dumps(func_args, ensure_ascii=False, separators=(",", ":")), _VERDICT_ARG_CAP
+            )
         except (TypeError, ValueError):
-            func_args_json = str(func_args)
+            func_args_json = honest_truncate(str(func_args), _VERDICT_ARG_CAP)
 
         # Prepare context
         judge_messages = self._prepare_context(item, messages)
@@ -1381,16 +1443,27 @@ class IntentJudge:
         )
         return None
 
+    def arg_budget_chars(self) -> int:
+        """Character budget for the pending call's projected ``func_args``.
+
+        Scales with the judge model's context window (see
+        :data:`_ARG_CONTEXT_RATIO`) so callers can truncate large argument
+        fields — a file body, a batch of edits — to what *this* judge can
+        actually read, rather than a fixed cap that starves a 200k model and
+        overflows a 4k one.  Used by the session's projection step; the judge
+        re-shares the same window in :meth:`_prepare_context`.  No fixed
+        ceiling: args lower whole up to the judge's real window, and only a
+        genuine window overflow forces an honest, marked truncation — the
+        record/stream copy is bounded separately (see :data:`_VERDICT_ARG_CAP`).
+        """
+        return int(self._judge_context_window * _ARG_CONTEXT_RATIO * _CHARS_PER_TOKEN)
+
     def _prepare_context(
         self,
         item: dict[str, Any],
         messages: list[dict[str, Any]],
     ) -> list[dict[str, Any]]:
         """Build the judge's message list with FIFO-truncated conversation."""
-        # Calculate token budget for conversation history
-        budget_tokens = int(self._judge_context_window * self._config.max_context_ratio)
-        budget_chars = int(budget_tokens * _CHARS_PER_TOKEN)
-
         # Build user message with tool call details
         func_name = item.get("func_name", item.get("name", ""))
         func_args = item.get("func_args", {})
@@ -1407,6 +1480,16 @@ class IntentJudge:
             f"Arguments:\n```json\n"
             f"{json.dumps(func_args, indent=2, ensure_ascii=False)}\n```"
         )
+
+        # Calculate the character budget for conversation history.  The
+        # arguments (``tool_detail``) and the transcript share the same
+        # context slice, so deduct what the arguments already consume — a
+        # large but budgeted write/edit shrinks the history it competes with
+        # instead of pushing the prompt past the window.  Floor keeps at least
+        # a minimal transcript even when the arguments are unusually large.
+        budget_tokens = int(self._judge_context_window * self._config.max_context_ratio)
+        budget_chars = int(budget_tokens * _CHARS_PER_TOKEN)
+        budget_chars = max(budget_chars - len(tool_detail), budget_chars // 5)
 
         # Trim to messages from the last user message onward — the judge
         # only needs the immediate request context, not the full history.

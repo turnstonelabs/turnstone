@@ -6,7 +6,7 @@ import json
 import subprocess
 import time
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, ClassVar
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -448,6 +448,7 @@ class TestTaskExec:
         fake_verdict.to_dict.return_value = {"verdict_id": "v0", "tier": "heuristic"}
         fake_judge = MagicMock()
         fake_judge.evaluate.side_effect = lambda items, *_a, **_kw: [fake_verdict] * len(items)
+        fake_judge.arg_budget_chars.return_value = 200_000
         monkeypatch.setattr(session, "_ensure_judge", lambda: fake_judge)
 
         skill = {"name": "research", "content": "# Research", "enabled": True}
@@ -468,6 +469,7 @@ class TestTaskExec:
         fake_verdict.to_dict.return_value = {"verdict_id": "v0", "tier": "heuristic"}
         fake_judge = MagicMock()
         fake_judge.evaluate.side_effect = lambda items, *_a, **_kw: [fake_verdict] * len(items)
+        fake_judge.arg_budget_chars.return_value = 200_000
         monkeypatch.setattr(session, "_ensure_judge", lambda: fake_judge)
 
         item = session._prepare_task("c1", {"prompt": "do x"})
@@ -603,6 +605,383 @@ class TestTaskExec:
         event = self._drive_gate(session, monkeypatch, cancel_on_approval=True)
         assert event is not None
         assert event.is_set()
+
+
+# ---------------------------------------------------------------------------
+# func_args projection for the intent judge
+# ---------------------------------------------------------------------------
+
+
+def _project_func_args(item: dict[str, Any], *, budget: int = 200_000) -> Any:
+    """Run *item* through ``_evaluate_intent`` with a stub judge and return the
+    ``func_args`` the judge would be handed — its ENTIRE view of the call's
+    arguments.  ``budget`` stands in for the judge model's context window so
+    truncation behaviour is testable without a live model."""
+    session = _make_session()
+    fake_verdict = MagicMock()
+    fake_verdict.to_dict.return_value = {"verdict_id": "v0", "tier": "heuristic"}
+    fake_judge = MagicMock()
+    fake_judge.evaluate.side_effect = lambda items, *_a, **_kw: [fake_verdict] * len(items)
+    fake_judge.arg_budget_chars.return_value = budget
+    session._ensure_judge = lambda: fake_judge  # type: ignore[method-assign]
+    session._evaluate_intent([item])
+    return item.get("func_args", "<<UNSET>>")
+
+
+class TestEvaluateIntentProjection:
+    """The projection block in ``_evaluate_intent`` is the judge's only view of
+    a pending call's arguments.  A narrow projection silently starves the judge:
+    a live 9B judge denied a legitimate multi-edit ``edit_file`` at 95% because
+    it received ``{"path": ...}`` with no ``edits``.  These pin the full risk
+    surface per tool, the None-safety the batch depends on, and the
+    context-window-budgeted honest truncation."""
+
+    # -- the incident: edit_file must carry its edits ----------------------
+
+    def test_edit_file_projects_edits_not_just_path(self) -> None:
+        """Regression for the false-deny incident: the judge must see the
+        old_string/new_string pairs, not a bare path."""
+        item = {
+            "call_id": "c1",
+            "func_name": "edit_file",
+            "needs_approval": True,
+            "path": "/workspace/contextllens/contextllens.py",
+            "edits": [
+                {"old_string": "if first_token_ts", "new_string": "ttft = ...", "near_line": 42},
+            ],
+            "replace_all": False,
+        }
+        fa = _project_func_args(item)
+        assert fa["path"].endswith("contextllens.py")
+        assert fa["edits"][0]["old_string"] == "if first_token_ts"
+        assert fa["edits"][0]["new_string"] == "ttft = ..."
+        assert fa["edits"][0]["near_line"] == 42
+        assert fa["replace_all"] is False
+
+    # -- skills: the dead-assignment bug -----------------------------------
+
+    def test_skills_create_projection_is_not_empty(self) -> None:
+        """``fa`` was built and never assigned — the judge saw ``{}`` for every
+        skills mutation.  It must now carry the full create surface."""
+        item = {
+            "call_id": "c1",
+            "func_name": "skills",
+            "needs_approval": True,
+            "action": "create",
+            "name": "helper",
+            "category": "general",
+            "kind": "any",
+            "description": "does things",
+            "content": "# Helper\nrun stuff",
+            "projected_risk": "medium",
+        }
+        fa = _project_func_args(item)
+        assert fa != {}
+        assert fa["action"] == "create"
+        assert fa["name"] == "helper"
+        assert fa["content"] == "# Helper\nrun stuff"
+        assert fa["projected_risk"] == "medium"
+
+    def test_skills_create_surfaces_self_escalation_signal(self) -> None:
+        """allowed_tools + auto_approve is the skills self-escalation risk the
+        approval card warns on; the judge must see it too."""
+        item = {
+            "call_id": "c1",
+            "func_name": "skills",
+            "needs_approval": True,
+            "action": "create",
+            "name": "sneaky",
+            "content": "x",
+            "projected_risk": "critical",
+            "session_fields": {
+                "allowed_tools": '["bash"]',
+                "auto_approve": True,
+                "activation": "default",
+            },
+        }
+        fa = _project_func_args(item)
+        assert fa["allowed_tools"] == '["bash"]'
+        assert fa["auto_approve"] is True
+        assert fa["activation"] == "default"
+
+    def test_skills_update_projects_updated_fields_and_allowed_tools(self) -> None:
+        item = {
+            "call_id": "c1",
+            "func_name": "skills",
+            "needs_approval": True,
+            "action": "update",
+            "name": "helper",
+            "updates": {"content": "new body", "allowed_tools": '["bash"]', "auto_approve": True},
+            "projected_risk": "high",
+            "current_risk": "low",
+        }
+        fa = _project_func_args(item)
+        assert fa["updated_fields"] == ["allowed_tools", "auto_approve", "content"]
+        assert fa["content"] == "new body"
+        assert fa["allowed_tools"] == '["bash"]'
+        assert fa["auto_approve"] is True
+        assert fa["projected_risk"] == "high"
+        assert fa["current_risk"] == "low"
+
+    def test_skills_enable_surfaces_stored_risk_and_auto_approve(self) -> None:
+        """Re-enabling a planted critical/auto_approve skill is the attack —
+        the judge must see WHAT is being re-enabled, not just the name."""
+        item = {
+            "call_id": "c1",
+            "func_name": "skills",
+            "needs_approval": True,
+            "action": "enable",
+            "name": "planted",
+            "risk_level": "critical",
+            "auto_approve": True,
+        }
+        fa = _project_func_args(item)
+        assert fa["action"] == "enable"
+        assert fa["name"] == "planted"
+        assert fa["risk_level"] == "critical"
+        assert fa["auto_approve"] is True
+
+    # -- write_file / bash content and control fields ----------------------
+
+    def test_write_file_projects_content_and_append(self) -> None:
+        item = {
+            "call_id": "c1",
+            "func_name": "write_file",
+            "needs_approval": True,
+            "path": "/etc/hosts",
+            "content": "127.0.0.1 evil.example",
+            "append": True,
+        }
+        fa = _project_func_args(item)
+        assert fa["content"] == "127.0.0.1 evil.example"
+        assert fa["append"] is True
+
+    def test_bash_projects_timeout_and_stop_on_error(self) -> None:
+        item = {
+            "call_id": "c1",
+            "func_name": "bash",
+            "needs_approval": True,
+            "command": "make build",
+            "timeout": 120,
+            "stop_on_error": True,
+        }
+        fa = _project_func_args(item)
+        assert fa["command"] == "make build"
+        assert fa["timeout"] == 120
+        assert fa["stop_on_error"] is True
+
+    def test_task_agent_projects_model_override(self) -> None:
+        item = {
+            "call_id": "c1",
+            "func_name": "task_agent",
+            "needs_approval": True,
+            "prompt": "investigate",
+            "skill": {"name": "research"},
+            "model_override": "gpt-5",
+        }
+        fa = _project_func_args(item)
+        assert fa["model_override"] == "gpt-5"
+        assert fa["skill"] == "research"
+
+    def test_watch_projects_stop_on_and_limits(self) -> None:
+        item = {
+            "call_id": "c1",
+            "func_name": "watch",
+            "needs_approval": True,
+            "action": "create",
+            "command": "curl health",
+            "watch_name": "hc",
+            "stop_on": "status==200",
+            "max_polls": 50,
+            "interval_secs": 300,
+        }
+        fa = _project_func_args(item)
+        assert fa["stop_on"] == "status==200"
+        assert fa["max_polls"] == 50
+        assert fa["interval_secs"] == 300
+
+    def test_spawn_workstream_projects_project(self) -> None:
+        item = {
+            "call_id": "c1",
+            "func_name": "spawn_workstream",
+            "needs_approval": True,
+            "skill": "x",
+            "initial_message": "go",
+            "target_node": "n1",
+            "name": "w",
+            "model": "m",
+            "project": "proj-42",
+        }
+        fa = _project_func_args(item)
+        assert fa["project"] == "proj-42"
+
+    # -- gated MCP tools: read_resource / use_prompt -----------------------
+
+    def test_read_resource_projects_uri(self) -> None:
+        """The URI is the risk surface (file:///etc/shadow, SSRF-shaped http).
+        Without a branch this reached the judge as {}."""
+        item = {
+            "call_id": "c1",
+            "func_name": "read_resource",
+            "needs_approval": True,
+            "resource_uri": "file:///etc/shadow",
+        }
+        fa = _project_func_args(item)
+        assert fa == {"uri": "file:///etc/shadow"}
+
+    def test_use_prompt_projects_name_and_arguments(self) -> None:
+        item = {
+            "call_id": "c1",
+            "func_name": "use_prompt",
+            "needs_approval": True,
+            "prompt_name": "summarize",
+            "prompt_arguments": {"topic": "secrets"},
+        }
+        fa = _project_func_args(item)
+        assert fa["prompt_name"] == "summarize"
+        assert "secrets" in fa["prompt_arguments"]
+
+    # -- tasks: status / child_ws_id / ordering + None-safety --------------
+
+    def test_tasks_add_projects_status_and_child_ws_id(self) -> None:
+        item = {
+            "call_id": "c1",
+            "func_name": "tasks",
+            "needs_approval": True,
+            "action": "add",
+            "title": "ship it",
+            "status": "in_progress",
+            "child_ws_id": "ws-9",
+        }
+        fa = _project_func_args(item)
+        assert fa["title"] == "ship it"
+        assert fa["status"] == "in_progress"
+        assert fa["child_ws_id"] == "ws-9"
+
+    def test_tasks_update_passes_none_status_through_without_crashing(self) -> None:
+        """_prepare_tasks stores None for omitted update fields; the projection
+        must not slice them (a single None once cancelled the whole batch)."""
+        item = {
+            "call_id": "c1",
+            "func_name": "tasks",
+            "needs_approval": True,
+            "action": "update",
+            "task_id": "t1",
+            "title": None,
+            "status": None,
+            "child_ws_id": None,
+        }
+        fa = _project_func_args(item)
+        assert fa["task_id"] == "t1"
+        assert fa["title"] == ""  # None → "" (title is truncatable text)
+        assert fa["status"] is None  # passthrough — null == "unchanged"
+        assert fa["child_ws_id"] is None
+
+    def test_tasks_reorder_projects_full_ordering(self) -> None:
+        item = {
+            "call_id": "c1",
+            "func_name": "tasks",
+            "needs_approval": True,
+            "action": "reorder",
+            "task_ids": ["t3", "t1", "t2"],
+        }
+        fa = _project_func_args(item)
+        assert fa["task_ids"] == ["t3", "t1", "t2"]
+
+    # -- context-window-budgeted honest truncation -------------------------
+
+    def test_small_content_is_not_truncated(self) -> None:
+        item = {
+            "call_id": "c1",
+            "func_name": "write_file",
+            "needs_approval": True,
+            "path": "/f",
+            "content": "small body",
+        }
+        fa = _project_func_args(item, budget=200_000)
+        assert fa["content"] == "small body"
+        assert "omitted" not in fa["content"]
+
+    def test_large_content_truncated_to_budget_with_honest_marker(self) -> None:
+        body = "A" * 5000
+        item = {
+            "call_id": "c1",
+            "func_name": "write_file",
+            "needs_approval": True,
+            "path": "/f",
+            "content": body,
+        }
+        fa = _project_func_args(item, budget=1000)
+        assert fa["content"].startswith("A" * 1000)
+        # honest about exactly how much was dropped
+        assert "4,000 of 5,000 chars omitted" in fa["content"]
+
+    def test_edit_projection_marks_overflow_when_budget_exhausted(self) -> None:
+        """A batch of huge edits collapses its tail to an honest count rather
+        than silently showing only a prefix of the list."""
+        edits = [
+            {"old_string": "X" * 4000, "new_string": "Y" * 4000, "near_line": None}
+            for _ in range(5)
+        ]
+        item = {
+            "call_id": "c1",
+            "func_name": "edit_file",
+            "needs_approval": True,
+            "path": "/f",
+            "edits": edits,
+            "replace_all": False,
+        }
+        fa = _project_func_args(item, budget=2000)
+        # first edit projected (truncated), tail collapsed to a marker entry
+        assert "old_string" in fa["edits"][0]
+        assert fa["edits"][-1].get("omitted_edits", 0) > 0
+
+    # -- systemic guard: no gated tool may project an empty view -----------
+
+    _GATED_ITEMS: ClassVar[list[dict[str, Any]]] = [
+        {"func_name": "bash", "command": "ls", "needs_approval": True},
+        {"func_name": "write_file", "path": "/f", "content": "c", "needs_approval": True},
+        {
+            "func_name": "edit_file",
+            "path": "/f",
+            "edits": [{"old_string": "a", "new_string": "b"}],
+            "needs_approval": True,
+        },
+        {
+            "func_name": "skills",
+            "action": "create",
+            "name": "s",
+            "content": "c",
+            "needs_approval": True,
+        },
+        {"func_name": "skills", "action": "enable", "name": "s", "needs_approval": True},
+        {"func_name": "task_agent", "prompt": "p", "needs_approval": True},
+        {"func_name": "watch", "action": "create", "command": "c", "needs_approval": True},
+        {"func_name": "spawn_workstream", "skill": "x", "needs_approval": True},
+        {"func_name": "send_to_workstream", "ws_id": "w", "message": "m", "needs_approval": True},
+        {"func_name": "close_workstream", "ws_id": "w", "needs_approval": True},
+        {"func_name": "cancel_workstream", "ws_id": "w", "needs_approval": True},
+        {"func_name": "tasks", "action": "add", "title": "t", "needs_approval": True},
+        {"func_name": "tasks", "action": "reorder", "task_ids": ["a"], "needs_approval": True},
+        # MCP resource read / prompt invocation — gated but set neither mcp_args
+        # nor func_args; without an explicit branch they reached the judge as {}.
+        {"func_name": "read_resource", "resource_uri": "file:///etc/x", "needs_approval": True},
+        {
+            "func_name": "use_prompt",
+            "prompt_name": "p",
+            "prompt_arguments": {},
+            "needs_approval": True,
+        },
+    ]
+
+    def test_no_gated_tool_projects_empty_func_args(self) -> None:
+        """If a gated tool ever projects ``{}`` (a forgotten branch or an
+        unassigned ``fa``), the judge rules on nothing — fail loudly here."""
+        for base in self._GATED_ITEMS:
+            item = {"call_id": "c1", **base}
+            fa = _project_func_args(item)
+            label = f"{base['func_name']}/{base.get('action', '')}"
+            assert isinstance(fa, dict) and fa, f"{label} projected empty func_args: {fa!r}"
 
 
 # ---------------------------------------------------------------------------

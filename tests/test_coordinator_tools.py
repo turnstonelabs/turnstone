@@ -1504,6 +1504,9 @@ def _stub_judge_for_evaluate_intent(monkeypatch, sess):
     fake_judge = MagicMock()
     # judge.evaluate(items, messages, callback=, cancel_event=) → list[verdict]
     fake_judge.evaluate.side_effect = lambda items, *_args, **_kw: [fake_verdict] * len(items)
+    # arg_budget_chars() feeds honest_truncate in the projection loop and must
+    # be a real int, not a MagicMock; large enough that nothing truncates.
+    fake_judge.arg_budget_chars.return_value = 200_000
     monkeypatch.setattr(sess, "_ensure_judge", lambda: fake_judge)
     return fake_judge
 
@@ -1545,7 +1548,10 @@ def test_spawn_batch_evaluate_intent_projects_all_children(coord_session, monkey
 
 def test_spawn_batch_evaluate_intent_truncates_long_messages(coord_session, monkeypatch):
     sess, _coord, _ui = coord_session
-    _stub_judge_for_evaluate_intent(monkeypatch, sess)
+    fake_judge = _stub_judge_for_evaluate_intent(monkeypatch, sess)
+    # Each child's initial_message is truncated to its share of the judge's
+    # arg budget (window-based), not a fixed cap, and the omission is honest.
+    fake_judge.arg_budget_chars.return_value = 300  # 1 child → 300 chars/child
     long_msg = "x" * 500
     item = sess._prepare_tool(
         _tc("spawn_batch", {"children": [{"initial_message": long_msg, "skill": "researcher"}]})
@@ -1554,9 +1560,9 @@ def test_spawn_batch_evaluate_intent_truncates_long_messages(coord_session, monk
 
     children = item["func_args"]["children"]
     assert len(children) == 1
-    # Cap is 200 chars — same shape every other coord-tool projection uses.
-    assert len(children[0]["initial_message"]) == 200
-    assert children[0]["initial_message"] == "x" * 200
+    msg = children[0]["initial_message"]
+    assert msg.startswith("x" * 300)
+    assert "200 of 500 chars omitted" in msg
 
 
 def test_spawn_batch_evaluate_intent_handles_empty_children_defensively(coord_session, monkeypatch):
@@ -1609,10 +1615,15 @@ def test_tasks_update_without_title_evaluates_intent_cleanly(coord_session, monk
     # The crash trigger: item["title"] is None after _prepare_tasks.
     assert item["title"] is None
     sess._evaluate_intent([item])
+    # title collapses None → "" (truncatable text); status is projected so the
+    # judge can see what state is being set; child_ws_id passes through as None
+    # ("unchanged"), never sliced.
     assert item["func_args"] == {
         "action": "update",
         "task_id": "tsk_1",
         "title": "",
+        "status": "in_progress",
+        "child_ws_id": None,
     }
 
 
