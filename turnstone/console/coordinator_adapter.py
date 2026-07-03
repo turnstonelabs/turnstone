@@ -282,6 +282,7 @@ class CoordinatorAdapter:
         *,
         attachments: list[Attachment] | None = None,
         send_id: str | None = None,
+        acting_user_id: str = "",
     ) -> bool:
         """Queue a message onto a coordinator session's ChatSession.
 
@@ -289,6 +290,15 @@ class CoordinatorAdapter:
         if the worker's pending-message queue is full (caller should
         surface 429 / backpressure). Priority is parsed from the message
         prefix (``/high``, ``/urgent``, etc.) by :meth:`ChatSession.queue_message`.
+
+        ``acting_user_id`` is the authenticated sender. On a fresh turn it is
+        bound as the coordinator's acting user (so per-participant MCP creds and
+        the state_change acting-user signal work once coordinator MCP lands);
+        on a mid-turn interjection it is passed to ``queue_message``, which
+        rejects a DIFFERENT participant (:class:`CrossUserInterjectionError`) —
+        the same cross-user protection the interactive surface has. Empty on
+        internal / unauthenticated dispatch (the create-time initial message
+        passes the creator's id; no rebind, no block, on a single sender).
 
         Worker spawn / reuse mechanics live in
         :func:`turnstone.core.session_worker.send`; the closures below
@@ -325,6 +335,14 @@ class CoordinatorAdapter:
 
         def _run() -> None:
             try:
+                # Fresh turn: bind the authenticated sender so any MCP tools run
+                # under their credentials and the acting-user signal is correct
+                # (guarded getattr mirrors the interactive route; a no-op when
+                # unset). The queue (interject) path below never rebinds.
+                if acting_user_id:
+                    bind = getattr(session, "bind_acting_user", None)
+                    if callable(bind):
+                        bind(acting_user_id)
                 session.send(message, attachments=_attachments, send_id=_send_id)
             except Exception:
                 # Attachments were resolved (peeked) from the per-node upload
@@ -354,7 +372,12 @@ class CoordinatorAdapter:
             # release: the staged bytes were peeked, not soft-locked, and a
             # rejected enqueue never drained them.
             att_ids = [a.attachment_id for a in _attachments] if _attachments else None
-            session.queue_message(message, attachment_ids=att_ids, queue_msg_id=_send_id)
+            session.queue_message(
+                message,
+                attachment_ids=att_ids,
+                queue_msg_id=_send_id,
+                interjector_user_id=acting_user_id,
+            )
 
         return session_worker.send(
             ws,

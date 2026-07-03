@@ -666,3 +666,28 @@ def test_coord_child_links_open_interactive_pane():
     assert 'data-node-id="' in coord_js
     # The /node/{id}/?ws_id= href fallback must remain for the standalone page.
     assert '"/node/"' in coord_js
+
+
+def test_coordinator_js_gates_send_on_cross_user_busy():
+    """The coordinator pane mirrors the interactive pane's shared-workstream
+    send gate: while another participant's turn is in flight it blocks this
+    viewer's send (the UX complement to the server-side 409). String-presence
+    guard — coord.js has no JS test framework."""
+    from pathlib import Path
+
+    coord_js = (
+        Path(__file__).resolve().parent.parent
+        / "turnstone/console/static/coordinator/coordinator.js"
+    ).read_text(encoding="utf-8")
+    # tracks the acting user from state_change, clears on settle
+    assert "actingUserId = ev.acting_user_id;" in coord_js
+    assert "actingUserId = null;" in coord_js
+    # compares against the viewer's own id and drives the composer hard block
+    assert 'sessionStorage.getItem("ts.user_id")' in coord_js
+    assert "actingUserId !== me" in coord_js
+    assert "composer.setSendBlocked(" in coord_js
+    assert "function reconcileSendBlock()" in coord_js
+    # reactive 409 fallback
+    assert "r.status === 409" in coord_js
+    assert 'status: "cross_user_interjection"' in coord_js
+    assert 'data.status === "cross_user_interjection"' in coord_js

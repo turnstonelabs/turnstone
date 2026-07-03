@@ -291,6 +291,10 @@ function createCoordinatorPane(root, wsId, opts) {
     },
   });
   let busy = false;
+  // Acting user (turn initiator) of the in-flight turn, from state_change
+  // events; drives the shared-workstream cross-user send gate. null when idle
+  // or single-user. Mirrors the interactive pane.
+  let actingUserId = null;
   // Edit-and-resend latch (#549): set by _editAndResend, consumed by the
   // clear_ui SSE handler once the rewind's truncated history is re-fetched.
   let _pendingEditSend = null;
@@ -1141,6 +1145,10 @@ function createCoordinatorPane(root, wsId, opts) {
     // is only updated when the rebuild runs, so dropping the tier from
     // the signature would lock the header on ``⚙ heuristic`` even
     // after the LLM verdict lands.
+    // Joined on U+001F (unit separator) — a control char that can't appear in
+    // any of these fields, so the signature can't collide across differing
+    // splits. Built via fromCharCode to keep the source ASCII-clean (no raw
+    // control byte in the file).
     return [
       verdict.recommendation || "",
       verdict.risk_level || "",
@@ -1148,7 +1156,7 @@ function createCoordinatorPane(root, wsId, opts) {
       verdict.reasoning || "",
       verdict.tier || "",
       verdict.judge_model || "",
-    ].join("");
+    ].join(String.fromCharCode(0x1f));
   }
 
   function _appendVerdictLineTo(row, verdict) {
@@ -1782,7 +1790,31 @@ function createCoordinatorPane(root, wsId, opts) {
     messagesEl.setAttribute("data-busy", next ? "true" : "false");
     const edge = next !== busy;
     busy = next;
+    reconcileSendBlock();
     if (edge && !next) queue.onIdleEdge();
+  }
+
+  // Shared-workstream send gate: block this viewer's send while another
+  // participant's turn is in flight (their credentials, not this viewer's,
+  // would run any MCP tool an interjection triggers, and the message would be
+  // misattributed to them). The server also rejects it with a 409; this is
+  // the proactive UX half. No-ops on a single-user coordinator (acting user is
+  // this viewer) or when the acting id is unknown. Mirrors the interactive
+  // pane's _reconcileSendBlock.
+  function reconcileSendBlock() {
+    let me = null;
+    try {
+      me = sessionStorage.getItem("ts.user_id");
+    } catch (_e) {
+      me = null;
+    }
+    const blocked = !!busy && !!actingUserId && !!me && actingUserId !== me;
+    composer.setSendBlocked(
+      blocked,
+      blocked
+        ? "Another participant's turn is in progress - wait for it to finish."
+        : "",
+    );
   }
 
   // Update the four-cell status bar from an on_status SSE event.
@@ -1894,6 +1926,19 @@ function createCoordinatorPane(root, wsId, opts) {
         // (502/504 HTML); the parse-failure arm falls back to the status code
         // so that can't surface as an "Unexpected token <" error.
         if (!r.ok) {
+          // 409 = the server-side cross-user interjection block; convert to a
+          // handled status so it routes to the clean branch below (not the
+          // generic error). Reactive fallback for the race where the send
+          // button wasn't yet disabled.
+          if (r.status === 409) {
+            return r.json().then(
+              (b) => ({
+                status: "cross_user_interjection",
+                error: (b && b.error) || "",
+              }),
+              () => ({ status: "cross_user_interjection", error: "" }),
+            );
+          }
           return r.json().then(
             (b) => {
               throw new Error((b && b.error) || "send_http_" + r.status);
@@ -1940,6 +1985,19 @@ function createCoordinatorPane(root, wsId, opts) {
             "Attachments can't be sent while the assistant is working. Send a text-only message now, or wait and resend with attachments.",
             { label: "error" },
           );
+        } else if (data && data.status === "cross_user_interjection") {
+          // Another participant's turn is in flight; the server refused the
+          // interjection so it can't run under their credentials or be
+          // misattributed. Reactive fallback for the click-beats-event race
+          // (the send gate normally disables the button first).
+          if (queuedEl) queue.remove(queuedEl);
+          appendText(
+            "error",
+            data.error ||
+              "Another participant's turn is in progress. Wait for it to finish, then send your message.",
+            { label: "error" },
+          );
+          if (!queuedEl) setBusy(false);
         } else {
           // Unknown / "ok" status (stale-busy race): settle the optimistic
           // bubble so a pre-bind × can't strand it in the dismissing state.
@@ -2545,6 +2603,15 @@ function createCoordinatorPane(root, wsId, opts) {
         break;
       case "state_change":
         if (statusEl) statusEl.textContent = ev.state || "";
+        // Track who holds the in-flight turn so the send gate can compare
+        // against this viewer; cleared when the turn settles. Present on busy
+        // transitions from a shared coordinator, absent otherwise (gate then
+        // never engages).
+        if (ev.state === "idle" || ev.state === "error") {
+          actingUserId = null;
+        } else if (ev.acting_user_id) {
+          actingUserId = ev.acting_user_id;
+        }
         // Drive the composer's busy state from the canonical
         // server-side workstream state so the Stop button + queue
         // mode follow whatever the worker is doing — including
