@@ -530,7 +530,6 @@ def _run_single_test(
                         break
                 message_count = len(session.messages)
                 total_usage = session.total_usage
-                session = None  # type: ignore[assignment]  # release memory
                 break
             except TimeoutError:
                 raise
