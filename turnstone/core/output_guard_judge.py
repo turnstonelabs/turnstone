@@ -280,8 +280,9 @@ class OutputGuardJudge:
         # ``provider.get_capabilities()``, which returns a static 200000 for
         # every model absent from its table (i.e. every local / self-hosted
         # judge), so a guard keyed off it would never trip for the small-window
-        # local judges it exists to protect.  ``_positive_window`` also guards a
-        # config.toml ``context_window=0`` (which would zero out the guard).
+        # local judges it exists to protect.  ``_positive_window`` also
+        # defensively coerces any non-positive window (which would zero out the
+        # guard) to the session window, then a floor.
         resolved = False
         if config.output_guard_model and model_registry is not None:
             try:

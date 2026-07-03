@@ -481,7 +481,12 @@ def load_model_registry(
             base_url=entry_base_url,
             api_key=_resolve_env_vars(entry.get("api_key", api_key)),
             model=model_name,
-            context_window=entry.get("context_window", context_window),
+            # 0 = auto-detect: inherit the CLI-detected context_window, matching
+            # the DB loader above.  ``.get(k, 0) or context_window`` (NOT
+            # ``.get(k, default)``) is load-bearing — an explicit
+            # ``context_window = 0`` must normalize to the inherited window, not
+            # stay a literal 0 that zeroes every downstream budget.
+            context_window=entry.get("context_window", 0) or context_window,
             provider=_resolve_openai_provider(entry.get("provider", "openai"), entry_base_url),
             capabilities=entry_caps,
             source="config",
