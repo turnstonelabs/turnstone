@@ -1126,9 +1126,7 @@ class TestReadinessReconciler:
         async def _classified(**kwargs: Any) -> Any:
             return SimpleNamespace(kind="decrypt_failure", token=None)
 
-        with patch(
-            "turnstone.core.mcp_client.get_user_access_token_classified", new=_classified
-        ):
+        with patch("turnstone.core.mcp_client.get_user_access_token_classified", new=_classified):
             _run_on_loop(loop, mgr._prime_user_pools("u1"))
         # Operator-actionable (key unknown) — recorded, but NOT a user-consent badge.
         assert mgr._readiness_status[key] == "decrypt_error"
@@ -1203,7 +1201,9 @@ class TestReadinessReconciler:
         _seed_user_token(storage, cipher, user_id="alice", server_name="srv-b")
         # bob's access token is already expired but the refresh token is live —
         # still a consented, reconcilable grant, so bob must be enumerated.
-        _seed_user_token(storage, cipher, user_id="bob", server_name="srv-a", expires_in_seconds=-999)
+        _seed_user_token(
+            storage, cipher, user_id="bob", server_name="srv-a", expires_in_seconds=-999
+        )
         assert sorted(storage.list_mcp_user_token_owners()) == ["alice", "bob"]
 
     # -- mechanism 2 primitives: readiness accessor + blocking prime ---------
@@ -1238,7 +1238,9 @@ class TestReadinessReconciler:
         # Returned only AFTER the reconcile coroutine finished — not racing it.
         assert done.is_set()
 
-    def test_prime_sync_degrades_on_timeout_without_raising(self, running_loop_mgr, storage) -> None:
+    def test_prime_sync_degrades_on_timeout_without_raising(
+        self, running_loop_mgr, storage
+    ) -> None:
         mgr, loop, _ = running_loop_mgr
         cipher = make_mcp_token_cipher()
         self._wire(mgr, storage, cipher)

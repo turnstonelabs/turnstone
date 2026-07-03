@@ -4950,9 +4950,7 @@ class SQLiteBackend:
         warm. Only the ``user_id`` column is projected — no ciphertext.
         """
         with self._conn() as conn:
-            rows = conn.execute(
-                sa.select(sa.distinct(mcp_user_tokens.c.user_id))
-            ).fetchall()
+            rows = conn.execute(sa.select(sa.distinct(mcp_user_tokens.c.user_id))).fetchall()
         return [row[0] for row in rows]
 
     def delete_mcp_oauth_rows_by_server_name(self, server_name: str) -> int:

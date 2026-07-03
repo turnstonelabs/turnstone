@@ -5230,9 +5230,7 @@ class ChatSession:
             try:
                 mcp.prime_user_pools_sync(new_listener_uid, timeout=3.0)
             except Exception:
-                log.debug(
-                    "mcp pre-flight prime failed user=%s", new_listener_uid, exc_info=True
-                )
+                log.debug("mcp pre-flight prime failed user=%s", new_listener_uid, exc_info=True)
         elif new_listener_uid and hasattr(mcp, "prime_user_pools"):
             # Backstop for a manager without the sync primitive (older build).
             try:

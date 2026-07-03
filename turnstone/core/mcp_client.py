@@ -2176,9 +2176,7 @@ class MCPClientManager:
             try:
                 await self._prime_user_pools(user_id)
             except Exception:
-                log.debug(
-                    "MCP readiness: reconcile failed for user=%s", user_id, exc_info=True
-                )
+                log.debug("MCP readiness: reconcile failed for user=%s", user_id, exc_info=True)
 
     # -- pool eviction --------------------------------------------------------
 
