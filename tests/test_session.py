@@ -4218,6 +4218,39 @@ class TestMetacognitiveBuffers:
         # _collect_advisories itself appends nothing — the caller does.
         assert len(session.messages) == pre_count
 
+    def test_cross_user_interjection_rejected(self, tmp_db):
+        """A different authenticated participant cannot interject into another
+        user's in-flight turn: folding it in would borrow the initiator's MCP
+        credentials and misattribute the message, so queue_message rejects."""
+        from turnstone.core.session import CrossUserInterjectionError
+
+        session = _make_session(user_id="owner")  # effective user = owner
+        with pytest.raises(CrossUserInterjectionError):
+            session.queue_message("let me in", interjector_user_id="bob")
+        assert session._queued_messages == {}  # nothing queued
+
+    def test_acting_user_can_interject_own_turn(self, tmp_db):
+        """The user whose turn is in flight may queue their own follow-ups."""
+        session = _make_session(user_id="owner")
+        session._acting_user_id = "alice"  # alice is driving (bind_acting_user)
+        # alice interjecting her own turn is fine...
+        session.queue_message("and also this", interjector_user_id="alice", queue_msg_id="q1")
+        assert "q1" in session._queued_messages
+        # ...but the owner (not the acting user) cannot interject alice's turn.
+        from turnstone.core.session import CrossUserInterjectionError
+
+        with pytest.raises(CrossUserInterjectionError):
+            session.queue_message("owner butting in", interjector_user_id="owner")
+
+    def test_unauthenticated_interjection_allowed(self, tmp_db):
+        """Empty interjector id (CLI / eval / coordinator internal lanes) keeps
+        the pre-existing behaviour — the guard only blocks an authenticated
+        non-acting participant."""
+        session = _make_session(user_id="owner")
+        session._acting_user_id = "alice"
+        session.queue_message("internal", interjector_user_id="", queue_msg_id="q1")
+        assert "q1" in session._queued_messages
+
     def test_empty_interjection_dropped_on_drain(self, tmp_db):
         """A queued message that reduces to empty — e.g. a bare ``!!!`` whose
         priority prefix ``parse_priority`` strips to "" — produces no
