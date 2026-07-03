@@ -1497,3 +1497,35 @@ class TestSkillsLoadRiskGate:
             gs.return_value.get_prompt_template_by_name.return_value = None
             item = session._prepare_skills("c1", {"action": "load", "name": "ghost"})
         assert item.get("needs_approval") is True
+
+    def test_shared_helper_denies_high_and_critical_only(self) -> None:
+        # The one shared gate used by skills(load) AND the spawn paths, so a
+        # child spawn cannot route around it.
+        session = _make_session()
+        for tier in ("high", "critical"):
+            with patch("turnstone.core.session.get_storage") as gs:
+                gs.return_value.get_prompt_template_by_name.return_value = {
+                    "name": "x",
+                    "risk_level": tier,
+                }
+                assert "/skill x" in session._high_risk_skill_denied("x")
+        for row in (
+            {"name": "y", "risk_level": "low"},
+            {"name": "y", "risk_level": ""},
+            None,
+        ):
+            with patch("turnstone.core.session.get_storage") as gs:
+                gs.return_value.get_prompt_template_by_name.return_value = row
+                assert session._high_risk_skill_denied("y") == ""
+
+    def test_risk_gate_fails_closed_on_storage_error(self) -> None:
+        # A risk gate that can't read the row must DENY, never wave the skill
+        # through (fail closed).  Returning a denial (not "") also keeps
+        # spawn_batch's per-row partial-success intact under a storage blip.
+        session = _make_session()
+        with patch("turnstone.core.session.get_storage") as gs:
+            gs.return_value.get_prompt_template_by_name.side_effect = RuntimeError("db down")
+            denial = session._high_risk_skill_denied("z")
+        assert denial != ""
+        assert "z" in denial
+        assert "/skill z" in denial

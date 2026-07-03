@@ -64,8 +64,11 @@ def _create_skill(db: Any, skill_id: str, name: str, content: str, **kw: Any) ->
 
 class TestRenderSkillBodySharedPath:
     """``_render_skill_body`` is the single substitution path — the one
-    ``task_agent`` now calls.  Assert it resolves the spec forms that the
-    old ``_render_template``-only ``task_agent`` path left literal."""
+    ``task_agent`` now calls.  With ``substitute_args=True`` (arg-capable
+    invocations: interactive /skill, skills(load)) the spec arg forms
+    resolve; with ``substitute_args=False`` (capability contexts: defaults,
+    task_agent) literal ``$N``/``$ARGUMENTS`` are left untouched.  Env vars
+    resolve either way."""
 
     def test_env_vars_resolve(self, tmp_db: str) -> None:
         session = make_session(reasoning_effort="high")
@@ -85,11 +88,9 @@ class TestRenderSkillBodySharedPath:
         finally:
             session.close()
 
-    def test_bare_arguments_clears_to_empty(self, tmp_db: str) -> None:
-        # A ``task_agent`` gets its task via the prompt, not invocation
-        # args, so the shared path is called with ``arguments_str=""`` —
-        # the bare ``$ARGUMENTS`` placeholder clears to empty (spawn-child
-        # semantics), NOT the literal string it was before unification.
+    def test_arg_capable_path_clears_bare_arguments_when_no_args(self, tmp_db: str) -> None:
+        # Arg-capable invocation (interactive /skill, skills(load)) with no
+        # args → bare $ARGUMENTS clears to empty, per the SKILL.md spec.
         session = make_session()
         try:
             assert session._render_skill_body("before $ARGUMENTS after") == "before  after"
@@ -106,16 +107,27 @@ class TestRenderSkillBodySharedPath:
         finally:
             session.close()
 
-    def test_positional_tokens_clear_without_args(self, tmp_db: str) -> None:
-        # A sub-agent supplies no invocation args, so every positional form
-        # ($N / $0 / $ARGUMENTS[N]) — like bare $ARGUMENTS — resolves to
-        # empty, identical to the defaults and spawn-child paths.  Pinned so
-        # this deliberate unification isn't mistaken for silent corruption:
-        # the old _render_template-only path left these tokens verbatim.
+    def test_arg_capable_path_clears_positional_tokens_when_no_args(self, tmp_db: str) -> None:
+        # Arg-capable path with no args → positional forms clear to empty (spec).
         session = make_session()
         try:
             out = session._render_skill_body("step $1 / $0 / $ARGUMENTS[2] done")
             assert out == "step  /  /  done"
+        finally:
+            session.close()
+
+    def test_capability_context_preserves_literal_arg_tokens(self, tmp_db: str) -> None:
+        # Capability contexts (task_agent, defaults) never receive invocation
+        # args, so substitute_args=False leaves literal $ARGUMENTS/$N/$name
+        # untouched (they are prose/shell text) while env vars still resolve.
+        # Pins the review fix that stopped blanking such tokens for sub-agents.
+        session = make_session(reasoning_effort="high")
+        try:
+            out = session._render_skill_body(
+                "run ./deploy.sh $1 $2 at ${TURNSTONE_EFFORT}; process $ARGUMENTS",
+                substitute_args=False,
+            )
+            assert out == "run ./deploy.sh $1 $2 at high; process $ARGUMENTS"
         finally:
             session.close()
 
@@ -151,16 +163,25 @@ class TestSkillDirResolvesInBody:
         finally:
             session.close()
 
-    def test_claude_skill_dir_alias_in_body(self, tmp_db: str) -> None:
+    def test_claude_skill_dir_not_aliased_in_body(self, tmp_db: str) -> None:
+        # CLAUDE_SKILL_DIR is NOT a turnstone-owned alias: it stays a literal
+        # placeholder even with a materialized bundle (that name belongs to the
+        # host in bash; turnstone claims neither surface).  The canonical
+        # TURNSTONE_SKILL_DIR does resolve.
         db = get_storage()
-        _create_skill(db, "s1", "dir-alias-skill", "Bundle at ${CLAUDE_SKILL_DIR}")
+        _create_skill(
+            db,
+            "s1",
+            "dir-alias-skill",
+            "Bundle at ${CLAUDE_SKILL_DIR} vs ${TURNSTONE_SKILL_DIR}",
+        )
         db.create_skill_resource("r1", "s1", "references/a.md", "# a")
 
         session = make_session(skill="dir-alias-skill")
         try:
             base = session._skill_resources_dir
             assert base is not None
-            assert session._skill_content == f"Bundle at {base}"
+            assert session._skill_content == f"Bundle at ${{CLAUDE_SKILL_DIR}} vs {base}"
         finally:
             session.close()
 
@@ -180,11 +201,11 @@ class TestSkillDirResolvesInBody:
 
 class TestSkillResourceEnvAliases:
     """Bash env exposes the materialized bundle dir under turnstone-owned
-    names unconditionally, and under the foreign ``CLAUDE_SKILL_DIR`` alias
-    only when the host hasn't already set it (no shadowing when turnstone
-    runs as a node inside Claude Code)."""
+    names (``TURNSTONE_SKILL_DIR`` / ``SKILL_RESOURCES_DIR``) unconditionally,
+    and never under the foreign ``CLAUDE_SKILL_DIR`` — that name is the host's,
+    so turnstone leaves it untouched whether or not the host has set it."""
 
-    def test_turnstone_owned_aliases_always_present(
+    def test_turnstone_owned_names_present_claude_absent(
         self, tmp_db: str, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         monkeypatch.delenv("CLAUDE_SKILL_DIR", raising=False)
@@ -198,18 +219,18 @@ class TestSkillResourceEnvAliases:
             d = session._skill_resources_dir
             assert env["SKILL_RESOURCES_DIR"] == d
             assert env["TURNSTONE_SKILL_DIR"] == d
-            # Host hasn't set it → turnstone supplies the portability alias.
-            assert env["CLAUDE_SKILL_DIR"] == d
+            # turnstone never supplies CLAUDE_SKILL_DIR (the host's namespace),
+            # even when the host hasn't set it.
+            assert "CLAUDE_SKILL_DIR" not in env
         finally:
             session.close()
 
-    def test_host_claude_skill_dir_not_shadowed(
+    def test_host_claude_skill_dir_untouched(
         self, tmp_db: str, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         # turnstone as a node inside Claude Code: the host's CLAUDE_SKILL_DIR
-        # must survive.  turnstone only injects its own names and leaves
-        # CLAUDE_SKILL_DIR out of the extra-env so scrubbed_env's passthrough
-        # keeps the host value.
+        # must survive.  turnstone never injects CLAUDE_SKILL_DIR into the
+        # extra-env, so scrubbed_env's passthrough keeps the host value.
         monkeypatch.setenv("CLAUDE_SKILL_DIR", "/host/claude/skill")
         db = get_storage()
         _create_skill(db, "s1", "env-host-skill", "content")

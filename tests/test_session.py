@@ -425,6 +425,195 @@ class TestTaskExec:
         assert item.get("needs_approval") is False
         assert "interactive" in item["error"]
 
+    def test_persona_tool_allowlist_restricts_sub_agent_tools(self, tmp_db) -> None:
+        """A restrictive persona caps the sub-agent's TOOLS (Principle 7 /
+        review fix), not just its identity text — stated identity must match
+        granted authority."""
+        session = _make_session()
+        session._task_tools = [
+            {"function": {"name": "read_file"}},
+            {"function": {"name": "write_file"}},
+            {"function": {"name": "bash"}},
+        ]
+        persona_row = {
+            "name": "readonly",
+            "base_prompt": "# Readonly reviewer",
+            "base_prompt_file": None,
+            "tool_allowlist": ["read_file", "search"],  # excludes write_file/bash
+            "mcp_enabled": True,
+            "memory_enabled": True,
+            "enabled": True,
+            "applies_to_kinds": ["interactive"],
+        }
+        with patch("turnstone.core.session.get_storage") as gs:
+            gs.return_value.get_persona_by_name.return_value = persona_row
+            item = session._prepare_task("c1", {"prompt": "edit auth", "persona": "readonly"})
+        assert item["persona_tools"] == frozenset({"read_file", "search"})
+
+        captured: dict = {}
+
+        def fake_run_agent(messages, **kwargs):
+            captured.update(kwargs)
+            return "done"
+
+        with patch.object(session, "_run_agent", side_effect=fake_run_agent):
+            session._exec_task(item)
+        tool_names = {t["function"]["name"] for t in captured["tools"]}
+        # write_file + bash dropped by the persona; read_file kept (search was
+        # never in the task tool set to begin with).
+        assert tool_names == {"read_file"}
+
+    def test_no_persona_keeps_full_task_tools(self, tmp_db) -> None:
+        session = _make_session()
+        session._task_tools = [
+            {"function": {"name": "read_file"}},
+            {"function": {"name": "bash"}},
+        ]
+        item = session._prepare_task("c1", {"prompt": "do x"})
+        assert item["persona_tools"] is None
+
+        captured: dict = {}
+
+        def fake_run_agent(messages, **kwargs):
+            captured.update(kwargs)
+            return "done"
+
+        with patch.object(session, "_run_agent", side_effect=fake_run_agent):
+            session._exec_task(item)
+        assert {t["function"]["name"] for t in captured["tools"]} == {"read_file", "bash"}
+
+    def test_parent_persona_caps_sub_agent_tools(self, tmp_db) -> None:
+        """A restricted PARENT session must not escalate authority by spawning:
+        the sub-agent's tools are capped by the parent's own persona grant even
+        with NO child persona (Principle 7 — delegation narrows, never widens;
+        whole-PR review fix)."""
+        session = _make_session()
+        session._tool_search = None
+        session._task_tools = [
+            {"function": {"name": "read_file"}},
+            {"function": {"name": "write_file"}},
+            {"function": {"name": "bash"}},
+        ]
+        # Parent runs under a read-only persona.
+        session._persona_tools = frozenset({"read_file", "search"})
+
+        item = session._prepare_task("c1", {"prompt": "edit auth"})
+        assert item["persona_tools"] is None  # no CHILD persona
+
+        captured: dict = {}
+
+        def fake_run_agent(messages, **kwargs):
+            captured.update(kwargs)
+            return "done"
+
+        with patch.object(session, "_run_agent", side_effect=fake_run_agent):
+            session._exec_task(item)
+        # Parent's read-only grant caps the sub-agent: write_file + bash dropped.
+        assert {t["function"]["name"] for t in captured["tools"]} == {"read_file"}
+
+    def test_child_persona_mcp_off_drops_mcp_tools(self, tmp_db) -> None:
+        """A child persona with mcp_enabled=False hides MCP tools (``mcp__*`` and
+        the MCP-access read_resource / use_prompt) from the sub-agent, even when
+        tool_allowlist is null (unrestricted native tools) — the mcp lever must
+        not silently no-op on the task_agent path (whole-PR review fix)."""
+        session = _make_session()
+        session._tool_search = None
+        session._task_tools = [
+            {"function": {"name": "read_file"}},
+            {"function": {"name": "read_resource"}},
+            {"function": {"name": "use_prompt"}},
+            {"function": {"name": "mcp__github__search"}},
+        ]
+        persona_row = {
+            "name": "sandboxed",
+            "base_prompt": "# Sandboxed",
+            "base_prompt_file": None,
+            "tool_allowlist": None,  # null = unrestricted native tools
+            "mcp_enabled": False,  # but MCP is OFF
+            "memory_enabled": True,
+            "enabled": True,
+            "applies_to_kinds": ["interactive"],
+        }
+        with patch("turnstone.core.session.get_storage") as gs:
+            gs.return_value.get_persona_by_name.return_value = persona_row
+            item = session._prepare_task("c1", {"prompt": "do x", "persona": "sandboxed"})
+        assert item["persona_mcp"] is False
+        assert item["persona_tools"] is None
+
+        captured: dict = {}
+
+        def fake_run_agent(messages, **kwargs):
+            captured.update(kwargs)
+            return "done"
+
+        with patch.object(session, "_run_agent", side_effect=fake_run_agent):
+            session._exec_task(item)
+        # MCP tools shed; native read_file kept.
+        assert {t["function"]["name"] for t in captured["tools"]} == {"read_file"}
+
+    def test_child_persona_memory_off_drops_memory_tool(self, tmp_db) -> None:
+        """A child persona with memory_enabled=False drops the memory tool from
+        the sub-agent's hands (lever 4), matching a main session under the same
+        persona (whole-PR review fix)."""
+        session = _make_session()
+        session._tool_search = None
+        session._task_tools = [
+            {"function": {"name": "read_file"}},
+            {"function": {"name": "memory"}},
+        ]
+        persona_row = {
+            "name": "nomem",
+            "base_prompt": "# No memory",
+            "base_prompt_file": None,
+            "tool_allowlist": None,
+            "mcp_enabled": True,
+            "memory_enabled": False,
+            "enabled": True,
+            "applies_to_kinds": ["interactive"],
+        }
+        with patch("turnstone.core.session.get_storage") as gs:
+            gs.return_value.get_persona_by_name.return_value = persona_row
+            item = session._prepare_task("c1", {"prompt": "do x", "persona": "nomem"})
+        assert item["persona_memory"] is False
+
+        captured: dict = {}
+
+        def fake_run_agent(messages, **kwargs):
+            captured.update(kwargs)
+            return "done"
+
+        with patch.object(session, "_run_agent", side_effect=fake_run_agent):
+            session._exec_task(item)
+        assert {t["function"]["name"] for t in captured["tools"]} == {"read_file"}
+
+    def test_evaluate_intent_projects_persona_for_task_agent(self, tmp_db, monkeypatch) -> None:
+        """Judge/audit projection includes the persona name (review fix): a
+        persona-driven identity shift must be visible to policy + audit, like
+        spawn_workstream."""
+        session = _make_session()
+        fake_verdict = MagicMock()
+        fake_verdict.to_dict.return_value = {"verdict_id": "v0", "tier": "heuristic"}
+        fake_judge = MagicMock()
+        fake_judge.evaluate.side_effect = lambda items, *_a, **_kw: [fake_verdict] * len(items)
+        fake_judge.arg_budget_chars.return_value = 200_000
+        monkeypatch.setattr(session, "_ensure_judge", lambda: fake_judge)
+
+        persona_row = {
+            "name": "engineer",
+            "base_prompt": "# Engineer",
+            "base_prompt_file": None,
+            "tool_allowlist": None,
+            "mcp_enabled": True,
+            "memory_enabled": True,
+            "enabled": True,
+            "applies_to_kinds": ["interactive"],
+        }
+        with patch("turnstone.core.session.get_storage") as gs:
+            gs.return_value.get_persona_by_name.return_value = persona_row
+            item = session._prepare_task("c1", {"prompt": "do x", "persona": "engineer"})
+        session._evaluate_intent([item])
+        assert item["func_args"]["persona"] == "engineer"
+
     @pytest.mark.parametrize("skill_value", ["", "   ", "\t\n"])
     def test_prepare_task_empty_or_whitespace_skill_treated_as_omitted(
         self, tmp_db, skill_value
@@ -471,12 +660,11 @@ class TestTaskExec:
         # tell them apart at recovery time.
         assert "unknown skill" not in item["error"]
 
-    def test_prepare_task_high_risk_skill_surfaces_in_header(self, tmp_db, caplog) -> None:
-        """High/critical risk skills surface the tier in the approval header
-        and emit a structured warning, mirroring the signal ``_load_skills``
-        emits for session-level skills (session.py:1336)."""
-        import logging
-
+    def test_prepare_task_denies_high_risk_skill(self, tmp_db) -> None:
+        """High/critical-risk skills are PRINCIPAL-load-only: task_agent(skill=…)
+        DENIES them — the same gate skills(load) / spawn_* enforce, so a model
+        cannot route around it by delegating activation to a sub-agent
+        (whole-PR review fix — task_agent was the un-gated surface)."""
         session = _make_session()
         risky_skill = {
             "name": "danger",
@@ -484,16 +672,15 @@ class TestTaskExec:
             "enabled": True,
             "risk_level": "critical",
         }
-        with (
-            caplog.at_level(logging.WARNING, logger="turnstone.core.session"),
-            patch("turnstone.core.session.get_skill_by_name", return_value=risky_skill),
-        ):
+        with patch("turnstone.core.session.get_skill_by_name", return_value=risky_skill):
             item = session._prepare_task("c1", {"prompt": "do x", "skill": "danger"})
-        assert item.get("needs_approval") is True
-        assert "skill: danger" in item["header"]
-        assert "risk: critical" in item["header"]
-        warning_seen = any("high_risk_skill" in r.getMessage() for r in caplog.records)
-        assert warning_seen, "expected task_agent.high_risk_skill warning"
+        assert item.get("needs_approval") is False
+        assert "principal-load-only" in item["header"]
+        assert "/skill danger" in item["error"]
+        # Distinct from the unknown/disabled errors so the model's recovery
+        # path can tell them apart.
+        assert "unknown skill" not in item["error"]
+        assert "disabled" not in item["error"]
 
     def test_prepare_task_normal_risk_skill_omits_tier_from_header(self, tmp_db) -> None:
         """Header only surfaces high/critical — low/medium/safe skills don't

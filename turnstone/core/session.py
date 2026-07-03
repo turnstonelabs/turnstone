@@ -786,6 +786,18 @@ def _without_tool(tools: list[dict[str, Any]], name: str) -> list[dict[str, Any]
     return [t for t in tools if t.get("function", {}).get("name") != name]
 
 
+def _is_mcp_surface_tool(name: str) -> bool:
+    """Whether *name* is an MCP-surfaced tool an mcp-off persona should not see.
+
+    Covers both a server tool (``mcp__{server}__{tool}`` — see
+    ``mcp_client`` naming) and the MCP-access native tools (``read_resource`` /
+    ``use_prompt``).  An mcp-off main session sheds these by nulling its client;
+    a sub-agent, which reuses the parent's ``_task_tools``, sheds them by this
+    name filter instead.
+    """
+    return name.startswith("mcp__") or name in ("read_resource", "use_prompt")
+
+
 def _render_template(content: str, context: dict[str, str]) -> str:
     """Replace ``{{variable}}`` placeholders in a single pass.
 
@@ -807,8 +819,16 @@ def _substitute_skill_args(
     ws_id: str,
     effort: str,
     skill_dir: str = "",
+    substitute_args: bool = True,
 ) -> str:
     """Apply SKILL.md spec placeholder substitution.
+
+    When *substitute_args* is False the invocation-arg forms
+    (``$ARGUMENTS`` / ``$ARGUMENTS[N]`` / ``$N`` / ``$<name>``) are left
+    LITERAL and only the ``${…}`` env vars resolve — for capability
+    contexts (defaults, ``task_agent``) that are never invoked with args,
+    where a literal ``$1`` or ``$ARGUMENTS`` in the body is prose or shell
+    text, not a placeholder to blank.
 
     Handles every spec placeholder form:
 
@@ -825,11 +845,15 @@ def _substitute_skill_args(
       back-compat alias so skills imported from Claude Code / skills.sh
       keep resolving.  Both map to the same value.
     * ``${TURNSTONE_EFFORT}`` / ``${CLAUDE_EFFORT}`` — reasoning_effort
-    * ``${TURNSTONE_SKILL_DIR}`` / ``${CLAUDE_SKILL_DIR}`` — absolute
-      path of the materialized resource bundle, resolved when *skill_dir*
-      is supplied (the caller materializes resources BEFORE substituting)
-      and left literal otherwise, so a skill that bundles no resources
-      degrades gracefully rather than emitting an empty path.
+    * ``${TURNSTONE_SKILL_DIR}`` — absolute path of the materialized
+      resource bundle, resolved when *skill_dir* is supplied (the caller
+      materializes resources BEFORE substituting) and left literal
+      otherwise, so a skill that bundles no resources degrades gracefully
+      rather than emitting an empty path.  Unlike the session/effort vars
+      there is deliberately NO ``CLAUDE_SKILL_DIR`` alias: that name also
+      lives in bash, where turnstone-as-a-node-inside-Claude-Code must not
+      shadow the host's value — so turnstone claims it in neither surface
+      and leaves the foreign name entirely to the host.
 
     Single-pass: a value containing a placeholder token (e.g.
     ``$0='$ARGUMENTS'``) does not get re-expanded.  Matches the
@@ -864,18 +888,25 @@ def _substitute_skill_args(
         "CLAUDE_EFFORT": effort,
     }
     if skill_dir:
+        # TURNSTONE_SKILL_DIR only — NO CLAUDE_SKILL_DIR alias.  That name is
+        # the host's in bash (see _skill_resource_env), so turnstone claims it
+        # in neither surface to avoid a prompt-vs-bash divergence.
         env["TURNSTONE_SKILL_DIR"] = skill_dir
-        env["CLAUDE_SKILL_DIR"] = skill_dir
 
     def _at(idx_str: str) -> str:
         idx = int(idx_str)  # regex guarantees digits
         return positional[idx] if 0 <= idx < len(positional) else ""
 
     def _replace(m: re.Match[str]) -> str:
-        if m.group("idx_bracket") is not None:
-            return _at(m.group("idx_bracket"))
         if m.group("env") is not None:
             return env.get(m.group("env"), m.group(0))
+        if not substitute_args:
+            # Capability contexts never receive invocation args, so a literal
+            # $ARGUMENTS/$N/$name is prose or shell text — leave it untouched
+            # rather than blanking it.  Only the env vars above resolve.
+            return m.group(0)
+        if m.group("idx_bracket") is not None:
+            return _at(m.group("idx_bracket"))
         if m.group("idx_short") is not None:
             return _at(m.group("idx_short"))
         if m.group("named") is not None:
@@ -887,11 +918,17 @@ def _substitute_skill_args(
         # Match is the bare $ARGUMENTS literal (no named groups).
         return arguments_str or ""
 
-    had_literal_arguments = bool(_SPEC_ARGUMENTS_LITERAL_RE.search(content))
     rendered = _SPEC_PLACEHOLDER_RE.sub(_replace, content)
 
-    if arguments_str and not had_literal_arguments:
-        rendered = f"{rendered}\n\nARGUMENTS: {arguments_str}"
+    # The spec's append-ARGUMENTS-at-end rule only applies when args are being
+    # substituted at all — capability contexts (substitute_args=False) ignore
+    # invocation args entirely, so they must not append them either.  The
+    # literal-$ARGUMENTS scan is only consumed on that path, so defer it behind
+    # the guard rather than scanning every default / task_agent capability body.
+    if substitute_args and arguments_str:
+        had_literal_arguments = bool(_SPEC_ARGUMENTS_LITERAL_RE.search(content))
+        if not had_literal_arguments:
+            rendered = f"{rendered}\n\nARGUMENTS: {arguments_str}"
 
     return rendered
 
@@ -2132,6 +2169,7 @@ class ChatSession:
         arguments_str: str = "",
         arg_names: list[str] | None = None,
         skill_dir: str | None = None,
+        substitute_args: bool = True,
     ) -> str:
         """Render one skill body through the single substitution path.
 
@@ -2146,8 +2184,11 @@ class ChatSession:
 
         Every invocation context routes through here — interactive load,
         default skills, and ``task_agent`` sub-agents — so a skill reading
-        ``${TURNSTONE_EFFORT}`` or ``$ARGUMENTS`` resolves identically
-        wherever it runs, instead of rendering literally in some paths.
+        ``${TURNSTONE_EFFORT}`` resolves identically wherever it runs.
+        *substitute_args* is False for capability contexts that never
+        receive invocation args (defaults, ``task_agent``): there a literal
+        ``$1`` / ``$ARGUMENTS`` is prose or shell text and is left
+        untouched, while env vars still resolve.
         """
         context = {
             "model": self.model,
@@ -2163,6 +2204,7 @@ class ChatSession:
             ws_id=self._ws_id,
             effort=effort,
             skill_dir=skill_dir or "",
+            substitute_args=substitute_args,
         )
 
     def _load_skills(self) -> None:
@@ -2223,7 +2265,9 @@ class ChatSession:
                 # subs (``${TURNSTONE_SESSION_ID}`` / ``${TURNSTONE_EFFORT}``)
                 # still resolve.  Defaults carry no per-skill resource bundle,
                 # so ``skill_dir`` is omitted.
-                parts = [self._render_skill_body(t["content"]) for t in defaults]
+                parts = [
+                    self._render_skill_body(t["content"], substitute_args=False) for t in defaults
+                ]
                 self._skill_content = "\n\n".join(parts)
             else:
                 self._skill_content = None
@@ -2359,11 +2403,11 @@ class ChatSession:
         The bundle dir is exported as canonical ``TURNSTONE_SKILL_DIR`` and
         the original ``SKILL_RESOURCES_DIR`` (back-compat for existing skills
         and the ``$SKILL_RESOURCES_DIR`` disclosure hint), both pointing at
-        the same directory.  ``CLAUDE_SKILL_DIR`` is added as a portability
-        alias for imported Claude Code / skills.sh skills, but ONLY when the
-        host hasn't already set it: ``CLAUDE_SKILL_DIR`` is another vendor's
-        namespace, and turnstone running as a node inside Claude Code must
-        not shadow the host's real value.
+        the same directory.  There is deliberately NO ``CLAUDE_SKILL_DIR``:
+        that is another vendor's namespace, and turnstone running as a node
+        inside Claude Code must leave the host's value untouched — so turnstone
+        neither exports it here nor substitutes it in the prompt (see
+        ``_substitute_skill_args``), keeping the two surfaces in agreement.
         """
         if not self._skill_resources_dir:
             return {}
@@ -2371,8 +2415,6 @@ class ChatSession:
             "SKILL_RESOURCES_DIR": self._skill_resources_dir,
             "TURNSTONE_SKILL_DIR": self._skill_resources_dir,
         }
-        if "CLAUDE_SKILL_DIR" not in os.environ:
-            env["CLAUDE_SKILL_DIR"] = self._skill_resources_dir
         scripts_dir = os.path.join(self._skill_resources_dir, "scripts")
         if os.path.isdir(scripts_dir):
             current_path = os.environ.get("PATH")
@@ -3519,54 +3561,59 @@ class ChatSession:
                     "to invoke the prompts listed above."
                 )
                 dev_parts.append("\n".join(lines))
-        # Applied-skill body is CAPABILITY context, not identity — build it
-        # into its own block, delivered below as a separate (user-role)
-        # message rather than concatenated into the identity system prefix.
-        # Keeping it off that prefix means skills(load) no longer busts the
-        # cached identity block, and the skill never reads as who-the-agent-is.
-        # PRE-MERGE GATE: the model-adherence eval this vs main (design §7 Q1)
-        # is NOT run in-tree — it must clear before this branch merges.
+        # Applied-skill body is CAPABILITY context, not identity.  A NAMED
+        # applied skill (loaded via /skill or skills(load)) is the only
+        # mid-session-changeable skill and thus the only one that would bust the
+        # cached identity block, so its body is delivered below as a separate
+        # (user-role) message, off the identity system prefix — it never reads
+        # as who-the-agent-is and no longer invalidates the identity cache.
+        # DEFAULT (always-on) skills are set at init, never change mid-session,
+        # and are the standing baseline, so they stay in the identity system
+        # message where their guidance keeps system-level weight.
+        # PRE-MERGE GATE: the §7 Q1 model-adherence eval (this branch vs main)
+        # covers ONLY the named-skill move; it is not run in-tree and must clear
+        # before this branch merges.
         skill_context = ""
         if self._skill_content:
             tpl = self._skill_content
             if len(tpl) > _MAX_SKILL_CONTENT:
                 log.warning("skill_content.truncated", length=len(tpl))
                 tpl = tpl[:_MAX_SKILL_CONTENT]
-            if self._skill_name:
+            if not self._skill_name:
+                # Default (always-on) skills: keep in the identity system prefix.
+                dev_parts.append("")
+                dev_parts.append(tpl)
+            else:
                 intro = (
                     f"The following is the guidance for your active skill "
                     f"'{self._skill_name}'. Apply it throughout this session."
                 )
-            else:
-                intro = (
-                    "The following is your active skill guidance. Apply it throughout this session."
-                )
-            skill_parts = [intro, "", tpl]
-            if self._skill_resources:
-                lines = ["<skill-resources>"]
-                total_size = 0
-                for rpath, rcontent in sorted(self._skill_resources.items()):
-                    size_kb = f"{len(rcontent) / 1024:.1f}KB"
-                    total_size += len(rcontent)
-                    lines.append(f"- {rpath} ({size_kb})")
-                if total_size <= 8192:
+                skill_parts = [intro, "", tpl]
+                if self._skill_resources:
+                    lines = ["<skill-resources>"]
+                    total_size = 0
                     for rpath, rcontent in sorted(self._skill_resources.items()):
-                        lines.append(f"\n--- {rpath} ---")
-                        lines.append(rcontent)
-                else:
-                    lines.append(
-                        "Resource content omitted (total exceeds 8KB). "
-                        "Resource files are listed above by path and size."
-                    )
-                if self._skill_resources_dir:
-                    lines.append(
-                        "\nResource files are materialized on disk. "
-                        "Scripts in scripts/ are on PATH and can be run by name. "
-                        "All files are under $SKILL_RESOURCES_DIR."
-                    )
-                lines.append("</skill-resources>")
-                skill_parts.append("\n".join(lines))
-            skill_context = "\n".join(skill_parts)
+                        size_kb = f"{len(rcontent) / 1024:.1f}KB"
+                        total_size += len(rcontent)
+                        lines.append(f"- {rpath} ({size_kb})")
+                    if total_size <= 8192:
+                        for rpath, rcontent in sorted(self._skill_resources.items()):
+                            lines.append(f"\n--- {rpath} ---")
+                            lines.append(rcontent)
+                    else:
+                        lines.append(
+                            "Resource content omitted (total exceeds 8KB). "
+                            "Resource files are listed above by path and size."
+                        )
+                    if self._skill_resources_dir:
+                        lines.append(
+                            "\nResource files are materialized on disk. "
+                            "Scripts in scripts/ are on PATH and can be run by name. "
+                            "All files are under $SKILL_RESOURCES_DIR."
+                        )
+                    lines.append("</skill-resources>")
+                    skill_parts.append("\n".join(lines))
+                skill_context = "\n".join(skill_parts)
         # Skill catalog: disclose search-activated skills so the model
         # knows they exist (Agent Skills standard progressive disclosure).
         try:
@@ -3601,11 +3648,12 @@ class ChatSession:
             # Composed against a real user-message query at least once; send()
             # uses this to know the deferred first-turn recompose is done.
             self._system_composed_with_context = True
-        # Persona lever 4 (own hands only): memory-off suppresses recalled-
-        # memory injection here, the nudges at their producer sites, and the
-        # memory tool via the visibility filter.  Task agents keep their own
-        # memory tool (``_task_tools`` is not persona-filtered), and
-        # compaction spill/markers are session mechanics — never gated.
+        # Persona lever 4: memory-off suppresses recalled-memory injection
+        # here, the nudges at their producer sites, and the memory tool via the
+        # visibility filter.  Sub-agents (task_agent) are persona-filtered at
+        # the delegation edge too now (see _exec_task), so a memory-off persona
+        # drops their memory tool as well; compaction spill/markers are session
+        # mechanics — never gated.
         visible_mems, candidate_source = (
             self._select_memory_candidates(context) if self._persona_memory else ([], "")
         )
@@ -7662,6 +7710,9 @@ class ChatSession:
                 it["func_args"] = {
                     "prompt": honest_truncate(it.get("prompt") or "", arg_budget),
                     "skill": skill_dict.get("name", "") if isinstance(skill_dict, dict) else "",
+                    # Persona swaps the sub-agent's identity/authority — the
+                    # judge and audit row must see it, mirroring spawn_workstream.
+                    "persona": it.get("persona") or "",
                     "model_override": it.get("model_override") or "",
                 }
             # Coordinator tool args — only the ``needs_approval=True`` set
@@ -9600,6 +9651,22 @@ class ChatSession:
                         "Use skills(action='find', query='...') to find available names."
                     ),
                 }
+            # Risk gate: high/critical-risk skills are PRINCIPAL-load-only — the
+            # same bar skills(load) / spawn_workstream / spawn_batch enforce via
+            # _high_risk_skill_denied.  task_agent is a model-initiated
+            # activation surface too, so a sub-agent must not route around it.
+            # Enforced on the row we ALREADY fetched (no re-query, no drift
+            # between get_skill_by_name and get_prompt_template_by_name).
+            risk_tier = skill_data.get("risk_level", "")
+            if risk_tier in ("high", "critical"):
+                return {
+                    "call_id": call_id,
+                    "func_name": "task_agent",
+                    "header": f"✗ task_agent: skill '{skill_arg}' is principal-load-only",
+                    "preview": "",
+                    "needs_approval": False,
+                    "error": f"Error: {self._principal_load_only_msg(skill_arg, risk_tier)}",
+                }
             # ``get_skill_by_name`` returns the full prompt_templates row
             # (~30 columns including ``scan_report``, ``installed_by``,
             # ``source_url``, etc.).  Project to the minimal field set
@@ -9611,45 +9678,63 @@ class ChatSession:
                 "content": skill_data["content"],
                 "risk_level": skill_data.get("risk_level", ""),
             }
-        # Persona = the sub-agent's identity (system prompt).  Validated at
-        # prep against the interactive kind (the general-purpose personas a
-        # worker can adopt) so an invalid name becomes a clean tool error the
-        # model can react to, not a mid-exec surprise.  The resolved BASE text
-        # is frozen into the item; ``_exec_task`` never re-reads storage.
-        # Omitted → the default autonomous task-agent identity.
+        # Persona = the sub-agent's identity AND its authority envelope.
+        # Validated at prep against the interactive kind (the general-purpose
+        # personas a worker can adopt) so an invalid name becomes a clean tool
+        # error the model can react to, not a mid-exec surprise.  All four
+        # levers — prompt (identity), tools + mcp + memory (authority) — are
+        # frozen into the item; ``_exec_task`` never re-reads storage.  A
+        # restrictive persona must actually restrict the sub-agent (Principle 7
+        # attenuation), not merely relabel its identity.  Omitted → default
+        # identity, full tools.
         persona_arg = (args.get("persona") or "").strip()
         persona_prompt = ""
+        persona_tools: frozenset[str] | None = None
+        persona_mcp = True
+        persona_memory = True
         if persona_arg:
-            row, perr = resolve_persona_for_kind(get_storage(), persona_arg, "interactive")
-            if perr or row is None:
-                detail = perr or f"unknown persona {persona_arg!r}"
+            try:
+                row, perr = resolve_persona_for_kind(get_storage(), persona_arg, "interactive")
+                if perr or row is None:
+                    detail = perr or f"unknown persona {persona_arg!r}"
+                    return {
+                        "call_id": call_id,
+                        "func_name": "task_agent",
+                        "header": f"✗ task_agent: {detail}",
+                        "preview": "",
+                        "needs_approval": False,
+                        "error": (
+                            f"Error: {detail}. Omit `persona` for the default task-agent identity."
+                        ),
+                    }
+                snap = snapshot_from_persona(row)
+            except Exception:
+                # Match the spawn path's defensive posture
+                # (_validate_child_persona): a storage blip or a drifted
+                # base_prompt file becomes a clean tool error the model can
+                # react to, not an opaque "internal error preparing task_agent".
+                log.debug("task_agent.persona_resolve_failed", persona=persona_arg, exc_info=True)
                 return {
                     "call_id": call_id,
                     "func_name": "task_agent",
-                    "header": f"✗ task_agent: {detail}",
+                    "header": f"✗ task_agent: could not resolve persona '{persona_arg}'",
                     "preview": "",
                     "needs_approval": False,
                     "error": (
-                        f"Error: {detail}. Omit `persona` for the default task-agent identity."
+                        f"Error: could not resolve persona '{persona_arg}' (storage "
+                        "unavailable). Retry, or omit `persona` for the default identity."
                     ),
                 }
-            persona_prompt = snapshot_from_persona(row).prompt
+            persona_prompt = snap.prompt
+            persona_tools = snap.tools
+            persona_mcp = snap.mcp
+            persona_memory = snap.memory
         preview_text = prompt[:300] + ("..." if len(prompt) > 300 else "")
         header = "\u2699 task_agent (autonomous agent"
         if skill_data:
+            # High/critical skills were denied above (principal-load-only), so a
+            # skill that reaches here is safe-tier — just name it in the header.
             header += f", skill: {skill_data['name']}"
-            # Surface high/critical risk at approval time so the operator
-            # sees the same signal ``_load_skills`` emits for session-level
-            # skills (session.py:1336).  Log mirrors that path's structured
-            # event for forensic continuity.
-            risk_tier = skill_data.get("risk_level", "")
-            if risk_tier in ("high", "critical"):
-                header += f", risk: {risk_tier}"
-                log.warning(
-                    "task_agent.high_risk_skill",
-                    skill=skill_data["name"],
-                    risk_level=risk_tier,
-                )
         if persona_arg:
             header += f", persona: {persona_arg}"
         header += ")"
@@ -9666,6 +9751,9 @@ class ChatSession:
             "skill": skill_data,
             "persona": persona_arg,
             "persona_prompt": persona_prompt,
+            "persona_tools": persona_tools,
+            "persona_mcp": persona_mcp,
+            "persona_memory": persona_memory,
         }
 
     def _resolve_scope_id(self, scope: str) -> str:
@@ -10393,6 +10481,12 @@ class ChatSession:
             persona_err = self._validate_child_persona(persona)
             if persona_err:
                 return self._coord_tool_error(call_id, "spawn_workstream", persona_err)
+        if skill:
+            # Same principal-load-only gate as skills(load): a high/critical-risk
+            # skill must not be model-activated by handing it to a child.
+            skill_err = self._high_risk_skill_denied(skill)
+            if skill_err:
+                return self._coord_tool_error(call_id, "spawn_workstream", skill_err)
         if initial_message:
             first_line = initial_message.splitlines()[0]
             preview_line = first_line[:120] + ("..." if len(first_line) > 120 else "")
@@ -10539,6 +10633,7 @@ class ChatSession:
         # Persona prechecks hit storage; a fan-out batch usually repeats one
         # persona across all children, so memoize per prepare call.
         persona_verdicts: dict[str, str] = {}
+        skill_verdicts: dict[str, str] = {}
         for idx, raw in enumerate(raw_children):
             if not isinstance(raw, dict):
                 normalised.append({"idx": idx, "_error": "child spec must be an object"})
@@ -10570,6 +10665,14 @@ class ChatSession:
                     persona_verdicts[persona] = self._validate_child_persona(persona)
                 if persona_verdicts[persona]:
                     spec["_error"] = persona_verdicts[persona]
+            if skill and not spec.get("_error"):
+                # Same principal-load-only risk gate as spawn_workstream,
+                # surfaced per-row (partial-success) rather than failing the
+                # whole batch.  Memoized: a fan-out usually repeats one skill.
+                if skill not in skill_verdicts:
+                    skill_verdicts[skill] = self._high_risk_skill_denied(skill)
+                if skill_verdicts[skill]:
+                    spec["_error"] = skill_verdicts[skill]
             normalised.append(spec)
             if spec.get("_error"):
                 preview_rows.append(f"  {idx}. [invalid — {spec['_error']}]")
@@ -11616,6 +11719,57 @@ class ChatSession:
 
     # -- load -------------------------------------------------------------------
 
+    @staticmethod
+    def _principal_load_only_msg(name: str, tier: str) -> str:
+        """The canonical denial wording for a principal-load-only skill.
+
+        Single-sourced so every activation surface (skills(load), spawn_*,
+        task_agent) speaks with one voice — the model keys its recovery path
+        off this text, so it must not drift between callers.
+        """
+        return (
+            f"skill '{name}' has risk tier '{tier}' and can only be "
+            f"activated by the operator. Ask the user to run /skill {name} — the "
+            f"model cannot load or assign it."
+        )
+
+    def _high_risk_skill_denied(self, name: str) -> str:
+        """Return a denial message when *name* is a high/critical-risk skill the
+        model may not activate, else ``""``.
+
+        Design §5.5 / HYPOTHESIS Principle 7: such a skill is PRINCIPAL-load-only
+        — the model must not activate it through any tools path (an injection-
+        steerable lane that would widen authority behind a rubber-stampable
+        approval; the scanner escalates risk precisely for the auto_approve +
+        allowed_tools authority the create path warns about).  The operator
+        loads it explicitly with ``/skill`` (handle_command / cli --skill call
+        set_skill directly and bypass this gate).  This is the shared check for
+        the model-initiated activation surfaces that resolve the row by name —
+        skills(load) AND spawn_workstream / spawn_batch(skill=…) — so the gate
+        cannot be routed around by delegating activation to a spawned child.
+        ``task_agent`` enforces the same bar inline on the row it already
+        fetched (see ``_prepare_task``).  Narrowing-only: it can DENY, never
+        widen, so it is safe by construction.
+        """
+        storage = get_storage()
+        if storage is None:
+            return ""
+        try:
+            row = storage.get_prompt_template_by_name(name)
+        except Exception:
+            # Fail CLOSED: a risk gate that can't read the row must DENY, never
+            # wave the skill through.  Denying (not returning "") also keeps
+            # spawn_batch's per-row partial-success intact — one child's lookup
+            # fault denies only that child, not the whole batch.
+            log.warning("skill.risk_gate_lookup_failed", skill=name, exc_info=True)
+            return (
+                f"skill '{name}' could not be risk-checked (storage unavailable) "
+                f"and was not activated. Retry, or ask the operator to run /skill {name}."
+            )
+        if row and row.get("risk_level") in ("high", "critical"):
+            return self._principal_load_only_msg(name, row["risk_level"])
+        return ""
+
     def _prepare_skills_load(self, call_id: str, args: dict[str, Any]) -> dict[str, Any]:
         # Both kinds can ``load`` — interactive sessions replace their own
         # persona, coordinator sessions do the same for their orchestrator.
@@ -11632,26 +11786,12 @@ class ChatSession:
         name = self._coord_str_arg(args, "name").strip()
         if not name:
             return self._coord_tool_error(call_id, "skills", "load: 'name' is required")
-        # Risk gate (design §5.5 / HYPOTHESIS Principle 7): a high/critical-risk
-        # skill is PRINCIPAL-load-only.  The model must not activate it through
-        # the tools path — an injection-steerable lane that would widen
-        # authority behind a rubber-stampable approval (the scanner escalates
-        # risk precisely for the auto_approve + allowed_tools authority the
-        # create path warns about).  The operator loads such a skill explicitly
-        # with ``/skill``; that path (handle_command / cli --skill) calls
-        # set_skill directly and bypasses this gate.  A narrowing check — it can
-        # only DENY, never widen — so it is safe by construction.
-        storage = get_storage()
-        if storage is not None:
-            row = storage.get_prompt_template_by_name(name)
-            if row and row.get("risk_level") in ("high", "critical"):
-                return self._coord_tool_error(
-                    call_id,
-                    "skills",
-                    f"load: skill '{name}' has risk tier '{row['risk_level']}' and can "
-                    f"only be activated by the operator. Ask the user to run "
-                    f"/skill {name} if they want it — the model cannot load it.",
-                )
+        # Risk gate: a high/critical-risk skill is principal-load-only.  Shared
+        # with the spawn paths (see _high_risk_skill_denied) so delegating
+        # activation to a child cannot route around it.
+        block = self._high_risk_skill_denied(name)
+        if block:
+            return self._coord_tool_error(call_id, "skills", f"load: {block}")
         # SKILL.md spec ``$ARGUMENTS`` payload — optional.  Mirror
         # the spec's free-form string shape (``/skill-name a b "c d"``)
         # rather than a list, so the model can pass quoted positional
@@ -14342,7 +14482,7 @@ class ChatSession:
             # defaults and spawn-child paths) and ``${TURNSTONE_*}`` env vars
             # resolve; ``skill_dir`` is unset (sub-agent bundles aren't
             # materialized yet), leaving ``${TURNSTONE_SKILL_DIR}`` literal.
-            skill_body = self._render_skill_body(skill_data["content"])
+            skill_body = self._render_skill_body(skill_data["content"], substitute_args=False)
             if len(skill_body) > _MAX_SKILL_CONTENT:
                 log.warning(
                     "skill_content.truncated",
@@ -14353,6 +14493,36 @@ class ChatSession:
                 skill_body = skill_body[:_MAX_SKILL_CONTENT]
             agent_turns.append(Turn.user(self._TASK_SKILL_CAPABILITY_PREAMBLE + skill_body))
         agent_turns.append(Turn.user(prompt))
+        # Attenuate the sub-agent's tools (Principle 7): authority narrows down
+        # a delegation edge, never widens.  TWO envelopes apply, both narrowing
+        # (filtering the available set is sufficient — a tool absent from the
+        # list can't be called, so it can't be auto-approved whatever
+        # ``auto_tools`` says):
+        #   1. the PARENT session's own persona grant — a restricted principal
+        #      must not escalate by spawning.  ``_apply_persona_visibility`` is a
+        #      no-op when the parent has no restrictive persona, and already
+        #      honours the parent's tools + memory levers (parent mcp-off is
+        #      reflected in ``_task_tools`` at construction).
+        #   2. the CHILD persona (``task_agent persona=…``) — its tools, mcp,
+        #      and memory levers confine the sub-agent exactly as they would a
+        #      main session that adopted the persona.
+        task_tools = self._apply_persona_visibility(self._task_tools)
+        persona_tools = item.get("persona_tools")
+        if persona_tools is not None:
+            task_tools = [
+                t for t in task_tools if t.get("function", {}).get("name") in persona_tools
+            ]
+        if not item.get("persona_mcp", True):
+            # Child persona mcp-off: shed MCP server tools + MCP-access tools,
+            # mirroring how an mcp-off main session sheds them (nulled client).
+            task_tools = [
+                t
+                for t in task_tools
+                if not _is_mcp_surface_tool(t.get("function", {}).get("name", ""))
+            ]
+        if not item.get("persona_memory", True):
+            # Child persona memory-off: drop the memory tool from its hands.
+            task_tools = [t for t in task_tools if t.get("function", {}).get("name") != "memory"]
         self._begin_agent_scope()
         # Per-sub-agent file-read tracking.  COPY the parent's current set in (so
         # the agent can edit a file the parent already read for it — no spurious
@@ -14364,7 +14534,7 @@ class ChatSession:
             result = self._run_agent(
                 agent_turns,
                 label="task",
-                tools=self._task_tools,
+                tools=task_tools,
                 auto_tools=TASK_AUTO_TOOLS,
                 agent_alias=item.get("model_override"),
                 parent_call_id=call_id,

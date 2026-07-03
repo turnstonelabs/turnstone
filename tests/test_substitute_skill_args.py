@@ -2,12 +2,13 @@
 substitution applied to skill bodies at load time.
 
 Covers every placeholder form Turnstone implements — including the
-``${TURNSTONE_*}`` canonical env vars and their ``${CLAUDE_*}``
-back-compat aliases, and ``${TURNSTONE_SKILL_DIR}`` / ``${CLAUDE_SKILL_DIR}``
-resolution when the caller supplies a materialized bundle path — plus the
-spec's "append ARGUMENTS at end if no placeholder" rule and the
-single-pass guarantee against re-expansion of user-supplied values that
-happen to contain placeholder syntax.
+``${TURNSTONE_*}`` canonical env vars and the ``${CLAUDE_SESSION_ID}`` /
+``${CLAUDE_EFFORT}`` back-compat aliases (there is deliberately NO
+``CLAUDE_SKILL_DIR`` alias), ``${TURNSTONE_SKILL_DIR}`` resolution when the
+caller supplies a materialized bundle path, plus the spec's "append
+ARGUMENTS at end if no placeholder" rule and the single-pass guarantee
+against re-expansion of user-supplied values that happen to contain
+placeholder syntax.
 """
 
 from __future__ import annotations
@@ -159,10 +160,11 @@ class TestEnvironmentAliases:
 
 
 class TestSkillDir:
-    """``${TURNSTONE_SKILL_DIR}`` / ``${CLAUDE_SKILL_DIR}`` resolve to the
-    materialized bundle path when the caller supplies one (it materializes
-    resources BEFORE substituting), and degrade to a literal placeholder
-    when the skill bundles no resources."""
+    """``${TURNSTONE_SKILL_DIR}`` resolves to the materialized bundle path when
+    the caller supplies one (it materializes resources BEFORE substituting) and
+    degrades to a literal placeholder when the skill bundles no resources.
+    ``${CLAUDE_SKILL_DIR}`` is NOT a turnstone alias — it always stays literal
+    (that name is the host's in bash; turnstone claims neither surface)."""
 
     def test_turnstone_skill_dir_resolves(self) -> None:
         out = _substitute_skill_args(
@@ -175,7 +177,10 @@ class TestSkillDir:
         )
         assert out == "cd /tmp/skill-xyz/scripts"
 
-    def test_claude_skill_dir_alias_resolves(self) -> None:
+    def test_claude_skill_dir_not_aliased(self) -> None:
+        # Even with a materialized bundle, ${CLAUDE_SKILL_DIR} is left literal:
+        # turnstone owns TURNSTONE_SKILL_DIR only, so the two never diverge from
+        # the bash env (which likewise never sets CLAUDE_SKILL_DIR).
         out = _substitute_skill_args(
             "cd ${CLAUDE_SKILL_DIR}",
             arguments_str="",
@@ -184,7 +189,7 @@ class TestSkillDir:
             effort="high",
             skill_dir="/tmp/skill-xyz",
         )
-        assert out == "cd /tmp/skill-xyz"
+        assert out == "cd ${CLAUDE_SKILL_DIR}"
 
     def test_skill_dir_left_literal_when_unset(self) -> None:
         # Default skill_dir="" → placeholder stays literal (graceful),
@@ -234,3 +239,45 @@ class TestIntegration:
             "Named: 123 resolved on main.\n"
             "Full: 123 main"
         )
+
+
+class TestSubstituteArgsToggle:
+    """``substitute_args=False`` (capability contexts: defaults, task_agent)
+    leaves every invocation-arg form LITERAL while still resolving env vars,
+    so literal ``$1`` / ``$ARGUMENTS`` prose or shell text isn't blanked."""
+
+    def test_arg_forms_left_literal(self) -> None:
+        out = _substitute_skill_args(
+            "run $0 $1 $ARGUMENTS $ARGUMENTS[2] $named",
+            arguments_str="a b c",  # present, but ignored under substitute_args=False
+            arg_names=["named"],
+            ws_id="ws-abc",
+            effort="high",
+            substitute_args=False,
+        )
+        assert out == "run $0 $1 $ARGUMENTS $ARGUMENTS[2] $named"
+
+    def test_env_still_resolves(self) -> None:
+        out = _substitute_skill_args(
+            "id ${TURNSTONE_SESSION_ID} at ${TURNSTONE_EFFORT} in ${TURNSTONE_SKILL_DIR}",
+            arguments_str="",
+            arg_names=[],
+            ws_id="ws-abc",
+            effort="high",
+            skill_dir="/tmp/skill-x",
+            substitute_args=False,
+        )
+        assert out == "id ws-abc at high in /tmp/skill-x"
+
+    def test_no_append_when_args_disabled(self) -> None:
+        # The append-ARGUMENTS-at-end rule must not fire when arg substitution
+        # is off, even if arguments_str is non-empty.
+        out = _substitute_skill_args(
+            "body with no placeholder",
+            arguments_str="x y",
+            arg_names=[],
+            ws_id="ws-abc",
+            effort="high",
+            substitute_args=False,
+        )
+        assert out == "body with no placeholder"

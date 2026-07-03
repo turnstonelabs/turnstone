@@ -186,10 +186,11 @@ class TestDefaultTemplates:
         content = _sys_content(session)
         assert "Not default." not in content
 
-    def test_default_template_delivered_as_context_after_identity(self, tmp_db):
-        """Default templates are CAPABILITY context (step 3): delivered in a
-        separate message after the identity system message (which carries user
-        instructions), not interleaved into the identity block."""
+    def test_default_template_stays_in_identity_system_message(self, tmp_db):
+        """Default (always-on) templates are the standing baseline and never
+        change mid-session, so they stay in the identity system message (with
+        user instructions) — only a NAMED applied skill moves to a separate
+        context message.  Template guidance still precedes user instructions."""
         from turnstone.core.storage import get_storage
 
         db = get_storage()
@@ -197,13 +198,11 @@ class TestDefaultTemplates:
 
         session = _make_session(instructions="USER_INSTRUCTIONS")
         msgs = session.system_messages
-        # Instructions live in the identity system message; the template body
-        # does NOT.
-        assert "USER_INSTRUCTIONS" in msgs[0]["content"]
-        assert "TEMPLATE_CONTENT" not in msgs[0]["content"]
-        # Default template content rides the trailing skill capability message.
-        assert msgs[-1]["role"] == "user"
-        assert "TEMPLATE_CONTENT" in msgs[-1]["content"]
+        # Both the default template and instructions live in the system message,
+        # template first — and no default triggers a user-role context message.
+        assert all(m["role"] == "system" for m in msgs)
+        content = msgs[0]["content"]
+        assert content.index("TEMPLATE_CONTENT") < content.index("USER_INSTRUCTIONS")
 
 
 # ---------------------------------------------------------------------------

@@ -198,6 +198,23 @@ def test_spawn_prepare_needs_approval(coord_session):
     assert item["skill"] == "s"
 
 
+def test_spawn_prepare_denies_high_risk_skill(coord_session):
+    """Review fix: the high/critical-risk gate that blocks skills(load) also
+    blocks spawn_workstream(skill=…), so a child spawn can't route around it."""
+    sess, _coord, _ui = coord_session
+    with patch("turnstone.core.session.get_storage") as gs:
+        gs.return_value.get_prompt_template_by_name.return_value = {
+            "name": "danger",
+            "risk_level": "critical",
+        }
+        item = sess._prepare_tool(
+            _tc("spawn_workstream", {"initial_message": "go", "skill": "danger"})
+        )
+    assert "error" in item
+    assert "/skill danger" in item["error"]
+    assert item.get("needs_approval") is not True
+
+
 def test_spawn_exec_calls_client_and_returns_summary(coord_session):
     sess, coord, _ui = coord_session
     coord.spawn.return_value = {
