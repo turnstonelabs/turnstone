@@ -23,6 +23,10 @@ def _make_provider(
     """Build a mock LLMProvider whose create_completion returns the given content."""
     provider = MagicMock()
     provider.provider_name = "openai"
+    # The judge reads context_window at construction for its oversize guard.
+    caps = MagicMock()
+    caps.context_window = 200_000
+    provider.get_capabilities = MagicMock(return_value=caps)
 
     def _create_completion(**_kwargs: Any) -> Any:
         if delay:
@@ -243,6 +247,58 @@ class TestEvaluateFailurePaths:
         assert stragglers == [], f"non-daemon worker survived evaluate(): {stragglers}"
 
 
+class TestOversizeGuard:
+    """A tool output that would overflow the judge model's context window must
+    not silently fall to heuristic-only via an opaque provider 400 — it is
+    detected up front and surfaced as a labelled llm_error the operator sees."""
+
+    def test_oversize_output_skips_llm_and_returns_labeled_error(self) -> None:
+        # ``content`` would parse to a clean verdict IF the provider were
+        # called — so a labelled oversize error proves the call was skipped.
+        judge = _make_judge(content='{"risk_level": "low", "flags": [], "reasoning": "x"}')
+        judge._judge_context_window = 50  # tiny window forces the guard to trip
+        v = judge.evaluate("Z" * 2000, func_name="web_fetch", call_id="c1")
+        assert not v.succeeded
+        assert "output_too_large_for_judge_window" in v.error
+        assert v.judge_model  # model recorded so the audit row is attributable
+
+    def test_output_within_window_is_judged_normally(self) -> None:
+        judge = _make_judge(content='{"risk_level": "low", "flags": [], "reasoning": "x"}')
+        v = judge.evaluate("a small, safe output", func_name="bash", call_id="c1")
+        assert v.succeeded
+        assert "too_large" not in v.error
+
+    def test_guard_threshold_scales_with_resolved_window(self) -> None:
+        """The same output that overflows a tiny window passes a large one —
+        the guard is keyed to the judge model, not a fixed cap."""
+        payload = "Z" * 4000  # assembled prompt overflows a 200-tok window, fits 200k
+        small = _make_judge(content='{"risk_level": "low", "flags": [], "reasoning": "x"}')
+        small._judge_context_window = 200
+        big = _make_judge(content='{"risk_level": "low", "flags": [], "reasoning": "x"}')
+        big._judge_context_window = 200_000
+        assert not small.evaluate(payload, call_id="c1").succeeded
+        assert big.evaluate(payload, call_id="c1").succeeded
+
+    def test_missing_provider_capabilities_falls_back_to_default_window(self) -> None:
+        """If the provider can't report a context window, construction uses the
+        conservative default rather than crashing or an unbounded window."""
+        from turnstone.core.output_guard_judge import _DEFAULT_JUDGE_CONTEXT_WINDOW
+
+        provider = _make_provider(content='{"risk_level": "none", "flags": []}')
+        provider.get_capabilities = MagicMock(side_effect=RuntimeError("no caps"))
+        config = JudgeConfig(output_guard_llm=True)
+        client = MagicMock()
+        client.base_url = "http://test"
+        client.api_key = "k"
+        judge = OutputGuardJudge(
+            config=config,
+            session_provider=provider,
+            session_client=client,
+            session_model="test-model",
+        )
+        assert judge._judge_context_window == _DEFAULT_JUDGE_CONTEXT_WINDOW
+
+
 class TestAliasResolution:
     def test_unknown_alias_falls_back_to_session_model(self) -> None:
         # Registry says alias does not exist; judge should fall back.
@@ -390,14 +446,24 @@ class TestFenceEscape:
         assert "Heuristic stage flagged:" not in prompt
         assert "Heuristic annotations:" not in prompt
 
-    def test_user_prompt_truncates_long_tool_args(self) -> None:
+    def test_user_prompt_does_not_default_truncate_tool_args(self) -> None:
+        """tool_args lowers whole — no default cap.  A pathologically large call
+        is caught by evaluate()'s window backstop, not by clipping a normal
+        argument into a misleading prefix."""
         long_args = '{"query": "' + ("x" * 1000) + '"}'
         prompt = OutputGuardJudge._user_prompt(
             "the output", func_name="search", tool_args=long_args
         )
-        assert "...(truncated)" in prompt
-        # Original full 1000+ chars must not appear.
-        assert long_args not in prompt
+        assert long_args in prompt
+        assert "chars omitted" not in prompt
+
+    def test_user_prompt_never_truncates_the_output_under_review(self) -> None:
+        """The fenced output is the content being judged and must reach the
+        judge whole."""
+        big_output = "Z" * 20_000
+        prompt = OutputGuardJudge._user_prompt(big_output, func_name="web_fetch")
+        assert big_output in prompt
+        assert "chars omitted" not in prompt
 
     def test_user_prompt_skips_heuristic_section_when_clean(self) -> None:
         # risk='none' and empty flags → no "Heuristic stage flagged" line.
