@@ -4513,6 +4513,44 @@ class TestMetacognitiveBuffers:
         assert _user_pending(session) == [("correction", "USER_NUDGE_MARK")]
         assert _tool_pending(session) == [("tool_error", "TOOL_NUDGE_MARK")]
 
+    def test_mcp_readiness_advisory_queued_for_unusable_servers(self, tmp_db):
+        """A dead-grant / undecryptable server surfaces as an in-run advisory the
+        model and user both see; a ``ready`` server is not mentioned."""
+        session = _make_session()
+        mcp = MagicMock()
+        mcp.readiness_for_user.return_value = {
+            "xconnect": "needs_consent",
+            "maildir": "ready",
+            "storage3": "decrypt_error",
+        }
+        session._mcp_client = mcp
+        session._emit_mcp_readiness_advisory("alice")
+        pending = _user_pending(session)
+        assert len(pending) == 1
+        nudge_type, text = pending[0]
+        assert nudge_type == "mcp_readiness"
+        assert "xconnect" in text and "re-consent" in text
+        assert "storage3" in text  # decrypt_error is also surfaced as unusable
+        assert "maildir" not in text  # a ready server is not called out
+        mcp.readiness_for_user.assert_called_once_with("alice")
+
+    def test_mcp_readiness_advisory_silent_when_all_ready(self, tmp_db):
+        session = _make_session()
+        mcp = MagicMock()
+        mcp.readiness_for_user.return_value = {"xconnect": "ready", "ringdown": "cooling"}
+        session._mcp_client = mcp
+        session._emit_mcp_readiness_advisory("alice")
+        assert _user_pending(session) == []  # 'cooling' is transient, not a known-issue
+
+    def test_mcp_readiness_advisory_noop_without_user_or_client(self, tmp_db):
+        session = _make_session()
+        session._mcp_client = MagicMock()
+        session._emit_mcp_readiness_advisory(None)
+        assert _user_pending(session) == []
+        session._mcp_client = None
+        session._emit_mcp_readiness_advisory("alice")
+        assert _user_pending(session) == []
+
     def test_collect_advisories_drains_tool_buffer_on_last_result(self, tmp_db):
         """Tool-channel metacog nudges drain on the last result as
         ``(source, content, meta)`` system-turn specs — the caller

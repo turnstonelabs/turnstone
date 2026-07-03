@@ -4771,6 +4771,19 @@ class PostgreSQLBackend:
                 )
             return out
 
+    def list_mcp_user_token_owners(self) -> list[str]:
+        """Return every distinct ``user_id`` owning >=1 MCP user-token row.
+
+        Unfiltered by expiry: an expired access token with a live refresh
+        token is still a consented grant the readiness reconciler must keep
+        warm. Only the ``user_id`` column is projected — no ciphertext.
+        """
+        with self._conn() as conn:
+            rows = conn.execute(
+                sa.select(sa.distinct(mcp_user_tokens.c.user_id))
+            ).fetchall()
+        return [row[0] for row in rows]
+
     def delete_mcp_oauth_rows_by_server_name(self, server_name: str) -> int:
         """Purge user tokens + pending OAuth state for *server_name*."""
         with self._conn() as conn:

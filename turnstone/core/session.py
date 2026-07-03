@@ -5186,8 +5186,13 @@ class ChatSession:
         - swaps the user-scoped tool/resource/prompt listeners so pool
           catalog changes for the acting user reach this session
           (listener identity is the ``(user_id, callback)`` pair);
-        - fire-and-forget primes the acting user's oauth_user pools so
-          their tools surface without a manual reconnect;
+        - runs a BOUNDED, BLOCKING pre-flight prime of the acting user's
+          oauth_user pools so an OBO-appended task (e.g. a ringdown
+          remediation workstream) finds its tools live BEFORE the turn's
+          first tool dispatch — instead of racing a fire-and-forget prime.
+          Near-zero when the keep-ready reconciler already holds them warm;
+          capped by a short timeout when cold, after which lazy dispatch
+          backstops;
         - rebuilds the merged tool list and catalog-dependent state via
           the same callbacks a pool notification would fire.
 
@@ -5218,7 +5223,18 @@ class ChatSession:
                 mcp.remove_prompt_listener(self._mcp_prompt_cb, user_id=old_listener_uid)
                 mcp.add_prompt_listener(self._mcp_prompt_cb, user_id=new_listener_uid)
             self._mcp_listener_user_id = new_listener_uid
-        if new_listener_uid and hasattr(mcp, "prime_user_pools"):
+        if new_listener_uid and hasattr(mcp, "prime_user_pools_sync"):
+            # Pre-flight readiness gate: reconcile + WAIT (bounded) so the acting
+            # user's tools are live before the agent loop can dispatch. Cheap when
+            # warm; capped when cold. Never raises — degrades to lazy dispatch.
+            try:
+                mcp.prime_user_pools_sync(new_listener_uid, timeout=3.0)
+            except Exception:
+                log.debug(
+                    "mcp pre-flight prime failed user=%s", new_listener_uid, exc_info=True
+                )
+        elif new_listener_uid and hasattr(mcp, "prime_user_pools"):
+            # Backstop for a manager without the sync primitive (older build).
             try:
                 mcp.prime_user_pools(new_listener_uid)
             except Exception:
@@ -5228,13 +5244,15 @@ class ChatSession:
                     exc_info=True,
                 )
         # Rebuild the merged tool list and resource/prompt-dependent
-        # state under the new identity NOW — the prime above completes
-        # asynchronously and only notifies on catalog changes, while
-        # already-warm pool entries for this user produce no
-        # notification at all.
+        # state under the new identity NOW — already-warm pool entries for
+        # this user produce no notification, and the pre-flight prime above
+        # has completed (or timed out) so the catalog reflects what's live.
         self._on_mcp_tools_changed()
         self._on_mcp_resources_changed()
         self._on_mcp_prompts_changed()
+        # Surface any tool server the pre-flight found un-usable (dead grant /
+        # undecryptable token) as an in-run notice for user + model.
+        self._emit_mcp_readiness_advisory(new_listener_uid)
 
     def send(
         self,
@@ -10014,6 +10032,43 @@ class ChatSession:
                 continue
             meta = {k: v for k, v in entry.items() if k not in ("type", "text")}
             self._append_system_turn(source, str(entry.get("text") or ""), **meta)
+
+    def _emit_mcp_readiness_advisory(self, user_id: str | None) -> None:
+        """Queue an up-front advisory when the acting user has an MCP tool server
+        that can't currently be used (dead grant / undecryptable token).
+
+        Runs from :meth:`bind_acting_user` right after the bounded pre-flight
+        prime, so the readiness substrate is fresh. The reconciler already raised
+        the dashboard pending-consent badge (the human's out-of-band signal); this
+        is the IN-RUN signal — a ``{"role": "system"}`` turn both the user (via the
+        ``on_system_turn`` SSE hook) and the model (in conversation history) see,
+        so a known issue is visible before the turn's work depends on that tool.
+        Lazy dispatch still surfaces the precise per-call error if the model tries
+        the tool anyway. Fires only on an acting-user *change* (bind_acting_user
+        early-returns otherwise), so it advises once, not every turn.
+        """
+        mcp = self._mcp_client
+        if not user_id or not mcp or not hasattr(mcp, "readiness_for_user"):
+            return
+        try:
+            statuses = mcp.readiness_for_user(user_id)
+        except Exception:
+            return
+        unusable = {
+            "needs_consent": "authorization expired — needs re-consent via MCP settings",
+            "decrypt_error": "stored token unreadable — an operator must reset the key",
+        }
+        blocked = {srv: unusable[st] for srv, st in statuses.items() if st in unusable}
+        if not blocked:
+            return
+        detail = "; ".join(f"'{srv}' ({why})" for srv, why in sorted(blocked.items()))
+        text = (
+            "MCP tool availability notice: the following consented tool server(s) "
+            f"cannot be used right now — {detail}. Calls to their tools will fail "
+            "until this is resolved. Plan around this or surface it to the user "
+            "rather than retrying blindly."
+        )
+        self._queue_user_advisory("mcp_readiness", text)
 
     def _queue_tool_advisory(self, nudge_type: str, text: str) -> None:
         """Queue a metacognitive nudge for the next tool-result batch.

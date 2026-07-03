@@ -2158,6 +2158,18 @@ class StorageBackend(Protocol):
         """
         ...
 
+    def list_mcp_user_token_owners(self) -> list[str]:
+        """Return every distinct ``user_id`` that owns at least one MCP user-token row.
+
+        Deliberately UNFILTERED by ``expires_at``: an expired access token backed
+        by a live refresh token is still a consented, reconcilable grant. The
+        background readiness reconciler (:class:`MCPClientManager`) drives per-user
+        priming off this set to keep every consented ``oauth_user`` connection
+        warm without a caller or an external cron poking it. Ciphertext columns
+        are never touched — only the ``user_id`` projection crosses the wire.
+        """
+        ...
+
     def delete_mcp_oauth_rows_by_server_name(self, server_name: str) -> int:
         """Purge per-(user, server) tokens and pending OAuth states for *server_name*.
 

@@ -712,6 +712,29 @@ class MCPClientManager:
         # static-only deployments).
         self._user_pool_eviction_task: asyncio.Task[None] | None = None
 
+        # Autonomous reconnect-probe task handle. Unlike the eviction task
+        # (started lazily on the first pool entry), this is started once in
+        # ``_connect_all`` so static-server connections self-heal even in a
+        # deployment that never creates a pool entry.
+        self._reconnect_probe_task: asyncio.Task[None] | None = None
+
+        # -- self-maintained readiness (oauth_user keep-warm) -----------------
+        # ``(user, server)`` keys the readiness reconciler pins WARM: entries in
+        # this set are exempt from the idle-TTL eviction pass so a deliberately
+        # kept-primed connection isn't torn down between uses. Turnstone keeps
+        # every consented pair ready for incoming work itself — no caller
+        # readiness check, no external cron. Discarded when a grant goes dead
+        # (needs re-consent) or an entry is closed, so the set tracks only pairs
+        # that are actually being held warm. Loop-only mutation.
+        self._keepalive_keys: set[tuple[str, str]] = set()
+        # Last observed readiness per ``(user, server)`` — the substrate the
+        # pre-flight gate (mechanism 2) and any health surface read WITHOUT
+        # driving reconciliation themselves. Values: "ready" | "needs_consent"
+        # | "decrypt_error" | "transient_error" | "cooling" | "connect_failed".
+        # A dead-grant transition is the proactive escalation signal (logged
+        # once, on change). Loop-only mutation.
+        self._readiness_status: dict[tuple[str, str], str] = {}
+
         # Strong references to fire-and-forget background tasks (catalog
         # refreshes etc.).  ``create_task`` alone keeps only a weak ref — an
         # untracked task can be GC'd mid-flight, and its exception surfaces
@@ -799,6 +822,14 @@ class MCPClientManager:
 
         self._connected.set()
 
+        # Start the autonomous reconnect probe (once, on the mcp-loop). Self-
+        # heals static-server connections dropped by restarts or outages without
+        # waiting for a dispatch or an operator. Static-only deployments never
+        # create a pool entry, so this is started here rather than lazily like
+        # the eviction task.
+        if self._reconnect_probe_task is None:
+            self._reconnect_probe_task = asyncio.create_task(self._reconnect_probe_loop())
+
     _CONNECT_TIMEOUT = 30  # seconds — prevents hung connections on broken remotes
     _TCP_PROBE_TIMEOUT = 5  # seconds — fast TCP pre-flight for HTTP transports
 
@@ -816,6 +847,11 @@ class MCPClientManager:
     # Best-effort lock acquire timeout for the eviction pass; eviction must
     # never block on a contested per-key lock so the next tick retries.
     _POOL_EVICTION_LOCK_ACQUIRE_TIMEOUT_S = 0.05
+
+    # Autonomous reconnect-probe loop tick (seconds). Each tick reconnects any
+    # disconnected static server whose circuit-breaker cooldown has expired; the
+    # circuit breaker supplies the backoff, so this is only the wake cadence.
+    _RECONNECT_PROBE_TICK_S = 30.0
 
     # -- circuit breaker (per-server) -----------------------------------------
 
@@ -1807,6 +1843,78 @@ class MCPClientManager:
             # mcp-loop is shutting down — skip; lazy dispatch is the backstop.
             log.debug("mcp pool prime skipped: loop closed user=%s", user_id)
 
+    def prime_user_pools_sync(self, user_id: str, *, timeout: float = 5.0) -> None:
+        """Blocking variant of :meth:`prime_user_pools` — reconcile THIS user's
+        consented ``oauth_user`` pools and WAIT (up to ``timeout`` seconds) for it.
+
+        The pre-flight readiness gate calls this at OBO / taskstream ingest so an
+        appended task (e.g. a ringdown alert's remediation workstream) finds its
+        tools already live instead of racing a fire-and-forget prime against the
+        first tool dispatch. Cost is near-zero when the pools are already warm —
+        the keep-ready reconciler holds them so, and each server short-circuits
+        to a pin with no I/O; it is bounded by ``timeout`` when a pool is cold or
+        an upstream is slow, after which it returns and lazy dispatch remains the
+        backstop. Never raises: a scheduling / await failure degrades to the same
+        best-effort outcome as the non-blocking path.
+
+        MUST be called from a NON-mcp-loop thread (e.g. a session worker). The
+        wait is a ``concurrent.futures`` block, so calling it on the mcp-loop
+        would deadlock — invoked there, it degrades to fire-and-forget instead.
+        """
+        if not user_id or self._loop is None or not self._oauth_user_server_names:
+            return
+        if self._app_state is None or self._storage is None:
+            return
+        if threading.current_thread() is self._thread:
+            # On the mcp-loop itself — cannot block on our own loop; schedule
+            # the reconcile and return without waiting.
+            self.prime_user_pools(user_id)
+            return
+        try:
+            fut = asyncio.run_coroutine_threadsafe(self._prime_user_pools(user_id), self._loop)
+        except RuntimeError:
+            log.debug("mcp pool prime skipped: loop closed user=%s", user_id)
+            return
+        try:
+            fut.result(timeout=timeout)
+        except concurrent.futures.TimeoutError:
+            # Cold / slow upstream — don't hold the turn open indefinitely; the
+            # partially-primed pools finish in the background and lazy dispatch
+            # backstops whatever isn't ready yet.
+            log.info(
+                "mcp pool prime gate timed out user=%s after %.1fs; continuing", user_id, timeout
+            )
+        except Exception:
+            log.debug("mcp pool prime gate failed user=%s", user_id, exc_info=True)
+
+    def readiness_for_user(self, user_id: str) -> dict[str, str]:
+        """Return ``{server_name: readiness_status}`` for THIS user's consented
+        ``oauth_user`` servers, read from the substrate the keep-ready reconciler
+        maintains (``_readiness_status``).
+
+        Statuses: ``ready``, ``needs_consent``, ``decrypt_error``,
+        ``transient_error``, ``cooling``, ``connect_failed``. A server absent from
+        the map (never primed / not consented) is simply omitted.
+
+        Read-only snapshot for the pre-flight gate and health surfaces — it does
+        NOT drive reconciliation (the background loop does), so callers stay free
+        of readiness responsibility. Scoped to ``user_id`` only: never exposes
+        another user's pool state (mirrors the cross-user guard in
+        ``_oauth_user_server_status``). Eventually consistent: the map is mutated
+        only on the mcp-loop, so a rare concurrent mutation yields an empty
+        snapshot here, which the gate treats as "unknown" and defers to lazy
+        dispatch — never a wrong answer, just an occasional missed pre-flight.
+        """
+        if not user_id:
+            return {}
+        try:
+            items = list(self._readiness_status.items())
+        except RuntimeError:
+            # dict changed size during iteration (loop mutated mid-read) — the
+            # caller reads {} as "unknown" and lazy dispatch remains the backstop.
+            return {}
+        return {server_name: status for (uid, server_name), status in items if uid == user_id}
+
     async def _prime_user_pools(self, user_id: str) -> None:
         """Warm THIS user's consented ``oauth_user`` pools (runs on the mcp-loop).
 
@@ -1833,7 +1941,12 @@ class MCPClientManager:
             key = (user_id, server_name)
             entry = self._user_pool_entries.get(key)
             if entry is not None and entry.session is not None:
-                return  # already connected — nothing to do
+                # Already warm — pin it against the idle-TTL eviction pass and
+                # record readiness. Idempotent: the common steady-state path for
+                # a kept-warm pair, so it must stay a pure dict update (no I/O).
+                self._keepalive_keys.add(key)
+                self._set_readiness(key, "ready")
+                return
             if key in self._priming_keys:
                 return  # a concurrent prime for this (user, server) is in flight
             # Claim synchronously before any await — the mcp-loop is single-
@@ -1850,30 +1963,81 @@ class MCPClientManager:
                         # is deferred to lazy dispatch — priming runs for every
                         # consented server, so an AS hiccup we can't classify must
                         # not revoke consent for one the user may not be using this
-                        # session. Only kind == "token" warms the pool.
+                        # session.
                         lookup = await get_user_access_token_classified(
                             app_state=self._app_state,
                             user_id=user_id,
                             server_name=server_name,
                             revoke_ambiguous_escalation=False,
                         )
+                        if lookup.kind == "missing":
+                            # No stored grant: the user simply hasn't consented to
+                            # this server. Nothing to keep warm — NOT an escalation.
+                            # (``refresh_failed`` also lands here on the *next* tick,
+                            # after its one-shot revoke deletes the row — by which
+                            # point the needs_consent status is already recorded.)
+                            self._keepalive_keys.discard(key)
+                            self._readiness_status.pop(key, None)
+                            return
+                        if lookup.kind == "refresh_failed":
+                            # Dead refresh token (invalid_grant): only a human
+                            # re-consent in a browser can fix it. Detect it
+                            # PROACTIVELY here — ahead of any work that needs the
+                            # tool — and unpin so a stale warm entry can be reclaimed.
+                            self._keepalive_keys.discard(key)
+                            self._set_readiness(key, "needs_consent")
+                            # Raise the dashboard pending-consent badge NOW, days
+                            # ahead of any bot action that would need the tool —
+                            # rather than waiting for a dispatch to fail. Reuses the
+                            # same deferred-consent surface as the lazy path.
+                            await self._persist_pending_consent_best_effort(user_id, server_name)
+                            return
+                        if lookup.kind == "decrypt_failure":
+                            # Undecryptable stored token — an operator key issue,
+                            # not auto-recoverable. Surface it; unpin.
+                            self._keepalive_keys.discard(key)
+                            self._set_readiness(key, "decrypt_error")
+                            return
                         if lookup.kind != "token" or not lookup.token:
-                            return  # not consented / undecryptable / refresh failed — lazy paths handle it
+                            # refresh_failed_transient — AS/network hiccup. Keep the
+                            # grant and the pin; lazy dispatch + the next tick retry.
+                            self._set_readiness(key, "transient_error")
+                            return
+                        # kind == "token": warm the pool, but gate the CONNECT on
+                        # the server circuit breaker so a prolonged upstream outage
+                        # settles into one probe per cooldown instead of a reconnect
+                        # every tick for every consented user. Token classification
+                        # (above) hits the AS, a different subsystem, so it stays
+                        # outside the gate — a down MCP server must not suppress
+                        # dead-consent detection.
+                        try:
+                            self._cb_gate(server_name)
+                        except RuntimeError:
+                            self._set_readiness(key, "cooling")
+                            return
                         server_row = await asyncio.to_thread(
                             self._storage.get_mcp_server_by_name, server_name
                         )
                         if not server_row:
                             return
                         cfg = _pool_cfg_from_row(server_row)
-                        await self._prime_user_server(key, cfg, lookup.token)
+                        try:
+                            await self._prime_user_server(key, cfg, lookup.token)
+                        except Exception:
+                            self._cb_record_failure(server_name)
+                            self._set_readiness(key, "connect_failed")
+                            raise
+                        self._cb_record_success(server_name)
+                        self._keepalive_keys.add(key)
+                        self._set_readiness(key, "ready")
                         log.info(
-                            "mcp pool auto-primed at session start user=%s server=%s",
+                            "mcp pool primed (readiness) user=%s server=%s",
                             user_id,
                             server_name,
                         )
                     except Exception:
                         log.debug(
-                            "mcp pool auto-prime failed user=%s server=%s",
+                            "mcp pool prime failed user=%s server=%s",
                             user_id,
                             server_name,
                             exc_info=True,
@@ -1882,6 +2046,139 @@ class MCPClientManager:
                 self._priming_keys.discard(key)
 
         await asyncio.gather(*(_prime_one(s) for s in list(self._oauth_user_server_names)))
+
+    # -- autonomous reconnect probe -------------------------------------------
+
+    async def _reconnect_probe_loop(self) -> None:
+        """Long-running coroutine — the single internal keep-ready driver.
+
+        The SDK's own GET-stream reconnect gives up after a bounded burst, and
+        every other reconnect/prime path (``_cb_auto_reconnect``, operator
+        refresh, session-start priming) is *lazy* — it fires only on a dispatch
+        or a human. So a server that goes down and comes back, or a token that
+        quietly expires, stays broken until someone happens to use it. That is
+        exactly the failure the ringdown → autonomous-remediation path can't
+        tolerate: an alert appends work for a user and the tool must already be
+        live. This loop is Turnstone keeping ITSELF ready — no caller readiness
+        check, no external cron poking it. Each tick, on the mcp-loop:
+
+          1. ``_reconnect_probe_tick`` — reconnect disconnected STATIC servers.
+          2. ``_oauth_readiness_tick`` — for every consented ``oauth_user`` pair,
+             refresh the token, keep the pool warm (pinned against idle
+             eviction), and surface dead grants that need a human re-consent.
+
+        Backoff is delegated to the circuit breaker (``_cb_gate`` /
+        ``_cb_record_failure``), so a multi-hour outage settles into one probe
+        per ``_CB_MAX_COOLDOWN`` instead of hammering every tick. Each tick is
+        isolated so a failure in one half can't starve the other.
+        """
+        while True:
+            try:
+                await asyncio.sleep(self._RECONNECT_PROBE_TICK_S)
+                await self._reconnect_probe_tick()
+                await self._oauth_readiness_tick()
+            except asyncio.CancelledError:
+                return
+            except Exception:
+                log.warning("MCP reconnect probe iteration failed", exc_info=True)
+
+    async def _reconnect_probe_tick(self) -> None:
+        """One pass: reconnect every disconnected static server the CB allows.
+
+        MUST run on the mcp-loop (calls ``_connect_one``). Per-server failures
+        are isolated so one dead upstream can't starve the rest of the pass.
+        """
+        for name in list(self._server_configs.keys()):
+            if name in self._oauth_user_server_names:
+                continue  # per-user connections — not manager-owned
+            state = self._static_servers.get(name)
+            if state is not None and state.session is not None:
+                continue  # already connected
+            cfg = self._server_configs.get(name)
+            if not cfg:
+                continue
+            # The circuit-breaker gate IS the backoff: open+cooling raises →
+            # skip this tick; open+expired (half-open) → ``_cb_gate`` clears the
+            # deadline and lets this one probe through; closed → proceed.
+            try:
+                self._cb_gate(name)
+            except RuntimeError:
+                continue
+            try:
+                log.info("MCP autonomous reconnect probe: reconnecting '%s'", name)
+                await self._connect_one(name, cfg)
+                self._cb_record_success(name)
+                # Refresh the catalog off the critical path (mirrors
+                # ``_cb_auto_reconnect``): the session is usable immediately;
+                # tool/resource drift reconciles in the background.
+                self._spawn_background(
+                    self._refresh_server(name),
+                    f"catalog refresh after autonomous reconnect '{name}'",
+                )
+            except Exception as exc:
+                self._cb_record_failure(name)
+                # A dead transport leaves a non-None but unusable session; evict
+                # it so the next tick's ``session is None`` check re-probes rather
+                # than re-using the corpse (same reasoning as ``_refresh_all``).
+                if _is_dead_transport(exc):
+                    dead = self._static_servers.get(name)
+                    if dead is not None:
+                        dead.session = None
+                log.debug("autonomous reconnect probe failed for '%s': %s", name, exc)
+
+    def _set_readiness(self, key: tuple[str, str], status: str) -> None:
+        """Record the readiness of a ``(user, server)`` pair.
+
+        Idempotent and cheap (loop-only dict write). A *transition* into a
+        state that needs a human — ``needs_consent`` (dead refresh token) or
+        ``decrypt_error`` (operator key issue) — is logged once, at WARNING:
+        this is the proactive escalation. Because ``refresh_failed`` revokes
+        its row and thereafter reads as ``missing``, and ``decrypt_error``
+        recurs every tick, logging only on the transition keeps the escalation
+        loud-once rather than spamming every tick.
+        """
+        prev = self._readiness_status.get(key)
+        if prev == status:
+            return
+        self._readiness_status[key] = status
+        if status in ("needs_consent", "decrypt_error"):
+            user_id, server_name = key
+            log.warning(
+                "MCP readiness: '%s' for user=%s server=%s needs human intervention "
+                "(re-consent required before autonomous work can use this tool)",
+                status,
+                user_id,
+                server_name,
+            )
+
+    async def _oauth_readiness_tick(self) -> None:
+        """One pass: keep every consented ``oauth_user`` pair primed and warm.
+
+        Drives the SAME per-user priming state machine session start uses
+        (:meth:`_prime_user_pools`), but for ALL consented users — enumerated
+        from Turnstone's own token store, so no caller and no cron supplies the
+        set. Steady state is nearly free: an already-warm pair short-circuits to
+        a pin + status update with no I/O; only a disconnected or token-expiring
+        pair does real work. Dead grants are surfaced (needs_consent) without
+        auto-fixing — that ceiling is a human in a browser.
+
+        MUST run on the mcp-loop. Per-user failures are isolated so one bad
+        user can't starve the rest of the pass.
+        """
+        if self._storage is None or self._app_state is None or not self._oauth_user_server_names:
+            return  # nothing pool-backed to keep warm, or not wired yet
+        try:
+            owners = await asyncio.to_thread(self._storage.list_mcp_user_token_owners)
+        except Exception:
+            log.debug("MCP readiness: failed to enumerate consented users", exc_info=True)
+            return
+        for user_id in owners:
+            try:
+                await self._prime_user_pools(user_id)
+            except Exception:
+                log.debug(
+                    "MCP readiness: reconcile failed for user=%s", user_id, exc_info=True
+                )
 
     # -- pool eviction --------------------------------------------------------
 
@@ -1909,6 +2206,15 @@ class MCPClientManager:
         Skips any key whose ``open_lock`` is currently held or whose
         ``in_flight`` counter is non-zero — eviction never blocks on a
         contested lock or an active dispatch; the next tick retries.
+
+        Keepalive-pinned keys (``_keepalive_keys``) are exempt from the idle-TTL
+        pass: the readiness reconciler holds those connections warm ON PURPOSE
+        so incoming work finds them live, and tearing them down on idle would
+        just make the next reconciler tick reconnect them. They remain eligible
+        for the LRU-cap pass — a hard ceiling on total pool size that a
+        misconfigured keepalive set must not be able to blow past. (At the
+        deployment scale this targets — admins in the low tens × a few servers
+        — the pool sits far under the cap and the LRU pass never fires.)
         """
         if not self._user_pool_entries:
             return
@@ -1919,6 +2225,8 @@ class MCPClientManager:
         # that needs to evict many entries doesn't block on serial teardowns.
         ttl_targets: list[tuple[str, str]] = []
         for key, entry in list(self._user_pool_entries.items()):
+            if key in self._keepalive_keys:
+                continue  # deliberately kept warm — never idle-evicted
             last = self._user_pool_last_used.get(key, entry.last_used)
             if (now - last) >= ttl:
                 ttl_targets.append(key)
@@ -1988,6 +2296,9 @@ class MCPClientManager:
                 await self._safe_close_stack(stack)
             self._user_pool_entries.pop(key, None)
             self._user_pool_last_used.pop(key, None)
+            # Drop the keepalive pin so a torn-down entry isn't recorded as
+            # kept-warm; the reconciler re-pins on its next successful prime.
+            self._keepalive_keys.discard(key)
             # Mirror ``_evict_session``'s catalog cleanup: dropping the
             # entry without rebuilding the per-user catalogs would leave
             # ``is_mcp_tool`` / per-user resource & prompt maps returning
@@ -3047,6 +3358,15 @@ class MCPClientManager:
         if self._loop is not None and self._loop.is_running():
 
             async def _cancel_background() -> None:
+                # Autonomous reconnect probe is a dedicated handle (not in
+                # _background_tasks); cancel it here so a static-only deployment
+                # — which never enters the pool-eviction teardown below — still
+                # stops it cleanly.
+                if self._reconnect_probe_task is not None:
+                    self._reconnect_probe_task.cancel()
+                    with contextlib.suppress(BaseException):
+                        await self._reconnect_probe_task
+                    self._reconnect_probe_task = None
                 tasks = list(self._background_tasks)
                 for task in tasks:
                     task.cancel()
@@ -3076,6 +3396,8 @@ class MCPClientManager:
                         await self._safe_close_stack(entry.stack)
                 self._user_pool_entries.clear()
                 self._user_pool_last_used.clear()
+                self._keepalive_keys.clear()
+                self._readiness_status.clear()
                 self._user_pool_locks.clear()
 
             future = asyncio.run_coroutine_threadsafe(_close_all_pool(), self._loop)
@@ -3152,6 +3474,8 @@ class MCPClientManager:
         self._user_pool_entries.clear()
         self._user_pool_last_used.clear()
         self._user_pool_locks.clear()
+        self._keepalive_keys.clear()
+        self._readiness_status.clear()
         self._user_tool_map.clear()
         self._user_tools.clear()
         # Phase 7b — per-user resource / prompt catalogs.
@@ -4111,6 +4435,41 @@ class MCPClientManager:
                 user_id,
                 server_name,
                 code,
+                exc_info=True,
+            )
+
+    async def _persist_pending_consent_best_effort(self, user_id: str, server_name: str) -> None:
+        """Raise the dashboard pending-consent badge for a proactively-detected
+        dead grant (readiness ``needs_consent``), off the mcp-loop.
+
+        The keep-ready reconciler runs ON the loop, so the blocking storage write
+        goes through ``asyncio.to_thread`` — never block the loop on the DB. Maps
+        to the ``mcp_consent_required`` code the dashboard already renders; the
+        ``last_ws_id`` / ``last_tool_call_id`` fields are ``None`` (there is no
+        triggering dispatch — that is the whole point of surfacing it early).
+        ``decrypt_error`` is intentionally NOT badged here: it is operator-
+        actionable (key unknown), outside the user-consent dashboard's scope —
+        same filter the lazy path applies in ``_record_pending_consent_best_effort``.
+        Best-effort: a storage failure is logged, never raised onto the loop.
+        """
+        if self._storage is None:
+            return
+        try:
+            await asyncio.to_thread(
+                self._storage.upsert_mcp_pending_consent,
+                user_id=user_id,
+                server_name=server_name,
+                error_code="mcp_consent_required",
+                scopes_required=None,
+                last_ws_id=None,
+                last_tool_call_id=None,
+                now_iso=datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S"),
+            )
+        except Exception:
+            log.warning(
+                "mcp readiness: pending-consent badge persist failed user=%s server=%s",
+                user_id,
+                server_name,
                 exc_info=True,
             )
 

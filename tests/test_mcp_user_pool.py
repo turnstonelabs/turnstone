@@ -15,13 +15,14 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
+import logging
 import threading
 import time
 from contextlib import AsyncExitStack
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 from typing import Any
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -969,3 +970,297 @@ class TestUserIdThreadThrough:
         assert result == "static-output"
         # No pool entries were created.
         assert mgr._user_pool_entries == {}
+
+
+# ---------------------------------------------------------------------------
+# Mechanism 1: self-maintained readiness reconciler (oauth_user keep-warm)
+# ---------------------------------------------------------------------------
+
+
+class TestReadinessReconciler:
+    """The internal keep-ready driver: Turnstone keeps every consented
+    ``oauth_user`` pair primed for incoming work WITHOUT a caller readiness
+    check or an external cron. Covers keepalive pinning vs eviction, readiness
+    status + dead-grant escalation, the all-owners reconcile pass, and the
+    ``DISTINCT user_id`` enumerator that feeds it."""
+
+    def _wire(self, mgr: MCPClientManager, storage: SQLiteBackend, cipher: Any) -> SimpleNamespace:
+        mgr.set_storage(storage)
+        state = _make_app_state(storage, cipher=cipher)
+        mgr.set_app_state(state)
+        mgr._oauth_user_server_names = {"pool-srv"}
+        return state
+
+    # -- keepalive pin vs eviction ------------------------------------------
+
+    def test_keepalive_exempt_from_idle_eviction(self, running_loop_mgr) -> None:
+        mgr, loop, _ = running_loop_mgr
+        mgr._user_pool_idle_ttl_s = 0.0  # everything is stale
+
+        async def _seed() -> None:
+            for uid in ("u-pin", "u-free"):
+                entry = await mgr._ensure_pool_entry((uid, "pool-srv"))
+                entry.session = MagicMock()
+            mgr._keepalive_keys.add(("u-pin", "pool-srv"))
+
+        _run_on_loop(loop, _seed())
+        _run_on_loop(loop, mgr._evict_idle_pool_entries())
+        # The pinned pair is kept warm; the un-pinned idle one is reaped.
+        assert ("u-pin", "pool-srv") in mgr._user_pool_entries
+        assert ("u-free", "pool-srv") not in mgr._user_pool_entries
+
+    def test_keepalive_still_bounded_by_lru_and_unpinned_on_close(self, running_loop_mgr) -> None:
+        mgr, loop, _ = running_loop_mgr
+        mgr._user_pool_idle_ttl_s = 999_999.0  # TTL disabled — isolate LRU
+        mgr._user_pool_lru_max = 1
+
+        async def _seed() -> None:
+            base = time.monotonic()
+            for i in range(3):
+                key = (f"u{i}", "pool-srv")
+                entry = await mgr._ensure_pool_entry(key)
+                entry.session = MagicMock()
+                entry.last_used = base + i
+                mgr._user_pool_last_used[key] = base + i
+                mgr._keepalive_keys.add(key)
+
+        _run_on_loop(loop, _seed())
+        _run_on_loop(loop, mgr._evict_idle_pool_entries())
+        # LRU is a hard ceiling even for pinned keys — a runaway keepalive set
+        # can never blow past the pool cap.
+        assert len(mgr._user_pool_entries) <= 1
+        # Closed keys are unpinned so the pin set never points at a gone entry.
+        assert mgr._keepalive_keys <= set(mgr._user_pool_entries.keys())
+
+    # -- readiness status + escalation --------------------------------------
+
+    def test_set_readiness_escalates_needs_consent_once(self, running_loop_mgr, caplog) -> None:
+        mgr, _, _ = running_loop_mgr
+        key = ("u1", "pool-srv")
+        with caplog.at_level(logging.WARNING, logger="turnstone.core.mcp_client"):
+            mgr._set_readiness(key, "needs_consent")
+            mgr._set_readiness(key, "needs_consent")  # no transition → no 2nd log
+        assert mgr._readiness_status[key] == "needs_consent"
+        escalations = [r for r in caplog.records if "needs human intervention" in r.getMessage()]
+        assert len(escalations) == 1
+
+    def test_set_readiness_ready_is_silent(self, running_loop_mgr, caplog) -> None:
+        mgr, _, _ = running_loop_mgr
+        with caplog.at_level(logging.WARNING, logger="turnstone.core.mcp_client"):
+            mgr._set_readiness(("u1", "pool-srv"), "ready")
+        assert not [r for r in caplog.records if "needs human intervention" in r.getMessage()]
+
+    # -- all-owners reconcile pass ------------------------------------------
+
+    def test_readiness_tick_reconciles_every_owner(self, running_loop_mgr, storage) -> None:
+        mgr, loop, _ = running_loop_mgr
+        cipher = make_mcp_token_cipher()
+        self._wire(mgr, storage, cipher)
+        _seed_oauth_server(storage)
+        _seed_user_token(storage, cipher, user_id="alice")
+        _seed_user_token(storage, cipher, user_id="bob")
+
+        primed: list[str] = []
+
+        async def _fake_prime(uid: str) -> None:
+            primed.append(uid)
+
+        mgr._prime_user_pools = _fake_prime  # type: ignore[assignment]
+        _run_on_loop(loop, mgr._oauth_readiness_tick())
+        assert sorted(primed) == ["alice", "bob"]
+
+    def test_readiness_tick_noop_without_pool_servers(self, running_loop_mgr, storage) -> None:
+        mgr, loop, _ = running_loop_mgr
+        cipher = make_mcp_token_cipher()
+        self._wire(mgr, storage, cipher)
+        mgr._oauth_user_server_names = set()  # nothing pool-backed to keep warm
+        _seed_user_token(storage, cipher, user_id="alice")
+
+        called: list[str] = []
+
+        async def _fake_prime(uid: str) -> None:
+            called.append(uid)
+
+        mgr._prime_user_pools = _fake_prime  # type: ignore[assignment]
+        _run_on_loop(loop, mgr._oauth_readiness_tick())
+        assert called == []
+
+    # -- per-pair classification (via _prime_user_pools) --------------------
+
+    def test_dead_grant_escalates_and_unpins(self, running_loop_mgr, storage, caplog) -> None:
+        mgr, loop, _ = running_loop_mgr
+        cipher = make_mcp_token_cipher()
+        self._wire(mgr, storage, cipher)
+        _seed_oauth_server(storage)
+        key = ("u1", "pool-srv")
+        mgr._keepalive_keys.add(key)  # previously warm; the grant just died
+        storage.upsert_mcp_pending_consent = MagicMock()  # spy the dashboard badge write
+
+        async def _classified(**kwargs: Any) -> Any:
+            return SimpleNamespace(kind="refresh_failed", token=None)
+
+        with (
+            patch.object(mgr, "_prime_user_server", new=AsyncMock()),
+            patch("turnstone.core.mcp_client.get_user_access_token_classified", new=_classified),
+            caplog.at_level(logging.WARNING, logger="turnstone.core.mcp_client"),
+        ):
+            _run_on_loop(loop, mgr._prime_user_pools("u1"))
+        assert mgr._readiness_status[key] == "needs_consent"
+        assert key not in mgr._keepalive_keys  # unpinned so a stale entry can be reclaimed
+        assert [r for r in caplog.records if "needs human intervention" in r.getMessage()]
+        # dashboard pending-consent badge raised proactively, ahead of any dispatch
+        storage.upsert_mcp_pending_consent.assert_called_once()
+        assert (
+            storage.upsert_mcp_pending_consent.call_args.kwargs["error_code"]
+            == "mcp_consent_required"
+        )
+
+    def test_decrypt_error_surfaces_but_does_not_badge(self, running_loop_mgr, storage) -> None:
+        mgr, loop, _ = running_loop_mgr
+        cipher = make_mcp_token_cipher()
+        self._wire(mgr, storage, cipher)
+        _seed_oauth_server(storage)
+        key = ("u1", "pool-srv")
+        storage.upsert_mcp_pending_consent = MagicMock()
+
+        async def _classified(**kwargs: Any) -> Any:
+            return SimpleNamespace(kind="decrypt_failure", token=None)
+
+        with patch(
+            "turnstone.core.mcp_client.get_user_access_token_classified", new=_classified
+        ):
+            _run_on_loop(loop, mgr._prime_user_pools("u1"))
+        # Operator-actionable (key unknown) — recorded, but NOT a user-consent badge.
+        assert mgr._readiness_status[key] == "decrypt_error"
+        storage.upsert_mcp_pending_consent.assert_not_called()
+
+    def test_missing_grant_is_silent_and_unpinned(self, running_loop_mgr, storage, caplog) -> None:
+        mgr, loop, _ = running_loop_mgr
+        cipher = make_mcp_token_cipher()
+        self._wire(mgr, storage, cipher)
+        _seed_oauth_server(storage)
+        key = ("u1", "pool-srv")
+
+        async def _classified(**kwargs: Any) -> Any:
+            return SimpleNamespace(kind="missing", token=None)
+
+        with (
+            patch("turnstone.core.mcp_client.get_user_access_token_classified", new=_classified),
+            caplog.at_level(logging.WARNING, logger="turnstone.core.mcp_client"),
+        ):
+            _run_on_loop(loop, mgr._prime_user_pools("u1"))
+        # No stored grant = the user never consented — not warm, not an escalation.
+        assert key not in mgr._readiness_status
+        assert key not in mgr._keepalive_keys
+        assert not [r for r in caplog.records if "needs human intervention" in r.getMessage()]
+
+    def test_token_grant_warms_and_pins(self, running_loop_mgr, storage) -> None:
+        mgr, loop, _ = running_loop_mgr
+        cipher = make_mcp_token_cipher()
+        self._wire(mgr, storage, cipher)
+        _seed_oauth_server(storage)
+        key = ("u1", "pool-srv")
+
+        async def _classified(**kwargs: Any) -> Any:
+            return SimpleNamespace(kind="token", token="access-aaa")
+
+        with (
+            patch.object(mgr, "_prime_user_server", new=AsyncMock(return_value=3)) as prime_srv,
+            patch("turnstone.core.mcp_client.get_user_access_token_classified", new=_classified),
+        ):
+            _run_on_loop(loop, mgr._prime_user_pools("u1"))
+        prime_srv.assert_awaited_once()
+        assert key in mgr._keepalive_keys
+        assert mgr._readiness_status[key] == "ready"
+
+    def test_cooling_server_skips_connect(self, running_loop_mgr, storage) -> None:
+        mgr, loop, _ = running_loop_mgr
+        cipher = make_mcp_token_cipher()
+        self._wire(mgr, storage, cipher)
+        _seed_oauth_server(storage)
+        key = ("u1", "pool-srv")
+        # Force the circuit open + still cooling so the CB gate raises.
+        mgr._circuit_open_until["pool-srv"] = time.monotonic() + 300.0
+
+        async def _classified(**kwargs: Any) -> Any:
+            return SimpleNamespace(kind="token", token="access-aaa")
+
+        with (
+            patch.object(mgr, "_prime_user_server", new=AsyncMock()) as prime_srv,
+            patch("turnstone.core.mcp_client.get_user_access_token_classified", new=_classified),
+        ):
+            _run_on_loop(loop, mgr._prime_user_pools("u1"))
+        prime_srv.assert_not_awaited()  # gated by backoff — no hammering a down server
+        assert mgr._readiness_status[key] == "cooling"
+        assert key not in mgr._keepalive_keys
+
+    # -- storage enumerator --------------------------------------------------
+
+    def test_list_token_owners_distinct_and_expiry_unfiltered(self, storage) -> None:
+        cipher = make_mcp_token_cipher()
+        # alice consents to two servers → must dedupe to a single owner entry.
+        _seed_user_token(storage, cipher, user_id="alice", server_name="srv-a")
+        _seed_user_token(storage, cipher, user_id="alice", server_name="srv-b")
+        # bob's access token is already expired but the refresh token is live —
+        # still a consented, reconcilable grant, so bob must be enumerated.
+        _seed_user_token(storage, cipher, user_id="bob", server_name="srv-a", expires_in_seconds=-999)
+        assert sorted(storage.list_mcp_user_token_owners()) == ["alice", "bob"]
+
+    # -- mechanism 2 primitives: readiness accessor + blocking prime ---------
+
+    def test_readiness_for_user_is_scoped_to_that_user(self) -> None:
+        mgr = MCPClientManager({})
+        mgr._readiness_status = {
+            ("alice", "xconnect"): "ready",
+            ("alice", "ringdown"): "needs_consent",
+            ("bob", "xconnect"): "cooling",
+        }
+        assert mgr.readiness_for_user("alice") == {
+            "xconnect": "ready",
+            "ringdown": "needs_consent",
+        }
+        assert mgr.readiness_for_user("bob") == {"xconnect": "cooling"}  # no cross-user leak
+        assert mgr.readiness_for_user("carol") == {}
+        assert mgr.readiness_for_user("") == {}
+
+    def test_prime_sync_blocks_until_reconcile_completes(self, running_loop_mgr, storage) -> None:
+        mgr, loop, _ = running_loop_mgr
+        cipher = make_mcp_token_cipher()
+        self._wire(mgr, storage, cipher)
+        done = threading.Event()
+
+        async def _fake(uid: str) -> None:
+            await asyncio.sleep(0.05)
+            done.set()
+
+        mgr._prime_user_pools = _fake  # type: ignore[assignment]
+        mgr.prime_user_pools_sync("u1", timeout=5.0)
+        # Returned only AFTER the reconcile coroutine finished — not racing it.
+        assert done.is_set()
+
+    def test_prime_sync_degrades_on_timeout_without_raising(self, running_loop_mgr, storage) -> None:
+        mgr, loop, _ = running_loop_mgr
+        cipher = make_mcp_token_cipher()
+        self._wire(mgr, storage, cipher)
+
+        async def _slow(uid: str) -> None:
+            await asyncio.sleep(3.0)
+
+        mgr._prime_user_pools = _slow  # type: ignore[assignment]
+        start = time.monotonic()
+        mgr.prime_user_pools_sync("u1", timeout=0.2)  # must return ~0.2s, no raise
+        assert (time.monotonic() - start) < 1.5  # bounded — didn't wait out the slow coro
+
+    def test_prime_sync_noop_without_pool_servers(self, running_loop_mgr, storage) -> None:
+        mgr, loop, _ = running_loop_mgr
+        cipher = make_mcp_token_cipher()
+        self._wire(mgr, storage, cipher)
+        mgr._oauth_user_server_names = set()
+        called: list[str] = []
+
+        async def _fake(uid: str) -> None:
+            called.append(uid)
+
+        mgr._prime_user_pools = _fake  # type: ignore[assignment]
+        mgr.prime_user_pools_sync("u1", timeout=1.0)
+        assert called == []
