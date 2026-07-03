@@ -2994,7 +2994,9 @@ function _renderPersonas(personas) {
       escapeHtml(p.description || "") +
       '">' +
       escapeHtml(label) +
-      (p.is_default ? ' <span class="label-hint">(default)</span>' : "") +
+      (p.is_default
+        ? ' <span class="scope-badge scope-default">default</span>'
+        : "") +
       "</span>" +
       '<span class="admin-col admin-col-name">' +
       escapeHtml((p.applies_to_kinds || []).join(", ")) +
@@ -3019,8 +3021,8 @@ function _renderPersonas(personas) {
               ? []
               : [
                   {
-                    label: "make default",
-                    title: "Make this the kind default (demotes the incumbent)",
+                    label: "set default",
+                    title: "Set as the kind default (demotes the incumbent)",
                     attrs: { "data-default-persona": p.persona_id },
                   },
                 ],
@@ -3234,9 +3236,10 @@ function showCreatePersonaModal() {
   document.getElementById("pr-description").value = "";
   document.getElementById("pr-kinds").value = "interactive";
   document.getElementById("pr-base-prompt").value = "";
+  document.getElementById("pr-base-prompt").placeholder =
+    "Required — the base system prompt for this persona";
   document.getElementById("pr-mcp").checked = true;
   document.getElementById("pr-memory").checked = true;
-  document.getElementById("pr-default").checked = false;
   _personaFillToolsForm(null);
   document.getElementById("persona-shelf-title").textContent = "New persona";
   document.getElementById("pr-submit").textContent = "Create";
@@ -3259,9 +3262,10 @@ function showEditPersonaModal(pid) {
   document.getElementById("pr-kinds").value =
     (p.applies_to_kinds || ["interactive"])[0] || "interactive";
   document.getElementById("pr-base-prompt").value = p.base_prompt || "";
+  document.getElementById("pr-base-prompt").placeholder =
+    "Blank keeps this built-in's shipped prompt";
   document.getElementById("pr-mcp").checked = !!p.mcp_enabled;
   document.getElementById("pr-memory").checked = !!p.memory_enabled;
-  document.getElementById("pr-default").checked = !!p.is_default;
   _personaFillToolsForm(
     p.tool_allowlist === undefined ? null : p.tool_allowlist,
   );
@@ -3280,6 +3284,8 @@ function submitPersonaShelf() {
   if (!editing && !name) return _showModalError(errEl, "Name is required");
 
   const prompt = document.getElementById("pr-base-prompt").value;
+  if (!editing && !prompt.trim())
+    return _showModalError(errEl, "Base prompt is required");
   const original = editing ? _personaById(pid) || {} : {};
   const wasDefault = editing && !!original.is_default;
   const body = {
@@ -3293,11 +3299,6 @@ function submitPersonaShelf() {
     memory_enabled: document.getElementById("pr-memory").checked,
     applies_to_kinds: [document.getElementById("pr-kinds").value],
   };
-  const wantDefault = document.getElementById("pr-default").checked;
-  // is_default is one-way (unset it by flipping the flag on a successor —
-  // the storage layer demotes the incumbent atomically), so only send it
-  // when it's actually turning ON.
-  if (wantDefault && !wasDefault) body.is_default = true;
   if (!editing) body.name = name;
   if (editing) {
     const originalKinds = original.applies_to_kinds || [];

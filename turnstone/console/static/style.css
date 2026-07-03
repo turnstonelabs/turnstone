@@ -575,6 +575,12 @@
 #admin-projects .admin-row {
   grid-template-columns: 1fr 110px 100px 80px;
 }
+/* Personas: NAME | KINDS | ENVELOPE | STATE | ACTIONS.  ENVELOPE carries the
+   levers summary, so it gets the extra flexible track. */
+#admin-personas .admin-colheaders,
+#admin-personas .admin-row {
+  grid-template-columns: 1fr 110px 1.6fr 100px 80px;
+}
 /* Members list inside the project-members shelf: USER | ACTIONS. */
 #pm-members-container .admin-row {
   grid-template-columns: 1fr auto;
