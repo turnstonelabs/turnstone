@@ -289,6 +289,7 @@ class _SendSession:
     ) -> None:
         self.send_calls: list[str] = []
         self.queue_calls: list[str] = []
+        self.interjector_ids: list[str] = []
         self._queue_full = queue_full
         # When set, ``send`` blocks on this event — lets the test pin a
         # worker inside session.send while a second thread races through
@@ -315,9 +316,11 @@ class _SendSession:
         message: str,
         attachment_ids: Any = None,
         queue_msg_id: str | None = None,
+        interjector_user_id: str = "",
     ) -> None:
         if self._queue_full:
             raise queue.Full
+        self.interjector_ids.append(interjector_user_id)
         self.queue_calls.append(message)
 
     def cancel(self) -> None:

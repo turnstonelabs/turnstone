@@ -260,7 +260,15 @@ class ConsoleCoordinatorUI(SessionUIBase):
                         self.ws_id,
                         exc_info=True,
                     )
-        self._enqueue({"type": "state_change", "state": state})
+        # Include the acting user (turn initiator) so a shared coordinator can
+        # gate cross-user sends the way the interactive pane does — the UX
+        # complement to CrossUserInterjectionError. ``_acting_user_id`` is
+        # pushed by ChatSession._emit_state; empty until coordinator sends bind
+        # an acting user (see CoordinatorAdapter.send). Mirrors WebUI.
+        evt: dict[str, Any] = {"type": "state_change", "state": state}
+        if self._acting_user_id:
+            evt["acting_user_id"] = self._acting_user_id
+        self._enqueue(evt)
 
     def on_rename(self, name: str) -> None:
         self._enqueue({"type": "rename", "name": name})

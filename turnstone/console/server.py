@@ -3683,6 +3683,7 @@ async def _coord_create_post_install(
         initial_message,
         attachments=resolved_atts or None,
         send_id=send_id if resolved_atts else None,
+        acting_user_id=uid,
     )
     return {}
 
