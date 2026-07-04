@@ -4511,7 +4511,11 @@ class MCPClientManager:
                 # shutdown path. A CancelledError IN the results is per-server
                 # fallout (a stray anyio cancel-scope poison from a wedged
                 # transport) — re-raising it here killed the whole loop.
-                log.debug("MCP static health: server '%s' pass failed", name, exc_info=res)
+                log.debug(
+                    "MCP static health: server '%s' pass failed",
+                    name,
+                    exc_info=(type(res), res, res.__traceback__),
+                )
                 due = after + self._static_health_check_s
             else:
                 due = res
