@@ -43,6 +43,19 @@ _GOOGLE_DEFAULT = ModelCapabilities(
     # Gemini's OpenAI-compat endpoint accepts max_tokens (not
     # max_completion_tokens which is OpenAI Responses-specific).
     token_param="max_tokens",
+    # Gemini's OpenAI-compat endpoint accepts a flat ``reasoning_effort``
+    # (2.5 family: thinking_budget 1024/1024/8192/24576 for minimal/low/
+    # medium/high; 3.x family: thinking_level of the same name).  The
+    # declared values are the safe set across ALL current Gemini models:
+    # "none" is excluded because 2.5 Pro and the 3.x family reject
+    # disabling thinking — and ``resolve_reasoning_effort`` never
+    # forwards the knob's "none" anyway (the param is omitted and the
+    # server default applies).  Off-list knob values (xhigh, max) snap
+    # to the default "high".  Encoded from
+    # ai.google.dev/gemini-api/docs/openai (2026-07); not live-verified —
+    # the static-caps pattern for commercial providers.
+    reasoning_effort_values=("minimal", "low", "medium", "high"),
+    default_reasoning_effort="high",
 )
 
 

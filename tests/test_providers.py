@@ -1802,6 +1802,39 @@ class TestProviderFactory:
 # ===========================================================================
 
 
+class TestGoogleEffortKnob:
+    """The session effort knob reaches Gemini as a flat reasoning_effort."""
+
+    def _create_kwargs(self, reasoning_effort: str) -> dict[str, Any]:
+        from turnstone.core.providers._google import GoogleProvider
+
+        prov = GoogleProvider()
+        client = MagicMock()
+        client.chat.completions.create.return_value = iter([])
+        list(
+            prov.create_streaming(
+                client=client,
+                model="gemini-3-flash",
+                messages=[{"role": "user", "content": "hi"}],
+                reasoning_effort=reasoning_effort,
+            )
+        )
+        return client.chat.completions.create.call_args[1]
+
+    def test_knob_values_forward_verbatim(self) -> None:
+        for knob in ("minimal", "low", "medium", "high"):
+            assert self._create_kwargs(knob)["reasoning_effort"] == knob
+
+    def test_off_list_knob_snaps_to_high(self) -> None:
+        """xhigh/max are not in Gemini's vocabulary — snap down to high."""
+        for knob in ("xhigh", "max"):
+            assert self._create_kwargs(knob)["reasoning_effort"] == "high"
+
+    def test_none_omits_the_param(self) -> None:
+        """Knob none never sends "none" — 2.5 Pro / 3.x reject disabling."""
+        assert "reasoning_effort" not in self._create_kwargs("none")
+
+
 class TestGoogleProviderFidelity:
     """Tests for thought_signature round-trip via provider_blocks."""
 
