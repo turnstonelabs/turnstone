@@ -5532,6 +5532,8 @@ class SQLiteBackend:
         issuer: str,
         subject: str,
         email: str,
+        oid: str = "",
+        tid: str = "",
     ) -> None:
         from turnstone.core.storage._protocol import StorageConflictError
 
@@ -5560,6 +5562,8 @@ class SQLiteBackend:
                         "email": email,
                         "created": now,
                         "last_login": now,
+                        "oid": oid,
+                        "tid": tid,
                     },
                 )
             except sa.exc.IntegrityError as exc:
@@ -5602,6 +5606,8 @@ class SQLiteBackend:
                     oidc_identities.c.email,
                     oidc_identities.c.created,
                     oidc_identities.c.last_login,
+                    oidc_identities.c.oid,
+                    oidc_identities.c.tid,
                 ).where(
                     (oidc_identities.c.issuer == issuer) & (oidc_identities.c.subject == subject)
                 )
@@ -5614,19 +5620,30 @@ class SQLiteBackend:
                     email=row[3],
                     created=row[4],
                     last_login=row[5],
+                    oid=row[6],
+                    tid=row[7],
                 )
             return None
 
-    def update_oidc_identity_login(self, issuer: str, subject: str) -> bool:
+    def update_oidc_identity_login(
+        self, issuer: str, subject: str, oid: str = "", tid: str = ""
+    ) -> bool:
 
         now = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S")
+        # last_login always; oid/tid only when supplied, so a login that omits
+        # them can't wipe a value captured on an earlier login.
+        values: dict[str, str] = {"last_login": now}
+        if oid:
+            values["oid"] = oid
+        if tid:
+            values["tid"] = tid
         with self._conn() as conn:
             result = conn.execute(
                 sa.update(oidc_identities)
                 .where(
                     (oidc_identities.c.issuer == issuer) & (oidc_identities.c.subject == subject)
                 )
-                .values(last_login=now)
+                .values(**values)
             )
             conn.commit()
             return result.rowcount > 0
@@ -5642,6 +5659,8 @@ class SQLiteBackend:
                     oidc_identities.c.email,
                     oidc_identities.c.created,
                     oidc_identities.c.last_login,
+                    oidc_identities.c.oid,
+                    oidc_identities.c.tid,
                 )
                 .where(oidc_identities.c.user_id == user_id)
                 .order_by(oidc_identities.c.created.desc())
@@ -5654,6 +5673,8 @@ class SQLiteBackend:
                     email=r[3],
                     created=r[4],
                     last_login=r[5],
+                    oid=r[6],
+                    tid=r[7],
                 )
                 for r in rows
             ]

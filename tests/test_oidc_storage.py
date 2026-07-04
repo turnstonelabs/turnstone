@@ -84,6 +84,40 @@ class TestCreateOIDCUser:
         assert identity is not None
         assert identity["user_id"] == "u-other"
 
+    def test_create_oidc_user_captures_oid_tid(self, db):
+        """Entra oid/tid are persisted and returned on the identity."""
+        db.create_oidc_user(
+            user_id="u-oid",
+            username="carol",
+            display_name="Carol",
+            password_hash="!oidc",
+            issuer="https://idp.example.com",
+            subject="sub-oid",
+            email="carol@example.com",
+            oid="obj-123",
+            tid="tenant-abc",
+        )
+        identity = db.get_oidc_identity("https://idp.example.com", "sub-oid")
+        assert identity is not None
+        assert identity["oid"] == "obj-123"
+        assert identity["tid"] == "tenant-abc"
+
+    def test_create_oidc_user_oid_tid_default_empty(self, db):
+        """Omitting oid/tid (non-Entra IdP) stores "" — never NULL."""
+        db.create_oidc_user(
+            user_id="u-noid",
+            username="dave",
+            display_name="Dave",
+            password_hash="!oidc",
+            issuer="https://idp.example.com",
+            subject="sub-noid",
+            email="dave@example.com",
+        )
+        identity = db.get_oidc_identity("https://idp.example.com", "sub-noid")
+        assert identity is not None
+        assert identity["oid"] == ""
+        assert identity["tid"] == ""
+
 
 # ---------------------------------------------------------------------------
 # OIDC Identity CRUD
@@ -136,6 +170,33 @@ class TestOIDCIdentityCRUD:
     def test_update_oidc_identity_login_nonexistent(self, db):
         result = db.update_oidc_identity_login("https://idp.example.com", "sub-999")
         assert result is False
+
+    def test_update_oidc_identity_login_backfills_oid_tid(self, db):
+        """A login carrying oid/tid backfills them onto a pre-existing row."""
+        db.create_oidc_identity("https://idp.example.com", "sub-bf", "u1", "a@example.com")
+        before = db.get_oidc_identity("https://idp.example.com", "sub-bf")
+        assert before is not None and before["oid"] == ""
+
+        db.update_oidc_identity_login("https://idp.example.com", "sub-bf", oid="obj-9", tid="ten-9")
+
+        after = db.get_oidc_identity("https://idp.example.com", "sub-bf")
+        assert after is not None
+        assert after["oid"] == "obj-9"
+        assert after["tid"] == "ten-9"
+
+    def test_update_oidc_identity_login_omitted_does_not_clobber_oid_tid(self, db):
+        """A later login WITHOUT oid/tid must not wipe previously-captured values."""
+        db.create_oidc_identity("https://idp.example.com", "sub-keep", "u1", "a@example.com")
+        db.update_oidc_identity_login(
+            "https://idp.example.com", "sub-keep", oid="obj-keep", tid="ten-keep"
+        )
+        # Simulate a subsequent login where the token omitted oid/tid.
+        db.update_oidc_identity_login("https://idp.example.com", "sub-keep")
+
+        identity = db.get_oidc_identity("https://idp.example.com", "sub-keep")
+        assert identity is not None
+        assert identity["oid"] == "obj-keep"
+        assert identity["tid"] == "ten-keep"
 
     def test_list_oidc_identities_for_user(self, db):
         """Two identities for same user, list returns both."""

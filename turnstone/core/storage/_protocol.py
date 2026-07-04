@@ -32,6 +32,10 @@ class OIDCIdentity(TypedDict):
     email: str
     created: str
     last_login: str
+    # Entra `oid`/`tid`: the stable cross-app user key (see oidc_identities schema).
+    # "" when the IdP did not supply them.
+    oid: str
+    tid: str
 
 
 class OIDCPendingState(TypedDict):
@@ -947,6 +951,8 @@ class StorageBackend(Protocol):
         issuer: str,
         subject: str,
         email: str,
+        oid: str = "",
+        tid: str = "",
     ) -> None:
         """Atomically create a user row and bind their OIDC identity.
 
@@ -972,8 +978,10 @@ class StorageBackend(Protocol):
         """Lookup turnstone user by OIDC issuer+subject. Returns dict or None."""
         ...
 
-    def update_oidc_identity_login(self, issuer: str, subject: str) -> bool:
-        """Update last_login timestamp. Returns True if row existed."""
+    def update_oidc_identity_login(
+        self, issuer: str, subject: str, oid: str = "", tid: str = ""
+    ) -> bool:
+        """Update last_login; backfill oid/tid when provided. Returns True if row existed."""
         ...
 
     def list_oidc_identities_for_user(self, user_id: str) -> list[OIDCIdentity]:

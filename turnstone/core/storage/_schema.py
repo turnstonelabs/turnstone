@@ -923,10 +923,17 @@ oidc_identities = sa.Table(
     sa.Column("email", sa.Text, nullable=False, server_default=""),
     sa.Column("created", sa.Text, nullable=False),
     sa.Column("last_login", sa.Text, nullable=False),
+    # Entra ID: the immutable directory object id (`oid`) and tenant id (`tid`).
+    # Unlike `subject` (Azure `sub` is PAIRWISE — different per application), the
+    # oid+tid pair is stable across every app in the tenant, so external services
+    # can resolve this user by it. Populated on login; "" when the IdP omits them.
+    sa.Column("oid", sa.Text, nullable=False, server_default=""),
+    sa.Column("tid", sa.Text, nullable=False, server_default=""),
     sa.PrimaryKeyConstraint("issuer", "subject"),
 )
 
 sa.Index("idx_oidc_identities_user_id", oidc_identities.c.user_id)
+sa.Index("idx_oidc_identities_oid", oidc_identities.c.oid)
 
 oidc_pending_states = sa.Table(
     "oidc_pending_states",
