@@ -6980,13 +6980,14 @@ function showEditModelModal(definitionId) {
         ? capsObj.server_compat
         : {};
       // Only extract thinking_mode into the dropdown when the UI can
-      // represent it ("manual" or "").  Unrepresentable values like
-      // "adaptive" keep thinking_mode in the raw capabilities JSON so it
-      // isn't silently lost on save.  Both compat lanes round-trip the
-      // dropdown: on anthropic-compatible it drives the effort-knob →
-      // chat_template_kwargs mapping (merge_reasoning_template_kwargs).
+      // represent it ("", "manual" = effort-knob controlled, "adaptive" =
+      // always on).  Unrepresentable/garbage values keep thinking_mode in
+      // the raw capabilities JSON so they aren't silently lost on save.
+      // Both compat lanes round-trip the dropdown: it drives the
+      // effort-knob → chat_template_kwargs mapping
+      // (merge_reasoning_template_kwargs).
       const tmVal = capsObj.thinking_mode || "";
-      const tmCaptured = tmVal === "" || tmVal === "manual";
+      const tmCaptured = tmVal === "" || tmVal === "manual" || tmVal === "adaptive";
       if (tmCaptured) {
         document.getElementById("model-thinking-mode").value = tmVal;
         document.getElementById("model-thinking-param").value =
