@@ -52,8 +52,60 @@ def serve_until_exit(server: Any) -> None:
         loop.close()
 
 
+class _PendingResolver:
+    """Race-free drop-in for ``threading.Timer(delay, ui.resolve_approval)``.
+
+    ``approve_tools`` runs ``_approval_event.clear()`` -> register
+    ``_pending_approval`` -> ``_approval_event.wait(_APPROVAL_WAIT_TIMEOUT)``
+    (3600s). A *fixed-delay* timer can fire ``resolve_approval``
+    (``_approval_event.set()``) BEFORE that ``.clear()`` on a slow/loaded
+    runner, so the set is wiped by the clear and ``approve_tools`` blocks the
+    full hour -- surfacing as a CI hang. This instead waits until the approval
+    is actually registered (which happens *after* the clear), then resolves, so
+    the wakeup can never be lost. ``start()`` / ``cancel()`` mirror
+    ``threading.Timer`` so it drops into existing scaffolding; ``cancel()``
+    joins the worker (the resolve has already run or the deadline lapsed).
+    ``before`` runs just before resolving -- e.g. to snapshot pending-state
+    fields the test asserts on.
+    """
+
+    def __init__(
+        self,
+        ui: Any,
+        *args: Any,
+        before: Callable[[], None] | None = None,
+        deadline: float = 10.0,
+        **kwargs: Any,
+    ) -> None:
+        self._ui = ui
+        self._args = args
+        self._kwargs = kwargs
+        self._before = before
+        self._deadline = deadline
+        self._thread = threading.Thread(target=self._run, name="resolve-when-pending", daemon=True)
+
+    def _run(self) -> None:
+        end = time.monotonic() + self._deadline
+        while self._ui._pending_approval is None and time.monotonic() < end:
+            time.sleep(0.001)
+        if self._before is not None:
+            self._before()
+        self._ui.resolve_approval(*self._args, **self._kwargs)
+
+    def start(self) -> None:
+        self._thread.start()
+
+    def cancel(self) -> None:
+        self._thread.join(timeout=5)
+
+
+def resolve_when_pending(ui: Any, *args: Any, **kwargs: Any) -> _PendingResolver:
+    """Build a race-free approval resolver (see :class:`_PendingResolver`)."""
+    return _PendingResolver(ui, *args, **kwargs)
+
+
 if TYPE_CHECKING:
-    from collections.abc import Iterator
+    from collections.abc import Callable, Iterator
 
     from turnstone.core.mcp_client import MCPClientManager, StaticServerState
     from turnstone.core.mcp_crypto import MCPTokenCipher

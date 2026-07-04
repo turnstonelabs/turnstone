@@ -16,10 +16,10 @@ to ``SessionUIBase`` automatically enables:
 
 from __future__ import annotations
 
-import threading
 from typing import Any
 from unittest.mock import MagicMock, patch
 
+from tests.conftest import resolve_when_pending
 from turnstone.console.coordinator_ui import ConsoleCoordinatorUI
 
 
@@ -153,7 +153,7 @@ def test_coord_heuristic_verdict_persists_to_storage() -> None:
     items[0]["_heuristic_verdict"] = hv
 
     storage = MagicMock()
-    timer = threading.Timer(0.05, lambda: ui.resolve_approval(False))
+    timer = resolve_when_pending(ui, False)
     timer.start()
     try:
         with _patch_storage(storage):
@@ -246,9 +246,8 @@ def test_coord_pending_approval_sets_activity_tag() -> None:
     def _capture_activity() -> None:
         captured["activity"] = ui._ws_current_activity
         captured["state"] = ui._ws_activity_state
-        ui.resolve_approval(False)
 
-    timer = threading.Timer(0.05, _capture_activity)
+    timer = resolve_when_pending(ui, False, before=_capture_activity)
     timer.start()
     try:
         with _patch_storage(MagicMock()):
@@ -292,7 +291,7 @@ def test_coord_judge_pending_flag_dynamic_when_heuristic_present() -> None:
     captured_events: list[dict[str, Any]] = []
     ui._enqueue = captured_events.append  # type: ignore[method-assign]
 
-    timer = threading.Timer(0.05, lambda: ui.resolve_approval(False))
+    timer = resolve_when_pending(ui, False)
     timer.start()
     try:
         with _patch_storage(MagicMock()):
@@ -338,7 +337,7 @@ def test_coord_judge_pending_false_when_no_heuristic_verdict() -> None:
     captured_events: list[dict[str, Any]] = []
     ui._enqueue = captured_events.append  # type: ignore[method-assign]
 
-    timer = threading.Timer(0.05, lambda: ui.resolve_approval(False))
+    timer = resolve_when_pending(ui, False)
     timer.start()
     try:
         with _patch_storage(MagicMock()):
@@ -410,7 +409,7 @@ def test_coord_budget_override_prompts_even_under_blanket_auto_approve() -> None
     captured_events: list[dict[str, Any]] = []
     ui._enqueue = captured_events.append  # type: ignore[method-assign]
 
-    timer = threading.Timer(0.05, lambda: ui.resolve_approval(True))
+    timer = resolve_when_pending(ui, True)
     timer.start()
     try:
         with _patch_storage(MagicMock()):
@@ -453,7 +452,7 @@ def test_coord_budget_override_survives_wildcard_allow_policy() -> None:
     captured_events: list[dict[str, Any]] = []
     ui._enqueue = captured_events.append  # type: ignore[method-assign]
 
-    timer = threading.Timer(0.05, lambda: ui.resolve_approval(True))
+    timer = resolve_when_pending(ui, True)
     timer.start()
     try:
         with _patch_storage(MagicMock()), _patch_policies({"__budget_override__": "allow"}):
