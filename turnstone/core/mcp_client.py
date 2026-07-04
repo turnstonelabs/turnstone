@@ -1288,9 +1288,7 @@ class MCPClientManager:
                 # own accounting (or doesn't — shutdown state is discarded).
                 if not isinstance(exc, asyncio.CancelledError):
                     self._cb_record_failure(name)
-                st = self._static_servers.get(name)
-                if st is not None:
-                    st.session = None
+                await self._teardown_static_session(name)
                 raise
             state = self._static_servers.get(name)
             if state is None or state.session is None:
