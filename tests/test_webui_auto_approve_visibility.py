@@ -21,12 +21,12 @@ exactly the case the visibility fix is meant to surface.
 from __future__ import annotations
 
 import queue
-import threading
 from typing import Any
 from unittest.mock import MagicMock, patch
 
 import pytest
 
+from tests.conftest import resolve_when_pending
 from turnstone.server import WebUI
 
 
@@ -107,11 +107,11 @@ def test_policy_partial_allow_then_prompt_records_allowed_items() -> None:
     ui = WebUI(ws_id="ws-test")
     items = _make_items(("c1", "read_file"), ("c2", "bash"))
 
-    # ``approve_tools`` blocks on ``_approval_event.wait`` for the
-    # prompt path.  Schedule a deny-by-operator on a tiny timer so
-    # the wait returns promptly; this test asserts on ring-buffer
-    # state, not the verdict outcome, so a deny is fine.
-    timer = threading.Timer(0.05, lambda: ui.resolve_approval(False))
+    # ``approve_tools`` blocks on ``_approval_event.wait`` for the prompt
+    # path.  Resolve (deny) once the approval is registered so the wait
+    # returns promptly without the lost-wakeup race a fixed-delay timer has;
+    # this test asserts on ring-buffer state, not the verdict, so a deny is fine.
+    timer = resolve_when_pending(ui, False)
     timer.start()
 
     storage = MagicMock()

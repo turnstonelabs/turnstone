@@ -20,6 +20,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+from tests.conftest import resolve_when_pending
 from turnstone.core.session_ui_base import SessionUIBase
 
 
@@ -1832,7 +1833,7 @@ def test_approve_tools_skips_smart_stage_when_disabled() -> None:
     ui.smart_approval_wait_seconds = 1.0
     item = _pending_item("c1")
     ui.seed_verdicts = [_llm_verdict("c1", recommendation="approve", confidence=0.99)]
-    timer = threading.Timer(0.05, lambda: ui.resolve_approval(True, "ok"))
+    timer = resolve_when_pending(ui, True, "ok")
     timer.start()
     try:
         with _patch_get_storage(storage), _patch_policies({}):
@@ -1941,7 +1942,7 @@ def test_approve_tools_reemits_verdict_after_card_on_held_batch() -> None:
     item = _pending_item("c1")
     ui.seed_verdicts = [_llm_verdict("c1", recommendation="review", confidence=0.99)]
     lq = ui._register_listener()
-    timer = threading.Timer(0.1, lambda: ui.resolve_approval(False, "no"))
+    timer = resolve_when_pending(ui, False, "no")
     timer.start()
     try:
         with _patch_get_storage(storage), _patch_policies({}):
@@ -1970,7 +1971,7 @@ def test_judge_pending_true_when_llm_verdict_not_yet_cached() -> None:
     ui = _make_ui()  # smart_approvals_enabled defaults False
     item = _pending_item("c1")  # carries _heuristic_verdict, no cached LLM verdict
     lq = ui._register_listener()
-    timer = threading.Timer(0.1, lambda: ui.resolve_approval(True, "ok"))
+    timer = resolve_when_pending(ui, True, "ok")
     timer.start()
     try:
         with _patch_get_storage(MagicMock()), _patch_policies({}):
