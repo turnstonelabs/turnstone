@@ -3240,7 +3240,7 @@ class TestStaticHealthLoop:
             patch.object(mgr, "_connect_one_locked", side_effect=_fake_connect),
             patch.object(mgr, "_refresh_server", new=AsyncMock()),
         ):
-            _run_hl(loop, mgr._static_reconnect_one("down", time.monotonic()))
+            _run_hl(loop, mgr._static_reconnect_one("down"))
 
         assert mgr._static_servers["down"].session is not None
         assert "down" not in mgr._static_reconnect_attempt  # health backoff reset
@@ -3261,7 +3261,7 @@ class TestStaticHealthLoop:
         with patch.object(mgr, "_connect_one_locked", side_effect=_boom):
             for expected in range(1, 7):
                 mgr._static_reconnect_next.pop("down", None)  # force it due
-                due = _run_hl(loop, mgr._static_reconnect_one("down", time.monotonic()))
+                due = _run_hl(loop, mgr._static_reconnect_one("down"))
                 assert mgr._static_reconnect_attempt["down"] == expected  # no cap
                 assert due > time.monotonic() - 1  # next attempt scheduled
 
@@ -3278,7 +3278,7 @@ class TestStaticHealthLoop:
         async def _scenario() -> float:
             lock = mgr._static_connect_lock_for("down")
             await lock.acquire()  # a dispatch reconnect in progress
-            recon = asyncio.ensure_future(mgr._static_reconnect_one("down", time.monotonic()))
+            recon = asyncio.ensure_future(mgr._static_reconnect_one("down"))
             await asyncio.sleep(0.05)
             assert not recon.done()  # queued on the lock, not skipped/failed
             mgr._static_servers["down"].session = sess  # the holder's connect lands
@@ -3328,7 +3328,7 @@ class TestStaticHealthLoop:
         assert due > time.monotonic()  # next ping scheduled
 
     def test_ping_one_dead_session_evicts_for_reconnect(self, running_loop_mgr) -> None:
-        """The Understone case: a connected-but-dead session that nothing else
+        """The Turnstone case: a connected-but-dead session that nothing else
         would notice is detected by the ping and evicted so the next tick
         reconnects it."""
         mgr, loop, _ = running_loop_mgr
@@ -3504,7 +3504,7 @@ class TestStaticHealthLoop:
 
         # Patch the LOCKED body so the real ``_connect_one`` still takes the lock.
         with patch.object(mgr, "_connect_one_locked", side_effect=_wedge_locked):
-            due = _run_hl(loop, mgr._static_reconnect_one("wedge", time.monotonic()))
+            due = _run_hl(loop, mgr._static_reconnect_one("wedge"))
         assert mgr._static_reconnect_attempt["wedge"] == 1  # failed attempt
         assert not mgr._static_connect_lock_for("wedge").locked()  # lock released
         assert due > time.monotonic() - 1  # backoff scheduled
@@ -3552,15 +3552,15 @@ class TestStaticHealthLoop:
         mgr._server_configs = {"srv": {"type": "stdio", "command": "echo"}}
         _seed_static_state(mgr, "srv", session=None)
 
-        async def _slow_reconnect(name: str, now: float) -> float:
+        async def _slow_reconnect(name: str) -> float:
             await asyncio.sleep(0.3)  # burn real time during the pass
-            return now + 1.0  # next-due 1s from the TICK-START clock
+            return time.monotonic() + 1.0  # due in ~1s from now
 
         with patch.object(mgr, "_static_reconnect_one", side_effect=_slow_reconnect):
             sleep_s = _run_hl(loop, mgr._static_health_tick())
-        # Stale-clock sleep would be ~1.0 (due - tick_start_now). Fresh-clock
-        # subtracts the ~0.3s the pass elapsed, so it is well under 0.9.
-        assert 0.5 <= sleep_s < 0.9
+        # The reconnect returns "due ~1s from post-sleep clock", and the tick
+        # subtracts its own fresh after-clock — the result should be near 1.0.
+        assert 0.7 <= sleep_s <= 1.3
 
     def test_tick_skips_double_underscore_names(self, running_loop_mgr) -> None:
         """A ``__``-containing server can never connect (reserved delimiter); the
@@ -3595,6 +3595,40 @@ class TestStaticHealthLoop:
             result = mgr.reconnect_sync("srv")
         assert result["connected"] is True
         assert held == [True]  # the lock was held while rebuilding
+
+    def test_reconnect_sync_timeout_cleans_catalog(self, running_loop_mgr) -> None:
+        """The inner ``asyncio.timeout`` in ``reconnect_sync``'s ``_reconnect``
+        fires before the caller-side ``future.result(timeout=...)``, triggers the
+        catalog cleanup (empty tools/resources/prompts so the merged maps don't
+        advertise entries with no live session), nulls the stale session, and
+        returns an error dict."""
+        mgr, loop, _ = running_loop_mgr
+        mgr._server_configs["srv"] = {"type": "stdio", "command": "echo"}
+        mgr._STATIC_RECONNECT_ATTEMPT_TIMEOUT_S = 0.1  # fire quickly
+        _seed_static_state(mgr, "srv", session=MagicMock())
+        state = mgr._static_servers["srv"]
+        state.tools = [{"name": "ghost_tool"}]
+        state.resources = [{"uri": "ghost://resource"}]
+        state.prompts = [{"name": "ghost_prompt"}]
+
+        async def _stall(name: str, _cfg: dict[str, Any]) -> None:
+            await asyncio.sleep(3600)  # never completes — timeout fires first
+
+        with (
+            patch.object(mgr, "_connect_one_locked", side_effect=_stall),
+            patch.object(mgr, "_pre_close_streams", new=AsyncMock()),
+        ):
+            result = mgr.reconnect_sync("srv")
+
+        assert result["connected"] is False
+        assert "timed out" in result["error"].lower()
+        assert result["tools"] == 0
+        assert result["resources"] == 0
+        assert result["prompts"] == 0
+        # Stale session was nulled after the timeout
+        assert mgr._static_servers["srv"].session is None
+        # Lock was released after the timeout + cleanup
+        assert not mgr._static_connect_lock_for("srv").locked()
 
     def test_cb_auto_reconnect_reuses_existing_session(self, running_loop_mgr) -> None:
         """If a session is already live (a health reconnect established it), a
@@ -3634,12 +3668,12 @@ class TestStaticHealthLoop:
         lock = asyncio.run_coroutine_threadsafe(_acquire_hold(), loop).result(timeout=5)
 
         result: dict[str, Any] = {}
-        error: dict[str, BaseException] = {}
+        error: dict[str, Exception] = {}
 
         def _dispatch() -> None:
             try:
                 result["session"] = mgr._cb_auto_reconnect("srv")
-            except BaseException as exc:  # noqa: BLE001 - surfaced to the test
+            except Exception as exc:
                 error["exc"] = exc
 
         with (
@@ -3729,7 +3763,7 @@ class TestStaticHealthLoop:
         state.in_flight = 1  # a call_tool still draining on the evicted stack
         before = time.monotonic()
         with patch.object(mgr, "_connect_one_locked", new=AsyncMock()) as cm:
-            due = _run_hl(loop, mgr._static_reconnect_one("down", time.monotonic()))
+            due = _run_hl(loop, mgr._static_reconnect_one("down"))
         cm.assert_not_awaited()  # no teardown-under-dispatch
         assert before < due <= time.monotonic() + 1.5  # ~1s recheck, not backoff
         assert "down" not in mgr._static_reconnect_attempt  # not a failed attempt
@@ -3747,10 +3781,9 @@ class TestStaticHealthLoop:
         async def _boom(name: str, _cfg: dict[str, Any]) -> None:
             raise RuntimeError("still down")
 
-        stale_now = time.monotonic() - 45.0  # tick "started" 45s ago
         with patch.object(mgr, "_connect_one_locked", side_effect=_boom):
             before = time.monotonic()
-            due = _run_hl(loop, mgr._static_reconnect_one("down", stale_now))
+            due = _run_hl(loop, mgr._static_reconnect_one("down"))
         assert due >= before  # future-dated, not tick-start-relative
         assert mgr._static_reconnect_next["down"] == due
 
@@ -3776,7 +3809,7 @@ class TestStaticHealthLoop:
         mgr._server_configs = {"srv": {"type": "stdio", "command": "echo"}}
         _seed_static_state(mgr, "srv", session=None)
 
-        async def _stray(name: str, now: float) -> float:
+        async def _stray(name: str) -> float:
             raise asyncio.CancelledError
 
         with patch.object(mgr, "_static_reconnect_one", side_effect=_stray):
@@ -3886,12 +3919,12 @@ class TestStaticHealthLoop:
             return lock
 
         lock = asyncio.run_coroutine_threadsafe(_hold(), loop).result(timeout=5)
-        error: dict[str, BaseException] = {}
+        error: dict[str, Exception] = {}
 
         def _dispatch() -> None:
             try:
                 mgr._cb_auto_reconnect("srv")
-            except BaseException as exc:  # noqa: BLE001 - surfaced to the test
+            except Exception as exc:
                 error["exc"] = exc
 
         with patch.object(mgr, "_connect_one_locked", new=AsyncMock()) as cm:
@@ -4019,13 +4052,13 @@ class TestEnsureStaticConnected:
         assert out is sess  # reconnected despite in_flight > 0
         assert cm.await_count == 1
 
-    def test_cancelled_attempt_cleans_up_partial_session_and_records(
+    def test_cancelled_attempt_cleans_up_partial_session_and_no_breaker_record(
         self, running_loop_mgr
     ) -> None:
-        """Round-4 [0]/[1]: a bare CancelledError delivered mid-connect (a caller
+        """A bare CancelledError delivered mid-connect (a caller
         sync-boundary giving up, or shutdown) must NOT leave a half-discovered
-        session installed and must record the failed attempt — the handler is
-        `except BaseException`, not `except Exception`."""
+        session installed but must NOT record a breaker failure — CancelledError
+        proves nothing about the server."""
         mgr, loop, _ = running_loop_mgr
         state = _seed_static_state(mgr, "srv", session=None)
 
@@ -4041,7 +4074,7 @@ class TestEnsureStaticConnected:
         ):
             _run_hl(loop, mgr._ensure_static_connected("srv", mgr._server_configs["srv"]))
         assert mgr._static_servers["srv"].session is None  # partial session dropped
-        assert mgr._consecutive_failures.get("srv") == 1  # breaker recorded
+        assert "srv" not in mgr._consecutive_failures  # CancelledError is NOT a server failure
 
     def test_timeout_hierarchy_caller_exceeds_attempt(self) -> None:
         """The systemic round-4 fix: the caller wait must exceed the inner attempt

@@ -1274,16 +1274,20 @@ class MCPClientManager:
             try:
                 async with asyncio.timeout(self._STATIC_RECONNECT_ATTEMPT_TIMEOUT_S):
                     await self._connect_one_locked(name, cfg)
-            except BaseException:
+            except BaseException as exc:
                 # ANY non-success exit — an ``except Exception`` connect error,
                 # the converted inner TimeoutError, or a bare CancelledError (a
                 # caller's sync boundary giving up early, or a genuine shutdown)
-                # — must not leave a half-discovered session installed, and
-                # records the failed attempt so the breaker can trip. Recording
-                # on a shutdown cancel is harmless; the cleanup is synchronous
-                # (no await), so it is safe under an active cancellation. We hold
+                # — must not leave a half-discovered session installed. We hold
                 # the lock, so no concurrent driver installed a fresh session.
-                self._cb_record_failure(name)
+                #
+                # A CancelledError proves nothing about the server (the caller
+                # may have given up before the connect completed) — skip the
+                # breaker record so a spurious cancel doesn't inflate the
+                # failure count for a healthy server. The caller provides its
+                # own accounting (or doesn't — shutdown state is discarded).
+                if not isinstance(exc, asyncio.CancelledError):
+                    self._cb_record_failure(name)
                 st = self._static_servers.get(name)
                 if st is not None:
                     st.session = None
@@ -3846,16 +3850,28 @@ class MCPClientManager:
             # live session (unlike the lazy ``_ensure_static_connected`` path).
             async with self._static_connect_lock_for(name):
                 try:
-                    await self._connect_one_locked(name, cfg)
-                except Exception:
+                    # Bounded connect — mirrors ``_ensure_static_connected``'s
+                    # inner timeout. The attempt bound covers discovery (the
+                    # one phase ``_connect_one_locked``'s handshake-only
+                    # ``_CONNECT_TIMEOUT`` does not cover), fires strictly
+                    # before the caller-side ``future.result(timeout=...)``,
+                    # and converts to ``TimeoutError`` inside the lock so the
+                    # catalog cleanup below runs instead of the connect being
+                    # externally cancelled mid-flight.
+                    async with asyncio.timeout(self._STATIC_RECONNECT_ATTEMPT_TIMEOUT_S):
+                        await self._connect_one_locked(name, cfg)
+                except BaseException:
                     # Connect failed mid-reconnect — drop the stale per-server
                     # catalog so the merged tool/resource/prompt maps don't keep
-                    # advertising entries with no live session behind them.
+                    # advertising entries with no live session behind them, and
+                    # null the session so a later health-loop check doesn't see
+                    # a live (but tool-less) session.
                     fail_state = self._static_servers.get(name)
                     if fail_state is not None:
                         fail_state.tools = []
                         fail_state.resources = []
                         fail_state.prompts = []
+                        fail_state.session = None
                     self._rebuild_tools()
                     self._rebuild_resources()
                     self._rebuild_prompts()
@@ -4465,7 +4481,8 @@ class MCPClientManager:
         exception isolation. The returned sleep is against a FRESHLY-read clock —
         the per-server work can take seconds, so the tick-start ``now`` is stale
         by return — computed from the soonest per-server monotonic deadline and
-        clamped so the loop neither busy-spins nor sleeps through a short backoff.
+        clamped at 0.5s minimum to avoid busy-spinning (a deadline shorter
+        than 0.5s adds at most 0.5s latency before the next tick re-checks).
         """
         now = time.monotonic()
         names = [
@@ -4511,7 +4528,7 @@ class MCPClientManager:
         state = self._static_servers.get(name)
         if state is not None and state.session is not None:
             return await self._static_ping_one(name, now)
-        return await self._static_reconnect_one(name, now)
+        return await self._static_reconnect_one(name)
 
     def _static_reconnect_delay(self, attempt: int) -> float:
         """Full-jitter capped-exponential backoff: ``uniform(0, min(CAP, BASE*2^n))``.
@@ -4525,7 +4542,7 @@ class MCPClientManager:
         )
         return random.uniform(0.0, ceiling)
 
-    async def _static_reconnect_one(self, name: str, now: float) -> float:
+    async def _static_reconnect_one(self, name: str) -> float:
         """Reconnect a disconnected static server if its backoff has elapsed.
 
         Returns the monotonic deadline of the next attempt so the loop can
@@ -4535,14 +4552,12 @@ class MCPClientManager:
         shared state; the primitive also owns the attempt bound and the breaker
         (a failure here only advances the health loop's OWN backoff clock).
 
-        Clock discipline: *now* is the tick-start time and can be tens of
-        seconds stale after a slow sibling op in the same gather — it may gate
-        "is it due?", but every WRITTEN/RETURNED deadline uses a fresh
-        ``time.monotonic()`` (a stale base lands deadlines in the past and
-        collapses the backoff into an every-tick retry storm).
+        Uses a FRESH monotonic clock internally (not a caller-passed tick-start
+        snapshot that could be stale after a slow sibling ``gather``).
         """
-        due = self._static_reconnect_next.get(name, now)
-        if now < due:
+        fresh_now = time.monotonic()
+        due = self._static_reconnect_next.get(name, fresh_now)
+        if fresh_now < due:
             return due
         cfg = self._server_configs.get(name)
         if not cfg:
