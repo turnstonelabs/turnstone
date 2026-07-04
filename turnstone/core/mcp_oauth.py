@@ -1506,6 +1506,7 @@ async def get_user_access_token_classified(
     server_name: str,
     force_refresh: bool = False,
     revoke_ambiguous_escalation: bool = True,
+    revoke_on_failure: bool = True,
 ) -> TokenLookupResult:
     """Tagged token lookup with refresh-on-expiry.
 
@@ -1549,6 +1550,18 @@ async def get_user_access_token_classified(
     this session. The streak + cooldown persist, so the authoritative
     escalation-revoke happens on the lazy-dispatch path when the user actually
     invokes the tool.
+
+    ``revoke_on_failure=False`` makes the lookup fully OBSERVE-ONLY: it still
+    refreshes a healthy near-expiry token, but a failure NEVER mutates durable
+    or cross-call state — no token deletion, no ``token_revoked`` audit, and no
+    ambiguous-streak / cooldown bump. A permanent rejection is reported as
+    ``refresh_failed`` and everything else as ``refresh_failed_transient``, but
+    the row is left intact for the authoritative (revoking) lazy-dispatch path.
+    Used by the background token-freshness sweep, which reconciles EVERY
+    consented grant on a timer for users who aren't present: a timer must not be
+    able to delete a token or move a foreground user's revoke threshold, and a
+    spurious server-wide ``invalid_grant`` (e.g. an AS maintenance window) must
+    self-heal on a later tick rather than force a fleet-wide re-consent.
     """
     token_store: MCPTokenStore | None = getattr(app_state, "mcp_token_store", None)
     if token_store is None:
@@ -1614,6 +1627,9 @@ async def get_user_access_token_classified(
     if not refresh_value:
         # Expired token with no refresh token: genuinely unusable, no
         # misclassification risk (a local check, not an AS response) — revoke.
+        # Observe-only callers surface it as a dead grant without deleting.
+        if not revoke_on_failure:
+            return TokenLookupResult(kind="refresh_failed")
         return await _revoke_after_refresh_failure(
             app_state,
             token_store,
@@ -1669,6 +1685,8 @@ async def get_user_access_token_classified(
                 return _token_result(app_state, user_id, server_name, plain2["access_token"])
         refresh_value2 = plain2.get("refresh_token")
         if not refresh_value2:
+            if not revoke_on_failure:
+                return TokenLookupResult(kind="refresh_failed")
             return await _revoke_after_refresh_failure(
                 app_state,
                 token_store,
@@ -1690,6 +1708,16 @@ async def get_user_access_token_classified(
                 existing_scopes=plain2.get("scopes") or "",
             )
         except MCPOAuthRefreshFailed as exc:
+            if not revoke_on_failure:
+                # Observe-only (background sweep): never revoke, never mutate the
+                # shared streak / cooldown. A permanent rejection surfaces as a
+                # dead grant to badge; anything else is a retryable transient the
+                # next tick (or a real dispatch) re-attempts. The 240s sweep
+                # cadence is its own rate limit, so skipping the cooldown here
+                # cannot hammer the AS.
+                if exc.failure_class is _RefreshFailureClass.PERMANENT:
+                    return TokenLookupResult(kind="refresh_failed")
+                return TokenLookupResult(kind="refresh_failed_transient")
             if exc.failure_class is _RefreshFailureClass.PERMANENT:
                 # The AS rejected the grant as dead (invalid_grant / invalid_scope
                 # / an OIDC interaction-required code): a reliable dead-grant

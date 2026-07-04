@@ -2158,6 +2158,22 @@ class StorageBackend(Protocol):
         """
         ...
 
+    def list_mcp_user_token_reconcile_targets(self) -> list[tuple[str, str, str | None]]:
+        """Return ``(user_id, server_name, last_exercised_iso)`` for every MCP
+        user-token row — the drive set for the background freshness sweep.
+
+        ``last_exercised = COALESCE(last_refreshed, created)`` is the last time
+        the grant's refresh token was exercised; the sweep force-refreshes once
+        it exceeds the configured keepalive window, so a provider that ages out
+        an *idle* refresh token can't expire one between a user's real sessions.
+        Deliberately UNFILTERED by ``expires_at``: an expired access token backed
+        by a live refresh token is still a consented, reconcilable grant. Only
+        ``auth_type='oauth_user'`` servers ever write these rows, so a static /
+        no-auth server is structurally absent; ciphertext columns are never
+        touched — only the identity + timestamp cross the wire.
+        """
+        ...
+
     def delete_mcp_oauth_rows_by_server_name(self, server_name: str) -> int:
         """Purge per-(user, server) tokens and pending OAuth states for *server_name*.
 

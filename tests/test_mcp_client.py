@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import concurrent.futures
+import contextlib
 import inspect
 import json
 import time
@@ -2180,6 +2181,13 @@ class TestConnectOneUnreachable:
 
         loop = asyncio.new_event_loop()
         loop.run_until_complete(mgr._connect_all())
+        # _connect_all spawns the long-lived token-freshness sweep task; cancel
+        # it before closing the loop so it isn't destroyed while pending.
+        sweep = mgr._user_token_sweep_task
+        if sweep is not None:
+            sweep.cancel()
+            with contextlib.suppress(BaseException):
+                loop.run_until_complete(sweep)
         loop.close()
 
         bad_state = mgr._static_servers.get("bad")

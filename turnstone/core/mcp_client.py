@@ -690,6 +690,29 @@ class MCPClientManager:
         mcp_cfg = load_config("mcp")
         self._user_pool_idle_ttl_s = float(mcp_cfg.get("user_session_idle_ttl_seconds", 600))
         self._user_pool_lru_max = int(mcp_cfg.get("user_session_lru_max", 200))
+        # Background token-freshness sweep cadence (seconds). Keeps every
+        # consented oauth_user grant hot for unattended / autonomous work. Kept
+        # comfortably under the shortest common access-token lifetime so a token
+        # is refreshed before it lapses; 240 s clears the usual 300 s floor with
+        # margin. A value <= 0 DISABLES the sweep (the task is never started); a
+        # positive value is floored at ``_MIN_USER_TOKEN_SWEEP_S`` so a
+        # fat-fingered tiny cadence can't turn the loop into a CPU/DB/AS
+        # busy-loop (``asyncio.sleep(0)`` yields without delay).
+        raw_sweep_s = float(mcp_cfg.get("user_token_sweep_seconds", 240))
+        self._user_token_sweep_s = (
+            max(self._MIN_USER_TOKEN_SWEEP_S, raw_sweep_s) if raw_sweep_s > 0 else 0.0
+        )
+        # How long a consented grant's refresh token may sit un-exercised before
+        # the sweep FORCE-refreshes it (even while the access token is still
+        # fresh) to keep it alive for a provider that ages out idle refresh
+        # tokens — the exact unattended-work failure the sweep exists to prevent.
+        # <= 0 disables keepalive (only near-expiry refreshes). Must sit safely
+        # under the shortest provider refresh-token idle timeout; 1800s (30m)
+        # clears a ~1h idle window with margin. Effective floor is the sweep
+        # cadence (a grant can't be force-refreshed more than once per tick).
+        self._user_token_refresh_keepalive_s = float(
+            mcp_cfg.get("user_token_refresh_keepalive_seconds", 1800)
+        )
 
         # OAuth integration. ``set_app_state`` wires app_state in after the
         # lifespan has built the token store / OAuth helpers; pool dispatch
@@ -711,6 +734,21 @@ class MCPClientManager:
         # rows exist, so deferring keeps the task count at zero in
         # static-only deployments).
         self._user_pool_eviction_task: asyncio.Task[None] | None = None
+
+        # Token-freshness sweep task handle. Like the eviction task it is a
+        # dedicated handle (not in ``_background_tasks``); UNLIKE it, the sweep
+        # is started once in ``_connect_all`` because a consented grant needs
+        # keeping-hot even before any pool entry exists. Its tick early-returns
+        # when no ``oauth_user`` server is configured, so a static-only / no-auth
+        # deployment pays only a per-tick set-emptiness check — no AS calls, no
+        # token-table scans.
+        self._user_token_sweep_task: asyncio.Task[None] | None = None
+        # ``(user, server)`` pairs whose dead-grant / undecryptable state the
+        # sweep has already surfaced, so it badges + logs ONCE on the transition
+        # rather than every tick. Pruned to the currently-consented set each
+        # pass, so a recovered or re-consented grant re-arms the surfacing.
+        # Loop-only mutation.
+        self._token_sweep_warned: set[tuple[str, str]] = set()
 
         # Strong references to fire-and-forget background tasks (catalog
         # refreshes etc.).  ``create_task`` alone keeps only a weak ref — an
@@ -799,6 +837,16 @@ class MCPClientManager:
 
         self._connected.set()
 
+        # Start the background token-freshness sweep (once, on the mcp-loop).
+        # Keeps every consented oauth_user grant hot for unattended work and
+        # surfaces dead grants proactively. Started here rather than lazily (like
+        # the eviction task) because a grant needs keeping-hot even in a
+        # deployment that has not yet created a pool entry; the tick self-gates
+        # to a no-op when no oauth_user server is configured. Skipped entirely
+        # when disabled via config (cadence <= 0).
+        if self._user_token_sweep_s > 0 and self._user_token_sweep_task is None:
+            self._user_token_sweep_task = asyncio.create_task(self._user_token_sweep_loop())
+
     _CONNECT_TIMEOUT = 30  # seconds — prevents hung connections on broken remotes
     _TCP_PROBE_TIMEOUT = 5  # seconds — fast TCP pre-flight for HTTP transports
 
@@ -812,6 +860,16 @@ class MCPClientManager:
 
     # Pool eviction loop tick interval (per-iteration sleep, seconds).
     _POOL_EVICTION_TICK_S = 30.0
+
+    # Floor for the config-driven token-freshness sweep cadence. A positive
+    # ``user_token_sweep_seconds`` below this is clamped up so a misconfigured
+    # tiny value can't busy-loop the sweep; <= 0 disables it (handled at start).
+    _MIN_USER_TOKEN_SWEEP_S = 30.0
+
+    # Short grace before the FIRST sweep after connect, so a restart surfaces a
+    # grant that died during downtime quickly (rather than after a full cadence)
+    # without hammering a cold cluster the instant every node boots.
+    _USER_TOKEN_SWEEP_STARTUP_GRACE_S = 5.0
 
     # Best-effort lock acquire timeout for the eviction pass; eviction must
     # never block on a contested per-key lock so the next tick retries.
@@ -1882,6 +1940,263 @@ class MCPClientManager:
                 self._priming_keys.discard(key)
 
         await asyncio.gather(*(_prime_one(s) for s in list(self._oauth_user_server_names)))
+
+    # -- background token-freshness sweep (oauth_user grants) -----------------
+
+    async def _user_token_sweep_loop(self) -> None:
+        """Long-running coroutine — keeps every consented ``oauth_user`` grant hot.
+
+        Turnstone's OAuth token refresh is otherwise entirely LAZY: a token is
+        refreshed only when a tool is dispatched or a session binds the acting
+        user, and a dead refresh token (needs re-consent) is discovered only when
+        a dispatch fails. That assumes a human is driving the session — it breaks
+        for unattended / autonomous work, where a scheduled run or an
+        alert-triggered workstream acts on behalf of a user who is NOT present and
+        must find the token already fresh and the grant already known-good.
+
+        This loop closes that gap WITHOUT keeping connections warm and WITHOUT
+        mutating consent state on a timer (:meth:`_reconcile_one_user_token` is
+        observe-only). Each tick it walks every consented ``(user, server)`` pair
+        and runs the canonical refresh path
+        (:func:`get_user_access_token_classified`), which (a) refreshes an access
+        token within the 60s expiry skew AND — via the keepalive gate
+        (:meth:`_keepalive_refresh_due`) — force-refreshes a grant whose refresh
+        token has sat un-exercised past the keepalive window, so a provider that
+        ages out *idle* refresh tokens can't expire one between the user's real
+        sessions even when the access-token TTL is long; and (b) surfaces a dead
+        grant as a proactive re-consent badge, ahead of the work that needs it
+        instead of at dispatch time. Connections stay lazy: one cheap reconnect
+        on first dispatch is fine; a failed or stale-token dispatch is not.
+
+        STRICTLY ``oauth_user``-scoped. :meth:`_sweep_user_token_freshness`
+        early-returns when no ``oauth_user`` server is configured, so a
+        static-only / no-auth deployment does no AS round-trips, no MCP-server
+        calls, and no token-table scans — just a set-emptiness check per tick.
+
+        The FIRST sweep runs after only a short startup grace (not a full
+        cadence) so a restart surfaces a grant that died during downtime within
+        seconds; every subsequent sweep waits the full cadence.
+        """
+        delay = min(self._USER_TOKEN_SWEEP_STARTUP_GRACE_S, self._user_token_sweep_s)
+        while True:
+            try:
+                await asyncio.sleep(delay)
+                await self._sweep_user_token_freshness()
+            except asyncio.CancelledError:
+                return
+            except Exception:
+                log.warning("MCP token-freshness sweep iteration failed", exc_info=True)
+            delay = self._user_token_sweep_s  # subsequent sweeps wait the full cadence
+
+    async def _sweep_user_token_freshness(self) -> None:
+        """One pass: refresh + classify every consented ``oauth_user`` grant.
+
+        MUST run on the mcp-loop. The gate below IS the no-auth safety property:
+        with no ``oauth_user`` server, or before storage / app_state are wired,
+        this returns before touching the DB or any AS — a static / no-auth server
+        (whose rows :func:`_db_servers_to_config` strips out, and which never
+        writes a user-token row) is structurally invisible to this pass. Per-pair
+        failures are isolated so one bad grant can't starve the rest.
+        """
+        if self._storage is None or self._app_state is None or not self._oauth_user_server_names:
+            return
+        try:
+            targets = await asyncio.to_thread(self._storage.list_mcp_user_token_reconcile_targets)
+        except Exception:
+            log.debug("MCP token sweep: failed to enumerate consented grants", exc_info=True)
+            return
+        oauth_servers = self._oauth_user_server_names
+        seen: set[tuple[str, str]] = set()
+        for user_id, server_name, last_exercised in targets:
+            if server_name not in oauth_servers:
+                # A token row lingering for a server that is no longer
+                # auth_type=oauth_user (renamed / demoted) — not ours to keep hot.
+                continue
+            key = (user_id, server_name)
+            seen.add(key)
+            try:
+                # Force a refresh when the refresh token has sat un-exercised past
+                # the keepalive window, so a provider that ages out idle refresh
+                # tokens can't expire one between the user's real sessions.
+                await self._reconcile_one_user_token(
+                    key, force_refresh=self._keepalive_refresh_due(last_exercised)
+                )
+            except Exception:
+                log.debug(
+                    "MCP token sweep: reconcile failed user=%s server=%s",
+                    user_id,
+                    server_name,
+                    exc_info=True,
+                )
+        # Prune the once-only surfacing set to pairs still consented this pass, so
+        # a re-consented or revoked-then-recreated grant re-arms (and the set can
+        # never grow unbounded across many transient dead grants).
+        self._token_sweep_warned &= seen
+
+    async def _reconcile_one_user_token(
+        self, key: tuple[str, str], *, force_refresh: bool = False
+    ) -> None:
+        """Refresh-on-expiry + dead-grant classification for one ``(user, server)``.
+
+        OBSERVE-ONLY: runs the canonical lookup with ``revoke_on_failure=False``
+        so a background timer NEVER deletes a token or moves a foreground user's
+        revoke threshold — a dead grant is only *surfaced*, and the authoritative
+        revoke stays on the lazy-dispatch path where a real user action justifies
+        it. NEVER connects to the MCP server: only the token is kept hot. Because
+        the row survives, the pair is re-checked every tick, so a spurious
+        server-wide ``invalid_grant`` (an AS maintenance window) self-heals — the
+        badge is dropped on the tick the grant works again.
+
+        ``force_refresh`` (set by the keepalive gate) exercises the refresh token
+        even while the access token is still fresh, so a provider that ages out
+        idle refresh tokens can't expire one between the user's real sessions.
+
+        Surfacing is once-per-transition (tracked in ``_token_sweep_warned``):
+        ``refresh_failed`` (dead grant) raises the dashboard pending-consent
+        badge — and the pin is set ONLY after a successful persist, so a failed
+        badge write retries next tick rather than being lost forever;
+        ``decrypt_failure`` (operator key issue) is logged but NOT badged (the
+        same split :meth:`_record_pending_consent_best_effort` applies).
+        """
+        user_id, server_name = key
+        lookup = await get_user_access_token_classified(
+            app_state=self._app_state,
+            user_id=user_id,
+            server_name=server_name,
+            revoke_ambiguous_escalation=False,
+            revoke_on_failure=False,
+            force_refresh=force_refresh,
+        )
+        if lookup.kind == "refresh_failed":
+            # Dead grant: only a human re-consent in a browser fixes it. Badge it
+            # proactively so the user sees the affordance ahead of autonomous use.
+            if key not in self._token_sweep_warned:
+                log.warning(
+                    "MCP token sweep: grant for user=%s server=%s needs re-consent "
+                    "(dead refresh token) — surfaced proactively before autonomous use",
+                    user_id,
+                    server_name,
+                )
+                # Pin only on a durable badge — a failed write is retried next
+                # tick (the observe-only row survives to be re-enumerated).
+                if await self._persist_pending_consent_best_effort(user_id, server_name):
+                    self._token_sweep_warned.add(key)
+        elif lookup.kind == "decrypt_failure":
+            # Undecryptable stored token — an operator key issue, not
+            # user-fixable and outside the consent dashboard's scope. Surface it
+            # once; do not badge.
+            if key not in self._token_sweep_warned:
+                self._token_sweep_warned.add(key)
+                log.warning(
+                    "MCP token sweep: stored token for user=%s server=%s is undecryptable "
+                    "(operator key issue) — cannot keep this grant hot",
+                    user_id,
+                    server_name,
+                )
+        elif lookup.kind in ("token", "missing") and key in self._token_sweep_warned:
+            # Usable again (fresh / freshly-refreshed) or gone (de-consented). On
+            # a transition out of a surfaced state, re-arm and drop any stale
+            # badge — the self-heal for a spurious invalid_grant that recovered
+            # (no-op if none was raised, e.g. a decrypt_error).
+            self._token_sweep_warned.discard(key)
+            await self._clear_pending_consent_best_effort(user_id, server_name)
+        # refresh_failed_transient: AS / network blip — the token is retained and
+        # the next tick retries. Not human-actionable, so nothing is surfaced and
+        # the prior warned state (if any) is left intact.
+
+    def _keepalive_refresh_due(self, last_exercised_iso: str | None) -> bool:
+        """True when a grant's refresh token has sat un-exercised past the
+        keepalive window and should be force-refreshed to stay alive.
+
+        Disabled (``_user_token_refresh_keepalive_s <= 0``) → never. An unknown /
+        unparseable timestamp → force once (safe: exercising a live token is
+        harmless; missing the keepalive is the failure we're preventing). The
+        stored timestamp is naive-UTC ISO (``%Y-%m-%dT%H:%M:%S``).
+        """
+        if self._user_token_refresh_keepalive_s <= 0:
+            return False
+        if not last_exercised_iso:
+            return True
+        try:
+            last = datetime.fromisoformat(last_exercised_iso)
+        except (TypeError, ValueError):
+            return True
+        if last.tzinfo is None:
+            last = last.replace(tzinfo=UTC)
+        return (datetime.now(UTC) - last).total_seconds() >= self._user_token_refresh_keepalive_s
+
+    def _write_pending_consent(
+        self, user_id: str, server_name: str, *, error_code: str, scopes_required: str | None
+    ) -> None:
+        """Single source of the deferred-consent upsert call shape (blocking).
+
+        Both best-effort wrappers — the sync dispatch-path
+        :meth:`_record_pending_consent_best_effort` and the loop-path
+        :meth:`_persist_pending_consent_best_effort` — route through here so the
+        7-kwarg ``upsert_mcp_pending_consent`` call and the timestamp format live
+        in ONE place. ``last_ws_id`` / ``last_tool_call_id`` are ``None`` for the
+        proactive (no-dispatch) path; the dispatch path passes its ids through a
+        thin wrapper. Raises on storage error — callers wrap best-effort.
+        """
+        if self._storage is None:
+            return
+        self._storage.upsert_mcp_pending_consent(
+            user_id=user_id,
+            server_name=server_name,
+            error_code=error_code,
+            scopes_required=scopes_required,
+            last_ws_id=None,
+            last_tool_call_id=None,
+            now_iso=datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S"),
+        )
+
+    async def _persist_pending_consent_best_effort(self, user_id: str, server_name: str) -> bool:
+        """Raise the dashboard pending-consent badge for a proactively-detected
+        dead grant, off the mcp-loop. Returns True iff the badge was persisted.
+
+        The sweep runs ON the loop, so the blocking storage write goes through
+        :func:`asyncio.to_thread`. Maps to the ``mcp_consent_required`` code the
+        dashboard already renders. Best-effort: a storage failure is logged and
+        returns False (never raised onto the loop) so the caller retries on the
+        next tick rather than pinning a badge that was never written.
+        """
+        if self._storage is None:
+            return False
+        try:
+            await asyncio.to_thread(
+                self._write_pending_consent,
+                user_id,
+                server_name,
+                error_code="mcp_consent_required",
+                scopes_required=None,
+            )
+            return True
+        except Exception:
+            log.warning(
+                "MCP token sweep: pending-consent badge persist failed user=%s server=%s",
+                user_id,
+                server_name,
+                exc_info=True,
+            )
+            return False
+
+    async def _clear_pending_consent_best_effort(self, user_id: str, server_name: str) -> None:
+        """Drop a stale pending-consent badge when a previously-surfaced grant is
+        usable again (real re-consent, or a spurious ``invalid_grant`` that has
+        healed), off the mcp-loop. No-op if no badge was raised. Best-effort: a
+        storage failure is logged, never raised onto the loop.
+        """
+        if self._storage is None:
+            return
+        try:
+            await asyncio.to_thread(self._storage.delete_mcp_pending_consent, user_id, server_name)
+        except Exception:
+            log.debug(
+                "MCP token sweep: pending-consent clear failed user=%s server=%s",
+                user_id,
+                server_name,
+                exc_info=True,
+            )
 
     # -- pool eviction --------------------------------------------------------
 
@@ -3047,6 +3362,15 @@ class MCPClientManager:
         if self._loop is not None and self._loop.is_running():
 
             async def _cancel_background() -> None:
+                # The token-freshness sweep is a dedicated handle (not in
+                # _background_tasks); cancel it here so a deployment that never
+                # creates a pool entry — and thus skips the pool-teardown block
+                # below — still stops it cleanly.
+                if self._user_token_sweep_task is not None:
+                    self._user_token_sweep_task.cancel()
+                    with contextlib.suppress(BaseException):
+                        await self._user_token_sweep_task
+                    self._user_token_sweep_task = None
                 tasks = list(self._background_tasks)
                 for task in tasks:
                     task.cancel()
@@ -3161,6 +3485,8 @@ class MCPClientManager:
         self._user_prompt_map.clear()
         self._user_prompts.clear()
         self._user_pool_eviction_task = None
+        self._user_token_sweep_task = None
+        self._token_sweep_warned.clear()
 
         log.info("MCP client shut down")
 
@@ -4096,14 +4422,8 @@ class MCPClientManager:
         code, scopes = parsed
         scopes_str = " ".join(scopes) if scopes else None
         try:
-            self._storage.upsert_mcp_pending_consent(
-                user_id=user_id,
-                server_name=server_name,
-                error_code=code,
-                scopes_required=scopes_str,
-                last_ws_id=None,
-                last_tool_call_id=None,
-                now_iso=datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S"),
+            self._write_pending_consent(
+                user_id, server_name, error_code=code, scopes_required=scopes_str
             )
         except Exception:
             log.warning(

@@ -408,6 +408,97 @@ class TestRefreshFailureClassification:
         assert ("user-1", "srv-oauth") not in state.mcp_oauth_refresh_locks
 
 
+class TestObserveOnlyLookup:
+    """``revoke_on_failure=False`` (the background token-freshness sweep): still
+    refresh a healthy token, but on failure NEVER delete a token or mutate the
+    shared streak — a timer must not destroy consent or move a foreground user's
+    revoke threshold. A permanent rejection surfaces as ``refresh_failed`` with
+    the row INTACT; an ambiguous one as transient with the streak untouched."""
+
+    def _lookup(self, state: SimpleNamespace) -> Any:
+        from turnstone.core.mcp_oauth import get_user_access_token_classified
+
+        async def _run() -> Any:
+            with _public_addr_patch():
+                return await get_user_access_token_classified(
+                    app_state=state,
+                    user_id="user-1",
+                    server_name="srv-oauth",
+                    force_refresh=True,
+                    revoke_on_failure=False,
+                )
+
+        return asyncio.run(_run())
+
+    def test_permanent_invalid_grant_does_not_revoke(self, storage: SQLiteBackend) -> None:
+        """The exact contrast to ``test_permanent_invalid_grant_revokes``: same
+        dead-grant signal, but observe-only leaves the row for the lazy path."""
+        _seed_server(storage)
+        client = MagicMock(spec=httpx.AsyncClient)
+        client.get = AsyncMock(return_value=_mk_response(200, _good_as_metadata_doc()))
+        client.post = AsyncMock(return_value=_mk_response(400, {"error": "invalid_grant"}))
+        state = _make_app_state(storage, http_client=client)
+        _seed_token(state, expires_in_seconds=-1000)
+
+        result = self._lookup(state)
+
+        assert result.kind == "refresh_failed"
+        assert state.mcp_token_store.get_user_token("user-1", "srv-oauth") is not None
+
+    def test_ambiguous_does_not_touch_shared_streak(self, storage: SQLiteBackend) -> None:
+        """Repeated observe-mode ambiguous failures never bump the shared
+        ambiguous_streak, so a later foreground dispatch is not pushed over the
+        escalation edge by background activity (the finding this guards)."""
+        _seed_server(storage)
+        client = MagicMock(spec=httpx.AsyncClient)
+        client.get = AsyncMock(return_value=_mk_response(200, _good_as_metadata_doc()))
+        client.post = AsyncMock(return_value=_mk_response(400, None))
+        state = _make_app_state(storage, http_client=client)
+        _seed_token(state, expires_in_seconds=-1000)
+
+        with patch("turnstone.core.mcp_oauth._AMBIGUOUS_ESCALATION_THRESHOLD", 2):
+            for _ in range(5):
+                assert self._lookup(state).kind == "refresh_failed_transient"
+
+        backoff = getattr(state, "mcp_oauth_refresh_backoff", {})
+        entry = backoff.get(("user-1", "srv-oauth"))
+        assert entry is None or entry.ambiguous_streak == 0
+        assert state.mcp_token_store.get_user_token("user-1", "srv-oauth") is not None
+
+    def test_expired_no_refresh_does_not_revoke(self, storage: SQLiteBackend) -> None:
+        """An expired token with no refresh token surfaces as a dead grant but is
+        NOT deleted on the observe path."""
+        _seed_server(storage)
+        client = MagicMock(spec=httpx.AsyncClient)
+        client.get = AsyncMock(return_value=_mk_response(200, _good_as_metadata_doc()))
+        state = _make_app_state(storage, http_client=client)
+        _seed_token(state, expires_in_seconds=-1000, refresh=None)
+
+        result = self._lookup(state)
+
+        assert result.kind == "refresh_failed"
+        assert state.mcp_token_store.get_user_token("user-1", "srv-oauth") is not None
+
+    def test_healthy_token_still_refreshes(self, storage: SQLiteBackend) -> None:
+        """Observe mode is not read-only: a near-expiry token is still refreshed
+        (only the destructive failure paths change)."""
+        _seed_server(storage)
+        client = MagicMock(spec=httpx.AsyncClient)
+        client.get = AsyncMock(return_value=_mk_response(200, _good_as_metadata_doc()))
+        client.post = AsyncMock(
+            return_value=_mk_response(
+                200, {"access_token": "fresh-bbb", "expires_in": 3600, "token_type": "Bearer"}
+            )
+        )
+        state = _make_app_state(storage, http_client=client)
+        _seed_token(state, expires_in_seconds=-1000)
+
+        result = self._lookup(state)
+
+        assert result.kind == "token"
+        assert result.token == "fresh-bbb"
+
+
 # ---------------------------------------------------------------------------
 # Happy paths
 # ---------------------------------------------------------------------------

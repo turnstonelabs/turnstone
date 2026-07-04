@@ -4942,6 +4942,24 @@ class SQLiteBackend:
                 )
             return out
 
+    def list_mcp_user_token_reconcile_targets(self) -> list[tuple[str, str, str | None]]:
+        """Return ``(user_id, server_name, COALESCE(last_refreshed, created))`` per
+        token row — the freshness sweep's drive set + keepalive-refresh signal.
+
+        Unfiltered by expiry: an expired access token with a live refresh token
+        is still a consented grant the sweep must keep hot. Only ``oauth_user``
+        servers write these rows; no ciphertext is projected.
+        """
+        with self._conn() as conn:
+            rows = conn.execute(
+                sa.select(
+                    mcp_user_tokens.c.user_id,
+                    mcp_user_tokens.c.server_name,
+                    sa.func.coalesce(mcp_user_tokens.c.last_refreshed, mcp_user_tokens.c.created),
+                )
+            ).fetchall()
+        return [(row[0], row[1], row[2]) for row in rows]
+
     def delete_mcp_oauth_rows_by_server_name(self, server_name: str) -> int:
         """Purge user tokens + pending OAuth state for *server_name*."""
         with self._conn() as conn:

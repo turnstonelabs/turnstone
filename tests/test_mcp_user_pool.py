@@ -15,13 +15,14 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
+import logging
 import threading
 import time
 from contextlib import AsyncExitStack
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 from typing import Any
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -114,12 +115,13 @@ def running_loop_mgr():
         # handlers don't fire after pytest has torn its handlers down. Mirrors
         # the production ``shutdown()`` shape.
         async def _drain(m: MCPClientManager) -> None:
-            task = m._user_pool_eviction_task
-            if task is not None:
-                task.cancel()
-                with contextlib.suppress(BaseException):
-                    await task
-                m._user_pool_eviction_task = None
+            for attr in ("_user_pool_eviction_task", "_user_token_sweep_task"):
+                task = getattr(m, attr)
+                if task is not None:
+                    task.cancel()
+                    with contextlib.suppress(BaseException):
+                        await task
+                    setattr(m, attr, None)
 
         with contextlib.suppress(Exception):
             asyncio.run_coroutine_threadsafe(_drain(mgr), loop).result(timeout=2)
@@ -969,3 +971,400 @@ class TestUserIdThreadThrough:
         assert result == "static-output"
         # No pool entries were created.
         assert mgr._user_pool_entries == {}
+
+
+# ---------------------------------------------------------------------------
+# Background token-freshness sweep (oauth_user keep-hot, no connection warming)
+# ---------------------------------------------------------------------------
+
+
+class TestUserTokenFreshnessSweep:
+    """The background sweep that keeps every consented ``oauth_user`` grant hot
+    for unattended / autonomous work: refresh-on-expiry via the canonical path,
+    proactive dead-grant badging, once-only surfacing, and — the load-bearing
+    property — total invisibility to static / no-auth deployments."""
+
+    def _wire(self, mgr: MCPClientManager, storage: SQLiteBackend, cipher: Any) -> None:
+        mgr.set_storage(storage)
+        mgr.set_app_state(_make_app_state(storage, cipher=cipher))
+        mgr._oauth_user_server_names = {"pool-srv"}
+
+    @staticmethod
+    def _classified(kind: str, token: str | None = None):
+        async def _fake(**kwargs: Any) -> Any:
+            return SimpleNamespace(kind=kind, token=token)
+
+        return _fake
+
+    # -- no-auth / static safety: the sweep must be structurally invisible ----
+
+    def test_sweep_noop_without_oauth_servers(self, running_loop_mgr, storage) -> None:
+        """A static-only / no-auth deployment: the OBO gate returns before any
+        DB scan or AS round-trip — the single most important property."""
+        mgr, loop, _ = running_loop_mgr
+        cipher = make_mcp_token_cipher()
+        self._wire(mgr, storage, cipher)
+        mgr._oauth_user_server_names = set()  # no oauth_user server configured
+        storage.list_mcp_user_token_reconcile_targets = MagicMock(return_value=[])  # type: ignore[method-assign]
+
+        with patch(
+            "turnstone.core.mcp_client.get_user_access_token_classified",
+            new=AsyncMock(),
+        ) as classified:
+            _run_on_loop(loop, mgr._sweep_user_token_freshness())
+        storage.list_mcp_user_token_reconcile_targets.assert_not_called()  # no token-table scan
+        classified.assert_not_awaited()  # no AS round-trip
+
+    def test_sweep_noop_before_storage_wired(self, running_loop_mgr) -> None:
+        mgr, loop, _ = running_loop_mgr
+        mgr._oauth_user_server_names = {"pool-srv"}  # oauth configured but app not wired yet
+        with patch(
+            "turnstone.core.mcp_client.get_user_access_token_classified",
+            new=AsyncMock(),
+        ) as classified:
+            _run_on_loop(loop, mgr._sweep_user_token_freshness())
+        classified.assert_not_awaited()
+
+    def test_sweep_skips_server_not_in_oauth_set(self, running_loop_mgr, storage) -> None:
+        """A token row lingering for a since-demoted / renamed server is not
+        reconciled — only pairs whose server is currently ``oauth_user``."""
+        mgr, loop, _ = running_loop_mgr
+        cipher = make_mcp_token_cipher()
+        self._wire(mgr, storage, cipher)
+        _seed_user_token(storage, cipher, user_id="u1", server_name="ghost-srv")
+
+        with patch(
+            "turnstone.core.mcp_client.get_user_access_token_classified",
+            new=AsyncMock(),
+        ) as classified:
+            _run_on_loop(loop, mgr._sweep_user_token_freshness())
+        classified.assert_not_awaited()  # ghost-srv is not in _oauth_user_server_names
+
+    # -- classification branches --------------------------------------------
+
+    def test_healthy_token_no_badge(self, running_loop_mgr, storage) -> None:
+        mgr, loop, _ = running_loop_mgr
+        cipher = make_mcp_token_cipher()
+        self._wire(mgr, storage, cipher)
+        _seed_user_token(storage, cipher, user_id="u1", server_name="pool-srv")
+        storage.upsert_mcp_pending_consent = MagicMock()  # type: ignore[method-assign]
+
+        with patch(
+            "turnstone.core.mcp_client.get_user_access_token_classified",
+            new=self._classified("token", token="access-aaa"),
+        ):
+            _run_on_loop(loop, mgr._sweep_user_token_freshness())
+        storage.upsert_mcp_pending_consent.assert_not_called()
+        assert ("u1", "pool-srv") not in mgr._token_sweep_warned
+
+    def test_dead_grant_badges_once_and_dedups(self, running_loop_mgr, storage, caplog) -> None:
+        mgr, loop, _ = running_loop_mgr
+        cipher = make_mcp_token_cipher()
+        self._wire(mgr, storage, cipher)
+        _seed_user_token(storage, cipher, user_id="u1", server_name="pool-srv")
+        storage.upsert_mcp_pending_consent = MagicMock()  # type: ignore[method-assign]
+
+        with (
+            patch(
+                "turnstone.core.mcp_client.get_user_access_token_classified",
+                new=self._classified("refresh_failed"),
+            ),
+            caplog.at_level(logging.WARNING, logger="turnstone.core.mcp_client"),
+        ):
+            _run_on_loop(loop, mgr._sweep_user_token_freshness())
+            _run_on_loop(loop, mgr._sweep_user_token_freshness())  # second tick: no re-badge
+
+        # Badge raised exactly once, proactively, with the dashboard's code.
+        storage.upsert_mcp_pending_consent.assert_called_once()
+        assert (
+            storage.upsert_mcp_pending_consent.call_args.kwargs["error_code"]
+            == "mcp_consent_required"
+        )
+        assert ("u1", "pool-srv") in mgr._token_sweep_warned
+        escalations = [r for r in caplog.records if "needs re-consent" in r.getMessage()]
+        assert len(escalations) == 1  # logged loud-once, not every tick
+
+    def test_decrypt_failure_warns_but_does_not_badge(self, running_loop_mgr, storage) -> None:
+        mgr, loop, _ = running_loop_mgr
+        cipher = make_mcp_token_cipher()
+        self._wire(mgr, storage, cipher)
+        _seed_user_token(storage, cipher, user_id="u1", server_name="pool-srv")
+        storage.upsert_mcp_pending_consent = MagicMock()  # type: ignore[method-assign]
+
+        with patch(
+            "turnstone.core.mcp_client.get_user_access_token_classified",
+            new=self._classified("decrypt_failure"),
+        ):
+            _run_on_loop(loop, mgr._sweep_user_token_freshness())
+        # Operator-actionable (key unknown) — surfaced in the warned set, but NOT
+        # a user-consent badge (outside the dashboard's scope).
+        storage.upsert_mcp_pending_consent.assert_not_called()
+        assert ("u1", "pool-srv") in mgr._token_sweep_warned
+
+    def test_transient_failure_is_silent(self, running_loop_mgr, storage) -> None:
+        mgr, loop, _ = running_loop_mgr
+        cipher = make_mcp_token_cipher()
+        self._wire(mgr, storage, cipher)
+        _seed_user_token(storage, cipher, user_id="u1", server_name="pool-srv")
+        storage.upsert_mcp_pending_consent = MagicMock()  # type: ignore[method-assign]
+
+        with patch(
+            "turnstone.core.mcp_client.get_user_access_token_classified",
+            new=self._classified("refresh_failed_transient"),
+        ):
+            _run_on_loop(loop, mgr._sweep_user_token_freshness())
+        storage.upsert_mcp_pending_consent.assert_not_called()
+        assert ("u1", "pool-srv") not in mgr._token_sweep_warned  # retryable, not surfaced
+
+    def test_recovery_rearms_and_clears_badge(self, running_loop_mgr, storage) -> None:
+        """A dead grant that later returns healthy clears its warned pin AND drops
+        the stale badge — the self-heal for a spurious invalid_grant that has
+        since recovered. Production-reachable now that the observe-only sweep no
+        longer deletes the row on refresh_failed, so the pair keeps enumerating."""
+        mgr, loop, _ = running_loop_mgr
+        cipher = make_mcp_token_cipher()
+        self._wire(mgr, storage, cipher)
+        _seed_user_token(storage, cipher, user_id="u1", server_name="pool-srv")
+        storage.delete_mcp_pending_consent = MagicMock(return_value=True)  # type: ignore[method-assign]
+        key = ("u1", "pool-srv")
+
+        with patch(
+            "turnstone.core.mcp_client.get_user_access_token_classified",
+            new=self._classified("refresh_failed"),
+        ):
+            _run_on_loop(loop, mgr._sweep_user_token_freshness())
+        assert key in mgr._token_sweep_warned
+        with patch(
+            "turnstone.core.mcp_client.get_user_access_token_classified",
+            new=self._classified("token", token="access-aaa"),
+        ):
+            _run_on_loop(loop, mgr._sweep_user_token_freshness())
+        assert key not in mgr._token_sweep_warned  # recovered → re-armed
+        storage.delete_mcp_pending_consent.assert_called_once_with("u1", "pool-srv")
+
+    def test_dead_grant_not_pinned_when_badge_persist_fails(
+        self, running_loop_mgr, storage
+    ) -> None:
+        """If the badge write fails, the pair is NOT pinned, so the next tick
+        retries — a single failed persist must not permanently lose the only
+        proactive signal for a sweep-detected dead grant."""
+        mgr, loop, _ = running_loop_mgr
+        cipher = make_mcp_token_cipher()
+        self._wire(mgr, storage, cipher)
+        _seed_user_token(storage, cipher, user_id="u1", server_name="pool-srv")
+        storage.upsert_mcp_pending_consent = MagicMock(  # type: ignore[method-assign]
+            side_effect=RuntimeError("db down")
+        )
+        key = ("u1", "pool-srv")
+
+        with patch(
+            "turnstone.core.mcp_client.get_user_access_token_classified",
+            new=self._classified("refresh_failed"),
+        ):
+            _run_on_loop(loop, mgr._sweep_user_token_freshness())
+            assert key not in mgr._token_sweep_warned  # not pinned — will retry
+            _run_on_loop(loop, mgr._sweep_user_token_freshness())
+        # Retried on the second tick rather than deduped away by a phantom pin.
+        assert storage.upsert_mcp_pending_consent.call_count == 2
+
+    def test_sweep_uses_non_revoking_observe_mode(self, running_loop_mgr, storage) -> None:
+        """The background sweep MUST call the canonical lookup non-destructively:
+        a timer may never delete a token or move a foreground user's revoke
+        threshold."""
+        mgr, loop, _ = running_loop_mgr
+        cipher = make_mcp_token_cipher()
+        self._wire(mgr, storage, cipher)
+        _seed_user_token(storage, cipher, user_id="u1", server_name="pool-srv")
+        seen_kwargs: list[dict[str, Any]] = []
+
+        async def _spy(**kwargs: Any) -> Any:
+            seen_kwargs.append(kwargs)
+            return SimpleNamespace(kind="token", token="access-aaa")
+
+        with patch("turnstone.core.mcp_client.get_user_access_token_classified", new=_spy):
+            _run_on_loop(loop, mgr._sweep_user_token_freshness())
+        assert seen_kwargs and seen_kwargs[0]["revoke_on_failure"] is False
+        assert seen_kwargs[0]["revoke_ambiguous_escalation"] is False
+
+    # -- keepalive refresh (exercise the refresh token before it idles out) ---
+
+    def test_keepalive_refresh_due_logic(self) -> None:
+        mgr = MCPClientManager({})
+        mgr._user_token_refresh_keepalive_s = 3600.0
+        old = (datetime.now(UTC) - timedelta(hours=2)).strftime("%Y-%m-%dT%H:%M:%S")
+        recent = (datetime.now(UTC) - timedelta(minutes=1)).strftime("%Y-%m-%dT%H:%M:%S")
+        assert mgr._keepalive_refresh_due(old) is True  # past the window → force
+        assert mgr._keepalive_refresh_due(recent) is False  # still warm
+        assert mgr._keepalive_refresh_due(None) is True  # unknown → force once, safe
+        assert mgr._keepalive_refresh_due("not-a-date") is True  # unparseable → force
+        mgr._user_token_refresh_keepalive_s = 0.0
+        assert mgr._keepalive_refresh_due(old) is False  # disabled → never force
+
+    def test_keepalive_due_forces_refresh(self, running_loop_mgr, storage) -> None:
+        """A grant whose refresh token has idled past the window is force-refreshed
+        even though its access token may be fresh — the [6] fix: keep the refresh
+        token alive so an unattended run never finds it aged out."""
+        mgr, loop, _ = running_loop_mgr
+        cipher = make_mcp_token_cipher()
+        self._wire(mgr, storage, cipher)
+        mgr._user_token_refresh_keepalive_s = 1800.0
+        stale = (datetime.now(UTC) - timedelta(hours=2)).strftime("%Y-%m-%dT%H:%M:%S")
+        storage.list_mcp_user_token_reconcile_targets = MagicMock(  # type: ignore[method-assign]
+            return_value=[("u1", "pool-srv", stale)]
+        )
+        seen_kwargs: list[dict[str, Any]] = []
+
+        async def _spy(**kwargs: Any) -> Any:
+            seen_kwargs.append(kwargs)
+            return SimpleNamespace(kind="token", token="access-aaa")
+
+        with patch("turnstone.core.mcp_client.get_user_access_token_classified", new=_spy):
+            _run_on_loop(loop, mgr._sweep_user_token_freshness())
+        assert seen_kwargs and seen_kwargs[0]["force_refresh"] is True
+
+    def test_keepalive_not_due_does_not_force(self, running_loop_mgr, storage) -> None:
+        mgr, loop, _ = running_loop_mgr
+        cipher = make_mcp_token_cipher()
+        self._wire(mgr, storage, cipher)
+        mgr._user_token_refresh_keepalive_s = 1800.0
+        recent = (datetime.now(UTC) - timedelta(minutes=1)).strftime("%Y-%m-%dT%H:%M:%S")
+        storage.list_mcp_user_token_reconcile_targets = MagicMock(  # type: ignore[method-assign]
+            return_value=[("u1", "pool-srv", recent)]
+        )
+        seen_kwargs: list[dict[str, Any]] = []
+
+        async def _spy(**kwargs: Any) -> Any:
+            seen_kwargs.append(kwargs)
+            return SimpleNamespace(kind="token", token="access-aaa")
+
+        with patch("turnstone.core.mcp_client.get_user_access_token_classified", new=_spy):
+            _run_on_loop(loop, mgr._sweep_user_token_freshness())
+        assert seen_kwargs and seen_kwargs[0]["force_refresh"] is False  # still warm
+
+    def test_warned_set_pruned_to_consented_pairs(self, running_loop_mgr, storage) -> None:
+        """A warned pair that is no longer consented (row gone) is dropped from
+        the dedup set so it can't grow unbounded across transient dead grants."""
+        mgr, loop, _ = running_loop_mgr
+        cipher = make_mcp_token_cipher()
+        self._wire(mgr, storage, cipher)
+        _seed_user_token(storage, cipher, user_id="u1", server_name="pool-srv")
+        mgr._token_sweep_warned = {("gone-user", "pool-srv"), ("u1", "pool-srv")}
+
+        with patch(
+            "turnstone.core.mcp_client.get_user_access_token_classified",
+            new=self._classified("token", token="access-aaa"),
+        ):
+            _run_on_loop(loop, mgr._sweep_user_token_freshness())
+        assert ("gone-user", "pool-srv") not in mgr._token_sweep_warned  # pruned
+        assert ("u1", "pool-srv") not in mgr._token_sweep_warned  # healthy → cleared
+
+    def test_per_pair_failure_isolated(self, running_loop_mgr, storage) -> None:
+        """One pair raising must not starve the rest of the pass."""
+        mgr, loop, _ = running_loop_mgr
+        cipher = make_mcp_token_cipher()
+        self._wire(mgr, storage, cipher)
+        mgr._oauth_user_server_names = {"pool-srv"}
+        _seed_user_token(storage, cipher, user_id="u-bad", server_name="pool-srv")
+        _seed_user_token(storage, cipher, user_id="u-ok", server_name="pool-srv")
+        seen: list[str] = []
+
+        async def _flaky(**kwargs: Any) -> Any:
+            uid = kwargs["user_id"]
+            seen.append(uid)
+            if uid == "u-bad":
+                raise RuntimeError("boom")
+            return SimpleNamespace(kind="token", token="access-aaa")
+
+        with patch("turnstone.core.mcp_client.get_user_access_token_classified", new=_flaky):
+            _run_on_loop(loop, mgr._sweep_user_token_freshness())
+        assert {"u-bad", "u-ok"} <= set(seen)  # both attempted despite one raising
+
+    def test_sweep_loop_cancel_returns_cleanly(self, running_loop_mgr) -> None:
+        """The loop body exits on cancellation without raising (mirrors the
+        eviction loop's teardown contract)."""
+        mgr, loop, _ = running_loop_mgr
+        mgr._user_token_sweep_s = 999.0  # park in the sleep
+
+        async def _spawn() -> asyncio.Task[None]:
+            return asyncio.ensure_future(mgr._user_token_sweep_loop())
+
+        task = _run_on_loop(loop, _spawn())
+
+        async def _cancel() -> None:
+            task.cancel()
+            with contextlib.suppress(BaseException):
+                await task
+
+        _run_on_loop(loop, _cancel())
+        assert task.cancelled() or task.done()
+
+    def test_connect_all_starts_the_sweep_task(self, running_loop_mgr) -> None:
+        """Wiring guard: ``_connect_all`` must start the sweep once, even with no
+        servers configured — otherwise the whole keep-hot mechanism is dead code."""
+        mgr, loop, _ = running_loop_mgr
+        assert mgr._user_token_sweep_task is None
+
+        _run_on_loop(loop, mgr._connect_all())
+        try:
+            task = mgr._user_token_sweep_task
+            assert task is not None and not task.done()  # live, single instance
+        finally:
+
+            async def _drain() -> None:
+                t = mgr._user_token_sweep_task
+                if t is not None:
+                    t.cancel()
+                    with contextlib.suppress(BaseException):
+                        await t
+                    mgr._user_token_sweep_task = None
+
+            _run_on_loop(loop, _drain())
+
+    def test_disabled_sweep_not_started_by_connect_all(self, running_loop_mgr) -> None:
+        """Cadence <= 0 disables the sweep entirely — no task is spawned."""
+        mgr, loop, _ = running_loop_mgr
+        mgr._user_token_sweep_s = 0.0
+        _run_on_loop(loop, mgr._connect_all())
+        assert mgr._user_token_sweep_task is None
+
+    @pytest.mark.parametrize(
+        ("configured", "expected"),
+        [
+            (0, 0.0),  # explicit disable
+            (-5, 0.0),  # negative disables (no busy-loop)
+            (1, 30.0),  # tiny positive floored to _MIN_USER_TOKEN_SWEEP_S
+            (600, 600.0),  # normal value passes through
+        ],
+    )
+    def test_cadence_clamped_or_disabled(self, configured, expected) -> None:
+        """The config cadence is floored (positive) or disabled (<= 0) so an
+        ``asyncio.sleep(0)`` busy-loop is unreachable."""
+        with patch(
+            "turnstone.core.mcp_client.load_config",
+            return_value={"user_token_sweep_seconds": configured},
+        ):
+            mgr = MCPClientManager({})
+        assert mgr._user_token_sweep_s == expected
+
+    # -- storage enumerator --------------------------------------------------
+
+    def test_reconcile_targets_pairs_expiry_unfiltered_with_last_exercised(self, storage) -> None:
+        cipher = make_mcp_token_cipher()
+        # alice consents to two servers → two rows.
+        _seed_user_token(storage, cipher, user_id="alice", server_name="srv-a")
+        _seed_user_token(storage, cipher, user_id="alice", server_name="srv-b")
+        # bob's access token is expired but the refresh token is live — still a
+        # consented, reconcilable grant, so bob must be enumerated.
+        _seed_user_token(
+            storage, cipher, user_id="bob", server_name="srv-a", expires_in_seconds=-999
+        )
+        targets = storage.list_mcp_user_token_reconcile_targets()
+        # (user, server) identity, all three grants present regardless of expiry.
+        assert sorted((u, s) for u, s, _ in targets) == [
+            ("alice", "srv-a"),
+            ("alice", "srv-b"),
+            ("bob", "srv-a"),
+        ]
+        # last_exercised = COALESCE(last_refreshed, created); never-refreshed rows
+        # fall back to created, so it is always populated (drives the keepalive).
+        assert all(last_exercised for _, _, last_exercised in targets)
