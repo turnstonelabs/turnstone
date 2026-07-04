@@ -63,10 +63,11 @@ class _PendingResolver:
     full hour -- surfacing as a CI hang. This instead waits until the approval
     is actually registered (which happens *after* the clear), then resolves, so
     the wakeup can never be lost. ``start()`` / ``cancel()`` mirror
-    ``threading.Timer`` so it drops into existing scaffolding; ``cancel()``
-    joins the worker (the resolve has already run or the deadline lapsed).
-    ``before`` runs just before resolving -- e.g. to snapshot pending-state
-    fields the test asserts on.
+    ``threading.Timer`` so it drops into existing scaffolding. ``cancel()``
+    signals the worker to stop and joins it, so a test that errors *before* the
+    approval registers can't leak the thread or resolve late into a finished
+    test. ``before`` runs just before resolving -- e.g. to snapshot
+    pending-state fields the test asserts on.
     """
 
     def __init__(
@@ -82,21 +83,36 @@ class _PendingResolver:
         self._kwargs = kwargs
         self._before = before
         self._deadline = deadline
+        self._cancelled = threading.Event()
+        self._started = False
         self._thread = threading.Thread(target=self._run, name="resolve-when-pending", daemon=True)
 
     def _run(self) -> None:
         end = time.monotonic() + self._deadline
-        while self._ui._pending_approval is None and time.monotonic() < end:
+        while time.monotonic() < end:
+            if self._cancelled.is_set():
+                return
+            # getattr (not a bare read) so a UI without _pending_approval can't
+            # crash the worker into a silent death that leaves approve_tools
+            # blocked for the full _APPROVAL_WAIT_TIMEOUT.
+            if getattr(self._ui, "_pending_approval", None) is not None:
+                if self._before is not None:
+                    self._before()
+                self._ui.resolve_approval(*self._args, **self._kwargs)
+                return
             time.sleep(0.001)
-        if self._before is not None:
-            self._before()
-        self._ui.resolve_approval(*self._args, **self._kwargs)
+        # Deadline without registration: approve_tools isn't parked on the
+        # approval event (returned early, or never reached it) -- don't resolve
+        # into an unknown state; let the test's own assertions speak.
 
     def start(self) -> None:
+        self._started = True
         self._thread.start()
 
     def cancel(self) -> None:
-        self._thread.join(timeout=5)
+        self._cancelled.set()
+        if self._started:
+            self._thread.join(timeout=5)
 
 
 def resolve_when_pending(ui: Any, *args: Any, **kwargs: Any) -> _PendingResolver:
