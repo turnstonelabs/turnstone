@@ -807,14 +807,15 @@ the levers live in the chat template, reached through
 `chat_template_kwargs` in the request body. Two channels, dynamic first:
 
 * **Session effort knob (dynamic).** Set the model's thinking mode to
-  Enabled in the admin Models form (or `thinking_mode = "manual"` +
-  `thinking_param` under `[models.*.capabilities]`) and the provider
-  maps the session's reasoning-effort knob onto the template toggle
-  per-request: effort `none` sends `{<thinking_param>: false}`, any
-  other level sends `true` — the same contract as the real lane's
-  manual mode. (`thinking_mode = "adaptive"` instead always sends
-  `true`: adaptive means the model self-regulates, so the knob never
-  force-disables — mirroring the native adaptive branch.) Templates
+  "Effort-knob controlled" in the admin Models form (or
+  `thinking_mode = "manual"` + `thinking_param` under
+  `[models.*.capabilities]`) and the provider maps the session's
+  reasoning-effort knob onto the template toggle per-request: effort
+  `none` sends `{<thinking_param>: false}`, any other level sends
+  `true` — the same contract as the real lane's manual mode. ("Always
+  on" / `thinking_mode = "adaptive"` instead always sends `true`: the
+  model self-regulates, so the knob never force-disables — mirroring
+  the native adaptive branch.) Templates
   with a graded effort key (gpt-oss-style) additionally set
   `effort_param` (e.g. `"reasoning_effort"`), plus optional
   `reasoning_effort_values` / `default_reasoning_effort` to validate
