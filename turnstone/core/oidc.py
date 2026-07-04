@@ -822,8 +822,11 @@ def provision_oidc_user(
     # pairwise (a different value per application), so it cannot correlate this
     # user across services; oid+tid can. Captured here (present in every v2.0 ID
     # token, no extra scope). "" for IdPs that don't emit them.
-    oid = str(claims.get("oid", ""))
-    tid = str(claims.get("tid", ""))
+    # `or ""` (not a get default) so a present-but-null claim collapses to the
+    # same "" sentinel — `.get(k, "")` returns None when the key is present with
+    # a JSON null, and str(None) would store the bogus non-empty value "None".
+    oid = str(claims.get("oid") or "")
+    tid = str(claims.get("tid") or "")
     display_name = str(claims.get("name", "") or claims.get("preferred_username", "") or email)
 
     # Try to find existing identity

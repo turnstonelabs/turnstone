@@ -1643,6 +1643,65 @@ class TestProvisionOIDCUser:
 
         storage.assign_role.assert_not_called()
 
+    def test_provision_oidc_user_null_oid_tid_collapse_to_empty(self):
+        """A present-but-null oid/tid claim must store "" — never the string "None".
+
+        `claims.get("oid", "")` returns None (not the "" default) when the key is
+        present with a JSON null, and str(None) == "None" would slip past both the
+        server_default and the truthy backfill guard, storing a bogus non-empty
+        sentinel that collides across every null-emitting user. New-user path.
+        """
+        config = _make_config()
+        storage = _mock_storage()
+        storage.get_user.return_value = {
+            "user_id": "u-new",
+            "username": "bob",
+            "display_name": "Bob",
+            "password_hash": "!oidc",
+        }
+
+        claims = {"sub": "sub-null", "preferred_username": "bob", "oid": None, "tid": None}
+        with patch("turnstone.core.oidc.uuid") as mock_uuid:
+            mock_uuid.uuid4.return_value = MagicMock(hex="u-new-hex-00000000000000000000")
+            provision_oidc_user(storage, config, claims)
+
+        kwargs = storage.create_oidc_user.call_args.kwargs
+        assert kwargs["oid"] == ""
+        assert kwargs["tid"] == ""
+
+    def test_provision_oidc_user_null_oid_tid_not_backfilled_existing(self):
+        """Existing-identity path: null oid/tid claims must not backfill "None".
+
+        The truthy guard in update_oidc_identity_login only protects against ""; a
+        "None" produced by str(None) is truthy and would be written, clobbering a
+        real value captured on an earlier login.
+        """
+        config = _make_config()
+        existing_user = {
+            "user_id": "u1",
+            "username": "alice",
+            "display_name": "Alice",
+            "password_hash": "!oidc",
+        }
+        existing_identity = {
+            "issuer": "https://idp.example.com",
+            "subject": "sub-123",
+            "user_id": "u1",
+            "email": "alice@example.com",
+            "created": "2024-01-01T00:00:00",
+            "last_login": "2024-01-01T00:00:00",
+            "oid": "obj-real",
+            "tid": "ten-real",
+        }
+        storage = _mock_storage(identity=existing_identity, user=existing_user)
+
+        claims = {"sub": "sub-123", "email": "alice@example.com", "oid": None, "tid": None}
+        provision_oidc_user(storage, config, claims)
+
+        kwargs = storage.update_oidc_identity_login.call_args.kwargs
+        assert kwargs["oid"] == ""
+        assert kwargs["tid"] == ""
+
     def test_existing_identity_self_heals_zero_roles(self):
         """Existing identity user with zero roles -> safety-net assigns builtin-viewer.
 
