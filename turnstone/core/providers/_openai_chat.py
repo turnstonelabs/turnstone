@@ -29,6 +29,7 @@ from turnstone.core.providers._protocol import (
     StreamChunk,
     ToolCallDelta,
     _join_reasoning_with_cap,
+    merge_reasoning_template_kwargs,
 )
 from turnstone.core.trajectory import materialize_attachments
 
@@ -117,49 +118,25 @@ class OpenAIChatCompletionsProvider:
 
     # -- thinking mode -------------------------------------------------------
 
-    @staticmethod
-    def _apply_thinking_mode(
-        extra_body: dict[str, Any],
-        caps: ModelCapabilities,
-    ) -> None:
-        """Inject thinking-mode params into *extra_body* based on capabilities.
-
-        When ``caps.thinking_mode`` is ``"manual"`` or ``"adaptive"``, sets
-        the model-family-specific key (``caps.thinking_param``, e.g.
-        ``"enable_thinking"`` or ``"thinking"``) to ``True`` inside
-        ``extra_body["chat_template_kwargs"]``.
-
-        Does nothing when thinking mode is ``"none"`` or the key is already
-        present (operator override via ``extra_body`` takes precedence).
-        """
-        if caps.thinking_mode == "none":
-            return
-        ctk = extra_body.get("chat_template_kwargs")
-        if not isinstance(ctk, dict):
-            ctk = {}
-            extra_body["chat_template_kwargs"] = ctk
-        if caps.thinking_param not in ctk:
-            ctk[caps.thinking_param] = True
-
     def _finalize_extra_body(
         self,
         extra_params: dict[str, Any] | None,
         caps: ModelCapabilities,
+        reasoning_effort: str,
     ) -> dict[str, Any] | None:
-        """Build the final ``extra_body``, injecting thinking params if needed.
+        """Build the final ``extra_body``, injecting reasoning params if needed.
 
-        Returns ``None`` when the result would be empty (no extra_body needed).
-        Shallow-copies *extra_params* and its ``chat_template_kwargs`` so the
-        caller's dict is never mutated.
+        ``merge_reasoning_template_kwargs`` maps the session effort knob onto
+        the template's thinking toggle (``caps.thinking_param``, active when
+        ``thinking_mode`` is manual/adaptive — effort ``"none"`` sends
+        ``false``) and the graded effort key (``caps.effort_param``) inside
+        ``chat_template_kwargs``.  Keys the operator already pinned via
+        ``server_compat`` win; the caller's dict is never mutated.
+
+        Returns ``None`` when the result would be empty (no extra_body
+        needed).
         """
-        eb: dict[str, Any] = {}
-        if extra_params:
-            eb = dict(extra_params)
-            ctk = eb.get("chat_template_kwargs")
-            if isinstance(ctk, dict):
-                eb["chat_template_kwargs"] = dict(ctk)
-        self._apply_thinking_mode(eb, caps)
-        return eb or None
+        return merge_reasoning_template_kwargs(caps, reasoning_effort, extra_params) or None
 
     # -- streaming -----------------------------------------------------------
 
@@ -203,7 +180,7 @@ class OpenAIChatCompletionsProvider:
         tools = apply_tool_search(caps, tools, deferred_names)
         if tools:
             kwargs["tools"] = tools
-        extra_body = self._finalize_extra_body(extra_params, caps)
+        extra_body = self._finalize_extra_body(extra_params, caps, reasoning_effort)
         if extra_body:
             kwargs["extra_body"] = extra_body
         if extra_headers:
@@ -338,7 +315,7 @@ class OpenAIChatCompletionsProvider:
         tools = apply_tool_search(caps, tools, deferred_names)
         if tools:
             kwargs["tools"] = tools
-        extra_body = self._finalize_extra_body(extra_params, caps)
+        extra_body = self._finalize_extra_body(extra_params, caps, reasoning_effort)
         if extra_body:
             kwargs["extra_body"] = extra_body
         if extra_headers:

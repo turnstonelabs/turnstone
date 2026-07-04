@@ -6904,6 +6904,7 @@ function showCreateModelModal() {
   document.getElementById("model-thinking-mode").value = "";
   document.getElementById("model-thinking-param").value = "";
   document.getElementById("model-thinking-param-row").hidden = true;
+  document.getElementById("model-effort-param").value = "";
   document.getElementById("model-extra-body").value = "";
   document.getElementById("model-capabilities").value = "";
   // Clear validation error styling from prior submit attempts
@@ -6995,6 +6996,10 @@ function showEditModelModal(definitionId) {
         document.getElementById("model-thinking-param").value = "";
       }
       _toggleThinkingParam();
+      // effort_param is a plain string — always representable, so it lifts
+      // into its field unconditionally (stripped from the raw JSON below).
+      document.getElementById("model-effort-param").value =
+        capsObj.effort_param || "";
       // Server compat: server_type, api_surface, and extra_body workarounds
       document.getElementById("model-server-type").value = sc.server_type || "";
       document.getElementById("model-api-surface").value = sc.api_surface || "";
@@ -7034,6 +7039,7 @@ function showEditModelModal(definitionId) {
         delete capsObj.thinking_mode;
         delete capsObj.thinking_param;
       }
+      delete capsObj.effort_param;
       const capsText = JSON.stringify(capsObj, null, 2);
       document.getElementById("model-capabilities").value =
         capsText === "{}" ? "" : capsText;
@@ -7116,6 +7122,13 @@ function submitCreateModel() {
     const savedParam = document.getElementById("model-thinking-param").value;
     if (savedParam) caps.thinking_param = savedParam;
   }
+  // Effort param (graded chat-template effort key, e.g. gpt-oss
+  // "reasoning_effort") round-trips like thinking_param: lifted out of
+  // the raw JSON on edit-load, re-added here when the field is set.
+  const effortParam = document
+    .getElementById("model-effort-param")
+    .value.trim();
+  if (effortParam) caps.effort_param = effortParam;
 
   // Build server_compat from structured fields.  Only meaningful for the
   // compat lanes (openai-compatible: all fields; anthropic-compatible: the

@@ -826,6 +826,12 @@ the levers live in the chat template, reached through
   regardless of the session knob. (Server type and API surface remain
   openai-compatible-only knobs and stay hidden for this provider.)
 
+The same knob mapping drives the `openai-compatible` lane's Chat
+Completions requests — `merge_reasoning_template_kwargs` is shared by
+both local-server lanes, so `thinking_mode`/`thinking_param`/
+`effort_param` mean the same thing whichever endpoint serves the model.
+Only the Responses API surface (native reasoning) ignores it.
+
 Verified quirks of vLLM's Anthropic endpoint:
 
 * The `thinking` request param is silently dropped — use

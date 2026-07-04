@@ -4480,16 +4480,14 @@ class ChatSession:
         (``skip_special_tokens``, ``reasoning_format``, or explicit
         ``chat_template_kwargs``) to the OpenAI SDK ``extra_body`` on the
         OpenAI-shaped lanes, and to the Anthropic SDK ``extra_body`` on the
-        anthropic-compatible lane (the channel for vLLM's
-        ``chat_template_kwargs`` reasoning toggle).  Operators
-        running gpt-oss-style local templates that consume ``reasoning_effort``
-        from ``chat_template_kwargs`` should set it explicitly under
-        ``server_compat["extra_body"]["chat_template_kwargs"]``.
+        anthropic-compatible lane.  Entries set here are static operator
+        pins — they win over the dynamic knob mapping below.
 
-        Thinking-mode params (``enable_thinking``, ``thinking``) are added
-        separately by ``OpenAIChatCompletionsProvider._apply_thinking_mode``
-        based on ``ModelCapabilities.thinking_mode`` — the Responses API
-        surface handles reasoning natively and ignores ``extra_body``.
+        Reasoning params (the ``enable_thinking``/``thinking`` toggle and
+        the ``effort_param`` graded key) are added separately by the
+        providers via ``merge_reasoning_template_kwargs``, driven by
+        ``ModelCapabilities`` and the session effort knob — the Responses
+        API surface handles reasoning natively and ignores ``extra_body``.
 
         *model_alias* selects which stored config supplies server compat
         settings.  When ``None``, defaults to the session's primary alias.
