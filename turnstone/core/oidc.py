@@ -818,13 +818,24 @@ def provision_oidc_user(
     issuer = config.issuer
     sub = str(claims["sub"])
     email = str(claims.get("email", ""))
+    # Entra `oid`+`tid` are the STABLE, cross-app user key. The `sub` above is
+    # pairwise (a different value per application), so it cannot correlate this
+    # user across services; oid+tid can. Captured here (present in every v2.0 ID
+    # token, no extra scope). "" for IdPs that don't emit them.
+    # `or ""` (not a get default) so a present-but-null claim collapses to the
+    # same "" sentinel — `.get(k, "")` returns None when the key is present with
+    # a JSON null, and str(None) would store the bogus non-empty value "None".
+    oid = str(claims.get("oid") or "")
+    tid = str(claims.get("tid") or "")
     display_name = str(claims.get("name", "") or claims.get("preferred_username", "") or email)
 
     # Try to find existing identity
     identity = storage.get_oidc_identity(issuer, sub)
     if identity is not None:
         user_id = identity["user_id"]
-        storage.update_oidc_identity_login(issuer, sub)
+        # Passing oid/tid backfills them onto identities created before this
+        # change, on the user's next login.
+        storage.update_oidc_identity_login(issuer, sub, oid=oid, tid=tid)
         desired_role_ids = apply_role_mapping(storage, user_id, claims, config)
         _ensure_default_role(storage, user_id, desired_role_ids)
         user: dict[str, str] | None = storage.get_user(user_id)
@@ -845,6 +856,8 @@ def provision_oidc_user(
             issuer,
             sub,
             email,
+            oid=oid,
+            tid=tid,
         )
     except StorageConflictError as exc:
         raise OIDCError(f"OIDC provisioning failed: {exc}") from exc
