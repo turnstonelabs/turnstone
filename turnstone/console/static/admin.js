@@ -6984,7 +6984,7 @@ function showEditModelModal(definitionId) {
       // "adaptive" keep thinking_mode in the raw capabilities JSON so it
       // isn't silently lost on save.  Both compat lanes round-trip the
       // dropdown: on anthropic-compatible it drives the effort-knob →
-      // chat_template_kwargs mapping (_compat_extra_params).
+      // chat_template_kwargs mapping (merge_reasoning_template_kwargs).
       const tmVal = capsObj.thinking_mode || "";
       const tmCaptured = tmVal === "" || tmVal === "manual";
       if (tmCaptured) {
@@ -7037,7 +7037,11 @@ function showEditModelModal(definitionId) {
       delete capsObj.server_compat;
       if (tmCaptured) {
         delete capsObj.thinking_mode;
-        delete capsObj.thinking_param;
+        // Strip thinking_param only when a mode value round-trips through
+        // the dropdown. With mode unset the save path writes neither key,
+        // so a stored thinking_param must stay in the raw JSON — deleting
+        // it here would silently drop it on the next unrelated edit-save.
+        if (tmVal) delete capsObj.thinking_param;
       }
       delete capsObj.effort_param;
       const capsText = JSON.stringify(capsObj, null, 2);
@@ -7113,7 +7117,8 @@ function submitCreateModel() {
   // Thinking mode → capabilities.  thinking_mode round-trips through the
   // dropdown for every provider, including anthropic-compatible (where
   // manual mode maps the session effort knob onto the template's
-  // thinking toggle via chat_template_kwargs — _compat_extra_params).
+  // thinking toggle via chat_template_kwargs —
+  // merge_reasoning_template_kwargs).
   const thinkingMode = document.getElementById("model-thinking-mode").value;
   if (thinkingMode) {
     caps.thinking_mode = thinkingMode;
@@ -7125,10 +7130,18 @@ function submitCreateModel() {
   // Effort param (graded chat-template effort key, e.g. gpt-oss
   // "reasoning_effort") round-trips like thinking_param: lifted out of
   // the raw JSON on edit-load, re-added here when the field is set.
-  const effortParam = document
-    .getElementById("model-effort-param")
-    .value.trim();
-  if (effortParam) caps.effort_param = effortParam;
+  // Gated on the local-server lanes (like the server_compat block
+  // below): the field is hidden for other providers, so a lingering
+  // value from a provider switch must never persist.
+  if (
+    providerVal === "openai-compatible" ||
+    providerVal === "anthropic-compatible"
+  ) {
+    const effortParam = document
+      .getElementById("model-effort-param")
+      .value.trim();
+    if (effortParam) caps.effort_param = effortParam;
+  }
 
   // Build server_compat from structured fields.  Only meaningful for the
   // compat lanes (openai-compatible: all fields; anthropic-compatible: the

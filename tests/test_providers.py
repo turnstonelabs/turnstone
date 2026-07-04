@@ -193,11 +193,29 @@ class TestOpenAIProvider:
         assert eb is not None
         assert eb["chat_template_kwargs"]["enable_thinking"] is False
 
-    def test_thinking_mode_adaptive(self) -> None:
-        """Adaptive thinking mode drives the toggle the same way."""
+    def test_thinking_mode_adaptive_never_knob_disables(self) -> None:
+        """Adaptive = model self-regulates; knob "none" must not force false."""
         caps = ModelCapabilities(thinking_mode="adaptive")
-        eb = self.provider._finalize_extra_body(None, caps, "high")
-        assert eb == {"chat_template_kwargs": {"enable_thinking": True}}
+        for knob in ("high", "none", ""):
+            eb = self.provider._finalize_extra_body(None, caps, knob)
+            assert eb == {"chat_template_kwargs": {"enable_thinking": True}}
+
+    def test_effort_param_suppresses_flat_reasoning_effort(self) -> None:
+        """Declaring the ctk effort channel must not double-send the flat param."""
+        from turnstone.core.providers._openai_common import apply_temperature_and_effort
+
+        caps = ModelCapabilities(
+            effort_param="reasoning_effort",
+            reasoning_effort_values=("low", "medium", "high"),
+        )
+        kwargs: dict[str, Any] = {}
+        apply_temperature_and_effort(kwargs, caps, 0.5, "medium")
+        assert "reasoning_effort" not in kwargs
+        # Without effort_param the flat param still flows (commercial path).
+        flat_caps = ModelCapabilities(reasoning_effort_values=("low", "medium", "high"))
+        kwargs = {}
+        apply_temperature_and_effort(kwargs, flat_caps, 0.5, "medium")
+        assert kwargs["reasoning_effort"] == "medium"
 
     def test_effort_param_injects_knob_value(self) -> None:
         """effort_param carries the knob into chat_template_kwargs (gpt-oss)."""

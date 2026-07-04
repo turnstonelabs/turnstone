@@ -177,12 +177,13 @@ class TestCompatReasoningControl:
     """Session effort knob → ``chat_template_kwargs`` on the compat lane.
 
     vLLM's ``/v1/messages`` ignores the native ``thinking`` param — the
-    reasoning levers live in the chat template.  ``_compat_extra_params``
-    maps the knob onto ``caps.thinking_param`` (toggle, knob "none" = off,
-    mirroring ``_reasoning_params``) and ``caps.effort_param`` (graded
-    value for gpt-oss-style templates).  Verified live against qwen3.6 on
-    vLLM 2026-07-03: ``{"enable_thinking": false}`` disables thinking,
-    unknown chat_template_kwargs keys are silently ignored.
+    reasoning levers live in the chat template.
+    ``merge_reasoning_template_kwargs`` maps the knob onto
+    ``caps.thinking_param`` (manual: knob "none" = off, mirroring
+    ``_reasoning_params``; adaptive: always on) and ``caps.effort_param``
+    (graded value for gpt-oss-style templates).  Verified live against
+    qwen3.6 on vLLM 2026-07-03: ``{"enable_thinking": false}`` disables
+    thinking, unknown chat_template_kwargs keys are silently ignored.
     """
 
     _MANUAL_CAPS = ModelCapabilities(
@@ -229,13 +230,14 @@ class TestCompatReasoningControl:
         assert kwargs["extra_body"] == {"chat_template_kwargs": {"enable_thinking": False}}
         assert "thinking" not in kwargs
 
-    def test_adaptive_maps_like_manual(self) -> None:
-        """Adaptive on compat drives the toggle too — no native thinking dict."""
+    def test_adaptive_always_on(self) -> None:
+        """Adaptive never knob-disables — native-adaptive contract, no native dict."""
         caps = dataclasses.replace(self._MANUAL_CAPS, thinking_mode="adaptive")
-        kwargs = self._stream_kwargs(caps, "high")
-        assert kwargs["extra_body"] == {"chat_template_kwargs": {"enable_thinking": True}}
-        assert "thinking" not in kwargs
-        assert kwargs["temperature"] == 0.6
+        for knob in ("high", "none"):
+            kwargs = self._stream_kwargs(caps, knob)
+            assert kwargs["extra_body"] == {"chat_template_kwargs": {"enable_thinking": True}}
+            assert "thinking" not in kwargs
+            assert kwargs["temperature"] == 0.6
 
     def test_default_caps_inject_nothing(self) -> None:
         """Untouched compat defaults (thinking_mode=none) keep today's wire."""

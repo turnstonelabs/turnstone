@@ -168,20 +168,25 @@ def reasoning_template_kwargs(
     """``chat_template_kwargs`` entries carrying reasoning control.
 
     On local model servers the reasoning levers live in the chat template:
-    a boolean toggle (``caps.thinking_param``, active when ``thinking_mode``
-    is ``"manual"``/``"adaptive"``) and an optional graded effort key
-    (``caps.effort_param``, gpt-oss-style templates).  The session effort
-    knob drives both — ``"none"``/empty turns the toggle off, mirroring the
-    Anthropic provider's native manual-mode contract (``_reasoning_params``).
-    The effort value is validated via ``resolve_reasoning_effort`` when the
-    model declares ``reasoning_effort_values`` (off-list knob values snap to
+    a boolean toggle (``caps.thinking_param``) and an optional graded
+    effort key (``caps.effort_param``, gpt-oss-style templates).  The
+    session effort knob drives both, mirroring the native Anthropic
+    contracts: ``"manual"`` maps ``"none"``/empty to an explicit
+    ``false`` (``_reasoning_params`` parity — the knob is the switch),
+    while ``"adaptive"`` always sends ``true`` (the model self-regulates;
+    the native adaptive branch never lets the knob force-disable
+    thinking).  The effort value is validated via
+    ``resolve_reasoning_effort`` when the model declares
+    ``reasoning_effort_values`` (off-list knob values snap to
     ``default_reasoning_effort``); with no declared values the knob is
     forwarded as-is and the template is the authority on validity.
     """
     updates: dict[str, Any] = {}
     effort_on = bool(reasoning_effort) and reasoning_effort != "none"
-    if caps.thinking_mode in ("manual", "adaptive"):
+    if caps.thinking_mode == "manual":
         updates[caps.thinking_param] = effort_on
+    elif caps.thinking_mode == "adaptive":
+        updates[caps.thinking_param] = True
     if caps.effort_param and effort_on:
         effort = (
             resolve_reasoning_effort(caps, reasoning_effort)

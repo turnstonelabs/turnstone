@@ -812,13 +812,24 @@ the levers live in the chat template, reached through
   maps the session's reasoning-effort knob onto the template toggle
   per-request: effort `none` sends `{<thinking_param>: false}`, any
   other level sends `true` — the same contract as the real lane's
-  manual mode. Templates with a graded effort key (gpt-oss-style)
-  additionally set `effort_param` (e.g. `"reasoning_effort"`), plus
-  optional `reasoning_effort_values` / `default_reasoning_effort` to
-  validate the knob before it reaches the template; without declared
-  values the knob is forwarded as-is. With the default
-  `thinking_mode = "none"` nothing is injected and the server's
-  template default decides.
+  manual mode. (`thinking_mode = "adaptive"` instead always sends
+  `true`: adaptive means the model self-regulates, so the knob never
+  force-disables — mirroring the native adaptive branch.) Templates
+  with a graded effort key (gpt-oss-style) additionally set
+  `effort_param` (e.g. `"reasoning_effort"`), plus optional
+  `reasoning_effort_values` / `default_reasoning_effort` to validate
+  the knob before it reaches the template; without declared values the
+  knob is forwarded as-is. Setting `effort_param` also suppresses the
+  flat top-level `reasoning_effort` request param on the
+  openai-compatible lane — the template channel replaces it, never
+  doubles it. With the default `thinking_mode = "none"` nothing is
+  injected and the server's template default decides.
+
+  Upgrade note: before 1.7.0a7 the openai-compatible lane sent the
+  toggle unconditionally `true` whenever thinking mode was enabled. A
+  stored per-model `reasoning_effort = "none"` now disables thinking
+  on such models — pick any real level (or clear the override) to keep
+  it on.
 * **Operator pin (static).** Entries under `{"chat_template_kwargs":
   ...}` in the admin Models extra-body field ride the SDK's
   `extra_body` unconditionally and win over the knob mapping on key
@@ -831,6 +842,15 @@ Completions requests — `merge_reasoning_template_kwargs` is shared by
 both local-server lanes, so `thinking_mode`/`thinking_param`/
 `effort_param` mean the same thing whichever endpoint serves the model.
 Only the Responses API surface (native reasoning) ignores it.
+
+The `anthropic-compatible` lane never sends Anthropic's native
+`thinking`/`output_config` params — they are not in vLLM's request
+schema. The real `anthropic` provider is unaffected: official Claude
+models keep native thinking, budget mapping, and `output_config`
+effort. A gateway fronting *real* Claude on a Messages-shaped URL
+(e.g. a LiteLLM `anthropic/` route to the Claude API) should use
+`provider = "anthropic"` with a custom `base_url`, which keeps the
+native thinking params.
 
 Verified quirks of vLLM's Anthropic endpoint:
 
