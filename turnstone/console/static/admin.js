@@ -6905,6 +6905,7 @@ function showCreateModelModal() {
   document.getElementById("model-thinking-param").value = "";
   document.getElementById("model-thinking-param-row").hidden = true;
   document.getElementById("model-effort-param").value = "";
+  _annotateEffortSelect(document.getElementById("model-reasoning-effort"), null);
   document.getElementById("model-extra-body").value = "";
   document.getElementById("model-capabilities").value = "";
   // Clear validation error styling from prior submit attempts
@@ -7033,6 +7034,7 @@ function showEditModelModal(definitionId) {
       });
       _modelRenderTiles();
       _modelCapsRefreshBaseline();
+      _scheduleEffortLadder();
       // Remove structured fields from capabilities display — only delete
       // thinking_mode/thinking_param when the UI successfully captured them.
       delete capsObj.server_compat;
@@ -7625,6 +7627,99 @@ let _modelCapsSeq = 0;
 function _onModelFieldChange() {
   clearTimeout(_capsTimer);
   _capsTimer = setTimeout(_modelCapsRefreshBaseline, 500);
+  _scheduleEffortLadder();
+}
+
+/* Effort-ladder annotation: label knob positions that alias to the same
+   wire behavior for a given model, from the server-computed projection
+   (providers/effort_ladder.py — equal "effective" tokens ⇒ identical
+   requests).  Defined here and shared as a page global with
+   governance.js (skill launch config), which loads after this file. */
+function _annotateEffortSelect(sel, ladder) {
+  if (!sel) return;
+  const byVal = {};
+  const firstOf = {};
+  (ladder || []).forEach(function (row) {
+    byVal[row.value] = row.effective;
+    if (!(row.effective in firstOf)) firstOf[row.effective] = row.value;
+  });
+  Array.from(sel.options).forEach(function (opt) {
+    if (!opt.value) return; // "" = inherit-the-default option
+    if (!opt.dataset.baseLabel) opt.dataset.baseLabel = opt.textContent;
+    let label = opt.dataset.baseLabel;
+    let title = "";
+    const eff = byVal[opt.value];
+    if (eff !== undefined) {
+      const first = firstOf[eff];
+      if (first !== opt.value) {
+        label += " (= " + first + ")";
+      } else if (eff === "default") {
+        label += " (model default)";
+      }
+      title = "sends: " + eff;
+    }
+    opt.textContent = label;
+    opt.title = title;
+  });
+}
+
+let _effortLadderTimer = null;
+let _effortLadderSeq = 0;
+function _scheduleEffortLadder() {
+  clearTimeout(_effortLadderTimer);
+  _effortLadderTimer = setTimeout(_refreshModelEffortLadder, 500);
+}
+function _refreshModelEffortLadder() {
+  const shelf = document.getElementById("model-shelf");
+  const sel = document.getElementById("model-reasoning-effort");
+  if (!shelf || !shelf.open || !sel) return;
+  const provider = document.getElementById("model-provider").value;
+  const modelName = document.getElementById("model-name").value.trim();
+  if (!modelName) {
+    _annotateEffortSelect(sel, null);
+    return;
+  }
+  // Assemble the same capabilities the save path would persist: raw
+  // JSON base, structured thinking/effort fields overlaid.  Mid-edit
+  // invalid JSON annotates from the structured fields alone.
+  let caps = {};
+  const rawText = document.getElementById("model-capabilities").value.trim();
+  if (rawText) {
+    try {
+      const parsed = JSON.parse(rawText);
+      if (_isPlainObject(parsed)) caps = parsed;
+    } catch (e) {
+      /* fall through */
+    }
+  }
+  const tm = document.getElementById("model-thinking-mode").value;
+  if (tm) {
+    caps.thinking_mode = tm;
+    const tp = document.getElementById("model-thinking-param").value;
+    if (tp) caps.thinking_param = tp;
+  }
+  const ep = document.getElementById("model-effort-param").value.trim();
+  if (ep) caps.effort_param = ep;
+  const seq = ++_effortLadderSeq;
+  authFetch("/v1/api/admin/models/effort-ladder", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      provider: provider,
+      model: modelName,
+      capabilities: caps,
+    }),
+  })
+    .then(function (r) {
+      return r.ok ? r.json() : null;
+    })
+    .then(function (d) {
+      if (seq !== _effortLadderSeq) return; // superseded by a newer edit
+      _annotateEffortSelect(sel, d && d.ladder);
+    })
+    .catch(function () {
+      /* silent — annotation only */
+    });
 }
 
 /* Known-model lookup feeding the tile matrix: the table becomes the display
@@ -7771,6 +7866,13 @@ function _refreshModelSuggestions() {
   const provEl = document.getElementById("model-provider");
   const tmEl = document.getElementById("model-thinking-mode");
   if (tmEl) tmEl.addEventListener("change", _toggleThinkingParam);
+  if (tmEl) tmEl.addEventListener("change", _scheduleEffortLadder);
+  ["model-thinking-param", "model-effort-param", "model-capabilities"].forEach(
+    function (id) {
+      const el = document.getElementById(id);
+      if (el) el.addEventListener("input", _scheduleEffortLadder);
+    },
+  );
   const grid = document.getElementById("model-capgrid");
   if (grid) {
     grid.addEventListener("change", function (e) {

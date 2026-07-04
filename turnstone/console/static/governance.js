@@ -1965,6 +1965,7 @@ function showEditTemplateModal(tmplId) {
   document.getElementById("skl-default").checked = tmpl.is_default;
   // Session config fields
   document.getElementById("sklc-model").value = tmpl.model || "";
+  _sklcScheduleEffortLadder();
   document.getElementById("sklc-temperature").value =
     tmpl.temperature != null ? tmpl.temperature : "";
   document.getElementById("sklc-reasoning-effort").value =
@@ -5044,3 +5045,43 @@ function _submitOGPShelf() {
       errEl.classList.add("is-visible");
     });
 }
+
+/* Effort-ladder annotation for the skill launch-config effort select.
+   Resolves the typed alias against /v1/api/models (each row carries a
+   server-computed effort_ladder) and reuses the page-global
+   _annotateEffortSelect from admin.js, which loads before this file. */
+let _sklcModelsPromise = null;
+let _sklcLadderTimer = null;
+function _sklcRefreshEffortLadder() {
+  const sel = document.getElementById("sklc-reasoning-effort");
+  const aliasEl = document.getElementById("sklc-model");
+  if (!sel || !aliasEl || typeof _annotateEffortSelect !== "function") return;
+  const alias = aliasEl.value.trim();
+  if (!alias) {
+    _annotateEffortSelect(sel, null);
+    return;
+  }
+  if (!_sklcModelsPromise) {
+    _sklcModelsPromise = authFetch("/v1/api/models").then(function (r) {
+      return r.json();
+    });
+  }
+  _sklcModelsPromise
+    .then(function (d) {
+      const row = (d.models || []).find(function (m) {
+        return m.alias === alias;
+      });
+      _annotateEffortSelect(sel, row ? row.effort_ladder : null);
+    })
+    .catch(function () {
+      /* silent — annotation only */
+    });
+}
+function _sklcScheduleEffortLadder() {
+  clearTimeout(_sklcLadderTimer);
+  _sklcLadderTimer = setTimeout(_sklcRefreshEffortLadder, 400);
+}
+(function () {
+  const el = document.getElementById("sklc-model");
+  if (el) el.addEventListener("input", _sklcScheduleEffortLadder);
+})();

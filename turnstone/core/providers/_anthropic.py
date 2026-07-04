@@ -78,6 +78,12 @@ _TOOL_SEARCH_TOOL_TYPE = "tool_search_tool_bm25"
 # bodies byte-identical when a caller threads thinking overrides.
 _INTERNAL_EXTRA_PARAMS = frozenset({"thinking_budget_tokens"})
 
+# Manual-mode thinking budgets per effort knob level; knob values outside
+# the map (minimal, xhigh, max) fall back to the default budget.  Shared
+# with ``effort_ladder`` so UI projections can't drift from the wire.
+_EFFORT_BUDGET_MAP = {"low": 1024, "medium": 4096, "high": 16384}
+_DEFAULT_THINKING_BUDGET = 4096
+
 # -- model capabilities -------------------------------------------------------
 
 _ANTHROPIC_DEFAULT = ModelCapabilities(
@@ -778,8 +784,7 @@ class AnthropicProvider:
         """
         if not reasoning_effort or reasoning_effort in ("none", ""):
             return {}
-        budget_map = {"low": 1024, "medium": 4096, "high": 16384}
-        budget = budget_map.get(reasoning_effort, 4096)
+        budget = _EFFORT_BUDGET_MAP.get(reasoning_effort, _DEFAULT_THINKING_BUDGET)
         if extra_params and "thinking_budget_tokens" in extra_params:
             budget = extra_params["thinking_budget_tokens"]
         if budget > 0:

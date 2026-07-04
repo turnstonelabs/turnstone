@@ -1908,8 +1908,26 @@ async def list_available_models(request: Request) -> JSONResponse:
         return err
 
     rows = storage.list_model_definitions(enabled_only=True)
-    # Only expose alias/model/provider — rows also contain api_key, base_url, etc.
-    models = [{"alias": r["alias"], "model": r["model"], "provider": r["provider"]} for r in rows]
+    # Only expose alias/model/provider (+ the derived effort ladder) —
+    # rows also contain api_key, base_url, etc.
+    from turnstone.core.providers.effort_ladder import effort_ladder_for_model
+
+    models = []
+    for r in rows:
+        entry: dict[str, Any] = {
+            "alias": r["alias"],
+            "model": r["model"],
+            "provider": r["provider"],
+        }
+        try:
+            entry["effort_ladder"] = effort_ladder_for_model(
+                r["provider"], r["model"], r.get("capabilities") or {}
+            )
+        except Exception:
+            # Unknown provider string / malformed capabilities row must
+            # not take down the picker — the ladder is an annotation.
+            log.debug("models.effort_ladder_failed alias=%s", r.get("alias"), exc_info=True)
+        models.append(entry)
 
     # Include effective defaults for clients (web UI, channel gateway).
     default_alias = ""
@@ -11592,6 +11610,47 @@ async def admin_model_capabilities(request: Request) -> JSONResponse:
     )
 
 
+async def admin_effort_ladder(request: Request) -> JSONResponse:
+    """POST /v1/api/admin/models/effort-ladder — knob→wire projection.
+
+    Body: ``{"provider": ..., "model": ..., "capabilities": {...}}`` —
+    capabilities are the (possibly unsaved) overrides from the model
+    form, so the modal can annotate its effort select live while the
+    operator edits thinking mode / effort param.  Pure computation; no
+    stored state is read or written.
+    """
+    from turnstone.core.auth import require_permission
+    from turnstone.core.providers.effort_ladder import effort_ladder_for_model
+
+    err = require_permission(request, "admin.models")
+    if err:
+        return err
+
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"error": "invalid JSON body"}, status_code=400)
+    provider = str(body.get("provider") or "").strip()
+    model = str(body.get("model") or "").strip()
+    capabilities = body.get("capabilities")
+
+    if provider not in _MODEL_PROVIDERS:
+        return JSONResponse({"error": f"Unknown provider: {provider!r}"}, status_code=400)
+    if not model:
+        return JSONResponse({"error": "model is required"}, status_code=400)
+    if capabilities is not None and not isinstance(capabilities, dict):
+        return JSONResponse({"error": "capabilities must be an object"}, status_code=400)
+
+    try:
+        ladder = effort_ladder_for_model(provider, model, capabilities or {})
+    except Exception:
+        # Garbage override values (wrong types for capability fields)
+        # surface as a clean 400 rather than a 500 — the form's raw
+        # JSON is operator-typed.
+        return JSONResponse({"error": "could not resolve capabilities"}, status_code=400)
+    return JSONResponse({"provider": provider, "model": model, "ladder": ladder})
+
+
 async def admin_known_models(request: Request) -> JSONResponse:
     """GET /v1/api/admin/model-capabilities/known — list known model name prefixes."""
     from turnstone.core.auth import require_permission
@@ -13987,6 +14046,11 @@ def create_app(
                     Route(
                         "/api/admin/model-capabilities/known",
                         admin_known_models,
+                    ),
+                    Route(
+                        "/api/admin/models/effort-ladder",
+                        admin_effort_ladder,
+                        methods=["POST"],
                     ),
                     # Governance: Prompt Policies
                     Route("/api/admin/prompt-policies", admin_list_prompt_policies),

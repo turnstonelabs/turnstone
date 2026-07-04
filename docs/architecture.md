@@ -852,6 +852,16 @@ both local-server lanes, so `thinking_mode`/`thinking_param`/
 `effort_param` mean the same thing whichever endpoint serves the model.
 Only the Responses API surface (native reasoning) ignores it.
 
+The console surfaces this projection as an *effective effort ladder*:
+the admin model form's per-model effort select and the skill
+launch-config effort select annotate knob positions that alias to the
+same wire behavior (e.g. "Max (= high)"), computed server-side by
+`providers/effort_ladder.py` from the same mapping functions the
+providers use at request time and shipped on `/v1/api/models` rows and
+`POST /v1/api/admin/models/effort-ladder`. The ladder describes what
+Turnstone sends — a server-side template may alias further (DeepSeek-V4
+folds `low`/`medium` into its default `high` tier).
+
 The `anthropic-compatible` lane never sends Anthropic's native
 `thinking`/`output_config` params — they are not in vLLM's request
 schema. The real `anthropic` provider is unaffected: official Claude
