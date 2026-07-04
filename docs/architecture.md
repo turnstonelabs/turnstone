@@ -819,7 +819,15 @@ the levers live in the chat template, reached through
   `effort_param` (e.g. `"reasoning_effort"`), plus optional
   `reasoning_effort_values` / `default_reasoning_effort` to validate
   the knob before it reaches the template; without declared values the
-  knob is forwarded as-is. Setting `effort_param` also suppresses the
+  knob is forwarded as-is. Only declare values that match the
+  template's documented vocabulary — snapping an off-list knob to the
+  default can defeat a real tier. DeepSeek-V4, for example, officially
+  accepts `high`/`max` (Think High is the default thinking tier;
+  `low`/`medium` alias to `high`, `xhigh` to `max`), so freeform
+  passthrough matches the contract while a `("low", "medium", "high")`
+  values list would make Think Max unreachable. To map an undocumented
+  template, probe with per-request `chat_template_kwargs` and compare
+  `input_tokens`. Setting `effort_param` also suppresses the
   flat top-level `reasoning_effort` request param on the
   openai-compatible lane — the template channel replaces it, never
   doubles it. With the default `thinking_mode = "none"` nothing is
