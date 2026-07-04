@@ -147,6 +147,32 @@ class TestAdherenceLift:
         assert row["n_runs"] == 3
         assert result["mean_lift"] == pytest.approx(2.0 / 3.0)
 
+    def test_rejects_malformed_skill(self) -> None:
+        # A skill missing 'content' (or 'name') fails fast with a clear error,
+        # not a KeyError mid-run (Copilot review). Validation raises before any
+        # arm runs, so no _run_iteration stub is needed.
+        cases = [
+            {
+                "id": "bad-skill",
+                "skill": {"name": "x"},  # missing 'content'
+                "user_prompt": "do x",
+                "expected_actions": [{"tool": "search"}],
+            }
+        ]
+        with pytest.raises(ValueError, match="non-empty 'name' and 'content'"):
+            run_skill_adherence(
+                client=None,
+                base_url="http://localhost:9/v1",
+                api_key="dummy",
+                model="test-model",
+                cases=cases,
+                n_runs=1,
+                temperature=0.7,
+                max_tokens=1024,
+                reasoning_effort="medium",
+                context_window=8192,
+            )
+
     def test_skipped_when_no_skill(self, monkeypatch: pytest.MonkeyPatch) -> None:
         # A case with no skill is not measurable — it must be skipped, not
         # crash, and must not contribute to the mean.

@@ -452,8 +452,11 @@ def _run_single_test(
     When ``skill_mode`` is True the session is built WITHOUT a system-prompt
     override so the model runs under turnstone's natural prompt composition
     (the base identity under test).  If ``skill`` is given it is seeded into
-    the temp DB and activated via the real ``set_skill`` path, so the skill
-    body composes into the system message exactly as it would in production;
+    the temp DB and activated via the real ``set_skill`` path — the skill
+    flows through turnstone's natural composition exactly as in production,
+    landing wherever THAT checkout places a named skill (the system message,
+    or a separate context turn).  This harness measures adherence regardless
+    of placement, which is the whole point of comparing across checkouts.
     ``skill`` None is the control arm (natural default, no skill).  When
     ``skill_mode`` is False behaviour is unchanged — the system prompt is
     overridden as before.
@@ -519,7 +522,8 @@ def _run_single_test(
                 client=run_client,
                 model=model,
                 # skill_mode uses turnstone's natural composition (no override)
-                # so the skill can fold into the system message under test.
+                # so the skill folds in wherever the checkout under test places
+                # a named skill (system message, or a separate context turn).
                 system_prompt_override=None if skill_mode else system_prompt,
                 instructions=None,
                 temperature=temperature,
@@ -1254,8 +1258,9 @@ def run_skill_adherence(
     For every case that carries a ``skill`` this runs two arms ``n_runs``
     times each, scoring both against the case's ``expected_actions``:
 
-    * **treatment** — the skill is composed into the system message via the
-      real ``set_skill`` path (``skill_mode=True, skill=<case skill>``);
+    * **treatment** — the skill is applied via the real ``set_skill``
+      composition path (``skill_mode=True, skill=<case skill>``); where its
+      body lands (system message or a context turn) depends on the checkout;
     * **control** — the same base identity with no skill
       (``skill_mode=True, skill=None``).
 
@@ -1268,6 +1273,16 @@ def run_skill_adherence(
     """
     case_results: list[dict[str, Any]] = []
     skill_cases = [c for c in cases if c.get("skill")]
+
+    # Validate skill shape up front so a malformed dataset fails with a clear
+    # message instead of a KeyError mid-run (after arms have already started).
+    for case in skill_cases:
+        s = case["skill"]
+        if not isinstance(s, dict) or not s.get("name") or not s.get("content"):
+            raise ValueError(
+                f"case {case.get('id', '?')!r}: 'skill' must be an object with "
+                "non-empty 'name' and 'content'"
+            )
 
     for ci, case in enumerate(skill_cases):
         skill = case["skill"]

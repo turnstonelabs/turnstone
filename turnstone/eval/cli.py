@@ -48,6 +48,14 @@ def _run_skill_adherence_cli(
             raise SystemExit(f"Test case {i} missing required 'id' field")
         if "user_prompt" not in case:
             raise SystemExit(f"Test case '{case.get('id', i)}' missing 'user_prompt'")
+        skill = case.get("skill")
+        if skill is not None and (
+            not isinstance(skill, dict) or not skill.get("name") or not skill.get("content")
+        ):
+            raise SystemExit(
+                f"Test case '{case['id']}' has a malformed 'skill' — it must be an "
+                "object with non-empty 'name' and 'content'"
+            )
     if not any(c.get("skill") for c in cases):
         raise SystemExit("No cases carry a 'skill' — nothing to measure for adherence")
 
@@ -179,8 +187,8 @@ def main() -> None:
         action="store_true",
         help=(
             "Measure skill adherence: for each case carrying a 'skill', run a "
-            "treatment arm (skill composed into the system message) vs a control "
-            "arm (no skill) and report the pass-rate lift"
+            "treatment arm (skill applied via the real set_skill composition "
+            "path) vs a control arm (no skill) and report the pass-rate lift"
         ),
     )
     parser.add_argument(
