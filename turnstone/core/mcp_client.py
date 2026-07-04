@@ -2134,9 +2134,12 @@ class MCPClientManager:
         :meth:`_record_pending_consent_best_effort` and the loop-path
         :meth:`_persist_pending_consent_best_effort` — route through here so the
         7-kwarg ``upsert_mcp_pending_consent`` call and the timestamp format live
-        in ONE place. ``last_ws_id`` / ``last_tool_call_id`` are ``None`` for the
-        proactive (no-dispatch) path; the dispatch path passes its ids through a
-        thin wrapper. Raises on storage error — callers wrap best-effort.
+        in ONE place. ``last_ws_id`` / ``last_tool_call_id`` are always ``None``:
+        neither path captures a triggering ws / tool-call id (the mcp dispatch
+        layer never receives one, and the proactive sweep has no dispatch), and
+        no caller reads those columns today — they are unpopulated schema
+        affordances from migration 054. Raises on storage error — callers wrap
+        best-effort.
         """
         if self._storage is None:
             return
