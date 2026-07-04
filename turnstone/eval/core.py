@@ -32,7 +32,7 @@ from openai import OpenAI
 
 from turnstone.core.providers import LLMProvider, create_client, create_provider
 from turnstone.core.session import ChatSession
-from turnstone.core.storage import init_storage, reset_storage
+from turnstone.core.storage import get_storage, init_storage, reset_storage
 from turnstone.core.tools import INTERACTIVE_TOOLS, PRIMARY_KEY_MAP
 from turnstone.core.trajectory import Role, turn_from_dict
 
@@ -441,11 +441,22 @@ def _run_single_test(
     log_prefix: str = "",
     test_timeout: int = 300,
     tool_overrides: dict[str, dict[str, Any]] | None = None,
+    skill: dict[str, Any] | None = None,
+    skill_mode: bool = False,
 ) -> dict[str, Any]:
     """Run a single test case once in an isolated temp directory.
 
     Uses os.chdir (process-global), so concurrent calls must run in
     separate processes (see _run_and_score_subprocess / --parallel).
+
+    When ``skill_mode`` is True the session is built WITHOUT a system-prompt
+    override so the model runs under turnstone's natural prompt composition
+    (the base identity under test).  If ``skill`` is given it is seeded into
+    the temp DB and activated via the real ``set_skill`` path, so the skill
+    body composes into the system message exactly as it would in production;
+    ``skill`` None is the control arm (natural default, no skill).  When
+    ``skill_mode`` is False behaviour is unchanged — the system prompt is
+    overridden as before.
 
     Returns dict with keys: tool_log, final_content, message_count,
     elapsed, usage.
@@ -471,6 +482,24 @@ def _run_single_test(
 
         os.chdir(workdir)
 
+        # Skill-adherence treatment arm: seed the named skill into the temp DB
+        # (once — before the retry loop) so set_skill can activate it through
+        # the real composition path.  The subprocess/serial DB is fresh per
+        # run, so template_id "eval-skill" never collides.
+        if skill_mode and skill is not None:
+            get_storage().create_prompt_template(
+                template_id="eval-skill",
+                name=skill["name"],
+                category="eval",
+                content=skill["content"],
+                variables="[]",
+                is_default=False,
+                org_id="",
+                created_by="eval",
+                activation="named",
+                enabled=True,
+            )
+
         max_turns = case.get("max_turns", 15)
         # Retry on transient API errors to avoid poisoning eval scores
         tool_log: list[dict[str, Any]] = []
@@ -489,7 +518,9 @@ def _run_single_test(
             session = HeadlessSession(
                 client=run_client,
                 model=model,
-                system_prompt_override=system_prompt,
+                # skill_mode uses turnstone's natural composition (no override)
+                # so the skill can fold into the system message under test.
+                system_prompt_override=None if skill_mode else system_prompt,
                 instructions=None,
                 temperature=temperature,
                 max_tokens=max_tokens,
@@ -499,6 +530,11 @@ def _run_single_test(
                 tool_truncation=2000,
                 tool_overrides=tool_overrides,
             )
+            if skill_mode and skill is not None:
+                # Activate the seeded skill via the production path:
+                # _load_skills() -> _init_system_messages() composes the
+                # skill body into session.system_messages.
+                session.set_skill(skill["name"])
             executor: ThreadPoolExecutor | None = None
             try:
                 executor = ThreadPoolExecutor(max_workers=1)
@@ -587,6 +623,8 @@ def _run_and_score_subprocess(params: dict[str, Any]) -> dict[str, Any]:
             log_prefix="",
             test_timeout=params["test_timeout"],
             tool_overrides=params.get("tool_overrides"),
+            skill=params.get("skill"),
+            skill_mode=params.get("skill_mode", False),
         )
 
         score_result = score_run(
@@ -842,6 +880,8 @@ def _run_iteration_parallel(
     parallel: int,
     prompt_variants: dict[str, list[str]] | None = None,
     tool_overrides: dict[str, dict[str, Any]] | None = None,
+    skill: dict[str, Any] | None = None,
+    skill_mode: bool = False,
 ) -> dict[str, Any]:
     """Run all test cases in parallel using ProcessPoolExecutor."""
     # Build work items for every (case, run) combination
@@ -872,6 +912,8 @@ def _run_iteration_parallel(
                     "test_timeout": test_timeout,
                     "original_user_prompt": case["user_prompt"],
                     "tool_overrides": tool_overrides,
+                    "skill": skill,
+                    "skill_mode": skill_mode,
                 }
             )
 
@@ -993,6 +1035,8 @@ def _run_iteration(
     api_key: str = "",
     prompt_variants: dict[str, list[str]] | None = None,
     tool_overrides: dict[str, dict[str, Any]] | None = None,
+    skill: dict[str, Any] | None = None,
+    skill_mode: bool = False,
 ) -> dict[str, Any]:
     """Run all test cases n_runs times and score them."""
     if parallel > 1 and base_url:
@@ -1011,6 +1055,8 @@ def _run_iteration(
             parallel=parallel,
             prompt_variants=prompt_variants,
             tool_overrides=tool_overrides,
+            skill=skill,
+            skill_mode=skill_mode,
         )
 
     case_results: dict[str, Any] = {}
@@ -1061,6 +1107,8 @@ def _run_iteration(
                     log_prefix=log_prefix,
                     test_timeout=test_timeout,
                     tool_overrides=tool_overrides,
+                    skill=skill,
+                    skill_mode=skill_mode,
                 )
 
                 score_result = score_run(
@@ -1183,6 +1231,98 @@ def _run_iteration(
     return _aggregate_case_results(cases, case_results, total_tokens)
 
 
+# ─── Skill-adherence driver ──────────────────────────────────────────────────
+
+
+def run_skill_adherence(
+    client: Any,
+    base_url: str,
+    api_key: str,
+    model: str,
+    cases: list[dict[str, Any]],
+    n_runs: int,
+    temperature: float,
+    max_tokens: int,
+    reasoning_effort: str,
+    context_window: int,
+    test_timeout: int = 300,
+    parallel: int = 1,
+    verbose: bool = False,
+) -> dict[str, Any]:
+    """Measure how much a named skill changes tool-use behaviour.
+
+    For every case that carries a ``skill`` this runs two arms ``n_runs``
+    times each, scoring both against the case's ``expected_actions``:
+
+    * **treatment** — the skill is composed into the system message via the
+      real ``set_skill`` path (``skill_mode=True, skill=<case skill>``);
+    * **control** — the same base identity with no skill
+      (``skill_mode=True, skill=None``).
+
+    The adherence lift is ``pass_rate(treatment) - pass_rate(control)``.  The
+    control isolates the skill's causal effect: a scenario the model passes
+    anyway yields ~0 lift and is uninformative — that near-zero IS the signal.
+
+    Returns ``{"cases": [{case_id, skill, treatment_rate, control_rate, lift,
+    n_runs}, ...], "mean_lift": float}``.
+    """
+    case_results: list[dict[str, Any]] = []
+    skill_cases = [c for c in cases if c.get("skill")]
+
+    for ci, case in enumerate(skill_cases):
+        skill = case["skill"]
+        # Drop the skill key from the case handed to the runner — it is
+        # supplied out-of-band per arm, not read from the case dict.
+        arm_case = {k: v for k, v in case.items() if k != "skill"}
+        print(
+            f"\n  {CYAN}[{ci + 1}/{len(skill_cases)}]{RESET} "
+            f"{BOLD}{case['id']}{RESET} — skill {DIM}'{skill['name']}'{RESET}"
+        )
+
+        arm_rates: dict[str, float] = {}
+        for arm, arm_skill in (("treatment", skill), ("control", None)):
+            print(f"    {DIM}{arm}{RESET}")
+            iter_result = _run_iteration(
+                client=client,
+                model=model,
+                system_prompt="",
+                cases=[arm_case],
+                n_runs=n_runs,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                reasoning_effort=reasoning_effort,
+                context_window=context_window,
+                verbose=verbose,
+                test_timeout=test_timeout,
+                # Never fast-fail: the treatment arm's pass rate must be
+                # counted over every run, and control runs are expected to
+                # fail — skipping them would corrupt the lift.
+                fast_fail=False,
+                parallel=parallel,
+                base_url=base_url,
+                api_key=api_key,
+                skill=arm_skill,
+                skill_mode=True,
+            )
+            arm_rates[arm] = iter_result["aggregate"]["overall_pass_rate"]
+
+        treatment_rate = arm_rates["treatment"]
+        control_rate = arm_rates["control"]
+        case_results.append(
+            {
+                "case_id": case["id"],
+                "skill": skill["name"],
+                "treatment_rate": treatment_rate,
+                "control_rate": control_rate,
+                "lift": treatment_rate - control_rate,
+                "n_runs": n_runs,
+            }
+        )
+
+    mean_lift = sum(c["lift"] for c in case_results) / len(case_results) if case_results else 0.0
+    return {"cases": case_results, "mean_lift": mean_lift}
+
+
 # ─── Summary & reporting ─────────────────────────────────────────────────────
 
 
@@ -1240,6 +1380,37 @@ def _print_summary_table(iter_result: dict[str, Any]) -> None:
         f"{overall_avg:>5.2f}  "
         f"{total_passes:>2}/{total_runs_count:<2}  "
         f"{total_elapsed:>5.1f}s{jd_str}"
+    )
+
+
+def _print_skill_adherence_table(result: dict[str, Any]) -> None:
+    """Print a per-case treatment/control/lift table plus the mean lift."""
+    rows = result.get("cases", [])
+    if not rows:
+        print("\n  No skill-bearing cases to measure.")
+        return
+
+    max_id = max(len(str(r["case_id"])) for r in rows)
+    max_id = max(max_id, 4)  # min "CASE" header
+
+    print(f"\n{BOLD}  {'CASE'.ljust(max_id)}  {'TREAT':>6}  {'CTRL':>6}  {'LIFT':>7}{RESET}")
+    print(f"  {'─' * (max_id + 25)}")
+
+    for r in rows:
+        lift = r["lift"]
+        color = GREEN if lift > 0.01 else (RED if lift < -0.01 else DIM)
+        print(
+            f"  {str(r['case_id']).ljust(max_id)}  "
+            f"{r['treatment_rate']:>6.2f}  {r['control_rate']:>6.2f}  "
+            f"{color}{lift:>+7.2f}{RESET}"
+        )
+
+    print(f"  {'─' * (max_id + 25)}")
+    mean = result.get("mean_lift", 0.0)
+    mcolor = GREEN if mean > 0.01 else (RED if mean < -0.01 else DIM)
+    print(
+        f"  {BOLD}{'MEAN'.ljust(max_id)}{RESET}  {'':>6}  {'':>6}  "
+        f"{mcolor}{BOLD}{mean:>+7.2f}{RESET}"
     )
 
 

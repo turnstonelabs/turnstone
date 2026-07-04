@@ -25,9 +25,67 @@ from turnstone.core.session import ChatSession
 from turnstone.eval.core import (
     NullUI,
     _append_summary_tsv,
+    _print_skill_adherence_table,
     _print_summary_table,
     _run_iteration,
+    run_skill_adherence,
 )
+
+
+def _run_skill_adherence_cli(
+    args: argparse.Namespace,
+    client: OpenAI,
+    model: str,
+    api_key: str,
+) -> None:
+    """Load a skill-scenario dataset and report per-case adherence lift."""
+    with open(args.test_file) as f:
+        suite: dict[str, Any] = json.load(f)
+
+    cases: list[dict[str, Any]] = suite["cases"]
+    for i, case in enumerate(cases):
+        if "id" not in case:
+            raise SystemExit(f"Test case {i} missing required 'id' field")
+        if "user_prompt" not in case:
+            raise SystemExit(f"Test case '{case.get('id', i)}' missing 'user_prompt'")
+    if not any(c.get("skill") for c in cases):
+        raise SystemExit("No cases carry a 'skill' — nothing to measure for adherence")
+
+    defaults = suite.get("defaults", {})
+    resolved_n_runs: int = (
+        args.n_runs if args.n_runs is not None else int(defaults.get("n_runs", 3))
+    )
+    parallel = args.parallel if args.parallel != 0 else (os.cpu_count() or 4)
+
+    result = run_skill_adherence(
+        client=client,
+        base_url=args.base_url,
+        api_key=api_key,
+        model=model,
+        cases=cases,
+        n_runs=resolved_n_runs,
+        temperature=args.temperature,
+        max_tokens=args.max_tokens,
+        reasoning_effort=args.reasoning_effort,
+        context_window=args.context_window,
+        test_timeout=args.test_timeout,
+        parallel=parallel,
+        verbose=args.verbose,
+    )
+    result["meta"] = {
+        "model": model,
+        "base_url": args.base_url,
+        "test_suite": args.test_file,
+        "n_runs": resolved_n_runs,
+        "started": datetime.now().isoformat(),
+    }
+
+    _print_skill_adherence_table(result)
+
+    with open(args.output, "w") as f:
+        json.dump(result, f, indent=2)
+        f.write("\n")
+    print(f"Results written to {args.output}")
 
 
 def main() -> None:
@@ -117,6 +175,15 @@ def main() -> None:
         help="Parallel workers (default: 1=serial, 0=auto)",
     )
     parser.add_argument(
+        "--skill-adherence",
+        action="store_true",
+        help=(
+            "Measure skill adherence: for each case carrying a 'skill', run a "
+            "treatment arm (skill composed into the system message) vs a control "
+            "arm (no skill) and report the pass-rate lift"
+        ),
+    )
+    parser.add_argument(
         "-v",
         "--verbose",
         action="store_true",
@@ -141,6 +208,12 @@ def main() -> None:
         detected, _ = detect_model(client)
         assert detected is not None  # fatal=True guarantees non-None or SystemExit
         model = detected
+
+    # Skill-adherence mode is a distinct two-arm measurement — it uses natural
+    # prompt composition (no --prompt), so branch before the initial-prompt path.
+    if args.skill_adherence:
+        _run_skill_adherence_cli(args, client, model, api_key)
+        return
 
     # Resolve the initial prompt: --prompt file, else turnstone's built-in.
     initial_prompt: str | None = None

@@ -1,0 +1,56 @@
+{
+  "defaults": {
+    "n_runs": 3
+  },
+  "cases": [
+    {
+      "id": "search-first",
+      "skill": {
+        "name": "search-first",
+        "content": "# Search First\n\nBefore answering ANY question about where something lives in the codebase, you MUST call the `search` tool first. Never answer from memory."
+      },
+      "user_prompt": "Where is JWT token validation implemented in this project?",
+      "expected_actions": [{ "tool": "search" }],
+      "match_mode": "ordered_subset",
+      "max_turns": 4
+    },
+    {
+      "id": "test-after-edit",
+      "skill": {
+        "name": "test-after-edit",
+        "content": "# Test After Edit\n\nAfter editing or writing ANY file, you MUST run the test suite with `python -m pytest` via bash before you finish. Do not report done until tests have run."
+      },
+      "user_prompt": "Add a function `clamp(x, lo, hi)` that clamps x to [lo, hi] in utils.py.",
+      "setup": {
+        "files": {
+          "utils.py": ""
+        }
+      },
+      "expected_actions": [
+        { "tool": "write_file" },
+        { "tool": "bash", "args_pattern": { "command": "pytest" } }
+      ],
+      "match_mode": "ordered_subset",
+      "max_turns": 8
+    },
+    {
+      "id": "changelog-update",
+      "skill": {
+        "name": "changelog-update",
+        "content": "# Changelog Discipline\n\nWhenever you modify a file, you MUST also append a one-line entry to CHANGELOG.md describing the change in the same task."
+      },
+      "user_prompt": "Fix the off-by-one so pager.py shows the last page. Edit pager.py.",
+      "setup": {
+        "files": {
+          "pager.py": "def last_page(total_items, per_page):\n    # off-by-one: drops the final partial page\n    return total_items // per_page\n",
+          "CHANGELOG.md": "# Changelog\n"
+        }
+      },
+      "expected_actions": [
+        { "tool": "edit_file", "args_pattern": { "path": "CHANGELOG.md" } }
+      ],
+      "match_mode": "subset",
+      "max_turns": 8
+    }
+  ]
+}
