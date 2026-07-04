@@ -12,6 +12,7 @@ toggle.
 
 from __future__ import annotations
 
+import dataclasses
 import os
 import sys
 from typing import Any
@@ -21,6 +22,7 @@ import pytest
 
 from tests._session_helpers import make_session as _make_session
 from turnstone.core.providers._anthropic import AnthropicProvider
+from turnstone.core.providers._protocol import ModelCapabilities
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -164,6 +166,161 @@ class TestCompatWireShape:
         kwargs = client.messages.stream.call_args[1]
         assert "extra_body" not in kwargs
         assert kwargs["thinking"] == {"type": "enabled", "budget_tokens": 2048}
+
+
+# ===========================================================================
+# TestCompatReasoningControl
+# ===========================================================================
+
+
+class TestCompatReasoningControl:
+    """Session effort knob → ``chat_template_kwargs`` on the compat lane.
+
+    vLLM's ``/v1/messages`` ignores the native ``thinking`` param — the
+    reasoning levers live in the chat template.  ``_compat_extra_params``
+    maps the knob onto ``caps.thinking_param`` (toggle, knob "none" = off,
+    mirroring ``_reasoning_params``) and ``caps.effort_param`` (graded
+    value for gpt-oss-style templates).  Verified live against qwen3.6 on
+    vLLM 2026-07-03: ``{"enable_thinking": false}`` disables thinking,
+    unknown chat_template_kwargs keys are silently ignored.
+    """
+
+    _MANUAL_CAPS = ModelCapabilities(
+        token_param="max_tokens",
+        thinking_mode="manual",
+        thinking_param="enable_thinking",
+    )
+
+    def setup_method(self) -> None:
+        self.provider = AnthropicProvider(compat=True)
+
+    def _stream_kwargs(
+        self,
+        caps: ModelCapabilities | None,
+        reasoning_effort: str,
+        extra_params: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        client = _capture_client()
+        with patch("turnstone.core.providers._anthropic._ensure_anthropic"):
+            list(
+                self.provider.create_streaming(
+                    client=client,
+                    model="qwen3.6-27b",
+                    messages=[{"role": "user", "content": "hi"}],
+                    temperature=0.6,
+                    reasoning_effort=reasoning_effort,
+                    extra_params=extra_params,
+                    capabilities=caps,
+                )
+            )
+        return client.messages.stream.call_args[1]
+
+    def test_manual_toggle_on(self) -> None:
+        """Any non-none effort turns the template toggle on; wire stays clean."""
+        kwargs = self._stream_kwargs(self._MANUAL_CAPS, "medium")
+        assert kwargs["extra_body"] == {"chat_template_kwargs": {"enable_thinking": True}}
+        assert "thinking" not in kwargs
+        assert kwargs["temperature"] == 0.6  # never forced to 1.0 on compat
+
+    @pytest.mark.parametrize("knob", ["none", ""])
+    def test_manual_toggle_off(self, knob: str) -> None:
+        """Effort "none"/empty disables thinking — native manual-mode parity."""
+        kwargs = self._stream_kwargs(self._MANUAL_CAPS, knob)
+        assert kwargs["extra_body"] == {"chat_template_kwargs": {"enable_thinking": False}}
+        assert "thinking" not in kwargs
+
+    def test_adaptive_maps_like_manual(self) -> None:
+        """Adaptive on compat drives the toggle too — no native thinking dict."""
+        caps = dataclasses.replace(self._MANUAL_CAPS, thinking_mode="adaptive")
+        kwargs = self._stream_kwargs(caps, "high")
+        assert kwargs["extra_body"] == {"chat_template_kwargs": {"enable_thinking": True}}
+        assert "thinking" not in kwargs
+        assert kwargs["temperature"] == 0.6
+
+    def test_default_caps_inject_nothing(self) -> None:
+        """Untouched compat defaults (thinking_mode=none) keep today's wire."""
+        kwargs = self._stream_kwargs(None, "medium")
+        assert "extra_body" not in kwargs
+        assert "thinking" not in kwargs
+
+    def test_effort_param_validated_against_values(self) -> None:
+        """Off-list knob snaps to default_reasoning_effort, not sent raw."""
+        caps = dataclasses.replace(
+            self._MANUAL_CAPS,
+            effort_param="reasoning_effort",
+            reasoning_effort_values=("low", "medium", "high"),
+            default_reasoning_effort="medium",
+        )
+        kwargs = self._stream_kwargs(caps, "xhigh")
+        assert kwargs["extra_body"] == {
+            "chat_template_kwargs": {"enable_thinking": True, "reasoning_effort": "medium"}
+        }
+
+    def test_effort_param_freeform_without_values(self) -> None:
+        """No declared values → knob forwarded as-is, template is authority."""
+        caps = ModelCapabilities(
+            token_param="max_tokens",
+            effort_param="reasoning_effort",
+        )
+        kwargs = self._stream_kwargs(caps, "xhigh")
+        assert kwargs["extra_body"] == {"chat_template_kwargs": {"reasoning_effort": "xhigh"}}
+
+    def test_effort_param_omitted_on_none(self) -> None:
+        """Knob "none" sends no effort key (and toggles thinking off)."""
+        caps = dataclasses.replace(
+            self._MANUAL_CAPS,
+            effort_param="reasoning_effort",
+            reasoning_effort_values=("low", "medium", "high"),
+        )
+        kwargs = self._stream_kwargs(caps, "none")
+        assert kwargs["extra_body"] == {"chat_template_kwargs": {"enable_thinking": False}}
+
+    def test_operator_override_wins(self) -> None:
+        """server_compat chat_template_kwargs entries beat the knob mapping."""
+        kwargs = self._stream_kwargs(
+            self._MANUAL_CAPS,
+            "none",
+            extra_params={"chat_template_kwargs": {"enable_thinking": True}, "foo": 1},
+        )
+        assert kwargs["extra_body"] == {
+            "chat_template_kwargs": {"enable_thinking": True},
+            "foo": 1,
+        }
+
+    def test_caller_extra_params_not_mutated(self) -> None:
+        """The session's extra_params dict must never be written through."""
+        extra = {"chat_template_kwargs": {"foo": 1}}
+        self._stream_kwargs(self._MANUAL_CAPS, "medium", extra_params=extra)
+        assert extra == {"chat_template_kwargs": {"foo": 1}}
+
+    def test_no_output_config_on_compat(self) -> None:
+        """supports_effort must not leak Anthropic output_config to vLLM."""
+        caps = dataclasses.replace(
+            self._MANUAL_CAPS,
+            supports_effort=True,
+            effort_levels=("low", "medium", "high"),
+        )
+        kwargs = self._stream_kwargs(caps, "high")
+        assert "output_config" not in kwargs
+        assert kwargs["extra_body"] == {"chat_template_kwargs": {"enable_thinking": True}}
+
+    def test_create_completion_same_injection(self) -> None:
+        """The non-streaming path shares _build_thinking_and_kwargs."""
+        client = MagicMock()
+        final = MagicMock(content=[], stop_reason="end_turn")
+        stream = MagicMock()
+        stream.get_final_message.return_value = final
+        client.messages.stream.return_value.__enter__.return_value = stream
+        with patch("turnstone.core.providers._anthropic._ensure_anthropic"):
+            self.provider.create_completion(
+                client=client,
+                model="qwen3.6-27b",
+                messages=[{"role": "user", "content": "hi"}],
+                reasoning_effort="none",
+                capabilities=self._MANUAL_CAPS,
+            )
+        kwargs = client.messages.stream.call_args[1]
+        assert kwargs["extra_body"] == {"chat_template_kwargs": {"enable_thinking": False}}
 
 
 # ===========================================================================

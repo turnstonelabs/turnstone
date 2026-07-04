@@ -74,11 +74,21 @@ class ModelCapabilities:
     supports_tools: bool = True
     token_param: str = "max_completion_tokens"
     thinking_mode: str = "none"  # "none" | "manual" | "adaptive"
-    # For openai-compatible servers: the chat_template_kwargs key that
-    # toggles thinking (e.g. "enable_thinking" for Gemma/Qwen,
-    # "thinking" for Granite/DeepSeek).  Ignored when thinking_mode is
-    # "none" or by providers that handle thinking natively (Anthropic).
+    # For local-server lanes (openai-compatible, anthropic-compatible):
+    # the chat_template_kwargs key that toggles thinking (e.g.
+    # "enable_thinking" for Gemma/Qwen, "thinking" for Granite/DeepSeek).
+    # Ignored when thinking_mode is "none" or by providers that handle
+    # thinking natively (real Anthropic).
     thinking_param: str = "enable_thinking"
+    # For the anthropic-compatible lane: the chat_template_kwargs key that
+    # carries a graded reasoning-effort value, for templates that have one
+    # (e.g. "reasoning_effort" for gpt-oss-style templates).  Empty = the
+    # template has no effort lever, send nothing.  The session knob value
+    # is validated against ``reasoning_effort_values`` when that is
+    # non-empty (off-list values snap to ``default_reasoning_effort``);
+    # with no declared values the knob is forwarded as-is and the template
+    # is the authority on validity.
+    effort_param: str = ""
     supports_effort: bool = False
     effort_levels: tuple[str, ...] = ()
     reasoning_effort_values: tuple[str, ...] = ()
@@ -134,6 +144,20 @@ class ModelCapabilities:
     rerank_threshold: float = 0.0
     rerank_scale: str = ""
     rerank_separated: bool = False
+
+
+def resolve_reasoning_effort(caps: ModelCapabilities, reasoning_effort: str) -> str | None:
+    """Return the validated reasoning effort value, or ``None`` to omit.
+
+    Validates against supported values and falls back to model default.
+    """
+    if not caps.reasoning_effort_values or not reasoning_effort or reasoning_effort == "none":
+        return None
+    if reasoning_effort in caps.reasoning_effort_values:
+        return reasoning_effort
+    if caps.default_reasoning_effort and caps.default_reasoning_effort != "none":
+        return caps.default_reasoning_effort
+    return None
 
 
 # Operator-friendly UI cap on reasoning text returned from

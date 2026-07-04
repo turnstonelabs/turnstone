@@ -132,6 +132,9 @@ provider = "anthropic-compatible"
 base_url = "http://INFERENCE_HOST:4000"            # /v1/messages (no /v1 suffix)
 api_key = "dummy"
 context_window = 262144
+[models.qwen.capabilities]
+thinking_mode = "manual"          # session effort knob drives the template's
+thinking_param = "enable_thinking"  # thinking toggle (effort "none" = off)
 
 [models.gemma]
 model = "gemma-4-12b"

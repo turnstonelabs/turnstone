@@ -6979,15 +6979,13 @@ function showEditModelModal(definitionId) {
         ? capsObj.server_compat
         : {};
       // Only extract thinking_mode into the dropdown when the UI can
-      // represent it ("manual" or "") AND the provider round-trips the
-      // dropdown on save (every provider except anthropic-compatible —
-      // see submitCreateModel).  Unrepresentable values like "adaptive"
-      // and anthropic-compatible rows keep thinking_mode in the raw
-      // capabilities JSON so it isn't silently lost on save.
+      // represent it ("manual" or "").  Unrepresentable values like
+      // "adaptive" keep thinking_mode in the raw capabilities JSON so it
+      // isn't silently lost on save.  Both compat lanes round-trip the
+      // dropdown: on anthropic-compatible it drives the effort-knob →
+      // chat_template_kwargs mapping (_compat_extra_params).
       const tmVal = capsObj.thinking_mode || "";
-      const tmRepresentable = tmVal === "" || tmVal === "manual";
-      const tmCaptured =
-        tmRepresentable && (m.provider || "openai") !== "anthropic-compatible";
+      const tmCaptured = tmVal === "" || tmVal === "manual";
       if (tmCaptured) {
         document.getElementById("model-thinking-mode").value = tmVal;
         document.getElementById("model-thinking-param").value =
@@ -7107,13 +7105,11 @@ function submitCreateModel() {
   const providerVal = document.getElementById("model-provider").value;
 
   // Thinking mode → capabilities.  thinking_mode round-trips through the
-  // dropdown for every provider EXCEPT anthropic-compatible, where it
-  // stays in the raw capabilities JSON (mirroring the edit-load lift):
-  // that lane hides the dropdown row and drives reasoning via extra-body
-  // chat_template_kwargs, so a lingering dropdown value must never be
-  // persisted.
+  // dropdown for every provider, including anthropic-compatible (where
+  // manual mode maps the session effort knob onto the template's
+  // thinking toggle via chat_template_kwargs — _compat_extra_params).
   const thinkingMode = document.getElementById("model-thinking-mode").value;
-  if (providerVal !== "anthropic-compatible" && thinkingMode) {
+  if (thinkingMode) {
     caps.thinking_mode = thinkingMode;
     // Preserve thinking_param so Granite/DeepSeek "thinking" key
     // isn't silently reverted to the default "enable_thinking".
@@ -7701,15 +7697,15 @@ function _applyProviderDefaults() {
     scSection.hidden =
       provider !== "openai-compatible" && provider !== "anthropic-compatible";
   }
-  // Within the section, server type / API surface / thinking mode are
-  // openai-compatible knobs — the anthropic-compatible lane is configured
-  // through the extra-body JSON alone, so collapse the section to just
-  // that field.
-  const hideOpenaiOnlyRows = provider === "anthropic-compatible";
-  ["model-server-fields-row", "model-thinking-mode-row"].forEach(function (id) {
-    const row = document.getElementById(id);
-    if (row) row.hidden = hideOpenaiOnlyRows;
-  });
+  // Within the section, server type / API surface are openai-compatible
+  // knobs (Detect heuristics + chat-vs-responses surface pick) and stay
+  // hidden on the anthropic-compatible lane.  Thinking mode applies to
+  // BOTH compat lanes: on anthropic-compatible it opts the model into
+  // the effort-knob → chat_template_kwargs mapping.
+  const serverFieldsRow = document.getElementById("model-server-fields-row");
+  if (serverFieldsRow) {
+    serverFieldsRow.hidden = provider === "anthropic-compatible";
+  }
 }
 
 /* Populate the model name datalist with known model prefixes for the

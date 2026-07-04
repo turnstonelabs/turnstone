@@ -18,6 +18,7 @@ from turnstone.core.providers._protocol import (
     ModelCapabilities,
     UsageInfo,
     _lookup_capabilities,
+    resolve_reasoning_effort,
 )
 
 log = structlog.get_logger(__name__)
@@ -285,20 +286,6 @@ def apply_temperature(
     if "none" in caps.reasoning_effort_values and reasoning_effort not in ("none", ""):
         return  # Skip temperature when reasoning is active
     kwargs["temperature"] = temperature
-
-
-def resolve_reasoning_effort(caps: ModelCapabilities, reasoning_effort: str) -> str | None:
-    """Return the validated reasoning effort value, or ``None`` to omit.
-
-    Validates against supported values and falls back to model default.
-    """
-    if not caps.reasoning_effort_values or not reasoning_effort or reasoning_effort == "none":
-        return None
-    if reasoning_effort in caps.reasoning_effort_values:
-        return reasoning_effort
-    if caps.default_reasoning_effort and caps.default_reasoning_effort != "none":
-        return caps.default_reasoning_effort
-    return None
 
 
 def apply_temperature_and_effort(

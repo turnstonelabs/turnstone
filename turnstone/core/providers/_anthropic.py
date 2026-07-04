@@ -20,6 +20,7 @@ from turnstone.core.providers._protocol import (
     UsageInfo,
     _join_reasoning_with_cap,
     _lookup_capabilities,
+    resolve_reasoning_effort,
 )
 from turnstone.core.trajectory import materialize_attachments
 
@@ -93,13 +94,17 @@ _ANTHROPIC_DEFAULT = ModelCapabilities(
 # Anthropic-compatible local servers (vLLM's /v1/messages endpoint):
 # token_param must be "max_tokens" (the only token param the endpoint
 # accepts); the "thinking" request param is not consumed by vLLM — the
-# reasoning toggle rides chat_template_kwargs via extra_body, so
-# thinking_mode stays "none"; supports_reasoning_replay stays True even
-# so, because the endpoint emits and round-trips thinking blocks whenever
-# the chat template enables reasoning (the request param is simply not
-# the switch); native web_search / tool_search server-tool types 400 on
-# vLLM (tools require input_schema); vision is opt-in per model.
-# supports_temperature stays True via the dataclass default.
+# reasoning levers ride chat_template_kwargs via extra_body instead
+# (``_compat_extra_params``).  thinking_mode defaults to "none" = inject
+# nothing, the server's template default reigns; per-model capabilities
+# opt into the effort-knob-driven toggle with thinking_mode="manual" +
+# thinking_param (plus a graded effort key via effort_param where the
+# template has one).  supports_reasoning_replay stays True even at
+# "none", because the endpoint emits and round-trips thinking blocks
+# whenever the chat template enables reasoning (the request param is
+# simply not the switch); native web_search / tool_search server-tool
+# types 400 on vLLM (tools require input_schema); vision is opt-in per
+# model.  supports_temperature stays True via the dataclass default.
 _ANTHROPIC_COMPAT_DEFAULT = ModelCapabilities(
     context_window=200000,
     max_output_tokens=64000,
@@ -346,6 +351,53 @@ class AnthropicProvider:
 
     # -- shared param logic --------------------------------------------------
 
+    def _compat_extra_params(
+        self,
+        caps: ModelCapabilities,
+        reasoning_effort: str,
+        extra_params: dict[str, Any] | None,
+    ) -> dict[str, Any] | None:
+        """Fold reasoning control into ``chat_template_kwargs`` (compat lane).
+
+        The reasoning levers on Anthropic-compatible local servers live in
+        the chat template, reached via ``extra_body["chat_template_kwargs"]``
+        — vLLM's ``/v1/messages`` accepts it as a first-class request field.
+
+        Mirrors the native manual-mode contract of ``_reasoning_params``:
+        effort ``"none"``/empty disables thinking, any other level enables
+        it — so the session effort knob drives the template toggle
+        (``caps.thinking_param``) whenever ``caps.thinking_mode`` is
+        ``"manual"`` or ``"adaptive"``.  Templates with a graded effort key
+        (``caps.effort_param``, gpt-oss-style) additionally receive the
+        resolved effort value.  With ``thinking_mode="none"`` and no
+        ``effort_param`` (the untouched-capabilities default) nothing is
+        injected and the server's template default reigns, as before.
+
+        Operator ``server_compat`` entries win on key collision; the
+        caller's dict is never mutated.
+        """
+        updates: dict[str, Any] = {}
+        effort_on = bool(reasoning_effort) and reasoning_effort != "none"
+        if caps.thinking_mode in ("manual", "adaptive"):
+            updates[caps.thinking_param] = effort_on
+        if caps.effort_param and effort_on:
+            effort = (
+                resolve_reasoning_effort(caps, reasoning_effort)
+                if caps.reasoning_effort_values
+                else reasoning_effort
+            )
+            if effort:
+                updates[caps.effort_param] = effort
+        if not updates:
+            return extra_params
+        merged = dict(extra_params) if extra_params else {}
+        raw_ctk = merged.get("chat_template_kwargs")
+        ctk = dict(raw_ctk) if isinstance(raw_ctk, dict) else {}
+        for key, value in updates.items():
+            ctk.setdefault(key, value)
+        merged["chat_template_kwargs"] = ctk
+        return merged
+
     def _build_thinking_and_kwargs(
         self,
         caps: ModelCapabilities,
@@ -361,7 +413,14 @@ class AnthropicProvider:
     ) -> dict[str, Any]:
         """Build the full kwargs dict with thinking mode and effort params."""
         thinking_params: dict[str, Any] = {}
-        if caps.thinking_mode == "adaptive":
+        if self._compat:
+            # vLLM's /v1/messages has no ``thinking`` field in its request
+            # schema (silently dropped) and must not have temperature forced
+            # to 1.0 — reasoning control rides chat_template_kwargs instead,
+            # folded into extra_params here so the extra_body forwarding
+            # below carries it to the wire.
+            extra_params = self._compat_extra_params(caps, reasoning_effort, extra_params)
+        elif caps.thinking_mode == "adaptive":
             thinking_dict: dict[str, Any] = {"type": "adaptive"}
             if caps.thinking_display:
                 thinking_dict["display"] = caps.thinking_display
@@ -393,8 +452,11 @@ class AnthropicProvider:
             kwargs["tools"] = anthropic_tools
         kwargs.update(thinking_params)
 
-        # Effort param for models that support it (Opus 4.8, Opus 4.7, Opus 4.6, Sonnet 4.6, Opus 4.5)
-        if caps.supports_effort and reasoning_effort:
+        # Effort param for models that support it (Opus 4.8, Opus 4.7, Opus 4.6, Sonnet 4.6, Opus 4.5).
+        # Never on the compat lane: ``output_config`` is not in vLLM's request
+        # schema — graded effort there is ``caps.effort_param`` via
+        # chat_template_kwargs.
+        if not self._compat and caps.supports_effort and reasoning_effort:
             effort = _map_reasoning_to_effort(reasoning_effort, caps.effort_levels)
             if effort:
                 kwargs["output_config"] = {"effort": effort}

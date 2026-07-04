@@ -24,7 +24,6 @@ from turnstone.core.providers._openai_common import (
     format_citations,
     format_document_wrapper,
     lookup_openai_capabilities,
-    resolve_reasoning_effort,
     resolve_server_side_tools,
     sanitize_messages,
 )
@@ -34,6 +33,7 @@ from turnstone.core.providers._protocol import (
     StreamChunk,
     ToolCallDelta,
     _join_reasoning_with_cap,
+    resolve_reasoning_effort,
 )
 from turnstone.core.trajectory import materialize_attachments
 

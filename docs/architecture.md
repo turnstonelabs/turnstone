@@ -798,15 +798,33 @@ model = "deepseek-ai/DeepSeek-V4-Flash"
 supports_vision = true                    # multimodal checkpoints only
 supports_mid_conversation_system = true   # template-dependent
 context_window = 131072
+thinking_mode = "manual"                  # session effort knob drives the template toggle
+thinking_param = "enable_thinking"        # Qwen/Gemma key; "thinking" for Granite/DeepSeek
 ```
 
-The reasoning toggle does NOT use Anthropic's `thinking` request param.
-Toggle it through the chat template instead: set `{"chat_template_kwargs":
-{"thinking": false}}` as extra body params in the admin Models
-server-compat section (for this provider the section shows only the
-extra-body field — server type, API surface, and thinking mode are
-openai-compatible-only knobs); the provider forwards it via the SDK's
-`extra_body`.
+Reasoning control does NOT use Anthropic's `thinking` request param —
+the levers live in the chat template, reached through
+`chat_template_kwargs` in the request body. Two channels, dynamic first:
+
+* **Session effort knob (dynamic).** Set the model's thinking mode to
+  Enabled in the admin Models form (or `thinking_mode = "manual"` +
+  `thinking_param` under `[models.*.capabilities]`) and the provider
+  maps the session's reasoning-effort knob onto the template toggle
+  per-request: effort `none` sends `{<thinking_param>: false}`, any
+  other level sends `true` — the same contract as the real lane's
+  manual mode. Templates with a graded effort key (gpt-oss-style)
+  additionally set `effort_param` (e.g. `"reasoning_effort"`), plus
+  optional `reasoning_effort_values` / `default_reasoning_effort` to
+  validate the knob before it reaches the template; without declared
+  values the knob is forwarded as-is. With the default
+  `thinking_mode = "none"` nothing is injected and the server's
+  template default decides.
+* **Operator pin (static).** Entries under `{"chat_template_kwargs":
+  ...}` in the admin Models extra-body field ride the SDK's
+  `extra_body` unconditionally and win over the knob mapping on key
+  collision — e.g. pin `{"enable_thinking": true}` to keep thinking on
+  regardless of the session knob. (Server type and API surface remain
+  openai-compatible-only knobs and stay hidden for this provider.)
 
 Verified quirks of vLLM's Anthropic endpoint:
 
