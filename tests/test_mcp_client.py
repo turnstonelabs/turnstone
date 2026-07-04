@@ -3827,7 +3827,9 @@ class TestStaticHealthLoop:
         attempt) must not advance the breaker — the server was never proven
         unreachable. The breaker is owned by _ensure_static_connected."""
         mgr, loop, _ = running_loop_mgr
-        mgr._CONNECT_TIMEOUT = 1  # instance shadow: sync-boundary wait, fast test
+        # Instance-shadow the sync-boundary wait (now the caller-timeout constant,
+        # not _CONNECT_TIMEOUT) so the held-lock contention path resolves fast.
+        mgr._STATIC_RECONNECT_CALLER_TIMEOUT_S = 1.0
         _seed_static_state(mgr, "srv", session=None)
 
         async def _hold() -> asyncio.Lock:
@@ -3995,6 +3997,62 @@ class TestEnsureStaticConnected:
         assert out2 is sess
         assert cm.await_count == 1
 
+    def test_dispatch_does_not_defer_when_busy(self, running_loop_mgr) -> None:
+        """Round-4 [3]: a DISPATCH (defer_if_busy=False) reconnects even with an
+        in-flight sibling — it needs the session now — rather than hard-failing a
+        reachable server. The autonomous default still defers (test above)."""
+        mgr, loop, _ = running_loop_mgr
+        state = _seed_static_state(mgr, "srv", session=None)
+        state.in_flight = 1
+        sess = MagicMock()
+
+        async def _connect(name: str, _cfg: dict[str, Any]) -> None:
+            _seed_static_state(mgr, name, session=sess)
+
+        with patch.object(mgr, "_connect_one_locked", side_effect=_connect) as cm:
+            out = _run_hl(
+                loop,
+                mgr._ensure_static_connected(
+                    "srv", mgr._server_configs["srv"], defer_if_busy=False
+                ),
+            )
+        assert out is sess  # reconnected despite in_flight > 0
+        assert cm.await_count == 1
+
+    def test_cancelled_attempt_cleans_up_partial_session_and_records(
+        self, running_loop_mgr
+    ) -> None:
+        """Round-4 [0]/[1]: a bare CancelledError delivered mid-connect (a caller
+        sync-boundary giving up, or shutdown) must NOT leave a half-discovered
+        session installed and must record the failed attempt — the handler is
+        `except BaseException`, not `except Exception`."""
+        mgr, loop, _ = running_loop_mgr
+        state = _seed_static_state(mgr, "srv", session=None)
+
+        async def _handshake_then_cancel(name: str, _cfg: dict[str, Any]) -> None:
+            state.session = MagicMock()  # handshake OK, session installed
+            raise asyncio.CancelledError()  # discovery cancelled by a caller giving up
+
+        with (
+            patch.object(mgr, "_connect_one_locked", side_effect=_handshake_then_cancel),
+            # run_coroutine_threadsafe surfaces a re-raised asyncio.CancelledError
+            # as concurrent.futures.CancelledError at the .result() boundary.
+            pytest.raises((asyncio.CancelledError, concurrent.futures.CancelledError)),
+        ):
+            _run_hl(loop, mgr._ensure_static_connected("srv", mgr._server_configs["srv"]))
+        assert mgr._static_servers["srv"].session is None  # partial session dropped
+        assert mgr._consecutive_failures.get("srv") == 1  # breaker recorded
+
+    def test_timeout_hierarchy_caller_exceeds_attempt(self) -> None:
+        """The systemic round-4 fix: the caller wait must exceed the inner attempt
+        bound so the inner asyncio.timeout fires first (clean TimeoutError), never
+        a bare cancel escaping — and the attempt must cover a full handshake."""
+        assert (
+            MCPClientManager._STATIC_RECONNECT_CALLER_TIMEOUT_S
+            > MCPClientManager._STATIC_RECONNECT_ATTEMPT_TIMEOUT_S
+            > MCPClientManager._CONNECT_TIMEOUT
+        )
+
     def test_failure_records_one_breaker_failure_and_raises(self, running_loop_mgr) -> None:
         mgr, loop, _ = running_loop_mgr
         _seed_static_state(mgr, "srv", session=None)
@@ -4053,6 +4111,34 @@ class TestEnsureStaticConnected:
             assert mgr._static_servers["srv"].session is sess
 
         asyncio.run(_run())
+
+    def test_remove_server_sync_cancels_on_timeout_and_reports_failure(
+        self, running_loop_mgr
+    ) -> None:
+        """Round-4 [2]: if teardown can't finish within the caller timeout (a slow
+        reconnect holding the per-name lock), remove_server_sync CANCELS the
+        pending _remove — so it can't later pop a re-added entry — and returns
+        False rather than a false 'removed'."""
+        mgr, loop, _ = running_loop_mgr
+        _seed_static_state(mgr, "srv", session=MagicMock())
+
+        async def _hang(_name: str) -> None:
+            await asyncio.sleep(10)  # teardown wedged (stands in for lock contention)
+
+        with patch.object(mgr, "_teardown_static_session", side_effect=_hang):
+            result = mgr.remove_server_sync("srv", timeout=0.2)
+        assert result is False  # not a false success
+        assert "srv" not in mgr._server_configs  # config still popped (won't reconnect)
+
+    def test_schedule_next_ping_sets_and_returns_fresh_deadline(self) -> None:
+        """Round-4 [5]: the extracted ping-scheduling helper stores and returns
+        the same fresh deadline (was a copy-pasted triplet in 3 branches)."""
+        mgr = MCPClientManager({})
+        mgr._static_health_check_s = 30.0
+        before = time.monotonic()
+        due = mgr._schedule_next_ping("srv")
+        assert mgr._static_next_ping["srv"] == due
+        assert before + 30.0 <= due <= time.monotonic() + 30.0
 
 
 class TestTeardownStaticSession:
