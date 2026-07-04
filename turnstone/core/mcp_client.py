@@ -4668,7 +4668,12 @@ class MCPClientManager:
             # stops via its ``except asyncio.CancelledError: return``.
             if not ping_timeout.expired() and isinstance(exc, asyncio.CancelledError):
                 raise
-            dead = (not ping_timeout.expired()) and _is_dead_transport(exc)
+            if ping_timeout.expired():
+                dead = False
+            elif isinstance(exc, BaseExceptionGroup):
+                dead = any(_is_dead_transport(e) for e in exc.exceptions)
+            else:
+                dead = _is_dead_transport(exc)
             # Re-check in-flight under this synchronous handler: a dispatch may
             # have started during the ping window; never evict a busy server.
             # Session-identity: only act on the session we actually PINGED — a
