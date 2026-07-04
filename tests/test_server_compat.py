@@ -208,7 +208,9 @@ class TestMergeServerCompat:
 
 
 class TestEndToEndRequestShaping:
-    """Compose both layers — session builds extra_params, provider applies thinking."""
+    """Compose both layers — session builds extra_params, provider applies reasoning."""
+
+    provider = OpenAIChatCompletionsProvider()
 
     def test_vllm_gemma_full_flow(self) -> None:
         """Gemma now needs only the thinking param — no server workaround."""
@@ -216,18 +218,27 @@ class TestEndToEndRequestShaping:
         server_compat = {"server_type": "vllm"}
         # Step 1: session forwards (no auto-injection of reasoning_effort).
         extra_params = merge_server_compat(None, server_compat)
-        # Step 2: provider injects thinking param into chat_template_kwargs.
-        extra_body = dict(extra_params)
-        OpenAIChatCompletionsProvider._apply_thinking_mode(extra_body, caps)
+        # Step 2: provider folds the effort knob into chat_template_kwargs.
+        extra_body = self.provider._finalize_extra_body(extra_params, caps, "medium")
 
         assert extra_body == {"chat_template_kwargs": {"enable_thinking": True}}
+
+    def test_knob_none_disables_toggle(self) -> None:
+        """Session effort "none" turns the template toggle off dynamically."""
+        caps = ModelCapabilities(thinking_mode="manual", thinking_param="enable_thinking")
+        extra_body = self.provider._finalize_extra_body(
+            merge_server_compat(None, {"server_type": "vllm"}), caps, "none"
+        )
+
+        assert extra_body == {"chat_template_kwargs": {"enable_thinking": False}}
 
     def test_server_workaround_composes_with_thinking(self) -> None:
         """A top-level server workaround forwards alongside the injected thinking param."""
         caps = ModelCapabilities(thinking_mode="manual", thinking_param="enable_thinking")
         compat = {"server_type": "llama.cpp", "extra_body": {"reasoning_format": "auto"}}
-        extra_body = dict(merge_server_compat(None, compat))
-        OpenAIChatCompletionsProvider._apply_thinking_mode(extra_body, caps)
+        extra_body = self.provider._finalize_extra_body(
+            merge_server_compat(None, compat), caps, "medium"
+        )
 
         assert extra_body == {
             "chat_template_kwargs": {"enable_thinking": True},
@@ -237,20 +248,20 @@ class TestEndToEndRequestShaping:
     def test_granite_thinking_key(self) -> None:
         """Granite uses 'thinking' instead of 'enable_thinking'."""
         caps = ModelCapabilities(thinking_mode="manual", thinking_param="thinking")
-        extra_params = merge_server_compat(None, {})
-        extra_body = dict(extra_params)
-        OpenAIChatCompletionsProvider._apply_thinking_mode(extra_body, caps)
+        extra_body = self.provider._finalize_extra_body(
+            merge_server_compat(None, {}), caps, "medium"
+        )
 
         assert extra_body == {"chat_template_kwargs": {"thinking": True}}
 
     def test_non_thinking_model_no_injection(self) -> None:
-        """Non-thinking model gets no chat_template_kwargs at all."""
+        """Non-thinking model gets no extra_body at all."""
         caps = ModelCapabilities()  # thinking_mode="none"
-        extra_params = merge_server_compat(None, {})
-        extra_body = dict(extra_params)
-        OpenAIChatCompletionsProvider._apply_thinking_mode(extra_body, caps)
+        extra_body = self.provider._finalize_extra_body(
+            merge_server_compat(None, {}), caps, "medium"
+        )
 
-        assert extra_body == {}
+        assert extra_body is None
 
     def test_operator_reasoning_effort_passthrough(self) -> None:
         """Operator-supplied reasoning_effort under chat_template_kwargs is preserved."""
@@ -259,9 +270,9 @@ class TestEndToEndRequestShaping:
             "server_type": "vllm",
             "extra_body": {"chat_template_kwargs": {"reasoning_effort": "high"}},
         }
-        extra_params = merge_server_compat(None, compat)
-        extra_body = dict(extra_params)
-        OpenAIChatCompletionsProvider._apply_thinking_mode(extra_body, caps)
+        extra_body = self.provider._finalize_extra_body(
+            merge_server_compat(None, compat), caps, "medium"
+        )
 
         assert extra_body == {
             "chat_template_kwargs": {
@@ -269,6 +280,19 @@ class TestEndToEndRequestShaping:
                 "enable_thinking": True,
             },
         }
+
+    def test_operator_pin_beats_effort_param(self) -> None:
+        """A pinned effort key wins over the knob mapping (setdefault)."""
+        caps = ModelCapabilities(
+            thinking_mode="none",
+            effort_param="reasoning_effort",
+        )
+        compat = {"extra_body": {"chat_template_kwargs": {"reasoning_effort": "low"}}}
+        extra_body = self.provider._finalize_extra_body(
+            merge_server_compat(None, compat), caps, "high"
+        )
+
+        assert extra_body == {"chat_template_kwargs": {"reasoning_effort": "low"}}
 
 
 # ---------------------------------------------------------------------------

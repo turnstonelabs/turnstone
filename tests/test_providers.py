@@ -153,51 +153,70 @@ class TestOpenAIProvider:
     def test_provider_name(self) -> None:
         assert self.provider.provider_name == "openai-compatible"
 
-    # -- _apply_thinking_mode -------------------------------------------------
+    # -- reasoning template kwargs (_finalize_extra_body) ---------------------
 
     def test_thinking_mode_none_does_nothing(self) -> None:
-        """No thinking params injected when thinking_mode is 'none'."""
+        """No toggle injected when thinking_mode is 'none'; operator keys pass."""
         caps = ModelCapabilities(thinking_mode="none")
-        extra_body: dict[str, Any] = {"chat_template_kwargs": {"reasoning_effort": "medium"}}
-        OpenAIProvider._apply_thinking_mode(extra_body, caps)
-        assert "enable_thinking" not in extra_body["chat_template_kwargs"]
+        extra_params = {"chat_template_kwargs": {"reasoning_effort": "medium"}}
+        eb = self.provider._finalize_extra_body(extra_params, caps, "medium")
+        assert eb is not None
+        assert "enable_thinking" not in eb["chat_template_kwargs"]
+        assert eb["chat_template_kwargs"]["reasoning_effort"] == "medium"
 
     def test_thinking_mode_manual_injects_param(self) -> None:
         """Manual thinking mode injects enable_thinking into chat_template_kwargs."""
         caps = ModelCapabilities(thinking_mode="manual")
-        extra_body: dict[str, Any] = {"chat_template_kwargs": {"reasoning_effort": "medium"}}
-        OpenAIProvider._apply_thinking_mode(extra_body, caps)
-        assert extra_body["chat_template_kwargs"]["enable_thinking"] is True
-        assert extra_body["chat_template_kwargs"]["reasoning_effort"] == "medium"
+        extra_params = {"chat_template_kwargs": {"reasoning_effort": "medium"}}
+        eb = self.provider._finalize_extra_body(extra_params, caps, "medium")
+        assert eb is not None
+        assert eb["chat_template_kwargs"]["enable_thinking"] is True
+        assert eb["chat_template_kwargs"]["reasoning_effort"] == "medium"
+
+    def test_thinking_mode_manual_knob_none_disables(self) -> None:
+        """Effort knob "none" turns the template toggle off, not just quiet."""
+        caps = ModelCapabilities(thinking_mode="manual")
+        eb = self.provider._finalize_extra_body(None, caps, "none")
+        assert eb == {"chat_template_kwargs": {"enable_thinking": False}}
 
     def test_thinking_mode_custom_param(self) -> None:
         """Custom thinking_param (e.g. Granite's 'thinking') is used."""
         caps = ModelCapabilities(thinking_mode="manual", thinking_param="thinking")
-        extra_body: dict[str, Any] = {"chat_template_kwargs": {}}
-        OpenAIProvider._apply_thinking_mode(extra_body, caps)
-        assert extra_body["chat_template_kwargs"]["thinking"] is True
-        assert "enable_thinking" not in extra_body["chat_template_kwargs"]
+        eb = self.provider._finalize_extra_body(None, caps, "medium")
+        assert eb == {"chat_template_kwargs": {"thinking": True}}
 
     def test_thinking_mode_does_not_override_explicit(self) -> None:
         """If operator explicitly set the param to False, provider respects it."""
         caps = ModelCapabilities(thinking_mode="manual")
-        extra_body: dict[str, Any] = {"chat_template_kwargs": {"enable_thinking": False}}
-        OpenAIProvider._apply_thinking_mode(extra_body, caps)
-        assert extra_body["chat_template_kwargs"]["enable_thinking"] is False
-
-    def test_thinking_mode_creates_ctk_if_missing(self) -> None:
-        """Creates chat_template_kwargs dict if not present in extra_body."""
-        caps = ModelCapabilities(thinking_mode="manual")
-        extra_body: dict[str, Any] = {}
-        OpenAIProvider._apply_thinking_mode(extra_body, caps)
-        assert extra_body["chat_template_kwargs"]["enable_thinking"] is True
+        extra_params = {"chat_template_kwargs": {"enable_thinking": False}}
+        eb = self.provider._finalize_extra_body(extra_params, caps, "medium")
+        assert eb is not None
+        assert eb["chat_template_kwargs"]["enable_thinking"] is False
 
     def test_thinking_mode_adaptive(self) -> None:
-        """Adaptive thinking mode also injects the param."""
+        """Adaptive thinking mode drives the toggle the same way."""
         caps = ModelCapabilities(thinking_mode="adaptive")
-        extra_body: dict[str, Any] = {"chat_template_kwargs": {}}
-        OpenAIProvider._apply_thinking_mode(extra_body, caps)
-        assert extra_body["chat_template_kwargs"]["enable_thinking"] is True
+        eb = self.provider._finalize_extra_body(None, caps, "high")
+        assert eb == {"chat_template_kwargs": {"enable_thinking": True}}
+
+    def test_effort_param_injects_knob_value(self) -> None:
+        """effort_param carries the knob into chat_template_kwargs (gpt-oss)."""
+        caps = ModelCapabilities(
+            thinking_mode="none",
+            effort_param="reasoning_effort",
+            reasoning_effort_values=("low", "medium", "high"),
+            default_reasoning_effort="medium",
+        )
+        eb = self.provider._finalize_extra_body(None, caps, "xhigh")
+        assert eb == {"chat_template_kwargs": {"reasoning_effort": "medium"}}
+        assert self.provider._finalize_extra_body(None, caps, "none") is None
+
+    def test_caller_extra_params_not_mutated(self) -> None:
+        """The session dict and its ctk sub-dict survive injection untouched."""
+        caps = ModelCapabilities(thinking_mode="manual")
+        extra_params = {"chat_template_kwargs": {"foo": 1}}
+        self.provider._finalize_extra_body(extra_params, caps, "medium")
+        assert extra_params == {"chat_template_kwargs": {"foo": 1}}
 
     # -- _sanitize_messages ---------------------------------------------------
 

@@ -80,14 +80,15 @@ class ModelCapabilities:
     # Ignored when thinking_mode is "none" or by providers that handle
     # thinking natively (real Anthropic).
     thinking_param: str = "enable_thinking"
-    # For the anthropic-compatible lane: the chat_template_kwargs key that
-    # carries a graded reasoning-effort value, for templates that have one
-    # (e.g. "reasoning_effort" for gpt-oss-style templates).  Empty = the
-    # template has no effort lever, send nothing.  The session knob value
-    # is validated against ``reasoning_effort_values`` when that is
-    # non-empty (off-list values snap to ``default_reasoning_effort``);
-    # with no declared values the knob is forwarded as-is and the template
-    # is the authority on validity.
+    # For local-server lanes (openai-compatible, anthropic-compatible):
+    # the chat_template_kwargs key that carries a graded reasoning-effort
+    # value, for templates that have one (e.g. "reasoning_effort" for
+    # gpt-oss-style templates).  Empty = the template has no effort lever,
+    # send nothing.  The session knob value is validated against
+    # ``reasoning_effort_values`` when that is non-empty (off-list values
+    # snap to ``default_reasoning_effort``); with no declared values the
+    # knob is forwarded as-is and the template is the authority on
+    # validity.  See ``reasoning_template_kwargs``.
     effort_param: str = ""
     supports_effort: bool = False
     effort_levels: tuple[str, ...] = ()
@@ -158,6 +159,64 @@ def resolve_reasoning_effort(caps: ModelCapabilities, reasoning_effort: str) -> 
     if caps.default_reasoning_effort and caps.default_reasoning_effort != "none":
         return caps.default_reasoning_effort
     return None
+
+
+def reasoning_template_kwargs(
+    caps: ModelCapabilities,
+    reasoning_effort: str,
+) -> dict[str, Any]:
+    """``chat_template_kwargs`` entries carrying reasoning control.
+
+    On local model servers the reasoning levers live in the chat template:
+    a boolean toggle (``caps.thinking_param``, active when ``thinking_mode``
+    is ``"manual"``/``"adaptive"``) and an optional graded effort key
+    (``caps.effort_param``, gpt-oss-style templates).  The session effort
+    knob drives both — ``"none"``/empty turns the toggle off, mirroring the
+    Anthropic provider's native manual-mode contract (``_reasoning_params``).
+    The effort value is validated via ``resolve_reasoning_effort`` when the
+    model declares ``reasoning_effort_values`` (off-list knob values snap to
+    ``default_reasoning_effort``); with no declared values the knob is
+    forwarded as-is and the template is the authority on validity.
+    """
+    updates: dict[str, Any] = {}
+    effort_on = bool(reasoning_effort) and reasoning_effort != "none"
+    if caps.thinking_mode in ("manual", "adaptive"):
+        updates[caps.thinking_param] = effort_on
+    if caps.effort_param and effort_on:
+        effort = (
+            resolve_reasoning_effort(caps, reasoning_effort)
+            if caps.reasoning_effort_values
+            else reasoning_effort
+        )
+        if effort:
+            updates[caps.effort_param] = effort
+    return updates
+
+
+def merge_reasoning_template_kwargs(
+    caps: ModelCapabilities,
+    reasoning_effort: str,
+    extra_params: dict[str, Any] | None,
+) -> dict[str, Any] | None:
+    """Copy-on-write merge of ``reasoning_template_kwargs`` into extra params.
+
+    Returns *extra_params* unchanged (possibly ``None``) when the
+    capabilities call for no injection; otherwise returns a new dict with
+    the reasoning entries folded into ``chat_template_kwargs``.  Existing
+    keys win — an operator ``server_compat`` pin beats the knob mapping.
+    The caller's dict (and its ``chat_template_kwargs`` sub-dict) is never
+    mutated.
+    """
+    updates = reasoning_template_kwargs(caps, reasoning_effort)
+    if not updates:
+        return extra_params
+    merged = dict(extra_params) if extra_params else {}
+    raw_ctk = merged.get("chat_template_kwargs")
+    ctk = dict(raw_ctk) if isinstance(raw_ctk, dict) else {}
+    for key, value in updates.items():
+        ctk.setdefault(key, value)
+    merged["chat_template_kwargs"] = ctk
+    return merged
 
 
 # Operator-friendly UI cap on reasoning text returned from
