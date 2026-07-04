@@ -1033,7 +1033,9 @@ class TestStaticPathUnchanged:
 
         from turnstone.core import mcp_client
 
-        source = inspect.getsource(mcp_client.MCPClientManager._connect_one)
+        # The connect body (incl. the streamablehttp_client call site) lives in
+        # ``_connect_one_locked``; ``_connect_one`` is now a per-name-lock wrapper.
+        source = inspect.getsource(mcp_client.MCPClientManager._connect_one_locked)
 
         # The static path's streamablehttp_client invocation should NOT
         # mention ``httpx_client_factory``. Pool path keeps it.
