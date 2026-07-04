@@ -108,8 +108,6 @@ def _seed_pending(
         server_name=server_name,
         error_code=error_code,
         scopes_required=None,
-        last_ws_id=None,
-        last_tool_call_id=None,
         now_iso=now_iso,
     )
 

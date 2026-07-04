@@ -630,8 +630,6 @@ class TestCallback:
             server_name="srv-oauth",
             error_code="mcp_consent_required",
             scopes_required=None,
-            last_ws_id="ws-1",
-            last_tool_call_id="tool-1",
             now_iso="2026-05-11T12:00:00",
         )
         storage.upsert_mcp_pending_consent(
@@ -639,8 +637,6 @@ class TestCallback:
             server_name="srv-oauth",
             error_code="mcp_consent_required",
             scopes_required=None,
-            last_ws_id=None,
-            last_tool_call_id=None,
             now_iso="2026-05-11T12:00:00",
         )
         token_store = _make_token_store(storage)

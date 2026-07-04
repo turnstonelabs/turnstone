@@ -108,8 +108,6 @@ class MCPPendingConsentRow(TypedDict):
     server_name: str
     error_code: str
     scopes_required: str | None
-    last_ws_id: str | None
-    last_tool_call_id: str | None
     first_seen_at: str
     last_seen_at: str
     occurrence_count: int
@@ -2233,8 +2231,6 @@ class StorageBackend(Protocol):
         server_name: str,
         error_code: str,
         scopes_required: str | None,
-        last_ws_id: str | None,
-        last_tool_call_id: str | None,
         now_iso: str,
     ) -> None:
         """Insert or refresh a deferred-consent record for ``(user, server)``.
@@ -2242,10 +2238,10 @@ class StorageBackend(Protocol):
         On insert: ``first_seen_at = last_seen_at = now_iso``,
         ``occurrence_count = 1``.  On conflict (existing row for the
         same composite PK): rewrites ``error_code``, ``scopes_required``,
-        ``last_ws_id``, ``last_tool_call_id``, ``last_seen_at`` to the
-        current values; bumps ``occurrence_count`` by 1.  Preserves
-        ``first_seen_at`` so the dashboard can show how long the
-        deferred-consent need has been pending.
+        ``last_seen_at`` to the current values; bumps
+        ``occurrence_count`` by 1.  Preserves ``first_seen_at`` so the
+        dashboard can show how long the deferred-consent need has been
+        pending.
         """
         ...
 

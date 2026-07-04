@@ -24,8 +24,6 @@ class TestUpsertAndList:
             server_name="srv-x",
             error_code="mcp_consent_required",
             scopes_required="read write",
-            last_ws_id="ws-1",
-            last_tool_call_id="tool-1",
             now_iso=_iso(),
         )
         rows = backend.list_mcp_pending_consent_by_user("user-a")
@@ -35,8 +33,6 @@ class TestUpsertAndList:
         assert r["server_name"] == "srv-x"
         assert r["error_code"] == "mcp_consent_required"
         assert r["scopes_required"] == "read write"
-        assert r["last_ws_id"] == "ws-1"
-        assert r["last_tool_call_id"] == "tool-1"
         assert r["occurrence_count"] == 1
         assert r["first_seen_at"] == r["last_seen_at"]
 
@@ -46,8 +42,6 @@ class TestUpsertAndList:
             server_name="srv-x",
             error_code="mcp_consent_required",
             scopes_required=None,
-            last_ws_id=None,
-            last_tool_call_id=None,
             now_iso="2026-05-11T12:00:00",
         )
         backend.upsert_mcp_pending_consent(
@@ -55,8 +49,6 @@ class TestUpsertAndList:
             server_name="srv-x",
             error_code="mcp_insufficient_scope",
             scopes_required="read",
-            last_ws_id="ws-2",
-            last_tool_call_id="tool-2",
             now_iso="2026-05-11T13:00:00",
         )
         rows = backend.list_mcp_pending_consent_by_user("user-a")
@@ -66,8 +58,6 @@ class TestUpsertAndList:
         assert r["occurrence_count"] == 2
         assert r["error_code"] == "mcp_insufficient_scope"
         assert r["scopes_required"] == "read"
-        assert r["last_ws_id"] == "ws-2"
-        assert r["last_tool_call_id"] == "tool-2"
         assert r["last_seen_at"] == "2026-05-11T13:00:00"
         # first_seen_at preserved — that's the load-bearing audit value.
         assert r["first_seen_at"] == "2026-05-11T12:00:00"
@@ -78,8 +68,6 @@ class TestUpsertAndList:
             server_name="srv-old",
             error_code="mcp_consent_required",
             scopes_required=None,
-            last_ws_id=None,
-            last_tool_call_id=None,
             now_iso="2026-05-11T10:00:00",
         )
         backend.upsert_mcp_pending_consent(
@@ -87,8 +75,6 @@ class TestUpsertAndList:
             server_name="srv-new",
             error_code="mcp_consent_required",
             scopes_required=None,
-            last_ws_id=None,
-            last_tool_call_id=None,
             now_iso="2026-05-11T11:00:00",
         )
         rows = backend.list_mcp_pending_consent_by_user("user-a")
@@ -100,8 +86,6 @@ class TestUpsertAndList:
             server_name="srv",
             error_code="mcp_consent_required",
             scopes_required=None,
-            last_ws_id=None,
-            last_tool_call_id=None,
             now_iso=_iso(),
         )
         assert backend.list_mcp_pending_consent_by_user("user-b") == []
@@ -114,8 +98,6 @@ class TestDelete:
             server_name="srv-x",
             error_code="mcp_consent_required",
             scopes_required=None,
-            last_ws_id=None,
-            last_tool_call_id=None,
             now_iso=_iso(),
         )
         assert backend.delete_mcp_pending_consent("user-a", "srv-x") is True
@@ -133,8 +115,6 @@ class TestDelete:
                 server_name=name,
                 error_code="mcp_consent_required",
                 scopes_required=None,
-                last_ws_id=None,
-                last_tool_call_id=None,
                 now_iso=_iso(),
             )
         # Cross-user row that must NOT be touched.
@@ -143,8 +123,6 @@ class TestDelete:
             server_name="srv-z",
             error_code="mcp_consent_required",
             scopes_required=None,
-            last_ws_id=None,
-            last_tool_call_id=None,
             now_iso=_iso(),
         )
         assert backend.delete_all_mcp_pending_consent_by_user("user-a") == 3

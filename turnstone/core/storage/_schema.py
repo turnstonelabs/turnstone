@@ -999,8 +999,6 @@ mcp_pending_consent = sa.Table(
     sa.Column("server_name", sa.Text, nullable=False),
     sa.Column("error_code", sa.Text, nullable=False),
     sa.Column("scopes_required", sa.Text, nullable=True),
-    sa.Column("last_ws_id", sa.Text, nullable=True),
-    sa.Column("last_tool_call_id", sa.Text, nullable=True),
     sa.Column("first_seen_at", sa.Text, nullable=False),
     sa.Column("last_seen_at", sa.Text, nullable=False),
     sa.Column("occurrence_count", sa.Integer, nullable=False, server_default="1"),

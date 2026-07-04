@@ -4892,8 +4892,6 @@ class PostgreSQLBackend:
         server_name: str,
         error_code: str,
         scopes_required: str | None,
-        last_ws_id: str | None,
-        last_tool_call_id: str | None,
         now_iso: str,
     ) -> None:
         from sqlalchemy.dialects import postgresql
@@ -4903,8 +4901,6 @@ class PostgreSQLBackend:
             server_name=server_name,
             error_code=error_code,
             scopes_required=scopes_required,
-            last_ws_id=last_ws_id,
-            last_tool_call_id=last_tool_call_id,
             first_seen_at=now_iso,
             last_seen_at=now_iso,
             occurrence_count=1,
@@ -4914,8 +4910,6 @@ class PostgreSQLBackend:
             set_={
                 "error_code": stmt.excluded.error_code,
                 "scopes_required": stmt.excluded.scopes_required,
-                "last_ws_id": stmt.excluded.last_ws_id,
-                "last_tool_call_id": stmt.excluded.last_tool_call_id,
                 "last_seen_at": stmt.excluded.last_seen_at,
                 "occurrence_count": mcp_pending_consent.c.occurrence_count + 1,
             },
@@ -4940,8 +4934,6 @@ class PostgreSQLBackend:
                     server_name=m["server_name"],
                     error_code=m["error_code"],
                     scopes_required=m["scopes_required"],
-                    last_ws_id=m["last_ws_id"],
-                    last_tool_call_id=m["last_tool_call_id"],
                     first_seen_at=m["first_seen_at"],
                     last_seen_at=m["last_seen_at"],
                     occurrence_count=m["occurrence_count"],
