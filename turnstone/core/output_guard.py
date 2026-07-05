@@ -142,9 +142,12 @@ _CREDENTIAL_PATTERNS: list[tuple[re.Pattern[str], str]] = [
     # The trailing _? allows both snake_case and compact forms (api_key / apikey).
     # Bare key=/token= are included as alternatives so standalone assignments like
     # key=<20+ chars> still match.
+    # Multi-segment keys like secret_access_key and aws_secret_access_key are
+    # included explicitly so the prefix doesn't leak as "secret_".
     (
         re.compile(
-            r"(?:(?:api|secret|session|auth|encryption|signing|private|public|access)_?key|"
+            r"(?:(?:api|secret|session|auth|encryption|signing|private|public|access|"
+            r"secret_access|aws_secret_access)_?key|"
             r"(?<![a-zA-Z0-9_])key)="
             r"[a-zA-Z0-9]{20,}"
         ),
@@ -152,7 +155,7 @@ _CREDENTIAL_PATTERNS: list[tuple[re.Pattern[str], str]] = [
     ),
     (
         re.compile(
-            r"(?:(?:access|refresh|auth|api|session)_?token|"
+            r"(?:(?:access|refresh|auth|api|session|bearer|secret)_?token|"
             r"(?<![a-zA-Z0-9_])token)="
             r"[a-zA-Z0-9]{20,}"
         ),
@@ -458,7 +461,7 @@ _BUILTIN_OG_PATTERNS: list[OutputGuardPatternDef] = [
         category="credentials",
         risk_level="high",
         compiled=re.compile(
-            r"(?:(?:access|refresh|auth|api|session)_?token|"
+            r"(?:(?:access|refresh|auth|api|session|bearer|secret)_?token|"
             r"(?<![a-zA-Z0-9_])token)="
             r"[a-zA-Z0-9]{20,}"
         ),
@@ -473,7 +476,8 @@ _BUILTIN_OG_PATTERNS: list[OutputGuardPatternDef] = [
         category="credentials",
         risk_level="high",
         compiled=re.compile(
-            r"(?:(?:api|secret|session|auth|encryption|signing|private|public|access)_?key|"
+            r"(?:(?:api|secret|session|auth|encryption|signing|private|public|access|"
+            r"secret_access|aws_secret_access)_?key|"
             r"(?<![a-zA-Z0-9_])key)="
             r"[a-zA-Z0-9]{20,}"
         ),
