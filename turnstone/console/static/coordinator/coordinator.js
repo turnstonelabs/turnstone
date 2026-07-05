@@ -40,6 +40,7 @@ import {
   batchKicker,
   indexLabel,
 } from "/shared/conversation.js";
+import { redactCredentials } from "/shared/redact_credentials.js";
 
 function buildCoordChrome(root, opts) {
   opts = opts || {};
@@ -533,7 +534,7 @@ function createCoordinatorPane(root, wsId, opts) {
       /* fall through */
     }
     if (!parsed || typeof parsed !== "object") {
-      return esc(rawText);
+      return esc(redactCredentials(rawText));
     }
     // Normalize to an array of rows we can linkify.
     let rows = [];
@@ -543,7 +544,7 @@ function createCoordinatorPane(root, wsId, opts) {
       rows = [parsed];
     }
     if (rows.length === 0) {
-      return "<pre>" + esc(JSON.stringify(parsed, null, 2)) + "</pre>";
+      return "<pre>" + esc(redactCredentials(JSON.stringify(parsed, null, 2))) + "</pre>";
     }
     const lines = rows.map((row) => {
       const safeWs = row.ws_id && WS_ID_RE.test(row.ws_id) ? row.ws_id : null;

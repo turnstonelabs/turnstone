@@ -9,6 +9,8 @@ manual testing.
 
 from __future__ import annotations
 
+import json
+import os
 import re
 import subprocess
 from pathlib import Path
@@ -18,6 +20,9 @@ import pytest
 _APP_JS = Path(__file__).resolve().parent.parent / "turnstone/ui/static/app.js"
 _INTERACTIVE_JS = Path(__file__).resolve().parent.parent / "turnstone/shared_static/interactive.js"
 _SHELL_JS = Path(__file__).resolve().parent.parent / "turnstone/shared_static/shell.js"
+_REDACT_CREDENTIALS_JS = (
+    Path(__file__).resolve().parent.parent / "turnstone/shared_static/redact_credentials.js"
+)
 _CONSOLE_APP_JS = Path(__file__).resolve().parent.parent / "turnstone/console/static/app.js"
 _CONSOLE_INDEX = Path(__file__).resolve().parent.parent / "turnstone/console/static/index.html"
 
@@ -957,6 +962,7 @@ _CONST_GUARD_BUNDLES = _SWEPT_BUNDLES + [
     _REPO_ROOT / "turnstone/shared_static/rail.js",
     _REPO_ROOT / "turnstone/shared_static/interactive.js",
     _REPO_ROOT / "turnstone/shared_static/conversation.js",
+    _REPO_ROOT / "turnstone/shared_static/redact_credentials.js",
 ]
 
 
@@ -1269,41 +1275,59 @@ def test_swept_bundle_has_no_const_reassign(bundle: Path) -> None:
         )
 
 
-def test_redact_api_keys_runtime_smoke() -> None:
-    """Runtime smoke for ``_redactApiKeys``.  The function is pure — no
-    DOM dependency — so it transplants cleanly into a standalone
-    ``node -e`` invocation.  This is the bit that would have caught
-    the original ``const redacted`` bug (which ``node --check`` and a
-    pure-static keyword scan both miss; the ``TypeError`` only fires
-    at call-time)."""
-    body = _INTERACTIVE_JS.read_text(encoding="utf-8")
-    m = re.search(
-        r"function _redactApiKeys\(text\) \{.*?\n\}\n",
-        body,
-        re.DOTALL,
-    )
-    assert m is not None, "_redactApiKeys not found in app.js"
-    fn = m.group(0)
-    script = (
-        fn
-        + "\nconst q = _redactApiKeys('https://x?api_key=abc&u=foo');\n"
+def test_redact_credentials_runtime_smoke() -> None:
+    """Runtime smoke for ``redactCredentials`` via a temp harness file.
+    The function is pure (no DOM dependency).  Tests the shared module
+    directly via ESM import (replaces the legacy ``_redactApiKeys`` test
+    which now delegates to this).
+
+    The tempfile is written with a ``.mjs`` extension so Node forces ESM
+    parsing regardless of any ``package.json`` ``type`` field in parent
+    directories.  The ``redact_credentials.js`` source file is imported
+    by absolute path so resolution is unambiguous.
+    """
+    import tempfile
+
+    mod_path = _REDACT_CREDENTIALS_JS.resolve()
+    harness = (
+        "import { redactCredentials } from "
+        + json.dumps(str(mod_path))
+        + ";\n"
+        + "const q = redactCredentials('https://x?api_key=abc&u=foo');\n"
         + 'if (q !== "https://x?api_key=***&u=foo") '
         + "throw new Error('query-string redact failed: ' + q);\n"
-        + 'const j = _redactApiKeys(\'{"api_key":"abc"}\');\n'
+        + 'const j = redactCredentials(\'{"api_key":"abc"}\');\n'
         + 'if (j !== \'{"api_key":"***"}\') '
         + "throw new Error('json-style redact failed: ' + j);\n"
+        + "// Bearer token redaction (raw input)\n"
+        + "const b = redactCredentials('Authorization: Bearer eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjMifQ.test-token_here');\n"
+        + "if (!b.includes('[REDACTED:api_key]')) "
+        + "throw new Error('bearer redact failed: ' + b);\n"
+        + "// Connection string redaction (raw input)\n"
+        + "const c = redactCredentials('postgresql://user:supersecret@localhost/db');\n"
+        + "if (!c.includes('[REDACTED:password]')) "
+        + "throw new Error('conn-string redact failed: ' + c);\n"
+        + "// Authorization JSON key redaction (step 6 comprehensive)\n"
+        + 'const a = redactCredentials(\'{"Authorization": "Bearer canstillseethis"}\');\n'
+        + "if (!a.includes('[REDACTED:secret]')) "
+        + "throw new Error('authorization JSON redact failed: ' + a);\n"
     )
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".mjs", delete=False) as f:
+        f.write(harness)
+        tmp = f.name
     try:
         proc = subprocess.run(
-            ["node", "-e", script],
+            ["node", tmp],
             capture_output=True,
             text=True,
             timeout=15,
         )
     except FileNotFoundError:
         pytest.skip("node binary not available on PATH")
+    finally:
+        os.unlink(tmp)
     assert proc.returncode == 0, (
-        f"_redactApiKeys runtime smoke failed.  stdout={proc.stdout!r} stderr={proc.stderr!r}"
+        f"redactCredentials runtime smoke failed.  stdout={proc.stdout!r} stderr={proc.stderr!r}"
     )
 
 
