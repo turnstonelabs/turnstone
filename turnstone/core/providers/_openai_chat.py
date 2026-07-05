@@ -14,13 +14,13 @@ if TYPE_CHECKING:
 import structlog
 
 from turnstone.core.providers._openai_common import (
+    OPENAI_COMPAT_DEFAULT,
     RETRYABLE_ERROR_NAMES,
     apply_cache_retention,
     apply_temperature_and_effort,
     apply_tool_search,
     extract_usage,
     format_citations,
-    lookup_openai_capabilities,
     sanitize_messages,
 )
 from turnstone.core.providers._protocol import (
@@ -47,7 +47,10 @@ class OpenAIChatCompletionsProvider:
         return "openai-compatible"
 
     def get_capabilities(self, model: str) -> ModelCapabilities:
-        return lookup_openai_capabilities(model)
+        # Operator-owned lane — never the commercial table (see
+        # ``OPENAI_COMPAT_DEFAULT``).  GoogleProvider subclasses this
+        # class and overrides with its own registry.
+        return OPENAI_COMPAT_DEFAULT
 
     # -- message preparation --------------------------------------------------
 

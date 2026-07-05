@@ -634,8 +634,17 @@ function tool (the model always searches). Citations from `url_citation`
 annotations are formatted as footnotes. Extended prompt cache retention
 (`prompt_cache_retention: "24h"`) is enabled for GPT-5.x models at no
 additional cost. Cached token counts are extracted from
-`usage.prompt_tokens_details.cached_tokens`. Unknown models (local servers) get
-permissive defaults with `supports_vision=False` and use SearxNG for web search.
+`usage.prompt_tokens_details.cached_tokens`. Unknown models get permissive
+defaults with `supports_vision=False` and use SearxNG for web search. The
+`openai-compatible` lane never consults this table at all — on either API
+surface (the responses pin is served by a compat-mode
+`OpenAIResponsesProvider`, mirroring `AnthropicProvider(compat=True)`): a
+local server serves whatever the operator named it (vLLM
+`--served-model-name` is a free string), so a prefix collision with a cloud
+model id must not inherit that model's sampling/effort contract — every
+local model gets the plain defaults, and anything beyond them is declared on
+the model definition (capabilities JSON + `server_compat`), matching the
+`anthropic-compatible` lane.
 
 **AnthropicProvider** (`_anthropic.py`): converts OpenAI-format messages to
 Anthropic content blocks, maps `system`/`developer` roles to the `system`

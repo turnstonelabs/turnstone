@@ -16,6 +16,7 @@ if TYPE_CHECKING:
 import structlog
 
 from turnstone.core.providers._openai_common import (
+    OPENAI_COMPAT_DEFAULT,
     RETRYABLE_ERROR_NAMES,
     apply_cache_retention,
     apply_temperature,
@@ -97,17 +98,31 @@ def convert_content_parts(parts: list[Any]) -> list[dict[str, Any]]:
 
 
 class OpenAIResponsesProvider:
-    """Provider for commercial OpenAI models via the Responses API.
+    """Provider for the Responses API — commercial OpenAI, plus the
+    ``openai-compatible`` lane pinned to ``api_surface="responses"``.
 
     Translates between turnstone's internal OpenAI Chat Completions-like
     message format and the Responses API input/output format.
+
+    *compat* mirrors ``AnthropicProvider(compat=True)``: the compat-mode
+    instance serves operator-run Responses endpoints, so capability
+    lookup skips the commercial table (``OPENAI_COMPAT_DEFAULT`` — the
+    model id is an operator-chosen string there, and a prefix collision
+    with a cloud model id must not inherit its contract).  The request
+    shape is identical in both modes; ``XAIProvider`` subclasses the
+    default (non-compat) mode.
     """
+
+    def __init__(self, *, compat: bool = False) -> None:
+        self._compat = compat
 
     @property
     def provider_name(self) -> str:
         return "openai"
 
     def get_capabilities(self, model: str) -> ModelCapabilities:
+        if self._compat:
+            return OPENAI_COMPAT_DEFAULT
         return lookup_openai_capabilities(model)
 
     # -- message conversion --------------------------------------------------
