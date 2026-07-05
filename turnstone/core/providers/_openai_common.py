@@ -291,12 +291,17 @@ OPENAI_DEFAULT = ModelCapabilities()
 # collision with a cloud model id ("gpt-5.5-my-finetune", "o3-distill")
 # would inherit that model's sampling and effort contract, none of which
 # holds for the box actually serving the name.  Every local model gets
-# the plain dataclass defaults — the same fallthrough unmatched names
-# always got — and anything beyond them is declared by the operator on
+# the plain dataclass defaults plus ``effort_passthrough`` — the session
+# effort knob is forwarded verbatim on the flat ``reasoning_effort``
+# param (the documented compat field; tolerant servers ignore it, vLLM
+# maps it into the template where supported) unless the operator
+# declares ``reasoning_effort_values`` (then the ordinal snap applies)
+# or an ``effort_param`` (then the template channel claims the value
+# and the flat param is suppressed).  Everything else is declared on
 # the model definition (capabilities JSON + server_compat), mirroring
 # ``_ANTHROPIC_COMPAT_DEFAULT`` and ``lookup_model_capabilities``'s
 # "no static table for local models" contract.
-OPENAI_COMPAT_DEFAULT = ModelCapabilities()
+OPENAI_COMPAT_DEFAULT = ModelCapabilities(effort_passthrough=True)
 
 
 def lookup_openai_capabilities(model: str) -> ModelCapabilities:

@@ -217,27 +217,39 @@ class TestCompatReasoningControl:
         return client.messages.stream.call_args[1]
 
     def test_manual_toggle_on(self) -> None:
-        """Any non-none effort turns the template toggle on; wire stays clean."""
+        """Any non-none effort turns the toggle on AND carries the graded
+        value under the fallback key — the user's effort setting always
+        reaches the wire; a template that doesn't reference the kwarg
+        ignores it."""
         kwargs = self._stream_kwargs(self._MANUAL_CAPS, "medium")
-        assert kwargs["extra_body"] == {"chat_template_kwargs": {"enable_thinking": True}}
+        assert kwargs["extra_body"] == {
+            "chat_template_kwargs": {"enable_thinking": True, "reasoning_effort": "medium"}
+        }
         assert "thinking" not in kwargs
         assert kwargs["temperature"] == 0.6  # never forced to 1.0 on compat
 
     @pytest.mark.parametrize("knob", ["none", ""])
     def test_manual_toggle_off(self, knob: str) -> None:
-        """Effort "none"/empty disables thinking — native manual-mode parity."""
+        """Effort "none"/empty disables thinking — native manual-mode parity;
+        no effort key rides when thinking is off."""
         kwargs = self._stream_kwargs(self._MANUAL_CAPS, knob)
         assert kwargs["extra_body"] == {"chat_template_kwargs": {"enable_thinking": False}}
         assert "thinking" not in kwargs
 
     def test_adaptive_always_on(self) -> None:
-        """Adaptive never knob-disables — native-adaptive contract, no native dict."""
+        """Adaptive never knob-disables — native-adaptive contract, no native
+        dict; the graded value rides for on-positions only."""
         caps = dataclasses.replace(self._MANUAL_CAPS, thinking_mode="adaptive")
-        for knob in ("high", "none"):
-            kwargs = self._stream_kwargs(caps, knob)
-            assert kwargs["extra_body"] == {"chat_template_kwargs": {"enable_thinking": True}}
-            assert "thinking" not in kwargs
-            assert kwargs["temperature"] == 0.6
+        kwargs = self._stream_kwargs(caps, "high")
+        assert kwargs["extra_body"] == {
+            "chat_template_kwargs": {"enable_thinking": True, "reasoning_effort": "high"}
+        }
+        assert "thinking" not in kwargs
+        assert kwargs["temperature"] == 0.6
+        kwargs = self._stream_kwargs(caps, "none")
+        assert kwargs["extra_body"] == {"chat_template_kwargs": {"enable_thinking": True}}
+        assert "thinking" not in kwargs
+        assert kwargs["temperature"] == 0.6
 
     def test_default_caps_inject_nothing(self) -> None:
         """Untouched compat defaults (thinking_mode=none) keep today's wire."""
@@ -305,7 +317,9 @@ class TestCompatReasoningControl:
         )
         kwargs = self._stream_kwargs(caps, "high")
         assert "output_config" not in kwargs
-        assert kwargs["extra_body"] == {"chat_template_kwargs": {"enable_thinking": True}}
+        assert kwargs["extra_body"] == {
+            "chat_template_kwargs": {"enable_thinking": True, "reasoning_effort": "high"}
+        }
 
     def test_create_completion_same_injection(self) -> None:
         """The non-streaming path shares _build_thinking_and_kwargs."""

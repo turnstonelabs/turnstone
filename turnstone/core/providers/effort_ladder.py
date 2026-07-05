@@ -40,6 +40,7 @@ from turnstone.core.providers._anthropic import (
     _map_reasoning_to_effort,
 )
 from turnstone.core.providers._protocol import (
+    EFFORT_TEMPLATE_FALLBACK_PARAM,
     ModelCapabilities,
     flat_effort_suppressed,
     reasoning_template_kwargs,
@@ -151,12 +152,17 @@ def _effective_anthropic(caps: ModelCapabilities, knob: str) -> str:
 
 def _effective_local(provider_name: str, caps: ModelCapabilities, knob: str) -> str:
     """Chat lanes — mirrors ``merge_reasoning_template_kwargs`` (+ flat param)."""
-    updates = reasoning_template_kwargs(caps, knob)
+    # The anthropic-compatible request path passes the fallback effort
+    # key (its only effort channel is chat_template_kwargs); the chat
+    # lanes carry effort on the flat param instead.
+    fallback = EFFORT_TEMPLATE_FALLBACK_PARAM if provider_name == "anthropic-compatible" else ""
+    updates = reasoning_template_kwargs(caps, knob, fallback_effort_param=fallback)
+    effort_param = caps.effort_param or fallback
     parts: list[str] = []
     if caps.thinking_param in updates:
         parts.append("on" if updates[caps.thinking_param] else "off")
-    if caps.effort_param and caps.effort_param in updates:
-        parts.append(str(updates[caps.effort_param]))
+    if effort_param and effort_param in updates:
+        parts.append(str(updates[effort_param]))
     # Chat-completions providers also send the flat param unless a
     # declared effort_param claims the template channel — the same
     # ``flat_effort_suppressed`` predicate ``apply_temperature_and_effort``

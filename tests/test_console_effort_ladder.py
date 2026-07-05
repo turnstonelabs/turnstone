@@ -44,7 +44,7 @@ def test_valid_request_returns_ladder() -> None:
     assert resp.status_code == 200, resp.text
     ladder = {r["value"]: r["effective"] for r in resp.json()["ladder"]}
     assert ladder["none"] == "off"
-    assert ladder["high"] == "on"
+    assert ladder["high"] == "on+high"
 
 
 def test_api_surface_switches_projection() -> None:

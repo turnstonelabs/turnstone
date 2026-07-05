@@ -37,7 +37,10 @@ import pytest
 
 from tests._wire_capture import RecordingClient
 from turnstone.core.providers import create_provider
-from turnstone.core.providers._protocol import ModelCapabilities
+from turnstone.core.providers._protocol import (
+    EFFORT_TEMPLATE_FALLBACK_PARAM,
+    ModelCapabilities,
+)
 from turnstone.core.providers.effort_ladder import KNOB_VALUES, effort_ladder
 
 # Above the largest manual-mode thinking budget (max: 65536) so the
@@ -271,14 +274,21 @@ def _wire_payload(shape: Shape, knob: str) -> dict[str, Any]:
     return dict(client.captured["payload"])
 
 
-def _effort_wire_subset(payload: dict[str, Any], caps: ModelCapabilities) -> dict[str, Any]:
+def _effort_wire_subset(payload: dict[str, Any], shape: Shape) -> dict[str, Any]:
     """Every effort-related lever in *payload*, normalized across lanes.
 
     Keys: ``thinking`` (native Anthropic param), ``output_effort``
     (Anthropic ``output_config.effort``), ``flat`` (Chat Completions
     ``reasoning_effort`` / Responses ``reasoning.effort``), ``toggle``
-    and ``template_effort`` (``extra_body.chat_template_kwargs``).
+    and ``template_effort`` (``extra_body.chat_template_kwargs`` — the
+    graded key is ``caps.effort_param``, else the fallback template key
+    on the anthropic-compatible lane, whose only effort channel is the
+    template).
     """
+    caps = shape.caps
+    effort_key = caps.effort_param or (
+        EFFORT_TEMPLATE_FALLBACK_PARAM if shape.provider == "anthropic-compatible" else ""
+    )
     subset: dict[str, Any] = {}
     if "thinking" in payload:
         subset["thinking"] = payload["thinking"]
@@ -293,13 +303,13 @@ def _effort_wire_subset(payload: dict[str, Any], caps: ModelCapabilities) -> dic
     extra_body = payload.get("extra_body")
     ctk = extra_body.get("chat_template_kwargs") if isinstance(extra_body, dict) else None
     if isinstance(ctk, dict):
-        known = {caps.thinking_param, caps.effort_param} - {""}
+        known = {caps.thinking_param, effort_key} - {""}
         unexpected = set(ctk) - known
         assert not unexpected, f"unexpected chat_template_kwargs keys: {unexpected}"
         if caps.thinking_param in ctk:
             subset["toggle"] = ctk[caps.thinking_param]
-        if caps.effort_param and caps.effort_param in ctk:
-            subset["template_effort"] = ctk[caps.effort_param]
+        if effort_key and effort_key in ctk:
+            subset["template_effort"] = ctk[effort_key]
     return subset
 
 
@@ -350,12 +360,12 @@ def _decode_template(provider: str, caps: ModelCapabilities, token: str) -> dict
         parts = parts[1:]
     if parts:
         assert len(parts) == 1, f"unparseable ladder token: {token!r}"
-        if caps.effort_param:
+        if caps.effort_param or provider == "anthropic-compatible":
+            # Declared graded key, or the anthropic-compatible fallback
+            # template key — that lane has no flat channel, so a graded
+            # part there is always template-borne.
             expected["template_effort"] = parts[0]
         else:
-            # The anthropic-compatible lane has no flat channel, so a
-            # bare effort part there could only be the template key.
-            assert provider != "anthropic-compatible", token
             expected["flat"] = parts[0]
     return expected
 
@@ -372,7 +382,7 @@ def test_ladder_tokens_match_wire(shape: Shape) -> None:
     assert [row["value"] for row in ladder] == list(KNOB_VALUES)
     for row in ladder:
         knob, token = row["value"], row["effective"]
-        observed = _effort_wire_subset(_wire_payload(shape, knob), shape.caps)
+        observed = _effort_wire_subset(_wire_payload(shape, knob), shape)
         expected = _decode_token(shape, token)
         assert observed == expected, (
             f"{shape.id}/knob={knob}: ladder says {token!r} which decodes to "
@@ -387,9 +397,7 @@ def test_equal_tokens_iff_equal_wire(shape: Shape) -> None:
         row["value"]: row["effective"]
         for row in effort_ladder(shape.provider, shape.caps, shape.api_surface)
     }
-    subsets = {
-        knob: _effort_wire_subset(_wire_payload(shape, knob), shape.caps) for knob in KNOB_VALUES
-    }
+    subsets = {knob: _effort_wire_subset(_wire_payload(shape, knob), shape) for knob in KNOB_VALUES}
     for a, b in itertools.combinations(KNOB_VALUES, 2):
         same_token = tokens[a] == tokens[b]
         same_wire = subsets[a] == subsets[b]

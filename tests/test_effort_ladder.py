@@ -21,12 +21,17 @@ def _as_map(ladder: list[dict[str, str]]) -> dict[str, str]:
 
 
 class TestLocalLanes:
-    def test_qwen_style_toggle_only_two_groups(self) -> None:
-        """Toggle-only model: none=off, everything else one 'on' group."""
+    def test_toggle_engaged_carries_graded_value_per_position(self) -> None:
+        """No declared effort key: the toggle rides the knob AND the graded
+        value is forwarded under the fallback template key — the user's
+        effort setting always reaches the wire (a template that doesn't
+        reference the kwarg ignores it), so every position is distinct."""
         caps = ModelCapabilities(thinking_mode="manual", thinking_param="enable_thinking")
         eff = _as_map(effort_ladder("anthropic-compatible", caps))
         assert eff["none"] == "off"
-        assert {eff[k] for k in KNOB_VALUES if k != "none"} == {"on"}
+        assert eff["minimal"] == "on+minimal"
+        assert eff["max"] == "on+max"
+        assert len({eff[k] for k in KNOB_VALUES}) == len(KNOB_VALUES)
 
     def test_freeform_effort_param_forwards_each_value(self) -> None:
         """deepseek-style config: toggle + verbatim effort per position."""

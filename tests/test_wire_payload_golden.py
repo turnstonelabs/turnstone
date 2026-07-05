@@ -85,7 +85,10 @@ def _assert_golden(name: str, payload: dict[str, Any]) -> None:
     norm = _normalize(payload)
     if _UPDATE:
         GOLDEN_DIR.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps(norm, indent=2, sort_keys=True) + "\n")
+        # ensure_ascii=False keeps non-ASCII (em dashes in repair
+        # messages) literal, matching the existing baselines — a regen
+        # must not churn unrelated lines into \uXXXX escapes.
+        path.write_text(json.dumps(norm, indent=2, sort_keys=True, ensure_ascii=False) + "\n")
         return
     assert path.exists(), f"missing golden {name!r}; run UPDATE_WIRE_GOLDENS=1 to baseline"
     assert norm == json.loads(path.read_text()), f"wire-payload drift for {name!r}"

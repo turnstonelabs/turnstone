@@ -368,8 +368,8 @@ def test_effort_ladder_parses_string_capabilities(storage: SQLiteBackend) -> Non
     body = _get_models(_make_client(storage))
     ladder = {r["value"]: r["effective"] for r in body["models"][0]["effort_ladder"]}
     assert ladder["none"] == "off"
-    assert ladder["medium"] == "on"
-    assert ladder["max"] == "on"
+    assert ladder["medium"] == "on+medium"
+    assert ladder["max"] == "on+max"
 
 
 def test_effort_ladder_key_survives_malformed_capabilities(

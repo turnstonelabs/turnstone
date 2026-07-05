@@ -2095,13 +2095,19 @@ class TestOpenAIParameterGating:
     def setup_method(self) -> None:
         self.provider = OpenAIProvider()
 
-    def test_unknown_model_no_reasoning_effort(self) -> None:
-        """Unknown/local models should NOT receive top-level reasoning_effort."""
+    def test_local_model_effort_forwarded_verbatim(self) -> None:
+        """Local-lane models receive the session knob verbatim on the flat
+        param (effort_passthrough) — the user's effort setting always
+        reaches the wire; "none" stays omitted (nothing to disable
+        beyond the template toggle)."""
         caps = self.provider.get_capabilities("my-local-model")
         kwargs: dict[str, Any] = {}
         apply_temperature_and_effort(kwargs, caps, temperature=0.7, reasoning_effort="medium")
-        assert "reasoning_effort" not in kwargs
+        assert kwargs["reasoning_effort"] == "medium"
         assert kwargs["temperature"] == 0.7
+        kwargs = {}
+        apply_temperature_and_effort(kwargs, caps, temperature=0.7, reasoning_effort="none")
+        assert "reasoning_effort" not in kwargs
 
     def test_gpt5_no_temperature_has_reasoning_effort(self) -> None:
         """GPT-5 base: no temperature, reasoning_effort sent."""

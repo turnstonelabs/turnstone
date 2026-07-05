@@ -33,7 +33,7 @@
       "tool_call_id": "call_1"
     },
     {
-      "content": "Tool execution was cancelled. Outcome UNKNOWN \u2014 this call may have begun executing before the generation was stopped; do not assume it did not run, and reconcile before re-issuing it.",
+      "content": "Tool execution was cancelled. Outcome UNKNOWN — this call may have begun executing before the generation was stopped; do not assume it did not run, and reconcile before re-issuing it.",
       "role": "tool",
       "tool_call_id": "call_2"
     },

@@ -824,12 +824,17 @@ the levers live in the chat template, reached through
   `true` — the same contract as the real lane's manual mode. ("Always
   on" / `thinking_mode = "adaptive"` instead always sends `true`: the
   model self-regulates, so the knob never force-disables — mirroring
-  the native adaptive branch.) Templates
-  with a graded effort key (gpt-oss-style) additionally set
-  `effort_param` (e.g. `"reasoning_effort"`), plus optional
-  `reasoning_effort_values` / `default_reasoning_effort` to validate
-  the knob before it reaches the template; without declared values the
-  knob is forwarded as-is. The knob is ordinal, and validation
+  the native adaptive branch.) The graded effort value always rides
+  alongside the toggle: under `effort_param` when the operator names
+  the template's key, else under the conventional fallback key
+  (`reasoning_effort`) on the anthropic-compatible lane — the user's
+  effort setting always reaches the wire, and a template that doesn't
+  reference the kwarg ignores it. On the openai-compatible lane the
+  undeclared-key case rides the flat top-level `reasoning_effort`
+  param instead (the documented compat field), forwarded verbatim.
+  Optional `reasoning_effort_values` / `default_reasoning_effort`
+  validate the knob before it reaches the server; without declared
+  values the knob is forwarded as-is. The knob is ordinal, and validation
   respects that: an off-list knob value rounds UP onto the declared
   list and a value above the ceiling rides the ceiling
   (`snap_reasoning_effort`) — asking for more effort than the model
@@ -858,7 +863,11 @@ the levers live in the chat template, reached through
   toggle unconditionally `true` whenever thinking mode was enabled. A
   stored per-model `reasoning_effort = "none"` now disables thinking
   on such models — pick any real level (or clear the override) to keep
-  it on.
+  it on. Also since 1.7.0a7 the effort level itself always reaches the
+  wire on the local lanes (previously dropped unless
+  `reasoning_effort_values` was declared): flat `reasoning_effort` on
+  openai-compatible, the `effort_param`-or-fallback template key on
+  anthropic-compatible when reasoning control is engaged.
 * **Operator pin (static).** Entries under `{"chat_template_kwargs":
   ...}` in the admin Models extra-body field ride the SDK's
   `extra_body` unconditionally and win over the knob mapping on key

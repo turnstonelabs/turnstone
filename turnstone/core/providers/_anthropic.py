@@ -13,6 +13,7 @@ from typing import TYPE_CHECKING, Any
 
 from turnstone.core.attachments import safe_attachment_label
 from turnstone.core.providers._protocol import (
+    EFFORT_TEMPLATE_FALLBACK_PARAM,
     CompletionResult,
     ModelCapabilities,
     StreamChunk,
@@ -420,8 +421,17 @@ class AnthropicProvider:
             # schema (silently dropped) and must not have temperature forced
             # to 1.0 — reasoning control rides chat_template_kwargs instead,
             # folded into extra_params here so the extra_body forwarding
-            # below carries it to the wire.
-            extra_params = merge_reasoning_template_kwargs(caps, reasoning_effort, extra_params)
+            # below carries it to the wire.  This lane has no flat effort
+            # param, so the graded value falls back to the conventional
+            # template key when the operator engaged reasoning control
+            # without naming one — the session effort setting always
+            # reaches the wire.
+            extra_params = merge_reasoning_template_kwargs(
+                caps,
+                reasoning_effort,
+                extra_params,
+                fallback_effort_param=EFFORT_TEMPLATE_FALLBACK_PARAM,
+            )
         elif caps.thinking_mode == "adaptive":
             thinking_dict: dict[str, Any] = {"type": "adaptive"}
             if caps.thinking_display:
