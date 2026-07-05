@@ -96,7 +96,7 @@ _RE_PRIVATE_KEY_BLOCK = re.compile(
 # [^@\s]+@`` is specific enough that ``https://example.com:8080/path``
 # (host:port without ``@``) doesn't match.
 _RE_CONNECTION_STRING = re.compile(
-    r"(?:postgresql\+?(?:psycopg)?|mysql|mongodb|redis|amqp|sqlite|https?)"
+    r"(?:postgresql\+?(?:psycopg)?|mysql|mongodb(?:\+srv)?|rediss?|amqps?|sqlite|https?)"
     r"://[^:@\s]+:[^@\s]+@",
 )
 _RE_ENV_SECRET_LINE = re.compile(r"[A-Z][A-Z_0-9]+=\S+")
@@ -113,6 +113,16 @@ _RE_JSON_SECRET = re.compile(
     r'authorization)"\s*:\s*"([^"]{8,})"',
     re.IGNORECASE,
 )
+# Single-quoted sibling — Python dict reprs / JS object literals emit single
+# quotes (e.g. {'Authorization': 'Bearer ...'}); the double-quoted form above
+# misses them.  Same key set, same 8-char value floor, group(1) == value.
+_RE_JSON_SECRET_SQ = re.compile(
+    r"'(?:api_key|apikey|api_secret|secret_key|secret|password|passwd|"
+    r"token|access_token|refresh_token|auth_token|private_key|"
+    r"client_secret|webhook_secret|signing_key|encryption_key|"
+    r"authorization)'\s*:\s*'([^']{8,})'",
+    re.IGNORECASE,
+)
 
 # (pattern, redact_label) — ordered most-specific first for redaction.
 _CREDENTIAL_PATTERNS: list[tuple[re.Pattern[str], str]] = [
@@ -122,9 +132,12 @@ _CREDENTIAL_PATTERNS: list[tuple[re.Pattern[str], str]] = [
     (re.compile(r"gho_[a-zA-Z0-9]{36}"), "api_key"),
     (re.compile(r"AKIA[0-9A-Z]{16}"), "api_key"),
     (re.compile(r"AIza[a-zA-Z0-9_\-]{35}"), "api_key"),
-    (re.compile(r"Bearer\s+[a-zA-Z0-9._~+/=\-]{20,}"), "api_key"),
-    (re.compile(r"token=[a-zA-Z0-9]{20,}"), "api_key"),
-    (re.compile(r"key=[a-zA-Z0-9]{20,}"), "api_key"),
+    (re.compile(r"Bearer\s+[a-zA-Z0-9._~+/=\-]{20,}", re.IGNORECASE), "api_key"),
+    # Optional [a-zA-Z0-9_]* prefix so these swallow the whole
+    # access_token=/api_key=/secret_key= assignment instead of chewing only the
+    # tail into a garbled "access_[REDACTED:api_key]" — bare token=/key= still match.
+    (re.compile(r"[a-zA-Z0-9_]*token=[a-zA-Z0-9]{20,}"), "api_key"),
+    (re.compile(r"[a-zA-Z0-9_]*key=[a-zA-Z0-9]{20,}"), "api_key"),
 ]
 
 # -- Priority 3: Encoded / obfuscated payloads (MEDIUM) --------------------
@@ -575,7 +588,7 @@ def _check_credentials(
         found = True
         risk = "high"
 
-    if _RE_JSON_SECRET.search(text):
+    if _RE_JSON_SECRET.search(text) or _RE_JSON_SECRET_SQ.search(text):
         _add_flag(flags, "credential_leak")
         flags.append("json_secret_leak")
         ann.append(
@@ -623,6 +636,7 @@ def _redact_credentials(text: str) -> str:
         return full[:start] + "[REDACTED:secret]" + full[end:]
 
     result = _RE_JSON_SECRET.sub(_redact_json_secret, result)
+    result = _RE_JSON_SECRET_SQ.sub(_redact_json_secret, result)
     return result
 
 
@@ -817,7 +831,7 @@ def _check_credentials_complex(
         found = True
         risk = "high"
 
-    if _RE_JSON_SECRET.search(text):
+    if _RE_JSON_SECRET.search(text) or _RE_JSON_SECRET_SQ.search(text):
         _add_flag(flags, "credential_leak")
         _add_flag(flags, "json_secret_leak")
         ann.append(
@@ -856,6 +870,7 @@ def _redact_credentials_complex(text: str) -> str:
         return full[:start] + "[REDACTED:secret]" + full[end:]
 
     result = _RE_JSON_SECRET.sub(_redact_json_secret, result)
+    result = _RE_JSON_SECRET_SQ.sub(_redact_json_secret, result)
     return result
 
 
