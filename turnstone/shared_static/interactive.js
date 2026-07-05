@@ -541,6 +541,18 @@ class Pane {
   // live.
 
   _syncApprovalState() {
+    // Prune orphaned cycles whose block elements are no longer in the DOM.
+    // A clear_ui / replay_truncated / re-render that wipes the conversation
+    // subtree (messagesEl.replaceChildren()) also clears approvalCycles via
+    // _resetStreamingRefs.  But if an approve_request event is processed
+    // between the wipe and the refetch, its cycle card is in a detached
+    // subtree and the matching approval_resolved may never arrive — leaving
+    // pendingApproval=true and the send button disabled forever.
+    for (const [cid, entry] of this.approvalCycles) {
+      if (entry.blockEls && !entry.blockEls.some((el) => el.isConnected)) {
+        this.approvalCycles.delete(cid);
+      }
+    }
     const first = this.approvalCycles.values().next();
     const active = first.done ? null : first.value;
     this.pendingApproval = this.approvalCycles.size > 0;
@@ -2952,8 +2964,16 @@ class Pane {
           ),
       });
       block.appendChild(actions);
+    }
+
+    // Append BEFORE registering the approval cycle — the orphan-prune in
+    // _syncApprovalState checks blockEls.every(el => el.isConnected), so
+    // a freshly-built block (not yet in the DOM) would be mistaken for an
+    // orphan and immediately pruned if we registered before appending.
+    if (!announced) this.messagesEl.appendChild(block);
+    if (!autoApproved) {
       this._registerApprovalCycle(cycleId, [block], items);
-      const fb = actions.querySelector(".conv-feedback");
+      const fb = block.querySelector(".conv-feedback");
       // Focus the feedback field only for the FIRST (oldest) live cycle —
       // a sibling card arriving while the user is typing into another
       // cycle's field must not steal focus mid-word.
@@ -2963,8 +2983,6 @@ class Pane {
         });
       }
     }
-
-    if (!announced) this.messagesEl.appendChild(block);
     this._relinkAgentCards(items);
     this.scrollToBottom(stick);
   }

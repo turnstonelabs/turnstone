@@ -409,3 +409,23 @@ def test_pane_handles_cross_user_409() -> None:
     assert "r.status === 409" in body
     assert 'status: "cross_user_interjection"' in body
     assert 'data.status === "cross_user_interjection"' in body
+
+
+def test_sync_approval_state_prunes_orphan_cycles() -> None:
+    """``_syncApprovalState`` prunes cycles whose block elements are no longer
+    in the living DOM (``.isConnected === false``).  This covers the rare case
+    where an ``approve_request`` event is processed between a DOM wipe
+    (``clear_ui`` / ``replay_truncated`` / ``replaceChildren``) and the
+    refetch-restore — the cycle card lives in a detached subtree, the matching
+    ``approval_resolved`` never arrives, and the send button stays disabled
+    forever without this guard.  The pin guards against a future refactor that
+    drops the orphan prune but doesn't otherwise break ``_syncApprovalState``."""
+    body = _INTERACTIVE.read_text(encoding="utf-8")
+    fn_start = body.index("_syncApprovalState() {")
+    assert "entry.blockEls && !entry.blockEls.some((el) => el.isConnected)" in body, (
+        "orphan pruning must check .isConnected on block elements"
+    )
+    tail = body[fn_start : body.index("_oldestCycleId()", fn_start)]
+    assert "this.approvalCycles.delete(cid);" in tail, (
+        "orphan pruning must delete the cycle from the Map"
+    )
