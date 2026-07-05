@@ -2967,9 +2967,10 @@ class Pane {
     }
 
     // Append BEFORE registering the approval cycle — the orphan-prune in
-    // _syncApprovalState checks blockEls.every(el => el.isConnected), so
-    // a freshly-built block (not yet in the DOM) would be mistaken for an
-    // orphan and immediately pruned if we registered before appending.
+    // _syncApprovalState checks that no blockEls are connected
+    // (!blockEls.some(el => el.isConnected)), so a freshly-built block
+    // (not yet in the DOM) would be mistaken for an orphan and immediately
+    // pruned if we registered before appending.
     if (!announced) this.messagesEl.appendChild(block);
     if (!autoApproved) {
       this._registerApprovalCycle(cycleId, [block], items);
