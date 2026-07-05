@@ -183,9 +183,19 @@ def resolve_reasoning_effort(caps: ModelCapabilities, reasoning_effort: str) -> 
     the declared list, capped at its ceiling (``snap_reasoning_effort``).
     ``default_reasoning_effort`` is the last resort for values the
     ordinal snap cannot rank (custom strings on either side).
+
+    The knob's ``"none"`` position means "no reasoning": it is forwarded
+    verbatim ONLY when the model declares an explicit ``"none"`` level
+    (gpt-5.1+, grok-4.3) — omitting the param there would leave the
+    server default (possibly reasoning ON, e.g. gpt-5.5's ``medium``) in
+    charge of a knob that promises off.  Models without a declared
+    ``"none"`` get the param omitted, and ``"none"`` is never a snap
+    target for other knob positions.
     """
-    if not caps.reasoning_effort_values or not reasoning_effort or reasoning_effort == "none":
+    if not caps.reasoning_effort_values or not reasoning_effort:
         return None
+    if reasoning_effort == "none":
+        return "none" if "none" in caps.reasoning_effort_values else None
     if reasoning_effort in caps.reasoning_effort_values:
         return reasoning_effort
     snapped = snap_reasoning_effort(reasoning_effort, caps.reasoning_effort_values)

@@ -824,7 +824,12 @@ the levers live in the chat template, reached through
   respects that: an off-list knob value rounds UP onto the declared
   list and a value above the ceiling rides the ceiling
   (`snap_reasoning_effort`) — asking for more effort than the model
-  declares never falls back to a lower default tier.
+  declares never falls back to a lower default tier.  The knob's
+  `none` position is forwarded verbatim when the model declares an
+  explicit `none` level (gpt-5.1+, grok-4.3) — omitting it there would
+  leave a reasoning-on server default (e.g. gpt-5.5's `medium`) in
+  charge of a knob that promises off — and omitted otherwise; `none`
+  is never a snap target for other positions.
   `default_reasoning_effort` only catches values the ordinal snap
   cannot rank (custom strings). Declare values that match the
   template's documented vocabulary: for DeepSeek-V4, which officially

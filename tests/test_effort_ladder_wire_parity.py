@@ -60,10 +60,11 @@ class Shape:
     model: str = "m"
 
 
-# Real registry rows for the two lanes whose defaults carry effort values —
+# Real registry rows for the lanes whose defaults carry effort values —
 # parity should cover what ships, not only synthetic shapes.
 _GEMINI_CAPS = create_provider("google").get_capabilities("gemini-3-flash")
 _GROK_CAPS = create_provider("xai").get_capabilities("grok-4.3")
+_GPT55_CAPS = create_provider("openai").get_capabilities("gpt-5.5")
 
 SHAPES: tuple[Shape, ...] = (
     # -- anthropic-compatible (vLLM /v1/messages): template channel only --
@@ -159,12 +160,14 @@ SHAPES: tuple[Shape, ...] = (
     ),
     # -- commercial flat lanes --
     Shape(
-        "openai-flat",
+        # Real registry row: none/low/medium/high/xhigh, default medium.
+        # Knob none must send the EXPLICIT "none" level (omission would
+        # leave the server default medium reasoning on); knob max rides
+        # the xhigh ceiling.
+        "openai-gpt-5.5",
         "openai",
-        ModelCapabilities(
-            reasoning_effort_values=("low", "medium", "high"),
-            default_reasoning_effort="medium",
-        ),
+        _GPT55_CAPS,
+        model="gpt-5.5",
     ),
     Shape("google-default", "google", _GEMINI_CAPS, model="gemini-3-flash"),
     Shape(

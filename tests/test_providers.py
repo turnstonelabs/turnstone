@@ -2091,12 +2091,13 @@ class TestOpenAIParameterGating:
         assert kwargs["reasoning_effort"] == "high"
 
     def test_gpt51_temperature_when_effort_none(self) -> None:
-        """GPT-5.1: temperature only when reasoning_effort='none'."""
+        """GPT-5.1: temperature only when reasoning_effort='none'; the
+        declared "none" level is forwarded explicitly (knob = off)."""
         caps = self.provider.get_capabilities("gpt-5.1")
         kwargs: dict[str, Any] = {}
         apply_temperature_and_effort(kwargs, caps, temperature=0.7, reasoning_effort="none")
         assert kwargs["temperature"] == 0.7
-        assert "reasoning_effort" not in kwargs  # "none" is skipped
+        assert kwargs["reasoning_effort"] == "none"
 
     def test_gpt51_no_temperature_when_reasoning_active(self) -> None:
         """GPT-5.1: no temperature when reasoning is active."""
@@ -2106,12 +2107,20 @@ class TestOpenAIParameterGating:
         assert "temperature" not in kwargs
         assert kwargs["reasoning_effort"] == "high"
 
-    def test_o_series_no_temperature_no_reasoning_effort(self) -> None:
-        """O-series: no temperature, no reasoning_effort."""
+    def test_o_series_no_temperature_but_effort_forwarded(self) -> None:
+        """O-series: no temperature; low/medium/high ARE valid effort
+        values (all o-series except o1-mini) and the knob reaches them."""
         caps = self.provider.get_capabilities("o3")
         kwargs: dict[str, Any] = {}
         apply_temperature_and_effort(kwargs, caps, temperature=0.7, reasoning_effort="medium")
         assert "temperature" not in kwargs
+        assert kwargs["reasoning_effort"] == "medium"
+
+    def test_o1_mini_has_no_effort_control(self) -> None:
+        """o1-mini is the one o-series model without reasoning_effort."""
+        caps = self.provider.get_capabilities("o1-mini")
+        kwargs: dict[str, Any] = {}
+        apply_temperature_and_effort(kwargs, caps, temperature=0.7, reasoning_effort="medium")
         assert "reasoning_effort" not in kwargs
 
     def test_gpt5_pro_unsupported_effort_falls_back(self) -> None:
@@ -2136,7 +2145,7 @@ class TestOpenAIParameterGating:
         kwargs: dict[str, Any] = {}
         apply_temperature_and_effort(kwargs, caps, temperature=0.7, reasoning_effort="none")
         assert kwargs["temperature"] == 0.7
-        assert "reasoning_effort" not in kwargs
+        assert kwargs["reasoning_effort"] == "none"  # declared level, forwarded
         kwargs2: dict[str, Any] = {}
         apply_temperature_and_effort(kwargs2, caps, temperature=0.7, reasoning_effort="xhigh")
         assert "temperature" not in kwargs2
@@ -2160,7 +2169,7 @@ class TestOpenAIParameterGating:
         kwargs: dict[str, Any] = {}
         apply_temperature_and_effort(kwargs, caps, temperature=0.7, reasoning_effort="none")
         assert kwargs["temperature"] == 0.7
-        assert "reasoning_effort" not in kwargs
+        assert kwargs["reasoning_effort"] == "none"  # declared level, forwarded
         kwargs2: dict[str, Any] = {}
         apply_temperature_and_effort(kwargs2, caps, temperature=0.7, reasoning_effort="xhigh")
         assert "temperature" not in kwargs2
@@ -4254,7 +4263,10 @@ class TestResponsesParamBuilding:
         assert kwargs["reasoning"] == {"effort": "high"}
         assert "reasoning_effort" not in kwargs
 
-    def test_no_reasoning_when_none_effort(self) -> None:
+    def test_none_effort_sends_declared_none_level(self) -> None:
+        """gpt-5.4 declares an explicit "none" level — the knob's off
+        position forwards it rather than omitting (omission would leave
+        the server default in charge on models like gpt-5.5)."""
         kwargs = self.provider._build_kwargs(
             model="gpt-5.4",
             messages=[{"role": "user", "content": "Hi"}],
@@ -4264,7 +4276,7 @@ class TestResponsesParamBuilding:
             reasoning_effort="none",
             deferred_names=None,
         )
-        assert "reasoning" not in kwargs
+        assert kwargs["reasoning"] == {"effort": "none"}
 
     def test_store_is_false(self) -> None:
         kwargs = self.provider._build_kwargs(

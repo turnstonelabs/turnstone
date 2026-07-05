@@ -81,6 +81,18 @@ OPENAI_CAPABILITIES: dict[str, ModelCapabilities] = {
         supports_pdf=True,
         supports_reasoning_replay=True,
     ),
+    # GPT-5.1 codex-max — the model xhigh was introduced on; without this
+    # row it would prefix-match "gpt-5.1" (no xhigh) and the knob's xhigh
+    # would wrongly cap at high.  Responses-only, supports explicit none.
+    "gpt-5.1-codex-max": ModelCapabilities(
+        context_window=400000,
+        max_output_tokens=128000,
+        reasoning_effort_values=("none", "low", "medium", "high", "xhigh"),
+        default_reasoning_effort="medium",
+        supports_vision=True,
+        supports_pdf=True,
+        supports_reasoning_replay=True,
+    ),
     # GPT-5.2 — adds xhigh
     "gpt-5.2": ModelCapabilities(
         context_window=400000,
@@ -135,12 +147,14 @@ OPENAI_CAPABILITIES: dict[str, ModelCapabilities] = {
         supports_pdf=True,
         supports_reasoning_replay=True,
     ),
-    # GPT-5.5 — 1M context, native tool search, stronger agentic/tool use
+    # GPT-5.5 — 1M context, native tool search, stronger agentic/tool use.
+    # Unlike 5.1-5.4 (default none), 5.5 defaults to MEDIUM reasoning per
+    # developers.openai.com/api/docs/guides/latest-model (2026-07 check).
     "gpt-5.5": ModelCapabilities(
         context_window=1050000,
         max_output_tokens=128000,
         reasoning_effort_values=("none", "low", "medium", "high", "xhigh"),
-        default_reasoning_effort="none",
+        default_reasoning_effort="medium",
         supports_tool_search=True,
         supports_vision=True,
         supports_pdf=True,
@@ -164,6 +178,8 @@ OPENAI_CAPABILITIES: dict[str, ModelCapabilities] = {
         max_output_tokens=100000,
         supports_temperature=False,
         supports_streaming=False,
+        reasoning_effort_values=("low", "medium", "high"),
+        default_reasoning_effort="medium",
         supports_vision=True,
         supports_pdf=True,
         supports_reasoning_replay=True,
@@ -177,10 +193,15 @@ OPENAI_CAPABILITIES: dict[str, ModelCapabilities] = {
         supports_pdf=True,
         supports_reasoning_replay=True,
     ),
+    # low/medium/high on every o-series model EXCEPT o1-mini (Azure
+    # reasoning guide, 2026-06 revision) — without declared values the
+    # session knob was silently dropped for these models.
     "o3": ModelCapabilities(
         context_window=200000,
         max_output_tokens=100000,
         supports_temperature=False,
+        reasoning_effort_values=("low", "medium", "high"),
+        default_reasoning_effort="medium",
         supports_vision=True,
         supports_pdf=True,
         supports_reasoning_replay=True,
@@ -189,6 +210,8 @@ OPENAI_CAPABILITIES: dict[str, ModelCapabilities] = {
         context_window=200000,
         max_output_tokens=100000,
         supports_temperature=False,
+        reasoning_effort_values=("low", "medium", "high"),
+        default_reasoning_effort="medium",
         supports_vision=True,
         supports_pdf=True,
         supports_reasoning_replay=True,
@@ -198,6 +221,8 @@ OPENAI_CAPABILITIES: dict[str, ModelCapabilities] = {
         max_output_tokens=100000,
         supports_temperature=False,
         supports_streaming=False,
+        reasoning_effort_values=("low", "medium", "high"),
+        default_reasoning_effort="medium",
         supports_vision=True,
         supports_pdf=True,
         supports_reasoning_replay=True,
@@ -206,6 +231,8 @@ OPENAI_CAPABILITIES: dict[str, ModelCapabilities] = {
         context_window=200000,
         max_output_tokens=100000,
         supports_temperature=False,
+        reasoning_effort_values=("low", "medium", "high"),
+        default_reasoning_effort="medium",
         supports_vision=True,
         supports_pdf=True,
         supports_reasoning_replay=True,
