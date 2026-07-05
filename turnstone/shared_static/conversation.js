@@ -243,7 +243,7 @@ export function buildConvRow(item, opts) {
   if (opts.argsText) {
     const args = document.createElement("span");
     args.className = "conv-row-args";
-    args.textContent = opts.argsText;
+    args.textContent = redactCredentials(opts.argsText);
     call.appendChild(args);
   }
   row.appendChild(call);
@@ -266,9 +266,9 @@ export function buildConvCmd(item) {
       const dollar = document.createElement("span");
       dollar.className = "conv-row-cmd-dollar";
       dollar.textContent = "$ ";
-      cmd.append(dollar, cmdText);
+      cmd.append(dollar, redactCredentials(cmdText));
     } else {
-      cmd.textContent = cmdText;
+      cmd.textContent = redactCredentials(cmdText);
     }
     frag.appendChild(cmd);
   }
@@ -282,8 +282,12 @@ export function buildConvCmd(item) {
     // list can throw RangeError mid-paint (engines cap spread arity around
     // 65k args), killing the tool card — and the approval gate — for the
     // batch.  Appended incrementally for the same reason.
+    // Redact credentials ONCE on the full text before splitting, rather than
+    // running 7 regex sweeps per line (~2800 passes at 400 lines).
     const MAX_PREVIEW_LINES = 400;
-    let lines = stripAnsi(item.preview).split("\n");
+    const raw = stripAnsi(item.preview);
+    const redacted = redactCredentials(raw);
+    let lines = redacted.split("\n");
     const omitted = lines.length - MAX_PREVIEW_LINES;
     if (omitted > 0) lines = lines.slice(0, MAX_PREVIEW_LINES);
     lines.forEach((line, i) => {
