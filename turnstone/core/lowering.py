@@ -53,10 +53,12 @@ their own.
 from __future__ import annotations
 
 import json
+import re
 from typing import Any
 
 from turnstone.core import fence
 from turnstone.core.log import get_logger
+from turnstone.core.output_guard import redact_credentials
 from turnstone.core.trajectory import EffectStatus, Turn, dicts_from_turns
 
 log = get_logger(__name__)
@@ -195,15 +197,31 @@ def wire_valid_arguments(arguments: Any) -> bool:
         return False
 
 
-def tool_args_preview(arguments: Any) -> str:
-    """A short, log-safe preview of a tool call's raw ``arguments`` (any type).
+# All C0 control chars (tab/newline/CR included) plus DEL, collapsed to a space so
+# a preview stays a single log line — stricter than ``audit._scrub_string``, which
+# keeps tab/newline because audit detail is JSON-dumped and rendered multi-line.
+# Built via chr()/range() rather than literal ``\xNN`` escapes to keep control
+# bytes out of this source file.
+_ARGS_PREVIEW_CONTROL_RE = re.compile(
+    "[" + re.escape("".join(chr(c) for c in range(0x20)) + chr(0x7F)) + "]"
+)
 
-    Shared by the wire legalizer and the session-layer accumulator's
-    ``stream.tool_args_malformed`` warning so the two malformed-args log sites can't
-    drift on how much of the raw value they show.
+
+def tool_args_preview(arguments: Any) -> str:
+    """A short, credential-scrubbed, single-line preview of a tool call's raw
+    ``arguments`` (any type), safe to emit into logs.
+
+    Tool arguments are model/user-controlled and can carry secrets (a token in a
+    bash command, a password in a connection string) or raw control characters
+    (CR/LF → multi-line / log-injection artifacts).  Mirroring
+    ``audit._scrub_string``: :func:`redact_credentials` runs over the *full* value
+    first — so a secret straddling the 120-char cut isn't half-shown past the
+    pattern's reach — then every control char collapses to a space, then the result
+    is capped.  Shared by the wire legalizer and the session-layer
+    ``stream.tool_args_malformed`` warning so both log sites are equally safe.
     """
     text = arguments if isinstance(arguments, str) else repr(arguments)
-    return text[:120]
+    return _ARGS_PREVIEW_CONTROL_RE.sub(" ", redact_credentials(text))[:120]
 
 
 def _legalized_arguments(arguments: Any) -> str | None:
