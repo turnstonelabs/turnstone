@@ -30,6 +30,7 @@ from typing import TYPE_CHECKING, Any, cast
 
 import pytest
 
+from tests._wire_capture import RecordingClient
 from turnstone.core.lowering import repair_wire_messages
 from turnstone.core.providers._anthropic import AnthropicProvider
 from turnstone.core.providers._google import GoogleProvider
@@ -37,71 +38,10 @@ from turnstone.core.providers._openai_chat import OpenAIChatCompletionsProvider
 from turnstone.core.providers._openai_responses import OpenAIResponsesProvider
 
 if TYPE_CHECKING:
-    from collections.abc import Iterator
-
     from turnstone.core.providers._protocol import LLMProvider
 
 GOLDEN_DIR = Path(__file__).parent / "data" / "wire_payloads"
 _UPDATE = os.environ.get("UPDATE_WIRE_GOLDENS") == "1"
-
-
-# --------------------------------------------------------------------------- #
-# Recording fake client — captures the kwargs at each provider's SDK seam.
-# --------------------------------------------------------------------------- #
-class _EmptyStream:
-    """Stand-in for an SDK stream / stream-manager: empty iterable AND no-op CM."""
-
-    def __iter__(self) -> Iterator[Any]:
-        return iter(())
-
-    def __enter__(self) -> _EmptyStream:
-        return self
-
-    def __exit__(self, *exc: object) -> None:
-        return None
-
-
-class _Seam:
-    """Records the kwargs of a single SDK call, returns an empty stream stub."""
-
-    def __init__(self, sink: dict[str, Any]) -> None:
-        self._sink = sink
-
-    def __call__(self, **kwargs: Any) -> _EmptyStream:
-        # Last write wins; only one seam is exercised per provider call.
-        self._sink["payload"] = kwargs
-        return _EmptyStream()
-
-
-class _Completions:
-    def __init__(self, sink: dict[str, Any]) -> None:
-        self.create = _Seam(sink)
-
-
-class _Chat:
-    def __init__(self, sink: dict[str, Any]) -> None:
-        self.completions = _Completions(sink)
-
-
-class _Messages:
-    def __init__(self, sink: dict[str, Any]) -> None:
-        self.stream = _Seam(sink)
-
-
-class _Responses:
-    def __init__(self, sink: dict[str, Any]) -> None:
-        self.create = _Seam(sink)
-        self.stream = _Seam(sink)
-
-
-class RecordingClient:
-    """Fake SDK client exposing every provider's call seam, recording kwargs."""
-
-    def __init__(self) -> None:
-        self.captured: dict[str, Any] = {}
-        self.messages = _Messages(self.captured)
-        self.chat = _Chat(self.captured)
-        self.responses = _Responses(self.captured)
 
 
 def _capture(
