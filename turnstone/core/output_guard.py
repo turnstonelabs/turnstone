@@ -110,6 +110,7 @@ _RE_JSON_SECRET = re.compile(
     r'"(?:api_key|apikey|api_secret|secret_key|secret|password|passwd|'
     r"token|access_token|refresh_token|auth_token|private_key|"
     r"client_secret|webhook_secret|signing_key|encryption_key|"
+    r'x_api_key|x-api-key|'
     r'authorization)"\s*:\s*"([^"]{8,})"',
     re.IGNORECASE,
 )
@@ -120,6 +121,7 @@ _RE_JSON_SECRET_SQ = re.compile(
     r"'(?:api_key|apikey|api_secret|secret_key|secret|password|passwd|"
     r"token|access_token|refresh_token|auth_token|private_key|"
     r"client_secret|webhook_secret|signing_key|encryption_key|"
+    r"x_api_key|x-api-key|"
     r"authorization)'\s*:\s*'([^']{8,})'",
     re.IGNORECASE,
 )
@@ -133,11 +135,19 @@ _CREDENTIAL_PATTERNS: list[tuple[re.Pattern[str], str]] = [
     (re.compile(r"AKIA[0-9A-Z]{16}"), "api_key"),
     (re.compile(r"AIza[a-zA-Z0-9_\-]{35}"), "api_key"),
     (re.compile(r"Bearer\s+[a-zA-Z0-9._~+/=\-]{20,}", re.IGNORECASE), "api_key"),
-    # Optional [a-zA-Z0-9_]* prefix so these swallow the whole
-    # access_token=/api_key=/secret_key= assignment instead of chewing only the
-    # tail into a garbled "access_[REDACTED:api_key]" — bare token=/key= still match.
-    (re.compile(r"[a-zA-Z0-9_]*token=[a-zA-Z0-9]{20,}"), "api_key"),
-    (re.compile(r"[a-zA-Z0-9_]*key=[a-zA-Z0-9]{20,}"), "api_key"),
+    # Specific credential key suffixes so these swallow the whole
+    # access_token=/api_key=/secret_key=/auth_token= assignment instead of
+    # chewing only the tail into a garbled "access_[REDACTED:api_key]", while
+    # NOT matching innocent identifiers like monkey=, turkey=, over_tokenized=.
+    # The trailing _? allows both snake_case and compact forms (api_key / apikey).
+    (re.compile(
+        r"(?:(?:api|secret|session|auth|encryption|signing|private|public|access)_?key)="
+        r"[a-zA-Z0-9]{20,}"
+    ), "api_key"),
+    (re.compile(
+        r"(?:(?:access|refresh|auth|api|session)_?token)="
+        r"[a-zA-Z0-9]{20,}"
+    ), "api_key"),
 ]
 
 # -- Priority 3: Encoded / obfuscated payloads (MEDIUM) --------------------
@@ -426,7 +436,7 @@ _BUILTIN_OG_PATTERNS: list[OutputGuardPatternDef] = [
         name="credential_bearer",
         category="credentials",
         risk_level="high",
-        compiled=re.compile(r"Bearer\s+[a-zA-Z0-9._~+/=\-]{20,}"),
+        compiled=re.compile(r"Bearer\s+[a-zA-Z0-9._~+/=\-]{20,}", re.IGNORECASE),
         flag_name="credential_leak",
         annotation="Output contains what appears to be an API key or token.",
         is_credential=True,
@@ -437,7 +447,10 @@ _BUILTIN_OG_PATTERNS: list[OutputGuardPatternDef] = [
         name="credential_token_param",
         category="credentials",
         risk_level="high",
-        compiled=re.compile(r"token=[a-zA-Z0-9]{20,}"),
+        compiled=re.compile(
+            r"(?:(?:access|refresh|auth|api|session)_?token)="
+            r"[a-zA-Z0-9]{20,}"
+        ),
         flag_name="credential_leak",
         annotation="Output contains what appears to be an API key or token.",
         is_credential=True,
@@ -448,7 +461,10 @@ _BUILTIN_OG_PATTERNS: list[OutputGuardPatternDef] = [
         name="credential_key_param",
         category="credentials",
         risk_level="high",
-        compiled=re.compile(r"key=[a-zA-Z0-9]{20,}"),
+        compiled=re.compile(
+            r"(?:(?:api|secret|session|auth|encryption|signing|private|public|access)_?key)="
+            r"[a-zA-Z0-9]{20,}"
+        ),
         flag_name="credential_leak",
         annotation="Output contains what appears to be an API key or token.",
         is_credential=True,
@@ -559,8 +575,8 @@ def _check_credentials(
 
     for pattern, _label in _CREDENTIAL_PATTERNS:
         if pattern.search(text):
-            if "credential_leak" not in flags:
-                flags.append("credential_leak")
+            _add_flag(flags, "credential_leak")
+            if "Output contains what appears to be an API key or token." not in ann:
                 ann.append("Output contains what appears to be an API key or token.")
             found = True
             risk = "high"

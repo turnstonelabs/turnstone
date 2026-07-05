@@ -59,13 +59,13 @@ const _CREDENTIAL_REPLACEMENTS = [
   // Bearer tokens — min 20 chars of JWT/opaque token (scheme is
   // case-insensitive per RFC 7235, so match bearer/BEARER too)
   [/Bearer\s+[a-zA-Z0-9._~+/=\-]{20,}/gi, "[REDACTED:api_key]"],
-  // token=<value> (20+ hex/alnum).  The optional [a-zA-Z0-9_]* prefix lets it
-  // swallow the WHOLE access_token=/auth_token= key rather than chewing only the
-  // tail into "access_[REDACTED:api_key]" — while still covering bare token=.
-  [/[a-zA-Z0-9_]*token=[a-zA-Z0-9]{20,}/g, "[REDACTED:api_key]"],
-  // key=<value> (20+).  Prefix swallows api_key=/secret_key=/session_key= whole
-  // instead of leaving a garbled "api_[REDACTED:api_key]".
-  [/[a-zA-Z0-9_]*key=[a-zA-Z0-9]{20,}/g, "[REDACTED:api_key]"],
+  // token=<value> (20+).  Specific credential key prefixes only — not
+  // unbounded [a-zA-Z0-9_]* which would match innocent identifiers
+  // like "monkey=" or "turkey=".  Covers access_token=/auth_token=/api_token= etc.
+  [/(?:(?:access|refresh|auth|api|session)_?token)=[a-zA-Z0-9]{20,}/g, "[REDACTED:api_key]"],
+  // key=<value> (20+).  Same bounded prefix approach: api_key=/secret_key= etc.
+  // but not monkey= or turkey=.  The _? allows both snake_case and compact forms.
+  [/(?:(?:api|secret|session|auth|encryption|signing|private|public|access)_?key)=[a-zA-Z0-9]{20,}/g, "[REDACTED:api_key]"],
 ];
 
 // ---------------------------------------------------------------------------
@@ -73,7 +73,7 @@ const _CREDENTIAL_REPLACEMENTS = [
 //   ?api_key=abc123   →   ?api_key=***
 //   &apiKey=abc       →   &apiKey=***
 // ---------------------------------------------------------------------------
-const _RE_QUERY_CRED = /(?:api_key|apiKey|api-key|token)=[^&\s"]+/g;
+const _RE_QUERY_CRED = /(?:api_key|apiKey|api-key|token|secret|password|auth)=[^&\s"]+/g;
 
 // ---------------------------------------------------------------------------
 // JSON-style simple redaction (legacy _redactApiKeys compat)
@@ -92,9 +92,9 @@ const _RE_JSON_STYLE_CRED =
 // the key stays intact even when value == key name.  /i already covers casing,
 // so keys are listed once (no separate |Authorization alternative needed).
 const _RE_JSON_SECRET_DQ =
-  /("(?:api_key|apikey|api_secret|secret_key|secret|password|passwd|token|access_token|refresh_token|auth_token|private_key|client_secret|webhook_secret|signing_key|encryption_key|authorization)"\s*:\s*")[^"]{8,}"/gi;
+  /("(?:api_key|apikey|api_secret|secret_key|secret|password|passwd|token|access_token|refresh_token|auth_token|private_key|client_secret|webhook_secret|signing_key|encryption_key|x_api_key|x-api-key|authorization)"\s*:\s*")[^"]{8,}"/gi;
 const _RE_JSON_SECRET_SQ =
-  /('(?:api_key|apikey|api_secret|secret_key|secret|password|passwd|token|access_token|refresh_token|auth_token|private_key|client_secret|webhook_secret|signing_key|encryption_key|authorization)'\s*:\s*')[^']{8,}'/gi;
+  /('(?:api_key|apikey|api_secret|secret_key|secret|password|passwd|token|access_token|refresh_token|auth_token|private_key|client_secret|webhook_secret|signing_key|encryption_key|x_api_key|x-api-key|authorization)'\s*:\s*')[^']{8,}'/gi;
 
 // ---------------------------------------------------------------------------
 // ENV secret line redaction — matches the backend's two-regex pipeline
