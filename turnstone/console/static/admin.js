@@ -7671,10 +7671,17 @@ function _annotateEffortSelect(sel, ladder) {
       if (eff === "default") {
         label += " — model default";
       } else if (eff === "on") {
-        // Bare toggle-on without a graded value: only the adaptive
-        // lanes' none position produces this — the knob cannot
-        // disable an adaptive model's thinking.
+        // Local adaptive lane, none position: we send only the thinking
+        // toggle (no effort grade exists), so the knob can't turn
+        // thinking off — that is the whole story here.
         label += " — thinking stays on";
+      } else if (eff === "adaptive") {
+        // Native Anthropic adaptive: thinking is ALWAYS on and an effort
+        // level rides output_config on every graded position, so
+        // "thinking stays on" is true everywhere and not what sets the
+        // none position apart.  What "none" uniquely means is that no
+        // effort is pinned — the model self-regulates it.
+        label += " — model sets effort";
       } else if (eff !== "off") {
         // "off" needs no echo on the none position.  Otherwise strip
         // the toggle prefix and budget qualifier ("on+high" → "high",
