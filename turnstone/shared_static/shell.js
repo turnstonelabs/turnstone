@@ -253,6 +253,68 @@ function postWsVerb(base, wsId, verb, body) {
   );
 }
 
+// --- Pane accelerators -----------------------------------------------------
+// ONE source of truth for the pane keyboard shortcuts, shared by BOTH the
+// tab-menu key badges (below) and the keydown handler (in mountShell), so a
+// badge can never advertise a chord the handler doesn't actually listen for.
+//
+// The modifier is chosen per platform: Ctrl on macOS (the browser owns Cmd and
+// leaves Ctrl free) and Alt on Windows/Linux (there Ctrl IS the browser's own
+// new-tab / close-tab / switch-tab accelerator and never reaches the page).
+const IS_MAC =
+  (navigator.platform && navigator.platform.indexOf("Mac") > -1) || false;
+const PANE_MOD_LABEL = IS_MAC ? "Ctrl" : "Alt";
+
+// The per-pane menu actions that also carry a shortcut, keyed by a stable id
+// (the menu item's `accel`).  `letter` is matched case-insensitively; `shift`
+// gates the Shift-family.  Close-pane is the one non-Shift chord.
+const PANE_MENU_ACCELS = {
+  "close-pane": { letter: "w", shift: false },
+  "edit-title": { letter: "e", shift: true },
+  "refresh-title": { letter: "r", shift: true },
+  fork: { letter: "f", shift: true },
+  delete: { letter: "x", shift: true },
+};
+
+// The badge string for a menu accel, e.g. "Alt+Shift+E" — platform-correct.
+function paneAccelBadge(id) {
+  const a = PANE_MENU_ACCELS[id];
+  if (!a) return "";
+  return (
+    PANE_MOD_LABEL + (a.shift ? "+Shift" : "") + "+" + a.letter.toUpperCase()
+  );
+}
+
+// True when `e` carries the pane modifier and no other primary modifier — on
+// Windows/Linux AltGr surfaces as Ctrl+Alt, so this keeps accented-character
+// entry (and the browser's own Ctrl chords) from firing pane shortcuts.
+function paneModDown(e) {
+  return IS_MAC
+    ? e.ctrlKey && !e.altKey && !e.metaKey
+    : e.altKey && !e.ctrlKey && !e.metaKey;
+}
+
+// Which per-pane menu accel (if any) a keydown triggers, else null.
+function paneAccelFor(e) {
+  if (!paneModDown(e)) return null;
+  const k = e.key.toLowerCase();
+  for (const id in PANE_MENU_ACCELS) {
+    const a = PANE_MENU_ACCELS[id];
+    if (!!e.shiftKey === a.shift && k === a.letter) return id;
+  }
+  return null;
+}
+
+// True when focus is in an editable element.  On macOS Ctrl+T / Ctrl+D are the
+// Cocoa "transpose" / "delete-forward" text bindings, so each surface's
+// creation and dashboard chords must yield to text editing while a field is
+// focused.  Exposed on TS_SHELL so both app.js surfaces share ONE definition.
+function inEditable(el) {
+  if (!el) return false;
+  const tag = el.tagName;
+  return tag === "INPUT" || tag === "TEXTAREA" || el.isContentEditable;
+}
+
 // Tab-action menu items for a conversational pane — the three-verb close plus
 // the per-persona verbs.  Pane-type-derived AND deployment-aware, in two lanes:
 // the classic verb GLOBALS where they exist (the standalone's ui/static app.js,
@@ -275,11 +337,15 @@ function convTabMenu(pane, pm, wsId, opts) {
     if (typeof G.refreshWorkstreamTitle === "function")
       items.push({
         label: "Refresh title",
+        accel: "refresh-title",
+        key: paneAccelBadge("refresh-title"),
         action: () => G.refreshWorkstreamTitle(wsId),
       });
     else if (base != null)
       items.push({
         label: "Refresh title",
+        accel: "refresh-title",
+        key: paneAccelBadge("refresh-title"),
         action: () =>
           postWsVerb(base, wsId, "refresh-title")
             .then((r) =>
@@ -292,12 +358,15 @@ function convTabMenu(pane, pm, wsId, opts) {
     if (typeof G.editWorkstreamTitle === "function")
       items.push({
         label: "Edit title",
-        key: "Ctrl+Shift+E",
+        accel: "edit-title",
+        key: paneAccelBadge("edit-title"),
         action: () => G.editWorkstreamTitle(wsId),
       });
     else if (base != null)
       items.push({
         label: "Edit title",
+        accel: "edit-title",
+        key: paneAccelBadge("edit-title"),
         action: () => {
           const f = findWs(wsId, false);
           const cur = (f && (f.ws.name || f.ws.title)) || "";
@@ -319,7 +388,8 @@ function convTabMenu(pane, pm, wsId, opts) {
     if (typeof G.forkWorkstream === "function")
       items.push({
         label: "Fork",
-        key: "Ctrl+Shift+F",
+        accel: "fork",
+        key: paneAccelBadge("fork"),
         action: () => G.forkWorkstream(wsId),
       });
   }
@@ -334,7 +404,8 @@ function convTabMenu(pane, pm, wsId, opts) {
   // Close pane — drop the tab, leave the session running (PaneManager-level).
   items.push({
     label: "Close pane",
-    key: "Ctrl+W",
+    accel: "close-pane",
+    key: paneAccelBadge("close-pane"),
     action: () => pm.close(pane.id),
   });
   // Close workstream — stop the session itself (distinct from closing the tab).
@@ -346,13 +417,16 @@ function convTabMenu(pane, pm, wsId, opts) {
     if (typeof G.confirmDeleteWorkstream === "function")
       items.push({
         label: "Delete",
-        key: "Ctrl+Shift+X",
+        accel: "delete",
+        key: paneAccelBadge("delete"),
         cls: "destructive",
         action: () => G.confirmDeleteWorkstream(wsId),
       });
     else if (base != null)
       items.push({
         label: "Delete",
+        accel: "delete",
+        key: paneAccelBadge("delete"),
         cls: "destructive",
         action: () => {
           if (!window.confirm("Delete this session? This cannot be undone."))
@@ -510,6 +584,33 @@ async function mountShell() {
   });
   pm.onActiveChange(() => setDrawer(false));
 
+  // Pane keyboard accelerators (shared by every surface): the per-pane tab-menu
+  // actions — close pane, edit/refresh title, fork, delete — driven off the
+  // ACTIVE conversational pane's OWN menu, so the chord runs the exact action
+  // its badge advertises and each surface contributes only the items it
+  // supports (the console omits Fork; a non-conversational pane has no tabMenu
+  // and is skipped).  The global accels — new, switch, dashboard — live in each
+  // surface's app.js.  None of these chords overlap in-field text editing
+  // (close is Mod+W; the rest are Mod+Shift+…), so no typing guard is needed.
+  document.addEventListener("keydown", (e) => {
+    if (document.querySelector("dialog:modal")) return;
+    const accel = paneAccelFor(e);
+    if (!accel) return;
+    const active = pm.getActive();
+    if (!active) return;
+    const pane = pm.getPane(active.type, active.rawId);
+    if (!pane || typeof pane.tabMenu !== "function") return;
+    let item;
+    try {
+      item = (pane.tabMenu() || []).find((it) => it.accel === accel);
+    } catch (err) {
+      return; // a pane whose menu throws simply has no accelerators
+    }
+    if (!item || typeof item.action !== "function") return;
+    e.preventDefault();
+    item.action();
+  });
+
   // Split controls (the revived split-view): they act on the FOCUSED pane.
   // Split right / split down open a second cell beside/below it, filled with
   // the most-recently-used backgrounded tab; Unsplit returns to one pane and
@@ -574,7 +675,12 @@ async function mountShell() {
   pm.registerType("admin", () => {
     const pane = new ShellPane({ type: "admin", title: "Admin", glyph: "⚙" });
     pane.tabMenu = () => [
-      { label: "Close pane", key: "Ctrl+W", action: () => pm.close(pane.id) },
+      {
+        label: "Close pane",
+        accel: "close-pane",
+        key: paneAccelBadge("close-pane"),
+        action: () => pm.close(pane.id),
+      },
     ];
     pane.onMount = function () {
       if (viewAdminEl) {
@@ -911,7 +1017,13 @@ async function mountShell() {
   // in ui/static/app.js) stamp a count chip on a Manage row without importing the
   // ESM rail module — the shell is its module bridge.  Generic: the rail owns the
   // chip mechanism, the caller owns what the count means.
-  window.TS_SHELL = { panes: pm, caps, notifySessionClosed, setRowBadge };
+  window.TS_SHELL = {
+    panes: pm,
+    caps,
+    notifySessionClosed,
+    setRowBadge,
+    inEditable,
+  };
 
   // Login fan-out: app.js owns the single window.onLoginSuccess (the Tier-1
   // reconnect, set at load).  Wrap it in a tiny registry so EVERY conversational

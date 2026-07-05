@@ -3837,6 +3837,14 @@
         orchestration: true,
         brandSub: "console",
       };
+      // Pane accelerators bind to Ctrl on macOS (the browser owns Cmd and
+      // leaves Ctrl free) and to Alt on Windows/Linux (Ctrl is the browser's
+      // own switch-tab accelerator).  Must match what app.js / shell.js listen
+      // for on this host.
+      const PANE_MOD =
+        navigator.platform && navigator.platform.indexOf("Mac") > -1
+          ? "Ctrl"
+          : "Alt";
       window.TURNSTONE_KB_SHORTCUTS = [
         {
           title: "Navigation",
@@ -3857,6 +3865,31 @@
           ],
         },
         {
+          title: "Panes",
+          keys: [
+            {
+              desc: "Switch pane",
+              badge: `<span class="kb-key">${PANE_MOD}+1</span>\u2026<span class="kb-key">${PANE_MOD}+9</span>`,
+            },
+            {
+              desc: "Close pane",
+              badge: `<span class="kb-key">${PANE_MOD}+W</span>`,
+            },
+            {
+              desc: "Edit title",
+              badge: `<span class="kb-key">${PANE_MOD}+Shift+E</span>`,
+            },
+            {
+              desc: "Refresh title",
+              badge: `<span class="kb-key">${PANE_MOD}+Shift+R</span>`,
+            },
+            {
+              desc: "Delete workstream",
+              badge: `<span class="kb-key">${PANE_MOD}+Shift+X</span>`,
+            },
+          ],
+        },
+        {
           title: "General",
           keys: [
             {
@@ -3867,6 +3900,10 @@
                   ? "\u2318"
                   : "Ctrl") +
                 '</span>+<span class="kb-key">Enter</span>',
+            },
+            {
+              desc: "Toggle dashboard",
+              badge: '<span class="kb-key">Ctrl+D</span>',
             },
             { desc: "Show this help", badge: '<span class="kb-key">?</span>' },
             { desc: "Close overlay", badge: '<span class="kb-key">Esc</span>' },

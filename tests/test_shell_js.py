@@ -444,7 +444,8 @@ def test_shell_bridges_setrowbadge_for_classic_subsystems() -> None:
     badge the same way the gear deletion did)."""
     body = _SHELL_JS.read_text(encoding="utf-8")
     assert 'setRowBadge } from "./rail.js"' in body, "shell must import setRowBadge from rail.js"
-    assert "notifySessionClosed, setRowBadge }" in body, (
+    ts_shell = body[body.index("window.TS_SHELL = {") :][:200]
+    assert "setRowBadge" in ts_shell, (
         "TS_SHELL must expose setRowBadge for classic subsystems (the consent-badge bridge)"
     )
 
@@ -1011,7 +1012,8 @@ def test_shell_closes_pane_on_ws_closed() -> None:
     assert 'pm.getPane("interactive", wsId)' in shell
     assert "if (p) pm.close(p.id)" in shell, "ws_closed closes the pane, not mark-dead"
     assert "showDeadBanner" in shell, "the banner lane must survive for non-closed deaths"
-    assert "window.TS_SHELL = { panes: pm, caps, notifySessionClosed, setRowBadge }" in shell, (
+    ts_shell = shell[shell.index("window.TS_SHELL = {") :][:200]
+    assert "panes: pm" in ts_shell and "notifySessionClosed" in ts_shell, (
         "the seam must be exported on TS_SHELL for the console's Tier-1 handler"
     )
     app = _CONSOLE_APP.read_text(encoding="utf-8")
