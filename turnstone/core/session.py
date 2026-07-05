@@ -60,6 +60,9 @@ from turnstone.core.lowering import (
     drop_empty_user_turns,
     fold_system_turns,
     repair_wire_messages,
+    sanitize_tool_call_arguments,
+    tool_args_preview,
+    wire_valid_arguments,
 )
 from turnstone.core.memory import (
     count_messages,
@@ -4287,11 +4290,19 @@ class ChatSession:
         *after* the fold so the fold-path wake turn, which the nudge folds into
         and thereby fills, is kept.
 
+        Before that, :func:`turnstone.core.lowering.sanitize_tool_call_arguments`
+        legalizes any tool-call ``arguments`` that isn't a JSON-object string (a
+        model can emit an unterminated one with a non-``length`` finish reason, and
+        a strict renderer like vLLM's ``deepseek_v4`` ``json.loads`` it and 400s the
+        whole request) — on the wire copy only, so the canonical trajectory keeps
+        the raw output.
+
         Finally, :func:`turnstone.core.lowering.repair_wire_messages`
         synthesizes cancellation results for any orphaned client tool calls so
         the provider translator (the ``C`` layer) never sees an unanswered
         tool call — this is the sole send-time orphan repair; the translators
-        carry none.  Identity-preserving when nothing is orphaned.
+        carry none.  Both final passes are identity-preserving when there is
+        nothing to fix.
         """
         # The lowering passes (fold / drop / repair) are dict-native and the
         # provider translators consume the same dict projection, so the wire prep
@@ -4312,7 +4323,8 @@ class ChatSession:
                 nonce=self._envelope_nonce,
             )
         dropped = drop_empty_user_turns(folded)
-        return repair_wire_messages(dropped)
+        legalized = sanitize_tool_call_arguments(dropped)
+        return repair_wire_messages(legalized)
 
     def _emit_state(self, state: str) -> None:
         """Notify UI of a workstream state transition.
@@ -6545,11 +6557,29 @@ class ChatSession:
 
         if tool_calls_acc:
             self._ensure_tool_call_ids(tool_calls_acc)
-            msg["tool_calls"] = [tool_calls_acc[i] for i in sorted(tool_calls_acc)]
+            ordered = [tool_calls_acc[i] for i in sorted(tool_calls_acc)]
+            msg["tool_calls"] = ordered
+            # Non-destructive integrity signal: the length-guard above drops tool
+            # calls only on ``finish_reason == "length"``, so a model that emits
+            # invalid-JSON arguments with a ``stop`` / ``tool_calls`` finish reason
+            # commits them verbatim.  We keep the raw output (the canonical Turn
+            # stays a faithful record; the wire copy is legalized by
+            # ``lowering.sanitize_tool_call_arguments``) and only flag it here — so a
+            # model-quality problem is visible at the moment it happens, not merely
+            # as a downstream wire legalization on every replay.
+            for tc in ordered:
+                raw_args = tc["function"].get("arguments")
+                if not wire_valid_arguments(raw_args):
+                    log.warning(
+                        "stream.tool_args_malformed",
+                        tool=tc["function"].get("name", "?"),
+                        call_id=tc.get("id", ""),
+                        raw_preview=tool_args_preview(raw_args),
+                    )
             log.info(
                 "stream.tool_calls",
-                count=len(tool_calls_acc),
-                tools=[tool_calls_acc[i]["function"]["name"] for i in sorted(tool_calls_acc)],
+                count=len(ordered),
+                tools=[tc["function"]["name"] for tc in ordered],
             )
 
         # Store raw provider content blocks for multi-turn preservation

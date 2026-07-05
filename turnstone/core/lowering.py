@@ -6,12 +6,19 @@ trajectory) and the per-provider translators (which own format only — the
 *valid* for an LLM round-trip, so every translator can assume a well-formed
 input and stay a pure format mapping.
 
-This module owns the two provider-neutral lowering passes:
+This module owns the three provider-neutral lowering passes:
 
 * **fold** (representation) — operator-context ``system`` turns are folded into
   the preceding turn as nonce-fenced ``[start system-reminder]`` blocks for models
   without native mid-conversation system support (native models keep them
   inline).  See :func:`fold_system_turns`.
+* **legalize** (validity) — normalizing any tool-call ``arguments`` that isn't a
+  JSON-object string (an unterminated string from a non-``length`` truncation, an
+  empty ``""``, a bare scalar) to ``"{}"`` so a strict renderer (e.g. vLLM's
+  ``deepseek_v4``, which ``json.loads`` the arguments at request-render time)
+  can't reject the whole request.  Mutates the transient wire copy only — the
+  canonical trajectory keeps the raw output.  See
+  :func:`sanitize_tool_call_arguments`.
 * **repair** (validity) — synthesizing cancellation results for orphaned client
   tool calls.  See :func:`repair_wire_messages`.
 
@@ -45,13 +52,14 @@ their own.
 
 from __future__ import annotations
 
-import logging
+import json
 from typing import Any
 
 from turnstone.core import fence
+from turnstone.core.log import get_logger
 from turnstone.core.trajectory import EffectStatus, Turn, dicts_from_turns
 
-logger = logging.getLogger(__name__)
+log = get_logger(__name__)
 
 # The "you cannot tell whether it ran" clause, shared by every cancel
 # disposition surface (this wire-repair fallback AND the session-layer
@@ -162,6 +170,106 @@ def repair_wire_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]
 
 
 # --------------------------------------------------------------------------- #
+# Legalize — a tool call's ``arguments`` must be a JSON-object string on the wire.
+# --------------------------------------------------------------------------- #
+def wire_valid_arguments(arguments: Any) -> bool:
+    """True when *arguments* is a string that decodes to a JSON object.
+
+    A tool call carries ``arguments`` as an opaque JSON string, and a strict
+    renderer re-parses it at request-render time (vLLM's ``deepseek_v4``
+    ``_postprocess_messages`` does ``json.loads`` on it), so anything that isn't a
+    string decoding to a JSON *object* — an unterminated string from a
+    non-``length`` truncation, an empty ``""``, a bare scalar/array, a raw ``dict``
+    that never got serialized — makes the provider reject the whole request.
+    Shared by the wire legalizer here and the session-layer accumulator's integrity
+    check so the two can't drift on what "valid" means.
+    """
+    if not isinstance(arguments, str):
+        return False
+    try:
+        # json.loads raises JSONDecodeError (already a ValueError, so listing both
+        # was redundant) on malformed JSON, and RecursionError on deeply-nested
+        # JSON — catch both so this predicate is total for any string input.
+        return isinstance(json.loads(arguments), dict)
+    except (json.JSONDecodeError, RecursionError):
+        return False
+
+
+def tool_args_preview(arguments: Any) -> str:
+    """A short, log-safe preview of a tool call's raw ``arguments`` (any type).
+
+    Shared by the wire legalizer and the session-layer accumulator's
+    ``stream.tool_args_malformed`` warning so the two malformed-args log sites can't
+    drift on how much of the raw value they show.
+    """
+    text = arguments if isinstance(arguments, str) else repr(arguments)
+    return text[:120]
+
+
+def _legalized_arguments(arguments: Any) -> str | None:
+    """A wire-valid replacement for *arguments*, or ``None`` if already valid.
+
+    A raw ``dict`` (an internal shape that reached the wire seat) is serialized;
+    anything else that fails :func:`wire_valid_arguments` collapses to ``"{}"``.
+    The value is cosmetic on replay — a malformed call was already answered with a
+    "retry with valid JSON" result, and the model consumes that result, not its own
+    prior arguments — so an empty object drops nothing a strict renderer would keep.
+    """
+    if wire_valid_arguments(arguments):
+        return None
+    if isinstance(arguments, dict):
+        try:
+            return json.dumps(arguments)
+        except (TypeError, ValueError, RecursionError):
+            return "{}"
+    return "{}"
+
+
+def sanitize_tool_call_arguments(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Return *messages* with every assistant tool call's ``arguments`` made
+    wire-valid — the legalize pass (see the module docstring).
+
+    The stream accumulator commits ``arguments`` verbatim, and the only guard that
+    drops a malformed tool call is ``finish_reason == "length"``
+    (``ChatSession._stream_response``); a model that emits invalid JSON with a
+    ``stop`` / ``tool_calls`` finish reason slips through, and one such turn then
+    poison-pills every later request that replays it on a strict renderer.  This
+    legalizes each offending ``arguments`` to a JSON-object string.
+
+    Faithful and cheap, exactly like :func:`repair_wire_messages`: the canonical
+    ``Turn`` trajectory keeps the raw model output (this mutates only the transient
+    wire copy), and the pass is copy-on-write + identity-preserving — a
+    conversation with no malformed call is returned unchanged (same object).
+    """
+    out: list[dict[str, Any]] | None = None  # copy-on-write: None until first fix
+    for idx, msg in enumerate(messages):
+        if msg.get("role") != "assistant" or not msg.get("tool_calls"):
+            continue
+        repaired: list[dict[str, Any]] | None = None
+        for ci, tc in enumerate(msg["tool_calls"]):
+            fn = tc.get("function")
+            if not isinstance(fn, dict):
+                continue
+            replacement = _legalized_arguments(fn.get("arguments"))
+            if replacement is None:
+                continue  # already wire-valid — leave byte-for-byte untouched
+            if repaired is None:
+                repaired = list(msg["tool_calls"])
+            log.debug(
+                "wire.tool_args_legalized",
+                tool=fn.get("name", "?"),
+                call_id=tc.get("id", ""),
+                raw_preview=tool_args_preview(fn.get("arguments")),
+            )
+            repaired[ci] = {**tc, "function": {**fn, "arguments": replacement}}
+        if repaired is not None:
+            if out is None:
+                out = list(messages)
+            out[idx] = {**msg, "tool_calls": repaired}
+    return messages if out is None else out
+
+
+# --------------------------------------------------------------------------- #
 # Fold — operator-context representation (A); runs BEFORE repair on the wire.
 # --------------------------------------------------------------------------- #
 def fold_system_turns(
@@ -225,7 +333,7 @@ def fold_system_turns(
                     # authorship.  Degrade (still fold) rather than crash the turn —
                     # the harm is OOD voice, not a trust breach (the nonce still
                     # gates operator trust regardless of host turn).
-                    logger.warning(
+                    log.warning(
                         "operator-context system turn (_source=%s) is folding onto "
                         "an assistant turn; operator context should follow a "
                         "user/tool turn",
