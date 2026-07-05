@@ -77,23 +77,33 @@ export interface ToolInfoEvent {
 
 /** One approval CYCLE awaiting the operator.  Several can be outstanding
  *  at once (parallel task agents each gate their own tool calls) — key
- *  prompt UI by `cycle_id` and echo it back on the approve POST. */
+ *  prompt UI by `cycle_id` and echo it back on the approve POST.
+ *
+ *  `cycle_id` is optional because it was added in 1.7: a pre-1.7 server
+ *  omits it on the wire, so a current SDK talking to an older node sees
+ *  `undefined`.  Resolve those the legacy way (no selector → oldest
+ *  cycle). A current server always sends it. */
 export interface ApproveRequestEvent {
   type: "approve_request";
-  cycle_id: string;
+  cycle_id?: string;
   items: Array<Record<string, unknown>>;
   judge_pending?: boolean;
 }
 
 /** A specific approval cycle resolved; `cycle_id`/`call_ids` identify
- *  which prompt to dismiss. */
+ *  which prompt to dismiss.
+ *
+ *  Both are optional for the same reason as `ApproveRequestEvent.cycle_id`
+ *  — a pre-1.7 server emits neither, so a bare "something resolved"
+ *  dismisses the sole tracked prompt (the legacy fallback the UI and
+ *  channel adapters keep). A current server always sends both. */
 export interface ApprovalResolvedEvent {
   type: "approval_resolved";
   approved: boolean;
   feedback: string;
   always?: boolean;
-  cycle_id: string;
-  call_ids: string[];
+  cycle_id?: string;
+  call_ids?: string[];
 }
 
 export interface ToolResultEvent {
