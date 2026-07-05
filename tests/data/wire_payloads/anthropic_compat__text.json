@@ -1,0 +1,33 @@
+{
+  "cache_control": {
+    "type": "ephemeral"
+  },
+  "extra_body": {
+    "chat_template_kwargs": {
+      "enable_thinking": true,
+      "reasoning_effort": "high"
+    }
+  },
+  "max_tokens": 4096,
+  "messages": [
+    {
+      "content": "Hi there.",
+      "role": "user"
+    },
+    {
+      "content": [
+        {
+          "text": "Hello! How can I help?",
+          "type": "text"
+        }
+      ],
+      "role": "assistant"
+    },
+    {
+      "content": "What's the weather in Paris?",
+      "role": "user"
+    }
+  ],
+  "model": "qwen3.6-27b",
+  "temperature": 0.5
+}

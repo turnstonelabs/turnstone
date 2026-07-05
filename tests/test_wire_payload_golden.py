@@ -36,6 +36,7 @@ from turnstone.core.providers._anthropic import AnthropicProvider
 from turnstone.core.providers._google import GoogleProvider
 from turnstone.core.providers._openai_chat import OpenAIChatCompletionsProvider
 from turnstone.core.providers._openai_responses import OpenAIResponsesProvider
+from turnstone.core.providers._protocol import ModelCapabilities
 
 if TYPE_CHECKING:
     from turnstone.core.providers._protocol import LLMProvider
@@ -45,11 +46,21 @@ _UPDATE = os.environ.get("UPDATE_WIRE_GOLDENS") == "1"
 
 
 def _capture(
-    provider: LLMProvider, *, model: str, messages: list[dict[str, Any]], **opts: Any
+    provider: LLMProvider,
+    *,
+    model: str,
+    messages: list[dict[str, Any]],
+    caps: ModelCapabilities | None = None,
+    **opts: Any,
 ) -> dict[str, Any]:
-    """Drive ``create_streaming`` against a recording client; return the SDK kwargs."""
+    """Drive ``create_streaming`` against a recording client; return the SDK kwargs.
+
+    *caps* overrides the provider's own capability lookup — required for the
+    anthropic-compatible lane, which has no static table (an operator-run model
+    definition supplies its capabilities).
+    """
     client = RecordingClient()
-    caps = provider.get_capabilities(model)
+    caps = caps or provider.get_capabilities(model)
     # Mirror the session's wire prep: orphan repair runs once on the canonical
     # Turns (``ChatSession._prepare_wire_messages``), then the result is lowered
     # to the dict projection the translator consumes.  Fixtures arrive
@@ -264,3 +275,36 @@ def test_wire_payload(
     provider = factory()
     payload = _capture(provider, model=model, messages=[dict(m) for m in messages], **opts)
     _assert_golden(f"{provider_id}__{fixture_id}", payload)
+
+
+# The anthropic-compatible lane (vLLM /v1/messages) has no static capability
+# table and carries reasoning control in ``extra_body.chat_template_kwargs``
+# rather than the native ``thinking`` param — a wire shape the matrix above
+# never exercises (both AnthropicProvider rows are the native lane). Freeze it
+# with the capabilities a manual-mode model definition supplies and a real
+# effort level, so the graded ``reasoning_effort`` key is pinned in the golden
+# (never the native ``thinking`` param, and no forced ``temperature=1.0``).
+_COMPAT_CAPS = ModelCapabilities(
+    context_window=262144,
+    max_output_tokens=64000,
+    token_param="max_tokens",
+    thinking_mode="manual",
+    thinking_param="enable_thinking",
+    supports_reasoning_replay=True,
+)
+
+
+@pytest.mark.parametrize("fixture_id", sorted(_FIXTURES))
+def test_wire_payload_anthropic_compat(fixture_id: str) -> None:
+    messages, opts = _FIXTURES[fixture_id]
+    provider = AnthropicProvider(compat=True)
+    payload = _capture(
+        provider,
+        model="qwen3.6-27b",
+        messages=[dict(m) for m in messages],
+        caps=_COMPAT_CAPS,
+        reasoning_effort="high",
+        **opts,
+    )
+    assert "thinking" not in payload, "compat lane must never send the native thinking param"
+    _assert_golden(f"anthropic_compat__{fixture_id}", payload)

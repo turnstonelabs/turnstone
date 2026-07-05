@@ -1,0 +1,63 @@
+{
+  "cache_control": {
+    "type": "ephemeral"
+  },
+  "extra_body": {
+    "chat_template_kwargs": {
+      "enable_thinking": true,
+      "reasoning_effort": "high"
+    }
+  },
+  "max_tokens": 4096,
+  "messages": [
+    {
+      "content": "Run the deploy.",
+      "role": "user"
+    },
+    {
+      "content": [
+        {
+          "id": "call_1",
+          "input": {},
+          "name": "deploy",
+          "type": "tool_use"
+        }
+      ],
+      "role": "assistant"
+    },
+    {
+      "content": [
+        {
+          "content": "deployed",
+          "tool_use_id": "call_1",
+          "type": "tool_result"
+        },
+        {
+          "text": "Great, what's next?",
+          "type": "text"
+        }
+      ],
+      "role": "user"
+    }
+  ],
+  "model": "qwen3.6-27b",
+  "system": "Output-guard: deploy output looked clean.",
+  "temperature": 0.5,
+  "tools": [
+    {
+      "description": "Look up the weather for a city.",
+      "input_schema": {
+        "properties": {
+          "city": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "city"
+        ],
+        "type": "object"
+      },
+      "name": "get_weather"
+    }
+  ]
+}

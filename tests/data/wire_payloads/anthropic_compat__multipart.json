@@ -1,0 +1,33 @@
+{
+  "cache_control": {
+    "type": "ephemeral"
+  },
+  "extra_body": {
+    "chat_template_kwargs": {
+      "enable_thinking": true,
+      "reasoning_effort": "high"
+    }
+  },
+  "max_tokens": 4096,
+  "messages": [
+    {
+      "content": [
+        {
+          "text": "What's in this image?",
+          "type": "text"
+        },
+        {
+          "source": {
+            "data": "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==",
+            "media_type": "image/png",
+            "type": "base64"
+          },
+          "type": "image"
+        }
+      ],
+      "role": "user"
+    }
+  ],
+  "model": "qwen3.6-27b",
+  "temperature": 0.5
+}
