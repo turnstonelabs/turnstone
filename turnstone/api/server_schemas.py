@@ -287,8 +287,8 @@ class ListWorkstreamsResponse(BaseModel):
 class PendingApprovalItem(BaseModel):
     """One pending tool-call inside a ``PendingApprovalDetail`` envelope.
 
-    Mirrors the dict ``SessionUIBase.serialize_pending_approval_detail``
-    emits per item. ``heuristic_verdict`` / ``judge_verdict`` are kept
+    Mirrors the dict ``SessionUIBase.serialize_pending_approval_details``
+    emits per item inside each cycle entry. ``heuristic_verdict`` / ``judge_verdict`` are kept
     loosely-typed because the underlying verdict shape varies by tier;
     consumers that want the full structure can decode against
     :class:`turnstone.sdk.events.IntentVerdictEvent`.

@@ -2223,7 +2223,7 @@ class SessionUIBase:
         see which path silently approved each call.
 
         Heuristic verdict surfaces under ``heuristic_verdict`` for
-        consistency with :meth:`serialize_pending_approval_detail`
+        consistency with :meth:`serialize_pending_approval_details`
         and :class:`api.server_schemas.PendingApprovalItem` — pre-
         fix this method emitted ``verdict`` while the dashboard
         payload used ``heuristic_verdict``, leaving JS consumers

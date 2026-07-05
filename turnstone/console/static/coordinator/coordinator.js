@@ -4130,8 +4130,8 @@ function createCoordinatorPane(root, wsId, opts) {
     const existing = childrenState.get(childId);
     if (!existing) return;
     existing.state = ev.reason === "deleted" ? "deleted" : "closed";
-    // Clearing the live cache eagerly on close prevents a stale
-    // pending_approval_detail from continuing to render approve/deny
+    // Clearing the live cache eagerly on close prevents stale
+    // pending_approval_details from continuing to render approve/deny
     // buttons on a closed row (its TTL would otherwise survive into
     // the closed/deleted lifecycle until natural expiry).
     invalidateLiveBadge(childId);
