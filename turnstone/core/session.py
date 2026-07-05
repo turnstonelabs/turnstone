@@ -1062,8 +1062,13 @@ class SessionUI(Protocol):
     ) -> int | None: ...
     def on_state_change(self, state: str) -> None: ...
     def on_rename(self, name: str) -> None: ...
-    def on_intent_verdict(self, verdict: dict[str, Any]) -> None:
-        """Called when the LLM judge produces a verdict for a pending approval."""
+    def on_intent_verdict(self, verdict: dict[str, Any], judge_event: object | None = None) -> None:
+        """Called when the LLM judge produces a verdict for a pending approval.
+
+        ``judge_event`` identifies the delivering daemon's generation
+        (its cancel event); multi-cycle UIs use its identity to reject a
+        stale generation's verdict aimed at a live approval cycle.
+        """
         ...
 
     def on_output_warning(self, call_id: str, assessment: dict[str, Any]) -> None:
@@ -1497,6 +1502,15 @@ class ChatSession:
         self._judge_config: JudgeConfig | None = judge_config
         self._judge: IntentJudge | None = None
         self._judge_cancel_event: threading.Event | None = None
+        # EVERY live judge generation's cancel event — the main loop's
+        # (also mirrored in the slot above, which carries the supersede
+        # semantics) plus one per sub-agent gate; parallel task agents
+        # spawn judges concurrently, and ``close()`` must be able to
+        # abort them all.  Membership is exact: added at spawn, removed
+        # by the daemon's ``done_callback``.  Own lock — spawns happen
+        # on the main worker AND agent pool threads.
+        self._judge_cancel_events: set[threading.Event] = set()
+        self._judge_events_lock = threading.Lock()
         # Output-guard LLM judge (lazy-initialized, issue #560 mitigation #1).
         # Lives alongside ``_judge`` and is reset by the same client/model
         # swap paths so both judges pick up new credentials.
@@ -2709,6 +2723,12 @@ class ChatSession:
         """Release resources (listener registrations, etc.)."""
         if self._judge_cancel_event is not None:
             self._judge_cancel_event.set()
+        # Abort every in-flight judge daemon — with parallel task agents
+        # several sub-agent generations can be live beyond the main slot.
+        with self._judge_events_lock:
+            live_judges = list(self._judge_cancel_events)
+        for ev in live_judges:
+            ev.set()
         if self._mcp_client and self._mcp_refresh_cb:
             # ``user_id`` MUST match the value used at registration —
             # the listener identity is ``(user_id, callback)``, not
@@ -7557,6 +7577,9 @@ class ChatSession:
     def _evaluate_intent(
         self,
         items: list[dict[str, Any]],
+        *,
+        conversation: list[Turn] | None = None,
+        agent_gate: bool = False,
     ) -> threading.Event | None:
         """Run intent validation on pending approval items.
 
@@ -7573,6 +7596,26 @@ class ChatSession:
         ``judge.cancel_on_approval`` is enabled — the default leaves
         the daemon running to completion so every call gets a real
         LLM verdict for the audit trail.
+
+        ``conversation`` is the trajectory the judge grounds intent
+        against — defaults to the session's main messages.  A task
+        agent's gate passes its own sub-trajectory: the task prompt in
+        it is the delegation contract the operator approved when they
+        let ``task_agent`` run, so "does this call serve the task" is
+        the right local alignment question (alignment-to-user was
+        anchored one level up, at the task_agent approval itself).
+
+        ``agent_gate`` marks a sub-agent generation: it must NOT touch
+        ``_judge_cancel_event`` — that slot carries the MAIN loop's
+        supersede semantics, and with parallel task agents each
+        spawning a judge, publish-into-the-slot would make every
+        agent's verdicts look stale to the previous agent's callback
+        (only the last spawn would survive).  Sub-agent staleness is
+        instead enforced per-cycle: the batch's items carry this
+        generation's event (``_judge_event``) and the UI identity-
+        checks it at delivery and at Smart-Approvals qualification.
+        Every generation, both kinds, lands in ``_judge_cancel_events``
+        so ``close()`` can abort all in-flight daemons.
         """
         judge = self._ensure_judge()
         if not judge:
@@ -7820,9 +7863,28 @@ class ChatSession:
         # turn has superseded it (this turn always runs before its own
         # approve_tools, so the assignment is in place before any verdict can
         # land).  ``_execute_tools`` re-asserts the same value and handles the
-        # judge-disabled (None) case.
+        # judge-disabled (None) case.  Sub-agent generations skip the slot —
+        # see the ``agent_gate`` docstring note — but every generation joins
+        # ``_judge_cancel_events`` for ``close()``; the set is kept exact by
+        # the daemon's ``done_callback`` (fires in its ``finally``).
         cancel_event = threading.Event()
-        self._judge_cancel_event = cancel_event
+        if not agent_gate:
+            self._judge_cancel_event = cancel_event
+        with self._judge_events_lock:
+            self._judge_cancel_events.add(cancel_event)
+        # Stamp the generation on each judged item: the UI's approval
+        # cycle captures it to bind cached verdicts to THIS spawn
+        # (Smart-Approvals origin check + stale-delivery rejection).
+        # Private key — ``_serialize_approval_items`` uses an explicit
+        # field allowlist, so it never reaches the wire.
+        for it in pending:
+            it["_judge_event"] = cancel_event
+
+        # SessionUIBase accepts the generation alongside the verdict;
+        # other UIs (CLI, eval) keep the bare one-arg call.
+        from turnstone.core.session_ui_base import SessionUIBase
+
+        ui_takes_event = isinstance(self.ui, SessionUIBase)
 
         def _on_verdict(verdict: object) -> None:
             """Callback from the daemon judge thread.
@@ -7831,13 +7893,20 @@ class ChatSession:
             replaced this judge generation.  With ``cancel_on_approval=False``
             (the default) the prior turn's daemon runs to completion and would
             otherwise write a stale verdict — keyed only by ``call_id`` — into
-            the freshly-reset ``_llm_verdicts`` cache; a model that reuses a
+            the freshly-purged ``_llm_verdicts`` cache; a model that reuses a
             ``call_id`` across turns could then ride that stale ``approve`` to
             a wrongful Smart Approval of a *different* call.  Identity-
             comparing the live generation closes that without affecting
             same-turn late delivery (``cancel_on_approval=False`` still
             streams this turn's verdicts, since the session event still
             points at this ``cancel_event``).
+
+            A sub-agent generation (``agent_gate``) has no session-level
+            slot to compare against — concurrent agents each own a live
+            generation.  Its staleness is enforced downstream by
+            ``SessionUIBase.on_intent_verdict``, which identity-checks
+            the delivering generation against the owning cycle's
+            ``judge_event`` before touching any live surface.
 
             Superseded verdicts still reach the audit table via the UI's
             ``on_superseded_intent_verdict`` (persist-only, duck-typed —
@@ -7846,7 +7915,7 @@ class ChatSession:
             the next turn began left ``intent_verdicts`` claiming the judge
             never answered.
             """
-            if self._judge_cancel_event is not cancel_event:
+            if not agent_gate and self._judge_cancel_event is not cancel_event:
                 persist_only = getattr(self.ui, "on_superseded_intent_verdict", None)
                 if persist_only is not None:
                     try:
@@ -7855,15 +7924,27 @@ class ChatSession:
                         log.debug("judge.superseded_verdict_persist_failed", exc_info=True)
                 return
             try:
-                self.ui.on_intent_verdict(verdict.to_dict())  # type: ignore[attr-defined]
+                if ui_takes_event:
+                    self.ui.on_intent_verdict(
+                        verdict.to_dict(),  # type: ignore[attr-defined]
+                        judge_event=cancel_event,
+                    )
+                else:
+                    self.ui.on_intent_verdict(verdict.to_dict())  # type: ignore[attr-defined]
             except Exception:
                 log.debug("judge.verdict_delivery_failed", exc_info=True)
 
+        def _on_done() -> None:
+            with self._judge_events_lock:
+                self._judge_cancel_events.discard(cancel_event)
+
+        convo = conversation if conversation is not None else self.messages
         heuristic_verdicts = judge.evaluate(
             pending,
-            dicts_from_turns(self.messages),  # snapshot — daemon thread must not see mutations
+            dicts_from_turns(convo),  # snapshot — daemon thread must not see mutations
             callback=_on_verdict,
             cancel_event=cancel_event,
+            done_callback=_on_done,
         )
 
         # Attach heuristic verdicts to items for the approval UI
@@ -8402,6 +8483,28 @@ class ChatSession:
     # Phase 2 — approve: display all previews, single prompt (serial)
     # Phase 3 — execute: run approved tools (parallel if multiple)
 
+    def _push_smart_approval_config(self) -> None:
+        """Push the live Smart Approvals config onto the UI before a gate.
+
+        Called just before EVERY ``approve_tools`` — the main loop's and
+        each sub-agent gate's — so a hot-reloaded ``judge.*`` change
+        takes effect on the next batch whichever path gates it.  Only
+        SessionUIBase carries the smart-approval gate (the CLI / eval
+        UIs have their own ``approve_tools``); the isinstance check both
+        skips those and narrows the type for the attribute writes.
+        ``approve_tools`` acts on these only when the judge is enabled
+        AND ``judge.smart_approvals`` is on, so the feature stays inert
+        (human-gated, as today) unless explicitly turned on.
+        """
+        from turnstone.core.session_ui_base import SessionUIBase
+
+        if isinstance(self.ui, SessionUIBase):
+            jc = self._judge_cfg
+            self.ui.smart_approvals_enabled = bool(jc and jc.enabled and jc.smart_approvals)
+            if jc is not None:
+                self.ui.smart_approval_threshold = jc.confidence_threshold
+                self.ui.smart_approval_wait_seconds = jc.timeout
+
     def _execute_tools(
         self, tool_calls: list[dict[str, Any]]
     ) -> tuple[list[tuple[str, str | list[dict[str, Any]]]], str | None]:
@@ -8481,22 +8584,7 @@ class ChatSession:
         judge_cancel = self._evaluate_intent(items)
         self._judge_cancel_event = judge_cancel  # track for close()
 
-        # Push the live Smart Approvals config onto the UI just before the
-        # gate so a hot-reloaded ``judge.*`` change takes effect on this
-        # batch.  Only SessionUIBase carries the smart-approval gate (the
-        # CLI / eval UIs have their own ``approve_tools``); the isinstance
-        # check both skips those and narrows the type for the attribute
-        # writes.  ``approve_tools`` acts on these only when the judge is
-        # enabled AND ``judge.smart_approvals`` is on, so the feature stays
-        # inert (human-gated, as today) unless explicitly turned on.
-        from turnstone.core.session_ui_base import SessionUIBase
-
-        if isinstance(self.ui, SessionUIBase):
-            jc = self._judge_cfg
-            self.ui.smart_approvals_enabled = bool(jc and jc.enabled and jc.smart_approvals)
-            if jc is not None:
-                self.ui.smart_approval_threshold = jc.confidence_threshold
-                self.ui.smart_approval_wait_seconds = jc.timeout
+        self._push_smart_approval_config()
 
         # Phase 2: approve via UI
         self._emit_state("attention")
@@ -14340,7 +14428,37 @@ class ChatSession:
                         is_tool_error = self._tool_error_flags.pop(tc_dict["id"], False)
                     # Tools not in auto_tools require user approval.
                     elif "execute" in prepared:
-                        approved, denial_feedback = self.ui.approve_tools([prepared])
+                        # Run the SAME intent-validation pipeline the main
+                        # loop runs (issue: sub-agent calls previously hit
+                        # the gate judge-blind — no heuristic verdict on
+                        # the card, no LLM verdict, no audit row, and
+                        # Smart Approvals could never clear them).  The
+                        # judge grounds intent in the sub-agent's OWN
+                        # trajectory: its task prompt is the delegation
+                        # contract the operator approved, so "does this
+                        # call serve the task" is the local alignment
+                        # question.  ``agent_gate=True`` keeps this
+                        # generation off the main-loop supersede slot —
+                        # parallel siblings each own theirs — and the
+                        # config push honours a hot judge.* reload per
+                        # gate, exactly like the main loop.
+                        agent_judge_cancel = self._evaluate_intent(
+                            [prepared],
+                            conversation=agent_turns,
+                            agent_gate=True,
+                        )
+                        self._push_smart_approval_config()
+                        try:
+                            approved, denial_feedback = self.ui.approve_tools([prepared])
+                        finally:
+                            # Mirror the main gate's post-decision policy:
+                            # fire the abort only when the operator opted
+                            # into ``judge.cancel_on_approval``; default
+                            # leaves the daemon to finish for the audit
+                            # trail (bounded to this one call).
+                            jc_live = self._judge_cfg
+                            if agent_judge_cancel and jc_live and jc_live.cancel_on_approval:
+                                agent_judge_cancel.set()
                         if not approved and not prepared.get("denied"):
                             # ``approve_tools`` already stamps a SPECIFIC
                             # denial_msg on a denied item (the matched policy

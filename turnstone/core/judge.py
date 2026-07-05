@@ -1058,6 +1058,7 @@ class IntentJudge:
         messages: list[dict[str, Any]],
         callback: Callable[[IntentVerdict], None],
         cancel_event: threading.Event | None = None,
+        done_callback: Callable[[], None] | None = None,
     ) -> list[IntentVerdict]:
         """Evaluate tool calls. Returns heuristic verdicts immediately.
 
@@ -1078,6 +1079,12 @@ class IntentJudge:
                 newer batch supersedes this generation, on session
                 close, and — only when ``cancel_on_approval`` is
                 enabled — as soon as the approval gate resolves.
+            done_callback: Invoked exactly once from the daemon's
+                ``finally`` when this generation finishes — normally,
+                cancelled, or by escape of a delivery error.  ChatSession
+                uses it to retire the generation's cancel event from its
+                live set (parallel task agents each spawn a generation;
+                ``close()`` aborts whatever is still live).
 
         Returns:
             List of heuristic verdicts (one per item), available immediately.
@@ -1103,7 +1110,7 @@ class IntentJudge:
         # Spawn daemon thread for LLM judge
         thread = threading.Thread(
             target=self._run_judge,
-            args=(items, messages, heuristic_verdicts, callback, cancel_event),
+            args=(items, messages, heuristic_verdicts, callback, cancel_event, done_callback),
             daemon=True,
             name="intent-judge",
         )
@@ -1118,6 +1125,7 @@ class IntentJudge:
         heuristic_verdicts: list[IntentVerdict],
         callback: Callable[[IntentVerdict], None],
         cancel_event: threading.Event | None = None,
+        done_callback: Callable[[], None] | None = None,
     ) -> None:
         """Daemon thread: run LLM judge for each item and invoke callback.
 
@@ -1207,6 +1215,11 @@ class IntentJudge:
                     client.close()
             except Exception:
                 log.debug("judge.client_close_failed", exc_info=True)
+            if done_callback is not None:
+                try:
+                    done_callback()
+                except Exception:
+                    log.debug("judge.done_callback_failed", exc_info=True)
 
     def _deliver_fallbacks(
         self,

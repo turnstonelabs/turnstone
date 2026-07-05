@@ -324,8 +324,13 @@ class TerminalUI(SessionUI):
     def on_state_change(self, state: str) -> None:
         pass  # base TerminalUI ignores state changes
 
-    def on_intent_verdict(self, verdict: dict[str, Any]) -> None:
-        """Display LLM judge verdict — called from daemon thread while approval is pending."""
+    def on_intent_verdict(self, verdict: dict[str, Any], judge_event: object | None = None) -> None:
+        """Display LLM judge verdict — called from daemon thread while approval is pending.
+
+        ``judge_event`` (the delivering judge generation) is a
+        cycle-registry concern — the terminal renders every verdict it
+        receives and ignores it.
+        """
         risk = verdict.get("risk_level", "medium")
         rec = verdict.get("recommendation", "review")
         summary = verdict.get("intent_summary", "")
