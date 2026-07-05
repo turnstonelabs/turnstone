@@ -74,8 +74,8 @@ describe("TurnstoneServer", () => {
     await client.send("Hello", "ws1");
 
     const [url, init] = (fetchFn as ReturnType<typeof vi.fn>).mock.calls[0];
-    expect(url).toBe("http://test/v1/api/send");
-    expect(JSON.parse(init.body)).toEqual({ message: "Hello", ws_id: "ws1" });
+    expect(url).toBe("http://test/v1/api/workstreams/ws1/send");
+    expect(JSON.parse(init.body)).toEqual({ message: "Hello" });
   });
 
   it("injects auth header when token provided", async () => {

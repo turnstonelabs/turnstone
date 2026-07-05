@@ -104,7 +104,6 @@ describe("TurnstoneServer attachments", () => {
     const [, init] = (fetchFn as ReturnType<typeof vi.fn>).mock.calls[0];
     expect(JSON.parse(init.body)).toEqual({
       message: "hi",
-      ws_id: "ws-X",
       attachment_ids: ["a1", "a2"],
     });
   });
@@ -117,7 +116,7 @@ describe("TurnstoneServer attachments", () => {
     });
     await client.send("hi", "ws-X");
     const [, init] = (fetchFn as ReturnType<typeof vi.fn>).mock.calls[0];
-    expect(JSON.parse(init.body)).toEqual({ message: "hi", ws_id: "ws-X" });
+    expect(JSON.parse(init.body)).toEqual({ message: "hi" });
   });
 
   it("createWorkstream with attachments sends multipart and auto-generates ws_id", async () => {
