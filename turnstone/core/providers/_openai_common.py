@@ -282,8 +282,21 @@ OPENAI_CAPABILITIES: dict[str, ModelCapabilities] = {
     ),
 }
 
-# Default for unknown models (local servers: vLLM, llama.cpp, etc.)
+# Default for unknown models on the commercial lane.
 OPENAI_DEFAULT = ModelCapabilities()
+
+# The ``openai-compatible`` lane (either API surface) never consults the
+# commercial table above: a local server serves whatever the operator
+# named it (vLLM ``--served-model-name`` is a free string), so a prefix
+# collision with a cloud model id ("gpt-5.5-my-finetune", "o3-distill")
+# would inherit that model's sampling and effort contract, none of which
+# holds for the box actually serving the name.  Every local model gets
+# the plain dataclass defaults — the same fallthrough unmatched names
+# always got — and anything beyond them is declared by the operator on
+# the model definition (capabilities JSON + server_compat), mirroring
+# ``_ANTHROPIC_COMPAT_DEFAULT`` and ``lookup_model_capabilities``'s
+# "no static table for local models" contract.
+OPENAI_COMPAT_DEFAULT = ModelCapabilities()
 
 
 def lookup_openai_capabilities(model: str) -> ModelCapabilities:

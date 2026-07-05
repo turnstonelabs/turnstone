@@ -35,15 +35,18 @@ __all__ = [
     "lookup_model_capabilities",
 ]
 
-# Singleton instances (stateless, safe to share).  ``_openai_provider``
-# is reused for both cloud OpenAI and ``openai-compatible`` with
-# ``api_surface="responses"`` — see the ``create_provider`` docstring.
+# Singleton instances (stateless, safe to share).
+# ``_openai_compat_responses_provider`` serves ``openai-compatible``
+# pinned to ``api_surface="responses"``: same request shape as cloud
+# OpenAI, but compat mode skips the commercial capability table — the
+# whole openai-compatible lane is operator-owned regardless of surface.
 # ``_xai_provider`` is its own singleton because it overrides
 # ``_build_kwargs`` to add ``*_call_output`` includes for xAI's hidden
 # server-tool outputs.
 _provider_lock = threading.Lock()
 _openai_provider = OpenAIResponsesProvider()
 _openai_compat_provider = OpenAIChatCompletionsProvider()
+_openai_compat_responses_provider = OpenAIResponsesProvider(compat=True)
 _xai_provider = XAIProvider()
 _anthropic_provider: LLMProvider | None = None
 _anthropic_compat_provider: LLMProvider | None = None
@@ -76,11 +79,11 @@ def create_provider(
     e.g. vLLM).  ``provider_name="openai"`` always uses the Responses
     API regardless of *api_surface*.
 
-    Note: the ``OpenAIResponsesProvider`` singleton is reused for both
-    cloud OpenAI and ``openai-compatible`` + responses, so its
-    ``provider_name`` reports ``"openai"`` even when serving an
-    openai-compatible config.  Code that needs to distinguish the two
-    must read ``ModelConfig.provider`` and ``server_compat["api_surface"]``
+    Note: ``openai-compatible`` + responses is served by a compat-mode
+    ``OpenAIResponsesProvider`` (operator-owned capabilities, no
+    commercial table), whose ``provider_name`` still reports
+    ``"openai"``.  Code that needs to distinguish the two must read
+    ``ModelConfig.provider`` and ``server_compat["api_surface"]``
     rather than ``provider.provider_name``.
     """
     global _anthropic_provider, _anthropic_compat_provider, _google_provider  # noqa: PLW0603
@@ -93,7 +96,7 @@ def create_provider(
                 f"Unknown api_surface: {api_surface!r}. Supported: {', '.join(_VALID_API_SURFACES)}"
             )
         if normalised == "responses":
-            return _openai_provider
+            return _openai_compat_responses_provider
         return _openai_compat_provider
     if provider_name == "xai":
         return _xai_provider

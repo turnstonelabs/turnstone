@@ -12,10 +12,12 @@ from turnstone.core.lowering import repair_wire_messages
 from turnstone.core.providers._openai import OpenAIProvider
 from turnstone.core.providers._openai_chat import OpenAIChatCompletionsProvider
 from turnstone.core.providers._openai_common import (
+    OPENAI_COMPAT_DEFAULT,
     apply_cache_retention,
     apply_temperature_and_effort,
     apply_tool_search,
     format_citations,
+    lookup_openai_capabilities,
     sanitize_messages,
 )
 from turnstone.core.providers._protocol import (
@@ -1671,6 +1673,25 @@ class TestProviderFactory:
         assert openai_prov.provider_name == "openai"
         assert compat.provider_name == "openai-compatible"
 
+    def test_openai_compatible_never_consults_commercial_registry(self) -> None:
+        """Local-lane model ids are operator-chosen strings — a prefix
+        collision with a cloud model id must not inherit that model's
+        sampling/effort contract, on either API surface.  Cloud lookups
+        are unaffected."""
+        from turnstone.core.providers import create_provider
+
+        compat = create_provider("openai-compatible")
+        compat_responses = create_provider("openai-compatible", api_surface="responses")
+        for name in ("gpt-5.5-my-finetune", "o3-distill", "deepseek-v4-flash", ""):
+            assert compat.get_capabilities(name) is OPENAI_COMPAT_DEFAULT
+            assert compat_responses.get_capabilities(name) is OPENAI_COMPAT_DEFAULT
+        # The commercial lane keeps resolving its registry rows — through
+        # the factory AND through the non-compat class default.
+        cloud = create_provider("openai").get_capabilities("gpt-5.5")
+        assert cloud.default_reasoning_effort == "medium"
+        assert "xhigh" in cloud.reasoning_effort_values
+        assert create_provider("openai") is not compat_responses
+
     def test_create_provider_returns_singleton(self) -> None:
         from turnstone.core.providers import create_provider
 
@@ -2084,7 +2105,7 @@ class TestOpenAIParameterGating:
 
     def test_gpt5_no_temperature_has_reasoning_effort(self) -> None:
         """GPT-5 base: no temperature, reasoning_effort sent."""
-        caps = self.provider.get_capabilities("gpt-5")
+        caps = lookup_openai_capabilities("gpt-5")
         kwargs: dict[str, Any] = {}
         apply_temperature_and_effort(kwargs, caps, temperature=0.7, reasoning_effort="high")
         assert "temperature" not in kwargs
@@ -2093,7 +2114,7 @@ class TestOpenAIParameterGating:
     def test_gpt51_temperature_when_effort_none(self) -> None:
         """GPT-5.1: temperature only when reasoning_effort='none'; the
         declared "none" level is forwarded explicitly (knob = off)."""
-        caps = self.provider.get_capabilities("gpt-5.1")
+        caps = lookup_openai_capabilities("gpt-5.1")
         kwargs: dict[str, Any] = {}
         apply_temperature_and_effort(kwargs, caps, temperature=0.7, reasoning_effort="none")
         assert kwargs["temperature"] == 0.7
@@ -2101,7 +2122,7 @@ class TestOpenAIParameterGating:
 
     def test_gpt51_no_temperature_when_reasoning_active(self) -> None:
         """GPT-5.1: no temperature when reasoning is active."""
-        caps = self.provider.get_capabilities("gpt-5.1")
+        caps = lookup_openai_capabilities("gpt-5.1")
         kwargs: dict[str, Any] = {}
         apply_temperature_and_effort(kwargs, caps, temperature=0.7, reasoning_effort="high")
         assert "temperature" not in kwargs
@@ -2110,7 +2131,7 @@ class TestOpenAIParameterGating:
     def test_o_series_no_temperature_but_effort_forwarded(self) -> None:
         """O-series: no temperature; low/medium/high ARE valid effort
         values (all o-series except o1-mini) and the knob reaches them."""
-        caps = self.provider.get_capabilities("o3")
+        caps = lookup_openai_capabilities("o3")
         kwargs: dict[str, Any] = {}
         apply_temperature_and_effort(kwargs, caps, temperature=0.7, reasoning_effort="medium")
         assert "temperature" not in kwargs
@@ -2118,14 +2139,14 @@ class TestOpenAIParameterGating:
 
     def test_o1_mini_has_no_effort_control(self) -> None:
         """o1-mini is the one o-series model without reasoning_effort."""
-        caps = self.provider.get_capabilities("o1-mini")
+        caps = lookup_openai_capabilities("o1-mini")
         kwargs: dict[str, Any] = {}
         apply_temperature_and_effort(kwargs, caps, temperature=0.7, reasoning_effort="medium")
         assert "reasoning_effort" not in kwargs
 
     def test_gpt5_pro_unsupported_effort_falls_back(self) -> None:
         """GPT-5 pro only supports 'high'; unsupported values fall back to default."""
-        caps = self.provider.get_capabilities("gpt-5-pro")
+        caps = lookup_openai_capabilities("gpt-5-pro")
         kwargs: dict[str, Any] = {}
         apply_temperature_and_effort(kwargs, caps, temperature=0.7, reasoning_effort="medium")
         assert "temperature" not in kwargs
@@ -2133,14 +2154,14 @@ class TestOpenAIParameterGating:
 
     def test_gpt5_pro_supported_effort_passes_through(self) -> None:
         """GPT-5 pro accepts 'high' directly."""
-        caps = self.provider.get_capabilities("gpt-5-pro")
+        caps = lookup_openai_capabilities("gpt-5-pro")
         kwargs: dict[str, Any] = {}
         apply_temperature_and_effort(kwargs, caps, temperature=0.7, reasoning_effort="high")
         assert kwargs["reasoning_effort"] == "high"
 
     def test_gpt54_1m_context_and_effort(self) -> None:
         """GPT-5.4: 1M context, temperature when effort=none, xhigh supported."""
-        caps = self.provider.get_capabilities("gpt-5.4")
+        caps = lookup_openai_capabilities("gpt-5.4")
         assert caps.context_window == 1050000
         kwargs: dict[str, Any] = {}
         apply_temperature_and_effort(kwargs, caps, temperature=0.7, reasoning_effort="none")
@@ -2153,7 +2174,7 @@ class TestOpenAIParameterGating:
 
     def test_gpt54_pro_no_temperature_always_reasoning(self) -> None:
         """GPT-5.4 pro: no temperature, medium/high/xhigh only."""
-        caps = self.provider.get_capabilities("gpt-5.4-pro")
+        caps = lookup_openai_capabilities("gpt-5.4-pro")
         assert caps.context_window == 1050000
         kwargs: dict[str, Any] = {}
         apply_temperature_and_effort(kwargs, caps, temperature=0.7, reasoning_effort="low")
@@ -2162,7 +2183,7 @@ class TestOpenAIParameterGating:
 
     def test_gpt55_1m_context_and_effort(self) -> None:
         """GPT-5.5: 1M context, temperature when effort=none, xhigh supported."""
-        caps = self.provider.get_capabilities("gpt-5.5")
+        caps = lookup_openai_capabilities("gpt-5.5")
         assert caps.context_window == 1050000
         assert caps.supports_tool_search is True
         assert caps.supports_vision is True
@@ -2177,7 +2198,7 @@ class TestOpenAIParameterGating:
 
     def test_gpt55_pro_no_temperature_always_reasoning(self) -> None:
         """GPT-5.5 pro: no temperature, medium/high/xhigh only."""
-        caps = self.provider.get_capabilities("gpt-5.5-pro")
+        caps = lookup_openai_capabilities("gpt-5.5-pro")
         assert caps.context_window == 1050000
         assert caps.supports_tool_search is True
         kwargs: dict[str, Any] = {}
@@ -2793,19 +2814,19 @@ class TestOpenAIWebSearch:
 
     def test_search_model_capability(self) -> None:
         """Search models should have supports_web_search=True."""
-        caps = self.provider.get_capabilities("gpt-5-search-api")
+        caps = lookup_openai_capabilities("gpt-5-search-api")
         assert caps.supports_web_search is True
 
     def test_non_search_model_no_web_search(self) -> None:
         """Regular models should not have supports_web_search."""
-        caps = self.provider.get_capabilities("gpt-5")
+        caps = lookup_openai_capabilities("gpt-5")
         assert caps.supports_web_search is False
-        caps = self.provider.get_capabilities("gpt-5.2")
+        caps = lookup_openai_capabilities("gpt-5.2")
         assert caps.supports_web_search is False
 
     def test_apply_web_search_injects_options(self) -> None:
         """For search models, web_search_options should be added to kwargs."""
-        caps = self.provider.get_capabilities("gpt-5-search-api")
+        caps = lookup_openai_capabilities("gpt-5-search-api")
         kwargs: dict[str, Any] = {"model": "gpt-5-search-api"}
         tools: list[dict[str, Any]] = [
             {"type": "function", "function": {"name": "bash", "description": "Run bash"}},
@@ -2822,7 +2843,7 @@ class TestOpenAIWebSearch:
 
     def test_apply_web_search_no_op_for_regular_models(self) -> None:
         """For non-search models, no web_search_options, tools unchanged."""
-        caps = self.provider.get_capabilities("gpt-5")
+        caps = lookup_openai_capabilities("gpt-5")
         kwargs: dict[str, Any] = {"model": "gpt-5"}
         tools: list[dict[str, Any]] = [
             {"type": "function", "function": {"name": "web_search", "description": "Search"}},
@@ -2833,7 +2854,7 @@ class TestOpenAIWebSearch:
 
     def test_apply_web_search_returns_none_when_only_web_search(self) -> None:
         """If web_search was the only tool, return None after removing it."""
-        caps = self.provider.get_capabilities("gpt-5-search-api")
+        caps = lookup_openai_capabilities("gpt-5-search-api")
         kwargs: dict[str, Any] = {}
         tools: list[dict[str, Any]] = [
             {"type": "function", "function": {"name": "web_search", "description": "Search"}},
@@ -2847,7 +2868,7 @@ class TestOpenAIWebSearch:
         toolset) must NOT gain native search — the option stays off and the
         tools pass through untouched.  Contrast test_apply_web_search_with_
         no_tools, which covers the tool-less utility-call case."""
-        caps = self.provider.get_capabilities("gpt-5-search-api")
+        caps = lookup_openai_capabilities("gpt-5-search-api")
         assert caps.supports_web_search is True
         kwargs: dict[str, Any] = {"model": "gpt-5-search-api"}
         tools: list[dict[str, Any]] = [
@@ -2922,7 +2943,7 @@ class TestOpenAIWebSearch:
         visibility set, coordinator toolset, or a tool-less utility call —
         must not gain native search at the provider layer.
         """
-        caps = self.provider.get_capabilities("gpt-5-search-api")
+        caps = lookup_openai_capabilities("gpt-5-search-api")
         kwargs: dict[str, Any] = {}
         result = self.provider._apply_web_search(kwargs, caps, None)
         assert "web_search_options" not in kwargs
@@ -2930,7 +2951,7 @@ class TestOpenAIWebSearch:
 
     def test_apply_web_search_replaces_client_def(self) -> None:
         """With the client def present, it is filtered and the option set."""
-        caps = self.provider.get_capabilities("gpt-5-search-api")
+        caps = lookup_openai_capabilities("gpt-5-search-api")
         kwargs: dict[str, Any] = {}
         tools = [{"type": "function", "function": {"name": "web_search"}}]
         result = self.provider._apply_web_search(kwargs, caps, tools)
@@ -2956,6 +2977,10 @@ class TestOpenAIWebSearch:
                         "function": {"name": "web_search", "description": "Search"},
                     },
                 ],
+                # The local lane resolves no commercial rows — the search
+                # model's capabilities ride in explicitly, as the session
+                # layer would pass them.
+                capabilities=lookup_openai_capabilities("gpt-5-search-api"),
             )
         )
         call_kwargs = client.chat.completions.create.call_args[1]
@@ -3376,22 +3401,18 @@ class TestAnthropicToolSearch:
 
 
 class TestOpenAIToolSearch:
-    """Test OpenAI provider tool search injection."""
+    """Test OpenAI tool search injection (registry rows + shared helper)."""
 
-    @pytest.fixture()
-    def provider(self):
-        return OpenAIProvider()
-
-    def test_tool_search_capability_on_gpt54(self, provider):
-        caps = provider.get_capabilities("gpt-5.4")
+    def test_tool_search_capability_on_gpt54(self):
+        caps = lookup_openai_capabilities("gpt-5.4")
         assert caps.supports_tool_search is True
 
-    def test_tool_search_not_supported_on_gpt5(self, provider):
-        caps = provider.get_capabilities("gpt-5")
+    def test_tool_search_not_supported_on_gpt5(self):
+        caps = lookup_openai_capabilities("gpt-5")
         assert caps.supports_tool_search is False
 
-    def test_apply_tool_search_marks_deferred(self, provider):
-        caps = provider.get_capabilities("gpt-5.4")
+    def test_apply_tool_search_marks_deferred(self):
+        caps = lookup_openai_capabilities("gpt-5.4")
         tools = [
             {"type": "function", "function": {"name": "bash", "description": "Run commands"}},
             {
@@ -3407,16 +3428,16 @@ class TestOpenAIToolSearch:
         # slack tool deferred
         assert result[1]["defer_loading"] is True
 
-    def test_apply_tool_search_no_op_without_deferred(self, provider):
-        caps = provider.get_capabilities("gpt-5.4")
+    def test_apply_tool_search_no_op_without_deferred(self):
+        caps = lookup_openai_capabilities("gpt-5.4")
         tools = [
             {"type": "function", "function": {"name": "bash", "description": "Run commands"}},
         ]
         result = apply_tool_search(caps, tools, None)
         assert result == tools
 
-    def test_apply_tool_search_no_op_on_unsupported_model(self, provider):
-        caps = provider.get_capabilities("gpt-5")
+    def test_apply_tool_search_no_op_on_unsupported_model(self):
+        caps = lookup_openai_capabilities("gpt-5")
         tools = [
             {"type": "function", "function": {"name": "bash", "description": "Run commands"}},
         ]
@@ -3484,13 +3505,12 @@ class TestVisionCapabilities:
         assert caps.supports_vision is False
 
     def test_openai_commercial_supports_vision(self) -> None:
-        provider = OpenAIProvider()
         for model in ("gpt-5", "gpt-5-mini", "gpt-5.4", "o3", "o4-mini"):
-            caps = provider.get_capabilities(model)
+            caps = lookup_openai_capabilities(model)
             assert caps.supports_vision is True, f"{model} should support vision"
 
     def test_openai_default_no_vision(self) -> None:
-        """Unknown models (local servers) default to no vision."""
+        """Local-lane models (any name) default to no vision."""
         provider = OpenAIProvider()
         caps = provider.get_capabilities("some-local-model")
         assert caps.supports_vision is False
