@@ -33,8 +33,18 @@ def cleanup_session_ui(ws: Workstream) -> None:
         ws.session.cancel()
     ui = ws.ui
     if ui is not None:
-        if hasattr(ui, "_approval_event"):
-            ui._approval_result = False, None  # type: ignore[attr-defined]
+        if hasattr(ui, "resolve_all_approvals"):
+            # Deny + unblock EVERY live approval cycle — with parallel
+            # task agents several gate threads can be parked at once,
+            # and each must wake with its own (denied) result.
+            with contextlib.suppress(Exception):
+                ui.resolve_all_approvals(False, "Workstream closed")
+        elif hasattr(ui, "_approval_event"):
+            # Pre-cycle external SessionUI impls: the old single-slot
+            # contract.  Without this kick their gate thread stays
+            # parked on a workstream that no longer exists.
+            if hasattr(ui, "_approval_result"):
+                ui._approval_result = (False, None)
             ui._approval_event.set()
         if hasattr(ui, "_fg_event"):
             ui._fg_event.set()

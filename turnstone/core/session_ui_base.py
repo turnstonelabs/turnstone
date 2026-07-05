@@ -51,6 +51,80 @@ _DEFAULT_LISTENER_QUEUE_MAX = 500
 # recalls honestly as "not retained" rather than a fabricated 0-step card.
 _AGENT_TRAJECTORY_CAP = 256
 
+# How many resolved-cycle decisions to remember (call_id → decision) so a
+# late LLM verdict — the run-to-completion judge can deliver seconds after
+# its gate resolved — still lands with the decision the operator actually
+# took.  Bounded because call_ids of resolved cycles accrue forever on a
+# long-running workstream.  Invariant for the cap: it must exceed the
+# number of call_ids the session can resolve inside one judge-deadline
+# window (the daemon's delivery bound), or an eviction could orphan a
+# still-in-flight verdict as forever-"pending" in the audit table.  A
+# smart-approvals storm across parallel task agents resolves tens of
+# calls per second at the extreme; 1024 covers minutes of that, and the
+# entries are (str, (str, Event)) — negligible memory.
+_RECENT_DECISION_CAP = 1024
+
+
+class ApprovalCycle:
+    """One in-flight human-approval round on a workstream.
+
+    The approval gate used to be a per-UI singleton — one pending card,
+    one ``threading.Event``, one result slot.  Parallel task agents
+    broke that: each sub-agent thread runs its own gate, so several
+    rounds are now live at once and each needs its own wait/result/
+    verdict bookkeeping.  ``approve_tools`` registers one of these per
+    human-gated batch in ``_approval_cycles`` (insertion-ordered =
+    oldest-first); HTTP resolvers route a decision to exactly one cycle
+    by ``cycle_id`` / member ``call_id`` (or the oldest, for legacy
+    selector-less clients).
+
+    Lifecycle: created + registered by the gate thread, resolved
+    exactly once by :meth:`SessionUIBase.resolve_approval` (double
+    resolution is a guarded no-op), unregistered by the gate thread
+    after its wait returns.  ``event``/``result`` are per-cycle so one
+    decision can never leak onto a concurrent sibling round — the
+    cross-approval hazard the singleton design had.
+    """
+
+    __slots__ = (
+        "call_ids",
+        "card",
+        "cycle_id",
+        "decision",
+        "event",
+        "items",
+        "judge_event",
+        "pending_verdicts",
+        "resolved",
+        "result",
+    )
+
+    def __init__(
+        self,
+        items: list[dict[str, Any]],
+        card: dict[str, Any],
+        judge_event: threading.Event | None,
+    ) -> None:
+        self.cycle_id: str = card.get("cycle_id", "") or uuid.uuid4().hex
+        self.items = items
+        self.card = card
+        self.call_ids: set[str] = {it.get("call_id", "") for it in items if it.get("call_id")}
+        # The judge generation that evaluated this batch — identity-
+        # compared against the delivering daemon's cancel event so a
+        # stale generation (a prior turn's run-to-completion daemon
+        # whose provider reused call_ids) can never satisfy THIS
+        # cycle's Smart-Approvals wait or park verdicts on it.
+        self.judge_event: threading.Event | None = judge_event
+        self.event = threading.Event()
+        self.result: tuple[bool, str | None] = (False, None)
+        self.resolved = False
+        self.decision = ""
+        # LLM verdicts that fired during this round, awaiting the
+        # operator's decision stamp (was the UI-global
+        # ``_pending_verdicts`` list).
+        self.pending_verdicts: list[dict[str, Any]] = []
+
+
 # Sub-agent scope, PER-THREAD.  A task agent's progress chatter reaches the UI as
 # ``on_info`` lines ("[task done] N chars", a tool's "fetched N chars") that
 # carry no call_id — they can't nest under the task card and would escape to the
@@ -304,13 +378,20 @@ class SessionUIBase:
         )
         # (Sub-agent ``on_info`` suppression is per-thread via the module-level
         # ``_agent_scope_var`` contextvar — no instance field.)
-        # Approval blocking — the worker thread calls approve_tools
-        # which waits on _approval_event; the /approve endpoint sets
-        # it via resolve_approval.
-        self._approval_event = threading.Event()
-        self._approval_result: tuple[bool, str | None] = (False, None)
-        # Pending approval shape — re-sent on SSE reconnect so a user
-        # switching tabs still sees the prompt.
+        # Approval blocking — each gate thread (main loop, or a parallel
+        # task-agent thread) registers an :class:`ApprovalCycle` here and
+        # waits on the CYCLE's own event; the /approve endpoint routes a
+        # decision to exactly one cycle via resolve_approval.  Insertion-
+        # ordered (dict) = oldest-first, which is the resolution order for
+        # legacy selector-less approvals.  Guarded by ``_ws_lock``.
+        self._approval_cycles: dict[str, ApprovalCycle] = {}
+        # Legacy single-slot view of the OLDEST live cycle's card — many
+        # read-only consumers (cancel gating, dashboard booleans, history
+        # ``awaiting_approval``) only need "is something pending"; they
+        # keep working unchanged against this view.  Maintained under
+        # ``_ws_lock`` by ``_refresh_pending_approval_view`` on every
+        # register/unregister.  Multi-cycle-aware surfaces (SSE replay,
+        # dashboard detail, approve routing) use ``_approval_cycles``.
         self._pending_approval: dict[str, Any] | None = None
         self.auto_approve = False
         self.auto_approve_tools: set[str] = set()
@@ -433,14 +514,26 @@ class SessionUIBase:
         # ``None`` until the first broadcast so the first emit always
         # fires.
         self._last_broadcast_activity: tuple[str, str] | None = None
-        # Verdicts from the LLM intent judge — tracked so
-        # ``resolve_approval`` can stamp a ``user_decision`` onto every
-        # verdict that fired during this approval round.
-        self._pending_verdicts: list[dict[str, Any]] = []
-        self._last_verdict_decision: str = ""
+        # Decisions of recently-resolved cycles (call_id → decision
+        # string) so a late LLM verdict — the run-to-completion daemon
+        # can deliver after its gate resolved — is stamped with what the
+        # operator actually chose.  Replaces the single
+        # ``_last_verdict_decision`` string, which under concurrent
+        # cycles stamped sibling B's late verdicts with sibling A's
+        # decision.  FIFO-bounded; guarded by ``_ws_lock``.
+        self._recent_decisions: collections.OrderedDict[str, tuple[str, threading.Event | None]] = (
+            collections.OrderedDict()
+        )
         # Verdict cache for SSE reconnect replay (tab switching
         # shouldn't lose the judge's final call on a just-run tool).
         self._llm_verdicts: dict[str, dict[str, Any]] = {}
+        # Judge-generation origin per cached verdict: ``call_id`` →
+        # ``id(cancel_event)`` of the daemon that delivered it.  The
+        # Smart-Approvals qualification loop compares this against the
+        # batch's own generation so a stale daemon's verdict (reused
+        # call_id across turns) can satisfy neither the wait nor the
+        # auto-approve bar.  Evicted in lockstep with ``_llm_verdicts``.
+        self._verdict_origins: dict[str, int] = {}
         # Signalled by ``on_intent_verdict`` whenever an LLM verdict
         # lands in ``_llm_verdicts``; Smart Approvals (``approve_tools``)
         # waits on it for the verdicts of the calls it's about to gate.
@@ -834,18 +927,114 @@ class SessionUIBase:
     # Approval blocking gates
     # ------------------------------------------------------------------
 
-    def _reset_approval_cycle(self) -> None:
-        """Clear per-round verdict state at the start of a new approval.
+    def _purge_round_verdicts(
+        self,
+        call_ids: set[str],
+        keep_origin: threading.Event | None = None,
+    ) -> None:
+        """Evict stale verdict state for the call_ids entering a new gate.
 
-        Subclasses call this at the top of ``approve_tools`` so late
-        verdicts from the previous round can't leak their
-        ``user_decision`` onto the next round's verdicts, and the SSE
-        reconnect replay cache doesn't serve stale tool verdicts to a
-        client that just switched tabs mid-approval.
+        Successor of the old whole-cache ``_reset_approval_cycle``: with
+        concurrent cycles a full clear wiped a live sibling's verdicts
+        mid-wait, so eviction is now scoped to the entering batch.  It
+        protects the same two things the reset did — a provider that
+        reuses call_ids across turns can't have a PRIOR round's cached
+        verdict pre-satisfy this round's Smart-Approvals wait, and the
+        reconnect-replay cache can't serve that stale verdict onto the
+        new round's card — without touching any other cycle's state.
+
+        ``keep_origin`` is the entering batch's own judge generation
+        (its cancel event): a cached verdict THAT generation delivered
+        survives the purge.  The judge daemon is spawned before the
+        gate is entered, so a fast judge can deliver ahead of this
+        purge (the policy DB round-trip sits in between) — evicting its
+        verdict would stall the Smart-Approvals wait to its full budget
+        and send an already-cleared batch to a human.  Prior-round
+        decisions for a reused call_id are evicted unconditionally:
+        this round has not been decided yet, whatever generation ruled
+        before.
         """
         with self._ws_lock:
-            self._last_verdict_decision = ""
-            self._llm_verdicts.clear()
+            for cid in call_ids:
+                if keep_origin is None or self._verdict_origins.get(cid) != id(keep_origin):
+                    self._llm_verdicts.pop(cid, None)
+                    self._verdict_origins.pop(cid, None)
+                self._recent_decisions.pop(cid, None)
+
+    # ------------------------------------------------------------------
+    # Approval-cycle registry
+    # ------------------------------------------------------------------
+
+    def _refresh_pending_approval_view(self) -> None:
+        """Point the legacy ``_pending_approval`` slot at the oldest cycle.
+
+        Caller must hold ``_ws_lock``.  Boolean-ish consumers (cancel
+        gating, dashboard ``pending_approval`` flags, history
+        ``awaiting_approval``) read the slot directly; they see "some
+        cycle is live", which is exactly the question they ask.
+        """
+        first = next(iter(self._approval_cycles.values()), None)
+        self._pending_approval = first.card if first is not None else None
+
+    def _register_approval_cycle(self, cycle: ApprovalCycle) -> None:
+        with self._ws_lock:
+            self._approval_cycles[cycle.cycle_id] = cycle
+            self._refresh_pending_approval_view()
+
+    def _unregister_approval_cycle(self, cycle: ApprovalCycle) -> None:
+        with self._ws_lock:
+            self._approval_cycles.pop(cycle.cycle_id, None)
+            self._refresh_pending_approval_view()
+
+    def _select_cycle_locked(
+        self,
+        *,
+        cycle_id: str | None = None,
+        call_id: str | None = None,
+    ) -> ApprovalCycle | None:
+        """Pick the cycle a decision addresses.  Caller holds ``_ws_lock``.
+
+        Precedence: explicit ``cycle_id`` → member ``call_id`` → the
+        oldest unresolved cycle (legacy clients that never learned to
+        send a selector: CLI wrappers, channel adapters, old tabs).
+        Only unresolved cycles are eligible — a second click racing the
+        gate thread's unregister must not re-resolve.
+        """
+        if cycle_id:
+            cycle = self._approval_cycles.get(cycle_id)
+            return cycle if cycle is not None and not cycle.resolved else None
+        if call_id:
+            for cycle in self._approval_cycles.values():
+                if call_id in cycle.call_ids and not cycle.resolved:
+                    return cycle
+            return None
+        return next((c for c in self._approval_cycles.values() if not c.resolved), None)
+
+    def find_approval_cycle(
+        self,
+        *,
+        cycle_id: str | None = None,
+        call_id: str | None = None,
+    ) -> dict[str, Any] | None:
+        """Public card lookup for HTTP handlers (pre-resolve inspection).
+
+        Returns the matched cycle's ``approve_request`` card (the dict
+        also used for SSE replay), or ``None``.  Same selector
+        precedence as resolution, so "which cycle will this decision
+        hit" and "which cycle did it hit" can never disagree.
+        """
+        with self._ws_lock:
+            cycle = self._select_cycle_locked(cycle_id=cycle_id, call_id=call_id)
+            return cycle.card if cycle is not None else None
+
+    def pending_approval_cards(self) -> list[dict[str, Any]]:
+        """All live cycles' ``approve_request`` cards, oldest first.
+
+        SSE fresh-connect/reconnect replay yields each so a returning
+        tab repaints EVERY outstanding prompt, not just the newest.
+        """
+        with self._ws_lock:
+            return [c.card for c in self._approval_cycles.values()]
 
     def resolve_approval(
         self,
@@ -854,61 +1043,128 @@ class SessionUIBase:
         *,
         always: bool = False,
         timeout: bool = False,
-    ) -> None:
-        """Unblock a pending approval with the caller's decision.
+        call_id: str | None = None,
+        cycle_id: str | None = None,
+    ) -> str | None:
+        """Unblock ONE pending approval cycle with the caller's decision.
 
-        Broadcasts ``approval_resolved`` so every connected tab can
-        dismiss its prompt modal in sync (e.g. desktop dismisses when
-        phone approves). Updates ``user_decision`` on every LLM
-        intent-verdict that fired during this approval round — the
-        audit trail reflects what the user actually chose.
+        Routes to a single :class:`ApprovalCycle` — by ``cycle_id``, by
+        member ``call_id``, or (selector-less legacy callers: CLI
+        wrappers, channel adapters, cancel/timeout paths) the oldest
+        unresolved cycle.  Returns the resolved ``cycle_id`` or ``None``
+        when nothing matched — a second click racing the gate thread, or
+        a stale selector.  One decision can no longer fan out to every
+        parked gate: each cycle owns its event/result, which is the
+        whole fix for the cross-approval hazard the singleton slot had.
+
+        Broadcasts ``approval_resolved`` (now carrying ``cycle_id`` +
+        ``call_ids``) so every connected tab dismisses the RIGHT prompt
+        in sync. Updates ``user_decision`` on every LLM intent-verdict
+        that fired during this cycle's round — the audit trail reflects
+        what the user actually chose for THESE calls.
 
         ``always`` reports whether the resolving caller asked for
         "Approve + Always" (the tool name has been added to
         ``auto_approve_tools`` upstream by the HTTP handler — this
         method only echoes the intent on the SSE event so peer tabs
-        can label their resolved-status pill correctly).  Keyword-only
-        + default ``False`` so the four pre-existing callers (cancel,
-        timeout, channel adapters) compile unchanged.
+        can label their resolved-status pill correctly).
 
         ``timeout`` flips the persisted ``user_decision`` from
         ``"denied"`` to ``"timeout"`` so the audit trail can
         distinguish an active user denial from a passive
-        approval-timeout expiry — the feedback string carries the
-        same information today but operators querying on the
-        ``user_decision`` column alone could not tell them apart.
-        Mutually exclusive with ``approved=True`` (a timeout is a
-        passive denial); the combination raises ``ValueError`` so a
-        future caller can't accidentally ship a row whose audit
-        column says ``"timeout"`` while the SSE event reports
-        ``approved=True``.
+        approval-timeout expiry.  Mutually exclusive with
+        ``approved=True`` (a timeout is a passive denial); the
+        combination raises ``ValueError``.
         """
         if timeout and approved:
             raise ValueError("resolve_approval: timeout=True is incompatible with approved=True")
         decision_str = "timeout" if timeout else ("approved" if approved else "denied")
-        # Swap-and-clear + set decision under lock to avoid racing
-        # with the daemon judge thread's ``on_intent_verdict`` appends.
+        # Select + mark resolved + swap verdicts out under ONE lock
+        # acquisition so a concurrent resolver can't double-resolve and
+        # the judge daemon's ``on_intent_verdict`` can't append to a
+        # list we're about to stamp.
         with self._ws_lock:
-            pending = self._pending_verdicts
-            self._pending_verdicts = []
-            self._last_verdict_decision = decision_str
+            cycle = self._select_cycle_locked(cycle_id=cycle_id, call_id=call_id)
+            if cycle is None:
+                return None
+            cycle.resolved = True
+            cycle.decision = decision_str
+            cycle.result = (approved, feedback)
+            pending = cycle.pending_verdicts
+            cycle.pending_verdicts = []
+            # Remember the decision per call_id — tagged with the
+            # cycle's judge generation — so this round's late verdicts
+            # (run-to-completion daemon) stamp correctly even after the
+            # cycle is unregistered, while a STALE generation's late
+            # verdict under a reused call_id can be told apart and
+            # stamped ``superseded`` instead of stealing this decision.
+            for cid in cycle.call_ids:
+                self._recent_decisions[cid] = (decision_str, cycle.judge_event)
+                self._recent_decisions.move_to_end(cid)
+            while len(self._recent_decisions) > _RECENT_DECISION_CAP:
+                self._recent_decisions.popitem(last=False)
         if pending:
             self._persist_verdict_decisions(pending, decision_str)
-        self._approval_result = (approved, feedback)
+        sorted_call_ids = sorted(cycle.call_ids)
         self._enqueue(
             {
                 "type": "approval_resolved",
                 "approved": approved,
                 "feedback": feedback or "",
                 "always": bool(always),
+                "cycle_id": cycle.cycle_id,
+                "call_ids": sorted_call_ids,
             }
         )
         # Kind-specific cross-stream broadcast — ConsoleCoordinatorUI
         # overrides to push onto the cluster bus so a coord parent's
         # tree UI clears the pending-approval pill in lockstep with
         # the actual decision. Stage 3 Step 4.
-        self._broadcast_approval_resolved(approved, feedback, always=always)
-        self._approval_event.set()
+        self._broadcast_approval_resolved(
+            approved,
+            feedback,
+            always=always,
+            cycle_id=cycle.cycle_id,
+            call_ids=tuple(sorted_call_ids),
+        )
+        cycle.event.set()
+        return cycle.cycle_id
+
+    def resolve_all_approvals(
+        self,
+        approved: bool,
+        feedback: str | None = None,
+        *,
+        timeout: bool = False,
+    ) -> int:
+        """Resolve EVERY live cycle with one decision; returns the count.
+
+        For the sweep paths where the operator's intent addresses the
+        workstream, not a specific batch: cancel ("stop everything"),
+        session close, worker-recovery.  Loops :meth:`resolve_approval`
+        oldest-first so per-cycle bookkeeping (verdict stamps, SSE
+        dismissals, per-cycle events) runs identically to a targeted
+        resolution.
+
+        Deliberately optimistic about concurrency: the scan re-runs
+        after every attempt, so a cycle that a gate timeout (or another
+        resolver) claims between our scan and our
+        :meth:`resolve_approval` call is simply not counted — it was
+        resolved either way — and the rescan picks up cycles that
+        REGISTER mid-sweep, which a snapshot-then-resolve loop would
+        miss.  Termination: every iteration either resolves its target
+        or observes it already resolved; resolved cycles never re-enter
+        the scan.
+        """
+        count = 0
+        while True:
+            with self._ws_lock:
+                target = next((c for c in self._approval_cycles.values() if not c.resolved), None)
+                target_id = target.cycle_id if target is not None else None
+            if target_id is None:
+                return count
+            if self.resolve_approval(approved, feedback, timeout=timeout, cycle_id=target_id):
+                count += 1
 
     @staticmethod
     def _persist_verdict_decisions(
@@ -949,16 +1205,33 @@ class SessionUIBase:
         6. Heuristic verdict persistence (one row per ``_heuristic_verdict``
            item) + ``_record_judge_metric`` hook (subclass-overridden to
            feed the node's or console's Prometheus collector).
-        7. Emit the ``approve_request`` and block on ``_approval_event``
-           up to ``_APPROVAL_WAIT_TIMEOUT``.
+        7. Register an :class:`ApprovalCycle`, emit its ``approve_request``
+           card, and block on the CYCLE's event up to
+           ``_APPROVAL_WAIT_TIMEOUT``.
 
         ``__budget_override__`` is interactive-only today (coord
         workstreams don't have token budgets), but the carve-out check
         is cheap (``any(...)`` over pending) and is a no-op on coord;
         kept unconditional so a future coord-skill path picks it up
         for free.
+
+        Reentrant by design: several gate threads (main loop + parallel
+        task agents) run this body concurrently, each against its own
+        :class:`ApprovalCycle`.  Shared state is touched only under
+        ``_ws_lock`` and scoped to this batch's call_ids.
         """
-        self._reset_approval_cycle()
+        # The batch's judge generation, stamped by ``_evaluate_intent`` —
+        # one event per spawn, shared by every item in the batch.  Read
+        # before the purge so the purge can spare verdicts this very
+        # generation already delivered.
+        judge_event = next(
+            (it.get("_judge_event") for it in items if it.get("_judge_event") is not None),
+            None,
+        )
+        self._purge_round_verdicts(
+            {it.get("call_id", "") for it in items if it.get("call_id")},
+            keep_origin=judge_event,
+        )
 
         # Early-paint the pending tool batch — BEFORE the tool-policy lookup,
         # the Smart Approvals verdict wait (``judge.smart_approvals`` parks here
@@ -1163,8 +1436,9 @@ class SessionUIBase:
         # (mixed-path case: policy allowed some, others still prompt)
         # carry their auto_approve_reason directly; items still pending
         # operator decision carry ``"pending"`` and get updated by
-        # ``resolve_approval`` on close.  ``_pending_verdicts`` only
-        # tracks the latter — auto-approved verdicts are already final.
+        # ``resolve_approval`` on close.  The cycle's ``pending_verdicts``
+        # only tracks the latter — auto-approved verdicts are already
+        # final.
         heuristic_verdicts: list[dict[str, Any]] = []
         pending_verdicts: list[dict[str, Any]] = []
         for item in items:
@@ -1183,21 +1457,6 @@ class SessionUIBase:
             self._record_judge_metric(hv)
         self._persist_intent_verdicts_bulk(heuristic_verdicts, default_tier="heuristic")
 
-        with self._ws_lock:
-            # Normally a plain assignment: in the async flow the LLM judge
-            # is slower than this setup so ``_pending_verdicts`` is still
-            # the empty list ``_reset_approval_cycle`` left it.  But Smart
-            # Approvals deliberately waits for verdicts upstream, so by here
-            # ``on_intent_verdict`` has already parked the LLM verdicts of
-            # the human-pending siblings; carry them across the reassignment
-            # so ``resolve_approval`` can stamp their ``user_decision``
-            # (without this they'd be dropped and stuck at ``"pending"``).
-            # Smart-approved calls were pulled out + stamped already by
-            # ``_finalize_smart_verdicts``, so they don't reappear here.
-            pending_cids = {hv.get("call_id") for hv in pending_verdicts}
-            early_llm = [v for v in self._pending_verdicts if v.get("call_id") in pending_cids]
-            self._pending_verdicts = pending_verdicts + early_llm
-
         # Record any items the policy block already auto-approved
         # before falling through to the prompt — without this the
         # mixed-policy-then-prompt path leaves the policy bypass
@@ -1212,18 +1471,62 @@ class SessionUIBase:
         # Approvals the gate already waited for every verdict, so they are
         # present and this is false (no spurious "judge working" spinner /
         # poll); in the normal async flow they haven't arrived yet → true.
+        #
+        # The card carries a ``cycle_id`` so clients and HTTP resolvers
+        # address THIS round among concurrent siblings (parallel task
+        # agents run their own gates through this same body).
+        cycle_id = uuid.uuid4().hex
+        card: dict[str, Any] = {
+            "type": "approve_request",
+            "cycle_id": cycle_id,
+            "items": self._serialize_approval_items(items),
+        }
+        cycle = ApprovalCycle(items, card, judge_event)
         with self._ws_lock:
+            # Evict any cached verdict for this batch's call_ids that a
+            # STALE judge generation delivered into the purge→register
+            # window (delivery is concurrent with this gate; the
+            # entry-time purge can't see arrivals that land during the
+            # policy round-trip or the Smart-Approvals wait).  By
+            # registration time these call_ids belong to THIS
+            # generation — a wrong-generation entry would blank the
+            # "judge analysing" cue below, be adopted into
+            # ``pending_verdicts`` for decision-stamping, and replay
+            # onto the new card on reconnect.  Once the cycle is
+            # registered, ``on_intent_verdict``'s owner check keeps
+            # such deliveries out on its own.
+            if judge_event is not None:
+                for cid in {it.get("call_id", "") for it in items if it.get("call_id")}:
+                    if cid in self._llm_verdicts and self._verdict_origins.get(cid) != id(
+                        judge_event
+                    ):
+                        del self._llm_verdicts[cid]
+                        self._verdict_origins.pop(cid, None)
             judge_pending = any(
                 it.get("_heuristic_verdict") and it.get("call_id", "") not in self._llm_verdicts
                 for it in items
             )
-        self._approval_event.clear()
-        self._pending_approval = {
-            "type": "approve_request",
-            "items": self._serialize_approval_items(items),
-            "judge_pending": judge_pending,
-        }
-        self._enqueue(self._pending_approval)
+            card["judge_pending"] = judge_pending
+            # Park this round's verdicts on the cycle: the heuristic rows
+            # just persisted as ``"pending"``, plus any LLM verdicts that
+            # arrived EARLY (the Smart-Approvals wait runs before the
+            # cycle exists, so ``on_intent_verdict`` cached them with no
+            # cycle to park on).  ``resolve_approval`` stamps the final
+            # ``user_decision`` on exactly this set.  Smart-approved
+            # calls were pulled out + stamped by
+            # ``_finalize_smart_verdicts`` already and their cached dicts
+            # carry a non-"pending" decision, so the early sweep skips
+            # them.
+            pending_cids = {hv.get("call_id") for hv in pending_verdicts}
+            early_llm = [
+                v
+                for cid, v in self._llm_verdicts.items()
+                if cid in pending_cids and v.get("user_decision", "pending") == "pending"
+            ]
+            cycle.pending_verdicts = pending_verdicts + early_llm
+            self._approval_cycles[cycle.cycle_id] = cycle
+            self._refresh_pending_approval_view()
+        self._enqueue(card)
         # Cross-stream broadcast — push the items via the cluster bus
         # so a coord parent's tree UI can render the inline approve/deny
         # block without waiting for a bulk fetch. Without this, the
@@ -1231,13 +1534,12 @@ class SessionUIBase:
         # to ATTENTION fires upstream BEFORE approve_tools runs (see
         # session.py:_emit_state("attention") preceding ui.approve_tools),
         # so a bulk fetch landing in the ~50-200ms window between
-        # _emit_state and this point sees ``_pending_approval=None``
-        # and returns ``pending_approval_detail: null``. The 5s TTL
-        # then locks the coord row on a "loading" placeholder until
-        # the next state event triggers a refresh — which never comes
-        # while parked on _approval_event.wait. The push path
-        # eliminates the race.
-        self._broadcast_approve_request(self._pending_approval)
+        # _emit_state and this point sees no live cycle and returns
+        # ``pending_approval_detail: null``. The 5s TTL then locks the
+        # coord row on a "loading" placeholder until the next state
+        # event triggers a refresh — which never comes while parked on
+        # the cycle's event.wait. The push path eliminates the race.
+        self._broadcast_approve_request(card)
         # Smart Approvals waited for the LLM verdicts BEFORE this card was
         # built, so on_intent_verdict already fanned out their
         # ``intent_verdict`` events while no card existed — a live client
@@ -1248,19 +1550,27 @@ class SessionUIBase:
         # empty here) and when the feature is off.
         if self.smart_approvals_enabled:
             self._replay_pending_verdicts(items)
-        if not self._approval_event.wait(timeout=self._APPROVAL_WAIT_TIMEOUT):
-            # Approval timed out (e.g., user disconnected). Deny via
-            # resolve_approval so verdicts and state are updated consistently.
-            # Feedback string derives from ``_APPROVAL_WAIT_TIMEOUT`` so the
-            # text follows the constant if the timeout knob moves.
-            log.warning("Approval timed out for ws_id=%s", self.ws_id)
-            self.resolve_approval(
-                False,
-                f"Approval timed out after {self._APPROVAL_WAIT_TIMEOUT}s",
-                timeout=True,
-            )
-        self._pending_approval = None
-        approved, feedback = self._approval_result
+        try:
+            if not cycle.event.wait(timeout=self._APPROVAL_WAIT_TIMEOUT):
+                # Approval timed out (e.g., user disconnected). Deny via
+                # resolve_approval so verdicts and state are updated
+                # consistently — targeted at THIS cycle so a sibling gate
+                # timing out can't deny someone else's round.  Feedback
+                # string derives from ``_APPROVAL_WAIT_TIMEOUT`` so the
+                # text follows the constant if the timeout knob moves.
+                log.warning("Approval timed out for ws_id=%s", self.ws_id)
+                self.resolve_approval(
+                    False,
+                    f"Approval timed out after {self._APPROVAL_WAIT_TIMEOUT}s",
+                    timeout=True,
+                    cycle_id=cycle.cycle_id,
+                )
+        finally:
+            # Gate thread owns the cycle's lifecycle end-to-end; the
+            # resolver only flips its state.  Unregister even if the
+            # wait raises so a dead gate can't strand a zombie card.
+            self._unregister_approval_cycle(cycle)
+        approved, feedback = cycle.result
 
         if not approved:
             denial_msg = "Denied by user"
@@ -1336,6 +1646,16 @@ class SessionUIBase:
         self._await_llm_verdicts(needed, self.smart_approval_wait_seconds)
 
         threshold = self.smart_approval_threshold
+        # This batch's judge generation — every cached verdict must have
+        # been delivered by THIS spawn's daemon.  A verdict of a stale
+        # generation (prior turn's run-to-completion daemon + a provider
+        # that reuses call_ids) fails qualification and the batch goes to
+        # a human.  ``None`` when the caller never ran the judge (legacy
+        # tests) — origin check skipped, matching the old behavior.
+        expected_gen = next(
+            (it.get("_judge_event") for it in candidates if it.get("_judge_event") is not None),
+            None,
+        )
         qualified: dict[str, dict[str, Any]] = {}
         with self._ws_lock:
             for it in candidates:
@@ -1343,12 +1663,17 @@ class SessionUIBase:
                 v = self._llm_verdicts.get(cid)
                 # Require a COMPLETED LLM verdict — tier "llm", not the
                 # "llm_fallback" error carry-over ("heuristic" never lands in
-                # this cache) — recommending "approve" at/above threshold.
+                # this cache) — recommending "approve" at/above threshold,
+                # delivered by this batch's own judge generation.
                 if (
                     v is None
                     or v.get("tier") != "llm"
                     or v.get("recommendation") != "approve"
                     or self._verdict_confidence(v) < threshold
+                    or (
+                        expected_gen is not None
+                        and self._verdict_origins.get(cid) != id(expected_gen)
+                    )
                 ):
                     return pending  # one fails → none of the batch auto-approves
                 hv = it.get("_heuristic_verdict") or {}
@@ -1412,15 +1737,17 @@ class SessionUIBase:
     def _finalize_smart_verdicts(self, smart_ids: set[str]) -> None:
         """Stamp ``smart_approval`` on the LLM verdicts of auto-approved calls.
 
-        The verdicts arrived during ``_await_llm_verdicts`` — before the
-        call was tagged auto-approved — so ``on_intent_verdict`` parked
-        them in ``_pending_verdicts`` with ``user_decision="pending"``.
-        Pull them out (so a human-pending sibling's ``resolve_approval``
-        can't overwrite the reason), stamp the cached dict in place (the
-        reconnect-replay payload reflects the final decision), and UPDATE
-        the persisted rows.  The matching heuristic verdict is stamped by
-        ``approve_tools``'s own persistence path via the ``auto_approved``
-        tag set just before this call.
+        The verdicts arrived during ``_await_llm_verdicts`` — before any
+        cycle existed for this round (the gate registers its
+        :class:`ApprovalCycle` only after the wait, and a fully
+        smart-approved batch never registers one at all) — so they live
+        only in the ``_llm_verdicts`` cache.  Stamp the cached dict in
+        place (the reconnect-replay payload reflects the final decision,
+        and the non-"pending" ``user_decision`` keeps every later parking
+        sweep away from it) and UPDATE the persisted rows.  The matching
+        heuristic verdict is stamped by ``approve_tools``'s own
+        persistence path via the ``auto_approved`` tag set just before
+        this call.
         """
         stamped: list[dict[str, Any]] = []
         with self._ws_lock:
@@ -1429,10 +1756,6 @@ class SessionUIBase:
                 if v is not None:
                     v["user_decision"] = AutoApproveReason.SMART_APPROVAL
                     stamped.append(v)
-            if self._pending_verdicts:
-                self._pending_verdicts = [
-                    v for v in self._pending_verdicts if v.get("call_id") not in smart_ids
-                ]
         if stamped:
             self._persist_verdict_decisions(stamped, AutoApproveReason.SMART_APPROVAL)
 
@@ -1467,14 +1790,28 @@ class SessionUIBase:
     # place.
     _APPROVAL_WAIT_TIMEOUT = 3600
 
-    def on_intent_verdict(self, verdict: dict[str, Any]) -> None:
+    def on_intent_verdict(
+        self,
+        verdict: dict[str, Any],
+        judge_event: object | None = None,
+    ) -> None:
         """Deliver an LLM intent-judge verdict to the frontend + persist.
 
         Caches under ``_ws_lock`` for SSE reconnect replay, persists
         the row to storage, and either records the caller's
         ``user_decision`` immediately (if the approval already
-        resolved) or parks the verdict in ``_pending_verdicts`` for
-        ``resolve_approval`` to stamp on close.
+        resolved) or parks the verdict on its owning
+        :class:`ApprovalCycle` for ``resolve_approval`` to stamp.
+
+        ``judge_event`` is the delivering daemon's cancel event —
+        its identity names the judge GENERATION.  When the verdict's
+        call_id belongs to a live cycle evaluated by a DIFFERENT
+        generation (a provider that reuses call_ids across turns +
+        a prior turn's run-to-completion daemon still delivering),
+        the verdict is persisted for audit only: no cache write, no
+        cond notify, no park — a stale ``approve`` must never satisfy
+        the new round's Smart-Approvals wait.  ``None`` (legacy/test
+        callers) skips the generation check.
 
         When the verdict arrives for a call_id that ``approve_tools``
         already auto-approved (the LLM judge is async and can fire
@@ -1486,15 +1823,34 @@ class SessionUIBase:
         """
         call_id = verdict.get("call_id", "")
         auto_reason = ""
+        decision = ""
         if call_id:
             with self._ws_lock:
+                owner = next(
+                    (c for c in self._approval_cycles.values() if call_id in c.call_ids),
+                    None,
+                )
+                if (
+                    owner is not None
+                    and judge_event is not None
+                    and owner.judge_event is not None
+                    and owner.judge_event is not judge_event
+                ):
+                    # Stale generation aimed at a LIVE cycle — the one
+                    # collision that could smart-approve the wrong call.
+                    stale = dict(verdict)
+                    stale.setdefault("user_decision", "superseded")
+                    self._persist_intent_verdict(stale)
+                    return
                 if (
                     len(self._llm_verdicts) >= self._LLM_VERDICT_CACHE_MAX
                     and call_id not in self._llm_verdicts
                 ):
                     oldest_key = next(iter(self._llm_verdicts))
                     del self._llm_verdicts[oldest_key]
+                    self._verdict_origins.pop(oldest_key, None)
                 self._llm_verdicts[call_id] = verdict
+                self._verdict_origins[call_id] = id(judge_event)
                 # Wake any Smart Approvals wait parked on this call's
                 # verdict (``_verdict_cond`` shares ``_ws_lock``, so the
                 # notify is valid here and the waiter re-checks its
@@ -1516,43 +1872,72 @@ class SessionUIBase:
         # SSE listeners). Stage 3 Step 4.
         self._broadcast_intent_verdict(verdict)
         self._persist_intent_verdict(verdict)
-        # Decision check + either queue or flag-for-persist happen
-        # under ONE lock acquisition so resolve_approval can't swap-
-        # and-clear _pending_verdicts between our read and our
-        # append. Without this: decide "no decision yet" → release
-        # lock → resolve_approval swaps the list + sets decision →
-        # we re-acquire and append to the fresh (empty) list; verdict
-        # sits queued until the next round, gets stamped with the
-        # WRONG decision.  Storage UPDATE happens outside the lock
-        # on the already-resolved path — no contention with other
-        # ws-scoped work.
         # If ``auto_reason`` was stamped above, the verdict already
         # carries the final ``user_decision`` for this row.  Neither
-        # path below applies: appending to ``_pending_verdicts`` would
-        # cause ``resolve_approval`` (on the manual-approval sibling
-        # in a mixed batch) to overwrite the auto-reason with
+        # path below applies: parking on a cycle would cause
+        # ``resolve_approval`` (on the manual-approval sibling in a
+        # mixed batch) to overwrite the auto-reason with
         # ``"approved"``/``"denied"``/``"timeout"``; the
         # ``_persist_verdict_decisions`` immediate-stamp path would
-        # overwrite it the same way from a prior cycle's decision.
+        # overwrite it the same way from the round's decision.
         # Skip both so the audit trail keeps the auto-approve reason.
         if auto_reason:
             return
         with self._ws_lock:
-            decision = self._last_verdict_decision
-            # Skip the append when the verdict already carries a final
-            # ``user_decision``.  Smart Approvals' ``_finalize_smart_verdicts``
-            # runs on the worker thread the moment ``_await_llm_verdicts``
-            # wakes — which is this method's ``notify_all`` (above), fired
-            # BEFORE this append and with an unlocked ``_persist_intent_verdict``
-            # in between.  So finalize can stamp ``smart_approval`` on this
-            # same cached dict and clear ``_pending_verdicts`` before we get
-            # here; without this guard we'd re-park the already-final verdict,
-            # and the NEXT round's ``resolve_approval`` would overwrite its
-            # audit row with approved/denied/timeout.  (The reverse ordering —
-            # append before finalize — is handled by finalize's own
-            # ``_pending_verdicts`` filter.)
-            if not decision and verdict.get("user_decision", "pending") == "pending":
-                self._pending_verdicts.append(verdict)
+            # Park-or-stamp under ONE lock acquisition so
+            # ``resolve_approval`` can't interleave: it marks the cycle
+            # resolved AND records the per-call decision atomically
+            # under this same lock, so exactly one of the two branches
+            # below sees the verdict — parked pre-decision (the resolve
+            # stamps it from ``pending_verdicts``) or stamped
+            # post-decision (from ``_recent_decisions``).  A two-step
+            # check-then-park reintroduces the audit-corruption race
+            # the old single-slot code fixed.
+            #
+            # Skip both when the verdict already carries a final
+            # ``user_decision`` — Smart Approvals'
+            # ``_finalize_smart_verdicts`` runs on the worker thread
+            # the moment ``_await_llm_verdicts`` wakes (this method's
+            # ``notify_all`` above) and can stamp ``smart_approval``
+            # on this same cached dict before we get here; re-parking
+            # it would let a later resolution overwrite the audit row.
+            # No live owner and no decision (pre-cycle Smart-Approvals
+            # arrival) → cache-only: the gate's registration sweep
+            # picks pending verdicts up from ``_llm_verdicts`` when
+            # the cycle is created.
+            if verdict.get("user_decision", "pending") == "pending":
+                owner = next(
+                    (
+                        c
+                        for c in self._approval_cycles.values()
+                        if call_id in c.call_ids and not c.resolved
+                    ),
+                    None,
+                )
+                if owner is not None:
+                    owner.pending_verdicts.append(verdict)
+                else:
+                    recent = self._recent_decisions.get(call_id)
+                    if recent is not None:
+                        prior_decision, origin = recent
+                        if (
+                            judge_event is not None
+                            and origin is not None
+                            and origin is not judge_event
+                        ):
+                            # The recorded decision belongs to a
+                            # DIFFERENT generation's round under a
+                            # reused call_id — the round this verdict
+                            # was judging resolved and fell out of
+                            # ``_recent_decisions`` before delivery.
+                            # Stamping it with the other round's
+                            # decision would claim the operator ruled
+                            # on THIS verdict; ``superseded`` is the
+                            # honest terminal state (same vocabulary
+                            # as :meth:`on_superseded_intent_verdict`).
+                            decision = "superseded"
+                        else:
+                            decision = prior_decision
         if decision:
             self._persist_verdict_decisions([verdict], decision)
 
@@ -1717,18 +2102,18 @@ class SessionUIBase:
         except Exception:
             log.debug("Failed to persist intent verdict", exc_info=True)
 
-    def serialize_pending_approval_detail(self) -> dict[str, Any] | None:
-        """Build the inline approval payload for dashboard projection.
+    def serialize_pending_approval_details(self) -> list[dict[str, Any]]:
+        """Per-cycle inline-approval payloads, EVERY live cycle, oldest first.
 
-        Merges :attr:`_pending_approval` items with the per-call_id
-        LLM verdict cache so a coordinator's children-tree row can
-        render inline approve/deny buttons + judge-verdict pill
-        without making a separate per-child round-trip. Returns
-        ``None`` when no approval is pending.
+        Merges each cycle's card items with the per-call_id LLM verdict
+        cache so a coordinator's children-tree row can render inline
+        approve/deny buttons + judge-verdict pill without a separate
+        per-child round-trip; one entry per live cycle (parallel task
+        agents each gate their own batch), each addressable by its
+        ``cycle_id``.  Empty when nothing is pending.
 
-        The shape mirrors the inline tool-call info already broadcast
-        via the ``approve_request`` SSE event but adds a
-        ``judge_verdict`` sibling per item (looked up from
+        The per-entry shape mirrors the ``approve_request`` SSE event
+        but adds a ``judge_verdict`` sibling per item (looked up from
         :attr:`_llm_verdicts`, the cache seeded by
         :meth:`on_intent_verdict`). Heuristic verdicts already carried
         on items are forwarded as ``heuristic_verdict``.
@@ -1743,56 +2128,60 @@ class SessionUIBase:
         assumption, project the verdict to a safe subset before
         embedding (or move the field behind ``admin.cluster.inspect``).
         """
-        pending = self._pending_approval
-        if pending is None:
-            return None
-        items = pending.get("items") or []
-        if not items:
-            return None
-        call_ids = [item.get("call_id", "") for item in items]
-        # Snapshot verdict references under lock, deepcopy after
-        # release. Writers (``on_intent_verdict`` daemon judge
-        # thread + ``_reset_approval_cycle`` worker thread) only
-        # ASSIGN entries, never mutate them in place — so a snapped
-        # reference is stable after the lock drops, and the
-        # subsequent deepcopy can run lock-free even though
-        # verdict dicts carry list-typed ``evidence`` that
-        # downstream callers might mutate. This keeps the lock
-        # window O(N items) without paying the deepcopy cost
-        # (O(verdict size)) under contention with the per-token
-        # write path that also holds ``_ws_lock``.
         with self._ws_lock:
-            verdict_refs = {
-                cid: self._llm_verdicts[cid]
-                for cid in call_ids
-                if cid and cid in self._llm_verdicts
-            }
-        verdicts = {cid: copy.deepcopy(v) for cid, v in verdict_refs.items()}
-        serialized: list[dict[str, Any]] = []
-        for item in items:
-            cid = item.get("call_id", "")
-            serialized.append(
+            cards = [(c.cycle_id, c.card) for c in self._approval_cycles.values()]
+            # Snapshot verdict references under lock, deepcopy after
+            # release. Writers (``on_intent_verdict`` daemon judge
+            # thread) only ASSIGN entries, never mutate them in place —
+            # so a snapped reference is stable after the lock drops, and
+            # the subsequent deepcopy can run lock-free even though
+            # verdict dicts carry list-typed ``evidence`` that
+            # downstream callers might mutate. This keeps the lock
+            # window O(N items) without paying the deepcopy cost
+            # (O(verdict size)) under contention with the per-token
+            # write path that also holds ``_ws_lock``.
+            verdict_refs = dict(self._llm_verdicts)
+        verdicts: dict[str, dict[str, Any]] = {}
+        details: list[dict[str, Any]] = []
+        for cycle_id, card in cards:
+            items = card.get("items") or []
+            if not items:
+                continue
+            call_ids = [item.get("call_id", "") for item in items]
+            serialized: list[dict[str, Any]] = []
+            for item in items:
+                cid = item.get("call_id", "")
+                if cid in verdict_refs and cid not in verdicts:
+                    verdicts[cid] = copy.deepcopy(verdict_refs[cid])
+                serialized.append(
+                    {
+                        "call_id": cid,
+                        "header": item.get("header", ""),
+                        "preview": item.get("preview", ""),
+                        "func_name": item.get("func_name", ""),
+                        "approval_label": item.get("approval_label", ""),
+                        "needs_approval": item.get("needs_approval", False),
+                        "error": item.get("error"),
+                        # Card items are already wire-shaped by
+                        # ``_serialize_approval_items`` — the heuristic
+                        # verdict rides under ``heuristic_verdict``.
+                        "heuristic_verdict": item.get("heuristic_verdict"),
+                        "judge_verdict": verdicts.get(cid),
+                    }
+                )
+            # Primary call_id = first non-empty in list order (matches the
+            # 409 response shape from ``make_approve_handler`` so the UI
+            # can render the same identifier the server thinks is current).
+            primary = next((cid for cid in call_ids if cid), "")
+            details.append(
                 {
-                    "call_id": cid,
-                    "header": item.get("header", ""),
-                    "preview": item.get("preview", ""),
-                    "func_name": item.get("func_name", ""),
-                    "approval_label": item.get("approval_label", ""),
-                    "needs_approval": item.get("needs_approval", False),
-                    "error": item.get("error"),
-                    "heuristic_verdict": item.get("verdict"),
-                    "judge_verdict": verdicts.get(cid),
+                    "cycle_id": cycle_id,
+                    "call_id": primary,
+                    "judge_pending": bool(card.get("judge_pending", False)),
+                    "items": serialized,
                 }
             )
-        # Primary call_id = first non-empty in list order (matches the
-        # 409 response shape from ``make_approve_handler`` so the UI
-        # can render the same identifier the server thinks is current).
-        primary = next((cid for cid in call_ids if cid), "")
-        return {
-            "call_id": primary,
-            "judge_pending": bool(pending.get("judge_pending", False)),
-            "items": serialized,
-        }
+        return details
 
     # ---------------------------------------------------------------
     # Auto-approve visibility — shared by interactive + coord UIs
@@ -2640,12 +3029,17 @@ class SessionUIBase:
         feedback: str | None = None,  # noqa: ARG002 — hook stub
         *,
         always: bool = False,  # noqa: ARG002 — hook stub
+        cycle_id: str = "",  # noqa: ARG002 — hook stub
+        call_ids: tuple[str, ...] = (),  # noqa: ARG002 — hook stub
     ) -> None:
         """Fan an ``approval_resolved`` decision out to the kind's transport.
 
         Default: no-op. ``ConsoleCoordinatorUI`` overrides to push to
         the cluster bus so the parent coordinator's tree UI can clear
         the pending-approval pill in sync with the actual decision.
+        ``cycle_id`` / ``call_ids`` name WHICH cycle resolved — with
+        parallel task agents several are live, and a bare decision
+        would clear the wrong block.
         """
 
     def _broadcast_approve_request(self, detail: dict[str, Any]) -> None:  # noqa: ARG002 — hook stub

@@ -6,7 +6,7 @@ surface is asymmetric on the interactive side and the asymmetry is
 load-bearing — see ``InteractiveAdapter`` docstring.
 
 Uses ``WebUI``'s per-UI listener set for ``cleanup_ui`` — the same
-hooks (``_approval_event`` / ``_fg_event`` + the ``ws_closed``
+hooks (``resolve_all_approvals`` / ``_fg_event`` + the ``ws_closed``
 broadcast) the old ``WorkstreamManager._cleanup_ui`` touched.
 """
 
