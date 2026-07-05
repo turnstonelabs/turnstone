@@ -432,6 +432,12 @@ function handleClusterEvent(data) {
     if (typeof _sklcInvalidateModelsCache === "function") {
       _sklcInvalidateModelsCache();
     }
+    if (typeof _sklcScheduleEffortLadder === "function") {
+      // Re-annotate from the fresh cache — an edited model's ladder
+      // would otherwise stay stale until the next keystroke in the
+      // launch-config form.
+      _sklcScheduleEffortLadder();
+    }
     if (
       typeof _adminTab !== "undefined" &&
       _adminTab === "models" &&

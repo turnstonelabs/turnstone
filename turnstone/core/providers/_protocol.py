@@ -161,6 +161,22 @@ def resolve_reasoning_effort(caps: ModelCapabilities, reasoning_effort: str) -> 
     return None
 
 
+def flat_effort_suppressed(caps: ModelCapabilities) -> bool:
+    """True when the flat ``reasoning_effort`` param must NOT be sent.
+
+    A set ``caps.effort_param`` declares the chat-template channel
+    (``chat_template_kwargs`` via ``merge_reasoning_template_kwargs``) as
+    the one this server consumes for graded effort, so the flat param is
+    suppressed: sending both would 400 on servers that reject unknown
+    top-level fields and can disagree with an operator ``server_compat``
+    pin on tolerant ones.  Single source of the rule — the request path
+    (``apply_temperature_and_effort``) and the effort-ladder projection
+    must apply the same predicate or the UI annotates behavior the wire
+    doesn't have.
+    """
+    return bool(caps.effort_param)
+
+
 def reasoning_template_kwargs(
     caps: ModelCapabilities,
     reasoning_effort: str,

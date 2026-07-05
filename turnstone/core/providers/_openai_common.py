@@ -18,6 +18,7 @@ from turnstone.core.providers._protocol import (
     ModelCapabilities,
     UsageInfo,
     _lookup_capabilities,
+    flat_effort_suppressed,
     resolve_reasoning_effort,
 )
 
@@ -296,15 +297,13 @@ def apply_temperature_and_effort(
 ) -> None:
     """Conditionally add temperature and reasoning_effort to *kwargs*.
 
-    Chat Completions API version — reasoning effort is a flat parameter.
-    A set ``caps.effort_param`` declares the chat-template channel
-    (``chat_template_kwargs`` via ``merge_reasoning_template_kwargs``) as
-    the one this server consumes, so the flat param is suppressed: sending
-    both would 400 on servers that reject unknown top-level fields and
-    can disagree with an operator ``server_compat`` pin on tolerant ones.
+    Chat Completions API version — reasoning effort is a flat parameter,
+    suppressed when a declared ``caps.effort_param`` claims the
+    chat-template channel instead (see ``flat_effort_suppressed`` for the
+    rationale; the effort-ladder projection shares the same predicate).
     """
     apply_temperature(kwargs, caps, temperature, reasoning_effort)
-    if caps.effort_param:
+    if flat_effort_suppressed(caps):
         return
     effort = resolve_reasoning_effort(caps, reasoning_effort)
     if effort:

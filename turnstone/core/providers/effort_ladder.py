@@ -41,6 +41,7 @@ from turnstone.core.providers._anthropic import (
 )
 from turnstone.core.providers._protocol import (
     ModelCapabilities,
+    flat_effort_suppressed,
     reasoning_template_kwargs,
     resolve_reasoning_effort,
 )
@@ -53,11 +54,14 @@ KNOB_VALUES: tuple[str, ...] = ("none", "minimal", "low", "medium", "high", "xhi
 # Providers that serve requests through OpenAIChatCompletionsProvider (or
 # a subclass) and therefore inherit BOTH channels: chat_template_kwargs
 # injection via _finalize_extra_body AND the flat reasoning_effort param
-# via apply_temperature_and_effort.  google/xai belong here because their
-# providers subclass the chat provider — an operator override that sets
-# thinking_mode/effort_param on such a model changes real requests, and
-# the ladder must mirror that.
-_CHAT_LANES = frozenset({"openai-compatible", "google", "xai"})
+# via apply_temperature_and_effort.  google belongs here because
+# GoogleProvider subclasses the chat provider — an operator override that
+# sets thinking_mode/effort_param on such a model changes real requests,
+# and the ladder must mirror that.  xai does NOT: XAIProvider subclasses
+# OpenAIResponsesProvider, whose surface ignores extra_body entirely, so
+# template overrides can never change an xai request and the ladder
+# projects xai through the flat channel only (fallthrough in _effective).
+_CHAT_LANES = frozenset({"openai-compatible", "google"})
 
 
 def effort_ladder(
@@ -122,7 +126,9 @@ def _effective(
             # Responses surface: native reasoning, extra_body ignored.
             return resolve_reasoning_effort(caps, knob) or "default"
         return _effective_local(provider_name, caps, knob)
-    # openai commercial (Responses provider by default).
+    # openai / xai — Responses-surface providers: reasoning rides the
+    # native ``reasoning={"effort": ...}`` param and extra_body is
+    # ignored, so the flat channel is the whole story.
     return resolve_reasoning_effort(caps, knob) or "default"
 
 
@@ -151,11 +157,12 @@ def _effective_local(provider_name: str, caps: ModelCapabilities, knob: str) -> 
         parts.append("on" if updates[caps.thinking_param] else "off")
     if caps.effort_param and caps.effort_param in updates:
         parts.append(str(updates[caps.effort_param]))
-    # Chat-completions providers also send the flat param when no
-    # effort_param declares the template channel (suppression rule in
-    # apply_temperature_and_effort).  The anthropic-compatible lane has
-    # no flat param.
-    if provider_name != "anthropic-compatible" and not caps.effort_param:
+    # Chat-completions providers also send the flat param unless a
+    # declared effort_param claims the template channel — the same
+    # ``flat_effort_suppressed`` predicate ``apply_temperature_and_effort``
+    # applies at request time.  The anthropic-compatible lane has no
+    # flat param.
+    if provider_name != "anthropic-compatible" and not flat_effort_suppressed(caps):
         flat = resolve_reasoning_effort(caps, knob)
         if flat:
             parts.append(flat)

@@ -131,6 +131,34 @@ class TestFlatParamLanes:
         assert responses["medium"] == "medium"
         assert responses["none"] == "default"
 
+    def test_xai_projects_flat_only(self) -> None:
+        """grok-4.3 declares values (none/low/medium/high, default low);
+        off-list knob positions snap to the default."""
+        eff = _as_map(effort_ladder_for_model("xai", "grok-4.3", None))
+        assert eff["none"] == "default"  # resolve_ never forwards "none"
+        assert eff["low"] == "low"
+        assert eff["high"] == "high"
+        assert eff["xhigh"] == eff["max"] == "low"
+
+    def test_xai_ignores_template_overrides(self) -> None:
+        """XAIProvider subclasses OpenAIResponsesProvider, which drops
+        extra_body — a thinking_mode/effort_param override cannot change
+        an xai request, so it must not change the ladder either."""
+        eff = _as_map(
+            effort_ladder_for_model(
+                "xai",
+                "grok-4.3",
+                {
+                    "thinking_mode": "manual",
+                    "thinking_param": "enable_thinking",
+                    "effort_param": "reasoning_effort",
+                },
+            )
+        )
+        assert eff["none"] == "default"  # not "off" — there is no toggle
+        assert eff["medium"] == "medium"
+        assert all("+" not in v and v not in ("on", "off") for v in eff.values())
+
     def test_anthropic_effort_applies_even_with_thinking_mode_none(self) -> None:
         """output_config gates on supports_effort alone at request time."""
         caps = ModelCapabilities(

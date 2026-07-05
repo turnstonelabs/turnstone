@@ -1921,15 +1921,17 @@ async def list_available_models(request: Request) -> JSONResponse:
         }
         try:
             # ``capabilities`` is a JSON string (sa.Text column) with
-            # ``server_compat`` namespaced inside — parse and split the
-            # same way the model_registry loader does.
+            # ``server_compat`` namespaced inside — parse it the same way
+            # the model_registry loader does.  Read (don't pop) the
+            # namespace: the ladder's field filter drops non-capability
+            # keys, so the parsed dict can stay unmutated.
             caps: dict[str, Any] = {}
             raw_caps = r.get("capabilities")
             if raw_caps:
                 parsed = json.loads(raw_caps)
                 if isinstance(parsed, dict):
                     caps = parsed
-            server_compat = caps.pop("server_compat", {})
+            server_compat = caps.get("server_compat", {})
             api_surface = (
                 server_compat.get("api_surface", "") if isinstance(server_compat, dict) else ""
             )
@@ -11666,7 +11668,14 @@ async def admin_effort_ladder(request: Request) -> JSONResponse:
     except Exception:
         # Garbage override values (wrong types for capability fields)
         # surface as a clean 400 rather than a 500 — the form's raw
-        # JSON is operator-typed.
+        # JSON is operator-typed.  Log it: the same catch would
+        # otherwise mask a genuine resolver bug as a silent 400.
+        log.warning(
+            "models.effort_ladder_resolve_failed provider=%s model=%s",
+            provider,
+            model,
+            exc_info=True,
+        )
         return JSONResponse({"error": "could not resolve capabilities"}, status_code=400)
     return JSONResponse({"provider": provider, "model": model, "ladder": ladder})
 
