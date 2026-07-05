@@ -1311,6 +1311,23 @@ def test_redact_credentials_runtime_smoke() -> None:
         + 'const a = redactCredentials(\'{"Authorization": "Bearer canstillseethis"}\');\n'
         + "if (!a.includes('[REDACTED:secret]')) "
         + "throw new Error('authorization JSON redact failed: ' + a);\n"
+        + "// Single-quote JSON (Python dict repr / JS object literal)\n"
+        + "const sq = redactCredentials(\"{'Authorization': 'Bearer canstillseethis'}\");\n"
+        + "if (!sq.includes('[REDACTED:secret]')) "
+        + "throw new Error('single-quote authorization redact failed: ' + sq);\n"
+        + "// mongodb+srv connection string (Atlas SRV)\n"
+        + "const ms = redactCredentials('mongodb+srv://u:s3cretpw@cluster.mongodb.net/db');\n"
+        + "if (!ms.includes('[REDACTED:password]')) "
+        + "throw new Error('mongodb+srv redact failed: ' + ms);\n"
+        + "// lowercase bearer scheme (RFC 7235 case-insensitive)\n"
+        + "const lb = redactCredentials('authorization: bearer "
+        + "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.sig12345');\n"
+        + "if (!lb.includes('[REDACTED:api_key]')) "
+        + "throw new Error('lowercase bearer redact failed: ' + lb);\n"
+        + "// api_key= assignment redacts the whole token, not a garbled api_[REDACTED\n"
+        + "const ak = redactCredentials('api_key=abcdefghijklmnopqrstuvwxyz');\n"
+        + "if (ak !== '[REDACTED:api_key]') "
+        + "throw new Error('api_key= clean redact failed: ' + ak);\n"
     )
     with tempfile.NamedTemporaryFile(mode="w", suffix=".mjs", delete=False) as f:
         f.write(harness)

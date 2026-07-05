@@ -32,10 +32,12 @@ const _RE_PRIVATE_KEY_BLOCK =
 //   https://user:token@api.example.com → https://user:[REDACTED:password]@api.example.com
 // ---------------------------------------------------------------------------
 const _RE_CONNECTION_STRING =
-  /(?:postgresql\+?(?:psycopg)?|mysql|mongodb|redis|amqp|sqlite|https?):\/\/[^:@\s]+:[^@\s]+@/g;
+  /(?:postgresql\+?(?:psycopg)?|mysql|mongodb(?:\+srv)?|rediss?|amqps?|sqlite|https?):\/\/[^:@\s]+:[^@\s]+@/g;
+
+const _RE_CONN_USERINFO = /:\/\/([^:@\s]+):([^@\s]+)@/;
 
 function _redactConnPassword(match) {
-  return match.replace(/:\/\/([^:@\s]+):([^@\s]+)@/, "://$1:[REDACTED:password]@");
+  return match.replace(_RE_CONN_USERINFO, "://$1:[REDACTED:password]@");
 }
 
 // ---------------------------------------------------------------------------
@@ -54,12 +56,16 @@ const _CREDENTIAL_REPLACEMENTS = [
   [/AKIA[0-9A-Z]{16}/g, "[REDACTED:api_key]"],
   // Google API keys               AIzaxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
   [/AIza[a-zA-Z0-9_\-]{35}/g, "[REDACTED:api_key]"],
-  // Bearer tokens — min 20 chars of JWT/opaque token
-  [/Bearer\s+[a-zA-Z0-9._~+/=\-]{20,}/g, "[REDACTED:api_key]"],
-  // token= in query strings (20+ hex/alnum chars)
-  [/token=[a-zA-Z0-9]{20,}/g, "[REDACTED:api_key]"],
-  // key= in query strings (20+ chars)
-  [/key=[a-zA-Z0-9]{20,}/g, "[REDACTED:api_key]"],
+  // Bearer tokens — min 20 chars of JWT/opaque token (scheme is
+  // case-insensitive per RFC 7235, so match bearer/BEARER too)
+  [/Bearer\s+[a-zA-Z0-9._~+/=\-]{20,}/gi, "[REDACTED:api_key]"],
+  // token=<value> (20+ hex/alnum).  The optional [a-zA-Z0-9_]* prefix lets it
+  // swallow the WHOLE access_token=/auth_token= key rather than chewing only the
+  // tail into "access_[REDACTED:api_key]" — while still covering bare token=.
+  [/[a-zA-Z0-9_]*token=[a-zA-Z0-9]{20,}/g, "[REDACTED:api_key]"],
+  // key=<value> (20+).  Prefix swallows api_key=/secret_key=/session_key= whole
+  // instead of leaving a garbled "api_[REDACTED:api_key]".
+  [/[a-zA-Z0-9_]*key=[a-zA-Z0-9]{20,}/g, "[REDACTED:api_key]"],
 ];
 
 // ---------------------------------------------------------------------------
@@ -73,23 +79,22 @@ const _RE_QUERY_CRED = /(?:api_key|apiKey|api-key|token)=[^&\s"]+/g;
 // JSON-style simple redaction (legacy _redactApiKeys compat)
 //   {"api_key": "abc"}   →   {"api_key": "***"}
 // ---------------------------------------------------------------------------
-const _RE_JSON_STYLE_CRED = /(["'](?:api_key|apiKey|api-key|token)["']\s*:\s*["'])([^"']*)(['"])/gi;
+const _RE_JSON_STYLE_CRED =
+  /(["'](?:api_key|apiKey|api-key|token)["']\s*:\s*["'])([^"']*)(['"])/gi;
 
 // ---------------------------------------------------------------------------
 // JSON secret keys — comprehensive set matching backend
 //   "api_key": "sk-abcdefghijklmnopqrst"  →  "api_key": "[REDACTED:secret]"
 // ---------------------------------------------------------------------------
-const _RE_JSON_SECRET_KEY_VALUE =
-  /"(?:api_key|apikey|api_secret|secret_key|secret|password|passwd|token|access_token|refresh_token|auth_token|private_key|client_secret|webhook_secret|signing_key|encryption_key|authorization|Authorization)"\s*:\s*"([^"]{8,})"/gi;
-
-function _redactJsonSecretValue(fullMatch) {
-  // Locate the value capture within the match
-  const valStart = fullMatch.indexOf('"', fullMatch.indexOf(":") + 1) + 1;
-  // valEnd is the index of the closing quote of the value
-  const valEnd = fullMatch.lastIndexOf('"');
-  if (valStart <= 0 || valEnd <= valStart) return fullMatch;
-  return fullMatch.slice(0, valStart) + "[REDACTED:secret]" + fullMatch.slice(valEnd);
-}
+// Double-quoted form (standard JSON).  The single-quoted sibling below covers
+// Python dict reprs / JS object literals, e.g. {'Authorization': 'Bearer ...'}.
+// $1 captures the key + colon + opening quote; only the value is replaced, so
+// the key stays intact even when value == key name.  /i already covers casing,
+// so keys are listed once (no separate |Authorization alternative needed).
+const _RE_JSON_SECRET_DQ =
+  /("(?:api_key|apikey|api_secret|secret_key|secret|password|passwd|token|access_token|refresh_token|auth_token|private_key|client_secret|webhook_secret|signing_key|encryption_key|authorization)"\s*:\s*")[^"]{8,}"/gi;
+const _RE_JSON_SECRET_SQ =
+  /('(?:api_key|apikey|api_secret|secret_key|secret|password|passwd|token|access_token|refresh_token|auth_token|private_key|client_secret|webhook_secret|signing_key|encryption_key|authorization)'\s*:\s*')[^']{8,}'/gi;
 
 // ---------------------------------------------------------------------------
 // ENV secret line redaction — matches the backend's two-regex pipeline
@@ -154,8 +159,10 @@ export function redactCredentials(text) {
   // [REDACTED:secret] marker instead.
   result = result.replace(_RE_JSON_STYLE_CRED, "$1***$3");
 
-  // 6. JSON secret key values (comprehensive set, backend-parity)
-  result = result.replace(_RE_JSON_SECRET_KEY_VALUE, _redactJsonSecretValue);
+  // 6. JSON secret key values (double- and single-quoted; backend-parity).
+  // $1 is the key + colon + opening quote; only the value is replaced.
+  result = result.replace(_RE_JSON_SECRET_DQ, '$1[REDACTED:secret]"');
+  result = result.replace(_RE_JSON_SECRET_SQ, "$1[REDACTED:secret]'");
 
   // 7. ENV secret lines
   result = result.replace(_RE_ENV_SECRET_LINE, _redactEnvLine);
