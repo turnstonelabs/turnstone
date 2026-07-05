@@ -1310,6 +1310,7 @@ function createCoordinatorPane(root, wsId, opts) {
         approved: !!approved,
         always: !!always,
         call_id: callId,
+        cycle_id: batch.dataset.cycleId || null,
       });
       if (!resp.ok) throw new Error("approve failed: HTTP " + resp.status);
     } catch (e) {
@@ -1465,6 +1466,9 @@ function createCoordinatorPane(root, wsId, opts) {
     }
     if (allMapped) {
       const existing = toolRows.get(items[0].call_id).batch;
+      // Late cycle identity (SSE approve_request upgrading a replay /
+      // early-paint shell) — stamp it so the approve POST can route.
+      if (opts.cycleId) existing.dataset.cycleId = opts.cycleId;
       // Upgrade-in-place: when SSE arrives with a more specific state
       // than the placeholder history replay rendered, morph the
       // existing shell instead of leaving stale chrome.  The two real
@@ -1578,6 +1582,10 @@ function createCoordinatorPane(root, wsId, opts) {
       summaryText,
       tierText: _pickBatchTier(items),
     });
+    // Approval-cycle identity — _resolveBatchAction posts it back so
+    // the decision lands on exactly this round when several batches
+    // are pending (parallel task agents).
+    if (opts.cycleId) batch.dataset.cycleId = opts.cycleId;
     if (opts.pending) batch.classList.add("conv-batch--pending");
     else if (opts.auto) batch.classList.add("conv-batch--auto");
     else if (opts.resolved) {
@@ -1732,12 +1740,13 @@ function createCoordinatorPane(root, wsId, opts) {
   // directly, and inline action buttons drive _resolveBatchAction.
   // ------------------------------------------------------------------
 
-  function showApproval(items, judgePending) {
+  function showApproval(items, judgePending, cycleId) {
     const list = (items || []).filter(Boolean);
     if (list.length === 0) return;
     const batch = appendToolBatch(list, {
       pending: true,
       judgePending: !!judgePending,
+      cycleId: cycleId || "",
     });
     const firstPending = list.find((it) => it.needs_approval);
     if (batch && firstPending && firstPending.call_id) {
@@ -2233,7 +2242,7 @@ function createCoordinatorPane(root, wsId, opts) {
         loadChildren({ replace: true });
         loadTasks();
         // Drop the live-badge cache too — entries within the 5s TTL
-        // can carry stale pending_approval_detail (the child may
+        // can carry stale pending_approval_details (the child may
         // have resolved its approval during the SSE gap).  Without
         // this clear, inline approve/deny buttons could render on
         // a row whose approval was resolved elsewhere; the next
@@ -2448,26 +2457,36 @@ function createCoordinatorPane(root, wsId, opts) {
         break;
       case "approve_request":
         // appendToolBatch is idempotent on call_ids — the console replays
-        // _pending_approval into every new SSE subscriber, so reconnect
-        // won't double-render the construct.
-        showApproval(ev.items, !!ev.judge_pending);
+        // every live cycle's card into every new SSE subscriber, so
+        // reconnect won't double-render the construct.
+        showApproval(ev.items, !!ev.judge_pending, ev.cycle_id || "");
         break;
       case "approval_resolved": {
-        // Server-driven resolution.  Morph the active pending batch
-        // (the construct that posted the approve POST).  The server
-        // event carries `approved` + `feedback` only — the "always"
-        // intent.  Server now echoes ``always`` on the SSE payload
-        // (post-PR-447) so cross-tab resolution renders the right
-        // status pill on every subscribed tab — not just the one
-        // that clicked.  Fall back to this tab's stashed dataset
-        // flag for backward compat with a server hot-deploy where
-        // the SSE event might briefly omit the field.
-        // Fall back to a DOM lookup if activeBatch was never set
-        // (e.g. cross-tab resolution where this tab never rendered
-        // the approval gate before the resolved event landed).
-        const target =
-          activeBatch ||
-          messagesEl.querySelector(".conv-batch.conv-batch--pending");
+        // Server-driven resolution.  Route to the batch whose rows
+        // carry one of the resolved call_ids — several batches can be
+        // pending at once (parallel task agents), and morphing "the
+        // active" one would resolve the wrong construct.  Server now
+        // echoes ``always`` on the SSE payload (post-PR-447) so
+        // cross-tab resolution renders the right status pill on every
+        // subscribed tab — not just the one that clicked.  Fall back
+        // to this tab's stashed dataset flag for backward compat with
+        // a server hot-deploy where the SSE event might briefly omit
+        // the field.  Legacy events without call_ids fall back to
+        // activeBatch / the last pending batch (single-cycle server).
+        let target = null;
+        const resolvedIds = Array.isArray(ev.call_ids) ? ev.call_ids : [];
+        for (const cid of resolvedIds) {
+          const mapped = toolRows.get(cid);
+          if (mapped && mapped.batch) {
+            target = mapped.batch;
+            break;
+          }
+        }
+        if (!target) {
+          target =
+            activeBatch ||
+            messagesEl.querySelector(".conv-batch.conv-batch--pending");
+        }
         if (target) {
           const wasAlways =
             ev.always === true ||
@@ -2971,11 +2990,18 @@ function createCoordinatorPane(root, wsId, opts) {
     // \u2014 without it the operator sees a "demand for action" badge
     // with no actionable content.
     if (cached && cached.live && cached.live.pending_approval) {
-      const detail = cached.live.pending_approval_detail;
-      const block = detail
-        ? renderApprovalBlock(child, detail)
-        : renderApprovalPlaceholder(child);
-      if (block) row.appendChild(block);
+      // One block per live cycle — a child running parallel task agents
+      // can gate several batches at once, each independently resolvable.
+      const details = _liveApprovalDetails(cached.live);
+      if (details.length) {
+        details.forEach((detail) => {
+          const block = renderApprovalBlock(child, detail);
+          if (block) row.appendChild(block);
+        });
+      } else {
+        const block = renderApprovalPlaceholder(child);
+        if (block) row.appendChild(block);
+      }
     }
     // Recent auto-approves — tools that bypassed the operator gate
     // (skill ``allowed_tools`` allowlist / blanket / admin policy /
@@ -3130,6 +3156,16 @@ function createCoordinatorPane(root, wsId, opts) {
     header.appendChild(pill);
     block.appendChild(header);
     return block;
+  }
+
+  // Normalize the live block's approval payload to a list of cycle
+  // details (``pending_approval_details``).  Defensive against a
+  // malformed entry: non-arrays fold to [].
+  function _liveApprovalDetails(live) {
+    if (!live) return [];
+    return Array.isArray(live.pending_approval_details)
+      ? live.pending_approval_details.filter(Boolean)
+      : [];
   }
 
   function renderApprovalBlock(child, detail) {
@@ -3397,7 +3433,7 @@ function createCoordinatorPane(root, wsId, opts) {
   }
 
   // Submit the approve POST + handle the result.  On success, locally
-  // clear pending_approval_detail so the row re-renders without
+  // clear the resolved cycle from pending_approval_details so the row re-renders without
   // buttons immediately (optimistic update \u2014 the next live-bulk poll
   // confirms).  On 409 (stale call_id), refresh the live block so the
   // row re-renders against the new round.
@@ -3423,6 +3459,7 @@ function createCoordinatorPane(root, wsId, opts) {
         approved: !!approved,
         always: false,
         call_id: callId,
+        cycle_id: (detail && detail.cycle_id) || null,
       });
       if (resp.status === 409) {
         // Stale call_id \u2014 server has rolled to a new round, or
@@ -3477,9 +3514,15 @@ function createCoordinatorPane(root, wsId, opts) {
       // pill flickers back. (Caught by /review bug-4.)
       const cached = liveBadgeCache.get(targetWsId);
       if (cached && cached.live) {
+        // Optimistically remove ONLY the resolved cycle — sibling
+        // cycles (parallel task agents) keep their buttons.  The
+        // pending flag clears only when no cycles remain.
+        const remaining = _liveApprovalDetails(cached.live).filter(
+          (d) => d !== detail && d.cycle_id !== (detail && detail.cycle_id),
+        );
         cached.live = Object.assign({}, cached.live, {
-          pending_approval: false,
-          pending_approval_detail: null,
+          pending_approval: remaining.length > 0,
+          pending_approval_details: remaining,
         });
         cached.sseUpdatedAt = Date.now();
         _liveBadgeCacheSet(targetWsId, cached);
@@ -3488,8 +3531,14 @@ function createCoordinatorPane(root, wsId, opts) {
       // badge in .meta disappears immediately too — without this, the
       // row shows the badge with no buttons for ~50-150ms until the
       // child_ws_approval_resolved push or next state event lands.
+      // Only when NO cycles remain: a sibling prompt keeps the badge.
+      const cachedAfter = liveBadgeCache.get(targetWsId);
+      const anyLeft =
+        cachedAfter &&
+        cachedAfter.live &&
+        _liveApprovalDetails(cachedAfter.live).length > 0;
       const childState = childrenState.get(targetWsId);
-      if (childState && childState.activity_state === "approval") {
+      if (childState && childState.activity_state === "approval" && !anyLeft) {
         childState.activity_state = "";
       }
       renderChildren();
@@ -3895,7 +3944,7 @@ function createCoordinatorPane(root, wsId, opts) {
         ) {
           mergedLive = Object.assign({}, live, {
             pending_approval: prev.live.pending_approval,
-            pending_approval_detail: prev.live.pending_approval_detail,
+            pending_approval_details: prev.live.pending_approval_details,
           });
         }
         _liveBadgeCacheSet(id, {
@@ -3996,10 +4045,20 @@ function createCoordinatorPane(root, wsId, opts) {
     // misses 30+ children all sitting in attention. (Caught manual
     // testing: 30 children all state=attention rendered with no
     // approval blocks because pendingApproval was always false.)
-    const pendingApproval =
+    // The ws-level activity signal is COARSE under parallel task
+    // agents: one gate resolving (activity flips to "tool") while a
+    // sibling is still parked would read as "no approval pending".
+    // The per-cycle details list is the authoritative surface — a
+    // non-empty list keeps the row pending regardless of the
+    // activity flicker; per-cycle removal happens in
+    // handleChildApprovalResolved, and the bulk fetch reconciles a
+    // dropped resolution event within its ~2s TTL.
+    const coarsePending =
       existing.state === "attention" || existing.activity_state === "approval";
     const cached = liveBadgeCache.get(childId);
     const cachedLive = (cached && cached.live) || {};
+    const pendingApproval =
+      coarsePending || _liveApprovalDetails(cachedLive).length > 0;
     // Rising-edge detection BEFORE we mutate the cache. The chat-pane
     // tool batches already announce assertively
     // (renderApprovalDock / appendToolBatch); the children-tree was
@@ -4018,18 +4077,18 @@ function createCoordinatorPane(root, wsId, opts) {
     // authoritatively writes a value the bulk fetch must not
     // resurrect (a stale bulk-fetch landing within
     // SSE_AUTHORITATIVE_MS would otherwise re-render the cleared
-    // approval block). Setting ``pending_approval=true`` does NOT
+    // approval blocks). Setting ``pending_approval=true`` does NOT
     // claim cache authority — the bulk fetch is the source of
-    // truth for ``pending_approval_detail``, and bumping
+    // truth for ``pending_approval_details``, and bumping
     // sseUpdatedAt here makes the merge guard in flushLiveFetches
-    // preserve our stale (often null) detail over the bulk
+    // preserve our stale (often empty) details over the bulk
     // fetch's actual data, leaving the row stuck on the loading
     // placeholder. (Caught when the screenshot showed buttons
     // briefly then loading replaced them.)
     const detailClearedAuthoritatively =
       !pendingApproval && cachedLive.pending_approval === true;
     if (!pendingApproval) {
-      nextLive.pending_approval_detail = null;
+      nextLive.pending_approval_details = [];
     }
     _liveBadgeCacheSet(childId, {
       live: nextLive,
@@ -4114,17 +4173,23 @@ function createCoordinatorPane(root, wsId, opts) {
     if (!callId) return;
     const cached = liveBadgeCache.get(childId);
     const cachedLive = (cached && cached.live) || {};
-    const detail = cachedLive.pending_approval_detail;
+    // Stamp onto the CYCLE containing this call_id — several details
+    // can be live at once (parallel task agents).
+    const detail = _liveApprovalDetails(cachedLive).find(
+      (d) =>
+        Array.isArray(d.items) &&
+        d.items.some((it) => it && it.call_id === callId),
+    );
     if (!detail) {
-      // No pending_approval_detail to stamp the verdict onto. The
-      // verdict is still durable in storage; the next bulk fetch
-      // will hydrate the detail and include the verdict via the
-      // existing serialize path.
+      // No pending detail to stamp the verdict onto. The verdict is
+      // still durable in storage; the next bulk fetch will hydrate
+      // the details and include the verdict via the existing
+      // serialize path.
       return;
     }
     // Stamp on the matching item (UI render reads judge_verdict per
     // item) AND on the by-call_id map (matches the
-    // serialize_pending_approval_detail shape).
+    // serialize_pending_approval_details shape).
     const items = Array.isArray(detail.items) ? detail.items : [];
     for (const item of items) {
       if (item && item.call_id === callId) {
@@ -4153,8 +4218,15 @@ function createCoordinatorPane(root, wsId, opts) {
     if (!childId) return;
     const cached = liveBadgeCache.get(childId);
     const cachedLive = (cached && cached.live) || {};
-    cachedLive.pending_approval = false;
-    cachedLive.pending_approval_detail = null;
+    // Remove ONLY the resolved cycle; siblings keep their buttons.
+    // Legacy events without a cycle_id (pre-multi-cycle node) clear
+    // everything, matching the old single-slot behavior.
+    const details = _liveApprovalDetails(cachedLive);
+    const remaining = ev.cycle_id
+      ? details.filter((d) => d.cycle_id !== ev.cycle_id)
+      : [];
+    cachedLive.pending_approval = remaining.length > 0;
+    cachedLive.pending_approval_details = remaining;
     _liveBadgeCacheSet(childId, {
       live: cachedLive,
       fetched: cached ? cached.fetched : 0,
@@ -4179,8 +4251,17 @@ function createCoordinatorPane(root, wsId, opts) {
     if (!detail) return;
     const cached = liveBadgeCache.get(childId);
     const cachedLive = (cached && cached.live) || {};
+    // Append (or replace, keyed by cycle_id) — several cycles can be
+    // outstanding under parallel task agents; a sibling's push must
+    // not clobber ours.  Legacy nodes without cycle_id fold to a
+    // single-slot replace via the shared "" key.
+    const key = detail.cycle_id || "";
+    const details = _liveApprovalDetails(cachedLive).filter(
+      (d) => (d.cycle_id || "") !== key,
+    );
+    details.push(detail);
     cachedLive.pending_approval = true;
-    cachedLive.pending_approval_detail = detail;
+    cachedLive.pending_approval_details = details;
     _liveBadgeCacheSet(childId, {
       live: cachedLive,
       fetched: cached ? cached.fetched : 0,
@@ -4530,19 +4611,20 @@ function createCoordinatorPane(root, wsId, opts) {
     // NOT re-run this (SSE re-delivers approve_request live, and replaying a
     // stale pre-rewind pending batch would be wrong).
     try {
-      const pendingDetail =
+      const pendingDetails =
         wsSnapshot &&
         wsSnapshot.pending_approval &&
-        wsSnapshot.pending_approval_detail &&
-        Array.isArray(wsSnapshot.pending_approval_detail.items)
-          ? wsSnapshot.pending_approval_detail
-          : null;
-      if (pendingDetail) {
+        Array.isArray(wsSnapshot.pending_approval_details)
+          ? wsSnapshot.pending_approval_details
+          : [];
+      pendingDetails.forEach((pendingDetail) => {
+        if (!pendingDetail || !Array.isArray(pendingDetail.items)) return;
         appendToolBatch(pendingDetail.items, {
           pending: true,
           judgePending: !!pendingDetail.judge_pending,
+          cycleId: pendingDetail.cycle_id || "",
         });
-      }
+      });
     } catch (e) {
       console.warn("pending-approval replay failed", e);
     }

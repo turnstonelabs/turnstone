@@ -200,11 +200,23 @@ class Pane {
     // null when idle/error or when the backend sends no acting id
     // (unauthenticated / older backend).
     this._actingUserId = null;
+    // Live approval cycles, cycleId → {blockEls, callIds}.  Parallel task
+    // agents gate concurrently, so several approve_request cards can be
+    // outstanding at once; each resolves independently by its cycle_id.
+    // Insertion order = arrival order — keyboard shortcuts act on the
+    // OLDEST (first) entry.  pendingApproval / approvalBlockEl are
+    // DERIVED views maintained by _syncApprovalState(): the boolean for
+    // the many "is anything pending" readers, the element pointing at
+    // the active (oldest) cycle's card for keyboard/feedback routing.
+    this.approvalCycles = new Map();
     this.pendingApproval = false;
     this.approvalBlockEl = null;
-    // Early-paint shell from a ``tool_pending`` event, awaiting its
-    // authoritative ``tool_info`` / ``approve_request`` upgrade.
-    this.announcedBlockEl = null;
+    // Early-paint shells from ``tool_pending`` events, keyed by their
+    // sorted call_id set, awaiting the authoritative ``tool_info`` /
+    // ``approve_request`` upgrade.  A Map (not a single slot): with
+    // parallel task agents several announces can be in flight, and a
+    // sibling's announce must not discard ours.
+    this.announcedBlocks = new Map();
     this.retryDelay = 1000;
     this.model = "";
     this.modelAlias = "";
@@ -255,9 +267,10 @@ class Pane {
     this.currentReasoningEl = null;
     this.contentBuffer = "";
     this.setBusy(false);
+    this.approvalCycles = new Map();
     this.pendingApproval = false;
     this.approvalBlockEl = null;
-    this.announcedBlockEl = null;
+    this.announcedBlocks = new Map();
     this._pendingEditSend = null;
     this.inputEl.disabled = false;
     this.attachments.clearChips();
@@ -491,9 +504,44 @@ class Pane {
     this.scrollToBottom(true);
   }
 
-  getFeedback() {
-    if (!this.approvalBlockEl) return null;
-    const inp = this.approvalBlockEl.querySelector(".conv-feedback");
+  // --- Approval-cycle bookkeeping -----------------------------------------
+  // The backend registers one ApprovalCycle per human-gated batch; parallel
+  // task agents make several live at once.  Cards register here on paint and
+  // deregister on resolution; the composer stays disabled while ANY cycle is
+  // live.
+
+  _syncApprovalState() {
+    const first = this.approvalCycles.values().next();
+    const active = first.done ? null : first.value;
+    this.pendingApproval = this.approvalCycles.size > 0;
+    this.approvalBlockEl = active ? active.blockEls[0] : null;
+    this.inputEl.disabled = this.pendingApproval;
+    this.sendBtn.disabled = this.pendingApproval || this.busy;
+  }
+
+  _oldestCycleId() {
+    const first = this.approvalCycles.keys().next();
+    return first.done ? null : first.value;
+  }
+
+  _registerApprovalCycle(cycleId, blockEls, items) {
+    const callIds = (items || []).map((it) => it && it.call_id).filter(Boolean);
+    this.approvalCycles.set(cycleId, { blockEls, callIds });
+    this._syncApprovalState();
+  }
+
+  // Cycle id for pre-multi-cycle servers that omit it: synthesize a stable
+  // key from the batch's first call_id so the Map still routes uniquely.
+  _cycleKey(evt) {
+    if (evt.cycle_id) return evt.cycle_id;
+    const first = ((evt.items || [])[0] || {}).call_id || "";
+    return "legacy:" + first;
+  }
+
+  getFeedback(blockEl) {
+    const el = blockEl || this.approvalBlockEl;
+    if (!el) return null;
+    const inp = el.querySelector(".conv-feedback");
     return inp && inp.value.trim() ? inp.value.trim() : null;
   }
 
@@ -614,15 +662,26 @@ class Pane {
     }
     badge.replaceWith(buildConvVerdict(verdict, { judgePending: false }));
 
-    this.updateVerdictGlow(verdict.recommendation);
+    this.updateVerdictGlow(
+      verdict.recommendation,
+      vRow ? vRow.closest(".conv-batch") : null,
+    );
   }
 
-  updateVerdictGlow(recommendation) {
-    if (!this.approvalBlockEl) return;
-    const actions = this.approvalBlockEl.querySelector(".conv-actions");
+  updateVerdictGlow(recommendation, batchEl) {
+    // Glow is a PER-BATCH aggregate: score the batch that owns the
+    // verdict, not whichever cycle happens to be oldest.  With
+    // concurrent approval cycles a sibling's verdict must neither
+    // recolor the oldest card (the old single-El read seeded `worst`
+    // with the sibling's recommendation) nor leave its own card
+    // stale.  Batch-less rows (legacy replay shapes) fall back to the
+    // oldest live cycle — the pre-multi-cycle behavior.
+    const scope = batchEl || this.approvalBlockEl;
+    if (!scope) return;
+    const actions = scope.querySelector(".conv-actions");
     if (!actions) return;
     // Collect all verdict badges currently visible in this approval block.
-    const badges = this.approvalBlockEl.querySelectorAll(".conv-verdict");
+    const badges = scope.querySelectorAll(".conv-verdict");
     let worst = recommendation;
     for (let i = 0; i < badges.length; i++) {
       const recEl = badges[i].querySelector(".conv-verdict-rec");
@@ -751,27 +810,77 @@ class Pane {
     // keys type; elsewhere y|Enter approve, n|Esc deny, a = approve-all.
     this.el.addEventListener("keydown", (e) => {
       if (!this.pendingApproval || !this.approvalBlockEl) return;
-      const fb = this.approvalBlockEl.querySelector(".conv-feedback");
-      if (fb && document.activeElement === fb) {
+      // Keyboard acts on the OLDEST live cycle (the one approvalBlockEl
+      // tracks); sibling cards from parallel task agents resolve by
+      // their own buttons or become oldest in turn.  When the feedback
+      // field getting the keystroke belongs to a DIFFERENT cycle's
+      // card, route to THAT cycle instead — the user is clearly acting
+      // on the card they're typing into.
+      let targetId = this._oldestCycleId();
+      let targetBlock = this.approvalBlockEl;
+      const ae = document.activeElement;
+      if (ae && ae.classList && ae.classList.contains("conv-feedback")) {
+        for (const [cid, entry] of this.approvalCycles) {
+          if (entry.blockEls.some((el) => el.contains(ae))) {
+            targetId = cid;
+            targetBlock = entry.blockEls[0];
+            break;
+          }
+        }
+      }
+      const fb = targetBlock
+        ? targetBlock.querySelector(".conv-feedback")
+        : null;
+      if (ae && fb && ae === fb) {
         if (e.key === "Enter" && !e.shiftKey) {
           e.preventDefault();
-          this.resolveApproval(true, false, this.getFeedback());
+          this.resolveApproval(
+            true,
+            false,
+            this.getFeedback(targetBlock),
+            false,
+            targetId,
+          );
         } else if (e.key === "Escape") {
           e.preventDefault();
-          this.resolveApproval(false, false, this.getFeedback());
+          this.resolveApproval(
+            false,
+            false,
+            this.getFeedback(targetBlock),
+            false,
+            targetId,
+          );
         }
         return;
       }
       const k = e.key.toLowerCase();
       if (k === "y" || e.key === "Enter") {
         e.preventDefault();
-        this.resolveApproval(true, false, this.getFeedback());
+        this.resolveApproval(
+          true,
+          false,
+          this.getFeedback(targetBlock),
+          false,
+          targetId,
+        );
       } else if (k === "n" || e.key === "Escape") {
         e.preventDefault();
-        this.resolveApproval(false, false, this.getFeedback());
+        this.resolveApproval(
+          false,
+          false,
+          this.getFeedback(targetBlock),
+          false,
+          targetId,
+        );
       } else if (k === "a") {
         e.preventDefault();
-        this.resolveApproval(true, true, this.getFeedback());
+        this.resolveApproval(
+          true,
+          true,
+          this.getFeedback(targetBlock),
+          false,
+          targetId,
+        );
       }
     });
 
@@ -1435,8 +1544,20 @@ class Pane {
         break;
 
       case "approve_request":
-        if (!this._routeAgentItems(evt.items, "approve", evt.judge_pending)) {
-          this.showInlineToolBlock(evt.items, false, evt.judge_pending);
+        if (
+          !this._routeAgentItems(
+            evt.items,
+            "approve",
+            evt.judge_pending,
+            this._cycleKey(evt),
+          )
+        ) {
+          this.showInlineToolBlock(
+            evt.items,
+            false,
+            evt.judge_pending,
+            this._cycleKey(evt),
+          );
         }
         break;
 
@@ -1449,7 +1570,15 @@ class Pane {
         break;
 
       case "approval_resolved":
-        this.resolveApproval(evt.approved, false, evt.feedback, true);
+        // Route to the resolved cycle; an event without a cycle_id
+        // (pre-multi-cycle server) falls back to the oldest.
+        this.resolveApproval(
+          evt.approved,
+          false,
+          evt.feedback,
+          true,
+          evt.cycle_id || this._oldestCycleId(),
+        );
         break;
 
       case "tool_output_chunk":
@@ -2282,7 +2411,11 @@ class Pane {
     this.currentAssistantBodyEl = null;
     this.currentReasoningEl = null;
     this.contentBuffer = "";
-    this.announcedBlockEl = null;
+    // Approval cycles + announce shells point into the wiped subtree too;
+    // the replayed history / detail snapshot re-registers live ones.
+    this.approvalCycles = new Map();
+    this.announcedBlocks = new Map();
+    this._syncApprovalState();
     this._thinkingEl = null;
     this._retryHolderEl = null;
   }
@@ -2625,10 +2758,22 @@ class Pane {
     // so auto-follow would silently disengage at exactly tool-call time.  Token
     // streaming stays pinned without this because each append is sub-threshold.
     const stick = this.isNearBottom();
-    // Drop a previous un-consumed announce so shells don't pile up.
-    if (this.announcedBlockEl) {
-      this.announcedBlockEl.remove();
-      this.announcedBlockEl = null;
+    // Key the shell by its call_id set.  A re-announce of the SAME batch
+    // replaces its own shell; shells of OTHER batches stay — parallel
+    // task agents announce concurrently and must not discard each other.
+    // Bounded: shells whose upgrade never arrives (dropped SSE) are
+    // evicted oldest-first past the cap so they can't pile up forever.
+    const key = this._announceKey(items);
+    const prior = this.announcedBlocks.get(key);
+    if (prior) {
+      prior.remove();
+      this.announcedBlocks.delete(key);
+    }
+    while (this.announcedBlocks.size >= 8) {
+      const oldestKey = this.announcedBlocks.keys().next().value;
+      const oldest = this.announcedBlocks.get(oldestKey);
+      if (oldest) oldest.remove();
+      this.announcedBlocks.delete(oldestKey);
     }
     const block = document.createElement("div");
     block.className =
@@ -2651,44 +2796,36 @@ class Pane {
         block.appendChild(buildConvVerdict(verdict, { judgePending: true }));
       }
     });
-    this.announcedBlockEl = block;
+    this.announcedBlocks.set(key, block);
     this.messagesEl.appendChild(block);
     this._relinkAgentCards(list);
     this.scrollToBottom(stick);
     toolAnnounce(_toolAnnounceText(list));
   }
 
-  // Hand back the early-paint shell to upgrade in place if it matches this
-  // batch's call_ids, else null (caller builds fresh).  Clears the tracking
-  // ref so the shell is consumed exactly once.  Matching by id set is
-  // defensive — the interactive pane is strictly serial, so an announce is
-  // always followed by ITS approve_request / tool_info — but it guarantees a
-  // stale shell can never capture a different batch.
+  _announceKey(items) {
+    return JSON.stringify(
+      (items || [])
+        .map((it) => it && it.call_id)
+        .filter(Boolean)
+        .sort(),
+    );
+  }
+
+  // Hand back the early-paint shell to upgrade in place if one exists for
+  // this batch's call_id set, else null (caller builds fresh).  Deletes the
+  // entry so the shell is consumed exactly once.  Keyed lookup (not a single
+  // slot): parallel task agents keep several shells in flight, and taking
+  // one must not disturb the others.
   _takeAnnouncedBlock(items) {
-    const block = this.announcedBlockEl;
+    const key = this._announceKey(items);
+    const block = this.announcedBlocks.get(key);
     if (!block) return null;
-    this.announcedBlockEl = null;
-    const want = (items || [])
-      .map((it) => it.call_id)
-      .filter(Boolean)
-      .sort();
-    let have = [];
-    try {
-      have = JSON.parse(block.dataset.callIds || "[]");
-    } catch (_e) {
-      have = [];
-    }
-    have = have.slice().sort();
-    const matches =
-      want.length === have.length && want.every((id, i) => id === have[i]);
-    if (!matches) {
-      block.remove(); // stale orphan — discard, caller builds fresh
-      return null;
-    }
+    this.announcedBlocks.delete(key);
     return block;
   }
 
-  showInlineToolBlock(items, autoApproved, judgePending) {
+  showInlineToolBlock(items, autoApproved, judgePending, cycleId) {
     // Capture pin before _takeAnnouncedBlock/append change scrollHeight — see
     // announceToolBlock for why post-append measurement breaks here.
     const stick = this.isNearBottom();
@@ -2753,19 +2890,42 @@ class Pane {
           : "",
         glowRec,
         withFeedback: true,
-        onApprove: () => this.resolveApproval(true, false, this.getFeedback()),
-        onDeny: () => this.resolveApproval(false, false, this.getFeedback()),
-        onAlways: () => this.resolveApproval(true, true, this.getFeedback()),
+        onApprove: () =>
+          this.resolveApproval(
+            true,
+            false,
+            this.getFeedback(block),
+            false,
+            cycleId,
+          ),
+        onDeny: () =>
+          this.resolveApproval(
+            false,
+            false,
+            this.getFeedback(block),
+            false,
+            cycleId,
+          ),
+        onAlways: () =>
+          this.resolveApproval(
+            true,
+            true,
+            this.getFeedback(block),
+            false,
+            cycleId,
+          ),
       });
       block.appendChild(actions);
-      this.pendingApproval = true;
-      this.approvalBlockEl = block;
-      this.inputEl.disabled = true;
-      this.sendBtn.disabled = true;
+      this._registerApprovalCycle(cycleId, [block], items);
       const fb = actions.querySelector(".conv-feedback");
-      requestAnimationFrame(() => {
-        if (fb) fb.focus();
-      });
+      // Focus the feedback field only for the FIRST (oldest) live cycle —
+      // a sibling card arriving while the user is typing into another
+      // cycle's field must not steal focus mid-word.
+      if (this._oldestCycleId() === cycleId) {
+        requestAnimationFrame(() => {
+          if (fb) fb.focus();
+        });
+      }
     }
 
     if (!announced) this.messagesEl.appendChild(block);
@@ -2773,29 +2933,40 @@ class Pane {
     this.scrollToBottom(stick);
   }
 
-  resolveApproval(approved, always, feedback, skipPost) {
-    if (!this.approvalBlockEl) return;
+  resolveApproval(approved, always, feedback, skipPost, cycleId) {
+    // Resolve exactly ONE cycle — parallel task agents can have several
+    // cards live; a decision must never bleed onto a sibling's.  No
+    // cycleId (legacy caller) → the oldest.
+    const id = cycleId || this._oldestCycleId();
+    if (!id) return;
+    const entry = this.approvalCycles.get(id);
+    if (!entry) return; // already resolved (peer tab / server race) — idempotent
+    this.approvalCycles.delete(id);
+
     // Capture pin before the status badge reflows the block — see
     // announceToolBlock.
     const stick = this.isNearBottom();
-    this.pendingApproval = false;
 
-    const actions = this.approvalBlockEl.querySelector(".conv-actions");
-    if (actions) actions.remove();
+    entry.blockEls.forEach((el) => {
+      const actions = el.querySelector(".conv-actions");
+      if (actions) actions.remove();
+    });
+    const statusHost = entry.blockEls[0];
+    if (statusHost) {
+      statusHost.appendChild(
+        buildConvStatus({ approved, always, feedback: feedback || "" }),
+      );
+      statusHost.classList.add(
+        approved ? "conv-batch--approved" : "conv-batch--denied",
+      );
+    }
 
-    this.approvalBlockEl.appendChild(
-      buildConvStatus({ approved, always, feedback: feedback || "" }),
-    );
-    this.approvalBlockEl.classList.add(
-      approved ? "conv-batch--approved" : "conv-batch--denied",
-    );
-    this.approvalBlockEl = null;
-
-    this.inputEl.disabled = false;
-    this.sendBtn.disabled = this.busy;
-    this.inputEl.focus();
+    this._syncApprovalState();
+    if (!this.pendingApproval) this.inputEl.focus();
 
     // POST to server (skip when server already resolved, e.g. timeout).
+    // cycle_id pins the decision to THIS round server-side; call_id
+    // rides along as defense-in-depth (the server 409s a stale pair).
     if (!skipPost) {
       authFetch(
         this._base +
@@ -2809,6 +2980,8 @@ class Pane {
             approved: approved,
             feedback: feedback || null,
             always: !!always,
+            cycle_id: id.startsWith("legacy:") ? null : id,
+            call_id: entry.callIds[0] || null,
           }),
         },
       ).catch((err) => {
@@ -2826,7 +2999,7 @@ class Pane {
   // — their handlers find the row by call_id anywhere under messagesEl,
   // including inside the card body.  Returns true when handled (the caller then
   // skips the top-level rendering path).
-  _routeAgentItems(items, mode, judgePending) {
+  _routeAgentItems(items, mode, judgePending, cycleId) {
     if (!items || !items.length) return false;
     const parentId = items[0] && items[0].parent_call_id;
     if (!parentId) return false;
@@ -2854,6 +3027,7 @@ class Pane {
       if (toggle) toggle.setAttribute("aria-expanded", "true");
     }
     const stick = this.isNearBottom();
+    const approveRows = [];
     items.forEach((item) => {
       if (!item || !item.parent_call_id) return;
       const escId = item.call_id ? CSS.escape(item.call_id) : "";
@@ -2875,20 +3049,33 @@ class Pane {
           glowRec: verdict && verdict.recommendation,
           withFeedback: true,
           onApprove: () =>
-            this.resolveApproval(true, false, this.getFeedback()),
-          onDeny: () => this.resolveApproval(false, false, this.getFeedback()),
+            this.resolveApproval(
+              true,
+              false,
+              this.getFeedback(row),
+              false,
+              cycleId,
+            ),
+          onDeny: () =>
+            this.resolveApproval(
+              false,
+              false,
+              this.getFeedback(row),
+              false,
+              cycleId,
+            ),
         });
         row.appendChild(actions);
-        // Reuse the session-level approval resolution: the backend's
-        // approve_tools blocks on ONE pending decision, so pointing
-        // approvalBlockEl at this nested row is enough for resolveApproval to
-        // POST /approve and unblock it.
-        this.pendingApproval = true;
-        this.approvalBlockEl = row;
-        this.inputEl.disabled = true;
-        this.sendBtn.disabled = true;
+        approveRows.push(row);
       }
     });
+    if (mode === "approve" && approveRows.length) {
+      // Register this nested batch as its own approval cycle — the
+      // backend gates each sub-agent batch independently, so buttons
+      // must resolve THIS cycle, not "the" pending one (parallel task
+      // agents can have several nested prompts live at once).
+      this._registerApprovalCycle(cycleId, approveRows, items);
+    }
     this._updateAgentLabel(card);
     this.scrollToBottom(stick);
     return true;
