@@ -61,19 +61,22 @@ const _CREDENTIAL_REPLACEMENTS = [
   [/Bearer\s+[a-zA-Z0-9._~+/=\-]{20,}/gi, "[REDACTED:api_key]"],
   // token=<value> (20+).  Specific credential key prefixes only — not
   // unbounded [a-zA-Z0-9_]* which would match innocent identifiers
-  // like "monkey=" or "turkey=".  Covers access_token=/auth_token=/api_token= etc.
-  [/(?:(?:access|refresh|auth|api|session)_?token)=[a-zA-Z0-9]{20,}/g, "[REDACTED:api_key]"],
+  // like "monkey=" or "turkey=".  Bare "token=" included via negative
+  // lookbehind so standalone assignments still match (token=abcdef...)
+  // without matching word suffixes like "over_tokenized=".
+  [/(?:(?:access|refresh|auth|api|session)_?token|(?<![a-zA-Z0-9_])token)=[a-zA-Z0-9]{20,}/g, "[REDACTED:api_key]"],
   // key=<value> (20+).  Same bounded prefix approach: api_key=/secret_key= etc.
-  // but not monkey= or turkey=.  The _? allows both snake_case and compact forms.
-  [/(?:(?:api|secret|session|auth|encryption|signing|private|public|access)_?key)=[a-zA-Z0-9]{20,}/g, "[REDACTED:api_key]"],
+  // but not monkey= or turkey=.  Bare "key=" included with negative lookbehind.
+  // The _? allows both snake_case and compact forms.
+  [/(?:(?:api|secret|session|auth|encryption|signing|private|public|access)_?key|(?<![a-zA-Z0-9_])key)=[a-zA-Z0-9]{20,}/g, "[REDACTED:api_key]"],
 ];
 
 // ---------------------------------------------------------------------------
-// Query-string api_key / token redaction (legacy _redactApiKeys compat)
-//   ?api_key=abc123   →   ?api_key=***
-//   &apiKey=abc       →   &apiKey=***
+// Query-string api_key / token / secret / password / auth redaction
+//   ?api_key=abc123   →   ?api_key=***   (legacy _redactApiKeys compat)
+//   &secret=value     →   &secret=***
 // ---------------------------------------------------------------------------
-const _RE_QUERY_CRED = /(?:api_key|apiKey|api-key|token|secret|password|auth)=[^&\s"]+/g;
+const _RE_QUERY_CRED = /(?:api_key|apiKey|api-key|(?<![a-zA-Z0-9_])token|secret|password|auth)=[^&\s"]+/g;
 
 // ---------------------------------------------------------------------------
 // JSON-style simple redaction (legacy _redactApiKeys compat)

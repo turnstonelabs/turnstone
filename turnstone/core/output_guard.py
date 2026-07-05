@@ -110,7 +110,7 @@ _RE_JSON_SECRET = re.compile(
     r'"(?:api_key|apikey|api_secret|secret_key|secret|password|passwd|'
     r"token|access_token|refresh_token|auth_token|private_key|"
     r"client_secret|webhook_secret|signing_key|encryption_key|"
-    r'x_api_key|x-api-key|'
+    r"x_api_key|x-api-key|"
     r'authorization)"\s*:\s*"([^"]{8,})"',
     re.IGNORECASE,
 )
@@ -140,14 +140,24 @@ _CREDENTIAL_PATTERNS: list[tuple[re.Pattern[str], str]] = [
     # chewing only the tail into a garbled "access_[REDACTED:api_key]", while
     # NOT matching innocent identifiers like monkey=, turkey=, over_tokenized=.
     # The trailing _? allows both snake_case and compact forms (api_key / apikey).
-    (re.compile(
-        r"(?:(?:api|secret|session|auth|encryption|signing|private|public|access)_?key)="
-        r"[a-zA-Z0-9]{20,}"
-    ), "api_key"),
-    (re.compile(
-        r"(?:(?:access|refresh|auth|api|session)_?token)="
-        r"[a-zA-Z0-9]{20,}"
-    ), "api_key"),
+    # Bare key=/token= are included as alternatives so standalone assignments like
+    # key=<20+ chars> still match.
+    (
+        re.compile(
+            r"(?:(?:api|secret|session|auth|encryption|signing|private|public|access)_?key|"
+            r"(?<![a-zA-Z0-9_])key)="
+            r"[a-zA-Z0-9]{20,}"
+        ),
+        "api_key",
+    ),
+    (
+        re.compile(
+            r"(?:(?:access|refresh|auth|api|session)_?token|"
+            r"(?<![a-zA-Z0-9_])token)="
+            r"[a-zA-Z0-9]{20,}"
+        ),
+        "api_key",
+    ),
 ]
 
 # -- Priority 3: Encoded / obfuscated payloads (MEDIUM) --------------------
@@ -448,7 +458,8 @@ _BUILTIN_OG_PATTERNS: list[OutputGuardPatternDef] = [
         category="credentials",
         risk_level="high",
         compiled=re.compile(
-            r"(?:(?:access|refresh|auth|api|session)_?token)="
+            r"(?:(?:access|refresh|auth|api|session)_?token|"
+            r"(?<![a-zA-Z0-9_])token)="
             r"[a-zA-Z0-9]{20,}"
         ),
         flag_name="credential_leak",
@@ -462,7 +473,8 @@ _BUILTIN_OG_PATTERNS: list[OutputGuardPatternDef] = [
         category="credentials",
         risk_level="high",
         compiled=re.compile(
-            r"(?:(?:api|secret|session|auth|encryption|signing|private|public|access)_?key)="
+            r"(?:(?:api|secret|session|auth|encryption|signing|private|public|access)_?key|"
+            r"(?<![a-zA-Z0-9_])key)="
             r"[a-zA-Z0-9]{20,}"
         ),
         flag_name="credential_leak",
