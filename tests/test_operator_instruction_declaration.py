@@ -8,6 +8,7 @@ capability-gated emission in ``ChatSession._init_system_messages``.
 
 from __future__ import annotations
 
+import json
 import logging
 from typing import TYPE_CHECKING
 
@@ -330,3 +331,38 @@ class TestEmptyUserTurnDrop:
         assert len(user_turns) == 1
         assert f"[start system-reminder_{nonce}]" in user_turns[0]["content"]
         assert "child done" in user_turns[0]["content"]
+
+
+class TestToolArgumentLegalization:
+    """``_prepare_wire_messages`` legalizes malformed tool-call ``arguments`` so a
+    strict renderer (vLLM ``deepseek_v4``) can ``json.loads`` every arguments string
+    — the sibling send-time validity pass to orphan repair."""
+
+    def test_unterminated_arguments_legalized_on_the_wire(self) -> None:
+        s = make_session()
+        msgs = [
+            {"role": "user", "content": "go"},
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "c1",
+                        "type": "function",
+                        "function": {"name": "bash", "arguments": '{"command": "cat /va'},
+                    }
+                ],
+            },
+            {"role": "tool", "tool_call_id": "c1", "content": "retry with valid JSON"},
+        ]
+        out = s._prepare_wire_messages(msgs)
+        emitted = [
+            tc["function"]["arguments"]
+            for m in out
+            if m.get("role") == "assistant"
+            for tc in m.get("tool_calls", [])
+        ]
+        assert emitted == ["{}"]
+        assert json.loads(emitted[0]) == {}
+        # Canonical input is untouched — legalization is wire-copy only.
+        assert msgs[1]["tool_calls"][0]["function"]["arguments"] == '{"command": "cat /va'
