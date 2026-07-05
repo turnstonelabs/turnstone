@@ -798,6 +798,89 @@ class TestTaskExec:
         captured[0](fake_verdict)  # must not raise
         session.ui.on_intent_verdict.assert_not_called()
 
+    def test_evaluate_intent_agent_gate_owns_generation_off_the_main_slot(
+        self, tmp_db, monkeypatch
+    ) -> None:
+        """Sub-agent gates run the SAME judge pipeline as the main loop
+        but as their OWN generation (release blocker #1: task_agent
+        calls used to reach the gate judge-blind).  The main-loop
+        supersede slot stays untouched — with parallel task agents,
+        publishing into it would make every sibling's verdicts look
+        stale to the previous sibling's callback — while the generation
+        is stamped on the items for the UI's origin checks, registered
+        for ``close()``'s sweep, delivered alongside the verdict, and
+        grounded on the SUB-AGENT's trajectory (its task prompt is the
+        delegation contract), not the parent conversation."""
+        import threading
+
+        from turnstone.core.session_ui_base import SessionUIBase
+        from turnstone.core.trajectory import turns_from_dicts
+
+        class _GateUI(SessionUIBase):
+            pass
+
+        session = _make_session()
+        ui = _GateUI(ws_id="ws-gate", user_id="u1")
+        ui.on_intent_verdict = MagicMock()  # shadow: capture delivery kwargs
+        session.ui = ui
+
+        captured: dict[str, Any] = {}
+        fake_verdict = MagicMock()
+        fake_verdict.to_dict.return_value = {"verdict_id": "v0", "call_id": "c1", "tier": "llm"}
+        fake_judge = MagicMock()
+
+        def _eval(items, convo, **kw):
+            captured["convo"] = convo
+            captured["callback"] = kw.get("callback")
+            captured["cancel_event"] = kw.get("cancel_event")
+            captured["done"] = kw.get("done_callback")
+            return [fake_verdict] * len(items)
+
+        fake_judge.evaluate.side_effect = _eval
+        monkeypatch.setattr(session, "_ensure_judge", lambda: fake_judge)
+
+        main_slot = threading.Event()
+        session._judge_cancel_event = main_slot
+        agent_turns = turns_from_dicts([{"role": "user", "content": "Task: reindex the docs tree"}])
+        item = {"call_id": "c1", "func_name": "bash", "needs_approval": True, "command": "ls"}
+
+        ev = session._evaluate_intent([item], conversation=agent_turns, agent_gate=True)
+
+        assert ev is not None and ev is not main_slot
+        # Main-loop slot untouched by the sub-agent spawn.
+        assert session._judge_cancel_event is main_slot
+        # Generation stamped for the UI's origin checks + close() sweep,
+        # and handed to the daemon as its cancel event.
+        assert item["_judge_event"] is ev
+        assert ev in session._judge_cancel_events
+        assert captured["cancel_event"] is ev
+        # Judge grounded on the sub-agent trajectory, not session.messages.
+        assert any("reindex the docs tree" in str(m) for m in captured["convo"])
+        # Delivery rides the generation into the UI.
+        captured["callback"](fake_verdict)
+        assert ui.on_intent_verdict.call_args.kwargs.get("judge_event") is ev
+        # Daemon completion keeps the close()-sweep set exact.
+        captured["done"]()
+        assert ev not in session._judge_cancel_events
+
+    def test_close_fires_agent_gate_judge_generations(self, tmp_db, monkeypatch) -> None:
+        """``close()`` aborts EVERY in-flight judge daemon — including
+        sub-agent generations that never touched the main slot — so a
+        torn-down session can't leave daemons running against a dead
+        UI."""
+        session = _make_session()
+        fake_verdict = MagicMock()
+        fake_verdict.to_dict.return_value = {"verdict_id": "v0", "call_id": "c1", "tier": "llm"}
+        fake_judge = MagicMock()
+        fake_judge.evaluate.side_effect = lambda items, *_a, **_kw: [fake_verdict] * len(items)
+        monkeypatch.setattr(session, "_ensure_judge", lambda: fake_judge)
+
+        item = {"call_id": "c1", "func_name": "bash", "needs_approval": True, "command": "ls"}
+        ev = session._evaluate_intent([item], conversation=[], agent_gate=True)
+        assert ev is not None and not ev.is_set()
+        session.close()
+        assert ev.is_set()
+
     def _drive_gate(self, session, monkeypatch, *, cancel_on_approval: bool):
         """Run one needs_approval bash item through ``_execute_tools`` with a
         stubbed judge + approval gate; return the cancel event the judge

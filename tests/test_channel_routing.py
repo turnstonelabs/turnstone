@@ -87,7 +87,7 @@ class TestSendApproval:
         monkeypatch.setattr(router._server, "approve", mock_approve)
         await router.send_approval("ws-1", "corr-abc", approved=True, feedback="ok")
         mock_approve.assert_awaited_once_with(
-            ws_id="ws-1", approved=True, feedback="ok", always=False
+            ws_id="ws-1", approved=True, feedback="ok", always=False, cycle_id="corr-abc"
         )
 
     @pytest.mark.anyio
@@ -99,7 +99,7 @@ class TestSendApproval:
         monkeypatch.setattr(router._server, "approve", mock_approve)
         await router.send_approval("ws-1", "corr-abc", approved=False)
         mock_approve.assert_awaited_once_with(
-            ws_id="ws-1", approved=False, feedback=None, always=False
+            ws_id="ws-1", approved=False, feedback=None, always=False, cycle_id="corr-abc"
         )
 
     @pytest.mark.anyio
@@ -110,7 +110,9 @@ class TestSendApproval:
         mock_approve = AsyncMock()
         monkeypatch.setattr(console_router._console, "route_approve", mock_approve)
         await console_router.send_approval("ws-1", "corr-abc", approved=True, always=True)
-        mock_approve.assert_awaited_once_with(ws_id="ws-1", approved=True, feedback="", always=True)
+        mock_approve.assert_awaited_once_with(
+            ws_id="ws-1", approved=True, feedback="", always=True, cycle_id="corr-abc"
+        )
 
 
 class TestDeleteRoute:

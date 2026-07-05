@@ -1598,7 +1598,7 @@ class TestDetailInteractive:
             "user_id": "test-user",
             "kind": "interactive",
             "pending_approval": False,
-            "pending_approval_detail": None,
+            "pending_approval_details": [],
         }
 
     def test_pending_approval_fields_propagate_from_ui(self):
@@ -1631,23 +1631,26 @@ class TestDetailInteractive:
             ],
             "judge_pending": True,
         }
-        loaded_ws.ui.serialize_pending_approval_detail = MagicMock(
-            return_value={
-                "call_id": "c-1",
-                "judge_pending": True,
-                "items": [
-                    {
-                        "call_id": "c-1",
-                        "func_name": "spawn_workstream",
-                        "needs_approval": True,
-                        "heuristic_verdict": {
-                            "recommendation": "approve",
-                            "risk_level": "low",
-                            "confidence": 0.9,
-                        },
-                    }
-                ],
-            }
+        loaded_ws.ui.serialize_pending_approval_details = MagicMock(
+            return_value=[
+                {
+                    "cycle_id": "cyc-1",
+                    "call_id": "c-1",
+                    "judge_pending": True,
+                    "items": [
+                        {
+                            "call_id": "c-1",
+                            "func_name": "spawn_workstream",
+                            "needs_approval": True,
+                            "heuristic_verdict": {
+                                "recommendation": "approve",
+                                "risk_level": "low",
+                                "confidence": 0.9,
+                            },
+                        }
+                    ],
+                }
+            ]
         )
         mock_mgr = MagicMock()
         mock_mgr.get.return_value = loaded_ws
@@ -1657,9 +1660,12 @@ class TestDetailInteractive:
         assert r.status_code == 200
         body = r.json()
         assert body["pending_approval"] is True
-        assert body["pending_approval_detail"]["call_id"] == "c-1"
-        assert body["pending_approval_detail"]["judge_pending"] is True
-        items = body["pending_approval_detail"]["items"]
+        details = body["pending_approval_details"]
+        assert len(details) == 1
+        assert details[0]["cycle_id"] == "cyc-1"
+        assert details[0]["call_id"] == "c-1"
+        assert details[0]["judge_pending"] is True
+        items = details[0]["items"]
         assert len(items) == 1
         assert items[0]["func_name"] == "spawn_workstream"
         assert items[0]["needs_approval"] is True
@@ -1680,7 +1686,7 @@ class TestDetailInteractive:
         loaded_ws.user_id = "test-user"
         loaded_ws.kind = "coordinator"
         loaded_ws.ui._pending_approval = {"items": []}
-        loaded_ws.ui.serialize_pending_approval_detail = MagicMock(
+        loaded_ws.ui.serialize_pending_approval_details = MagicMock(
             side_effect=RuntimeError("verdict object is malformed"),
         )
         mock_mgr = MagicMock()
@@ -1691,7 +1697,7 @@ class TestDetailInteractive:
         assert r.status_code == 200
         body = r.json()
         assert body["pending_approval"] is True
-        assert body["pending_approval_detail"] is None
+        assert body["pending_approval_details"] == []
 
     def test_lazy_rehydrates_on_miss(self):
         """``mgr.get`` miss → ``mgr.open`` rehydrate. Same flow as coord;
@@ -1801,7 +1807,7 @@ class TestTenantCheckOnReadEndpoints:
         # Sensitive fields the PR added must not surface for a
         # non-owning caller.
         assert "name" not in body
-        assert "pending_approval_detail" not in body
+        assert "pending_approval_details" not in body
         assert "user_id" not in body
         # And mgr.get was NEVER consulted — the gate fires first.
         mock_mgr.get.assert_not_called()
@@ -1832,7 +1838,7 @@ class TestTenantCheckOnReadEndpoints:
         body = r.json()
         assert body["ws_id"] == ws_id
         assert body["pending_approval"] is False
-        assert body["pending_approval_detail"] is None
+        assert body["pending_approval_details"] == []
 
     def test_history_404s_when_tenant_check_rejects(self, _inject_storage):
         """A non-owning interactive caller reading another user's ws_id

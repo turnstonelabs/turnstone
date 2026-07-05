@@ -576,10 +576,11 @@ class TestApprovalOwnership:
 
         bot, router, client = _make_bot()
         ws_id = "ws-1"
-        bot._pending_approval[ws_id] = PendingApproval(  # type: ignore[attr-defined]
+        bot._pending_approval[(ws_id, "corr-1")] = PendingApproval(  # type: ignore[attr-defined]
             channel="C01SAPU5414",
             message_ts="111.222",
             owner_user_id="U_OWNER",
+            cycle_id="corr-1",
         )
 
         body = {
@@ -598,10 +599,11 @@ class TestApprovalOwnership:
 
         bot, router, client = _make_bot()
         ws_id = "ws-1"
-        bot._pending_approval[ws_id] = PendingApproval(  # type: ignore[attr-defined]
+        bot._pending_approval[(ws_id, "corr-1")] = PendingApproval(  # type: ignore[attr-defined]
             channel="C01SAPU5414",
             message_ts="111.222",
             owner_user_id="U_OWNER",
+            cycle_id="corr-1",
         )
 
         body = {
@@ -620,10 +622,11 @@ class TestApprovalOwnership:
 
         bot, router, client = _make_bot()
         ws_id = "ws-1"
-        bot._pending_approval[ws_id] = PendingApproval(  # type: ignore[attr-defined]
+        bot._pending_approval[(ws_id, "corr-1")] = PendingApproval(  # type: ignore[attr-defined]
             channel="C01SAPU5414",
             message_ts="111.222",
             owner_user_id="U_OWNER",
+            cycle_id="corr-1",
         )
 
         body = {
@@ -776,7 +779,9 @@ class TestWsEventDispatch:
         bot, client = self._make_ws_bot()
 
         event = ApproveRequestEvent(
-            ws_id="ws-1", items=[{"func_name": "bash", "needs_approval": True}]
+            ws_id="ws-1",
+            cycle_id="cyc-1",
+            items=[{"call_id": "c-1", "func_name": "bash", "needs_approval": True}],
         )
         route = SlackRoute(channel="C1", user_id="U12345", thread_ts="123.456")
         _run(bot._on_ws_event("ws-1", route, event))  # type: ignore[attr-defined]
@@ -784,8 +789,12 @@ class TestWsEventDispatch:
         client.chat_postMessage.assert_awaited_once()
         call_kwargs = client.chat_postMessage.call_args[1]
         assert "blocks" in call_kwargs
-        assert "ws-1" in bot._pending_approval  # type: ignore[attr-defined]
-        assert bot._pending_approval["ws-1"].owner_user_id == "U12345"  # type: ignore[attr-defined]
+        # Tracked under (ws_id, cycle_id) so concurrent cycles each get
+        # their own Slack message.
+        entry = bot._pending_approval[("ws-1", "cyc-1")]  # type: ignore[attr-defined]
+        assert entry.owner_user_id == "U12345"
+        assert entry.cycle_id == "cyc-1"
+        assert entry.call_ids == frozenset({"c-1"})
 
     def test_intent_verdict_updates_approval_message(self) -> None:
         from turnstone.channels.slack.bot import PendingApproval
@@ -797,14 +806,17 @@ class TestWsEventDispatch:
             return_value={"ok": True, "messages": [{"blocks": []}]}
         )
 
-        bot._pending_approval["ws-1"] = PendingApproval(  # type: ignore[attr-defined]
+        bot._pending_approval[("ws-1", "cyc-1")] = PendingApproval(  # type: ignore[attr-defined]
             channel="C1",
             message_ts="999.000",
             owner_user_id="U12345",
+            cycle_id="cyc-1",
+            call_ids=frozenset({"c-1"}),
         )
 
         event = IntentVerdictEvent(
             ws_id="ws-1",
+            call_id="c-1",
             func_name="bash",
             risk_level="high",
             confidence=0.9,
@@ -821,17 +833,20 @@ class TestWsEventDispatch:
         from turnstone.sdk.events import ApprovalResolvedEvent
 
         bot, client = self._make_ws_bot()
-        bot._pending_approval["ws-1"] = PendingApproval(  # type: ignore[attr-defined]
+        bot._pending_approval[("ws-1", "cyc-9")] = PendingApproval(  # type: ignore[attr-defined]
             channel="C1",
             message_ts="999.000",
             owner_user_id="U12345",
+            cycle_id="cyc-9",
         )
 
+        # Event WITHOUT a cycle_id (pre-multi-cycle server): the legacy
+        # fallback clears the ws's single tracked entry, as before.
         event = ApprovalResolvedEvent(ws_id="ws-1", approved=True)
         route = SlackRoute(channel="C1", user_id="U12345", thread_ts="123.456")
         _run(bot._on_ws_event("ws-1", route, event))  # type: ignore[attr-defined]
 
-        assert "ws-1" not in bot._pending_approval  # type: ignore[attr-defined]
+        assert not bot._pending_approval  # type: ignore[attr-defined]
         client.chat_update.assert_awaited_once()
 
     def test_link_prefix_does_not_hijack_regular_prompt(self) -> None:

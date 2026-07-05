@@ -525,12 +525,16 @@ class TestBroadcastApprovalResolved:
         collector = MagicMock()
         ConsoleCoordinatorUI._collector = collector
         try:
-            ui._broadcast_approval_resolved(True, "lgtm", always=True)
+            ui._broadcast_approval_resolved(
+                True, "lgtm", always=True, cycle_id="cyc-1", call_ids=("c-1", "c-2")
+            )
             collector.emit_console_ws_approval_resolved.assert_called_once_with(
                 "coord-a",
                 approved=True,
                 feedback="lgtm",
                 always=True,
+                cycle_id="cyc-1",
+                call_ids=["c-1", "c-2"],
             )
         finally:
             ConsoleCoordinatorUI._collector = None
@@ -546,6 +550,8 @@ class TestBroadcastApprovalResolved:
                 approved=False,
                 feedback="",
                 always=False,
+                cycle_id="",
+                call_ids=[],
             )
         finally:
             ConsoleCoordinatorUI._collector = None

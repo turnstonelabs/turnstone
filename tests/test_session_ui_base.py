@@ -13,8 +13,11 @@ in its own test files.
 
 from __future__ import annotations
 
+import contextlib
 import queue
 import threading
+import time
+from collections.abc import Callable, Iterator
 from typing import Any
 from unittest.mock import MagicMock, patch
 
@@ -93,22 +96,67 @@ def test_enqueue_tolerates_full_listener_queue() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_resolve_approval_sets_result_and_unblocks_event() -> None:
+def _register_cycle(
+    ui: SessionUIBase,
+    call_ids: list[str],
+    *,
+    judge_event: object | None = None,
+) -> Any:
+    """Register a live ApprovalCycle the way ``approve_tools`` does.
+
+    Builds the card from wire-shaped items so serializer tests see the
+    exact production shape, registers under the lock, and returns the
+    cycle for direct assertions.
+    """
+    from turnstone.core.session_ui_base import ApprovalCycle
+
+    items = [
+        {"call_id": cid, "func_name": "bash", "approval_label": "bash", "needs_approval": True}
+        for cid in call_ids
+    ]
+    card: dict[str, Any] = {
+        "type": "approve_request",
+        "cycle_id": f"cycle-{'-'.join(call_ids)}",
+        "items": ui._serialize_approval_items(items),
+        "judge_pending": False,
+    }
+    cycle = ApprovalCycle(items, card, judge_event)
+    ui._register_approval_cycle(cycle)
+    return cycle
+
+
+def test_resolve_approval_sets_result_and_unblocks_cycle_event() -> None:
     ui = _make_ui()
-    ui._approval_event.clear()
-    ui.resolve_approval(True, "looks good")
-    assert ui._approval_result == (True, "looks good")
-    assert ui._approval_event.is_set()
+    cycle = _register_cycle(ui, ["c1"])
+    resolved = ui.resolve_approval(True, "looks good")
+    assert resolved == cycle.cycle_id
+    assert cycle.result == (True, "looks good")
+    assert cycle.resolved is True
+    assert cycle.event.is_set()
+
+
+def test_resolve_approval_without_live_cycle_is_a_noop() -> None:
+    """No live cycle → nothing to resolve: returns None and broadcasts
+    nothing (the old singleton overwrote a shared result slot and
+    leaked a stale ``approval_resolved`` event on idle cancels)."""
+    ui = _make_ui()
+    lq = ui._register_listener()
+    assert ui.resolve_approval(True, "nobody asked") is None
+    assert lq.empty()
 
 
 def test_resolve_approval_broadcasts_approval_resolved() -> None:
     ui = _make_ui()
+    cycle = _register_cycle(ui, ["c1"])
     lq = ui._register_listener()
     ui.resolve_approval(False, "nope")
     event = lq.get_nowait()
     assert event["type"] == "approval_resolved"
     assert event["approved"] is False
     assert event["feedback"] == "nope"
+    # Cycle identity rides the event so clients dismiss the RIGHT card.
+    assert event["cycle_id"] == cycle.cycle_id
+    assert event["call_ids"] == ["c1"]
 
 
 # ---------------------------------------------------------------------------
@@ -156,24 +204,52 @@ def test_on_intent_verdict_persists_verdict_row() -> None:
     assert kwargs["call_id"] == "c1"
 
 
-def test_on_intent_verdict_queues_pending_when_decision_unset() -> None:
+def test_on_intent_verdict_parks_on_owning_cycle_when_undecided() -> None:
+    ui = _make_ui()
+    cycle = _register_cycle(ui, ["c1"])
+    with _patch_get_storage(MagicMock()):
+        ui.on_intent_verdict({"verdict_id": "v1", "call_id": "c1"})
+    assert cycle.pending_verdicts == [{"verdict_id": "v1", "call_id": "c1"}]
+
+
+def test_on_intent_verdict_without_owner_is_cache_only() -> None:
+    """No live cycle owns the call (pre-cycle Smart-Approvals arrival):
+    the verdict caches for the wait/replay but parks nowhere — the
+    gate's registration sweep adopts it when the cycle is created."""
     ui = _make_ui()
     with _patch_get_storage(MagicMock()):
         ui.on_intent_verdict({"verdict_id": "v1", "call_id": "c1"})
-    assert ui._pending_verdicts == [{"verdict_id": "v1", "call_id": "c1"}]
+    assert ui._llm_verdicts["c1"]["verdict_id"] == "v1"
+    assert ui._approval_cycles == {}
 
 
 def test_on_intent_verdict_stamps_immediately_when_decision_already_set() -> None:
-    """Late-arriving verdict (after approval resolved) gets
-    user_decision stamped immediately instead of queued."""
+    """Late-arriving verdict (after its round resolved) gets
+    user_decision stamped from the per-call decision map instead of
+    parked — the run-to-completion daemon can deliver seconds after
+    the gate closed."""
     storage = MagicMock()
     ui = _make_ui()
-    ui._last_verdict_decision = "approved"
+    ui._recent_decisions["c-late"] = ("approved", None)
     with _patch_get_storage(storage):
         ui.on_intent_verdict({"verdict_id": "v-late", "call_id": "c-late"})
-    # Not queued — decision was already set.
-    assert ui._pending_verdicts == []
     storage.update_intent_verdict.assert_called_once_with("v-late", user_decision="approved")
+
+
+def test_on_intent_verdict_late_stamp_is_per_call_not_global() -> None:
+    """Concurrent-cycles regression: sibling B's late verdict must NOT
+    inherit sibling A's decision — the old single ``_last_verdict_decision``
+    string stamped every late verdict with whichever round resolved last."""
+    storage = MagicMock()
+    ui = _make_ui()
+    _register_cycle(ui, ["a1"])
+    _register_cycle(ui, ["b1"])
+    with _patch_get_storage(storage):
+        ui.resolve_approval(True, None, call_id="a1")  # approve A only
+        ui.on_intent_verdict({"verdict_id": "v-b", "call_id": "b1"})
+    # B's verdict is parked on B's still-open cycle, unstamped.
+    for call in storage.update_intent_verdict.call_args_list:
+        assert call.args[0] != "v-b", "sibling A's decision leaked onto B's verdict"
 
 
 def test_on_superseded_intent_verdict_persists_without_live_surfaces() -> None:
@@ -201,7 +277,6 @@ def test_on_superseded_intent_verdict_persists_without_live_surfaces() -> None:
     assert kwargs["user_decision"] == "superseded"
     assert lq.empty()  # no SSE delivery
     assert "c-late" not in ui._llm_verdicts  # no replay-cache write
-    assert ui._pending_verdicts == []  # no decision-stamp park
     assert "user_decision" not in verdict  # caller's dict not mutated
 
 
@@ -221,54 +296,64 @@ def test_llm_verdict_cache_evicts_oldest_at_cap() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Approval cycle reset — the bug-1 regression
+# Per-round verdict purge — the bug-1 regression, scoped for concurrency
 # ---------------------------------------------------------------------------
 
 
-def test_reset_approval_cycle_clears_decision_and_cache() -> None:
+def test_purge_round_verdicts_is_scoped_to_the_entering_batch() -> None:
+    """Successor of the whole-cache reset: entering a gate evicts stale
+    verdict state for ITS call_ids only — a concurrent sibling cycle's
+    cached verdicts must survive (the old full clear wiped them
+    mid-wait and sent qualifying batches to a human)."""
     ui = _make_ui()
-    ui._last_verdict_decision = "approved"
+    ui._recent_decisions["c-stale"] = ("approved", None)
     ui._llm_verdicts["c-stale"] = {"verdict_id": "stale"}
-    ui._reset_approval_cycle()
-    assert ui._last_verdict_decision == ""
-    assert ui._llm_verdicts == {}
+    ui._verdict_origins["c-stale"] = 123
+    ui._llm_verdicts["c-sibling"] = {"verdict_id": "sibling"}
+    ui._purge_round_verdicts({"c-stale"})
+    assert "c-stale" not in ui._llm_verdicts
+    assert "c-stale" not in ui._verdict_origins
+    assert "c-stale" not in ui._recent_decisions
+    # The concurrent sibling's verdict is untouched.
+    assert ui._llm_verdicts["c-sibling"]["verdict_id"] == "sibling"
 
 
 def test_late_verdict_in_new_round_not_stamped_with_prior_decision() -> None:
-    """Regression test for the ultrareview bug-1 finding.
+    """Regression test for the ultrareview bug-1 finding, cycle-scoped.
 
-    Round 1: approve → _last_verdict_decision = "approved".
-    Round 2 begins: caller calls _reset_approval_cycle().
+    Round 1 (call c1): approve → decision recorded for c1 only.
+    Round 2 (call c2, new cycle) begins.
     A verdict fires mid-round 2: must NOT inherit "approved" from
-    round 1. Must land in _pending_verdicts waiting for this round's
-    resolution.
+    round 1. Must park on round 2's cycle awaiting ITS resolution.
     """
     storage = MagicMock()
     ui = _make_ui()
-    # Simulate round 1 completion.
+    # Round 1 completion.
+    _register_cycle(ui, ["c1"])
     with _patch_get_storage(storage):
         ui.on_intent_verdict({"verdict_id": "v1", "call_id": "c1"})
         ui.resolve_approval(True, None)
-    assert ui._last_verdict_decision == "approved"
-    # Round 2 begins — subclass approve_tools calls this at entry.
-    ui._reset_approval_cycle()
+    assert ui._recent_decisions.get("c1") == ("approved", None)
+    # Round 2 begins — approve_tools purges the entering ids and
+    # registers a fresh cycle.
+    ui._purge_round_verdicts({"c2"})
+    cycle2 = _register_cycle(ui, ["c2"])
     # Late judge fires during round 2 BEFORE the user decides.
     with _patch_get_storage(storage):
         ui.on_intent_verdict({"verdict_id": "v2", "call_id": "c2"})
-    # The new verdict must be pending (awaiting this round's decision),
+    # The new verdict parks on round 2's cycle (awaiting its decision),
     # NOT already stamped with round 1's "approved".
-    assert ui._pending_verdicts == [{"verdict_id": "v2", "call_id": "c2"}]
-    # update_intent_verdict was only called ONCE: for v1 when round 1
-    # resolved. v2 should NOT have been stamped.
+    assert cycle2.pending_verdicts == [{"verdict_id": "v2", "call_id": "c2"}]
     for call in storage.update_intent_verdict.call_args_list:
         assert call.args[0] != "v2", "late verdict was stamped with prior round's decision"
 
 
-def test_both_subclasses_call_reset_from_approve_tools() -> None:
-    """Regression for bug-1: the real subclass ``approve_tools``
-    methods must invoke ``_reset_approval_cycle`` at entry. Without
-    this, coord sessions that already resolved a prior approval stamp
-    the next round's late verdicts with the stale decision.
+def test_both_subclasses_purge_round_state_from_approve_tools() -> None:
+    """Regression for bug-1, scoped: the real subclass ``approve_tools``
+    bodies must purge the ENTERING batch's stale verdict state at entry
+    — a provider that reuses call_ids across turns must not have round
+    1's cached ``approve`` pre-satisfy round 2's Smart-Approvals wait.
+    A concurrent sibling's cache entry survives.
     """
     import turnstone.server
     from turnstone.console.coordinator_ui import ConsoleCoordinatorUI
@@ -277,39 +362,47 @@ def test_both_subclasses_call_reset_from_approve_tools() -> None:
 
     for cls in (webui, ConsoleCoordinatorUI):
         ui = cls(ws_id="ws-x", user_id="u1")
-        # Stage state as if a prior approval round already finished.
-        ui._last_verdict_decision = "approved"
-        ui._llm_verdicts["stale"] = {"verdict_id": "stale"}
-        # Entering approve_tools for a new round — the reset must fire.
-        # Pass items with needs_approval=False so approve_tools returns
-        # without blocking on user input.
+        # Stage state as if a prior round already finished on the SAME
+        # call_id this round reuses, plus an unrelated sibling entry.
+        ui._recent_decisions["c-reused"] = ("approved", None)
+        ui._llm_verdicts["c-reused"] = {"verdict_id": "stale"}
+        ui._llm_verdicts["c-sibling"] = {"verdict_id": "sibling"}
+        # Entering approve_tools for the new round — the scoped purge
+        # must fire for c-reused.  needs_approval=False so the gate
+        # returns without blocking on user input.
         with _patch_get_storage(MagicMock()):
-            ui.approve_tools([{"func_name": "ls", "needs_approval": False}])
-        assert ui._last_verdict_decision == "", (
-            f"{cls.__name__}.approve_tools did not call _reset_approval_cycle "
-            "— next round's verdicts would inherit the prior decision"
+            ui.approve_tools([{"call_id": "c-reused", "func_name": "ls", "needs_approval": False}])
+        assert "c-reused" not in ui._llm_verdicts, (
+            f"{cls.__name__}.approve_tools did not purge the entering batch's "
+            "stale cached verdict — round 2 could ride round 1's approve"
         )
-        assert ui._llm_verdicts == {}, (
-            f"{cls.__name__}.approve_tools did not clear the LLM verdict cache"
+        assert "c-reused" not in ui._recent_decisions, (
+            f"{cls.__name__}.approve_tools did not purge the entering batch's "
+            "stale decision — this round's verdicts would inherit it"
+        )
+        assert ui._llm_verdicts.get("c-sibling") == {"verdict_id": "sibling"}, (
+            f"{cls.__name__}.approve_tools wiped a concurrent sibling's verdict"
         )
 
 
 def test_on_intent_verdict_decision_check_and_queue_are_atomic() -> None:
     """Regression for the on_intent_verdict ↔ resolve_approval race.
 
-    Prior implementation acquired ``_ws_lock`` twice: once to read
-    ``_last_verdict_decision``, once to append to
-    ``_pending_verdicts``. Between those two acquisitions
-    ``resolve_approval`` could swap-and-clear the pending list and
-    set the decision — our verdict then got appended to the fresh
-    list and stamped with the NEXT round's decision.
+    The owner-check, the park, and the fallback decision-read must
+    happen under a SINGLE lock acquisition: ``resolve_approval`` marks
+    the cycle resolved and records the per-call decision atomically
+    under the same lock, so exactly one side wins — the verdict is
+    either parked pre-decision (resolve stamps it from the cycle's
+    ``pending_verdicts``) or stamped post-decision (from
+    ``_recent_decisions``).  A check-then-release-then-park pattern
+    reopens the window where a verdict lands unparked AND unstamped —
+    an audit row stuck at "pending" forever.
 
-    Fix: decision check + append happen under a single lock
-    acquisition. This test counts lock acquisitions during one
-    ``on_intent_verdict`` and fails if the release-then-reacquire
-    pattern returns.
+    This test counts lock acquisitions during one ``on_intent_verdict``
+    and fails if the release-then-reacquire pattern returns.
     """
     ui = _make_ui()
+    _register_cycle(ui, ["c1"])
     acquire_count = 0
     original_lock = ui._ws_lock
 
@@ -335,32 +428,34 @@ def test_on_intent_verdict_decision_check_and_queue_are_atomic() -> None:
     with _patch_get_storage(MagicMock()):
         ui.on_intent_verdict({"verdict_id": "v1", "call_id": "c1"})
     # Two acquisitions: one for the cache write (call_id is truthy),
-    # one for decision-check + pending-append. Before the fix there
-    # were three, with a window resolve_approval could slip into.
+    # one for owner-check + park-or-stamp. A third acquisition means
+    # the release-then-reacquire window is back.
     assert acquire_count == 2, (
         f"on_intent_verdict acquired _ws_lock {acquire_count} times; "
-        "decision-check + pending-append must happen under ONE acquisition "
+        "owner-check + park-or-stamp must happen under ONE acquisition "
         "to avoid a race with resolve_approval"
     )
 
 
 def test_resolve_approval_stamps_all_pending_verdicts() -> None:
-    """Normal path: multiple verdicts queued during the round, all get
+    """Normal path: multiple verdicts parked on the round's cycle, all
     stamped with the user's decision on resolve."""
     storage = MagicMock()
     ui = _make_ui()
+    cycle = _register_cycle(ui, ["c1", "c2"])
     with _patch_get_storage(storage):
         ui.on_intent_verdict({"verdict_id": "v1", "call_id": "c1"})
         ui.on_intent_verdict({"verdict_id": "v2", "call_id": "c2"})
-    assert len(ui._pending_verdicts) == 2
+    assert len(cycle.pending_verdicts) == 2
     with _patch_get_storage(storage):
         ui.resolve_approval(False, "too risky")
     # Both verdicts get stamped.
     stamped_ids = {c.args[0] for c in storage.update_intent_verdict.call_args_list}
     assert stamped_ids == {"v1", "v2"}
-    # Pending list cleared after resolve.
-    assert ui._pending_verdicts == []
-    assert ui._last_verdict_decision == "denied"
+    # Cycle's park cleared after resolve; decisions recorded per call.
+    assert cycle.pending_verdicts == []
+    assert ui._recent_decisions.get("c1") == ("denied", None)
+    assert ui._recent_decisions.get("c2") == ("denied", None)
 
 
 # ---------------------------------------------------------------------------
@@ -377,12 +472,13 @@ def test_resolve_approval_timeout_kwarg_writes_timeout_value() -> None:
     string used to carry this distinction but the column alone could not."""
     storage = MagicMock()
     ui = _make_ui()
+    _register_cycle(ui, ["c1"])
     with _patch_get_storage(storage):
         ui.on_intent_verdict({"verdict_id": "v1", "call_id": "c1"})
     with _patch_get_storage(storage):
         ui.resolve_approval(False, "expired", timeout=True)
     storage.update_intent_verdict.assert_any_call("v1", user_decision="timeout")
-    assert ui._last_verdict_decision == "timeout"
+    assert ui._recent_decisions.get("c1") == ("timeout", None)
 
 
 def test_resolve_approval_timeout_with_approved_raises() -> None:
@@ -442,11 +538,6 @@ def test_on_intent_verdict_consumes_auto_approve_reason() -> None:
     assert kwargs["user_decision"] == "auto_approve_tools"
     # Consumed on read so the same call_id can't double-stamp later.
     assert "c-x" not in ui._auto_approve_reasons
-    # Auto-stamped verdicts must NOT join _pending_verdicts — the
-    # row's final decision is already set; appending would let a
-    # later resolve_approval overwrite the auto-reason with the
-    # manual decision (real audit-trail clobber bug).
-    assert ui._pending_verdicts == []
 
 
 def test_on_intent_verdict_auto_reason_survives_resolve_cycle() -> None:
@@ -459,6 +550,7 @@ def test_on_intent_verdict_auto_reason_survives_resolve_cycle() -> None:
     ``"approved"``/``"denied"`` by the resolve path."""
     storage = MagicMock()
     ui = _make_ui()
+    _register_cycle(ui, ["c-pending"])
     ui._auto_approve_reasons["c-auto"] = ("policy", 0.0)
     with _patch_get_storage(storage):
         # LLM verdict fires for the auto-approved sibling.
@@ -627,39 +719,54 @@ def test_record_output_assessment_defaults_to_heuristic_tier() -> None:
 
 
 # ---------------------------------------------------------------------------
-# serialize_pending_approval_detail — dashboard projection
+# serialize_pending_approval_details — dashboard projection (per cycle)
 # ---------------------------------------------------------------------------
 
 
-def test_serialize_pending_approval_detail_returns_none_when_unset() -> None:
+def _register_card_cycle(ui: SessionUIBase, card: dict[str, Any]) -> Any:
+    """Register a cycle from a raw approve_request card (shape-exact tests)."""
+    from turnstone.core.session_ui_base import ApprovalCycle
+
+    cycle = ApprovalCycle(list(card.get("items") or []), card, None)
+    ui._register_approval_cycle(cycle)
+    return cycle
+
+
+def test_serialize_pending_approval_details_empty_when_no_cycles() -> None:
     ui = _make_ui()
-    assert ui.serialize_pending_approval_detail() is None
+    assert ui.serialize_pending_approval_details() == []
 
 
-def test_serialize_pending_approval_detail_returns_none_when_items_empty() -> None:
+def test_serialize_pending_approval_details_skips_empty_items_card() -> None:
     ui = _make_ui()
-    ui._pending_approval = {"type": "approve_request", "items": [], "judge_pending": False}
-    assert ui.serialize_pending_approval_detail() is None
+    _register_card_cycle(
+        ui, {"type": "approve_request", "cycle_id": "cy-0", "items": [], "judge_pending": False}
+    )
+    assert ui.serialize_pending_approval_details() == []
 
 
-def test_serialize_pending_approval_detail_merges_judge_verdict() -> None:
+def test_serialize_pending_approval_details_merges_judge_verdict() -> None:
     ui = _make_ui()
-    ui._pending_approval = {
-        "type": "approve_request",
-        "items": [
-            {
-                "call_id": "c-1",
-                "header": "bash",
-                "preview": "$ ls",
-                "func_name": "bash",
-                "approval_label": "bash",
-                "needs_approval": True,
-                "error": None,
-                "verdict": {"recommendation": "review", "tier": "heuristic"},
-            }
-        ],
-        "judge_pending": True,
-    }
+    _register_card_cycle(
+        ui,
+        {
+            "type": "approve_request",
+            "cycle_id": "cy-1",
+            "items": [
+                {
+                    "call_id": "c-1",
+                    "header": "bash",
+                    "preview": "$ ls",
+                    "func_name": "bash",
+                    "approval_label": "bash",
+                    "needs_approval": True,
+                    "error": None,
+                    "heuristic_verdict": {"recommendation": "review", "tier": "heuristic"},
+                }
+            ],
+            "judge_pending": True,
+        },
+    )
     ui._llm_verdicts["c-1"] = {
         "verdict_id": "v-1",
         "call_id": "c-1",
@@ -667,8 +774,10 @@ def test_serialize_pending_approval_detail_merges_judge_verdict() -> None:
         "recommendation": "deny",
         "tier": "llm",
     }
-    detail = ui.serialize_pending_approval_detail()
-    assert detail is not None
+    details = ui.serialize_pending_approval_details()
+    assert len(details) == 1
+    detail = details[0]
+    assert detail["cycle_id"] == "cy-1"
     assert detail["call_id"] == "c-1"
     assert detail["judge_pending"] is True
     assert len(detail["items"]) == 1
@@ -681,63 +790,100 @@ def test_serialize_pending_approval_detail_merges_judge_verdict() -> None:
     assert item["judge_verdict"]["risk_level"] == "high"
 
 
-def test_serialize_pending_approval_detail_judge_verdict_none_when_missing() -> None:
+def test_serialize_pending_approval_details_judge_verdict_none_when_missing() -> None:
     """No cached verdict for the call_id → judge_verdict is None,
     not absent or some sentinel."""
     ui = _make_ui()
-    ui._pending_approval = {
-        "type": "approve_request",
-        "items": [{"call_id": "c-1", "func_name": "ls", "needs_approval": True}],
-        "judge_pending": True,
-    }
-    detail = ui.serialize_pending_approval_detail()
-    assert detail is not None
-    assert detail["items"][0]["judge_verdict"] is None
-    assert detail["items"][0]["heuristic_verdict"] is None
+    _register_card_cycle(
+        ui,
+        {
+            "type": "approve_request",
+            "cycle_id": "cy-1",
+            "items": [{"call_id": "c-1", "func_name": "ls", "needs_approval": True}],
+            "judge_pending": True,
+        },
+    )
+    details = ui.serialize_pending_approval_details()
+    assert details[0]["items"][0]["judge_verdict"] is None
+    assert details[0]["items"][0]["heuristic_verdict"] is None
 
 
-def test_serialize_pending_approval_detail_multi_item() -> None:
+def test_serialize_pending_approval_details_multi_item() -> None:
     ui = _make_ui()
-    ui._pending_approval = {
-        "type": "approve_request",
-        "items": [
-            {"call_id": "c-1", "func_name": "bash", "needs_approval": True},
-            {"call_id": "c-2", "func_name": "mcp__sf__query", "needs_approval": True},
-        ],
-        "judge_pending": False,
-    }
+    _register_card_cycle(
+        ui,
+        {
+            "type": "approve_request",
+            "cycle_id": "cy-1",
+            "items": [
+                {"call_id": "c-1", "func_name": "bash", "needs_approval": True},
+                {"call_id": "c-2", "func_name": "mcp__sf__query", "needs_approval": True},
+            ],
+            "judge_pending": False,
+        },
+    )
     ui._llm_verdicts["c-2"] = {"recommendation": "deny", "risk_level": "crit"}
-    detail = ui.serialize_pending_approval_detail()
-    assert detail is not None
+    details = ui.serialize_pending_approval_details()
+    detail = details[0]
     assert detail["call_id"] == "c-1"  # primary = first item
     assert len(detail["items"]) == 2
     assert detail["items"][0]["judge_verdict"] is None
     assert detail["items"][1]["judge_verdict"]["recommendation"] == "deny"
 
 
-def test_serialize_pending_approval_detail_tool_policy_denied_passthrough() -> None:
+def test_serialize_pending_approval_details_one_entry_per_live_cycle() -> None:
+    """Parallel task agents: every live cycle serializes, oldest first,
+    each addressable by its cycle_id — the single-slot serializer only
+    ever showed the one card the last writer left behind."""
+    ui = _make_ui()
+    _register_card_cycle(
+        ui,
+        {
+            "type": "approve_request",
+            "cycle_id": "cy-old",
+            "items": [{"call_id": "a-1", "func_name": "bash", "needs_approval": True}],
+            "judge_pending": False,
+        },
+    )
+    _register_card_cycle(
+        ui,
+        {
+            "type": "approve_request",
+            "cycle_id": "cy-new",
+            "items": [{"call_id": "b-1", "func_name": "write_file", "needs_approval": True}],
+            "judge_pending": False,
+        },
+    )
+    details = ui.serialize_pending_approval_details()
+    assert [d["cycle_id"] for d in details] == ["cy-old", "cy-new"]
+    assert [d["call_id"] for d in details] == ["a-1", "b-1"]
+
+
+def test_serialize_pending_approval_details_tool_policy_denied_passthrough() -> None:
     """A tool-policy-denied item carries error + needs_approval=False
     after WebUI.approve_tools mutates the items list. The serializer
     must round-trip both fields so the JS can detect the
     POLICY-BLOCKED matrix row and render the banner instead of
     approve/deny buttons."""
     ui = _make_ui()
-    ui._pending_approval = {
-        "type": "approve_request",
-        "items": [
-            {
-                "call_id": "c-1",
-                "func_name": "rm_rf",
-                "approval_label": "rm_rf",
-                "needs_approval": False,
-                "error": "Blocked by tool policy (pattern match for 'rm_rf')",
-            }
-        ],
-        "judge_pending": False,
-    }
-    detail = ui.serialize_pending_approval_detail()
-    assert detail is not None
-    item = detail["items"][0]
+    _register_card_cycle(
+        ui,
+        {
+            "type": "approve_request",
+            "cycle_id": "cy-1",
+            "items": [
+                {
+                    "call_id": "c-1",
+                    "func_name": "rm_rf",
+                    "approval_label": "rm_rf",
+                    "needs_approval": False,
+                    "error": "Blocked by tool policy (pattern match for 'rm_rf')",
+                }
+            ],
+            "judge_pending": False,
+        },
+    )
+    item = ui.serialize_pending_approval_details()[0]["items"][0]
     # Both fields are the JS detection keys for the POLICY-BLOCKED
     # branch in renderApprovalBlock — drift here silently regresses
     # to a buttoned approve UI on a server-blocked call.
@@ -745,26 +891,29 @@ def test_serialize_pending_approval_detail_tool_policy_denied_passthrough() -> N
     assert item["error"] == "Blocked by tool policy (pattern match for 'rm_rf')"
 
 
-def test_serialize_pending_approval_detail_judge_unavailable_path() -> None:
+def test_serialize_pending_approval_details_judge_unavailable_path() -> None:
     """No judge_verdict + no heuristic_verdict + judge_pending=False
     is the (judge unavailable) matrix row — the JS detects it via
     !verdict && !judgePending && !policyBlocked. Verify the
     serialized payload preserves the absence of all three signals."""
     ui = _make_ui()
-    ui._pending_approval = {
-        "type": "approve_request",
-        "items": [
-            {
-                "call_id": "c-1",
-                "func_name": "bash",
-                "approval_label": "bash",
-                "needs_approval": True,
-            }
-        ],
-        "judge_pending": False,
-    }
-    detail = ui.serialize_pending_approval_detail()
-    assert detail is not None
+    _register_card_cycle(
+        ui,
+        {
+            "type": "approve_request",
+            "cycle_id": "cy-1",
+            "items": [
+                {
+                    "call_id": "c-1",
+                    "func_name": "bash",
+                    "approval_label": "bash",
+                    "needs_approval": True,
+                }
+            ],
+            "judge_pending": False,
+        },
+    )
+    detail = ui.serialize_pending_approval_details()[0]
     assert detail["judge_pending"] is False
     item = detail["items"][0]
     assert item["judge_verdict"] is None
@@ -773,18 +922,21 @@ def test_serialize_pending_approval_detail_judge_unavailable_path() -> None:
     assert item["error"] is None
 
 
-def test_serialize_pending_approval_detail_returned_dict_is_decoupled() -> None:
+def test_serialize_pending_approval_details_returned_dict_is_decoupled() -> None:
     """Mutating the returned dict must not corrupt the cached
     verdict, which other consumers may still read."""
     ui = _make_ui()
-    ui._pending_approval = {
-        "type": "approve_request",
-        "items": [{"call_id": "c-1", "func_name": "bash", "needs_approval": True}],
-        "judge_pending": False,
-    }
+    _register_card_cycle(
+        ui,
+        {
+            "type": "approve_request",
+            "cycle_id": "cy-1",
+            "items": [{"call_id": "c-1", "func_name": "bash", "needs_approval": True}],
+            "judge_pending": False,
+        },
+    )
     ui._llm_verdicts["c-1"] = {"recommendation": "approve"}
-    detail = ui.serialize_pending_approval_detail()
-    assert detail is not None
+    detail = ui.serialize_pending_approval_details()[0]
     detail["items"][0]["judge_verdict"]["recommendation"] = "MUTATED"
     assert ui._llm_verdicts["c-1"]["recommendation"] == "approve"
 
@@ -1535,19 +1687,27 @@ def test_concurrent_writer_and_register_with_snapshot_no_loss_no_dup() -> None:
 
 
 class _SeedingUI(_ConcreteUI):
-    """Re-delivers seeded LLM verdicts right after the approval-cycle
-    reset clears the cache — simulates the async judge daemon delivering
-    them via ``on_intent_verdict`` during the Smart Approvals wait, which
-    is the only point at which they can land and survive the reset."""
+    """Re-delivers seeded LLM verdicts right after the per-round purge
+    evicts the entering batch's ids — simulates the async judge daemon
+    delivering them via ``on_intent_verdict`` during the Smart Approvals
+    wait, which is the only point at which they can land and survive
+    the purge.  ``seed_judge_event`` optionally tags the deliveries with
+    a generation, for window tests that need a STALE-generation arrival
+    between the purge and the cycle registration."""
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
         self.seed_verdicts: list[dict[str, Any]] = []
+        self.seed_judge_event: threading.Event | None = None
 
-    def _reset_approval_cycle(self) -> None:
-        super()._reset_approval_cycle()
+    def _purge_round_verdicts(
+        self,
+        call_ids: set[str],
+        keep_origin: threading.Event | None = None,
+    ) -> None:
+        super()._purge_round_verdicts(call_ids, keep_origin=keep_origin)
         for verdict in self.seed_verdicts:
-            self.on_intent_verdict(dict(verdict))
+            self.on_intent_verdict(dict(verdict), judge_event=self.seed_judge_event)
 
 
 def _patch_policies(verdicts: dict[str, str]):  # type: ignore[no-untyped-def]
@@ -1775,19 +1935,17 @@ def test_smart_approval_skips_budget_override_pseudo_tool() -> None:
 
 
 def test_smart_approval_stamps_verdict_user_decision() -> None:
-    """The LLM verdict arrived during the wait (parked in
-    ``_pending_verdicts`` as pending); the smart stage pulls it out so a
-    sibling's resolve can't re-stamp it, and records ``smart_approval`` on
-    both the cached dict and the persisted row."""
+    """The LLM verdict arrived during the wait (cache-only — no cycle
+    exists yet at that point); the smart stage stamps ``smart_approval``
+    on both the cached dict and the persisted row, and the non-"pending"
+    stamp keeps every later cycle-registration sweep away from it."""
     storage = MagicMock()
     ui = _smart_ui()
     item = _pending_item("c1")
     verdict = _llm_verdict("c1", recommendation="approve", confidence=0.99)
     ui._llm_verdicts["c1"] = verdict
-    ui._pending_verdicts = [verdict]  # as on_intent_verdict would have parked it
     with _patch_get_storage(storage):
         ui._apply_smart_approvals([item])
-    assert ui._pending_verdicts == []
     assert ui._llm_verdicts["c1"]["user_decision"] == "smart_approval"
     storage.update_intent_verdict.assert_called_once_with("v-c1", user_decision="smart_approval")
 
@@ -1812,7 +1970,7 @@ def test_approve_tools_smart_approves_whole_batch_without_prompt() -> None:
     assert item["auto_approve_reason"] == "smart_approval"
     assert item["needs_approval"] is False
     assert ui._pending_approval is None  # operator was never prompted
-    assert ui._pending_verdicts == []  # smart verdict pulled out + stamped
+    assert ui._approval_cycles == {}  # no cycle was ever registered
     # No approval prompt was fanned out to listeners.
     events = []
     while True:
@@ -2035,16 +2193,17 @@ def test_smart_approval_holds_batch_with_duplicate_call_ids() -> None:
     assert a.get("auto_approved") is not True
 
 
-def test_on_intent_verdict_skips_append_for_already_finalized_verdict() -> None:
+def test_on_intent_verdict_skips_park_for_already_finalized_verdict() -> None:
     """Guards the audit-corruption race: a verdict already stamped with a
     final user_decision (e.g. ``_finalize_smart_verdicts`` ran between this
-    verdict's notify and its append) is NOT re-parked in _pending_verdicts,
-    so a later round's resolve_approval can't overwrite its audit row."""
+    verdict's notify and its park) is NOT parked on its owning cycle,
+    so that cycle's resolve_approval can't overwrite the audit row."""
     ui = _make_ui()
+    cycle = _register_cycle(ui, ["c1"])
     verdict = {"verdict_id": "v1", "call_id": "c1", "user_decision": "smart_approval"}
     with _patch_get_storage(MagicMock()):
         ui.on_intent_verdict(verdict)
-    assert ui._pending_verdicts == []
+    assert cycle.pending_verdicts == []
     assert ui._llm_verdicts["c1"]["user_decision"] == "smart_approval"
 
 
@@ -2264,3 +2423,395 @@ class TestAgentTrajectoryStash:
         assert ui.get_agent_trajectory("t0") is None
         assert ui.get_agent_trajectory("t2") is None
         assert ui.get_agent_trajectory(f"t{_AGENT_TRAJECTORY_CAP + 2}") is not None
+
+
+# ---------------------------------------------------------------------------
+# Concurrent approval cycles — parallel task agents each run their own gate.
+# Regression matrix for the two 1.7 release blockers: cross-approval (one
+# click resolving every parked gate) and the lost-wakeup hang (a sibling's
+# gate entry eating a just-fired resolution).
+# ---------------------------------------------------------------------------
+
+
+_Spawn = Callable[[dict[str, Any]], tuple[threading.Thread, dict[str, Any]]]
+
+
+@contextlib.contextmanager
+def _gate_harness(ui: SessionUIBase) -> Iterator[_Spawn]:
+    """ONE storage/policy patch pair + spawn + guaranteed teardown for
+    concurrent ``approve_tools`` gates.
+
+    The patches are applied ONCE, on the calling thread, and cover every
+    spawned gate thread: ``mock.patch`` start/stop of the SAME target
+    from concurrent threads corrupts the patcher's restore stack — the
+    second stop can reinstall the first thread's mock as the "original",
+    leaking it into every later test in the process.
+
+    Teardown keeps sweeping ``resolve_all_approvals`` until every gate
+    thread has exited — a gate that registers its cycle after a single
+    sweep would otherwise park for the full approval timeout and trip
+    the conftest thread-leak guard.
+    """
+    threads: list[threading.Thread] = []
+
+    def spawn(item: dict[str, Any]) -> tuple[threading.Thread, dict[str, Any]]:
+        box: dict[str, Any] = {}
+
+        def _run() -> None:
+            approved, feedback = ui.approve_tools([item])
+            box["approved"] = approved
+            box["feedback"] = feedback
+
+        t = threading.Thread(target=_run, daemon=True)
+        t.start()
+        threads.append(t)
+        return t, box
+
+    with _patch_get_storage(MagicMock()), _patch_policies({}):
+        try:
+            yield spawn
+        finally:
+            stop = time.monotonic() + 5.0
+            while any(t.is_alive() for t in threads) and time.monotonic() < stop:
+                ui.resolve_all_approvals(False, "test teardown")
+                time.sleep(0.01)
+            for t in threads:
+                t.join(timeout=1.0)
+
+
+def _wait_for_cycles(ui: SessionUIBase, count: int, deadline: float = 5.0) -> None:
+    stop = time.monotonic() + deadline
+    while time.monotonic() < stop:
+        with ui._ws_lock:
+            if len(ui._approval_cycles) >= count:
+                return
+        time.sleep(0.005)
+    raise AssertionError(f"never saw {count} live cycles")
+
+
+def test_concurrent_gates_resolve_independently() -> None:
+    """THE cross-approval regression: two parallel gates, two separate
+    decisions.  Approving A's cycle must not wake B, and B's later
+    denial must reach B's thread — one click can no longer resolve
+    every parked batch with the same verdict."""
+    ui = _make_ui()
+    with _gate_harness(ui) as spawn:
+        ta, box_a = spawn(_pending_item("a-1"))
+        tb, box_b = spawn(_pending_item("b-1"))
+        _wait_for_cycles(ui, 2)
+        assert ui.resolve_approval(True, "run it", call_id="a-1") is not None
+        ta.join(timeout=5.0)
+        assert not ta.is_alive(), "A's gate did not wake on its own resolution"
+        # B is still parked — A's approval must NOT have leaked to it.
+        assert tb.is_alive(), "resolving A also unblocked B (cross-approval)"
+        assert box_a == {"approved": True, "feedback": "run it"}
+        assert ui.resolve_approval(False, "not this one", call_id="b-1") is not None
+        tb.join(timeout=5.0)
+        assert not tb.is_alive()
+        assert box_b["approved"] is False
+        assert box_b["feedback"] == "not this one"
+
+
+def test_sibling_gate_entry_cannot_eat_a_resolution() -> None:
+    """THE lost-wakeup regression: under the singleton event, sibling B
+    entering the gate ran ``event.clear()`` and could erase A's
+    just-fired resolution — A then parked for the full 3600s timeout
+    ("approval dialog stuck").  Per-cycle events make the interleaving
+    structurally impossible: A's resolution lands on A's OWN event, so
+    B's registration can't touch it."""
+    ui = _make_ui()
+    with _gate_harness(ui) as spawn:
+        ta, box_a = spawn(_pending_item("a-1"))
+        _wait_for_cycles(ui, 1)
+        # Resolve A and IMMEDIATELY register sibling B — the old code's
+        # clear() window.  A must still return promptly.
+        ui.resolve_approval(True, None, call_id="a-1")
+        spawn(_pending_item("b-1"))
+        ta.join(timeout=5.0)
+        assert not ta.is_alive(), (
+            "A's gate lost its wakeup when sibling B entered — the singleton-event race is back"
+        )
+        assert box_a["approved"] is True
+
+
+def test_selectorless_resolve_hits_oldest_cycle() -> None:
+    """Legacy clients (CLI wrappers, channel adapters, old tabs) send no
+    selector — the decision lands on the OLDEST live cycle, matching
+    the order the prompts were issued."""
+    ui = _make_ui()
+    with _gate_harness(ui) as spawn:
+        ta, box_a = spawn(_pending_item("a-1"))
+        _wait_for_cycles(ui, 1)
+        tb, _box_b = spawn(_pending_item("b-1"))
+        _wait_for_cycles(ui, 2)
+        ui.resolve_approval(True, "first in, first out")
+        ta.join(timeout=5.0)
+        assert not ta.is_alive(), "selector-less resolve missed the oldest cycle"
+        assert box_a["approved"] is True
+        assert tb.is_alive(), "selector-less resolve hit more than one cycle"
+
+
+def test_resolve_all_approvals_wakes_every_gate() -> None:
+    """The cancel/close sweep: every parked gate wakes with its own
+    denied result."""
+    ui = _make_ui()
+    with _gate_harness(ui) as spawn:
+        ta, box_a = spawn(_pending_item("a-1"))
+        tb, box_b = spawn(_pending_item("b-1"))
+        _wait_for_cycles(ui, 2)
+        assert ui.resolve_all_approvals(False, "Cancelled by user") == 2
+        ta.join(timeout=5.0)
+        tb.join(timeout=5.0)
+        assert box_a["approved"] is False
+        assert box_b["approved"] is False
+        assert "Cancelled by user" in (box_a["feedback"] or "")
+
+
+def test_resolve_all_approvals_noop_when_idle() -> None:
+    """Idle cancels stay silent — no stale approval_resolved broadcast."""
+    ui = _make_ui()
+    lq = ui._register_listener()
+    assert ui.resolve_all_approvals(False, "Cancelled by user") == 0
+    assert lq.empty()
+
+
+def test_double_resolution_is_a_guarded_noop() -> None:
+    """A second decision racing the first (two tabs, or timeout racing a
+    click) must not re-resolve, re-broadcast, or clobber the recorded
+    result."""
+    ui = _make_ui()
+    with _gate_harness(ui) as spawn:
+        ta, box_a = spawn(_pending_item("a-1"))
+        _wait_for_cycles(ui, 1)
+        first = ui.resolve_approval(True, "yes", call_id="a-1")
+        second = ui.resolve_approval(False, "no", call_id="a-1")
+        assert first is not None
+        assert second is None
+        ta.join(timeout=5.0)
+        assert box_a == {"approved": True, "feedback": "yes"}
+
+
+def test_pending_cards_and_legacy_view_track_cycles() -> None:
+    """``pending_approval_cards`` lists every live cycle's card (SSE
+    replay repaints them all); the legacy ``_pending_approval`` view
+    tracks the OLDEST for boolean-ish consumers and rolls forward as
+    cycles resolve."""
+    ui = _make_ui()
+    with _gate_harness(ui) as spawn:
+        ta, _box_a = spawn(_pending_item("a-1"))
+        _wait_for_cycles(ui, 1)
+        spawn(_pending_item("b-1"))
+        _wait_for_cycles(ui, 2)
+        cards = ui.pending_approval_cards()
+        assert [c["items"][0]["call_id"] for c in cards] == ["a-1", "b-1"]
+        assert ui._pending_approval is not None
+        assert ui._pending_approval["items"][0]["call_id"] == "a-1"
+        ui.resolve_approval(True, None, call_id="a-1")
+        ta.join(timeout=5.0)
+        # View rolls forward to the surviving cycle.
+        assert ui._pending_approval is not None
+        assert ui._pending_approval["items"][0]["call_id"] == "b-1"
+
+
+def test_stale_generation_verdict_cannot_touch_live_cycle() -> None:
+    """A prior turn's run-to-completion daemon delivering a reused
+    call_id must not satisfy the NEW cycle's wait: the delivery's
+    generation (its cancel event) is identity-checked against the
+    owning cycle's — mismatch persists for audit only, with no cache
+    write, no SSE, no park."""
+    storage = MagicMock()
+    ui = _make_ui()
+    fresh_gen = threading.Event()
+    stale_gen = threading.Event()
+    cycle = _register_cycle(ui, ["c-reused"], judge_event=fresh_gen)
+    lq = ui._register_listener()
+    with _patch_get_storage(storage):
+        ui.on_intent_verdict(
+            {"verdict_id": "v-stale", "call_id": "c-reused", "tier": "llm"},
+            judge_event=stale_gen,
+        )
+    assert "c-reused" not in ui._llm_verdicts
+    assert cycle.pending_verdicts == []
+    assert lq.empty()
+    kwargs = storage.upsert_intent_verdict.call_args.kwargs
+    assert kwargs["user_decision"] == "superseded"
+    # The cycle's OWN generation delivers normally.
+    with _patch_get_storage(storage):
+        ui.on_intent_verdict(
+            {"verdict_id": "v-fresh", "call_id": "c-reused", "tier": "llm"},
+            judge_event=fresh_gen,
+        )
+    assert ui._llm_verdicts["c-reused"]["verdict_id"] == "v-fresh"
+    assert cycle.pending_verdicts and cycle.pending_verdicts[0]["verdict_id"] == "v-fresh"
+
+
+def test_smart_approval_rejects_stale_origin_verdict() -> None:
+    """Smart-Approvals qualification requires the cached verdict to have
+    been delivered by THIS batch's judge generation — a cached approve
+    of unknown/stale origin sends the batch to a human."""
+    ui = _smart_ui()
+    ui.smart_approval_wait_seconds = 0.05
+    fresh_gen = threading.Event()
+    item = _pending_item("c1")
+    item["_judge_event"] = fresh_gen
+    ui._llm_verdicts["c1"] = _llm_verdict("c1", recommendation="approve", confidence=0.99)
+    ui._verdict_origins["c1"] = id(object())  # a different generation delivered it
+    with _patch_get_storage(MagicMock()):
+        remaining = ui._apply_smart_approvals([item])
+    assert remaining == [item]
+    assert item.get("auto_approved") is not True
+    # Same verdict with the RIGHT origin qualifies.
+    ui._verdict_origins["c1"] = id(fresh_gen)
+    with _patch_get_storage(MagicMock()):
+        remaining = ui._apply_smart_approvals([item])
+    assert remaining == []
+    assert item["auto_approved"] is True
+
+
+def test_concurrent_smart_gate_and_human_gate() -> None:
+    """A smart-qualifying batch auto-approves while a sibling batch is
+    parked on a human — the sibling's cycle survives untouched (the old
+    whole-cache reset at gate entry wiped its verdicts mid-wait)."""
+    ui = _make_ui()
+    ui.smart_approvals_enabled = True
+    ui.smart_approval_threshold = 0.95
+    ui.smart_approval_wait_seconds = 1.0
+    # Regression guard: if the smart batch ever falls through to the
+    # human gate (it runs on THIS thread), fail in seconds instead of
+    # hanging the suite for the full approval timeout.
+    ui._APPROVAL_WAIT_TIMEOUT = 10.0
+    with _gate_harness(ui) as spawn:
+        # Human-gated sibling parks first.
+        ta, box_a = spawn(_pending_item("a-1"))
+        _wait_for_cycles(ui, 1)
+        # Smart-qualifying batch flows straight through on this thread —
+        # its verdict was delivered by its OWN generation before the
+        # gate was entered, so the entry purge must spare it.
+        gen = threading.Event()
+        item = _pending_item("s-1")
+        item["_judge_event"] = gen
+        ui._llm_verdicts["s-1"] = _llm_verdict("s-1", recommendation="approve", confidence=0.99)
+        ui._verdict_origins["s-1"] = id(gen)
+        approved, _ = ui.approve_tools([item])
+        assert approved is True
+        assert item["auto_approved"] is True
+        # Sibling still parked, its cycle + verdict path intact.
+        assert ta.is_alive()
+        ui.resolve_approval(True, "ok", call_id="a-1")
+        ta.join(timeout=5.0)
+        assert box_a["approved"] is True
+
+
+def test_purge_round_verdicts_keeps_entry_from_the_entering_generation() -> None:
+    """``keep_origin``: a verdict the entering batch's OWN judge spawn
+    already delivered survives the entry purge.  The judge daemon is
+    spawned before the gate is entered, so a fast judge can beat the
+    gate to the cache — evicting its verdict as if it were a prior
+    round's leftover stalled the Smart-Approvals wait to its full
+    budget and sent an already-cleared batch to a human.  Foreign
+    generations and prior-round decisions still purge."""
+    ui = _make_ui()
+    gen = threading.Event()
+    other_gen = threading.Event()
+    ui._llm_verdicts["c-own"] = {"verdict_id": "own"}
+    ui._verdict_origins["c-own"] = id(gen)
+    ui._llm_verdicts["c-foreign"] = {"verdict_id": "foreign"}
+    ui._verdict_origins["c-foreign"] = id(other_gen)
+    ui._recent_decisions["c-own"] = ("approved", None)
+    ui._purge_round_verdicts({"c-own", "c-foreign"}, keep_origin=gen)
+    assert ui._llm_verdicts.get("c-own") == {"verdict_id": "own"}
+    assert ui._verdict_origins.get("c-own") == id(gen)
+    assert "c-foreign" not in ui._llm_verdicts
+    assert "c-foreign" not in ui._verdict_origins
+    # Decisions never survive: this round has not been decided yet.
+    assert "c-own" not in ui._recent_decisions
+
+
+def test_smart_gate_uses_verdict_delivered_before_gate_entry() -> None:
+    """Production shape of the generation-aware purge: judge spawned
+    before the gate, verdict delivered before ``approve_tools`` runs.
+    The entry purge spares the same-generation verdict, so the smart
+    wait sees it immediately and the batch auto-approves without a
+    human prompt or a full-budget stall."""
+    ui = _smart_ui()
+    ui.smart_approval_wait_seconds = 3.0
+    # Regression guard: a purged verdict sends this batch to the human
+    # gate on THIS thread — bound the park so the test fails instead of
+    # hanging the suite.
+    ui._APPROVAL_WAIT_TIMEOUT = 1.0
+    gen = threading.Event()
+    item = _pending_item("s-1")
+    item["_judge_event"] = gen
+    with _patch_get_storage(MagicMock()), _patch_policies({}):
+        # The "fast judge": delivery lands before the gate is entered.
+        ui.on_intent_verdict(_llm_verdict("s-1"), judge_event=gen)
+        approved, _feedback = ui.approve_tools([item])
+    assert approved is True, "entry purge evicted this batch's own pre-delivered verdict"
+    assert item["auto_approved"] is True
+
+
+def test_registration_evicts_stale_generation_window_arrival() -> None:
+    """A STALE generation delivering into the purge→register window
+    (the entry purge can't see arrivals that land during the policy
+    round-trip or the smart wait) must not blank the card's "judge
+    analysing" cue, be adopted into ``pending_verdicts`` for
+    decision-stamping, or linger in the replay cache once the cycle
+    registers."""
+    ui = _SeedingUI(ws_id="ws-1", user_id="u1")
+    stale_gen = threading.Event()
+    fresh_gen = threading.Event()
+    # _SeedingUI re-delivers right after the entry purge — inside the
+    # purge→register window — tagged with the STALE generation.
+    ui.seed_verdicts = [_llm_verdict("w-1")]
+    ui.seed_judge_event = stale_gen
+    item = _pending_item("w-1")
+    item["_judge_event"] = fresh_gen
+    with _gate_harness(ui) as spawn:
+        _t, box = spawn(item)
+        _wait_for_cycles(ui, 1)
+        with ui._ws_lock:
+            cycle = next(iter(ui._approval_cycles.values()))
+        assert "w-1" not in ui._llm_verdicts, "stale window arrival survived registration"
+        assert "w-1" not in ui._verdict_origins
+        assert cycle.card["judge_pending"] is True, "stale verdict blanked the judge cue"
+        assert [v["verdict_id"] for v in cycle.pending_verdicts] == ["h-w-1"], (
+            "stale window arrival was adopted for decision-stamping"
+        )
+        ui.resolve_approval(True, None, call_id="w-1")
+    assert box["approved"] is True
+
+
+def test_late_stale_generation_verdict_stamps_superseded() -> None:
+    """A late verdict from generation A delivering AFTER its round
+    resolved — and after a reused call_id's round from generation B
+    also resolved — must not steal B's recorded decision.  Recorded
+    decisions are generation-tagged: a mismatched late delivery stamps
+    ``superseded`` (same vocabulary as the superseded persist path); a
+    same-generation late delivery still stamps the real decision."""
+    storage = MagicMock()
+    ui = _make_ui()
+    gen_a = threading.Event()
+    gen_b = threading.Event()
+    # Round B (reusing the call_id generation A once judged) resolves
+    # and its gate unregisters the cycle — the decision survives only
+    # in ``_recent_decisions``, tagged with B's generation.
+    cycle_b = _register_cycle(ui, ["c-reuse"], judge_event=gen_b)
+    with _patch_get_storage(storage):
+        ui.resolve_approval(True, None, call_id="c-reuse")
+    ui._unregister_approval_cycle(cycle_b)
+    assert ui._recent_decisions["c-reuse"] == ("approved", gen_b)
+    # Generation A's run-to-completion daemon delivers late — no live
+    # owner, and the decision on file belongs to B.
+    with _patch_get_storage(storage):
+        ui.on_intent_verdict(
+            {"verdict_id": "v-stale-late", "call_id": "c-reuse", "tier": "llm"},
+            judge_event=gen_a,
+        )
+    storage.update_intent_verdict.assert_any_call("v-stale-late", user_decision="superseded")
+    # B's own late delivery still stamps B's real decision.
+    with _patch_get_storage(storage):
+        ui.on_intent_verdict(
+            {"verdict_id": "v-b-late", "call_id": "c-reuse", "tier": "llm"},
+            judge_event=gen_b,
+        )
+    storage.update_intent_verdict.assert_any_call("v-b-late", user_decision="approved")

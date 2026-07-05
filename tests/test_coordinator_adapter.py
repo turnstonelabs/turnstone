@@ -195,6 +195,21 @@ def test_emit_tolerates_collector_exception() -> None:
 # ---------------------------------------------------------------------------
 
 
+def test_cleanup_ui_sweeps_all_approval_cycles_on_registry_uis() -> None:
+    """The real ConsoleCoordinatorUI carries the approval-cycle
+    registry: cleanup denies + wakes EVERY parked gate via
+    ``resolve_all_approvals`` (parallel task agents can hold several),
+    not the pre-cycle single-slot kick."""
+    adapter, _ = _make_adapter()
+    ws = _make_ws()
+    ws.ui.resolve_all_approvals = MagicMock(return_value=2)  # type: ignore[attr-defined]
+    adapter.cleanup_ui(ws)
+    ws.ui.resolve_all_approvals.assert_called_once_with(  # type: ignore[attr-defined]
+        False, "Workstream closed"
+    )
+    assert ws.ui._fg_event.is_set()  # type: ignore[attr-defined]
+
+
 def test_cleanup_ui_unblocks_events_and_broadcasts_to_listeners() -> None:
     adapter, _ = _make_adapter()
     ws = _make_ws()

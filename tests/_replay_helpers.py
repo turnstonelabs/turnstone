@@ -51,6 +51,12 @@ def make_replay_mocks(
     ui._ws_messages = 0
     for key, value in ui_overrides.items():
         setattr(ui, key, value)
+    # Both replay paths read cycle cards via ``pending_approval_cards()``
+    # (one card per concurrent approval cycle).  Model it from the
+    # single-slot ``_pending_approval`` override so tests keep seeding
+    # the one field; a bare MagicMock here would iterate empty and
+    # silently drop the approve_request from the replay.
+    ui.pending_approval_cards = lambda: [ui._pending_approval] if ui._pending_approval else []
     ws = MagicMock()
     ws.session = session
     request = MagicMock()

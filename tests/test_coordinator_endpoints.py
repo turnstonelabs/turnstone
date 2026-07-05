@@ -1103,18 +1103,7 @@ def test_approve_resolves_ui_event(storage):
     mgr = _build_mgr(storage)
     ws = mgr.create(user_id="user-1")
     assert isinstance(ws.ui, ConsoleCoordinatorUI)
-    ws.ui._pending_approval = {
-        "type": "approve_request",
-        "items": [
-            {
-                "call_id": "c-1",
-                "func_name": "spawn_workstream",
-                "approval_label": "spawn_workstream",
-                "needs_approval": True,
-            }
-        ],
-    }
-    ws.ui._approval_event.clear()
+    cycle = _seed_pending(ws, "c-1")
     client = _make_client(storage, coord_mgr=mgr, registry=_fake_registry())
     resp = client.post(
         f"/v1/api/workstreams/{ws.id}/approve",
@@ -1122,34 +1111,46 @@ def test_approve_resolves_ui_event(storage):
         headers=_COORD_HEADERS,
     )
     assert resp.status_code == 200
-    assert ws.ui._approval_event.is_set()
-    assert ws.ui._approval_result == (True, None)
+    assert resp.json()["cycle_id"] == cycle.cycle_id
+    assert cycle.event.is_set()
+    assert cycle.result == (True, None)
     assert "spawn_workstream" in ws.ui.auto_approve_tools
 
 
-def _seed_pending(ws, *call_ids: str) -> None:
-    ws.ui._pending_approval = {
+def _seed_pending(ws, *call_ids: str, func_name: str = "spawn_workstream"):
+    """Register a live ApprovalCycle on the coord UI the way its
+    ``approve_tools`` gate does, returning the cycle for direct
+    event/result assertions (the pre-cycle singleton
+    ``_approval_event`` / ``_approval_result`` slots are gone)."""
+    from turnstone.core.session_ui_base import ApprovalCycle
+
+    items = [
+        {
+            "call_id": cid,
+            "func_name": func_name,
+            "approval_label": func_name,
+            "needs_approval": True,
+        }
+        for cid in call_ids
+    ]
+    card = {
         "type": "approve_request",
-        "items": [
-            {
-                "call_id": cid,
-                "func_name": "spawn_workstream",
-                "approval_label": "spawn_workstream",
-                "needs_approval": True,
-            }
-            for cid in call_ids
-        ],
+        "cycle_id": f"cyc-{'-'.join(call_ids)}",
+        "items": ws.ui._serialize_approval_items(items),
+        "judge_pending": False,
     }
-    ws.ui._approval_event.clear()
+    cycle = ApprovalCycle(items, card, None)
+    ws.ui._register_approval_cycle(cycle)
+    return cycle
 
 
 def test_approve_409_on_stale_call_id(storage):
     """Body call_id doesn't match any pending item → 409 with the
-    current primary call_id so the UI can re-render against the
-    new round."""
+    current primary call_id + cycle_id so the UI can re-render
+    against the new round."""
     mgr = _build_mgr(storage)
     ws = mgr.create(user_id="user-1")
-    _seed_pending(ws, "c-current")
+    cycle = _seed_pending(ws, "c-current")
     client = _make_client(storage, coord_mgr=mgr, registry=_fake_registry())
     resp = client.post(
         f"/v1/api/workstreams/{ws.id}/approve",
@@ -1160,17 +1161,17 @@ def test_approve_409_on_stale_call_id(storage):
     body = resp.json()
     assert body["error"] == "stale call_id"
     assert body["current_call_id"] == "c-current"
-    # Approval event must NOT be set — no resolve_approval ran.
-    assert not ws.ui._approval_event.is_set()
+    assert body["current_cycle_id"] == cycle.cycle_id
+    # The live cycle must NOT have been resolved.
+    assert not cycle.event.is_set()
 
 
 def test_approve_409_when_no_pending_and_call_id_sent(storage):
-    """Body sends a call_id but the UI has no pending approval —
-    409 with current_call_id=None so the UI knows to clear the row."""
+    """Body sends a call_id but the UI has no live cycle — 409 with
+    current_call_id=None so the UI knows to clear the row."""
     mgr = _build_mgr(storage)
     ws = mgr.create(user_id="user-1")
-    # No _pending_approval seeded → ui._pending_approval is None.
-    ws.ui._approval_event.clear()
+    # No cycle registered.
     client = _make_client(storage, coord_mgr=mgr, registry=_fake_registry())
     resp = client.post(
         f"/v1/api/workstreams/{ws.id}/approve",
@@ -1179,18 +1180,18 @@ def test_approve_409_when_no_pending_and_call_id_sent(storage):
     )
     assert resp.status_code == 409
     body = resp.json()
-    assert body["error"] == "no pending approval"
+    assert body["error"] == "stale call_id"
     assert body["current_call_id"] is None
-    assert not ws.ui._approval_event.is_set()
+    assert body["current_cycle_id"] is None
 
 
 def test_approve_no_call_id_preserves_backward_compat(storage):
     """Existing clients (CLI, channel adapters) that omit call_id
-    must still resolve approvals — the guard only kicks in when
-    call_id is present in the body."""
+    must still resolve approvals — a selector-less body lands on the
+    oldest live cycle."""
     mgr = _build_mgr(storage)
     ws = mgr.create(user_id="user-1")
-    _seed_pending(ws, "c-1")
+    cycle = _seed_pending(ws, "c-1")
     client = _make_client(storage, coord_mgr=mgr, registry=_fake_registry())
     resp = client.post(
         f"/v1/api/workstreams/{ws.id}/approve",
@@ -1198,18 +1199,18 @@ def test_approve_no_call_id_preserves_backward_compat(storage):
         headers=_COORD_HEADERS,
     )
     assert resp.status_code == 200
-    assert ws.ui._approval_event.is_set()
+    assert resp.json()["cycle_id"] == cycle.cycle_id
+    assert cycle.event.is_set()
 
 
-def test_approve_no_call_id_no_pending_falls_through(storage):
-    """Legacy clients (no call_id) calling approve when pending is
-    None hit the existing resolve_approval no-op path — the new
-    guard must not change that behavior. Regression guard for the
-    legacy code path that the call_id check intentionally bypasses."""
+def test_approve_no_call_id_no_pending_resolves_nothing(storage):
+    """Legacy clients (no call_id) calling approve with no live cycle:
+    200 with ``cycle_id: null`` — the handler resolves NOTHING rather
+    than racing a cycle that registers between its lookup and its
+    resolve (the client can't have been looking at one)."""
     mgr = _build_mgr(storage)
     ws = mgr.create(user_id="user-1")
-    ws.ui._approval_event.clear()
-    # No _pending_approval seeded.
+    # No cycle registered.
     client = _make_client(storage, coord_mgr=mgr, registry=_fake_registry())
     resp = client.post(
         f"/v1/api/workstreams/{ws.id}/approve",
@@ -1217,7 +1218,7 @@ def test_approve_no_call_id_no_pending_falls_through(storage):
         headers=_COORD_HEADERS,
     )
     assert resp.status_code == 200
-    assert ws.ui._approval_event.is_set()
+    assert resp.json()["cycle_id"] is None
 
 
 def test_approve_call_id_matches_any_item_in_multi_envelope(storage):
@@ -1226,7 +1227,7 @@ def test_approve_call_id_matches_any_item_in_multi_envelope(storage):
     one-boolean semantics of resolve_approval."""
     mgr = _build_mgr(storage)
     ws = mgr.create(user_id="user-1")
-    _seed_pending(ws, "c-1", "c-2", "c-3")
+    cycle = _seed_pending(ws, "c-1", "c-2", "c-3")
     client = _make_client(storage, coord_mgr=mgr, registry=_fake_registry())
     resp = client.post(
         f"/v1/api/workstreams/{ws.id}/approve",
@@ -1234,7 +1235,61 @@ def test_approve_call_id_matches_any_item_in_multi_envelope(storage):
         headers=_COORD_HEADERS,
     )
     assert resp.status_code == 200
-    assert ws.ui._approval_event.is_set()
+    assert cycle.event.is_set()
+
+
+def test_selectorless_always_whitelists_only_the_resolved_oldest_cycle(storage):
+    """sweep-3 regression: with several live cycles, a selector-less
+    "Approve + Always" must whitelist the tools of the cycle it
+    actually resolved (the oldest) — not a sibling's."""
+    mgr = _build_mgr(storage)
+    ws = mgr.create(user_id="user-1")
+    oldest = _seed_pending(ws, "a-1", func_name="spawn_workstream")
+    newer = _seed_pending(ws, "b-1", func_name="send_message")
+    client = _make_client(storage, coord_mgr=mgr, registry=_fake_registry())
+    resp = client.post(
+        f"/v1/api/workstreams/{ws.id}/approve",
+        json={"approved": True, "always": True},  # no selector
+        headers=_COORD_HEADERS,
+    )
+    assert resp.status_code == 200
+    assert resp.json()["cycle_id"] == oldest.cycle_id
+    assert oldest.event.is_set()
+    assert not newer.event.is_set()
+    assert "spawn_workstream" in ws.ui.auto_approve_tools
+    assert "send_message" not in ws.ui.auto_approve_tools
+
+
+def test_approve_always_skips_whitelist_when_pinned_cycle_lost_the_race(storage):
+    """sweep-3 regression: the handler collects always-names from the
+    cycle its lookup pinned; if that cycle is resolved by someone else
+    (gate timeout, peer tab) between lookup and resolve, the whitelist
+    must NOT grow — approving a card that already resolved must not
+    auto-approve anything."""
+    mgr = _build_mgr(storage)
+    ws = mgr.create(user_id="user-1")
+    _seed_pending(ws, "a-1", func_name="spawn_workstream")
+    ui = ws.ui
+    real_find = ui.find_approval_cycle
+
+    def racing_find(**kwargs):
+        card = real_find(**kwargs)
+        if card is not None:
+            # A concurrent resolver wins the gap between the handler's
+            # lookup and its (pinned) resolve.
+            ui.resolve_approval(False, "raced", cycle_id=card["cycle_id"])
+        return card
+
+    ui.find_approval_cycle = racing_find
+    client = _make_client(storage, coord_mgr=mgr, registry=_fake_registry())
+    resp = client.post(
+        f"/v1/api/workstreams/{ws.id}/approve",
+        json={"approved": True, "always": True},
+        headers=_COORD_HEADERS,
+    )
+    assert resp.status_code == 200
+    assert resp.json()["cycle_id"] is None
+    assert "spawn_workstream" not in ws.ui.auto_approve_tools
 
 
 # ---------------------------------------------------------------------------
@@ -1521,15 +1576,19 @@ def test_export_404_when_kind_interactive(storage):
 
 
 def test_cancel_resolves_pending_approval(storage):
+    """Cancel addresses the workstream, not one batch — EVERY live
+    cycle resolves (parallel task agents can hold several gates)."""
     mgr = _build_mgr(storage)
     ws = mgr.create(user_id="user-1")
     assert isinstance(ws.ui, ConsoleCoordinatorUI)
-    ws.ui._pending_approval = {"type": "approve_request", "items": []}
-    ws.ui._approval_event.clear()
+    first = _seed_pending(ws, "c-1")
+    second = _seed_pending(ws, "c-2")
     client = _make_client(storage, coord_mgr=mgr, registry=_fake_registry())
     resp = client.post(f"/v1/api/workstreams/{ws.id}/cancel", headers=_COORD_HEADERS)
     assert resp.status_code == 200
-    assert ws.ui._approval_event.is_set()
+    assert first.event.is_set()
+    assert second.event.is_set()
+    assert first.result == (False, "Cancelled by user")
 
 
 def test_cancel_response_always_includes_dropped_key(storage):
@@ -2399,6 +2458,7 @@ def test_cluster_inspect_node_backed_pending_approval_detail_passes_through(stor
     ws_id = "f0" * 16
     _seed_node_workstream(storage, ws_id=ws_id, node_id="node-a")
     detail = {
+        "cycle_id": "cyc-bash",
         "call_id": "c-bash",
         "judge_pending": False,
         "items": [
@@ -2427,7 +2487,7 @@ def test_cluster_inspect_node_backed_pending_approval_detail_passes_through(stor
                 "activity_state": "approval",
                 "activity": "awaiting approval",
                 "tokens": 100,
-                "pending_approval_detail": detail,
+                "pending_approval_details": [detail],
             }
         ]
     }
@@ -2438,7 +2498,7 @@ def test_cluster_inspect_node_backed_pending_approval_detail_passes_through(stor
     assert resp.status_code == 200
     live = resp.json()["live"]
     assert live["pending_approval"] is True  # derived bool, existing behavior
-    assert live["pending_approval_detail"] == detail  # full payload, new behavior
+    assert live["pending_approval_details"] == [detail]  # full payload passthrough
 
 
 def test_cluster_inspect_node_backed_pending_approval_synthesized(storage):

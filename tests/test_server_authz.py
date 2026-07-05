@@ -88,18 +88,19 @@ class _FakeUI:
         self._ws_turn_tool_calls = 0
         self._llm_verdicts: dict[str, dict[str, Any]] = {}
 
-    def serialize_pending_approval_detail(self) -> dict[str, Any] | None:
-        # Mirrors SessionUIBase.serialize_pending_approval_detail —
+    def serialize_pending_approval_details(self) -> list[dict[str, Any]]:
+        # Mirrors SessionUIBase.serialize_pending_approval_details —
         # the fake is monkeypatched in for ``WebUI`` and the dashboard
         # handler reads this method during projection. Real subclasses
-        # inherit from ``SessionUIBase``; the fake replicates the
-        # shape directly to stay decoupled.
+        # iterate their approval-cycle registry (one entry per live
+        # cycle); the fake models a single slot, so the list carries
+        # zero or one entries.
         pending = self._pending_approval
         if pending is None:
-            return None
+            return []
         items = pending.get("items") or []
         if not items:
-            return None
+            return []
         call_ids = [item.get("call_id", "") for item in items]
         # Match the real impl's pattern (session_ui_base.py): snapshot
         # references under the lock, copy after release. Writers only
@@ -133,11 +134,14 @@ class _FakeUI:
         # fake here keeps test-vs-prod behavioural drift from
         # masking a real-shape regression.
         primary = next((cid for cid in call_ids if cid), "")
-        return {
-            "call_id": primary,
-            "judge_pending": bool(pending.get("judge_pending", False)),
-            "items": serialized,
-        }
+        return [
+            {
+                "cycle_id": pending.get("cycle_id", ""),
+                "call_id": primary,
+                "judge_pending": bool(pending.get("judge_pending", False)),
+                "items": serialized,
+            }
+        ]
 
     def serialize_recent_auto_approvals(self) -> list[dict[str, Any]]:
         # Empty buffer for tests that don't exercise the auto-approve
@@ -671,28 +675,35 @@ class TestDashboardTrustedTeamVisibility:
         owners = {w["user_id"] for w in data["workstreams"]}
         assert {"user-a", "user-b"}.issubset(owners)
 
-    def test_dashboard_pending_approval_detail_default_none(self, app_client):
-        """No pending approval → field is explicitly null on the wire so
-        consumers can distinguish "not present" from "absent key"."""
+    def test_dashboard_pending_approval_details_default_empty(self, app_client):
+        """No pending approval → the list field is explicitly empty on
+        the wire so consumers can distinguish "nothing pending" from
+        "absent key".  Replaces 1.6's singular ``pending_approval_detail``
+        null (breaking, 1.7)."""
         client, _mgr = app_client
         client.post("/v1/api/workstreams/new", json={"name": "a"}, headers=_auth("user-a"))
         resp = client.get("/v1/api/dashboard", headers=_auth("user-a"))
         assert resp.status_code == 200
         rows = resp.json()["workstreams"]
         assert len(rows) == 1
-        assert "pending_approval_detail" in rows[0]
-        assert rows[0]["pending_approval_detail"] is None
+        assert "pending_approval_details" in rows[0]
+        assert rows[0]["pending_approval_details"] == []
+        # The 1.6 singular field is GONE, not null — a consumer still
+        # reading it should break loudly, not read None forever.
+        assert "pending_approval_detail" not in rows[0]
 
-    def test_dashboard_pending_approval_detail_merges_judge_verdict(self, app_client):
+    def test_dashboard_pending_approval_details_merge_judge_verdict(self, app_client):
         """When _pending_approval is set on a ws's UI, /dashboard
-        embeds the merged items + judge_verdict so coord live-bulk
-        callers can render inline approve/deny buttons."""
+        embeds one detail entry per live cycle with merged items +
+        judge_verdict so coord live-bulk callers can render inline
+        approve/deny buttons."""
         client, mgr = app_client
         client.post("/v1/api/workstreams/new", json={"name": "a"}, headers=_auth("user-a"))
         ws_id = next(iter(mgr.list_all())).id
         ui = mgr.get(ws_id).ui
         ui._pending_approval = {
             "type": "approve_request",
+            "cycle_id": "cyc-1",
             "items": [
                 {
                     "call_id": "c-1",
@@ -714,8 +725,10 @@ class TestDashboardTrustedTeamVisibility:
         resp = client.get("/v1/api/dashboard", headers=_auth("user-a"))
         assert resp.status_code == 200
         row = next(w for w in resp.json()["workstreams"] if w["ws_id"] == ws_id)
-        detail = row["pending_approval_detail"]
-        assert detail is not None
+        details = row["pending_approval_details"]
+        assert len(details) == 1
+        detail = details[0]
+        assert detail["cycle_id"] == "cyc-1"
         assert detail["call_id"] == "c-1"
         assert detail["judge_pending"] is False
         item = detail["items"][0]

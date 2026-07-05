@@ -41,6 +41,11 @@ def _bind_ws_event_handlers(bot, cls):
             attr = getattr(cls, name)
             if callable(attr):
                 setattr(bot, name, attr.__get__(bot, cls))
+    # ``_handle_stream_end`` delegates the all-cycles sweep to
+    # ``_pop_ws_approvals``; bind the real method too so dispatcher
+    # tests observe the pop instead of a spec'd AsyncMock no-op.
+    if hasattr(cls, "_pop_ws_approvals"):
+        bot._pop_ws_approvals = cls._pop_ws_approvals.__get__(bot, cls)
 
 
 def _make_message(*, bot=False, guild=True, content="hello", channel=None, reference=None):
@@ -537,7 +542,7 @@ class TestApprovalVerdictDisplay:
                 },
             }
         ]
-        event = ApproveRequestEvent(ws_id="ws-1", items=items)
+        event = ApproveRequestEvent(ws_id="ws-1", cycle_id="cyc-1", items=items)
         _run(bot._on_ws_event("ws-1", thread, event))
 
         # thread.send was called with an embed containing a verdict field
@@ -551,8 +556,8 @@ class TestApprovalVerdictDisplay:
         assert "HIGH" in field.value
         assert "85%" in field.value
 
-        # Pending approval message tracked
-        assert "ws-1" in bot._pending_approval_msgs
+        # Pending approval message tracked under (ws_id, cycle_id).
+        assert ("ws-1", "cyc-1") in bot._pending_approval_msgs
 
     def test_approval_without_verdict(self):
         """ApproveRequestEvent items without verdict still work normally."""
@@ -585,10 +590,11 @@ class TestApprovalVerdictDisplay:
         embed = MagicMock()
         msg.embeds = [embed]
         msg.edit = AsyncMock()
-        bot._pending_approval_msgs["ws-1"] = msg
+        bot._pending_approval_msgs[("ws-1", "cyc-1")] = (msg, frozenset({"c-1"}))
 
         event = IntentVerdictEvent(
             ws_id="ws-1",
+            call_id="c-1",
             func_name="bash",
             risk_level="high",
             recommendation="deny",
@@ -628,7 +634,10 @@ class TestApprovalVerdictDisplay:
         bot._streaming = {}
         bot._thinking_msgs = {}
         bot._tool_info_msgs = {}
-        bot._pending_approval_msgs = {"ws-1": MagicMock()}
+        bot._pending_approval_msgs = {
+            ("ws-1", "cyc-1"): (MagicMock(), frozenset()),
+            ("ws-1", "cyc-2"): (MagicMock(), frozenset()),
+        }
         bot._notify_reply_channels = {}
         _bind_ws_event_handlers(bot, TurnstoneBot)
 
@@ -636,7 +645,8 @@ class TestApprovalVerdictDisplay:
         event = StreamEndEvent(ws_id="ws-1")
         _run(bot._on_ws_event("ws-1", thread, event))
 
-        assert "ws-1" not in bot._pending_approval_msgs
+        # ALL of the ws's cycles are swept, not just one entry.
+        assert not bot._pending_approval_msgs
 
 
 class TestStreamEndBehavior:
@@ -1657,19 +1667,21 @@ class TestApprovalResolved:
         bot = self._make_bot()
         thread = AsyncMock()
 
-        # Set up a pending approval message with components.
+        # Set up a pending approval message with components.  The event
+        # below carries no cycle_id (pre-multi-cycle server) — the
+        # legacy fallback clears the ws's single tracked entry.
         approval_msg = MagicMock()
         approval_msg.embeds = [MagicMock()]
         approval_msg.components = []
         approval_msg.edit = AsyncMock()
-        bot._pending_approval_msgs["ws-1"] = approval_msg
+        bot._pending_approval_msgs[("ws-1", "cyc-1")] = (approval_msg, frozenset())
 
         event = ApprovalResolvedEvent(ws_id="ws-1", approved=False, feedback="timeout")
         _run(bot._on_ws_event("ws-1", thread, event))
 
         approval_msg.edit.assert_awaited_once()
         # Pending approval message should be removed.
-        assert "ws-1" not in bot._pending_approval_msgs
+        assert not bot._pending_approval_msgs
 
     def test_disables_buttons_on_approved(self):
         from turnstone.sdk.events import ApprovalResolvedEvent
@@ -1681,9 +1693,11 @@ class TestApprovalResolved:
         approval_msg.embeds = [MagicMock()]
         approval_msg.components = []
         approval_msg.edit = AsyncMock()
-        bot._pending_approval_msgs["ws-1"] = approval_msg
+        bot._pending_approval_msgs[("ws-1", "cyc-1")] = (approval_msg, frozenset())
 
-        event = ApprovalResolvedEvent(ws_id="ws-1", approved=True)
+        # Cycle-routed resolution: the event's cycle_id selects exactly
+        # this tracked message.
+        event = ApprovalResolvedEvent(ws_id="ws-1", approved=True, cycle_id="cyc-1")
         _run(bot._on_ws_event("ws-1", thread, event))
 
         approval_msg.edit.assert_awaited_once()

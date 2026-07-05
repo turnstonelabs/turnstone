@@ -313,17 +313,17 @@ def test_coordinator_js_handle_child_state_no_longer_reads_sse_pending_approval_
     )
 
     # The merge body must preserve BOTH pending_approval and
-    # pending_approval_detail from prev — preserving only one would
+    # pending_approval_details from prev — preserving only one would
     # render a row with a phantom badge but no buttons (or vice versa).
     merge_body = re.search(
         r"mergedLive\s*=\s*Object\.assign\(\s*\{\}\s*,\s*live\s*,\s*\{"
         r"[^}]*pending_approval:\s*prev\.live\.pending_approval[^}]*"
-        r"pending_approval_detail:\s*prev\.live\.pending_approval_detail",
+        r"pending_approval_details:\s*prev\.live\.pending_approval_details",
         body,
     )
     assert merge_body is not None, (
         "Merge body must preserve both pending_approval AND "
-        "pending_approval_detail from prev.live — preserving only one "
+        "pending_approval_details from prev.live — preserving only one "
         "creates a half-rendered approval row."
     )
 
