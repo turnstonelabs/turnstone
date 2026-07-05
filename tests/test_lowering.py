@@ -218,6 +218,22 @@ def test_tool_args_preview_stringifies_and_caps() -> None:
     assert tool_args_preview({"a": 1}) == "{'a': 1}"
 
 
+def test_tool_args_preview_redacts_credentials() -> None:
+    # Secrets in tool args (bash commands, tokens) must not reach logs — the preview
+    # runs output_guard.redact_credentials over the full value first (PR #778 review).
+    out = tool_args_preview('{"command": "aws configure set key AKIAIOSFODNN7EXAMPLE"}')
+    assert "AKIAIOSFODNN7EXAMPLE" not in out
+    assert "[REDACTED:api_key]" in out
+
+
+def test_tool_args_preview_is_single_line() -> None:
+    # Control chars (LF/CR/TAB) collapse to spaces so the preview stays one log line.
+    raw = "line1" + chr(10) + "line2" + chr(13) + "end" + chr(9) + "z"
+    out = tool_args_preview(raw)
+    assert chr(10) not in out and chr(13) not in out and chr(9) not in out
+    assert "line1" in out and "end" in out
+
+
 # --------------------------------------------------------------------------- #
 # sanitize_tool_call_arguments — the legalize pass
 # --------------------------------------------------------------------------- #
