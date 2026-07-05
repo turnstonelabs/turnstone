@@ -11,13 +11,15 @@ import asyncio
 import time
 from collections import OrderedDict
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, Literal
+from typing import TYPE_CHECKING, Any, Literal, TypeVar
 
 from turnstone.channels._config import CREATE_LOCK_CAP
 from turnstone.core.log import get_logger
 from turnstone.sdk._types import TurnstoneAPIError
 from turnstone.sdk.console import AsyncTurnstoneConsole
 from turnstone.sdk.server import AsyncTurnstoneServer
+
+_V = TypeVar("_V")
 
 
 @dataclass
@@ -43,7 +45,7 @@ class PolicyVerdict:
 
 
 if TYPE_CHECKING:
-    from collections.abc import Callable
+    from collections.abc import Callable, Mapping, MutableMapping
 
     from turnstone.core.storage import StorageBackend
 
@@ -54,6 +56,57 @@ _CHANNEL_DEFAULT_TTL = 300.0  # cache channel default alias for 5 minutes
 _MODELS_CACHE_TTL = 30.0  # cache model list for autocomplete
 _ROUTE_CACHE_TTL = 30.0  # cache (channel_type, channel_id) → ws_id lookups
 _ROUTE_CACHE_CAP = 4096  # LRU bound on the lookup cache
+
+
+# ---------------------------------------------------------------------------
+# Pending-approval bookkeeping shared by the channel adapters.
+#
+# Every adapter tracks its posted approval prompts in a dict keyed by
+# ``(ws_id, cycle_id)`` — one entry per concurrent approval cycle — and
+# needs the same two lookups: "this exact cycle, falling back to the
+# workstream's single entry when the cycle_id is empty" (events from a
+# pre-multi-cycle server, or buttons posted before an in-flight
+# upgrade), and "everything for this workstream" (stream end / close /
+# unsubscribe sweeps).  Centralised here so the legacy-fallback
+# semantics can't drift between adapters.
+# ---------------------------------------------------------------------------
+
+
+def get_cycle_entry(
+    entries: Mapping[tuple[str, str], _V],
+    ws_id: str,
+    cycle_id: str,
+) -> _V | None:
+    """Exact ``(ws_id, cycle_id)`` lookup with the pre-multi-cycle fallback.
+
+    An empty *cycle_id* falls back to the workstream's single tracked
+    entry; a NON-empty one never falls back (a stale cycle must not
+    resolve an unrelated prompt).
+    """
+    entry = entries.get((ws_id, cycle_id))
+    if entry is None and not cycle_id:
+        entry = next((v for (wid, _), v in entries.items() if wid == ws_id), None)
+    return entry
+
+
+def pop_cycle_entry(
+    entries: MutableMapping[tuple[str, str], _V],
+    ws_id: str,
+    cycle_id: str,
+) -> _V | None:
+    """Like :func:`get_cycle_entry`, but removes the matched entry."""
+    entry = entries.pop((ws_id, cycle_id), None)
+    if entry is None and not cycle_id:
+        key = next((k for k in entries if k[0] == ws_id), None)
+        if key is not None:
+            entry = entries.pop(key, None)
+    return entry
+
+
+def pop_ws_entries(entries: MutableMapping[tuple[str, str], _V], ws_id: str) -> None:
+    """Drop every entry tracked under *ws_id* (all cycles)."""
+    for key in [k for k in entries if k[0] == ws_id]:
+        entries.pop(key, None)
 
 
 class ChannelRouter:
@@ -428,15 +481,33 @@ class ChannelRouter:
         feedback: str = "",
         always: bool = False,
     ) -> None:
-        """Approve or deny a pending tool call via the server API."""
+        """Approve or deny a pending tool call via the server API.
+
+        ``correlation_id`` is the cycle_id captured from the
+        ``approve_request`` event the adapter displayed; forwarding it
+        makes the decision land on exactly that cycle.  With parallel
+        task agents a workstream can hold several prompts — a
+        selector-less approve would resolve the OLDEST, which may not
+        be the message the user answered.  Empty string (policy /
+        auto-approve sweeps that act on "whatever is pending") keeps
+        the legacy oldest-first behavior.
+        """
         if self._console:
             await self._console.route_approve(
-                ws_id=ws_id, approved=approved, feedback=feedback, always=always
+                ws_id=ws_id,
+                approved=approved,
+                feedback=feedback,
+                always=always,
+                cycle_id=correlation_id,
             )
         else:
             assert self._server is not None
             await self._server.approve(
-                ws_id=ws_id, approved=approved, feedback=feedback or None, always=always
+                ws_id=ws_id,
+                approved=approved,
+                feedback=feedback or None,
+                always=always,
+                cycle_id=correlation_id or None,
             )
         log.debug(
             "channel_router.send_approval",

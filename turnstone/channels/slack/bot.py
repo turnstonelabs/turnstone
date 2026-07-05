@@ -36,7 +36,12 @@ from slack_sdk.web.async_client import AsyncWebClient
 
 from turnstone.channels._config import MAX_NOTIFY_TRACKING
 from turnstone.channels._formatter import chunk_message
-from turnstone.channels._routing import ChannelRouter
+from turnstone.channels._routing import (
+    ChannelRouter,
+    get_cycle_entry,
+    pop_cycle_entry,
+    pop_ws_entries,
+)
 from turnstone.channels._sse import run_sse_stream
 from turnstone.channels.slack.routes import SlackRoute
 from turnstone.core.log import get_logger
@@ -128,6 +133,13 @@ class PendingApproval:
     # approval message (matches the pre-refactor "fetch live blocks
     # and append" behavior).
     blocks: list[dict[str, Any]] = field(default_factory=list)
+    # Approval-cycle identity + member call_ids.  A workstream can hold
+    # several concurrent cycles (parallel task agents), each its own
+    # Slack message; the cycle_id routes the button click to exactly
+    # this round and call_ids route IntentVerdictEvents (keyed by
+    # call_id) onto the right message.
+    cycle_id: str = ""
+    call_ids: frozenset[str] = frozenset()
 
 
 @dataclass
@@ -275,7 +287,11 @@ class TurnstoneSlackBot:
         self._sse_tasks: dict[str, asyncio.Task[None]] = {}
         self._streaming: dict[str, StreamingMessage] = {}
 
-        self._pending_approval: dict[str, PendingApproval] = {}
+        # Keyed by (ws_id, cycle_id) — one entry per approval MESSAGE.
+        # Parallel task agents make several cycles live per ws at once;
+        # the old ws_id-only key silently replaced the tracked message
+        # so verdict edits and resolution updates hit the wrong prompt.
+        self._pending_approval: dict[tuple[str, str], PendingApproval] = {}
         self._notify_ws_map: dict[str, tuple[str, SlackRoute]] = {}
         # Per-workstream override used to route the next streamed assistant
         # response back into a Slack notification reply thread instead of the
@@ -865,7 +881,11 @@ class TurnstoneSlackBot:
             return
 
         ws_id, correlation_id = parts
-        entry = self._pending_approval.get(ws_id)
+        # correlation_id = the cycle_id stamped into the button value at
+        # post time; pre-multi-cycle messages carry "" — fall back to
+        # the ws's single tracked entry so an in-flight upgrade doesn't
+        # orphan an already-posted prompt.
+        entry = get_cycle_entry(self._pending_approval, ws_id, correlation_id)
         actor_user_id = body.get("user", {}).get("id", "")
         channel = body["container"]["channel_id"]
         verb = "approve" if approved else "deny"
@@ -899,12 +919,12 @@ class TurnstoneSlackBot:
             )
             return
 
-        await self.router.send_approval(ws_id, correlation_id, approved=approved)
+        await self.router.send_approval(ws_id, entry.cycle_id, approved=approved)
         # Drop the pending entry now that we've handled it locally. Otherwise
         # the subsequent ApprovalResolvedEvent will rewrite the message a
         # second time ("Tool approved" → "Approved") — wasted chat_update and
         # a visible edit flicker.
-        self._pending_approval.pop(ws_id, None)
+        self._pending_approval.pop((ws_id, entry.cycle_id), None)
         ts = body["container"]["message_ts"]
         update_text = "Tool approved" if approved else "Tool denied"
         event_key = "approve" if approved else "deny"
@@ -941,6 +961,10 @@ class TurnstoneSlackBot:
         self._subscribed_ws.add(ws_id)
         log.info("slack.subscribed", ws_id=ws_id, channel_id=channel_id)
 
+    def _pop_ws_approvals(self, ws_id: str) -> None:
+        """Drop every tracked approval message for *ws_id* (all cycles)."""
+        pop_ws_entries(self._pending_approval, ws_id)
+
     def _clear_ws_state(self, ws_id: str) -> None:
         """Drop all in-memory state keyed by *ws_id*.
 
@@ -950,7 +974,7 @@ class TurnstoneSlackBot:
         """
         self._subscribed_ws.discard(ws_id)
         self._streaming.pop(ws_id, None)
-        self._pending_approval.pop(ws_id, None)
+        self._pop_ws_approvals(ws_id)
         self._clear_notification_tracking_for_ws(ws_id)
 
     async def unsubscribe_ws(self, ws_id: str) -> None:
@@ -1062,13 +1086,17 @@ class TurnstoneSlackBot:
         thread_ts = route.thread_ts or ""
         owner_user_id = route.user_id
 
+        # Every decision this handler takes is about THIS event's cycle —
+        # forward its cycle_id so the resolution can't land on a sibling
+        # round (parallel task agents can have several outstanding).
+        cycle_id = event.cycle_id
         verdict = await self.router.evaluate_tool_policies(event.items)
         policy_handled = False
         if verdict.kind == "deny":
             denied = ", ".join(verdict.denied_tools)
             await self.router.send_approval(
                 ws_id,
-                "",
+                cycle_id,
                 approved=False,
                 feedback=f"Blocked by tool policy: {denied}",
             )
@@ -1079,7 +1107,7 @@ class TurnstoneSlackBot:
             )
             policy_handled = True
         elif verdict.kind == "allow":
-            await self.router.send_approval(ws_id, "", approved=True)
+            await self.router.send_approval(ws_id, cycle_id, approved=True)
             await self._client.chat_postMessage(
                 channel=slack_channel,
                 thread_ts=thread_ts or None,
@@ -1088,7 +1116,7 @@ class TurnstoneSlackBot:
             policy_handled = True
 
         if not policy_handled and (self.config.auto_approve or self._should_auto_approve(event)):
-            await self.router.send_approval(ws_id, "", approved=True)
+            await self.router.send_approval(ws_id, cycle_id, approved=True)
             await self._client.chat_postMessage(
                 channel=slack_channel,
                 thread_ts=thread_ts or None,
@@ -1097,7 +1125,7 @@ class TurnstoneSlackBot:
         elif not policy_handled:
             await self._send_approval_request(
                 ws_id,
-                "",
+                cycle_id,
                 event.items,
                 slack_channel,
                 thread_ts,
@@ -1105,7 +1133,18 @@ class TurnstoneSlackBot:
             )
 
     async def _handle_intent_verdict(self, ws_id: str, event: IntentVerdictEvent) -> None:
-        entry = self._pending_approval.get(ws_id)
+        # Route the verdict onto the message whose cycle contains this
+        # call_id — with several prompts live, editing "the" entry would
+        # stack the judge section on the wrong message.  Legacy entries
+        # (empty call_ids) accept any verdict for the ws, as before.
+        entry = next(
+            (
+                v
+                for (wid, _), v in self._pending_approval.items()
+                if wid == ws_id and (not v.call_ids or event.call_id in v.call_ids)
+            ),
+            None,
+        )
         if entry is None:
             return
 
@@ -1138,7 +1177,9 @@ class TurnstoneSlackBot:
             log.debug("slack.verdict_message_update_failed", ws_id=ws_id, exc_info=True)
 
     async def _handle_approval_resolved(self, ws_id: str, event: ApprovalResolvedEvent) -> None:
-        entry = self._pending_approval.pop(ws_id, None)
+        # Route by the event's cycle_id; a pre-multi-cycle server (no
+        # cycle_id) clears the ws's single tracked entry, as before.
+        entry = pop_cycle_entry(self._pending_approval, ws_id, event.cycle_id)
         if entry is None:
             return
 
@@ -1174,7 +1215,7 @@ class TurnstoneSlackBot:
         ):
             self._track_notification(sm.message_ts, ws_id, reply_route)
 
-        self._pending_approval.pop(ws_id, None)
+        self._pop_ws_approvals(ws_id)
 
     async def _handle_error(self, route: SlackRoute, event: ErrorEvent) -> None:
         safe_msg = event.message[:500] if event.message else "An error occurred"
@@ -1254,15 +1295,18 @@ class TurnstoneSlackBot:
             blocks=cast("list[dict[str, Any]]", blocks),
         )
         if resp.get("ok"):
-            self._pending_approval[ws_id] = PendingApproval(
+            self._pending_approval[(ws_id, correlation_id)] = PendingApproval(
                 channel=channel,
                 message_ts=resp["ts"],
                 owner_user_id=owner_user_id,
                 blocks=list(cast("list[dict[str, Any]]", blocks)),
+                cycle_id=correlation_id,
+                call_ids=frozenset(str(it.get("call_id", "")) for it in items if it.get("call_id")),
             )
             log.info(
                 "slack.pending_approval_stored",
                 ws_id=ws_id,
+                cycle_id=correlation_id,
                 channel=channel,
                 thread_ts=thread_ts,
                 owner_user_id=owner_user_id,

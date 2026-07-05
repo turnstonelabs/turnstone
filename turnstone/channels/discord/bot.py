@@ -23,7 +23,7 @@ import httpx
 
 from turnstone.channels._config import MAX_NOTIFY_TRACKING
 from turnstone.channels._formatter import chunk_message
-from turnstone.channels._routing import ChannelRouter
+from turnstone.channels._routing import ChannelRouter, pop_cycle_entry, pop_ws_entries
 from turnstone.channels._sse import run_sse_stream
 from turnstone.core.log import get_logger
 from turnstone.sdk.events import (
@@ -235,10 +235,15 @@ class TurnstoneBot:
         # List preserves call order for FIFO matching when the same tool name
         # appears more than once in a single turn.
         self._tool_info_msgs: dict[str, list[tuple[str, str, str, discord.Message]]] = {}
-        # Track the Discord message containing the pending approval embed per
-        # workstream so that IntentVerdictEvent can update it with LLM judge
-        # results.
-        self._pending_approval_msgs: dict[str, discord.Message] = {}
+        # Track the Discord message containing each pending approval embed,
+        # keyed by (ws_id, cycle_id) — parallel task agents make several
+        # approval cycles live per workstream at once, each its own embed.
+        # The value carries the cycle's member call_ids so
+        # IntentVerdictEvent (keyed by call_id) updates the RIGHT embed
+        # with LLM judge results.
+        self._pending_approval_msgs: dict[
+            tuple[str, str], tuple[discord.Message, frozenset[str]]
+        ] = {}
         # Notification reply tracking: maps Discord message ID ->
         # (ws_id, target_discord_user_id) so that DM replies can be routed
         # back to the originating workstream.  The target user ID is checked
@@ -413,12 +418,16 @@ class TurnstoneBot:
             with contextlib.suppress(Exception):
                 await thinking_msg.delete()
         self._tool_info_msgs.pop(ws_id, None)
-        self._pending_approval_msgs.pop(ws_id, None)
+        self._pop_ws_approvals(ws_id)
         self._notify_reply_channels.pop(ws_id, None)
         # Purge stale notification tracking entries for this workstream.
         stale = [mid for mid, entry in self._notify_ws_map.items() if entry[0] == ws_id]
         for mid in stale:
             del self._notify_ws_map[mid]
+
+    def _pop_ws_approvals(self, ws_id: str) -> None:
+        """Drop every tracked approval embed for *ws_id* (all cycles)."""
+        pop_ws_entries(self._pending_approval_msgs, ws_id)
 
     async def unsubscribe_ws(self, ws_id: str) -> None:
         """Cancel the SSE listener for *ws_id* and clean up streaming state."""
@@ -680,6 +689,10 @@ class TurnstoneBot:
         from turnstone.channels._formatter import format_approval_request, format_verdict
         from turnstone.channels.discord.views import ApprovalView
 
+        # Every decision below is about THIS event's cycle — forward its
+        # cycle_id so the resolution can't land on a sibling round
+        # (parallel task agents can have several prompts outstanding).
+        cycle_id = event.cycle_id
         # Evaluate admin tool policies before auto-approve.
         policy_verdict = await self.router.evaluate_tool_policies(event.items)
         policy_handled = False
@@ -687,22 +700,19 @@ class TurnstoneBot:
             denied = ", ".join(policy_verdict.denied_tools)
             await self.router.send_approval(
                 ws_id,
-                "",
+                cycle_id,
                 approved=False,
                 feedback=f"Blocked by tool policy: {denied}",
             )
             await thread.send(f"*Tool blocked by admin policy: {denied}*")
             policy_handled = True
         elif policy_verdict.kind == "allow":
-            await self.router.send_approval(ws_id, "", approved=True)
+            await self.router.send_approval(ws_id, cycle_id, approved=True)
             await thread.send("*Tool approved by policy.*")
             policy_handled = True
 
         if not policy_handled and (self.config.auto_approve or self._should_auto_approve(event)):
-            # correlation_id is empty because the server's /api/approve
-            # endpoint resolves approvals by ws_id alone (one pending
-            # approval per workstream at a time).
-            await self.router.send_approval(ws_id, "", approved=True)
+            await self.router.send_approval(ws_id, cycle_id, approved=True)
             await thread.send("*Tool auto-approved.*")
         elif not policy_handled:
             text = format_approval_request(event.items)
@@ -721,9 +731,15 @@ class TurnstoneBot:
                         value=format_verdict(verdict),
                         inline=False,
                     )
-            embed.set_footer(text=f"{ws_id}||{_thread_owner_id(thread)}")
+            # Footer format ws_id|cycle_id|owner — the persistent view
+            # parses it back on click and routes the decision to exactly
+            # this cycle.
+            embed.set_footer(text=f"{ws_id}|{cycle_id}|{_thread_owner_id(thread)}")
             msg = await thread.send(embed=embed, view=ApprovalView(self)._view)
-            self._pending_approval_msgs[ws_id] = msg
+            call_ids = frozenset(
+                str(it.get("call_id", "")) for it in event.items if it.get("call_id")
+            )
+            self._pending_approval_msgs[(ws_id, cycle_id)] = (msg, call_ids)
 
     async def _handle_intent_verdict(
         self,
@@ -734,8 +750,18 @@ class TurnstoneBot:
 
         from turnstone.channels._formatter import format_verdict
 
-        # LLM judge verdict arrived — update the pending approval embed.
-        approval_msg = self._pending_approval_msgs.get(ws_id)
+        # LLM judge verdict arrived — update the pending approval embed
+        # whose cycle contains this call_id (several can be live at once
+        # under parallel task agents).  Legacy entries (empty call_ids)
+        # accept any verdict for the ws, as before.
+        approval_msg = next(
+            (
+                msg
+                for (wid, _), (msg, call_ids) in self._pending_approval_msgs.items()
+                if wid == ws_id and (not call_ids or event.call_id in call_ids)
+            ),
+            None,
+        )
         if approval_msg and approval_msg.embeds:
             embed = approval_msg.embeds[0]
             verdict_data = {
@@ -771,9 +797,12 @@ class TurnstoneBot:
         event: ApprovalResolvedEvent,
     ) -> None:
         # Server resolved the approval (timeout, external approve/reject).
-        # Disable the buttons so they can't be clicked stale.
-        approval_msg = self._pending_approval_msgs.pop(ws_id, None)
-        if approval_msg is not None:
+        # Disable the buttons so they can't be clicked stale.  Route by
+        # the event's cycle_id; a pre-multi-cycle server (no cycle_id)
+        # clears the ws's single tracked entry, as before.
+        entry = pop_cycle_entry(self._pending_approval_msgs, ws_id, event.cycle_id)
+        if entry is not None:
+            approval_msg = entry[0]
             from turnstone.channels.discord.views import disable_message_buttons
 
             label = "Approved" if event.approved else "Denied"
@@ -809,8 +838,8 @@ class TurnstoneBot:
                 # for multi-turn DM conversations.
                 if last_msg is not None:
                     self._track_notification(last_msg.id, ws_id, target_user_id)
-        # Clean up pending approval message tracking.
-        self._pending_approval_msgs.pop(ws_id, None)
+        # Clean up pending approval message tracking (all cycles).
+        self._pop_ws_approvals(ws_id)
 
     # -- helpers -------------------------------------------------------------
 

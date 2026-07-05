@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
+from turnstone.channels._routing import pop_cycle_entry
 from turnstone.core.log import get_logger
 
 if TYPE_CHECKING:
@@ -187,7 +188,9 @@ class ApprovalView:
 
         label = "Always Approved" if always else ("Approved" if approved else "Rejected")
         # Pop pending approval so ApprovalResolvedEvent doesn't double-update.
-        self.bot._pending_approval_msgs.pop(ws_id, None)
+        # Keyed by (ws_id, cycle_id); a legacy footer without a cycle_id
+        # clears the ws's single tracked entry.
+        pop_cycle_entry(self.bot._pending_approval_msgs, ws_id, correlation_id)
         await _disable_buttons(interaction, label)
         await interaction.followup.send(
             f"Tool execution **{label.lower()}**.",
