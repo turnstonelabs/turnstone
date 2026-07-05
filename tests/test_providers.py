@@ -218,7 +218,8 @@ class TestOpenAIProvider:
         assert kwargs["reasoning_effort"] == "medium"
 
     def test_effort_param_injects_knob_value(self) -> None:
-        """effort_param carries the knob into chat_template_kwargs (gpt-oss)."""
+        """effort_param carries the knob into chat_template_kwargs (gpt-oss);
+        a knob above the declared ceiling rides the ceiling, not the default."""
         caps = ModelCapabilities(
             thinking_mode="none",
             effort_param="reasoning_effort",
@@ -226,7 +227,7 @@ class TestOpenAIProvider:
             default_reasoning_effort="medium",
         )
         eb = self.provider._finalize_extra_body(None, caps, "xhigh")
-        assert eb == {"chat_template_kwargs": {"reasoning_effort": "medium"}}
+        assert eb == {"chat_template_kwargs": {"reasoning_effort": "high"}}
         assert self.provider._finalize_extra_body(None, caps, "none") is None
 
     def test_caller_extra_params_not_mutated(self) -> None:
@@ -2386,11 +2387,20 @@ class TestAnthropicReasoningNone:
         result = _map_reasoning_to_effort("xhigh", ("low", "medium", "high", "xhigh", "max"))
         assert result == "xhigh"
 
-    def test_map_xhigh_rejected_by_model_without_it(self) -> None:
+    def test_map_xhigh_snaps_up_through_gap_to_max(self) -> None:
+        """Levels with a hole (no xhigh) round the knob UP to the next
+        declared level rather than dropping output_config entirely."""
         from turnstone.core.providers._anthropic import _map_reasoning_to_effort
 
         result = _map_reasoning_to_effort("xhigh", ("low", "medium", "high", "max"))
-        assert result is None
+        assert result == "max"
+
+    def test_map_above_ceiling_rides_ceiling(self) -> None:
+        from turnstone.core.providers._anthropic import _map_reasoning_to_effort
+
+        assert _map_reasoning_to_effort("max", ("low", "medium", "high")) == "high"
+        assert _map_reasoning_to_effort("minimal", ("low", "medium", "high")) == "low"
+        assert _map_reasoning_to_effort("none", ("low", "medium", "high")) is None
 
 
 # ===========================================================================
@@ -3696,8 +3706,9 @@ class TestAnthropicPromptCaching:
         )
         assert kwargs["output_config"] == {"effort": "xhigh"}
 
-    def test_xhigh_effort_not_applied_to_opus_4_6(self) -> None:
-        """xhigh is not a valid effort level for Opus 4.6 — should be ignored."""
+    def test_xhigh_effort_snaps_to_max_on_opus_4_6(self) -> None:
+        """Opus 4.6 declares (low, medium, high, max) — a knob of xhigh
+        rounds up to max instead of silently dropping output_config."""
         caps = self.provider.get_capabilities("claude-opus-4-6")
         kwargs = self.provider._build_thinking_and_kwargs(
             caps=caps,
@@ -3710,7 +3721,7 @@ class TestAnthropicPromptCaching:
             model="claude-opus-4-6",
             tools=None,
         )
-        assert "output_config" not in kwargs
+        assert kwargs["output_config"] == {"effort": "max"}
 
     @patch("turnstone.core.providers._anthropic._ensure_anthropic")
     def test_streaming_message_start_cache_metrics(self, mock_ensure: MagicMock) -> None:

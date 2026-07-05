@@ -40,9 +40,13 @@ from turnstone.core.providers import create_provider
 from turnstone.core.providers._protocol import ModelCapabilities
 from turnstone.core.providers.effort_ladder import KNOB_VALUES, effort_ladder
 
-# Big enough that Anthropic manual-mode budgets are never clamped by
-# max_tokens (the ladder documents budgets unclamped).
-_MAX_TOKENS = 32_000
+# Above the largest manual-mode thinking budget (max: 65536) so the
+# request path's budget<max_tokens clamp never fires — the ladder
+# documents budgets unclamped, so the capture must be too.  (At small
+# per-request max_tokens the clamp can genuinely alias adjacent budget
+# tiers on the wire; that is the ladder's documented approximation, not
+# a parity break.)
+_MAX_TOKENS = 128_000
 
 
 @dataclasses.dataclass(frozen=True)

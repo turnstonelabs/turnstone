@@ -41,7 +41,8 @@ class TestLocalLanes:
         assert eff["max"] == "on+max"
 
     def test_validated_effort_param_shows_snapping(self) -> None:
-        """Declared values collapse off-list positions onto the default."""
+        """Off-list positions round up onto the declared values; above the
+        ceiling they ride the ceiling — never the (possibly lower) default."""
         caps = ModelCapabilities(
             thinking_mode="manual",
             thinking_param="enable_thinking",
@@ -50,9 +51,10 @@ class TestLocalLanes:
             default_reasoning_effort="medium",
         )
         eff = _as_map(effort_ladder("openai-compatible", caps))
-        assert eff["xhigh"] == "on+medium"
-        assert eff["max"] == "on+medium"
+        assert eff["minimal"] == "on+low"
         assert eff["high"] == "on+high"
+        assert eff["xhigh"] == "on+high"
+        assert eff["max"] == "on+high"
 
     def test_openai_compatible_flat_param_without_effort_param(self) -> None:
         caps = ModelCapabilities(
@@ -62,7 +64,7 @@ class TestLocalLanes:
         eff = _as_map(effort_ladder("openai-compatible", caps))
         assert eff["none"] == "default"
         assert eff["high"] == "high"
-        assert eff["xhigh"] == "medium"
+        assert eff["xhigh"] == "high"  # ceiling, not default
 
     def test_adaptive_local_never_off(self) -> None:
         caps = ModelCapabilities(thinking_mode="adaptive", thinking_param="enable_thinking")
@@ -80,19 +82,20 @@ class TestNativeAnthropicLane:
         )
         eff = _as_map(effort_ladder("anthropic", caps))
         assert eff["none"] == "adaptive"  # thinking on, model decides
-        assert eff["minimal"] == "adaptive"  # unmapped knob level
+        assert eff["minimal"] == "low"  # rounds up onto the declared levels
         assert eff["low"] == "low"
         assert eff["max"] == "max"
 
     def test_manual_budget_ladder(self) -> None:
+        """Budgets are monotone over the whole knob domain."""
         caps = ModelCapabilities(thinking_mode="manual")
         eff = _as_map(effort_ladder("anthropic", caps))
         assert eff["none"] == "off"
-        assert eff["low"] == "budget:1024"
+        assert eff["minimal"] == eff["low"] == "budget:1024"  # 1024 = API floor
         assert eff["medium"] == "budget:4096"
         assert eff["high"] == "budget:16384"
-        # Off-map knob levels share the default budget — aliased group.
-        assert eff["minimal"] == eff["xhigh"] == eff["max"] == "budget:4096"
+        assert eff["xhigh"] == "budget:32768"
+        assert eff["max"] == "budget:65536"
 
 
 class TestFlatParamLanes:
@@ -133,12 +136,14 @@ class TestFlatParamLanes:
 
     def test_xai_projects_flat_only(self) -> None:
         """grok-4.3 declares values (none/low/medium/high, default low);
-        off-list knob positions snap to the default."""
+        knob positions above the ceiling ride the ceiling (high), and the
+        declared "none" is never a snap target."""
         eff = _as_map(effort_ladder_for_model("xai", "grok-4.3", None))
         assert eff["none"] == "default"  # resolve_ never forwards "none"
+        assert eff["minimal"] == "low"
         assert eff["low"] == "low"
         assert eff["high"] == "high"
-        assert eff["xhigh"] == eff["max"] == "low"
+        assert eff["xhigh"] == eff["max"] == "high"
 
     def test_xai_ignores_template_overrides(self) -> None:
         """XAIProvider subclasses OpenAIResponsesProvider, which drops

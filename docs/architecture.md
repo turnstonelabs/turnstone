@@ -820,13 +820,19 @@ the levers live in the chat template, reached through
   `effort_param` (e.g. `"reasoning_effort"`), plus optional
   `reasoning_effort_values` / `default_reasoning_effort` to validate
   the knob before it reaches the template; without declared values the
-  knob is forwarded as-is. Only declare values that match the
-  template's documented vocabulary — snapping an off-list knob to the
-  default can defeat a real tier. DeepSeek-V4, for example, officially
+  knob is forwarded as-is. The knob is ordinal, and validation
+  respects that: an off-list knob value rounds UP onto the declared
+  list and a value above the ceiling rides the ceiling
+  (`snap_reasoning_effort`) — asking for more effort than the model
+  declares never falls back to a lower default tier.
+  `default_reasoning_effort` only catches values the ordinal snap
+  cannot rank (custom strings). Declare values that match the
+  template's documented vocabulary: for DeepSeek-V4, which officially
   accepts `high`/`max` (Think High is the default thinking tier;
-  `low`/`medium` alias to `high`, `xhigh` to `max`), so freeform
-  passthrough matches the contract while a `("low", "medium", "high")`
-  values list would make Think Max unreachable. To map an undocumented
+  `low`/`medium` alias to `high`, `xhigh` to `max`), a
+  `("high", "max")` values list reproduces the official aliasing
+  exactly — `low`/`medium` round up to `high`, `xhigh` to `max` —
+  and freeform passthrough matches it too. To map an undocumented
   template, probe with per-request `chat_template_kwargs` and compare
   `input_tokens`. Setting `effort_param` also suppresses the
   flat top-level `reasoning_effort` request param on the

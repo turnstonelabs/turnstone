@@ -21,6 +21,7 @@ from turnstone.core.providers._protocol import (
     _join_reasoning_with_cap,
     _lookup_capabilities,
     merge_reasoning_template_kwargs,
+    snap_reasoning_effort,
 )
 from turnstone.core.trajectory import materialize_attachments
 
@@ -78,11 +79,21 @@ _TOOL_SEARCH_TOOL_TYPE = "tool_search_tool_bm25"
 # bodies byte-identical when a caller threads thinking overrides.
 _INTERNAL_EXTRA_PARAMS = frozenset({"thinking_budget_tokens"})
 
-# Manual-mode thinking budgets per effort knob level; knob values outside
-# the map (minimal, xhigh, max) fall back to the default budget.  Public:
-# shared with ``effort_ladder`` so UI projections can't drift from the
-# wire.
-EFFORT_BUDGET_MAP = {"low": 1024, "medium": 4096, "high": 16384}
+# Manual-mode thinking budgets per effort knob level — monotone over the
+# whole knob domain (a higher knob position must never buy a smaller
+# budget; the request path still clamps below per-request max_tokens).
+# minimal shares the 1024 floor with low: the API rejects budgets under
+# 1024, so there is no smaller tier to express.  Unknown strings (custom
+# configs) fall back to the default budget.  Public: shared with
+# ``effort_ladder`` so UI projections can't drift from the wire.
+EFFORT_BUDGET_MAP = {
+    "minimal": 1024,
+    "low": 1024,
+    "medium": 4096,
+    "high": 16384,
+    "xhigh": 32768,
+    "max": 65536,
+}
 DEFAULT_THINKING_BUDGET = 4096
 
 # -- model capabilities -------------------------------------------------------
@@ -242,12 +253,19 @@ def _map_reasoning_to_effort(
     reasoning_effort: str,
     valid_levels: tuple[str, ...],
 ) -> str | None:
-    """Map turnstone reasoning_effort to Anthropic effort parameter."""
-    mapping = {"low": "low", "medium": "medium", "high": "high", "xhigh": "xhigh", "max": "max"}
-    effort = mapping.get(reasoning_effort)
-    if effort and effort in valid_levels:
-        return effort
-    return None
+    """Map turnstone reasoning_effort to Anthropic effort parameter.
+
+    Declared levels match verbatim; off-list knob values round up onto
+    the declared levels, capped at their ceiling (a knob above the
+    model's top level must ride the top level, not silently drop
+    output_config).  "none"/empty and unrankable strings return None —
+    no effort param.
+    """
+    if not reasoning_effort or reasoning_effort == "none":
+        return None
+    if reasoning_effort in valid_levels:
+        return reasoning_effort
+    return snap_reasoning_effort(reasoning_effort, valid_levels)
 
 
 # Anthropic accepts only a closed set of content-block types on the

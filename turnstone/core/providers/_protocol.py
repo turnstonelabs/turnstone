@@ -86,9 +86,10 @@ class ModelCapabilities:
     # gpt-oss-style templates).  Empty = the template has no effort lever,
     # send nothing.  The session knob value is validated against
     # ``reasoning_effort_values`` when that is non-empty (off-list values
-    # snap to ``default_reasoning_effort``); with no declared values the
-    # knob is forwarded as-is and the template is the authority on
-    # validity.  See ``reasoning_template_kwargs``.
+    # round UP onto the declared list, capped at its ceiling — see
+    # ``snap_reasoning_effort``); with no declared values the knob is
+    # forwarded as-is and the template is the authority on validity.
+    # See ``reasoning_template_kwargs``.
     effort_param: str = ""
     supports_effort: bool = False
     effort_levels: tuple[str, ...] = ()
@@ -147,15 +148,49 @@ class ModelCapabilities:
     rerank_separated: bool = False
 
 
+# The session effort knob is ORDINAL — snapping must respect this order.
+# "none" is the disable position and is never a snap target (snapping a
+# high knob onto "none" would invert the request into "don't think").
+KNOB_EFFORT_ORDER: tuple[str, ...] = ("none", "minimal", "low", "medium", "high", "xhigh", "max")
+_KNOB_RANK: dict[str, int] = {value: rank for rank, value in enumerate(KNOB_EFFORT_ORDER)}
+
+
+def snap_reasoning_effort(reasoning_effort: str, declared: tuple[str, ...]) -> str | None:
+    """Round an off-list knob value up onto the declared effort levels.
+
+    Returns the smallest declared level ranking >= the knob; when the
+    knob is above every declared level, the highest declared level (the
+    ceiling — asking for more effort than exists must not fall to a
+    lower tier).  Declared values outside the knob vocabulary cannot be
+    ranked and are reachable only by exact match in the caller; "none"
+    is never a snap target.  Returns ``None`` when the knob itself is
+    unrankable or nothing declared is rankable.
+    """
+    rank = _KNOB_RANK.get(reasoning_effort)
+    if rank is None or reasoning_effort == "none":
+        return None
+    rankable = [(r, v) for v in declared if (r := _KNOB_RANK.get(v)) is not None and v != "none"]
+    if not rankable:
+        return None
+    at_or_above = [(r, v) for r, v in rankable if r >= rank]
+    return min(at_or_above)[1] if at_or_above else max(rankable)[1]
+
+
 def resolve_reasoning_effort(caps: ModelCapabilities, reasoning_effort: str) -> str | None:
     """Return the validated reasoning effort value, or ``None`` to omit.
 
-    Validates against supported values and falls back to model default.
+    Declared values match verbatim; off-list knob values round UP onto
+    the declared list, capped at its ceiling (``snap_reasoning_effort``).
+    ``default_reasoning_effort`` is the last resort for values the
+    ordinal snap cannot rank (custom strings on either side).
     """
     if not caps.reasoning_effort_values or not reasoning_effort or reasoning_effort == "none":
         return None
     if reasoning_effort in caps.reasoning_effort_values:
         return reasoning_effort
+    snapped = snap_reasoning_effort(reasoning_effort, caps.reasoning_effort_values)
+    if snapped:
+        return snapped
     if caps.default_reasoning_effort and caps.default_reasoning_effort != "none":
         return caps.default_reasoning_effort
     return None
@@ -193,9 +228,10 @@ def reasoning_template_kwargs(
     the native adaptive branch never lets the knob force-disable
     thinking).  The effort value is validated via
     ``resolve_reasoning_effort`` when the model declares
-    ``reasoning_effort_values`` (off-list knob values snap to
-    ``default_reasoning_effort``); with no declared values the knob is
-    forwarded as-is and the template is the authority on validity.
+    ``reasoning_effort_values`` (off-list knob values round up onto the
+    declared list, capped at its ceiling); with no declared values the
+    knob is forwarded as-is and the template is the authority on
+    validity.
     """
     updates: dict[str, Any] = {}
     effort_on = bool(reasoning_effort) and reasoning_effort != "none"

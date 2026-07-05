@@ -246,7 +246,8 @@ class TestCompatReasoningControl:
         assert "thinking" not in kwargs
 
     def test_effort_param_validated_against_values(self) -> None:
-        """Off-list knob snaps to default_reasoning_effort, not sent raw."""
+        """Off-list knob rounds up onto the declared values (ceiling-capped),
+        never sent raw — and never snaps DOWN to the default."""
         caps = dataclasses.replace(
             self._MANUAL_CAPS,
             effort_param="reasoning_effort",
@@ -255,7 +256,7 @@ class TestCompatReasoningControl:
         )
         kwargs = self._stream_kwargs(caps, "xhigh")
         assert kwargs["extra_body"] == {
-            "chat_template_kwargs": {"enable_thinking": True, "reasoning_effort": "medium"}
+            "chat_template_kwargs": {"enable_thinking": True, "reasoning_effort": "high"}
         }
 
     def test_effort_param_freeform_without_values(self) -> None:
