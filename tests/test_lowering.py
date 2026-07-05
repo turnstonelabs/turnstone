@@ -11,12 +11,16 @@ this pins the behaviour the old ``_anthropic`` ``pc_tool_ids`` /
 
 from __future__ import annotations
 
+import json
 from typing import Any
 
 from turnstone.core.lowering import (
     CANCELLED_TOOL_RESULT,
     _find_orphaned_tool_calls,
     repair_wire_messages,
+    sanitize_tool_call_arguments,
+    tool_args_preview,
+    wire_valid_arguments,
 )
 
 
@@ -180,3 +184,143 @@ def test_repair_does_not_mutate_input() -> None:
     repair_wire_messages(msgs)
     assert len(msgs) == original_len  # caller's list untouched
     assert "tool_calls" in msgs[0]
+
+
+# --------------------------------------------------------------------------- #
+# wire_valid_arguments — the shared "is this renderable" predicate
+# --------------------------------------------------------------------------- #
+def test_wire_valid_arguments_accepts_json_objects() -> None:
+    assert wire_valid_arguments("{}") is True
+    assert wire_valid_arguments('{"command": "ls -la"}') is True
+    assert wire_valid_arguments('  { "a": 1 }\n') is True  # surrounding whitespace ok
+
+
+def test_wire_valid_arguments_rejects_unrenderable() -> None:
+    assert wire_valid_arguments('{"command": "cat /va') is False  # unterminated (the incident)
+    assert wire_valid_arguments("") is False  # empty (no-arg call) — json.loads raises
+    assert wire_valid_arguments("[]") is False  # array, not object
+    assert wire_valid_arguments("5") is False  # bare scalar
+    assert wire_valid_arguments('"hi"') is False  # bare string
+    assert wire_valid_arguments(None) is False  # missing
+    assert wire_valid_arguments({"a": 1}) is False  # raw dict — not a string on the wire
+
+
+def test_wire_valid_arguments_totals_on_deeply_nested_json() -> None:
+    # Deeply-nested JSON makes json.loads raise RecursionError (not a ValueError);
+    # the predicate must return False, not propagate and crash the send.
+    deep = "[" * 5000 + "]" * 5000
+    assert wire_valid_arguments(deep) is False
+
+
+def test_tool_args_preview_stringifies_and_caps() -> None:
+    assert tool_args_preview("x" * 500) == "x" * 120
+    assert tool_args_preview(None) == "None"
+    assert tool_args_preview({"a": 1}) == "{'a': 1}"
+
+
+# --------------------------------------------------------------------------- #
+# sanitize_tool_call_arguments — the legalize pass
+# --------------------------------------------------------------------------- #
+def _call(call_id: str, arguments: Any, name: str = "bash") -> dict[str, Any]:
+    return {"id": call_id, "type": "function", "function": {"name": name, "arguments": arguments}}
+
+
+def _assistant_calls(*calls: dict[str, Any]) -> dict[str, Any]:
+    return {"role": "assistant", "content": "", "tool_calls": list(calls)}
+
+
+def test_sanitize_identity_when_all_valid() -> None:
+    msgs = [_assistant_calls(_call("c1", "{}"), _call("c2", '{"a": 1}')), _tool("c1"), _tool("c2")]
+    # Every arguments already a JSON object → same object returned (allocation-free).
+    assert sanitize_tool_call_arguments(msgs) is msgs
+
+
+def test_sanitize_identity_when_no_tool_calls() -> None:
+    msgs = [{"role": "user", "content": "hi"}, {"role": "assistant", "content": "yo"}]
+    assert sanitize_tool_call_arguments(msgs) is msgs
+
+
+def test_sanitize_legalizes_unterminated_arguments() -> None:
+    # The production incident: deepseek-v4-flash emitted an unterminated args string
+    # with a non-``length`` finish reason, so it was committed and replayed verbatim.
+    msgs = [_assistant_calls(_call("c1", '{"command": "cat /va')), _tool("c1", "retry")]
+    out = sanitize_tool_call_arguments(msgs)
+    assert out is not msgs  # copied on repair
+    assert out[0]["tool_calls"][0]["function"]["arguments"] == "{}"
+    assert json.loads(out[0]["tool_calls"][0]["function"]["arguments"]) == {}
+
+
+def test_sanitize_legalizes_empty_arguments() -> None:
+    # A no-arg tool call sends ``""``; json.loads("") raises, so deepseek_v4 would 400.
+    out = sanitize_tool_call_arguments([_assistant_calls(_call("c1", ""))])
+    assert out[0]["tool_calls"][0]["function"]["arguments"] == "{}"
+
+
+def test_sanitize_legalizes_non_object_json() -> None:
+    out = sanitize_tool_call_arguments([_assistant_calls(_call("c1", "[]"), _call("c2", "5"))])
+    assert [tc["function"]["arguments"] for tc in out[0]["tool_calls"]] == ["{}", "{}"]
+
+
+def test_sanitize_serializes_raw_dict_arguments() -> None:
+    out = sanitize_tool_call_arguments([_assistant_calls(_call("c1", {"command": "ls"}))])
+    got = out[0]["tool_calls"][0]["function"]["arguments"]
+    assert isinstance(got, str) and json.loads(got) == {"command": "ls"}
+
+
+def test_sanitize_falls_back_when_dict_not_serializable() -> None:
+    # Defensive branch: a dict arguments carrying a non-JSON-encodable value
+    # (a set) makes json.dumps raise TypeError — it collapses to "{}", not a crash.
+    out = sanitize_tool_call_arguments([_assistant_calls(_call("c1", {"x": {1, 2, 3}}))])
+    assert out[0]["tool_calls"][0]["function"]["arguments"] == "{}"
+
+
+def test_sanitize_touches_only_the_offending_call() -> None:
+    good = _call("c1", '{"a": 1}')
+    bad = _call("c2", "{oops")
+    out = sanitize_tool_call_arguments([_assistant_calls(good, bad)])
+    # Valid sibling preserved by identity; only the bad call is rebuilt.
+    assert out[0]["tool_calls"][0] is good
+    assert out[0]["tool_calls"][1]["function"]["arguments"] == "{}"
+
+
+def test_sanitize_does_not_mutate_input() -> None:
+    raw = '{"command": "cat /va'
+    bad = _call("c1", raw)
+    msgs = [_assistant_calls(bad)]
+    sanitize_tool_call_arguments(msgs)
+    assert bad["function"]["arguments"] == raw  # caller's dict untouched
+    assert msgs[0]["tool_calls"][0] is bad
+
+
+# --------------------------------------------------------------------------- #
+# legalize ∘ repair — the two send-time validity passes compose
+# --------------------------------------------------------------------------- #
+def test_legalize_then_repair_answered_call() -> None:
+    # Malformed-but-answered (the poison-pill shape): args legalized, no orphan added.
+    msgs = [_assistant_calls(_call("c1", "{bad")), _tool("c1", "retry with valid JSON")]
+    out = repair_wire_messages(sanitize_tool_call_arguments(msgs))
+    assert [m["role"] for m in out] == ["assistant", "tool"]
+    assert json.loads(out[0]["tool_calls"][0]["function"]["arguments"]) == {}
+
+
+def test_legalize_then_repair_orphaned_call() -> None:
+    # Malformed AND unanswered: legalized args + a synthesized cancellation result.
+    msgs = [_assistant_calls(_call("c1", "{bad"))]
+    out = repair_wire_messages(sanitize_tool_call_arguments(msgs))
+    assert [m["role"] for m in out] == ["assistant", "tool"]
+    assert json.loads(out[0]["tool_calls"][0]["function"]["arguments"]) == {}
+    assert out[1]["content"] == CANCELLED_TOOL_RESULT
+
+
+def test_pipeline_every_emitted_arguments_is_a_json_object() -> None:
+    # The end-state invariant a strict renderer relies on.
+    msgs = [
+        _assistant_calls(_call("c1", ""), _call("c2", "{oops"), _call("c3", '{"ok": true}')),
+        _tool("c1"),
+        _tool("c2"),
+        _tool("c3"),
+    ]
+    out = repair_wire_messages(sanitize_tool_call_arguments(msgs))
+    for m in out:
+        for tc in m.get("tool_calls", []):
+            assert isinstance(json.loads(tc["function"]["arguments"]), dict)
