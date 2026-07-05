@@ -35,6 +35,7 @@ import {
   batchKicker,
   indexLabel,
 } from "./conversation.js";
+import { redactCredentials } from "./redact_credentials.js";
 import { authFetch } from "./auth.js";
 import { showToast } from "./toast.js";
 import { Composer } from "./composer.js";
@@ -3656,22 +3657,6 @@ function _formatRuntime(item) {
   return h > 0 ? h + "h " + m + "m" : m + "m";
 }
 
-function _redactApiKeys(text) {
-  // Query-string style: api_key=VALUE
-  let redacted = text.replace(
-    /(?:api_key|apiKey|api-key|token)=[^&\s"]+/g,
-    function (m) {
-      return m.split("=")[0] + "=***";
-    },
-  );
-  // JSON style: "api_key": "VALUE"
-  redacted = redacted.replace(
-    /(["'](?:api_key|apiKey|api-key|token)["']\s*:\s*["'])([^"']*)(['"])/gi,
-    "$1***$3",
-  );
-  return redacted;
-}
-
 function _tryPrettyJson(text) {
   let obj;
   try {
@@ -3679,7 +3664,7 @@ function _tryPrettyJson(text) {
   } catch (e) {
     return null;
   }
-  return _redactApiKeys(JSON.stringify(obj, null, 2));
+  return redactCredentials(JSON.stringify(obj, null, 2));
 }
 
 // ---------------------------------------------------------------------------
@@ -4146,7 +4131,7 @@ function renderToolOutput(stripped, isError) {
       return out;
     }
   }
-  out.textContent = _redactApiKeys(stripped);
+  out.textContent = redactCredentials(stripped);
   return out;
 }
 
@@ -4181,7 +4166,7 @@ function buildMediaEmbed(media, rawJson) {
   // Collapsed raw JSON for inspection (with redacted API keys)
   const raw = document.createElement("div");
   raw.className = "tool-output";
-  raw.textContent = _tryPrettyJson(rawJson) || _redactApiKeys(rawJson);
+  raw.textContent = _tryPrettyJson(rawJson) || redactCredentials(rawJson);
   makeCollapsible(raw);
   wrapper.appendChild(raw);
 
@@ -4306,7 +4291,7 @@ function buildMcpErrorEmbed(err, rawJson, onConsent) {
   details.appendChild(summary);
   const pre = document.createElement("pre");
   pre.className = "tool-output";
-  pre.textContent = _tryPrettyJson(rawJson) || _redactApiKeys(rawJson);
+  pre.textContent = _tryPrettyJson(rawJson) || redactCredentials(rawJson);
   details.appendChild(pre);
   wrapper.appendChild(details);
 

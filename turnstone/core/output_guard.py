@@ -109,7 +109,8 @@ _RE_ENV_SECRET_KEY = re.compile(
 _RE_JSON_SECRET = re.compile(
     r'"(?:api_key|apikey|api_secret|secret_key|secret|password|passwd|'
     r"token|access_token|refresh_token|auth_token|private_key|"
-    r'client_secret|webhook_secret|signing_key|encryption_key)"\s*:\s*"([^"]{8,})"',
+    r"client_secret|webhook_secret|signing_key|encryption_key|"
+    r'authorization)"\s*:\s*"([^"]{8,})"',
     re.IGNORECASE,
 )
 

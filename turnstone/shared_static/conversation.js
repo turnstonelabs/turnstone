@@ -13,6 +13,8 @@
 // never innerHTML.  Builders return a detached element and let the caller append
 // + scroll, so they stay pane- and transport-agnostic.
 
+import { redactCredentials } from "./redact_credentials.js";
+
 // ANSI / CSI escape stripper — a tool that emits control sequences (bash through
 // MCP, or a child node) must land as readable text in the result block.
 // Null-safe: a non-string argument coerces to "" rather than throwing.
@@ -632,7 +634,7 @@ export function buildConvResult(output, opts) {
       " chars total — truncated for display)";
   }
   const body = document.createElement("span");
-  body.textContent = pretty;
+  body.textContent = redactCredentials(pretty);
   block.appendChild(body);
   return block;
 }
