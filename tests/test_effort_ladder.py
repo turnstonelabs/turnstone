@@ -86,6 +86,24 @@ class TestNativeAnthropicLane:
         assert eff["low"] == "low"
         assert eff["max"] == "max"
 
+    def test_sonnet_5_registry_row(self) -> None:
+        """claude-sonnet-5: adaptive + full effort ladder incl. xhigh/max —
+        every knob level above none is a distinct wire behavior."""
+        eff = _as_map(effort_ladder_for_model("anthropic", "claude-sonnet-5", None))
+        assert eff["none"] == "adaptive"
+        assert eff["minimal"] == "low"  # rounds up onto declared levels
+        assert eff["low"] == "low"
+        assert eff["xhigh"] == "xhigh"
+        assert eff["max"] == "max"
+
+    def test_sonnet_4_6_xhigh_rides_max(self) -> None:
+        """Sonnet 4.6 declares (low, medium, high, max) — no xhigh, so the
+        knob's xhigh snaps up onto max rather than down onto high."""
+        eff = _as_map(effort_ladder_for_model("anthropic", "claude-sonnet-4-6", None))
+        assert eff["high"] == "high"
+        assert eff["xhigh"] == "max"
+        assert eff["max"] == "max"
+
     def test_manual_budget_ladder(self) -> None:
         """Budgets are monotone over the whole knob domain."""
         caps = ModelCapabilities(thinking_mode="manual")
@@ -136,10 +154,12 @@ class TestFlatParamLanes:
 
     def test_xai_projects_flat_only(self) -> None:
         """grok-4.3 declares values (none/low/medium/high, default low);
-        knob positions above the ceiling ride the ceiling (high), and the
-        declared "none" is never a snap target."""
+        knob positions above the ceiling ride the ceiling (high).  The
+        declared "none" IS forwarded for the knob's off position (xAI
+        documents it as disabling reasoning) but is never a snap target
+        for other positions."""
         eff = _as_map(effort_ladder_for_model("xai", "grok-4.3", None))
-        assert eff["none"] == "default"  # resolve_ never forwards "none"
+        assert eff["none"] == "none"  # explicit disable, declared by grok
         assert eff["minimal"] == "low"
         assert eff["low"] == "low"
         assert eff["high"] == "high"
@@ -160,9 +180,36 @@ class TestFlatParamLanes:
                 },
             )
         )
-        assert eff["none"] == "default"  # not "off" — there is no toggle
+        assert eff["none"] == "none"  # flat channel, not an "off" toggle
         assert eff["medium"] == "medium"
         assert all("+" not in v and v not in ("on", "off") for v in eff.values())
+
+    def test_openai_gpt55_registry_row(self) -> None:
+        """gpt-5.5 declares none/low/medium/high/xhigh with default medium:
+        knob none sends the explicit "none" level (server default is
+        MEDIUM, so omission would not disable), max rides the xhigh
+        ceiling, minimal rounds up to low."""
+        eff = _as_map(effort_ladder_for_model("openai", "gpt-5.5", None))
+        assert eff["none"] == "none"
+        assert eff["minimal"] == "low"
+        assert eff["xhigh"] == "xhigh"
+        assert eff["max"] == "xhigh"
+
+    def test_openai_o3_registry_row(self) -> None:
+        """o-series (except o1-mini) accept low/medium/high; no declared
+        "none" level, so the knob's off position omits the param."""
+        eff = _as_map(effort_ladder_for_model("openai", "o3", None))
+        assert eff["none"] == "default"
+        assert eff["minimal"] == "low"
+        assert eff["medium"] == "medium"
+        assert eff["xhigh"] == eff["max"] == "high"
+
+    def test_openai_codex_max_has_xhigh(self) -> None:
+        """gpt-5.1-codex-max must not prefix-fall onto the gpt-5.1 row
+        (which lacks xhigh) — xhigh reaches the wire verbatim."""
+        eff = _as_map(effort_ladder_for_model("openai", "gpt-5.1-codex-max", None))
+        assert eff["xhigh"] == "xhigh"
+        assert eff["max"] == "xhigh"
 
     def test_anthropic_effort_applies_even_with_thinking_mode_none(self) -> None:
         """output_config gates on supports_effort alone at request time."""

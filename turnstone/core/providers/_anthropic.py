@@ -201,13 +201,37 @@ _ANTHROPIC_CAPABILITIES: dict[str, ModelCapabilities] = {
         supports_pdf=True,
         supports_reasoning_replay=True,
     ),
-    "claude-sonnet-4-6": ModelCapabilities(
+    # Sonnet 5: adaptive thinking is on by default (explicit adaptive config
+    # accepted; manual budget_tokens is a 400); unlike Fable 5, an explicit
+    # thinking={"type": "disabled"} IS accepted.  Non-default sampling params
+    # (temperature/top_p/top_k) are a 400, same as Opus 4.8 / Fable 5.
+    # Effort: full ladder incl. xhigh + max; API default is high
+    # (platform.claude.com/docs/en/build-with-claude/effort, 2026-07 check).
+    "claude-sonnet-5": ModelCapabilities(
         context_window=1000000,
-        max_output_tokens=64000,
+        max_output_tokens=128000,
         token_param="max_tokens",
         thinking_mode="adaptive",
         supports_effort=True,
-        effort_levels=("low", "medium", "high"),
+        effort_levels=("low", "medium", "high", "xhigh", "max"),
+        supports_web_search=True,
+        supports_tool_search=True,
+        supports_vision=True,
+        supports_pdf=True,
+        supports_temperature=False,
+        thinking_display="summarized",
+        supports_reasoning_replay=True,
+    ),
+    # Sonnet 4.6: effort ladder tops at max (no xhigh — that level exists
+    # only on Fable 5 / Sonnet 5 / Opus 4.7+); knob xhigh rides max via the
+    # ordinal snap.
+    "claude-sonnet-4-6": ModelCapabilities(
+        context_window=1000000,
+        max_output_tokens=128000,
+        token_param="max_tokens",
+        thinking_mode="adaptive",
+        supports_effort=True,
+        effort_levels=("low", "medium", "high", "max"),
         supports_web_search=True,
         supports_tool_search=True,
         supports_vision=True,
