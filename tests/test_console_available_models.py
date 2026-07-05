@@ -372,6 +372,30 @@ def test_effort_ladder_parses_string_capabilities(storage: SQLiteBackend) -> Non
     assert ladder["max"] == "on"
 
 
+def test_effort_ladder_key_survives_malformed_capabilities(
+    storage: SQLiteBackend,
+) -> None:
+    """A capabilities column that fails to parse must not drop the key —
+    every row carries ``effort_ladder`` (empty on failure) so clients can
+    index it unconditionally instead of null-checking per row."""
+    storage.create_model_definition(
+        definition_id="m1",
+        alias="broken",
+        model="model-x",
+        provider="openai-compatible",
+        base_url="http://localhost:8000/v1",
+        api_key="dummy",
+        context_window=131072,
+        capabilities="{not valid json",
+        enabled=True,
+        created_by="admin",
+    )
+    body = _get_models(_make_client(storage))
+    entry = body["models"][0]
+    assert set(entry) == {"alias", "model", "provider", "effort_ladder"}
+    assert entry["effort_ladder"] == []
+
+
 def test_effort_ladder_honors_responses_api_surface(storage: SQLiteBackend) -> None:
     """server_compat.api_surface (namespaced inside the capabilities JSON)
     switches the projection to the flat-param path — no template toggle."""

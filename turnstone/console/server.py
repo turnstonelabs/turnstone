@@ -1914,10 +1914,14 @@ async def list_available_models(request: Request) -> JSONResponse:
 
     models = []
     for r in rows:
+        # ``effort_ladder`` starts as the empty list so the row schema is
+        # stable even when the try block below bails on a malformed
+        # capabilities column — clients can index the key unconditionally.
         entry: dict[str, Any] = {
             "alias": r["alias"],
             "model": r["model"],
             "provider": r["provider"],
+            "effort_ladder": [],
         }
         try:
             # ``capabilities`` is a JSON string (sa.Text column) with
