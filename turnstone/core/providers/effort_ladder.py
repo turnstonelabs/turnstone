@@ -13,9 +13,17 @@ Pure computation — no network, no provider clients.  Labels are short
 comparable tokens: two knob positions with the same ``effective`` string
 produce the same request.  ``"default"`` means nothing effort-related is
 sent (the server/model default applies); ``"off"``/``"on"`` describe the
-local-lane template toggle.  The ladder describes what Turnstone SENDS —
-a server-side template may alias further (e.g. DeepSeek-V4 maps
-``low``/``medium`` to its default ``high`` tier).
+local-lane template toggle.
+
+Two documented approximations:
+
+* The ladder describes what Turnstone SENDS — a server-side template
+  may alias further (e.g. DeepSeek-V4 maps ``low``/``medium`` to its
+  default ``high`` tier).
+* Anthropic manual-mode budgets are shown unclamped.  The request path
+  additionally clamps ``budget_tokens`` below the per-request
+  ``max_tokens``, so a very small ``max_tokens`` can collapse tiers (or
+  disable thinking) at request time — not knowable from capabilities.
 """
 
 from __future__ import annotations
@@ -23,9 +31,12 @@ from __future__ import annotations
 import dataclasses
 from typing import Any
 
+# _map_reasoning_to_effort is Anthropic-lane semantics shared with the
+# request path deliberately — projecting through the same function is
+# what keeps the ladder honest.
 from turnstone.core.providers._anthropic import (
-    _DEFAULT_THINKING_BUDGET,
-    _EFFORT_BUDGET_MAP,
+    DEFAULT_THINKING_BUDGET,
+    EFFORT_BUDGET_MAP,
     _map_reasoning_to_effort,
 )
 from turnstone.core.providers._protocol import (
@@ -39,19 +50,35 @@ from turnstone.core.providers._protocol import (
 # ladder row).
 KNOB_VALUES: tuple[str, ...] = ("none", "minimal", "low", "medium", "high", "xhigh", "max")
 
-# Lanes whose reasoning control rides chat_template_kwargs
-# (merge_reasoning_template_kwargs) rather than native params.
-_LOCAL_LANES = frozenset({"openai-compatible", "anthropic-compatible"})
+# Providers that serve requests through OpenAIChatCompletionsProvider (or
+# a subclass) and therefore inherit BOTH channels: chat_template_kwargs
+# injection via _finalize_extra_body AND the flat reasoning_effort param
+# via apply_temperature_and_effort.  google/xai belong here because their
+# providers subclass the chat provider — an operator override that sets
+# thinking_mode/effort_param on such a model changes real requests, and
+# the ladder must mirror that.
+_CHAT_LANES = frozenset({"openai-compatible", "google", "xai"})
 
 
-def effort_ladder(provider_name: str, caps: ModelCapabilities) -> list[dict[str, str]]:
+def effort_ladder(
+    provider_name: str,
+    caps: ModelCapabilities,
+    api_surface: str = "",
+) -> list[dict[str, str]]:
     """Project every knob position to its effective wire behavior.
 
     Returns ``[{"value": <knob>, "effective": <token>}, ...]`` in knob
     order.  Equal ``effective`` tokens ⇒ identical requests.
+
+    *api_surface* mirrors ``server_compat["api_surface"]``: the
+    ``"responses"`` surface handles reasoning natively and ignores
+    ``extra_body``, so chat-lane providers pinned to it project through
+    the flat param only — the same divergence ``create_provider``
+    applies at request time.
     """
     return [
-        {"value": knob, "effective": _effective(provider_name, caps, knob)} for knob in KNOB_VALUES
+        {"value": knob, "effective": _effective(provider_name, caps, knob, api_surface)}
+        for knob in KNOB_VALUES
     ]
 
 
@@ -59,29 +86,43 @@ def effort_ladder_for_model(
     provider_name: str,
     model: str,
     capability_overrides: dict[str, Any] | None,
+    api_surface: str = "",
 ) -> list[dict[str, str]]:
     """Ladder for a stored model row: provider defaults + operator overrides.
 
     Mirrors ``ChatSession._resolve_capabilities`` — overrides are
     field-filtered and applied over the provider's per-model defaults.
+    Callers holding a raw DB row must parse the ``capabilities`` JSON
+    string first (``model_registry`` does the same) — this function
+    takes a dict.
     """
     from turnstone.core.providers import create_provider
 
-    caps = create_provider(provider_name).get_capabilities(model)
+    caps = create_provider(provider_name, api_surface=api_surface or None).get_capabilities(model)
     if capability_overrides:
         fields = {f.name for f in dataclasses.fields(type(caps))}
         overrides = {k: v for k, v in capability_overrides.items() if k in fields}
         if overrides:
             caps = dataclasses.replace(caps, **overrides)
-    return effort_ladder(provider_name, caps)
+    return effort_ladder(provider_name, caps, api_surface)
 
 
-def _effective(provider_name: str, caps: ModelCapabilities, knob: str) -> str:
+def _effective(
+    provider_name: str,
+    caps: ModelCapabilities,
+    knob: str,
+    api_surface: str = "",
+) -> str:
     if provider_name == "anthropic":
         return _effective_anthropic(caps, knob)
-    if provider_name in _LOCAL_LANES:
+    if provider_name == "anthropic-compatible":
         return _effective_local(provider_name, caps, knob)
-    # Flat-param lanes: openai (chat + responses), google, xai.
+    if provider_name in _CHAT_LANES:
+        if api_surface == "responses":
+            # Responses surface: native reasoning, extra_body ignored.
+            return resolve_reasoning_effort(caps, knob) or "default"
+        return _effective_local(provider_name, caps, knob)
+    # openai commercial (Responses provider by default).
     return resolve_reasoning_effort(caps, knob) or "default"
 
 
@@ -95,23 +136,26 @@ def _effective_anthropic(caps: ModelCapabilities, knob: str) -> str:
     if caps.thinking_mode == "manual":
         if not knob or knob == "none":
             return "off"
-        budget = _EFFORT_BUDGET_MAP.get(knob, _DEFAULT_THINKING_BUDGET)
+        budget = EFFORT_BUDGET_MAP.get(knob, DEFAULT_THINKING_BUDGET)
         return f"{effort}·budget:{budget}" if effort else f"budget:{budget}"
-    return "default"
+    # thinking_mode "none": output_config effort still applies — the
+    # request path gates it on supports_effort alone, not thinking_mode.
+    return effort or "default"
 
 
 def _effective_local(provider_name: str, caps: ModelCapabilities, knob: str) -> str:
-    """Local lanes — mirrors ``merge_reasoning_template_kwargs`` (+ flat param)."""
+    """Chat lanes — mirrors ``merge_reasoning_template_kwargs`` (+ flat param)."""
     updates = reasoning_template_kwargs(caps, knob)
     parts: list[str] = []
     if caps.thinking_param in updates:
         parts.append("on" if updates[caps.thinking_param] else "off")
     if caps.effort_param and caps.effort_param in updates:
         parts.append(str(updates[caps.effort_param]))
-    # openai-compatible additionally sends the flat param when no
+    # Chat-completions providers also send the flat param when no
     # effort_param declares the template channel (suppression rule in
-    # apply_temperature_and_effort).
-    if provider_name == "openai-compatible" and not caps.effort_param:
+    # apply_temperature_and_effort).  The anthropic-compatible lane has
+    # no flat param.
+    if provider_name != "anthropic-compatible" and not caps.effort_param:
         flat = resolve_reasoning_effort(caps, knob)
         if flat:
             parts.append(flat)

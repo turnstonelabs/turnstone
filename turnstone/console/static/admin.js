@@ -7046,7 +7046,16 @@ function showEditModelModal(definitionId) {
         // it here would silently drop it on the next unrelated edit-save.
         if (tmVal) delete capsObj.thinking_param;
       }
-      delete capsObj.effort_param;
+      // Strip effort_param only for the lanes whose save path re-adds it
+      // (the same provider gate) — on other providers the field is
+      // hidden and the save path never writes it, so deleting it here
+      // would silently drop a stored key on an unrelated edit-save.
+      if (
+        m.provider === "openai-compatible" ||
+        m.provider === "anthropic-compatible"
+      ) {
+        delete capsObj.effort_param;
+      }
       const capsText = JSON.stringify(capsObj, null, 2);
       document.getElementById("model-capabilities").value =
         capsText === "{}" ? "" : capsText;
@@ -7638,10 +7647,16 @@ function _onModelFieldChange() {
 function _annotateEffortSelect(sel, ladder) {
   if (!sel) return;
   const byVal = {};
-  const firstOf = {};
   (ladder || []).forEach(function (row) {
     byVal[row.value] = row.effective;
-    if (!(row.effective in firstOf)) firstOf[row.effective] = row.value;
+  });
+  // First selectable position per effective token — restricted to the
+  // options THIS select offers, so an alias label never points at a
+  // position the user cannot pick (the skill shelf omits none/minimal).
+  const firstOf = {};
+  Array.from(sel.options).forEach(function (opt) {
+    const eff = byVal[opt.value];
+    if (eff !== undefined && !(eff in firstOf)) firstOf[eff] = opt.value;
   });
   Array.from(sel.options).forEach(function (opt) {
     if (!opt.value) return; // "" = inherit-the-default option
@@ -7676,6 +7691,7 @@ function _refreshModelEffortLadder() {
   const provider = document.getElementById("model-provider").value;
   const modelName = document.getElementById("model-name").value.trim();
   if (!modelName) {
+    _effortLadderSeq++; // invalidate any in-flight response
     _annotateEffortSelect(sel, null);
     return;
   }
@@ -7708,6 +7724,7 @@ function _refreshModelEffortLadder() {
       provider: provider,
       model: modelName,
       capabilities: caps,
+      api_surface: document.getElementById("model-api-surface").value || "",
     }),
   })
     .then(function (r) {
@@ -7873,6 +7890,8 @@ function _refreshModelSuggestions() {
       if (el) el.addEventListener("input", _scheduleEffortLadder);
     },
   );
+  const apiSurfEl = document.getElementById("model-api-surface");
+  if (apiSurfEl) apiSurfEl.addEventListener("change", _scheduleEffortLadder);
   const grid = document.getElementById("model-capgrid");
   if (grid) {
     grid.addEventListener("change", function (e) {

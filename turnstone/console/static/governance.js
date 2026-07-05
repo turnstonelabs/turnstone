@@ -5052,6 +5052,11 @@ function _submitOGPShelf() {
    _annotateEffortSelect from admin.js, which loads before this file. */
 let _sklcModelsPromise = null;
 let _sklcLadderTimer = null;
+/* Called from app.js on the models_changed SSE event so edited/added
+   models don't serve a stale ladder until page reload. */
+function _sklcInvalidateModelsCache() {
+  _sklcModelsPromise = null;
+}
 function _sklcRefreshEffortLadder() {
   const sel = document.getElementById("sklc-reasoning-effort");
   const aliasEl = document.getElementById("sklc-model");
@@ -5062,9 +5067,16 @@ function _sklcRefreshEffortLadder() {
     return;
   }
   if (!_sklcModelsPromise) {
-    _sklcModelsPromise = authFetch("/v1/api/models").then(function (r) {
-      return r.json();
-    });
+    _sklcModelsPromise = authFetch("/v1/api/models")
+      .then(function (r) {
+        return r.json();
+      })
+      .catch(function (e) {
+        // A cached rejection would block every retry (the truthy guard
+        // above) — reset so the next keystroke can refetch.
+        _sklcModelsPromise = null;
+        throw e;
+      });
   }
   _sklcModelsPromise
     .then(function (d) {
@@ -5079,7 +5091,7 @@ function _sklcRefreshEffortLadder() {
 }
 function _sklcScheduleEffortLadder() {
   clearTimeout(_sklcLadderTimer);
-  _sklcLadderTimer = setTimeout(_sklcRefreshEffortLadder, 400);
+  _sklcLadderTimer = setTimeout(_sklcRefreshEffortLadder, 500);
 }
 (function () {
   const el = document.getElementById("sklc-model");

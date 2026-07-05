@@ -203,18 +203,18 @@ def merge_reasoning_template_kwargs(
     reasoning_effort: str,
     extra_params: dict[str, Any] | None,
 ) -> dict[str, Any] | None:
-    """Copy-on-write merge of ``reasoning_template_kwargs`` into extra params.
+    """Merge ``reasoning_template_kwargs`` into a copy of the extra params.
 
-    Returns *extra_params* unchanged (possibly ``None``) when the
-    capabilities call for no injection; otherwise returns a new dict with
-    the reasoning entries folded into ``chat_template_kwargs``.  Existing
-    keys win — an operator ``server_compat`` pin beats the knob mapping.
-    The caller's dict (and its ``chat_template_kwargs`` sub-dict) is never
-    mutated.
+    Returns a new top-level dict whenever *extra_params* is non-empty or
+    an injection applies (``None`` stays ``None`` when there is nothing
+    to inject) — callers may attach the result to a request without
+    aliasing the session's dict.  Existing keys win — an operator
+    ``server_compat`` pin beats the knob mapping.  The caller's dict
+    (and its ``chat_template_kwargs`` sub-dict) is never mutated.
     """
     updates = reasoning_template_kwargs(caps, reasoning_effort)
     if not updates:
-        return extra_params
+        return dict(extra_params) if extra_params else extra_params
     merged = dict(extra_params) if extra_params else {}
     raw_ctk = merged.get("chat_template_kwargs")
     ctk = dict(raw_ctk) if isinstance(raw_ctk, dict) else {}

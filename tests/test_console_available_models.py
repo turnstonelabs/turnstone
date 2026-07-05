@@ -336,10 +336,64 @@ def test_channel_default_alias_blanked_when_disabled(
 
 
 def test_models_payload_strips_secret_fields(storage: SQLiteBackend) -> None:
-    """Regression guard: only alias/model/provider land in the response,
-    never api_key / base_url / context_window / capabilities."""
+    """Regression guard: only alias/model/provider (+ the derived
+    effort_ladder) land in the response, never api_key / base_url /
+    context_window / raw capabilities."""
     _seed_model(storage, definition_id="m1", alias="primary")
     body = _get_models(_make_client(storage))
-    assert body["models"] == [
-        {"alias": "primary", "model": "model-x", "provider": "openai-compatible"}
-    ]
+    assert len(body["models"]) == 1
+    entry = body["models"][0]
+    assert set(entry) == {"alias", "model", "provider", "effort_ladder"}
+    assert entry["alias"] == "primary"
+    assert entry["model"] == "model-x"
+    assert entry["provider"] == "openai-compatible"
+
+
+def test_effort_ladder_parses_string_capabilities(storage: SQLiteBackend) -> None:
+    """The capabilities column is a JSON STRING — the ladder must survive
+    the parse (regression: .items() on the raw string threw and the
+    guard silently dropped the field from every row)."""
+    storage.create_model_definition(
+        definition_id="m1",
+        alias="qwen",
+        model="qwen3.6-27b",
+        provider="anthropic-compatible",
+        base_url="http://localhost:8000",
+        api_key="dummy",
+        context_window=262144,
+        capabilities='{"thinking_mode": "manual", "thinking_param": "enable_thinking"}',
+        enabled=True,
+        created_by="admin",
+    )
+    body = _get_models(_make_client(storage))
+    ladder = {r["value"]: r["effective"] for r in body["models"][0]["effort_ladder"]}
+    assert ladder["none"] == "off"
+    assert ladder["medium"] == "on"
+    assert ladder["max"] == "on"
+
+
+def test_effort_ladder_honors_responses_api_surface(storage: SQLiteBackend) -> None:
+    """server_compat.api_surface (namespaced inside the capabilities JSON)
+    switches the projection to the flat-param path — no template toggle."""
+    caps = (
+        '{"thinking_mode": "manual", "thinking_param": "enable_thinking",'
+        ' "reasoning_effort_values": ["low", "medium", "high"],'
+        ' "server_compat": {"api_surface": "responses"}}'
+    )
+    storage.create_model_definition(
+        definition_id="m1",
+        alias="mistral",
+        model="mistral-medium",
+        provider="openai-compatible",
+        base_url="http://localhost:8000/v1",
+        api_key="dummy",
+        context_window=131072,
+        capabilities=caps,
+        enabled=True,
+        created_by="admin",
+    )
+    body = _get_models(_make_client(storage))
+    ladder = {r["value"]: r["effective"] for r in body["models"][0]["effort_ladder"]}
+    # Responses surface: flat param only — no "on+"/"off" toggle tokens.
+    assert ladder["medium"] == "medium"
+    assert ladder["none"] == "default"

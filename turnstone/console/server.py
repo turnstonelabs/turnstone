@@ -1920,8 +1920,21 @@ async def list_available_models(request: Request) -> JSONResponse:
             "provider": r["provider"],
         }
         try:
+            # ``capabilities`` is a JSON string (sa.Text column) with
+            # ``server_compat`` namespaced inside — parse and split the
+            # same way the model_registry loader does.
+            caps: dict[str, Any] = {}
+            raw_caps = r.get("capabilities")
+            if raw_caps:
+                parsed = json.loads(raw_caps)
+                if isinstance(parsed, dict):
+                    caps = parsed
+            server_compat = caps.pop("server_compat", {})
+            api_surface = (
+                server_compat.get("api_surface", "") if isinstance(server_compat, dict) else ""
+            )
             entry["effort_ladder"] = effort_ladder_for_model(
-                r["provider"], r["model"], r.get("capabilities") or {}
+                r["provider"], r["model"], caps, api_surface=str(api_surface or "")
             )
         except Exception:
             # Unknown provider string / malformed capabilities row must
@@ -11630,9 +11643,14 @@ async def admin_effort_ladder(request: Request) -> JSONResponse:
         body = await request.json()
     except Exception:
         return JSONResponse({"error": "invalid JSON body"}, status_code=400)
+    if not isinstance(body, dict):
+        # json() happily parses null/arrays/strings — .get() on those
+        # would 500 where the contract says 400.
+        return JSONResponse({"error": "body must be a JSON object"}, status_code=400)
     provider = str(body.get("provider") or "").strip()
     model = str(body.get("model") or "").strip()
     capabilities = body.get("capabilities")
+    api_surface = str(body.get("api_surface") or "").strip()
 
     if provider not in _MODEL_PROVIDERS:
         return JSONResponse({"error": f"Unknown provider: {provider!r}"}, status_code=400)
@@ -11642,7 +11660,9 @@ async def admin_effort_ladder(request: Request) -> JSONResponse:
         return JSONResponse({"error": "capabilities must be an object"}, status_code=400)
 
     try:
-        ladder = effort_ladder_for_model(provider, model, capabilities or {})
+        ladder = effort_ladder_for_model(
+            provider, model, capabilities or {}, api_surface=api_surface
+        )
     except Exception:
         # Garbage override values (wrong types for capability fields)
         # surface as a clean 400 rather than a 500 — the form's raw

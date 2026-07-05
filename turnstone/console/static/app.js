@@ -429,6 +429,9 @@ function handleClusterEvent(data) {
     if (typeof _populateHomeModelDropdowns === "function") {
       _populateHomeModelDropdowns();
     }
+    if (typeof _sklcInvalidateModelsCache === "function") {
+      _sklcInvalidateModelsCache();
+    }
     if (
       typeof _adminTab !== "undefined" &&
       _adminTab === "models" &&

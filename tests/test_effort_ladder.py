@@ -103,6 +103,45 @@ class TestFlatParamLanes:
         assert eff["high"] == "high"
         assert eff["xhigh"] == eff["max"] == "high"
 
+    def test_google_override_routes_through_chat_lane(self) -> None:
+        """GoogleProvider inherits _finalize_extra_body — a thinking_mode
+        override changes real requests, and the ladder must mirror it."""
+        eff = _as_map(
+            effort_ladder_for_model(
+                "google",
+                "gemini-3-flash",
+                {"thinking_mode": "manual", "thinking_param": "enable_thinking"},
+            )
+        )
+        assert eff["none"] == "off"
+        assert eff["medium"] == "on+medium"  # toggle + inherited flat param
+
+    def test_responses_surface_projects_flat_only(self) -> None:
+        caps_overrides = {
+            "thinking_mode": "manual",
+            "reasoning_effort_values": ["low", "medium", "high"],
+        }
+        chat = _as_map(effort_ladder_for_model("openai-compatible", "m", caps_overrides))
+        responses = _as_map(
+            effort_ladder_for_model(
+                "openai-compatible", "m", caps_overrides, api_surface="responses"
+            )
+        )
+        assert chat["medium"] == "on+medium"
+        assert responses["medium"] == "medium"
+        assert responses["none"] == "default"
+
+    def test_anthropic_effort_applies_even_with_thinking_mode_none(self) -> None:
+        """output_config gates on supports_effort alone at request time."""
+        caps = ModelCapabilities(
+            thinking_mode="none",
+            supports_effort=True,
+            effort_levels=("low", "medium", "high"),
+        )
+        eff = _as_map(effort_ladder("anthropic", caps))
+        assert eff["high"] == "high"
+        assert eff["none"] == "default"
+
     def test_overrides_merge_and_unknown_keys_ignored(self) -> None:
         eff = _as_map(
             effort_ladder_for_model(
