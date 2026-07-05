@@ -883,10 +883,17 @@ Only the Responses API surface (native reasoning) ignores it.
 
 The console surfaces this projection as an *effective effort ladder*:
 the admin model form's per-model effort select and the skill
-launch-config effort select annotate knob positions that alias to the
-same wire behavior (e.g. "Max (= high)"), computed server-side by
-`providers/effort_ladder.py` from the same mapping functions the
-providers use at request time and shipped on `/v1/api/models` rows and
+launch-config effort select annotate each position with what the
+request will carry, in plain words — a position whose delivered level
+matches its name stays plain ("Max"), a snapped position says so
+("Low — sends high"), the adaptive lanes' none position warns
+"thinking stays on", and budget detail lives in the tooltip. A
+position is never labeled after a sibling that shares its wire (that
+rendered "Max (= minimal)", implying a downgrade the wire doesn't
+contain). Computed server-side by `providers/effort_ladder.py` from
+the same mapping functions the providers use at request time and
+shipped on `/v1/api/models` rows (every row carries `effort_ladder`,
+empty when the capabilities column fails to parse) and
 `POST /v1/api/admin/models/effort-ladder`. The ladder describes what
 Turnstone sends — a server-side template may alias further (DeepSeek-V4
 folds `low`/`medium` into its default `high` tier).

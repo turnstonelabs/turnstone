@@ -6905,7 +6905,10 @@ function showCreateModelModal() {
   document.getElementById("model-thinking-param").value = "";
   document.getElementById("model-thinking-param-row").hidden = true;
   document.getElementById("model-effort-param").value = "";
-  _annotateEffortSelect(document.getElementById("model-reasoning-effort"), null);
+  _annotateEffortSelect(
+    document.getElementById("model-reasoning-effort"),
+    null,
+  );
   document.getElementById("model-extra-body").value = "";
   document.getElementById("model-capabilities").value = "";
   // Clear validation error styling from prior submit attempts
@@ -6988,7 +6991,8 @@ function showEditModelModal(definitionId) {
       // effort-knob → chat_template_kwargs mapping
       // (merge_reasoning_template_kwargs).
       const tmVal = capsObj.thinking_mode || "";
-      const tmCaptured = tmVal === "" || tmVal === "manual" || tmVal === "adaptive";
+      const tmCaptured =
+        tmVal === "" || tmVal === "manual" || tmVal === "adaptive";
       if (tmCaptured) {
         document.getElementById("model-thinking-mode").value = tmVal;
         document.getElementById("model-thinking-param").value =
@@ -7639,24 +7643,22 @@ function _onModelFieldChange() {
   _scheduleEffortLadder();
 }
 
-/* Effort-ladder annotation: label knob positions that alias to the same
-   wire behavior for a given model, from the server-computed projection
+/* Effort-ladder annotation: each knob position states, in plain words,
+   what the request will carry — from the server-computed projection
    (providers/effort_ladder.py — equal "effective" tokens ⇒ identical
-   requests).  Defined here and shared as a page global with
-   governance.js (skill launch config), which loads after this file. */
+   requests).  A position whose delivered level matches its name stays
+   plain ("Max"); a snapped position says so ("Low — sends high"); the
+   adaptive none position warns "thinking stays on"; budget detail
+   lives in the tooltip.  Never label a position after a sibling that
+   shares its token — that rendered "Max (= minimal)", implying a
+   downgrade the wire doesn't contain.  Defined here and shared as a
+   page global with governance.js (skill launch config), which loads
+   after this file. */
 function _annotateEffortSelect(sel, ladder) {
   if (!sel) return;
   const byVal = {};
   (ladder || []).forEach(function (row) {
     byVal[row.value] = row.effective;
-  });
-  // First selectable position per effective token — restricted to the
-  // options THIS select offers, so an alias label never points at a
-  // position the user cannot pick (the skill shelf omits none/minimal).
-  const firstOf = {};
-  Array.from(sel.options).forEach(function (opt) {
-    const eff = byVal[opt.value];
-    if (eff !== undefined && !(eff in firstOf)) firstOf[eff] = opt.value;
   });
   Array.from(sel.options).forEach(function (opt) {
     if (!opt.value) return; // "" = inherit-the-default option
@@ -7665,13 +7667,22 @@ function _annotateEffortSelect(sel, ladder) {
     let title = "";
     const eff = byVal[opt.value];
     if (eff !== undefined) {
-      const first = firstOf[eff];
-      if (first !== opt.value) {
-        label += " (= " + first + ")";
-      } else if (eff === "default") {
-        label += " (model default)";
-      }
       title = "sends: " + eff;
+      if (eff === "default") {
+        label += " — model default";
+      } else if (eff === "on") {
+        // Bare toggle-on without a graded value: only the adaptive
+        // lanes' none position produces this — the knob cannot
+        // disable an adaptive model's thinking.
+        label += " — thinking stays on";
+      } else if (eff !== "off") {
+        // "off" needs no echo on the none position.  Otherwise strip
+        // the toggle prefix and budget qualifier ("on+high" → "high",
+        // "high·budget:16384" → "high", bare "budget:4096" → "" = no
+        // suffix); the tooltip keeps the full token.
+        const wire = eff.replace(/^on\+/, "").replace(/(^|·)budget:\d+$/, "");
+        if (wire && wire !== opt.value) label += " — sends " + wire;
+      }
     }
     opt.textContent = label;
     opt.title = title;
