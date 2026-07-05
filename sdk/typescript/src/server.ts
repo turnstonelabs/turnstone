@@ -166,6 +166,13 @@ export class TurnstoneServer extends BaseClient {
     approved?: boolean;
     feedback?: string | null;
     always?: boolean;
+    /** Resolve exactly this approval cycle (from ApproveRequestEvent.cycle_id).
+     *  Omitting it resolves the OLDEST live cycle — ambiguous when parallel
+     *  task agents have several prompts outstanding, so pass it whenever the
+     *  triggering event is known. */
+    cycleId?: string;
+    /** Alternative selector: any call_id inside the target cycle. */
+    callId?: string;
   }): Promise<StatusResponse> {
     return this.request(
       "POST",
@@ -175,6 +182,8 @@ export class TurnstoneServer extends BaseClient {
           approved: opts.approved ?? true,
           feedback: opts.feedback,
           always: opts.always,
+          cycle_id: opts.cycleId,
+          call_id: opts.callId,
         },
       },
     );

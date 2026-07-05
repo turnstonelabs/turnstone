@@ -733,6 +733,9 @@ class ClusterCollector:
                 # coordinator's tree UI can clear the pending-approval
                 # pill the moment the user decides, rather than waiting
                 # for the subsequent state-change piggyback.
+                # ``cycle_id`` / ``call_ids`` name WHICH cycle resolved —
+                # a child running parallel task agents can have several
+                # approval blocks live at once.
                 ws_id = data.get("ws_id", "")
                 if ws_id:
                     pending_events.append(
@@ -743,6 +746,8 @@ class ClusterCollector:
                             "approved": bool(data.get("approved", False)),
                             "feedback": data.get("feedback", "") or "",
                             "always": bool(data.get("always", False)),
+                            "cycle_id": data.get("cycle_id", "") or "",
+                            "call_ids": data.get("call_ids") or [],
                         }
                     )
 
@@ -1391,6 +1396,8 @@ class ClusterCollector:
         approved: bool,
         feedback: str = "",
         always: bool = False,
+        cycle_id: str = "",
+        call_ids: list[str] | None = None,
     ) -> None:
         """Fan an ``approval_resolved`` decision for a console-pseudo-node ws.
 
@@ -1407,6 +1414,8 @@ class ClusterCollector:
                 "approved": approved,
                 "feedback": feedback,
                 "always": always,
+                "cycle_id": cycle_id,
+                "call_ids": call_ids or [],
             }
         )
 

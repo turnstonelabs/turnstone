@@ -1047,12 +1047,14 @@ _CLUSTER_WS_LIVE_KEYS = (
     "model_alias",
     "title",
     "name",
-    # Carries the inline approve/deny payload (items + judge_verdict)
-    # so coord live-bulk callers can render row-level UI without a
-    # per-child round-trip. ``None`` when no approval is pending.
-    # Cross-tenant exposure follows the trusted-team posture documented
-    # on ``SessionUIBase.serialize_pending_approval_detail``.
-    "pending_approval_detail",
+    # Carries the inline approve/deny payloads (one per live cycle,
+    # items + judge_verdict each) so coord live-bulk callers can render
+    # row-level UI without a per-child round-trip. ``[]`` when no
+    # approval is pending; several entries when parallel task agents
+    # gate concurrently.  Cross-tenant exposure follows the trusted-team
+    # posture documented on
+    # ``SessionUIBase.serialize_pending_approval_details``.
+    "pending_approval_details",
     # Ring buffer of the child's recent auto-approves (last 10) for
     # the coord-tree's "auto-approved by skill X" pill.  Without this
     # the operator has no surface to see WHICH tool calls bypassed
@@ -1170,16 +1172,16 @@ def _coordinator_live_snapshot(ws: Any) -> dict[str, Any]:
         val = getattr(obj, name, "") if obj else ""
         return val if isinstance(val, str) else ""
 
-    # Coord rows synthesize the same ``pending_approval_detail`` shape
+    # Coord rows synthesize the same ``pending_approval_details`` shape
     # the node-side dashboard produces — single source of truth via
-    # ``SessionUIBase.serialize_pending_approval_detail``. The console
+    # ``SessionUIBase.serialize_pending_approval_details``. The console
     # coord LLM judge isn't wired today (``coordinator_ui.py:138``
     # hardcodes ``judge_pending=False``), so ``judge_verdict`` will
     # always be ``None`` for these rows; the coord-self stretch in
     # the plan covers that follow-up. ``ui`` may be ``None`` in
     # transient states (newly-created ws before activation); every
     # active coord UI is a ``SessionUIBase`` and supports the method.
-    pending_approval_detail = ui.serialize_pending_approval_detail() if ui is not None else None
+    pending_approval_details = ui.serialize_pending_approval_details() if ui is not None else []
     recent_auto_approvals = ui.serialize_recent_auto_approvals() if ui is not None else []
 
     return {
@@ -1194,7 +1196,7 @@ def _coordinator_live_snapshot(ws: Any) -> dict[str, Any]:
         "title": "",
         "name": getattr(ws, "name", "") or "",
         "pending_approval": pending_approval,
-        "pending_approval_detail": pending_approval_detail,
+        "pending_approval_details": pending_approval_details,
         "recent_auto_approvals": recent_auto_approvals,
     }
 
@@ -1286,15 +1288,15 @@ async def _fetch_live_block(
             # ``activity_state="approval"`` is set inside approve_tools
             # AFTER the state transition fires, so a bulk fetch that
             # races with that window can see state=attention and
-            # activity_state="" simultaneously. A non-null
-            # ``pending_approval_detail`` is also a definitive signal
-            # (the serializer only emits non-None when ``_pending_approval``
-            # is set on the UI). Any of the three flips this true; the
-            # frontend reducer mirrors the same disjunction.
+            # activity_state="" simultaneously. A non-empty
+            # ``pending_approval_details`` is also a definitive signal
+            # (the serializer emits entries only for live cycles). Any
+            # of the three flips this true; the frontend reducer
+            # mirrors the same disjunction.
             live["pending_approval"] = (
                 live.get("activity_state") == "approval"
                 or entry.get("state") == "attention"
-                or live.get("pending_approval_detail") is not None
+                or bool(live.get("pending_approval_details"))
             )
             return live
     return None
@@ -3561,16 +3563,18 @@ def _coord_events_replay(
     """
     yield from session_replay_preamble(ws.session, ui)
 
-    pending_approval = getattr(ui, "_pending_approval", None)
-    if pending_approval is not None:
-        yield pending_approval
-        # Cached LLM verdicts that fired since the approval prompt
-        # — without this replay, a reconnecting / refreshing tab
-        # sees the approve_request prompt but no judge chip, and
-        # since intent_verdict only fires once per call_id (no
-        # push to a late subscriber), the chip would never appear
-        # until the operator re-invokes the action. Mirrors the
-        # interactive path at ``turnstone/server.py:875-878``.
+    # EVERY live approval cycle replays (parallel task agents can have
+    # several outstanding), each card followed once by the cached LLM
+    # verdicts — without this replay, a reconnecting / refreshing tab
+    # sees the approve_request prompts but no judge chips, and since
+    # intent_verdict only fires once per call_id (no push to a late
+    # subscriber), the chips would never appear until the operator
+    # re-invokes the action. Mirrors the interactive path in
+    # ``turnstone/server.py`` (fresh-connect replay).
+    cards_fn = getattr(ui, "pending_approval_cards", None)
+    pending_cards = cards_fn() if callable(cards_fn) else []
+    if pending_cards:
+        yield from pending_cards
         llm_verdicts = getattr(ui, "_llm_verdicts", None)
         ws_lock = getattr(ui, "_ws_lock", None)
         if llm_verdicts and ws_lock is not None:

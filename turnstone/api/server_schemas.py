@@ -339,13 +339,24 @@ class RecentAutoApproval(BaseModel):
 class PendingApprovalDetail(BaseModel):
     """Inline approval payload merged into ``DashboardWorkstream``.
 
-    Set when a workstream's ``approve_tools`` is parked on
-    ``_approval_event``; ``None`` (omitted) otherwise. Cross-tenant
+    One entry per live approval CYCLE — a gate thread parked in
+    ``approve_tools`` awaiting the operator.  Parallel task agents run
+    concurrent gates, so a workstream can have several of these at
+    once (``pending_approval_details``, oldest first).  Cross-tenant
     exposure here follows the same trusted-team posture as
     ``activity`` / ``tokens`` — see ``server.py``'s ``dashboard``
     handler comment.
     """
 
+    cycle_id: str = Field(
+        default="",
+        description=(
+            "Identity of this approval cycle.  Echo it back on "
+            "``POST /v1/api/workstreams/{ws_id}/approve`` to resolve "
+            "exactly this round — required for correctness when "
+            "several cycles are live (parallel task agents)."
+        ),
+    )
     call_id: str = Field(
         default="",
         description=(
@@ -388,16 +399,21 @@ class DashboardWorkstream(BaseModel):
     parent_ws_id: str | None = None
     user_id: str = ""
     project_id: str | None = None
-    pending_approval_detail: PendingApprovalDetail | None = Field(
-        default=None,
+    pending_approval_details: list[PendingApprovalDetail] = Field(
+        default_factory=list,
         description=(
             "Inline approval payload for the coordinator children-tree "
-            "UI. Carries the merged ``_pending_approval`` items list + "
-            "per-call_id LLM verdict cache so a coord can render "
-            "approve/deny buttons + judge pill without a separate "
-            "per-child round-trip. ``None`` when no approval is pending. "
-            "Also surfaced (verbatim) on ``GET /v1/api/cluster/ws/live`` "
-            "via the ``_CLUSTER_WS_LIVE_KEYS`` projection."
+            "UI: EVERY live approval cycle, oldest first — parallel "
+            "task agents gate concurrently, so a workstream can hold "
+            "several prompts at once.  Each entry carries the cycle's "
+            "items + per-call_id LLM verdict cache so a coord can "
+            "render approve/deny buttons + judge pill without a "
+            "separate per-child round-trip; resolve each with its "
+            "``cycle_id``.  Empty when no approval is pending.  Also "
+            "surfaced (verbatim) on ``GET /v1/api/cluster/ws/live`` "
+            "via the ``_CLUSTER_WS_LIVE_KEYS`` projection.  Replaces "
+            "1.6's ``pending_approval_detail`` single-object field "
+            "(breaking, 1.7)."
         ),
     )
     recent_auto_approvals: list[RecentAutoApproval] = Field(
@@ -482,21 +498,25 @@ class WorkstreamDetailResponse(BaseModel):
     pending_approval: bool = Field(
         default=False,
         description=(
-            "True when the workstream is parked on ``_approval_event`` "
-            "awaiting an operator approve/deny.  Mirrors the same field "
-            "on ``DashboardWorkstream`` / cluster live projections so a "
-            "freshly-loaded chat tab can render the inline approval gate "
-            "from the detail snapshot before SSE replay arrives."
+            "True when at least one approval cycle is live (a gate "
+            "thread parked awaiting an operator approve/deny).  Mirrors "
+            "the same field on ``DashboardWorkstream`` / cluster live "
+            "projections so a freshly-loaded chat tab can render the "
+            "inline approval gate from the detail snapshot before SSE "
+            "replay arrives."
         ),
     )
-    pending_approval_detail: PendingApprovalDetail | None = Field(
-        default=None,
+    pending_approval_details: list[PendingApprovalDetail] = Field(
+        default_factory=list,
         description=(
-            "Inline approval payload — same shape as ``DashboardWorkstream"
-            ".pending_approval_detail``.  ``None`` when no approval is "
-            "pending.  Lets a reload paint the action row + judge "
+            "Inline approval payloads, one per live cycle, oldest "
+            "first — same shape as ``DashboardWorkstream"
+            ".pending_approval_details``.  Empty when no approval is "
+            "pending.  Lets a reload paint every action row + judge "
             "verdicts immediately instead of relying on the SSE "
-            "approve_request replay timing window."
+            "approve_request replay timing window.  Replaces 1.6's "
+            "``pending_approval_detail`` single-object field "
+            "(breaking, 1.7)."
         ),
     )
 

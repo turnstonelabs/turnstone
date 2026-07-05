@@ -670,6 +670,11 @@ class CoordinatorAdapter:
                     "approved": bool(event.get("approved", False)),
                     "feedback": event.get("feedback", "") or "",
                     "always": bool(event.get("always", False)),
+                    # Which cycle resolved — the tree row can hold several
+                    # approval blocks when the child runs parallel task
+                    # agents; empty (legacy node) clears them all.
+                    "cycle_id": event.get("cycle_id", "") or "",
+                    "call_ids": event.get("call_ids") or [],
                 }
             else:  # approve_request
                 # Push path for the initial approval items —

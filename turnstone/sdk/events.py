@@ -157,16 +157,35 @@ class ToolInfoEvent(ServerEvent):
 
 @dataclass
 class ApproveRequestEvent(ServerEvent):
+    """One approval CYCLE awaiting the operator.
+
+    ``cycle_id`` names the round: echo it back on the approve POST to
+    resolve exactly this batch.  Several of these can be outstanding at
+    once — parallel task agents each gate their own tool calls — so
+    clients must key prompt UI by ``cycle_id``, not assume a singleton.
+    """
+
     type: str = "approve_request"
+    cycle_id: str = ""
     items: list[dict[str, Any]] = field(default_factory=list)
     judge_pending: bool = False
 
 
 @dataclass
 class ApprovalResolvedEvent(ServerEvent):
+    """A specific approval cycle resolved (by any connected client).
+
+    ``cycle_id`` / ``call_ids`` identify WHICH prompt to dismiss —
+    with concurrent cycles a bare "something resolved" would dismiss
+    the wrong card.
+    """
+
     type: str = "approval_resolved"
     approved: bool = False
     feedback: str = ""
+    always: bool = False
+    cycle_id: str = ""
+    call_ids: list[str] = field(default_factory=list)
 
 
 @dataclass

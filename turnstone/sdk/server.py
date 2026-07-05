@@ -276,12 +276,26 @@ class AsyncTurnstoneServer(_BaseClient):
         approved: bool = True,
         feedback: str | None = None,
         always: bool = False,
+        cycle_id: str | None = None,
+        call_id: str | None = None,
     ) -> StatusResponse:
+        """Resolve one approval cycle.
+
+        ``cycle_id`` (from the ``approve_request`` event) or ``call_id``
+        (any member call) selects the cycle; omitting both resolves the
+        OLDEST live one — ambiguous when parallel task agents have
+        several prompts outstanding, so pass a selector whenever the
+        triggering event is known.
+        """
         body: dict[str, Any] = {"approved": approved}
         if feedback is not None:
             body["feedback"] = feedback
         if always:
             body["always"] = True
+        if cycle_id:
+            body["cycle_id"] = cycle_id
+        if call_id:
+            body["call_id"] = call_id
         return await self._request(
             "POST",
             f"/v1/api/workstreams/{ws_id}/approve",
@@ -684,9 +698,18 @@ class TurnstoneServer:
         approved: bool = True,
         feedback: str | None = None,
         always: bool = False,
+        cycle_id: str | None = None,
+        call_id: str | None = None,
     ) -> StatusResponse:
         return self._runner.run(
-            self._async.approve(ws_id=ws_id, approved=approved, feedback=feedback, always=always)
+            self._async.approve(
+                ws_id=ws_id,
+                approved=approved,
+                feedback=feedback,
+                always=always,
+                cycle_id=cycle_id,
+                call_id=call_id,
+            )
         )
 
     def command(self, *, ws_id: str, command: str) -> StatusResponse:

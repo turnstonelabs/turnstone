@@ -5,8 +5,8 @@ Mirrors ``turnstone.server.WebUI`` but scoped to the console's needs:
 - Per-session SSE listener fan-out (inherited from
   :class:`SessionUIBase` — same ``threading.Lock`` + queue list
   pattern WebUI uses).
-- ``threading.Event`` + ``_approval_result`` for blocking the worker
-  thread until a console endpoint delivers the decision (inherited).
+- Per-cycle ``ApprovalCycle`` registry for blocking each gate thread
+  until a console endpoint delivers its decision (inherited).
 - Per-ws metric tracking + turn-content accumulator + activity
   bookkeeping (inherited from :class:`SessionUIBase` post the rich
   ``ws_state`` payload lift). Coord populates the same
@@ -196,6 +196,8 @@ class ConsoleCoordinatorUI(SessionUIBase):
         feedback: str | None = None,
         *,
         always: bool = False,
+        cycle_id: str = "",
+        call_ids: tuple[str, ...] = (),
     ) -> None:
         """Fan an ``approval_resolved`` decision to the cluster collector.
 
@@ -213,6 +215,8 @@ class ConsoleCoordinatorUI(SessionUIBase):
                 approved=approved,
                 feedback=feedback or "",
                 always=always,
+                cycle_id=cycle_id,
+                call_ids=list(call_ids),
             )
         except Exception:
             log.debug(
@@ -317,8 +321,12 @@ class ConsoleCoordinatorUI(SessionUIBase):
             return
         fire_judge_verdict_metric(cm, verdict, "heuristic")
 
-    def on_intent_verdict(self, verdict: dict[str, Any]) -> None:
-        super().on_intent_verdict(verdict)
+    def on_intent_verdict(
+        self,
+        verdict: dict[str, Any],
+        judge_event: object | None = None,
+    ) -> None:
+        super().on_intent_verdict(verdict, judge_event)
         cm = ConsoleCoordinatorUI._console_metrics
         if cm is None:
             return

@@ -75,15 +75,25 @@ export interface ToolInfoEvent {
   items: Array<Record<string, unknown>>;
 }
 
+/** One approval CYCLE awaiting the operator.  Several can be outstanding
+ *  at once (parallel task agents each gate their own tool calls) — key
+ *  prompt UI by `cycle_id` and echo it back on the approve POST. */
 export interface ApproveRequestEvent {
   type: "approve_request";
+  cycle_id: string;
   items: Array<Record<string, unknown>>;
+  judge_pending?: boolean;
 }
 
+/** A specific approval cycle resolved; `cycle_id`/`call_ids` identify
+ *  which prompt to dismiss. */
 export interface ApprovalResolvedEvent {
   type: "approval_resolved";
   approved: boolean;
   feedback: string;
+  always?: boolean;
+  cycle_id: string;
+  call_ids: string[];
 }
 
 export interface ToolResultEvent {

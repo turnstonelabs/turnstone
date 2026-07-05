@@ -708,12 +708,15 @@ def make_approve_handler(
 ) -> Handler:
     """Lifted body for ``POST {prefix}/{ws_id}/approve``.
 
-    Resolves a pending tool approval on the workstream's UI. Both
-    kinds expose the same approve / feedback / always body shape and
-    the same ``ui.resolve_approval(approved, feedback)`` mechanic;
-    differences are auth scope, manager lookup, and the
-    ``__budget_override__`` filter (interactive-only — coord workstreams
-    don't have the budget-override pseudo-tool).
+    Resolves ONE pending approval cycle on the workstream's UI. Both
+    kinds expose the same approve / feedback / always / call_id /
+    cycle_id body shape and the same cycle-routed
+    ``ui.resolve_approval(...)`` mechanic; differences are auth scope,
+    manager lookup, and the ``__budget_override__`` filter
+    (interactive-only — coord workstreams don't have the
+    budget-override pseudo-tool).  With parallel task agents a
+    workstream can hold several cycles; a body without a selector
+    resolves the oldest.
 
     ``accepted_permissions`` is OR-checked via :func:`require_any_permission`
     only when ``cfg.permission_gate`` is ``None`` — i.e. for the
@@ -766,49 +769,140 @@ def make_approve_handler(
                 {"error": "session UI does not support approval"},
                 status_code=409,
             )
-        # ``_pending_approval`` and ``auto_approve_tools`` aren't on the
-        # ``SessionUI`` Protocol — both interactive ``WebUI`` and
-        # ``ConsoleCoordinatorUI`` add them, but a kind-agnostic body
-        # has to look them up dynamically. The CLI ``CliUI`` wouldn't
-        # have either, so accessing through ``getattr`` is also safer.
-        pending = getattr(ui, "_pending_approval", None)
         auto_approve_tools = getattr(ui, "auto_approve_tools", None)
-        # call_id guard — when the body sends a call_id, it must
-        # match one of the currently-pending items. Stops a stale
-        # row in the coordinator's children tree (where the operator
-        # clicked approve on call A) from silently resolving an
-        # unrelated call B that took A's place after the row was
-        # rendered. Empty/missing call_id preserves backward-compat
-        # for clients (CLI, channel adapters) that don't track it.
+        # Cycle routing — with parallel task agents a workstream can
+        # have SEVERAL approval cycles live at once, each its own
+        # prompt.  A decision addresses exactly one:
+        #   - ``cycle_id`` (new clients) selects it directly;
+        #   - ``call_id`` (coord tree rows, channel adapters) selects
+        #     the cycle containing that call — and doubles as the
+        #     legacy stale-guard: a click on a row whose round was
+        #     already replaced 409s instead of silently resolving an
+        #     unrelated batch;
+        #   - neither (CLI wrappers, old tabs) → the OLDEST live cycle,
+        #     matching the order the prompts were issued.
         body_call_id_raw = body.get("call_id", "")
         body_call_id = body_call_id_raw.strip() if isinstance(body_call_id_raw, str) else ""
-        if body_call_id:
-            if pending is None:
-                return JSONResponse(
-                    {"error": "no pending approval", "current_call_id": None},
-                    status_code=409,
-                )
-            pending_items = pending.get("items") or []
-            pending_call_ids = {
-                item.get("call_id", "") for item in pending_items if item.get("call_id")
-            }
-            if body_call_id not in pending_call_ids:
-                # Primary = first non-empty call_id in list order, matching
-                # ``serialize_pending_approval_detail``. The two definitions
-                # must agree so the UI can re-render against the same
-                # identifier the server reports as current.
+        body_cycle_id_raw = body.get("cycle_id", "")
+        body_cycle_id = body_cycle_id_raw.strip() if isinstance(body_cycle_id_raw, str) else ""
+        find_cycle = getattr(ui, "find_approval_cycle", None)
+        target_card: dict[str, Any] | None = None
+        pinned_cycle_id: str | None = None
+        if find_cycle is not None:
+            target_card = find_cycle(cycle_id=body_cycle_id or None, call_id=body_call_id or None)
+            if target_card is None and (body_cycle_id or body_call_id):
+                # Selector given but nothing matched: the round was
+                # resolved/replaced after this client rendered it.
+                # Report the CURRENT oldest cycle (first entry of
+                # ``serialize_pending_approval_details``) so the client
+                # can re-render against what the server thinks is live.
+                current = find_cycle()
+                current_items = (current or {}).get("items") or []
                 primary = next(
-                    (item.get("call_id", "") for item in pending_items if item.get("call_id")),
+                    (item.get("call_id", "") for item in current_items if item.get("call_id")),
                     None,
                 )
                 return JSONResponse(
-                    {"error": "stale call_id", "current_call_id": primary},
+                    {
+                        "error": ("stale call_id" if body_call_id else "stale cycle_id"),
+                        "current_call_id": primary,
+                        "current_cycle_id": (current or {}).get("cycle_id"),
+                    },
                     status_code=409,
                 )
-        if always and approved and pending and auto_approve_tools is not None:
+            # Pin the resolution to the exact cycle the lookup returned.
+            # For selector-less bodies the lookup and the resolve would
+            # otherwise EACH independently pick "the oldest" — a cycle
+            # resolving in the gap (gate timeout, peer tab, smart
+            # approval) silently retargets the resolve at the next
+            # cycle while the always-names below were collected from
+            # the previous one, whitelisting a batch the operator never
+            # looked at.
+            pinned_cycle_id = (target_card or {}).get("cycle_id") or None
+        else:
+            # Legacy/stub UI (tests, external SessionUI impls): fall back
+            # to the single-slot view for the always-names read below.
+            target_card = getattr(ui, "_pending_approval", None)
+            if body_call_id:
+                if target_card is None:
+                    return JSONResponse(
+                        {"error": "no pending approval", "current_call_id": None},
+                        status_code=409,
+                    )
+                legacy_ids = {
+                    item.get("call_id", "")
+                    for item in target_card.get("items") or []
+                    if item.get("call_id")
+                }
+                if body_call_id not in legacy_ids:
+                    primary = next(iter(sorted(legacy_ids)), None)
+                    return JSONResponse(
+                        {"error": "stale call_id", "current_call_id": primary},
+                        status_code=409,
+                    )
+        # Resolve FIRST, then whitelist: the "Approve + Always" names
+        # must describe the cycle that actually resolved.  On the cycle
+        # path the resolve is pinned to the lookup's cycle_id, so the
+        # only race left is that cycle resolving in the gap — then
+        # ``resolved_cycle`` comes back ``None`` and the whitelist below
+        # is skipped (approving a card someone else already resolved
+        # must not grow the auto-approve set).  ``always`` still rides
+        # the ``approval_resolved`` SSE event so peer tabs that didn't
+        # click can render the right status pill ("✓ approved · always"
+        # vs plain "✓ approved") without a side-channel broadcast.
+        try:
+            if find_cycle is not None:
+                if pinned_cycle_id is not None:
+                    resolved_cycle = ui.resolve_approval(
+                        approved,
+                        feedback,
+                        always=always,
+                        cycle_id=pinned_cycle_id,
+                    )
+                elif body_call_id or body_cycle_id:
+                    # Lookup matched a card that carries no cycle_id
+                    # (custom registrations outside ``approve_tools``):
+                    # honor the client's own selector.
+                    resolved_cycle = ui.resolve_approval(
+                        approved,
+                        feedback,
+                        always=always,
+                        call_id=body_call_id or None,
+                        cycle_id=body_cycle_id or None,
+                    )
+                else:
+                    # No selector AND nothing pending at lookup time:
+                    # resolve nothing rather than racing a cycle that
+                    # registered in the gap — the client can't have
+                    # been looking at it.
+                    resolved_cycle = None
+            else:
+                resolved_cycle = ui.resolve_approval(
+                    approved,
+                    feedback,
+                    always=always,
+                    call_id=body_call_id or None,
+                    cycle_id=body_cycle_id or None,
+                )
+        except TypeError:
+            # Pre-cycle SessionUI impls (external/custom) without the
+            # selector kwargs.
+            resolved_cycle = ui.resolve_approval(approved, feedback, always=always)
+        if (
+            always
+            and approved
+            and target_card
+            and auto_approve_tools is not None
+            # Cycle-registry UIs: whitelist only when OUR resolve landed
+            # on the pinned cycle (non-None return).  Stub/legacy UIs
+            # (no registry) keep the unconditional legacy behavior —
+            # their resolve's return value carries no cycle contract to
+            # gate on.
+            and (find_cycle is None or resolved_cycle is not None)
+        ):
             tool_names: set[str] = {
                 it.get("approval_label", "") or it.get("func_name", "")
-                for it in pending.get("items", [])
+                for it in target_card.get("items", [])
                 if it.get("needs_approval") and it.get("func_name") and not it.get("error")
             }
             tool_names.discard("")
@@ -828,13 +922,7 @@ def make_approve_handler(
                 if source_map is not None:
                     for t in tool_names:
                         source_map[t] = AutoApproveReason.ALWAYS
-        # Forward ``always`` so the resulting ``approval_resolved`` SSE
-        # event carries the intent — peer tabs that didn't click but
-        # are subscribed to the same workstream can render the right
-        # status pill ("✓ approved · always" vs plain "✓ approved")
-        # without needing a side-channel broadcast.
-        ui.resolve_approval(approved, feedback, always=always)
-        return JSONResponse({"status": "ok"})
+        return JSONResponse({"status": "ok", "cycle_id": resolved_cycle})
 
     return approve
 
@@ -1154,13 +1242,13 @@ def make_cancel_handler(
       ``coord_mgr.cancel`` which silently no-op'd on a placeholder;
       the lifted body 400s for parity with interactive's existing
       "No session" branch.
-    - ``resolve_approval`` is **gated on ``ui._pending_approval is not None``**
-      because :meth:`SessionUIBase.resolve_approval` is *not*
-      idempotent — it always broadcasts ``approval_resolved`` and
-      overwrites ``_approval_result``. Without the gate, every idle
-      cancel would leak a stale resolution event to SSE listeners.
-      The gate preserves the recovery semantics for the genuine
-      stuck case while skipping the broadcast on idle cancels.
+    - Pending approvals are denied via ``resolve_all_approvals`` —
+      cancel addresses the workstream, so EVERY live cycle (parallel
+      task agents can park several gates at once) wakes with its own
+      denied result.  The sweep is a no-op when nothing is pending
+      (no stale ``approval_resolved`` broadcast on idle cancels);
+      legacy/stub UIs without it fall back to the old single-slot
+      ``resolve_approval`` gated on ``_pending_approval``.
     """
 
     async def cancel(request: Request) -> Response:
@@ -1218,29 +1306,34 @@ def make_cancel_handler(
                 dropped = {}
 
         # Always set the cooperative cancel flag — cheap, no harm if
-        # nothing's running. resolve_approval is gated on its
-        # ``_pending_approval`` slot: pre-lift coord called it
-        # unconditionally via ``mgr.cancel`` (which is
-        # recovery-friendly: a stuck approval-pending state from a
-        # crashed worker can still be cleared), but ``resolve_approval``
-        # is NOT idempotent — calling it with no pending approval
-        # broadcasts a stale ``approval_resolved`` SSE event and
-        # overwrites ``_approval_result``. Gating on the pending slot
-        # preserves the recovery semantics for the actual stuck case
-        # while skipping the broadcast on idle cancels.
+        # nothing's running.  Cancel addresses the WORKSTREAM, so it
+        # denies EVERY live approval cycle: with parallel task agents
+        # several gate threads can be parked at once and each must wake
+        # with its own (denied) result.  ``resolve_all_approvals`` is a
+        # no-op with no live cycles (returns 0, no SSE broadcast), so
+        # idle cancels stay silent — the same property the old
+        # pending-slot gate provided; the recovery semantics for a
+        # stuck approval-pending state are preserved because a stuck
+        # cycle IS a live cycle.  Legacy/stub UIs without the sweep
+        # keep the old single-slot fallback.
         try:
             session.cancel()
         except Exception:
             log.debug("ws.cancel.session_failed ws=%s", ws_id[:8], exc_info=True)
-        if hasattr(ui, "resolve_approval") and getattr(ui, "_pending_approval", None) is not None:
-            try:
+        try:
+            if hasattr(ui, "resolve_all_approvals"):
+                ui.resolve_all_approvals(False, "Cancelled by user")
+            elif (
+                hasattr(ui, "resolve_approval")
+                and getattr(ui, "_pending_approval", None) is not None
+            ):
                 ui.resolve_approval(False, "Cancelled by user")
-            except Exception:
-                log.debug(
-                    "ws.cancel.resolve_approval_failed ws=%s",
-                    ws_id[:8],
-                    exc_info=True,
-                )
+        except Exception:
+            log.debug(
+                "ws.cancel.resolve_approval_failed ws=%s",
+                ws_id[:8],
+                exc_info=True,
+            )
 
         # The remaining steps only matter when a worker is actually
         # running: force-recovery has nothing to recover otherwise,
@@ -3630,9 +3723,10 @@ def make_detail_handler(cfg: SessionEndpointConfig) -> Handler:
         if not ws_id:
             return JSONResponse({"error": "ws_id is required"}, status_code=400)
 
-        # Cross-tenant gate.  PR 447 added ``pending_approval_detail``
-        # to the response (tool previews, function arguments, LLM
-        # judge reasoning) — a richer payload than the pre-PR
+        # Cross-tenant gate.  PR 447 added the inline approval payload
+        # (now ``pending_approval_details``) to the response (tool
+        # previews, function arguments, LLM judge reasoning) — a
+        # richer payload than the pre-PR
         # ``{ws_id, name, state, user_id, kind}`` tuple.  Coord wires
         # ``tenant_check=None`` (the cluster-wide ``admin.coordinator``
         # permission_gate covers it); interactive wires
@@ -3690,26 +3784,28 @@ def make_detail_handler(cfg: SessionEndpointConfig) -> Handler:
         # paint the inline approval gate from this single response
         # instead of waiting for the SSE approve_request replay (which
         # introduces a brief --running flash on reload).  Both keys
-        # (``pending_approval`` + ``pending_approval_detail``) are
+        # (``pending_approval`` + ``pending_approval_details``) are
         # always present in the response: a UI that doesn't expose
-        # ``serialize_pending_approval_detail`` (CLI / channel
-        # adapters) reports ``False`` / ``null`` for them.  The
+        # ``serialize_pending_approval_details`` (CLI / channel
+        # adapters) reports ``False`` / ``[]`` for them.  The
         # ``_pending_approval`` lookup is asserted as ``dict`` (its
-        # only real production shape — see
-        # ``SessionUIBase._pending_approval``) so a MagicMock-based
-        # unit test or other non-dict sentinel doesn't trip the path.
+        # only real production shape — the oldest-cycle view kept by
+        # ``SessionUIBase``) so a MagicMock-based unit test or other
+        # non-dict sentinel doesn't trip the path.
         pending_approval = False
-        pending_approval_detail: dict[str, Any] | None = None
+        pending_approval_details: list[dict[str, Any]] = []
         ui = ws.ui
         pending_raw = getattr(ui, "_pending_approval", None) if ui is not None else None
         if isinstance(pending_raw, dict):
             pending_approval = True
-            serializer = getattr(ui, "serialize_pending_approval_detail", None)
+            # Full per-cycle list — parallel task agents can have
+            # several prompts live; the reload path paints them all.
+            serializer = getattr(ui, "serialize_pending_approval_details", None)
             if callable(serializer):
                 try:
-                    serialized = serializer()
-                    if isinstance(serialized, dict) or serialized is None:
-                        pending_approval_detail = serialized
+                    maybe_list = serializer()
+                    if isinstance(maybe_list, list):
+                        pending_approval_details = maybe_list
                 except Exception:
                     # Defensive: a malformed verdict object inside the
                     # serializer shouldn't fail the entire detail
@@ -3730,7 +3826,7 @@ def make_detail_handler(cfg: SessionEndpointConfig) -> Handler:
                 "user_id": ws.user_id,
                 "kind": ws.kind,
                 "pending_approval": pending_approval,
-                "pending_approval_detail": pending_approval_detail,
+                "pending_approval_details": pending_approval_details,
             }
         )
 

@@ -421,13 +421,24 @@ class AsyncTurnstoneConsole(_BaseClient):
         approved: bool = True,
         feedback: str = "",
         always: bool = False,
+        cycle_id: str = "",
+        call_id: str = "",
     ) -> dict[str, Any]:
-        """Approve or reject a pending tool call via the routing proxy."""
+        """Approve or reject a pending tool call via the routing proxy.
+
+        ``cycle_id`` / ``call_id`` select the approval cycle when the
+        workstream has several live (parallel task agents); omitting
+        both resolves the oldest.
+        """
         body: dict[str, Any] = {"approved": approved}
         if feedback:
             body["feedback"] = feedback
         if always:
             body["always"] = True
+        if cycle_id:
+            body["cycle_id"] = cycle_id
+        if call_id:
+            body["call_id"] = call_id
         return await self._request(
             "POST", f"/v1/api/route/workstreams/{ws_id}/approve", json_body=body
         )
@@ -1357,10 +1368,17 @@ class TurnstoneConsole:
         approved: bool = True,
         feedback: str = "",
         always: bool = False,
+        cycle_id: str = "",
+        call_id: str = "",
     ) -> dict[str, Any]:
         return self._runner.run(
             self._async.route_approve(
-                ws_id=ws_id, approved=approved, feedback=feedback, always=always
+                ws_id=ws_id,
+                approved=approved,
+                feedback=feedback,
+                always=always,
+                cycle_id=cycle_id,
+                call_id=call_id,
             )
         )
 

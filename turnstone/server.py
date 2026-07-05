@@ -256,12 +256,16 @@ class WebUI(SessionUIBase):
         feedback: str | None = None,
         *,
         always: bool = False,
+        cycle_id: str = "",
+        call_ids: tuple[str, ...] = (),
     ) -> None:
         """Send an ``approval_resolved`` decision to the global SSE channel.
 
         Clears the parent's pending-approval pill in lockstep with
         the actual decision rather than waiting for the next
-        state-change piggyback.
+        state-change piggyback.  ``cycle_id`` / ``call_ids`` identify
+        WHICH cycle resolved so the coord tree clears the right block
+        when several are live (parallel task agents).
         """
         if WebUI._global_queue is not None:
             with contextlib.suppress(queue.Full):
@@ -272,6 +276,8 @@ class WebUI(SessionUIBase):
                         "approved": approved,
                         "feedback": feedback or "",
                         "always": bool(always),
+                        "cycle_id": cycle_id,
+                        "call_ids": list(call_ids),
                     }
                 )
 
@@ -402,11 +408,15 @@ class WebUI(SessionUIBase):
                     {"type": "ws_rename", "ws_id": self.ws_id, "name": name}
                 )
 
-    def on_intent_verdict(self, verdict: dict[str, Any]) -> None:
+    def on_intent_verdict(
+        self,
+        verdict: dict[str, Any],
+        judge_event: object | None = None,
+    ) -> None:
         """Extend :meth:`SessionUIBase.on_intent_verdict` with a
         node-level prometheus metric update.
         """
-        super().on_intent_verdict(verdict)
+        super().on_intent_verdict(verdict, judge_event)
         fire_judge_verdict_metric(_metrics, verdict, "llm")
 
     # ``on_output_warning`` inherited from :class:`SessionUIBase`.
@@ -746,9 +756,15 @@ def _interactive_events_replay(
 
     # Pending approval re-injection (so a reconnecting tab sees the
     # prompt) + cached LLM verdicts received since the prompt fired.
-    pending_approval = getattr(ui, "_pending_approval", None)
-    if pending_approval is not None:
-        yield pending_approval
+    # EVERY live cycle replays — parallel task agents can have several
+    # prompts outstanding, and a tab that repaints only the newest
+    # leaves the others unanswerable.  Cards first (oldest-first), then
+    # the verdict cache once: clients route ``intent_verdict`` by
+    # call_id, so ordering across cards is irrelevant as long as every
+    # card exists before its verdicts.
+    pending_cards = ui.pending_approval_cards() if hasattr(ui, "pending_approval_cards") else []
+    if pending_cards:
+        yield from pending_cards
         with ui._ws_lock:
             cached_verdicts = list(ui._llm_verdicts.values())
         for v in cached_verdicts:
@@ -881,16 +897,16 @@ def _build_node_snapshot(app_state: Any) -> dict[str, Any]:
         title = ""
         if ws.session:
             title = get_workstream_display_name(ws.session.ws_id) or ""
-        # ``pending_approval_detail`` mirrors the dashboard handler's
+        # ``pending_approval_details`` mirrors the dashboard handler's
         # projection so the console collector's reconnect-via-snapshot
         # path (``_reconcile_node``) can carry the rich approval payload
         # across reconnects — without it, a child sitting in approval-
         # pending across a console restart or network blip would render
         # with no buttons until the next state change. Same data, same
         # ``read`` scope as ``/v1/api/dashboard``.
-        approval_detail: dict[str, Any] | None = None
-        if ui is not None and hasattr(ui, "serialize_pending_approval_detail"):
-            approval_detail = ui.serialize_pending_approval_detail()
+        approval_details: list[dict[str, Any]] = []
+        if ui is not None and hasattr(ui, "serialize_pending_approval_details"):
+            approval_details = ui.serialize_pending_approval_details()
         ws_list.append(
             {
                 "id": ws.id,
@@ -909,7 +925,7 @@ def _build_node_snapshot(app_state: Any) -> dict[str, Any]:
                 "user_id": ws.user_id,
                 "project_id": ws.project_id,
                 "persona": ws.persona,
-                "pending_approval_detail": approval_detail,
+                "pending_approval_details": approval_details,
             }
         )
     return {
@@ -1132,7 +1148,7 @@ async def dashboard(request: Request) -> JSONResponse:
                 "user_id": ws.user_id,
                 "project_id": ws.project_id,
                 "persona": ws.persona,
-                "pending_approval_detail": ui.serialize_pending_approval_detail(),
+                "pending_approval_details": ui.serialize_pending_approval_details(),
                 # Per-ws ring buffer of recent auto-approves (last 10).
                 # Lets the coord-tree render a "recently auto-approved
                 # by skill X" pill without a per-child round-trip — the
