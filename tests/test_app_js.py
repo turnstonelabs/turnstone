@@ -17,6 +17,9 @@ import pytest
 
 _APP_JS = Path(__file__).resolve().parent.parent / "turnstone/ui/static/app.js"
 _INTERACTIVE_JS = Path(__file__).resolve().parent.parent / "turnstone/shared_static/interactive.js"
+_SHELL_JS = Path(__file__).resolve().parent.parent / "turnstone/shared_static/shell.js"
+_CONSOLE_APP_JS = Path(__file__).resolve().parent.parent / "turnstone/console/static/app.js"
+_CONSOLE_INDEX = Path(__file__).resolve().parent.parent / "turnstone/console/static/index.html"
 
 
 def _pane_method_offset(body: str, name: str) -> int:
@@ -555,7 +558,6 @@ _CONSOLE_ADMIN_JS = Path(__file__).resolve().parent.parent / "turnstone/console/
 _CONSOLE_GOVERNANCE_JS = (
     Path(__file__).resolve().parent.parent / "turnstone/console/static/governance.js"
 )
-_CONSOLE_INTERACTIVE_JS = Path(__file__).resolve().parent.parent / "turnstone/console/static/app.js"
 
 
 _UNSAFE_CODE_SINK_LINT_TARGETS = [
@@ -566,7 +568,7 @@ _UNSAFE_CODE_SINK_LINT_TARGETS = [
     ("turnstone/console/static/coordinator/coordinator.js", _COORD_JS),
     ("turnstone/console/static/admin.js", _CONSOLE_ADMIN_JS),
     ("turnstone/console/static/governance.js", _CONSOLE_GOVERNANCE_JS),
-    ("turnstone/console/static/app.js", _CONSOLE_INTERACTIVE_JS),
+    ("turnstone/console/static/app.js", _CONSOLE_APP_JS),
 ]
 
 
@@ -1756,4 +1758,108 @@ def test_global_stream_recovery_floor_and_render_coalescing() -> None:
     fire = body.index("function fireRender()")
     assert "requestAnimationFrame(" in body[fire : fire + 700], (
         "fireRender must coalesce subscriber repaints to one per frame"
+    )
+
+
+def test_server_global_accels_are_platform_aware_and_scoped() -> None:
+    """The standalone's keydown handler owns only the GLOBAL accels — new
+    workstream, switch, dashboard.  They pick the modifier per platform (Ctrl on
+    macOS where the browser owns Cmd, Alt elsewhere) so Ctrl+T/1-9 aren't eaten
+    by the browser off macOS.  The per-pane verbs (edit/refresh/fork/delete/
+    close) moved to shell.js, so the handler must not invoke them itself."""
+    body = _APP_JS.read_text(encoding="utf-8")
+    assert "const IS_MAC" in body and 'navigator.platform.indexOf("Mac")' in body, (
+        "the accelerators need a platform check to choose Ctrl vs Alt"
+    )
+    handler = body[body.index('document.addEventListener("keydown"') :]
+    assert "const paneMod" in handler, (
+        "global accels must gate on the platform-aware paneMod, not raw ctrlKey"
+    )
+    assert 'e.ctrlKey && e.key === "t"' not in handler, (
+        "Ctrl+T is browser-reserved off macOS — new workstream must bind via paneMod"
+    )
+    assert "newWorkstream()" in handler and "switchTab(" in handler, (
+        "the standalone handler still owns new + switch"
+    )
+    # macOS Ctrl+T / Ctrl+D are the Cocoa transpose / delete-forward text
+    # bindings; the creation/dashboard chords must yield while typing, through
+    # the shared TS_SHELL.inEditable guard (not a per-file copy).
+    assert "TS_SHELL.inEditable(" in handler, (
+        "new + dashboard must yield to text editing (macOS Ctrl+T / Ctrl+D)"
+    )
+    # The per-pane verbs are shell.js's job now — the standalone handler must not
+    # double-bind them (shell.js drives them off the active pane's menu).
+    for verb in ("editWorkstreamTitle()", "forkWorkstream()", "confirmDeleteWorkstream()"):
+        assert verb not in handler, (
+            f"{verb} moved to shell.js — the app.js handler must not also bind it"
+        )
+
+
+def test_shortcut_overlay_labels_match_the_platform_modifier() -> None:
+    """The '?' help overlay must advertise the same modifier the handler
+    listens for — Ctrl on macOS, Alt on Windows/Linux — instead of a hardcoded
+    Ctrl that is wrong (and non-functional) off macOS."""
+    index = _INDEX_HTML.read_text(encoding="utf-8")
+    assert "const PANE_MOD" in index and 'navigator.platform.indexOf("Mac")' in index, (
+        "the overlay must compute its modifier label per platform"
+    )
+    assert "${PANE_MOD}+T" in index, "the New-workstream badge must render through PANE_MOD"
+    assert '<span class="kb-key">Ctrl+T</span>' not in index, (
+        "the New-workstream badge must not hardcode Ctrl (wrong off macOS)"
+    )
+
+
+def test_pane_menu_accels_are_shared_and_platform_aware() -> None:
+    """shell.js is the single source of truth for the per-pane tab-menu
+    shortcuts: the badge string and the keydown handler come from ONE registry,
+    so a badge can't advertise a chord the handler ignores.  Badges must be
+    platform-aware (no hardcoded Ctrl), and the shared handler must drive the
+    ACTIVE pane's own menu so each surface contributes only what it supports."""
+    shell = _SHELL_JS.read_text(encoding="utf-8")
+    assert "PANE_MENU_ACCELS" in shell and "function paneAccelBadge" in shell, (
+        "shell.js must own the accel registry + badge builder"
+    )
+    assert "const PANE_MOD_LABEL" in shell and 'navigator.platform.indexOf("Mac")' in shell, (
+        "the shared badge must be platform-aware (Ctrl on macOS, Alt elsewhere)"
+    )
+    # The tab-menu items carry a stable accel + a computed badge, NOT a hardcoded
+    # Ctrl string that would lie on Windows/Linux.
+    for accel in ("close-pane", "edit-title", "refresh-title", "delete"):
+        assert f'accel: "{accel}"' in shell, f"tab menu must tag the {accel} item"
+    assert 'key: "Ctrl+Shift+E"' not in shell and 'key: "Ctrl+W"' not in shell, (
+        "tab-menu badges must go through paneAccelBadge, not hardcoded Ctrl"
+    )
+    # The shared handler resolves the active pane and runs its menu item by accel.
+    assert "paneAccelFor(e)" in shell and "pane.tabMenu()" in shell, (
+        "the shared keydown handler must drive the active pane's menu by accel"
+    )
+    # The typing guard is shared (TS_SHELL.inEditable), not copied per surface.
+    assert "function inEditable(" in shell and "inEditable," in shell, (
+        "shell.js must define + expose the shared inEditable guard on TS_SHELL"
+    )
+    ui = _APP_JS.read_text(encoding="utf-8")
+    console = _CONSOLE_APP_JS.read_text(encoding="utf-8")
+    assert "_inEditable" not in ui and "_consoleInEditable" not in console, (
+        "surfaces must use TS_SHELL.inEditable, not a per-file copy of the guard"
+    )
+
+
+def test_console_has_matching_pane_hotkeys() -> None:
+    """The console regained pane hotkeys to match the standalone: a keydown
+    handler for switch (Mod+1-9) + dashboard (Ctrl+D), and a '?' overlay that
+    advertises them platform-aware.  New workstream and Fork are intentionally
+    omitted (no console fork / blank-new surface)."""
+    app = _CONSOLE_APP_JS.read_text(encoding="utf-8")
+    assert (
+        "_CONSOLE_IS_MAC" in app and "statefulTabs()" in app and 'openPane("dashboard")' in app
+    ), "the console must wire switch (statefulTabs) + dashboard hotkeys"
+    index = _CONSOLE_INDEX.read_text(encoding="utf-8")
+    assert "const PANE_MOD" in index and '"Panes"' in index, (
+        "the console '?' overlay needs a platform-aware Panes section"
+    )
+    assert "${PANE_MOD}+W" in index and "${PANE_MOD}+Shift+E" in index, (
+        "console badges must render through PANE_MOD"
+    )
+    assert '"Fork"' not in index and "New workstream" not in index, (
+        "Fork + New are intentionally omitted on the console"
     )

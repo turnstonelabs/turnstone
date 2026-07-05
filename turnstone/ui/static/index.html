@@ -557,25 +557,45 @@
         orchestration: false,
         brandSub: "server",
       };
+      // Pane accelerators bind to Ctrl on macOS (where the browser owns Cmd
+      // and leaves Ctrl free) and to Alt on Windows/Linux (where Ctrl is the
+      // browser's own new-tab/close-tab/switch-tab accelerator).  The overlay
+      // labels must match whatever app.js actually listens for on this host.
+      const PANE_MOD =
+        navigator.platform && navigator.platform.indexOf("Mac") > -1
+          ? "Ctrl"
+          : "Alt";
       window.TURNSTONE_KB_SHORTCUTS = [
         {
           title: "Workstreams",
           keys: [
             {
               desc: "New workstream",
-              badge: '<span class="kb-key">Ctrl+T</span>',
+              badge: `<span class="kb-key">${PANE_MOD}+T</span>`,
             },
             {
-              desc: "Refresh title",
-              badge: '<span class="kb-key">Ctrl+Shift+R</span>',
+              desc: "Close pane",
+              badge: `<span class="kb-key">${PANE_MOD}+W</span>`,
+            },
+            {
+              desc: "Switch workstream",
+              badge: `<span class="kb-key">${PANE_MOD}+1</span>…<span class="kb-key">${PANE_MOD}+9</span>`,
             },
             {
               desc: "Edit title",
-              badge: '<span class="kb-key">Ctrl+Shift+E</span>',
+              badge: `<span class="kb-key">${PANE_MOD}+Shift+E</span>`,
+            },
+            {
+              desc: "Refresh title",
+              badge: `<span class="kb-key">${PANE_MOD}+Shift+R</span>`,
             },
             {
               desc: "Fork workstream",
-              badge: '<span class="kb-key">Ctrl+Shift+F</span>',
+              badge: `<span class="kb-key">${PANE_MOD}+Shift+F</span>`,
+            },
+            {
+              desc: "Delete workstream",
+              badge: `<span class="kb-key">${PANE_MOD}+Shift+X</span>`,
             },
           ],
         },
@@ -615,6 +635,10 @@
         {
           title: "General",
           keys: [
+            {
+              desc: "Toggle dashboard",
+              badge: '<span class="kb-key">Ctrl+D</span>',
+            },
             { desc: "Show this help", badge: '<span class="kb-key">?</span>' },
           ],
         },

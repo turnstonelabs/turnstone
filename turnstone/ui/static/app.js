@@ -2098,6 +2098,20 @@ function _formatRelativeTimestamp(iso) {
   }
 }
 
+// The GLOBAL pane accelerators — new workstream, switch, and dashboard.  The
+// per-pane tab-menu actions (close pane, edit/refresh title, fork, delete) are
+// bound once in shell.js off the active pane's own menu, so they stay identical
+// across the standalone and the console; only these roster/shell-level chords
+// live here.
+//
+// The modifier is chosen per platform: Ctrl on macOS (the browser owns Cmd and
+// leaves Ctrl free) and Alt on Windows/Linux (there Ctrl IS the browser's own
+// new-tab / switch-tab accelerator and never reaches the page).
+const IS_MAC =
+  (navigator.platform && navigator.platform.indexOf("Mac") > -1) || false;
+
+// The typing guard (`inEditable`) lives on TS_SHELL — shell.js is the single
+// source of truth for these keyboard helpers, shared by both surfaces.
 document.addEventListener("keydown", function (e) {
   // Defer while a document-modal hatch dialog is open — native dialogs own
   // their Escape, and global shortcuts must not fire under the top layer.
@@ -2108,60 +2122,40 @@ document.addEventListener("keydown", function (e) {
     return;
   }
 
-  // Ctrl+D: toggle dashboard
-  if (e.ctrlKey && e.key === "d") {
+  // Ctrl+D: toggle dashboard.  Left on Ctrl for every platform — it is
+  // cancelable everywhere (the Cmd+D / Ctrl+D bookmark dialog), whereas Alt+D
+  // is the browser's "focus the address bar" and can't be reclaimed.  Yields to
+  // text editing (macOS delete-forward) while a field is focused.
+  if (e.ctrlKey && !e.altKey && !e.metaKey && !e.shiftKey && e.key === "d") {
+    if (window.TS_SHELL && window.TS_SHELL.inEditable(e.target)) return;
     e.preventDefault();
     toggleDashboard();
     return;
   }
-  // Ctrl+T: new tab
-  if (e.ctrlKey && e.key === "t") {
+
+  // The pane modifier: Ctrl on macOS, Alt elsewhere.  Require it WITHOUT the
+  // other primary modifier — on Windows/Linux AltGr surfaces as Ctrl+Alt, and
+  // this guard keeps accented-character entry from firing Alt shortcuts.
+  const paneMod = IS_MAC
+    ? e.ctrlKey && !e.altKey && !e.metaKey
+    : e.altKey && !e.ctrlKey && !e.metaKey;
+  if (!paneMod || e.shiftKey) return;
+
+  // <mod>+T: new workstream.  Yields to text editing (macOS transpose) while a
+  // field is focused.
+  if (e.key.toLowerCase() === "t") {
+    if (window.TS_SHELL && window.TS_SHELL.inEditable(e.target)) return;
     e.preventDefault();
     newWorkstream();
     return;
   }
-  // Ctrl+1..9: switch tabs
-  if (e.ctrlKey && e.key >= "1" && e.key <= "9") {
+  // <mod>+1..9: switch workstreams.  No text-binding overlap, so it works even
+  // while composing — mirroring a browser's own Ctrl+1..9.
+  if (e.key >= "1" && e.key <= "9") {
     e.preventDefault();
-    const idx = parseInt(e.key) - 1;
+    const idx = parseInt(e.key, 10) - 1;
     const wsIds = Object.keys(workstreams);
     if (idx < wsIds.length) switchTab(wsIds[idx]);
-    return;
-  }
-  // Workstream action shortcuts — only preventDefault when a workstream
-  // is active, so native browser shortcuts (e.g. Ctrl+Shift+R hard reload)
-  // still work when no workstream is focused.
-  if (e.ctrlKey && e.shiftKey) {
-    const wsActionKey = e.key.toLowerCase();
-    const activeWsId = !dashboardVisible && getCurrentWsId();
-    if (wsActionKey === "e" && activeWsId) {
-      e.preventDefault();
-      editWorkstreamTitle();
-      return;
-    }
-    if (wsActionKey === "f" && activeWsId) {
-      e.preventDefault();
-      forkWorkstream();
-      return;
-    }
-    // X not D — D conflicts with Chrome DevTools
-    if (
-      wsActionKey === "x" &&
-      activeWsId &&
-      Object.keys(workstreams).length > 1
-    ) {
-      e.preventDefault();
-      confirmDeleteWorkstream();
-      return;
-    }
-  }
-  // Ctrl+W: close current workstream tab
-  if (e.ctrlKey && !e.shiftKey && e.key === "w") {
-    if (Object.keys(workstreams).length > 1) {
-      e.preventDefault();
-      closeWorkstream(getCurrentWsId());
-    }
-    return;
   }
 });
 

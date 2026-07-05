@@ -1887,6 +1887,49 @@ document.addEventListener("keydown", function (e) {
   if (!_homeCoordComposer.sendBtn.disabled) submitHomeCoord();
 });
 
+// Global pane accelerators for the console — switch panes and jump to the
+// Dashboard.  The per-pane tab-menu actions (close pane, edit/refresh title,
+// delete) are bound once in shell.js off the active pane's OWN menu, so they
+// match the standalone automatically; only these shell-level chords live here.
+// New workstream and Fork are omitted: the console starts work from the
+// Dashboard and has no interactive fork surface yet.
+//
+// Modifier per platform: Ctrl on macOS (the browser owns Cmd), Alt on
+// Windows/Linux (Ctrl is the browser's own switch-tab / bookmark accelerator).
+const _CONSOLE_IS_MAC =
+  (navigator.platform && navigator.platform.indexOf("Mac") > -1) || false;
+
+document.addEventListener("keydown", function (e) {
+  if (document.querySelector("dialog:modal")) return;
+  const pm = window.TS_SHELL && window.TS_SHELL.panes;
+  if (!pm) return;
+
+  // Ctrl+D: jump to the Dashboard pane.  Kept on Ctrl every platform — Alt+D is
+  // the browser's focus-address-bar.  Yields to macOS delete-forward in fields.
+  if (e.ctrlKey && !e.altKey && !e.metaKey && !e.shiftKey && e.key === "d") {
+    if (window.TS_SHELL.inEditable(e.target)) return;
+    e.preventDefault();
+    pm.openPane("dashboard");
+    return;
+  }
+
+  const paneMod = _CONSOLE_IS_MAC
+    ? e.ctrlKey && !e.altKey && !e.metaKey
+    : e.altKey && !e.ctrlKey && !e.metaKey;
+  if (!paneMod || e.shiftKey) return;
+
+  // <mod>+1..9: switch among the open conversational panes (mirrors a browser's
+  // Ctrl+1..9); works while composing.
+  if (e.key >= "1" && e.key <= "9") {
+    const tabs = pm.statefulTabs();
+    const idx = parseInt(e.key, 10) - 1;
+    if (idx < tabs.length) {
+      e.preventDefault();
+      pm.activate(tabs[idx].id);
+    }
+  }
+});
+
 // ---------------------------------------------------------------------------
 // Saved coordinators — closed sessions persisted on disk.  Mirrors the
 // interactive UI's "Saved Workstreams" table (same /shared/cards.js
