@@ -210,6 +210,11 @@ class Pane {
     // the active (oldest) cycle's card for keyboard/feedback routing.
     this.approvalCycles = new Map();
     this.pendingApproval = false;
+    // Cross-user send gate (another participant's turn is in flight),
+    // recomputed in _reconcileSendBlock. Stored on the App because the
+    // App — not the Composer — owns sendBtn.disabled (see
+    // _reconcileSendDisabled + the composer's externalDisable option).
+    this._crossUserBlocked = false;
     this.approvalBlockEl = null;
     // Early-paint shells from ``tool_pending`` events, keyed by their
     // sorted call_id set, awaiting the authoritative ``tool_info`` /
@@ -273,6 +278,10 @@ class Pane {
     this.announcedBlocks = new Map();
     this._pendingEditSend = null;
     this.inputEl.disabled = false;
+    // setBusy(false) above reconciled sendBtn.disabled while
+    // pendingApproval was still stale-true; re-reconcile now that the
+    // cycle state is cleared so a reset-from-pending re-enables send.
+    this._reconcileSendDisabled();
     this.attachments.clearChips();
     this._stopRecording(true);
     this._stopTTS();
@@ -348,12 +357,33 @@ class Pane {
     }
     const blocked =
       !!this.busy && !!this._actingUserId && !!me && this._actingUserId !== me;
+    this._crossUserBlocked = blocked;
+    // Still drive the Composer's placeholder / title hint — externalDisable
+    // suppresses only its disabled write, not the hint.
     this.composer.setSendBlocked(
       blocked,
       blocked
         ? "Another participant's turn is in progress - wait for it to finish."
         : "",
     );
+    this._reconcileSendDisabled();
+  }
+
+  // Single owner of ``sendBtn.disabled``.  The Composer runs with
+  // ``externalDisable``, so it never writes the flag itself (it still
+  // rotates the Send/Queue label + placeholder + stop button on
+  // ``setBusy``); this combines every disable axis instead, so two
+  // writers can't clobber each other on event ordering.
+  //
+  // ``busy`` is deliberately NOT an axis: this composer is
+  // ``queueWhileBusy``, so a running turn keeps Send clickable as
+  // "Queue".  The old ``pendingApproval || this.busy`` both defeated
+  // that affordance (Send disabled while merely busy) and let
+  // ``composer.setBusy`` — which re-enables in queue mode — race the
+  // approval disable back off when a ``state_change`` fired after the
+  // approve_request card rendered.
+  _reconcileSendDisabled() {
+    this.sendBtn.disabled = this.pendingApproval || this._crossUserBlocked;
   }
 
   showEmptyState() {
@@ -516,7 +546,7 @@ class Pane {
     this.pendingApproval = this.approvalCycles.size > 0;
     this.approvalBlockEl = active ? active.blockEls[0] : null;
     this.inputEl.disabled = this.pendingApproval;
-    this.sendBtn.disabled = this.pendingApproval || this.busy;
+    this._reconcileSendDisabled();
   }
 
   _oldestCycleId() {
@@ -992,6 +1022,12 @@ class Pane {
       },
       stopBtn: true,
       queueWhileBusy: true,
+      // The App owns sendBtn.disabled: it has to combine three axes the
+      // Composer can't see together \u2014 a live approval cycle, the
+      // cross-user send gate, and busy \u2014 so the Composer's own
+      // disabled write (which re-enables in queueWhileBusy mode) would
+      // otherwise race the approval disable back off on event ordering.
+      externalDisable: true,
       busyPlaceholder: "Queue a message\u2026 (!!! for urgent)",
       onSend: () => {
         this.sendMessage();
