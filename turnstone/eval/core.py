@@ -136,7 +136,7 @@ class NullUI:
     def on_rename(self, name: str) -> None:
         pass
 
-    def on_intent_verdict(self, verdict: dict[str, Any]) -> None:
+    def on_intent_verdict(self, verdict: dict[str, Any], judge_event: object | None = None) -> None:
         pass
 
     def on_output_warning(self, call_id: str, assessment: dict[str, Any]) -> None:
