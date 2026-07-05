@@ -64,11 +64,11 @@ const _CREDENTIAL_REPLACEMENTS = [
   // like "monkey=" or "turkey=".  Bare "token=" included via negative
   // lookbehind so standalone assignments still match (token=abcdef...)
   // without matching word suffixes like "over_tokenized=".
-  [/(?:(?:access|refresh|auth|api|session)_?token|(?<![a-zA-Z0-9_])token)=[a-zA-Z0-9]{20,}/g, "[REDACTED:api_key]"],
+  [/(?:(?:access|refresh|auth|api|session|bearer|secret)_?token|(?<![a-zA-Z0-9_])token)=[a-zA-Z0-9]{20,}/g, "[REDACTED:api_key]"],
   // key=<value> (20+).  Same bounded prefix approach: api_key=/secret_key= etc.
   // but not monkey= or turkey=.  Bare "key=" included with negative lookbehind.
-  // The _? allows both snake_case and compact forms.
-  [/(?:(?:api|secret|session|auth|encryption|signing|private|public|access)_?key|(?<![a-zA-Z0-9_])key)=[a-zA-Z0-9]{20,}/g, "[REDACTED:api_key]"],
+  // Multi-segment keys secret_access_key / aws_secret_access_key included explicitly.
+  [/(?:(?:api|secret|session|auth|encryption|signing|private|public|access|secret_access|aws_secret_access)_?key|(?<![a-zA-Z0-9_])key)=[a-zA-Z0-9]{20,}/g, "[REDACTED:api_key]"],
 ];
 
 // ---------------------------------------------------------------------------
