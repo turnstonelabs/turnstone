@@ -1033,22 +1033,22 @@ class TestStaticPathUnchanged:
 
         from turnstone.core import mcp_client
 
-        # The connect body (incl. the streamablehttp_client call site) lives in
-        # ``_connect_one_locked``; ``_connect_one`` is now a per-name-lock wrapper.
-        source = inspect.getsource(mcp_client.MCPClientManager._connect_one_locked)
+        # The static path's streamablehttp_client call site lives in the
+        # transport owner task (``_static_transport_owner``); ``_connect_one``
+        # is a per-name-lock wrapper and ``_connect_one_locked`` only waits on
+        # the owner's readiness.
+        source = inspect.getsource(mcp_client.MCPClientManager._static_transport_owner)
 
         # The static path's streamablehttp_client invocation should NOT
         # mention ``httpx_client_factory``. Pool path keeps it.
-        # Find the streamablehttp_client(...) call inside _connect_one.
         assert "streamablehttp_client" in source
-        # The call site in _connect_one is bare — no factory keyword.
-        # We grep by line: the factory keyword must not appear in the
-        # static-path source.
+        # The call site in the owner is bare — no factory keyword. We grep by
+        # line: the factory keyword must not appear in the static-path source.
         for line in source.splitlines():
             if "httpx_client_factory" in line:
                 pytest.fail(
-                    "_connect_one (static path) passes httpx_client_factory to "
-                    "streamablehttp_client; hard invariant 1 violated."
+                    "_static_transport_owner (static path) passes httpx_client_factory "
+                    "to streamablehttp_client; hard invariant 1 violated."
                 )
 
 

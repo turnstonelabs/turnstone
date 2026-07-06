@@ -115,7 +115,16 @@ def running_loop_mgr():
         # handlers don't fire after pytest has torn its handlers down. Mirrors
         # the production ``shutdown()`` shape.
         async def _drain(m: MCPClientManager) -> None:
-            for attr in ("_user_pool_eviction_task", "_user_token_sweep_task"):
+            # ``_static_health_task`` included: since the BaseExceptionGroup
+            # hardening, ``_connect_all`` reliably starts (and keeps alive) the
+            # health loop even when every configured connect fails — a test
+            # that drives ``_connect_all`` must drain it like production
+            # ``shutdown()`` does, or the task is destroyed pending at GC.
+            for attr in (
+                "_user_pool_eviction_task",
+                "_user_token_sweep_task",
+                "_static_health_task",
+            ):
                 task = getattr(m, attr)
                 if task is not None:
                     task.cancel()

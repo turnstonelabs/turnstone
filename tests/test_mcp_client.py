@@ -2209,6 +2209,7 @@ class TestSafeCloseStack:
 
     def test_suppresses_runtime_error(self):
         """RuntimeError from broken cancel scope is suppressed."""
+        mgr = MCPClientManager({})
 
         async def _run():
             stack = AsyncExitStack()
@@ -2220,12 +2221,13 @@ class TestSafeCloseStack:
 
             stack.aclose = _broken_close
             # Should not raise
-            await MCPClientManager._safe_close_stack(stack)
+            await mgr._safe_close_stack(stack)
 
         asyncio.run(_run())
 
     def test_suppresses_cancelled_error(self):
         """CancelledError during close is suppressed."""
+        mgr = MCPClientManager({})
 
         async def _run():
             stack = AsyncExitStack()
@@ -2235,7 +2237,25 @@ class TestSafeCloseStack:
                 raise asyncio.CancelledError()
 
             stack.aclose = _cancel_close
-            await MCPClientManager._safe_close_stack(stack)
+            await mgr._safe_close_stack(stack)
+
+        asyncio.run(_run())
+
+    def test_suppressed_close_triggers_scope_disarm(self):
+        """A suppressed close runs the orphaned-scope disarm backstop."""
+        mgr = MCPClientManager({})
+
+        async def _run():
+            stack = AsyncExitStack()
+            await stack.__aenter__()
+
+            async def _broken_close():
+                raise RuntimeError("Attempted to exit cancel scope in a different task")
+
+            stack.aclose = _broken_close
+            with patch.object(mgr, "_maybe_disarm_orphaned_scopes") as disarm:
+                await mgr._safe_close_stack(stack)
+            disarm.assert_called_once()
 
         asyncio.run(_run())
 
@@ -2455,10 +2475,12 @@ class TestCircuitBreaker:
         mgr = MCPClientManager({"test": {"type": "stdio", "command": "echo"}})
         mock_session = MagicMock()
         mock_session.call_tool = MagicMock(return_value="sentinel")
-        # Seed both session and stack so the test can verify stack survives.
-        old_stack = MagicMock()
+        # Seed session + owner so the test can verify the owner survives.
+        old_owner = MagicMock()
         old_streams = (MagicMock(), MagicMock())
-        _seed_static_state(mgr, "test", session=mock_session, stack=old_stack, streams=old_streams)
+        _seed_static_state(
+            mgr, "test", session=mock_session, owner_task=old_owner, streams=old_streams
+        )
         mgr._loop = MagicMock()
         mgr._tool_map["mcp__test__ping"] = ("test", "ping")
         mock_future = MagicMock()
@@ -2468,11 +2490,11 @@ class TestCircuitBreaker:
             pytest.raises(BrokenPipeError),
         ):
             mgr.call_tool_sync("mcp__test__ping", {}, timeout=5)
-        # Session evicted, but stack/streams remain for the stale-and-stack
-        # guard in _connect_one to clean up on next reconnect attempt.
+        # Session evicted, but the owner/streams remain for the stale guard in
+        # _connect_one_locked to close on the next reconnect attempt.
         state = mgr._static_servers["test"]
         assert state.session is None
-        assert state.stack is old_stack
+        assert state.owner_task is old_owner
         assert state.streams is old_streams
 
     def test_independent_circuits_per_server(self):
@@ -2958,42 +2980,47 @@ class TestReconnectSync:
         ``reconnect_sync`` no longer carries its own copy. Drive the REAL locked
         body via a no-command stdio cfg: the stale-guard runs, then the connect
         early-returns, so the ordering is observable without a live server."""
-        mgr, _loop, _thread = running_loop_mgr
+        mgr, loop, _thread = running_loop_mgr
         mgr._server_configs["srv"] = {"type": "stdio"}  # no command → early return
 
         order: list[str] = []
-        old_stack = MagicMock(spec=AsyncExitStack)
+
+        async def _make_owner() -> tuple[asyncio.Event, asyncio.Task[None]]:
+            ev = asyncio.Event()
+
+            async def _parked_owner() -> None:
+                await ev.wait()
+                order.append("owner_exit")
+
+            task = asyncio.create_task(_parked_owner())
+            await asyncio.sleep(0)
+            return ev, task
+
+        ev, old_owner = _run_hl(loop, _make_owner())
 
         async def _pre_close(name: str) -> None:
             order.append("pre_close")
             # Session must already be nulled when streams close (canonical order).
             assert mgr._static_servers["srv"].session is None
 
-        async def _safe_close(stack: Any) -> None:
-            # Only the OLD stack is closed on this path (the fresh connect
-            # stack is aclose()d directly by the no-command early return).
-            assert stack is old_stack
-            order.append("safe_close")
-
-        # Seed the old session/stack/streams that the stale-guard should clear.
+        # Seed the old session/owner/streams that the stale-guard should close.
         _seed_static_state(
             mgr,
             "srv",
             session=MagicMock(),
-            stack=old_stack,
+            owner_task=old_owner,
+            close_requested=ev,
             streams=(MagicMock(), MagicMock()),
         )
 
-        with (
-            patch.object(mgr, "_pre_close_streams", side_effect=_pre_close),
-            patch.object(mgr, "_safe_close_stack", side_effect=_safe_close),
-        ):
+        with patch.object(mgr, "_pre_close_streams", side_effect=_pre_close):
             result = mgr.reconnect_sync("srv")
-        assert order == ["pre_close", "safe_close"]  # teardown ran, in order
+        assert order == ["pre_close", "owner_exit"]  # teardown ran, in order
         assert result["connected"] is False  # no command — nothing to rebuild
         state = mgr._static_servers["srv"]
         assert state.session is None
-        assert state.stack is not old_stack  # old stack cleared from state
+        assert state.owner_task is None  # old owner cleared from state
+        assert old_owner.done() and not old_owner.cancelled()
 
     def test_reconnect_failure_returns_error_dict(self, running_loop_mgr):
         mgr, _loop, _thread = running_loop_mgr
@@ -4013,7 +4040,7 @@ class TestEnsureStaticConnected:
         """session None + in_flight > 0 → defer (None) without teardown; once
         the sibling call drains, the next call reconnects."""
         mgr, loop, _ = running_loop_mgr
-        state = _seed_static_state(mgr, "srv", session=None, stack=MagicMock(spec=AsyncExitStack))
+        state = _seed_static_state(mgr, "srv", session=None)
         state.in_flight = 1
         sess = MagicMock()
 
@@ -4179,30 +4206,75 @@ class TestTeardownStaticSession:
     stale-guard and remove_server_sync)."""
 
     def test_teardown_order_and_state_cleared(self, running_loop_mgr) -> None:
+        """Close protocol: session nulled, close event set BEFORE the first
+        await (a teardown cancelled mid-flight must still have delivered the
+        owner's marching orders), streams pre-closed, then the parked owner
+        exits GRACEFULLY — no cancel."""
         mgr, loop, _ = running_loop_mgr
         order: list[str] = []
-        old_stack = MagicMock(spec=AsyncExitStack)
+
+        async def _make_owner() -> tuple[asyncio.Event, asyncio.Task[None]]:
+            ev = asyncio.Event()
+
+            async def _parked_owner() -> None:
+                await ev.wait()
+                order.append("owner_exit")
+
+            task = asyncio.create_task(_parked_owner())
+            await asyncio.sleep(0)  # let the owner park
+            return ev, task
+
+        ev, owner = _run_hl(loop, _make_owner())
 
         async def _pre_close(name: str) -> None:
             order.append("pre_close")
             # Session nulled FIRST so concurrent dispatch reads see
             # "disconnected", not a corpse.
             assert mgr._static_servers["srv"].session is None
+            # The close signal precedes the first await of the teardown.
+            assert ev.is_set()
 
-        async def _safe_close(stack: Any) -> None:
-            order.append("safe_close")
-            assert stack is old_stack
-
-        _seed_static_state(mgr, "srv", session=MagicMock(), stack=old_stack)
-        with (
-            patch.object(mgr, "_pre_close_streams", side_effect=_pre_close),
-            patch.object(mgr, "_safe_close_stack", side_effect=_safe_close),
-        ):
+        _seed_static_state(mgr, "srv", session=MagicMock(), owner_task=owner, close_requested=ev)
+        with patch.object(mgr, "_pre_close_streams", side_effect=_pre_close):
             _run_hl(loop, mgr._teardown_static_session("srv"))
-        assert order == ["pre_close", "safe_close"]
+        assert order == ["pre_close", "owner_exit"]
         state = mgr._static_servers["srv"]
         assert state.session is None
-        assert state.stack is None
+        assert state.owner_task is None
+        assert state.close_requested is None
+        assert owner.done() and not owner.cancelled()  # graceful, no escalation
+
+    def test_teardown_escalates_to_single_cancel(self, running_loop_mgr) -> None:
+        """An owner that ignores the close event gets EXACTLY one cancel — a
+        second cancel is the zombie-minting mistake the protocol forbids, so
+        the count is pinned, not just the final cancelled state."""
+        mgr, loop, _ = running_loop_mgr
+        mgr._OWNER_CLOSE_GRACE_S = 0.05  # keep the graceful window short
+        cancel_calls: list[Any] = []
+
+        async def _make_owner() -> asyncio.Task[None]:
+            async def _stubborn_owner() -> None:
+                await asyncio.sleep(3600)  # never watches the event
+
+            task = asyncio.create_task(_stubborn_owner())
+            await asyncio.sleep(0)
+            real_cancel = task.cancel
+
+            def _counting_cancel(*args: Any, **kwargs: Any) -> bool:
+                cancel_calls.append(args)
+                return real_cancel(*args, **kwargs)
+
+            task.cancel = _counting_cancel  # type: ignore[method-assign]
+            return task
+
+        owner = _run_hl(loop, _make_owner())
+        _seed_static_state(
+            mgr, "srv", session=MagicMock(), owner_task=owner, close_requested=asyncio.Event()
+        )
+        _run_hl(loop, mgr._teardown_static_session("srv"))
+        assert owner.cancelled()
+        assert len(cancel_calls) == 1  # one cancel, never a second
+        assert mgr._static_servers["srv"].owner_task is None
 
     def test_teardown_missing_server_is_noop(self, running_loop_mgr) -> None:
         mgr, loop, _ = running_loop_mgr
