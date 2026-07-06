@@ -14,7 +14,7 @@ one port; the reranker is reached directly (it speaks the `/rerank` wire format)
 
 | Service | Model | Role | Turnstone reaches it via |
 |---|---|---|---|
-| `vllm-qwen` | Qwen 3.6 27B (FP8) | reasoning + tools | LiteLLM `/v1/messages` (Anthropic) |
+| `vllm-qwen` | Qwen 3.6 27B (NVFP4) | reasoning + tools | LiteLLM `/v1/messages` (Anthropic) |
 | `vllm-gemma` | Gemma 4 12B | vision + audio (omni) | LiteLLM `/v1/chat/completions` (OpenAI) |
 | `vllm-reranker` | Qwen3-Reranker 4B | retrieval rerank | `:8002/rerank` (direct) |
 | `litellm` | — | gateway (both chat routes) | `:4000` |
@@ -37,10 +37,10 @@ they're cached on disk.
   no equivalent in the Anthropic Messages API, so Turnstone gates audio roles to
   OpenAI-SDK providers. Vision works on either lane; audio works only here.
 
-**Validated shape (GB10, 128 GiB):** qwen full **256K @ ~1.4×** (MTP spec-decode +
-runai_streamer), gemma full **131072 @ ~2×**, reranker **@ ~1.4×**; ~117/121 GiB
-used. Two hard rules on one unified-memory card (rationale in *Troubleshooting*):
-**drop the page cache before `up`**, and **start sequentially** (enforced via
+**Validated shape (GB10, 128 GiB):** qwen full **256K** (MTP spec-decode + NVFP4
+4-bit), gemma full **131072**, reranker; ~117/121 GiB used.
+Two hard rules on one unified-memory card (rationale in *Troubleshooting*): **drop
+the page cache before `up`**, and **start sequentially** (enforced via
 `depends_on: service_healthy`) so each model profiles against clean memory.
 
 ## Requirements
@@ -71,8 +71,8 @@ watch -n5 'docker compose ps'
 Verify the KV pools and a round-trip on each route:
 
 ```sh
-docker compose logs vllm-qwen     | grep "Maximum concurrency"   # ~1.4x @ 262144
-docker compose logs vllm-gemma    | grep "Maximum concurrency"   # ~2x   @ 131072
+docker compose logs vllm-qwen     | grep "Maximum concurrency"   # output varies by GPU/memory
+docker compose logs vllm-gemma    | grep "Maximum concurrency"
 docker compose logs vllm-reranker | grep "Maximum concurrency"
 
 # qwen — Anthropic route
@@ -97,13 +97,8 @@ Same compose, with these changes:
    [kyuz0/amd-strix-halo-vllm-toolboxes](https://github.com/kyuz0/amd-strix-halo-vllm-toolboxes)
    or the TheRock-ROCm build in [hec-ovi/vllm-qwen](https://github.com/hec-ovi/vllm-qwen)
    — then set `VLLM_IMAGE` to it.
-2. **Qwen weights & loader** — gfx1151 has no FP8 matmul; recent ROCm/vLLM *can*
-   load an FP8 checkpoint but compute falls back to BF16 speed and it's rough.
-   Prefer BF16: set `QWEN_MODEL=Qwen/Qwen3.6-27B` in `.env`. Then, in the
-   `vllm-qwen` command in `docker-compose.yml`, lower `--max-model-len` toward
-   131072 (bf16 27B weights ≈ 54 GiB, less KV room) and remove the
-   `--load-format runai_streamer` line (it may not help on ROCm; drop it if it
-   errors). Those two are compose literals, not `.env` vars.
+2. **Qwen model** — use the original FP8 checkpoint: set
+   `QWEN_MODEL=Qwen/Qwen3.6-27B-FP8` in `.env`.
 3. **GPU access** — ROCm doesn't use the `deploy:` nvidia reservation. In
    `docker-compose.yml`, **delete the `deploy:` block** on *each* vLLM service and
    replace it with:
@@ -163,15 +158,18 @@ default = "qwen"
 
 ## Tuning notes
 
-- **`runai_streamer` on qwen only.** It cut qwen's weight load **166 s → ~1 s**
-  (~26×). But its streaming buffers add memory that breaks the *small* models'
-  tight KV budgets ("No available memory for the cache blocks"), so gemma and the
-  reranker use the default loader.
-- **MTP spec-decode on qwen** (`--speculative-config '{"method":"mtp",…}'`): qwen3.6
-  has a built-in MTP head, giving ~1.6× decode (≈8→13 tok/s) at ~84% acceptance,
-  no draft model. Pair with `--max-num-batched-tokens 8192`.
-- **qwen 0.50 default-KV holds full 256K (~1.4×).** `--kv-cache-dtype fp8` is the
-  reserve lever (halves KV) if you need to give the others more room.
+- **`runai_streamer` on qwen only** (`--load-format runai_streamer`): streams
+  weights from disk, cutting load time substantially vs the default loader. Use it
+  ONLY on this big model — its streaming buffers add memory that can break the
+  small models' tight KV budgets, so gemma and the reranker use the default
+  loader.
+- **MTP spec-decode on qwen** (`--speculative-config '{"method":"mtp","num_speculative_tokens":2}'`): qwen3.6
+  has a built-in MTP head for speculative decoding, no draft model needed. Pair
+  with `--max-num-batched-tokens 8192`.
+- **`--max-num-seqs 8`**: this is a scheduler limit, not a memory allocator —
+  bumping it allows more concurrent requests to be interleaved, improving
+  throughput under load. Independent of the weight format; tune for your
+  workload.
 - **Shape:** gemma-4-12B (full-quality perception, `sliding_window` keeps long-ctx
   KV cheap) + a light **4B** reranker fit alongside qwen; the 8B reranker or
   gemma-4-E4B are the levers if you need to trade quality for memory.
@@ -180,9 +178,7 @@ default = "qwen"
 
 **`No available memory for the cache blocks` (a model won't start).** Its util
 left no room for KV after weights. Raise that model's `--gpu-memory-utilization`,
-or free memory elsewhere (qwen is the big tenant — drop its util or add
-`--kv-cache-dtype fp8`). This is also what `runai_streamer` triggers on small
-models — keep it on qwen only.
+or free memory elsewhere (qwen is the big tenant — drop its util).
 
 **`max seq len (X) larger than available KV cache (Y)`.** Same family: not enough
 KV for the context. First check you dropped the page cache before `up`; then raise
