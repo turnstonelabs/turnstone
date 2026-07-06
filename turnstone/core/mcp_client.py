@@ -19,6 +19,7 @@ from __future__ import annotations
 import asyncio
 import concurrent.futures
 import contextlib
+import gc
 import json
 import random
 import threading
@@ -453,7 +454,17 @@ class StaticServerState:
 
     name: str
     session: Any | None = None
-    stack: AsyncExitStack | None = None
+    # Transport ownership. The owner task is the ONE task that enters and
+    # exits the transport + ClientSession context managers (anyio cancel
+    # scopes are host-task-bound: a scope whose host task has finished can
+    # never be exited, and anyio then re-delivers cancellation to it in a
+    # ``call_soon`` loop forever — the SDK #2147 100%-CPU spin). The exit
+    # stack is deliberately a LOCAL of the owner coroutine, unreachable from
+    # other tasks, so nothing can ``aclose()`` it cross-task. Teardown asks
+    # the owner to close via ``close_requested`` (see
+    # ``_teardown_static_session`` for the close protocol).
+    owner_task: asyncio.Task[None] | None = None
+    close_requested: asyncio.Event | None = None
     streams: tuple[Any, Any] | None = None
     tools: list[dict[str, Any]] = field(default_factory=list)
     resources: list[dict[str, Any]] = field(default_factory=list)
@@ -554,8 +565,8 @@ class MCPClientManager:
         self._exit_stack: AsyncExitStack | None = None
 
         # Per-server state for auth_type ∈ {none, static}.  Each entry holds
-        # session/stack/streams/catalog/capability flags for one name-keyed
-        # connection.  The upcoming per-user pool integration introduces a
+        # session/owner-task/streams/catalog/capability flags for one
+        # name-keyed connection.  The upcoming per-user pool integration introduces a
         # sibling pool-entry map for auth_type=oauth_user; static entries
         # always live here.
         self._static_servers: dict[str, StaticServerState] = {}
@@ -727,6 +738,9 @@ class MCPClientManager:
         # is Turnstone's own reconnect — nothing upstream to lean on. <= 0
         # disables the loop entirely.
         self._static_health_check_s = float(mcp_cfg.get("static_health_check_seconds", 30))
+        # Rate-limit clock for the orphaned-scope disarm backstop
+        # (:meth:`_maybe_disarm_orphaned_scopes`). Monotonic; 0.0 = never ran.
+        self._last_scope_disarm: float = 0.0
 
         # OAuth integration. ``set_app_state`` wires app_state in after the
         # lifespan has built the token store / OAuth helpers; pool dispatch
@@ -860,7 +874,14 @@ class MCPClientManager:
                 await self._connect_one(name, cfg)
             except asyncio.CancelledError:
                 raise  # propagate so the background task can be cleanly stopped
-            except Exception as exc:
+            except (Exception, BaseExceptionGroup) as exc:
+                # ``BaseExceptionGroup`` explicitly: anyio task groups wrap a
+                # transport failure that includes a stray CancelledError (an
+                # accept-then-RST server, a cancel-scope collapse) into a
+                # BaseException-derived group that ``except Exception`` MISSES.
+                # Before this arm, one such server at startup killed
+                # ``_connect_all`` before the health/sweep loops below were
+                # ever created — silently disabling all autonomous recovery.
                 log.warning("Failed to connect MCP server '%s'", name, exc_info=True)
                 self._set_error(name, f"{type(exc).__name__}: {exc}")
                 self._cb_record_failure(name)
@@ -907,13 +928,14 @@ class MCPClientManager:
     # Well beyond the 120s dispatch call is unnecessary; a ping is a lightweight
     # round-trip, but heavy servers / congested links can still take seconds.
     _STATIC_HEALTH_PING_TIMEOUT_S = 30.0
-    # Outer bound on a single autonomous reconnect ATTEMPT. ``_connect_one_locked``
-    # bounds only the handshake (``_CONNECT_TIMEOUT``); its post-handshake
-    # ``list_tools``/``list_resources``/``list_prompts`` are unbounded, so a server
-    # that handshakes then stalls discovery would wedge the loop AND hold the
-    # per-name lock forever. Bound from the caller side (invariant: never edit
-    # ``_connect_one_locked``'s connect internals) with headroom for a worst-case
-    # handshake plus fast discovery.
+    # Outer bound on a single autonomous reconnect ATTEMPT. The transport
+    # owner bounds only the connect phases (``_CONNECT_TIMEOUT`` each); the
+    # post-handshake ``list_tools``/``list_resources``/``list_prompts`` run in
+    # the calling task and are unbounded, so a server that handshakes then
+    # stalls discovery would wedge the loop AND hold the per-name lock
+    # forever. Bound from the caller side with headroom for a worst-case
+    # handshake plus fast discovery — safe to cancel now: the transport cms
+    # live in the owner task, which is closed via the one-cancel protocol.
     _STATIC_RECONNECT_ATTEMPT_TIMEOUT_S = float(_CONNECT_TIMEOUT + 15)
 
     # Caller-side wait for a reconnect routed through ``_ensure_static_connected``
@@ -925,6 +947,23 @@ class MCPClientManager:
     # half-discovered session installed with no breaker record, or an operator
     # teardown silently timing out behind a slow reconnect that holds the lock.
     _STATIC_RECONNECT_CALLER_TIMEOUT_S = _STATIC_RECONNECT_ATTEMPT_TIMEOUT_S + 10.0
+
+    # Transport-owner close protocol (see ``_teardown_static_session``).
+    # Grace for the GRACEFUL phase: the parked owner is asked to close via its
+    # event and unwinds the transport cms in-task; the SDK's streamable-http
+    # ``__aexit__`` may issue a session-termination DELETE, so allow it a few
+    # seconds before escalating.
+    _OWNER_CLOSE_GRACE_S = 5.0
+    # Grace for the ESCALATED phase: after the single ``cancel()``. If the
+    # unwind is STILL running when this expires, the owner is left to finish
+    # on its own — it is self-contained and completing solo is harmless; a
+    # SECOND cancel is what must never happen (it abandons anyio scope exits
+    # mid-flight, minting the exact zombie this design removes).
+    _OWNER_CANCEL_GRACE_S = 5.0
+    # Rate limit for the orphaned-scope disarm sweep (``gc.get_objects`` walk;
+    # cheap enough on failure paths, too heavy to run on every suppressed
+    # close in a storm).
+    _SCOPE_DISARM_MIN_INTERVAL_S = 30.0
 
     # Notification debounce
     _NOTIFICATION_DEBOUNCE = 5.0  # seconds between refreshes per server
@@ -1089,8 +1128,7 @@ class MCPClientManager:
                 f"MCP server '{label}' unreachable at {host}:{port}: {exc}"
             ) from None
 
-    @staticmethod
-    async def _safe_close_stack(stack: AsyncExitStack) -> None:
+    async def _safe_close_stack(self, stack: AsyncExitStack) -> None:
         """Close an AsyncExitStack, suppressing errors from broken anyio scopes.
 
         Called from exception handlers — must not raise, otherwise cleanup
@@ -1119,49 +1157,163 @@ class MCPClientManager:
         scope-exit identity. The 5s bound stays as protection against
         ``aclose()`` hanging on a broken stack (a never-completing
         anyio task during teardown).
+
+        A suppressed close is also the tell that a task group may have been
+        cancelled without its host being able to drain it (the anyio
+        no-progress ``_deliver_cancellation`` spin), so it triggers the
+        rate-limited orphaned-scope disarm sweep as a backstop.
         """
         try:
             async with asyncio.timeout(5):
                 await stack.aclose()
         except (Exception, asyncio.CancelledError, BaseExceptionGroup):
             log.debug("Error closing AsyncExitStack; ignoring", exc_info=True)
+            self._maybe_disarm_orphaned_scopes("suppressed stack close")
+
+    def _maybe_disarm_orphaned_scopes(self, context: str) -> int:
+        """Disarm anyio cancel scopes that can never drain (rate-limited backstop).
+
+        anyio's ``CancelScope._deliver_cancellation`` reschedules itself via
+        ``call_soon`` for as long as ANY task remains registered in the scope —
+        including tasks that are already ``done()``, on which ``task.cancel()``
+        is a silent no-op. A cancelled scope whose registered tasks have all
+        finished (host task abandoned mid-exit, or a transport task group whose
+        child died after the connecting task returned) therefore spins the
+        event loop at 100% CPU forever (verified against anyio 4.14.1; no
+        upstream fix as of that release). The owner-task architecture prevents
+        Turnstone's static path from ever creating that state; this sweep is
+        the belt-and-suspenders for anything else (the pool path's cross-task
+        closes, SDK internals, future regressions).
+
+        Only scopes where EVERY registered task is done are touched — by then
+        no task can ever exit the scope, so cancelling the armed handle and
+        clearing the task set cannot suppress a real cancellation delivery.
+        (Coverage note: the unit tests pin the all-done gate and the field
+        manipulation with a synthetic handle; a REAL self-rescheduling
+        ``_deliver_cancellation`` storm is prevented structurally by the owner
+        architecture, so no test drives one through this sweep.)
+
+        MUST run on the mcp-loop, and only touches scopes HOSTED on it: the
+        ``gc.get_objects()`` walk is process-global, and in ``turnstone-server``
+        this process also runs FastAPI/httpx anyio scopes on the MAIN loop —
+        cancelling another loop's ``call_soon`` handle or clearing a set that
+        loop may be iterating is a cross-thread reach with no thread-safety
+        contract. Foreign-loop orphans are that loop's problem to fix.
+        Returns the number of scopes disarmed. Rate-limited because the walk
+        is O(heap).
+        """
+        now = time.monotonic()
+        if now - self._last_scope_disarm < self._SCOPE_DISARM_MIN_INTERVAL_S:
+            return 0
+        self._last_scope_disarm = now
+        try:
+            from anyio._backends._asyncio import CancelScope as _AnyioCancelScope
+        except ImportError:  # pragma: no cover - anyio is a hard dependency
+            return 0
+        disarmed = 0
+        for obj in gc.get_objects():
+            if not isinstance(obj, _AnyioCancelScope):
+                continue
+            handle = getattr(obj, "_cancel_handle", None)
+            tasks = getattr(obj, "_tasks", None)
+            if handle is None or tasks is None:
+                continue
+            try:
+                host = getattr(obj, "_host_task", None)
+                if host is None or host.get_loop() is not self._loop:
+                    continue
+                if any(not t.done() for t in tasks):
+                    continue
+                handle.cancel()
+                obj._cancel_handle = None
+                tasks.clear()
+                disarmed += 1
+            except Exception:  # never let the backstop become its own failure
+                log.debug("Failed to disarm a cancel scope", exc_info=True)
+        if disarmed:
+            log.warning(
+                "MCP: disarmed %d orphaned anyio cancel scope(s) after %s "
+                "(each was re-delivering cancellation every loop iteration)",
+                disarmed,
+                context,
+            )
+        return disarmed
 
     async def _safe_teardown_on_connect_failure(
         self, key: str | tuple[str, str], stack: AsyncExitStack
     ) -> None:
         """Pre-close streams + close the stack on a connect-time failure.
 
-        Shared by ``_connect_one`` (static) and ``_connect_one_pool``
-        (per-(user, server)) — both raise from inside the stream-enter /
-        session-init try blocks, and both must drain the anyio
-        zero-buffer ``send()`` calls before closing the stack to avoid
-        the SDK #2147 CPU busy-loop.
+        POOL PATH ONLY (``_connect_one_pool``) — it raises from inside the
+        stream-enter / session-init try blocks and must drain the anyio
+        zero-buffer ``send()`` calls before closing the stack to avoid the
+        SDK #2147 CPU busy-loop. The static path no longer builds stacks in
+        the connecting task at all: its transport cms live inside the
+        per-server owner task (:meth:`_static_transport_owner`), which unwinds
+        them in-task on failure.
         """
         await self._pre_close_streams(key)
         await self._safe_close_stack(stack)
 
     async def _teardown_static_session(self, name: str) -> None:
-        """Tear down a static server's session/stack (the ONE canonical order).
+        """Tear down a static server's session/transport (the ONE canonical order).
 
-        Shared by :meth:`_connect_one_locked`'s stale-guard and
-        :meth:`remove_server_sync` so a future ordering fix lands in one place:
-        null the session FIRST (concurrent dispatch reads see "disconnected",
-        not a corpse), pre-close the transport streams (unblocks anyio tasks
-        stuck on zero-buffer ``send()`` — SDK #2147), then close the captured
-        stack. MUST run under the per-name connect lock. Callers decide WHEN
-        teardown is safe — live-session reuse and the ``in_flight`` interlock
-        are enforced by :meth:`_ensure_static_connected`, not here. No-op when
-        the server has no state.
+        Shared by :meth:`_connect_one_locked`'s stale-guard,
+        :meth:`remove_server_sync`, and shutdown so a future ordering fix lands
+        in one place. MUST run under the per-name connect lock (shutdown is
+        exempt: the health loop and dispatch drivers are already stopped).
+        Callers decide WHEN teardown is safe — live-session reuse and the
+        ``in_flight`` interlock are enforced by :meth:`_ensure_static_connected`,
+        not here. No-op when the server has no state.
+
+        Close protocol (the anyio host-task invariant): the transport +
+        ``ClientSession`` cms were entered by the server's OWNER task and can
+        only be exited by it — an exit stack ``aclose()`` from any other task
+        raises anyio's cross-task scope-exit error, and a scope whose host
+        task has finished can never drain, which arms anyio's
+        ``_deliver_cancellation`` retry into a permanent ``call_soon`` storm
+        (the SDK #2147 100%-CPU spin this design removes). So:
+
+        1. null the session (concurrent dispatch reads see "disconnected");
+        2. pre-close the transport streams (unblocks anyio transport tasks
+           stuck on zero-buffer ``send()`` and lets the SDK's readers/writers
+           exit promptly);
+        3. ask the owner to close (``close_requested.set()``) and give its
+           in-task unwind ``_OWNER_CLOSE_GRACE_S``;
+        4. escalate to ONE ``cancel()`` and wait ``_OWNER_CANCEL_GRACE_S``;
+        5. if it is STILL unwinding, leave it to finish solo (it is
+           self-contained; a SECOND cancel would abandon a scope exit
+           mid-flight and mint the exact zombie this protocol exists to
+           prevent) and run the orphaned-scope disarm sweep as a backstop.
         """
         state = self._static_servers.get(name)
         if state is None:
             return
         state.session = None
+        owner = state.owner_task
+        close_requested = state.close_requested
+        state.owner_task = None
+        state.close_requested = None
+        # Signal BEFORE the first await: if this coroutine is itself cancelled
+        # mid-teardown, the owner must already have its marching orders — a
+        # parked owner that never learns of the close would hold the transport
+        # open forever.
+        if close_requested is not None:
+            close_requested.set()
         await self._pre_close_streams(name)
-        old_stack = state.stack
-        state.stack = None
-        if old_stack is not None:
-            await self._safe_close_stack(old_stack)
+        if owner is None or owner.done():
+            return
+        _done, pending = await asyncio.wait({owner}, timeout=self._OWNER_CLOSE_GRACE_S)
+        if pending:
+            owner.cancel()
+            _done, pending = await asyncio.wait({owner}, timeout=self._OWNER_CANCEL_GRACE_S)
+        if pending:
+            log.warning(
+                "MCP transport owner for '%s' still unwinding after close+cancel; "
+                "leaving it to finish on its own",
+                name,
+            )
+            self._maybe_disarm_orphaned_scopes(f"slow owner unwind for '{name}'")
 
     def _static_connect_lock_for(self, name: str) -> asyncio.Lock:
         """Return the per-server connect lock for ``name`` (lazily created).
@@ -1219,9 +1371,12 @@ class MCPClientManager:
            abort it mid-flight. Defer — the next driver pass reconnects once
            it drains (mirrors the pool path's ``_close_pool_entry_if_idle``).
         4. **Bounded connect** — :meth:`_connect_one_locked` under
-           ``_STATIC_RECONNECT_ATTEMPT_TIMEOUT_S`` from the caller side
-           (invariant: never edit its connect internals; its own bounds cover
-           only the handshake, not discovery).
+           ``_STATIC_RECONNECT_ATTEMPT_TIMEOUT_S`` from the caller side (the
+           owner task's internal bounds cover only the connect phases, not
+           discovery). Cancelling the caller here is SAFE: the transport cms
+           live in the owner task, which is closed via the one-cancel
+           protocol and unwinds in-task — a caller-side cancel can no longer
+           abandon an anyio scope mid-exit (the old 100%-CPU zombie).
 
         The circuit breaker is OWNED here for connect outcomes — callers must
         not record the connect again. Success clears only the OPEN-CIRCUIT
@@ -1300,93 +1455,15 @@ class MCPClientManager:
             self._circuit_open_until.pop(name, None)
             return state.session
 
-    async def _connect_one_locked(self, name: str, cfg: dict[str, Any]) -> None:
-        """Connect to a single MCP server and discover its tools.
+    def _make_static_notification_handler(self, name: str) -> Any:
+        """Build the per-server notification handler for a static session.
 
-        MUST run under the per-server connect lock (see :meth:`_connect_one`).
+        Dispatches tool, resource, and prompt list-change notifications to the
+        appropriate refresh method (body unchanged from the pre-owner-task
+        closure in ``_connect_one_locked``; extracted because the session cm
+        is now entered by the transport owner).
         """
-        # Operate on a single state object throughout: get-or-create up front
-        # so the stale-entry guard and the post-handshake field assignments
-        # touch the same instance (PR #296 invariant 5: identity stability).
-        state = self._ensure_static_state(name)
 
-        # Guard: tear down stale session/stack so we don't leak.  Transport
-        # errors in the sync dispatch methods evict the session but leave the
-        # stack behind; ``_teardown_static_session`` clears both (and is a
-        # no-op on a brand new entry).
-        await self._teardown_static_session(name)
-
-        # Per-server exit stack for clean per-server lifecycle management
-        stack = AsyncExitStack()
-        await stack.__aenter__()
-
-        transport = cfg.get("type", "stdio")
-        try:
-            if transport in ("http", "streamable-http") or "url" in cfg:
-                # Pre-flight TCP check: fail fast before entering the anyio
-                # task group in streamablehttp_client.  An immediate connect
-                # failure (ECONNREFUSED) inside the anyio context causes a
-                # CancelledError that escapes asyncio.wait_for and leaves
-                # orphaned cancel-scope tasks spinning at 100% CPU.
-                await self._tcp_probe(name, cfg["url"])
-
-                # ``wait_for`` retained — the static path is byte-identical
-                # (invariant 1) and its narrow connect-once / no-eviction-then-
-                # reuse pattern doesn't trigger the cross-task scope-exit that
-                # f6a3b66 fixed for ``_safe_close_stack`` and that the pool
-                # path's ``_connect_one_pool`` migrated at line 1206 below.
-                # Migrating here would change the static path's bytes; reverting
-                # 1206 to match would re-introduce the pool-path flake. Pin both
-                # directions.
-                read, write, _ = await asyncio.wait_for(
-                    stack.enter_async_context(
-                        streamablehttp_client(url=cfg["url"], headers=cfg.get("headers"))
-                    ),
-                    timeout=self._CONNECT_TIMEOUT,
-                )
-                # Stash stream refs so _pre_close_streams can unblock anyio
-                # transport tasks before the cancel scope fires (SDK #2147).
-                state.streams = (read, write)
-            else:
-                # Default: stdio transport
-                command = cfg.get("command", "")
-                if not command:
-                    log.warning("MCP server '%s' has no command configured", name)
-                    await stack.aclose()
-                    return
-                from turnstone.core.env import scrubbed_env
-
-                env = scrubbed_env(extra=cfg.get("env", {}))
-                params = StdioServerParameters(
-                    command=command,
-                    args=cfg.get("args", []),
-                    env=env,
-                )
-                read, write = await stack.enter_async_context(stdio_client(params))
-                state.streams = (read, write)
-        except asyncio.CancelledError:
-            # Stray CancelledError from broken anyio cancel scope -- treat as
-            # connection failure.  But if the task is genuinely being cancelled
-            # (shutdown), re-raise so we don't block teardown.
-            task = asyncio.current_task()
-            if task is not None and task.cancelling():
-                await self._safe_teardown_on_connect_failure(name, stack)
-                raise
-            log.warning("MCP server '%s' connection failed (anyio cancel)", name)
-            await self._safe_teardown_on_connect_failure(name, stack)
-            raise TimeoutError(f"Connection failed for '{name}'") from None
-        except TimeoutError:
-            log.warning(
-                "MCP server '%s' connection timed out after %ds", name, self._CONNECT_TIMEOUT
-            )
-            await self._safe_teardown_on_connect_failure(name, stack)
-            raise TimeoutError(f"Connection timed out after {self._CONNECT_TIMEOUT}s") from None
-        except Exception:
-            await self._safe_teardown_on_connect_failure(name, stack)
-            raise
-
-        # Register notification handler — dispatches tool, resource, and
-        # prompt list-change notifications to the appropriate refresh method.
         async def _on_notification(
             msg: Any,  # RequestResponder | ServerNotification | Exception
         ) -> None:
@@ -1423,35 +1500,203 @@ class MCPClientManager:
                 log.warning("Refresh after notification failed for '%s'", name, exc_info=True)
                 self._set_error(name, f"Refresh failed: {exc}")
 
+        return _on_notification
+
+    async def _static_transport_owner(
+        self,
+        name: str,
+        cfg: dict[str, Any],
+        ready: asyncio.Future[Any],
+        close_requested: asyncio.Event,
+    ) -> None:
+        """Own the transport + session cm lifecycle for one static server.
+
+        THE anyio host-task invariant, and the fix for the flaky-server
+        100%-CPU regression: anyio cancel scopes (inside the SDK's
+        ``streamablehttp_client`` / ``stdio_client`` / ``ClientSession`` task
+        groups) are bound to the task that enters them. A scope whose host
+        task has finished can never be exited, and once such a scope is
+        cancelled — by anyio's own ``task_done`` when a transport child dies
+        with the server, or by ``ClientSession.__aexit__`` during a later
+        teardown — anyio re-delivers cancellation to it in a ``call_soon``
+        loop every event-loop iteration, forever (~10^5+ callbacks/s per
+        scope, verified against anyio 4.14.1; no upstream fix). Entering the
+        cms from short-lived connect tasks (every health tick is a new task)
+        made that state routine.
+
+        So this long-lived task IS the cm host: it enters the transport and
+        ``ClientSession`` contexts, initializes (each phase bounded by a
+        SAME-TASK ``asyncio.timeout``, whose cancel unwinds the async-with
+        chain in-task and completes), reports readiness, then parks. It
+        unwinds — again in-task — on any of:
+
+          * a requested close (``close_requested`` set by the teardown
+            protocol in :meth:`_teardown_static_session`);
+          * ONE ``cancel()`` (teardown escalation, or shutdown);
+          * the transport task group collapsing underneath it because the
+            server died — anyio cancels the scope, finds THIS task alive and
+            parked, and the delivery drains normally instead of spinning.
+
+        The exit stack is deliberately a local: nothing outside this task can
+        reach it to ``aclose()`` cross-task. Connect-phase failures are
+        delivered through *ready*; post-ready death is observed by the
+        done-callback (:meth:`_on_static_owner_death`), which evicts the
+        session for the health loop / next dispatch to reconnect.
+        """
+        state = self._ensure_static_state(name)
         try:
-            session = await stack.enter_async_context(
-                ClientSession(read, write, message_handler=_on_notification)  # type: ignore[arg-type]
-            )
-        except Exception:
-            await self._safe_teardown_on_connect_failure(name, stack)
+            async with AsyncExitStack() as stack:
+                transport = cfg.get("type", "stdio")
+                if transport in ("http", "streamable-http") or "url" in cfg:
+                    async with asyncio.timeout(self._CONNECT_TIMEOUT):
+                        read, write, _ = await stack.enter_async_context(
+                            streamablehttp_client(url=cfg["url"], headers=cfg.get("headers"))
+                        )
+                else:
+                    from turnstone.core.env import scrubbed_env
+
+                    env = scrubbed_env(extra=cfg.get("env", {}))
+                    params = StdioServerParameters(
+                        command=cfg.get("command", ""),
+                        args=cfg.get("args", []),
+                        env=env,
+                    )
+                    async with asyncio.timeout(self._CONNECT_TIMEOUT):
+                        read, write = await stack.enter_async_context(stdio_client(params))
+                # Stash stream refs so _pre_close_streams can unblock the
+                # SDK's transport tasks promptly during teardown (SDK #2147).
+                state.streams = (read, write)
+                session = await stack.enter_async_context(
+                    ClientSession(
+                        read,
+                        write,
+                        message_handler=self._make_static_notification_handler(name),
+                    )
+                )
+                async with asyncio.timeout(self._CONNECT_TIMEOUT):
+                    await session.initialize()
+                if not ready.done():
+                    ready.set_result(session)
+                await close_requested.wait()
+        except asyncio.CancelledError:
+            if not ready.done():
+                ready.set_exception(ConnectionError(f"MCP connect for '{name}' was cancelled"))
+                with contextlib.suppress(BaseException):
+                    ready.exception()  # mark retrieved: the waiter may be gone
+            raise
+        except BaseException as exc:
+            if not ready.done():
+                # Connect-phase failure: deliver to the waiting caller. Phase
+                # timeouts arrive as TimeoutError (``asyncio.timeout`` converts
+                # its own cancel in THIS task); transport task-group failures
+                # may be BaseExceptionGroup — passed through, the consumers
+                # handle groups explicitly.
+                ready.set_exception(exc)
+                with contextlib.suppress(BaseException):
+                    ready.exception()  # mark retrieved: the waiter may be gone
+                return
+            # Post-ready death: the server dropped the transport under a live
+            # session. The done-callback evicts; the health loop owns the
+            # reconnect story. Quiet — a flapping server would otherwise spam.
+            log.debug("MCP transport owner for '%s' terminated: %r", name, exc)
+
+    def _on_static_owner_death(self, name: str, task: asyncio.Task[None]) -> None:
+        """Done-callback for a transport owner: observe UNREQUESTED death.
+
+        A requested teardown de-registers the owner from state before closing
+        it, so reaching here with ``state.owner_task is task`` means the
+        transport collapsed underneath a live session (server died, stream
+        dropped) — the owner unwound its scopes in-task (its job) and the
+        session is now a corpse. Evict it so dispatch fails fast into
+        reconnect and the health loop picks it up on its next tick, instead
+        of every caller rediscovering the corpse via a dead-transport error.
+        The breaker is left alone: no dispatch failure was observed, and
+        connect outcomes are recorded by ``_ensure_static_connected``.
+        """
+        with contextlib.suppress(BaseException):
+            if not task.cancelled():
+                task.exception()  # mark retrieved; the owner already logged
+        state = self._static_servers.get(name)
+        if state is None or state.owner_task is not task:
+            return
+        state.owner_task = None
+        state.close_requested = None
+        if state.session is not None:
+            state.session = None
+            log.info("MCP server '%s' transport terminated; session evicted for reconnect", name)
+
+    async def _connect_one_locked(self, name: str, cfg: dict[str, Any]) -> None:
+        """Connect to a single MCP server and discover its tools.
+
+        MUST run under the per-server connect lock (see :meth:`_connect_one`).
+
+        The transport + session cms are entered by a dedicated OWNER task
+        (:meth:`_static_transport_owner`); this method only WAITS for it to
+        report readiness — so a caller-side cancellation (the attempt timeout
+        in ``_ensure_static_connected``, shutdown, a sync boundary giving up)
+        can never abandon an anyio cancel scope mid-exit. On failure the owner
+        unwinds fully in its own task. This method's job is bookkeeping:
+        the close protocol on the way in (stale-guard), state fields and
+        catalog discovery on the way out.
+        """
+        # Operate on a single state object throughout: get-or-create up front
+        # so the stale-entry guard and the post-handshake field assignments
+        # touch the same instance (PR #296 invariant 5: identity stability).
+        state = self._ensure_static_state(name)
+
+        # Guard: close any stale owner/session so we don't leak. Transport
+        # errors in the sync dispatch methods evict the session but leave the
+        # owner (and its open transport) behind; the close protocol clears
+        # both (and is a no-op on a brand new entry).
+        await self._teardown_static_session(name)
+
+        transport = cfg.get("type", "stdio")
+        if transport in ("http", "streamable-http") or "url" in cfg:
+            # Pre-flight TCP check: fail fast before spawning an owner and
+            # entering the SDK's anyio task group at all (an ECONNREFUSED
+            # surfaces here as a clean ConnectionError instead of a
+            # cancel-scope unwind).
+            await self._tcp_probe(name, cfg["url"])
+        elif not cfg.get("command", ""):
+            # Default transport is stdio; without a command there is nothing
+            # to spawn. Preserves the historical no-session no-raise shape
+            # (``_ensure_static_connected`` converts it to a clean failure).
+            log.warning("MCP server '%s' has no command configured", name)
+            return
+
+        loop = asyncio.get_running_loop()
+        ready: asyncio.Future[Any] = loop.create_future()
+        close_requested = asyncio.Event()
+        owner = asyncio.create_task(
+            self._static_transport_owner(name, cfg, ready, close_requested),
+            name=f"mcp-transport-owner:{name}",
+        )
+        owner.add_done_callback(lambda t: self._on_static_owner_death(name, t))
+        try:
+            session = await ready
+        except asyncio.CancelledError:
+            # Caller cancelled while the owner was still connecting. Close the
+            # owner with the one-cancel protocol and let its unwind finish
+            # in-task; never abandon it mid-exit, never cancel twice.
+            close_requested.set()
+            if not owner.done():
+                owner.cancel()
+                await asyncio.wait({owner}, timeout=self._OWNER_CANCEL_GRACE_S)
+            raise
+        except BaseException:
+            # Connect failed: the owner delivered the failure and is unwinding
+            # itself in-task. Reap quietly, then surface the error.
+            await asyncio.wait({owner}, timeout=self._OWNER_CLOSE_GRACE_S)
             raise
 
-        state.stack = stack
-        try:
-            # ``wait_for`` retained — see line 905 for the static-path
-            # exemption from the pool-path migration (invariant 1 byte-identical).
-            await asyncio.wait_for(session.initialize(), timeout=self._CONNECT_TIMEOUT)
-        except asyncio.CancelledError:
-            state.stack = None
-            task = asyncio.current_task()
-            if task is not None and task.cancelling():
-                await self._safe_teardown_on_connect_failure(name, stack)
-                raise
-            await self._safe_teardown_on_connect_failure(name, stack)
-            raise TimeoutError(f"MCP handshake failed for '{name}'") from None
-        except TimeoutError:
-            state.stack = None
-            await self._safe_teardown_on_connect_failure(name, stack)
-            raise TimeoutError(f"MCP handshake timed out after {self._CONNECT_TIMEOUT}s") from None
-        except Exception:
-            state.stack = None
-            await self._safe_teardown_on_connect_failure(name, stack)
-            raise
+        if owner.done():
+            # The transport collapsed in the instant between readiness and the
+            # caller resuming (flapping server). Treat it as a failed connect
+            # rather than installing a corpse the first dispatch trips over.
+            raise ConnectionError(f"MCP server '{name}' transport died during connect")
+
+        state.owner_task = owner
+        state.close_requested = close_requested
         state.session = session
 
         # Check push notification support for each capability
@@ -2226,7 +2471,9 @@ class MCPClientManager:
                 await self._sweep_user_token_freshness()
             except asyncio.CancelledError:
                 return
-            except Exception:
+            except (Exception, BaseExceptionGroup):
+                # BaseExceptionGroup: same rationale as ``_static_health_loop``
+                # — a transport-layer group must not kill the loop.
                 log.warning("MCP token-freshness sweep iteration failed", exc_info=True)
             delay = self._user_token_sweep_s  # subsequent sweeps wait the full cadence
 
@@ -2453,7 +2700,9 @@ class MCPClientManager:
                 await self._evict_idle_pool_entries()
             except asyncio.CancelledError:
                 return
-            except Exception:
+            except (Exception, BaseExceptionGroup):
+                # BaseExceptionGroup: same rationale as ``_static_health_loop``
+                # — a transport-layer group must not kill the loop.
                 log.warning("MCP pool eviction iteration failed", exc_info=True)
 
     async def _evict_idle_pool_entries(self) -> None:
@@ -3099,7 +3348,10 @@ class MCPClientManager:
                 added, removed = await self._refresh_server(name)
                 self._cb_record_success(name)
                 results[name] = (added, removed)
-            except Exception as exc:
+            except (Exception, BaseExceptionGroup) as exc:
+                # BaseExceptionGroup: a transport task-group failure from the
+                # reconnect/refresh must stay isolated to this server, not
+                # abort the whole refresh pass.
                 log.warning("Refresh failed for MCP server '%s'", name, exc_info=True)
                 self._set_error(name, f"Refresh failed: {exc}")
                 results[name] = ([], [])
@@ -3664,20 +3916,48 @@ class MCPClientManager:
             except Exception:
                 log.debug("Error closing MCP pool sessions", exc_info=True)
 
-        # Close all per-server stacks (transports + sessions)
+        # Close all per-server transports (owner tasks own the cm stacks).
+        # Parallel version of ``_teardown_static_session``'s close protocol:
+        # signal every owner first, give them one shared graceful window, then
+        # ONE cancel each for stragglers and a short drain — never a second
+        # cancel (it would abandon an anyio scope exit mid-flight; the owner
+        # completing solo is harmless, and the loop is stopping anyway).
         if self._loop and self._static_servers:
 
-            async def _close_all_stacks() -> None:
-                # Pre-close streams to prevent anyio CPU busy-loop during teardown
-                for srv_name in list(self._static_servers):
+            async def _close_all_owners() -> None:
+                owners: list[asyncio.Task[None]] = []
+                for srv_name, srv_state in list(self._static_servers.items()):
+                    srv_state.session = None
+                    owner = srv_state.owner_task
+                    close_requested = srv_state.close_requested
+                    srv_state.owner_task = None
+                    srv_state.close_requested = None
+                    if close_requested is not None:
+                        close_requested.set()
+                    if owner is not None and not owner.done():
+                        owners.append(owner)
+                    # Pre-close streams to unblock the SDK's transport tasks
+                    # (anyio zero-buffer send — SDK #2147) so owners unwind fast.
                     await self._pre_close_streams(srv_name)
-                for srv_state in self._static_servers.values():
-                    if srv_state.stack is not None:
-                        await self._safe_close_stack(srv_state.stack)
+                if not owners:
+                    return
+                _done, pending = await asyncio.wait(owners, timeout=self._OWNER_CLOSE_GRACE_S)
+                for owner in pending:
+                    owner.cancel()
+                if pending:
+                    _done, pending = await asyncio.wait(
+                        pending, timeout=self._OWNER_CANCEL_GRACE_S / 2
+                    )
+                    if pending:
+                        log.warning(
+                            "MCP shutdown: %d transport owner(s) still unwinding; "
+                            "left to the dying loop",
+                            len(pending),
+                        )
 
-            future = asyncio.run_coroutine_threadsafe(_close_all_stacks(), self._loop)
+            future = asyncio.run_coroutine_threadsafe(_close_all_owners(), self._loop)
             try:
-                future.result(timeout=10)
+                future.result(timeout=12)
             except Exception:
                 log.debug("Error closing MCP sessions", exc_info=True)
 
@@ -3934,7 +4214,7 @@ class MCPClientManager:
                 # popped above, so no NEW reconnect will start; this serializes
                 # against one already in flight).
                 async with self._static_connect_lock_for(name):
-                    # Close session + transport via per-server stack
+                    # Close session + transport via the owner close protocol
                     await self._teardown_static_session(name)
                     # Clean up per-server state (on the event loop thread)
                     self._static_servers.pop(name, None)
@@ -4467,7 +4747,13 @@ class MCPClientManager:
                     return  # genuine shutdown
                 log.warning("MCP static health: stray cancellation absorbed; continuing")
                 await asyncio.sleep(self._static_health_check_s)
-            except Exception:
+            except (Exception, BaseExceptionGroup):
+                # BaseExceptionGroup explicitly: an anyio task-group collapse
+                # that wraps a stray CancelledError is BaseException-derived
+                # and would otherwise kill the only autonomous reconnect
+                # driver, silently. A genuine shutdown racing the group is
+                # still honored: the pending cancel fires at the sleep below
+                # and the CancelledError arm above returns.
                 log.warning("MCP static health iteration failed", exc_info=True)
                 await asyncio.sleep(self._static_health_check_s)
 
@@ -4567,10 +4853,13 @@ class MCPClientManager:
         try:
             log.info("MCP static health: reconnecting '%s'", name)
             session = await self._ensure_static_connected(name, cfg)
-        except Exception as exc:
+        except (Exception, BaseExceptionGroup) as exc:
             # The primitive already recorded the breaker failure and dropped
             # any partially-initialized session; only the health loop's own
-            # backoff state advances here.
+            # backoff state advances here. BaseExceptionGroup explicitly: a
+            # transport task-group failure must advance the backoff like any
+            # other connect error, not skip it (a hot every-tick retry) by
+            # escaping to the tick's exception isolation.
             attempt = self._static_reconnect_attempt.get(name, 0) + 1
             self._static_reconnect_attempt[name] = attempt
             delay = self._static_reconnect_delay(attempt)
@@ -4748,9 +5037,11 @@ class MCPClientManager:
             # No breaker record: see docstring — lock contention is not a
             # server failure, and this boundary cannot tell the two apart.
             raise RuntimeError(f"MCP server '{server_name}' reconnect timed out") from None
-        except Exception as exc:
+        except (Exception, BaseExceptionGroup) as exc:
             # Real connect failures were already recorded by the primitive;
             # recording here again would double-count one outcome.
+            # BaseExceptionGroup: normalize a transport task-group failure to
+            # the same RuntimeError shape every dispatch caller expects.
             raise RuntimeError(f"MCP server '{server_name}' reconnect failed: {exc}") from None
         if session is None:
             # Deliberate skip: the server was removed while we queued, or a
@@ -4789,9 +5080,10 @@ class MCPClientManager:
         Closed/BrokenResourceError, the SDK-swallowed ``McpError(CONNECTION_CLOSED)``,
         a server-restarted session, or a gone httpx connection — IS a transport
         failure even when it is an ``McpError``, so it trips the breaker AND evicts
-        the session (leaving stack/streams for ``_connect_one``'s stale-and-stack
-        guard to reap). Eviction is what lets the next dispatch's ``session is
-        None`` check fire ``_cb_auto_reconnect`` instead of re-using the corpse.
+        the session (leaving the owner/streams for ``_connect_one_locked``'s
+        stale-guard close protocol to reap). Eviction is what lets the next
+        dispatch's ``session is None`` check fire ``_cb_auto_reconnect`` instead
+        of re-using the corpse.
         """
         dead = _is_dead_transport(exc)
         if dead or not isinstance(exc, McpError):
