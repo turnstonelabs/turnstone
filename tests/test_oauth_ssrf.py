@@ -15,6 +15,7 @@ import pytest
 
 from turnstone.core.oauth_ssrf import (
     OAuthSSRFError,
+    OAuthSSRFPrivateAddressError,
     effective_port,
     is_localhost,
     validate_discovered_endpoint,
@@ -86,6 +87,54 @@ class TestValidateUrlNoSSRF:
         ):
             validate_url_no_ssrf("https://corp.example.com", allow_http=False)
 
+    def test_private_address_raises_distinct_subclass(self) -> None:
+        # Callers with an operator opt-in (OIDC) catch the subclass to
+        # append the remediation hint; plain OAuthSSRFError catches still work.
+        with (
+            patch("socket.getaddrinfo", return_value=self._PRIVATE_ADDR),
+            pytest.raises(OAuthSSRFPrivateAddressError),
+        ):
+            validate_url_no_ssrf("https://corp.example.com", allow_http=False)
+
+    def test_allow_private_accepts_rfc1918(self) -> None:
+        with patch("socket.getaddrinfo", return_value=self._PRIVATE_ADDR):
+            parsed = validate_url_no_ssrf(
+                "https://auth.corp.example.com", allow_http=False, allow_private=True
+            )
+        assert parsed.hostname == "auth.corp.example.com"
+
+    def test_allow_private_accepts_cgnat(self) -> None:
+        # 100.64/10 (RFC 6598, shared address space) — e.g. a tailnet-hosted IdP.
+        with patch("socket.getaddrinfo", return_value=[(2, 1, 6, "", ("100.64.0.7", 0))]):
+            validate_url_no_ssrf("https://idp.tail.example", allow_http=False, allow_private=True)
+
+    def test_allow_private_accepts_loopback_hostname(self) -> None:
+        # A non-localhost hostname resolving to loopback (IdP behind a
+        # local reverse proxy) is operator-trusted under the opt-in.
+        with patch("socket.getaddrinfo", return_value=self._LOOPBACK_ADDR):
+            validate_url_no_ssrf("https://auth.internal", allow_http=False, allow_private=True)
+
+    def test_allow_private_still_rejects_link_local(self) -> None:
+        # Cloud metadata services live on link-local; no legitimate IdP does.
+        with (
+            patch("socket.getaddrinfo", return_value=[(2, 1, 6, "", ("169.254.169.254", 0))]),
+            pytest.raises(OAuthSSRFError, match="refused even with private"),
+        ):
+            validate_url_no_ssrf("https://md.example.com", allow_http=False, allow_private=True)
+
+    def test_allow_private_still_rejects_unspecified(self) -> None:
+        with (
+            patch("socket.getaddrinfo", return_value=[(2, 1, 6, "", ("0.0.0.0", 0))]),
+            pytest.raises(OAuthSSRFError, match="refused even with private"),
+        ):
+            validate_url_no_ssrf("https://zero.example.com", allow_http=False, allow_private=True)
+
+    def test_allow_private_does_not_relax_https(self) -> None:
+        with pytest.raises(OAuthSSRFError, match="must use HTTPS"):
+            validate_url_no_ssrf(
+                "http://auth.corp.example.com", allow_http=False, allow_private=True
+            )
+
     def test_rejects_unresolvable(self) -> None:
         import socket
 
@@ -120,6 +169,19 @@ class TestValidateDiscoveredEndpoint:
                 issuer,
                 allow_http=False,
                 trusted_endpoint_hosts=frozenset(),
+            )
+
+    def test_allow_private_passes_through(self) -> None:
+        # Same-origin endpoint on a private-resolving issuer host is accepted
+        # when the operator opted in.
+        issuer = urllib.parse.urlparse("https://auth.corp.example.com")
+        with patch("socket.getaddrinfo", return_value=[(2, 1, 6, "", ("10.0.0.5", 0))]):
+            validate_discovered_endpoint(
+                "https://auth.corp.example.com/token",
+                issuer,
+                allow_http=False,
+                trusted_endpoint_hosts=frozenset(),
+                allow_private=True,
             )
 
     def test_trusted_endpoint_host_passes(self) -> None:
