@@ -98,9 +98,12 @@ _RE_PRIVATE_KEY_BLOCK = re.compile(
 # covers SQLAlchemy dialect+driver URLs (``postgresql+psycopg2``,
 # ``postgresql+asyncpg``, ``mysql+pymysql``) and ``mongodb+srv`` —
 # enumerating drivers is a losing game, the suffix shape isn't.
+# Schemes are case-insensitive per RFC 3986, hence IGNORECASE:
+# ``POSTGRESQL://`` leaks the same password ``postgresql://`` does.
 _RE_CONNECTION_STRING = re.compile(
     r"(?:postgresql|mysql|mongodb|rediss?|amqps?|sqlite|https?)(?:\+[a-z0-9]*)?"
     r"://[^:@\s]+:[^@\s]+@",
+    re.IGNORECASE,
 )
 _RE_ENV_SECRET_LINE = re.compile(r"[A-Z][A-Z_0-9]+=\S+")
 _RE_ENV_SECRET_KEY = re.compile(
