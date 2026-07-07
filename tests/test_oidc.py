@@ -565,6 +565,20 @@ class TestValidateDiscoveredEndpoint:
                 trusted_endpoint_hosts=frozenset(),
             )
 
+    def test_private_endpoint_hint_mentions_opt_in(self):
+        """A discovered endpoint resolving private carries the opt-in hint
+        just like the issuer does — the remediation is the same knob."""
+        with (
+            patch("socket.getaddrinfo", return_value=[(2, 1, 6, "", ("10.0.0.5", 0))]),
+            pytest.raises(OIDCError, match="allow_private_network"),
+        ):
+            validate_discovered_endpoint(
+                "https://idp.example.com/token",
+                self._issuer(),
+                allow_http=False,
+                trusted_endpoint_hosts=frozenset(),
+            )
+
     def test_rejects_http_when_issuer_is_https(self):
         """http:// discovered endpoint rejected when issuer is https://."""
         with (
