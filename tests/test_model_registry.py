@@ -176,12 +176,17 @@ class TestModelRegistry:
         with (
             patch(
                 "turnstone.core.model_registry.create_client",
-                side_effect=FileNotFoundError(2, "No such file or directory"),
+                side_effect=FileNotFoundError(2, "No such file", "/gone/cacert.pem"),
             ),
             pytest.raises(ValueError, match="'default'.*FileNotFoundError") as excinfo,
         ):
             reg.get_client("default")
         assert isinstance(excinfo.value.__cause__, FileNotFoundError)
+        # The message is echoed in 503 bodies: exception TYPE only — the
+        # raw exception text can embed filesystem paths and must stay in
+        # the server log.
+        assert "/gone/cacert.pem" not in str(excinfo.value)
+        assert "No such file" not in str(excinfo.value)
         # Nothing half-constructed may be cached — a later call with a
         # repaired environment must construct for real.
         assert "default" not in reg._clients

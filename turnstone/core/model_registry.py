@@ -159,10 +159,20 @@ class ModelRegistry:
                     # path that a venv rebuild deleted (FileNotFoundError).
                     # Routes map ValueError to a 503 with the message;
                     # anything else surfaces as an opaque 500, so re-type
-                    # here where the alias is known.
+                    # here where the alias is known.  The ValueError text is
+                    # echoed to HTTP callers, so it carries only the
+                    # exception TYPE — arbitrary SDK exception text can
+                    # embed filesystem paths; the full detail goes to the
+                    # server log instead.
+                    log.warning(
+                        "Client construction failed for model alias %r (provider %s)",
+                        alias,
+                        cfg.provider,
+                        exc_info=True,
+                    )
                     raise ValueError(
                         f"failed to construct {cfg.provider} client for model "
-                        f"alias {alias!r}: {type(exc).__name__}: {exc}"
+                        f"alias {alias!r}: {type(exc).__name__} (details in server log)"
                     ) from exc
             return self._clients[alias]
 
