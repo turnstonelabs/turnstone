@@ -1055,7 +1055,7 @@ def _seed_committed(ws_id: str, kind: str, mime: str, body: bytes, filename: str
 
 
 class TestGetPreview:
-    def test_html_served_renderable_with_bare_sandbox_csp(self, app_client):
+    def test_html_default_serves_locked_down_csp(self, app_client):
         client, _ = app_client
         body = b'<html><head><base href="https://acme.com/"></head><body>x</body></html>'
         aid = _seed_committed("ws-A", "preview", "text/html; charset=utf-8", body, "preview-web")
@@ -1066,12 +1066,28 @@ class TestGetPreview:
         assert resp.status_code == 200
         assert resp.headers["content-type"].startswith("text/html")
         assert resp.content == body
-        # Renderable but locked down: bare sandbox (no default-src 'none' —
-        # the page's own subresources must load), nosniff, inline, no-store.
-        assert resp.headers.get("content-security-policy") == "sandbox"
+        # Default (no ?assets): renderable but off the network — sandboxed,
+        # inline styling + data-URI images only, so previewing discloses
+        # nothing to the origin site.
+        assert resp.headers.get("content-security-policy") == (
+            "sandbox; default-src 'none'; style-src 'unsafe-inline'; img-src data:; font-src data:"
+        )
         assert resp.headers.get("x-content-type-options") == "nosniff"
         assert resp.headers.get("content-disposition", "").startswith("inline;")
         assert resp.headers.get("cache-control") == "private, no-store"
+
+    def test_html_assets_flag_serves_bare_sandbox(self, app_client):
+        # ?assets=1 is the per-pane opt-in: drop back to the bare sandbox so
+        # the page's own images / CSS load.
+        client, _ = app_client
+        body = b"<html><head></head><body>x</body></html>"
+        aid = _seed_committed("ws-A", "preview", "text/html; charset=utf-8", body, "preview-web")
+        resp = client.get(
+            f"/v1/api/workstreams/ws-A/attachments/{aid}/preview?assets=1",
+            headers=_auth("userA"),
+        )
+        assert resp.status_code == 200
+        assert resp.headers.get("content-security-policy") == "sandbox"
 
     def test_pdf_served_without_csp(self, app_client):
         client, _ = app_client
@@ -1125,13 +1141,47 @@ class TestGetPreview:
         )
         assert resp.status_code == 404
 
-    def test_head_preflight_supported(self, app_client):
-        # The pane preflights src-loaded kinds with HEAD (the persist race);
-        # Starlette derives HEAD from the GET route.
+    def test_probe_returns_204_with_hardening_headers(self, app_client):
+        # The pane preflights src-loaded kinds with ?probe=1 instead of HEAD:
+        # the console reverse proxy forwards a HEAD as a full GET, so a real
+        # HEAD would drag the whole blob across the hop just to discard it. The
+        # probe runs the ownership + renderable-type gates and returns the real
+        # response's hardening headers with an empty body.
         client, _ = app_client
-        aid = _seed_committed("ws-A", "preview", "text/html", b"<p>x</p>", "p")
-        resp = client.head(
-            f"/v1/api/workstreams/ws-A/attachments/{aid}/preview",
+        body = b"<html><head></head><body>x</body></html>"
+        aid = _seed_committed("ws-A", "preview", "text/html; charset=utf-8", body, "preview-web")
+        resp = client.get(
+            f"/v1/api/workstreams/ws-A/attachments/{aid}/preview?probe=1",
             headers=_auth("userA"),
         )
-        assert resp.status_code == 200
+        assert resp.status_code == 204
+        assert resp.content == b""
+        # Same hardening headers the real GET would carry (the probe answers
+        # "will the load paint?"): the html CSP is present.
+        assert resp.headers.get("content-security-policy") == (
+            "sandbox; default-src 'none'; style-src 'unsafe-inline'; img-src data:; font-src data:"
+        )
+        assert resp.headers.get("x-content-type-options") == "nosniff"
+
+    def test_probe_composes_with_assets_flag(self, app_client):
+        # ?probe=1&assets=1 → 204 whose headers reflect the assets opt-in.
+        client, _ = app_client
+        body = b"<html><head></head><body>x</body></html>"
+        aid = _seed_committed("ws-A", "preview", "text/html; charset=utf-8", body, "preview-web")
+        resp = client.get(
+            f"/v1/api/workstreams/ws-A/attachments/{aid}/preview?probe=1&assets=1",
+            headers=_auth("userA"),
+        )
+        assert resp.status_code == 204
+        assert resp.headers.get("content-security-policy") == "sandbox"
+
+    def test_probe_non_renderable_mime_still_415(self, app_client):
+        # A probe must answer "will the real load succeed?" — a non-renderable
+        # blob 415s exactly as the real GET would, before any 204.
+        client, _ = app_client
+        aid = _seed_committed("ws-A", "audio", "audio/wav", WAV_12, "a.wav")
+        resp = client.get(
+            f"/v1/api/workstreams/ws-A/attachments/{aid}/preview?probe=1",
+            headers=_auth("userA"),
+        )
+        assert resp.status_code == 415

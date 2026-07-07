@@ -23,7 +23,7 @@
 import { ShellPane } from "./pane.js";
 import { authFetch } from "./auth.js";
 import { redactCredentials } from "./redact_credentials.js";
-import { renderMarkdown } from "./renderer.js";
+import { renderMarkdown, postRenderMarkdown } from "./renderer.js";
 import { setSafeHtml } from "./utils.js";
 
 // How many viewed descriptors the ←/→ history keeps.  Session-scoped and
@@ -61,6 +61,18 @@ function previewContentUrl(ctx, descriptor) {
     encodeURIComponent(descriptor.attachment_id || "") +
     "/preview"
   );
+}
+
+// Append preview query flags to a content URL (which never carries a query of
+// its own).  ``probe`` asks the route for a bodyless 204 "will the real load
+// paint?" preflight — the console reverse proxy forwards a HEAD as a full GET,
+// so a real HEAD would drag the whole blob across the hop just to discard it.
+// ``assets`` opts a sandboxed page back into loading its remote images/styles.
+function withPreviewFlags(url, opts) {
+  const q = [];
+  if (opts && opts.probe) q.push("probe=1");
+  if (opts && opts.assets) q.push("assets=1");
+  return q.length ? url + "?" + q.join("&") : url;
 }
 
 // ---------------------------------------------------------------------------
@@ -198,6 +210,10 @@ export function createPreviewPane(extra, hostApi) {
   pane._stack = [];
   pane._idx = -1;
   pane._loadToken = 0;
+  // Remote-assets opt-in: per-pane, sticky across previews, NOT persisted in
+  // pane meta.  Default OFF — a previewed page must not contact its origin
+  // site (an IP/traffic disclosure) until the user asks.
+  pane._assetsOn = false;
 
   const shortTitle = (d) => {
     const t = redactCredentials(d.title || d.source || "preview");
@@ -277,6 +293,13 @@ export function createPreviewPane(extra, hostApi) {
     // The one sanctioned HTML lane: renderer.js output through setSafeHtml.
     setSafeHtml(doc, renderMarkdown(text));
     pane._contentEl.replaceChildren(doc);
+    // Vendor post-pass — hljs token coloring + mermaid diagrams, matching the
+    // conversation pane.  Runs AFTER the attach: the renderer tolerates
+    // detached elements (the async mermaid apply gates on isConnected and
+    // attachment here is synchronous), but attach-first matches the
+    // conversation pane's ordering and leaves no room for doubt.
+    // renderer.js typeof-guards absent vendors, so no try/catch is needed.
+    postRenderMarkdown(doc);
   };
 
   const renderTable = (text, d) => {
@@ -405,14 +428,23 @@ export function createPreviewPane(extra, hostApi) {
     const isWeb = d.kind === "web" && /^https?:\/\//.test(d.source || "");
     pane._extLink.hidden = !isWeb;
     if (isWeb) pane._extLink.href = d.source;
+    // The remote-assets toggle rides web previews only; its checked state
+    // mirrors the pane's sticky opt-in on every render.
+    pane._assetsLabel.hidden = d.kind !== "web";
+    pane._assetsBox.checked = !!pane._assetsOn;
     api.setTitle && api.setTitle("Preview · " + shortTitle(d));
 
     pane._contentEl.replaceChildren(make("div", "preview-loading", "Loading…"));
 
+    // Remote assets are a web-only concern; the flag only reaches web URLs.
+    const assetsOn = d.kind === "web" && !!pane._assetsOn;
+    const probeUrl = withPreviewFlags(url, { probe: true, assets: assetsOn });
+    const srcUrl = withPreviewFlags(url, { assets: assetsOn });
+
     if (d.kind === "web" || d.kind === "pdf" || d.kind === "image") {
-      // src-loaded kinds: preflight with authFetch so the persist race and
-      // auth failures surface as a typed error card, not a broken frame.
-      authFetch(url, { method: "HEAD" })
+      // src-loaded kinds: preflight with a probe request so the persist race
+      // and auth failures surface as a typed error card, not a broken frame.
+      authFetch(probeUrl)
         .then((r) => {
           if (token !== pane._loadToken) return;
           if (!r.ok) {
@@ -423,9 +455,9 @@ export function createPreviewPane(extra, hostApi) {
             );
             return;
           }
-          if (d.kind === "web") renderWeb(url);
-          else if (d.kind === "pdf") renderPdf(url, d);
-          else renderImage(url, d);
+          if (d.kind === "web") renderWeb(srcUrl);
+          else if (d.kind === "pdf") renderPdf(srcUrl, d);
+          else renderImage(srcUrl, d);
         })
         .catch(() => failed("Could not load the preview."));
       return;
@@ -506,7 +538,26 @@ export function createPreviewPane(extra, hostApi) {
     ext.target = "_blank";
     ext.rel = "noopener noreferrer";
     ext.hidden = true;
-    bar.append(back, fwd, kind, title, ext);
+    // Remote-assets opt-in — web previews only.  Plain operator language; the
+    // tooltip states the default posture without naming the mechanism.
+    const assets = make("label", "preview-assets");
+    assets.title = "Off keeps this preview from contacting the site";
+    const assetsBox = make("input", "preview-assets-box");
+    assetsBox.type = "checkbox";
+    assets.append(
+      assetsBox,
+      make("span", "preview-assets-text", "Load remote images & styles"),
+    );
+    assets.hidden = true;
+    assetsBox.addEventListener("change", () => {
+      pane._assetsOn = assetsBox.checked;
+      // Reload the current web preview so its iframe re-fetches in the new
+      // mode.  A toggle is a deliberate act — no silent-backoff run.
+      const cur = pane._stack[pane._idx];
+      if (cur && cur.descriptor.kind === "web")
+        renderEntry(cur, MAX_AUTO_RETRIES);
+    });
+    bar.append(back, fwd, kind, title, ext, assets);
 
     const content = make("div", "preview-content");
 
@@ -515,6 +566,8 @@ export function createPreviewPane(extra, hostApi) {
     pane._kindEl = kind;
     pane._titleEl = title;
     pane._extLink = ext;
+    pane._assetsLabel = assets;
+    pane._assetsBox = assetsBox;
     pane._contentEl = content;
 
     root.append(bar, content);

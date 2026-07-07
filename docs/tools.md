@@ -1,6 +1,6 @@
 # Tools Reference
 
-turnstone exposes 16 built-in tools plus any number of external MCP tools to the
+turnstone exposes 17 built-in tools plus any number of external MCP tools to the
 LLM via the OpenAI function-calling interface. Built-in tools are defined as JSON
 files under `turnstone/tools/` and loaded at startup by `turnstone/core/tools.py`.
 MCP tools are discovered from configured MCP servers at startup by
@@ -44,10 +44,10 @@ schema plus turnstone-specific metadata keys:
 
 | Name                | Description |
 |---------------------|-------------|
-| `TOOLS`             | All 28 loaded built-in tool definitions (interactive + coordinator union). Sessions send a kind-specific subset (`INTERACTIVE_TOOLS` or `COORDINATOR_TOOLS`). |
+| `TOOLS`             | All 29 loaded built-in tool definitions (interactive + coordinator union). Sessions send a kind-specific subset (`INTERACTIVE_TOOLS` or `COORDINATOR_TOOLS`). |
 | `TASK_AGENT_TOOLS`  | Tools with `task_agent: true` -- available to task sub-agents. Includes write operations. |
 | `TASK_AUTO_TOOLS`   | Set of all tool names with `auto_approve: true` -- used by task-agent sub-sessions to skip confirmation for matching available tools. |
-| `BUILTIN_TOOL_NAMES`| Frozenset of all 28 built-in tool names (interactive + coordinator union). Used by tool search to distinguish always-on tools from deferrable MCP tools. |
+| `BUILTIN_TOOL_NAMES`| Frozenset of all 29 built-in tool names (interactive + coordinator union). Used by tool search to distinguish always-on tools from deferrable MCP tools. |
 | `PRIMARY_KEY_MAP`   | Dict mapping tool name to its `primary_key` parameter name. |
 
 ---
@@ -65,7 +65,7 @@ Tool execution follows a three-phase pipeline inside `ChatSession._execute_tools
 - Parses the JSON arguments (with fallback for malformed JSON).
 - If JSON parsing fails entirely, uses `PRIMARY_KEY_MAP` to map a bare string
   to the correct parameter.
-- Dispatches to the matching `_prepare_{func_name}()` handler. There are 16
+- Dispatches to the matching `_prepare_{func_name}()` handler. There are 17
   built-in tools plus `tool_search` (synthetic, client-side BM25 fallback) and
   the generic `_prepare_mcp_tool()` handler for MCP tools.
 - Validates arguments and builds a preview dict containing:
@@ -364,7 +364,10 @@ Show the user rich content in a preview pane beside the conversation.
   content, stores it content-addressed against the workstream, and opens the
   frontend preview pane beside the conversation: web pages render in a fully
   sandboxed iframe (no scripts, opaque origin), PDFs in the browser viewer,
-  images inline, CSV/TSV/JSON as a sortable table, text/markdown rendered. The
+  images inline, CSV/TSV/JSON as a sortable table, text/markdown rendered. A
+  previewed web page loads none of its remote images or styles by default, so
+  opening it never reveals the viewer to the page's site; a toggle in the pane
+  header turns remote content back on for that preview. The
   model receives only a one-line confirmation — to reason about content, use
   `web_fetch` / `read_file` instead. Preview content is size-capped per kind
   (pages 4 MB, PDFs 32 MB, images 4 MB, tables 2 MB, text 512 KB) and GC'd
@@ -688,7 +691,7 @@ MCP-compatible service.
 3. **Schema conversion**: Each MCP tool's `inputSchema` is converted to OpenAI
    function-calling format. The tool name is prefixed: `mcp__{server}__{tool}`.
 
-4. **Merging**: MCP tools are appended after the 16 built-in tools via
+4. **Merging**: MCP tools are appended after the 17 built-in tools via
    `merge_mcp_tools()`. Built-in tools appear first, giving them natural LLM priority.
    When dynamic tool search is active, MCP tools are deferred rather than directly
    visible -- the model discovers them via search as needed (see

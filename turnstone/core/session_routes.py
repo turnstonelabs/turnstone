@@ -4390,11 +4390,23 @@ def make_attachment_handlers(cfg: SessionEndpointConfig) -> AttachmentHandlers:
         bare_mime = stored_mime.split(";", 1)[0].strip().lower()
         if bare_mime not in PREVIEW_SERVE_MIMES:
             return JSONResponse({"error": "attachment is not previewable"}, status_code=415)
-        return _Response(
-            body,
-            media_type=stored_mime,
-            headers=preview_response_headers(bare_mime, filename),
+        # ``?assets=1`` opts a previewed page back into loading its remote
+        # images / styles; default-off keeps the sandboxed document off the
+        # network (see ``preview_response_headers``).
+        allow_remote_assets = bool(request.query_params.get("assets"))
+        headers = preview_response_headers(
+            bare_mime, filename, allow_remote_assets=allow_remote_assets
         )
+        # ``?probe=1`` preflight: the pane asks "will the real load paint?"
+        # before pointing an iframe / img at this URL.  Answer with the exact
+        # hardening headers the real response would carry but no body — the
+        # console reverse proxy forwards a HEAD as a full GET, so a HEAD
+        # preflight would drag the whole blob across the node→console hop just
+        # to discard it.  The ownership gate and the renderable-type check
+        # above have already run, so a 204 here means the GET will succeed.
+        if request.query_params.get("probe"):
+            return _Response(status_code=204, headers=headers)
+        return _Response(body, media_type=stored_mime, headers=headers)
 
     async def get_thumbnail(request: Request) -> Response:
         import asyncio
