@@ -1166,10 +1166,21 @@ class MCPClientManager:
         this process also runs FastAPI/httpx anyio scopes on the MAIN loop —
         cancelling another loop's ``call_soon`` handle or clearing a set that
         loop may be iterating is a cross-thread reach with no thread-safety
-        contract. Foreign-loop orphans are that loop's problem to fix.
+        contract. Foreign-loop orphans are that loop's problem to fix. The
+        guard below ENFORCES the mcp-loop requirement rather than trusting
+        callers (a suppressed close can fire before ``start()`` or after
+        ``shutdown()``, when there is no mcp-loop to be on), and a skipped
+        call does not advance the rate-limit clock — a legitimate on-loop
+        sweep may be needed immediately after.
         Returns the number of scopes disarmed. Rate-limited because the walk
         is O(heap).
         """
+        try:
+            running = asyncio.get_running_loop()
+        except RuntimeError:
+            return 0
+        if self._loop is None or running is not self._loop:
+            return 0
         now = time.monotonic()
         if now - self._last_scope_disarm < self._SCOPE_DISARM_MIN_INTERVAL_S:
             return 0
@@ -1537,7 +1548,8 @@ class MCPClientManager:
                     ready.exception()  # mark retrieved: the waiter may be gone
             raise
         except BaseException as exc:
-            if not ready.done():
+            pre_ready = not ready.done()
+            if pre_ready:
                 # Connect-phase failure: deliver to the waiting caller. Phase
                 # timeouts arrive as TimeoutError (``asyncio.timeout`` converts
                 # its own cancel in THIS task); transport task-group failures
@@ -1546,6 +1558,12 @@ class MCPClientManager:
                 ready.set_exception(exc)
                 with contextlib.suppress(BaseException):
                     ready.exception()  # mark retrieved: the waiter may be gone
+            if not isinstance(exc, (Exception, BaseExceptionGroup)):
+                # An interpreter-level exit (KeyboardInterrupt, SystemExit)
+                # must keep unwinding the task — delivery to the waiter was
+                # this arm's only job for it.
+                raise
+            if pre_ready:
                 return
             # Post-ready death: the server dropped the transport under a live
             # session. The done-callback evicts; the health loop owns the
