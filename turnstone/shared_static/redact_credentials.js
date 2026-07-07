@@ -18,6 +18,10 @@
 //   6. JSON secret keys              → "secret": "[REDACTED:secret]"
 //   7. ENV secret lines              → SECRET_KEY=[REDACTED:secret]
 //
+// A single prefilter scan (_RE_PREFILTER) bails out before all of the
+// above when the text cannot contain any credential — the common case
+// for plain-log tool output.
+//
 // House style: no innerHTML, no DOM access, no side-effects.
 
 // ---------------------------------------------------------------------------
@@ -30,9 +34,13 @@ const _RE_PRIVATE_KEY_BLOCK =
 // Connection strings — preserves protocol + user, redacts only the password
 //   postgresql://user:pass@host   →   postgresql://user:[REDACTED:password]@host
 //   https://user:token@api.example.com → https://user:[REDACTED:password]@api.example.com
+// The optional +suffix covers SQLAlchemy dialect+driver URLs
+// (postgresql+psycopg2, postgresql+asyncpg, mysql+pymysql) and
+// mongodb+srv — enumerating drivers is a losing game, the suffix
+// shape isn't.
 // ---------------------------------------------------------------------------
 const _RE_CONNECTION_STRING =
-  /(?:postgresql\+?(?:psycopg)?|mysql|mongodb(?:\+srv)?|rediss?|amqps?|sqlite|https?):\/\/[^:@\s]+:[^@\s]+@/g;
+  /(?:postgresql|mysql|mongodb|rediss?|amqps?|sqlite|https?)(?:\+[a-z0-9]*)?:\/\/[^:@\s]+:[^@\s]+@/g;
 
 const _RE_CONN_USERINFO = /:\/\/([^:@\s]+):([^@\s]+)@/;
 
@@ -64,11 +72,17 @@ const _CREDENTIAL_REPLACEMENTS = [
   // like "monkey=" or "turkey=".  Bare "token=" included via negative
   // lookbehind so standalone assignments still match (token=abcdef...)
   // without matching word suffixes like "over_tokenized=".
-  [/(?:(?:access|refresh|auth|api|session|bearer|secret)_?token|(?<![a-zA-Z0-9_])token)=[a-zA-Z0-9]{20,}/g, "[REDACTED:api_key]"],
+  [
+    /(?:(?:access|refresh|auth|api|session|bearer|secret)_?token|(?<![a-zA-Z0-9_])token)=[a-zA-Z0-9]{20,}/g,
+    "[REDACTED:api_key]",
+  ],
   // key=<value> (20+).  Same bounded prefix approach: api_key=/secret_key= etc.
   // but not monkey= or turkey=.  Bare "key=" included with negative lookbehind.
   // Multi-segment keys secret_access_key / aws_secret_access_key included explicitly.
-  [/(?:(?:api|secret|session|auth|encryption|signing|private|public|access|secret_access|aws_secret_access)_?key|(?<![a-zA-Z0-9_])key)=[a-zA-Z0-9]{20,}/g, "[REDACTED:api_key]"],
+  [
+    /(?:(?:api|secret|session|auth|encryption|signing|private|public|access|secret_access|aws_secret_access)_?key|(?<![a-zA-Z0-9_])key)=[a-zA-Z0-9]{20,}/g,
+    "[REDACTED:api_key]",
+  ],
 ];
 
 // ---------------------------------------------------------------------------
@@ -76,7 +90,8 @@ const _CREDENTIAL_REPLACEMENTS = [
 //   ?api_key=abc123   →   ?api_key=***   (legacy _redactApiKeys compat)
 //   &secret=value     →   &secret=***
 // ---------------------------------------------------------------------------
-const _RE_QUERY_CRED = /(?:api_key|apiKey|api-key|(?<![a-zA-Z0-9_])token|secret|password|auth)=[^&\s"]+/g;
+const _RE_QUERY_CRED =
+  /(?:api_key|apiKey|api-key|(?<![a-zA-Z0-9_])token|secret|password|auth)=[^&\s"]+/g;
 
 // ---------------------------------------------------------------------------
 // JSON-style simple redaction (legacy _redactApiKeys compat)
@@ -120,6 +135,24 @@ function _redactEnvLine(match) {
 }
 
 // ---------------------------------------------------------------------------
+// Prefilter — one early-exit scan deciding whether the pipeline can match.
+// MUST remain a superset of every pattern above: each pattern requires at
+// least one of these substrings, so skipping on a prefilter miss is sound.
+// Anchor → patterns:
+//   =           env lines, key=/token= assignments, query-string creds
+//   " '         JSON-style and JSON-secret forms
+//   @           connection-string userinfo
+//   -----BEGIN  PEM private key blocks
+//   sk- ghp_ gho_ AKIA AIza bearer   well-known key prefixes ("bearer" is
+//               case-insensitive per RFC 7235; /i over-approximates the
+//               case-sensitive prefixes, which only costs a full scan)
+// Adding a pattern above without an anchor here is a SILENT REDACTION
+// BYPASS — extend this regex and the runtime smoke test together
+// (tests/test_app_js.py::test_redact_credentials_runtime_smoke).
+// ---------------------------------------------------------------------------
+const _RE_PREFILTER = /[='"@]|-----BEGIN|sk-|ghp_|gho_|AKIA|AIza|bearer/i;
+
+// ---------------------------------------------------------------------------
 // Public API
 // ---------------------------------------------------------------------------
 
@@ -137,6 +170,11 @@ export function redactCredentials(text) {
   if (!text) return text;
 
   let result = String(text);
+
+  // Fast bailout — most tool output (plain logs, timestamps, table data)
+  // carries no anchor substring; one early-exit scan skips the sixteen
+  // replace passes below.  Soundness argument lives on _RE_PREFILTER.
+  if (!_RE_PREFILTER.test(result)) return result;
 
   // 1. PEM private key blocks (whole-block removal)
   result = result.replace(_RE_PRIVATE_KEY_BLOCK, "[REDACTED:private_key]");

@@ -236,6 +236,20 @@ class TestCredentialLeakage:
         assert r.sanitized is not None
         assert "s3cretpw" not in r.sanitized
 
+    def test_sqlalchemy_driver_connection_string(self) -> None:
+        # SQLAlchemy dialect+driver URLs must match — the bare-dialect
+        # list alone leaked these (only +psycopg was enumerated).
+        for url in (
+            "postgresql+psycopg2://admin:s3cret_pass@db.internal:5432/prod",
+            "postgresql+asyncpg://admin:s3cret_pass@db.internal/prod",
+            "mysql+pymysql://admin:s3cret_pass@db.internal/prod",
+        ):
+            r = evaluate_output(url)
+            assert "connection_string_leak" in r.flags, url
+            assert r.sanitized is not None, url
+            assert "s3cret_pass" not in r.sanitized, url
+            assert ":[REDACTED:password]@" in r.sanitized, url
+
     def test_bearer_scheme_case_insensitive(self) -> None:
         # RFC 7235 scheme name is case-insensitive.
         r = evaluate_output("authorization: bearer eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.sig12345")
