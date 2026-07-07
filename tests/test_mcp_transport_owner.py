@@ -217,7 +217,10 @@ class TestTransportOwnerLifecycle:
             waiter_exc: BaseException | None = None
             try:
                 await ready
-            except BaseException as e:  # noqa: BLE001 - asserting the exact type below
+            except (Exception, _TransportLibraryEscape) as e:
+                # Exception covers the expected ConnectionError; the escape
+                # type covers the exact regression this test guards (the raw
+                # escape leaking to the waiter instead of being converted).
                 waiter_exc = e
             await asyncio.wait({owner}, timeout=5)
             owner_exc = owner.exception() if owner.done() and not owner.cancelled() else None
