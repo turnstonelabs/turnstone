@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from typing import Any
 
+import pytest
 import sqlalchemy as sa
 
 from turnstone.core.storage._schema import workstreams
@@ -575,6 +576,48 @@ class TestSearch:
         backend.save_message("s1", "user", "msg2")
         results = backend.search_history_recent(limit=1)
         assert len(results) == 1
+
+    def test_search_history_survives_oversized_row(self, backend):
+        # A multi-MB row of mostly-unique words: on PostgreSQL its full
+        # tsvector exceeds the 1MB hard limit, which used to abort every
+        # search_history scan ("string is too long for tsvector") — one
+        # giant tool dump silently killed history recall entirely.
+        backend.register_workstream("s1")
+        giant = "gargantuan beacon " + " ".join(f"w{i}" for i in range(300_000))
+        assert len(giant) > 2_000_000
+        backend.save_message("s1", "tool", giant)
+        backend.save_message("s1", "user", "hello world")
+
+        results = backend.search_history("hello")
+        assert any("hello" in str(r[3]) for r in results)
+
+        # The oversized row itself stays findable by its head.
+        results = backend.search_history("gargantuan beacon")
+        assert any("gargantuan" in str(r[3]) for r in results)
+
+    def test_search_history_fts_error_falls_back_to_ilike(self, request, backend, monkeypatch):
+        # PostgreSQL only: a failed FTS statement aborts the connection's
+        # autobegun transaction, and the ILIKE fallback runs on that same
+        # connection — without a rollback first it dies with
+        # InFailedSqlTransaction instead of returning results.
+        if request.config.getoption("--storage-backend") != "postgresql":
+            pytest.skip("exercises PostgreSQL aborted-transaction fallback")
+
+        backend.register_workstream("s1")
+        backend.save_message("s1", "user", "hello fallback world")
+
+        real_execute = sa.engine.Connection.execute
+
+        def failing_fts_execute(self, statement, *args, **kwargs):
+            if "to_tsvector" in str(statement):
+                # A genuine server-side error, so the transaction is aborted
+                # exactly as when to_tsvector rejects a row.
+                return real_execute(self, sa.text("SELECT 1/0"))
+            return real_execute(self, statement, *args, **kwargs)
+
+        monkeypatch.setattr(sa.engine.Connection, "execute", failing_fts_execute)
+        results = backend.search_history("fallback")
+        assert any("fallback" in str(r[3]) for r in results)
 
 
 # -- Workstream operations -----------------------------------------------------
