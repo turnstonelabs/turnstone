@@ -56,8 +56,7 @@ def running_loop_mgr():
                 task = getattr(m, attr)
                 if task is not None:
                     task.cancel()
-                    with contextlib.suppress(BaseException):
-                        await task
+                    await asyncio.gather(task, return_exceptions=True)
                     setattr(m, attr, None)
             for entry in list(m._user_pool_entries.values()):
                 owner = entry.owner_task
@@ -65,8 +64,7 @@ def running_loop_mgr():
                     if entry.close_requested is not None:
                         entry.close_requested.set()
                     owner.cancel()
-                    with contextlib.suppress(BaseException):
-                        await owner
+                    await asyncio.gather(owner, return_exceptions=True)
 
         with contextlib.suppress(Exception):
             asyncio.run_coroutine_threadsafe(_drain(mgr), loop).result(timeout=5)
@@ -226,7 +224,7 @@ class TestPoolTransportOwnerLifecycle:
                 # The expected ConnectionError; anything else (a cancel leak,
                 # an interpreter exit) propagates and fails the test loudly.
                 exc = e
-            await collapser
+            _ = await collapser  # synchronization point; failures propagate
             return asyncio.get_running_loop().time() - t0, exc
 
         with (
@@ -278,7 +276,7 @@ class TestPoolTransportOwnerLifecycle:
                 # leaking through instead of being converted).
                 exc = e
             parked.set()
-            await owner
+            _ = await owner  # synchronization point; failures propagate
             return exc
 
         exc = _run(loop, _drive())
@@ -409,7 +407,7 @@ class TestPoolTransportOwnerLifecycle:
             await asyncio.wait_for(entered.wait(), timeout=5)
             connect.cancel()  # the attempt-timeout / shutdown shape
             with contextlib.suppress(asyncio.CancelledError):
-                await connect
+                _ = await connect  # only the expected cancel is absorbed
             # The owner must be closed (one cancel) and fully unwound.
             deadline = asyncio.get_running_loop().time() + 5
             while asyncio.get_running_loop().time() < deadline:

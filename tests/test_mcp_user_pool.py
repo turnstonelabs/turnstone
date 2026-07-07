@@ -127,8 +127,7 @@ def running_loop_mgr():
                 task = getattr(m, attr)
                 if task is not None:
                     task.cancel()
-                    with contextlib.suppress(BaseException):
-                        await task
+                    await asyncio.gather(task, return_exceptions=True)
                     setattr(m, attr, None)
             # Close any parked pool transport owners a successful
             # ``_connect_one_pool`` left installed, mirroring production
@@ -139,8 +138,7 @@ def running_loop_mgr():
                     if entry.close_requested is not None:
                         entry.close_requested.set()
                     owner.cancel()
-                    with contextlib.suppress(BaseException):
-                        await owner
+                    await asyncio.gather(owner, return_exceptions=True)
 
         with contextlib.suppress(Exception):
             asyncio.run_coroutine_threadsafe(_drain(mgr), loop).result(timeout=2)

@@ -2073,10 +2073,11 @@ class MCPClientManager:
             await asyncio.wait({call, owner}, return_when=asyncio.FIRST_COMPLETED)
         except asyncio.CancelledError:
             # Caller cancelled (attempt timeout / phase ``asyncio.timeout`` /
-            # shutdown): reap the discovery future, leave the owner to teardown.
+            # shutdown): reap the discovery future — gather waits for the
+            # cancel to land and absorbs its outcome — leave the owner to
+            # teardown, and re-raise ours.
             call.cancel()
-            with contextlib.suppress(BaseException):
-                await call
+            await asyncio.gather(call, return_exceptions=True)
             raise
         if call.done():
             if call.cancelled():
@@ -2088,10 +2089,12 @@ class MCPClientManager:
                 # cancellation.
                 raise ConnectionError("MCP discovery request cancelled by transport failure")
             return call.result()  # normal result, or the real discovery error
-        # Owner finished first — the transport died under discovery.
+        # Owner finished first — the transport died under discovery. Reap the
+        # discovery future (gather absorbs its cancellation outcome; a caller
+        # cancellation arriving DURING the reap propagates instead — honoring
+        # the cancel beats reporting the dead transport).
         call.cancel()
-        with contextlib.suppress(BaseException):
-            await call
+        await asyncio.gather(call, return_exceptions=True)
         raise ConnectionError("MCP transport owner died during discovery")
 
     async def _connect_one_pool(

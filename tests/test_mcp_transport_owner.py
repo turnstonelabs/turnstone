@@ -57,8 +57,7 @@ def running_loop_mgr():
                 task = getattr(m, attr)
                 if task is not None:
                     task.cancel()
-                    with contextlib.suppress(BaseException):
-                        await task
+                    await asyncio.gather(task, return_exceptions=True)
                     setattr(m, attr, None)
             for state in m._static_servers.values():
                 owner = state.owner_task
@@ -66,8 +65,7 @@ def running_loop_mgr():
                     if state.close_requested is not None:
                         state.close_requested.set()
                     owner.cancel()
-                    with contextlib.suppress(BaseException):
-                        await owner
+                    await asyncio.gather(owner, return_exceptions=True)
 
         with contextlib.suppress(Exception):
             asyncio.run_coroutine_threadsafe(_drain(mgr), loop).result(timeout=5)
@@ -222,7 +220,7 @@ class TestTransportOwnerLifecycle:
                 # The expected ConnectionError; anything else (a cancel leak,
                 # an interpreter exit) propagates and fails the test loudly.
                 exc = e
-            await collapser
+            _ = await collapser  # synchronization point; failures propagate
             return asyncio.get_running_loop().time() - t0, exc
 
         with (
@@ -335,7 +333,7 @@ class TestTransportOwnerLifecycle:
             await asyncio.wait_for(entered.wait(), timeout=5)
             connect.cancel()  # the attempt-timeout / shutdown shape
             with contextlib.suppress(asyncio.CancelledError):
-                await connect
+                _ = await connect  # only the expected cancel is absorbed
             # The owner must be closed (one cancel) and fully unwound.
             deadline = asyncio.get_running_loop().time() + 5
             while asyncio.get_running_loop().time() < deadline:
@@ -409,7 +407,7 @@ class TestBaseExceptionGroupHardening:
                 assert not task.done()
                 task.cancel()
                 with contextlib.suppress(asyncio.CancelledError):
-                    await task
+                    _ = await task  # only the expected cancel is absorbed
                 return task
 
             _run(loop, _drive(), timeout=10)
@@ -444,7 +442,7 @@ class TestScopeDisarmBackstop:
                 await blocker.wait()
 
             done_task = asyncio.create_task(_noop())
-            await done_task
+            _ = await done_task  # synchronization point; failures propagate
             live_task = asyncio.create_task(_parked())
             await asyncio.sleep(0)
 
@@ -479,7 +477,7 @@ class TestScopeDisarmBackstop:
                     scope._cancel_handle = None
                 scope._tasks.clear()
             blocker.set()
-            await live_task
+            _ = await live_task  # synchronization point; failures propagate
             return results
 
         r = _run(loop, _arm_and_sweep())
