@@ -224,7 +224,7 @@ class CreateWorkstreamResponse(BaseModel):
             "/v1/api/workstreams/{ws_id}/send."
         ),
     )
-    initial_message_status: str | None = Field(
+    initial_message_status: Literal["queue_full", "refused_closed"] | None = Field(
         default=None,
         description=(
             "Present ONLY when the workstream was created but its "
