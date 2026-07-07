@@ -6,12 +6,71 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [PEP 440](https://peps.python.org/pep-0440/) for
 version numbers (`X.Y.Z`, with `X.Y.ZaN` / `bN` / `rcN` for pre-releases).
 
-Three release tracks are maintained — the current stable, one prior
-stable, and the experimental line:
+Two active release tracks are maintained — the current stable and the
+experimental line:
 
-- **`stable/1.5`** — patch-only (`v1.5.x`)
-- **`stable/1.6`** — patch-only (`v1.6.x`)
+- **`stable/1.7`** — patch-only (`v1.7.x`)
 - **`main`** — experimental (next major)
+
+Earlier stable lines (`stable/1.6`, `stable/1.5`) are frozen.
+
+## [1.7.1]
+
+A maintenance and hardening patch for the 1.7 line. No schema migrations;
+the credential-redaction work below is additive and needs no configuration
+change. The one new operator-facing knob is the opt-in `[oidc]
+allow_private_network` flag (default off).
+
+### Security
+
+- **Credential redaction hardened across the tool-call surface** — the
+  redactor that scrubs secrets from tool arguments and log previews was
+  reworked on both the backend and the browser to close several leak paths
+  and to fix false-positive and performance issues. Malformed tool-call
+  arguments are now legalised before they reach the wire; the tool-args log
+  preview scrubs credentials and control characters; and the coordinator's
+  tool-call cards gain a matching client-side redaction pass so the JS and
+  backend redactors stay at parity. Pattern coverage now includes
+  `secret_access_key` / `aws_secret_access_key` multi-segment keys, bare
+  `token=` / `key=` forms (guarded by a negative lookbehind to avoid
+  false positives), and SQLAlchemy `+driver`-qualified connection-string
+  schemes matched case-insensitively.
+- **OIDC SSRF guard: `[oidc] allow_private_network` opt-in** — self-hosted
+  identity providers on private networks can now be reached by setting
+  `allow_private_network = true` under `[oidc]` (default off; the MCP OAuth
+  path stays strict). Rejections of discovered endpoints carry the opt-in
+  hint so the misconfiguration is self-explanatory. See `docs/oidc.md`.
+
+### Added
+
+- **Persona discoverability + forgiving name resolution** — personas are
+  now discoverable by agents, and persona-name resolution tolerates
+  case/whitespace variation; a not-found resolution reports the offending
+  input verbatim instead of a bare error.
+
+### Fixed
+
+- **MCP transport lifecycles routed through per-entry owner tasks**
+  (#787/#788) — static and pooled MCP transport lifecycles are now driven
+  by per-server / per-entry owner tasks, with a hardened disarm-sweep loop
+  guard and targeted exception handling in place of a broad `BaseException`
+  arm, so a dying transport can no longer spin the CPU or strand delivery.
+- **Client-construction failures surface as misconfiguration, not raw
+  500s** — a model whose client cannot be constructed now reports a factory
+  misconfiguration, and the raw exception text is kept out of the resulting
+  503 response.
+- **Postgres history search survives oversized rows** — a conversation row
+  exceeding Postgres' full-text limits no longer aborts history search.
+- **Agent-tool render is idempotent** — tool rendering no longer deep-copies
+  a tool definition until a description actually changes, so no-persona
+  sessions share the tool constant (correctness plus a hot-path allocation
+  win).
+- **Private-project workstream visibility scoped to members** — workstreams
+  in a private project are visible to project members only, not to every
+  admin; coordinator tenancy checks now use request-scoped storage.
+- **Pane hotkeys work off macOS and match across surfaces** — the pane
+  keyboard shortcuts no longer collide with browser accelerators on
+  non-macOS platforms and behave consistently across surfaces.
 
 ## [1.7.0]
 
