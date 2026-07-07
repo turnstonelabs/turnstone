@@ -320,8 +320,8 @@ def resolve_workstream_owner(
     is still not enforced here. The one row-level check this performs
     is PROJECT tenancy: a workstream attached to a *private* project is
     only reachable by the project's owner/members, the workstream's own
-    creator, service-scope callers, and ``admin.cluster.inspect``
-    holders — everyone else gets a 403 (see
+    creator, and service-scope callers — everyone else, admins included,
+    gets a 403 (see
     :class:`turnstone.core.auth.WorkstreamProjectVisibility`). Returns
     ``(owner_user_id, None)`` on success — the persisted owner id,
     which attachments should be filed under so existing storage shape

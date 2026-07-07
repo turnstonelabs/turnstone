@@ -57,6 +57,39 @@ def _auth(
     return {"Authorization": f"Bearer {_make_jwt(user, scopes=scopes, permissions=permissions)}"}
 
 
+class TestAssignableScopes:
+    """``service`` scope is a cross-tenant bypass and must never be
+    GRANTED via a user-facing token mint (admin API or CLI) — otherwise an
+    ``admin.users`` holder could self-mint it and see every private
+    project's workstreams.  Both mint paths route through
+    :func:`reject_unassignable_scopes`."""
+
+    def test_service_scope_rejected(self) -> None:
+        from turnstone.core.auth import reject_unassignable_scopes
+
+        assert reject_unassignable_scopes("service") is not None
+        assert reject_unassignable_scopes("read,service") is not None
+        assert reject_unassignable_scopes("read,write,approve,service") is not None
+
+    def test_service_not_in_assignable_set(self) -> None:
+        from turnstone.core.auth import ASSIGNABLE_SCOPES, VALID_SCOPES
+
+        assert "service" in VALID_SCOPES  # still a valid runtime scope
+        assert "service" not in ASSIGNABLE_SCOPES  # but not user-assignable
+
+    def test_ordinary_scopes_accepted(self) -> None:
+        from turnstone.core.auth import reject_unassignable_scopes
+
+        assert reject_unassignable_scopes("read") is None
+        assert reject_unassignable_scopes("read,write,approve") is None
+
+    def test_empty_and_unknown_rejected(self) -> None:
+        from turnstone.core.auth import reject_unassignable_scopes
+
+        assert reject_unassignable_scopes("") is not None
+        assert reject_unassignable_scopes("bogus") is not None
+
+
 # ---------------------------------------------------------------------------
 # FakeUI / FakeSession doubles — match the shape the create handler expects
 # ---------------------------------------------------------------------------

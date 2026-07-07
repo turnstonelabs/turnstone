@@ -1735,6 +1735,16 @@ def make_open_handler(
                 return JSONResponse({"error": cfg.not_found_label}, status_code=404)
             ws_id = resolved
 
+        # Tenancy gate BEFORE the already-loaded shortcut and before
+        # ``mgr.open`` rehydrates — otherwise ``open`` is a private-project
+        # existence/metadata oracle (it returns the auto-titled name) and an
+        # unauthorized resurrection of a closed private workstream into the
+        # pool. Interactive wires ownership, coord wires project tenancy.
+        if cfg.tenant_check is not None:
+            err_tenant = await asyncio.to_thread(cfg.tenant_check, request, ws_id, mgr)
+            if err_tenant is not None:
+                return err_tenant
+
         # Already-loaded shortcut — both kinds return the same
         # ``{ws_id, name, already_loaded: true}`` shape.
         existing = mgr.get(ws_id)

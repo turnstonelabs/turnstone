@@ -1323,7 +1323,7 @@ async def cluster_ws_detail(request: Request) -> JSONResponse:
     404 masks ownership failures (match :func:`make_detail_handler`).
     Correlation-id masks unexpected exceptions in the merge path.
     """
-    from turnstone.core.auth import require_permission
+    from turnstone.core.auth import WorkstreamProjectVisibility, require_permission
     from turnstone.core.web_helpers import require_storage_or_503
 
     err = require_permission(request, "admin.cluster.inspect")
@@ -1336,6 +1336,12 @@ async def cluster_ws_detail(request: Request) -> JSONResponse:
     ws_id = request.path_params.get("ws_id", "")
     if not _VALID_WS_ID_RE.match(ws_id):
         return JSONResponse({"error": "invalid ws_id"}, status_code=400)
+
+    # ``admin.cluster.inspect`` gates the surface, but a workstream attached
+    # to a private project stays confidential to its members — a permitted
+    # admin who isn't the owner/creator/member sees a 404, same existence
+    # masking as an unknown ws_id below (no private-project oracle).
+    visibility = WorkstreamProjectVisibility.for_request(request, storage=storage)
 
     # Accept either ``?limit=`` (the canonical name used by
     # the lifted history factory and the list_workstreams tool) or the
@@ -1376,6 +1382,14 @@ async def cluster_ws_detail(request: Request) -> JSONResponse:
         )
 
     if row is None:
+        return JSONResponse({"error": "workstream not found"}, status_code=404)
+
+    # Private-project tenancy — the memoized predicate may resolve a project
+    # row + membership from storage, so judge it off the event loop.
+    ws_visible = await asyncio.to_thread(
+        visibility.ws_visible, row.get("project_id") or "", row.get("user_id") or ""
+    )
+    if not ws_visible:
         return JSONResponse({"error": "workstream not found"}, status_code=404)
 
     try:
@@ -1430,14 +1444,15 @@ async def cluster_ws_live_bulk(request: Request) -> JSONResponse:
     ``cluster_ws_detail`` so node-dashboard cache behaviour, coordinator
     in-process snapshots, and ownership masking stay consistent.
 
-    Permission + ownership semantics match ``cluster_ws_detail``:
-    gated on ``admin.cluster.inspect`` and rows the caller doesn't
-    own surface in ``denied`` rather than ``results`` (so the endpoint
-    can't be used as an existence oracle).  Missing ids also route to
+    Permission + tenancy semantics match ``cluster_ws_detail``:
+    gated on ``admin.cluster.inspect``, and rows the caller can't see —
+    private-project workstreams they don't own / aren't a member of —
+    surface in ``denied`` rather than ``results`` (so the endpoint can't
+    be used as a private-project oracle).  Missing ids also route to
     ``denied`` for the same reason.  ``ids`` over the cap is truncated
     with ``truncated=true`` so the model / frontend knows to paginate.
     """
-    from turnstone.core.auth import require_permission
+    from turnstone.core.auth import WorkstreamProjectVisibility, require_permission
     from turnstone.core.web_helpers import require_storage_or_503
 
     err = require_permission(request, "admin.cluster.inspect")
@@ -1446,6 +1461,7 @@ async def cluster_ws_live_bulk(request: Request) -> JSONResponse:
     storage, err503 = require_storage_or_503(request)
     if err503 is not None:
         return err503
+    visibility = WorkstreamProjectVisibility.for_request(request, storage=storage)
 
     raw_ids = request.query_params.get("ids", "") or ""
     # Split on comma; strip whitespace; drop empty / invalid entries.
@@ -1484,17 +1500,27 @@ async def cluster_ws_live_bulk(request: Request) -> JSONResponse:
         )
 
     results: dict[str, dict[str, Any] | None] = {}
-    denied: list[str] = []
-    owned_rows: list[tuple[str, dict[str, Any]]] = []
-    for wid in cleaned:
-        row = rows.get(wid)
-        if row is None:
-            # Missing rows route to ``denied`` rather than ``results``
-            # so the endpoint can't be used as an existence oracle for
-            # ids outside the caller's knowledge.
-            denied.append(wid)
-            continue
-        owned_rows.append((wid, row))
+
+    def _partition() -> tuple[list[tuple[str, dict[str, Any]]], list[str]]:
+        # Missing rows AND private-project rows the caller isn't a member of
+        # both route to ``denied`` rather than ``results`` — neither an
+        # existence oracle for unknown ids nor a private-project oracle for
+        # workstreams the admin can't see. The tenancy predicate resolves
+        # project rows + membership from storage, so this runs off the
+        # event loop.
+        visible: list[tuple[str, dict[str, Any]]] = []
+        hidden: list[str] = []
+        for wid in cleaned:
+            row = rows.get(wid)
+            if row is None or not visibility.ws_visible(
+                row.get("project_id") or "", row.get("user_id") or ""
+            ):
+                hidden.append(wid)
+                continue
+            visible.append((wid, row))
+        return visible, hidden
+
+    owned_rows, denied = await asyncio.to_thread(_partition)
 
     # Fetch live blocks concurrently — ``_fetch_live_block`` already
     # routes node-backed reads through the per-node dashboard cache,
@@ -1604,10 +1630,11 @@ class _ClusterTenancyFilter:
 
     def __init__(self, visibility: Any) -> None:
         self._vis = visibility
-        # Bypass principals (service scope / admin.cluster.inspect) get
-        # the payload UNTOUCHED — no row drops, and crucially no
-        # overview recompute (their header should reflect the
-        # collector's own aggregates).
+        # Bypass principals (service scope only — the collector/machine
+        # plumbing) get the payload UNTOUCHED — no row drops, and crucially
+        # no overview recompute (their header should reflect the
+        # collector's own aggregates). Human admins are NOT bypass; they
+        # see the same private-project filtering as any other user.
         self._bypass = bool(getattr(visibility, "bypass", False))
         self._hidden: set[str] = set()
         # wid -> (project_id, ws_owner) awaiting a definitive verdict.
@@ -3091,6 +3118,18 @@ async def proxy_api(request: Request) -> Response:
         # service identity instead. Per-ws + bare events stay on
         # the user's identity for upstream audit attribution.
         use_service = path == "events/global"
+        if use_service:
+            # Elevating to the console's SERVICE identity bypasses the
+            # node's per-user filtering, so the raw cross-tenant firehose
+            # must be operator-gated — otherwise any authenticated user
+            # could read every tenant's (incl. private-project) workstream
+            # inventory through the node proxy. admin.cluster.inspect is
+            # the same permission the cluster-inspect surfaces use.
+            from turnstone.core.auth import require_permission
+
+            perm_err = require_permission(request, "admin.cluster.inspect")
+            if perm_err is not None:
+                return perm_err
         return await _proxy_sse(
             request,
             server_url,
@@ -3363,14 +3402,20 @@ async def _resolve_coordinator_or_404(
     Centralises the manager-first, storage-fallback, 404-mask ladder
     used by the coord-only verbs (``coordinator_children`` /
     ``coordinator_tasks``).  The shared verbs (history, detail, ...)
-    inline the same ladder via :func:`make_history_handler` /
-    :func:`make_detail_handler`.  Turnstone is a
-    trusted-team tool — ``user_id`` is metadata, not an access
-    boundary, so this helper no longer gates on row ownership; scope
-    auth (``admin.coordinator``) upstream is the gate.
+    route through :func:`_coordinator_tenant_check` instead (wired onto
+    ``coord_endpoint_config.tenant_check``).  Turnstone is a trusted-team
+    tool — ``user_id`` is metadata, not an ownership boundary, so this
+    helper does not gate on row ownership; ``admin.coordinator`` upstream
+    gates the surface.  It DOES enforce project tenancy, though: a
+    coordinator attached to a PRIVATE project stays confidential to its
+    members, so a non-member (even an ``admin.coordinator`` holder) is
+    404-masked, same as a missing row.
     """
     del user_id  # retained in signature for caller-site clarity; not consulted here
+    from turnstone.core.auth import WorkstreamProjectVisibility
+
     miss = JSONResponse({"error": "coordinator not found"}, status_code=404)
+    visibility = WorkstreamProjectVisibility.for_request(request, storage=storage)
     ws = coord_mgr.get(ws_id) if coord_mgr is not None else None
     if ws is None:
         if storage is None:
@@ -3386,8 +3431,59 @@ async def _resolve_coordinator_or_404(
             return None, miss
         if row is None or row.get("kind") != WorkstreamKind.COORDINATOR:
             return None, miss
+        # Project tenancy — the predicate may resolve a project row +
+        # membership, so judge it off the event loop.
+        if not await asyncio.to_thread(
+            visibility.ws_visible, row.get("project_id") or "", row.get("user_id") or ""
+        ):
+            return None, miss
         return None, None
+    if not await asyncio.to_thread(
+        visibility.ws_visible, getattr(ws, "project_id", "") or "", ws.user_id or ""
+    ):
+        return None, miss
     return ws, None
+
+
+def _coordinator_tenant_check(request: Request, ws_id: str, mgr: Any) -> JSONResponse | None:
+    """Project-tenancy gate for the lifted coordinator verbs.
+
+    Wired onto ``coord_endpoint_config.tenant_check`` (invoked SYNC in a
+    thread) so history / export / detail / set_title / send / approve / …
+    all enforce it.  ``admin.coordinator`` gates the coordinator surface
+    cluster-wide, so row OWNERSHIP is not enforced (any operator may drive
+    any coordinator) — but a coordinator attached to a PRIVATE project stays
+    confidential to its members.
+
+    Sync mirror of :func:`_resolve_coordinator_or_404`'s manager-first,
+    storage-fallback, coordinator-kind ladder (the in-memory manager is the
+    existence/kind authority; a storage row covers saved/closed
+    coordinators) plus the project-visibility gate.  Everything that fails —
+    unknown id, wrong kind, or a private project the caller can't see —
+    404-masks identically, so the surface is neither an existence nor a
+    private-project oracle.  Reusing the manager-first + kind ladder also
+    preserves the coord kind-isolation that :func:`make_set_title_handler`
+    previously got from the ``tenant_check is None`` manager-lookup guard.
+    """
+    from turnstone.core.auth import WorkstreamProjectVisibility
+    from turnstone.core.memory import get_workstream_row
+
+    miss = JSONResponse({"error": "coordinator not found"}, status_code=404)
+    ws = mgr.get(ws_id) if mgr is not None else None
+    if ws is not None:
+        # coord_mgr only holds coordinators, so kind is implied.
+        project_id = getattr(ws, "project_id", "") or ""
+        owner = ws.user_id or ""
+    else:
+        row = get_workstream_row(ws_id)
+        if row is None or row.get("kind") != WorkstreamKind.COORDINATOR:
+            return miss
+        project_id = row.get("project_id") or ""
+        owner = row.get("user_id") or ""
+    visibility = WorkstreamProjectVisibility.for_request(request)
+    if not visibility.ws_visible(project_id, ws_owner=owner):
+        return miss
+    return None
 
 
 def _auth_user_id(request: Request) -> str:
@@ -5633,14 +5729,14 @@ async def admin_create_token(request: Request) -> JSONResponse:
     scopes = body.get("scopes", "read,write,approve")
     expires_days = body.get("expires_days")
 
-    # Validate scopes
-    from turnstone.core.auth import VALID_SCOPES
+    # Validate scopes — ``service`` is NOT user-assignable (it bypasses
+    # private-project tenancy; only ServiceTokenManager / the JWT secret
+    # may mint it).
+    from turnstone.core.auth import reject_unassignable_scopes
 
-    requested = {s.strip() for s in scopes.split(",") if s.strip()}
-    if not requested or not requested.issubset(VALID_SCOPES):
-        return JSONResponse(
-            {"error": "Invalid scopes (allowed: read, write, approve)"}, status_code=400
-        )
+    scope_err = reject_unassignable_scopes(scopes)
+    if scope_err is not None:
+        return JSONResponse({"error": scope_err}, status_code=400)
 
     expires: str | None = None
     if expires_days is not None:
@@ -13519,10 +13615,19 @@ def create_app(
         coordinators must be ``open``ed before they can accept
         attachment operations.
         """
+        from turnstone.core.auth import WorkstreamProjectVisibility
         from turnstone.core.web_helpers import auth_user_id
 
         ws = mgr.get(ws_id)
         if ws is None:
+            return "", JSONResponse({"error": "coordinator not found"}, status_code=404)
+        # Private-project tenancy: a coordinator attached to a private project
+        # serves attachments only to its members — admin.coordinator gates the
+        # surface, not the tenancy. 404-mask non-members like the other verbs.
+        visibility = WorkstreamProjectVisibility.for_request(request)
+        if not visibility.ws_visible(
+            getattr(ws, "project_id", "") or "", ws_owner=ws.user_id or ""
+        ):
             return "", JSONResponse({"error": "coordinator not found"}, status_code=404)
         return ws.user_id or auth_user_id(request), None
 
@@ -13550,7 +13655,8 @@ def create_app(
     coord_endpoint_config = SessionEndpointConfig(
         permission_gate=_require_admin_coordinator,
         manager_lookup=_require_coord_mgr,
-        tenant_check=None,  # cluster-wide admin.coordinator gate covers it
+        # admin.coordinator gates the surface; this gates private-project tenancy.
+        tenant_check=_coordinator_tenant_check,
         not_found_label="coordinator not found",
         audit_action_prefix="coordinator",
         supports_attachments=True,

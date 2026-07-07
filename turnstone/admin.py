@@ -78,7 +78,13 @@ def _cmd_create_user(args: argparse.Namespace) -> None:
     print(f"  Name: {args.name}")
 
     if args.token:
+        from turnstone.core.auth import reject_unassignable_scopes
+
         scopes = args.scopes or "read,write,approve"
+        scope_err = reject_unassignable_scopes(scopes)
+        if scope_err is not None:
+            print(f"Error: {scope_err}", file=sys.stderr)
+            sys.exit(1)
         raw = generate_token()
         tid = uuid.uuid4().hex
         storage.create_api_token(
@@ -96,12 +102,23 @@ def _cmd_create_user(args: argparse.Namespace) -> None:
 
 
 def _cmd_create_token(args: argparse.Namespace) -> None:
-    from turnstone.core.auth import generate_token, hash_token, token_prefix
+    from turnstone.core.auth import (
+        generate_token,
+        hash_token,
+        reject_unassignable_scopes,
+        token_prefix,
+    )
 
     storage = _get_storage(args)
 
     if storage.get_user(args.user) is None:
         print(f"Error: user {args.user} not found", file=sys.stderr)
+        sys.exit(1)
+
+    scopes = args.scopes or "read,write,approve"
+    scope_err = reject_unassignable_scopes(scopes)
+    if scope_err is not None:
+        print(f"Error: {scope_err}", file=sys.stderr)
         sys.exit(1)
 
     expires = None
@@ -120,12 +137,12 @@ def _cmd_create_token(args: argparse.Namespace) -> None:
         token_prefix=token_prefix(raw),
         user_id=args.user,
         name=args.name or "",
-        scopes=args.scopes,
+        scopes=scopes,
         expires=expires,
     )
     print(f"Token: {raw}")
     print(f"  ID: {tid}")
-    print(f"  Scopes: {args.scopes}")
+    print(f"  Scopes: {scopes}")
     if expires:
         print(f"  Expires: {expires}")
     print("  (Save this token now — it cannot be retrieved again)")

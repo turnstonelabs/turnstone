@@ -42,6 +42,7 @@ from turnstone.console.server import (
     _coord_create_post_install,
     _coord_create_validate_request,
     _coord_saved_loaded_lookup,
+    _coordinator_tenant_check,
     _require_admin_coordinator,
     _require_coord_mgr,
     cluster_ws_detail,
@@ -83,14 +84,20 @@ def _coord_attach_owner(request, ws_id, mgr):
 
     Kind-strict — coord attachments can only be accessed for
     workstreams currently held by ``coord_mgr``; no storage fallback
-    so cross-kind ws_ids 404 instead of leaking through storage.
+    so cross-kind ws_ids 404 instead of leaking through storage. Also
+    project-tenancy-strict: mirrors ``_coord_attachment_owner`` so a
+    private-project coordinator's attachments 404-mask non-members.
     """
     from starlette.responses import JSONResponse
 
+    from turnstone.core.auth import WorkstreamProjectVisibility
     from turnstone.core.web_helpers import auth_user_id
 
     ws = mgr.get(ws_id)
     if ws is None:
+        return "", JSONResponse({"error": "coordinator not found"}, status_code=404)
+    visibility = WorkstreamProjectVisibility.for_request(request)
+    if not visibility.ws_visible(getattr(ws, "project_id", "") or "", ws_owner=ws.user_id or ""):
         return "", JSONResponse({"error": "coordinator not found"}, status_code=404)
     return ws.user_id or auth_user_id(request), None
 
@@ -101,7 +108,7 @@ def _coord_attach_owner(request, ws_id, mgr):
 _coord_endpoint_config = SessionEndpointConfig(
     permission_gate=_require_admin_coordinator,
     manager_lookup=_require_coord_mgr,
-    tenant_check=None,
+    tenant_check=_coordinator_tenant_check,
     not_found_label="coordinator not found",
     audit_action_prefix="coordinator",
     supports_attachments=True,
@@ -1408,6 +1415,110 @@ def test_history_any_admin_coordinator_caller_can_read(storage):
     assert resp.json()["ws_id"] == ws.id
 
 
+def test_history_private_project_hidden_from_non_member(storage):
+    # admin.coordinator gates the surface, but a coordinator in a private
+    # project the caller isn't a member of is 404-masked — the conversation
+    # does not leak to a non-member operator.
+    storage.create_project("proj-secret", "Secret", "alice")
+    storage.register_workstream(
+        "c" * 32, kind="coordinator", user_id="alice", project_id="proj-secret"
+    )
+    storage.save_message("c" * 32, "user", "secret plan")
+    client = _make_client(storage, coord_mgr=_build_mgr(storage), registry=_fake_registry())
+    resp = client.get(
+        f"/v1/api/workstreams/{'c' * 32}/history",
+        headers={"X-Test-User": "stranger", "X-Test-Perms": "admin.coordinator"},
+    )
+    assert resp.status_code == 404
+
+
+def test_history_private_project_visible_to_member(storage):
+    storage.create_project("proj-secret", "Secret", "alice")
+    storage.add_project_member("proj-secret", "member-bob")
+    storage.register_workstream(
+        "c" * 32, kind="coordinator", user_id="alice", project_id="proj-secret"
+    )
+    storage.save_message("c" * 32, "user", "secret plan")
+    client = _make_client(storage, coord_mgr=_build_mgr(storage), registry=_fake_registry())
+    resp = client.get(
+        f"/v1/api/workstreams/{'c' * 32}/history",
+        headers={"X-Test-User": "member-bob", "X-Test-Perms": "admin.coordinator"},
+    )
+    assert resp.status_code == 200
+    assert any(m.get("content") == "secret plan" for m in resp.json()["messages"])
+
+
+def test_export_private_project_hidden_from_non_member(storage):
+    storage.create_project("proj-secret", "Secret", "alice")
+    storage.register_workstream(
+        "c" * 32, kind="coordinator", user_id="alice", project_id="proj-secret"
+    )
+    storage.save_message("c" * 32, "user", "secret plan")
+    client = _make_client(storage, coord_mgr=_build_mgr(storage), registry=_fake_registry())
+    resp = client.get(
+        f"/v1/api/workstreams/{'c' * 32}/export",
+        headers={"X-Test-User": "stranger", "X-Test-Perms": "admin.coordinator"},
+    )
+    assert resp.status_code == 404
+
+
+def test_children_private_project_hidden_from_non_member(storage):
+    storage.create_project("proj-secret", "Secret", "alice")
+    storage.register_workstream(
+        "c" * 32, kind="coordinator", user_id="alice", project_id="proj-secret"
+    )
+    client = _make_client(storage, coord_mgr=_build_mgr(storage), registry=_fake_registry())
+    resp = client.get(
+        f"/v1/api/workstreams/{'c' * 32}/children",
+        headers={"X-Test-User": "stranger", "X-Test-Perms": "admin.coordinator"},
+    )
+    assert resp.status_code == 404
+
+
+def test_open_private_project_hidden_from_non_member(storage):
+    # `open` rehydrates + returns the auto-titled name, so an ungated open is a
+    # private-project existence/metadata oracle AND an unauthorized resurrection.
+    # The tenant_check must fire before the already-loaded shortcut and mgr.open.
+    storage.create_project("proj-secret", "Secret", "alice")
+    storage.register_workstream(
+        "c" * 32, kind="coordinator", user_id="alice", project_id="proj-secret"
+    )
+    client = _make_client(storage, coord_mgr=_build_mgr(storage), registry=_fake_registry())
+    resp = client.post(
+        f"/v1/api/workstreams/{'c' * 32}/open",
+        headers={"X-Test-User": "stranger", "X-Test-Perms": "admin.coordinator"},
+    )
+    assert resp.status_code == 404
+
+
+def test_coord_attachments_private_project_hidden_from_non_member(storage):
+    # Attachment list/serve resolves the owner as the coord owner and only
+    # enforced cross-kind before — a non-member operator could enumerate and
+    # download the owner's staged blobs. Now 404-masked by project tenancy.
+    storage.create_project("proj-secret", "Secret", "alice")
+    mgr = _build_mgr(storage)
+    ws = mgr.create(user_id="alice", project_id="proj-secret")
+    client = _make_client(storage, coord_mgr=mgr, registry=_fake_registry())
+    resp = client.get(
+        f"/v1/api/workstreams/{ws.id}/attachments",
+        headers={"X-Test-User": "stranger", "X-Test-Perms": "admin.coordinator"},
+    )
+    assert resp.status_code == 404
+
+
+def test_coord_attachments_private_project_visible_to_member(storage):
+    storage.create_project("proj-secret", "Secret", "alice")
+    storage.add_project_member("proj-secret", "member-bob")
+    mgr = _build_mgr(storage)
+    ws = mgr.create(user_id="alice", project_id="proj-secret")
+    client = _make_client(storage, coord_mgr=mgr, registry=_fake_registry())
+    resp = client.get(
+        f"/v1/api/workstreams/{ws.id}/attachments",
+        headers={"X-Test-User": "member-bob", "X-Test-Perms": "admin.coordinator"},
+    )
+    assert resp.status_code == 200
+
+
 def test_history_serves_storage_only_workstream(storage):
     """Persisted-but-not-loaded coordinators (closed / evicted) are still
     readable via /history without rehydrating. Mirrors the pre-lift
@@ -2108,6 +2219,10 @@ def test_open_any_admin_coordinator_caller_succeeds_in_memory(storage):
 
 def test_open_rehydrates_when_not_in_memory(storage, monkeypatch):
     mgr = _build_mgr(storage)
+    # The tenancy gate resolves the row from storage before rehydrating, so a
+    # legitimately-openable coordinator must exist there (it always does in
+    # production — open rehydrates a persisted row).
+    storage.register_workstream("coord-rehy", kind="coordinator", user_id="user-1")
     rehydrated = MagicMock()
     rehydrated.id = "coord-rehy"
     rehydrated.name = "rehydrated"
@@ -2141,6 +2256,7 @@ def test_open_503_on_coord_mgr_unavailable(storage):
 
 def test_open_correlation_id_on_factory_failure(storage, monkeypatch):
     mgr = _build_mgr(storage)
+    storage.register_workstream("bad-ws", kind="coordinator", user_id="user-1")
     monkeypatch.setattr(mgr, "open", MagicMock(side_effect=RuntimeError("boom")))
     client = _make_client(storage, coord_mgr=mgr, registry=_fake_registry())
     resp = client.post("/v1/api/workstreams/bad-ws/open", headers=_COORD_HEADERS)
@@ -2151,6 +2267,7 @@ def test_open_correlation_id_on_factory_failure(storage, monkeypatch):
 def test_open_503_when_open_raises_value_error(storage, monkeypatch):
     """ValueError from the factory surfaces as 503 with the remediation text."""
     mgr = _build_mgr(storage)
+    storage.register_workstream("bad-ws", kind="coordinator", user_id="user-1")
     monkeypatch.setattr(mgr, "open", MagicMock(side_effect=ValueError("coord registry missing")))
     client = _make_client(storage, coord_mgr=mgr, registry=_fake_registry())
     resp = client.post("/v1/api/workstreams/bad-ws/open", headers=_COORD_HEADERS)
@@ -2316,7 +2433,8 @@ def test_cluster_inspect_invalid_ws_id_400(storage):
 
 
 def test_cluster_inspect_any_inspect_caller_sees_detail(storage):
-    # Trusted-team visibility: admin.cluster.inspect sees every row.
+    # A project-less workstream has no tenancy to enforce, so any
+    # admin.cluster.inspect caller sees it (trusted-team default).
     mgr = _build_mgr(storage)
     ws = mgr.create(user_id="owner")
     client = _make_client(storage, coord_mgr=mgr, registry=_fake_registry())
@@ -2326,6 +2444,46 @@ def test_cluster_inspect_any_inspect_caller_sees_detail(storage):
     )
     assert resp.status_code == 200
     assert resp.json()["persisted"]["ws_id"] == ws.id
+
+
+def test_cluster_inspect_private_project_hidden_from_non_member(storage):
+    # admin.cluster.inspect gates the surface, but a workstream in a
+    # private project the caller isn't a member of is masked as 404 —
+    # no private-project oracle even for a cluster admin.
+    storage.create_project("proj-secret", "Secret", "alice")
+    storage.register_workstream(
+        "c" * 32,
+        node_id="console",
+        user_id="alice",
+        kind="coordinator",
+        project_id="proj-secret",
+    )
+    client = _make_client(storage, coord_mgr=_build_mgr(storage), registry=_fake_registry())
+    resp = client.get(
+        f"/v1/api/cluster/ws/{'c' * 32}/detail",
+        headers={"X-Test-User": "stranger", "X-Test-Perms": "admin.cluster.inspect"},
+    )
+    assert resp.status_code == 404
+
+
+def test_cluster_inspect_private_project_visible_to_member(storage):
+    # A project member (even a non-owner) still sees the persisted row.
+    storage.create_project("proj-secret", "Secret", "alice")
+    storage.add_project_member("proj-secret", "member-bob")
+    storage.register_workstream(
+        "c" * 32,
+        node_id="console",
+        user_id="alice",
+        kind="coordinator",
+        project_id="proj-secret",
+    )
+    client = _make_client(storage, coord_mgr=_build_mgr(storage), registry=_fake_registry())
+    resp = client.get(
+        f"/v1/api/cluster/ws/{'c' * 32}/detail",
+        headers={"X-Test-User": "member-bob", "X-Test-Perms": "admin.cluster.inspect"},
+    )
+    assert resp.status_code == 200
+    assert resp.json()["persisted"]["ws_id"] == "c" * 32
 
 
 def test_cluster_inspect_coordinator_self_path(storage):
