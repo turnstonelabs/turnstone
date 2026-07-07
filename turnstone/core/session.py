@@ -1175,6 +1175,36 @@ def _notify_auth_headers() -> dict[str, str]:
     return header
 
 
+def _screen_tool_url(url: str, allow_private_network: bool) -> tuple[str | None, bool]:
+    """SSRF-screen a tool's target URL under the operator's private-network opt-in.
+
+    ``allow_private_network`` is the live ``tools.allow_private_network``
+    setting (admin Settings → Tools; DB-backed, hot-toggleable — the caller
+    reads it per prepare).  Returns ``(error, private_origin)``.  ``error`` is
+    the rejection text (``None`` = proceed); a private-address rejection names
+    the setting so a self-hosted operator learns the knob from the refusal
+    itself.  ``private_origin`` is True when the target NAMES a private
+    address the operator opted into: the approval header tags it, and the
+    guarded fetch skips per-hop screening for that chain — the gate approved a
+    private URL, so its redirects are the operator's own network.  Public
+    origins never set it, keeping the public→private redirect bounce blocked
+    regardless of the opt-in.
+    """
+    ssrf_err = check_ssrf(url)
+    if not ssrf_err:
+        return None, False
+    is_private_block = "private/internal address" in ssrf_err
+    if is_private_block and allow_private_network:
+        return None, True
+    hint = ""
+    if is_private_block:
+        hint = (
+            " Enable 'tools.allow_private_network' in the console"
+            " (Settings → Tools) to allow fetching private-network addresses."
+        )
+    return f"Error: {ssrf_err}.{hint}", False
+
+
 def _tool_turn_meta(
     status: EffectStatus | None, preview: dict[str, Any] | None = None
 ) -> str | None:
@@ -9684,6 +9714,19 @@ class ChatSession:
             "replace_all": replace_all,
         }
 
+    def _allow_private_network(self) -> bool:
+        """Live read of ``tools.allow_private_network`` (admin Settings → Tools).
+
+        Read per prepare — an admin flipping the toggle takes effect on the
+        next tool call, no restart or config push.  Surfaces without a
+        ConfigStore (bare CLI, eval) stay strict: there is no admin surface
+        to have opted in on.
+        """
+        cs = getattr(self, "_config_store", None)
+        if cs is None:
+            return False
+        return bool(cs.get("tools.allow_private_network"))
+
     def _prepare_web_fetch(self, call_id: str, args: dict[str, Any]) -> dict[str, Any]:
         url = args.get("url", "").strip()
         question = args.get("question", "").strip()
@@ -9714,29 +9757,35 @@ class ChatSession:
                 "needs_approval": False,
                 "error": f"Error: URL must start with http:// or https:// (got {url!r})",
             }
-        # SSRF protection: reject private/link-local/metadata IPs
-        ssrf_err = check_ssrf(url)
-        if ssrf_err:
+        # SSRF screen \u2014 a NAMED private address is approvable under the
+        # tools.allow_private_network opt-in (the header tags it so the
+        # operator approves it as what it is).
+        screen_err, private_origin = _screen_tool_url(url, self._allow_private_network())
+        if screen_err:
             return {
                 "call_id": call_id,
                 "func_name": "web_fetch",
-                "header": "\u2717 web_fetch: blocked (private network)",
+                "header": "\u2717 web_fetch: blocked (private network)"
+                if "private/internal" in screen_err
+                else "\u2717 web_fetch: blocked",
                 "preview": f"    {url}",
                 "needs_approval": False,
-                "error": f"Error: {ssrf_err}",
+                "error": screen_err,
             }
         q_preview = question[:200] + ("..." if len(question) > 200 else "")
         preview = f"    {url}\n    Q: {q_preview}"
+        private_tag = " (private network)" if private_origin else ""
         return {
             "call_id": call_id,
             "func_name": "web_fetch",
-            "header": f"\u2699 web_fetch: {url[:80]}",
+            "header": f"\u2699 web_fetch: {url[:80]}{private_tag}",
             "preview": preview,
             "needs_approval": True,
             "approval_label": "web_fetch",
             "execute": self._exec_web_fetch,
             "url": url,
             "question": question,
+            "allow_private_origin": private_origin,
         }
 
     def _prepare_open_preview(self, call_id: str, args: dict[str, Any]) -> dict[str, Any]:
@@ -9780,16 +9829,23 @@ class ChatSession:
             "title": str(title).strip() if title else None,
         }
         if target.startswith(("http://", "https://")):
-            ssrf_err = check_ssrf(target)
-            if ssrf_err:
+            # Same opt-in lane as web_fetch: a named private address is
+            # approvable under tools.allow_private_network, tagged so the
+            # operator approves it as what it is.
+            screen_err, private_origin = _screen_tool_url(target, self._allow_private_network())
+            if screen_err:
                 return {
                     "call_id": call_id,
                     "func_name": "open_preview",
-                    "header": "✗ open_preview: blocked (private network)",
+                    "header": "✗ open_preview: blocked (private network)"
+                    if "private/internal" in screen_err
+                    else "✗ open_preview: blocked",
                     "preview": f"    {target}",
                     "needs_approval": False,
-                    "error": f"Error: {ssrf_err}",
+                    "error": screen_err,
                 }
+            if private_origin:
+                item["header"] = f"⚙ open_preview: {target[:80]} (private network)"
             item.update(
                 {
                     "preview": f"    {target}",
@@ -9797,6 +9853,7 @@ class ChatSession:
                     "approval_label": "open_preview",
                     "target_kind": "url",
                     "url": target,
+                    "allow_private_origin": private_origin,
                 }
             )
             return item
@@ -15986,7 +16043,11 @@ class ChatSession:
         # redirect hop before requesting it (the prepare-time check covers
         # only the URL the model named, not where it 302s).
         try:
-            resp = fetch_with_ssrf_guard(url, timeout=self.tool_timeout)
+            resp = fetch_with_ssrf_guard(
+                url,
+                timeout=self.tool_timeout,
+                allow_private_origin=item.get("allow_private_origin", False),
+            )
             resp.raise_for_status()
             ct = resp.headers.get("content-type", "")
             text = resp.text
@@ -16099,7 +16160,11 @@ class ChatSession:
                 # Every redirect hop is SSRF-screened BEFORE its request goes
                 # out — the pre-approval screen covers only the URL the model
                 # named, not where it 302s.
-                resp = fetch_with_ssrf_guard(url, timeout=self.tool_timeout)
+                resp = fetch_with_ssrf_guard(
+                    url,
+                    timeout=self.tool_timeout,
+                    allow_private_origin=item.get("allow_private_origin", False),
+                )
                 resp.raise_for_status()
             except httpx.HTTPStatusError as e:
                 return _fail(f"Error: fetch failed: HTTP {e.response.status_code}")

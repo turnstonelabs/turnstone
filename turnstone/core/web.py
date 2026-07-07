@@ -130,6 +130,7 @@ def fetch_with_ssrf_guard(
     timeout: float,
     user_agent: str = "turnstone/1.0",
     max_redirects: int = 5,
+    allow_private_origin: bool = False,
 ) -> httpx.Response:
     """GET *url* following redirects manually, SSRF-screening EVERY hop.
 
@@ -138,6 +139,14 @@ def fetch_with_ssrf_guard(
     internal admin endpoint) would be fetched before any post-hoc check runs,
     executing the private-network request even if the response is later
     discarded.  Here each hop's URL is screened BEFORE its request is issued.
+
+    ``allow_private_origin`` is the ``[tools] allow_private_network`` lane:
+    the CALLER sets it only when the operator opted in AND the ORIGINAL
+    target itself named a private address — the approval gate then saw and
+    approved that private URL, so its redirect chain is the operator's own
+    network and hop screening is skipped.  A public origin never sets it,
+    so a public site bouncing the fetcher into private space stays blocked
+    regardless of the opt-in: that hop was never shown to the approval gate.
 
     Raises ``ValueError`` for a blocked hop or a redirect chain past
     *max_redirects* (callers already route ``ValueError`` to their
@@ -151,9 +160,10 @@ def fetch_with_ssrf_guard(
         follow_redirects=False,
     ) as client:
         for _hop in range(max_redirects + 1):
-            ssrf_err = check_ssrf(current)
-            if ssrf_err:
-                raise ValueError(ssrf_err)
+            if not allow_private_origin:
+                ssrf_err = check_ssrf(current)
+                if ssrf_err:
+                    raise ValueError(ssrf_err)
             resp = client.get(current)
             if resp.status_code in (301, 302, 303, 307, 308):
                 location = resp.headers.get("location")

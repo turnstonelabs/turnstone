@@ -195,6 +195,19 @@ def _build_registry() -> dict[str, SettingDef]:
             "and take actions without human review.",
         ),
         SettingDef(
+            "tools.allow_private_network",
+            "bool",
+            False,
+            "Allow web_fetch / open_preview to reach private-network addresses",
+            "tools",
+            help="When enabled, a fetch or preview whose URL points at a private or "
+            "internal address (a home-lab service, an internal dashboard, localhost) "
+            "can be approved instead of being refused outright — the approval prompt "
+            "marks it as a private-network request. A public site that redirects into "
+            "your private network is still refused either way: that address never "
+            "appeared in the approval prompt, so it is never fetched.",
+        ),
+        SettingDef(
             "tools.search",
             "str",
             "auto",
