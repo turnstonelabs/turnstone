@@ -1046,7 +1046,7 @@ def _seed_committed(ws_id: str, kind: str, mime: str, body: bytes, filename: str
 
     from turnstone.core.memory import save_attachment, save_message, set_message_attachments
 
-    aid = hashlib.sha256(body).hexdigest()
+    aid = hashlib.sha256(b"preview:" + body).hexdigest()
     save_attachment(aid, filename, mime, len(body), kind, body, "tool")
     row_id = save_message(ws_id, "tool", "Preview shown", "open_preview", tool_call_id="c1")
     assert row_id is not None

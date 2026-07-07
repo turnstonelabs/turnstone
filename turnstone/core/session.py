@@ -16257,7 +16257,12 @@ class ChatSession:
             title = tail or source
         title = title[:200]
 
-        blob_id = hashlib.sha256(body).hexdigest()
+        # Salted out of the upload namespace: model-visible attachments use
+        # bare sha256(body) and save_attachment freezes `kind` at first insert,
+        # so a byte-identical preview and upload would otherwise share a row —
+        # whichever lands second inherits the other's kind (hiding an upload
+        # from model context, or materializing preview bytes into it).
+        blob_id = hashlib.sha256(b"preview:" + body).hexdigest()
         descriptor = build_preview_descriptor(
             kind=kind,
             title=title,

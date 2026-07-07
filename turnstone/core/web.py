@@ -124,6 +124,13 @@ def check_ssrf(url: str) -> str | None:
     return None
 
 
+FETCH_BYTE_CEILING = 32 * 1024 * 1024
+"""Anti-OOM backstop on a guarded fetch's decoded body (see fetch_with_ssrf_guard)."""
+
+_REDIRECT_STATUSES = (301, 302, 303, 307, 308)
+_STALE_FRAMING_HEADERS = frozenset({"content-encoding", "content-length", "transfer-encoding"})
+
+
 def fetch_with_ssrf_guard(
     url: str,
     *,
@@ -131,6 +138,7 @@ def fetch_with_ssrf_guard(
     user_agent: str = "turnstone/1.0",
     max_redirects: int = 5,
     allow_private_origin: bool = False,
+    max_bytes: int = FETCH_BYTE_CEILING,
 ) -> httpx.Response:
     """GET *url* following redirects manually, SSRF-screening EVERY hop.
 
@@ -148,10 +156,21 @@ def fetch_with_ssrf_guard(
     so a public site bouncing the fetcher into private space stays blocked
     regardless of the opt-in: that hop was never shown to the approval gate.
 
-    Raises ``ValueError`` for a blocked hop or a redirect chain past
-    *max_redirects* (callers already route ``ValueError`` to their
-    fetch-failed lane), and lets ``httpx`` transport errors propagate
-    unchanged.  ``resp.raise_for_status()`` stays the caller's call.
+    The body is streamed under a *max_bytes* budget rather than buffered
+    blind — ``client.get()`` would read an unbounded body into memory before
+    any caller-side size cap could run.  The budget counts DECODED bytes
+    (``iter_bytes`` runs after content-decoding), so a small gzip body cannot
+    expand past it, and redirect-hop bodies are never read at all.  Callers
+    keep their own tighter product caps; this ceiling only bounds a hostile
+    or runaway response.  The realized response drops the wire-framing
+    headers (content-encoding / content-length / transfer-encoding) that no
+    longer describe the decoded content it carries.
+
+    Raises ``ValueError`` for a blocked hop, an over-budget body, or a
+    redirect chain past *max_redirects* (callers already route
+    ``ValueError`` to their fetch-failed lane), and lets ``httpx``
+    transport errors propagate unchanged.  ``resp.raise_for_status()``
+    stays the caller's call.
     """
     current = url
     with httpx.Client(
@@ -164,11 +183,30 @@ def fetch_with_ssrf_guard(
                 ssrf_err = check_ssrf(current)
                 if ssrf_err:
                     raise ValueError(ssrf_err)
-            resp = client.get(current)
-            if resp.status_code in (301, 302, 303, 307, 308):
-                location = resp.headers.get("location")
-                if location:
-                    current = str(httpx.URL(current).join(location))
-                    continue
-            return resp
+            with client.stream("GET", current) as resp:
+                if resp.status_code in _REDIRECT_STATUSES:
+                    location = resp.headers.get("location")
+                    if location:
+                        current = str(httpx.URL(current).join(location))
+                        continue  # leaves the with-block: hop body never read
+                chunks: list[bytes] = []
+                total = 0
+                for chunk in resp.iter_bytes():
+                    total += len(chunk)
+                    if total > max_bytes:
+                        raise ValueError(
+                            f"Blocked: response body exceeded the {max_bytes:,}-byte fetch limit"
+                        )
+                    chunks.append(chunk)
+                headers = [
+                    (k, v)
+                    for k, v in resp.headers.items()
+                    if k.lower() not in _STALE_FRAMING_HEADERS
+                ]
+                return httpx.Response(
+                    status_code=resp.status_code,
+                    headers=headers,
+                    content=b"".join(chunks),
+                    request=httpx.Request("GET", current),
+                )
     raise ValueError(f"Blocked: more than {max_redirects} redirects")
