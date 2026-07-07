@@ -2588,55 +2588,62 @@ class ChatSession:
                 prop = self._persona_property(fn.get("parameters", {}).get("properties", {}))
                 persona_base[fn["name"]] = (prop or {}).get("description", "")
 
+        # task_agent's model-alias description is tool-independent — compute
+        # it once.  Always the full text (never appended) so a reload that
+        # drops every alias clears stale names rather than leaving them.
+        if aliases:
+            model_desc = (
+                "Optional model alias to run this task_agent on. "
+                "Omit to use the operator-configured task model. "
+                f"Available aliases: {aliases_str}."
+            )
+        else:
+            model_desc = (
+                "Optional model alias to run this task_agent on. "
+                "Omit to use the current session model. "
+                "(No alternative aliases configured in this session.)"
+            )
+
         new_tools: list[dict[str, Any]] = []
         changed = False
         for tool in self._tools:
             fn = tool.get("function") or {}
             name = fn.get("name", "")
-            rewrite_model = name == "task_agent" and self._registry is not None
-            rewrite_persona = name in self._PERSONA_ARG_TOOLS
-            if not rewrite_model and not rewrite_persona:
+            props = fn.get("parameters", {}).get("properties", {})
+            rewrite_model = name == "task_agent" and self._registry is not None and "model" in props
+            persona_prop = (
+                self._persona_property(props) if name in self._PERSONA_ARG_TOOLS else None
+            )
+            persona_desc = ""
+            if persona_prop is not None:
+                base = persona_base.get(name, "")
+                persona_desc = f"{base} {persona_line}".strip() if persona_line else base
+            # Decide whether anything differs BEFORE copying.  An idempotent
+            # render — nothing to inject, or the same aliases and personas as
+            # last time — must neither fork ``self._tools`` nor deepcopy the
+            # tool, so such sessions keep sharing the pristine module-level
+            # tool list (e.g. ``INTERACTIVE_TOOLS``).  A reload that drops a
+            # prior render's text differs here and takes the rewrite path.
+            model_changed = rewrite_model and props["model"].get("description") != model_desc
+            persona_changed = (
+                persona_prop is not None and persona_prop.get("description") != persona_desc
+            )
+            if not model_changed and not persona_changed:
                 new_tools.append(tool)
                 continue
             new_tool = copy.deepcopy(tool)
-            props = new_tool.get("function", {}).get("parameters", {}).get("properties", {})
-            if rewrite_model and "model" in props:
-                # Always rewrite — a reload that filters down to no
-                # alternatives (only ``default`` remains in the registry)
-                # must clear any stale alias names left over from a prior
-                # render, not return early and leave them in place.
-                if aliases:
-                    props["model"]["description"] = (
-                        "Optional model alias to run this task_agent on. "
-                        "Omit to use the operator-configured task model. "
-                        f"Available aliases: {aliases_str}."
-                    )
-                else:
-                    props["model"]["description"] = (
-                        "Optional model alias to run this task_agent on. "
-                        "Omit to use the current session model. "
-                        "(No alternative aliases configured in this session.)"
-                    )
-            if rewrite_persona:
-                prop = self._persona_property(props)
-                if prop is not None:
-                    base = persona_base.get(name, "")
-                    prop["description"] = f"{base} {persona_line}".strip() if persona_line else base
-            if new_tool == tool:
-                # The rendered description is identical to what this tool
-                # already carries — nothing dynamic to inject (no aliases,
-                # no personas).  Keep the original object so a session with
-                # nothing to render keeps sharing the pristine module-level
-                # tool list instead of allocating a per-session copy.
-                new_tools.append(tool)
-            else:
-                new_tools.append(new_tool)
-                changed = True
-        # Swap in the rebuilt list only when a description actually changed.
-        # This keeps the render idempotent and allocation-free when there is
-        # nothing to inject, so the shared constants (e.g. INTERACTIVE_TOOLS)
-        # stay referenced by such sessions; a reload that clears a prior
-        # render still takes the ``changed`` path and replaces the stale list.
+            new_props = new_tool.get("function", {}).get("parameters", {}).get("properties", {})
+            if model_changed:
+                new_props["model"]["description"] = model_desc
+            if persona_changed:
+                new_prop = self._persona_property(new_props)
+                if new_prop is not None:
+                    new_prop["description"] = persona_desc
+            new_tools.append(new_tool)
+            changed = True
+        # Reassign only when a description changed; a fully idempotent render
+        # leaves ``self._tools`` (and any shared constant it points at)
+        # untouched.
         if changed:
             self._tools = new_tools
 
