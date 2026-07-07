@@ -1595,9 +1595,8 @@ class MCPClientManager:
                 with contextlib.suppress(BaseException):
                     ready.exception()  # mark retrieved: the waiter may be gone
             raise
-        except BaseException as exc:
-            pre_ready = not ready.done()
-            if pre_ready:
+        except (BaseExceptionGroup, Exception) as exc:
+            if not ready.done():
                 # Connect-phase failure: deliver to the waiting caller. Phase
                 # timeouts arrive as TimeoutError (``asyncio.timeout`` converts
                 # its own cancel in THIS task); transport task-group failures
@@ -1606,17 +1605,26 @@ class MCPClientManager:
                 ready.set_exception(exc)
                 with contextlib.suppress(BaseException):
                     ready.exception()  # mark retrieved: the waiter may be gone
-            if not isinstance(exc, (Exception, BaseExceptionGroup)):
-                # An interpreter-level exit (KeyboardInterrupt, SystemExit)
-                # must keep unwinding the task — delivery to the waiter was
-                # this arm's only job for it.
-                raise
-            if pre_ready:
                 return
             # Post-ready death: the server dropped the transport under a live
             # session. The done-callback evicts; the health loop owns the
             # reconnect story. Quiet — a flapping server would otherwise spam.
             log.debug("MCP transport owner for '%s' terminated: %r", name, exc)
+        finally:
+            # BaseExceptions outside the arms above (interpreter exits, or a
+            # library's BaseException-derived control-flow escape) keep
+            # unwinding this task — but must still resolve the waiter, or the
+            # connecting caller blocks until its outer bound (and
+            # _connect_all's initial connect has none). For SystemExit /
+            # KeyboardInterrupt asyncio additionally stops the loop right
+            # after, making the delivery moot there — it is load-bearing for
+            # every other BaseException shape, and free for the exits.
+            if not ready.done():
+                ready.set_exception(
+                    ConnectionError(f"MCP transport owner for '{name}' exited during connect")
+                )
+                with contextlib.suppress(BaseException):
+                    ready.exception()  # mark retrieved: the waiter may be gone
 
     def _on_static_owner_death(self, name: str, task: asyncio.Task[None]) -> None:
         """Done-callback for a transport owner: observe UNREQUESTED death.

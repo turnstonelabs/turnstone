@@ -187,6 +187,48 @@ class TestTransportOwnerLifecycle:
         # The cms were still unwound in-task despite the stray cancel.
         assert fake["events"][-2:] == ["session_exit", "transport_exit"]
 
+    def test_base_exception_escape_resolves_waiter_and_propagates(self, running_loop_mgr) -> None:
+        """A BaseException-derived escape that is neither CancelledError nor
+        Exception/group (a library control-flow escape; SystemExit and
+        KeyboardInterrupt take the same path but additionally stop the loop —
+        asyncio semantics, unobservable in-process) is NOT swallowed — it
+        propagates from the owner task — but the waiter must still be resolved
+        with a transport-failure error, or the connecting caller would block
+        until its outer bound (and ``_connect_all``'s initial connect has
+        none)."""
+        mgr, loop, _ = running_loop_mgr
+
+        class _TransportLibraryEscape(BaseException):
+            pass
+
+        @asynccontextmanager
+        async def escaping_stdio_client(_params: Any):
+            raise _TransportLibraryEscape("control-flow escape")
+            yield  # pragma: no cover
+
+        async def _drive() -> tuple[BaseException | None, BaseException | None]:
+            ready: asyncio.Future[Any] = asyncio.get_running_loop().create_future()
+            close_requested = asyncio.Event()
+            owner = asyncio.create_task(
+                mgr._static_transport_owner(
+                    "srv", mgr._server_configs["srv"], ready, close_requested
+                )
+            )
+            waiter_exc: BaseException | None = None
+            try:
+                await ready
+            except BaseException as e:  # noqa: BLE001 - asserting the exact type below
+                waiter_exc = e
+            await asyncio.wait({owner}, timeout=5)
+            owner_exc = owner.exception() if owner.done() and not owner.cancelled() else None
+            return waiter_exc, owner_exc
+
+        with patch("turnstone.core.mcp_client.stdio_client", escaping_stdio_client):
+            waiter_exc, owner_exc = _run(loop, _drive(), timeout=10)
+
+        assert isinstance(waiter_exc, ConnectionError)  # waiter resolved, never hung
+        assert isinstance(owner_exc, _TransportLibraryEscape)  # propagated, unswallowed
+
     def test_connect_failure_unwinds_owner_and_raises(self, running_loop_mgr) -> None:
         mgr, loop, _ = running_loop_mgr
 
