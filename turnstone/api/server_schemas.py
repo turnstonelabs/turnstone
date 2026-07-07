@@ -224,6 +224,17 @@ class CreateWorkstreamResponse(BaseModel):
             "/v1/api/workstreams/{ws_id}/send."
         ),
     )
+    initial_message_status: str | None = Field(
+        default=None,
+        description=(
+            "Present ONLY when the workstream was created but its "
+            "initial_message could not be delivered: 'queue_full' (a raced "
+            "live worker's interjection queue was at capacity — resend via "
+            "/send; any uploads stay staged) or 'refused_closed' (the "
+            "workstream was closed mid-create). Absent whenever the message "
+            "was dispatched."
+        ),
+    )
 
 
 class CloseWorkstreamRequest(BaseModel):

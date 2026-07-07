@@ -459,6 +459,11 @@ class TestSendMessageAttachments:
         session = MagicMock()
         session._cancel_event = threading.Event()
         session.queue_message = MagicMock()
+        # A bare Mock's auto-created ``_nudge_queue`` (truthy, has_pending
+        # truthy, no-op deliver) turns the worker-exit wake backstop into an
+        # endless respawn loop; declare this a stub session WITHOUT a queue
+        # so the wake gate's stub-guard bails.
+        session._nudge_queue = None
         captured: dict = {}
 
         def fake_send(message, attachments=None, send_id=None):
@@ -480,6 +485,7 @@ class TestSendMessageAttachments:
         ws.session = session
         ws.worker_thread = None
         ws._worker_running = False
+        ws._closed = False  # a bare Mock attr is truthy → send() would refuse
         ws._lock = threading.RLock()
         mgr.get.return_value = ws
         return captured, session
@@ -658,6 +664,9 @@ class TestQueuedSendWithAttachments:
         session = MagicMock()
         session._cancel_event = threading.Event()
         session.queue_message = fake_queue_message
+        # Stub session without a NudgeQueue — see _wire_ws for why a bare
+        # Mock queue would feed the exit backstop an endless wake loop.
+        session._nudge_queue = None
 
         ui = MagicMock()
         ui._ws_lock = threading.Lock()
@@ -675,6 +684,7 @@ class TestQueuedSendWithAttachments:
         ws.session = session
         ws.worker_thread = worker
         ws._worker_running = True
+        ws._closed = False  # a bare Mock attr is truthy → send() would refuse
         ws._lock = threading.RLock()
         mgr.get.return_value = ws
         return captured
@@ -738,6 +748,7 @@ class TestBusyWorkerAttachments:
         ws.ui = ui
         ws.session = session
         ws.worker_thread = worker
+        ws._closed = False  # a bare Mock attr is truthy → send() would refuse
         ws._lock = threading.RLock()
         mgr.get.return_value = ws
         return ws, session

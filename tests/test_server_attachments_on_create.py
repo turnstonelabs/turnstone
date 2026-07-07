@@ -434,6 +434,91 @@ class TestCreateMultipart:
         # pane's rehydrate can't observe it as still-staged.
         assert get_attachment_buffer().get(aid, ws_id=ws_id, user_id="userA") is None
 
+    def test_create_raced_by_live_worker_keeps_attachments_staged(self, app_client, monkeypatch):
+        """The enqueue branch (caller-supplied ws_id raced by a concurrent
+        /send claiming the worker first) can't deliver attachments through
+        the interjection seam — they must REMAIN STAGED so the composer
+        still shows them and the user's next send delivers them, while the
+        message text itself rides the queue."""
+        from turnstone.core import session_worker
+        from turnstone.core.attachment_buffer import get_attachment_buffer
+
+        client, _sessions, _gq = app_client
+        queued: list[str] = []
+
+        def _record_queue(self, text, *a, **k):
+            queued.append(text)
+            return ("", "normal", "msg-x")
+
+        monkeypatch.setattr(_FakeSession, "queue_message", _record_queue)
+
+        def _live_worker_send(ws, *, enqueue, run, thread_name=None):
+            enqueue()  # a worker already owns the ws — reuse path
+            return True
+
+        monkeypatch.setattr(session_worker, "send", _live_worker_send)
+
+        meta = {"name": "raced", "initial_message": "look at this file"}
+        resp = client.post(
+            "/v1/api/workstreams/new",
+            data={"meta": json.dumps(meta)},
+            files=[("file", ("notes.md", b"# hello\n", "text/markdown"))],
+            headers=_auth("userA"),
+        )
+        assert resp.status_code == 200, resp.text
+        ws_id = resp.json()["ws_id"]
+        aid = resp.json()["attachment_ids"][0]
+
+        assert queued == ["look at this file"]  # text preserved via the queue
+        # NOT drained: the upload stays staged, recoverable on the next send.
+        assert get_attachment_buffer().get(aid, ws_id=ws_id, user_id="userA") is not None
+        # Delivered path → no dropped-message marker on the response.
+        assert "initial_message_status" not in resp.json()
+
+    def test_create_raced_queue_full_reports_dropped_message(self, app_client, monkeypatch):
+        """``queue.Full`` on the raced enqueue path must not read as
+        success: it propagates out of ``_enqueue_init`` into
+        ``session_worker.send``'s backpressure branch (→ ``False``), and
+        the create response carries ``initial_message_status:
+        "queue_full"`` instead of a bare 200 implying the first message
+        was delivered.  Attachments stay staged for the retry."""
+        import queue as _queue
+
+        from turnstone.core import session_worker
+        from turnstone.core.attachment_buffer import get_attachment_buffer
+
+        client, _sessions, _gq = app_client
+
+        def _full_queue(self, *a, **k):
+            raise _queue.Full
+
+        monkeypatch.setattr(_FakeSession, "queue_message", _full_queue)
+
+        def _live_worker_send(ws, *, enqueue, run, thread_name=None):
+            # Mirror the real send()'s reuse-path backpressure contract:
+            # queue.Full → False, never a raise to the caller.
+            try:
+                enqueue()
+            except _queue.Full:
+                return False
+            return True
+
+        monkeypatch.setattr(session_worker, "send", _live_worker_send)
+
+        meta = {"name": "raced-full", "initial_message": "look at this file"}
+        resp = client.post(
+            "/v1/api/workstreams/new",
+            data={"meta": json.dumps(meta)},
+            files=[("file", ("notes.md", b"# hello\n", "text/markdown"))],
+            headers=_auth("userA"),
+        )
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        assert body["initial_message_status"] == "queue_full"
+        # Attachments untouched — the composer chips survive for the retry.
+        aid = body["attachment_ids"][0]
+        assert get_attachment_buffer().get(aid, ws_id=body["ws_id"], user_id="userA") is not None
+
     def test_create_with_attachments_no_initial_message_keeps_staged(self, app_client):
         import hashlib
 
@@ -527,3 +612,28 @@ class TestCreateJsonStillWorks:
         assert data["ws_id"]
         # New optional field, but always emitted (empty list when absent)
         assert data["attachment_ids"] == []
+
+    def test_initial_message_routes_through_session_worker_send(self, app_client):
+        """The initial-message worker is dispatched via
+        ``session_worker.send`` (not an inlined ``threading.Thread``) so it
+        inherits the ownership-clear wake backstop.  Patching the module
+        attribute captures the wiring without spawning a thread — server.py
+        calls ``session_worker.send`` as a module attribute even from its
+        local import."""
+        from unittest.mock import patch
+
+        client, _sessions, _gq = app_client
+        with patch("turnstone.core.session_worker.send", return_value=True) as mock_send:
+            resp = client.post(
+                "/v1/api/workstreams/new",
+                json={"name": "init-dispatch", "initial_message": "go"},
+                headers=_auth("userA"),
+            )
+            assert resp.status_code == 200, resp.text
+            assert mock_send.call_count == 1
+            kwargs = mock_send.call_args.kwargs
+            assert kwargs["thread_name"].startswith("ws-init-")
+            # ``run`` is the init closure the shared dispatcher spawns; the
+            # dead-by-construction ``enqueue`` branch is still wired (loudly).
+            assert callable(kwargs["run"])
+            assert callable(kwargs["enqueue"])

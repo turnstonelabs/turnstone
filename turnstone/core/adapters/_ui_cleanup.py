@@ -23,12 +23,28 @@ if TYPE_CHECKING:
 def cleanup_session_ui(ws: Workstream) -> None:
     """Shared SessionKindAdapter cleanup_ui implementation.
 
-    Unblocks pending approval / plan / foreground events on the
-    workstream's UI, broadcasts ``ws_closed`` to per-UI listener
-    queues, then cancels + closes the session. The ``hasattr`` checks
-    guard stub UIs used in tests — the real ``WebUI`` /
+    Marks the workstream object dead (``ws._closed``) FIRST, under
+    ``ws._lock``, then unblocks pending approval / plan / foreground
+    events on the workstream's UI, broadcasts ``ws_closed`` to per-UI
+    listener queues, and cancels + closes the session. The ``hasattr``
+    checks guard stub UIs used in tests — the real ``WebUI`` /
     ``ConsoleCoordinatorUI`` always have these attributes.
+
+    The flag write lives HERE because every teardown path funnels
+    through this function — ``close``, ``close_idle``, EVICTION,
+    ``delete``, ``discard`` — and per-path writes are not enough: a
+    flag set by only some paths, or set after this teardown body,
+    leaves windows where the workstream is being torn down while
+    still reading as live.  The wake paths that hold OBJECT
+    references (the watch ``wake_fn``, ``session_worker``'s exit
+    backstop) gate on this flag, and ``session_worker.send``
+    re-checks it under the same lock: once this write lands, no wake
+    can spawn a worker on the torn-down session — including on
+    evicted or deleted workstreams, and including during the
+    remainder of this teardown.
     """
+    with ws._lock:
+        ws._closed = True
     if ws.session is not None and hasattr(ws.session, "cancel"):
         ws.session.cancel()
     ui = ws.ui

@@ -191,7 +191,7 @@ from turnstone.ui.colors import DIM, GRAY, GREEN, RED, RESET, YELLOW, bold, cyan
 log = get_logger(__name__)
 
 if TYPE_CHECKING:
-    from collections.abc import Iterable, Iterator
+    from collections.abc import Callable, Iterable, Iterator
 
     from turnstone.core.config_store import ConfigStore
     from turnstone.core.healthcheck import BackendHealthTracker, HealthTrackerRegistry
@@ -1485,6 +1485,16 @@ class ChatSession:
         self._notify_count = 0
         # Watch support: server-level runner injected via set_watch_runner()
         self._watch_runner: Any = None  # WatchRunner | None
+        # The wake_fn last passed to set_watch_runner, kept so a non-fork
+        # resume() can re-register the dispatch closure under the adopted
+        # ws_id with the same wake wiring (registration follows identity).
+        self._watch_wake_fn: Callable[[], object] | None = None
+        # The dispatch closure this session last registered — the OWNER
+        # token for registry removals: multiple live sessions can
+        # transiently serve one ws_id (watch-restore shell vs a reopened
+        # pane; in-session /resume of an id open in another pane), and a
+        # blind removal on teardown would unregister the OTHER session.
+        self._watch_dispatch_fn: Callable[[dict[str, Any], str], None] | None = None
         # Metacognitive nudges: ephemeral prompts for proactive memory use.
         # One ``NudgeQueue`` per session; producers tag each entry with a
         # channel and consumers drain by filter, emitting each drained nudge
@@ -2823,7 +2833,7 @@ class ChatSession:
         else:
             self._tool_search = None
 
-    def set_watch_runner(self, runner: Any) -> None:
+    def set_watch_runner(self, runner: Any, wake_fn: Callable[[], object] | None = None) -> None:
         """Inject the server-level WatchRunner and register a dispatch fn
         that routes watch results onto this session's NudgeQueue.
 
@@ -2842,14 +2852,37 @@ class ChatSession:
             sourced from arbitrary shell output can't tamper with the
             envelope at interpolation time.
 
+        ``wake_fn`` runs once per enqueued fire, AFTER the entry lands
+        on the queue.  The server wires it to
+        :func:`turnstone.core.idle_nudge_watcher.wake_workstream_if_pending`
+        closed over this session's Workstream: a watch firing on an
+        ALREADY-idle workstream sees no IDLE transition, so without an
+        explicit wake the entry would sit queued until the next user
+        message.  Busy workstreams stay safe — the wake gate defers to
+        ``session_worker.send``'s atomic ownership check, which
+        downgrades the wake to a no-op while a worker owns the session
+        (the in-flight worker drains the ``"any"``-channel entry at its
+        next seam).  Exceptions from ``wake_fn`` are logged and
+        swallowed: the enqueue already happened, and a raise here would
+        abort ``WatchRunner._poll_watch`` before the watch-row update
+        commits — re-firing the same reminder every subsequent tick.
+
         No ``valid_until`` predicate is wired: ``WatchRunner._poll_watch``
         commits ``active=False`` for terminal fires right after dispatch
         returns, and an ``is_watch_active`` predicate would race that
         write at drain time and drop the fire the model was meant to see.
         A user-cancelled watch's last splat is informative (the reminder
         carries ``is_final=True``), not stale-noise to suppress.
+
+        The registration is keyed on ``self._ws_id`` AT CALL TIME.  The
+        identity-rebind sites (non-fork :meth:`resume`, ``/new``) call
+        :meth:`_follow_watch_registration` to move it onto the new id
+        (re-invoking this method with the ``wake_fn`` stored below) —
+        callers therefore don't need to order their own
+        ``set_watch_runner``/``resume`` calls.
         """
         self._watch_runner = runner
+        self._watch_wake_fn = wake_fn
         nudge_queue = self._nudge_queue
         ws_id = self._ws_id
 
@@ -2892,7 +2925,13 @@ class ChatSession:
                 "any",
                 metadata=metadata or None,
             )
+            if wake_fn is not None:
+                try:
+                    wake_fn()
+                except Exception:
+                    log.warning("watch_dispatch.wake_failed ws=%s", ws_id, exc_info=True)
 
+        self._watch_dispatch_fn = _dispatch
         runner.set_dispatch_fn(self._ws_id, _dispatch)
 
     def close(self) -> None:
@@ -2929,8 +2968,12 @@ class ChatSession:
                 self._mcp_prompt_cb, user_id=self._mcp_listener_user_id
             )
             self._mcp_prompt_cb = None
-        if self._watch_runner:
-            self._watch_runner.remove_dispatch_fn(self._ws_id)
+        if self._watch_runner and self._watch_dispatch_fn is not None:
+            # Owner-checked: a watch-restore shell and a reopened pane can
+            # both have served this ws_id — tearing down one must not
+            # unregister the other (whose next fire would then restore a
+            # DUPLICATE auto-approved session onto the live conversation).
+            self._watch_runner.remove_dispatch_fn(self._ws_id, owner=self._watch_dispatch_fn)
         if self._coord_client is not None and hasattr(self._coord_client, "close"):
             try:
                 self._coord_client.close()
@@ -3369,6 +3412,9 @@ class ChatSession:
         turns = load_message_turns(ws_id)
         if not turns:
             return False
+        # Pre-rebind identity, for moving the watch dispatch registration
+        # onto the adopted id at the end of a successful non-fork resume.
+        old_ws_id = self._ws_id
         # Load persisted config and parse the persona stamp BEFORE touching
         # session identity/history: a corrupt stamp must raise while this
         # session is still intact — the web /command surface reports the
@@ -3585,8 +3631,41 @@ class ChatSession:
             cooldown_secs=self._mem_cfg.nudge_cooldown,
         ):
             self._queue_user_advisory("resume", format_nudge("resume"))
+        if not fork:
+            self._follow_watch_registration(old_ws_id)
         self._init_system_messages()
         return True
+
+    def _follow_watch_registration(self, old_ws_id: str) -> None:
+        """Move the watch dispatch registration onto the current
+        ``_ws_id`` after an identity rebind (non-fork :meth:`resume`,
+        ``/new``).
+
+        The registry is keyed by ``_ws_id`` at registration time.
+        Without the move, watches stamped with the NEW id never find
+        this live session — every fire takes the restore path and
+        spawns a DUPLICATE auto-approved session racing writes into the
+        same conversation — while fires for the OLD id keep delivering
+        into a session that no longer displays that conversation.  The
+        new key goes live BEFORE the old one is removed so no fire can
+        observe a window with no registration at all (which would
+        likewise divert to the restore path).  If ANOTHER live session
+        already serves the new id (in-session /resume of a workstream
+        open in a second pane — an inherently degenerate two-writers
+        state), its registration is NOT stolen: the original owner
+        keeps its watch fires.  Removal of the old key is owner-checked
+        for the same reason.
+        """
+        if self._watch_runner is None:
+            return
+        old_fn = self._watch_dispatch_fn
+        existing = self._watch_runner.get_dispatch_fn(self._ws_id)
+        if existing is None or existing is old_fn:
+            self.set_watch_runner(self._watch_runner, wake_fn=self._watch_wake_fn)
+        else:
+            log.warning("watch_registry.adopted_id_owned_elsewhere ws=%s", self._ws_id[:8])
+        if old_ws_id != self._ws_id:
+            self._watch_runner.remove_dispatch_fn(old_ws_id, owner=old_fn)
 
     def _nudges_enabled(self, nudge_type: str) -> bool:
         """Config gate + persona lever 4 for metacognitive nudges.
@@ -6023,8 +6102,9 @@ class ChatSession:
 
                     # Operator context for this result: output-guard
                     # findings + queued user messages (Seam 1), plus
-                    # tool-channel metacog nudges (tool_error / repeat) and
-                    # any-channel nudges (watch_triggered / idle_children).
+                    # tool-channel metacog nudges (tool_error / repeat /
+                    # denial) and any-channel nudges (watch_triggered /
+                    # idle_children).
                     # All of them are now emitted as first-class
                     # ``{"role": "system"}`` turns AFTER this clean tool
                     # message (uniform attach rule) — the tool message content
@@ -6239,10 +6319,11 @@ class ChatSession:
     def _drain_pending_advisories(self) -> None:
         """Drop every pending nudge regardless of channel.
 
-        Tool-channel nudges (``tool_error``, ``repeat``) queued earlier
-        in this batch and user-channel nudges (``correction``,
-        ``denial``, …) queued during ``_check_metacognitive_nudge`` but
-        not yet drained share the same per-session :class:`NudgeQueue`.
+        Tool-channel nudges (``tool_error``, ``repeat``, ``denial``)
+        queued earlier in this batch and user-channel nudges
+        (``correction``, …) queued during ``_check_metacognitive_nudge``
+        but not yet drained share the same per-session
+        :class:`NudgeQueue`.
         When a generation is abandoned (cancel, KeyboardInterrupt,
         unexpected exception) the entire queue drops so nothing bleeds
         into the next send's tool loop or next user turn.
@@ -8653,10 +8734,11 @@ class ChatSession:
           ``priority`` so the UI can frame important interjections
           distinctly.  Cancel / exception / no-tool-call paths drain the
           queue as a real user row instead (Seams 2 and 3).
-        - **Metacognitive tool-channel nudges** (``tool_error`` / ``repeat``)
-          and any-channel nudges (``watch_triggered`` / ``idle_children``)
-          — drained on the last result.  ``meta`` carries the producer's
-          optional fields (e.g. ``watch_triggered``'s ``watch_name``).
+        - **Metacognitive tool-channel nudges** (``tool_error`` /
+          ``repeat`` / ``denial``) and any-channel nudges
+          (``watch_triggered`` / ``idle_children``) — drained on the last
+          result.  ``meta`` carries the producer's optional fields
+          (e.g. ``watch_triggered``'s ``watch_name``).
 
         Empty when no advisories apply (common case).  Guard findings
         attach per-result; queued messages and metacognitive nudges drain
@@ -8867,7 +8949,13 @@ class ChatSession:
                 memory_count=self._visible_memory_count(),
                 cooldown_secs=self._mem_cfg.nudge_cooldown,
             ):
-                self._queue_user_advisory("denial", format_nudge("denial"))
+                # Tool channel, not user: the denial is a response to THIS
+                # batch, so the nudge rides ``_collect_advisories`` alongside
+                # the denied tool results (same seam as tool_error / repeat)
+                # instead of deferring to the next user-message seam — by
+                # which point the model has already reacted to the denial
+                # without it.
+                self._queue_tool_advisory("denial", format_nudge("denial"))
 
         # Phase 3: execute (check cancellation before starting)
         self._check_cancelled()
@@ -10599,8 +10687,10 @@ class ChatSession:
 
         Drains in ``_emit_pending_user_nudges`` and is appended as a
         first-class ``{"role": "system"}`` turn AFTER the user turn.  Used
-        for nudges that respond to user behaviour: ``correction``,
-        ``denial``, ``resume``, ``start``, ``completion``.
+        for nudges that respond to the user's message: ``correction``,
+        ``resume``, ``start``, ``completion``.  (``denial`` is user
+        behaviour too, but it responds to a specific TOOL BATCH — it
+        rides the tool channel so it lands with the denied results.)
 
         No-ops while the session is inside a wake-driven turn
         (``_wake_source_tag`` set) so model behaviour during the wake
@@ -10624,8 +10714,8 @@ class ChatSession:
         the system turns sit after the user turn they advise (uniform attach
         rule).  Each drained nudge becomes one ``{"role": "system",
         "_source": <nudge_type>, ...}`` turn via :meth:`_append_system_turn`
-        — the source is the nudge type (``correction`` / ``denial`` /
-        ``resume`` / ``start`` / ``completion`` / ``idle_children`` /
+        — the source is the nudge type (``correction`` / ``resume`` /
+        ``start`` / ``completion`` / ``idle_children`` /
         ``watch_triggered``) and any optional metadata (e.g.
         ``watch_triggered``'s ``watch_name``) rides as sibling keys.
         ``_append_system_turn`` persists each row and fires the live
@@ -10662,8 +10752,9 @@ class ChatSession:
         Drains in ``_collect_advisories`` alongside guard findings, then is
         emitted as a first-class ``{"role": "system"}`` turn AFTER the tool
         batch (see the per-result loop in ``_run_loop``).  Used for nudges
-        that respond to model behaviour at a tool boundary: ``tool_error``,
-        ``repeat``.
+        that respond to a tool batch: ``tool_error``, ``repeat`` (model
+        behaviour), and ``denial`` (the operator rejected the batch — the
+        nudge belongs next to the denied results it explains).
 
         No-ops while the session is inside a wake-driven turn (see
         ``_queue_user_advisory`` for the rationale).
@@ -10723,6 +10814,14 @@ class ChatSession:
         self._wake_drained_reminders = wake_reminders
         try:
             self.send("", from_wake=True)
+        except GenerationCancelled:
+            # A close/force-cancel raced this unattended wake turn.  This
+            # method IS the wake worker's run() closure, and
+            # ``session_worker._runner`` catches only ``Exception`` — a
+            # BaseException here would escape to ``threading.excepthook``
+            # as stderr noise.  The teardown gates stop any respawn; the
+            # cancellation itself is the intended outcome.
+            log.info("wake_nudge.cancelled ws=%s", self._ws_id[:8])
         finally:
             self._wake_source_tag = ""
             self._wake_drained_reminders = None
@@ -15882,15 +15981,22 @@ class ChatSession:
             # view (already-inactive or just-cancelled with empty
             # next_poll), so the runner's retry-deactivate branch will
             # never reclaim a pending ``_terminal_dispatched`` entry.
-            # Clear it here to bound the lifetime of any leftover from
-            # a previous dispatch-then-failed-row-write.
-            if self._watch_runner is not None:
-                self._watch_runner.forget_terminal_dispatched(target["watch_id"])
+            # Clear it via ``forget_terminal_dispatched`` to bound the
+            # lifetime of any leftover from a previous
+            # dispatch-then-failed-row-write — AFTER the row write, per
+            # that method's ordering contract: the runner's delivery
+            # paths re-check the row before stashing, so clearing first
+            # would let a racing poll thread re-stash a held reminder
+            # behind the clear.
             if not target["active"]:
+                if self._watch_runner is not None:
+                    self._watch_runner.forget_terminal_dispatched(target["watch_id"])
                 msg = f'Watch "{target["name"]}" already completed (auto-cancelled).'
                 self._report_tool_result(call_id, "watch", msg)
                 return call_id, msg
             storage.update_watch(target["watch_id"], active=False, next_poll="")
+            if self._watch_runner is not None:
+                self._watch_runner.forget_terminal_dispatched(target["watch_id"])
             msg = f'Watch "{target["name"]}" cancelled.'
             self._report_tool_result(call_id, "watch", msg)
             return call_id, msg
@@ -16371,14 +16477,20 @@ class ChatSession:
             self._last_usage = None
             self._calibrated_msg_count = 0
             self._msg_tokens = []
+            old_ws_id = self._ws_id
             self._ws_id = uuid.uuid4().hex
             # A brand-new ws_id is the same class of identity change as a
             # non-fork resume(): the old workstream's participant state must
-            # not leak into this empty one, and its trust nonces must not
-            # carry over (see resume()'s matching reset + remint).
+            # not leak into this empty one, its trust nonces must not carry
+            # over (see resume()'s matching reset + remint), and the watch
+            # dispatch registration must follow the identity — otherwise
+            # watches created here (stamped with the new id) never reach
+            # this session, and the old workstream's fires land in a
+            # conversation that no longer shows them.
             self._reset_shared_state()
             self._envelope_nonce = fence.mint_nonce()
             self._sender_label_nonce = fence.mint_nonce()
+            self._follow_watch_registration(old_ws_id)
             self._title_generated = False
             # The session keeps its persona across /new (the stamp is
             # re-written by _save_config below) — carry the display slug

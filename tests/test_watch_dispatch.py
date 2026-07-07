@@ -54,9 +54,11 @@ def _make_session_for_dispatch(**kwargs: Any) -> ChatSession:
     return ChatSession(**defaults)
 
 
-def _register_runner(session: ChatSession) -> tuple[Any, Any]:
+def _register_runner(session: ChatSession, wake_fn: Any = None) -> tuple[Any, Any]:
     """Attach a minimal stub ``WatchRunner`` to *session* and return the
     ``(runner, dispatch_fn)`` pair captured by ``set_dispatch_fn``.
+    ``wake_fn`` rides through to ``set_watch_runner`` (default ``None``
+    matches the pre-wake wiring most tests here exercise).
     """
     captured: dict[str, Any] = {}
 
@@ -65,7 +67,7 @@ def _register_runner(session: ChatSession) -> tuple[Any, Any]:
             captured["fn"] = fn
 
     runner = _StubRunner()
-    session.set_watch_runner(runner)
+    session.set_watch_runner(runner, wake_fn=wake_fn)
     return runner, captured["fn"]
 
 
@@ -400,3 +402,216 @@ class TestMetadataPropagation:
         assert len(snapshot) == 1
         _nt, _text, meta = snapshot[0]
         assert meta is None
+
+
+# ---------------------------------------------------------------------------
+# Wake trigger
+# ---------------------------------------------------------------------------
+
+
+class TestWakeFn:
+    """``set_watch_runner``'s optional ``wake_fn`` fires once per enqueued
+    dispatch — AFTER the entry lands — so a watch firing on an
+    already-idle workstream (no IDLE transition for the
+    ``IdleNudgeWatcher`` to observe) can spawn the wake worker that
+    drains it.  Failures are contained: the enqueue must survive a
+    raising ``wake_fn``, because a propagated raise would abort
+    ``WatchRunner._poll_watch`` before the watch-row update commits and
+    re-fire the same reminder every subsequent tick.
+    """
+
+    def test_wake_fn_called_after_enqueue(self, tmp_db):
+        session = _make_session_for_dispatch()
+        depth_at_wake: list[int] = []
+        _runner, dispatch = _register_runner(
+            session, wake_fn=lambda: depth_at_wake.append(len(session._nudge_queue))
+        )
+
+        dispatch(_reminder("watch fired body"), "watch-1")
+
+        # Fired exactly once, and the entry was already queued when it ran
+        # — the wake worker's drain must be able to see the fresh entry.
+        assert depth_at_wake == [1]
+
+    def test_wake_fn_not_called_when_payload_sanitizes_empty(self, tmp_db):
+        """A fire whose payload strips to nothing enqueues nothing — and
+        must not wake anything either (a wake with an empty queue would
+        just spawn a worker that no-ops at the drain guard)."""
+        session = _make_session_for_dispatch()
+        wake = MagicMock()
+        _runner, dispatch = _register_runner(session, wake_fn=wake)
+
+        dispatch(_reminder("\x07\x0b\x7f"), "watch-1")
+
+        assert len(session._nudge_queue) == 0
+        wake.assert_not_called()
+
+    def test_wake_fn_exception_is_contained(self, tmp_db, caplog):
+        session = _make_session_for_dispatch()
+        wake = MagicMock(side_effect=RuntimeError("boom"))
+        _runner, dispatch = _register_runner(session, wake_fn=wake)
+
+        with caplog.at_level("WARNING"):
+            dispatch(_reminder("body"), "watch-1")  # must not raise
+
+        # Entry survived; the failure surfaced as a warning, not a raise
+        # up into the poll loop.
+        assert len(session._nudge_queue) == 1
+        assert any("watch_dispatch.wake_failed" in r.message for r in caplog.records), (
+            "expected a watch_dispatch.wake_failed warning record"
+        )
+
+
+class _RecordingRunner:
+    """Stub WatchRunner recording registration/removal order.  Mirrors the
+    production owner-checked removal semantics — the resume tail passes
+    ``owner`` and peeks ``get_dispatch_fn`` before re-registering."""
+
+    def __init__(self) -> None:
+        self.events: list[tuple[str, str]] = []
+        self.fns: dict[str, Any] = {}
+
+    def set_dispatch_fn(self, ws_id: str, fn: Any) -> None:
+        self.events.append(("set", ws_id))
+        self.fns[ws_id] = fn
+
+    def get_dispatch_fn(self, ws_id: str) -> Any:
+        return self.fns.get(ws_id)
+
+    def remove_dispatch_fn(self, ws_id: str, owner: Any = None) -> None:
+        if owner is not None and self.fns.get(ws_id) is not owner:
+            return
+        self.events.append(("remove", ws_id))
+        self.fns.pop(ws_id, None)
+
+
+class TestResumeReRegistration:
+    """A non-fork ``resume()`` rebinds ``_ws_id``; the dispatch
+    registration must FOLLOW that identity — otherwise watches stamped
+    with the adopted id never find the live session, and every fire
+    takes the restore path, spawning a duplicate auto-approved session
+    racing writes into the same conversation (CLI ``--resume`` and the
+    ``/resume`` command both hit this)."""
+
+    def _saved_ws(self, ws_id: str) -> None:
+        from turnstone.core.memory import register_workstream, save_message
+
+        register_workstream(ws_id)
+        save_message(ws_id, "user", "hi")
+
+    def test_nonfork_resume_moves_registration_to_adopted_id(self, tmp_db):
+        self._saved_ws("resume-target")
+        session = _make_session_for_dispatch()
+        old_id = session._ws_id
+        runner = _RecordingRunner()
+        session.set_watch_runner(runner, wake_fn=None)
+
+        assert session.resume("resume-target") is True
+
+        # New key live BEFORE the old key is removed — a fire during the
+        # transition can never observe an empty registry (which would
+        # divert it to the restore path).
+        assert runner.events == [
+            ("set", old_id),
+            ("set", "resume-target"),
+            ("remove", old_id),
+        ]
+        assert set(runner.fns) == {"resume-target"}
+
+    def test_fork_resume_keeps_registration(self, tmp_db):
+        self._saved_ws("fork-src")
+        session = _make_session_for_dispatch()
+        old_id = session._ws_id
+        runner = _RecordingRunner()
+        session.set_watch_runner(runner, wake_fn=None)
+
+        assert session.resume("fork-src", fork=True) is True
+
+        # Fork keeps its own identity — registration untouched.
+        assert runner.events == [("set", old_id)]
+
+    def test_resume_without_runner_is_noop(self, tmp_db):
+        # CLI --resume / restore-fn shape: resume() runs BEFORE any
+        # set_watch_runner call — nothing to re-register, nothing raises.
+        self._saved_ws("resume-bare")
+        session = _make_session_for_dispatch()
+
+        assert session.resume("resume-bare") is True
+        assert session._watch_runner is None
+
+    def test_reregistered_closure_keeps_wake_fn(self, tmp_db):
+        # The stored wake_fn rides the re-registration: a watch firing on
+        # the ADOPTED id must still wake the workstream.
+        self._saved_ws("resume-wake")
+        session = _make_session_for_dispatch()
+        runner = _RecordingRunner()
+        wake = MagicMock()
+        session.set_watch_runner(runner, wake_fn=wake)
+
+        assert session.resume("resume-wake") is True
+
+        runner.fns["resume-wake"](_reminder("watch output"), "w1")
+        assert len(session._nudge_queue) == 1
+        wake.assert_called_once()
+
+    def test_resume_does_not_steal_another_live_registration(self, tmp_db):
+        # In-session /resume of a workstream that is OPEN IN ANOTHER PANE
+        # (a degenerate two-live-sessions state): the original owner keeps
+        # its watch fires — the adopter neither clobbers the target's
+        # registration nor (on a later resume-away or close) deletes it.
+        self._saved_ws("shared-A")
+        self._saved_ws("other-C")
+        runner = _RecordingRunner()
+
+        pane_a = _make_session_for_dispatch()
+        pane_a._ws_id = "shared-A"  # pane A opened A and registered
+        pane_a.set_watch_runner(runner, wake_fn=None)
+        fn_a = runner.fns["shared-A"]
+
+        pane_b = _make_session_for_dispatch()
+        pane_b.set_watch_runner(runner, wake_fn=None)
+
+        assert pane_b.resume("shared-A") is True
+        # Pane A's registration survived the adoption…
+        assert runner.fns["shared-A"] is fn_a
+
+        assert pane_b.resume("other-C") is True
+        # …and the resume-away removed only pane B's own (absent) claim.
+        assert runner.fns["shared-A"] is fn_a
+        assert "other-C" in runner.fns
+
+    def test_new_command_moves_registration_to_fresh_id(self, tmp_db):
+        # /new is the other identity rebind: watches created AFTER it stamp
+        # the fresh id and must reach this session, while the old
+        # workstream's fires must stop landing in a conversation that no
+        # longer shows them (they divert to the restore path instead).
+        session = _make_session_for_dispatch()
+        old_id = session._ws_id
+        runner = _RecordingRunner()
+        session.set_watch_runner(runner, wake_fn=None)
+
+        # handle_command's return means "should exit" — /new never exits.
+        assert session.handle_command("/new") is False
+
+        assert session._ws_id != old_id
+        assert set(runner.fns) == {session._ws_id}
+        assert ("remove", old_id) in runner.events
+
+    def test_close_removes_only_own_registration(self, tmp_db):
+        # A watch-restore shell and a reopened pane can serve one ws_id in
+        # sequence; the shell's later teardown must not unregister the pane.
+        self._saved_ws("shared-W")
+        runner = _RecordingRunner()
+
+        shell = _make_session_for_dispatch()
+        shell._ws_id = "shared-W"
+        shell.set_watch_runner(runner, wake_fn=None)
+
+        pane = _make_session_for_dispatch()
+        pane._ws_id = "shared-W"
+        pane.set_watch_runner(runner, wake_fn=None)  # pane re-registers (last writer)
+        pane_fn = runner.fns["shared-W"]
+
+        shell.close()  # shell reaped (close_idle / eviction)
+
+        assert runner.fns.get("shared-W") is pane_fn  # pane still registered

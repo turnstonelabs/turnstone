@@ -2,7 +2,7 @@
 
 The shared worker dispatch is load-bearing for both the interactive
 ``/v1/api/workstreams/{ws_id}/send`` HTTP handler and the coordinator
-``CoordinatorAdapter.send`` path. Tests cover the four invariants the
+``CoordinatorAdapter.send`` path. Tests cover the five invariants the
 module must hold:
 
 * live worker → enqueue, no thread spawn
@@ -10,10 +10,14 @@ module must hold:
 * concurrent ``send`` calls produce exactly one worker thread
   (Stage 1 bug-1 — the racy ``Thread.is_alive()`` gate stays caught)
 * ``_worker_running`` cleared in ``finally`` even on uncaught exception
+* ownership-clear wake backstop: a worker exiting with USER_DRAIN
+  nudges queued on an IDLE workstream spawns the wake send that the
+  IDLE fan-out (which ran on this worker's own thread) had to drop
 
-Callers pass no-arg closures, so this module never touches
-``ws.session`` — keeps the contract narrow and lets watch-style
-dispatchers drive a session that isn't installed on ``ws``.
+Callers pass no-arg closures, so dispatch never touches ``ws.session``;
+the exit backstop only PEEKS it defensively (``getattr`` for
+``_nudge_queue``, bail on stubs) — watch-style dispatchers can still
+drive a session that isn't installed on ``ws``.
 """
 
 from __future__ import annotations
@@ -22,8 +26,10 @@ import queue
 import threading
 from typing import Any
 
+from tests._helpers import wait_until as _wait_until
 from turnstone.core import session_worker
-from turnstone.core.workstream import Workstream
+from turnstone.core.nudge_queue import USER_DRAIN, NudgeQueue
+from turnstone.core.workstream import Workstream, WorkstreamState
 
 
 class _SendSession:
@@ -138,6 +144,41 @@ def test_enqueue_unexpected_exception_returns_false_logged() -> None:
     assert session.send_calls == []
     assert ws.worker_thread is None
     assert ws._worker_running is True
+
+
+def test_closed_workstream_refused_no_spawn() -> None:
+    """Authoritative closed-check: ``close()`` sets ``_closed`` under
+    ``ws._lock``, so a wake (or send) racing it must be refused HERE —
+    the wake gate's lockless peek can go stale, and a spawn past this
+    point would run a full unattended turn (inference, tool calls,
+    storage writes) on a workstream whose ``ws_closed`` already fired.
+    """
+    session = _SendSession()
+    ws = _make_ws(session)
+    ws._closed = True
+
+    ok = _send_message(ws, session, "hello")
+
+    assert ok is False
+    assert session.send_calls == []
+    assert session.queue_calls == []
+    assert ws.worker_thread is None
+    assert ws._worker_running is False
+
+
+def test_closed_workstream_refused_on_reuse_path_too() -> None:
+    """The refusal precedes the enqueue branch: no interjection is queued
+    onto a session whose workstream is already closed."""
+    session = _SendSession()
+    ws = _make_ws(session)
+    ws._worker_running = True
+    ws._closed = True
+
+    ok = _send_message(ws, session, "hello")
+
+    assert ok is False
+    assert session.queue_calls == []
+    assert ws._worker_running is True  # untouched — not ours to clear
 
 
 # ---------------------------------------------------------------------------
@@ -299,6 +340,141 @@ def test_thread_name_explicit_override() -> None:
     assert ws.worker_thread is not None
     assert ws.worker_thread.name == "custom-name"
     ws.worker_thread.join(timeout=2.0)
+
+
+class _WakeCapableSession(_SendSession):
+    """Adds the ChatSession surface the exit backstop peeks at."""
+
+    def __init__(self, **kwargs: Any) -> None:
+        super().__init__(**kwargs)
+        self._nudge_queue = NudgeQueue()
+        self.deliver_calls = 0
+        self.deliver_thread_names: list[str] = []
+        self.delivered = threading.Event()
+
+    def deliver_wake_nudge_from_queue(self) -> None:
+        # Mirror the real contract: the wake drains its own queue, so
+        # the wake worker's OWN exit backstop sees nothing pending and
+        # the chain converges instead of spawning wakes forever.
+        self.deliver_calls += 1
+        self.deliver_thread_names.append(threading.current_thread().name)
+        self._nudge_queue.drain(USER_DRAIN)
+        self.delivered.set()
+
+
+class TestWorkerExitWakeBackstop:
+    """A worker exiting while its (idle) workstream has USER_DRAIN
+    nudges queued spawns the wake send the IDLE fan-out had to drop.
+
+    Production shape being modelled: ``set_state(IDLE)`` fires its
+    subscribers on the worker thread from inside ``run()`` —
+    ``CoordinatorIdleObserver`` enqueues ``idle_children``, then
+    ``IdleNudgeWatcher``'s wake dispatch lands on the reuse path
+    (this very worker still owns the flag) and no-ops.  The enqueue
+    inside ``run`` below stands in for that observer enqueue.
+    """
+
+    def test_worker_exit_delivers_pending_wake(self) -> None:
+        session = _WakeCapableSession()
+        ws = _make_ws(session)
+        assert ws.state is WorkstreamState.IDLE  # dataclass default
+
+        def run() -> None:
+            # What the IDLE fan-out's observer does, on this thread.
+            session._nudge_queue.enqueue("idle_children", "kids waiting", "any")
+
+        ok = session_worker.send(ws, enqueue=lambda: None, run=run)
+        assert ok is True
+
+        # The wake is delivered on a fresh wake-named worker thread…
+        assert session.delivered.wait(timeout=2.0), (
+            "exit backstop did not deliver the pending nudge"
+        )
+        assert session.deliver_thread_names[0].startswith("wake-nudge-")
+        # …after which the wake worker's own exit backstop sees an empty
+        # queue and the chain converges: flag at rest, exactly one deliver.
+        _wait_until(lambda: ws._worker_running is False)
+        assert session.deliver_calls == 1
+        assert len(session._nudge_queue) == 0
+
+    def test_worker_exit_no_wake_when_queue_empty(self) -> None:
+        session = _WakeCapableSession()
+        ws = _make_ws(session)
+
+        ok = session_worker.send(ws, enqueue=lambda: None, run=lambda: None)
+        assert ok is True
+        original = ws.worker_thread
+        assert original is not None
+        original.join(timeout=2.0)
+
+        assert ws.worker_thread is original  # no wake spawned
+        assert session.deliver_calls == 0
+        assert ws._worker_running is False
+
+    def test_worker_exit_no_wake_for_stub_session_without_queue(self) -> None:
+        """The narrow-contract escape hatch: a session without a
+        ``_nudge_queue`` (watch-style stubs) is skipped by the shared
+        wake gate's own defensive peek — no AttributeError, no wake."""
+        session = _SendSession()
+        ws = _make_ws(session)
+
+        ok = _send_message(ws, session, "hello")
+        assert ok is True
+        original = ws.worker_thread
+        assert original is not None
+        original.join(timeout=2.0)
+
+        assert ws.worker_thread is original
+        assert ws._worker_running is False
+
+    def test_worker_exit_no_wake_when_state_not_idle(self) -> None:
+        """An ERROR exit stays parked for the operator — pending nudges
+        wait for the next real interaction rather than burning
+        unattended inference on a failed session."""
+        session = _WakeCapableSession()
+        ws = _make_ws(session)
+
+        def run() -> None:
+            session._nudge_queue.enqueue("idle_children", "kids waiting", "any")
+            ws.state = WorkstreamState.ERROR
+
+        ok = session_worker.send(ws, enqueue=lambda: None, run=run)
+        assert ok is True
+        original = ws.worker_thread
+        assert original is not None
+        original.join(timeout=2.0)
+
+        assert ws.worker_thread is original
+        assert session.deliver_calls == 0
+        assert len(session._nudge_queue) == 1  # still queued for later seams
+
+    def test_abandoned_worker_does_not_run_wake_backstop(self) -> None:
+        """Only the owner retries: an abandoned worker (successor claimed
+        the flag) finishing late must not spawn a wake — the successor's
+        own exit runs the backstop."""
+        send_gate = threading.Event()
+        session = _WakeCapableSession(send_gate=send_gate)
+        ws = _make_ws(session)
+
+        ok = _send_message(ws, session, "hello")
+        assert ok is True
+        abandoned = ws.worker_thread
+        assert abandoned is not None
+
+        session._nudge_queue.enqueue("idle_children", "kids waiting", "any")
+        sentinel = threading.Thread(target=lambda: None, name="successor")
+        with ws._lock:
+            ws.worker_thread = sentinel
+            ws._worker_running = True
+
+        send_gate.set()
+        abandoned.join(timeout=3.0)
+        assert not abandoned.is_alive()
+
+        # No wake spawned by the abandoned thread; ownership intact.
+        assert ws.worker_thread is sentinel
+        assert session.deliver_calls == 0
+        assert ws._worker_running is True
 
 
 def test_does_not_deadlock_when_run_briefly_grabs_ws_lock() -> None:

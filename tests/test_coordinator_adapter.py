@@ -245,6 +245,24 @@ def test_cleanup_ui_tolerates_missing_session_and_ui() -> None:
     ws.session = None
     ws.ui = None
     adapter.cleanup_ui(ws)  # no crash
+    assert ws._closed is True  # still marked dead
+
+
+def test_cleanup_ui_marks_workstream_closed() -> None:
+    """Every teardown path — close, close_idle, EVICTION, delete,
+    discard — funnels through cleanup_ui, which marks the object dead
+    under ``ws._lock`` BEFORE the teardown body runs.  The wake paths
+    that hold OBJECT references (the watch ``wake_fn``,
+    ``session_worker``'s exit backstop) gate on ``_closed``, and
+    ``session_worker.send`` re-checks it under the same lock — without
+    this write here, a wake racing an eviction or delete (which never
+    set the flag) would spawn a full unattended turn on the torn-down
+    session."""
+    adapter, _ = _make_adapter()
+    ws = _make_ws()
+    assert ws._closed is False
+    adapter.cleanup_ui(ws)
+    assert ws._closed is True
 
 
 # ---------------------------------------------------------------------------
