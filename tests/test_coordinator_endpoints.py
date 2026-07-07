@@ -96,7 +96,10 @@ def _coord_attach_owner(request, ws_id, mgr):
     ws = mgr.get(ws_id)
     if ws is None:
         return "", JSONResponse({"error": "coordinator not found"}, status_code=404)
-    visibility = WorkstreamProjectVisibility.for_request(request)
+    storage = getattr(request.app.state, "auth_storage", None)
+    if storage is None:
+        return "", JSONResponse({"error": "coordinator not found"}, status_code=404)
+    visibility = WorkstreamProjectVisibility.for_request(request, storage=storage)
     if not visibility.ws_visible(getattr(ws, "project_id", "") or "", ws_owner=ws.user_id or ""):
         return "", JSONResponse({"error": "coordinator not found"}, status_code=404)
     return ws.user_id or auth_user_id(request), None
