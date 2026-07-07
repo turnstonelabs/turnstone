@@ -653,11 +653,14 @@ class WatchRunner:
                 self._storage.update_watch(watch_id, active=False, next_poll="")
                 with self._terminal_dispatched_lock:
                     self._terminal_dispatched.discard(watch_id)
-                # A held reminder for an already-dispatched watch means a
-                # re-delivery SUCCEEDED but its row-commit raised (leaving
-                # the id in both sets).  The reminder is delivered, so drop
-                # the hold here — otherwise, once we deactivate the row it
-                # never re-lists and the entry would leak forever.
+                # Belt-and-braces: no current path leaves an id in both
+                # ``_terminal_dispatched`` AND ``_pending_delivery``
+                # (``_redeliver_pending`` clears the hold BEFORE its
+                # commit), but this branch deactivates the row — after
+                # which it never re-lists — so any hold that ever DID
+                # coexist with the terminal mark would leak forever
+                # without this clear.  The mark means the reminder was
+                # delivered; a coexisting hold is by definition stale.
                 self._clear_pending_delivery(watch_id)
             except Exception:
                 log.exception("watch_runner.retry_deactivate_failed", extra={"watch_id": watch_id})

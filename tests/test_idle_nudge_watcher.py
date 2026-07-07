@@ -296,3 +296,23 @@ class TestWakeWorkstreamIfPending:
         assert deferred[0].levelno == logging.INFO
         assert "trigger=" in deferred[0].getMessage()
         assert not any("nudge_wake.dispatched" in r.getMessage() for r in caplog.records)
+
+    def test_refused_path_logs_refusal(self, fake_mgr_and_ws, caplog):
+        """``send`` refusing outright — its authoritative under-lock
+        ``_closed`` re-check caught a teardown the gate's lockless peek
+        missed — emits ``nudge_wake.refused``: a dropped wake must stay
+        traceable to its trigger, not vanish silently."""
+        _mgr, ws = fake_mgr_and_ws
+        ws.session._nudge_queue.enqueue("watch_triggered", "output", "any")
+        with (
+            patch("turnstone.core.session_worker.send", return_value=False) as mock_send,
+            caplog.at_level(logging.INFO, logger="turnstone.core.idle_nudge_watcher"),
+        ):
+            assert wake_workstream_if_pending(ws, trigger="watch-fire") is False
+            assert mock_send.call_count == 1
+        refused = [r for r in caplog.records if "nudge_wake.refused" in r.getMessage()]
+        assert len(refused) == 1
+        assert refused[0].levelno == logging.INFO
+        assert "trigger=" in refused[0].getMessage()
+        assert not any("nudge_wake.dispatched" in r.getMessage() for r in caplog.records)
+        assert not any("nudge_wake.deferred_worker_busy" in r.getMessage() for r in caplog.records)
