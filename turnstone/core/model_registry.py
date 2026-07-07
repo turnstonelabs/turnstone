@@ -145,9 +145,25 @@ class ModelRegistry:
                 raise ValueError(f"Unknown model alias: {alias}")
             if alias not in self._clients:
                 cfg = self._models[alias]
-                self._clients[alias] = create_client(
-                    cfg.provider, base_url=cfg.base_url, api_key=cfg.api_key
-                )
+                try:
+                    self._clients[alias] = create_client(
+                        cfg.provider, base_url=cfg.base_url, api_key=cfg.api_key
+                    )
+                except ValueError:
+                    # create_client's own misconfig errors already carry
+                    # remediation text — pass through untouched.
+                    raise
+                except Exception as exc:
+                    # SDK construction can fail on environment problems the
+                    # config never sees — e.g. httpx resolving a CA-bundle
+                    # path that a venv rebuild deleted (FileNotFoundError).
+                    # Routes map ValueError to a 503 with the message;
+                    # anything else surfaces as an opaque 500, so re-type
+                    # here where the alias is known.
+                    raise ValueError(
+                        f"failed to construct {cfg.provider} client for model "
+                        f"alias {alias!r}: {type(exc).__name__}: {exc}"
+                    ) from exc
             return self._clients[alias]
 
     def get_provider(self, alias: str) -> LLMProvider:
