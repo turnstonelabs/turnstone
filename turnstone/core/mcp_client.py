@@ -1683,8 +1683,12 @@ class MCPClientManager:
         state.supports_prompts = prompts_cap is not None
         state.supports_prompt_list_changed = bool(getattr(prompts_cap, "listChanged", False))
 
-        # Discover tools
-        result = await session.list_tools()
+        # Discover tools. Discovery runs in THIS caller task while the
+        # transport is hosted by the owner, so a transport collapse
+        # mid-discovery cancels the OWNER, not us — ``_await_owner_discovery``
+        # races the owner so that death surfaces as a prompt ConnectionError
+        # instead of hanging to the caller-side attempt timeout.
+        result = await self._await_owner_discovery(owner, session.list_tools())
         capped = _cap_server_tools(name, result.tools)
         server_tools: list[dict[str, Any]] = [_mcp_to_openai(name, tool) for tool in capped]
 
@@ -1695,7 +1699,7 @@ class MCPClientManager:
         resource_count = 0
         if resources_cap is not None:
             server_resources: list[dict[str, Any]] = []
-            res_result = await session.list_resources()
+            res_result = await self._await_owner_discovery(owner, session.list_resources())
             for r in res_result.resources:
                 server_resources.append(
                     {
@@ -1708,7 +1712,9 @@ class MCPClientManager:
                 )
             # Also include resource templates (catalog-only — not directly
             # readable via read_resource since they contain URI placeholders)
-            tmpl_result = await session.list_resource_templates()
+            tmpl_result = await self._await_owner_discovery(
+                owner, session.list_resource_templates()
+            )
             for t in tmpl_result.resourceTemplates:
                 server_resources.append(
                     {
@@ -1728,7 +1734,7 @@ class MCPClientManager:
         prompt_count = 0
         if prompts_cap is not None:
             server_prompts: list[dict[str, Any]] = []
-            prompt_result = await session.list_prompts()
+            prompt_result = await self._await_owner_discovery(owner, session.list_prompts())
             for p in prompt_result.prompts:
                 server_prompts.append(
                     {
@@ -1909,7 +1915,8 @@ class MCPClientManager:
                     ready.exception()  # mark retrieved: the waiter may be gone
             raise
         except BaseException as exc:
-            if not ready.done():
+            pre_ready = not ready.done()
+            if pre_ready:
                 # Connect-phase failure: deliver to the waiting caller. Phase
                 # timeouts arrive as TimeoutError; transport task-group failures
                 # may be BaseExceptionGroup — passed through, the consumers
@@ -1917,6 +1924,12 @@ class MCPClientManager:
                 ready.set_exception(exc)
                 with contextlib.suppress(BaseException):
                     ready.exception()  # mark retrieved: the waiter may be gone
+            if not isinstance(exc, (Exception, BaseExceptionGroup)):
+                # An interpreter-level exit (KeyboardInterrupt, SystemExit)
+                # must keep unwinding the task — delivery to the waiter was
+                # this arm's only job for it.
+                raise
+            if pre_ready:
                 return
             # Post-ready death: the server dropped the transport under a live
             # session. The done-callback evicts; the next dispatch reconnects.
@@ -2022,19 +2035,20 @@ class MCPClientManager:
                 server_name,
             )
 
-    async def _await_pool_discovery(self, owner: asyncio.Task[None], coro: Any) -> Any:
+    async def _await_owner_discovery(self, owner: asyncio.Task[None], coro: Any) -> Any:
         """Await a discovery call in the caller task, aborting if the OWNER dies.
 
-        Discovery (``list_tools`` / ``list_resources`` / ``list_prompts``) runs
-        in the connecting caller, but the transport servicing it is hosted by
-        ``owner``. When that transport collapses — e.g. the SDK tears its task
-        group down on an upstream 401 — anyio cancels the OWNER (the scope host),
-        NOT this caller, so a bare ``await`` on the session's response stream
-        would hang until the phase ``asyncio.timeout`` fires. Racing the owner
-        turns a transport death into a prompt ``ConnectionError`` that the
-        caller's ``except`` arm converts into a clean teardown. The owner is
-        never cancelled here — teardown owns its lifecycle; only the discovery
-        future is reaped.
+        Shared by the static (``_connect_one_locked``) and pool
+        (``_connect_one_pool``) connect paths. Discovery (``list_tools`` /
+        ``list_resources`` / ``list_prompts``) runs in the connecting caller,
+        but the transport servicing it is hosted by ``owner``. When that
+        transport collapses — e.g. the SDK tears its task group down on an
+        upstream 401 — anyio cancels the OWNER (the scope host), NOT this
+        caller, so a bare ``await`` on the session's response stream would hang
+        until the surrounding bound fires. Racing the owner turns a transport
+        death into a prompt ``ConnectionError`` that the caller's ``except``
+        arm converts into a clean teardown. The owner is never cancelled here —
+        teardown owns its lifecycle; only the discovery future is reaped.
         """
         call: asyncio.Future[Any] = asyncio.ensure_future(coro)
         try:
@@ -2047,12 +2061,20 @@ class MCPClientManager:
                 await call
             raise
         if call.done():
+            if call.cancelled():
+                # The discovery future was cancelled out from under us (an
+                # SDK-internal cancellation shape, not this method's own reap)
+                # — the transport can no longer answer, which is the same
+                # failure class as the owner dying. Convert instead of leaking
+                # a bare CancelledError the caller would misread as its own
+                # cancellation.
+                raise ConnectionError("MCP discovery request cancelled by transport failure")
             return call.result()  # normal result, or the real discovery error
         # Owner finished first — the transport died under discovery.
         call.cancel()
         with contextlib.suppress(BaseException):
             await call
-        raise ConnectionError("MCP pool transport owner died during discovery")
+        raise ConnectionError("MCP transport owner died during discovery")
 
     async def _connect_one_pool(
         self,
@@ -2191,7 +2213,7 @@ class MCPClientManager:
         # Discover this user's tool catalog. Discovery runs in THIS caller task
         # while the transport is hosted by the owner, so an upstream failure
         # (e.g. a 401 the SDK surfaces by collapsing its task group) cancels the
-        # OWNER, not us — ``_await_pool_discovery`` races the owner so that death
+        # OWNER, not us — ``_await_owner_discovery`` races the owner so that death
         # aborts discovery promptly instead of hanging on the response stream
         # until the phase timeout. The carrier-race shape used by
         # ``_dispatch_pool_with_entry`` defends a different scenario
@@ -2210,7 +2232,7 @@ class MCPClientManager:
         # which closes the owner in-task.
         try:
             async with asyncio.timeout(self._CONNECT_TIMEOUT):
-                tools_result = await self._await_pool_discovery(owner, session.list_tools())
+                tools_result = await self._await_owner_discovery(owner, session.list_tools())
         except asyncio.CancelledError:
             task = asyncio.current_task()
             if task is not None and task.cancelling():
@@ -2238,7 +2260,7 @@ class MCPClientManager:
                     # calls share the same timeout budget and target
                     # disjoint catalogs (resources vs. templates), so
                     # ordering is irrelevant.
-                    res_result, tmpl_result = await self._await_pool_discovery(
+                    res_result, tmpl_result = await self._await_owner_discovery(
                         owner,
                         asyncio.gather(
                             session.list_resources(),
@@ -2288,7 +2310,7 @@ class MCPClientManager:
         if prompts_cap is not None:
             try:
                 async with asyncio.timeout(self._CONNECT_TIMEOUT):
-                    prompt_result = await self._await_pool_discovery(owner, session.list_prompts())
+                    prompt_result = await self._await_owner_discovery(owner, session.list_prompts())
             except asyncio.CancelledError:
                 task = asyncio.current_task()
                 if task is not None and task.cancelling():

@@ -187,6 +187,55 @@ class TestTransportOwnerLifecycle:
         # The cms were still unwound in-task despite the stray cancel.
         assert fake["events"][-2:] == ["session_exit", "transport_exit"]
 
+    def test_owner_death_during_discovery_fails_fast(self, running_loop_mgr) -> None:
+        """The static sibling of the pool's owner-death discovery race:
+        discovery runs in the connecting caller while the transport is hosted
+        by the owner, so a transport collapse mid-discovery cancels the OWNER
+        and a bare await on the response stream would hang to the caller-side
+        attempt timeout (~45s). ``_await_owner_discovery`` must convert it
+        into a PROMPT ``ConnectionError`` and leave the state torn down."""
+        mgr, loop, _ = running_loop_mgr
+        patches: dict[str, Any] = {}
+        fake = _fake_transport_and_session(patches)
+
+        discovery_parked = asyncio.Event()
+
+        async def _parked_list_tools() -> Any:
+            discovery_parked.set()
+            await asyncio.sleep(3600)  # the transport never answers
+
+        fake["session"].list_tools = AsyncMock(side_effect=_parked_list_tools)
+
+        async def _drive() -> tuple[float, BaseException | None]:
+            async def _collapse_owner_when_parked() -> None:
+                await discovery_parked.wait()
+                owner = mgr._static_servers["srv"].owner_task
+                assert owner is not None
+                owner.cancel()  # the transport task group collapsing
+
+            collapser = asyncio.create_task(_collapse_owner_when_parked())
+            t0 = asyncio.get_running_loop().time()
+            exc: BaseException | None = None
+            try:
+                await mgr._connect_one_locked("srv", mgr._server_configs["srv"])
+            except BaseException as e:  # noqa: BLE001 - asserting the exact type below
+                exc = e
+            await collapser
+            return asyncio.get_running_loop().time() - t0, exc
+
+        with (
+            patch("turnstone.core.mcp_client.stdio_client", patches["stdio_client"]),
+            patch("turnstone.core.mcp_client.ClientSession", patches["ClientSession"]),
+        ):
+            elapsed, exc = _run(loop, _drive(), timeout=15)
+
+        assert isinstance(exc, ConnectionError)
+        assert "died during discovery" in str(exc)
+        assert elapsed < 5.0  # prompt fail — not the attempt-timeout hang
+        assert mgr._static_servers["srv"].session is None
+        # The owner unwound its cms despite dying mid-discovery.
+        assert fake["events"][-2:] == ["session_exit", "transport_exit"]
+
     def test_connect_failure_unwinds_owner_and_raises(self, running_loop_mgr) -> None:
         mgr, loop, _ = running_loop_mgr
 

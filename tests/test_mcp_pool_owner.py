@@ -185,7 +185,7 @@ class TestPoolTransportOwnerLifecycle:
         assert key in mgr._user_pool_entries
 
     def test_owner_death_during_discovery_fails_fast(self, running_loop_mgr) -> None:
-        """The owner-died branch of ``_await_pool_discovery`` — the reason the
+        """The owner-died branch of ``_await_owner_discovery`` — the reason the
         helper exists: discovery runs in the caller while the transport is
         hosted by the owner, so a transport collapse mid-discovery cancels the
         OWNER and a bare await on the response stream would hang until the 30s
@@ -242,6 +242,43 @@ class TestPoolTransportOwnerLifecycle:
         entry = mgr._user_pool_entries[key]
         assert entry.session is None  # discovery-failure teardown ran
         assert entry.owner_task is None
+
+    def test_cancelled_discovery_future_converts_to_connection_error(
+        self, running_loop_mgr
+    ) -> None:
+        """A discovery future that completes CANCELLED without this race's own
+        reap (an SDK-internal cancellation shape) is the transport-failure
+        class, not the caller's cancellation — ``_await_owner_discovery`` must
+        surface it as ``ConnectionError``, never a bare ``CancelledError`` the
+        caller would misread as its own cancel."""
+        mgr, loop, _ = running_loop_mgr
+
+        async def _drive() -> BaseException | None:
+            parked = asyncio.Event()
+
+            async def _parked_owner() -> None:
+                await parked.wait()
+
+            owner = asyncio.create_task(_parked_owner())
+            await asyncio.sleep(0)
+
+            async def _self_cancelling_discovery() -> Any:
+                # A coroutine raising CancelledError makes its wrapping task
+                # complete CANCELLED — the shape of an SDK-internal cancel.
+                raise asyncio.CancelledError
+
+            exc: BaseException | None = None
+            try:
+                await mgr._await_owner_discovery(owner, _self_cancelling_discovery())
+            except BaseException as e:  # noqa: BLE001 - asserting the exact type below
+                exc = e
+            parked.set()
+            await owner
+            return exc
+
+        exc = _run(loop, _drive())
+        assert isinstance(exc, ConnectionError)
+        assert "cancelled by transport failure" in str(exc)
 
     def test_teardown_single_cancel_escalation(self, running_loop_mgr) -> None:
         """A parked owner whose in-task unwind stalls past the graceful window
