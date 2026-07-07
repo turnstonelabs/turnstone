@@ -1350,6 +1350,10 @@ def test_redact_credentials_runtime_smoke() -> None:
         + "const apg = redactCredentials('postgresql+asyncpg://user:s3cret@db/app');\n"
         + "if (apg !== 'postgresql+asyncpg://user:[REDACTED:password]@db/app') "
         + "throw new Error('asyncpg conn redact failed: ' + apg);\n"
+        + "// RFC 3986 schemes are case-insensitive - uppercase must not bypass\n"
+        + "const up = redactCredentials('POSTGRESQL+PSYCOPG2://user:s3cret@db/app');\n"
+        + "if (up !== 'POSTGRESQL+PSYCOPG2://user:[REDACTED:password]@db/app') "
+        + "throw new Error('uppercase scheme conn redact failed: ' + up);\n"
     )
     with tempfile.NamedTemporaryFile(mode="w", suffix=".mjs", delete=False) as f:
         f.write(harness)

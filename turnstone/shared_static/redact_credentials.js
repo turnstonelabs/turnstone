@@ -37,10 +37,11 @@ const _RE_PRIVATE_KEY_BLOCK =
 // The optional +suffix covers SQLAlchemy dialect+driver URLs
 // (postgresql+psycopg2, postgresql+asyncpg, mysql+pymysql) and
 // mongodb+srv — enumerating drivers is a losing game, the suffix
-// shape isn't.
+// shape isn't.  Schemes are case-insensitive per RFC 3986 (/i):
+// POSTGRESQL:// leaks the same password postgresql:// does.
 // ---------------------------------------------------------------------------
 const _RE_CONNECTION_STRING =
-  /(?:postgresql|mysql|mongodb|rediss?|amqps?|sqlite|https?)(?:\+[a-z0-9]*)?:\/\/[^:@\s]+:[^@\s]+@/g;
+  /(?:postgresql|mysql|mongodb|rediss?|amqps?|sqlite|https?)(?:\+[a-z0-9]*)?:\/\/[^:@\s]+:[^@\s]+@/gi;
 
 const _RE_CONN_USERINFO = /:\/\/([^:@\s]+):([^@\s]+)@/;
 

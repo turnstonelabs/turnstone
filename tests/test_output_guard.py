@@ -250,6 +250,18 @@ class TestCredentialLeakage:
             assert "s3cret_pass" not in r.sanitized, url
             assert ":[REDACTED:password]@" in r.sanitized, url
 
+    def test_uppercase_scheme_connection_string(self) -> None:
+        # RFC 3986 schemes are case-insensitive; an uppercase scheme must
+        # not bypass redaction.
+        for url in (
+            "POSTGRESQL+PSYCOPG2://admin:s3cret_pass@db.internal/prod",
+            "HTTPS://admin:s3cret_pass@api.internal/x",
+        ):
+            r = evaluate_output(url)
+            assert "connection_string_leak" in r.flags, url
+            assert r.sanitized is not None, url
+            assert "s3cret_pass" not in r.sanitized, url
+
     def test_bearer_scheme_case_insensitive(self) -> None:
         # RFC 7235 scheme name is case-insensitive.
         r = evaluate_output("authorization: bearer eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.sig12345")
