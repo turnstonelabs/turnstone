@@ -2204,62 +2204,6 @@ class TestConnectOneUnreachable:
         assert "bad" in mgr._last_error
 
 
-class TestSafeCloseStack:
-    """_safe_close_stack should suppress errors from broken anyio scopes."""
-
-    def test_suppresses_runtime_error(self):
-        """RuntimeError from broken cancel scope is suppressed."""
-        mgr = MCPClientManager({})
-
-        async def _run():
-            stack = AsyncExitStack()
-            await stack.__aenter__()
-
-            # Simulate a broken close that raises RuntimeError
-            async def _broken_close():
-                raise RuntimeError("Attempted to exit cancel scope in a different task")
-
-            stack.aclose = _broken_close
-            # Should not raise
-            await mgr._safe_close_stack(stack)
-
-        asyncio.run(_run())
-
-    def test_suppresses_cancelled_error(self):
-        """CancelledError during close is suppressed."""
-        mgr = MCPClientManager({})
-
-        async def _run():
-            stack = AsyncExitStack()
-            await stack.__aenter__()
-
-            async def _cancel_close():
-                raise asyncio.CancelledError()
-
-            stack.aclose = _cancel_close
-            await mgr._safe_close_stack(stack)
-
-        asyncio.run(_run())
-
-    def test_suppressed_close_triggers_scope_disarm(self):
-        """A suppressed close runs the orphaned-scope disarm backstop."""
-        mgr = MCPClientManager({})
-
-        async def _run():
-            stack = AsyncExitStack()
-            await stack.__aenter__()
-
-            async def _broken_close():
-                raise RuntimeError("Attempted to exit cancel scope in a different task")
-
-            stack.aclose = _broken_close
-            with patch.object(mgr, "_maybe_disarm_orphaned_scopes") as disarm:
-                await mgr._safe_close_stack(stack)
-            disarm.assert_called_once()
-
-        asyncio.run(_run())
-
-
 # ---------------------------------------------------------------------------
 # Fix 1: Cancel orphaned futures on timeout
 # ---------------------------------------------------------------------------

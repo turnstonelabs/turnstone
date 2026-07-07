@@ -57,8 +57,7 @@ def running_loop_mgr():
                 task = getattr(m, attr)
                 if task is not None:
                     task.cancel()
-                    with contextlib.suppress(BaseException):
-                        await task
+                    await asyncio.gather(task, return_exceptions=True)
                     setattr(m, attr, None)
             for state in m._static_servers.values():
                 owner = state.owner_task
@@ -66,8 +65,7 @@ def running_loop_mgr():
                     if state.close_requested is not None:
                         state.close_requested.set()
                     owner.cancel()
-                    with contextlib.suppress(BaseException):
-                        await owner
+                    await asyncio.gather(owner, return_exceptions=True)
 
         with contextlib.suppress(Exception):
             asyncio.run_coroutine_threadsafe(_drain(mgr), loop).result(timeout=5)
@@ -187,6 +185,57 @@ class TestTransportOwnerLifecycle:
         # The cms were still unwound in-task despite the stray cancel.
         assert fake["events"][-2:] == ["session_exit", "transport_exit"]
 
+    def test_owner_death_during_discovery_fails_fast(self, running_loop_mgr) -> None:
+        """The static sibling of the pool's owner-death discovery race:
+        discovery runs in the connecting caller while the transport is hosted
+        by the owner, so a transport collapse mid-discovery cancels the OWNER
+        and a bare await on the response stream would hang to the caller-side
+        attempt timeout (~45s). ``_await_owner_discovery`` must convert it
+        into a PROMPT ``ConnectionError`` and leave the state torn down."""
+        mgr, loop, _ = running_loop_mgr
+        patches: dict[str, Any] = {}
+        fake = _fake_transport_and_session(patches)
+
+        discovery_parked = asyncio.Event()
+
+        async def _parked_list_tools() -> Any:
+            discovery_parked.set()
+            await asyncio.sleep(3600)  # the transport never answers
+
+        fake["session"].list_tools = AsyncMock(side_effect=_parked_list_tools)
+
+        async def _drive() -> tuple[float, BaseException | None]:
+            async def _collapse_owner_when_parked() -> None:
+                await discovery_parked.wait()
+                owner = mgr._static_servers["srv"].owner_task
+                assert owner is not None
+                owner.cancel()  # the transport task group collapsing
+
+            collapser = asyncio.create_task(_collapse_owner_when_parked())
+            t0 = asyncio.get_running_loop().time()
+            exc: BaseException | None = None
+            try:
+                await mgr._connect_one_locked("srv", mgr._server_configs["srv"])
+            except Exception as e:
+                # The expected ConnectionError; anything else (a cancel leak,
+                # an interpreter exit) propagates and fails the test loudly.
+                exc = e
+            _ = await collapser  # synchronization point; failures propagate
+            return asyncio.get_running_loop().time() - t0, exc
+
+        with (
+            patch("turnstone.core.mcp_client.stdio_client", patches["stdio_client"]),
+            patch("turnstone.core.mcp_client.ClientSession", patches["ClientSession"]),
+        ):
+            elapsed, exc = _run(loop, _drive(), timeout=15)
+
+        assert isinstance(exc, ConnectionError)
+        assert "died during discovery" in str(exc)
+        assert elapsed < 5.0  # prompt fail — not the attempt-timeout hang
+        assert mgr._static_servers["srv"].session is None
+        # The owner unwound its cms despite dying mid-discovery.
+        assert fake["events"][-2:] == ["session_exit", "transport_exit"]
+
     def test_base_exception_escape_resolves_waiter_and_propagates(self, running_loop_mgr) -> None:
         """A BaseException-derived escape that is neither CancelledError nor
         Exception/group (a library control-flow escape; SystemExit and
@@ -284,7 +333,7 @@ class TestTransportOwnerLifecycle:
             await asyncio.wait_for(entered.wait(), timeout=5)
             connect.cancel()  # the attempt-timeout / shutdown shape
             with contextlib.suppress(asyncio.CancelledError):
-                await connect
+                _ = await connect  # only the expected cancel is absorbed
             # The owner must be closed (one cancel) and fully unwound.
             deadline = asyncio.get_running_loop().time() + 5
             while asyncio.get_running_loop().time() < deadline:
@@ -358,7 +407,7 @@ class TestBaseExceptionGroupHardening:
                 assert not task.done()
                 task.cancel()
                 with contextlib.suppress(asyncio.CancelledError):
-                    await task
+                    _ = await task  # only the expected cancel is absorbed
                 return task
 
             _run(loop, _drive(), timeout=10)
@@ -393,7 +442,7 @@ class TestScopeDisarmBackstop:
                 await blocker.wait()
 
             done_task = asyncio.create_task(_noop())
-            await done_task
+            _ = await done_task  # synchronization point; failures propagate
             live_task = asyncio.create_task(_parked())
             await asyncio.sleep(0)
 
@@ -428,7 +477,7 @@ class TestScopeDisarmBackstop:
                     scope._cancel_handle = None
                 scope._tasks.clear()
             blocker.set()
-            await live_task
+            _ = await live_task  # synchronization point; failures propagate
             return results
 
         r = _run(loop, _arm_and_sweep())
