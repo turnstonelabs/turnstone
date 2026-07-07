@@ -2589,6 +2589,7 @@ class ChatSession:
                 persona_base[fn["name"]] = (prop or {}).get("description", "")
 
         new_tools: list[dict[str, Any]] = []
+        changed = False
         for tool in self._tools:
             fn = tool.get("function") or {}
             name = fn.get("name", "")
@@ -2621,8 +2622,23 @@ class ChatSession:
                 if prop is not None:
                     base = persona_base.get(name, "")
                     prop["description"] = f"{base} {persona_line}".strip() if persona_line else base
-            new_tools.append(new_tool)
-        self._tools = new_tools
+            if new_tool == tool:
+                # The rendered description is identical to what this tool
+                # already carries — nothing dynamic to inject (no aliases,
+                # no personas).  Keep the original object so a session with
+                # nothing to render keeps sharing the pristine module-level
+                # tool list instead of allocating a per-session copy.
+                new_tools.append(tool)
+            else:
+                new_tools.append(new_tool)
+                changed = True
+        # Swap in the rebuilt list only when a description actually changed.
+        # This keeps the render idempotent and allocation-free when there is
+        # nothing to inject, so the shared constants (e.g. INTERACTIVE_TOOLS)
+        # stay referenced by such sessions; a reload that clears a prior
+        # render still takes the ``changed`` path and replaces the stale list.
+        if changed:
+            self._tools = new_tools
 
     @staticmethod
     def _persona_property(props: dict[str, Any]) -> dict[str, Any] | None:
