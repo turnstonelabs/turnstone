@@ -218,7 +218,9 @@ class TestTransportOwnerLifecycle:
             exc: BaseException | None = None
             try:
                 await mgr._connect_one_locked("srv", mgr._server_configs["srv"])
-            except BaseException as e:  # noqa: BLE001 - asserting the exact type below
+            except Exception as e:
+                # The expected ConnectionError; anything else (a cancel leak,
+                # an interpreter exit) propagates and fails the test loudly.
                 exc = e
             await collapser
             return asyncio.get_running_loop().time() - t0, exc

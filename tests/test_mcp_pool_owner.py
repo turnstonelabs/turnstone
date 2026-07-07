@@ -222,7 +222,9 @@ class TestPoolTransportOwnerLifecycle:
             try:
                 async with entry.open_lock:
                     await mgr._connect_one_pool(key, _http_cfg(), "tok-aaa")
-            except BaseException as e:  # noqa: BLE001 - asserting the exact type below
+            except Exception as e:
+                # The expected ConnectionError; anything else (a cancel leak,
+                # an interpreter exit) propagates and fails the test loudly.
                 exc = e
             await collapser
             return asyncio.get_running_loop().time() - t0, exc
@@ -270,7 +272,10 @@ class TestPoolTransportOwnerLifecycle:
             exc: BaseException | None = None
             try:
                 await mgr._await_owner_discovery(owner, _self_cancelling_discovery())
-            except BaseException as e:  # noqa: BLE001 - asserting the exact type below
+            except (Exception, asyncio.CancelledError) as e:
+                # Exception covers the expected ConnectionError; CancelledError
+                # covers the exact regression this test guards (the bare cancel
+                # leaking through instead of being converted).
                 exc = e
             parked.set()
             await owner
