@@ -2699,7 +2699,6 @@ class TestProxyGetHeaderPassThrough:
     finding, preview-pane branch)."""
 
     def test_security_headers_forwarded(self, monkeypatch):
-        import asyncio
         from types import SimpleNamespace
         from unittest.mock import MagicMock
 

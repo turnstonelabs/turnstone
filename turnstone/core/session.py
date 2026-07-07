@@ -16159,11 +16159,14 @@ class ChatSession:
             try:
                 # Every redirect hop is SSRF-screened BEFORE its request goes
                 # out — the pre-approval screen covers only the URL the model
-                # named, not where it 302s.
+                # named, not where it 302s.  The fetch ceiling tracks the most
+                # permissive kind cap (like the path lane's stat pre-check);
+                # the per-kind cap after resolution is the authority.
                 resp = fetch_with_ssrf_guard(
                     url,
                     timeout=self.tool_timeout,
                     allow_private_origin=item.get("allow_private_origin", False),
+                    max_bytes=max(PREVIEW_SIZE_CAPS.values()),
                 )
                 resp.raise_for_status()
             except httpx.HTTPStatusError as e:
@@ -16177,10 +16180,6 @@ class ChatSession:
             if resp.url.username or resp.url.password:
                 final_url = str(resp.url.copy_with(username=None, password=None))
             body = resp.content
-            if len(body) > 10 * 1024 * 1024:
-                return _fail(
-                    f"Error: response too large to preview ({len(body):,} bytes; cap 10 MB)"
-                )
             mime_hint = resp.headers.get("content-type", "")
             name_hint = final_url
             source = final_url

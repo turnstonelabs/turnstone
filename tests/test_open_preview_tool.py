@@ -183,6 +183,29 @@ class TestExecOpenPreview:
         assert msg.startswith("Error:")
         assert "too large" in msg
 
+    def test_url_pdf_over_10mb_previews_to_kind_cap(self, monkeypatch):
+        # Review finding (PR #800): a flat 10 MB URL pre-check rejected PDFs
+        # the 32 MiB pdf kind cap allows — the fetch ceiling must track the
+        # widest kind cap and leave the per-kind caps as the authority.
+        from turnstone.core.preview import PREVIEW_SIZE_CAPS
+
+        s = _make_session()
+        body = b"%PDF-1.7\n" + b"a" * (12 * 1024 * 1024)
+        seen = {}
+
+        def _capture(url, **kw):
+            seen.update(kw)
+            return _fake_response(url, body, "application/pdf")
+
+        monkeypatch.setattr("turnstone.core.session.fetch_with_ssrf_guard", _capture)
+        item = s._prepare_open_preview("c1", {"target": "https://acme.com/report.pdf"})
+        _, msg = s._exec_open_preview(item)
+        assert not msg.startswith("Error:")
+        descriptor, _ = s._tool_previews["c1"]
+        assert descriptor["kind"] == "pdf"
+        assert descriptor["size"] == len(body)
+        assert seen["max_bytes"] == max(PREVIEW_SIZE_CAPS.values())
+
     def test_path_image(self, tmp_path):
         s = _make_session()
         p = tmp_path / "chart.png"
