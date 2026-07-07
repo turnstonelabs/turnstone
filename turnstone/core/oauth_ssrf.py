@@ -58,6 +58,17 @@ class OAuthSSRFError(Exception):
     """
 
 
+class OAuthSSRFPrivateAddressError(OAuthSSRFError):
+    """A hostname resolved to a non-public address, specifically.
+
+    A distinct subclass so callers with an operator-facing opt-in
+    (``[oidc] allow_private_network``) can catch this case and append the
+    remediation hint, while callers with no such opt-in (``mcp_oauth``,
+    where endpoint URLs come from untrusted remote-server metadata) keep
+    catching :class:`OAuthSSRFError` and stay strict.
+    """
+
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -92,13 +103,23 @@ def effective_port(parsed: urllib.parse.ParseResult) -> int | None:
     return {"http": 80, "https": 443}.get(parsed.scheme)
 
 
-def validate_url_no_ssrf(url: str, *, allow_http: bool) -> urllib.parse.ParseResult:
+def validate_url_no_ssrf(
+    url: str, *, allow_http: bool, allow_private: bool = False
+) -> urllib.parse.ParseResult:
     """Run the scheme/userinfo/SSRF checks shared by issuer and discovered URLs.
 
     Returns the parsed URL on success. Raises :class:`OAuthSSRFError` on
-    failure. The ``allow_http`` flag is the only knob: when ``True``,
-    ``http://`` is accepted *if* the hostname is also a localhost form;
-    when ``False``, only ``https://`` is accepted.
+    failure. Two knobs: ``allow_http=True`` accepts ``http://`` *if* the
+    hostname is also a localhost form (when ``False``, only ``https://``
+    is accepted); ``allow_private=True`` accepts hostnames resolving to
+    private-range addresses (RFC 1918, ULA, CGNAT, loopback) for
+    operator-trusted URLs — a self-hosted IdP on an internal network.
+    Even with ``allow_private``, link-local, multicast, unspecified, and
+    reserved addresses stay refused: cloud metadata services
+    (169.254.169.254) are the canonical SSRF target, and no legitimate
+    IdP lives in those ranges. Non-public rejections raise the
+    :class:`OAuthSSRFPrivateAddressError` subclass so callers that *have*
+    an opt-in can point the operator at it.
     """
     parsed = urllib.parse.urlparse(url)
 
@@ -127,8 +148,19 @@ def validate_url_no_ssrf(url: str, *, allow_http: bool) -> urllib.parse.ParseRes
             raise OAuthSSRFError(
                 f"endpoint hostname resolved to invalid IP {sockaddr[0]!r}: {hostname}"
             ) from exc
-        if not addr.is_global and not is_localhost(hostname):
-            raise OAuthSSRFError(f"endpoint URL resolves to non-public address ({addr}): {url}")
+        if addr.is_global or is_localhost(hostname):
+            continue
+        if allow_private:
+            if addr.is_link_local or addr.is_multicast or addr.is_unspecified or addr.is_reserved:
+                raise OAuthSSRFError(
+                    f"endpoint URL resolves to a link-local/multicast/reserved "
+                    f"address ({addr}), refused even with private addresses "
+                    f"allowed: {url}"
+                )
+            continue
+        raise OAuthSSRFPrivateAddressError(
+            f"endpoint URL resolves to non-public address ({addr}): {url}"
+        )
 
     return parsed
 
@@ -139,6 +171,7 @@ def validate_discovered_endpoint(
     *,
     allow_http: bool,
     trusted_endpoint_hosts: frozenset[str],
+    allow_private: bool = False,
 ) -> None:
     """Validate an endpoint URL pulled from an OIDC/OAuth discovery document.
 
@@ -146,11 +179,12 @@ def validate_discovered_endpoint(
     constraint: the endpoint host must equal the issuer host, be in the
     well-known trust map, or be in the operator-supplied
     ``trusted_endpoint_hosts``.  Effective port (with scheme defaults
-    applied) and scheme must match the issuer.
+    applied) and scheme must match the issuer.  ``allow_private`` forwards
+    to :func:`validate_url_no_ssrf`.
 
     Raises :class:`OAuthSSRFError` on validation failure.
     """
-    parsed = validate_url_no_ssrf(url, allow_http=allow_http)
+    parsed = validate_url_no_ssrf(url, allow_http=allow_http, allow_private=allow_private)
 
     issuer_hostname = (issuer_parsed.hostname or "").lower()
     endpoint_hostname = (parsed.hostname or "").lower()
@@ -182,7 +216,9 @@ def validate_discovered_endpoint(
         )
 
 
-async def validate_url_no_ssrf_async(url: str, *, allow_http: bool) -> urllib.parse.ParseResult:
+async def validate_url_no_ssrf_async(
+    url: str, *, allow_http: bool, allow_private: bool = False
+) -> urllib.parse.ParseResult:
     """Async variant of :func:`validate_url_no_ssrf` for hot-path callers.
 
     The synchronous variant calls ``socket.getaddrinfo``, which blocks
@@ -191,7 +227,9 @@ async def validate_url_no_ssrf_async(url: str, *, allow_http: bool) -> urllib.pa
     :func:`asyncio.to_thread` to keep the loop responsive. This wrapper
     centralises that wrapping so callers don't repeat the idiom.
     """
-    return await asyncio.to_thread(validate_url_no_ssrf, url, allow_http=allow_http)
+    return await asyncio.to_thread(
+        validate_url_no_ssrf, url, allow_http=allow_http, allow_private=allow_private
+    )
 
 
 async def validate_discovered_endpoint_async(
@@ -200,6 +238,7 @@ async def validate_discovered_endpoint_async(
     *,
     allow_http: bool,
     trusted_endpoint_hosts: frozenset[str],
+    allow_private: bool = False,
 ) -> None:
     """Async variant of :func:`validate_discovered_endpoint`."""
     await asyncio.to_thread(
@@ -208,12 +247,14 @@ async def validate_discovered_endpoint_async(
         issuer_parsed,
         allow_http=allow_http,
         trusted_endpoint_hosts=trusted_endpoint_hosts,
+        allow_private=allow_private,
     )
 
 
 __all__ = [
     "KNOWN_TRUSTED_OAUTH_ENDPOINT_HOSTS",
     "OAuthSSRFError",
+    "OAuthSSRFPrivateAddressError",
     "effective_port",
     "is_localhost",
     "sanitize_log_text",

@@ -41,6 +41,7 @@ are set.
 | `TURNSTONE_OIDC_PASSWORD_ENABLED` | No | `true` | Set to `false` to hide the password form and block all username/password logins (including admin). API tokens continue to work. |
 | `TURNSTONE_OIDC_REDIRECT_BASE` | Yes | — | Externally-reachable origin for the OIDC redirect URI (e.g. `https://app.example.com`). Without this, OIDC will refuse to start. The previous Host-header fallback was unsafe under permissive reverse proxies. |
 | `TURNSTONE_OIDC_TRUSTED_ENDPOINT_HOSTS` | No | — | Comma-separated list of additional hostnames whose endpoints the IdP discovery document is allowed to reference. See [Cross-host endpoints](#cross-host-endpoints). |
+| `TURNSTONE_OIDC_ALLOW_PRIVATE_NETWORK` | No | `false` | Allow the issuer (and its discovered endpoints) to resolve to private/internal addresses — needed for a self-hosted IdP on an internal network. See [Self-hosted and internal IdPs](#self-hosted-and-internal-idps). |
 
 All four required fields — issuer, client ID, client secret, and
 `TURNSTONE_OIDC_REDIRECT_BASE` — must be set. If any are missing OIDC
@@ -99,6 +100,40 @@ The same scheme / no-userinfo / SSRF rules apply to allow-listed hosts —
 this knob only relaxes the same-origin check, not the security gates.
 Each entry is a hostname (no scheme, no path).
 
+### Self-hosted and internal IdPs
+
+By default Turnstone refuses an issuer whose hostname resolves to a
+private or internal address:
+
+```
+OIDCError: endpoint URL resolves to non-public address (10.0.0.5): https://auth.example.site
+```
+
+This is SSRF hardening, not a licensing or product restriction: the OIDC
+flow makes server-side HTTP requests (discovery, JWKS, token exchange),
+and refusing non-public destinations keeps a mistyped or maliciously
+steered issuer from aiming those fetches at internal services. For a
+self-hosted IdP (Keycloak, Authentik, Dex, …) on a private network,
+opt in explicitly in `config.toml`:
+
+```toml
+[oidc]
+allow_private_network = true
+```
+
+or via `TURNSTONE_OIDC_ALLOW_PRIVATE_NETWORK=true` (the env var wins
+when both are set).
+
+The opt-in admits private-range (RFC 1918), unique-local, CGNAT
+(100.64/10 — tailnets), and loopback addresses. Link-local, multicast,
+and reserved ranges stay refused even with the opt-in — cloud metadata
+services (169.254.169.254) live there, and no legitimate IdP does. The
+HTTPS requirement and the same-origin endpoint checks are unaffected.
+
+This knob only affects the login-flow IdP configured here. OAuth
+endpoints advertised by remote MCP servers are untrusted input and are
+always held to the strict public-address rule.
+
 ### config.toml alternative
 
 ```toml
@@ -111,6 +146,8 @@ provider_name = "Google"
 role_claim = "groups"
 password_enabled = true
 redirect_base = "https://app.example.com"
+# Self-hosted IdP on an internal network (see "Self-hosted and internal IdPs")
+allow_private_network = false
 
 [oidc.role_map]
 admin = "builtin-admin"

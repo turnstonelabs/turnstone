@@ -27,6 +27,7 @@ if TYPE_CHECKING:
 from turnstone.core.log import get_logger
 from turnstone.core.oauth_ssrf import (
     OAuthSSRFError,
+    OAuthSSRFPrivateAddressError,
     is_localhost,
 )
 from turnstone.core.oauth_ssrf import (
@@ -105,7 +106,7 @@ class OIDCConfig:
     Startup-config fields (set by :func:`load_oidc_config`):
         ``enabled``, ``issuer``, ``client_id``, ``client_secret``, ``scopes``,
         ``provider_name``, ``role_claim``, ``role_map``, ``password_enabled``,
-        ``redirect_base``, ``trusted_endpoint_hosts``.
+        ``redirect_base``, ``trusted_endpoint_hosts``, ``allow_private_network``.
 
     Discovery-derived fields (set by :func:`discover_oidc`; empty before
     discovery completes):
@@ -124,6 +125,10 @@ class OIDCConfig:
     password_enabled: bool = True
     redirect_base: str = ""
     trusted_endpoint_hosts: tuple[str, ...] = ()
+    # Opt-in for self-hosted IdPs on internal networks: permit the issuer
+    # (and its same-origin discovered endpoints) to resolve to private
+    # addresses. Link-local/multicast/reserved stay refused regardless.
+    allow_private_network: bool = False
     # Discovered from .well-known/openid-configuration
     authorization_endpoint: str = ""
     token_endpoint: str = ""
@@ -188,6 +193,9 @@ def load_oidc_config() -> OIDCConfig:
     role_claim = _env_or_cfg_str("TURNSTONE_OIDC_ROLE_CLAIM", cfg, "role_claim")
     password_enabled = _env_or_cfg_bool(
         "TURNSTONE_OIDC_PASSWORD_ENABLED", cfg, "password_enabled", True
+    )
+    allow_private_network = _env_or_cfg_bool(
+        "TURNSTONE_OIDC_ALLOW_PRIVATE_NETWORK", cfg, "allow_private_network", False
     )
 
     # Role map: env var is "admin:builtin-admin,eng:builtin-operator"
@@ -259,7 +267,12 @@ def load_oidc_config() -> OIDCConfig:
     enabled = bool(issuer and client_id and client_secret)
 
     if enabled:
-        log.info("OIDC enabled: issuer=%s provider=%s", issuer, provider_name)
+        log.info(
+            "OIDC enabled: issuer=%s provider=%s%s",
+            issuer,
+            provider_name,
+            " (private-network IdP allowed)" if allow_private_network else "",
+        )
     else:
         log.debug("OIDC not configured (issuer/client_id/client_secret incomplete)")
 
@@ -275,6 +288,7 @@ def load_oidc_config() -> OIDCConfig:
         password_enabled=password_enabled,
         redirect_base=redirect_base,
         trusted_endpoint_hosts=trusted_endpoint_hosts,
+        allow_private_network=allow_private_network,
     )
 
 
@@ -287,25 +301,43 @@ def load_oidc_config() -> OIDCConfig:
 # ---------------------------------------------------------------------------
 
 
-def _validate_url_no_ssrf(url: str, *, allow_http: bool) -> urllib.parse.ParseResult:
-    """OIDC-flavoured wrapper around :func:`oauth_ssrf.validate_url_no_ssrf`."""
+def _validate_url_no_ssrf(
+    url: str, *, allow_http: bool, allow_private: bool = False
+) -> urllib.parse.ParseResult:
+    """OIDC-flavoured wrapper around :func:`oauth_ssrf.validate_url_no_ssrf`.
+
+    The private-address rejection gets the remediation hint appended: the
+    login-flow issuer is operator-configured, so pointing the operator at
+    the ``allow_private_network`` opt-in is safe here (unlike ``mcp_oauth``,
+    where the URLs come from untrusted remote-server metadata and no such
+    opt-in exists).
+    """
     try:
-        return _ssrf_validate_url_no_ssrf(url, allow_http=allow_http)
+        return _ssrf_validate_url_no_ssrf(url, allow_http=allow_http, allow_private=allow_private)
+    except OAuthSSRFPrivateAddressError as exc:
+        raise OIDCError(
+            f"{exc} — to allow a self-hosted IdP on a private network, set "
+            "allow_private_network = true in the [oidc] section of config.toml "
+            "(or TURNSTONE_OIDC_ALLOW_PRIVATE_NETWORK=true)"
+        ) from exc
     except OAuthSSRFError as exc:
         raise OIDCError(str(exc)) from exc
 
 
-def validate_issuer_url(url: str) -> None:
+def validate_issuer_url(url: str, *, allow_private: bool = False) -> None:
     """Validate an OIDC issuer URL to prevent SSRF.
 
     Rejects:
     - Non-HTTPS URLs (except localhost for development)
     - URLs with embedded credentials (userinfo)
-    - Hostnames that resolve to private/internal/loopback IP addresses
+    - Hostnames that resolve to private/internal/loopback IP addresses,
+      unless ``allow_private`` is set (the ``allow_private_network``
+      opt-in for self-hosted IdPs; link-local/multicast/reserved
+      addresses stay refused regardless)
 
     Raises :class:`OIDCError` on validation failure.
     """
-    _validate_url_no_ssrf(url, allow_http=True)
+    _validate_url_no_ssrf(url, allow_http=True, allow_private=allow_private)
 
 
 def validate_discovered_endpoint(
@@ -314,6 +346,7 @@ def validate_discovered_endpoint(
     *,
     allow_http: bool,
     trusted_endpoint_hosts: frozenset[str],
+    allow_private: bool = False,
 ) -> None:
     """Validate an endpoint pulled from an IdP discovery document.
 
@@ -340,6 +373,7 @@ def validate_discovered_endpoint(
             issuer_parsed,
             allow_http=allow_http,
             trusted_endpoint_hosts=trusted_endpoint_hosts,
+            allow_private=allow_private,
         )
     except OAuthSSRFError as exc:
         raise OIDCError(str(exc)) from exc
@@ -367,7 +401,9 @@ async def discover_oidc(
         return dataclasses.replace(config, enabled=False)
 
     try:
-        issuer_parsed = _validate_url_no_ssrf(config.issuer, allow_http=True)
+        issuer_parsed = _validate_url_no_ssrf(
+            config.issuer, allow_http=True, allow_private=config.allow_private_network
+        )
     except OIDCError as exc:
         log.warning("OIDC issuer URL rejected: %s", exc)
         return dataclasses.replace(config, enabled=False)
@@ -422,6 +458,7 @@ async def discover_oidc(
                 issuer_parsed,
                 allow_http=allow_http,
                 trusted_endpoint_hosts=trusted_hosts,
+                allow_private=config.allow_private_network,
             )
         except OIDCError as exc:
             log.warning("OIDC discovered %s rejected (url=%s): %s", name, endpoint_url, exc)
@@ -434,6 +471,7 @@ async def discover_oidc(
                 issuer_parsed,
                 allow_http=allow_http,
                 trusted_endpoint_hosts=trusted_hosts,
+                allow_private=config.allow_private_network,
             )
         except OIDCError as exc:
             log.warning(

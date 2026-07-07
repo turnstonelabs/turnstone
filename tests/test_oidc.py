@@ -90,6 +90,42 @@ class TestLoadOIDCConfig:
         assert cfg.scopes == "openid"
         assert cfg.provider_name == "Okta"
 
+    def test_load_oidc_config_allow_private_network_env(self, monkeypatch):
+        monkeypatch.setenv("TURNSTONE_OIDC_ISSUER", "https://auth.internal.example")
+        monkeypatch.setenv("TURNSTONE_OIDC_CLIENT_ID", "cid")
+        monkeypatch.setenv("TURNSTONE_OIDC_CLIENT_SECRET", "csecret")
+        monkeypatch.setenv("TURNSTONE_OIDC_ALLOW_PRIVATE_NETWORK", "true")
+
+        with patch("turnstone.core.config.load_config", return_value={}):
+            cfg = load_oidc_config()
+
+        assert cfg.allow_private_network is True
+
+    def test_load_oidc_config_allow_private_network_toml(self, monkeypatch):
+        monkeypatch.setenv("TURNSTONE_OIDC_ISSUER", "https://auth.internal.example")
+        monkeypatch.setenv("TURNSTONE_OIDC_CLIENT_ID", "cid")
+        monkeypatch.setenv("TURNSTONE_OIDC_CLIENT_SECRET", "csecret")
+        monkeypatch.delenv("TURNSTONE_OIDC_ALLOW_PRIVATE_NETWORK", raising=False)
+
+        with patch(
+            "turnstone.core.config.load_config",
+            return_value={"allow_private_network": True},
+        ):
+            cfg = load_oidc_config()
+
+        assert cfg.allow_private_network is True
+
+    def test_load_oidc_config_allow_private_network_default_off(self, monkeypatch):
+        monkeypatch.setenv("TURNSTONE_OIDC_ISSUER", "https://auth.example.com")
+        monkeypatch.setenv("TURNSTONE_OIDC_CLIENT_ID", "cid")
+        monkeypatch.setenv("TURNSTONE_OIDC_CLIENT_SECRET", "csecret")
+        monkeypatch.delenv("TURNSTONE_OIDC_ALLOW_PRIVATE_NETWORK", raising=False)
+
+        with patch("turnstone.core.config.load_config", return_value={}):
+            cfg = load_oidc_config()
+
+        assert cfg.allow_private_network is False
+
     def test_load_oidc_config_disabled_when_missing(self, monkeypatch):
         monkeypatch.delenv("TURNSTONE_OIDC_ISSUER", raising=False)
         monkeypatch.delenv("TURNSTONE_OIDC_CLIENT_ID", raising=False)
@@ -344,6 +380,27 @@ class TestValidateIssuerURL:
             ],
         ):
             validate_issuer_url("https://idp.example.com")
+
+    def test_private_address_hint_mentions_opt_in(self):
+        """The rejection message points the operator at allow_private_network."""
+        with (
+            patch("socket.getaddrinfo", return_value=[(2, 1, 6, "", ("10.0.0.5", 0))]),
+            pytest.raises(OIDCError, match="allow_private_network"),
+        ):
+            validate_issuer_url("https://auth.internal.example")
+
+    def test_allow_private_accepts_private_issuer(self):
+        """The opt-in accepts an issuer resolving to RFC 1918 space."""
+        with patch("socket.getaddrinfo", return_value=[(2, 1, 6, "", ("10.0.0.5", 0))]):
+            validate_issuer_url("https://auth.internal.example", allow_private=True)
+
+    def test_allow_private_still_rejects_link_local(self):
+        """Link-local (cloud metadata) is refused even with the opt-in."""
+        with (
+            patch("socket.getaddrinfo", return_value=[(2, 1, 6, "", ("169.254.169.254", 0))]),
+            pytest.raises(OIDCError, match="refused even with private"),
+        ):
+            validate_issuer_url("https://md.internal.example", allow_private=True)
 
     def test_rejects_http_non_localhost(self):
         """HTTP is rejected for non-localhost hosts."""
@@ -2163,6 +2220,58 @@ class TestDiscoverOIDC:
             assert result.userinfo_endpoint == "https://idp.example.com/userinfo"
             assert result.jwks_uri == "https://idp.example.com/.well-known/jwks.json"
             assert result.enabled is True
+
+        asyncio.run(_run())
+
+    def test_discover_oidc_private_issuer_rejected_by_default(self):
+        """Without the opt-in, a private-resolving issuer disables OIDC."""
+        config = _make_config(
+            issuer="https://auth.internal.example",
+            authorization_endpoint="",
+            token_endpoint="",
+            userinfo_endpoint="",
+            jwks_uri="",
+        )
+
+        async def _run():
+            with patch("socket.getaddrinfo", return_value=[(2, 1, 6, "", ("10.0.0.5", 0))]):
+                result = await discover_oidc(config)
+            assert result.enabled is False
+
+        asyncio.run(_run())
+
+    def test_discover_oidc_private_issuer_with_opt_in(self):
+        """allow_private_network=True lets a private-resolving IdP discover."""
+        config = _make_config(
+            issuer="https://auth.internal.example",
+            allow_private_network=True,
+            authorization_endpoint="",
+            token_endpoint="",
+            userinfo_endpoint="",
+            jwks_uri="",
+        )
+
+        discovery_doc = {
+            "authorization_endpoint": "https://auth.internal.example/authorize",
+            "token_endpoint": "https://auth.internal.example/token",
+            "userinfo_endpoint": "https://auth.internal.example/userinfo",
+            "jwks_uri": "https://auth.internal.example/jwks",
+        }
+
+        mock_response = MagicMock()
+        mock_response.json.return_value = discovery_doc
+        mock_response.raise_for_status = MagicMock()
+
+        async def _run():
+            client = _mock_async_client(lambda url: _async_return(mock_response))
+            with (
+                patch("socket.getaddrinfo", return_value=[(2, 1, 6, "", ("10.0.0.5", 0))]),
+                patch("httpx.AsyncClient", return_value=client),
+            ):
+                result = await discover_oidc(config)
+
+            assert result.enabled is True
+            assert result.token_endpoint == "https://auth.internal.example/token"
 
         asyncio.run(_run())
 
