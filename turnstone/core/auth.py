@@ -73,6 +73,28 @@ _MIN_SECRET_LENGTH = 32  # 256 bits minimum for HMAC-SHA256
 
 VALID_SCOPES: frozenset[str] = frozenset({"read", "write", "approve", "service"})
 
+# Scopes a principal may be GRANTED via a user-facing token mint (the admin
+# token API / ``turnstone-admin create-token``).  ``service`` is deliberately
+# excluded: it is a full cross-tenant bypass (see
+# :meth:`WorkstreamProjectVisibility.for_request`) and must only ever be
+# minted by :class:`ServiceTokenManager` / operators holding the JWT secret —
+# never assigned to a user, or an admin could self-grant it and see every
+# private project's workstreams.
+ASSIGNABLE_SCOPES: frozenset[str] = VALID_SCOPES - frozenset({"service"})
+
+
+def reject_unassignable_scopes(scopes_csv: str) -> str | None:
+    """Validate a user-supplied comma-separated scope string for token mints.
+
+    Returns an error message when the request is empty or names any scope
+    outside :data:`ASSIGNABLE_SCOPES` (notably ``service``), else ``None``.
+    Shared by the admin token API and the CLI so the rule can't drift.
+    """
+    requested = {s.strip() for s in scopes_csv.split(",") if s.strip()}
+    if not requested or not requested.issubset(ASSIGNABLE_SCOPES):
+        return "Invalid scopes (allowed: read, write, approve)"
+    return None
+
 
 def jwt_version_slot() -> str:
     """Return ``major.minor`` from ``__version__`` for JWT version claims.
@@ -267,11 +289,13 @@ class WorkstreamProjectVisibility:
 
     Rules (first match wins):
 
-    * ``bypass`` instances see everything — service-scope callers (the
-      collector and other cluster machinery must never be blinded at the
-      node edge; user-facing filtering happens at the console edge) and
-      holders of ``admin.cluster.inspect`` (the existing cluster-wide
-      workstream-inspect surface).
+    * ``bypass`` instances see everything — but ONLY service-scope callers
+      (the collector and other cluster machinery must never be blinded at
+      the node edge; user-facing filtering happens per-principal at the
+      console edge). No human principal bypasses: a private project's
+      workstreams are confidential even from admins — ``admin.cluster.inspect``
+      still gates the cluster-inspect *surfaces*, but a permitted admin only
+      sees the private-project rows they own or are a member of.
     * No / dangling ``project_id`` → visible (a deleted project leaves the
       link behind by design — no row, no privacy to enforce).
     * Non-private visibility → visible (trusted-team default).
@@ -295,22 +319,23 @@ class WorkstreamProjectVisibility:
     def for_request(cls, request: Any, *, storage: Any = None) -> WorkstreamProjectVisibility:
         """Build a filter for an HTTP request's authenticated principal.
 
-        Service-scoped tokens and ``admin.cluster.inspect`` holders get a
-        bypass instance; everyone else filters as themselves.
+        Only service-scoped tokens get a bypass instance (node→console
+        machine plumbing, re-filtered per-user at the console edge);
+        everyone else — admins included — filters as themselves. An admin
+        holding ``admin.cluster.inspect`` reaches the cluster-inspect
+        surfaces but still only sees private-project workstreams they own
+        or belong to.
         """
         auth: AuthResult | None = getattr(getattr(request, "state", None), "auth_result", None)
         uid = str(getattr(auth, "user_id", "") or "")
-        bypass = bool(
-            auth is not None
-            and (auth.has_scope("service") or auth.has_permission("admin.cluster.inspect"))
-        )
+        bypass = bool(auth is not None and auth.has_scope("service"))
         return cls(uid, bypass=bypass, storage=storage)
 
     @property
     def bypass(self) -> bool:
-        """True when this principal sees everything (service scope /
-        ``admin.cluster.inspect``) — callers that transform payloads
-        (not just drop rows) use this to leave them untouched."""
+        """True when this principal sees everything (service scope only) —
+        callers that transform payloads (not just drop rows) use this to
+        leave them untouched."""
         return self._bypass
 
     def _resolve_storage(self) -> Any:

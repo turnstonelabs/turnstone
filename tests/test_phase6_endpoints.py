@@ -179,16 +179,58 @@ def test_bulk_live_admin_bypass_returns_live(storage):
 
 
 def test_bulk_live_cluster_wide_visibility(storage):
-    """Trusted-team visibility: any ``admin.cluster.inspect`` caller
-    sees every row in ``results``.  ``denied`` is reserved for ids
-    that don't correspond to a persisted workstream (no existence
-    oracle for unknown ids)."""
+    """A project-less workstream has no tenancy to enforce, so any
+    ``admin.cluster.inspect`` caller sees it in ``results``.  ``denied``
+    is reserved for ids that don't correspond to a persisted workstream
+    (no existence oracle for unknown ids)."""
     ws_id = "b" * 32
     _seed_workstream(storage, ws_id=ws_id, node_id="node-a", user_id="stranger")
     client = _make_client(storage, coord_mgr=_build_mgr(storage))
     resp = client.get(
         f"/v1/api/cluster/ws/live?ids={ws_id}",
         headers={"X-Test-User": "user-1", "X-Test-Perms": "admin.cluster.inspect"},
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert ws_id in body["results"]
+    assert body["denied"] == []
+
+
+def test_bulk_live_private_project_row_routes_to_denied(storage):
+    """A workstream in a private project the caller isn't a member of
+    routes to ``denied``, not ``results`` — a cluster admin gets no
+    private-project oracle from the bulk surface either."""
+    storage.create_project("proj-secret", "Secret", "alice")
+    ws_id = "c" * 32
+    storage.register_workstream(ws_id, node_id="node-a", user_id="alice", project_id="proj-secret")
+    client = _make_client(storage, coord_mgr=_build_mgr(storage))
+    resp = client.get(
+        f"/v1/api/cluster/ws/live?ids={ws_id}",
+        headers={"X-Test-User": "stranger", "X-Test-Perms": "admin.cluster.inspect"},
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["results"] == {}
+    assert body["denied"] == [ws_id]
+
+
+def test_bulk_live_private_project_row_visible_to_member(storage):
+    """A project member sees the row (routes to ``results``); the live
+    block is null only because the coordinator row isn't loaded."""
+    storage.create_project("proj-secret", "Secret", "alice")
+    storage.add_project_member("proj-secret", "member-bob")
+    ws_id = "c" * 32
+    storage.register_workstream(
+        ws_id,
+        node_id="console",
+        user_id="alice",
+        kind="coordinator",
+        project_id="proj-secret",
+    )
+    client = _make_client(storage, coord_mgr=_build_mgr(storage))
+    resp = client.get(
+        f"/v1/api/cluster/ws/live?ids={ws_id}",
+        headers={"X-Test-User": "member-bob", "X-Test-Perms": "admin.cluster.inspect"},
     )
     assert resp.status_code == 200
     body = resp.json()

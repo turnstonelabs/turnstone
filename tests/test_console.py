@@ -1600,6 +1600,82 @@ class TestConsoleProxy:
             # browser's interactive UI 403-loops on every retry.
             assert sse_mock.await_args.kwargs.get("use_service_auth") is True
 
+    def test_proxy_events_global_403_without_cluster_inspect(self, mock_collector):
+        """A plain authenticated user (no service scope, no
+        admin.cluster.inspect) cannot reach the node's cross-tenant
+        firehose through the proxy: elevating to the console's service
+        identity would bypass per-user filtering, so the path is
+        operator-gated. _proxy_sse must NOT be reached."""
+        from unittest.mock import AsyncMock, patch
+
+        from starlette.responses import Response
+        from starlette.testclient import TestClient
+
+        from turnstone.console.server import _load_static, create_app
+        from turnstone.core.auth import JWT_AUD_CONSOLE, create_jwt
+
+        _load_static()
+        app = create_app(collector=mock_collector, jwt_secret=_TEST_JWT_SECRET)
+        user_jwt = create_jwt(
+            user_id="plain-user",
+            scopes=frozenset({"read"}),
+            source="test",
+            secret=_TEST_JWT_SECRET,
+            audience=JWT_AUD_CONSOLE,
+            permissions=frozenset(),
+        )
+        user_client = TestClient(
+            app,
+            raise_server_exceptions=False,
+            headers={"Authorization": f"Bearer {user_jwt}"},
+        )
+        with patch(
+            "turnstone.console.server._proxy_sse",
+            new_callable=AsyncMock,
+            return_value=Response("ok", status_code=200),
+        ) as sse_mock:
+            resp = user_client.get("/node/node-a/v1/api/events/global")
+        assert resp.status_code == 403
+        assert sse_mock.await_count == 0
+        user_client.close()
+
+    def test_proxy_events_global_allows_cluster_inspect(self, mock_collector):
+        """An operator holding admin.cluster.inspect passes the gate and
+        reaches the SSE proxy with the service token."""
+        from unittest.mock import AsyncMock, patch
+
+        from starlette.responses import Response
+        from starlette.testclient import TestClient
+
+        from turnstone.console.server import _load_static, create_app
+        from turnstone.core.auth import JWT_AUD_CONSOLE, create_jwt
+
+        _load_static()
+        app = create_app(collector=mock_collector, jwt_secret=_TEST_JWT_SECRET)
+        op_jwt = create_jwt(
+            user_id="operator",
+            scopes=frozenset({"read"}),
+            source="test",
+            secret=_TEST_JWT_SECRET,
+            audience=JWT_AUD_CONSOLE,
+            permissions=frozenset({"admin.cluster.inspect"}),
+        )
+        op_client = TestClient(
+            app,
+            raise_server_exceptions=False,
+            headers={"Authorization": f"Bearer {op_jwt}"},
+        )
+        with patch(
+            "turnstone.console.server._proxy_sse",
+            new_callable=AsyncMock,
+            return_value=Response("ok", status_code=200),
+        ) as sse_mock:
+            resp = op_client.get("/node/node-a/v1/api/events/global")
+        assert resp.status_code == 200
+        assert sse_mock.await_count == 1
+        assert sse_mock.await_args.kwargs.get("use_service_auth") is True
+        op_client.close()
+
     def test_proxy_api_per_ws_events_uses_user_auth_not_service(self, client, mock_collector):
         """Per-ws events route uses the user's re-minted JWT, not the
         service token — the upstream per-ws SSE handler scopes by

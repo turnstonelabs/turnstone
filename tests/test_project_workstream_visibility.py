@@ -127,10 +127,14 @@ class TestWsVisiblePredicate:
         assert storage.get_project.call_count == 1
 
     def test_for_request_bypass_rules(self) -> None:
+        # Only service scope bypasses (node→console machine plumbing,
+        # re-filtered per-user at the console edge).
         assert WorkstreamProjectVisibility.for_request(
             _request_for("bob", scopes=("service",))
         )._bypass
-        assert WorkstreamProjectVisibility.for_request(
+        # admin.cluster.inspect gates the inspect *surfaces* but does NOT
+        # bypass private-project tenancy — the admin filters as themselves.
+        assert not WorkstreamProjectVisibility.for_request(
             _request_for("bob", permissions=("admin.cluster.inspect",))
         )._bypass
         assert not WorkstreamProjectVisibility.for_request(_request_for("bob"))._bypass
@@ -214,15 +218,17 @@ class TestResolveWorkstreamOwnerProjectGate:
         assert err is None
         assert owner == "bob"
 
-    def test_admin_inspect_bypasses(self, tmp_db: str) -> None:
+    def test_admin_inspect_does_not_bypass(self, tmp_db: str) -> None:
+        # A permitted admin (admin.cluster.inspect) who isn't the owner /
+        # creator / member of a private project is still 403'd at the row
+        # gate — the permission gates the inspect surface, not the tenancy.
         from turnstone.core.web_helpers import resolve_workstream_owner
 
         self._seed(member=False)
         owner, err = resolve_workstream_owner(
             _request_for("bob", permissions=("admin.cluster.inspect",)), "ws-priv"
         )
-        assert err is None
-        assert owner == "alice"
+        assert err is not None and err.status_code == 403
 
     def test_missing_ws_still_404s(self, tmp_db: str) -> None:
         from turnstone.core.web_helpers import resolve_workstream_owner

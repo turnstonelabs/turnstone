@@ -1572,9 +1572,12 @@ CONSOLE_ENDPOINTS: list[EndpointSpec] = [
             '``kind="coordinator"`` rows), and the tail of the message '
             "history.  Gated on the ``admin.cluster.inspect`` permission "
             "(granted to ``builtin-admin`` via migration 040; revoke or "
-            "reassign to a custom role for tighter control).  ``live`` "
-            "is null on node unreachability / 5xx so callers can degrade "
-            "gracefully."
+            "reassign to a custom role for tighter control).  A workstream "
+            "attached to a *private* project stays confidential to its "
+            "members: a permitted caller who isn't its owner / creator / "
+            "project member gets a 404 (same masking as an unknown id).  "
+            "``live`` is null on node unreachability / 5xx so callers can "
+            "degrade gracefully."
         ),
         response_model=ClusterWsDetailResponse,
         query_params=[
