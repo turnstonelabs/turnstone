@@ -154,7 +154,10 @@ def resolve_persona_for_kind(
                 f"(personas: {slugs}); use the exact name"
             )
     if not row or not row.get("enabled", False):
-        return None, f"Persona not found or disabled: {name}.{_available_for_kind(storage, kind)}"
+        # ``!r`` matters: forgiven inputs include whitespace-only and
+        # trailing-space typos, which an unquoted interpolation renders
+        # invisible in CLI output and logs.
+        return None, f"Persona not found or disabled: {name!r}.{_available_for_kind(storage, kind)}"
     if kind not in (row.get("applies_to_kinds") or []):
         return None, (
             f"Persona {row['name']!r} does not apply to kind {kind!r}."
