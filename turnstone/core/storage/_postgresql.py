@@ -178,6 +178,13 @@ from turnstone.core.workstream import BULK_CLOSE_STATE_VALUES, WorkstreamKind
 
 log = get_logger(__name__)
 
+# PostgreSQL rejects any tsvector larger than 1MB ("string is too long for
+# tsvector"), and search_history computes tsvectors inline per row — so one
+# oversized row would abort the whole scan and every search with it.  Worst
+# case a tsvector runs ~4x its input (unique short lexemes + position data),
+# so 250K chars keeps even pathological rows safely under the limit.
+_FTS_INPUT_CAP_CHARS = 250_000
+
 
 def _resolve_pg_listen_url(override: str, sqlalchemy_url: str) -> str:
     """Resolve the URL used by the dedicated LISTEN connection.
@@ -1289,26 +1296,31 @@ class PostgreSQLBackend:
             scope_params["excl_ws"] = exclude_ws_id
             scope_params["excl_after"] = -1 if exclude_after is None else exclude_after
         with self._conn() as conn:
-            # Use PostgreSQL full-text search if search_vector column exists
+            # Full-text search over an inline tsvector (there is no indexed
+            # search_vector column).  The input is capped — see
+            # _FTS_INPUT_CAP_CHARS — so a single giant row (multi-MB tool
+            # dumps exist) cannot trip PostgreSQL's 1MB tsvector limit and
+            # abort every search; oversized rows stay findable by their head.
             try:
                 return list(
                     conn.execute(
                         sa.text(
                             "SELECT c.timestamp, c.ws_id, c.role, c.content, c.tool_name "
                             "FROM conversations c "
-                            "WHERE to_tsvector('english', COALESCE(c.content, '')) "
+                            "WHERE to_tsvector('english', left(COALESCE(c.content, ''), :fts_cap)) "
                             "   @@ plainto_tsquery('english', :query) "
                             # Exclude compaction-checkpoint markers (resume-only
                             # summary artifacts); IS DISTINCT FROM is NULL-safe so
                             # normal rows (_source NULL) are not dropped.
                             "AND c._source IS DISTINCT FROM :compaction_source "
                             + scope_sql
-                            + "ORDER BY ts_rank(to_tsvector('english', COALESCE(c.content, '')), "
+                            + "ORDER BY ts_rank(to_tsvector('english', left(COALESCE(c.content, ''), :fts_cap)), "
                             "   plainto_tsquery('english', :query)) DESC "
                             "LIMIT :limit OFFSET :offset"
                         ),
                         {
                             "query": query,
+                            "fts_cap": _FTS_INPUT_CAP_CHARS,
                             "compaction_source": _COMPACTION_SOURCE,
                             "limit": capped,
                             "offset": capped_offset,
@@ -1317,6 +1329,11 @@ class PostgreSQLBackend:
                     ).fetchall()
                 )
             except Exception:
+                # The failed statement aborted the connection's autobegun
+                # transaction; PostgreSQL then refuses every command until a
+                # rollback, so without this the fallback can never run
+                # (InFailedSqlTransaction).
+                conn.rollback()
                 # Fallback to ILIKE
                 return list(
                     conn.execute(
