@@ -67,6 +67,39 @@ class PersonaSnapshot:
         }
 
 
+def _enabled_personas(storage: Any) -> list[dict[str, Any]]:
+    """Enabled persona rows, or ``[]`` when listing fails.
+
+    Swallowing here keeps the forgiving-lookup and error-enrichment paths
+    from introducing raise paths the exact-match lookup never had (the CLI
+    calls ``resolve_persona_for_kind`` uncaught).
+    """
+    try:
+        return list(storage.list_personas())
+    except Exception:
+        return []
+
+
+def persona_names_for_kind(storage: Any, kind: str) -> list[str]:
+    """Enabled persona names applying to ``kind`` — default first, then A→Z.
+
+    The default carries a ``" (default)"`` suffix so error text and tool
+    descriptions read the same way everywhere.
+    """
+    rows = [r for r in _enabled_personas(storage) if kind in (r.get("applies_to_kinds") or [])]
+    rows.sort(key=lambda r: (not r.get("is_default"), str(r.get("name") or "")))
+    return [
+        str(r["name"]) + (" (default)" if r.get("is_default") else "")
+        for r in rows
+        if r.get("name")
+    ]
+
+
+def _available_for_kind(storage: Any, kind: str) -> str:
+    names = persona_names_for_kind(storage, kind)
+    return f" Available for {kind}: {', '.join(names)}." if names else ""
+
+
 def resolve_persona_for_kind(
     storage: Any, name: str, kind: str
 ) -> tuple[dict[str, Any] | None, str]:
@@ -79,14 +112,54 @@ def resolve_persona_for_kind(
     (per-org personas, a new kind) cannot leave the surfaces disagreeing.
     ``storage is None`` reports a distinct storage-unavailable error — a
     storage outage must never masquerade as "unknown persona".
+
+    Lookup is forgiving: exact name first (stored names are lowercase slugs,
+    create-path validated), then the lowercased input, then a case-insensitive
+    match on display names.  ``display_name`` carries no uniqueness
+    constraint, so the fallback is deliberately narrow: candidates are the
+    ENABLED personas ELIGIBLE FOR ``kind`` (the label the caller saw came
+    from a kind-filtered surface — picker or injected tool description — so
+    a same-label persona of another kind must neither block nor win), and
+    the match is accepted only when exactly one candidate remains; duplicates
+    refuse loudly, naming the candidate slugs.  Callers must stamp/emit the
+    returned row's ``name``, never the input, so a forgiven variant can't
+    leak into ``workstream_config`` or approval chrome.  Failure messages
+    enumerate the kind's valid names: tool descriptions render the persona
+    list at session start, so this is how a caller with a stale list (or a
+    typo) self-corrects.
     """
     if storage is None:
         return None, "persona storage unavailable"
-    row = storage.get_persona_by_name(name)
+    wanted = name.strip()
+    row = storage.get_persona_by_name(wanted)
+    if row is None and wanted != wanted.lower():
+        row = storage.get_persona_by_name(wanted.lower())
+    if row is None and wanted:
+        # The non-empty gate is load-bearing: display_name defaults to "", so
+        # a whitespace-only input would otherwise match every blank-labelled
+        # persona and silently stamp an envelope the caller never named.
+        target = wanted.lower()
+        matches = [
+            r
+            for r in _enabled_personas(storage)
+            if kind in (r.get("applies_to_kinds") or [])
+            and str(r.get("display_name") or "").strip().lower() == target
+        ]
+        if len(matches) == 1:
+            row = matches[0]
+        elif len(matches) > 1:
+            slugs = ", ".join(sorted(str(m["name"]) for m in matches))
+            return None, (
+                f"Persona name {name!r} matches more than one display name "
+                f"(personas: {slugs}); use the exact name"
+            )
     if not row or not row.get("enabled", False):
-        return None, f"Persona not found or disabled: {name}"
+        return None, f"Persona not found or disabled: {name}.{_available_for_kind(storage, kind)}"
     if kind not in (row.get("applies_to_kinds") or []):
-        return None, f"Persona {name!r} does not apply to kind {kind!r}"
+        return None, (
+            f"Persona {row['name']!r} does not apply to kind {kind!r}."
+            f"{_available_for_kind(storage, kind)}"
+        )
     return row, ""
 
 
