@@ -5086,6 +5086,55 @@ class TestMetacognitiveBuffers:
         assert sys_turn["_source"] == "tool_error"
         assert sys_turn["content"] == "you hit an error; check memory"
 
+    def test_denial_nudge_queues_on_tool_channel(self, tmp_db):
+        """A denial responds to the tool batch the user just rejected — the
+        producer must queue it on the TOOL channel so it drains through
+        ``_collect_advisories`` alongside the denied results (the same seam
+        tool_error / repeat use), not sit on the user channel until the next
+        user-message seam — by which point the model has already reacted to
+        the denial without the nudge.
+
+        Drives the REAL ``_execute_tools`` two-phase gate with real
+        ``_nudges_enabled`` / ``should_nudge`` gating; only the prepare
+        step and the UI approval are stubbed."""
+        from turnstone.core.metacognition import format_nudge
+
+        session = _make_session()
+        # ``should_nudge`` skips the very first message — give the session
+        # the natural pre-batch shape (user turn + assistant tool-call turn).
+        session.messages.append(turn_from_dict({"role": "user", "content": "do the thing"}))
+        session.messages.append(turn_from_dict({"role": "assistant", "content": "calling"}))
+
+        item = {
+            "call_id": "call_1",
+            "func_name": "notify",
+            "needs_approval": True,
+            # Must NOT run — a denied tool never executes.
+            "execute": lambda p: (p["call_id"], "EXECUTED — must not happen"),
+        }
+        with (
+            patch.object(session, "_safe_prepare_tool", return_value=item),
+            patch.object(session.ui, "approve_tools", return_value=(False, "use /tmp instead")),
+            patch.object(session, "_visible_memory_count", return_value=0),
+        ):
+            tool_calls = [
+                {
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {"name": "notify", "arguments": "{}"},
+                }
+            ]
+            results, feedback = session._execute_tools(tool_calls)
+
+        # The denied item surfaced the operator's feedback as its result…
+        assert results == [("call_1", "Denied by user: use /tmp instead")]
+        assert feedback is None
+        # …and the denial nudge is queued on the TOOL channel, so the same
+        # batch's ``_collect_advisories`` drain delivers it; nothing defers
+        # to the next user turn.
+        assert session._nudge_queue.pending(channel="tool") == [("denial", format_nudge("denial"))]
+        assert session._nudge_queue.pending(channel="user") == []
+
     def test_queued_message_appends_system_turn_after_tool_batch(self, tmp_db):
         """A queued message arriving during a tool batch becomes a
         first-class ``{"role": "system", "_source": "user_interjection"}``

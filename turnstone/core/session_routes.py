@@ -2772,15 +2772,21 @@ def make_create_handler(
                 attachment_ids,
             )
 
-        return JSONResponse(
-            {
-                "ws_id": ws.id,
-                "name": ws.name,
-                "resumed": bool(extra_response.get("resumed", False)),
-                "message_count": int(extra_response.get("message_count", 0)),
-                "attachment_ids": attachment_ids,
-            }
-        )
+        create_payload: dict[str, Any] = {
+            "ws_id": ws.id,
+            "name": ws.name,
+            "resumed": bool(extra_response.get("resumed", False)),
+            "message_count": int(extra_response.get("message_count", 0)),
+            "attachment_ids": attachment_ids,
+        }
+        if extra_response.get("initial_message_status"):
+            # Present only when the post-install hook could NOT deliver
+            # the initial message (raced live worker, interjection queue
+            # full) — the workstream exists, but a bare 200 would read as
+            # "first message accepted".  Mirrors /send's in-body
+            # ``queue_full`` backpressure surface.
+            create_payload["initial_message_status"] = str(extra_response["initial_message_status"])
+        return JSONResponse(create_payload)
 
     return create
 
@@ -3798,6 +3804,27 @@ def make_detail_handler(cfg: SessionEndpointConfig) -> Handler:
                 # mismatch, and tombstoned rows — all surface as 404.
                 return JSONResponse({"error": cfg.not_found_label}, status_code=404)
 
+            # A detail GET that lazily rehydrates IS an open — run the
+            # same kind-specific post-load the open handler runs.
+            # Skipping it leaves the now-live session with no watch
+            # dispatch registration (its next watch fire would take the
+            # restore path and spawn a duplicate auto-approved session
+            # racing writes into this live conversation) and never tells
+            # dashboards the workstream came live (``ws_created``).
+            if cfg.open_post_load is not None:
+                try:
+                    # Off-loop: interactive's post_load does blocking
+                    # storage I/O (display-name lookup).
+                    await asyncio.to_thread(cfg.open_post_load, request, ws)
+                except Exception:
+                    # Post-load is observational — never let a hook bug
+                    # block the detail response. Log + continue.
+                    log.debug(
+                        "ws.detail.post_load_failed ws=%s",
+                        ws.id[:8],
+                        exc_info=True,
+                    )
+
         # Pending-approval snapshot — lets a freshly-loaded chat tab
         # paint the inline approval gate from this single response
         # instead of waiting for the SSE approve_request replay (which
@@ -4097,6 +4124,12 @@ def make_send_handler(cfg: SessionEndpointConfig) -> Handler:
             thread_name=f"send-worker-{ws.id[:8]}",
         )
         if not ok:
+            if ws._closed:
+                # ``send`` refused because the workstream closed between our
+                # resolution and the dispatch — a ``queue_full`` here would
+                # tell the client to retry a workstream whose very next
+                # resolution 404s.  Mirror the resolution miss instead.
+                return JSONResponse({"error": cfg.not_found_label}, status_code=404)
             # queue.Full or session-disappeared race — surface as
             # queue_full so clients retry rather than 500. ``attached_ids``
             # is always empty on this path (the dispatch never took

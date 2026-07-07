@@ -18,11 +18,22 @@ with no consumer. The flag transitions atomically inside the same lock
 this module holds, so both coord and interactive callers inherit the
 fix.
 
-This module owns ONLY the dispatch decision and the
-``_worker_running`` lifecycle. Per-kind concerns — session resolution,
+This module owns ONLY the dispatch decision, the ``_worker_running``
+lifecycle, and the ownership-clear wake backstop
+(:func:`_retry_pending_wake`). Per-kind concerns — session resolution,
 attachment resolution, error surfacing, UI callbacks,
 ``GenerationCancelled`` handling — live in the caller's
 ``enqueue`` / ``run`` no-arg closures.
+
+The wake backstop exists because IDLE state fans out from INSIDE
+``run()`` (``set_state`` subscribers fire on the calling thread — the
+worker that did the transition).  Any wake the IDLE fan-out dispatches
+(``IdleNudgeWatcher``) therefore lands on the reuse path while this
+worker still owns the flag and no-ops; with IDLE emitted at the END of
+a send there is no later seam in this worker to drain the queue, so
+the nudge would strand until the next user message.  Re-running the
+wake gate at the exact moment ownership clears is the only spot that
+closes the window without ever racing a competing worker.
 """
 
 from __future__ import annotations
@@ -39,6 +50,41 @@ if TYPE_CHECKING:
     from turnstone.core.workstream import Workstream
 
 log = get_logger(__name__)
+
+
+def _retry_pending_wake(ws: Workstream) -> None:
+    """Deliver nudges that arrived while the exiting worker owned *ws*.
+
+    Runs in the worker's ``finally`` immediately after it cleared
+    ``_worker_running`` (owner only — abandoned threads skip it).  The
+    canonical strand it closes: the coordinator's ``idle_children``
+    nudge, enqueued by ``CoordinatorIdleObserver`` during the IDLE
+    fan-out at the end of the coord's send — the fan-out runs on the
+    worker thread, so ``IdleNudgeWatcher``'s wake dispatch hits the
+    reuse path and no-ops, and nothing else ever re-checks the queue.
+    The same window covers a watch ``wake_fn`` firing while a worker
+    is mid-exit.
+
+    The wake gate
+    (:func:`~turnstone.core.idle_nudge_watcher.wake_workstream_if_pending`)
+    owns every defensive check — session missing, bare stub without a
+    NudgeQueue (watch-style dispatchers drive sessions that aren't
+    installed on the workstream), closed, non-idle, nothing pending —
+    and its ``session_worker.send`` dispatch is the same atomic spawn
+    as any other: a successor worker claimed between our flag-clear
+    and the retry just downgrades the wake to a no-op enqueue again,
+    and THAT worker's own exit re-runs this backstop.  Convergence is
+    owned by the producers' gates (cooldown, hard caps, ``valid_until``
+    predicates): a wake worker whose drain empties the queue retries
+    once at its own exit, sees nothing pending, and stops.
+    """
+    # Local import: idle_nudge_watcher imports this module at top level.
+    from turnstone.core.idle_nudge_watcher import wake_workstream_if_pending
+
+    try:
+        wake_workstream_if_pending(ws, trigger="worker-exit")
+    except Exception:
+        log.warning("session_worker.wake_retry_failed ws=%s", ws.id[:8], exc_info=True)
 
 
 def send(
@@ -63,10 +109,11 @@ def send(
     Returns:
         ``True`` on successful enqueue (existing worker accepted) or
         thread spawn (no live worker).
-        ``False`` when ``enqueue`` raises ``queue.Full`` (queue at
-        capacity — caller surfaces 429) or any other exception
-        (logged). Falling through to spawn a second worker on a full
-        queue would corrupt ChatSession state.
+        ``False`` when the workstream is already closed (see below), or
+        when ``enqueue`` raises ``queue.Full`` (queue at capacity —
+        caller surfaces 429) or any other exception (logged). Falling
+        through to spawn a second worker on a full queue would corrupt
+        ChatSession state.
     """
     name = thread_name or f"session-worker-{ws.id[:8]}"
 
@@ -85,6 +132,7 @@ def send(
             # close style signals if the runtime ever delivers them).
             log.exception("session_worker.uncaught ws=%s", ws.id[:8])
         finally:
+            was_owner = False
             with ws._lock:
                 # Only clear the flag if THIS thread is still the current
                 # worker.  A force-cancel abandons the worker
@@ -96,8 +144,23 @@ def send(
                 # spawns a second concurrent worker on the same session.
                 if ws.worker_thread is threading.current_thread():
                     ws._worker_running = False
+                    was_owner = True
+            # Outside the lock (the retry's wake dispatch re-acquires it).
+            # Owner only: an abandoned thread retrying would race the
+            # successor's own exit backstop for no benefit.
+            if was_owner:
+                _retry_pending_wake(ws)
 
     with ws._lock:
+        if ws._closed:
+            # Authoritative closed-check: ``SessionManager.close`` sets
+            # ``_closed`` under this same lock, so unlike the wake gate's
+            # lockless peek this read cannot go stale.  Without it, a
+            # wake (or send) racing ``close()`` spawns a worker that runs
+            # a full unattended turn — inference, tool calls, storage
+            # writes — on a workstream whose ``ws_closed`` already fired.
+            log.info("session_worker.closed_refused ws=%s", ws.id[:8])
+            return False
         if ws._worker_running:
             try:
                 enqueue()

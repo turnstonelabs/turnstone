@@ -28,8 +28,10 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+from tests._helpers import wait_until as _wait_until
 from tests.test_session_manager import FakeStorage
-from turnstone.core.idle_nudge_watcher import IdleNudgeWatcher
+from turnstone.core import session_worker
+from turnstone.core.idle_nudge_watcher import IdleNudgeWatcher, wake_workstream_if_pending
 from turnstone.core.session import ChatSession
 from turnstone.core.session_manager import SessionManager
 from turnstone.core.trajectory import dicts_from_turns, turn_from_dict
@@ -299,6 +301,72 @@ def test_idle_event_with_empty_queue_does_not_dispatch_wake(real_mgr, tmp_db):
         watcher.shutdown()
 
 
+def test_watch_fire_on_already_idle_session_drives_wake_send(real_mgr, tmp_db):
+    """A watch firing on an ALREADY-idle workstream sees no IDLE
+    transition, so :class:`IdleNudgeWatcher` never re-checks the queue —
+    the dispatch closure's ``wake_fn`` must drive the wake itself.
+
+    Boundary path under test (only the LLM stream is patched):
+      dispatch closure (real, built by ``set_watch_runner``)
+        → NudgeQueue.enqueue (real)
+        → wake_fn → wake_workstream_if_pending (real)
+        → session_worker.send (real) → daemon thread
+        → ChatSession.deliver_wake_nudge_from_queue (real)
+        → ChatSession.send("") → watch_triggered system turn in history
+    """
+    mgr, _adapter = real_mgr
+    ws = mgr.create(user_id="u1", name="watch-wake-int", skill=None)
+    assert ws.session is not None
+
+    captured: dict[str, Any] = {}
+
+    class _StubRunner:
+        def set_dispatch_fn(self, ws_id: str, fn: Any) -> None:
+            captured["fn"] = fn
+
+    # Production wiring shape (server.py): wake_fn closes over the
+    # Workstream OBJECT — not its id — so eviction+restore id drift
+    # can't strand the wake.
+    ws.session.set_watch_runner(
+        _StubRunner(), wake_fn=lambda: wake_workstream_if_pending(ws, trigger="watch-fire")
+    )
+
+    with (
+        patch.object(ws.session, "_create_stream_with_retry", return_value=iter([])),
+        patch.object(
+            ws.session,
+            "_stream_response",
+            return_value={"role": "assistant", "content": "ok"},
+        ),
+        patch.object(ws.session, "_update_token_table"),
+        patch.object(ws.session, "_print_status_line"),
+        patch.object(ws.session, "_visible_memory_count", return_value=0),
+        patch("turnstone.core.session.save_message"),
+    ):
+        ws.session._title_generated = True
+        # Idle all along — no worker, and no state transition coming.
+        assert ws.state is WorkstreamState.IDLE
+
+        # Simulate the WatchRunner poll thread delivering a fire.
+        captured["fn"]({"type": "watch_triggered", "text": "deploy finished: OK"}, "watch-1")
+
+        _wait_for_worker_done(ws)
+
+    # Queue drained by the wake — not parked until the next user message.
+    assert len(ws.session._nudge_queue) == 0
+
+    msgs = dicts_from_turns(ws.session.messages)
+    user_msgs = [m for m in msgs if m.get("role") == "user"]
+    assert user_msgs, "expected a synthesized user message from the wake"
+    assert user_msgs[-1]["content"] == ""
+    assert user_msgs[-1].get("_source") == "system_nudge"
+    sys_turns = [m for m in msgs if m.get("role") == "system"]
+    assert any(
+        m.get("_source") == "watch_triggered" and "deploy finished: OK" in m.get("content", "")
+        for m in sys_turns
+    ), f"expected a watch_triggered system turn, got {sys_turns!r}"
+
+
 @pytest.fixture
 def coord_mgr() -> tuple[SessionManager, _BuildRealSessionAdapter, FakeStorage]:
     """Real coord-side SessionManager with the adapter's kind set to
@@ -411,3 +479,120 @@ def test_coord_idle_with_active_children_emits_envelope_via_real_managers(coord_
     finally:
         watcher.shutdown()
         observer.shutdown()
+
+
+def test_coord_idle_emitted_from_worker_thread_still_wakes(coord_mgr, tmp_db):
+    """The production-shaped race the test above does NOT exercise: in
+    production, IDLE is emitted from INSIDE the worker (``set_state``
+    subscribers fire on the calling thread — the coord's send emits IDLE
+    before its worker exits).  The watcher's wake dispatch therefore
+    lands on ``session_worker.send``'s reuse path while the
+    transitioning worker still owns the flag, and no-ops.  Without the
+    ownership-clear backstop the ``idle_children`` nudge strands until
+    the next user message — a coord that forgot ``wait_for_workstream``
+    never revives.
+
+    Boundary path under test:
+      worker thread: mgr.set_state(IDLE)
+        → observer enqueues (real) → watcher wake no-ops (worker owns flag)
+        → run() returns → session_worker._runner finally clears the flag
+        → _retry_pending_wake → wake_workstream_if_pending (real)
+        → wake daemon → deliver_wake_nudge_from_queue → send("")
+        → idle_children system turn in history
+    """
+    from turnstone.console.coordinator_idle_observer import CoordinatorIdleObserver
+    from turnstone.core.workstream import WorkstreamKind as _Kind
+
+    mgr, adapter, storage = coord_mgr
+    observer = CoordinatorIdleObserver(mgr, storage)
+    observer.start()
+    watcher = IdleNudgeWatcher(mgr)
+    watcher.start()
+
+    try:
+        coord = mgr.create(user_id="u1", name="parent-coord-2", skill=None)
+        assert coord.session is not None
+
+        storage.register_workstream(
+            "child-x",
+            user_id="u1",
+            name="crawl-docs",
+            kind=_Kind.INTERACTIVE,
+            parent_ws_id=coord.id,
+            state="running",
+        )
+
+        coord.session.messages.append(turn_from_dict({"role": "user", "content": "spawn 1"}))
+        coord.session.messages.append(turn_from_dict({"role": "assistant", "content": "ok"}))
+
+        with (
+            patch.object(coord.session, "_create_stream_with_retry", return_value=iter([])),
+            patch.object(
+                coord.session,
+                "_stream_response",
+                return_value={"role": "assistant", "content": "ack"},
+            ),
+            patch.object(coord.session, "_full_messages", return_value=[]),
+            patch.object(coord.session, "_update_token_table"),
+            patch.object(coord.session, "_print_status_line"),
+            patch.object(coord.session, "_visible_memory_count", return_value=0),
+            patch("turnstone.core.session.save_message"),
+        ):
+            coord.session._title_generated = True
+
+            # Drive the IDLE transition from INSIDE a session_worker
+            # worker, as production does.
+            ok = session_worker.send(
+                coord,
+                enqueue=lambda: None,
+                run=lambda: mgr.set_state(coord.id, WorkstreamState.IDLE),
+                thread_name="coord-send-sim",
+            )
+            assert ok is True
+            # Without the backstop the queue never drains (the watcher's
+            # transition-time wake no-opped against the sim worker) and
+            # this poll times out.  Queue-empty implies the wake worker's
+            # drain ran, so the follow-up flag poll waits for ITS exit.
+            _wait_until(lambda: len(coord.session._nudge_queue) == 0)
+            _wait_for_worker_done(coord)
+
+        # Queue drained by the wake, not waiting on the next user message.
+        assert len(coord.session._nudge_queue) == 0
+        msgs = dicts_from_turns(coord.session.messages)
+        user_msgs = [m for m in msgs if m.get("role") == "user"]
+        wake_msg = user_msgs[-1]
+        assert wake_msg["content"] == ""
+        assert wake_msg.get("_source") == "system_nudge"
+        idle_turns = [
+            m for m in msgs if m.get("role") == "system" and m["_source"] == "idle_children"
+        ]
+        assert len(idle_turns) == 1
+        assert "crawl-docs" in idle_turns[0]["content"]
+        assert "wait_for_workstream" in idle_turns[0]["content"]
+    finally:
+        watcher.shutdown()
+        observer.shutdown()
+
+
+def test_wake_delivery_contains_generation_cancelled(tmp_db):
+    """A close/force-cancel racing the wake turn raises
+    ``GenerationCancelled`` (a BaseException) out of ``send("")`` — the
+    wake method must contain it: it IS the wake worker's ``run()``
+    closure, and ``session_worker._runner`` catches only ``Exception``,
+    so an escape would land in ``threading.excepthook`` as stderr noise
+    on every close-vs-wake race."""
+    from tests._helpers import make_chat_session
+    from turnstone.core.session import GenerationCancelled
+
+    session = make_chat_session()
+    session._nudge_queue.enqueue("idle_children", "kids waiting", "any")
+
+    def _cancelled_send(*_a: Any, **_k: Any) -> None:
+        raise GenerationCancelled
+
+    session.send = _cancelled_send  # type: ignore[method-assign]
+
+    session.deliver_wake_nudge_from_queue()  # must not raise
+
+    assert session._wake_source_tag == ""
+    assert session._wake_drained_reminders is None

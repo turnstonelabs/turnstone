@@ -948,6 +948,7 @@ All fields are optional. The body can be empty or an empty JSON object.
 | `name`          | string | Auto-generated workstream name                      |
 | `resumed`       | bool   | Whether a previous session was successfully resumed |
 | `message_count` | int    | Number of messages in the resumed session (0 if fresh) |
+| `initial_message_status` | string | Present ONLY when the workstream was created but its `initial_message` could not be delivered: `"queue_full"` (a raced live worker's interjection queue was at capacity — resend via `/send`; any uploads stay staged) or `"refused_closed"` (the workstream was closed mid-create). Absent whenever the message was dispatched. |
 
 **Error (limit reached):**
 
