@@ -26,7 +26,7 @@ from typing import TYPE_CHECKING, Any
 
 from turnstone.core import session_worker
 from turnstone.core.log import get_logger
-from turnstone.core.nudge_queue import USER_DRAIN
+from turnstone.core.nudge_queue import USER_DRAIN, NudgeQueue
 from turnstone.core.workstream import WorkstreamState
 
 if TYPE_CHECKING:
@@ -56,9 +56,14 @@ def wake_workstream_if_pending(ws: Workstream, *, trigger: str = "unspecified") 
     Gates, in order:
 
     * ``ws.session is None`` — workstream tracked but session not
-      built — or a bare stub session without a NudgeQueue (watch-style
-      dispatchers drive sessions that aren't installed on the
-      workstream).
+      built — or a session whose ``_nudge_queue`` is not a real
+      :class:`NudgeQueue` (bare stubs; mock sessions).  The wake
+      contract REQUIRES real drain semantics: the spawned worker's
+      ``deliver_wake_nudge_from_queue`` must actually CONSUME what
+      ``has_pending`` saw, or the worker-exit backstop respawns wake
+      workers forever — a mock queue's truthy ``has_pending`` plus a
+      no-op deliver is exactly that storm, so the gate refuses on
+      TYPE, not just presence.
     * ``ws._closed`` — ``close()`` already ran (or is racing us); its
       storage row says ``closed`` and a wake send would drive a
       torn-down session.  Lockless FAST-PATH only: a stale ``False``
@@ -92,7 +97,7 @@ def wake_workstream_if_pending(ws: Workstream, *, trigger: str = "unspecified") 
     if session is None or ws._closed or ws.state is not WorkstreamState.IDLE:
         return False
     nudge_queue = getattr(session, "_nudge_queue", None)
-    if nudge_queue is None or not nudge_queue.has_pending(USER_DRAIN):
+    if not isinstance(nudge_queue, NudgeQueue) or not nudge_queue.has_pending(USER_DRAIN):
         return False
 
     deferred = False

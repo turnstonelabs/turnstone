@@ -231,6 +231,23 @@ class TestWakeWorkstreamIfPending:
             assert wake_workstream_if_pending(ws) is False
             assert mock_send.call_count == 0
 
+    def test_refuses_non_nudgequeue_stub(self, fake_mgr_and_ws):
+        """The gate refuses on TYPE, not just presence: a mock session's
+        auto-created ``_nudge_queue`` answers ``has_pending`` truthily
+        while its ``deliver_wake_nudge_from_queue`` consumes nothing —
+        with the worker-exit backstop re-running this gate after every
+        exit, one worker on such a session would respawn wake workers
+        forever (the storm that took down the full-suite CI run).  Only
+        a real :class:`NudgeQueue` carries the drain semantics the wake
+        contract needs."""
+        from unittest.mock import MagicMock
+
+        _mgr, ws = fake_mgr_and_ws
+        ws.session._nudge_queue = MagicMock()  # truthy has_pending, no real drain
+        with patch("turnstone.core.session_worker.send") as mock_send:
+            assert wake_workstream_if_pending(ws) is False
+            assert mock_send.call_count == 0
+
     def test_dispatched_path_logs_trigger(self, fake_mgr_and_ws, caplog):
         """A fresh spawn — ``send`` returns True without touching the
         passed ``enqueue`` — emits ``nudge_wake.dispatched`` tagged with
