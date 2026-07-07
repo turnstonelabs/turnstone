@@ -3466,21 +3466,27 @@ def _coordinator_tenant_check(request: Request, ws_id: str, mgr: Any) -> JSONRes
     previously got from the ``tenant_check is None`` manager-lookup guard.
     """
     from turnstone.core.auth import WorkstreamProjectVisibility
-    from turnstone.core.memory import get_workstream_row
 
     miss = JSONResponse({"error": "coordinator not found"}, status_code=404)
+    # Use the request's configured storage (like cluster_ws_detail /
+    # _resolve_coordinator_or_404) — NOT the global registry, which can
+    # resolve a different/auto-init'd backend and evaluate the tenancy
+    # decision against the wrong DB (fail-open on a missing project row).
+    storage = getattr(request.app.state, "auth_storage", None)
+    if storage is None:
+        return miss
     ws = mgr.get(ws_id) if mgr is not None else None
     if ws is not None:
         # coord_mgr only holds coordinators, so kind is implied.
         project_id = getattr(ws, "project_id", "") or ""
         owner = ws.user_id or ""
     else:
-        row = get_workstream_row(ws_id)
+        row = storage.get_workstream(ws_id)
         if row is None or row.get("kind") != WorkstreamKind.COORDINATOR:
             return miss
         project_id = row.get("project_id") or ""
         owner = row.get("user_id") or ""
-    visibility = WorkstreamProjectVisibility.for_request(request)
+    visibility = WorkstreamProjectVisibility.for_request(request, storage=storage)
     if not visibility.ws_visible(project_id, ws_owner=owner):
         return miss
     return None
@@ -13624,7 +13630,12 @@ def create_app(
         # Private-project tenancy: a coordinator attached to a private project
         # serves attachments only to its members — admin.coordinator gates the
         # surface, not the tenancy. 404-mask non-members like the other verbs.
-        visibility = WorkstreamProjectVisibility.for_request(request)
+        # Use the request's configured storage (not the global registry) so the
+        # visibility decision can't be evaluated against the wrong DB.
+        storage = getattr(request.app.state, "auth_storage", None)
+        if storage is None:
+            return "", JSONResponse({"error": "coordinator not found"}, status_code=404)
+        visibility = WorkstreamProjectVisibility.for_request(request, storage=storage)
         if not visibility.ws_visible(
             getattr(ws, "project_id", "") or "", ws_owner=ws.user_id or ""
         ):

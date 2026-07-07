@@ -92,7 +92,8 @@ def reject_unassignable_scopes(scopes_csv: str) -> str | None:
     """
     requested = {s.strip() for s in scopes_csv.split(",") if s.strip()}
     if not requested or not requested.issubset(ASSIGNABLE_SCOPES):
-        return "Invalid scopes (allowed: read, write, approve)"
+        allowed = ", ".join(sorted(ASSIGNABLE_SCOPES))
+        return f"Invalid scopes (allowed: {allowed})"
     return None
 
 
