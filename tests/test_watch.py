@@ -775,10 +775,12 @@ class TestWatchRunnerDeliveryRetry:
             assert "ws-1" not in runner._restoring
 
     def test_pending_cleared_on_already_dispatched_retry(self):
-        # A re-delivery that succeeded but whose row-commit raised leaves
-        # the id in BOTH _terminal_dispatched and _pending_delivery.  The
-        # next tick's already-dispatched branch must clear the hold too, or
-        # it leaks once the row deactivates.
+        # Constructs the id-in-both-sets state DIRECTLY: no current path
+        # produces it (_redeliver_pending clears the hold before its
+        # commit), but the already-dispatched branch deactivates the row —
+        # after which it never re-lists — so it is the last line of
+        # defense against any such hold leaking forever.  Pin that it
+        # clears the hold alongside the retry-deactivate.
         storage = MagicMock()
         storage.update_watch.return_value = True
         runner = self._make_runner(storage)

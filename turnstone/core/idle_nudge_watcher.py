@@ -87,6 +87,11 @@ def wake_workstream_if_pending(ws: Workstream, *, trigger: str = "unspecified") 
       queued; the owning worker's exit backstop (or its next drain
       seam) delivers it.
     * ``nudge_wake.dispatched`` — a fresh wake daemon was spawned.
+    * ``nudge_wake.refused`` — ``session_worker.send`` declined the
+      spawn: its authoritative under-lock ``_closed`` re-check caught a
+      teardown this gate's lockless peek missed.  The entry dies with
+      the workstream; logged here so a dropped wake is traceable to its
+      trigger during production troubleshooting.
 
     Returns ``True`` iff the wake was handed to
     ``session_worker.send`` — which may still downgrade it to a no-op
@@ -116,6 +121,8 @@ def wake_workstream_if_pending(ws: Workstream, *, trigger: str = "unspecified") 
         log.info("nudge_wake.deferred_worker_busy ws=%s trigger=%s", ws.id[:8], trigger)
     elif ok:
         log.info("nudge_wake.dispatched ws=%s trigger=%s", ws.id[:8], trigger)
+    else:
+        log.info("nudge_wake.refused ws=%s trigger=%s", ws.id[:8], trigger)
     return ok
 
 
