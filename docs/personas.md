@@ -118,9 +118,37 @@ seeded):
   `persona` argument, validated when the coordinator prepares the spawn
   and re-checked by the node that creates the child (children are always
   interactive-kind). Omitted means the interactive **default** — a child
-  never inherits its parent coordinator's persona. Sub-agents spawned via
-  `task_agent` have no persona parameter at all; they keep their own
-  identity and envelope.
+  never inherits its parent coordinator's persona.
+- **Sub-agents**: `task_agent` takes a `persona` argument setting the
+  sub-agent's identity and capability envelope (resolved against
+  interactive-kind personas, frozen into the task at prep). Omitted keeps
+  the default autonomous task-agent identity — never the parent's persona.
+
+## How agents discover personas
+
+Agents are told, not expected to guess: the live persona list (enabled,
+interactive-kind — children and sub-agents are always interactive) is
+injected into the `persona` parameter description of `task_agent`,
+`spawn_workstream`, and `spawn_batch` whenever the session's tool surface
+is rendered — session start, MCP catalog change, model-registry reload.
+Each entry carries the name, the default marker, and the persona's
+one-line description so the model can pick by purpose (descriptions drop
+out past 25 personas; the name list always enumerates completely).
+
+A persona created after that render is still reachable — pass its name.
+Every resolve failure enumerates the names currently valid for the kind,
+so a stale list (or a typo) self-corrects on the next attempt.
+
+Resolution is forgiving on all surfaces (they share one rule):
+
+- names match case-insensitively (`Writer` resolves `writer`);
+- an input that uniquely matches a persona's **display name**
+  (case-insensitive, among the kind's enabled personas — display names are
+  not unique, and a same-label persona of another kind neither blocks nor
+  wins) resolves to that persona; an ambiguous match errors, listing the
+  candidate slugs;
+- whatever variant matched, the stamped identity, approval chrome, and
+  wire always carry the canonical `name` slug.
 
 ## Authoring (console)
 
@@ -128,7 +156,12 @@ Personas are managed in the console's **Manage → Governance → Personas**
 tab. The admin shelf exposes exactly the four levers plus the kind
 list, the default marker, and archive. Rules:
 
-- `name` is an immutable lowercase slug; edit `display_name` instead.
+- `name` is an immutable lowercase slug — and the identifier agents and
+  the CLI launch the persona by (`persona=` on the spawn tools,
+  `--persona` on the CLI); the create shelf says so under **Name**.
+  `display_name` is a list label, editable any time, and deliberately
+  not an identifier (a unique display name happens to resolve, as a
+  forgiveness fallback — don't design workflows around it).
 - Exactly one default per kind, storage-enforced: flipping the flag on a
   successor demotes the incumbent atomically, defaults are single-kind,
   and a default cannot be archived.

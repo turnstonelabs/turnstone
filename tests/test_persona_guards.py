@@ -1329,3 +1329,180 @@ class TestCreateStampsPersona:
         assert ws is not None and ws.session is not None
         assert ws.session._persona_name == ""
         assert not ws.persona
+
+
+# ---------------------------------------------------------------------------
+# Guard 10 — discovery: the calling LLM is TOLD which personas exist.  The
+# live enabled interactive-kind list rides the `persona` parameter
+# description of task_agent / spawn_workstream / spawn_batch, rebuilt from
+# the pristine TOOLS base on every render; storage-less sessions keep the
+# base text untouched.  Resolution is forgiving (case, unique display name)
+# but everything downstream carries the canonical slug.
+# ---------------------------------------------------------------------------
+
+
+def _persona_desc(session: ChatSession, tool_name: str) -> str:
+    tool = next(t for t in session._tools if t.get("function", {}).get("name") == tool_name)
+    prop = ChatSession._persona_property(tool["function"]["parameters"]["properties"])
+    assert prop is not None, f"{tool_name} has no persona parameter"
+    return prop["description"]
+
+
+def _pristine_persona_desc(tool_name: str) -> str:
+    from turnstone.core.tools import TOOLS
+
+    tool = next(t for t in TOOLS if t["function"]["name"] == tool_name)
+    prop = ChatSession._persona_property(tool["function"]["parameters"]["properties"])
+    assert prop is not None, f"{tool_name} has no persona parameter"
+    return prop["description"]
+
+
+class TestPersonaDiscovery:
+    def _seed(self) -> None:
+        get_storage().create_persona(
+            {
+                "persona_id": "p-eng",
+                "name": "engineer",
+                "display_name": "Engineer",
+                "description": "Default engineering identity",
+                "base_prompt": "E",
+                "applies_to_kinds": ["interactive"],
+                "is_default": True,
+            }
+        )
+        get_storage().create_persona(
+            {
+                "persona_id": "p-wri",
+                "name": "writer",
+                "display_name": "Creative Writer",
+                "description": "Prose-first writing partner",
+                "base_prompt": "W",
+                "applies_to_kinds": ["interactive"],
+            }
+        )
+
+    def _coord_session(self, mock_openai_client: Any) -> ChatSession:
+        return _session(
+            mock_openai_client,
+            kind=WorkstreamKind.COORDINATOR,
+            user_id="u1",
+            coord_client=MagicMock(),
+        )
+
+    def test_task_agent_description_lists_personas(self, tmp_db, mock_openai_client) -> None:
+        self._seed()
+        session = _session(mock_openai_client)
+        desc = _persona_desc(session, "task_agent")
+        assert desc.startswith(_pristine_persona_desc("task_agent"))
+        assert "Available personas:" in desc
+        # Default first, then A→Z, each with its one-line description.
+        assert desc.index("`engineer` (default)") < desc.index("`writer`")
+        assert "Prose-first writing partner" in desc
+
+    def test_spawn_tools_list_personas_for_coordinators(self, tmp_db, mock_openai_client) -> None:
+        self._seed()
+        session = self._coord_session(mock_openai_client)
+        for tool_name in ("spawn_workstream", "spawn_batch"):
+            desc = _persona_desc(session, tool_name)
+            assert desc.startswith(_pristine_persona_desc(tool_name))
+            assert "Available personas:" in desc
+            assert "`engineer` (default)" in desc
+
+    def test_coordinator_kind_personas_are_not_offered(self, tmp_db, mock_openai_client) -> None:
+        # Children and sub-agents are always interactive-kind; a
+        # coordinator-only persona in the list would be a guaranteed error.
+        self._seed()
+        get_storage().create_persona(
+            {
+                "persona_id": "p-exe",
+                "name": "executive",
+                "base_prompt": "X",
+                "applies_to_kinds": ["coordinator"],
+            }
+        )
+        session = self._coord_session(mock_openai_client)
+        assert "`executive`" not in _persona_desc(session, "spawn_workstream")
+
+    def test_storage_down_keeps_pristine_base(self, tmp_db, mock_openai_client) -> None:
+        self._seed()
+        with patch("turnstone.core.storage.is_storage_initialized", return_value=False):
+            session = _session(mock_openai_client)
+        assert _persona_desc(session, "task_agent") == _pristine_persona_desc("task_agent")
+
+    def test_rerender_is_idempotent_and_tracks_archive(self, tmp_db, mock_openai_client) -> None:
+        self._seed()
+        session = _session(mock_openai_client)
+        session._render_agent_tool_descriptions()
+        session._render_agent_tool_descriptions()
+        desc = _persona_desc(session, "task_agent")
+        assert desc.count("Available personas:") == 1
+        # Archive one persona; the next render must drop it, not append.
+        storage = get_storage()
+        writer = storage.get_persona_by_name("writer")
+        assert writer is not None
+        storage.update_persona(writer["persona_id"], enabled=False)
+        session._render_agent_tool_descriptions()
+        desc = _persona_desc(session, "task_agent")
+        assert "`writer`" not in desc
+        assert desc.count("Available personas:") == 1
+
+    def test_large_shelf_drops_prose_keeps_every_name(self, tmp_db, mock_openai_client) -> None:
+        storage = get_storage()
+        for i in range(26):
+            storage.create_persona(
+                {
+                    "persona_id": f"p-{i:02d}",
+                    "name": f"persona-{i:02d}",
+                    "description": "UNIQUE-PROSE-MARKER",
+                    "base_prompt": "x",
+                    "applies_to_kinds": ["interactive"],
+                }
+            )
+        session = _session(mock_openai_client)
+        desc = _persona_desc(session, "task_agent")
+        for i in range(26):
+            assert f"`persona-{i:02d}`" in desc
+        assert "UNIQUE-PROSE-MARKER" not in desc
+
+    def test_spawn_forgives_case_and_display_name_but_stamps_slug(
+        self, tmp_db, mock_openai_client
+    ) -> None:
+        self._seed()
+        session = self._coord_session(mock_openai_client)
+        for variant in ("WRITER", "Writer", "Creative Writer"):
+            item = session._prepare_spawn_workstream("c1", {"persona": variant})
+            assert not item.get("error"), item.get("error")
+            assert item["persona"] == "writer"
+
+    def test_spawn_batch_rows_land_on_canonical_slug(self, tmp_db, mock_openai_client) -> None:
+        self._seed()
+        session = self._coord_session(mock_openai_client)
+        item = session._prepare_spawn_batch(
+            "c1",
+            {
+                "children": [
+                    {"initial_message": "a", "persona": "WRITER"},
+                    {"initial_message": "b", "persona": "Creative Writer"},
+                ]
+            },
+        )
+        assert not item.get("error"), item.get("error")
+        personas = [c["persona"] for c in item["children"] if "_error" not in c]
+        assert personas == ["writer", "writer"]
+
+    def test_task_agent_prep_canonicalizes_header_and_stamp(
+        self, tmp_db, mock_openai_client
+    ) -> None:
+        self._seed()
+        session = _session(mock_openai_client)
+        item = session._prepare_task("t1", {"prompt": "go", "persona": "Writer"})
+        assert not item.get("error"), item.get("error")
+        assert item["persona"] == "writer"
+        assert "persona: writer" in item["header"]
+
+    def test_unknown_persona_error_enumerates_live_names(self, tmp_db, mock_openai_client) -> None:
+        self._seed()
+        session = self._coord_session(mock_openai_client)
+        item = session._prepare_spawn_workstream("c1", {"persona": "nope"})
+        assert item.get("error")
+        assert "Available for interactive: engineer (default), writer" in item["error"]

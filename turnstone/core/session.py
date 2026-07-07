@@ -151,6 +151,7 @@ from turnstone.core.tools import (
     PRIMARY_KEY_MAP,
     TASK_AGENT_TOOLS,
     TASK_AUTO_TOOLS,
+    TOOLS,
     merge_mcp_tools,
 )
 from turnstone.core.trajectory import (
@@ -2491,43 +2492,114 @@ class ChatSession:
         self._render_agent_tool_descriptions()
         self._rebuild_tool_search()
 
-    def _render_agent_tool_descriptions(self) -> None:
-        """Inject the live alias list into the ``model`` parameter description
-        on the task_agent tool.
+    # Tools whose ``persona`` parameter names an interactive-kind persona —
+    # task_agent sub-agents and spawned children are always interactive.
+    _PERSONA_ARG_TOOLS = ("task_agent", "spawn_workstream", "spawn_batch")
 
-        Lets the calling LLM see which aliases are valid right now.
-        Called on session init and on registry reload (via
-        ``refresh_agent_tool_schemas``).  No-op when no registry is
-        configured (CLI single-model case).
+    def _persona_catalog_line(self) -> str:
+        """One sentence enumerating the enabled interactive-kind personas.
+
+        This is the persona DISCOVERY path for calling LLMs: without it a
+        coordinator or interactive agent has no way to learn which names the
+        ``persona=`` argument accepts.  Returns ``""`` when storage is not up
+        (never auto-initializes it — this runs at session construction),
+        listing fails, or nothing applies; the resolve-time error, which
+        enumerates the live names, remains the self-correction path for lists
+        rendered before a persona edit.
+        """
+        from turnstone.core.storage import get_storage, is_storage_initialized
+
+        if not is_storage_initialized():
+            return ""
+        try:
+            rows = [
+                r
+                for r in get_storage().list_personas()
+                if "interactive" in (r.get("applies_to_kinds") or [])
+            ]
+        except Exception:
+            log.debug("persona_catalog.list_failed", exc_info=True)
+            return ""
+        if not rows:
+            return ""
+        rows.sort(key=lambda r: (not r.get("is_default"), str(r.get("name") or "")))
+        # Descriptions help the model pick by purpose, but an operator shelf
+        # with dozens of personas would bloat every request — past 25, names
+        # still enumerate completely and only the prose is dropped.
+        include_desc = len(rows) <= 25
+        parts = []
+        for r in rows:
+            entry = f"`{r['name']}`"
+            if r.get("is_default"):
+                entry += " (default)"
+            if include_desc:
+                desc = " ".join(str(r.get("description") or "").split())
+                if len(desc) > 96:
+                    desc = desc[:95].rstrip() + "…"
+                if desc:
+                    entry += f" — {desc}"
+            parts.append(entry)
+        return "Available personas: " + "; ".join(parts) + "."
+
+    def _render_agent_tool_descriptions(self) -> None:
+        """Inject live option lists into agent-tool parameter descriptions.
+
+        Two lists, one mechanism:
+
+        - model aliases → ``task_agent.model`` (skipped when no registry is
+          configured — the CLI single-model case);
+        - enabled interactive-kind personas → the ``persona`` parameter on
+          task_agent / spawn_workstream / spawn_batch, so the calling LLM can
+          discover valid names instead of guessing (children and sub-agents
+          are always interactive-kind).
+
+        Lets the calling LLM see which values are valid right now.  Called on
+        session init and on registry reload (via
+        ``refresh_agent_tool_schemas``); personas listed reflect that render
+        moment — resolve errors enumerate the live set, so a stale list
+        self-corrects on the next attempt.
 
         Replaces affected tool dicts with deep copies so the module-level
-        tool-list constants stay untouched across sessions.
+        tool-list constants stay untouched across sessions.  Both rewrites
+        rebuild their full description text every render (persona text from
+        the pristine ``TOOLS`` base) — never append to the previous render's
+        output, so a list that shrinks to nothing clears rather than
+        lingering stale.
 
         task_agent lives in ``self._tools`` (the main session's tool set) —
         not in ``self._task_tools``, which is what *sub-agents* see
         (sub-agents don't get delegation tools to avoid infinite recursion).
         """
-        if self._registry is None:
-            return
         # Hide ``default`` from the alias list — the LLM reads the English
         # word and picks it explicitly, which routes to whichever model
         # carries that alias rather than the operator-configured per-role
         # default (task_alias).  Omitting ``model=`` already selects the
         # per-role default; offering the literal name as an alternative
         # invites the bypass.
-        aliases = sorted(a for a in self._registry.list_aliases() if a != "default")
+        aliases: list[str] = []
+        if self._registry is not None:
+            aliases = sorted(a for a in self._registry.list_aliases() if a != "default")
         aliases_str = ", ".join(f"`{a}`" for a in aliases)
+        persona_line = self._persona_catalog_line()
+        persona_base: dict[str, str] = {}
+        for tool in TOOLS:
+            fn = tool.get("function") or {}
+            if fn.get("name") in self._PERSONA_ARG_TOOLS:
+                prop = self._persona_property(fn.get("parameters", {}).get("properties", {}))
+                persona_base[fn["name"]] = (prop or {}).get("description", "")
 
         new_tools: list[dict[str, Any]] = []
         for tool in self._tools:
             fn = tool.get("function") or {}
             name = fn.get("name", "")
-            if name != "task_agent":
+            rewrite_model = name == "task_agent" and self._registry is not None
+            rewrite_persona = name in self._PERSONA_ARG_TOOLS
+            if not rewrite_model and not rewrite_persona:
                 new_tools.append(tool)
                 continue
             new_tool = copy.deepcopy(tool)
             props = new_tool.get("function", {}).get("parameters", {}).get("properties", {})
-            if "model" in props:
+            if rewrite_model and "model" in props:
                 # Always rewrite — a reload that filters down to no
                 # alternatives (only ``default`` remains in the registry)
                 # must clear any stale alias names left over from a prior
@@ -2544,8 +2616,33 @@ class ChatSession:
                         "Omit to use the current session model. "
                         "(No alternative aliases configured in this session.)"
                     )
+            if rewrite_persona:
+                prop = self._persona_property(props)
+                if prop is not None:
+                    base = persona_base.get(name, "")
+                    prop["description"] = f"{base} {persona_line}".strip() if persona_line else base
             new_tools.append(new_tool)
         self._tools = new_tools
+
+    @staticmethod
+    def _persona_property(props: dict[str, Any]) -> dict[str, Any] | None:
+        """Locate the ``persona`` schema dict inside a tool's properties.
+
+        task_agent and spawn_workstream carry it top-level; spawn_batch
+        nests it per-child under ``children.items.properties``.  Returns the
+        live (mutable) dict so the render loop can rewrite its description,
+        or ``None`` when the tool has no persona parameter.
+        """
+        top = props.get("persona")
+        if isinstance(top, dict):
+            return top
+        # Every isinstance gate matters: name-colliding MCP tools ride the
+        # same merged list, and list-form ``items`` is legal JSON Schema.
+        children = props.get("children")
+        items = children.get("items") if isinstance(children, dict) else None
+        sub = items.get("properties") if isinstance(items, dict) else None
+        nested = sub.get("persona") if isinstance(sub, dict) else None
+        return nested if isinstance(nested, dict) else None
 
     def refresh_agent_tool_schemas(self) -> None:
         """Public entry point: re-render the task_agent tool
@@ -9841,6 +9938,10 @@ class ChatSession:
                         "unavailable). Retry, or omit `persona` for the default identity."
                     ),
                 }
+            # Canonical slug from the resolved row — forgiving resolution may
+            # have matched a case variant or a display name, and the approval
+            # header + item stamp must carry the persona's real name.
+            persona_arg = snap.name
             persona_prompt = snap.prompt
             persona_tools = snap.tools
             persona_mcp = snap.mcp
@@ -10594,7 +10695,7 @@ class ChatSession:
         target_node = self._flatten_spawn_arg(args.get("target_node"), 64)
         persona = self._flatten_spawn_arg(args.get("persona"), 64)
         if persona:
-            persona_err = self._validate_child_persona(persona)
+            persona, persona_err = self._validate_child_persona(persona)
             if persona_err:
                 return self._coord_tool_error(call_id, "spawn_workstream", persona_err)
         if skill:
@@ -10635,26 +10736,32 @@ class ChatSession:
             "persona": persona,
         }
 
-    def _validate_child_persona(self, persona: str) -> str:
+    def _validate_child_persona(self, persona: str) -> tuple[str, str]:
         """Prep-time gate for a spawn's ``persona`` arg.
 
-        Returns an error string (empty = valid).  Children are always
-        ``kind=interactive`` — see ``CoordinatorClient.spawn``.  The
-        receiving node's create handler re-resolves through the SAME
-        shared rule (``resolve_persona_for_kind``) and stamps; this gate
-        just turns an inevitable HTTP 400 into a clean tool error the
-        model can react to.  Best-effort: a storage blip defers the
-        verdict to the create handler rather than blocking the spawn.
+        Returns ``(canonical_name, error)`` — an empty error means valid, and
+        ``canonical_name`` is the resolved row's slug (forgiving resolution
+        accepts case variants and unique display names, but the wire, the
+        preview chrome, and the child's stamp must carry the real name).
+        Children are always ``kind=interactive`` — see
+        ``CoordinatorClient.spawn``.  The receiving node's create handler
+        re-resolves through the SAME shared rule
+        (``resolve_persona_for_kind``) and stamps; this gate just turns an
+        inevitable HTTP 400 into a clean tool error the model can react to.
+        Best-effort: a storage blip defers the verdict to the create handler
+        rather than blocking the spawn (the raw name rides through).
         """
         try:
             storage = get_storage()
             if storage is None:
-                return ""
-            _row, err = resolve_persona_for_kind(storage, persona, "interactive")
+                return persona, ""
+            row, err = resolve_persona_for_kind(storage, persona, "interactive")
         except Exception:
-            log.debug("spawn.persona_precheck_failed persona=%s", persona, exc_info=True)
-            return ""
-        return err
+            log.debug("spawn.persona_precheck_failed", persona=persona, exc_info=True)
+            return persona, ""
+        if err or row is None:
+            return persona, err or f"unknown persona {persona!r}"
+        return str(row["name"]), ""
 
     def _exec_spawn_workstream(self, item: dict[str, Any]) -> tuple[str, str]:
         call_id = item["call_id"]
@@ -10747,8 +10854,10 @@ class ChatSession:
         normalised: list[dict[str, Any]] = []
         preview_rows: list[str] = []
         # Persona prechecks hit storage; a fan-out batch usually repeats one
-        # persona across all children, so memoize per prepare call.
-        persona_verdicts: dict[str, str] = {}
+        # persona across all children, so memoize per prepare call.  Keyed by
+        # the raw arg, valued ``(canonical_slug, error)`` — rows spelling the
+        # same forgiven variant land on the same stamped name.
+        persona_verdicts: dict[str, tuple[str, str]] = {}
         skill_verdicts: dict[str, str] = {}
         for idx, raw in enumerate(raw_children):
             if not isinstance(raw, dict):
@@ -10779,8 +10888,14 @@ class ChatSession:
                 # failing the whole batch.
                 if persona not in persona_verdicts:
                     persona_verdicts[persona] = self._validate_child_persona(persona)
-                if persona_verdicts[persona]:
-                    spec["_error"] = persona_verdicts[persona]
+                canonical, persona_err = persona_verdicts[persona]
+                if persona_err:
+                    spec["_error"] = persona_err
+                else:
+                    # Preview chrome below reads the local too — keep both
+                    # on the canonical slug.
+                    persona = canonical
+                    spec["persona"] = canonical
             if skill and not spec.get("_error"):
                 # Same principal-load-only risk gate as spawn_workstream,
                 # surfaced per-row (partial-success) rather than failing the
