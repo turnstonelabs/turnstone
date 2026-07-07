@@ -18,7 +18,6 @@ import json
 import logging
 import threading
 import time
-from contextlib import AsyncExitStack
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 from typing import Any
@@ -131,6 +130,17 @@ def running_loop_mgr():
                     with contextlib.suppress(BaseException):
                         await task
                     setattr(m, attr, None)
+            # Close any parked pool transport owners a successful
+            # ``_connect_one_pool`` left installed, mirroring production
+            # ``shutdown()`` — an undrained owner is destroyed pending at GC.
+            for entry in list(m._user_pool_entries.values()):
+                owner = entry.owner_task
+                if owner is not None and not owner.done():
+                    if entry.close_requested is not None:
+                        entry.close_requested.set()
+                    owner.cancel()
+                    with contextlib.suppress(BaseException):
+                        await owner
 
         with contextlib.suppress(Exception):
             asyncio.run_coroutine_threadsafe(_drain(mgr), loop).result(timeout=2)
@@ -352,25 +362,42 @@ class TestEviction:
         assert ("u4", "pool-srv") in mgr._user_pool_entries
         assert ("u3", "pool-srv") in mgr._user_pool_entries
 
-    def test_eviction_resilient_to_close_errors(self, running_loop_mgr) -> None:
+    def test_eviction_resilient_to_owner_unwind_errors(self, running_loop_mgr) -> None:
+        """Owner-model successor to the old ``resilient_to_close_errors`` test.
+
+        Teardown reaps the entry's owner through a bounded ``asyncio.wait`` that
+        never re-raises, so even an owner whose in-task unwind raises cannot
+        break eviction. The old failure mode this guarded — a cross-task
+        ``stack.aclose()`` raising ``RuntimeError('...different task...')`` — is
+        structurally impossible now: the transport cms live in, and unwind in,
+        the owner task, never the evictor.
+        """
         mgr, loop, _ = running_loop_mgr
         mgr._user_pool_idle_ttl_s = 0.0
 
-        broken_stack = MagicMock(spec=AsyncExitStack)
-        broken_stack.aclose = AsyncMock(side_effect=RuntimeError("close failed"))
-
         async def _seed() -> None:
             for i in range(2):
-                entry = await mgr._ensure_pool_entry((f"u{i}", "pool-srv"))
+                key = (f"u{i}", "pool-srv")
+                entry = await mgr._ensure_pool_entry(key)
+                event = asyncio.Event()
+
+                async def _owner(ev: asyncio.Event = event) -> None:
+                    await ev.wait()
+                    raise RuntimeError("unwind failed")
+
+                owner = asyncio.create_task(_owner(), name=f"mcp-pool-owner-test:{i}")
+                # Retrieve the exception so the raising owner doesn't warn at GC.
+                owner.add_done_callback(lambda t: None if t.cancelled() else t.exception())
                 entry.session = MagicMock()
-                entry.stack = broken_stack
+                entry.owner_task = owner
+                entry.close_requested = event
 
         _run_on_loop(loop, _seed())
 
         async def _evict() -> None:
             await mgr._evict_idle_pool_entries()
 
-        # Eviction must not raise even if close fails.
+        # Eviction must not raise even if the owner's unwind raises.
         _run_on_loop(loop, _evict())
         # All entries removed from the dict regardless.
         assert mgr._user_pool_entries == {}

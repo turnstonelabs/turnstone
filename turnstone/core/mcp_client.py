@@ -507,7 +507,17 @@ class PoolEntryState:
     key: tuple[str, str]  # (user_id, server_name)
     open_lock: asyncio.Lock
     session: Any | None = None
-    stack: AsyncExitStack | None = None
+    # Transport ownership. The owner task is the ONE task that enters and
+    # exits the transport + ClientSession context managers (anyio cancel
+    # scopes are host-task-bound: a scope whose host task has finished can
+    # never be exited, and anyio then re-delivers cancellation to it in a
+    # ``call_soon`` loop forever — the SDK #2147 100%-CPU spin). The exit
+    # stack is deliberately a LOCAL of the owner coroutine, unreachable from
+    # other tasks, so nothing can ``aclose()`` it cross-task. Teardown asks
+    # the owner to close via ``close_requested`` (see ``_teardown_pool_entry``
+    # for the close protocol).
+    owner_task: asyncio.Task[None] | None = None
+    close_requested: asyncio.Event | None = None
     streams: tuple[Any, Any] | None = None
     # Catalog state — populated lazily once per-user discovery wires
     # in; left ``None`` here so 200-entry pools don't retain 600 empty
@@ -1068,7 +1078,7 @@ class MCPClientManager:
     # -- safe transport helpers ------------------------------------------------
 
     async def _pre_close_streams(self, key: str | tuple[str, str]) -> None:
-        """Close MCP transport streams before stack teardown.
+        """Close MCP transport streams before the owner unwinds its transport.
 
         Pre-closing unblocks anyio transport tasks stuck on zero-buffer
         ``send()`` calls, preventing the CPU busy-loop from SDK #2147.
@@ -1128,48 +1138,6 @@ class MCPClientManager:
                 f"MCP server '{label}' unreachable at {host}:{port}: {exc}"
             ) from None
 
-    async def _safe_close_stack(self, stack: AsyncExitStack) -> None:
-        """Close an AsyncExitStack, suppressing errors from broken anyio scopes.
-
-        Called from exception handlers — must not raise, otherwise cleanup
-        errors could mask the original exception.  CancelledError is caught
-        explicitly because it is the primary failure mode (stray cancel from
-        broken anyio scope) and is BaseException, not Exception.
-
-        ``BaseExceptionGroup`` is also caught: anyio's TaskGroup wraps any
-        unhandled task exception (e.g., the SDK's
-        ``HTTPStatusError`` raised inside ``post_writer``'s
-        ``tg.start_soon(handle_request_async)`` after a 401/403)
-        into a ``BaseExceptionGroup`` on ``__aexit__``. Without this catch
-        the auth-retry path's eager teardown would propagate the SDK's
-        own collected fallout.
-
-        The 5s timeout uses ``asyncio.timeout`` (NOT ``asyncio.wait_for``)
-        because Python 3.11's ``asyncio.wait_for`` wraps its inner
-        coroutine in a fresh :class:`asyncio.Task`. When that fresh
-        task runs ``stack.aclose()``, it tries to exit anyio cancel
-        scopes that were entered in the CALLING task — anyio rejects
-        the cross-task scope-exit with
-        ``RuntimeError('Attempted to exit cancel scope in a different
-        task than it was entered in')`` and the aclose fails.
-        ``asyncio.timeout`` runs the inner code in the current task
-        (matches Python 3.12+'s ``wait_for`` rewrite), preserving
-        scope-exit identity. The 5s bound stays as protection against
-        ``aclose()`` hanging on a broken stack (a never-completing
-        anyio task during teardown).
-
-        A suppressed close is also the tell that a task group may have been
-        cancelled without its host being able to drain it (the anyio
-        no-progress ``_deliver_cancellation`` spin), so it triggers the
-        rate-limited orphaned-scope disarm sweep as a backstop.
-        """
-        try:
-            async with asyncio.timeout(5):
-                await stack.aclose()
-        except (Exception, asyncio.CancelledError, BaseExceptionGroup):
-            log.debug("Error closing AsyncExitStack; ignoring", exc_info=True)
-            self._maybe_disarm_orphaned_scopes("suppressed stack close")
-
     def _maybe_disarm_orphaned_scopes(self, context: str) -> int:
         """Disarm anyio cancel scopes that can never drain (rate-limited backstop).
 
@@ -1181,9 +1149,9 @@ class MCPClientManager:
         child died after the connecting task returned) therefore spins the
         event loop at 100% CPU forever (verified against anyio 4.14.1; no
         upstream fix as of that release). The owner-task architecture prevents
-        Turnstone's static path from ever creating that state; this sweep is
-        the belt-and-suspenders for anything else (the pool path's cross-task
-        closes, SDK internals, future regressions).
+        Turnstone's static and pool paths from ever creating that state; this
+        sweep is the belt-and-suspenders for anything else (SDK internals, a
+        not-yet-migrated path, future regressions).
 
         Only scopes where EVERY registered task is done are touched — by then
         no task can ever exit the scope, so cancelling the armed handle and
@@ -1238,22 +1206,6 @@ class MCPClientManager:
                 context,
             )
         return disarmed
-
-    async def _safe_teardown_on_connect_failure(
-        self, key: str | tuple[str, str], stack: AsyncExitStack
-    ) -> None:
-        """Pre-close streams + close the stack on a connect-time failure.
-
-        POOL PATH ONLY (``_connect_one_pool``) — it raises from inside the
-        stream-enter / session-init try blocks and must drain the anyio
-        zero-buffer ``send()`` calls before closing the stack to avoid the
-        SDK #2147 CPU busy-loop. The static path no longer builds stacks in
-        the connecting task at all: its transport cms live inside the
-        per-server owner task (:meth:`_static_transport_owner`), which unwinds
-        them in-task on failure.
-        """
-        await self._pre_close_streams(key)
-        await self._safe_close_stack(stack)
 
     async def _teardown_static_session(self, name: str) -> None:
         """Tear down a static server's session/transport (the ONE canonical order).
@@ -1806,156 +1758,20 @@ class MCPClientManager:
         # Connection succeeded — clear any previous error
         self._last_error.pop(name, None)
 
-    async def _connect_one_pool(
-        self,
-        key: tuple[str, str],
-        cfg: dict[str, Any],
-        access_token: str,
-        *,
-        auth_capture: _AuthCapture | None = None,
-        auth_fired_event: asyncio.Event | None = None,
-    ) -> PoolEntryState:
-        """Connect a single per-(user, server) pool entry.
+    def _make_pool_notification_handler(self, key: tuple[str, str]) -> Any:
+        """Build the per-(user, server) notification handler for a pool session.
 
-        Mirror of :meth:`_connect_one` for ``auth_type='oauth_user'``,
-        with three differences:
-
-        * Streamable-HTTP transport only — pool servers are remote.
-        * ``Authorization: Bearer {access_token}`` injected into headers
-          alongside any operator-supplied static headers.
-        * Tool / resource / prompt catalog discovery runs after
-          ``initialize()`` (RFC §3.2 — discovery covers all three
-          catalogs, capability-gated). The notification handler is
-          bound to ``(user_id, server_name)`` so push-driven
-          ``*/list_changed`` updates only refresh the owning user's
-          catalog (the static refreshers must NEVER fire from a pool
-          session — they would clobber static-path state).
-
-        When ``auth_capture`` is supplied, the underlying ``httpx``
-        client is built via a factory whose response hook records 401/403
-        status + ``WWW-Authenticate`` into the carrier, recovering the
-        upstream auth signal that the SDK's ``post_writer`` would
-        otherwise swallow. Static-path callers
-        (:meth:`_connect_one`) MUST NOT pass this — the static path
-        must remain byte-identical, which means the SDK's default
-        ``create_mcp_http_client`` factory.
-
-        MUST run on the mcp-loop. Caller holds ``entry.open_lock``.
+        Bound to ``(user_id, server_name)`` via closure so a push-driven
+        ``*/list_changed`` only refreshes THIS user's catalog, never the static
+        path's — calling the static ``_refresh_server_tools(server_name)`` from
+        a pool session would mutate ``_static_servers[server_name].tools`` and
+        ``_tool_map``, broadcasting one user's tool view to every other session.
+        Body unchanged from the pre-owner-task closure in ``_connect_one_pool``;
+        extracted because the session cm is now entered by the transport owner
+        (mirrors ``_make_static_notification_handler``).
         """
         user_id, server_name = key
-        if "__" in server_name:
-            raise RuntimeError(
-                f"MCP server name '{server_name}' contains '__' (reserved delimiter)"
-            )
 
-        entry = await self._ensure_pool_entry(key)
-
-        # Tear down any stale session/stack the same way ``_connect_one``
-        # does (cf. PR #296 invariant 5 for the static path).
-        if entry.session is not None or entry.stack is not None:
-            entry.session = None
-            await self._pre_close_streams(key)
-            old_stack = entry.stack
-            entry.stack = None
-            if old_stack is not None:
-                await self._safe_close_stack(old_stack)
-
-        url = cfg.get("url")
-        if not url or cfg.get("type") not in ("http", "streamable-http"):
-            raise RuntimeError(
-                f"MCP server '{server_name}' requires streamable-http transport for "
-                f"auth_type=oauth_user (got transport={cfg.get('type')!r})"
-            )
-
-        # Defense-in-depth: reject http:// (non-loopback) before the bearer
-        # is attached. _dispatch_pool already screens this at the structured-
-        # error boundary; this catch is for any callers that bypass it.
-        _validate_oauth_user_url(url)
-
-        # Merge operator-supplied headers with the per-user bearer.
-        headers: dict[str, str] = dict(cfg.get("headers") or {})
-        headers["Authorization"] = f"Bearer {access_token}"
-
-        client_kwargs: dict[str, Any] = {"url": url, "headers": headers}
-        if auth_capture is not None:
-            client_kwargs["httpx_client_factory"] = _make_capturing_http_factory(
-                auth_capture, fired_event=auth_fired_event
-            )
-
-        stack = AsyncExitStack()
-        await stack.__aenter__()
-        try:
-            await self._tcp_probe(key, url)
-            # ``asyncio.timeout`` (NOT ``asyncio.wait_for``) — same anyio /
-            # Python 3.11 reasoning as ``session.initialize`` below and
-            # the ``_safe_close_stack`` fix in f6a3b66. ``wait_for``
-            # wraps the inner coroutine in a fresh :class:`asyncio.Task`
-            # which enters ``streamablehttp_client``'s anyio cancel
-            # scopes. When that fresh task completes (connect succeeded)
-            # its scopes are recorded on the stack but the entering
-            # task is dead; the eventual ``stack.aclose()`` during
-            # eviction (or auth_401 retry) tries to exit those scopes
-            # from a different task and anyio raises
-            # ``RuntimeError('Attempted to exit cancel scope in a
-            # different task...')`` — the same cross-task hazard
-            # f6a3b66 fixed at the close side.
-            #
-            # Surfacing: ``test_integration_pool_reuse_401_refresh_and_retry_succeeds``
-            # times out (non-deterministically) on Python 3.11 /
-            # resource-constrained CI when reverted — the wedged anyio
-            # state from dispatch 1's fresh-task connect blocks the
-            # auth_401 retry's stack teardown + reconnect within the
-            # 15s call budget. The test is the symptom, NOT a structural
-            # gate (its docstring at tests/test_mcp_pool_auth_integration.py:806-836
-            # asserts carrier-on-entry + race-against-fired-event, neither
-            # of which exercises this scope-ownership invariant). The
-            # structural argument is ``_safe_close_stack`` at line 834-846
-            # plus invariant 18 (``asyncio.timeout`` not ``asyncio.wait_for``
-            # for any SDK / AS / pool-loop await crossing anyio scopes).
-            # Reverting and finding the test green on a fast machine
-            # does NOT validate the revert.
-            async with asyncio.timeout(self._CONNECT_TIMEOUT):
-                read, write, _ = await stack.enter_async_context(
-                    streamablehttp_client(**client_kwargs)
-                )
-            entry.streams = (read, write)
-        except asyncio.CancelledError:
-            task = asyncio.current_task()
-            if task is not None and task.cancelling():
-                await self._safe_teardown_on_connect_failure(key, stack)
-                raise
-            log.warning(
-                "MCP pool connect failed (anyio cancel) user=%s server=%s", user_id, server_name
-            )
-            await self._safe_teardown_on_connect_failure(key, stack)
-            raise TimeoutError(f"Pool connection failed for '{server_name}'") from None
-        except TimeoutError:
-            log.warning(
-                "MCP pool connect timed out after %ds user=%s server=%s",
-                self._CONNECT_TIMEOUT,
-                user_id,
-                server_name,
-            )
-            await self._safe_teardown_on_connect_failure(key, stack)
-            raise TimeoutError(
-                f"Pool connection timed out after {self._CONNECT_TIMEOUT}s"
-            ) from None
-        except Exception:
-            await self._safe_teardown_on_connect_failure(key, stack)
-            raise
-
-        # Pool-scoped notification handler — bound to ``(user_id,
-        # server_name)`` via closure so a push-driven
-        # ``tools/list_changed`` only refreshes THIS user's catalog,
-        # never the static path's. Calling the static
-        # ``_refresh_server_tools(server_name)`` from a pool session
-        # would mutate ``_static_servers[server_name].tools`` and
-        # ``_tool_map`` — breaking invariant 1 (static-path
-        # byte-identical) and broadcasting one user's tool view to all
-        # other sessions. Phase 7 wired tool list-changed; Phase 7b
-        # extends the same shape to resources and prompts via
-        # ``_refresh_pool_server_resources`` /
-        # ``_refresh_pool_server_prompts``.
         async def _on_pool_notification(
             msg: Any,  # RequestResponder | ServerNotification | Exception
         ) -> None:
@@ -2012,42 +1828,336 @@ class MCPClientManager:
                     type(exc).__name__,
                 )
 
-        try:
-            session = await stack.enter_async_context(
-                ClientSession(read, write, message_handler=_on_pool_notification)  # type: ignore[arg-type]
-            )
-        except Exception:
-            await self._safe_teardown_on_connect_failure(key, stack)
-            raise
+        return _on_pool_notification
 
-        entry.stack = stack
-        # ``asyncio.timeout`` (NOT ``asyncio.wait_for``) — same anyio /
-        # Python 3.11 reasoning as the discovery call below: ``wait_for``
-        # wraps the inner coroutine in a fresh task, and a 401-during-
-        # handshake that triggers ``streamablehttp_client``'s anyio
-        # TaskGroup to unwind would surface a cross-task cancel-scope
-        # exit. ``asyncio.timeout`` keeps the await in the current task.
+    async def _pool_transport_owner(
+        self,
+        key: tuple[str, str],
+        client_kwargs: dict[str, Any],
+        ready: asyncio.Future[Any],
+        close_requested: asyncio.Event,
+    ) -> None:
+        """Own the transport + session cm lifecycle for one pool entry.
+
+        The pool sibling of :meth:`_static_transport_owner` — see that method
+        for the full anyio host-task rationale (a cancel scope whose host task
+        has finished can never be exited, and anyio then re-delivers
+        cancellation to it in a ``call_soon`` loop forever, the SDK #2147
+        100%-CPU spin). The invariant is the same: this ONE long-lived task
+        enters the transport + ``ClientSession`` cms, initializes, reports
+        readiness, parks, and unwinds — always in-task.
+
+        The caller builds ``client_kwargs`` (url + merged bearer headers, plus
+        the auth-capture ``httpx_client_factory`` when a carrier is active) and
+        runs the TCP pre-flight, so this task stays dumb. Connect-phase failures
+        are delivered through *ready* (its cancel unwinds the async-with chain
+        in-task); post-ready death is observed by the done-callback
+        (:meth:`_on_pool_owner_death`), which evicts the session for the next
+        dispatch to reconnect. The exit stack is a local so nothing outside this
+        task can reach it to ``aclose()`` cross-task.
+        """
+        user_id, server_name = key
         try:
-            async with asyncio.timeout(self._CONNECT_TIMEOUT):
-                await session.initialize()
+            async with AsyncExitStack() as stack:
+                async with asyncio.timeout(self._CONNECT_TIMEOUT):
+                    read, write, _ = await stack.enter_async_context(
+                        streamablehttp_client(**client_kwargs)
+                    )
+                # Stash stream refs so _pre_close_streams can unblock the SDK's
+                # transport tasks promptly during teardown (SDK #2147).
+                entry = self._user_pool_entries.get(key)
+                if entry is not None:
+                    entry.streams = (read, write)
+                session = await stack.enter_async_context(
+                    ClientSession(
+                        read,
+                        write,
+                        message_handler=self._make_pool_notification_handler(key),
+                    )
+                )
+                async with asyncio.timeout(self._CONNECT_TIMEOUT):
+                    await session.initialize()
+                if not ready.done():
+                    ready.set_result(session)
+                await close_requested.wait()
         except asyncio.CancelledError:
-            entry.stack = None
-            task = asyncio.current_task()
-            if task is not None and task.cancelling():
-                await self._safe_teardown_on_connect_failure(key, stack)
-                raise
-            await self._safe_teardown_on_connect_failure(key, stack)
-            raise TimeoutError(f"Pool handshake failed for '{server_name}'") from None
-        except TimeoutError:
-            entry.stack = None
-            await self._safe_teardown_on_connect_failure(key, stack)
-            raise TimeoutError(f"Pool handshake timed out after {self._CONNECT_TIMEOUT}s") from None
-        except Exception:
-            entry.stack = None
-            await self._safe_teardown_on_connect_failure(key, stack)
+            if not ready.done():
+                ready.set_exception(
+                    ConnectionError(
+                        f"MCP pool connect for '{server_name}' (user={user_id}) was cancelled"
+                    )
+                )
+                with contextlib.suppress(BaseException):
+                    ready.exception()  # mark retrieved: the waiter may be gone
+            raise
+        except BaseException as exc:
+            if not ready.done():
+                # Connect-phase failure: deliver to the waiting caller. Phase
+                # timeouts arrive as TimeoutError; transport task-group failures
+                # may be BaseExceptionGroup — passed through, the consumers
+                # handle groups explicitly.
+                ready.set_exception(exc)
+                with contextlib.suppress(BaseException):
+                    ready.exception()  # mark retrieved: the waiter may be gone
+                return
+            # Post-ready death: the server dropped the transport under a live
+            # session. The done-callback evicts; the next dispatch reconnects.
+            log.debug(
+                "MCP pool transport owner user=%s server=%s terminated: %r",
+                user_id,
+                server_name,
+                exc,
+            )
+
+    async def _teardown_pool_entry(self, key: tuple[str, str]) -> None:
+        """Tear down a pool entry's session/transport (the ONE canonical order).
+
+        Shared by :meth:`_connect_one_pool`'s stale-guard,
+        :meth:`_close_pool_entry_if_idle`, and shutdown so a future ordering fix
+        lands in one place. Does NOT pop the entry from ``_user_pool_entries`` —
+        callers own map / catalog cleanup. Safe to call while holding
+        ``entry.open_lock`` (it never takes a lock itself). No-op when the entry
+        is gone.
+
+        Close protocol (the anyio host-task invariant, shared with
+        :meth:`_teardown_static_session`): the transport + ``ClientSession`` cms
+        were entered by the entry's OWNER task and can only be exited by it — an
+        exit-stack ``aclose()`` from any other task raises anyio's cross-task
+        scope-exit error, and a scope whose host task has finished can never
+        drain, which arms anyio's ``_deliver_cancellation`` retry into a
+        permanent ``call_soon`` storm (the SDK #2147 100%-CPU spin this design
+        removes). So:
+
+        1. null the session (concurrent dispatch reads see "disconnected");
+        2. pre-close the transport streams (unblocks anyio transport tasks stuck
+           on zero-buffer ``send()``);
+        3. ask the owner to close (``close_requested.set()``) and give its
+           in-task unwind ``_OWNER_CLOSE_GRACE_S``;
+        4. escalate to ONE ``cancel()`` and wait ``_OWNER_CANCEL_GRACE_S``;
+        5. if it is STILL unwinding, leave it to finish solo (a SECOND cancel
+           would abandon a scope exit mid-flight and mint the exact zombie this
+           protocol prevents) and run the orphaned-scope disarm sweep as a
+           backstop.
+
+        A plain-session entry with no owner (unit-test seeding) short-circuits
+        after step 2 — that path stays cheap.
+        """
+        entry = self._user_pool_entries.get(key)
+        if entry is None:
+            return
+        entry.session = None
+        owner = entry.owner_task
+        close_requested = entry.close_requested
+        entry.owner_task = None
+        entry.close_requested = None
+        # Signal BEFORE the first await: if this coroutine is itself cancelled
+        # mid-teardown, the owner must already have its marching orders — a
+        # parked owner that never learns of the close would hold the transport
+        # open forever.
+        if close_requested is not None:
+            close_requested.set()
+        await self._pre_close_streams(key)
+        if owner is None or owner.done():
+            return
+        _done, pending = await asyncio.wait({owner}, timeout=self._OWNER_CLOSE_GRACE_S)
+        if pending:
+            owner.cancel()
+            _done, pending = await asyncio.wait({owner}, timeout=self._OWNER_CANCEL_GRACE_S)
+        if pending:
+            user_id, server_name = key
+            log.warning(
+                "MCP pool transport owner for user=%s server=%s still unwinding after "
+                "close+cancel; leaving it to finish on its own",
+                user_id,
+                server_name,
+            )
+            self._maybe_disarm_orphaned_scopes(
+                f"slow pool owner unwind for '{server_name}' (user={user_id})"
+            )
+
+    def _on_pool_owner_death(self, key: tuple[str, str], task: asyncio.Task[None]) -> None:
+        """Done-callback for a pool transport owner: observe UNREQUESTED death.
+
+        A requested teardown de-registers the owner from the entry before
+        closing it, so reaching here with ``entry.owner_task is task`` means the
+        transport collapsed underneath a live session (server died, stream
+        dropped) — the owner unwound its scopes in-task and the session is now a
+        corpse. Evict the session so the next dispatch reconnects; the entry and
+        its catalog are left in place (evict-session-keep-entry — the next
+        connect reuses the discovered catalog). The entry is NOT popped and the
+        catalogs are NOT rebuilt here.
+        """
+        with contextlib.suppress(BaseException):
+            if not task.cancelled():
+                task.exception()  # mark retrieved; the owner already logged
+        entry = self._user_pool_entries.get(key)
+        if entry is None or entry.owner_task is not task:
+            return
+        entry.owner_task = None
+        entry.close_requested = None
+        if entry.session is not None:
+            entry.session = None
+            user_id, server_name = key
+            log.info(
+                "MCP pool transport terminated user=%s server=%s; session evicted for reconnect",
+                user_id,
+                server_name,
+            )
+
+    async def _await_pool_discovery(self, owner: asyncio.Task[None], coro: Any) -> Any:
+        """Await a discovery call in the caller task, aborting if the OWNER dies.
+
+        Discovery (``list_tools`` / ``list_resources`` / ``list_prompts``) runs
+        in the connecting caller, but the transport servicing it is hosted by
+        ``owner``. When that transport collapses — e.g. the SDK tears its task
+        group down on an upstream 401 — anyio cancels the OWNER (the scope host),
+        NOT this caller, so a bare ``await`` on the session's response stream
+        would hang until the phase ``asyncio.timeout`` fires. Racing the owner
+        turns a transport death into a prompt ``ConnectionError`` that the
+        caller's ``except`` arm converts into a clean teardown. The owner is
+        never cancelled here — teardown owns its lifecycle; only the discovery
+        future is reaped.
+        """
+        call: asyncio.Future[Any] = asyncio.ensure_future(coro)
+        try:
+            await asyncio.wait({call, owner}, return_when=asyncio.FIRST_COMPLETED)
+        except asyncio.CancelledError:
+            # Caller cancelled (attempt timeout / phase ``asyncio.timeout`` /
+            # shutdown): reap the discovery future, leave the owner to teardown.
+            call.cancel()
+            with contextlib.suppress(BaseException):
+                await call
+            raise
+        if call.done():
+            return call.result()  # normal result, or the real discovery error
+        # Owner finished first — the transport died under discovery.
+        call.cancel()
+        with contextlib.suppress(BaseException):
+            await call
+        raise ConnectionError("MCP pool transport owner died during discovery")
+
+    async def _connect_one_pool(
+        self,
+        key: tuple[str, str],
+        cfg: dict[str, Any],
+        access_token: str,
+        *,
+        auth_capture: _AuthCapture | None = None,
+        auth_fired_event: asyncio.Event | None = None,
+    ) -> PoolEntryState:
+        """Connect a single per-(user, server) pool entry.
+
+        Mirror of :meth:`_connect_one` for ``auth_type='oauth_user'``,
+        with three differences:
+
+        * Streamable-HTTP transport only — pool servers are remote.
+        * ``Authorization: Bearer {access_token}`` injected into headers
+          alongside any operator-supplied static headers.
+        * Tool / resource / prompt catalog discovery runs after
+          ``initialize()`` (RFC §3.2 — discovery covers all three
+          catalogs, capability-gated). The notification handler is
+          bound to ``(user_id, server_name)`` so push-driven
+          ``*/list_changed`` updates only refresh the owning user's
+          catalog (the static refreshers must NEVER fire from a pool
+          session — they would clobber static-path state).
+
+        When ``auth_capture`` is supplied, the underlying ``httpx``
+        client is built via a factory whose response hook records 401/403
+        status + ``WWW-Authenticate`` into the carrier, recovering the
+        upstream auth signal that the SDK's ``post_writer`` would
+        otherwise swallow. Static-path callers
+        (:meth:`_connect_one`) MUST NOT pass this — the static path
+        must remain byte-identical, which means the SDK's default
+        ``create_mcp_http_client`` factory.
+
+        MUST run on the mcp-loop. Caller holds ``entry.open_lock``.
+        """
+        user_id, server_name = key
+        if "__" in server_name:
+            raise RuntimeError(
+                f"MCP server name '{server_name}' contains '__' (reserved delimiter)"
+            )
+
+        entry = await self._ensure_pool_entry(key)
+
+        # Guard: close any stale owner/session so we don't leak, the same way
+        # ``_connect_one_locked`` does for the static path (cf. PR #296
+        # invariant 5). The close protocol clears both the owner (and its open
+        # transport) and the session, and is a no-op on a brand-new entry.
+        await self._teardown_pool_entry(key)
+
+        url = cfg.get("url")
+        if not url or cfg.get("type") not in ("http", "streamable-http"):
+            raise RuntimeError(
+                f"MCP server '{server_name}' requires streamable-http transport for "
+                f"auth_type=oauth_user (got transport={cfg.get('type')!r})"
+            )
+
+        # Defense-in-depth: reject http:// (non-loopback) before the bearer
+        # is attached. _dispatch_pool already screens this at the structured-
+        # error boundary; this catch is for any callers that bypass it.
+        _validate_oauth_user_url(url)
+
+        # Merge operator-supplied headers with the per-user bearer.
+        headers: dict[str, str] = dict(cfg.get("headers") or {})
+        headers["Authorization"] = f"Bearer {access_token}"
+
+        client_kwargs: dict[str, Any] = {"url": url, "headers": headers}
+        if auth_capture is not None:
+            client_kwargs["httpx_client_factory"] = _make_capturing_http_factory(
+                auth_capture, fired_event=auth_fired_event
+            )
+
+        # Pre-flight TCP check: fail fast before spawning an owner and entering
+        # the SDK's anyio task group at all (an ECONNREFUSED surfaces here as a
+        # clean ConnectionError instead of a cancel-scope unwind).
+        await self._tcp_probe(key, url)
+
+        # The transport + session cms are entered by a dedicated OWNER task
+        # (:meth:`_pool_transport_owner`); this method only WAITS for it to
+        # report readiness, so a caller-side cancellation (an eviction giving
+        # up, shutdown, a sync boundary timing out) can never abandon an anyio
+        # cancel scope mid-exit. On failure the owner unwinds fully in its own
+        # task. ``test_integration_pool_reuse_401_refresh_and_retry_succeeds``
+        # is the historical symptom sentinel for cross-task anyio state on this
+        # exact path.
+        loop = asyncio.get_running_loop()
+        ready: asyncio.Future[Any] = loop.create_future()
+        close_requested = asyncio.Event()
+        owner = asyncio.create_task(
+            self._pool_transport_owner(key, client_kwargs, ready, close_requested),
+            name=f"mcp-pool-owner:{user_id}:{server_name}",
+        )
+        owner.add_done_callback(lambda t: self._on_pool_owner_death(key, t))
+        try:
+            session = await ready
+        except asyncio.CancelledError:
+            # Caller cancelled while the owner was still connecting. Close the
+            # owner with the one-cancel protocol and let its unwind finish
+            # in-task; never abandon it mid-exit, never cancel twice.
+            close_requested.set()
+            if not owner.done():
+                owner.cancel()
+                await asyncio.wait({owner}, timeout=self._OWNER_CANCEL_GRACE_S)
+            raise
+        except BaseException:
+            # Connect failed: the owner delivered the failure and is unwinding
+            # itself in-task. Reap quietly, then surface the error.
+            await asyncio.wait({owner}, timeout=self._OWNER_CLOSE_GRACE_S)
             raise
 
-        # Capability fetch — mirror the static path at mcp_client.py:920-932.
+        if owner.done():
+            # The transport collapsed in the instant between readiness and this
+            # caller resuming (flapping server). Treat it as a failed connect
+            # rather than installing a corpse the first dispatch trips over.
+            raise ConnectionError(f"MCP pool server '{server_name}' transport died during connect")
+
+        entry.owner_task = owner
+        entry.close_requested = close_requested
+        entry.session = session
+
+        # Capability fetch — mirrors the static path's post-ready fetch in
+        # ``_connect_one_locked``.
         # Per RFC §3.2 the pool path now discovers resources & prompts too,
         # capability-gated so a server that doesn't implement them stays
         # cheap (no extra round-trips). Capabilities are populated by the
@@ -2060,46 +2170,41 @@ class MCPClientManager:
         entry.supports_prompts = prompts_cap is not None
         entry.supports_prompt_list_changed = bool(getattr(prompts_cap, "listChanged", False))
 
-        # Discover this user's tool catalog. R6 verified: a 401 here
-        # propagates through anyio TaskGroup unwinding (raises an
-        # ``ExceptionGroup`` from the surrounding ``streamablehttp_client``
-        # context) — plain ``await`` under ``asyncio.timeout`` is
-        # sufficient. The carrier-race shape used by
+        # Discover this user's tool catalog. Discovery runs in THIS caller task
+        # while the transport is hosted by the owner, so an upstream failure
+        # (e.g. a 401 the SDK surfaces by collapsing its task group) cancels the
+        # OWNER, not us — ``_await_pool_discovery`` races the owner so that death
+        # aborts discovery promptly instead of hanging on the response stream
+        # until the phase timeout. The carrier-race shape used by
         # ``_dispatch_pool_with_entry`` defends a different scenario
-        # (reused-session 401 from inside a SECOND dispatch) that
-        # doesn't apply to first-connect discovery.
+        # (reused-session 401 from inside a SECOND dispatch) that doesn't apply
+        # to first-connect discovery.
         #
-        # Why ``asyncio.timeout``, not ``asyncio.wait_for``: per
-        # ``feedback_asyncio_timeout_vs_wait_for.md`` and the f6a3b66
-        # fix, Python 3.11's ``asyncio.wait_for`` wraps the inner
-        # coroutine in a fresh task. When the SDK's ``streamablehttp_client``
-        # TaskGroup unwinds (e.g. on a 401), ``aclose`` on the surrounding
-        # anyio scope runs from a different task than entered it →
-        # ``RuntimeError("Attempted to exit cancel scope in a different
-        # task")``. ``asyncio.timeout`` runs the inner coroutine in the
-        # current task and is the safe shape for any await that may
-        # traverse anyio cleanup. R6 (Phase 7b) verified the same hazard
-        # applies to ``list_resources`` / ``list_resource_templates`` /
-        # ``list_prompts`` — they all traverse the same
-        # ``mcp/shared/session.py:240-314`` send_request infrastructure.
+        # ``asyncio.timeout``, NOT ``asyncio.wait_for`` (per
+        # ``feedback_asyncio_timeout_vs_wait_for.md``): ``wait_for`` wraps the
+        # inner coroutine in a fresh task, so any await that traverses anyio
+        # cleanup would run from a different task than entered the scope. That
+        # invariant STILL HOLDS here even though the transport cms now live in
+        # the owner task — the ``list_tools`` / ``list_resources`` /
+        # ``list_resource_templates`` / ``list_prompts`` calls all traverse the
+        # same ``mcp/shared/session.py`` ``send_request`` infrastructure (R6).
+        # Discovery-phase failures tear down through ``_teardown_pool_entry``,
+        # which closes the owner in-task.
         try:
             async with asyncio.timeout(self._CONNECT_TIMEOUT):
-                tools_result = await session.list_tools()
+                tools_result = await self._await_pool_discovery(owner, session.list_tools())
         except asyncio.CancelledError:
-            entry.stack = None
             task = asyncio.current_task()
             if task is not None and task.cancelling():
-                await self._safe_teardown_on_connect_failure(key, stack)
+                await self._teardown_pool_entry(key)
                 raise
-            await self._safe_teardown_on_connect_failure(key, stack)
+            await self._teardown_pool_entry(key)
             raise TimeoutError(f"Pool discovery failed for '{server_name}'") from None
         except TimeoutError:
-            entry.stack = None
-            await self._safe_teardown_on_connect_failure(key, stack)
+            await self._teardown_pool_entry(key)
             raise TimeoutError(f"Pool discovery timed out after {self._CONNECT_TIMEOUT}s") from None
         except Exception:
-            entry.stack = None
-            await self._safe_teardown_on_connect_failure(key, stack)
+            await self._teardown_pool_entry(key)
             raise
 
         capped_tools = _cap_server_tools(server_name, tools_result.tools)
@@ -2115,27 +2220,27 @@ class MCPClientManager:
                     # calls share the same timeout budget and target
                     # disjoint catalogs (resources vs. templates), so
                     # ordering is irrelevant.
-                    res_result, tmpl_result = await asyncio.gather(
-                        session.list_resources(),
-                        session.list_resource_templates(),
+                    res_result, tmpl_result = await self._await_pool_discovery(
+                        owner,
+                        asyncio.gather(
+                            session.list_resources(),
+                            session.list_resource_templates(),
+                        ),
                     )
             except asyncio.CancelledError:
-                entry.stack = None
                 task = asyncio.current_task()
                 if task is not None and task.cancelling():
-                    await self._safe_teardown_on_connect_failure(key, stack)
+                    await self._teardown_pool_entry(key)
                     raise
-                await self._safe_teardown_on_connect_failure(key, stack)
+                await self._teardown_pool_entry(key)
                 raise TimeoutError(f"Pool resource discovery failed for '{server_name}'") from None
             except TimeoutError:
-                entry.stack = None
-                await self._safe_teardown_on_connect_failure(key, stack)
+                await self._teardown_pool_entry(key)
                 raise TimeoutError(
                     f"Pool resource discovery timed out after {self._CONNECT_TIMEOUT}s"
                 ) from None
             except Exception:
-                entry.stack = None
-                await self._safe_teardown_on_connect_failure(key, stack)
+                await self._teardown_pool_entry(key)
                 raise
 
             for r in _cap_server_resources(server_name, res_result.resources):
@@ -2165,24 +2270,21 @@ class MCPClientManager:
         if prompts_cap is not None:
             try:
                 async with asyncio.timeout(self._CONNECT_TIMEOUT):
-                    prompt_result = await session.list_prompts()
+                    prompt_result = await self._await_pool_discovery(owner, session.list_prompts())
             except asyncio.CancelledError:
-                entry.stack = None
                 task = asyncio.current_task()
                 if task is not None and task.cancelling():
-                    await self._safe_teardown_on_connect_failure(key, stack)
+                    await self._teardown_pool_entry(key)
                     raise
-                await self._safe_teardown_on_connect_failure(key, stack)
+                await self._teardown_pool_entry(key)
                 raise TimeoutError(f"Pool prompt discovery failed for '{server_name}'") from None
             except TimeoutError:
-                entry.stack = None
-                await self._safe_teardown_on_connect_failure(key, stack)
+                await self._teardown_pool_entry(key)
                 raise TimeoutError(
                     f"Pool prompt discovery timed out after {self._CONNECT_TIMEOUT}s"
                 ) from None
             except Exception:
-                entry.stack = None
-                await self._safe_teardown_on_connect_failure(key, stack)
+                await self._teardown_pool_entry(key)
                 raise
 
             for p in _cap_server_prompts(server_name, prompt_result.prompts):
@@ -2206,18 +2308,15 @@ class MCPClientManager:
         entry.resources = server_resources if resources_cap is not None else None
         entry.prompts = server_prompts if prompts_cap is not None else None
 
-        # Publish session readiness BEFORE catalog visibility.
-        # ``_rebuild_user_tool_map`` makes ``is_mcp_tool(name, user_id=U)``
-        # return True for the discovered names; if catalog visibility
-        # preceded ``entry.session`` assignment, a sync-thread reader
-        # racing with this coroutine could observe a tool whose backing
-        # entry has ``session=None``. Defence-in-depth — dispatch
-        # re-fetches its own token through ``get_user_access_token_classified``
-        # and lazy-reconnects on session=None — but ordering catches the
-        # race at the source rather than relying on the dispatch-time
-        # recovery path. Same ordering invariant covers resources/prompts
-        # (R16).
-        entry.session = session
+        # Session + owner were published right after connect-readiness (above),
+        # before discovery; the per-user catalog maps are rebuilt LAST so a
+        # sync-thread reader never observes a tool whose backing entry isn't
+        # fully wired. ``_rebuild_user_tool_map`` is what makes
+        # ``is_mcp_tool(name, user_id=U)`` return True for the discovered names,
+        # and by the time it runs ``entry.session`` is already live — dispatch
+        # also re-fetches its own token and lazy-reconnects on session=None, but
+        # ordering catches the race at the source. Same invariant covers
+        # resources/prompts (R16).
         entry.bound_token = access_token  # remember the bearer this session carries
         entry.last_used = time.monotonic()
         self._user_pool_last_used[key] = entry.last_used
@@ -2782,12 +2881,7 @@ class MCPClientManager:
             # the lock acquisition.
             if entry.in_flight > 0:
                 return
-            entry.session = None
-            await self._pre_close_streams(key)
-            stack = entry.stack
-            entry.stack = None
-            if stack is not None:
-                await self._safe_close_stack(stack)
+            await self._teardown_pool_entry(key)
             self._user_pool_entries.pop(key, None)
             self._user_pool_last_used.pop(key, None)
             # Mirror ``_evict_session``'s catalog cleanup: dropping the
@@ -3901,11 +3995,43 @@ class MCPClientManager:
                     with contextlib.suppress(BaseException):
                         await self._user_pool_eviction_task
                     self._user_pool_eviction_task = None
+                # Parallel version of ``_teardown_pool_entry``'s close protocol
+                # (mirrors ``_close_all_owners`` for the static path): signal
+                # every owner first, one shared graceful window, then ONE cancel
+                # each for stragglers and a short drain — never a second cancel
+                # (it would abandon an anyio scope exit mid-flight; the owner
+                # completing solo is harmless, and the loop is stopping anyway).
+                owners: list[asyncio.Task[None]] = []
                 for key in list(self._user_pool_entries):
-                    await self._pre_close_streams(key)
                     entry = self._user_pool_entries.get(key)
-                    if entry is not None and entry.stack is not None:
-                        await self._safe_close_stack(entry.stack)
+                    if entry is None:
+                        continue
+                    entry.session = None
+                    owner = entry.owner_task
+                    close_requested = entry.close_requested
+                    entry.owner_task = None
+                    entry.close_requested = None
+                    if close_requested is not None:
+                        close_requested.set()
+                    if owner is not None and not owner.done():
+                        owners.append(owner)
+                    # Pre-close streams to unblock the SDK's transport tasks
+                    # (anyio zero-buffer send — SDK #2147) so owners unwind fast.
+                    await self._pre_close_streams(key)
+                if owners:
+                    _done, pending = await asyncio.wait(owners, timeout=self._OWNER_CLOSE_GRACE_S)
+                    for owner in pending:
+                        owner.cancel()
+                    if pending:
+                        _done, pending = await asyncio.wait(
+                            pending, timeout=self._OWNER_CANCEL_GRACE_S / 2
+                        )
+                        if pending:
+                            log.warning(
+                                "MCP shutdown: %d pool transport owner(s) still unwinding; "
+                                "left to the dying loop",
+                                len(pending),
+                            )
                 self._user_pool_entries.clear()
                 self._user_pool_last_used.clear()
                 self._user_pool_locks.clear()
@@ -6194,13 +6320,14 @@ class MCPClientManager:
     def _evict_session(self, key: tuple[str, str]) -> None:
         """Drop the cached session AND catalog on a pool entry.
 
-        Stack/streams left for reconnect. Auth/transport branches both
-        call this — the next connect's ``_connect_one_pool`` tears
-        down the stale stack lazily via the stale-entry guard at the
-        top of the method. Closing eagerly from here is incorrect
-        under cancellation: ``stack.aclose()`` must run inside the
-        same anyio scope it was entered in, which the next connect
-        arranges.
+        Owner/streams left for reconnect. Auth/transport branches both call
+        this — the next connect's ``_connect_one_pool`` tears down the stale
+        owner lazily via its stale-entry guard (``_teardown_pool_entry``).
+        Closing eagerly from here is incorrect: the transport cms live in the
+        owner task and can only be unwound there (the one-cancel close
+        protocol), which the next connect arranges. A session evicted with no
+        following reconnect is reaped by idle eviction, which drives the same
+        protocol.
 
         Catalog cleanup (Phase 7 / 7b): clearing ``entry.tools`` /
         ``entry.resources`` / ``entry.prompts`` here ensures an
@@ -6404,8 +6531,8 @@ class MCPClientManager:
                 # (_connect_one_pool), so a warm session would replay the now-
                 # stale bearer and eat a guaranteed upstream 401 before the
                 # auth_401 retry could heal it. Proactively reconnect to rebind
-                # the current token: _connect_one_pool pre-closes the old
-                # stack/streams, and entry.tools is retained (catalog intact), so
+                # the current token: _connect_one_pool tears down the old
+                # owner/streams, and entry.tools is retained (catalog intact), so
                 # this is a transparent in-place token rotation — attempt #0 now
                 # carries a valid bearer.
                 #
@@ -6463,10 +6590,10 @@ class MCPClientManager:
                     # Cancel-and-await both losers. Awaiting cancelled
                     # tasks here pins the broken session's streams
                     # against the auth_401 retry's
-                    # ``_safe_close_stack`` teardown — without it the
+                    # ``_teardown_pool_entry`` teardown — without it the
                     # cancelled ``call_task`` could keep touching the
                     # SDK's stream state concurrently with the new
-                    # ``_connect_one_pool``'s aclose.
+                    # ``_connect_one_pool``'s owner unwind.
                     # ``BaseException`` covers both the
                     # ``CancelledError`` we asked for and any
                     # ``BaseExceptionGroup`` the SDK's anyio
