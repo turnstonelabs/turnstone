@@ -289,7 +289,7 @@ Fetch a URL and extract specific information from it.
 | `url`      | string | yes      | The URL to fetch (must start with `http://` or `https://`). |
 | `question` | string | yes      | What to extract or answer from the page content. |
 
-- **What it does**: Fetches the URL, strips HTML to plain text, and uses the LLM to extract the answer to the question from the page content. Protected against SSRF (blocks private/internal IPs).
+- **What it does**: Fetches the URL, strips HTML to plain text, and uses the LLM to extract the answer to the question from the page content. Every redirect hop is SSRF-screened before it is requested. Private/internal addresses are refused by default; enable `tools.allow_private_network` (console Settings → Tools) to make them approvable for self-hosted setups whose services live on the local network — the approval prompt marks such requests, and a public site redirecting into private space is refused regardless.
 - **Auto-approve**: No -- requires user confirmation (makes network requests).
 - **Agent availability**: `task_agent`.
 
@@ -360,7 +360,8 @@ Show the user rich content in a preview pane beside the conversation.
 | `title`   | string | no       | Pane header title. Defaults to the page title, filename, or URL. |
 
 - **What it does**: Resolves the target to bytes (URLs fetch through the same
-  SSRF-guarded path as `web_fetch`, re-checked after redirects), classifies the
+  SSRF-guarded path as `web_fetch`, screened per redirect hop, honoring the
+  same `tools.allow_private_network` opt-in), classifies the
   content, stores it content-addressed against the workstream, and opens the
   frontend preview pane beside the conversation: web pages render in a fully
   sandboxed iframe (no scripts, opaque origin), PDFs in the browser viewer,

@@ -590,3 +590,115 @@ class TestCancelledBatchPreservesPreview:
         # The in-memory synthesized turn carries the descriptor too.
         tool_turns = [t for t in s.messages if isinstance(t, Turn) and t.role is Role.TOOL]
         assert tool_turns and tool_turns[-1].meta.extra.get("preview") == descriptor
+
+
+# ---------------------------------------------------------------------------
+# tools.allow_private_network — the self-hoster opt-in (admin Settings → Tools)
+# ---------------------------------------------------------------------------
+
+
+class TestAllowPrivateNetwork:
+    def test_screen_public_url_passes(self):
+        from turnstone.core.session import _screen_tool_url
+
+        err, private = _screen_tool_url("https://example.com/x", False)
+        assert err is None and private is False
+
+    def test_screen_private_blocked_with_discoverable_hint(self):
+        from turnstone.core.session import _screen_tool_url
+
+        err, private = _screen_tool_url("http://10.0.0.7/grafana", False)
+        assert err is not None and private is False
+        # The refusal teaches the knob (mirrors the oidc opt-in hint pattern).
+        assert "tools.allow_private_network" in err
+        assert "Settings" in err
+
+    def test_screen_private_allowed_when_opted_in(self):
+        from turnstone.core.session import _screen_tool_url
+
+        err, private = _screen_tool_url("http://10.0.0.7/grafana", True)
+        assert err is None and private is True
+
+    def test_screen_invalid_url_never_hints(self):
+        from turnstone.core.session import _screen_tool_url
+
+        err, private = _screen_tool_url("http://", True)
+        assert err is not None and private is False
+        assert "allow_private_network" not in err
+
+    def test_bare_session_defaults_strict(self):
+        # No ConfigStore (CLI / eval surface) → no admin opted in → strict.
+        s = _make_session()
+        assert s._allow_private_network() is False
+
+    def test_prepare_web_fetch_private_opted_in(self, monkeypatch):
+        s = _make_session()
+        monkeypatch.setattr(ChatSession, "_allow_private_network", lambda self: True)
+        item = s._prepare_web_fetch(
+            "c1", {"url": "http://192.168.1.50:3000/d/home", "question": "what is shown?"}
+        )
+        assert "error" not in item
+        assert item["needs_approval"] is True  # the human gate stays
+        assert "(private network)" in item["header"]
+        assert item["allow_private_origin"] is True
+
+    def test_prepare_open_preview_private_opted_in(self, monkeypatch):
+        s = _make_session()
+        monkeypatch.setattr(ChatSession, "_allow_private_network", lambda self: True)
+        item = s._prepare_open_preview("c1", {"target": "http://192.168.1.50:3000/d/home"})
+        assert "error" not in item
+        assert item["needs_approval"] is True
+        assert "(private network)" in item["header"]
+        assert item["allow_private_origin"] is True
+
+    def test_prepare_private_still_blocked_by_default(self, monkeypatch):
+        s = _make_session()
+        monkeypatch.setattr(ChatSession, "_allow_private_network", lambda self: False)
+        for prepare, args in (
+            (s._prepare_web_fetch, {"url": "http://10.0.0.7/x", "question": "q"}),
+            (s._prepare_open_preview, {"target": "http://10.0.0.7/x"}),
+        ):
+            item = prepare("c1", args)
+            assert "error" in item
+            assert "tools.allow_private_network" in item["error"]
+
+    def test_executor_passes_private_origin_to_guard(self, monkeypatch):
+        s = _make_session()
+        monkeypatch.setattr(ChatSession, "_allow_private_network", lambda self: True)
+        seen = {}
+
+        def _capture(url, **kw):
+            seen.update(kw, url=url)
+            return _fake_response(url, b"<html><head></head><body>x</body></html>", "text/html")
+
+        monkeypatch.setattr("turnstone.core.session.fetch_with_ssrf_guard", _capture)
+        item = s._prepare_open_preview("c1", {"target": "http://10.0.0.7/status"})
+        s._exec_open_preview(item)
+        assert seen["allow_private_origin"] is True
+
+    def test_guard_skips_hop_screen_for_private_origin(self, monkeypatch):
+        from turnstone.core.web import fetch_with_ssrf_guard
+
+        _FakeClient.calls = []
+        _FakeClient.table = {
+            "http://10.0.0.7/a": _FakeHop(302, {"location": "http://10.0.0.8/b"}),
+            "http://10.0.0.8/b": _FakeHop(200, {}, url="http://10.0.0.8/b"),
+        }
+        monkeypatch.setattr("turnstone.core.web.httpx.Client", _FakeClient)
+
+        def _explode(url):
+            raise AssertionError("hop screening must be skipped for a private origin")
+
+        monkeypatch.setattr("turnstone.core.web.check_ssrf", _explode)
+        resp = fetch_with_ssrf_guard("http://10.0.0.7/a", timeout=5, allow_private_origin=True)
+        assert resp.status_code == 200
+        assert _FakeClient.calls == ["http://10.0.0.7/a", "http://10.0.0.8/b"]
+
+    def test_registry_entry_shape(self):
+        from turnstone.core.settings_registry import SETTINGS
+
+        d = SETTINGS["tools.allow_private_network"]
+        assert d.type == "bool"
+        assert d.default is False
+        assert d.section == "tools"
+        assert d.help  # the admin form renders this — it must explain the caveat
