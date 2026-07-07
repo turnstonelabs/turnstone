@@ -340,8 +340,8 @@ def test_poll_watch_terminal_fire_survives_drain(
     monkeypatch.setattr(session._nudge_queue, "enqueue", _spy_enqueue)
 
     # For the max_polls=1 case the first poll has prev_output=None and
-    # would not normally fire on output change; the max_polls branch
-    # at watch.py:412-414 still marks is_final=True so dispatch runs.
+    # would not normally fire on output change; _poll_watch's max_polls
+    # branch still marks is_final=True so dispatch runs.
     due = storage.list_due_watches("2099-01-01T00:00:00")
     matching = [r for r in due if r["watch_id"] == f"w-regression-{label}"]
     assert len(matching) == 1, f"watch row not picked up by list_due_watches: {due!r}"

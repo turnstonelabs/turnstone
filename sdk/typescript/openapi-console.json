@@ -2,7 +2,7 @@
   "openapi": "3.1.0",
   "info": {
     "title": "turnstone Console API",
-    "version": "1.7.0a6",
+    "version": "1.7.0rc1",
     "description": "Cluster-wide visibility and control across all turnstone nodes."
   },
   "paths": {
@@ -6688,7 +6688,7 @@
         "tags": [
           "Coordinator"
         ],
-        "description": "Aggregates the persisted row, a best-effort live block from the owning node (or the in-process coordinator manager for ``kind=\"coordinator\"`` rows), and the tail of the message history.  Gated on the ``admin.cluster.inspect`` permission (granted to ``builtin-admin`` via migration 040; revoke or reassign to a custom role for tighter control).  ``live`` is null on node unreachability / 5xx so callers can degrade gracefully.",
+        "description": "Aggregates the persisted row, a best-effort live block from the owning node (or the in-process coordinator manager for ``kind=\"coordinator\"`` rows), and the tail of the message history.  Gated on the ``admin.cluster.inspect`` permission (granted to ``builtin-admin`` via migration 040; revoke or reassign to a custom role for tighter control).  A workstream attached to a *private* project stays confidential to its members: a permitted caller who isn't its owner / creator / project member gets a 404 (same masking as an unknown id).  ``live`` is null on node unreachability / 5xx so callers can degrade gracefully.",
         "parameters": [
           {
             "name": "ws_id",
@@ -13361,7 +13361,7 @@
         "type": "object"
       },
       "PendingApprovalItem": {
-        "description": "One pending tool-call inside a ``PendingApprovalDetail`` envelope.\n\nMirrors the dict ``SessionUIBase.serialize_pending_approval_detail``\nemits per item. ``heuristic_verdict`` / ``judge_verdict`` are kept\nloosely-typed because the underlying verdict shape varies by tier;\nconsumers that want the full structure can decode against\n:class:`turnstone.sdk.events.IntentVerdictEvent`.",
+        "description": "One pending tool-call inside a ``PendingApprovalDetail`` envelope.\n\nMirrors the dict ``SessionUIBase.serialize_pending_approval_details``\nemits per item inside each cycle entry. ``heuristic_verdict`` / ``judge_verdict`` are kept\nloosely-typed because the underlying verdict shape varies by tier;\nconsumers that want the full structure can decode against\n:class:`turnstone.sdk.events.IntentVerdictEvent`.",
         "properties": {
           "call_id": {
             "default": "",

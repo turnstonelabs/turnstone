@@ -33,7 +33,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
-    from collections.abc import Iterable
+    from collections.abc import Callable, Iterable
 
 from sse_starlette import EventSourceResponse
 from starlette.applications import Starlette
@@ -55,6 +55,7 @@ from turnstone.core.auth import (
     _DenyFilter,
     jwt_version_slot,
 )
+from turnstone.core.idle_nudge_watcher import wake_workstream_if_pending
 from turnstone.core.log import get_logger
 from turnstone.core.metrics import metrics as _metrics
 from turnstone.core.ratelimit import resolve_client_ip
@@ -772,6 +773,19 @@ def _interactive_events_replay(
             yield {"type": "intent_verdict", **v}
 
 
+def _watch_fire_wake_fn(ws: Workstream) -> Callable[[], object]:
+    """Wake closure for watch fires, for ``ChatSession.set_watch_runner``.
+
+    Closes over the Workstream OBJECT, never its id: after an
+    eviction+restore the manager tracks the workstream under a fresh id
+    while the watch rows keep the resumed session's ``_ws_id``, so an
+    id-keyed ``manager.get`` lookup at fire time would miss.  Shared by
+    every ``set_watch_runner`` site (create, reopen, watch-restore,
+    CLI ``--resume``) so they can't drift on that subtlety.
+    """
+    return lambda: wake_workstream_if_pending(ws, trigger="watch-fire")
+
+
 def _interactive_open_post_load(request: Request, ws: Workstream) -> None:
     """Post-load hook for the lifted interactive ``open`` body.
 
@@ -794,6 +808,13 @@ def _interactive_open_post_load(request: Request, ws: Workstream) -> None:
        handler-side emission is the load-bearing path on interactive;
        ``InteractiveAdapter.emit_rehydrated`` is a no-op stub
        precisely because this enqueue lives here.
+    4. Re-wire the watch dispatch registration.  The workstream's
+       previous ``close()`` removed its registration, and nothing on
+       the ``open`` path restored it — so a watch firing on a
+       REOPENED, actively-viewed workstream found no dispatch fn and
+       took the restore path, spawning a duplicate auto-approved
+       session that raced turns into the same conversation the live
+       one was showing.
     """
     from turnstone.core.memory import get_workstream_display_name
 
@@ -802,6 +823,12 @@ def _interactive_open_post_load(request: Request, ws: Workstream) -> None:
     session = ws.session
     if isinstance(ui, WebUI) and session is not None and session.messages:
         ui._enqueue({"type": "clear_ui"})
+
+    runner = getattr(request.app.state, "watch_runner", None)
+    if runner is not None and session is not None:
+        # ``mgr.open`` already resumed, so this keys the registration on
+        # the adopted id (and ``resume()`` re-registers by itself anyway).
+        session.set_watch_runner(runner, wake_fn=_watch_fire_wake_fn(ws))
 
     gq: queue.Queue[dict[str, Any]] | None = getattr(request.app.state, "global_queue", None)
     if gq is not None:
@@ -2104,7 +2131,7 @@ async def _interactive_create_post_install(
         ws.ui.auto_approve = True
     runner = getattr(request.app.state, "watch_runner", None)
     if runner and ws.session:
-        ws.session.set_watch_runner(runner)
+        ws.session.set_watch_runner(runner, wake_fn=_watch_fire_wake_fn(ws))
     gq: queue.Queue[dict[str, Any]] = request.app.state.global_queue
     # Emit ``ws_created`` on the global queue for SSE consumers
     # (console). Held until past attachment validation in the
@@ -2228,7 +2255,9 @@ async def _interactive_create_post_install(
 
     # Initial-message worker thread.
     initial_message = body.get("initial_message", "").strip()
+    initial_message_status = ""
     if initial_message and ws.session is not None:
+        from turnstone.core import session_worker
         from turnstone.core.attachments import (
             resolve_staged_attachments as _resolve_staged,
         )
@@ -2236,20 +2265,13 @@ async def _interactive_create_post_install(
         session = ws.session
         send_id = uuid.uuid4().hex
         resolved_atts: list[Any] = []
+        staged_ord: list[str] = []
         if attachment_ids:
-            # Resolve (peek) the staged uploads, then drain them from the buffer
-            # now.  The inlined first turn is their only consumer and it always
-            # commits at create (no queue rejection by construction), so leaving
-            # them staged would let the freshly-opened pane's rehydrate race the
-            # worker's write-time drain and paint them as still-pending composer
-            # chips.  ``_append_user_turn``'s own per-id discard then no-ops.
-            resolved_atts, _ord, _drop = _resolve_staged(attachment_ids, ws.id, uid)
-            if _ord:
-                from turnstone.core.attachment_buffer import get_attachment_buffer
-
-                _buf = get_attachment_buffer()
-                for _aid in _ord:
-                    _buf.discard(_aid, ws_id=ws.id, user_id=uid)
+            # Resolve (peek) the staged uploads.  The buffer DRAIN happens
+            # after the dispatch below, and only on the spawn path — the
+            # enqueue path can't deliver attachments, so there they must
+            # stay staged (see ``_enqueue_init``).
+            resolved_atts, staged_ord, _drop = _resolve_staged(attachment_ids, ws.id, uid)
 
         def _run_initial() -> None:
             try:
@@ -2268,31 +2290,89 @@ async def _interactive_create_post_install(
                     _fire_notify_targets(ws, last_content)
                 except Exception:
                     log.warning("notify_completion.hook_error", ws_id=ws.id, exc_info=True)
-                with ws._lock:
-                    # Only clear the flag if THIS thread is still the current
-                    # worker — a force-cancel abandons this thread and a
-                    # follow-up send may already have spawned a successor; an
-                    # abandoned initial-send worker finishing late must not
-                    # clobber that successor's running flag (mirrors the guard
-                    # in session_worker._runner).
-                    if ws.worker_thread is threading.current_thread():
-                        ws._worker_running = False
 
-        # Inlined rather than via ``session_worker.send`` because at
-        # workstream creation no live worker can exist by
-        # construction — the enqueue branch of the shared dispatch
-        # is dead code here. ``_worker_running`` + ``ws.worker_thread``
-        # are set together under ``ws._lock`` so a path-keyed send
-        # arriving immediately after creation observes the running
-        # state via the shared session_worker gate instead of racing
-        # into a parallel worker.
-        with ws._lock:
-            ws._worker_running = True
-            t = threading.Thread(target=_run_initial, daemon=True, name=f"ws-init-{ws.id[:8]}")
-            ws.worker_thread = t
-            t.start()
+        init_enqueued = False
 
-    return {"resumed": resumed, "message_count": message_count}
+        def _enqueue_init() -> None:
+            # Reached only if a worker already owns this freshly-created ws
+            # — possible solely with a caller-supplied ws_id raced by a
+            # concurrent /send.  Don't drop the user's first message: queue
+            # its TEXT as an interjection so the live worker delivers it.
+            # Attachments can't ride the interjection seam (queue_message
+            # rejects them), so they stay STAGED instead (the drain below
+            # is skipped on this branch): the composer keeps showing them
+            # as pending chips and the user's next send delivers them.
+            #
+            # No try/except: ``queue.Full`` must reach
+            # ``session_worker.send``'s backpressure branch so it returns
+            # ``False`` — the same surface the /send path reports as
+            # ``queue_full`` — instead of this create responding as if the
+            # message were delivered.
+            nonlocal init_enqueued
+            init_enqueued = True
+            session.queue_message(initial_message)
+            if resolved_atts:
+                log.warning(
+                    "ws_init.live_worker_at_creation ws=%s — %d attachment(s) left staged "
+                    "(cannot ride the interjection seam); message text queued, attachments "
+                    "stay in the composer for the next send",
+                    ws.id[:8],
+                    len(resolved_atts),
+                )
+
+        # Routed through ``session_worker.send`` so the init worker
+        # inherits ``_runner``'s ownership-clear wake backstop
+        # (``_retry_pending_wake``): a nudge enqueued during the initial
+        # send (e.g. a watch fire on a schedule-created workstream) no
+        # longer strands until the next user message.  The enqueue branch
+        # is unreachable by construction (no worker can own a ws at
+        # creation) unless a caller-supplied ws_id is raced — hence
+        # ``_enqueue_init`` preserves the message and leaves the staged
+        # attachments recoverable instead of assuming the branch is dead.
+        init_ok = session_worker.send(
+            ws,
+            enqueue=_enqueue_init,
+            run=_run_initial,
+            thread_name=f"ws-init-{ws.id[:8]}",
+        )
+        if not init_ok:
+            # Two refusal shapes: the raced live worker's interjection
+            # queue rejected the text (``init_enqueued=True`` — queue.Full,
+            # the condition /send surfaces as ``queue_full``), or ``send``
+            # refused outright because the workstream was closed under our
+            # feet (``init_enqueued=False`` — a create raced by an off-loop
+            # close).  Either way the workstream exists and the first
+            # message was NOT delivered; say so instead of answering as if
+            # it were.  Attachments stay staged on both paths (the drain
+            # below is gated on ``init_ok``) so the composer chips survive
+            # for the user's retry.
+            initial_message_status = "queue_full" if init_enqueued else "refused_closed"
+            log.error(
+                "ws_init.initial_message_dropped ws=%s (%s)",
+                ws.id[:8],
+                initial_message_status,
+            )
+        if staged_ord and not init_enqueued and init_ok:
+            # Spawn path took the message: drain the staged copies NOW,
+            # before this handler returns — the pane's rehydrate can only
+            # start after it receives this response, so it can never
+            # observe the consumed uploads as still-pending composer
+            # chips.  (``enqueue`` runs synchronously inside ``send``, so
+            # ``init_enqueued`` is settled here.)  ``_append_user_turn``'s
+            # own per-id discard then no-ops.
+            from turnstone.core.attachment_buffer import get_attachment_buffer
+
+            _buf = get_attachment_buffer()
+            for _aid in staged_ord:
+                _buf.discard(_aid, ws_id=ws.id, user_id=uid)
+
+    out: dict[str, Any] = {"resumed": resumed, "message_count": message_count}
+    if initial_message_status:
+        # Only present when the initial message was NOT delivered — the
+        # factory passes it through to the response so API clients don't
+        # read the 200 as "first message accepted".
+        out["initial_message_status"] = initial_message_status
+    return out
 
 
 def _audit_workstream_created(
@@ -2500,6 +2580,13 @@ async def cancel_watch(request: Request) -> JSONResponse:
     if watch_node and node_id and watch_node != node_id:
         return JSONResponse({"error": "Watch belongs to another node"}, status_code=403)
     storage.update_watch(watch_id, active=False, next_poll="")
+    # AFTER the row write, per forget_terminal_dispatched's ordering
+    # contract: drop the runner's transient state for this id (held
+    # reminder / terminal-dispatched mark) — the inactive row never
+    # re-lists, so nothing else would ever clear it.
+    runner = getattr(request.app.state, "watch_runner", None)
+    if runner is not None:
+        runner.forget_terminal_dispatched(watch_id)
     return JSONResponse({"status": "ok", "watch_id": watch_id})
 
 
@@ -4077,7 +4164,11 @@ async def _lifespan(app: Starlette) -> AsyncGenerator[None, None]:
     if tls_client is not None:
         await tls_client.stop_renewal()
     if app.state.watch_runner:
-        app.state.watch_runner.stop()
+        # ``stop()`` drains in-flight polls (bounded, but up to ~35 s) —
+        # run it off the event loop like the state-writer below so SSE
+        # teardown and the remaining shutdown steps aren't frozen behind
+        # a watch command that's still finishing.
+        await asyncio.to_thread(app.state.watch_runner.stop)
     from turnstone.core.idle_nudge_watcher import shutdown_idle_nudge_watchers
 
     shutdown_idle_nudge_watchers(app)
@@ -4964,7 +5055,7 @@ def main() -> None:
 
     # Create WatchRunner (periodic command polling, server-level)
     from turnstone.core.storage import get_storage as _get_storage
-    from turnstone.core.watch import WatchRunner
+    from turnstone.core.watch import WatchRunner, WatchWorkstreamUnrestorable
 
     # Create session manager first (watch restore_fn captures it).
     interactive_adapter = InteractiveAdapter(
@@ -5023,25 +5114,110 @@ def main() -> None:
         on the rehydrated session, so ``WatchRunner._dispatch_result`` can
         re-deliver the current message into the rehydrated workstream's
         :class:`NudgeQueue` without a second pass through ``restore_fn``.
+
+        Failure taxonomy: two failures are PERMANENT — the persona-stamp
+        pre-read raising (corrupt stamp, nothing created yet) and
+        ``resume()`` returning ``False`` (no stored turns: the target's
+        history is gone, so there is nothing to deliver into and every
+        retry would rebuild this shell just to fail again).  Everything
+        else after ``manager.create`` is treated as transient — the
+        half-built shell is closed so a failed attempt can't leak a
+        ``max_active`` slot, and the runner holds the reminder and
+        retries, bounded by the watch's own poll budget.  Deliberately
+        NOT mapping post-create ``ValueError`` to permanent: ``resume``
+        can raise it for reasons beyond the corrupt-stamp contract, and
+        a misclassification here silently kills the user's watch.
         """
         try:
-            ws = manager.create(user_id="", name="watch-restore", **_resume_persona_kwargs(ws_id))
+            persona_kwargs = _resume_persona_kwargs(ws_id)
+        except ValueError as exc:
+            # PERMANENT: corrupt persona stamp.  Refuse to run the watch
+            # under an envelope the operator didn't choose (it would be
+            # unattended AND auto-approved), and signal the runner to stop
+            # retrying and deactivate the watch rather than burn the whole
+            # attempt budget on a cause that can't clear on its own.
+            log.warning("watch_restore: corrupt persona stamp on ws %s", ws_id, exc_info=True)
+            raise WatchWorkstreamUnrestorable(ws_id) from exc
+
+        try:
+            ws = manager.create(user_id="", name="watch-restore", **persona_kwargs)
+        except RuntimeError:
+            # TRANSIENT: all restore slots active right now.  Return None so
+            # the runner holds the reminder and retries on a later tick.
+            log.warning("watch_restore: cannot restore ws %s (all slots active)", ws_id)
+            return None
+
+        try:
             # Restored workstreams run unattended — auto-approve tool calls
             # to avoid blocking forever on approval with no connected user.
             if isinstance(ws.ui, WebUI):
                 ws.ui.auto_approve = True
-            if ws.session:
-                ws.session.resume(ws_id)
-                ws.session.set_watch_runner(_watch_runner)
-                return _watch_runner.get_dispatch_fn(ws.session._ws_id)
-        except RuntimeError:
-            log.warning("watch_restore: cannot restore ws %s (all slots active)", ws_id)
-        except ValueError:
-            # Corrupt persona stamp — refuse to run the watch under an
-            # envelope the operator didn't choose (it would be unattended
-            # AND auto-approved); the watch stays queued for a manual open.
-            log.warning("watch_restore: corrupt persona stamp on ws %s", ws_id, exc_info=True)
-        return None
+            if ws.session is None:
+                raise RuntimeError("created workstream has no session")
+            if not ws.session.resume(ws_id):
+                # ``resume``'s turn loader swallows storage errors into []
+                # (memory.load_message_turns), so False here is EITHER
+                # "history is gone" (permanent — without this check the
+                # fresh session keeps its own fresh ``_ws_id``, the
+                # registration below keys on THAT, and the reminder would
+                # be "delivered" into a blank, orphaned, auto-approved
+                # session while the watch deactivates as delivered) OR a
+                # transient read blip.  Re-probe with the RAISING storage
+                # call before declaring permanence: misclassifying a blip
+                # silently kills the user's watch and drops the fired
+                # reminder.
+                with contextlib.suppress(Exception):
+                    manager.close(ws.id)
+                try:
+                    turns_exist = bool(_get_storage().load_message_turns(ws_id, checkpointed=True))
+                except Exception:
+                    log.warning(
+                        "watch_restore: turns probe failed for ws %s (treating as transient)",
+                        ws_id,
+                        exc_info=True,
+                    )
+                    return None
+                if turns_exist:
+                    # Rows exist but resume()'s read came back empty — a
+                    # blip.  Retry on the held-delivery cadence.
+                    log.warning("watch_restore: empty resume read for ws %s (blip)", ws_id)
+                    return None
+                log.warning("watch_restore: ws %s has no stored turns", ws_id)
+                raise WatchWorkstreamUnrestorable(ws_id)
+            # A live registration may have appeared while this shell was
+            # being built — the user reopening the workstream mid-restore
+            # (``mgr.open`` + post-load registers their PANE).  The pane
+            # wins: deliver into it and close the redundant shell.
+            # Registering ours would silently clobber the pane's — every
+            # later fire would run unattended in the shell while the user
+            # watches a conversation that never shows its watch results.
+            # (A pane registration landing in the microseconds between
+            # this check and the set below can still be clobbered; that
+            # residue requires the reopen to race a window ~10^6 times
+            # narrower than the restore itself.)
+            existing = _watch_runner.get_dispatch_fn(ws_id)
+            if existing is not None:
+                log.info("watch_restore: live registration appeared for ws %s — yielding", ws_id)
+                with contextlib.suppress(Exception):
+                    manager.close(ws.id)
+                return existing
+            # ``ws`` is the freshly created workstream (manager-tracked id)
+            # even though the session resumed the original ``ws_id`` — the
+            # wake must target the live Workstream object, and firing it
+            # is what lets an unattended restore actually RUN the watch
+            # result (auto_approve above exists for exactly that turn).
+            ws.session.set_watch_runner(_watch_runner, wake_fn=_watch_fire_wake_fn(ws))
+            return _watch_runner.get_dispatch_fn(ws.session._ws_id)
+        except WatchWorkstreamUnrestorable:
+            raise  # shell already closed at the raise site above
+        except Exception:
+            # TRANSIENT: the shell exists but never became the watch's live
+            # target — close it (untrack + mark closed) so the failed
+            # attempt doesn't hold a max_active slot forever.
+            log.warning("watch_restore: resume failed for ws %s", ws_id, exc_info=True)
+            with contextlib.suppress(Exception):
+                manager.close(ws.id)
+            return None
 
     _watch_runner = WatchRunner(
         storage=_get_storage(),
@@ -5067,10 +5243,16 @@ def main() -> None:
         if args.skip_permissions or config_store.get("tools.skip_permissions"):
             ws.ui.auto_approve = True
         assert ws.session is not None
-        ws.session.set_watch_runner(_watch_runner)
         if not ws.session.resume(target_id):
             log.error("Workstream '%s' has no messages.", args.resume)
             sys.exit(1)
+        # AFTER the successful resume (mirroring the restore fn's order),
+        # so the registration keys on the adopted ``target_id`` — the id
+        # the session's watch rows are stamped with.  Registered before
+        # resume, the registry key would be the create-time id no watch
+        # row references, and every fire would restore a SECOND
+        # auto-approved session onto the operator's live conversation.
+        ws.session.set_watch_runner(_watch_runner, wake_fn=_watch_fire_wake_fn(ws))
         log.info("Resumed workstream %s (%d messages)", target_id, len(ws.session.messages))
 
     # Record detected model and judge status in metrics

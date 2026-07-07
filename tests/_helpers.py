@@ -3,8 +3,36 @@ not fixtures, and several test files want to import them directly."""
 
 from __future__ import annotations
 
-from typing import Any
+import time
+from typing import TYPE_CHECKING, Any
 from unittest.mock import MagicMock
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
+
+
+def wait_until(cond: Callable[[], bool], timeout: float = 5.0) -> None:
+    """Poll ``cond`` to True within ``timeout`` or fail the test.
+
+    The worker/wake tests can't join threads by identity:
+    ``session_worker.send`` assigns ``ws.worker_thread`` under the lock
+    BEFORE ``t.start()``, so the instant a dispatching call returns, a
+    fast worker may already have run its exit backstop and installed the
+    (not-yet-started) wake thread — joining whatever ``ws.worker_thread``
+    points at races ``RuntimeError: cannot join thread before it is
+    started``.  Poll outcomes instead.
+    """
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if cond():
+            return
+        time.sleep(0.005)
+    if cond():
+        # Final re-check: the condition can become true during the last
+        # sleep (or a CI descheduling stall past the deadline) — failing
+        # without re-looking makes the helper itself a flake source.
+        return
+    raise AssertionError("condition not met within timeout")
 
 
 def make_chat_session(**overrides: Any) -> Any:

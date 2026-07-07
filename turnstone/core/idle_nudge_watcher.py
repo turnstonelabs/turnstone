@@ -1,8 +1,18 @@
-"""Idle wake-trigger for the metacog NudgeQueue pipeline.
+"""Idle wake-triggers for the metacog NudgeQueue pipeline.
 
-Hosts :class:`IdleNudgeWatcher` plus the
-:func:`install_idle_nudge_watcher` / :func:`shutdown_idle_nudge_watchers`
-lifespan helpers.  Pulled out of :mod:`turnstone.core.metacognition`
+Hosts the two wake entry points plus their lifespan helpers:
+
+* :class:`IdleNudgeWatcher` — event-driven: a workstream transitions
+  to IDLE while nudges are ALREADY queued.
+* :func:`wake_workstream_if_pending` — the shared wake gate, also
+  called directly by asynchronous producers that enqueue onto an
+  ALREADY-idle workstream (the watch dispatch closure, via
+  ``ChatSession.set_watch_runner``'s ``wake_fn``).  Such producers see
+  no IDLE transition — the workstream has been idle all along — so
+  the watcher alone would leave their entries queued until the next
+  user message.
+
+Pulled out of :mod:`turnstone.core.metacognition`
 because the watcher is subscriber-lifecycle / runtime-orchestration
 code with different concerns from the static nudge-text templates and
 detection heuristics that live in metacognition; mixing them grew the
@@ -23,8 +33,85 @@ if TYPE_CHECKING:
     from collections.abc import Callable
 
     from turnstone.core.session_manager import SessionManager
+    from turnstone.core.workstream import Workstream
 
 log = get_logger(__name__)
+
+
+def wake_workstream_if_pending(ws: Workstream, *, trigger: str = "unspecified") -> bool:
+    """Spawn a wake send for *ws* when it is idle with drainable nudges.
+
+    The shared gate behind both wake triggers:
+
+    * :class:`IdleNudgeWatcher` — the workstream just transitioned to
+      IDLE with nudges already queued.
+    * the watch dispatch closure (``ChatSession.set_watch_runner``'s
+      ``wake_fn``) — a watch fired on a workstream that is ALREADY
+      idle, so no IDLE transition will ever re-check the queue.
+
+    *trigger* is a short label naming which path requested the wake
+    (``"idle-transition"``, ``"watch-fire"``, ``"worker-exit"``); it is
+    used only to tag the log lines below and never affects control flow.
+
+    Gates, in order:
+
+    * ``ws.session is None`` — workstream tracked but session not
+      built — or a bare stub session without a NudgeQueue (watch-style
+      dispatchers drive sessions that aren't installed on the
+      workstream).
+    * ``ws._closed`` — ``close()`` already ran (or is racing us); its
+      storage row says ``closed`` and a wake send would drive a
+      torn-down session.  Lockless FAST-PATH only: a stale ``False``
+      falls through to ``session_worker.send``, which re-checks
+      ``_closed`` under ``ws._lock`` — the same lock ``close()`` sets
+      it under — and refuses, so a wake racing a close can never spawn
+      a worker on the torn-down session.
+    * ``ws.state is not IDLE`` — a busy workstream's worker drains the
+      queue at its own seams (``ATTENTION``/``THINKING``/``RUNNING``
+      all imply a live worker), and ``ERROR`` stays parked for the
+      operator rather than burning inference unattended.
+    * nothing drainable under ``USER_DRAIN`` — tool-only entries
+      belong to the next tool-result seam, not a synthetic empty user
+      turn (``deliver_wake_nudge_from_queue`` would no-op on them).
+
+    Past the gates, exactly one info line is emitted per call:
+
+    * ``nudge_wake.deferred_worker_busy`` — the reuse-path drop: a
+      worker owned the workstream, so ``session_worker.send`` called
+      the no-op ``enqueue`` instead of spawning.  The entry stays
+      queued; the owning worker's exit backstop (or its next drain
+      seam) delivers it.
+    * ``nudge_wake.dispatched`` — a fresh wake daemon was spawned.
+
+    Returns ``True`` iff the wake was handed to
+    ``session_worker.send`` — which may still downgrade it to a no-op
+    enqueue when a worker owns the workstream (see the race-semantics
+    section on :class:`IdleNudgeWatcher`).
+    """
+    session = ws.session
+    if session is None or ws._closed or ws.state is not WorkstreamState.IDLE:
+        return False
+    nudge_queue = getattr(session, "_nudge_queue", None)
+    if nudge_queue is None or not nudge_queue.has_pending(USER_DRAIN):
+        return False
+
+    deferred = False
+
+    def _noop_enqueue() -> None:
+        nonlocal deferred
+        deferred = True
+
+    ok = session_worker.send(
+        ws,
+        enqueue=_noop_enqueue,
+        run=session.deliver_wake_nudge_from_queue,
+        thread_name=f"wake-nudge-{ws.id[:8]}",
+    )
+    if deferred:
+        log.info("nudge_wake.deferred_worker_busy ws=%s trigger=%s", ws.id[:8], trigger)
+    elif ok:
+        log.info("nudge_wake.dispatched ws=%s trigger=%s", ws.id[:8], trigger)
+    return ok
 
 
 class IdleNudgeWatcher:
@@ -32,15 +119,23 @@ class IdleNudgeWatcher:
     session has queued nudges.
 
     Subscribes to :meth:`SessionManager.subscribe_to_state` and listens
-    for ``WorkstreamState.IDLE``.  If the workstream's
+    for ``WorkstreamState.IDLE``, then defers to
+    :func:`wake_workstream_if_pending` (the shared gate — see its
+    docstring for the full gate order).  If the workstream's
     :class:`NudgeQueue` has any drainable entry for the wake's drain
-    filter (``USER_DRAIN`` — channels ``"user"`` or ``"any"``),
-    dispatches via ``session_worker.send`` with a no-op ``enqueue``
-    callback.  Tool-only entries don't fire the wake — they belong to
-    the next tool-result seam, not a synthetic empty user turn —
-    otherwise every IDLE event with a queued tool advisory would spawn
-    a wake daemon that immediately no-ops at
+    filter (``USER_DRAIN`` — channels ``"user"`` or ``"any"``), the
+    gate dispatches via ``session_worker.send`` with a no-op
+    ``enqueue`` callback.  Tool-only entries don't fire the wake —
+    they belong to the next tool-result seam, not a synthetic empty
+    user turn — otherwise every IDLE event with a queued tool advisory
+    would spawn a wake daemon that immediately no-ops at
     ``deliver_wake_nudge_from_queue``'s drain guard.
+
+    This watcher only covers nudges that are already queued when the
+    IDLE transition fires.  Producers that enqueue asynchronously onto
+    an already-idle workstream (watch fires) call
+    :func:`wake_workstream_if_pending` themselves — there is no state
+    transition for this watcher to observe in that case.
 
     **Race semantics.**  ``session_worker.send`` decides atomically
     under ``ws._lock`` whether a worker thread already owns the
@@ -51,10 +146,17 @@ class IdleNudgeWatcher:
       drains its own queue and runs the synthetic empty-user turn).
     * Worker running → call our ``enqueue`` lambda, which is a no-op.
       The wake is silently dropped; the queued nudge stays in
-      ``NudgeQueue`` and the in-flight worker picks it up at its next
-      user-message-attach or tool-result seam (whichever fires first
-      for the entry's channel).  This is the load-bearing fallback —
-      we never spawn a competing worker.
+      ``NudgeQueue``.  We never spawn a competing worker.  This branch
+      is the COMMON case for IDLE-transition wakes, not the exception:
+      ``set_state`` subscribers fire on the calling thread, and IDLE
+      is emitted from inside ``run()`` at the end of a send — so the
+      transitioning worker still owns the flag while this watcher
+      dispatches.  Delivery is then owed to one of two follow-ups:
+      the in-flight worker's next drain seam (when IDLE fired
+      mid-turn), or — for the end-of-send case, where no later seam
+      exists — ``session_worker``'s ownership-clear backstop
+      (``_retry_pending_wake``), which re-runs
+      :func:`wake_workstream_if_pending` the moment the worker exits.
     * Workstream gone (``ws is None``) or session not built
       (``ws.session is None``) → bail.
 
@@ -82,17 +184,9 @@ class IdleNudgeWatcher:
             if state is not WorkstreamState.IDLE:
                 return
             ws = self._manager.get(ws_id)
-            if ws is None or ws.session is None:
+            if ws is None:
                 return
-            session = ws.session
-            if not session._nudge_queue.has_pending(USER_DRAIN):
-                return
-            session_worker.send(
-                ws,
-                enqueue=lambda: None,
-                run=session.deliver_wake_nudge_from_queue,
-                thread_name=f"wake-nudge-{ws.id[:8]}",
-            )
+            wake_workstream_if_pending(ws, trigger="idle-transition")
 
         self._callback = _on_state
         self._manager.subscribe_to_state(_on_state)

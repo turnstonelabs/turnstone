@@ -164,6 +164,13 @@ export interface CreateWorkstreamResponse {
   message_count?: number;
   /** Ids of attachments saved by this request (multipart variant only). */
   attachment_ids?: string[];
+  /**
+   * Present ONLY when the workstream was created but its initial_message
+   * could not be delivered: "queue_full" (raced live worker's interjection
+   * queue at capacity — resend via /send; uploads stay staged) or
+   * "refused_closed" (workstream closed mid-create).
+   */
+  initial_message_status?: "queue_full" | "refused_closed";
 }
 
 export interface CloseWorkstreamRequest {
