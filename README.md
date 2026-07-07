@@ -5,6 +5,7 @@
 [![Python](https://img.shields.io/pypi/pyversions/turnstone)](https://pypi.org/project/turnstone/)
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue)](LICENSE)
 [![Discord](https://img.shields.io/badge/Discord-join%20us-5865F2?logo=discord&logoColor=white)](https://discord.gg/Nh3bWMacaq)
+[![Sponsor](https://img.shields.io/badge/Sponsor-%E2%9D%A4-db61a2?logo=githubsponsors&logoColor=white)](https://github.com/sponsors/eous)
 
 Self-hosted, local-first orchestration for tool-using AI agents. Give LLMs real tools — shell, files, search, web — and run them across your own cluster with direct HTTP routing and interactive interfaces. Your code, your models, your data stay on hardware you control: no telemetry, no phone-home.
 
@@ -170,6 +171,14 @@ UML diagrams in [`docs/diagrams/`](docs/diagrams/):
 - An OpenAI-compatible API endpoint, Anthropic API key, or Google Gemini API key
 - Optional: Discord / Slack channel integrations (`pip install turnstone[discord,slack]`)
 - [Git LFS](https://git-lfs.com/) for cloning (diagram PNGs)
+
+## Support
+
+Turnstone is free, Apache-2.0, and self-hosted — no paid tier, no telemetry, no upsell. If it saves you time or you'd like to help keep development moving, you can sponsor the project:
+
+**[❤ Sponsor Turnstone →](https://github.com/sponsors/eous)**  ·  one-off via **[PayPal](https://paypal.me/eousphoros)**
+
+Sponsorship is entirely optional and funds maintenance, new features, and infrastructure. Prefer to contribute in other ways? Filing issues, improving docs, and [pull requests](CONTRIBUTING.md) help just as much.
 
 ## Community
 
