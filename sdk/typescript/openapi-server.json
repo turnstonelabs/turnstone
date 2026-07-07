@@ -2568,6 +2568,10 @@
           "initial_message_status": {
             "anyOf": [
               {
+                "enum": [
+                  "queue_full",
+                  "refused_closed"
+                ],
                 "type": "string"
               },
               {
