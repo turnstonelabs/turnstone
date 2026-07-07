@@ -280,7 +280,7 @@ class TestForgivingResolution:
     def test_unknown_error_lists_kind_names_default_first(self) -> None:
         row, err = self._resolve("nope")
         assert row is None
-        assert "Persona not found or disabled: nope" in err
+        assert "Persona not found or disabled: 'nope'" in err
         assert "Available for interactive: engineer (default), writer" in err
         assert "executive" not in err  # wrong kind
         assert "retired" not in err  # disabled
@@ -312,4 +312,4 @@ class TestForgivingResolution:
 
         row, err = resolve_persona_for_kind(_Broken(_rows()), "nope", "interactive")
         assert row is None
-        assert "Persona not found or disabled: nope" in err
+        assert "Persona not found or disabled: 'nope'" in err
