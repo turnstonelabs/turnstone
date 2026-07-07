@@ -167,6 +167,38 @@ class TestModelRegistry:
         with pytest.raises(ValueError, match="Unknown model alias"):
             reg.get_client("nonexistent")
 
+    def test_client_construction_failure_is_value_error(self) -> None:
+        # Environment failures inside SDK construction (e.g. httpx raising
+        # FileNotFoundError for a CA bundle deleted by a venv rebuild) must
+        # surface as ValueError so routes answer 503-with-message instead
+        # of an opaque 500.
+        reg = self._make_registry()
+        with (
+            patch(
+                "turnstone.core.model_registry.create_client",
+                side_effect=FileNotFoundError(2, "No such file or directory"),
+            ),
+            pytest.raises(ValueError, match="'default'.*FileNotFoundError") as excinfo,
+        ):
+            reg.get_client("default")
+        assert isinstance(excinfo.value.__cause__, FileNotFoundError)
+        # Nothing half-constructed may be cached — a later call with a
+        # repaired environment must construct for real.
+        assert "default" not in reg._clients
+
+    def test_client_construction_value_error_passes_through(self) -> None:
+        # create_client's own misconfig ValueErrors already carry
+        # remediation text and must not be double-wrapped.
+        reg = self._make_registry()
+        with (
+            patch(
+                "turnstone.core.model_registry.create_client",
+                side_effect=ValueError("anthropic-compatible requires base_url"),
+            ),
+            pytest.raises(ValueError, match="^anthropic-compatible requires base_url$"),
+        ):
+            reg.get_client("default")
+
     def test_shutdown(self) -> None:
         reg = self._make_registry()
         reg.get_client("default")
