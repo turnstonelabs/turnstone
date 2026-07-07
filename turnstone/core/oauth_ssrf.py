@@ -153,9 +153,9 @@ def validate_url_no_ssrf(
         if allow_private:
             if addr.is_link_local or addr.is_multicast or addr.is_unspecified or addr.is_reserved:
                 raise OAuthSSRFError(
-                    f"endpoint URL resolves to a link-local/multicast/reserved "
-                    f"address ({addr}), refused even with private addresses "
-                    f"allowed: {url}"
+                    f"endpoint URL resolves to a link-local/multicast/"
+                    f"unspecified/reserved address ({addr}), refused even "
+                    f"with private addresses allowed: {url}"
                 )
             continue
         raise OAuthSSRFPrivateAddressError(

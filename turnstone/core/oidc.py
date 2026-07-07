@@ -300,26 +300,26 @@ def load_oidc_config() -> OIDCConfig:
 # converting :class:`OAuthSSRFError` to :class:`OIDCError`.
 # ---------------------------------------------------------------------------
 
+# Appended to every private-address rejection in this module (issuer and
+# discovered endpoints alike): the login-flow URLs are operator-configured,
+# so pointing the operator at the opt-in is safe here — unlike ``mcp_oauth``,
+# where the URLs come from untrusted remote-server metadata and no such
+# opt-in exists.
+_PRIVATE_NETWORK_HINT = (
+    " — to allow a self-hosted IdP on a private network, set "
+    "allow_private_network = true in the [oidc] section of config.toml "
+    "(or TURNSTONE_OIDC_ALLOW_PRIVATE_NETWORK=true)"
+)
+
 
 def _validate_url_no_ssrf(
     url: str, *, allow_http: bool, allow_private: bool = False
 ) -> urllib.parse.ParseResult:
-    """OIDC-flavoured wrapper around :func:`oauth_ssrf.validate_url_no_ssrf`.
-
-    The private-address rejection gets the remediation hint appended: the
-    login-flow issuer is operator-configured, so pointing the operator at
-    the ``allow_private_network`` opt-in is safe here (unlike ``mcp_oauth``,
-    where the URLs come from untrusted remote-server metadata and no such
-    opt-in exists).
-    """
+    """OIDC-flavoured wrapper around :func:`oauth_ssrf.validate_url_no_ssrf`."""
     try:
         return _ssrf_validate_url_no_ssrf(url, allow_http=allow_http, allow_private=allow_private)
     except OAuthSSRFPrivateAddressError as exc:
-        raise OIDCError(
-            f"{exc} — to allow a self-hosted IdP on a private network, set "
-            "allow_private_network = true in the [oidc] section of config.toml "
-            "(or TURNSTONE_OIDC_ALLOW_PRIVATE_NETWORK=true)"
-        ) from exc
+        raise OIDCError(f"{exc}{_PRIVATE_NETWORK_HINT}") from exc
     except OAuthSSRFError as exc:
         raise OIDCError(str(exc)) from exc
 
@@ -375,6 +375,10 @@ def validate_discovered_endpoint(
             trusted_endpoint_hosts=trusted_endpoint_hosts,
             allow_private=allow_private,
         )
+    except OAuthSSRFPrivateAddressError as exc:
+        # A discovered endpoint (or trusted host) resolving private is fixed
+        # by the same opt-in as the issuer — carry the hint here too.
+        raise OIDCError(f"{exc}{_PRIVATE_NETWORK_HINT}") from exc
     except OAuthSSRFError as exc:
         raise OIDCError(str(exc)) from exc
 

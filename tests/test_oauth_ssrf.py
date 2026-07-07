@@ -123,9 +123,10 @@ class TestValidateUrlNoSSRF:
             validate_url_no_ssrf("https://md.example.com", allow_http=False, allow_private=True)
 
     def test_allow_private_still_rejects_unspecified(self) -> None:
+        # The message names the class so 0.0.0.0/:: rejections are unambiguous.
         with (
             patch("socket.getaddrinfo", return_value=[(2, 1, 6, "", ("0.0.0.0", 0))]),
-            pytest.raises(OAuthSSRFError, match="refused even with private"),
+            pytest.raises(OAuthSSRFError, match="unspecified"),
         ):
             validate_url_no_ssrf("https://zero.example.com", allow_http=False, allow_private=True)
 
