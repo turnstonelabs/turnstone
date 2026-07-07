@@ -643,6 +643,46 @@ export function buildConvResult(output, opts) {
   return block;
 }
 
+// Preview chip (.conv-preview-chip) — the transcript affordance for a tool
+// result that carries a preview-pane descriptor.  Live results auto-open the
+// pane; this chip is how the operator RE-opens one (after closing the pane,
+// or from a replayed transcript, where nothing auto-opens).  `descriptor` is
+// the structured preview object off the tool_result event / history entry;
+// `onOpen(descriptor)` is the pane-supplied opener (routed through the host
+// seam so this builder stays shell-agnostic).  textContent only.
+export function buildPreviewChip(descriptor, onOpen) {
+  const d = descriptor || {};
+  const chip = document.createElement("button");
+  chip.type = "button";
+  chip.className = "conv-preview-chip";
+  // The label can be a raw URL (no <title> found) — a target with embedded
+  // basic-auth must not print credentials into the transcript.
+  const label = redactCredentials(d.title || d.source || "preview");
+  chip.setAttribute("aria-label", "Open preview: " + label);
+  chip.title = d.source
+    ? "Open preview — " + redactCredentials(d.source)
+    : "Open preview";
+  const glyph = document.createElement("span");
+  glyph.className = "conv-preview-glyph";
+  glyph.setAttribute("aria-hidden", "true");
+  glyph.textContent = "▤";
+  chip.appendChild(glyph);
+  const text = document.createElement("span");
+  text.className = "conv-preview-title";
+  text.textContent = label;
+  chip.appendChild(text);
+  if (d.kind) {
+    const kind = document.createElement("span");
+    kind.className = "conv-preview-kind";
+    kind.textContent = d.kind;
+    chip.appendChild(kind);
+  }
+  if (typeof onOpen === "function") {
+    chip.addEventListener("click", () => onOpen(d));
+  }
+  return chip;
+}
+
 // Expandable body for a task_agent row's nested sub-steps (the "agent card").
 // A task agent runs its own sub-tools; this gives that row a collapsible body
 // the pane renders the live step stream into, so the steps nest UNDER the

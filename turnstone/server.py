@@ -335,10 +335,11 @@ class WebUI(SessionUIBase):
         output: str,
         *,
         is_error: bool = False,
+        preview: dict[str, Any] | None = None,
     ) -> None:
         """Layer node-only Prometheus metrics on top of the shared body."""
         _metrics.record_tool_call(name)
-        super().on_tool_result(call_id, name, output, is_error=is_error)
+        super().on_tool_result(call_id, name, output, is_error=is_error, preview=preview)
 
     def on_status(self, usage: dict[str, Any], context_window: int, effort: str) -> None:
         """Layer node-only Prometheus metrics on top of the shared body.

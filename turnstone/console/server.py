@@ -3154,6 +3154,25 @@ async def proxy_non_api(request: Request) -> Response:
     return await _proxy_get(request, server_url, path)
 
 
+# Upstream response headers the generic proxy must carry through.  These are
+# the node's hardening + disposition headers: dropping Content-Security-Policy
+# would serve previewed attacker HTML from the CONSOLE origin with no CSP
+# sandbox — opened top-level, its scripts would run with the operator's
+# console cookies, where the same bytes on the node origin are inert.  The
+# rendezvous attachment proxy (route_attachment_proxy) already preserves
+# these; the /node/{id} lane must match.
+_PROXY_PASS_HEADERS = (
+    "content-security-policy",
+    "x-content-type-options",
+    "content-disposition",
+    "cache-control",
+)
+
+
+def _proxy_pass_headers(resp: httpx.Response) -> dict[str, str]:
+    return {h: resp.headers[h] for h in _PROXY_PASS_HEADERS if h in resp.headers}
+
+
 async def _proxy_get(request: Request, server_url: str, path: str) -> Response:
     """Forward a GET request to the target server."""
     client: httpx.AsyncClient = request.app.state.proxy_client
@@ -3166,6 +3185,7 @@ async def _proxy_get(request: Request, server_url: str, path: str) -> Response:
             content=resp.content,
             status_code=resp.status_code,
             media_type=resp.headers.get("content-type", "application/json"),
+            headers=_proxy_pass_headers(resp),
         )
     except httpx.HTTPError as exc:
         log.debug("Proxy GET error for %s: %s", target, exc)

@@ -630,6 +630,12 @@ def project_history_messages(
             result_call_id = msg.get("tool_call_id")
             if result_call_id:
                 entry["tool_call_id"] = str(result_call_id)
+            # Preview-pane descriptor → top-level ``preview``, mirroring the
+            # live ``tool_result`` SSE event's field so replay renders the
+            # same reopen chip the live path did.
+            preview = msg.get("_preview")
+            if isinstance(preview, dict) and preview:
+                entry["preview"] = preview
             if isinstance(content, list):
                 # Renderers require a string (``replayHistory`` calls
                 # ``stripAnsi(content).trim()``; coord joins text parts), so

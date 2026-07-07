@@ -426,6 +426,12 @@ def _reconstruct_attachment_refs(
         # placeholder type ({type:pdf} / {type:audio}) consistent with the live
         # injection path, which already emits those.
         kind_str = str(att.get("kind") or "")
+        if kind_str == "preview":
+            # Preview-pane blobs ride the ref-list ONLY for refcount GC and
+            # the serving-route ownership gate — they are frontend content,
+            # addressed by the tool turn's meta descriptor, and must never
+            # become a content block a wire materialization could inline.
+            continue
         ref_kind = kind_str if kind_str in ("image", "pdf", "audio") else "document"
         refs.append(
             AttachmentRef(
@@ -1087,12 +1093,16 @@ def reconstruct_turns(
         raw_meta = _source_meta_from_json(row[10]) if len(row) > 10 else None
         if raw_meta is not None:
             # The ``meta`` column is role-exclusive: a TOOL row carries the
-            # typed ``{"effect_status": ...}`` envelope; a SYSTEM row carries
-            # operator-context ``source_meta``. Route so a tool's disposition
-            # doesn't land under source_meta (and vice versa). Legacy SYSTEM
-            # rows (bare source_meta dict, no effect_status key) fall through.
-            if role == "tool" and "effect_status" in raw_meta:
-                meta.extra["effect_status"] = raw_meta["effect_status"]
+            # typed ``{"effect_status": ..., "preview": ...}`` envelope (each
+            # key optional); a SYSTEM row carries operator-context
+            # ``source_meta``. Route so a tool's disposition doesn't land
+            # under source_meta (and vice versa). Legacy SYSTEM rows (bare
+            # source_meta dict, no tool keys) fall through.
+            if role == "tool" and ("effect_status" in raw_meta or "preview" in raw_meta):
+                if "effect_status" in raw_meta:
+                    meta.extra["effect_status"] = raw_meta["effect_status"]
+                if "preview" in raw_meta:
+                    meta.extra["preview"] = raw_meta["preview"]
             elif role == "user" and "sender" in raw_meta:
                 # Per-message sender identity (shared-workstream attribution).
                 # A USER row's meta blob carries only ``{"sender": ...}`` — route

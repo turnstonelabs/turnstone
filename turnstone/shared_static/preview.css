@@ -1,0 +1,249 @@
+/* ==========================================================================
+   Preview pane (shared_static/preview.js) — header bar + per-kind content.
+   DS tokens only (--ink-*, --panel*, --hair, --accent); no chat.css legacy
+   vars.  The pane fills its PaneManager cell; only .preview-content scrolls.
+   ========================================================================== */
+
+.preview-root {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  min-height: 0;
+}
+
+/* ----- header bar ----- */
+.preview-bar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 10px;
+  border-bottom: 1px solid var(--hair);
+  background: var(--panel);
+  flex: none;
+}
+
+.preview-nav {
+  flex: none;
+  width: 24px;
+  height: 22px;
+  padding: 0;
+  font-size: 10px;
+  line-height: 1;
+  color: var(--ink-2);
+  background: var(--panel-2);
+  border: 1px solid var(--hair);
+  border-radius: 3px;
+  cursor: pointer;
+}
+.preview-nav:hover:not(:disabled) {
+  color: var(--ink-1);
+  border-color: var(--ink-4);
+}
+.preview-nav:disabled {
+  opacity: 0.35;
+  cursor: default;
+}
+
+.preview-kindchip {
+  flex: none;
+  padding: 1px 6px;
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--ink-2);
+  background: color-mix(in srgb, var(--accent) 18%, transparent);
+  border: 1px solid var(--hair);
+  border-radius: 3px;
+}
+.preview-kindchip:empty {
+  display: none;
+}
+
+.preview-titletext {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 12px;
+  color: var(--ink-1);
+}
+
+.preview-ext {
+  flex: none;
+  font-size: 11px;
+  color: var(--ink-2);
+  text-decoration: none;
+  border-bottom: 1px dotted var(--ink-4);
+}
+.preview-ext:hover {
+  color: var(--ink-1);
+}
+
+/* ----- content host ----- */
+.preview-content {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow: auto;
+  background: var(--panel-2);
+}
+
+/* web + pdf fill the cell */
+.preview-frame {
+  display: block;
+  width: 100%;
+  height: 100%;
+  border: 0;
+  background: #fff; /* pages assume a light canvas until their CSS paints */
+}
+
+.preview-imgwrap {
+  display: flex;
+  align-items: flex-start;
+  justify-content: center;
+  padding: 12px;
+}
+.preview-img {
+  max-width: 100%;
+  height: auto;
+}
+
+.preview-pre {
+  margin: 0;
+  padding: 10px 12px;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  line-height: 1.5;
+  color: var(--ink-2);
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.preview-markdown {
+  padding: 12px 16px;
+  font-size: 13px;
+  color: var(--ink-1);
+}
+
+/* ----- table kind ----- */
+.preview-tablewrap {
+  overflow: auto;
+  padding: 8px;
+}
+.preview-table {
+  border-collapse: collapse;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--ink-2);
+}
+.preview-table th,
+.preview-table td {
+  padding: 3px 8px;
+  border: 1px solid var(--hair);
+  text-align: left;
+  white-space: nowrap;
+  max-width: 360px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.preview-table thead th {
+  position: sticky;
+  top: 0;
+  background: var(--panel);
+  padding: 0;
+}
+.preview-th {
+  display: block;
+  width: 100%;
+  padding: 4px 8px;
+  font: inherit;
+  font-weight: 600;
+  color: var(--ink-1);
+  text-align: left;
+  background: none;
+  border: 0;
+  cursor: pointer;
+}
+.preview-th:hover {
+  background: color-mix(in srgb, var(--accent) 15%, transparent);
+}
+.preview-table th[aria-sort] .preview-th::after {
+  content: " ▲";
+  font-size: 9px;
+}
+.preview-table th[aria-sort="descending"] .preview-th::after {
+  content: " ▼";
+}
+
+/* ----- states ----- */
+.preview-empty,
+.preview-loading,
+.preview-error {
+  padding: 24px 16px;
+  font-size: 12px;
+  color: var(--ink-3);
+  text-align: center;
+}
+.preview-error-msg {
+  margin-bottom: 10px;
+}
+.preview-retry {
+  padding: 4px 14px;
+  font-size: 11px;
+  color: var(--ink-1);
+  background: var(--panel);
+  border: 1px solid var(--hair);
+  border-radius: 3px;
+  cursor: pointer;
+}
+.preview-retry:hover {
+  border-color: var(--ink-4);
+}
+.preview-note {
+  padding: 6px 12px;
+  font-size: 10px;
+  color: var(--ink-3);
+  border-top: 1px solid var(--hair);
+}
+
+/* ----- transcript chip (conversation.js buildPreviewChip) ----- */
+.conv-preview-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  max-width: 100%;
+  margin-top: 6px;
+  padding: 3px 10px;
+  font-size: 11px;
+  color: var(--ink-2);
+  background: color-mix(in srgb, var(--accent) 15%, transparent);
+  border: 1px solid var(--hair);
+  border-radius: 3px;
+  cursor: pointer;
+}
+.conv-preview-chip:hover {
+  color: var(--ink-1);
+  border-color: var(--ink-4);
+}
+.conv-preview-glyph {
+  flex: none;
+  color: var(--ink-3);
+}
+.conv-preview-title {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.conv-preview-kind {
+  flex: none;
+  padding: 0 5px;
+  font-size: 9px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--ink-3);
+  border: 1px solid var(--hair);
+  border-radius: 3px;
+}

@@ -13,7 +13,7 @@ from turnstone.core.session import (
     ChatSession,
     GenerationCancelled,
     _CancelRef,
-    _effect_status_meta,
+    _tool_turn_meta,
 )
 from turnstone.core.trajectory import (
     EffectStatus,
@@ -1183,8 +1183,13 @@ class TestEffectStatusPersistence:
     effect-record appendix — the ledger persists for audit)."""
 
     def test_effect_status_meta_envelope(self):
-        assert _effect_status_meta(None) is None
-        assert json.loads(_effect_status_meta(EffectStatus.UNKNOWN)) == {"effect_status": "unknown"}
+        assert _tool_turn_meta(None) is None
+        assert json.loads(_tool_turn_meta(EffectStatus.UNKNOWN)) == {"effect_status": "unknown"}
+        assert json.loads(_tool_turn_meta(None, {"kind": "web"})) == {"preview": {"kind": "web"}}
+        assert json.loads(_tool_turn_meta(EffectStatus.UNKNOWN, {"kind": "web"})) == {
+            "effect_status": "unknown",
+            "preview": {"kind": "web"},
+        }
 
     def test_reconstruct_routes_tool_effect_status(self):
         from turnstone.core.storage._utils import reconstruct_turns

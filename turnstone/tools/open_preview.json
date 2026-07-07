@@ -1,0 +1,24 @@
+{
+  "name": "open_preview",
+  "description": "Show the user rich content in a preview pane beside the conversation: a rendered web page, a PDF, an image, a data table (CSV/TSV/JSON), or a text/markdown document. Use this when the user asks to SEE something — a page, document, chart image, or data file — rather than asking a question about its contents. The result only confirms what was shown; to reason about content yourself, use web_fetch or read_file. Typical flows: 'show me the pricing page' → open_preview(target='https://…'); after bash renders chart.png → open_preview(target='chart.png'); 'let me see that PDF' → open_preview(target='attachment:<id>').",
+  "parameters": {
+    "type": "object",
+    "properties": {
+      "target": {
+        "type": "string",
+        "description": "What to preview: an http(s) URL, a file path, or attachment:<id> for a file attached to this conversation."
+      },
+      "kind": {
+        "type": "string",
+        "enum": ["web", "pdf", "image", "table", "text", "markdown"],
+        "description": "Optional rendering override. Usually omitted — the kind is detected from the content. Set it to force a view, e.g. kind='table' for a .txt containing CSV, or kind='text' to show a page's raw HTML."
+      },
+      "title": {
+        "type": "string",
+        "description": "Optional title for the preview pane header. Defaults to the page title, filename, or URL."
+      }
+    },
+    "required": ["target"]
+  },
+  "primary_key": "target"
+}

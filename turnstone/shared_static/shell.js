@@ -33,6 +33,7 @@ import { authFetch } from "./auth.js";
 // standalone turnstone-server has no /static/coordinator/* and a static import
 // would 404 and abort the whole shell module.
 import { createInteractivePane } from "./interactive.js";
+import { createPreviewPane } from "./preview.js";
 
 function make(tag, className, text) {
   const node = document.createElement(tag);
@@ -1003,6 +1004,40 @@ async function mountShell() {
     }
   }
 
+  // Preview pane: rich rendering of tool-selected content (the open_preview
+  // tool) — a singleton that opens BESIDE the conversation that produced it.
+  // Surface-agnostic: the descriptor arrives on a conversational pane's
+  // Tier-2 stream and reaches here through the TS_SHELL.openPreview seam.
+  // `extra` is the rehydrate hint (last-viewed descriptor + transport ctx)
+  // the pane keeps current via setPaneMeta, so a reload restores the view.
+  pm.registerType("preview", (id, extra) => {
+    const pane = createPreviewPane(extra, {
+      persistMeta: (meta) => pm.setPaneMeta("preview", meta),
+      setTitle: (text) => pm.setTabTitle("preview", text),
+    });
+    pane.tabMenu = () => [
+      {
+        label: "Close pane",
+        accel: "close-pane",
+        key: paneAccelBadge("close-pane"),
+        action: () => pm.close(pane.id),
+      },
+    ];
+    return pane;
+  });
+  // Create-or-focus the preview pane BESIDE the focused cell (the
+  // conversation stays visible; a denied split degrades to a tab swap
+  // inside openPaneBeside), then hand it the descriptor.  `ctx` is the
+  // originating pane's transport context ({base, wsId}) — blob fetches ride
+  // the same node proxy the session streams from.
+  const openPreview = (descriptor, ctx) => {
+    if (!descriptor) return;
+    const pane = pm.openPaneBeside("preview");
+    if (pane && typeof pane.showPreview === "function") {
+      pane.showPreview(descriptor, ctx || null);
+    }
+  };
+
   // Tier-1 lifecycle → pane signal.  The console's ws_closed handler calls
   // this so an open pane on a CLOSED session closes outright — tab gone, a
   // split cell collapses onto its sibling.  This is the coordinator-closes-
@@ -1023,6 +1058,7 @@ async function mountShell() {
     notifySessionClosed,
     setRowBadge,
     inEditable,
+    openPreview,
   };
 
   // Login fan-out: app.js owns the single window.onLoginSuccess (the Tier-1

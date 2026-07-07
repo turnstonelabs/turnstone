@@ -2785,6 +2785,7 @@ class SessionUIBase:
         output: str,
         *,
         is_error: bool = False,
+        preview: dict[str, Any] | None = None,
     ) -> None:
         """Track per-ws tool-call counts + clear activity + enqueue.
 
@@ -2792,6 +2793,10 @@ class SessionUIBase:
         ``WebUI`` calls :func:`_metrics.record_tool_call` on top of the
         shared writes); call ``super().on_tool_result(...)`` to keep
         the per-ws counters consistent.
+
+        ``preview`` is the preview-pane descriptor (``open_preview``) — it
+        rides the live event verbatim, mirrored by the ``/history``
+        projection's ``preview`` field so live and replay render identically.
         """
         with self._ws_lock:
             self._ws_tool_calls[name] = self._ws_tool_calls.get(name, 0) + 1
@@ -2807,6 +2812,8 @@ class SessionUIBase:
         }
         if is_error:
             event["is_error"] = True
+        if preview:
+            event["preview"] = preview
         self._enqueue(event)
 
     def on_tool_output_chunk(self, call_id: str, chunk: str) -> None:

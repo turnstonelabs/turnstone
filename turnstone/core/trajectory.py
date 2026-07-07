@@ -305,6 +305,11 @@ def turn_from_dict(msg: dict[str, Any]) -> Turn:
     es = msg.get("_effect_status")
     if es:
         meta.extra["effect_status"] = es
+    # Preview-pane descriptor (``open_preview`` tool results) — frontend-facing
+    # only; never folded into wire content.
+    pv = msg.get("_preview")
+    if pv:
+        meta.extra["preview"] = pv
     # Per-message sender identity for shared workstreams (who actually sent this
     # user turn). Wire-invisible side channel — folded into the model-visible
     # content at :meth:`ChatSession._prepare_wire_messages` only when the
@@ -359,6 +364,9 @@ def turn_to_dict(turn: Turn) -> dict[str, Any]:
     es = turn.meta.extra.get("effect_status")
     if es:
         msg["_effect_status"] = es
+    pv = turn.meta.extra.get("preview")
+    if pv:
+        msg["_preview"] = pv
     sndr = turn.meta.extra.get("sender")
     if sndr:
         msg["_sender"] = sndr

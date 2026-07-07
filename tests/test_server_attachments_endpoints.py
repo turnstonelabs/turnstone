@@ -1032,3 +1032,106 @@ class TestTextToSpeech:
         body = resp.json()
         assert body["error"] == "Speech synthesis backend failed"
         assert "internal-host" not in body["error"]
+
+
+# ---------------------------------------------------------------------------
+# GET /preview — the renderable serving route (preview pane)
+# ---------------------------------------------------------------------------
+
+
+def _seed_committed(ws_id: str, kind: str, mime: str, body: bytes, filename: str) -> str:
+    """Commit a blob the way the open_preview fold does: content-addressed
+    save + a tool row whose ref-list names it (the serving ownership gate)."""
+    import hashlib
+
+    from turnstone.core.memory import save_attachment, save_message, set_message_attachments
+
+    aid = hashlib.sha256(body).hexdigest()
+    save_attachment(aid, filename, mime, len(body), kind, body, "tool")
+    row_id = save_message(ws_id, "tool", "Preview shown", "open_preview", tool_call_id="c1")
+    assert row_id is not None
+    set_message_attachments(ws_id, row_id, [aid])
+    return aid
+
+
+class TestGetPreview:
+    def test_html_served_renderable_with_bare_sandbox_csp(self, app_client):
+        client, _ = app_client
+        body = b'<html><head><base href="https://acme.com/"></head><body>x</body></html>'
+        aid = _seed_committed("ws-A", "preview", "text/html; charset=utf-8", body, "preview-web")
+        resp = client.get(
+            f"/v1/api/workstreams/ws-A/attachments/{aid}/preview",
+            headers=_auth("userA"),
+        )
+        assert resp.status_code == 200
+        assert resp.headers["content-type"].startswith("text/html")
+        assert resp.content == body
+        # Renderable but locked down: bare sandbox (no default-src 'none' —
+        # the page's own subresources must load), nosniff, inline, no-store.
+        assert resp.headers.get("content-security-policy") == "sandbox"
+        assert resp.headers.get("x-content-type-options") == "nosniff"
+        assert resp.headers.get("content-disposition", "").startswith("inline;")
+        assert resp.headers.get("cache-control") == "private, no-store"
+
+    def test_pdf_served_without_csp(self, app_client):
+        client, _ = app_client
+        aid = _seed_committed("ws-A", "preview", "application/pdf", b"%PDF-1.4 x", "d.pdf")
+        resp = client.get(
+            f"/v1/api/workstreams/ws-A/attachments/{aid}/preview",
+            headers=_auth("userA"),
+        )
+        assert resp.status_code == 200
+        assert resp.headers["content-type"].startswith("application/pdf")
+        # Chromium's viewer refuses sandboxed contexts — the route omits CSP.
+        assert "content-security-policy" not in resp.headers
+
+    def test_image_keeps_full_csp(self, app_client):
+        client, _ = app_client
+        aid = _seed_committed("ws-A", "preview", "image/png", PNG_1x1, "chart.png")
+        resp = client.get(
+            f"/v1/api/workstreams/ws-A/attachments/{aid}/preview",
+            headers=_auth("userA"),
+        )
+        assert resp.status_code == 200
+        assert "default-src 'none'" in resp.headers.get("content-security-policy", "")
+
+    def test_non_renderable_mime_415(self, app_client):
+        client, _ = app_client
+        aid = _seed_committed("ws-A", "audio", "audio/wav", WAV_12, "a.wav")
+        resp = client.get(
+            f"/v1/api/workstreams/ws-A/attachments/{aid}/preview",
+            headers=_auth("userA"),
+        )
+        assert resp.status_code == 415
+
+    def test_uploaded_attachment_also_previews(self, app_client):
+        # An UPLOADED image (committed via the normal user lane) renders
+        # through /preview too — the pane serves attachment: targets.
+        client, _ = app_client
+        aid = _seed_committed("ws-A", "image", "image/png", PNG_1x1, "up.png")
+        resp = client.get(
+            f"/v1/api/workstreams/ws-A/attachments/{aid}/preview",
+            headers=_auth("userA"),
+        )
+        assert resp.status_code == 200
+        assert resp.headers["content-type"].startswith("image/png")
+
+    def test_unreferenced_id_404(self, app_client):
+        client, _ = app_client
+        aid = _seed_committed("ws-A", "preview", "text/html", b"<p>x</p>", "p")
+        resp = client.get(
+            f"/v1/api/workstreams/ws-B/attachments/{aid}/preview",
+            headers=_auth("userB"),
+        )
+        assert resp.status_code == 404
+
+    def test_head_preflight_supported(self, app_client):
+        # The pane preflights src-loaded kinds with HEAD (the persist race);
+        # Starlette derives HEAD from the GET route.
+        client, _ = app_client
+        aid = _seed_committed("ws-A", "preview", "text/html", b"<p>x</p>", "p")
+        resp = client.head(
+            f"/v1/api/workstreams/ws-A/attachments/{aid}/preview",
+            headers=_auth("userA"),
+        )
+        assert resp.status_code == 200

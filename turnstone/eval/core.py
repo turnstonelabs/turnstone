@@ -112,6 +112,7 @@ class NullUI:
         output: str,
         *,
         is_error: bool = False,
+        preview: dict[str, Any] | None = None,
     ) -> None:
         pass
 

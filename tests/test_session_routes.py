@@ -37,7 +37,7 @@ async def _stub(_request: Request) -> JSONResponse:
 
 def _attach() -> AttachmentHandlers:
     return AttachmentHandlers(
-        upload=_stub, list=_stub, get_content=_stub, thumbnail=_stub, delete=_stub
+        upload=_stub, list=_stub, get_content=_stub, thumbnail=_stub, preview=_stub, delete=_stub
     )
 
 
