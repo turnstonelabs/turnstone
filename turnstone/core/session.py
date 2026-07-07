@@ -132,6 +132,7 @@ from turnstone.core.preview import (
     inject_base_href,
     page_title,
     resolve_preview_kind,
+    transcode_text,
 )
 from turnstone.core.providers import create_provider
 from turnstone.core.ratelimit import TokenBucket
@@ -16169,21 +16170,22 @@ class ChatSession:
             )
 
         title = title_override
-        if kind == "web":
-            # Store what the fetch saw, made renderable: decode on the
-            # transport charset, give relative assets a base to resolve
-            # against, and re-encode UTF-8 (matching the stored mime).
-            if target_kind == "url":
-                text = resp.text
-                text = inject_base_href(text, final_url)
-            else:
-                text = body.decode("utf-8", errors="replace")
-            if not title:
-                title = page_title(text)
+        if kind in ("web", "table", "text", "markdown"):
+            # Store text-family content as UTF-8 so legacy charsets render
+            # instead of erroring "not previewable": a fetch honors the
+            # response charset (httpx ``resp.text``); local / attachment bytes
+            # go through the transcode ladder.  Web additionally gains a
+            # ``<base href>`` (url targets) and a title fallback.
+            text = resp.text if target_kind == "url" else transcode_text(body, mime_hint)
+            if kind == "web":
+                if target_kind == "url":
+                    text = inject_base_href(text, final_url)
+                if not title:
+                    title = page_title(text)
             body = text.encode("utf-8")
             if len(body) > cap:
                 return _fail(
-                    f"Error: web content too large to preview ({len(body):,} bytes; cap {cap:,})"
+                    f"Error: {kind} content too large to preview ({len(body):,} bytes; cap {cap:,})"
                 )
         if not title:
             tail = name_hint.rsplit("/", 1)[-1].split("?", 1)[0]

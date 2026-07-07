@@ -20,6 +20,7 @@ from turnstone.core.preview import (
     page_title,
     preview_response_headers,
     resolve_preview_kind,
+    transcode_text,
 )
 
 PNG_1x1 = (
@@ -127,13 +128,34 @@ class TestHtmlHelpers:
         assert page_title("<title></title>") is None
 
 
+_LOCKED_HTML_CSP = (
+    "sandbox; default-src 'none'; style-src 'unsafe-inline'; img-src data:; font-src data:"
+)
+
+
 class TestServingPolicy:
-    def test_html_gets_bare_sandbox_csp(self):
+    def test_html_default_locks_out_remote_assets(self):
+        # Default (no opt-in): sandboxed AND off the network — inline styling +
+        # data-URI images render, but the page can fetch nothing, so previewing
+        # never discloses the viewer to the origin site.
         h = preview_response_headers("text/html", "page.html")
-        assert h["Content-Security-Policy"] == "sandbox"
+        assert h["Content-Security-Policy"] == _LOCKED_HTML_CSP
         assert h["X-Content-Type-Options"] == "nosniff"
         assert h["Cache-Control"] == "private, no-store"
         assert h["Content-Disposition"].startswith("inline;")
+
+    def test_html_assets_opt_in_gets_bare_sandbox_csp(self):
+        # allow_remote_assets=True drops back to the bare sandbox so the page's
+        # own images / CSS load.
+        h = preview_response_headers("text/html", "page.html", allow_remote_assets=True)
+        assert h["Content-Security-Policy"] == "sandbox"
+        assert h["X-Content-Type-Options"] == "nosniff"
+
+    def test_assets_flag_does_not_touch_non_html_kinds(self):
+        for mime in ("application/pdf", "image/png", "text/csv", "text/plain"):
+            assert preview_response_headers(
+                mime, "f", allow_remote_assets=True
+            ) == preview_response_headers(mime, "f")
 
     def test_pdf_gets_no_csp(self):
         h = preview_response_headers("application/pdf", "doc.pdf")
@@ -230,5 +252,54 @@ class TestReviewHardening:
         # Extension lane and explicit override agree.
         assert resolve_preview_kind("", "page.html", latin1_html)[0] == "web"
         assert resolve_preview_kind("", "page.bin", latin1_html, "web")[0] == "web"
-        # Non-web text kinds stay strict.
-        assert resolve_preview_kind("text/csv", "d.csv", latin1_html) is None
+        # Non-web text kinds now transcode too — a declared text/csv MIME on
+        # legacy-charset bytes is previewable (was strict-UTF-8-only before).
+        assert resolve_preview_kind("text/csv", "d.csv", latin1_html) == (
+            "table",
+            "text/csv; charset=utf-8",
+        )
+        # …but binary declared as text (a NUL byte) is still rejected.
+        assert resolve_preview_kind("text/csv", "d.csv", b"\x00\x01\x02" * 8) is None
+
+
+class TestLegacyCharsetText:
+    """Text-family kinds transcode legacy charsets at store time; only the
+    undeclared fallback lane stays strict UTF-8 (2026-07-07 follow-up)."""
+
+    def test_declared_latin1_csv_is_a_table(self):
+        latin1_csv = "name,city\nRené,Montréal\n".encode("iso-8859-1")
+        # MIME hint carrying the charset.
+        assert resolve_preview_kind("text/csv; charset=iso-8859-1", "d", latin1_csv) == (
+            "table",
+            "text/csv; charset=utf-8",
+        )
+        # Extension lane and explicit override agree — all "declared text".
+        assert resolve_preview_kind("", "data.csv", latin1_csv)[0] == "table"
+        assert resolve_preview_kind("", "data.bin", latin1_csv, "table")[0] == "table"
+
+    def test_declared_text_nul_byte_still_binary(self):
+        # The ladder never fails, so the NUL check is the only binary gate left
+        # for declared text — it must hold in every declared lane.
+        nul = b"a,b\n1,\x00\n"
+        assert resolve_preview_kind("text/csv", "d.csv", nul) is None
+        assert resolve_preview_kind("", "d.csv", nul) is None
+        assert resolve_preview_kind("", "d", nul, "table") is None
+
+    def test_undeclared_non_utf8_still_rejected(self):
+        # No MIME hint, no text-family extension, no override: the bare
+        # fallback lane stays strict UTF-8 — cp1252+replace would otherwise
+        # classify arbitrary binary as text.
+        assert resolve_preview_kind("", "mystery", b"caf\xe9 nonsense \xff\xfe") is None
+
+    def test_transcode_ladder_rungs(self):
+        # (a) charset= parameter honored.
+        assert transcode_text("café".encode("iso-8859-1"), "text/csv; charset=iso-8859-1") == "café"
+        # (b) UTF-8 when the charset is absent / unknown.
+        assert transcode_text("héllo".encode(), "text/plain") == "héllo"
+        assert transcode_text("héllo".encode(), "text/plain; charset=made-up") == "héllo"
+        # (c) cp1252 fallback rung: smart quotes are invalid UTF-8 (the shape a
+        # legacy .txt with no charset takes — empty mime hint), decoded via the
+        # last rung rather than erroring.
+        smart = b"he said \x93hi\x94"
+        out = transcode_text(smart, "")
+        assert "“" in out and "”" in out

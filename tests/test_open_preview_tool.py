@@ -251,6 +251,33 @@ class TestExecOpenPreview:
         assert descriptor["kind"] == "markdown"
         assert descriptor["title"] == "d.md"
 
+    def test_legacy_charset_table_stored_as_utf8(self, monkeypatch):
+        # A latin-1 CSV attachment previews as a table, and the executor
+        # transcodes it to UTF-8 at store time so "café" round-trips instead of
+        # erroring "not previewable".
+        s = _make_session(ws_id="ws-1")
+        latin1_csv = "name,city\nRené,Montréal\n".encode("iso-8859-1")
+        monkeypatch.setattr(
+            "turnstone.core.memory.get_attachment",
+            lambda aid: {
+                "content": latin1_csv,
+                "mime_type": "text/csv; charset=iso-8859-1",
+                "filename": "people.csv",
+            },
+        )
+        monkeypatch.setattr(
+            "turnstone.core.memory.attachment_referenced_in_ws",
+            lambda aid, ws: True,
+        )
+        item = s._prepare_open_preview("c1", {"target": "attachment:deadbeef"})
+        _, msg = s._exec_open_preview(item)
+        assert not msg.startswith("Error:")
+        descriptor, att = s._tool_previews["c1"]
+        assert descriptor["kind"] == "table"
+        assert descriptor["content_type"].startswith("text/csv")
+        # Stored bytes are valid UTF-8 with the accented characters preserved.
+        assert att.content.decode("utf-8") == "name,city\nRené,Montréal\n"
+
     def test_title_override_wins(self, tmp_path):
         s = _make_session()
         p = tmp_path / "x.csv"

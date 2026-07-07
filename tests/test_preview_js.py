@@ -46,16 +46,44 @@ class TestPreviewPaneModule:
         pdf_fn = body.split("const renderPdf")[1].split("const renderImage")[0]
         assert "sandbox" not in pdf_fn or "No sandbox attribute" in pdf_fn
 
-    def test_content_loads_through_authfetch_preflight(self) -> None:
-        """src-loaded kinds preflight with authFetch HEAD (surfaces the
-        persist race + auth failures as a typed error card, and rides the
-        401-refresh retry that a bare iframe/img src can't)."""
+    def test_content_loads_through_authfetch_probe(self) -> None:
+        """src-loaded kinds preflight with a probe request (authFetch of
+        ?probe=1), NOT a HEAD.  The console reverse proxy forwards a HEAD as a
+        full GET, so a real HEAD would drag the whole blob across the hop just
+        to discard it; the probe still surfaces the persist race + auth
+        failures as a typed error card and rides the 401-refresh retry a bare
+        iframe/img src can't."""
         body = _read(_PREVIEW_JS)
-        assert 'authFetch(url, { method: "HEAD" })' in body
+        assert "authFetch(probeUrl)" in body
+        assert "probe=1" in body
+        # The old full-GET HEAD preflight is gone.
+        assert 'method: "HEAD"' not in body
 
     def test_markdown_uses_the_sanctioned_html_lane(self) -> None:
         body = _read(_PREVIEW_JS)
         assert "setSafeHtml(doc, renderMarkdown(text))" in body
+
+    def test_markdown_runs_vendor_post_pass(self) -> None:
+        """The pane runs renderer.js's post-render pass (hljs token coloring +
+        mermaid) like the conversation pane — dropping it silently regresses
+        code highlighting and diagram rendering in previews."""
+        body = _read(_PREVIEW_JS)
+        assert "postRenderMarkdown(" in body
+
+    def test_remote_assets_toggle_is_default_off(self) -> None:
+        """The remote-assets opt-in defaults OFF: a previewed page must not
+        contact its origin site until the user asks.  Pins the label / tooltip
+        copy and the sticky-boolean initializer."""
+        body = _read(_PREVIEW_JS)
+        assert "Load remote images & styles" in body
+        assert "Off keeps this preview from contacting the site" in body
+        assert "pane._assetsOn = false" in body
+
+    def test_assets_flag_only_rides_behind_toggle(self) -> None:
+        """assets=1 reaches the URL only when the per-pane toggle is on."""
+        body = _read(_PREVIEW_JS)
+        assert "assets=1" in body
+        assert "pane._assetsOn" in body
 
     def test_history_is_bounded(self) -> None:
         assert "HISTORY_CAP" in _read(_PREVIEW_JS)

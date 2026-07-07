@@ -109,6 +109,52 @@ def _is_utf8_text(data: bytes) -> bool:
     return True
 
 
+def _is_decodable_text(data: bytes) -> bool:
+    """True when *data* carries no NUL byte — the gate for DECLARED text.
+
+    A text-family MIME hint / extension / ``kind`` override says "this is
+    text"; the store-time transcode ladder (:func:`transcode_text`) then
+    decodes it whatever the charset, so the only hard reject left is the NUL
+    byte that marks genuinely-binary content.  The *undeclared* fallback lane
+    keeps the stricter :func:`_is_utf8_text`: cp1252-with-replacement never
+    fails, so unknown bytes must prove UTF-8 rather than be waved through as
+    text.
+    """
+    return b"\x00" not in data
+
+
+def _charset_param(mime: str) -> str | None:
+    """The ``charset=`` value from a MIME string, lowercased, or ``None``."""
+    for part in mime.split(";")[1:]:
+        key, sep, value = part.partition("=")
+        if sep and key.strip().lower() == "charset":
+            return value.strip().strip('"').lower() or None
+    return None
+
+
+def transcode_text(body: bytes, mime_hint: str) -> str:
+    """Decode text-family *body* to ``str`` via a charset ladder.
+
+    Rungs: (a) the ``charset=`` parameter from *mime_hint* when it names a
+    codec Python knows, (b) UTF-8, (c) cp1252 with ``errors="replace"``.  The
+    last rung never fails, so the return is always a usable string — this is
+    the store-time transcode that lets a legacy-charset page / CSV / log render
+    as UTF-8.  Binary rejection stays upstream in :func:`resolve_preview_kind`
+    (the NUL check); by the time bytes reach here they are already classified
+    text.
+    """
+    charset = _charset_param(mime_hint)
+    if charset:
+        try:
+            return body.decode(charset)
+        except (LookupError, UnicodeDecodeError):
+            pass
+    try:
+        return body.decode("utf-8")
+    except UnicodeDecodeError:
+        return body.decode("cp1252", errors="replace")
+
+
 def _kind_from_mime(mime: str) -> tuple[str, str] | None:
     """Map a transport MIME hint to ``(kind, stored_mime)``, or ``None``."""
     bare = mime.split(";", 1)[0].strip().lower()
@@ -154,10 +200,11 @@ def resolve_preview_kind(
             return ("image", sniffed_image) if sniffed_image else None
         if kind_override == "pdf":
             return ("pdf", "application/pdf") if sniff_pdf_mime(body) else None
-        # Text-family overrides (table / text / markdown) require text; web
-        # is transcoded at store time (see the mime lane below) so a legacy
-        # charset page can still be forced to render.
-        if kind_override != "web" and not _is_utf8_text(body):
+        # Text-family overrides (table / text / markdown) reject only genuine
+        # binary here — the NUL check.  The executor transcodes the bytes to
+        # UTF-8 at store time, so a legacy-charset body forced to a text kind
+        # still renders (web always took this path; the others now join it).
+        if kind_override != "web" and not _is_decodable_text(body):
             return None
         if kind_override == "table":
             # Preserve a JSON payload's real type so the client parser branches.
@@ -177,17 +224,19 @@ def resolve_preview_kind(
         return "pdf", "application/pdf"
     from_mime = _kind_from_mime(mime_hint)
     if from_mime:
-        # Text-declared bytes that aren't text are misdeclared — reject rather
-        # than serve binary under a text MIME.  ``web`` is exempt: legacy
-        # charsets (windows-1252 / Shift-JIS pages) are not UTF-8 on the raw
-        # bytes, and the executor transcodes web content to UTF-8 at store
-        # time (charset-aware for fetches, replacement-decoded otherwise).
-        if from_mime[0] in ("table", "text", "markdown") and not _is_utf8_text(body):
+        # A text-family MIME hint declares text: reject only genuine binary
+        # (the NUL check).  Legacy charsets (windows-1252 / Shift-JIS pages,
+        # iso-8859-1 CSVs / logs) are not UTF-8 on the raw bytes, and the
+        # executor transcodes every text-family kind to UTF-8 at store time
+        # (charset-aware for fetches, ladder-decoded otherwise).
+        if from_mime[0] in ("table", "text", "markdown") and not _is_decodable_text(body):
             return None
         return from_mime
     ext_match = _EXT_KINDS.get(_name_ext(name_hint))
     if ext_match:
-        if ext_match[0] != "web" and not _is_utf8_text(body):
+        # A text-family extension declares text too — same NUL-only gate; the
+        # store-time ladder handles whatever charset the bytes are in.
+        if ext_match[0] != "web" and not _is_decodable_text(body):
             return None
         return ext_match
     if _is_utf8_text(body):
@@ -272,17 +321,23 @@ def build_preview_descriptor(
     }
 
 
-def preview_response_headers(bare_mime: str, filename: str) -> dict[str, str]:
+def preview_response_headers(
+    bare_mime: str, filename: str, *, allow_remote_assets: bool = False
+) -> dict[str, str]:
     """Response headers for the preview serving route, per rendered MIME.
 
-    ``text/html`` gets ``Content-Security-Policy: sandbox`` — the document
-    renders (its subresources load) but scripts never run and its origin is
-    opaque, so it can't touch the app origin's cookies or DOM; the embedding
-    iframe carries the ``sandbox`` attribute too.  ``application/pdf`` gets no
-    CSP: Chromium's PDF viewer refuses to paint inside a sandboxed context,
-    and the response is inert media rendered by browser chrome, not an active
-    document.  Everything else keeps the attachment endpoints' full
-    ``default-src 'none'; sandbox`` posture.
+    ``text/html`` is served sandboxed either way — scripts never run and its
+    origin is opaque, so it can't touch the app origin's cookies or DOM, and
+    the embedding iframe carries the ``sandbox`` attribute too.  The default
+    (``allow_remote_assets=False``) additionally locks the document out of the
+    network: it renders with its inline styling and data-URI images but cannot
+    fetch anything, so previewing a page never discloses the viewer's IP or
+    traffic to the origin site.  ``allow_remote_assets=True`` (a per-pane
+    opt-in) drops back to the bare ``sandbox`` so the page's own images / CSS
+    load.  ``application/pdf`` gets no CSP: Chromium's PDF viewer refuses to
+    paint inside a sandboxed context, and the response is inert media rendered
+    by browser chrome, not an active document.  Everything else keeps the
+    attachment endpoints' full ``default-src 'none'; sandbox`` posture.
     """
     # Header values must be latin-1 encodable (Starlette raises on anything
     # else), and page-title-derived filenames routinely carry em dashes / CJK
@@ -295,7 +350,13 @@ def preview_response_headers(bare_mime: str, filename: str) -> dict[str, str]:
         "Cache-Control": "private, no-store",
     }
     if bare_mime == "text/html":
-        headers["Content-Security-Policy"] = "sandbox"
+        if allow_remote_assets:
+            headers["Content-Security-Policy"] = "sandbox"
+        else:
+            headers["Content-Security-Policy"] = (
+                "sandbox; default-src 'none'; style-src 'unsafe-inline'; "
+                "img-src data:; font-src data:"
+            )
     elif bare_mime != "application/pdf":
         headers["Content-Security-Policy"] = "default-src 'none'; sandbox"
     return headers
