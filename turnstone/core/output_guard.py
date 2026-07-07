@@ -94,9 +94,12 @@ _RE_PRIVATE_KEY_BLOCK = re.compile(
 # ``redact_credentials`` — error persistence, audit details,
 # coordinator inspect/wait surfaces.  The structural form ``[^:@\s]+:
 # [^@\s]+@`` is specific enough that ``https://example.com:8080/path``
-# (host:port without ``@``) doesn't match.
+# (host:port without ``@``) doesn't match.  The optional ``+suffix``
+# covers SQLAlchemy dialect+driver URLs (``postgresql+psycopg2``,
+# ``postgresql+asyncpg``, ``mysql+pymysql``) and ``mongodb+srv`` —
+# enumerating drivers is a losing game, the suffix shape isn't.
 _RE_CONNECTION_STRING = re.compile(
-    r"(?:postgresql\+?(?:psycopg)?|mysql|mongodb(?:\+srv)?|rediss?|amqps?|sqlite|https?)"
+    r"(?:postgresql|mysql|mongodb|rediss?|amqps?|sqlite|https?)(?:\+[a-z0-9]*)?"
     r"://[^:@\s]+:[^@\s]+@",
 )
 _RE_ENV_SECRET_LINE = re.compile(r"[A-Z][A-Z_0-9]+=\S+")
