@@ -196,6 +196,21 @@ class TestExecOpenPreview:
         assert descriptor["title"] == "chart.png"
         assert att.content == PNG_1x1
 
+    def test_preview_blob_id_salted_out_of_upload_namespace(self, tmp_path):
+        import hashlib
+
+        s = _make_session()
+        p = tmp_path / "chart.png"
+        p.write_bytes(PNG_1x1)
+        item = s._prepare_open_preview("c1", {"target": str(p)})
+        s._exec_open_preview(item)
+        _, att = s._tool_previews["c1"]
+        # Uploads are keyed bare sha256(body) and save_attachment freezes
+        # `kind` at first insert — an unsalted preview of identical bytes
+        # would collide with (or pre-empt) a real upload's row.
+        assert att.attachment_id != hashlib.sha256(PNG_1x1).hexdigest()
+        assert att.attachment_id == hashlib.sha256(b"preview:" + PNG_1x1).hexdigest()
+
     def test_path_csv_is_table(self, tmp_path):
         s = _make_session()
         p = tmp_path / "results.csv"
@@ -422,10 +437,21 @@ class TestDescriptorSeams:
 
 
 class _FakeHop:
-    def __init__(self, status, headers=None, url=""):
+    """client.stream() double: a context manager yielding chunked body bytes."""
+
+    def __init__(self, status, headers=None, body=b""):
         self.status_code = status
         self.headers = headers or {}
-        self.url = url
+        self._chunks = body if isinstance(body, list) else [body]
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+    def iter_bytes(self):
+        yield from self._chunks
 
 
 class _FakeClient:
@@ -443,7 +469,7 @@ class _FakeClient:
     def __exit__(self, *a):
         return False
 
-    def get(self, url):
+    def stream(self, method, url):
         _FakeClient.calls.append(url)
         return _FakeClient.table[url]
 
@@ -461,7 +487,7 @@ class TestFetchWithSsrfGuard:
             monkeypatch,
             {
                 "https://a.example/": _FakeHop(302, {"location": "https://b.example/x"}),
-                "https://b.example/x": _FakeHop(200, {}, url="https://b.example/x"),
+                "https://b.example/x": _FakeHop(200, {}, body=b"landed"),
             },
         )
         monkeypatch.setattr("turnstone.core.web.check_ssrf", lambda url: None)
@@ -494,12 +520,15 @@ class TestFetchWithSsrfGuard:
             monkeypatch,
             {
                 "https://a.example/start": _FakeHop(301, {"location": "/moved"}),
-                "https://a.example/moved": _FakeHop(200, {}, url="https://a.example/moved"),
+                "https://a.example/moved": _FakeHop(200, {}),
             },
         )
         monkeypatch.setattr("turnstone.core.web.check_ssrf", lambda url: None)
         resp = fetch_with_ssrf_guard("https://a.example/start", timeout=5)
         assert resp.status_code == 200
+        # The realized response carries the FINAL hop's URL — open_preview's
+        # descriptor source and stored <base href> both key off it.
+        assert str(resp.url) == "https://a.example/moved"
 
     def test_redirect_loop_capped(self, monkeypatch):
         import pytest
@@ -513,6 +542,65 @@ class TestFetchWithSsrfGuard:
         monkeypatch.setattr("turnstone.core.web.check_ssrf", lambda url: None)
         with pytest.raises(ValueError, match="redirects"):
             fetch_with_ssrf_guard("https://a.example/", timeout=5)
+
+    def test_body_over_budget_aborts(self, monkeypatch):
+        import pytest
+
+        from turnstone.core.web import fetch_with_ssrf_guard
+
+        self._wire(
+            monkeypatch,
+            {"https://a.example/": _FakeHop(200, {}, body=[b"aaaa", b"bbbb", b"cccc"])},
+        )
+        monkeypatch.setattr("turnstone.core.web.check_ssrf", lambda url: None)
+        with pytest.raises(ValueError, match="fetch limit"):
+            fetch_with_ssrf_guard("https://a.example/", timeout=5, max_bytes=10)
+
+    def test_redirect_hop_body_never_read(self, monkeypatch):
+        from turnstone.core.web import fetch_with_ssrf_guard
+
+        class _BodyBomb(_FakeHop):
+            def iter_bytes(self):
+                raise AssertionError("redirect hop body must not be read")
+
+        self._wire(
+            monkeypatch,
+            {
+                "https://a.example/": _BodyBomb(302, {"location": "https://b.example/x"}),
+                "https://b.example/x": _FakeHop(200, {}, body=b"ok"),
+            },
+        )
+        monkeypatch.setattr("turnstone.core.web.check_ssrf", lambda url: None)
+        resp = fetch_with_ssrf_guard("https://a.example/", timeout=5)
+        assert resp.status_code == 200
+        assert resp.content == b"ok"
+
+    def test_stale_framing_headers_dropped(self, monkeypatch):
+        from turnstone.core.web import fetch_with_ssrf_guard
+
+        self._wire(
+            monkeypatch,
+            {
+                "https://a.example/": _FakeHop(
+                    200,
+                    {
+                        "content-encoding": "gzip",
+                        "content-length": "999",
+                        "content-type": "text/html; charset=utf-8",
+                    },
+                    body=b"<html>hi</html>",
+                )
+            },
+        )
+        monkeypatch.setattr("turnstone.core.web.check_ssrf", lambda url: None)
+        resp = fetch_with_ssrf_guard("https://a.example/", timeout=5)
+        # iter_bytes() hands the guard content-DECODED bytes — a surviving
+        # content-encoding would make .text try to gunzip plain text, and the
+        # upstream content-length no longer describes the body carried.
+        assert "content-encoding" not in resp.headers
+        assert resp.headers.get("content-length") != "999"
+        assert resp.headers.get("content-type") == "text/html; charset=utf-8"
+        assert resp.text == "<html>hi</html>"
 
 
 # ---------------------------------------------------------------------------
@@ -682,7 +770,7 @@ class TestAllowPrivateNetwork:
         _FakeClient.calls = []
         _FakeClient.table = {
             "http://10.0.0.7/a": _FakeHop(302, {"location": "http://10.0.0.8/b"}),
-            "http://10.0.0.8/b": _FakeHop(200, {}, url="http://10.0.0.8/b"),
+            "http://10.0.0.8/b": _FakeHop(200, {}),
         }
         monkeypatch.setattr("turnstone.core.web.httpx.Client", _FakeClient)
 
