@@ -26,6 +26,14 @@ Run a command, git, or tests → bash:
 Retrieve a URL → web_fetch:
    web_fetch(url='https://example.com')
 
+Show the user content visually (rendered page, PDF, image, data table) → open_preview:
+   open_preview(target='https://example.com/pricing')
+   open_preview(target='chart.png')
+   open_preview(target='results.csv')
+User asks to READ/SEE something → open_preview; you need to reason about it yourself → web_fetch / read_file.
+Render then show → bash then open_preview:
+   bash(command='python plot.py') → open_preview(target='plot.png')
+
 Search the web for information → web_search:
    web_search(query='current population of Tokyo')
 

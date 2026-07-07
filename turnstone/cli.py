@@ -277,7 +277,11 @@ class TerminalUI(SessionUI):
         output: str,
         *,
         is_error: bool = False,
+        preview: dict[str, Any] | None = None,
     ) -> None:
+        # ``preview`` renders nowhere in a terminal -- the result line already
+        # names what was shown, and the header carries the target for the
+        # operator to open themselves.
         if is_error:
             with self._print_lock:
                 sys.stderr.write(f"{RED}\u2717 {name}: {output}{RESET}\n")
@@ -479,9 +483,10 @@ class WorkstreamTerminalUI(TerminalUI):
         output: str,
         *,
         is_error: bool = False,
+        preview: dict[str, Any] | None = None,
     ) -> None:
         if self.is_foreground:
-            super().on_tool_result(call_id, name, output, is_error=is_error)
+            super().on_tool_result(call_id, name, output, is_error=is_error, preview=preview)
 
     def on_tool_output_chunk(self, call_id: str, chunk: str) -> None:
         if self.is_foreground:

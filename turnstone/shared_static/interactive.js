@@ -32,6 +32,7 @@ import {
   buildConvActions,
   buildConvStatus,
   buildAgentCardBody,
+  buildPreviewChip,
   batchKicker,
   indexLabel,
 } from "./conversation.js";
@@ -166,6 +167,10 @@ const INTERACTIVE_DEFAULT_HOST = {
   // An MCP server needs (re-)consent — the standalone shell drives its
   // settings-gear badge; a bare/console pane surfaces it inline only.
   onConsentDetected() {},
+  // A tool result carried a preview-pane descriptor — the L-shell host opens
+  // the preview pane beside this one; a bare pane keeps the transcript chip
+  // as the only affordance.
+  onPreview() {},
 };
 
 class Pane {
@@ -1640,6 +1645,7 @@ class Pane {
           evt.name,
           evt.output,
           evt.is_error,
+          evt.preview,
         );
         break;
 
@@ -2662,6 +2668,16 @@ class Pane {
               insertChained(renderCollapsibleOutput(stripped, isToolError));
             }
           }
+          // Replayed preview descriptor: chip only — a reload must never
+          // auto-open panes for every historical preview (the live path's
+          // focused auto-open already happened when it was current).  Error
+          // turns keep their chip: a cancelled BATCH synthesizes an error
+          // result for an open_preview whose content committed fine.
+          if (msg.preview && !isDenied) {
+            insertChained(
+              buildPreviewChip(msg.preview, (d) => this._host.onPreview(d)),
+            );
+          }
           if (
             isToolError &&
             !lastToolBlock.classList.contains("conv-batch--denied")
@@ -3265,7 +3281,7 @@ class Pane {
     return card.wrap;
   }
 
-  appendToolOutput(callId, name, output, isError) {
+  appendToolOutput(callId, name, output, isError, preview) {
     // Capture pin before the streamEl removal + result insertion change
     // scrollHeight — see announceToolBlock.  The result block is the other
     // tall one-shot append in the tool flow (up to 10 lines before collapse).
@@ -3382,6 +3398,15 @@ class Pane {
     }
 
     target.after(out);
+    // Preview descriptor (open_preview): chip in the transcript always; the
+    // pane auto-opens only while THIS pane is the user's focus — a
+    // backgrounded session must not commandeer the split, and the chip
+    // remains the deliberate reopen for that case (and for replay).
+    if (preview && !isError) {
+      const chip = buildPreviewChip(preview, (d) => this._host.onPreview(d));
+      out.after(chip);
+      if (this._host.isFocused(this)) this._host.onPreview(preview);
+    }
     this.scrollToBottom(stick);
   }
 
@@ -4410,6 +4435,19 @@ function createInteractivePane(root, wsId, opts) {
         typeof window.TS_APP.onConsentDetected === "function"
       ) {
         window.TS_APP.onConsentDetected(server);
+      }
+    },
+    // Preview descriptors open the shell's preview pane beside this one.
+    // Bridged through the TS_SHELL seam (mountShell defines it) with THIS
+    // pane's transport context attached, so the preview pane fetches blob
+    // content from the same workstream through the same node proxy the
+    // session streams from.
+    onPreview(descriptor) {
+      if (
+        window.TS_SHELL &&
+        typeof window.TS_SHELL.openPreview === "function"
+      ) {
+        window.TS_SHELL.openPreview(descriptor, { base: base, wsId: wsId });
       }
     },
   };

@@ -124,6 +124,15 @@ from turnstone.core.personas import (
     snapshot_from_config,
     snapshot_from_persona,
 )
+from turnstone.core.preview import (
+    PREVIEW_BLOB_KIND,
+    PREVIEW_KINDS,
+    PREVIEW_SIZE_CAPS,
+    build_preview_descriptor,
+    inject_base_href,
+    page_title,
+    resolve_preview_kind,
+)
 from turnstone.core.providers import create_provider
 from turnstone.core.ratelimit import TokenBucket
 from turnstone.core.safety import is_command_blocked, sanitize_command
@@ -166,7 +175,7 @@ from turnstone.core.trajectory import (
     turns_from_dicts,
 )
 from turnstone.core.watch import WATCH_REMINDER_OPTIONAL_KEYS
-from turnstone.core.web import check_ssrf, strip_html
+from turnstone.core.web import check_ssrf, fetch_with_ssrf_guard, strip_html
 from turnstone.core.workstream import WorkstreamKind
 from turnstone.prompts import (
     INTERACTIVE_CONSENT_CLIENT_TYPES,
@@ -1056,6 +1065,7 @@ class SessionUI(Protocol):
         output: str,
         *,
         is_error: bool = False,
+        preview: dict[str, Any] | None = None,
     ) -> None: ...
     def on_tool_output_chunk(self, call_id: str, chunk: str) -> None: ...
     def on_status(self, usage: dict[str, Any], context_window: int, effort: str) -> None: ...
@@ -1164,12 +1174,19 @@ def _notify_auth_headers() -> dict[str, str]:
     return header
 
 
-def _effect_status_meta(status: EffectStatus | None) -> str | None:
-    """Serialize a tool effect status to the ``conversations.meta`` JSON
-    envelope. Role-exclusive with ``source_meta`` (which rides SYSTEM turns),
-    so a tool row's meta column holds only ``{"effect_status": ...}``; the
-    decode + role routing lives in ``reconstruct_turns``. ``None`` → no meta."""
-    return json.dumps({"effect_status": status.value}) if status is not None else None
+def _tool_turn_meta(
+    status: EffectStatus | None, preview: dict[str, Any] | None = None
+) -> str | None:
+    """Serialize a tool turn's typed side-channels to the ``conversations.meta``
+    JSON envelope: the effect disposition and/or the preview-pane descriptor.
+    Role-exclusive with ``source_meta`` (which rides SYSTEM turns); the decode +
+    role routing lives in ``reconstruct_turns``. No channels → no meta."""
+    envelope: dict[str, Any] = {}
+    if status is not None:
+        envelope["effect_status"] = status.value
+    if preview:
+        envelope["preview"] = preview
+    return json.dumps(envelope) if envelope else None
 
 
 # ---------------------------------------------------------------------------
@@ -1487,6 +1504,11 @@ class ChatSession:
         # (only for non-ordinary outcomes — e.g. UNKNOWN on a timeout/cancel)
         # and popped at the fold; same lifecycle as ``_tool_error_flags``.
         self._tool_status: dict[str, EffectStatus] = {}
+        # Preview-pane side channel: call_id → (descriptor, blob Attachment),
+        # set by ``_exec_open_preview`` and popped at the fold, where the
+        # descriptor lands on the tool turn's meta and the blob persists
+        # content-addressed against the turn; same lifecycle as the two above.
+        self._tool_previews: dict[str, tuple[dict[str, Any], Attachment]] = {}
         # Cooperative cancellation: set from outside to stop generation
         self._cancel_event = threading.Event()
         self._cancel_ref: _CancelRef = _CancelRef(self)  # provider appends SDK stream here
@@ -2964,18 +2986,21 @@ class ChatSession:
         *,
         is_error: bool = False,
         status: EffectStatus | None = None,
+        preview: dict[str, Any] | None = None,
     ) -> None:
         """Notify the UI and record error flag for message persistence.
 
         ``status`` is the typed effect disposition (HYPOTHESIS.md effect-record
         appendix), set only for non-ordinary outcomes — UNKNOWN on a timeout or
         mid-flight cancel — and folded onto the persisted tool turn. ``None``
-        leaves the turn unclassified (the ordinary case)."""
+        leaves the turn unclassified (the ordinary case). ``preview`` is the
+        preview-pane descriptor riding the live event so the pane opens without
+        waiting for the fold."""
         if is_error:
             self._tool_error_flags[call_id] = True
         if status is not None:
             self._tool_status[call_id] = status
-        self.ui.on_tool_result(call_id, name, output, is_error=is_error)
+        self.ui.on_tool_result(call_id, name, output, is_error=is_error, preview=preview)
 
     def _ui_event_id(self) -> int | None:
         """Current per-ws SSE ring-buffer high-water mark for stamping
@@ -5996,6 +6021,12 @@ class ChatSession:
                     tool_status = self._tool_status.pop(tc_id, None)
                     if tool_status is not None:
                         tool_msg["_effect_status"] = tool_status.value
+                    # Preview descriptor + blob (``_exec_open_preview``): the
+                    # descriptor rides the turn's meta side channel to the
+                    # frontend; the blob persists content-addressed below.
+                    tool_preview = self._tool_previews.pop(tc_id, None)
+                    if tool_preview is not None:
+                        tool_msg["_preview"] = tool_preview[0]
                     self.messages.append(turn_from_dict(tool_msg))
 
                     # Token estimation — image content uses a fixed heuristic
@@ -6037,12 +6068,15 @@ class ChatSession:
                         tool_call_id=tc_id,
                         event_id=self._ui_event_id(),
                         is_error=tool_is_error,
-                        meta=_effect_status_meta(tool_status),
+                        meta=_tool_turn_meta(
+                            tool_status, tool_preview[0] if tool_preview else None
+                        ),
                     )
-                    if tool_image_atts and tool_message_id:
-                        self._persist_attachment_refs(
-                            tool_message_id, tool_image_atts, origin="tool"
-                        )
+                    tool_atts = list(tool_image_atts)
+                    if tool_preview is not None:
+                        tool_atts.append(tool_preview[1])
+                    if tool_atts and tool_message_id:
+                        self._persist_attachment_refs(tool_message_id, tool_atts, origin="tool")
 
                     # Accumulate this result's operator context (guard
                     # findings per-result; queued interjections + metacog
@@ -6223,11 +6257,23 @@ class ChatSession:
             tc_id = tc.id
             func_name = tc.name
             if tc_id and tc_id not in answered_ids:
-                self.messages.append(
-                    Turn.tool(tc_id, detail, is_error=True, effect_status=EffectStatus.UNKNOWN)
+                # A staged preview means _exec_open_preview COMPLETED and its
+                # descriptor already reached the frontend (live SSE at exec
+                # time) — the pane is open on it.  Discarding the blob here
+                # would 404 that pane forever and drop the reopen chip from
+                # replay, so commit blob + descriptor with the synthesized
+                # turn even though the BATCH outcome is unknown.  Popping
+                # regardless also keeps a never-shown blob from pinning its
+                # bytes in memory for the session's life.
+                preview_entry = self._tool_previews.pop(tc_id, None)
+                cancelled_turn = Turn.tool(
+                    tc_id, detail, is_error=True, effect_status=EffectStatus.UNKNOWN
                 )
+                if preview_entry is not None:
+                    cancelled_turn.meta.extra["preview"] = preview_entry[0]
+                self.messages.append(cancelled_turn)
                 self._msg_tokens.append(1)
-                save_message(
+                cancelled_row_id = save_message(
                     self._ws_id,
                     "tool",
                     detail,
@@ -6235,8 +6281,15 @@ class ChatSession:
                     tool_call_id=tc_id,
                     event_id=self._ui_event_id(),
                     is_error=True,
-                    meta=_effect_status_meta(EffectStatus.UNKNOWN),
+                    meta=_tool_turn_meta(
+                        EffectStatus.UNKNOWN,
+                        preview_entry[0] if preview_entry else None,
+                    ),
                 )
+                if preview_entry is not None and cancelled_row_id:
+                    self._persist_attachment_refs(
+                        cancelled_row_id, [preview_entry[1]], origin="tool"
+                    )
                 # Emit synthetic tool_result so live SSE listeners can
                 # complete the in-DOM tool batch — without this the
                 # coord ``--running`` indicator (added by SSE
@@ -9063,6 +9116,7 @@ class ChatSession:
             "edit_file": self._prepare_edit_file,
             "web_fetch": self._prepare_web_fetch,
             "web_search": self._prepare_web_search,
+            "open_preview": self._prepare_open_preview,
             "tool_search": self._prepare_tool_search,
             "task_agent": self._prepare_task,
             "memory": self._prepare_memory,
@@ -9683,6 +9737,95 @@ class ChatSession:
             "url": url,
             "question": question,
         }
+
+    def _prepare_open_preview(self, call_id: str, args: dict[str, Any]) -> dict[str, Any]:
+        """Prepare a preview-pane open for approval / execution.
+
+        The target decides the approval posture: an http(s) URL is network
+        egress and gates like ``web_fetch``; a file path or an
+        ``attachment:<id>`` reference is a local read and runs unprompted like
+        ``read_file``.  SSRF screening happens here (pre-approval) so a
+        blocked target never even reaches the approval card, and again on the
+        post-redirect URL at execution.
+        """
+        target = str(args.get("target") or "").strip()
+        kind = args.get("kind")
+        title = args.get("title")
+        if not target:
+            return {
+                "call_id": call_id,
+                "func_name": "open_preview",
+                "header": "✗ open_preview: missing target",
+                "preview": "",
+                "needs_approval": False,
+                "error": "Error: missing target",
+            }
+        if kind is not None and kind not in PREVIEW_KINDS:
+            return {
+                "call_id": call_id,
+                "func_name": "open_preview",
+                "header": "✗ open_preview: invalid kind",
+                "preview": "",
+                "needs_approval": False,
+                "error": (f"Error: kind must be one of {sorted(PREVIEW_KINDS)} (got {kind!r})"),
+            }
+        item: dict[str, Any] = {
+            "call_id": call_id,
+            "func_name": "open_preview",
+            "header": f"⚙ open_preview: {target[:80]}",
+            "preview": "",
+            "execute": self._exec_open_preview,
+            "kind": kind,
+            "title": str(title).strip() if title else None,
+        }
+        if target.startswith(("http://", "https://")):
+            ssrf_err = check_ssrf(target)
+            if ssrf_err:
+                return {
+                    "call_id": call_id,
+                    "func_name": "open_preview",
+                    "header": "✗ open_preview: blocked (private network)",
+                    "preview": f"    {target}",
+                    "needs_approval": False,
+                    "error": f"Error: {ssrf_err}",
+                }
+            item.update(
+                {
+                    "preview": f"    {target}",
+                    "needs_approval": True,
+                    "approval_label": "open_preview",
+                    "target_kind": "url",
+                    "url": target,
+                }
+            )
+            return item
+        if target.startswith("attachment:"):
+            attachment_id = target[len("attachment:") :].strip()
+            if not attachment_id:
+                return {
+                    "call_id": call_id,
+                    "func_name": "open_preview",
+                    "header": "✗ open_preview: empty attachment id",
+                    "preview": "",
+                    "needs_approval": False,
+                    "error": "Error: attachment:<id> requires an id",
+                }
+            item.update(
+                {
+                    "needs_approval": False,
+                    "target_kind": "attachment",
+                    "attachment_id": attachment_id,
+                }
+            )
+            return item
+        item.update(
+            {
+                "needs_approval": False,
+                "target_kind": "path",
+                "path": os.path.expanduser(target),
+            }
+        )
+        return item
 
     def _prepare_web_search(self, call_id: str, args: dict[str, Any]) -> dict[str, Any]:
         """Prepare a web search via the configured backend for approval."""
@@ -15838,14 +15981,11 @@ class ChatSession:
         call_id, url = item["call_id"], item["url"]
         question = item.get("question", "Summarize the key content of this page.")
 
-        # Phase 1: fetch the URL
+        # Phase 1: fetch the URL.  The guarded fetch SSRF-screens every
+        # redirect hop before requesting it (the prepare-time check covers
+        # only the URL the model named, not where it 302s).
         try:
-            resp = httpx.get(
-                url,
-                headers={"User-Agent": "turnstone/1.0"},
-                timeout=self.tool_timeout,
-                follow_redirects=True,
-            )
+            resp = fetch_with_ssrf_guard(url, timeout=self.tool_timeout)
             resp.raise_for_status()
             ct = resp.headers.get("content-type", "")
             text = resp.text
@@ -15929,6 +16069,150 @@ class ChatSession:
         )
 
         return call_id, answer
+
+    def _exec_open_preview(self, item: dict[str, Any]) -> tuple[str, str]:
+        """Resolve the preview target to bytes and hand the pane its descriptor.
+
+        Content is resolved server-side (URL fetch through the web_fetch
+        guards, local read, or committed-attachment lookup), classified by
+        ``resolve_preview_kind``, size-capped, and stashed on the
+        ``_tool_previews`` side channel: the fold persists the bytes
+        content-addressed against the tool turn and folds the descriptor onto
+        its meta.  The model gets a one-line confirmation — the content itself
+        is for the user's pane, not the wire.
+        """
+        self._check_cancelled()
+        call_id = item["call_id"]
+        target_kind = item["target_kind"]
+        kind_override = item.get("kind")
+        title_override = item.get("title")
+
+        def _fail(msg: str) -> tuple[str, str]:
+            self._report_tool_result(call_id, "open_preview", msg, is_error=True)
+            return call_id, msg
+
+        body: bytes
+        if target_kind == "url":
+            url = item["url"]
+            try:
+                # Every redirect hop is SSRF-screened BEFORE its request goes
+                # out — the pre-approval screen covers only the URL the model
+                # named, not where it 302s.
+                resp = fetch_with_ssrf_guard(url, timeout=self.tool_timeout)
+                resp.raise_for_status()
+            except httpx.HTTPStatusError as e:
+                return _fail(f"Error: fetch failed: HTTP {e.response.status_code}")
+            except (httpx.RequestError, ValueError) as e:
+                return _fail(f"Error: fetch failed: {e}")
+            final_url = str(resp.url)
+            # The final URL feeds the descriptor (displayed, persisted) and
+            # the stored <base href> — strip any userinfo so embedded
+            # credentials never reach the transcript or the stored bytes.
+            if resp.url.username or resp.url.password:
+                final_url = str(resp.url.copy_with(username=None, password=None))
+            body = resp.content
+            if len(body) > 10 * 1024 * 1024:
+                return _fail(
+                    f"Error: response too large to preview ({len(body):,} bytes; cap 10 MB)"
+                )
+            mime_hint = resp.headers.get("content-type", "")
+            name_hint = final_url
+            source = final_url
+        elif target_kind == "attachment":
+            from turnstone.core.memory import attachment_referenced_in_ws, get_attachment
+
+            attachment_id = item["attachment_id"]
+            row = get_attachment(attachment_id)
+            if not row or not attachment_referenced_in_ws(attachment_id, self._ws_id):
+                # Mirror the serving gate: unreferenced ids read as absent so
+                # existence in other workstreams doesn't leak.
+                return _fail(f"Error: attachment not found: {attachment_id}")
+            body = row.get("content") or b""
+            mime_hint = str(row.get("mime_type") or "")
+            name_hint = str(row.get("filename") or "")
+            source = name_hint or f"attachment:{attachment_id}"
+        else:
+            path = item["path"]
+            resolved = os.path.realpath(path)
+            if not os.path.isfile(resolved):
+                return _fail(f"Error: file not found: {path}")
+            try:
+                size = os.path.getsize(resolved)
+                if size > max(PREVIEW_SIZE_CAPS.values()):
+                    return _fail(
+                        f"Error: file too large to preview ({size:,} bytes; "
+                        f"cap {max(PREVIEW_SIZE_CAPS.values()):,})"
+                    )
+                with open(resolved, "rb") as f:
+                    body = f.read()
+            except OSError as e:
+                return _fail(f"Error: could not read file: {e}")
+            mime_hint = ""
+            name_hint = path
+            source = path
+
+        if not body:
+            return _fail("Error: nothing to preview (empty content)")
+
+        resolved_kind = resolve_preview_kind(mime_hint, name_hint, body, kind_override)
+        if resolved_kind is None:
+            hint = f" (content-type {mime_hint.split(';')[0]})" if mime_hint else ""
+            return _fail(
+                f"Error: content is not previewable{hint} — supported kinds: "
+                f"{', '.join(sorted(PREVIEW_KINDS))}"
+            )
+        kind, stored_mime = resolved_kind
+        cap = PREVIEW_SIZE_CAPS[kind]
+        if len(body) > cap:
+            return _fail(
+                f"Error: {kind} content too large to preview ({len(body):,} bytes; cap {cap:,})"
+            )
+
+        title = title_override
+        if kind == "web":
+            # Store what the fetch saw, made renderable: decode on the
+            # transport charset, give relative assets a base to resolve
+            # against, and re-encode UTF-8 (matching the stored mime).
+            if target_kind == "url":
+                text = resp.text
+                text = inject_base_href(text, final_url)
+            else:
+                text = body.decode("utf-8", errors="replace")
+            if not title:
+                title = page_title(text)
+            body = text.encode("utf-8")
+            if len(body) > cap:
+                return _fail(
+                    f"Error: web content too large to preview ({len(body):,} bytes; cap {cap:,})"
+                )
+        if not title:
+            tail = name_hint.rsplit("/", 1)[-1].split("?", 1)[0]
+            title = tail or source
+        title = title[:200]
+
+        blob_id = hashlib.sha256(body).hexdigest()
+        descriptor = build_preview_descriptor(
+            kind=kind,
+            title=title,
+            source=source,
+            attachment_id=blob_id,
+            content_type=stored_mime,
+            size=len(body),
+        )
+        filename = title if "." in title else f"preview-{kind}"
+        self._tool_previews[call_id] = (
+            descriptor,
+            Attachment(
+                attachment_id=blob_id,
+                filename=filename[:120],
+                mime_type=stored_mime,
+                kind=PREVIEW_BLOB_KIND,
+                content=body,
+            ),
+        )
+        msg = f"Preview shown to the user: {title} ({kind}, {len(body):,} bytes)"
+        self._report_tool_result(call_id, "open_preview", msg, preview=descriptor)
+        return call_id, msg
 
     def _exec_web_search(self, item: dict[str, Any]) -> tuple[str, str]:
         """Search the web via the configured backend (SearxNG or MCP)."""

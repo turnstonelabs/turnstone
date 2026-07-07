@@ -404,3 +404,29 @@ class TestParametrizedKind:
         assert len(rows) == 1
         assert rows[0]["content"] == payload
         assert rows[0]["kind"] == kind
+
+
+class TestGetAttachmentsExcludeKinds:
+    def test_exclude_kinds_filters_at_the_query(self, backend):
+        """Preview-pane blobs ride ref-lists only for GC + the serving gate;
+        the reconstruct loader excludes them so a history load never pulls
+        their multi-MB content just to discard it."""
+        backend.register_workstream("ws-ex")
+        blob = _hash(b"<html>big page</html>")
+        img = _hash(PNG_1x1)
+        backend.save_attachment(
+            blob,
+            "preview-web",
+            "text/html; charset=utf-8",
+            21,
+            "preview",
+            b"<html>big page</html>",
+            "tool",
+        )
+        backend.save_attachment(
+            img, "shot.png", "image/png", len(PNG_1x1), "image", PNG_1x1, "tool"
+        )
+        rows = backend.get_attachments([blob, img], exclude_kinds=("preview",))
+        assert [r["attachment_id"] for r in rows] == [img]
+        # Default stays unfiltered — the serving route still resolves previews.
+        assert {r["attachment_id"] for r in backend.get_attachments([blob, img])} == {blob, img}

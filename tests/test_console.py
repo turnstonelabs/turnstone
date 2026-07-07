@@ -2690,3 +2690,57 @@ class TestCollectorMCPAggregation:
         assert overview["mcp_servers"] == 3
         assert overview["mcp_resources"] == 10
         assert overview["mcp_prompts"] == 7
+
+
+class TestProxyGetHeaderPassThrough:
+    """The generic /node/{id} GET proxy must carry the node's hardening
+    headers through — dropping Content-Security-Policy would serve previewed
+    attacker HTML from the CONSOLE origin with no CSP sandbox (review
+    finding, preview-pane branch)."""
+
+    def test_security_headers_forwarded(self, monkeypatch):
+        import asyncio
+        from types import SimpleNamespace
+        from unittest.mock import MagicMock
+
+        import httpx
+
+        from turnstone.console import server as csrv
+
+        upstream = httpx.Response(
+            200,
+            content=b"<html>page</html>",
+            headers={
+                "content-type": "text/html; charset=utf-8",
+                "content-security-policy": "sandbox",
+                "x-content-type-options": "nosniff",
+                "content-disposition": 'inline; filename="p"',
+                "cache-control": "private, no-store",
+                "server": "upstream-internal",  # hop metadata: must NOT pass
+            },
+            request=httpx.Request("GET", "http://n:1/x"),
+        )
+
+        async def _mock_get(*a, **kw):
+            return upstream
+
+        proxy_client = MagicMock(spec=httpx.AsyncClient)
+        proxy_client.get = MagicMock(side_effect=_mock_get)
+        request = SimpleNamespace(
+            app=SimpleNamespace(state=SimpleNamespace(proxy_client=proxy_client)),
+            url=SimpleNamespace(query=""),
+        )
+        monkeypatch.setattr(csrv, "_proxy_auth_headers", lambda r: {})
+
+        resp = asyncio.run(csrv._proxy_get(request, "http://n:1", "v1/api/x"))
+
+        assert resp.status_code == 200
+        assert resp.headers["content-security-policy"] == "sandbox"
+        assert resp.headers["x-content-type-options"] == "nosniff"
+        assert resp.headers["content-disposition"] == 'inline; filename="p"'
+        assert resp.headers["cache-control"] == "private, no-store"
+        assert resp.headers["content-type"].startswith("text/html")
+        assert (
+            "server" not in {k.lower() for k in resp.headers}
+            or resp.headers.get("server") != "upstream-internal"
+        )

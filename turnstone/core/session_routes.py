@@ -486,6 +486,7 @@ class AttachmentHandlers:
     list: Handler  # GET    {prefix}/{ws_id}/attachments
     get_content: Handler  # GET    {prefix}/{ws_id}/attachments/{attachment_id}/content
     thumbnail: Handler  # GET    {prefix}/{ws_id}/attachments/{attachment_id}/thumbnail
+    preview: Handler  # GET    {prefix}/{ws_id}/attachments/{attachment_id}/preview
     delete: Handler  # DELETE {prefix}/{ws_id}/attachments/{attachment_id}
 
 
@@ -635,6 +636,13 @@ def register_session_routes(
             Route(
                 f"{p}/{{ws_id}}/attachments/{{attachment_id}}/thumbnail",
                 a.thumbnail,
+                methods=["GET"],
+            )
+        )
+        routes.append(
+            Route(
+                f"{p}/{{ws_id}}/attachments/{{attachment_id}}/preview",
+                a.preview,
                 methods=["GET"],
             )
         )
@@ -4364,6 +4372,30 @@ def make_attachment_handlers(cfg: SessionEndpointConfig) -> AttachmentHandlers:
         }
         return _Response(body, media_type=response_mime, headers=headers)
 
+    async def get_preview(request: Request) -> Response:
+        from starlette.responses import Response as _Response
+
+        from turnstone.core.preview import PREVIEW_SERVE_MIMES, preview_response_headers
+
+        resolved = await _resolve_served_blob(request)
+        if not isinstance(resolved, tuple):
+            return resolved
+        body, _kind, stored_mime, filename = resolved
+        # Serve the STORED type so the browser renders it (html document, pdf
+        # viewer, image) — the opposite posture from ``get_content``'s
+        # force-text/plain, made safe by the per-mime CSP sandbox headers
+        # (``preview_response_headers``) plus the pane's iframe sandbox.
+        # Non-renderable types 415 rather than fall back to octet-stream: this
+        # route exists to render, ``/content`` exists to download.
+        bare_mime = stored_mime.split(";", 1)[0].strip().lower()
+        if bare_mime not in PREVIEW_SERVE_MIMES:
+            return JSONResponse({"error": "attachment is not previewable"}, status_code=415)
+        return _Response(
+            body,
+            media_type=stored_mime,
+            headers=preview_response_headers(bare_mime, filename),
+        )
+
     async def get_thumbnail(request: Request) -> Response:
         import asyncio
 
@@ -4415,6 +4447,7 @@ def make_attachment_handlers(cfg: SessionEndpointConfig) -> AttachmentHandlers:
         list=list_pending,
         get_content=get_content,
         thumbnail=get_thumbnail,
+        preview=get_preview,
         delete=delete_,
     )
 

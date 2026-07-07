@@ -576,7 +576,10 @@ class SQLiteBackend:
                 all_ids.update(ids)
         if not all_ids:
             return {}
-        blobs = self.get_attachments(list(all_ids))
+        # Preview-pane blobs (kind='preview', see core.preview.PREVIEW_BLOB_KIND)
+        # ride ref-lists only for GC + the serving gate; reconstruction skips
+        # them, so don't pull their multi-MB content off disk on every load.
+        blobs = self.get_attachments(list(all_ids), exclude_kinds=("preview",))
         rows_by_id = {str(b["attachment_id"]): b for b in blobs}
         return _build_attachments_by_msg(attachment_refs, rows_by_id)
 
@@ -1293,15 +1296,18 @@ class SQLiteBackend:
             )
             conn.commit()
 
-    def get_attachments(self, attachment_ids: list[str]) -> list[dict[str, Any]]:
+    def get_attachments(
+        self, attachment_ids: list[str], exclude_kinds: tuple[str, ...] = ()
+    ) -> list[dict[str, Any]]:
         if not attachment_ids:
             return []
         with self._conn() as conn:
-            rows = conn.execute(
-                sa.select(workstream_attachments).where(
-                    workstream_attachments.c.attachment_id.in_(attachment_ids)
-                )
-            ).fetchall()
+            stmt = sa.select(workstream_attachments).where(
+                workstream_attachments.c.attachment_id.in_(attachment_ids)
+            )
+            if exclude_kinds:
+                stmt = stmt.where(workstream_attachments.c.kind.notin_(exclude_kinds))
+            rows = conn.execute(stmt).fetchall()
             return [dict(r._mapping) for r in rows]
 
     def get_attachment(self, attachment_id: str) -> dict[str, Any] | None:

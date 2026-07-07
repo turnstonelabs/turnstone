@@ -35,7 +35,14 @@ class _StubUI:
     def on_error(self, msg: str) -> None:
         self.errors.append(msg)
 
-    def on_tool_result(self, call_id: str, name: str, output: str, is_error: bool = False) -> None:
+    def on_tool_result(
+        self,
+        call_id: str,
+        name: str,
+        output: str,
+        is_error: bool = False,
+        preview: dict[str, Any] | None = None,
+    ) -> None:
         self.tool_results.append((call_id, name, output, is_error))
 
     # Other SessionUI methods — only stubs, not exercised here.

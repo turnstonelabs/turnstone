@@ -60,8 +60,8 @@ class TestToolsMetadata:
     """Validate the metadata extracted from JSON files."""
 
     def test_tool_count(self):
-        # 16 interactive tools + 12 coordinator-only tools.
-        assert len(TOOLS) == 28
+        # 17 interactive tools + 12 coordinator-only tools.
+        assert len(TOOLS) == 29
 
     def test_task_agent_tools_count(self):
         assert len(TASK_AGENT_TOOLS) == 11
@@ -126,6 +126,7 @@ class TestToolsMetadata:
             "edit_file": "old_string",
             "web_fetch": "url",
             "web_search": "query",
+            "open_preview": "target",
             "task_agent": "prompt",
             "memory": "name",
             "recall": "query",

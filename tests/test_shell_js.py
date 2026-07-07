@@ -49,6 +49,7 @@ _ESM_BUNDLES = [
     _SHARED / "composer_queue.js",
     _SHARED / "interactive.js",
     _SHARED / "conversation.js",
+    _SHARED / "preview.js",
     _SHARED / "redact_credentials.js",
 ]
 
@@ -69,6 +70,7 @@ _ESM_NO_VAR_BUNDLES = [
     _SHARED / "auth.js",
     _SHARED / "interactive.js",
     _SHARED / "conversation.js",
+    _SHARED / "preview.js",
     _SHARED / "redact_credentials.js",
 ]
 

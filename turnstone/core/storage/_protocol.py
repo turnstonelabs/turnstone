@@ -347,10 +347,15 @@ class StorageBackend(Protocol):
         """
         ...
 
-    def get_attachments(self, attachment_ids: list[str]) -> list[dict[str, Any]]:
+    def get_attachments(
+        self, attachment_ids: list[str], exclude_kinds: tuple[str, ...] = ()
+    ) -> list[dict[str, Any]]:
         """Bulk fetch attachments by id, including their ``content`` bytes.
 
         Unknown ids are silently skipped.  Order is unspecified.
+        ``exclude_kinds`` filters at the QUERY so callers that will discard a
+        kind anyway (trajectory reconstruction skips ``preview`` blobs) don't
+        pull multi-megabyte content off disk just to drop it.
         """
         ...
 

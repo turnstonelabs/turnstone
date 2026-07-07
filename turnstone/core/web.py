@@ -1,10 +1,12 @@
-"""Web utilities — HTML stripping and SSRF protection."""
+"""Web utilities — HTML stripping, SSRF protection, and the guarded fetch."""
 
 import ipaddress
 import re
 import socket
 from html import unescape as _html_unescape
 from urllib.parse import urlparse
+
+import httpx
 
 _RE_INVISIBLE = re.compile(
     r"<(script|style|template|noscript)\b[^>]*>.*?</\1\s*>",
@@ -120,3 +122,43 @@ def check_ssrf(url: str) -> str | None:
     except (socket.gaierror, OSError):
         pass  # DNS failure — let the actual fetch handle it
     return None
+
+
+def fetch_with_ssrf_guard(
+    url: str,
+    *,
+    timeout: float,
+    user_agent: str = "turnstone/1.0",
+    max_redirects: int = 5,
+) -> httpx.Response:
+    """GET *url* following redirects manually, SSRF-screening EVERY hop.
+
+    ``httpx.get(follow_redirects=True)`` checks nothing between hops — a
+    public URL that 302s into private address space (cloud metadata, an
+    internal admin endpoint) would be fetched before any post-hoc check runs,
+    executing the private-network request even if the response is later
+    discarded.  Here each hop's URL is screened BEFORE its request is issued.
+
+    Raises ``ValueError`` for a blocked hop or a redirect chain past
+    *max_redirects* (callers already route ``ValueError`` to their
+    fetch-failed lane), and lets ``httpx`` transport errors propagate
+    unchanged.  ``resp.raise_for_status()`` stays the caller's call.
+    """
+    current = url
+    with httpx.Client(
+        headers={"User-Agent": user_agent},
+        timeout=timeout,
+        follow_redirects=False,
+    ) as client:
+        for _hop in range(max_redirects + 1):
+            ssrf_err = check_ssrf(current)
+            if ssrf_err:
+                raise ValueError(ssrf_err)
+            resp = client.get(current)
+            if resp.status_code in (301, 302, 303, 307, 308):
+                location = resp.headers.get("location")
+                if location:
+                    current = str(httpx.URL(current).join(location))
+                    continue
+            return resp
+    raise ValueError(f"Blocked: more than {max_redirects} redirects")

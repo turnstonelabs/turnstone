@@ -125,6 +125,9 @@ Each item's `execute` callable is invoked:
 - `web_fetch` -- fetches a URL (SSRF-protected, but makes network requests)
 - `web_search` -- web search via self-hosted SearxNG (makes network requests)
 - `task_agent` -- spawns an autonomous sub-agent
+- `open_preview` -- **URL targets only** (network access, gated like `web_fetch`);
+  file-path and `attachment:` targets are local reads and run unprompted like
+  `read_file`
 
 Note: The JSON schema metadata key `auto_approve` controls membership in
 `TASK_AUTO_TOOLS` (used for task agent sub-sessions). The actual runtime
@@ -157,6 +160,7 @@ Every tool defines a `primary_key`. The mapping is:
 | `search`     | `query`     |
 | `web_fetch`  | `url`       |
 | `web_search` | `query`     |
+| `open_preview` | `target`  |
 | `task_agent` | `prompt`    |
 | `memory`     | `name`      |
 | `recall`     | `query`     |
@@ -342,6 +346,35 @@ turnstone-admin rerank-calibrate --apply   # ...and write tools.rerank_bm25_thre
 ```
 
 It reports the score scale, whether the endpoint cleanly separates relevant from irrelevant probes (a **"no clean separation"** result flags a mis-served or weak reranker), and the suggested floor. Leave the threshold at `0` to rerank-without-filtering.
+
+---
+
+### open_preview
+
+Show the user rich content in a preview pane beside the conversation.
+
+| Parameter | Type   | Required | Description |
+|-----------|--------|----------|-------------|
+| `target`  | string | yes      | An http(s) URL, a file path, or `attachment:<id>` for a file attached to the conversation. |
+| `kind`    | string | no       | Rendering override: `web`, `pdf`, `image`, `table`, `text`, or `markdown`. Detected from the content when omitted. |
+| `title`   | string | no       | Pane header title. Defaults to the page title, filename, or URL. |
+
+- **What it does**: Resolves the target to bytes (URLs fetch through the same
+  SSRF-guarded path as `web_fetch`, re-checked after redirects), classifies the
+  content, stores it content-addressed against the workstream, and opens the
+  frontend preview pane beside the conversation: web pages render in a fully
+  sandboxed iframe (no scripts, opaque origin), PDFs in the browser viewer,
+  images inline, CSV/TSV/JSON as a sortable table, text/markdown rendered. The
+  model receives only a one-line confirmation — to reason about content, use
+  `web_fetch` / `read_file` instead. Preview content is size-capped per kind
+  (pages 4 MB, PDFs 32 MB, images 4 MB, tables 2 MB, text 512 KB) and GC'd
+  with the workstream.
+- **Auto-approve**: URL targets require confirmation (network access); file
+  paths and `attachment:` targets run unprompted (local reads).
+- **Agent availability**: interactive sessions only (not `task_agent`, not
+  coordinators).
+- **Surfaces**: the pane renders in the web UI (standalone and console). The
+  CLI prints the confirmation line only — there is no terminal pane.
 
 ---
 
@@ -545,6 +578,7 @@ pre-configure skills at workstream creation.
 | `search`     | File Ops   | Yes          | Yes        | `query`     |
 | `web_fetch`  | Info       | No           | Yes        | `url`       |
 | `web_search` | Info       | No           | Yes        | `query`     |
+| `open_preview`| Info      | URL: no; path/attachment: yes | No | `target` |
 | `task_agent` | Agent      | No           | No         | `prompt`    |
 | `memory`     | Memory     | Yes          | No         | `name`      |
 | `recall`     | Memory     | Yes          | No         | `query`     |

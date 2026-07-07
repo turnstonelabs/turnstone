@@ -298,9 +298,9 @@ class TestLoadMessagesLimit:
         captured: list[list[str]] = []
         orig = backend.get_attachments
 
-        def _spy(ids):
+        def _spy(ids, exclude_kinds=()):
             captured.append(sorted(ids))
-            return orig(ids)
+            return orig(ids, exclude_kinds=exclude_kinds)
 
         # Tail-N=5 fetches only the 5 newest rows (all plain) — the
         # attachment row is excluded, so NO blob fetch is issued.
