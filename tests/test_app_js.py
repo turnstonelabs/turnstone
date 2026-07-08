@@ -1592,6 +1592,287 @@ def test_coord_connectsse_onerror_preserves_native_reconnect() -> None:
     assert passed, f"coordinator.js connectSSE.onerror regressed: {reason}"
 
 
+# ---------------------------------------------------------------------------
+# Coordinator-pane parity for the SSE overflow-recovery companions (issue #806).
+# The server-side fixes (emit-time batching, _ListenerQueue poison, out-of-band
+# closing) live in SessionUIBase and already cover EVERY SSE stream; these pin
+# the CLIENT-side companions ported into coordinator.js so it stops relying on
+# native reconnect alone — storm guard + degraded catch-up, close-on-hide /
+# replay-on-show, and drop-vs-render-wedge counters.
+# ---------------------------------------------------------------------------
+
+
+def test_coord_imports_shared_overflow_helpers() -> None:
+    """coordinator.js consumes the SAME sse_overflow.js helpers as the
+    interactive pane (over the /shared mount) so the trip threshold and cooldown
+    ladder cannot drift between the two surfaces."""
+    body = _COORD_JS.read_text(encoding="utf-8")
+    m = re.search(
+        r"import \{([^}]*)\} from \"/shared/sse_overflow\.js\";",
+        body,
+        re.S,
+    )
+    assert m is not None, "coordinator must import the shared overflow helpers"
+    imported = m.group(1)
+    for name in (
+        "OVERFLOW_TRIP_COUNT",
+        "OVERFLOW_TRIP_WINDOW_MS",
+        "DEGRADED_COOLDOWN_BASE_MS",
+        "DEGRADED_COOLDOWN_MAX_MS",
+        "DEGRADED_COOLDOWN_RESET_MS",
+        "overflowWindowTripped",
+        "degradedCooldownStep",
+    ):
+        assert name in imported, f"{name} must be imported from /shared/sse_overflow.js"
+    # No local fork of the extracted pure functions on the coordinator side.
+    assert not re.search(r"^\s*function overflowWindowTripped\(", body, re.M)
+    assert not re.search(r"^\s*function degradedCooldownStep\(", body, re.M)
+
+
+def test_coord_stream_overflow_case_counts_and_rate_limits() -> None:
+    """The coordinator handles the id-less ``stream_overflow`` frame: count it
+    (drop-vs-wedge field instrumentation) and feed the rolling-window storm
+    guard, exactly like the interactive pane."""
+    body = _COORD_JS.read_text(encoding="utf-8")
+    assert 'case "stream_overflow":' in body
+    assert "noteStreamOverflow();" in body
+    # The three-way health counter distinguishes dropped events (overflow /
+    # malformed frame) from render wedges (dispatch / render throw).
+    assert "streamHealth = { overflows: 0, renderThrows: 0, malformedFrames: 0 }" in body
+    assert "streamHealth.overflows += 1;" in body
+    assert "streamHealth.malformedFrames += 1;" in body
+    # Exactly two render-throw increment sites: the noteRenderThrow helper
+    # (all three contained render/finalize catches route through it — they
+    # recover with a plain-text fallback, so console.warn) and the onmessage
+    # dispatch catch (console.error class — the event is dropped outright).
+    # The three recovered call sites are pinned by label so a new render path
+    # that forgets to count surfaces loudly.
+    assert body.count("streamHealth.renderThrows += 1;") == 2
+    helper = re.search(r"function noteRenderThrow\(where, err\)\s*\{(.*?)\n  \}", body, re.S)
+    assert helper is not None, "noteRenderThrow helper not found"
+    assert "streamHealth.renderThrows += 1;" in helper.group(1)
+    assert 'noteRenderThrow("streamingRender", e);' in body
+    assert 'noteRenderThrow("in_progress_snapshot render", e);' in body
+    assert 'noteRenderThrow("streamingRenderFinalize", e);' in body
+    note = re.search(r"function noteStreamOverflow\(\)\s*\{(.*?)\n  \}", body, re.S)
+    assert note is not None, "noteStreamOverflow not found"
+    assert "overflowWindowTripped(" in note.group(1)
+    assert "enterDegradedCatchup()" in note.group(1)
+    # The trip handler only counts + trips; the cooldown reset lives in
+    # enterDegradedCatchup (keyed off lastDegradedAt) — the finding [0] shape.
+    assert "degradedCooldownMs" not in note.group(1), (
+        "noteStreamOverflow must not touch the cooldown — that reset defeated the ladder escalation"
+    )
+
+
+def test_coord_handleevent_dispatch_is_wedge_guarded() -> None:
+    """A throw escaping onmessage does NOT close the EventSource, so an
+    unguarded handler throw left the streaming refs stale and wedged every later
+    turn.  The coordinator wraps the dispatch and counts the throw (render-wedge
+    class) so a field report tells it apart from a dropped-events gap."""
+    body = _COORD_JS.read_text(encoding="utf-8")
+    m = re.search(r"try \{\s*handleEvent\(data\);\s*\} catch \(err\) \{(.*?)\}", body, re.S)
+    assert m is not None, "handleEvent(data) must be wrapped in try/catch in onmessage"
+    assert "streamHealth.renderThrows += 1;" in m.group(1)
+
+
+def test_coord_degraded_catchup_stops_live_stream_and_retries() -> None:
+    """Three overflow closes inside the window drop the coordinator to a
+    degraded catch-up: suspend the live stream, say so plainly, and reconnect
+    after a doubling cooldown — the reconnect replays the gap (or falls to the
+    /history floor once it outgrows the ring)."""
+    body = _COORD_JS.read_text(encoding="utf-8")
+    m = re.search(r"function enterDegradedCatchup\(\)\s*\{(.*?)\n  \}", body, re.S)
+    assert m is not None, "enterDegradedCatchup not found"
+    method = m.group(1)
+    assert "degradedCooldownStep(" in method
+    assert "lastDegradedAt = now" in method
+    # Suspend the stream BEFORE arming the retry timer (mirrors interactive's
+    # disconnect-then-rearm ordering) or the fresh timer is cancelled at once.
+    assert method.index("suspendStream()") < method.index("degradedTimer = setTimeout")
+    # Plain-language status, not a silent stall.
+    assert "catching up" in method
+    # A fresh connect must cancel a pending degraded timer so it can't
+    # double-open behind the retry — connectSSE's prologue routes through the
+    # shared closeStreamTransport teardown, which owns that clear (alongside
+    # the reconnect timer + the EventSource close/null).
+    conn = re.search(r"function connectSSE\(\)\s*\{(.*?)\n  \}", body, re.S)
+    assert conn is not None
+    assert "closeStreamTransport();" in conn.group(1)
+    teardown = re.search(r"function closeStreamTransport\(\)\s*\{(.*?)\n  \}", body, re.S)
+    assert teardown is not None, "closeStreamTransport not found"
+    assert "clearTimeout(degradedTimer)" in teardown.group(1)
+    assert "clearTimeout(reconnectTimer)" in teardown.group(1)
+    assert "evtSource = null;" in teardown.group(1)
+
+
+def test_coord_visibilitychange_closes_on_hide_reconnects_on_show() -> None:
+    """A hidden tab's throttled drain is the worst-case slow SSE consumer.  The
+    coordinator installs a visibilitychange handler that closes the stream on
+    hide (marking its OWN close via hiddenDisconnect) and reconnects on show from
+    the saved lastEventId, and removes the listener on teardown."""
+    body = _COORD_JS.read_text(encoding="utf-8")
+    assert 'document.addEventListener("visibilitychange", visHandler);' in body
+    assert 'document.removeEventListener("visibilitychange", visHandler);' in body
+    vis = re.search(r"function onVisibilityChange\(\)\s*\{(.*?)\n  \}", body, re.S)
+    assert vis is not None, "onVisibilityChange not found"
+    method = vis.group(1)
+    assert "document.hidden" in method
+    assert "suspendStream()" in method
+    assert "hiddenDisconnect = true;" in method
+    assert "else if (hiddenDisconnect)" in method
+    assert "connectSSE();" in method
+
+
+def test_coord_connectsse_defers_open_when_tab_hidden() -> None:
+    """connectSSE must never open an EventSource into a hidden tab — the single
+    chokepoint that also backstops a FIRST connect in a background tab (where the
+    close-on-hide handler never fires because there was no open stream).  It
+    marks hiddenDisconnect so the show edge owns the reconnect, marks the
+    deferral as a GAP (markStreamGap) so the eventual open runs the post-gap
+    recovery — without the mark a pane first opened in a background tab
+    silently missed every child/task created while hidden — and reports an
+    honest paused status instead of pinning "connecting" with no attempt in
+    flight."""
+    body = _COORD_JS.read_text(encoding="utf-8")
+    conn = re.search(r"function connectSSE\(\)\s*\{(.*?)\n  \}", body, re.S)
+    assert conn is not None
+    method = conn.group(1)
+    guard = method.index("if (document.hidden)")
+    open_idx = method.index("new EventSource(")
+    assert guard < open_idx, "the hidden guard must precede new EventSource"
+    head = method[guard:open_idx]
+    assert "markStreamGap();" in head, "the hidden deferral must count as a stream gap"
+    assert "hiddenDisconnect = true;" in head
+    assert "return;" in head
+    assert 'setSseStatus("paused' in head, "the deferral must report paused, not connecting"
+    # "connecting" is claimed only once an attempt actually starts — after
+    # the hidden guard, immediately before the EventSource construction.
+    connecting = method.index('setSseStatus("connecting')
+    assert guard < connecting < open_idx
+
+
+def test_coord_destroy_removes_visibility_handler_and_stream_transport() -> None:
+    """Teardown must detach the document-level visibilitychange listener (it
+    holds a strong ref to the closure) and tear down the stream transport —
+    closeStreamTransport closes the EventSource and cancels the reconnect +
+    degraded retry timers (pinned in the degraded-catchup test) — or a
+    destroyed pane leaks and a show edge / pending retry reopens its stream."""
+    body = _COORD_JS.read_text(encoding="utf-8")
+    d = re.search(r"function destroy\(\)\s*\{(.*?)\n  \}", body, re.S)
+    assert d is not None, "destroy not found"
+    method = d.group(1)
+    assert "removeVisibilityHandler();" in method
+    assert "closeStreamTransport();" in method
+
+
+def test_coord_close_session_detaches_visibility_reopen() -> None:
+    """coordCloseSession suspends the stream AND removes the visibilitychange
+    handler BEFORE awaiting the /close POST: a tab hide→show while the POST is
+    in flight must not reopen a stream against the workstream the server is
+    tearing down (404 / reconnect churn against a dead session).  The failure
+    paths resume via connectSSE, which reinstalls the handler at its
+    install-once chokepoint — so close-on-hide survives a failed close."""
+    body = _COORD_JS.read_text(encoding="utf-8")
+    m = re.search(r"async function coordCloseSession\(\)\s*\{(.*?)\n  \}", body, re.S)
+    assert m is not None, "coordCloseSession not found"
+    method = m.group(1)
+    suspend = method.index("suspendStream();")
+    unhook = method.index("removeVisibilityHandler();")
+    # The quoted URL fragment, not the bare word (comments mention /close too).
+    post = method.index('"/close"')
+    assert suspend < post, "stream suspension must precede the /close POST"
+    assert unhook < post, "visibility detach must precede the /close POST"
+    assert "resumeSse()" in method
+
+
+def test_coord_post_gap_sidebar_refresh_is_replay_aware() -> None:
+    """The replace-mode children/tasks refresh (a sidebar rebuild) must NOT
+    fire on every reconnect: child_ws_* / task-mutating events are ordinary
+    ring-buffer entries, so a cursor reconnect (replay_ok) redelivers them and
+    the sidebar heals through the normal handlers — a momentary blur→focus
+    under close-on-hide must not rebuild the sidebar.  The refresh fires
+    exactly when the replay cannot vouch for the gap: no resume cursor or an
+    over-threshold gap at onopen, or the server's replay_truncated envelope
+    (ring evicted), deduped per open via gapRefreshedAtOpen."""
+    body = _COORD_JS.read_text(encoding="utf-8")
+    conn = re.search(r"function connectSSE\(\)\s*\{(.*?)\n  \}", body, re.S)
+    assert conn is not None
+    method = conn.group(1)
+    gate = re.search(
+        r"wasReconnecting &&\s*\(lastEventId == null \|\| gapMs > GAP_REFRESH_THRESHOLD_MS\)",
+        method,
+    )
+    assert gate is not None, "onopen must gate the sidebar refresh on replay coverage"
+    assert "refreshSidebarAfterGap();" in method
+    assert "gapRefreshedAtOpen = true;" in method
+    # The ring-evicted signal triggers the same refresh (deduped per open).
+    trunc = re.search(r'case "replay_truncated":(.*?)break;', body, re.S)
+    assert trunc is not None, "replay_truncated case not found"
+    assert "refreshSidebarAfterGap()" in trunc.group(1)
+    assert "gapRefreshedAtOpen" in trunc.group(1)
+    # Deliberate suspends (hide / overflow / close-session) mark the gap so
+    # the next open participates in the recovery decision at all.
+    sus = re.search(r"function suspendStream\(\)\s*\{(.*?)\n  \}", body, re.S)
+    assert sus is not None, "suspendStream not found"
+    assert "markStreamGap();" in sus.group(1)
+    # The refresh helper carries the whole replace-mode bundle: children,
+    # tasks, and the live-badge purge (permanent 403/404 entries preserved).
+    ref = re.search(r"function refreshSidebarAfterGap\(\)\s*\{(.*?)\n  \}", body, re.S)
+    assert ref is not None, "refreshSidebarAfterGap not found"
+    assert "loadChildren({ replace: true });" in ref.group(1)
+    assert "loadTasks();" in ref.group(1)
+    assert "_liveBadgeCacheDelete(id)" in ref.group(1)
+
+
+def test_coord_defers_truncated_resync_and_consumes_at_idle() -> None:
+    """replay_truncated seen mid-stream must be DEFERRED, not dropped (matches
+    interactive's _pendingTruncatedResync): refetching immediately would detach
+    the live bubble (content OR a reasoning-only one), but skipping outright
+    leaves the ring-evicted turns lost for the session.  The guard covers both
+    streaming targets and latches otherwise; the next state_change=idle consumes
+    the flag — which also repairs a turn stranded by close-on-hide (stream_end
+    evicted while hidden), resetting the streaming refs first since
+    refetchHistory does not null them."""
+    body = _COORD_JS.read_text(encoding="utf-8")
+    trunc = re.search(r'case "replay_truncated":(.*?)break;', body, re.S)
+    assert trunc is not None, "replay_truncated case not found"
+    t = trunc.group(1)
+    assert "if (!currentAssistantEl && !currentReasoningEl)" in t
+    assert "refetchHistory();" in t
+    assert "pendingTruncatedResync = true;" in t
+    st = re.search(r'case "state_change":(.*?)\n      case ', body, re.S)
+    assert st is not None, "state_change case not found"
+    s = st.group(1)
+    assert "if (pendingTruncatedResync)" in s
+    assert "pendingTruncatedResync = false;" in s
+    assert "currentAssistantEl = null;" in s
+    assert "refetchHistory();" in s
+    # Consume the latch, THEN reset the dangling refs and refetch.
+    consume = s.index("pendingTruncatedResync = false;")
+    refetch = s.index("refetchHistory();")
+    assert consume < refetch
+
+
+def test_coord_detects_server_restart_by_backwards_event_id() -> None:
+    """A coordinator process restart resets the per-ws event counter, and the
+    replay path reports replay_ok for a stale-high cursor (past the new max), so
+    the gap is unsignalled and the sidebar goes stale.  onmessage catches it: a
+    live event id below the saved cursor == the counter reset → pull
+    authoritative sidebar state (deduped per open against onopen's refresh),
+    checked BEFORE the cursor is overwritten."""
+    body = _COORD_JS.read_text(encoding="utf-8")
+    m = re.search(r"evtSource\.onmessage = function \(event\) \{(.*?)\n    \};", body, re.S)
+    assert m is not None, "onmessage handler not found"
+    handler = m.group(1)
+    assert "Number(evtSource.lastEventId) < Number(lastEventId)" in handler
+    assert "!gapRefreshedAtOpen" in handler
+    assert "refreshSidebarAfterGap();" in handler
+    check = handler.index("Number(evtSource.lastEventId) < Number(lastEventId)")
+    overwrite = handler.index("lastEventId = evtSource.lastEventId;")
+    assert check < overwrite
+
+
 def test_interactive_history_is_rest_first_not_sse() -> None:
     """PR A converged interactive onto coord's REST-first history
     model: first paint and post-rewind re-render fetch ``GET /history``
