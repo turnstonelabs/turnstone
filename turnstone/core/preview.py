@@ -31,6 +31,7 @@ from turnstone.core.attachments import (
     sniff_image_mime,
     sniff_pdf_mime,
 )
+from turnstone.core.web_helpers import latin1_safe_filename
 
 # Rendered-content kinds the pane knows how to display.  ``web`` is a fetched
 # HTML document (sandboxed iframe); ``table`` is CSV/TSV/JSON parsed and
@@ -339,11 +340,10 @@ def preview_response_headers(
     by browser chrome, not an active document.  Everything else keeps the
     attachment endpoints' full ``default-src 'none'; sandbox`` posture.
     """
-    # Header values must be latin-1 encodable (Starlette raises on anything
-    # else), and page-title-derived filenames routinely carry em dashes / CJK
-    # — fold to ASCII rather than 500 the route.
-    safe_name = filename.replace('"', "").replace("\r", "").replace("\n", "")
-    safe_name = safe_name.encode("ascii", errors="replace").decode("ascii") or "preview"
+    # Page-title-derived filenames routinely carry em dashes / CJK (non-latin-1)
+    # and can carry control bytes — either would 500 the serving route, so run
+    # the shared header sanitizer rather than emit them verbatim.
+    safe_name = latin1_safe_filename(filename, fallback="preview")
     headers = {
         "X-Content-Type-Options": "nosniff",
         "Content-Disposition": f'inline; filename="{safe_name}"',

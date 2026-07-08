@@ -14,6 +14,33 @@ if TYPE_CHECKING:
     from starlette.responses import JSONResponse
 
 
+def latin1_safe_filename(name: str, *, fallback: str = "attachment") -> str:
+    """A ``Content-Disposition`` ``filename`` value that is safe on the wire.
+
+    The value is emitted as ``filename="<this>"``, and three independent
+    hazards bite filenames derived from user uploads or fetched-page titles:
+
+    * Starlette encodes header values as latin-1 and raises on anything
+      outside it, so a CJK / em-dash name would 500 the serving route.
+    * The HTTP server layer rejects control characters in a header value even
+      when they are latin-1 encodable (h11 rejects NUL / CR / LF / FF / VT;
+      httptools is stricter still), so a stray control byte 500s there.
+    * ``"`` and ``\\`` are the quoted-string metacharacters — ``\\`` is the
+      RFC 6266 quoted-pair escape — so either would break out of or corrupt
+      the value (a trailing ``\\`` escapes the closing quote).
+
+    Drop every non-printable character (covers CR / LF / TAB / NUL / DEL, the
+    C0 / C1 control ranges, and zero-width / bidi format chars) and both
+    quoted-string metacharacters, then fold any surviving non-ASCII codepoint
+    to ``?``.  The result is pure printable ASCII with no ``"`` or ``\\`` —
+    latin-1 clean, control-free, and safely quotable.  Falls back to
+    ``fallback`` when nothing survives, so the header never emits
+    ``filename=""``.
+    """
+    kept = "".join(c for c in name if c.isprintable() and c not in '"\\')
+    return kept.encode("ascii", errors="replace").decode("ascii") or fallback
+
+
 def skill_summary_rows(storage: Any) -> list[dict[str, Any]]:
     """Build the public picker payload for ``/v1/api/skills``.
 
