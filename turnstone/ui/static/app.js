@@ -2339,8 +2339,10 @@ window.addEventListener("beforeunload", function () {
 // close paths may leave it non-null in CLOSED state.  Either way means
 // "not actively streaming for a pane that has a workstream attached".
 //
-// Out of scope here: visibility-based DISCONNECT (close-on-hidden to
-// support many tabs).  That belongs to the fan-in design — issue #540.
+// Per-pane visibility-based DISCONNECT (close-on-hidden) lives in the
+// shared Pane itself (interactive.js visibilitychange handler), which
+// also reconnects its own stream with the saved Last-Event-ID on show —
+// this helper only revives the GLOBAL list stream.
 function _reconnectDeadSSEs() {
   if (!globalEvtSource || globalEvtSource.readyState === EventSource.CLOSED) {
     connectGlobalSSE();

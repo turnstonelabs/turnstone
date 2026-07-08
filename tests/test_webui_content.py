@@ -32,8 +32,15 @@ def _drain_global() -> list[dict]:
 class TestContentAccumulation:
     """WebUI should accumulate content tokens and include in idle broadcast."""
 
-    def test_content_token_accumulates(self):
-        """on_content_token should append to _ws_turn_content."""
+    def test_content_token_accumulates(self, monkeypatch):
+        """on_content_token should append to _ws_turn_content.
+
+        Batch window forced to 0 (per-token flush) — this pins the
+        accumulator wiring, not the emit-time batching cadence (which
+        coalesces fragments; see test_sse_token_batching.py)."""
+        import turnstone.core.session_ui_base as suib
+
+        monkeypatch.setattr(suib, "_TOKEN_BATCH_WINDOW_SECS", 0.0)
         ui = _make_ui()
         ui.on_content_token("Hello ")
         ui.on_content_token("world")

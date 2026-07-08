@@ -84,6 +84,15 @@ def _broadcast_ws_closed_to_listeners(ui: SessionUI) -> None:
         return
     with listeners_lock:
         for lq in listeners:
+            # Mark the stream closing BEFORE attempting the sentinel: a
+            # poisoned/full ``_ListenerQueue`` rejects every put (the
+            # eviction-safe retry below can't beat the poison latch), so
+            # the drain loop needs this out-of-band flag to unwind as a
+            # clean close instead of emitting a spurious ``stream_overflow``
+            # frame.  Best-effort on plain ``queue.Queue`` (no such method).
+            mark_closing = getattr(lq, "mark_closing", None)
+            if mark_closing is not None:
+                mark_closing()
             try:
                 lq.put_nowait({"type": "ws_closed"})
             except queue.Full:

@@ -39,6 +39,23 @@ def _make_ui(ws_id: str = "ws-1", user_id: str = "u1") -> _ConcreteUI:
     return _ConcreteUI(ws_id=ws_id, user_id=user_id)
 
 
+@pytest.fixture(autouse=True)
+def _per_token_flush(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Force per-token flushes (batch window 0) for this whole file.
+
+    These tests pin per-emit invariants — seq advance, mid-stream
+    inflight buffer state, snapshot atomicity — that predate emit-time
+    token batching and remain the contract AT each flush boundary;
+    window 0 makes every token its own flush, which is exactly the
+    emit shape they were written against.  Batching cadence itself
+    (window/size coalescing, pending-batch visibility, flush-before-
+    non-token ordering) is pinned in ``test_sse_token_batching.py``.
+    """
+    import turnstone.core.session_ui_base as suib
+
+    monkeypatch.setattr(suib, "_TOKEN_BATCH_WINDOW_SECS", 0.0)
+
+
 # ---------------------------------------------------------------------------
 # Listener fan-out
 # ---------------------------------------------------------------------------
