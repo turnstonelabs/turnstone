@@ -1549,3 +1549,352 @@ def test_streaming_apply_marks_buffer_only_on_success() -> None:
     assert ".catch(function (e) {" in body[chain_at : chain_at + 3500], (
         "every mermaid chain link must settle back to fulfilled"
     )
+
+
+# ---------------------------------------------------------------------------
+# Renderer containment escapes (frontend-render-containment-brief)
+#
+# The renderer protects structural blocks with in-band NUL-framed sentinels
+# (NUL + two-letter-tag + index + NUL, e.g. code-block 0 -> chr(0)+"CB0"+chr(0)).
+# escapeHtml preserves U+0000, so model/tool text carrying such a sequence used
+# to FORGE a sentinel: the shared restore pass rewrote every match, duplicating
+# or relocating a protected block (B1), printing literal "undefined" for an
+# out-of-range index (B2), or injecting a restored span across a container (B3).
+# Fix 1 strips U+0000 (NUL) at the TOP-LEVEL render entry only, so no forged
+# NUL survives to frame a sentinel while generated (recursive-frame) sentinels
+# are left intact.  Only NUL is stripped — every other control byte survives so
+# code fences show pasted source verbatim.  Inputs build NUL via chr(0) (never
+# a literal escape) per the brief.
+# ---------------------------------------------------------------------------
+
+_NUL = chr(0)
+
+
+def test_forged_code_block_sentinel_does_not_duplicate_block() -> None:
+    """B1: prose carrying a forged ``chr(0)+CB0+chr(0)`` used to make the
+    shared restore pass emit the protected code block a SECOND time (content
+    spoofing / relocation).  Stripping NUL at the entry neutralises the
+    forgery: exactly one code block, no leaked sentinel."""
+    md = "```python\nprint('hi')\n```\n\nprose " + _NUL + "CB0" + _NUL + " end"
+    out = _render(md)
+    assert out.count("<pre>") == 1, "forged CB sentinel duplicated the block:\n" + out
+    assert out.count("print(") == 1
+    assert _NUL not in out, "raw NUL / forged sentinel leaked into output"
+
+
+def test_forged_out_of_range_sentinel_does_not_print_undefined() -> None:
+    """B2: ``chr(0)+IC7+chr(0)`` with no inline codes used to restore
+    ``inlineCodes[7]`` -> literal ``undefined`` in the rendered text.  After
+    the entry strip the forged framing is gone, so no ``undefined`` appears."""
+    out = _render("text " + _NUL + "IC7" + _NUL + " tail")
+    assert "undefined" not in out, "out-of-range forged sentinel printed 'undefined':\n" + out
+    assert _NUL not in out
+
+
+def test_control_strip_preserves_legit_fence_and_inline() -> None:
+    """Fix 1 must not disturb legitimately generated sentinels: a normal
+    fence and inline-code span still render after the entry strip (the strip
+    only removes caller-supplied control chars, which are never valid data)."""
+    out = _render("Here is `inline` and a block:\n\n```py\nx = 1\n```")
+    assert "<code>inline</code>" in out
+    assert "<pre><code" in out
+    assert "x = 1" in out
+    assert _NUL not in out
+
+
+def test_strip_removes_only_nul_preserving_other_control_bytes() -> None:
+    """The entry strip removes ONLY NUL (the sentinel-framing byte), so a code
+    fence still shows pasted control bytes (terminal output, ANSI escapes)
+    verbatim.  Stripping the whole C0/DEL range would silently corrupt code
+    samples; only NUL can forge a sentinel."""
+    esc = chr(27)  # ANSI escape — legitimate in pasted terminal output
+    out = _render("```\nbefore " + esc + "[0m after " + _NUL + " end\n```")
+    assert esc in out, "ESC (0x1b) must survive inside a code fence:\n" + repr(out)
+    assert _NUL not in out, "NUL must still be stripped (sentinel-framing byte)"
+    assert "before " in out and " end" in out
+
+
+def test_forged_inline_sentinel_not_injected_inside_fence() -> None:
+    """B3: a forged ``chr(0)+IC0+chr(0)`` placed inside a real code fence
+    used to be substituted AFTER the fence was restored (CB restores before
+    IC), injecting a real ``<code>`` span into the ``<pre>``.  With a genuine
+    inline-code span present (so inlineCodes[0] exists), the forged reference
+    must NOT clone it into the code block."""
+    md = "`real`\n\n```text\nbefore " + _NUL + "IC0" + _NUL + " after\n```"
+    out = _render(md)
+    assert out.count("<code>real</code>") == 1, "forged IC sentinel injected into <pre>:\n" + out
+    assert _NUL not in out
+    assert "before IC0 after" in out, "fence body should show the inert forged tag as text"
+
+
+def test_nul_strip_scoped_to_top_level_call() -> None:
+    """Structural pin for the PLAUSIBLE placement refinement: the NUL strip
+    lives inside the ``_fnDepth === 0`` guard of the exported wrapper, NOT in
+    ``_renderMarkdownBody`` (which runs at every recursion depth).  An
+    unconditional strip would shred the generated sentinels that recursive
+    ``<details>``/footnote frames legitimately carry — foreclosing the
+    recursive-frame fix.  Recursion must reach raw text with its sentinels."""
+    body = _RENDERER_JS.read_text(encoding="utf-8")
+    assert "_NUL_STRIP_RE" in body
+    wrapper = body.index("export function renderMarkdown(text)")
+    body_fn = body.index("function _renderMarkdownBody(text)")
+    seg = body[wrapper:body_fn]
+    guard_at = seg.index("_fnDepth === 0")
+    strip_at = seg.index("_NUL_STRIP_RE", guard_at)
+    incr_at = seg.index("_fnDepth++")
+    assert guard_at < strip_at < incr_at, (
+        "the NUL strip must run inside the top-level (_fnDepth === 0) "
+        "guard, before the depth increment"
+    )
+    assert "_NUL_STRIP_RE" not in body[body_fn:], (
+        "strip must not live in _renderMarkdownBody (would run at every depth)"
+    )
+
+
+def test_recursive_frame_degrades_without_literal_undefined() -> None:
+    """Fix 2 floor for the NEW-1 residual: a recursive render frame
+    (``<details>`` body, footnote definition) whose fresh block arrays cannot
+    resolve an outer-scope sentinel must NOT print the literal word
+    ``undefined``.  The restore callbacks return the (inert) matched sentinel
+    instead.  (This asserts only the ``undefined`` floor — Fix 5 is what makes
+    the body actually render; the raw sentinel that the node harness preserves
+    here is dropped by a real browser's tokenizer.)"""
+    details = _render("<details>\n<summary>x</summary>\n\n```py\nsecret_code()\n```\n\n</details>")
+    assert "undefined" not in details, "code-in-<details> printed 'undefined':\n" + details
+    footnote = _render("See[^1].\n\n[^1]: a `snippet` ok")
+    assert "undefined" not in footnote, "inline-code-in-footnote printed 'undefined':\n" + footnote
+
+
+def test_standalone_code_block_not_wrapped_in_paragraph() -> None:
+    """Fix 6 (NEW-3): code blocks need the ``<p>SENTINEL</p>`` unwrap variant
+    that DT/BQ/MB/TB already have.  Without it a lone fenced block emits
+    ``<p><pre>…</pre></p>``, which a real browser splits into a stray empty
+    ``<p>`` before the ``<pre>``.  The unwrap removes the wrapping paragraph."""
+    out = _render("```py\nx = 1\n```")
+    assert "<pre><code" in out
+    assert "<p><pre>" not in out, "code block still wrapped in a paragraph:\n" + out
+    assert out.strip().startswith("<pre>"), "code block should not be paragraph-wrapped:\n" + out
+
+
+# ---------------------------------------------------------------------------
+# Fix 3 — blockquote-in-fence (B4): fence protection must run before (and
+# mask) the line-based blockquote pass, with the fence open anchored to line
+# start so a blockquoted fence (`> ```) is NOT matched at column > 0.
+# ---------------------------------------------------------------------------
+
+
+def test_blockquote_inside_fence_not_extracted() -> None:
+    """B4 (the common one, no special chars): ``> `` lines INSIDE a code
+    fence used to be scooped out by the blockquote pre-pass (which ran first)
+    and rendered as a real ``<blockquote>`` nested in ``<pre><code>`` — a
+    shell transcript or quoted-email code block would sprout a headline.  The
+    fence pass now runs first and masks the region."""
+    out = _render("```text\nplain\n> quoted\nafter\n```")
+    assert "<blockquote>" not in out, "blockquote extracted from inside a fence:\n" + out
+    assert "<pre><code" in out
+    assert "&gt; quoted" in out, "the quoted line must stay literal (escaped) code:\n" + out
+
+
+def test_blockquoted_fence_renders_as_code() -> None:
+    """A fence nested inside a blockquote (``> ```` ``) must still render as a
+    code block WITHIN the ``<blockquote>``.  Anchoring the fence open to line
+    start means it is not matched at column > 0, so the blockquote pass
+    extracts the ``> `` run and its recursive render handles the fence.  (Pins
+    that we did not over-correct by simply hoisting the fence pass — which
+    would have swallowed the blockquoted fence as ``undefined``.)"""
+    out = _render("> ```\n> code\n> ```")
+    assert "<blockquote>" in out
+    assert "<pre><code>code</code></pre>" in out, "blockquoted fence lost its code:\n" + out
+    assert "undefined" not in out
+    assert _NUL not in out
+
+
+def test_indented_fence_still_renders_as_code() -> None:
+    """The open anchor allows up to 3 spaces of indentation (CommonMark), so a
+    legitimately indented fence (e.g. under a list item) still renders as code
+    rather than as a paragraph of literal backticks.  A bare ``^`` anchor
+    would have dropped it."""
+    out = _render("  ```py\n  x = 1\n  ```")
+    assert "<pre><code" in out, "indented fence dropped (not rendered as code):\n" + out
+    assert "x = 1" in out
+
+
+# ---------------------------------------------------------------------------
+# Fix 4 — <details> open anchored to line start (B5). The details pass ran
+# with an unanchored open, so a `<details>` mentioned mid-line inside inline
+# code matched across the backtick spans and swallowed the DT sentinel /
+# lost the content between them.
+# ---------------------------------------------------------------------------
+
+
+def test_inline_code_details_tag_not_consumed_by_details_pass() -> None:
+    """B5: ``Use `<details>` then `</details>` to fold`` must render two
+    inline-code spans of the literal tags — NOT a real <details> element with
+    the text between the spans swallowed."""
+    out = _render("Use `<details>` then `</details>` to fold.")
+    assert "&lt;details&gt;" in out, "opening <details> tag not shown as literal code:\n" + out
+    assert "&lt;/details&gt;" in out, "closing </details> tag not shown as literal code:\n" + out
+    assert "<details>" not in out, "a real <details> element was wrongly created:\n" + out
+    assert out.count("<code>") == 2, "expected two inline-code spans:\n" + out
+
+
+def test_block_details_still_renders() -> None:
+    """No-regression: a genuine multi-line <details> block (at line start)
+    still renders as a real disclosure element."""
+    out = _render("<details>\n<summary>More</summary>\n\nBody text here.\n\n</details>")
+    assert "<details><summary>More</summary>" in out
+    assert "Body text here." in out
+
+
+def test_oneline_details_still_renders() -> None:
+    """No-regression: the common one-line form must survive the open anchor
+    (anchoring the CLOSE too would break this — do not)."""
+    out = _render("<details><summary>x</summary>y</details>")
+    assert "<details><summary>x</summary>" in out
+    assert "y" in out and out.rstrip().endswith("</details>")
+
+
+def test_details_inside_fence_stays_literal() -> None:
+    """Lock the behavior Fix 5a must preserve: a <details> shown INSIDE a code
+    fence is masked by the (earlier) fence pass and must stay literal escaped
+    code, never extracted into a real element."""
+    out = _render("```html\n<details><summary>s</summary>x</details>\n```")
+    assert "<pre><code" in out
+    assert "&lt;details&gt;" in out, "details-in-fence should be literal code:\n" + out
+    assert "<details>" not in out, "details inside a fence was wrongly extracted:\n" + out
+
+
+# ---------------------------------------------------------------------------
+# Fix 5 (NEW-1) — recursive-frame content loss.  renderMarkdown recurses for
+# <details> bodies and footnote definitions.  When those bodies were extracted
+# AFTER the fence/inline-code/math passes, they carried outer-scope sentinels
+# that the recursive call — with fresh, empty block arrays — could not resolve,
+# so a code block / inline code / math inside them rendered as `undefined` (or,
+# after the Fix 2 floor, an inert `CB0`/`IC0` sentinel) — silent content loss.
+# The structural fix extracts <details> from RAW markdown (before fence/inline
+# protection, fence-aware) and collects footnote definitions before the inline
+# passes, so each recursion sees raw content.
+# ---------------------------------------------------------------------------
+
+
+def test_code_block_in_details_renders_code() -> None:
+    """NEW-1 (a), the headline case: a fenced code block inside <details> must
+    render the CODE, not `undefined` and not an inert `CB0` sentinel."""
+    out = _render("<details>\n<summary>x</summary>\n\n```py\nsecret_code()\n```\n\n</details>")
+    assert "secret_code()" in out, "code inside <details> was lost:\n" + out
+    assert "<pre><code" in out and 'class="language-py"' in out
+    assert "undefined" not in out
+    assert _NUL not in out, "a raw sentinel leaked (recursion did not see raw markdown):\n" + out
+
+
+def test_blockquote_in_details_renders() -> None:
+    """NEW-1 generalises to any recursive block: a blockquote inside <details>
+    must render as a real <blockquote>, not a lost/inert sentinel."""
+    out = _render("<details>\n<summary>x</summary>\n\n> quoted\n\n</details>")
+    assert "<blockquote>" in out, "blockquote inside <details> was lost:\n" + out
+    assert "quoted" in out
+    assert _NUL not in out
+
+
+def test_inline_code_in_footnote_renders() -> None:
+    """NEW-1 (b): inline code in a footnote definition must render as a real
+    <code> span in the footnote section, not `undefined`/`IC0`."""
+    out = _render("See[^1].\n\n[^1]: uses `code` here")
+    assert "<code>code</code>" in out, "inline code in footnote def was lost:\n" + out
+    assert "undefined" not in out
+    assert _NUL not in out
+
+
+def test_math_in_footnote_renders() -> None:
+    r"""NEW-1 (b), math variant: display/inline math in a footnote definition
+    must reach KaTeX, not restore to `undefined`/`MB0`."""
+    out = _render("See[^1].\n\n[^1]: with \\(x^2\\) inline")
+    assert '<span class="katex">' in out, "math in footnote def was lost:\n" + out
+    assert "undefined" not in out
+    assert _NUL not in out
+
+
+# ---------------------------------------------------------------------------
+# Review round-1 regression pins: the details pass runs AFTER fence protection
+# (fence-masking, not offset math, provides fence-awareness), and both the
+# fence and details opens allow arbitrary leading indent.
+# ---------------------------------------------------------------------------
+
+
+def test_details_close_tag_shown_in_fenced_example_does_not_close_block() -> None:
+    """A `</details>` shown as example code inside a fence must NOT close the
+    real disclosure early.  Because the fence pass runs first and masks the
+    example as a sentinel, the details close matches only the real trailing
+    tag; the fenced example renders as literal code inside the block."""
+    md = "<details>\n<summary>s</summary>\n\n```html\n</details>\n```\n\n</details>"
+    out = _render(md)
+    assert '<pre><code class="language-html">' in out, "fenced example was swallowed:\n" + out
+    assert "&lt;/details&gt;" in out, "example </details> should be literal code:\n" + out
+    assert out.strip().startswith("<details><summary>s</summary>"), out
+    assert out.rstrip().endswith("</details>"), "real block closed early / stray text:\n" + out
+    assert _NUL not in out
+
+
+def test_deeply_indented_fence_renders_as_code() -> None:
+    """A fence indented 4+ spaces (as when nested under a list item) still
+    tokenises as a code block — the open anchor allows arbitrary indent, so we
+    don't regress deeply-nested code samples to literal backticks."""
+    out = _render("    ```py\n    x = 1\n    ```")
+    assert "<pre><code" in out, "deeply-indented fence dropped:\n" + out
+    assert "x = 1" in out
+
+
+def test_fence_on_list_marker_line_renders_as_code() -> None:
+    """A code fence that OPENS on the same line as a list marker (`- ```py`)
+    still tokenises as a code block inside the list item.  The open matches
+    after an optional list marker, which is re-emitted before the sentinel so
+    the list pass still sees the item.  Regression guard: a bare `^[ \\t]*`
+    anchor (no list-marker allowance) destroyed the block and leaked the raw
+    backticks + language tag as text."""
+    for src in ["- ```py\n  print(1)\n  ```", "1. ```py\n   print(1)\n   ```"]:
+        out = _render(src)
+        assert "<pre><code" in out, "list-marker-line fence dropped:\n" + repr(src) + "\n" + out
+        assert "print(1)" in out
+        assert "```py" not in out, "raw fence backticks leaked as text:\n" + out
+        assert "<li>" in out, "list structure lost:\n" + out
+
+
+def test_nested_list_fence_stays_nested() -> None:
+    """A fenced code block as a NESTED sub-item keeps its nesting level: the
+    fence pass re-emits the leading indent before the sentinel, so the list
+    pass still reads the sub-item's indentation.  Regression guard: dropping
+    the indent flattened the code block to a top-level sibling of the parent."""
+    out = _render("- parent\n  - ```py\n    code\n    ```")
+    assert "parent" in out
+    assert "<pre><code" in out and "```py" not in out
+    assert out.count("<ul>") == 2, "nested list fence flattened to a sibling:\n" + out
+
+
+def test_big_ordered_marker_fence_is_protected() -> None:
+    r"""A fence opening on a 10+ digit ordered-list marker line is still
+    protected — the marker alternation uses ``\d+``, matching the list pass,
+    not a capped ``\d{1,9}`` that would leave the fence unprotected."""
+    out = _render("1234567890. ```py\ncode\n```")
+    assert "<pre><code" in out, "big ordered-marker fence leaked as text:\n" + out
+    assert "```py" not in out
+
+
+def test_fenced_block_in_footnote_renders_in_footnote() -> None:
+    """A fenced code block continuing a footnote definition renders INSIDE the
+    footnote section (the fence pass re-emits the 2-space indent the
+    continuation scan needs; the restore round-trip then resolves it there)."""
+    out = _render("See[^1].\n\n[^1]: note\n  ```py\n  x=1\n  ```")
+    assert 'class="footnotes"' in out
+    assert out.find("<pre") > out.find('class="footnotes"'), (
+        "fenced code in a footnote rendered outside the footnote section:\n" + out
+    )
+    assert "x=1" in out
+
+
+def test_indented_details_is_extracted() -> None:
+    """An indented `<details>` (e.g. under a list item) is still extracted into
+    a real disclosure element — the open anchor allows leading whitespace,
+    while a mid-line `<details>` inside inline code still is not (B5)."""
+    out = _render("  <details><summary>x</summary>y</details>")
+    assert "<details><summary>x</summary>" in out, "indented <details> not extracted:\n" + out
+    assert "y" in out

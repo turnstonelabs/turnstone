@@ -268,6 +268,15 @@ function _langToCssClass(lang) {
 // the cap the nested body renders as escaped plain text: degraded, visible.
 var _MD_MAX_DEPTH = 100;
 
+// U+0000 (NUL) only.  Structural sentinels are NUL-framed (chr(0)+tag+idx+
+// chr(0)) and renderer.js is the sole NUL producer, so stripping NUL at the
+// top-level entry closes every forgery path — while leaving every OTHER
+// control byte intact, because a code fence must show pasted source verbatim
+// (terminal output legitimately carries ESC/FF/VT/DEL, none of which can forge
+// a sentinel).  Authored as the literal \x00 escape (only \uXXXX decodes to a
+// raw byte in this toolchain), matching the file's \x00 sentinel convention.
+var _NUL_STRIP_RE = /\x00/g;
+
 export function renderMarkdown(text) {
   if (_fnDepth >= _MD_MAX_DEPTH) {
     return "<p>" + escapeHtml(String(text == null ? "" : text)) + "</p>";
@@ -276,7 +285,21 @@ export function renderMarkdown(text) {
   // messages).  Depth accounting rides a try/finally: a throw anywhere in the
   // body used to strand _fnDepth elevated, freezing _fnScopeId so footnote
   // anchor ids collided across every later message.
-  if (_fnDepth === 0) _fnScopeId++;
+  //
+  // Strip caller-supplied NUL, but at the TOP-LEVEL call ONLY.  The renderer
+  // frames structural blocks with in-band NUL sentinels (NUL+tag+index+NUL)
+  // and escapeHtml preserves U+0000, so model/tool text carrying that shape
+  // could forge a sentinel and duplicate/relocate a block or print "undefined"
+  // (B1/B2/B3).  renderer.js is the sole NUL producer and every restore regex
+  // is NUL-framed, so removing NUL here erases every forgery path — and ONLY
+  // NUL, so a fenced code block still shows pasted control bytes (ESC/FF/VT/
+  // DEL) verbatim.  Depth 0 only: recursive frames (blockquote/details/
+  // footnote bodies) legitimately carry generated sentinels and an
+  // unconditional strip would shred them.  NUL is never valid content.
+  if (_fnDepth === 0) {
+    text = String(text == null ? "" : text).replace(_NUL_STRIP_RE, "");
+    _fnScopeId++;
+  }
   _fnDepth++;
   try {
     return _renderMarkdownBody(text);
@@ -285,10 +308,148 @@ export function renderMarkdown(text) {
   }
 }
 
+// Restore-pass callback factory: one guarded closure per protected-block
+// array.  Returns the matched sentinel `m` when the index is out of range (an
+// inert placeholder the tokenizer strips the NUL from) instead of the array's
+// `undefined`.  Factored so the ~12 restore passes share one implementation
+// and can't drift (e.g. a callback reading the wrong array after a copy-paste).
+function _restorer(arr) {
+  return function (m, idx) {
+    var v = arr[parseInt(idx)];
+    return v === undefined ? m : v;
+  };
+}
+
 function _renderMarkdownBody(text) {
-  // Pre-pass: extract blockquote blocks and recursively render.
-  // Must run FIRST (before code/math protection) so the recursive call
-  // processes raw markdown, not text with outer-scope placeholders.
+  // Protect code blocks before the line-based passes (blockquote,
+  // table) that would otherwise scoop a `> ` / `|` line out of a fenced body
+  // and render it as real markdown nested in <pre><code> (B4: shell
+  // transcripts, quoted email, markdown-about-markdown).  The open matches at
+  // line start after optional indent (group 1) AND an optional list marker
+  // (group 2: `- `, `1. `), so a fence opening on a list-item's marker line
+  // (`- ```py`) still tokenises; both the indent and the marker are re-emitted
+  // before the sentinel so the fence keeps its document position (see the
+  // callback).  A blockquoted fence (`> ```) is NOT matched — `>` is not indent
+  // or a list marker — so the blockquote pass below extracts that `> ` run and
+  // its recursive render handles it.
+  //
+  // The opening-run length is captured and required on the close via
+  // backreference so a 4-backtick outer fence wrapping a 3-backtick inner
+  // (common when embedding markdown-about-markdown or lang-tagged snippets
+  // inside another code block) is tokenised as one outer block with the inner
+  // triple-backticks preserved verbatim — the prior `` ```...``` `` regex
+  // treated the outer-open and inner-open as a single fence pair, stranding
+  // the rest of the content with visible \x00CB{n}\x00 sentinels.
+  //
+  // Two constraints below close the gap that mid-stream buffers expose:
+  //
+  //   1. Content can't contain its own close pattern — `(?!\3)` (group 3 is
+  //      the backtick run; groups 1-2 are the indent and optional list marker)
+  //      inside the content quantifier blocks the lazy matcher from extending
+  //      across another N-backtick run. Without this, a buffer like
+  //      ```mermaid\n<partial>\n```python\n<partial>\n```  would extend
+  //      mermaid's content all the way to the FINAL ```, swallowing python
+  //      and handing mermaid a wrong (and incomplete-looking) source. With
+  //      the lookahead, content stops at the first matching run and the open
+  //      simply doesn't match anything until a true close arrives. Inner
+  //      backticks of a SMALLER count (e.g. 3-backtick inner inside a
+  //      4-backtick outer) still pass since `\3` is the OPEN count.
+  //
+  //   2. The close must live at a line boundary — `[ \t]*(?=\n|$)` after
+  //      `\3` forbids the close from being immediately followed by a language
+  //      tag, so ```python opening another fence can't masquerade as the
+  //      previous fence's close.
+  //
+  // Together these mean an unclosed fence stays as plain markdown until its
+  // true close arrives — no intermediate parse errors flash through mermaid /
+  // hljs while a stream is in flight.
+  // codeBlockRaw keeps each fence's RAW source next to its rendered HTML, so
+  // the <details> pre-pass below can restore a fenced body to raw markdown for
+  // its recursive render (NEW-1) rather than an unresolvable outer sentinel.
+  // Populated only when the text contains a <details> tag — its sole reader —
+  // so the common no-<details> render skips the per-fence slice.  (When there
+  // is no <details>, the details .replace matches nothing and its CB->raw
+  // restore never runs, so the empty array is never read.)
+  var codeBlocks = [];
+  var codeBlockRaw = [];
+  var needFenceRaw = /<details>/i.test(text);
+  text = text.replace(
+    /^([ \t]*)((?:[-*+]|\d+[.)])[ \t]+)?(```+)([^\s`]*)\n((?:(?!\3)[\s\S])*?)\3[ \t]*(?=\n|$)/gm,
+    function (m, indent, marker, _open, lang, code) {
+      var cssLang = _langToCssClass(lang);
+      codeBlocks.push(
+        "<pre><code" +
+          (cssLang ? ' class="language-' + escapeHtml(cssLang) + '"' : "") +
+          ">" +
+          escapeHtml(code.replace(/\n$/, "")) +
+          "</code></pre>",
+      );
+      // Store the fence source WITHOUT the re-emitted indent/marker prefix so
+      // the <details> CB->raw restore substitutes the fence alone (no double);
+      // only when a <details> is present to read it (kept index-aligned with
+      // codeBlocks because every fence pushes to both in that case).
+      if (needFenceRaw) {
+        codeBlockRaw.push(
+          m.slice(indent.length + (marker ? marker.length : 0)),
+        );
+      }
+      // Re-emit the leading indent AND any list marker so the fence keeps its
+      // place in the document: a nested list item (`  - ```py`) stays nested,
+      // `- ```py` stays a list item, and a fence continuing a footnote def
+      // keeps the 2-space indent the continuation scan needs.  The CB <p>-unwrap
+      // (restore pass) tolerates that preserved indent, so an own-line indented
+      // fence still leaves no stray <p> (NEW-3).  A blockquoted fence (`> ```)
+      // stays excluded: `>` is neither indent nor a list marker.
+      return (
+        indent + (marker || "") + "\x00CB" + (codeBlocks.length - 1) + "\x00"
+      );
+    },
+  );
+
+  // Extract <details> blocks and recursively render — AFTER fence protection,
+  // BEFORE the blockquote/inline/math passes.  Running after fence means a
+  // fenced code block inside <details> is already a \x00CB\x00 sentinel; it is
+  // restored to its RAW source (codeBlockRaw) before the recursive
+  // renderMarkdown, so the code renders in-frame instead of restoring to
+  // `undefined` / an inert sentinel against the recursion's empty arrays
+  // (NEW-1, silent content loss).  Fence-first also masks a `</details>` shown
+  // as example code (so it can't close the block early) and a whole <details>
+  // shown inside a fence (so it stays literal) — no separate fence-awareness
+  // needed.  The open is anchored to line start (`^[ \t]*`: allows indentation,
+  // e.g. under a list, but not a mid-line `<details>` inside inline code — B5);
+  // the close stays unanchored so the one-line
+  // <details><summary>x</summary>y</details> form still matches.
+  var detailsBlocks = [];
+  text = text.replace(
+    /^[ \t]*<details>\s*\n?([\s\S]*?)<\/details>/gim,
+    function (m, inner) {
+      // Restore any fenced bodies to raw markdown so the recursion re-renders
+      // them in its own frame (the outer codeBlocks entry is then unused).
+      inner = inner.replace(/\x00CB(\d+)\x00/g, _restorer(codeBlockRaw));
+      var sumMatch = inner.match(
+        /^\s*<summary>([\s\S]*?)<\/summary>\s*\n?([\s\S]*)/i,
+      );
+      var html;
+      if (sumMatch) {
+        html =
+          "<details><summary>" +
+          inlineMarkdown(sumMatch[1].trim()) +
+          "</summary>" +
+          renderMarkdown(sumMatch[2]) +
+          "</details>";
+      } else {
+        html = "<details>" + renderMarkdown(inner) + "</details>";
+      }
+      detailsBlocks.push(html);
+      return "\x00DT" + (detailsBlocks.length - 1) + "\x00";
+    },
+  );
+
+  // Pre-pass: extract blockquote blocks and recursively render.  Runs after
+  // fence protection (a fenced `> ` line is already masked as a \x00CB\x00
+  // sentinel, so it is not scooped here — B4) but before the remaining
+  // code/math protection, so the recursive call still processes raw markdown,
+  // not text with outer-scope placeholders.
   var bqBlocks = [];
   (function () {
     var blines = text.split("\n");
@@ -349,80 +510,6 @@ function _renderMarkdownBody(text) {
     }
     text = result.join("\n");
   })();
-
-  // Protect code blocks.  The opening-run length is captured and
-  // required on the close via backreference so a 4-backtick outer
-  // fence wrapping a 3-backtick inner (common when embedding
-  // markdown-about-markdown or lang-tagged snippets inside another
-  // code block) is tokenised as one outer block with the inner
-  // triple-backticks preserved verbatim — the prior `` ```...``` ``
-  // regex treated the outer-open and inner-open as a single fence
-  // pair, stranding the rest of the content with visible
-  // \x00CB{n}\x00 sentinels.
-  //
-  // Two constraints below close the gap that mid-stream buffers
-  // expose:
-  //
-  //   1. Content can't contain its own close pattern — `(?!\1)`
-  //      inside the content quantifier blocks the lazy matcher
-  //      from extending across another N-backtick run. Without
-  //      this, a buffer like  ```mermaid\n<partial>\n```python\n
-  //      <partial>\n```  would extend mermaid's content all the
-  //      way to the FINAL ```, swallowing python and handing
-  //      mermaid a wrong (and incomplete-looking) source. With
-  //      the lookahead, content stops at the first matching run
-  //      and the open simply doesn't match anything until a true
-  //      close arrives. Inner backticks of a SMALLER count (e.g.
-  //      3-backtick inner inside a 4-backtick outer) still pass
-  //      since `\1` is the OPEN count, not just three.
-  //
-  //   2. The close must live at a line boundary — `[ \t]*(?=\n|$)`
-  //      after `\1` forbids the close from being immediately
-  //      followed by a language tag, so ```python opening another
-  //      fence can't masquerade as the previous fence's close.
-  //
-  // Together these mean an unclosed fence stays as plain markdown
-  // until its true close arrives — no intermediate parse errors
-  // flash through mermaid / hljs while a stream is in flight.
-  var codeBlocks = [];
-  text = text.replace(
-    /(```+)([^\s`]*)\n((?:(?!\1)[\s\S])*?)\1[ \t]*(?=\n|$)/g,
-    function (m, _open, lang, code) {
-      var cssLang = _langToCssClass(lang);
-      codeBlocks.push(
-        "<pre><code" +
-          (cssLang ? ' class="language-' + escapeHtml(cssLang) + '"' : "") +
-          ">" +
-          escapeHtml(code.replace(/\n$/, "")) +
-          "</code></pre>",
-      );
-      return "\x00CB" + (codeBlocks.length - 1) + "\x00";
-    },
-  );
-
-  // Protect <details> blocks (safe HTML — attribute-free only)
-  var detailsBlocks = [];
-  text = text.replace(
-    /<details>\s*\n?([\s\S]*?)<\/details>/gi,
-    function (m, inner) {
-      var sumMatch = inner.match(
-        /^\s*<summary>([\s\S]*?)<\/summary>\s*\n?([\s\S]*)/i,
-      );
-      var html;
-      if (sumMatch) {
-        html =
-          "<details><summary>" +
-          inlineMarkdown(sumMatch[1].trim()) +
-          "</summary>" +
-          renderMarkdown(sumMatch[2]) +
-          "</details>";
-      } else {
-        html = "<details>" + renderMarkdown(inner) + "</details>";
-      }
-      detailsBlocks.push(html);
-      return "\x00DT" + (detailsBlocks.length - 1) + "\x00";
-    },
-  );
 
   // Protect inline code FIRST so backtick spans containing math
   // delimiters (e.g. `` `$$x$$` `` or `` `\[x\]` ``) stay literal.
@@ -700,7 +787,20 @@ function _renderMarkdownBody(text) {
 
   var result = out.join("\n");
 
-  // Append footnote section if any definitions were collected
+  // Append footnote section if any definitions were collected.
+  //
+  // Each definition body is rendered by a recursive renderMarkdown call.  The
+  // body was collected AFTER the inline-code/math passes, so it may carry
+  // outer-scope sentinels (e.g. `code` in a footnote -> a \x00IC\x00 sentinel).
+  // The recursion can't resolve those against its own fresh, empty arrays, but
+  // the restore guard (Fix 2) leaves the sentinel intact instead of emitting
+  // "undefined"; because this section is appended to `result` BEFORE the
+  // restore passes below — whose inlineCodes/mathBlocks are still populated —
+  // the OUTER restore resolves it, so inline code / math in a footnote renders
+  // correctly.  A FENCED block continuing a footnote definition works the same
+  // way: the fence pass re-emits its 2-space indent before the sentinel, so
+  // the continuation scan still collects it and the round-trip restores the
+  // code inside the footnote item.
   var fnKeys = Object.keys(footnoteDefs);
   if (fnKeys.length > 0) {
     var fnHtml =
@@ -727,40 +827,31 @@ function _renderMarkdownBody(text) {
     result += fnHtml;
   }
 
-  // Restore protected blocks
-  result = result.replace(/\x00CB(\d+)\x00/g, function (m, idx) {
-    return codeBlocks[parseInt(idx)];
-  });
-  result = result.replace(/<p>\x00DT(\d+)\x00<\/p>/g, function (m, idx) {
-    return detailsBlocks[parseInt(idx)];
-  });
-  result = result.replace(/\x00DT(\d+)\x00/g, function (m, idx) {
-    return detailsBlocks[parseInt(idx)];
-  });
-  result = result.replace(/<p>\x00BQ(\d+)\x00<\/p>/g, function (m, idx) {
-    return bqBlocks[parseInt(idx)];
-  });
-  result = result.replace(/\x00BQ(\d+)\x00/g, function (m, idx) {
-    return bqBlocks[parseInt(idx)];
-  });
-  result = result.replace(/<p>\x00MB(\d+)\x00<\/p>/g, function (m, idx) {
-    return mathBlocks[parseInt(idx)];
-  });
-  result = result.replace(/\x00MB(\d+)\x00/g, function (m, idx) {
-    return mathBlocks[parseInt(idx)];
-  });
-  result = result.replace(/<p>\x00TB(\d+)\x00<\/p>/g, function (m, idx) {
-    return tableBlocks[parseInt(idx)];
-  });
-  result = result.replace(/\x00TB(\d+)\x00/g, function (m, idx) {
-    return tableBlocks[parseInt(idx)];
-  });
-  result = result.replace(/\x00IC(\d+)\x00/g, function (m, idx) {
-    return inlineCodes[parseInt(idx)];
-  });
-  result = result.replace(/\x00IM(\d+)\x00/g, function (m, idx) {
-    return inlineMaths[parseInt(idx)];
-  });
+  // Restore protected blocks through the _restorer factory (out-of-range
+  // indices — reachable only via a recursive frame whose fresh array can't
+  // resolve an outer-scope sentinel, the NEW-1 residual — leave the inert
+  // sentinel rather than the literal "undefined").  Each block type unwraps a
+  // `<p>SENTINEL</p>` paragraph first (the line pass wraps a lone sentinel in
+  // <p>) so the browser doesn't split a stray empty <p> off the block; the
+  // bare form follows.  The CB unwrap also tolerates surrounding whitespace
+  // (`<p>  \x00CB0\x00</p>`) because the fence pass re-emits an own-line
+  // fence's leading indent before the sentinel — the other block types emit
+  // their sentinel at column 0, so they don't need it.
+  result = result.replace(
+    /<p>[ \t]*\x00CB(\d+)\x00[ \t]*<\/p>/g,
+    _restorer(codeBlocks),
+  );
+  result = result.replace(/\x00CB(\d+)\x00/g, _restorer(codeBlocks));
+  result = result.replace(/<p>\x00DT(\d+)\x00<\/p>/g, _restorer(detailsBlocks));
+  result = result.replace(/\x00DT(\d+)\x00/g, _restorer(detailsBlocks));
+  result = result.replace(/<p>\x00BQ(\d+)\x00<\/p>/g, _restorer(bqBlocks));
+  result = result.replace(/\x00BQ(\d+)\x00/g, _restorer(bqBlocks));
+  result = result.replace(/<p>\x00MB(\d+)\x00<\/p>/g, _restorer(mathBlocks));
+  result = result.replace(/\x00MB(\d+)\x00/g, _restorer(mathBlocks));
+  result = result.replace(/<p>\x00TB(\d+)\x00<\/p>/g, _restorer(tableBlocks));
+  result = result.replace(/\x00TB(\d+)\x00/g, _restorer(tableBlocks));
+  result = result.replace(/\x00IC(\d+)\x00/g, _restorer(inlineCodes));
+  result = result.replace(/\x00IM(\d+)\x00/g, _restorer(inlineMaths));
 
   return result;
 }
