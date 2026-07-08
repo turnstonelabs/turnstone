@@ -271,9 +271,8 @@ def test_event_id_persists_across_turn_boundaries(monkeypatch: Any) -> None:
 
     Batch window forced to 0 (per-token flush) — this test pins id
     numbering across turn boundaries, not the batching cadence."""
-    import turnstone.core.session_ui_base as suib
 
-    monkeypatch.setattr(suib, "_TOKEN_BATCH_WINDOW_SECS", 0.0)
+    monkeypatch.setattr("turnstone.core.session_ui_base._TOKEN_BATCH_WINDOW_SECS", 0.0)
     ui = _make_ui()
     ui.on_content_token("turn-N tok1 ")
     ui.on_content_token("turn-N tok2 ")
@@ -334,9 +333,7 @@ def test_truncated_path_snapshot_captures_real_snap_seq(monkeypatch: Any) -> Non
     the truncation scenario needs 10 distinct buffered events."""
     import collections
 
-    import turnstone.core.session_ui_base as suib
-
-    monkeypatch.setattr(suib, "_TOKEN_BATCH_WINDOW_SECS", 0.0)
+    monkeypatch.setattr("turnstone.core.session_ui_base._TOKEN_BATCH_WINDOW_SECS", 0.0)
     ui = _make_ui()
     ui._event_buffer = collections.deque(maxlen=3)
     # Fire enough events to trigger truncation on reconnect with a
@@ -592,9 +589,8 @@ def test_handler_replay_ok_skips_snapshot_emits_id(monkeypatch: Any) -> None:
 
     Batch window forced to 0 so the two tokens are two ring entries
     (the assertion wants two distinct ``id:`` lines)."""
-    import turnstone.core.session_ui_base as suib
 
-    monkeypatch.setattr(suib, "_TOKEN_BATCH_WINDOW_SECS", 0.0)
+    monkeypatch.setattr("turnstone.core.session_ui_base._TOKEN_BATCH_WINDOW_SECS", 0.0)
     ui = _make_ui()
     ui.on_content_token("hello ")
     ui.on_content_token("world")
@@ -619,9 +615,7 @@ def test_handler_truncated_emits_envelope_then_snapshot(monkeypatch: Any) -> Non
     the truncation scenario needs the deque to evict."""
     import collections
 
-    import turnstone.core.session_ui_base as suib
-
-    monkeypatch.setattr(suib, "_TOKEN_BATCH_WINDOW_SECS", 0.0)
+    monkeypatch.setattr("turnstone.core.session_ui_base._TOKEN_BATCH_WINDOW_SECS", 0.0)
     ui = _make_ui()
     ui._event_buffer = collections.deque(maxlen=3)
     for i in range(10):
