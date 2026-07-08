@@ -41,6 +41,15 @@ import {
   indexLabel,
 } from "/shared/conversation.js";
 import { redactCredentials } from "/shared/redact_credentials.js";
+import {
+  OVERFLOW_TRIP_COUNT,
+  OVERFLOW_TRIP_WINDOW_MS,
+  DEGRADED_COOLDOWN_BASE_MS,
+  DEGRADED_COOLDOWN_MAX_MS,
+  DEGRADED_COOLDOWN_RESET_MS,
+  overflowWindowTripped,
+  degradedCooldownStep,
+} from "/shared/sse_overflow.js";
 
 function buildCoordChrome(root, opts) {
   opts = opts || {};
@@ -430,15 +439,40 @@ function createCoordinatorPane(root, wsId, opts) {
 
   let evtSource = null;
   let reconnectAttempts = 0;
-  // Flag set in onerror, cleared in onopen.  Drives the "did we
-  // just recover from a gap?" decision in onopen so the replace-
-  // mode refresh of children/tasks/wait/badge caches fires on
-  // every reconnect — including the common case where native
-  // EventSource auto-reconnect handles the underlying SSE transition
-  // without scheduleReconnect running (which used to be the only
-  // place reconnectAttempts incremented; that path is rarely hit
-  // now that native reconnect handles transient errors).
-  let disconnectedSinceLastOpen = false;
+  // Wall-clock start of the CURRENT gap (0 = no gap in progress).  Stamped by
+  // markStreamGap (from onerror and every deliberate suspend), cleared by
+  // onopen.  A non-zero value IS the "did we just recover from a gap?" flag
+  // that drives onopen's replace-mode children/tasks/badge refresh — no
+  // separate boolean is kept in lockstep with it.  Kept at the EARLIEST mark
+  // so repeated onerror fires during one outage don't shrink the measured gap.
+  // (The scheduleReconnect-after-CLOSED path bumps reconnectAttempts instead;
+  // wasReconnecting ORs the two — that path is rarely hit now that native
+  // reconnect handles transient errors.)
+  let disconnectedAt = 0;
+  // Reconnect-replay trust window for the sidebar.  child_ws_* / task events
+  // are ordinary ring-buffer entries, so a cursor reconnect (replay_ok)
+  // redelivers them and the sidebar heals without any REST refetch; gaps the
+  // ring could NOT cover announce themselves via replay_truncated.  The one
+  // blind spot is a stale cursor the server no longer recognises (process
+  // restart resets event ids; the empty/reset ring reports replay_ok and
+  // silently skips the gap).  Past this gap length we stop trusting the cursor
+  // and pull authoritative /children + /tasks state; a FASTER restart (under
+  // the threshold) is caught instead by the backwards-event-id check in
+  // onmessage (a live id below our saved cursor == the counter reset).
+  // Momentary blur/focus cycles stay well below the threshold — no rebuild
+  // flicker on an alt-tab.
+  const GAP_REFRESH_THRESHOLD_MS = 60000;
+  // True when THIS connection's onopen already ran refreshSidebarAfterGap —
+  // lets the replay_truncated handler (first frame after open) skip a
+  // back-to-back duplicate of the refresh it would otherwise trigger.
+  let gapRefreshedAtOpen = false;
+  // Set when replay_truncated arrives while a turn is mid-stream (refetching
+  // then would detach the live bubble); consumed on the next state_change=idle.
+  // Mirrors interactive.js's _pendingTruncatedResync — the deferral keeps a
+  // ring-evicted gap from going unrepaired for the rest of the session, and
+  // also catches a turn stranded by close-on-hide (finished while hidden, its
+  // stream_end evicted before the show-edge reconnect).
+  let pendingTruncatedResync = false;
   // Saved high-water mark for the manual-reconnect path.  The
   // EventSource constructor can't set custom headers, so when we
   // construct a fresh source we thread ``?last_event_id=N`` instead
@@ -449,6 +483,28 @@ function createCoordinatorPane(root, wsId, opts) {
   // close).
   let lastEventId = null;
   let reconnectTimer = null;
+  // --- SSE overflow-recovery state (client half — mirrors interactive.js) ---
+  // Field instrumentation for the two distinct "output stops while the backend
+  // is healthy" causes: server-signalled overflow closes (dropped-events
+  // class) vs client dispatch/render throws (wedge class).  The console line
+  // at each increment carries the running count, so a field report shows which
+  // class fired without a debugger attached.
+  const streamHealth = { overflows: 0, renderThrows: 0, malformedFrames: 0 };
+  // Rolling timestamps of stream_overflow closes feeding the degraded-catchup
+  // limiter (overflowWindowTripped); plus the cooldown-ladder state, keyed off
+  // the last-trip timestamp via degradedCooldownStep — never off overflowTimes
+  // (enterDegradedCatchup clears it each trip).  See enterDegradedCatchup.
+  const overflowTimes = [];
+  let degradedTimer = null;
+  let degradedCooldownMs = DEGRADED_COOLDOWN_BASE_MS;
+  let lastDegradedAt = 0;
+  // Close-on-hide / replay-on-show bookkeeping.  A hidden tab's throttled event
+  // loop is the likeliest too-slow SSE consumer, so the visibilitychange
+  // handler closes the stream on hide and reconnects with the saved lastEventId
+  // on show (replay_ok covers the gap).  hiddenDisconnect marks that WE closed
+  // for hide, so show never resurrects a stream closed deliberately elsewhere.
+  let visHandler = null;
+  let hiddenDisconnect = false;
   // Ids of operator-context system turns already painted from /history.  A
   // later SSE replay that redelivers one (resume-cursor overlap) is skipped
   // by the system_turn handler — reset per refetchHistory.  Mirrors
@@ -1681,7 +1737,7 @@ function createCoordinatorPane(root, wsId, opts) {
       try {
         streamingRender(body, currentAssistantBuf);
       } catch (e) {
-        console.warn("coordinator streamingRender failed", e);
+        noteRenderThrow("streamingRender", e);
         body.textContent = currentAssistantBuf;
       }
     } else if (body) {
@@ -1719,7 +1775,7 @@ function createCoordinatorPane(root, wsId, opts) {
         try {
           streamingRenderFinalize(body, currentAssistantBuf);
         } catch (e) {
-          console.warn("coordinator streamingRenderFinalize failed", e);
+          noteRenderThrow("streamingRenderFinalize", e);
         }
       }
     }
@@ -2090,11 +2146,13 @@ function createCoordinatorPane(root, wsId, opts) {
       }
     };
     try {
-      if (evtSource) evtSource.close();
-      if (reconnectTimer) {
-        clearTimeout(reconnectTimer);
-        reconnectTimer = null;
-      }
+      suspendStream();
+      // Session teardown owns the stream from here: a tab hide→show while
+      // the /close POST is in flight must NOT reopen a stream against the
+      // workstream the server is tearing down (404 / reconnect churn against
+      // a dead session).  connectSSE reinstalls the handler, so the failure
+      // paths below get close-on-hide back for free via resumeSse.
+      removeVisibilityHandler();
     } catch (_) {
       /* best-effort suspension */
     }
@@ -2184,32 +2242,47 @@ function createCoordinatorPane(root, wsId, opts) {
     }
   }
 
-  function connectSSE() {
-    if (reconnectTimer) {
-      clearTimeout(reconnectTimer);
-      reconnectTimer = null;
-    }
+  // The transport-teardown chokepoint: close + null the EventSource and
+  // cancel BOTH pending retry timers (reconnect backoff + degraded catch-up).
+  // Every teardown path routes through here — connectSSE's redial prologue,
+  // suspendStream (overflow / hide / close-session), destroy — so a new
+  // transport timer gets cancelled in one place instead of by hand at each
+  // call site.  Cancelling the degraded timer on redial also keeps a pending
+  // catch-up retry from firing mid-stream and double-opening;
+  // enterDegradedCatchup re-arms AFTER its own suspend, so this never cancels
+  // the timer it is about to set.  Gap accounting stays OUT of this helper —
+  // a redial is not itself a gap (suspendStream layers markStreamGap on top).
+  function closeStreamTransport() {
     if (evtSource) {
       try {
         evtSource.close();
       } catch (_) {
         /* noop */
       }
+      evtSource = null;
     }
-    setSseStatus("connecting…", "");
-    // Snapshot whether this is a reconnect BEFORE resetting
-    // reconnectAttempts in onopen — child_ws_* events dispatched while
-    // we were disconnected aren't replayed by the events SSE handler,
-    // so the client has to pull authoritative state after any gap.
-    // Snapshot whether this connect attempt follows a prior
-    // disconnect.  Native EventSource auto-reconnect no longer
-    // routes through scheduleReconnect on the transient-error path,
-    // so the legacy ``reconnectAttempts > 0`` check is always false
-    // after PR-D — use ``disconnectedSinceLastOpen`` (set by onerror,
-    // cleared by onopen below) as the authoritative "was-gap" flag.
-    // Falls back to the legacy semantic for the genuinely manual
-    // case (scheduleReconnect-driven reconnect after CLOSED state).
-    const wasReconnecting = disconnectedSinceLastOpen || reconnectAttempts > 0;
+    if (reconnectTimer) {
+      clearTimeout(reconnectTimer);
+      reconnectTimer = null;
+    }
+    if (degradedTimer) {
+      clearTimeout(degradedTimer);
+      degradedTimer = null;
+    }
+  }
+
+  function connectSSE() {
+    closeStreamTransport();
+    // Snapshot whether this connect attempt follows a prior disconnect
+    // BEFORE onopen resets the flags — onopen's post-gap sidebar recovery
+    // keys off it.  Native EventSource auto-reconnect no longer routes
+    // through scheduleReconnect on the transient-error path, so the legacy
+    // ``reconnectAttempts > 0`` check is always false after PR-D — use
+    // ``disconnectedAt`` (stamped by markStreamGap from onerror and from every
+    // deliberate suspend, cleared by onopen below) as the authoritative
+    // "was-gap" flag.  Falls back to the legacy semantic for the genuinely
+    // manual case (scheduleReconnect-driven reconnect after CLOSED state).
+    const wasReconnecting = disconnectedAt !== 0 || reconnectAttempts > 0;
     let url = "/v1/api/workstreams/" + encodeURIComponent(wsId) + "/events";
     // ``!= null`` (not truthiness): a resume cursor of 0 is valid (the
     // ring buffer's first emitted event is id 1), and a brand-new ws's
@@ -2218,12 +2291,47 @@ function createCoordinatorPane(root, wsId, opts) {
     if (lastEventId != null) {
       url += "?last_event_id=" + encodeURIComponent(lastEventId);
     }
+    // Close-on-hide / replay-on-show: install once per pane, removed by
+    // destroy().  A hidden tab's throttled drain is the likeliest slow consumer
+    // behind a server-side queue overflow, and an idle hidden tab holds a node
+    // connection for nothing — closing on hide removes both, and the saved
+    // lastEventId makes the show-edge reconnect lossless (replay_ok).
+    if (!visHandler) {
+      // onVisibilityChange is a plain closure function (no `this` to bind), so
+      // it serves directly as the once-install sentinel AND the
+      // add/removeEventListener handle — no wrapper needed.
+      visHandler = onVisibilityChange;
+      document.addEventListener("visibilitychange", visHandler);
+    }
+    // Never open an EventSource into a hidden (throttled) tab — including a
+    // FIRST connect in a background tab, where the close-on-hide handler never
+    // fires because there was no open stream to close.  This single connect
+    // chokepoint backstops every caller (init, scheduleReconnect, degraded
+    // retry, show edge); the saved lastEventId + the handler installed just
+    // above make the show-edge reconnect replay the gap.  The deferral IS a
+    // gap — everything until the show edge is missed exactly as if the
+    // transport had dropped — so mark it like one: without the mark, a pane
+    // first opened in a background tab skipped onopen's post-gap recovery and
+    // the sidebar silently missed every child/task the backend created while
+    // hidden.  And say so honestly — "connecting…" (set below, only when an
+    // attempt really starts) used to pin here forever with nothing in flight.
+    if (document.hidden) {
+      markStreamGap();
+      hiddenDisconnect = true;
+      setSseStatus("paused — tab hidden", "");
+      return;
+    }
+    setSseStatus("connecting…", "");
     evtSource = new EventSource(url, { withCredentials: true });
     evtSource.onopen = function () {
       reconnectAttempts = 0;
-      // Clear the "was disconnected" flag now that the gap is
-      // closed.  Future onerror fires will set it again.
-      disconnectedSinceLastOpen = false;
+      // Measure the gap this open just closed, then clear it (disconnectedAt is
+      // the was-gap flag).  A gap with no start stamp (legacy scheduleReconnect
+      // path) reads as Infinity — unknown length means we can't argue the
+      // replay covered it, so refresh below.
+      const gapMs = disconnectedAt ? Date.now() - disconnectedAt : Infinity;
+      disconnectedAt = 0;
+      gapRefreshedAtOpen = false;
       setSseStatus("live", "ok");
       // Lift the disconnected dim treatment + restore the last known
       // counters; the replay phase will overwrite with authoritative
@@ -2236,26 +2344,22 @@ function createCoordinatorPane(root, wsId, opts) {
       statusBarEl.classList.remove("ws-sb-disconnected");
       if (lastStatusEvt) updateStatusBar(lastStatusEvt);
       else StatusBar.resetTokensPlaceholder(sbTokensEl);
-      if (wasReconnecting) {
-        // Replace-mode refresh: the server is authoritative after a
-        // gap; any SSE-only rows the client accumulated before
-        // disconnect are stale.
-        loadChildren({ replace: true });
-        loadTasks();
-        // Drop the live-badge cache too — entries within the 5s TTL
-        // can carry stale pending_approval_details (the child may
-        // have resolved its approval during the SSE gap).  Without
-        // this clear, inline approve/deny buttons could render on
-        // a row whose approval was resolved elsewhere; the next
-        // scheduleLiveFetch from loadChildren's finally branch
-        // (which fires for every visible row) repopulates with
-        // authoritative state. Preserve `permanent: true` entries
-        // (set on 403/404 — denied by permission/identity, not by
-        // state) so a user lacking admin.cluster.inspect doesn't
-        // pay one 403 per denied id on every reconnect.
-        for (const [id, c] of liveBadgeCache) {
-          if (!c || !c.permanent) _liveBadgeCacheDelete(id);
-        }
+      // Post-gap sidebar recovery.  child_ws_* / task-mutating events are
+      // ordinary ring-buffer entries, so a cursor reconnect (replay_ok)
+      // redelivers them and the normal handlers heal the sidebar — no REST
+      // refetch, no replace-mode rebuild flicker on a momentary blur/focus.
+      // Refresh eagerly only when the replay CANNOT vouch for the gap: no
+      // cursor to resume from (the fresh path's synthetic replay carries no
+      // child events), or a gap long enough that a stale cursor could be
+      // lying (see GAP_REFRESH_THRESHOLD_MS).  The ring-evicted case
+      // announces itself — the replay_truncated handler runs the same
+      // refresh on arrival (gapRefreshedAtOpen keeps the two from stacking).
+      if (
+        wasReconnecting &&
+        (lastEventId == null || gapMs > GAP_REFRESH_THRESHOLD_MS)
+      ) {
+        refreshSidebarAfterGap();
+        gapRefreshedAtOpen = true;
       }
     };
     evtSource.onerror = function () {
@@ -2267,7 +2371,7 @@ function createCoordinatorPane(root, wsId, opts) {
       // reconnect, which is exactly the reconnect-with-replay defect
       // PR-D ships to fix.  See
       // tests/test_app_js.py::test_coord_connectsse_onerror_preserves_native_reconnect.
-      disconnectedSinceLastOpen = true;
+      markStreamGap();
       setSseStatus("disconnected", "err");
       // Dim the status bar so a stale reading doesn't read as live.
       statusBarEl.classList.add("ws-sb-disconnected");
@@ -2362,18 +2466,59 @@ function createCoordinatorPane(root, wsId, opts) {
       // doesn't desync the manual-reconnect fallback from native
       // auto-reconnect.
       if (evtSource && evtSource.lastEventId) {
+        // A live event id BELOW our saved cursor means the server's per-ws
+        // event counter reset — a coordinator process restart with a fresh,
+        // empty ring.  The replay path can't flag that (a cursor at/above the
+        // ring's earliest id reports replay_ok even when it's past the new
+        // max), so the gap is silent and the sidebar's pre-restart rows go
+        // stale with nothing to replay them.  Catch it here and pull
+        // authoritative state — deduped per open against onopen's /
+        // replay_truncated's own refresh.  (Gaps that DON'T reset the counter
+        // are handled at onopen by the cursor-trust window.)
+        if (
+          lastEventId != null &&
+          !gapRefreshedAtOpen &&
+          Number(evtSource.lastEventId) < Number(lastEventId)
+        ) {
+          refreshSidebarAfterGap();
+          gapRefreshedAtOpen = true;
+        }
         lastEventId = evtSource.lastEventId;
       }
       let data = null;
       try {
         data = JSON.parse(event.data);
-      } catch (_) {
+      } catch (err) {
+        streamHealth.malformedFrames += 1;
+        console.warn(
+          "coordinator: dropping malformed SSE frame (total " +
+            streamHealth.malformedFrames +
+            ")",
+          err,
+        );
         return;
       }
       // Tag the event with its own SSE id so the system_turn handler can dedup
       // a turn already painted from /history (mirrors ui/static/app.js).
       if (event.lastEventId) data._event_id = event.lastEventId;
-      handleEvent(data);
+      // Guard the dispatch: an exception escaping onmessage does NOT close the
+      // EventSource, so an unhandled throw here leaves the streaming refs stale
+      // and every later turn paints into the poisoned segment — the "output
+      // stops while the backend is healthy" wedge.  Count it (render-throw
+      // class) so a field report tells it apart from a dropped-events gap.
+      try {
+        handleEvent(data);
+      } catch (err) {
+        streamHealth.renderThrows += 1;
+        console.error(
+          "coordinator: handleEvent failed for " +
+            (data && data.type) +
+            " (render-throw total " +
+            streamHealth.renderThrows +
+            ")",
+          err,
+        );
+      }
     };
   }
 
@@ -2382,6 +2527,168 @@ function createCoordinatorPane(root, wsId, opts) {
     const jitter = Math.floor(Math.random() * 500);
     reconnectAttempts += 1;
     reconnectTimer = setTimeout(connectSSE, base + jitter);
+  }
+
+  // ------------------------------------------------------------------
+  // SSE overflow recovery (client half) — mirrors interactive.js.  The
+  // trip threshold + cooldown-ladder math is shared via sse_overflow.js;
+  // the stateful glue below is coupled to this closure's evtSource seam.
+  // ------------------------------------------------------------------
+
+  // Transport-only stream suspension for the overflow / visibility /
+  // close-session paths: the closeStreamTransport teardown WITHOUT the full
+  // destroy() cleanup (observers, task timers), plus gap accounting.
+  // connectSSE re-opens from the saved lastEventId, so this is lossless for
+  // committed turns.
+  function suspendStream() {
+    closeStreamTransport();
+    // A deliberate suspend is still a gap.  The transient-error path marks
+    // it via onerror; the overflow/hide/close-session paths self-close (no
+    // onerror fires after .close()), so mark it here instead.
+    markStreamGap();
+  }
+
+  // Open a gap in the stream's coverage: stamp its wall-clock start, which
+  // doubles as the was-reconnecting flag the next onopen snapshots (see
+  // connectSSE).  Keep the EARLIEST stamp when marks pile up (repeated onerror
+  // fires, hide followed by a deferred connect) so onopen measures the whole
+  // outage, not just its last slice.  onopen clears it.
+  function markStreamGap() {
+    if (!disconnectedAt) disconnectedAt = Date.now();
+  }
+
+  // Replace-mode sidebar re-sync after a gap the reconnect replay could not
+  // (or might not) have covered — the server is authoritative; any SSE-only
+  // child/task rows accumulated before the disconnect are stale.  Two
+  // callers: onopen (no-cursor / over-threshold gaps) and the
+  // replay_truncated handler (ring-evicted gaps).  Ordinary short gaps need
+  // neither — the ring replay redelivers child_ws_* / task events itself.
+  function refreshSidebarAfterGap() {
+    loadChildren({ replace: true });
+    loadTasks();
+    // Drop the live-badge cache too — entries within the 5s TTL can carry
+    // stale pending_approval_details (the child may have resolved its
+    // approval during the SSE gap).  Without this clear, inline approve/deny
+    // buttons could render on a row whose approval was resolved elsewhere;
+    // the next scheduleLiveFetch from loadChildren's finally branch (which
+    // fires for every visible row) repopulates with authoritative state.
+    // Preserve `permanent: true` entries (set on 403/404 — denied by
+    // permission/identity, not by state) so a user lacking
+    // admin.cluster.inspect doesn't pay one 403 per denied id on every
+    // refresh.
+    for (const [id, c] of liveBadgeCache) {
+      if (!c || !c.permanent) _liveBadgeCacheDelete(id);
+    }
+  }
+
+  // Count + log a caught render throw (wedge-class instrumentation).  The
+  // running total rides in the log line so a field report shows which class
+  // fired — dropped events vs render wedge — without a debugger attached.
+  // console.warn, not error: every caller recovers (plain-text fallback or
+  // keeping the already-streamed text).  The onmessage dispatch catch keeps
+  // its own inline increment — that one is console.error (the whole event is
+  // dropped, nothing recovers it) and names the event type.
+  function noteRenderThrow(where, err) {
+    streamHealth.renderThrows += 1;
+    console.warn(
+      "coordinator " +
+        where +
+        " failed (render-throw total " +
+        streamHealth.renderThrows +
+        ")",
+      err,
+    );
+  }
+
+  function noteStreamOverflow() {
+    streamHealth.overflows += 1;
+    const now = Date.now();
+    overflowTimes.push(now);
+    console.warn(
+      "coordinator: server closed the stream after a send-queue overflow " +
+        "(total " +
+        streamHealth.overflows +
+        "); reconnect will replay the gap",
+    );
+    // Trip when OVERFLOW_TRIP_COUNT closes land inside the rolling window.  The
+    // cooldown-ladder reset lives in enterDegradedCatchup (keyed off
+    // lastDegradedAt), NOT here — this only counts and trips.
+    if (
+      overflowWindowTripped(
+        overflowTimes,
+        now,
+        OVERFLOW_TRIP_COUNT,
+        OVERFLOW_TRIP_WINDOW_MS,
+      )
+    ) {
+      enterDegradedCatchup();
+    }
+  }
+
+  function enterDegradedCatchup() {
+    // Repeated overflow closes inside one window: this consumer cannot keep up
+    // with live streaming right now, and each reconnect round just stalls
+    // rendering behind the retry before re-saturating.  Stop the churn: close
+    // the stream, say so in plain language, and come back after a (doubling)
+    // cooldown — that reconnect replays the gap from the server's ring buffer,
+    // or falls to the replay_truncated → /history resync floor once the gap
+    // has outgrown it.  Either path is lossless for committed turns.
+    const now = Date.now();
+    // Escalate the cooldown when trips recur; reset to base only after a
+    // genuine quiet gap.  Keyed off lastDegradedAt (a timestamp), NOT
+    // overflowTimes — this clears that array below, so keying the reset off it
+    // would restart the ladder on the next storm's first overflow and the
+    // doubling (15→30→60→120s) would never take effect.
+    const step = degradedCooldownStep(
+      degradedCooldownMs,
+      lastDegradedAt,
+      now,
+      DEGRADED_COOLDOWN_BASE_MS,
+      DEGRADED_COOLDOWN_MAX_MS,
+      DEGRADED_COOLDOWN_RESET_MS,
+    );
+    lastDegradedAt = now;
+    degradedCooldownMs = step.nextCooldownMs;
+    overflowTimes.length = 0;
+    suspendStream(); // also cancels any earlier degraded timer
+    setSseStatus("catching up…", "err");
+    statusBarEl.classList.add("ws-sb-disconnected");
+    sbTokensEl.textContent = "Connection is slow — catching up…";
+    const cooldown = step.cooldown;
+    degradedTimer = setTimeout(function () {
+      degradedTimer = null;
+      if (document.hidden) {
+        // Reopening into a throttled hidden tab would overflow again — defer to
+        // the visibilitychange show edge instead.
+        hiddenDisconnect = true;
+        return;
+      }
+      connectSSE();
+    }, cooldown);
+  }
+
+  function onVisibilityChange() {
+    if (document.hidden) {
+      // Closing beats letting the hidden tab's throttled event loop starve the
+      // drain until the server-side queue overflows.  The streaming buffers
+      // (currentAssistantBuf / currentAssistantEl) survive — suspendStream is
+      // transport-only — so the visible tail is intact when the tab returns.
+      if (evtSource) {
+        suspendStream();
+        hiddenDisconnect = true;
+      }
+    } else if (hiddenDisconnect) {
+      hiddenDisconnect = false;
+      connectSSE();
+    }
+  }
+
+  function removeVisibilityHandler() {
+    if (visHandler) {
+      document.removeEventListener("visibilitychange", visHandler);
+      visHandler = null;
+    }
+    hiddenDisconnect = false;
   }
 
   // ------------------------------------------------------------------
@@ -2428,7 +2735,7 @@ function createCoordinatorPane(root, wsId, opts) {
             try {
               streamingRender(abody, currentAssistantBuf);
             } catch (e) {
-              console.warn("coordinator streamingRender failed", e);
+              noteRenderThrow("in_progress_snapshot render", e);
               abody.textContent = currentAssistantBuf;
             }
           } else if (abody) {
@@ -2439,6 +2746,15 @@ function createCoordinatorPane(root, wsId, opts) {
         break;
       case "stream_end":
         finishAssistantStream();
+        break;
+      case "stream_overflow":
+        // The server poisoned this listener at its first queue overflow and
+        // closes the stream right after this id-less frame.  lastEventId still
+        // points below the gap, so native EventSource reconnect replays it
+        // losslessly from the ring buffer.  Count the close: a persistently
+        // slow consumer trips the degraded catch-up instead of churning
+        // reconnects.
+        noteStreamOverflow();
         break;
       case "tool_result":
         appendToolResult(
@@ -2641,6 +2957,24 @@ function createCoordinatorPane(root, wsId, opts) {
         // reset, idle-after-error). Mirrors the interactive pane.
         if (ev.state === "idle" || ev.state === "error") {
           setBusy(false);
+          // Deferred replay_truncated re-sync: the truncation arrived while a
+          // turn was mid-stream (refetching then would have detached the live
+          // bubble), so repair the ring-evicted gap now that the turn is
+          // settled and /history is complete.  Also repairs a turn stranded by
+          // close-on-hide — hidden mid-turn, its stream_end evicted, so the
+          // show-edge replay_truncated latched the flag and the live bubble
+          // never finalized.  Reset the streaming refs first: refetchHistory
+          // replaceChildren()s the DOM but does NOT null them, and a dangling
+          // ref would strand the NEXT turn's tokens into a detached node.
+          // Mirrors interactive.js.
+          if (pendingTruncatedResync) {
+            pendingTruncatedResync = false;
+            currentAssistantEl = null;
+            currentAssistantBuf = "";
+            currentReasoningEl = null;
+            currentReasoningBuf = "";
+            refetchHistory();
+          }
         } else if (
           ev.state === "running" ||
           ev.state === "thinking" ||
@@ -2739,9 +3073,24 @@ function createCoordinatorPane(root, wsId, opts) {
       }
       case "replay_truncated":
         // Reconnect buffer evicted past our last-seen id — re-sync from REST.
-        // Skip mid-stream: in_progress_snapshot already paints the live turn
-        // and a replaceChildren() would detach the streaming bubble.
-        if (!currentAssistantEl) refetchHistory();
+        // Skip while a turn is mid-stream (BOTH a content bubble and a
+        // reasoning-only one are detachable): the recovery floor's
+        // in_progress_snapshot repaints it, and an async refetch's
+        // replaceChildren() would detach the live bubble so deltas render
+        // nowhere.  Mid-stream the resync is DEFERRED, not dropped — skipping
+        // outright left the ring-evicted gap unrepaired for the rest of the
+        // session (no clean reconnect may come for hours); the idle edge
+        // consumes the flag.  Mirrors interactive.js's _pendingTruncatedResync.
+        if (!currentAssistantEl && !currentReasoningEl) {
+          refetchHistory();
+        } else {
+          pendingTruncatedResync = true;
+        }
+        // The evicted slice may have carried child_ws_* / task events the
+        // sidebar will never see replayed — this is the server saying the
+        // gap was NOT covered, so pull authoritative state (unless onopen
+        // already did, milliseconds ago, for this same reconnect).
+        if (!gapRefreshedAtOpen) refreshSidebarAfterGap();
         break;
       case "tool_pending":
         // Early paint — render the batch the instant the model commits to
@@ -4959,10 +5308,8 @@ function createCoordinatorPane(root, wsId, opts) {
   //  login out to every open pane.)
   function onLogin() {
     reconnectAttempts = 0;
-    if (reconnectTimer) {
-      clearTimeout(reconnectTimer);
-      reconnectTimer = null;
-    }
+    // connectSSE's closeStreamTransport prologue cancels any pending
+    // reconnect / degraded timers before dialling.
     connectSSE();
   }
 
@@ -4970,20 +5317,21 @@ function createCoordinatorPane(root, wsId, opts) {
   // per-instance pane must release the stream + every timer/observer or a
   // backgrounded pane keeps an SSE open and fires renders into detached DOM.
   function destroy() {
-    if (evtSource) {
-      evtSource.close();
-      evtSource = null;
-    }
+    // Stream + both retry timers (reconnect backoff, degraded catch-up).
+    closeStreamTransport();
     [
-      reconnectTimer,
       cancelTimeoutId,
       forceTimeoutId,
       tasksRefreshTimer,
       liveBadgeFlushTimer,
     ].forEach((t) => t && clearTimeout(t));
-    reconnectTimer = cancelTimeoutId = forceTimeoutId = null;
+    cancelTimeoutId = forceTimeoutId = null;
     tasksRefreshTimer = liveBadgeFlushTimer = null;
     if (pruneTimer) clearInterval(pruneTimer);
+    // The document-level visibilitychange listener holds a strong ref to this
+    // closure — leaving it registered would both leak the pane and let a show
+    // edge reopen a stream for a destroyed pane.
+    removeVisibilityHandler();
     if (_childObserver && _childObserver.disconnect)
       _childObserver.disconnect();
   }

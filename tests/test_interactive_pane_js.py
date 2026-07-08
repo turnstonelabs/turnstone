@@ -522,116 +522,41 @@ def test_no_global_sse_gap_detector() -> None:
     )
 
 
-def test_overflow_window_tripped_runtime() -> None:
-    """Runtime probe for the limiter's rolling-window helper — the
-    storm-guard math is the part of Fix A the design review marked
-    UNCONFIRMED, so it gets executed, not just string-pinned: prunes
-    stale entries in place, trips at exactly K-in-window, and does not
-    trip for closes spread wider than the window."""
-    import json
-    import os
-    import subprocess
-    import tempfile
-
-    import pytest
-
+def test_overflow_helpers_extracted_to_shared_module() -> None:
+    """The storm-guard constants + the two pure helpers were extracted to the
+    shared ``sse_overflow.js`` module (its own runtime probes live in
+    ``test_sse_overflow_js.py``) so the interactive and coordinator panes can't
+    drift.  Pin that the pane IMPORTS them rather than re-declaring a local
+    copy: a stray local ``function overflowWindowTripped`` / ``const
+    OVERFLOW_TRIP_COUNT`` would silently fork the trip math again."""
     body = _INTERACTIVE.read_text(encoding="utf-8")
     m = re.search(
-        r"^function overflowWindowTripped\(times, nowMs, count, windowMs\) \{.*?^\}",
+        r"import \{([^}]*)\} from \"\./sse_overflow\.js\";",
         body,
-        re.S | re.M,
+        re.S,
     )
-    assert m is not None, "overflowWindowTripped not found (keep it a module-level function)"
-    harness = (
-        m.group(0)
-        + "\n"
-        + "// trips at exactly count-in-window\n"
-        + "let t = [1000, 2000, 3000];\n"
-        + "if (!overflowWindowTripped(t, 3000, 3, 60000)) throw new Error('K-in-window must trip');\n"
-        + "// stale entries prune in place and prevent the trip\n"
-        + "t = [1000, 2000, 70000];\n"
-        + "if (overflowWindowTripped(t, 70000, 3, 60000)) throw new Error('stale entries must not trip');\n"
-        + "if (JSON.stringify(t) !== '[70000]') throw new Error('prune in place failed: ' + JSON.stringify(t));\n"
-        + "// boundary: an entry exactly windowMs old is still counted\n"
-        + "t = [10000, 70000];\n"
-        + "if (!overflowWindowTripped(t, 70000, 2, 60000)) throw new Error('boundary entry must count');\n"
-        + "// below threshold never trips\n"
-        + "t = [];\n"
-        + "if (overflowWindowTripped(t, 1, 1, 60000) !== false) throw new Error('empty must not trip');\n"
+    assert m is not None, "interactive pane must import the shared overflow helpers"
+    imported = m.group(1)
+    for name in (
+        "OVERFLOW_TRIP_COUNT",
+        "OVERFLOW_TRIP_WINDOW_MS",
+        "DEGRADED_COOLDOWN_BASE_MS",
+        "DEGRADED_COOLDOWN_MAX_MS",
+        "DEGRADED_COOLDOWN_RESET_MS",
+        "overflowWindowTripped",
+        "degradedCooldownStep",
+    ):
+        assert name in imported, f"{name} must be imported from sse_overflow.js"
+    # No local fork of the extracted definitions.
+    assert not re.search(r"^function overflowWindowTripped\(", body, re.M), (
+        "overflowWindowTripped must be imported, not re-declared locally"
     )
-    with tempfile.NamedTemporaryFile(mode="w", suffix=".mjs", delete=False) as f:
-        f.write(harness)
-        tmp = f.name
-    try:
-        proc = subprocess.run(["node", tmp], capture_output=True, text=True, timeout=15)
-    except FileNotFoundError:
-        pytest.skip("node binary not available on PATH")
-    finally:
-        os.unlink(tmp)
-    assert proc.returncode == 0, (
-        f"overflowWindowTripped runtime probe failed. stdout={proc.stdout!r} stderr={proc.stderr!r}"
+    assert not re.search(r"^function degradedCooldownStep\(", body, re.M), (
+        "degradedCooldownStep must be imported, not re-declared locally"
     )
-    assert json.dumps  # keep the import shape consistent with test_app_js probes
-
-
-def test_degraded_cooldown_ladder_escalates_and_resets_runtime() -> None:
-    """Review finding [0] regression: the degraded-catchup cooldown ladder
-    must actually ESCALATE across consecutive trips (15→30→60→120s, capped)
-    and reset to base only after a genuine quiet gap.  The original bug
-    cleared _overflowTimes in _enterDegradedCatchup, so _noteStreamOverflow's
-    empty-window check reset the cooldown to base on every storm's first
-    overflow and the doubling never took effect.  The fix keys the ladder off
-    a last-trip timestamp via the pure degradedCooldownStep helper, exercised
-    here directly."""
-    import json
-    import os
-    import subprocess
-    import tempfile
-
-    import pytest
-
-    body = _INTERACTIVE.read_text(encoding="utf-8")
-    m = re.search(
-        r"^function degradedCooldownStep\(.*?\) \{.*?^\}",
-        body,
-        re.S | re.M,
+    assert not re.search(r"^const OVERFLOW_TRIP_COUNT\s*=", body, re.M), (
+        "the trip constants must be imported, not re-declared locally"
     )
-    assert m is not None, "degradedCooldownStep not found (keep it a module-level function)"
-    harness = (
-        m.group(0)
-        + "\n"
-        + "const BASE=15000, MAX=120000, RESET=300000;\n"
-        + "function assert(c,msg){ if(!c) throw new Error(msg); }\n"
-        + "// First trip: gap since lastTrip(0) exceeds RESET -> base, next doubles.\n"
-        + "let s = degradedCooldownStep(BASE, 0, 1000000, BASE, MAX, RESET);\n"
-        + "assert(s.cooldown===15000, 'first trip cooldown '+s.cooldown);\n"
-        + "assert(s.nextCooldownMs===30000, 'first next '+s.nextCooldownMs);\n"
-        + "// Second trip recurs within RESET -> escalates (uses the doubled prev).\n"
-        + "s = degradedCooldownStep(30000, 1000000, 1030000, BASE, MAX, RESET);\n"
-        + "assert(s.cooldown===30000, 'second trip must ESCALATE not reset, got '+s.cooldown);\n"
-        + "assert(s.nextCooldownMs===60000, 'second next '+s.nextCooldownMs);\n"
-        + "// Third + fourth keep escalating and cap at MAX.\n"
-        + "s = degradedCooldownStep(60000, 1030000, 1060000, BASE, MAX, RESET);\n"
-        + "assert(s.cooldown===60000 && s.nextCooldownMs===120000, 'third '+JSON.stringify(s));\n"
-        + "s = degradedCooldownStep(120000, 1060000, 1090000, BASE, MAX, RESET);\n"
-        + "assert(s.cooldown===120000 && s.nextCooldownMs===120000, 'fourth must cap at MAX '+JSON.stringify(s));\n"
-        + "// A quiet gap longer than RESET resets the ladder to base.\n"
-        + "s = degradedCooldownStep(120000, 1090000, 1090000+RESET+1, BASE, MAX, RESET);\n"
-        + "assert(s.cooldown===15000, 'quiet gap must reset to base, got '+s.cooldown);\n"
-    )
-    with tempfile.NamedTemporaryFile(mode="w", suffix=".mjs", delete=False) as f:
-        f.write(harness)
-        tmp = f.name
-    try:
-        proc = subprocess.run(["node", tmp], capture_output=True, text=True, timeout=15)
-    except FileNotFoundError:
-        pytest.skip("node binary not available on PATH")
-    finally:
-        os.unlink(tmp)
-    assert proc.returncode == 0, (
-        f"degradedCooldownStep escalation probe failed. stderr={proc.stderr!r}"
-    )
-    assert json.dumps
 
 
 def test_note_stream_overflow_does_not_reset_cooldown() -> None:
