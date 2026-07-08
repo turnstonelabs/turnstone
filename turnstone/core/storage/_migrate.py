@@ -12,6 +12,42 @@ log = get_logger(__name__)
 _MIGRATIONS_DIR = str(Path(__file__).parent / "migrations")
 
 
+class SchemaAheadOfCodeError(RuntimeError):
+    """Raised when the database's Alembic revision is unknown to this checkout.
+
+    On a rolling git-pull upgrade, a node that has already applied a newer
+    migration leaves ``alembic_version`` pointing at a revision this (older,
+    not-yet-upgraded) node's migration scripts have never heard of. Left
+    unchecked, Alembic fails deep inside dependency resolution with an opaque
+    "Can't locate revision" error — or, on SQLite, that error gets logged as a
+    non-fatal warning and the node boots up silently attached to a schema its
+    code doesn't understand. See issue #591.
+    """
+
+
+def _check_schema_not_ahead(engine: Any, cfg: Any) -> None:
+    """Refuse to proceed if the DB's current revision is unknown to this checkout."""
+    from alembic.runtime.migration import MigrationContext
+    from alembic.script import ScriptDirectory
+
+    script = ScriptDirectory.from_config(cfg)
+    known_revisions = {rev.revision for rev in script.walk_revisions()}
+
+    with engine.connect() as conn:
+        current_rev = MigrationContext.configure(conn).get_current_revision()
+
+    if current_rev is not None and current_rev not in known_revisions:
+        msg = (
+            f"Database schema is at revision {current_rev!r}, which this "
+            "installation's migrations do not recognize. Another node in the "
+            "cluster has likely already applied a newer migration than this "
+            "node's code knows about (a rolling git-pull upgrade applied out "
+            "of order). Upgrade this node's code to match before starting it "
+            "against this database."
+        )
+        raise SchemaAheadOfCodeError(msg)
+
+
 def run_migrations(storage: Any, backend: str) -> None:
     """Run pending Alembic migrations.
 
@@ -34,6 +70,11 @@ def run_migrations(storage: Any, backend: str) -> None:
     # Check if this is an existing database without alembic_version
     if backend == "sqlite":
         _bootstrap_existing_sqlite(engine, cfg)
+
+    # Fatal regardless of backend, and deliberately outside the try/excepts
+    # below — those exist to swallow transient/connection-class failures, and
+    # must not also swallow "this node's code is behind the schema."
+    _check_schema_not_ahead(engine, cfg)
 
     if backend == "postgresql":
         try:
