@@ -866,16 +866,20 @@ def test_pane_manager_split_engine() -> None:
     assert "_restoreLayout(data)" in pane and "seen.has(d.paneId)" in pane
     # the visible-but-unfocused tab marker
     assert 'classList.toggle("shown"' in pane
-    # per-pane ✕: split mode hides ONE cell keeping the tab (closeCell);
-    # single-pane it closes the pane (withheld from non-closable) — the click
-    # decides at click time, the label tracks the mode.  Manager-injected into
-    # the pane SECTION (content untouched), removed via _clearCellStyle.
+    # per-pane ✕: split mode hides ONE cell keeping the tab (closeCell), EXCEPT
+    # an ephemeral pane which closes outright; single-pane it closes the pane
+    # (withheld from non-closable) — the click decides at click time, the label
+    # tracks the mode.  Manager-injected into the pane SECTION (content
+    # untouched), removed via _clearCellStyle.  Ephemeral-dismiss behaviour has
+    # its own deep coverage in test_preview_js.py::TestEphemeralDismiss.
     assert "closeCell(paneId)" in pane and "_refreshCellChips()" in pane
     assert 'b.className = "cell-unsplit"' in pane
     assert '"Close pane"' in pane, "the single-pane chip mode"
     # mode-DISTINCT glyphs (designer P1: identical signifier + locus with a
-    # reversible/destructive divergence is a mode-error trap)
-    assert 'b.textContent = multi ? "−" : "✕"' in pane
+    # reversible/destructive divergence is a mode-error trap) — a click that
+    # cannot be a reversible cell-hide shows ✕, else −.
+    assert "const destroys = !multi || pane.ephemeral;" in pane
+    assert 'b.textContent = destroys ? "✕" : "−"' in pane
     assert '"cell-unsplit--close"' in pane
     assert "this._removeCellChip(pane)" in pane
     # open-beside: the coordinator child-link placement (split right of the

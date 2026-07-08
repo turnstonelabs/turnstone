@@ -45,6 +45,12 @@ export class ShellPane {
     this.glyph = opts.glyph || null; // a single static char shown in the tab (e.g. "◇"); stateful panes use a live .ui-glyph-* instead
     this.stateful = opts.stateful || false; // conversational panes: tab glyph tracks live Tier-1 state (set via setTabGlyph)
     this.closable = opts.closable !== false; // dashboard is not closable
+    // Ephemeral: a pane with no standalone background-tab life.  Dismissing its
+    // split cell (the ✕ chip, or unsplit) CLOSES it — destroy, not the default
+    // hide-and-keep-the-tab — because there is no meaningful re-open-from-tab;
+    // its reopen affordance lives elsewhere (the transcript preview chip).  The
+    // preview singleton sets this; conversational panes do not.
+    this.ephemeral = opts.ephemeral || false;
     // DOM — created and owned by the PaneManager on mount:
     this.el = null; // <section class="pane">
     this.bodyEl = null; // <div class="pane-body"> — pane content host
@@ -617,11 +623,21 @@ export class PaneManager {
     return { ok: true };
   }
 
-  /** Collapse back to a single pane — the focused one.  The other panes stay
-   *  open as tabs (they just stop being visible); nothing is closed. */
+  /** Collapse back to a single pane — the focused one.  Other panes stay open
+   *  as tabs (they just stop being visible) — EXCEPT ephemeral ones (e.g. the
+   *  preview), which have no background-tab life and close outright rather than
+   *  linger as orphan tabs.  The focused survivor is spared even if ephemeral. */
   unsplit() {
     if (!this._layout) return;
-    this._exitLayout(this._activeId);
+    const keep = this._activeId;
+    const doomed = this._leaves()
+      .map((l) => l.paneId)
+      .filter((id) => {
+        const p = this._panes.get(id);
+        return id !== keep && p && p.ephemeral;
+      });
+    for (const id of doomed) this.close(id); // collapses its cell, then destroys
+    if (this._layout) this._exitLayout(keep); // a close() may have already exited
     this._renderTabs();
     this._persist();
     this._notifyActive();
@@ -873,7 +889,11 @@ export class PaneManager {
       b.type = "button";
       b.className = "cell-unsplit";
       b.addEventListener("click", () => {
-        if (this._layout && this._leafFor(pane.id)) this.closeCell(pane.id);
+        // In a multi-cell split the chip HIDES this cell (the tab stays) —
+        // except an ephemeral pane (e.g. the preview), which has no background-
+        // tab life and so closes outright, exactly as it does single-pane.
+        if (this._layout && this._leafFor(pane.id) && !pane.ephemeral)
+          this.closeCell(pane.id);
         else this.close(pane.id);
       });
       pane.el.append(b);
@@ -882,11 +902,15 @@ export class PaneManager {
     // Mode-DISTINCT glyphs — an identical signifier at an identical locus with
     // divergent outcomes is a mode-error trap (split-mode muscle memory would
     // fire the destructive close): − hides the cell (reversible — the tab
-    // stays), ✕ closes the pane.  Close mode also wears a danger hover
-    // (shell.css .cell-unsplit--close).
-    b.textContent = multi ? "−" : "✕";
-    b.classList.toggle("cell-unsplit--close", !multi);
-    const label = multi ? "Hide from split — the tab stays open" : "Close pane";
+    // stays), ✕ closes the pane.  The chip DESTROYS whenever the click cannot be
+    // a reversible cell-hide: single-pane always, and an ephemeral pane even in
+    // a split.  Close mode also wears a danger hover (shell.css .cell-unsplit--close).
+    const destroys = !multi || pane.ephemeral;
+    b.textContent = destroys ? "✕" : "−";
+    b.classList.toggle("cell-unsplit--close", destroys);
+    const label = destroys
+      ? "Close pane"
+      : "Hide from split — the tab stays open";
     b.title = label;
     b.setAttribute("aria-label", label);
   }

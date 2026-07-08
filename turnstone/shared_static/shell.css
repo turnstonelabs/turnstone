@@ -828,8 +828,10 @@
   pointer-events: none;
 }
 /* per-pane ✕ — on every visible pane.  Split mode: "hide this cell" (the TAB
-   stays — closeCell); single-pane: "close pane" (withheld from the unclosable
-   Dashboard).  Shell chrome floating over pane content: elevated panel +
+   stays — closeCell), but an ephemeral pane (the preview) closes outright;
+   single-pane: "close pane" (withheld from the unclosable Dashboard).  The
+   destructive modes flip the glyph to ✕ and wear .cell-unsplit--close.
+   Shell chrome floating over pane content: elevated panel +
    hairline so it reads as the shell's, not the conversation's; sits clear of
    the 2px focus bar and the cell corner. */
 .cell-unsplit {

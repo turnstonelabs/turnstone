@@ -204,6 +204,10 @@ export function createPreviewPane(extra, hostApi) {
     type: "preview",
     title: "Preview",
     glyph: "▤",
+    // Dismissing the preview cell CLOSES it (tab and all) instead of parking an
+    // orphan tab — its content is transient tool output and its reopen lives on
+    // the transcript chip, not the tab bar.
+    ephemeral: true,
   });
 
   // Viewed-descriptor history (session-scoped): entries are {descriptor, ctx}.

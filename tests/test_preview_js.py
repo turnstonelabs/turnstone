@@ -13,6 +13,7 @@ from pathlib import Path
 
 _ROOT = Path(__file__).resolve().parent.parent
 _SHARED = _ROOT / "turnstone/shared_static"
+_PANE_JS = _SHARED / "pane.js"
 _PREVIEW_JS = _SHARED / "preview.js"
 _CONVERSATION_JS = _SHARED / "conversation.js"
 _INTERACTIVE_JS = _SHARED / "interactive.js"
@@ -155,3 +156,59 @@ class TestStylesheets:
         assert "var(--hair)" in body
         for legacy in ("var(--green)", "var(--red)", "var(--fg)"):
             assert legacy not in body
+
+
+class TestEphemeralDismiss:
+    """The preview is an ephemeral pane: dismissing its split cell CLOSES it
+    (tab and content gone) instead of parking an orphan tab whose only reopen
+    is the transcript chip.  Regression guard for the pane/tab desync."""
+
+    def test_preview_pane_is_ephemeral(self) -> None:
+        """createPreviewPane must flag the pane ephemeral — the whole fix keys
+        off this bit."""
+        body = _read(_PREVIEW_JS)
+        assert "ephemeral: true" in body, "the preview pane must declare itself ephemeral"
+
+    def test_shellpane_carries_the_ephemeral_flag(self) -> None:
+        body = _read(_PANE_JS)
+        assert "this.ephemeral = opts.ephemeral || false;" in body, (
+            "ShellPane must accept and default the ephemeral flag"
+        )
+
+    def test_cell_chip_closes_ephemeral_pane_outright(self) -> None:
+        """In a split the ✕ chip normally HIDES the cell (closeCell); for an
+        ephemeral pane it must fall through to close() — the `!pane.ephemeral`
+        guard is what routes it there.  Pin BOTH the guard and where the
+        skipped case lands (the else), or gutting the else regresses the fix
+        while the guard string survives verbatim."""
+        body = _read(_PANE_JS)
+        assert "if (this._layout && this._leafFor(pane.id) && !pane.ephemeral)" in body, (
+            "the cell chip must skip closeCell for an ephemeral pane"
+        )
+        assert "else this.close(pane.id);" in body, (
+            "the skipped (ephemeral / single-pane) case must land on close()"
+        )
+
+    def test_cell_chip_signals_destruction_for_ephemeral(self) -> None:
+        """The glyph/label must not lie: an ephemeral pane's split chip reads
+        as a destructive close (✕ + danger hover + 'Close pane'), never the
+        reversible '− / Hide from split'."""
+        body = _read(_PANE_JS)
+        assert "const destroys = !multi || pane.ephemeral;" in body, (
+            "chip mode must treat ephemeral panes as destructive even in a split"
+        )
+
+    def test_unsplit_closes_ephemeral_non_survivors(self) -> None:
+        """Collapsing the split from the OTHER pane must not orphan the preview
+        either — unsplit closes ephemeral panes it isn't keeping."""
+        body = _read(_PANE_JS)
+        assert "const keep = this._activeId;" in body, (
+            "the unsplit survivor must be the FOCUSED pane — the filter's "
+            "`id !== keep` guard is only correct if keep is _activeId"
+        )
+        assert "for (const id of doomed) this.close(id);" in body, (
+            "unsplit must destroy ephemeral panes it does not keep"
+        )
+        assert "return id !== keep && p && p.ephemeral;" in body, (
+            "unsplit must spare the focused survivor and non-ephemeral panes"
+        )
