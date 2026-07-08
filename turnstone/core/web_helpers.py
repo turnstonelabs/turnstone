@@ -33,12 +33,17 @@ def latin1_safe_filename(name: str, *, fallback: str = "attachment") -> str:
     C0 / C1 control ranges, and zero-width / bidi format chars) and both
     quoted-string metacharacters, then fold any surviving non-ASCII codepoint
     to ``?``.  The result is pure printable ASCII with no ``"`` or ``\\`` —
-    latin-1 clean, control-free, and safely quotable.  Falls back to
-    ``fallback`` when nothing survives, so the header never emits
-    ``filename=""``.
+    latin-1 clean, control-free, and safely quotable.  ``fallback`` is run
+    through the same cleaning (so a caller can't reintroduce the crash via an
+    unsafe fallback), backed by a safe constant if even that is empty — the
+    return is always wire-safe and never ``filename=""``.
     """
-    kept = "".join(c for c in name if c.isprintable() and c not in '"\\')
-    return kept.encode("ascii", errors="replace").decode("ascii") or fallback
+
+    def _clean(s: str) -> str:
+        kept = "".join(c for c in s if c.isprintable() and c not in '"\\')
+        return kept.encode("ascii", errors="replace").decode("ascii")
+
+    return _clean(name) or _clean(fallback) or "download"
 
 
 def skill_summary_rows(storage: Any) -> list[dict[str, Any]]:
