@@ -145,9 +145,10 @@
   font-size: 13px;
   color: var(--ink-1);
 }
-/* Code-block chrome + katex display: the per-ui style.css rules are scoped to
-   .msg.assistant and don't reach the pane, so restate them on DS tokens.  The
-   hljs TOKEN colors are global and already apply. */
+/* Code-block chrome + katex display + mermaid: the .msg.assistant-scoped rules
+   in shared chat.css don't reach the pane (content is .preview-markdown, not a
+   .msg.assistant message), so restate them on DS tokens.  The hljs TOKEN colors
+   are global and already apply. */
 .preview-markdown code {
   padding: 1px 4px;
   font-family: var(--font-mono);
@@ -172,6 +173,18 @@
 .preview-markdown .katex-display {
   margin: 8px 0;
   overflow-x: auto;
+}
+/* Mermaid: mermaid.js draws a self-contained SVG, but without a width clamp a
+   wide diagram overflows the pane (the .msg.assistant mermaid rules in chat.css
+   don't reach .preview-markdown). */
+.preview-markdown .mermaid-container {
+  margin: 8px 0;
+  text-align: center;
+  overflow-x: auto;
+}
+.preview-markdown .mermaid-container svg {
+  max-width: 100%;
+  height: auto;
 }
 .preview-markdown img {
   max-width: 100%;
