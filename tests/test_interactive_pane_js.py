@@ -429,3 +429,262 @@ def test_sync_approval_state_prunes_orphan_cycles() -> None:
     assert "this.approvalCycles.delete(cid);" in tail, (
         "orphan pruning must delete the cycle from the Map"
     )
+
+
+# ---------------------------------------------------------------------------
+# SSE overflow recovery + close-on-hide (fast-stream corruption fixes)
+# ---------------------------------------------------------------------------
+
+
+def test_stream_overflow_case_counts_and_rate_limits() -> None:
+    """The server closes an overflowed stream after an id-less
+    ``stream_overflow`` frame; the pane must count it (field
+    instrumentation for the drop-vs-render-wedge diagnosis) and route it
+    through the reconnect limiter so a persistently slow consumer trips
+    the degraded catch-up instead of churning reconnect/replay cycles."""
+    body = _INTERACTIVE.read_text(encoding="utf-8")
+    assert 'case "stream_overflow":' in body
+    assert "this._noteStreamOverflow();" in body
+    assert "_streamHealth = { overflows: 0, renderThrows: 0, malformedFrames: 0 }" in body
+    # Both wedge-class catch sites increment the render-throw counter,
+    # and the malformed-frame drop counts too — the C-OVERDETERMINED
+    # instrumentation that tells drops apart from wedges in the field.
+    assert body.count("this._streamHealth.renderThrows += 1;") == 2
+    assert "this._streamHealth.malformedFrames += 1;" in body
+    assert "this._streamHealth.overflows += 1;" in body
+
+
+def test_degraded_catchup_stops_live_stream_and_retries() -> None:
+    """Degraded catch-up contract: close the stream FIRST (which also
+    clears any earlier degraded timer — disconnectSSE owns that), show a
+    plain-language status, then arm the retry timer with a doubling
+    cooldown.  The retry must defer to the show edge when the tab is
+    hidden (reopening into a throttled tab would overflow again)."""
+    body = _INTERACTIVE.read_text(encoding="utf-8")
+    m = re.search(r"_enterDegradedCatchup\(\)\s*\{(.*?)\n  \}", body, re.S)
+    assert m is not None, "_enterDegradedCatchup method not found"
+    method = m.group(1)
+    # Order matters: disconnect before arming the timer, or the fresh
+    # timer would be cancelled by its own disconnect.
+    assert method.index("this.disconnectSSE()") < method.index("this._degradedTimer = setTimeout")
+    assert "Connection is slow" in method, "degraded state must use plain language"
+    assert "DEGRADED_COOLDOWN_MAX_MS" in method
+    assert "document.hidden" in method
+    # disconnectSSE owns the timer teardown (ws-switch / giveUp / destroy
+    # all supersede a pending degraded retry through it).
+    dis = re.search(r"disconnectSSE\(\)\s*\{(.*?)\n  \}", body, re.S)
+    assert dis is not None
+    assert "clearTimeout(this._degradedTimer)" in dis.group(1)
+
+
+def test_visibilitychange_closes_on_hide_reconnects_on_show() -> None:
+    """Close-on-hide / replay-on-show: a hidden tab's throttled drain is
+    the likeliest slow consumer behind server-side overflow (the old
+    "PR-G closes those connections on hide" comment described a handler
+    that never existed).  The pane installs one visibilitychange
+    listener, marks ITS OWN hide-closes via ``_hiddenDisconnect`` so a
+    show edge never resurrects a deliberately-closed stream, and the
+    factory's destroy removes the listener (it strongly references the
+    pane)."""
+    body = _INTERACTIVE.read_text(encoding="utf-8")
+    assert 'document.addEventListener("visibilitychange", this._visHandler);' in body
+    assert 'document.removeEventListener("visibilitychange", this._visHandler);' in body
+    vis = re.search(r"_onVisibilityChange\(\)\s*\{(.*?)\n  \}", body, re.S)
+    assert vis is not None, "_onVisibilityChange method not found"
+    method = vis.group(1)
+    assert "this.disconnectSSE();" in method
+    assert "this._hiddenDisconnect = true;" in method
+    assert "this.connectSSE(this.wsId);" in method
+    # Reconnect only consumes OUR hide-close marker.
+    assert "else if (this._hiddenDisconnect)" in method
+    # Teardown: the factory controller removes the listener on destroy.
+    assert "pane._removeVisibilityHandler();" in body
+    # The streaming buffers survive a hide-close: disconnectSSE stays
+    # transport-only (no contentBuffer wipe) so the visible tail is
+    # intact when the tab returns.
+    dis = re.search(r"disconnectSSE\(\)\s*\{(.*?)\n  \}", body, re.S)
+    assert dis is not None
+    assert "contentBuffer" not in dis.group(1)
+
+
+def test_no_global_sse_gap_detector() -> None:
+    """Live event ids are NOT strictly monotonic across concurrent
+    tool+content emit (the fan-out runs outside the listeners lock), so
+    a naive ``id !== lastEventId + 1`` gap check would false-positive.
+    Recovery is server-signalled (``stream_overflow``) + reconnect
+    replay instead.  This tripwire pins the absence of the naive
+    arithmetic — if gap detection is ever added, it must be scoped to
+    the content stream only (content-vs-content never reorders)."""
+    code = _strip_comments(_INTERACTIVE.read_text(encoding="utf-8"))
+    assert not re.search(r"_lastEventId\s*[+\-]\s*1", code), (
+        "found lastEventId +/- 1 arithmetic — a global gap detector "
+        "false-positives on legal concurrent tool/content id inversion"
+    )
+
+
+def test_overflow_window_tripped_runtime() -> None:
+    """Runtime probe for the limiter's rolling-window helper — the
+    storm-guard math is the part of Fix A the design review marked
+    UNCONFIRMED, so it gets executed, not just string-pinned: prunes
+    stale entries in place, trips at exactly K-in-window, and does not
+    trip for closes spread wider than the window."""
+    import json
+    import os
+    import subprocess
+    import tempfile
+
+    import pytest
+
+    body = _INTERACTIVE.read_text(encoding="utf-8")
+    m = re.search(
+        r"^function overflowWindowTripped\(times, nowMs, count, windowMs\) \{.*?^\}",
+        body,
+        re.S | re.M,
+    )
+    assert m is not None, "overflowWindowTripped not found (keep it a module-level function)"
+    harness = (
+        m.group(0)
+        + "\n"
+        + "// trips at exactly count-in-window\n"
+        + "let t = [1000, 2000, 3000];\n"
+        + "if (!overflowWindowTripped(t, 3000, 3, 60000)) throw new Error('K-in-window must trip');\n"
+        + "// stale entries prune in place and prevent the trip\n"
+        + "t = [1000, 2000, 70000];\n"
+        + "if (overflowWindowTripped(t, 70000, 3, 60000)) throw new Error('stale entries must not trip');\n"
+        + "if (JSON.stringify(t) !== '[70000]') throw new Error('prune in place failed: ' + JSON.stringify(t));\n"
+        + "// boundary: an entry exactly windowMs old is still counted\n"
+        + "t = [10000, 70000];\n"
+        + "if (!overflowWindowTripped(t, 70000, 2, 60000)) throw new Error('boundary entry must count');\n"
+        + "// below threshold never trips\n"
+        + "t = [];\n"
+        + "if (overflowWindowTripped(t, 1, 1, 60000) !== false) throw new Error('empty must not trip');\n"
+    )
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".mjs", delete=False) as f:
+        f.write(harness)
+        tmp = f.name
+    try:
+        proc = subprocess.run(["node", tmp], capture_output=True, text=True, timeout=15)
+    except FileNotFoundError:
+        pytest.skip("node binary not available on PATH")
+    finally:
+        os.unlink(tmp)
+    assert proc.returncode == 0, (
+        f"overflowWindowTripped runtime probe failed. stdout={proc.stdout!r} stderr={proc.stderr!r}"
+    )
+    assert json.dumps  # keep the import shape consistent with test_app_js probes
+
+
+def test_degraded_cooldown_ladder_escalates_and_resets_runtime() -> None:
+    """Review finding [0] regression: the degraded-catchup cooldown ladder
+    must actually ESCALATE across consecutive trips (15→30→60→120s, capped)
+    and reset to base only after a genuine quiet gap.  The original bug
+    cleared _overflowTimes in _enterDegradedCatchup, so _noteStreamOverflow's
+    empty-window check reset the cooldown to base on every storm's first
+    overflow and the doubling never took effect.  The fix keys the ladder off
+    a last-trip timestamp via the pure degradedCooldownStep helper, exercised
+    here directly."""
+    import json
+    import os
+    import subprocess
+    import tempfile
+
+    import pytest
+
+    body = _INTERACTIVE.read_text(encoding="utf-8")
+    m = re.search(
+        r"^function degradedCooldownStep\(.*?\) \{.*?^\}",
+        body,
+        re.S | re.M,
+    )
+    assert m is not None, "degradedCooldownStep not found (keep it a module-level function)"
+    harness = (
+        m.group(0)
+        + "\n"
+        + "const BASE=15000, MAX=120000, RESET=300000;\n"
+        + "function assert(c,msg){ if(!c) throw new Error(msg); }\n"
+        + "// First trip: gap since lastTrip(0) exceeds RESET -> base, next doubles.\n"
+        + "let s = degradedCooldownStep(BASE, 0, 1000000, BASE, MAX, RESET);\n"
+        + "assert(s.cooldown===15000, 'first trip cooldown '+s.cooldown);\n"
+        + "assert(s.nextCooldownMs===30000, 'first next '+s.nextCooldownMs);\n"
+        + "// Second trip recurs within RESET -> escalates (uses the doubled prev).\n"
+        + "s = degradedCooldownStep(30000, 1000000, 1030000, BASE, MAX, RESET);\n"
+        + "assert(s.cooldown===30000, 'second trip must ESCALATE not reset, got '+s.cooldown);\n"
+        + "assert(s.nextCooldownMs===60000, 'second next '+s.nextCooldownMs);\n"
+        + "// Third + fourth keep escalating and cap at MAX.\n"
+        + "s = degradedCooldownStep(60000, 1030000, 1060000, BASE, MAX, RESET);\n"
+        + "assert(s.cooldown===60000 && s.nextCooldownMs===120000, 'third '+JSON.stringify(s));\n"
+        + "s = degradedCooldownStep(120000, 1060000, 1090000, BASE, MAX, RESET);\n"
+        + "assert(s.cooldown===120000 && s.nextCooldownMs===120000, 'fourth must cap at MAX '+JSON.stringify(s));\n"
+        + "// A quiet gap longer than RESET resets the ladder to base.\n"
+        + "s = degradedCooldownStep(120000, 1090000, 1090000+RESET+1, BASE, MAX, RESET);\n"
+        + "assert(s.cooldown===15000, 'quiet gap must reset to base, got '+s.cooldown);\n"
+    )
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".mjs", delete=False) as f:
+        f.write(harness)
+        tmp = f.name
+    try:
+        proc = subprocess.run(["node", tmp], capture_output=True, text=True, timeout=15)
+    except FileNotFoundError:
+        pytest.skip("node binary not available on PATH")
+    finally:
+        os.unlink(tmp)
+    assert proc.returncode == 0, (
+        f"degradedCooldownStep escalation probe failed. stderr={proc.stderr!r}"
+    )
+    assert json.dumps
+
+
+def test_note_stream_overflow_does_not_reset_cooldown() -> None:
+    """The exact finding [0] bug shape must not regress: _noteStreamOverflow
+    only counts + trips; it must NOT touch _degradedCooldownMs (the reset
+    that defeated the ladder lived here).  The ladder decision lives solely
+    in _enterDegradedCatchup, keyed off _lastDegradedAt via
+    degradedCooldownStep."""
+    body = _INTERACTIVE.read_text(encoding="utf-8")
+    note = re.search(r"_noteStreamOverflow\(\)\s*\{(.*?)\n  \}", body, re.S)
+    assert note is not None, "_noteStreamOverflow not found"
+    assert "_degradedCooldownMs" not in note.group(1), (
+        "_noteStreamOverflow must not write _degradedCooldownMs — that reset "
+        "was the bug that stopped the ladder escalating"
+    )
+    enter = re.search(r"_enterDegradedCatchup\(\)\s*\{(.*?)\n  \}", body, re.S)
+    assert enter is not None
+    assert "degradedCooldownStep(" in enter.group(1)
+    assert "this._lastDegradedAt = now" in enter.group(1)
+
+
+def test_recover_beat_defers_reconnect_when_tab_hidden() -> None:
+    """Review round-2 finding [1]: the factory's transient-error recovery
+    beat (recoverTimer) must NOT reopen an EventSource into a hidden tab —
+    that re-creates the throttled slow-consumer overflow that close-on-hide
+    exists to prevent.  It guards on document.hidden and defers to the
+    visibilitychange show edge (marking _hiddenDisconnect)."""
+    body = _INTERACTIVE.read_text(encoding="utf-8")
+    beat = re.search(r"recoverTimer = setTimeout\(\(\) => \{(.*?)\n      \}, 5000\);", body, re.S)
+    assert beat is not None, "recoverTimer setTimeout body not found"
+    b = beat.group(1)
+    assert "document.hidden" in b, "recovery beat must guard on document.hidden"
+    assert "pane._hiddenDisconnect = true" in b, (
+        "recovery beat must defer to the show edge when hidden"
+    )
+    # The hidden guard must precede the reconnect (connectSSE) so it can't fall
+    # through to reopening the stream.
+    assert b.index("document.hidden") < b.index("pane.connectSSE(pane.wsId)")
+
+
+def test_giveup_removes_visibility_handler() -> None:
+    """Review round-2 finding [3]: giveUp() (markDead) must detach the
+    visibility handler and clear _hiddenDisconnect, or a tab hidden before
+    the give-up resurrects the dead controller's stream on return (the show
+    edge would connectSSE the closed ws and 404-reconnect it forever)."""
+    body = _INTERACTIVE.read_text(encoding="utf-8")
+    give = re.search(r"const giveUp = function \(\) \{(.*?)\n  \};", body, re.S)
+    assert give is not None, "giveUp function body not found"
+    g = give.group(1)
+    assert "pane._removeVisibilityHandler();" in g, (
+        "giveUp must remove the visibility handler so a show edge can't resurrect a dead controller"
+    )
+    # _removeVisibilityHandler also clears _hiddenDisconnect (pinned in its body).
+    rvh = re.search(r"_removeVisibilityHandler\(\)\s*\{(.*?)\n  \}", body, re.S)
+    assert rvh is not None
+    assert "this._hiddenDisconnect = false" in rvh.group(1)

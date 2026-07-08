@@ -173,6 +173,57 @@ const INTERACTIVE_DEFAULT_HOST = {
   onPreview() {},
 };
 
+// Overflow-reconnect limiter (client half of the SSE overflow recovery).
+// The server closes a stream whose listener queue overflowed — after an
+// id-less `stream_overflow` frame — and the native EventSource reconnect
+// replays the gap from the server's ring buffer.  For a consumer that
+// STAYS too slow that cycle would churn forever (reconnect → replay
+// burst → re-saturate → re-close, stalling ~3-5 s per retry round), so
+// after OVERFLOW_TRIP_COUNT overflow closes inside a rolling
+// OVERFLOW_TRIP_WINDOW_MS the pane drops to a degraded catch-up: stop
+// live streaming, say so plainly, and re-try after a doubling cooldown —
+// the eventual reconnect replays the gap, or falls to the
+// replay_truncated → /history floor once the gap outgrows the ring.
+const OVERFLOW_TRIP_COUNT = 3;
+const OVERFLOW_TRIP_WINDOW_MS = 60000;
+const DEGRADED_COOLDOWN_BASE_MS = 15000;
+const DEGRADED_COOLDOWN_MAX_MS = 120000;
+// Reset the cooldown ladder back to base only after this long WITHOUT a
+// degraded trip.  Deliberately larger than DEGRADED_COOLDOWN_MAX_MS: a
+// persistently-slow consumer trips again roughly one cooldown apart, so
+// keying the reset off the (shorter) trip window would let the gap
+// between top-of-ladder trips exceed the window and oscillate the
+// cooldown back to base — the escalation must survive its own backoff.
+const DEGRADED_COOLDOWN_RESET_MS = 300000;
+
+// Rolling-window trip check.  Prunes `times` in place (entries older
+// than windowMs against nowMs) and reports whether count-or-more
+// remain.  A standalone pure function so the trip logic can be lifted
+// verbatim into a bare `node -e` runtime probe (test_app_js.py style).
+function overflowWindowTripped(times, nowMs, count, windowMs) {
+  while (times.length && nowMs - times[0] > windowMs) times.shift();
+  return times.length >= count;
+}
+
+// Cooldown-ladder step for degraded catch-up.  Escalates (double, capped
+// at maxMs) when a trip recurs within resetMs of the last one; resets to
+// baseMs only after a genuine quiet gap.  Pure — keyed off the last-trip
+// TIMESTAMP, never the overflow-window array (which _enterDegradedCatchup
+// clears each trip, so keying off it would reset the ladder on every
+// storm's first overflow and the doubling would never escalate).  Split
+// out so the escalation is runtime-testable without a DOM-bound Pane.
+function degradedCooldownStep(
+  prevCooldownMs,
+  lastTripAtMs,
+  nowMs,
+  baseMs,
+  maxMs,
+  resetMs,
+) {
+  const cooldown = nowMs - lastTripAtMs > resetMs ? baseMs : prevCooldownMs;
+  return { cooldown, nextCooldownMs: Math.min(cooldown * 2, maxMs) };
+}
+
 class Pane {
   constructor(wsId, opts) {
     opts = opts || {};
@@ -252,6 +303,29 @@ class Pane {
     // Set when replay_truncated arrives mid-stream (refetching then would
     // detach the live bubble); consumed on the next idle edge.
     this._pendingTruncatedResync = false;
+    // Field instrumentation for the two distinct "output stops while the
+    // backend is healthy" causes: server-signalled overflow closes
+    // (dropped-events class) vs client dispatch/render throws (wedge
+    // class).  The console lines at each increment carry the running
+    // count, so a field report shows which class fired without a
+    // debugger attached.
+    this._streamHealth = { overflows: 0, renderThrows: 0, malformedFrames: 0 };
+    // Rolling timestamps of stream_overflow closes — input to the
+    // degraded catch-up limiter (see overflowWindowTripped above).
+    this._overflowTimes = [];
+    this._degradedTimer = null;
+    this._degradedCooldownMs = DEGRADED_COOLDOWN_BASE_MS;
+    // Timestamp of the last degraded-catchup trip; drives the cooldown
+    // ladder's escalate-vs-reset decision independently of _overflowTimes.
+    this._lastDegradedAt = 0;
+    // Close-on-hide bookkeeping.  A hidden tab's throttled event loop is
+    // the likeliest too-slow SSE consumer, so the visibilitychange
+    // handler closes the stream on hide and reconnects with the saved
+    // Last-Event-ID on show (replay_ok covers the gap).
+    // _hiddenDisconnect marks that WE closed for hide, so show never
+    // resurrects a stream that was closed deliberately elsewhere.
+    this._visHandler = null;
+    this._hiddenDisconnect = false;
     this._cancelTimeout = null;
     this._forceTimeout = null;
     this._pendingEditSend = null;
@@ -301,6 +375,15 @@ class Pane {
     if (this._forceTimeout) {
       clearTimeout(this._forceTimeout);
       this._forceTimeout = null;
+    }
+    // Any pending degraded-catch-up reconnect is owned by the stream
+    // lifecycle: whoever closes the stream (ws switch, giveUp, destroy,
+    // or a fresh manual connect — connectSSE's first line lands here)
+    // supersedes it.  _enterDegradedCatchup re-arms AFTER its own
+    // disconnect, so this never cancels the timer it is about to set.
+    if (this._degradedTimer) {
+      clearTimeout(this._degradedTimer);
+      this._degradedTimer = null;
     }
     if (this.evtSource) {
       this.evtSource.close();
@@ -1148,6 +1231,16 @@ class Pane {
     if (this._lastEventId != null) {
       evtUrl += "?last_event_id=" + encodeURIComponent(this._lastEventId);
     }
+    // Close-on-hide / replay-on-show: installed once per pane, removed
+    // by the factory's destroy().  A hidden tab's throttled drain is the
+    // likeliest slow consumer behind server-side queue overflow, and an
+    // idle hidden tab holds a node connection for nothing — closing on
+    // hide removes both, and the saved _lastEventId makes the show-edge
+    // reconnect lossless (replay_ok from the server's ring buffer).
+    if (!this._visHandler) {
+      this._visHandler = () => this._onVisibilityChange();
+      document.addEventListener("visibilitychange", this._visHandler);
+    }
     this.evtSource = new EventSource(evtUrl);
 
     this.evtSource.onopen = () => {
@@ -1180,7 +1273,13 @@ class Pane {
       try {
         data = JSON.parse(e.data);
       } catch (err) {
-        console.warn("interactive: dropping malformed SSE frame", err);
+        this._streamHealth.malformedFrames += 1;
+        console.warn(
+          "interactive: dropping malformed SSE frame (total " +
+            this._streamHealth.malformedFrames +
+            ")",
+          err,
+        );
         return;
       }
       // Tag the event with its own SSE id so the system_turn handler can
@@ -1191,8 +1290,13 @@ class Pane {
       try {
         this.handleEvent(data);
       } catch (err) {
+        this._streamHealth.renderThrows += 1;
         console.error(
-          "interactive: handleEvent failed for " + (data && data.type),
+          "interactive: handleEvent failed for " +
+            (data && data.type) +
+            " (render-throw total " +
+            this._streamHealth.renderThrows +
+            ")",
           err,
         );
       }
@@ -1219,6 +1323,98 @@ class Pane {
       // reconnect alone.
       this._host.onStreamError(this);
     };
+  }
+
+  _onVisibilityChange() {
+    if (document.hidden) {
+      // Closing beats letting the hidden tab's throttled event loop
+      // starve the drain until the server-side queue overflows.  The
+      // streaming refs (contentBuffer / currentAssistantEl) survive —
+      // disconnectSSE is transport-only — so the visible tail is intact
+      // when the tab comes back.
+      if (this.evtSource) {
+        this.disconnectSSE();
+        this._hiddenDisconnect = true;
+      }
+    } else if (this._hiddenDisconnect) {
+      this._hiddenDisconnect = false;
+      if (this.wsId) this.connectSSE(this.wsId);
+    }
+  }
+
+  _removeVisibilityHandler() {
+    if (this._visHandler) {
+      document.removeEventListener("visibilitychange", this._visHandler);
+      this._visHandler = null;
+    }
+    this._hiddenDisconnect = false;
+  }
+
+  _noteStreamOverflow() {
+    this._streamHealth.overflows += 1;
+    const now = Date.now();
+    this._overflowTimes.push(now);
+    console.warn(
+      "interactive: server closed the stream after a send-queue overflow " +
+        "(total " +
+        this._streamHealth.overflows +
+        "); reconnect will replay the gap",
+    );
+    // Trip when OVERFLOW_TRIP_COUNT closes land inside the rolling window.
+    // The cooldown-ladder reset lives in _enterDegradedCatchup (keyed off
+    // _lastDegradedAt), NOT here — this method only counts and trips.
+    if (
+      overflowWindowTripped(
+        this._overflowTimes,
+        now,
+        OVERFLOW_TRIP_COUNT,
+        OVERFLOW_TRIP_WINDOW_MS,
+      )
+    ) {
+      this._enterDegradedCatchup();
+    }
+  }
+
+  _enterDegradedCatchup() {
+    // Repeated overflow closes inside one window: this consumer cannot
+    // keep up with live streaming right now, and each reconnect round
+    // just stalls rendering behind the 2.5-4.5 s retry before
+    // re-saturating.  Stop the churn: close the stream, say so in plain
+    // language, and come back after a (doubling) cooldown — that
+    // reconnect replays the gap from the server's ring buffer, or falls
+    // to the replay_truncated → /history resync floor once the gap has
+    // outgrown it.  Either path is lossless for committed turns.
+    const now = Date.now();
+    // Escalate the cooldown when trips recur; reset to base only after a
+    // genuine quiet gap.  Keyed off _lastDegradedAt (a timestamp), NOT
+    // _overflowTimes — this method clears that array below, so keying the
+    // reset off it would restart the ladder on the next storm's first
+    // overflow and the doubling (15→30→60→120s) would never take effect.
+    const step = degradedCooldownStep(
+      this._degradedCooldownMs,
+      this._lastDegradedAt,
+      now,
+      DEGRADED_COOLDOWN_BASE_MS,
+      DEGRADED_COOLDOWN_MAX_MS,
+      DEGRADED_COOLDOWN_RESET_MS,
+    );
+    this._lastDegradedAt = now;
+    this._degradedCooldownMs = step.nextCooldownMs;
+    this._overflowTimes.length = 0;
+    this.disconnectSSE(); // also cancels any earlier degraded timer
+    this.statusBarEl.classList.add("ws-sb-disconnected");
+    this._sbTokens.textContent = "Connection is slow — catching up…";
+    const cooldown = step.cooldown;
+    this._degradedTimer = setTimeout(() => {
+      this._degradedTimer = null;
+      if (document.hidden) {
+        // Reopening into a throttled hidden tab would overflow again —
+        // defer to the visibilitychange show edge instead.
+        this._hiddenDisconnect = true;
+        return;
+      }
+      if (this.wsId) this.connectSSE(this.wsId);
+    }, cooldown);
   }
 
   _loadHistoryThenConnect(wsId) {
@@ -1487,7 +1683,13 @@ class Pane {
           try {
             streamingRenderFinalize(doneBodyEl, doneBuffer);
           } catch (err) {
-            console.warn("interactive: streamingRenderFinalize failed", err);
+            this._streamHealth.renderThrows += 1;
+            console.warn(
+              "interactive: streamingRenderFinalize failed (render-throw total " +
+                this._streamHealth.renderThrows +
+                ")",
+              err,
+            );
             doneBodyEl.textContent = doneBuffer;
           }
         }
@@ -1834,6 +2036,16 @@ class Pane {
         } else {
           this._pendingTruncatedResync = true;
         }
+        break;
+
+      case "stream_overflow":
+        // The server poisoned this listener at its first queue overflow
+        // and closes the stream right after this frame.  The frame is
+        // id-less, so lastEventId still points below the gap and the
+        // native EventSource reconnect replays it losslessly from the
+        // ring buffer.  Count the close: a persistently slow consumer
+        // trips the degraded catch-up instead of churning reconnects.
+        this._noteStreamOverflow();
         break;
     }
   }
@@ -4376,6 +4588,14 @@ function createInteractivePane(root, wsId, opts) {
     // reopen a stream for a session we just declared dead.
     pane._historyLoadToken = (pane._historyLoadToken || 0) + 1;
     pane.disconnectSSE();
+    // Detach the visibility handler and clear the hide-close marker: a dead
+    // controller must NOT be resurrected by a tab-visibility change.  Without
+    // this, a tab hidden BEFORE the give-up (which set _hiddenDisconnect) would,
+    // on return, fire _onVisibilityChange and connectSSE() the closed ws —
+    // reopening a stream the shell has declared gone and 404-reconnecting it
+    // forever (onStreamError early-returns when dead, so nothing stops it).
+    // Idempotent with destroy()'s own _removeVisibilityHandler call.
+    pane._removeVisibilityHandler();
     // Terminal wording — the transient error path says "Reconnecting…".
     pane.statusBarEl.classList.add("ws-sb-disconnected");
     pane._sbTokens.textContent = "Disconnected";
@@ -4405,6 +4625,15 @@ function createInteractivePane(root, wsId, opts) {
       if (recoverTimer) clearTimeout(recoverTimer);
       recoverTimer = setTimeout(() => {
         recoverTimer = null;
+        if (document.hidden) {
+          // Don't reopen an EventSource into a hidden (throttled) tab —
+          // that re-creates the slow-consumer overflow close-on-hide
+          // exists to prevent.  Mark it so the visibilitychange show edge
+          // owns the reconnect (a hide close normally set this already;
+          // set it defensively for the error-before-hide ordering).
+          pane._hiddenDisconnect = true;
+          return;
+        }
         if (
           pane.evtSource &&
           pane.evtSource.readyState !== EventSource.CLOSED
@@ -4504,6 +4733,10 @@ function createInteractivePane(root, wsId, opts) {
         recoverTimer = null;
       }
       pane.disconnectSSE();
+      // The document-level visibilitychange listener holds a strong ref
+      // to the pane — leaving it registered would both leak the pane and
+      // let a show edge reopen a stream for a destroyed controller.
+      pane._removeVisibilityHandler();
       // Terminal cleanup that transport-only reconnects must NOT do (see
       // disconnectSSE): cancel orphan grace timers so a post-destroy escape
       // can't paint into the detached pane / shared announcer, release the

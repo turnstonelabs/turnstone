@@ -2246,18 +2246,60 @@ def make_events_handler(cfg: SessionEndpointConfig) -> Handler:
                 # otherwise gate; shortening to 1s 5x'd the wakeup
                 # rate without any client-observable benefit).
                 #
-                # ``_seq`` filter: ``on_content_token`` /
-                # ``on_reasoning_token`` tag each emit with the
-                # per-ws event counter.  On the ``fresh`` path,
-                # events whose seq is already covered by the
-                # snapshot we just yielded get dropped to avoid
-                # double-rendering.  On ``replay_ok`` / ``truncated``
-                # paths, ``snap_seq`` is 0 so no live event is
-                # filtered — the replay buffer (or replay_truncated
-                # envelope) has already established the cutoff.
+                # ``_seq`` filter: token events are tagged with the
+                # per-ws event counter at enqueue time.  On the
+                # ``fresh`` and ``truncated`` paths, events whose seq
+                # is already covered by the snapshot we just yielded
+                # get dropped to avoid double-rendering.  On the
+                # ``replay_ok`` path ``snap_seq`` is 0 so no live
+                # event is filtered — the replayed buffer slice has
+                # already established the cutoff.
                 while True:
                     if await request.is_disconnected():
                         return
+                    if getattr(client_queue, "poisoned", False):
+                        # The queue overflowed: it latched ``poisoned``
+                        # at the FIRST rejected put, freezing its
+                        # contents as a contiguous prefix (see
+                        # ``_ListenerQueue``).
+                        if getattr(client_queue, "closing", False):
+                            # ws teardown raced the overflow: the queue is
+                            # poisoned AND its ws is closing.  Unwind as a
+                            # CLEAN close — no ``stream_overflow`` frame,
+                            # which would otherwise pollute the client's
+                            # drop-vs-wedge instrumentation and trip its
+                            # reconnect limiter on a ws that is simply gone
+                            # (the poisoned queue can't accept the in-band
+                            # ``ws_closed`` sentinel, so ``closing`` is the
+                            # only close signal it will ever see).  Recovery
+                            # of the frozen tail is the ``/history`` reload,
+                            # not a reconnect — the ws is gone.
+                            return
+                        # Genuine slow-consumer overflow (ws still live).
+                        # Close now — the queued backlog is discarded,
+                        # because the ring buffer replays everything past
+                        # the client's ``Last-Event-ID`` on the native
+                        # EventSource reconnect.  Delivering the backlog
+                        # first would only stall recovery behind the very
+                        # consumer that couldn't keep up.  The farewell
+                        # frame is id-less so ``lastEventId`` stays below
+                        # the gap; the client counts these closes for its
+                        # reconnect rate-limiter and the drop-vs-render-
+                        # wedge field instrumentation.
+                        log.info(
+                            "ws.events.overflow_close ws=%s",
+                            ws_id[:8],
+                        )
+                        yield {"data": json.dumps({"type": "stream_overflow", "ws_id": ws_id})}
+                        return
+                    # NOT poisoned: a ``closing`` ws is handled by the
+                    # in-band ``ws_closed`` sentinel below, AFTER the FIFO
+                    # drain delivers every queued event.  Returning here on
+                    # ``closing`` (as an earlier revision did) would drop a
+                    # healthy-but-slightly-behind client's queued tail (the
+                    # turn's final content batch + ``stream_end``) at
+                    # teardown — a permanent truncation, since a close has
+                    # no reconnect+replay to repaint it.
                     try:
                         event = await loop.run_in_executor(
                             live_executor,

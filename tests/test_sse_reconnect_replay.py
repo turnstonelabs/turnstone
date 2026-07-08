@@ -20,6 +20,7 @@ The browser-side guard for the ``onerror`` close pattern lives in
 from __future__ import annotations
 
 import asyncio
+import queue
 import threading
 from types import SimpleNamespace as SimpleNS
 from typing import Any
@@ -199,17 +200,17 @@ def test_event_id_monotonic_under_concurrent_writers() -> None:
 
 
 def test_event_id_does_not_skip_when_listener_queue_full() -> None:
-    """If a slow listener's queue is full, the per-listener
-    ``put_nowait`` is silently dropped — but the counter must NOT
-    skip.  A subsequently-registered listener with
-    ``Last-Event-ID=0`` must see ALL the ids from the buffer
-    (1..N), not a sparse subset.  Pre-bug-class: moving the
-    id-increment inside the per-listener loop would create phantom
-    "gaps" the truncation detector would misread."""
+    """If a slow listener's queue is full, the per-listener put is
+    rejected (the first rejection poisons the listener; later ones are
+    latch refusals) — but the counter must NOT skip.  A subsequently-
+    registered listener with ``Last-Event-ID=0`` must see ALL the ids
+    from the buffer (1..N), not a sparse subset.  Pre-bug-class:
+    moving the id-increment inside the per-listener loop would create
+    phantom "gaps" the truncation detector would misread."""
     ui = _make_ui()
     slow_lq = ui._register_listener(maxsize=1)
     slow_lq.put_nowait({"placeholder": True})  # full immediately
-    # Fire 10 events — 9 will hit queue.Full and be suppressed.
+    # Fire 10 events — none can land in the full/poisoned queue.
     for i in range(10):
         ui._enqueue({"type": "tool_started", "name": f"t{i}"})
     # Replay from id=0 — fresh listener gets all 10, ids 1..10 dense.
@@ -261,12 +262,18 @@ def test_cross_thread_writer_and_replay_observer_consistent() -> None:
         )
 
 
-def test_event_id_persists_across_turn_boundaries() -> None:
+def test_event_id_persists_across_turn_boundaries(monkeypatch: Any) -> None:
     """Resetting ``_event_id`` to 0 at turn boundaries would silently
     mis-replay a long-lived SSE subscriber whose ``Last-Event-ID``
     was from a prior turn.  Mirrors the pre-existing
     ``test_inflight_seq_monotonic_across_turn_boundaries`` invariant
-    on the snap_seq side, extended to the buffer/replay side."""
+    on the snap_seq side, extended to the buffer/replay side.
+
+    Batch window forced to 0 (per-token flush) — this test pins id
+    numbering across turn boundaries, not the batching cadence."""
+    import turnstone.core.session_ui_base as suib
+
+    monkeypatch.setattr(suib, "_TOKEN_BATCH_WINDOW_SECS", 0.0)
     ui = _make_ui()
     ui.on_content_token("turn-N tok1 ")
     ui.on_content_token("turn-N tok2 ")
@@ -305,7 +312,7 @@ def test_replay_ok_skips_in_progress_snapshot_path() -> None:
     assert snap["seq"] >= 1
 
 
-def test_truncated_path_snapshot_captures_real_snap_seq() -> None:
+def test_truncated_path_snapshot_captures_real_snap_seq(monkeypatch: Any) -> None:
     """Regression for PR #542 review comment 1 (Copilot, low-confidence).
 
     On the truncated path the caller used to set ``snap_seq=0``, which
@@ -321,9 +328,15 @@ def test_truncated_path_snapshot_captures_real_snap_seq() -> None:
     ``register_listener_with_replay`` under the same nested-lock
     acquire as the listener registration + buffer slice + counter
     read, so ``snap_seq`` returned in the snapshot is the exact
-    high-water mark the snapshot text corresponds to."""
+    high-water mark the snapshot text corresponds to.
+
+    Batch window forced to 0 so each token is its own ring entry —
+    the truncation scenario needs 10 distinct buffered events."""
     import collections
 
+    import turnstone.core.session_ui_base as suib
+
+    monkeypatch.setattr(suib, "_TOKEN_BATCH_WINDOW_SECS", 0.0)
     ui = _make_ui()
     ui._event_buffer = collections.deque(maxlen=3)
     # Fire enough events to trigger truncation on reconnect with a
@@ -362,15 +375,15 @@ def test_snap_seq_high_water_mark_holds_under_writer_race() -> None:
     double-render.
 
     The race window in plain Python is narrow (a few bytecodes
-    between lock release and the ``_enqueue`` call), so a pure
-    barrier-based race rarely hits it.  This test injects a
-    deterministic sleep into ``_enqueue`` via monkey-patch to
-    widen the window enough to be reliably observed under the
-    pre-fix code path — AND to be reliably AVOIDED under the
-    post-fix code path (because the post-fix
-    ``on_content_token`` calls ``_enqueue`` while still holding
-    ``_ws_lock``, so the snapshot reader can't acquire
-    ``_ws_lock`` until the writer is fully done).
+    between lock release and the emit call), so a pure barrier-based
+    race rarely hits it.  This test injects a deterministic sleep
+    into ``_enqueue_direct`` — the inner emit point the token
+    batcher's flush calls under ``_ws_lock`` — to widen the window
+    enough to be reliably observed if the flush's inflight-append
+    and enqueue are ever split across ``_ws_lock`` sections, AND to
+    be reliably AVOIDED under the correct code path (the flush holds
+    ``_ws_lock`` across both, so the snapshot reader can't acquire
+    it until the writer is fully done).
     """
     import queue
     import threading
@@ -378,20 +391,20 @@ def test_snap_seq_high_water_mark_holds_under_writer_race() -> None:
 
     ui = _make_ui()
     marker = "RACE-MARKER"
-    original_enqueue = ui._enqueue
+    original_direct = ui._enqueue_direct
 
-    # Widen the race window: sleep just BEFORE the original
-    # ``_enqueue`` runs (which is where ``_event_id`` would advance).
-    # Post-fix this sleep happens while the writer still holds
-    # ``_ws_lock`` — readers block.  Pre-fix the writer has
-    # released ``_ws_lock`` before reaching this monkey-patch, so
-    # the reader gets a clean window to capture an inconsistent
-    # ``(inflight, _event_id)`` pair.
-    def slow_enqueue(data: dict[str, Any]) -> None:
+    # Widen the race window: sleep just BEFORE the inner emit runs
+    # (which is where ``_event_id`` advances).  Under the correct
+    # locking this sleep happens while the writer still holds
+    # ``_ws_lock`` — readers block.  If the flush ever releases
+    # ``_ws_lock`` before its enqueue, the reader gets a clean
+    # window to capture an inconsistent ``(inflight, _event_id)``
+    # pair and the invariant below trips.
+    def slow_direct(data: dict[str, Any]) -> int:
         time.sleep(0.05)  # 50 ms — orders of magnitude wider than the GIL switch interval
-        return original_enqueue(data)
+        return original_direct(data)
 
-    ui._enqueue = slow_enqueue  # type: ignore[method-assign]
+    ui._enqueue_direct = slow_direct  # type: ignore[method-assign]
 
     snap_box: dict[str, Any] = {}
     writer_done = threading.Event()
@@ -572,10 +585,16 @@ def test_handler_emits_retry_on_first_yield() -> None:
     assert 2500 <= retry <= 4500, f"retry {retry} outside jitter band [2500, 4500]"
 
 
-def test_handler_replay_ok_skips_snapshot_emits_id() -> None:
+def test_handler_replay_ok_skips_snapshot_emits_id(monkeypatch: Any) -> None:
     """``Last-Event-ID`` + buffer covers gap → emit buffered events
     with SSE ``id:`` field, SKIP the in-progress snapshot (it would
-    double-render content the buffered events already carry)."""
+    double-render content the buffered events already carry).
+
+    Batch window forced to 0 so the two tokens are two ring entries
+    (the assertion wants two distinct ``id:`` lines)."""
+    import turnstone.core.session_ui_base as suib
+
+    monkeypatch.setattr(suib, "_TOKEN_BATCH_WINDOW_SECS", 0.0)
     ui = _make_ui()
     ui.on_content_token("hello ")
     ui.on_content_token("world")
@@ -590,13 +609,19 @@ def test_handler_replay_ok_skips_snapshot_emits_id() -> None:
     assert "id: 2" in blob, f"missing id: 2 in:\n{blob}"
 
 
-def test_handler_truncated_emits_envelope_then_snapshot() -> None:
+def test_handler_truncated_emits_envelope_then_snapshot(monkeypatch: Any) -> None:
     """Stale ``Last-Event-ID`` + buffer too short → emit
     ``replay_truncated`` envelope, THEN fall through to the
     fresh-style replay (state_change + in_progress_snapshot) as the
-    recovery floor."""
+    recovery floor.
+
+    Batch window forced to 0 so each token is its own ring entry —
+    the truncation scenario needs the deque to evict."""
     import collections
 
+    import turnstone.core.session_ui_base as suib
+
+    monkeypatch.setattr(suib, "_TOKEN_BATCH_WINDOW_SECS", 0.0)
     ui = _make_ui()
     ui._event_buffer = collections.deque(maxlen=3)
     for i in range(10):
@@ -717,3 +742,382 @@ def test_handler_replay_ok_does_not_resurface_last_error(monkeypatch: Any) -> No
     ui.on_content_token("hi")  # one buffered event so Last-Event-ID=0 → replay_ok
     _, blob = _drain_handler_yields(ui, headers={"Last-Event-ID": "0"}, state="error", max_yields=8)
     assert "boom" not in blob
+
+
+# ---------------------------------------------------------------------------
+# Poison-on-overflow (Fix A) — queue.Full stops being a silent drop
+# ---------------------------------------------------------------------------
+#
+# Silent per-listener drops at queue.Full left permanent holes BELOW the
+# client's advancing lastEventId (scattered interleaved drops once the
+# queue saturates), which reconnect-with-replay can never heal (the slice
+# is ``eid > last_event_id`` only).  The listener queue now latches
+# ``poisoned`` atomically at the FIRST rejected put and refuses every
+# later put, freezing its contents as a contiguous prefix; the drain
+# loop closes the stream (after an id-less ``stream_overflow`` frame)
+# and the native EventSource reconnect replays the contiguous tail.
+#
+# Poisoning at the first full (not after N) is load-bearing: any
+# delivered-while-dropping window advances lastEventId past interior
+# holes -> permanent gap even after a "successful" reconnect.
+
+
+def _fake_live_request(*, path_params: dict[str, str] | None = None) -> Request:
+    """A request whose ``receive()`` never resolves, so
+    ``is_disconnected()`` stays ``False`` — the poison check, not
+    disconnect detection, must be what terminates the drain loop."""
+    scope = {
+        "type": "http",
+        "method": "GET",
+        "headers": [],
+        "path": "/events",
+        "raw_path": b"/events",
+        "query_string": b"",
+        "path_params": path_params or {},
+        "app": MagicMock(),
+    }
+
+    async def _recv() -> dict[str, Any]:
+        await asyncio.Event().wait()  # pends forever
+        return {"type": "http.disconnect"}  # unreachable
+
+    return Request(scope, receive=_recv)
+
+
+def test_listener_queue_poisons_at_first_full_and_refuses_after() -> None:
+    """The first rejected put latches ``poisoned`` (atomically, under
+    the queue's own mutex) and every later put is refused even if the
+    consumer frees slots — otherwise a racing consumer pop would let a
+    later event land BEHIND the hole and the drain would deliver past
+    it, advancing lastEventId beyond an unreplayable gap."""
+    ui = _make_ui()
+    lq = ui._register_listener(maxsize=2)
+    ui._enqueue({"type": "a"})
+    ui._enqueue({"type": "b"})
+    assert getattr(lq, "poisoned", None) is False
+    ui._enqueue({"type": "c"})  # first overflow -> latch
+    assert lq.poisoned is True
+    lq.get_nowait()  # consumer frees a slot
+    ui._enqueue({"type": "d"})  # must be refused — queue contents frozen
+    leftover = []
+    while True:
+        try:
+            leftover.append(lq.get_nowait())
+        except queue.Empty:
+            break
+    assert [ev["type"] for ev in leftover] == ["b"], (
+        "a post-poison put landed in the freed slot — interior hole"
+    )
+    # The ring is untouched by listener poisoning: ids stay dense.
+    _, replay, status, _, _, _ = ui.register_listener_with_replay(0)
+    assert status == "replay_ok"
+    assert [ev["_event_id"] for ev in replay] == [1, 2, 3, 4]
+
+
+def test_poisoned_gap_is_contiguous_tail_fully_replayable() -> None:
+    """Recovery math at the poison instant: delivered ids form a
+    contiguous prefix, the ring holds everything, and a reconnect with
+    ``Last-Event-ID = <last delivered>`` replays exactly the missing
+    tail — no duplicate, no loss, no off-by-one."""
+    ui = _make_ui()
+    lq = ui._register_listener(maxsize=3)
+    for i in range(5):
+        ui._enqueue({"type": "tool_started", "name": f"t{i}"})
+    # Queue froze at [1,2,3]; 4 latched poison; 5 was refused.
+    delivered = []
+    while True:
+        try:
+            delivered.append(lq.get_nowait()["_event_id"])
+        except queue.Empty:
+            break
+    assert delivered == [1, 2, 3]
+    _, replay, status, lost, _, _ = ui.register_listener_with_replay(delivered[-1])
+    assert status == "replay_ok"
+    assert lost == 0
+    assert [ev["_event_id"] for ev in replay] == [4, 5]
+    assert delivered + [ev["_event_id"] for ev in replay] == [1, 2, 3, 4, 5]
+
+
+def test_poison_isolated_to_slow_listener() -> None:
+    """One slow tab must not degrade its siblings: the healthy listener
+    keeps receiving every event after the slow one is poisoned (and the
+    poisoned one stops consuming fan-out puts entirely)."""
+    ui = _make_ui()
+    slow = ui._register_listener(maxsize=1)
+    healthy = ui._register_listener(maxsize=100)
+    for i in range(6):
+        ui._enqueue({"type": "tool_started", "name": f"t{i}"})
+    assert slow.poisoned is True
+    got = []
+    while True:
+        try:
+            got.append(healthy.get_nowait()["name"])
+        except queue.Empty:
+            break
+    assert got == [f"t{i}" for i in range(6)]
+
+
+def test_drain_loop_closes_with_overflow_frame_on_poison() -> None:
+    """Once its queue is poisoned the drain loop must terminate the SSE
+    response — discarding the queued backlog (the replay covers it) —
+    after yielding a final id-less ``stream_overflow`` frame so the
+    client can count overflow closes (reconnect-limiter + the
+    drop-vs-render-wedge field instrumentation) without advancing
+    ``lastEventId`` past the gap."""
+    from turnstone.core.session_ui_base import _DEFAULT_LISTENER_QUEUE_MAX
+
+    ui = _make_ui()
+    handler = _wire_events_handler(ui)
+    req = _fake_live_request(path_params={"ws_id": ui.ws_id})
+
+    async def _run() -> list[Any]:
+        resp = await handler(req)
+        agen = resp.body_iterator
+        yields = [await agen.__anext__()]  # retry frame
+        yields.append(await agen.__anext__())  # synthetic state_change
+        # Overflow the registered listener's queue: cap fills, +1 poisons.
+        for i in range(_DEFAULT_LISTENER_QUEUE_MAX + 1):
+            ui._enqueue({"type": "info", "message": f"m{i}"})
+        yields.append(await agen.__anext__())  # overflow frame, then close
+        try:
+            extra = await agen.__anext__()
+        except StopAsyncIteration:
+            extra = None
+        yields.append(extra)
+        return yields
+
+    yields = asyncio.run(_run())
+    assert yields[-1] is None, "drain loop kept yielding after poison"
+    overflow = yields[-2]
+    assert isinstance(overflow, dict)
+    assert "stream_overflow" in overflow["data"]
+    assert "id" not in overflow, (
+        "the overflow frame must not carry an SSE id — advancing "
+        "lastEventId here would strand the dropped gap below the cursor"
+    )
+    # The 500-event backlog was discarded, not delivered: nothing
+    # between the synthetic replay and the overflow frame.
+    assert all("m0" not in str(y) for y in yields)
+
+
+def test_drain_loop_delivers_until_poison_then_stops_before_backlog() -> None:
+    """Pre-poison delivery works normally; at poison the loop closes
+    BEFORE delivering the queued backlog (check precedes the blocking
+    get), so the client's lastEventId freezes at the contiguous prefix
+    and reconnect replays everything else."""
+    from turnstone.core.session_ui_base import _DEFAULT_LISTENER_QUEUE_MAX
+
+    ui = _make_ui()
+    handler = _wire_events_handler(ui)
+    req = _fake_live_request(path_params={"ws_id": ui.ws_id})
+
+    async def _run() -> tuple[list[Any], Any, Any]:
+        resp = await handler(req)
+        agen = resp.body_iterator
+        head = [await agen.__anext__(), await agen.__anext__()]  # retry + state
+        ui._enqueue({"type": "info", "message": "live-1"})
+        live = await agen.__anext__()
+        for i in range(_DEFAULT_LISTENER_QUEUE_MAX + 1):
+            ui._enqueue({"type": "info", "message": f"m{i}"})
+        tail = await agen.__anext__()
+        try:
+            await agen.__anext__()
+            closed = False
+        except StopAsyncIteration:
+            closed = True
+        return head, live, (tail, closed)
+
+    _, live, (tail, closed) = asyncio.run(_run())
+    assert "live-1" in live["data"]
+    assert "stream_overflow" in tail["data"]
+    assert closed, "generator must return right after the overflow frame"
+
+
+def test_overflow_reconnect_replays_full_gap_through_handler() -> None:
+    """End-to-end recovery shape: after an overflow close, a reconnect
+    carrying the pre-poison ``Last-Event-ID`` replays the whole gap via
+    ``replay_ok`` — the poisoned stream lost nothing durable."""
+    ui = _make_ui()
+    lq = ui._register_listener(maxsize=3)
+    for i in range(5):
+        ui._enqueue({"type": "tool_started", "name": f"t{i}"})
+    delivered_ids = []
+    while True:
+        try:
+            delivered_ids.append(lq.get_nowait()["_event_id"])
+        except queue.Empty:
+            break
+    ui._unregister_listener(lq)  # what the drain loop's finally does
+    _, blob = _drain_handler_yields(
+        ui, headers={"Last-Event-ID": str(delivered_ids[-1])}, max_yields=6
+    )
+    assert "replay_truncated" not in blob
+    assert "t3" in blob
+    assert "t4" in blob
+
+
+def test_listener_queue_basic_put_get_semantics() -> None:
+    """Stdlib-drift canary for ``_ListenerQueue.put_nowait``'s
+    reimplementation against ``queue.Queue``'s documented extension
+    surface (``mutex`` / ``_qsize`` / ``_put`` / ``unfinished_tasks`` /
+    ``not_empty``): normal put/get round-trips work, FIFO order holds,
+    a blocked ``get(timeout=...)`` is woken by a put (the
+    ``not_empty.notify`` path the drain loop's executor get relies on),
+    and the poison latch engages exactly at the first rejected put."""
+    from turnstone.core.session_ui_base import _ListenerQueue
+
+    q = _ListenerQueue(maxsize=2)
+    q.put_nowait({"n": 1})
+    q.put_nowait({"n": 2})
+    assert q.qsize() == 2
+    try:
+        q.put_nowait({"n": 3})
+        raise AssertionError("third put must raise queue.Full")
+    except queue.Full:
+        pass
+    assert q.poisoned is True
+    assert q.get_nowait()["n"] == 1  # FIFO preserved
+    try:
+        q.put_nowait({"n": 4})
+        raise AssertionError("post-poison put must be refused")
+    except queue.Full:
+        pass
+    assert q.get_nowait()["n"] == 2
+
+    # A blocked get() must be woken by a concurrent put_nowait — the
+    # notify path the events handler's executor get depends on.
+    fresh = _ListenerQueue(maxsize=2)
+    got: list[dict[str, Any]] = []
+
+    def _getter() -> None:
+        got.append(fresh.get(timeout=5))
+
+    t = threading.Thread(target=_getter)
+    t.start()
+    fresh.put_nowait({"n": 42})
+    t.join(timeout=5)
+    assert not t.is_alive(), "get(timeout) never woke — not_empty.notify broken"
+    assert got == [{"n": 42}]
+
+
+def test_closing_queue_unwinds_clean_not_overflow_when_poisoned() -> None:
+    """Review finding [1]: a ws closing/evicting while a slow pane's
+    queue is full must unwind as a CLEAN close, not a false
+    ``stream_overflow``.  The poison latch rejects the in-band
+    ``ws_closed`` sentinel, so ``mark_closing`` carries the signal
+    out-of-band and the drain loop honours it BEFORE the poison check —
+    otherwise a clean close of a slow consumer is mis-reported as a
+    send-overflow (polluting the client's drop-vs-wedge counter and
+    tripping its reconnect limiter on a ws that is simply gone)."""
+    ui = _make_ui()
+    handler = _wire_events_handler(ui)
+    req = _fake_live_request(path_params={"ws_id": ui.ws_id})
+
+    async def _run() -> tuple[Any, bool]:
+        resp = await handler(req)
+        agen = resp.body_iterator
+        await agen.__anext__()  # retry frame
+        await agen.__anext__()  # synthetic state_change
+        # Overflow the listener queue so it poisons, exactly as a slow
+        # consumer would, THEN close the ws (evict/delete/close path).
+        from turnstone.core.session_ui_base import _DEFAULT_LISTENER_QUEUE_MAX
+
+        for i in range(_DEFAULT_LISTENER_QUEUE_MAX + 1):
+            ui._enqueue({"type": "info", "message": f"m{i}"})
+        assert ui._listeners, "listener should still be registered pre-close"
+        lq = ui._listeners[0]
+        assert lq.poisoned is True
+        # Simulate _broadcast_ws_closed_to_listeners' out-of-band flag.
+        lq.mark_closing()
+        try:
+            frame = await agen.__anext__()
+            closed = False
+        except StopAsyncIteration:
+            frame = None
+            closed = True
+        return frame, closed
+
+    frame, closed = asyncio.run(_run())
+    assert closed, "closing queue must end the stream"
+    assert frame is None, f"closing ws must NOT emit a stream_overflow frame; got {frame!r}"
+
+
+def test_broadcast_ws_closed_marks_closing_on_poisoned_queue() -> None:
+    """The teardown broadcaster must set the out-of-band ``closing``
+    flag even when the queue is poisoned/full (its in-band ``ws_closed``
+    put is refused by the poison latch).  Pins the wiring finding [1]
+    depends on: ``mark_closing`` is called for every listener."""
+    from turnstone.core.adapters._ui_cleanup import _broadcast_ws_closed_to_listeners
+
+    ui = _make_ui()
+    lq = ui._register_listener(maxsize=2)
+    ui._enqueue({"type": "a"})
+    ui._enqueue({"type": "b"})
+    ui._enqueue({"type": "c"})  # overflow -> poison
+    assert lq.poisoned is True
+    assert lq.closing is False
+    _broadcast_ws_closed_to_listeners(ui)
+    assert lq.closing is True, "teardown must flag the poisoned queue closing"
+    # Broadcaster clears the listener list (no re-fire on a closed ws).
+    assert ui._listeners == []
+
+
+def test_healthy_queue_close_still_delivers_ws_closed_sentinel() -> None:
+    """The out-of-band flag must not regress the normal path: a
+    non-full queue still receives the in-band ``ws_closed`` sentinel
+    (so a drain loop blocked in ``get`` wakes immediately) AND gets the
+    ``closing`` flag."""
+    from turnstone.core.adapters._ui_cleanup import _broadcast_ws_closed_to_listeners
+
+    ui = _make_ui()
+    lq = ui._register_listener(maxsize=100)
+    _broadcast_ws_closed_to_listeners(ui)
+    assert lq.closing is True
+    drained = []
+    while True:
+        try:
+            drained.append(lq.get_nowait())
+        except queue.Empty:
+            break
+    assert {ev["type"] for ev in drained} == {"ws_closed"}
+
+
+def test_healthy_closing_queue_drains_tail_before_close() -> None:
+    """Review round-2 finding [0]: a healthy (non-poisoned) client that is
+    momentarily behind must still receive its queued tail — the turn's
+    final content batch + ``stream_end`` — at ws teardown.  A close has no
+    reconnect+replay, so dropping that tail truncates the last assistant
+    message permanently.  The ``closing`` flag must therefore NOT
+    short-circuit the FIFO drain for a healthy queue (an earlier revision
+    checked it at the top of the loop and did exactly that); the in-band
+    ``ws_closed`` sentinel — which fits, the queue isn't full — closes the
+    stream AFTER the drain delivers everything."""
+    from turnstone.core.adapters._ui_cleanup import _broadcast_ws_closed_to_listeners
+
+    ui = _make_ui()
+    handler = _wire_events_handler(ui)
+    req = _fake_live_request(path_params={"ws_id": ui.ws_id})
+
+    async def _run() -> list[str]:
+        resp = await handler(req)
+        agen = resp.body_iterator
+        await agen.__anext__()  # retry frame
+        await agen.__anext__()  # synthetic state_change
+        # Enqueue the turn's tail into a HEALTHY (roomy) queue, then close
+        # the ws while those events are still undrained.
+        ui.on_content_token("final answer")
+        ui.on_stream_end()
+        _broadcast_ws_closed_to_listeners(ui)  # mark_closing + ws_closed sentinel
+        out: list[str] = []
+        while True:
+            try:
+                frame = await agen.__anext__()
+            except StopAsyncIteration:
+                break
+            out.append(frame["data"] if isinstance(frame, dict) else str(frame))
+        return out
+
+    blob = "\n".join(asyncio.run(_run()))
+    assert "final answer" in blob, "healthy closing queue dropped its content tail"
+    assert "stream_end" in blob, "healthy closing queue dropped stream_end"
+    assert "stream_overflow" not in blob, "a healthy close must not emit an overflow frame"

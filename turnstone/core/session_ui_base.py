@@ -42,8 +42,107 @@ log = get_logger(__name__)
 
 # Matches WebUI's historical listener queue size and the coordinator
 # UI's ``_LISTENER_QUEUE_MAX``. Per-queue cap keeps a slow SSE consumer
-# from bloating memory.
+# from bloating memory.  Headroom only — the load fix for fast models
+# is emit-time token batching (below), and the recovery for a consumer
+# that still can't keep up is the poison-at-first-overflow close in
+# :class:`_ListenerQueue` + the events handler's reconnect replay.
 _DEFAULT_LISTENER_QUEUE_MAX = 500
+
+# Emit-time micro-batching of content/reasoning fragments.  At
+# local-inference rates (500-2000 tok/s) per-delta ``_enqueue`` calls
+# were the event load that overflowed listener queues; coalescing
+# fragments over a small window cuts the wire event rate 10-20x while
+# staying invisible at human reading speed (tokens already arrive
+# faster than a display frame).  A batch is assembled BEFORE
+# ``_enqueue`` and gets one fresh ``_event_id``, so it never violates
+# the no-in-ring-coalescing rule (see ``_resolve_event_buffer_max``):
+# no consumer's ``last_event_id`` can fall inside a batch.
+#
+# The window is measured from the LAST flush, checked on token
+# arrival (no timer thread): the first fragment after ≥window of
+# quiet flushes immediately (time-to-first-token protection at turn
+# starts and after tool pauses), a sustained stream flushes every
+# ~window, and a slow stream (fragments arriving further apart than
+# the window) degenerates to per-token flushes — batching
+# self-disables.  The size cap bounds worst-case batch size (client
+# repaint cost) independent of rate.  Both are read at call time so
+# tests can pin cadence-sensitive behaviour deterministically.
+_TOKEN_BATCH_WINDOW_SECS = 0.025
+_TOKEN_BATCH_MAX_CHARS = 4096
+
+
+class _ListenerOverflow(queue.Full):
+    """Raised by :meth:`_ListenerQueue.put_nowait` exactly once per queue —
+    at the rejected put that latches ``poisoned``.  A ``queue.Full``
+    subclass so any caller that suppresses ``Full`` keeps working; the
+    fan-out in ``_enqueue_direct`` catches this subclass first to log the
+    overflow transition exactly once without racy flag bookkeeping."""
+
+
+class _ListenerQueue(queue.Queue[dict[str, Any]]):
+    """Per-SSE-listener queue that poisons itself at the FIRST rejected put.
+
+    A silently-dropped event is unrecoverable: once the consumer keeps
+    draining past a drop, its ``Last-Event-ID`` advances beyond the hole
+    and the reconnect replay (``eid > last_event_id``) never revisits it —
+    scattered interleaved drops under saturation corrupt the pane
+    permanently.  Poisoning at the first full instead freezes the queue's
+    contents as a contiguous prefix: the drain loop closes the stream, the
+    client reconnects with the last id it processed, and the ring buffer
+    replays the whole gap (the rejected event included — the ring append
+    precedes the per-listener put).
+
+    The latch and the rejection are one atomic step under the queue's own
+    ``mutex`` — the same lock every ``put_nowait``/``get`` uses — and a
+    poisoned queue refuses every later put.  Without that atomicity a
+    concurrent producer could land a later event in a slot the consumer
+    freed mid-latch, leaving an interior hole BEHIND the delivered
+    high-water mark (exactly the unrecoverable shape poisoning exists to
+    prevent).
+
+    Reimplements ``put_nowait`` against the documented ``queue.Queue``
+    extension surface (``mutex`` / ``_qsize`` / ``_put`` /
+    ``unfinished_tasks`` / ``not_empty``) because the stdlib body offers
+    no hook between the full-check and the insert;
+    ``test_listener_queue_basic_put_get_semantics`` canaries stdlib drift.
+    """
+
+    def __init__(self, maxsize: int = 0) -> None:
+        super().__init__(maxsize)
+        # Latched under ``self.mutex``; read locklessly by the events
+        # handler's drain loop (a stale read just delays the close by
+        # one iteration) and by ``_enqueue_direct``'s fan-out snapshot.
+        self.poisoned = False
+        # Set at ws teardown by ``_broadcast_ws_closed_to_listeners``.
+        # The drain loop checks this BEFORE ``poisoned`` so a full/
+        # poisoned queue whose ws is *closing* unwinds as a CLEAN close —
+        # not a false ``stream_overflow`` frame + client reconnect.  It
+        # has to travel out-of-band because a poisoned/full queue rejects
+        # the in-band ``ws_closed`` sentinel (the exact case the eviction-
+        # safe retry in ``_broadcast_ws_closed_to_listeners`` targets).
+        self.closing = False
+
+    def put_nowait(self, item: dict[str, Any]) -> None:
+        with self.mutex:
+            if self.poisoned:
+                raise queue.Full
+            if 0 < self.maxsize <= self._qsize():
+                self.poisoned = True
+                raise _ListenerOverflow
+            self._put(item)
+            self.unfinished_tasks += 1
+            self.not_empty.notify()
+
+    def mark_closing(self) -> None:
+        """Flag this listener's stream for a clean close at ws teardown.
+
+        Out-of-band (a bare bool set under ``self.mutex``) because a
+        poisoned/full queue rejects the in-band ``ws_closed`` sentinel,
+        yet the drain loop must still unwind as a clean close rather than
+        emit a spurious overflow frame.  Idempotent."""
+        with self.mutex:
+            self.closing = True
+
 
 # Recall: how many finished task agents' projected sub-trajectories to retain
 # in memory for /history card rebuilds.  LRU-bounded so a marathon workstream
@@ -146,29 +245,35 @@ def _resolve_event_buffer_max() -> int:
     casual reading of "how many events does an SSE stream see":
 
     1. Local-inference deployments stream at 500–2000 tok/s per
-       active model.  Each token is an ``_enqueue`` call, so a single
-       active workstream can fire ~2000 events/sec sustained.  At
-       the 50000 cap that buys ~25 s of pure token streaming before
-       truncation; at typical cloud-provider rates (50–200 events/sec
-       per stream) it's minutes of coverage.
+       active model.  Emit-time batching (``_TOKEN_BATCH_*``)
+       coalesces those into ~40 events/sec of content, so the cap
+       now buys the ring MINUTES of coverage at any token rate —
+       but tool-chunk storms and multi-listener turns still burst,
+       and the cap is deliberately sized for the pre-batching worst
+       case as safety margin.
     2. Browsers throttle the SSE-drain microtask aggressively when
        the tab isn't visible (Chrome's background-tab budget drops
-       to ~1 wake/min after ~5 min hidden).  A backgrounded tab can
-       legitimately go tens of seconds without draining its
-       EventSource buffer — and PR-G (drop-pings-let-it-die)
-       deliberately closes those connections on hide.  Reconnect-with-
-       replay is the recovery path; if the buffer evicted in the
-       interim, the snapshot floor is all that's left.
+       to ~1 wake/min after ~5 min hidden).  The client closes its
+       EventSource on tab-hide and reconnects with the saved
+       ``Last-Event-ID`` on show (interactive.js ``visibilitychange``
+       handler), so the ring's job is covering that hide window;
+       a consumer that stays slow while visible is handled by the
+       listener-queue poison → reconnect-replay path instead.  If
+       the buffer evicted in the interim, the snapshot floor is all
+       that's left.
 
-    Why not coalesce consecutive content/reasoning tokens?  A naive
-    text-merge breaks the replay-slice semantic: a coalesced entry
-    has the latest ``_event_id`` but text that includes content the
-    client already received under an earlier id, so any consumer
-    with ``last_event_id`` falling INSIDE the coalesced span would
-    double-render.  A correctness-preserving coalesce would need a
-    per-consumer high-water tracker we deliberately don't maintain
-    (consumers register and disconnect independently).  Bigger cap
-    + simple per-event storage avoids the trap.
+    Why not coalesce consecutive content/reasoning tokens IN THE
+    RING?  A naive in-buffer text-merge breaks the replay-slice
+    semantic: a coalesced entry has the latest ``_event_id`` but
+    text that includes content the client already received under an
+    earlier id, so any consumer with ``last_event_id`` falling
+    INSIDE the coalesced span would double-render.  A correctness-
+    preserving coalesce would need a per-consumer high-water tracker
+    we deliberately don't maintain (consumers register and
+    disconnect independently).  Bigger cap + simple per-event
+    storage avoids the trap.  (Emit-time batching is different in
+    kind: it merges fragments BEFORE they get an id, so a batch is
+    one ordinary ring entry no cursor can fall inside.)
 
     Memory cost is ~200–500 bytes per event (deque node + dict
     overhead + payload), so 50000 × 100-ws design ceiling caps at
@@ -505,6 +610,23 @@ class SessionUIBase:
         self._ws_inflight_content_size: int = 0
         self._ws_inflight_reasoning: list[str] = []
         self._ws_inflight_reasoning_size: int = 0
+        # Emit-time token-batch accumulator (see the module-level
+        # ``_TOKEN_BATCH_*`` constants).  Holds not-yet-emitted
+        # content/reasoning fragments; at most ONE kind pends at a time
+        # (a kind switch flushes the other first, preserving arrival
+        # order on the wire).  Pending text is INVISIBLE everywhere —
+        # not in the inflight buffers, not in the ring, no event id —
+        # until ``_flush_token_batch_locked`` appends it to the inflight
+        # buffers AND enqueues the batched event inside one ``_ws_lock``
+        # section, which is what keeps a snapshot's ``snap_seq`` a true
+        # high-water mark for its text (no double-render across a
+        # straddling batch).  All four fields guarded by ``_ws_lock``.
+        self._pending_tokens: list[str] = []
+        self._pending_tokens_size: int = 0
+        self._pending_kind: str = ""
+        # ``time.monotonic()`` of the last real flush; 0.0 makes the
+        # first fragment of a fresh UI flush immediately.
+        self._last_token_flush: float = 0.0
         # Last broadcast (activity, activity_state) tuple — used by
         # :meth:`_broadcast_activity` overrides to dedup back-to-back
         # identical activity ticks. Tool-heavy turns can fire many
@@ -565,6 +687,46 @@ class SessionUIBase:
     def _enqueue(self, data: dict[str, Any]) -> int:
         """Fan ``data`` out to every registered listener queue.
 
+        This is the choke point for every NON-token emit — base-class
+        ``on_*`` hooks, subclass overrides (``state_change`` /
+        ``clear_ui`` / rename), and route-level emits (``cancelled``,
+        the interject path's synthetic ``stream_end``) all land here —
+        so it first flushes any pending token batch.  Without that, a
+        ``stream_end`` could overtake its own turn's trailing content
+        batch: the client resets its streaming refs on ``stream_end``
+        and the late batch would paint into a NEW assistant bubble.
+        Emits that happen on the worker thread (the token producer) are
+        therefore strictly ordered after the tokens that preceded them;
+        cross-thread emits (a streaming tool's background
+        ``tool_output_chunk``) keep their pre-existing best-effort
+        ordering.
+
+        MUST NOT be called while holding ``_ws_lock`` — the flush
+        acquires it (non-reentrant).  Token events never come through
+        here: :meth:`on_content_token` / :meth:`on_reasoning_token`
+        buffer under ``_ws_lock`` and their flush emits via
+        :meth:`_enqueue_direct`.  Every current call site enqueues
+        outside ``_ws_lock``; a violation deadlocks immediately (and
+        loudly) in any test that exercises the path.
+
+        Returns the monotonic ``_event_id`` assigned to this event so a
+        caller that also persists the same turn (e.g.
+        ``ChatSession._append_system_turn``) can stamp the row with the
+        matching id, keeping the ``/history`` resume cursor and the live
+        event stream aligned.
+        """
+        self._flush_token_batch()
+        return self._enqueue_direct(data)
+
+    def _enqueue_direct(self, data: dict[str, Any]) -> int:
+        """Stamp + ring-append + fan out ``data`` (no batch flush).
+
+        Only two kinds of caller: :meth:`_enqueue` (after it flushed the
+        pending token batch) and :meth:`_flush_token_batch_locked` (the
+        flush itself, which runs under ``_ws_lock`` — acquisition order
+        ``_ws_lock`` outer → ``_listeners_lock`` inner matches the
+        snapshot helpers).
+
         Stamps ``ws_id`` on the payload if not already present so the
         browser can validate it belongs to the pane's current
         workstream.  Stamps a monotonic ``_event_id`` on every event
@@ -583,11 +745,12 @@ class SessionUIBase:
         fanned out to a not-yet-registered listener AND missing from
         the replay buffer.
 
-        Returns the monotonic ``_event_id`` assigned to this event so a
-        caller that also persists the same turn (e.g.
-        ``ChatSession._append_system_turn``) can stamp the row with the
-        matching id, keeping the ``/history`` resume cursor and the live
-        event stream aligned.
+        Fan-out skips queues already poisoned (their stream is closing;
+        puts would be latch-refused anyway) and logs the poison
+        TRANSITION exactly once per listener via the
+        :class:`_ListenerOverflow` first-rejection signal — the node-side
+        visibility for an overflow that is otherwise only observable in
+        the browser (a proxied coordinator pane hides it entirely).
         """
         if "ws_id" not in data:
             data = {**data, "ws_id": self.ws_id}
@@ -607,11 +770,122 @@ class SessionUIBase:
                 # bypassing the snapshot filter by absence of ``_seq``.
                 data = {**data, "_seq": event_id}
             self._event_buffer.append((event_id, data))
-            snapshot = list(self._listeners)
+            snapshot = [lq for lq in self._listeners if not getattr(lq, "poisoned", False)]
         for lq in snapshot:
-            with contextlib.suppress(queue.Full):
+            try:
                 lq.put_nowait(data)
+            except _ListenerOverflow:
+                log.warning(
+                    "sse.listener_overflow ws=%s event_id=%d: listener queue full; "
+                    "poisoned — its drain loop will close the stream and the "
+                    "client reconnect replays the gap from the ring buffer",
+                    self.ws_id[:8],
+                    event_id,
+                )
+            except queue.Full:
+                # Poison latched by a concurrent producer between our
+                # snapshot and this put (or a raw ``queue.Queue`` a test
+                # registered directly): same silent-skip as before.
+                continue
         return event_id
+
+    def _buffer_token_locked(self, kind: str, text: str) -> None:
+        """Accumulate one content/reasoning fragment; flush on window/size.
+
+        Caller holds ``_ws_lock``.  A kind switch (reasoning→content or
+        back) flushes the other kind first so the wire preserves arrival
+        order between the two token streams.  The window is measured
+        from the last flush and checked here, on arrival — no timer
+        thread, so a mid-stream stall just holds the final partial batch
+        until the next fragment or the next non-token emit's
+        choke-point flush (``stream_end`` at the latest).
+        """
+        if self._pending_kind and self._pending_kind != kind:
+            self._flush_token_batch_locked()
+        if not self._pending_tokens:
+            self._pending_kind = kind
+        self._pending_tokens.append(text)
+        self._pending_tokens_size += len(text)
+        if (
+            time.monotonic() - self._last_token_flush >= _TOKEN_BATCH_WINDOW_SECS
+            or self._pending_tokens_size >= _TOKEN_BATCH_MAX_CHARS
+        ):
+            self._flush_token_batch_locked()
+
+    def _flush_token_batch_locked(self) -> None:
+        """Emit the pending token batch as ONE event.  Caller holds ``_ws_lock``.
+
+        The inflight-buffer append and the enqueue are deliberately one
+        critical section: ``register_listener_with_in_progress_snapshot``
+        / ``register_listener_with_replay`` capture ``(inflight text,
+        _event_id)`` under the same lock, so ``snap_seq`` stays a true
+        high-water mark for the snapshot text.  Splitting them (e.g.
+        appending inflight per-token while enqueueing per-batch) lets a
+        straddling snapshot carry text whose batch then arrives with
+        ``_seq > snap_seq`` — the client (a blind ``+=``, no content
+        dedup) double-renders it.  Pinned by
+        ``test_snapshot_mid_batch_sees_only_flushed_text_no_double_render``
+        and the writer-race test in ``test_sse_reconnect_replay.py``.
+
+        Cap semantics match the old per-token appends: check-before-
+        append, so overshoot is bounded by one batch
+        (``_TOKEN_BATCH_MAX_CHARS`` + one fragment) instead of one
+        token; the live stream continues past the cap either way.
+        """
+        if not self._pending_tokens:
+            return
+        self._last_token_flush = time.monotonic()
+        text = "".join(self._pending_tokens)
+        kind = self._pending_kind
+        self._reset_pending_locked()
+        if kind == "content":
+            if self._ws_turn_content_size < _MAX_TURN_CONTENT_CHARS:
+                self._ws_turn_content.append(text)
+                self._ws_turn_content_size += len(text)
+            if self._ws_inflight_content_size < _MAX_TURN_CONTENT_CHARS:
+                self._ws_inflight_content.append(text)
+                self._ws_inflight_content_size += len(text)
+        else:
+            if self._ws_inflight_reasoning_size < _MAX_TURN_CONTENT_CHARS:
+                self._ws_inflight_reasoning.append(text)
+                self._ws_inflight_reasoning_size += len(text)
+        self._enqueue_direct({"type": kind, "text": text})
+
+    def _flush_token_batch(self) -> None:
+        """Flush the pending token batch from OUTSIDE ``_ws_lock``.
+
+        The lockless empty-check is the fast path for every non-token
+        emit (the overwhelmingly common case).  Same-thread visibility
+        is what correctness needs: the worker that buffered the tokens
+        sees its own append when it later emits ``stream_end`` /
+        ``tool_*`` — cross-thread emits racing a concurrent append keep
+        their pre-existing best-effort ordering either way.
+        """
+        if not self._pending_tokens:
+            return
+        with self._ws_lock:
+            self._flush_token_batch_locked()
+
+    def _reset_pending_locked(self) -> None:
+        """Zero the pending token accumulator.  Caller holds ``_ws_lock``.
+
+        Single source of truth for the reset so a later accumulator field
+        can't be half-cleared by one of its two callers
+        (:meth:`_flush_token_batch_locked` after capturing the text,
+        :meth:`_discard_pending_tokens_locked` on the crash path)."""
+        self._pending_tokens = []
+        self._pending_tokens_size = 0
+        self._pending_kind = ""
+
+    def _discard_pending_tokens_locked(self) -> None:
+        """Drop a never-emitted pending batch.  Caller holds ``_ws_lock``.
+
+        Only for the stale-crash path (:meth:`on_turn_start`): the text
+        was never enqueued, never ring-buffered, never inflight — so
+        discarding it is consistent everywhere, whereas flushing it
+        would paint a dead ``send()``'s tail into the NEW turn's bubble.
+        """
+        self._reset_pending_locked()
 
     def _stamp_agent_parent(self, data: dict[str, Any]) -> dict[str, Any]:
         """Stamp ``parent_call_id`` on a sub-agent's child event.
@@ -718,7 +992,7 @@ class SessionUIBase:
         self, maxsize: int = _DEFAULT_LISTENER_QUEUE_MAX
     ) -> queue.Queue[dict[str, Any]]:
         """Create a per-client queue and register it as a listener."""
-        client_queue: queue.Queue[dict[str, Any]] = queue.Queue(maxsize=maxsize)
+        client_queue: queue.Queue[dict[str, Any]] = _ListenerQueue(maxsize=maxsize)
         with self._listeners_lock:
             self._listeners.append(client_queue)
         return client_queue
@@ -769,7 +1043,7 @@ class SessionUIBase:
         duration. The shallow ``list(...)`` copies under the lock mean
         subsequent appends to the live buffers don't mutate our view.
         """
-        client_queue: queue.Queue[dict[str, Any]] = queue.Queue(maxsize=maxsize)
+        client_queue: queue.Queue[dict[str, Any]] = _ListenerQueue(maxsize=maxsize)
         with self._ws_lock:
             captured_content = list(self._ws_inflight_content)
             captured_reasoning = list(self._ws_inflight_reasoning)
@@ -862,7 +1136,7 @@ class SessionUIBase:
         for the genuine cold-start case (no false ``replay_truncated``
         envelopes on freshly-opened workstreams).
         """
-        client_queue: queue.Queue[dict[str, Any]] = queue.Queue(maxsize=maxsize)
+        client_queue: queue.Queue[dict[str, Any]] = _ListenerQueue(maxsize=maxsize)
         # Lock order matches writer: ``_ws_lock`` outer, ``_listeners_lock``
         # inner.  Both inflight buffers AND the buffer slice AND the
         # ``_event_id`` counter AND the listener registration captured
@@ -2655,8 +2929,13 @@ class SessionUIBase:
         stale content in the buffers. Steady-state, the buffers are
         already empty at this point because :meth:`on_turn_committed`
         cleared them right after the last assistant message committed.
+
+        A pending token batch here is the same stale-crash residue and
+        is DISCARDED (never emitted) — flushing it would paint the dead
+        ``send()``'s tail into the new turn's bubble.
         """
         with self._ws_lock:
+            self._discard_pending_tokens_locked()
             self._reset_inflight_buffers_locked()
 
     def on_turn_committed(self) -> None:
@@ -2674,8 +2953,15 @@ class SessionUIBase:
         within the current send) will override this hook to copy
         inflight reasoning to a per-message persistence store BEFORE
         clearing — keeping the `current vs historical` boundary clean.
+
+        A pending token batch here is part of the message that just
+        committed (the worker's ``stream_end`` normally flushed it
+        already), so it FLUSHES — before the reset — keeping the live
+        view and the replay ring complete rather than silently dropping
+        committed text from connected panes.
         """
         with self._ws_lock:
+            self._flush_token_batch_locked()
             self._reset_inflight_buffers_locked()
 
     def on_thinking_start(self) -> None:
@@ -2690,86 +2976,52 @@ class SessionUIBase:
         self._enqueue({"type": "thinking_stop"})
 
     def on_reasoning_token(self, text: str) -> None:
-        """Append to the inflight reasoning buffer (capped) + enqueue.
+        """Buffer one reasoning fragment into the emit-time batcher.
 
-        Mirrors :meth:`on_content_token`'s shape.  The ``_seq`` dedup
-        tag is stamped by :meth:`_enqueue` against the per-ws
-        ``_event_id`` counter, which advances on EVERY emit
-        regardless of whether the inflight cap rejected the append.
-        If the seq stalled at high-water-pre-cap, subscribers
-        registering after the cap is hit would capture
-        ``snap_seq == high-water`` and every subsequent live token
-        (with the same stalled seq) would be filter-dropped as
-        "already in your snapshot" — silently losing the rest of
-        the stream. The cap is a buffer-size limit, NOT a "stop
-        streaming" signal.
-
-        Tokens past the cap are absent from ``snap.reasoning`` (the
-        snapshot text was truncated at cap) but the live stream
-        continues normally past them — refresh-after-cap renders the
-        snapshot text up to the cap and then live tokens past it,
-        with a visual gap equal to the past-cap chunk. No silent
-        drop of subsequent tokens.
-
-        **Lock coupling**: ``_enqueue`` is called WHILE still
-        holding ``_ws_lock`` so the inflight append AND the
-        ``_event_id`` advancement happen atomically against a
-        snapshot reader.  Without this coupling a reader could
-        capture the inflight (with the new text) and read
-        ``_event_id`` BEFORE the writer's ``_enqueue`` bumped it,
-        producing a ``snap_seq`` lower than the new event's
-        ``_event_id``.  The new event would then slip past the
-        ``_seq <= snap_seq`` live-drain dedup and double-render
-        the text the snapshot already contained.  Acquisition
-        order ``_ws_lock`` (outer) → ``_listeners_lock`` (inner via
-        ``_enqueue``) matches the snapshot helpers, so no deadlock.
+        Mirrors :meth:`on_content_token`'s shape — see there for the
+        locking rationale and :meth:`_flush_token_batch_locked` for
+        where the (capped) inflight append + single-event enqueue
+        happen.  The inflight cap is a buffer-size limit, NOT a "stop
+        streaming" signal: batches past the cap skip the snapshot
+        buffers but still emit, so the live stream continues (a
+        refresh-after-cap renders the capped snapshot then live tokens
+        past it).
         """
         with self._ws_lock:
-            if self._ws_inflight_reasoning_size < _MAX_TURN_CONTENT_CHARS:
-                self._ws_inflight_reasoning.append(text)
-                self._ws_inflight_reasoning_size += len(text)
-            self._enqueue({"type": "reasoning", "text": text})
+            self._buffer_token_locked("reasoning", text)
 
     def on_content_token(self, text: str) -> None:
-        """Append to both turn-content buffers (capped) + enqueue.
+        """Buffer one content fragment into the emit-time batcher.
 
-        Writes under ``_ws_lock`` to two independent buffers:
+        Fragments accumulate under ``_ws_lock`` and flush as ONE
+        ``content`` event per batch window (see the ``_TOKEN_BATCH_*``
+        constants) — the event-rate reduction that keeps fast local
+        models (500+ tok/s) from overflowing listener queues.  The
+        flush — inside :meth:`_flush_token_batch_locked`, still under
+        the caller's ``_ws_lock`` — appends the batch to both capped
+        turn-content buffers:
+
          - ``_ws_turn_content`` (multi-turn, drained at idle/error)
            — fuels the dashboard's IDLE-piggyback content payload.
          - ``_ws_inflight_content`` (per-turn, drained at
            :meth:`on_turn_start`) — fuels the SSE ``in_progress_snapshot``
            event a reconnecting client sees on mid-stream refresh.
 
-        Both caps are checked independently.  The ``_seq`` dedup tag
-        is stamped by :meth:`_enqueue` against the per-ws
-        ``_event_id`` counter, which advances on EVERY emit
-        regardless of cap state — see :meth:`on_reasoning_token` for
-        the full rationale, including why ``_enqueue`` runs while
-        still holding ``_ws_lock`` (the lock coupling that makes
-        ``snap_seq`` a true high-water mark for the snapshot text).
-
-        The cap-check + append + size-update + enqueue all run under
-        ``_ws_lock`` so a concurrent
-        :meth:`snapshot_and_consume_state_payload` IDLE/ERROR drain or
-        a concurrent :meth:`register_listener_with_in_progress_snapshot`
-        / :meth:`register_listener_with_replay` sees a consistent
-        ``(inflight_content, _event_id)`` pair.  In production this
-        is single-writer-per-ws (the worker thread) but the snapshot
-        reader runs from coord's adapter via ``mgr.set_state``;
-        without the lock the writer's append could land in an
-        orphaned list reference the snapshot just swapped out, AND
-        the inflight/counter pair could de-sync.  Lock hold is
-        microseconds (the fan-out's ``put_nowait`` calls are O(N
-        listeners) but each is a single non-blocking enqueue).
+        and enqueues the batched event in the same critical section,
+        so a concurrent :meth:`snapshot_and_consume_state_payload`
+        IDLE/ERROR drain or a concurrent
+        :meth:`register_listener_with_in_progress_snapshot` /
+        :meth:`register_listener_with_replay` sees a consistent
+        ``(inflight_content, _event_id)`` pair — never a pending
+        fragment without its event, never an event without its text.
+        In production this is single-writer-per-ws (the worker
+        thread) but the snapshot reader runs from coord's adapter via
+        ``mgr.set_state``.  Acquisition order ``_ws_lock`` (outer) →
+        ``_listeners_lock`` (inner, via ``_enqueue_direct``) matches
+        the snapshot helpers, so no deadlock.
         """
         with self._ws_lock:
-            if self._ws_turn_content_size < _MAX_TURN_CONTENT_CHARS:
-                self._ws_turn_content.append(text)
-                self._ws_turn_content_size += len(text)
-            if self._ws_inflight_content_size < _MAX_TURN_CONTENT_CHARS:
-                self._ws_inflight_content.append(text)
-                self._ws_inflight_content_size += len(text)
-            self._enqueue({"type": "content", "text": text})
+            self._buffer_token_locked("content", text)
 
     def on_stream_end(self) -> None:
         with self._ws_lock:
@@ -3092,6 +3344,13 @@ class SessionUIBase:
         """
         captured_content: list[str] = []
         with self._ws_lock:
+            # Deliver any pending token batch first: this is the
+            # cancel/error chokepoint (see the idle-branch comment
+            # below), and the terminal-state payload must carry the
+            # full turn text — a batch stranded in the accumulator
+            # would otherwise vanish from the dashboard payload AND
+            # from connected panes.
+            self._flush_token_batch_locked()
             tokens = self._ws_prompt_tokens + self._ws_completion_tokens
             ctx = self._ws_context_ratio
             activity = self._ws_current_activity

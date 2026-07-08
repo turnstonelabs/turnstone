@@ -114,11 +114,17 @@ def test_coord_on_aux_usage_leaves_live_counters_untouched() -> None:
     assert ui._ws_context_ratio == 0.0
 
 
-def test_coord_on_content_token_accumulates() -> None:
+def test_coord_on_content_token_accumulates(monkeypatch: pytest.MonkeyPatch) -> None:
     """Pre-lift coord ``on_content_token`` only enqueued; lift turns it
     into the same per-ws accumulator WebUI uses so the collector
     broadcast can piggyback the joined turn content on the IDLE
-    state-change event."""
+    state-change event.
+
+    Batch window forced to 0 (per-token flush) — pins the accumulator
+    wiring, not the batching cadence (test_sse_token_batching.py)."""
+    import turnstone.core.session_ui_base as suib
+
+    monkeypatch.setattr(suib, "_TOKEN_BATCH_WINDOW_SECS", 0.0)
     ui = ConsoleCoordinatorUI(ws_id="coord-ws", user_id="u1")
     ui.on_content_token("Hello ")
     ui.on_content_token("world")
