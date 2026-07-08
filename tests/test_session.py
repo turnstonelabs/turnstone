@@ -7033,6 +7033,73 @@ def test_utility_completion_defers_temperature_to_session():
     assert kw2["temperature"] == 0.9  # explicit override still honored
 
 
+def test_web_fetch_extraction_inherits_session_max_tokens_and_effort():
+    """web_fetch's extraction call must inherit the session/registry max_tokens
+    and reasoning_effort rather than forcing constants.  Hard-coding
+    max_tokens=8192 / reasoning_effort="low" broke local-inference models whose
+    registry entry advertises a tighter output limit or a reasoning config the
+    forced values fought — this lane now behaves like the main turn."""
+    from unittest.mock import patch
+
+    from turnstone.core.providers._protocol import CompletionResult
+
+    session = _make_session(max_tokens=512, reasoning_effort="high")
+
+    resp = MagicMock()
+    resp.raise_for_status.return_value = None
+    resp.headers = {"content-type": "text/plain"}
+    resp.text = "The page body that holds the answer."
+
+    with (
+        patch("turnstone.core.session.fetch_with_ssrf_guard", return_value=resp),
+        patch.object(
+            session,
+            "_utility_completion",
+            return_value=CompletionResult(content="Extracted answer."),
+        ) as uc,
+    ):
+        call_id, answer = session._exec_web_fetch({"call_id": "c1", "url": "https://example.com/"})
+
+    assert call_id == "c1"
+    assert answer == "Extracted answer."
+    _, kw = uc.call_args
+    # 512 < context_window // 4 (8192), so the tighter session value passes
+    # through unclamped — inheritance, not the old hard-coded 8192.
+    assert kw["max_tokens"] == 512
+    assert kw["reasoning_effort"] == "high"  # session value, not the old "low"
+
+
+def test_web_fetch_extraction_caps_max_tokens_to_window_reserve():
+    """The extraction request is capped to the ~25% window slice Phase 2
+    reserves (``context_window // 4``), matching the main turn's response
+    reserve — so a large operator ``max_tokens`` on a small-context local
+    model can't push prompt + output past the window."""
+    from unittest.mock import patch
+
+    from turnstone.core.providers._protocol import CompletionResult
+
+    # context_window=8192 -> reserve 2048; the session budget is far larger.
+    session = _make_session(max_tokens=16384, context_window=8192)
+
+    resp = MagicMock()
+    resp.raise_for_status.return_value = None
+    resp.headers = {"content-type": "text/plain"}
+    resp.text = "The page body that holds the answer."
+
+    with (
+        patch("turnstone.core.session.fetch_with_ssrf_guard", return_value=resp),
+        patch.object(
+            session,
+            "_utility_completion",
+            return_value=CompletionResult(content="Extracted answer."),
+        ) as uc,
+    ):
+        session._exec_web_fetch({"call_id": "c1", "url": "https://example.com/"})
+
+    _, kw = uc.call_args
+    assert kw["max_tokens"] == 2048  # context_window // 4, not the 16384 session value
+
+
 def test_record_aux_usage_skips_when_usage_missing():
     """A provider that reports no usage object must not emit a phantom
     zero-token row."""
