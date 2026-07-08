@@ -6095,6 +6095,43 @@ def _validate_schedule_fields(schedule_type: str, cron_expr: str, at_time: str) 
     return None
 
 
+def _resolve_schedule_persona(storage: Any, persona: str) -> tuple[str, str | None]:
+    """Validate a schedule's persona slug against the interactive kind.
+
+    Schedules dispatch interactive workstreams, so the persona is resolved
+    against that kind — the same eligibility rule the create handler applies,
+    surfaced here so a bad slug fails at edit time rather than silently at the
+    next firing.  Returns ``(canonical_slug, None)`` on success (the resolved
+    row's name, never the raw input, per the persona contract) or
+    ``("", error)`` on failure.  Empty persona = kind default, always valid.
+    """
+    if not persona:
+        return "", None
+    from turnstone.core.personas import resolve_persona_for_kind
+
+    row, err = resolve_persona_for_kind(storage, persona, "interactive")
+    if err:
+        return "", err
+    return (str(row["name"]) if row else persona), None
+
+
+def _validate_schedule_project(
+    storage: Any, user_id: str, project_id: str
+) -> tuple[int, str] | None:
+    """Gate attaching a schedule's dispatched workstream to *project_id*.
+
+    Checked against *user_id* — the schedule's ``created_by``, the identity the
+    scheduler dispatches under — so the same owner/member rule the node enforces
+    at dispatch is applied up front.  Returns ``None`` when allowed, else the
+    ``(status, message)`` to surface.  Empty project_id = no attach, allowed.
+    """
+    if not project_id:
+        return None
+    from turnstone.core.auth import ensure_project_attachable
+
+    return ensure_project_attachable(user_id, project_id, storage=storage)
+
+
 async def admin_preview_schedule(request: Request) -> JSONResponse:
     """POST /v1/api/admin/schedules/preview — validate timing, return next runs.
 
@@ -6188,7 +6225,17 @@ async def admin_create_schedule(request: Request) -> JSONResponse:
     raw_tools = body.get("auto_approve_tools", [])
     auto_approve_tools = raw_tools if isinstance(raw_tools, list) else []
     skill_name = str(body.get("skill", "")).strip()[:256]
+    persona = str(body.get("persona", "")).strip()[:64]
+    project_id = str(body.get("project_id", "")).strip()[:64]
     enabled = bool(body.get("enabled", True))
+    # created_by is the authenticated admin — read via auth_result like every
+    # other console endpoint (AuthMiddleware never sets request.state.user_id,
+    # so the previous ``state.user_id`` read silently stored ""). It is now
+    # load-bearing: the scheduler dispatches under this identity and the node
+    # gates the project attach against it, so an empty value would make every
+    # project-scoped schedule fail the attach.
+    auth_result = getattr(getattr(request, "state", None), "auth_result", None)
+    created_by = getattr(auth_result, "user_id", "") or ""
 
     # Validate notify_targets
     from turnstone.server import _validate_notify_targets
@@ -6208,6 +6255,13 @@ async def admin_create_schedule(request: Request) -> JSONResponse:
         return JSONResponse({"error": "initial_message is required"}, status_code=400)
     if skill_name and not storage.get_prompt_template_by_name(skill_name):
         return JSONResponse({"error": f"Skill not found: {skill_name}"}, status_code=400)
+    persona, persona_err = _resolve_schedule_persona(storage, persona)
+    if persona_err:
+        return JSONResponse({"error": persona_err}, status_code=400)
+    project_denied = _validate_schedule_project(storage, created_by, project_id)
+    if project_denied is not None:
+        status_code, message = project_denied
+        return JSONResponse({"error": message}, status_code=status_code)
 
     validation_err = _validate_schedule_fields(schedule_type, cron_expr, at_time)
     if validation_err:
@@ -6226,7 +6280,6 @@ async def admin_create_schedule(request: Request) -> JSONResponse:
 
     next_run = _compute_next_run(schedule_type, cron_expr, at_time)
     task_id = uuid.uuid4().hex
-    created_by = getattr(getattr(request, "state", None), "user_id", "")
 
     storage.create_scheduled_task(
         task_id=task_id,
@@ -6244,6 +6297,8 @@ async def admin_create_schedule(request: Request) -> JSONResponse:
         next_run=next_run if enabled else "",
         skill=skill_name,
         notify_targets=notify_targets,
+        persona=persona,
+        project_id=project_id,
     )
 
     if not enabled:
@@ -6323,6 +6378,47 @@ async def admin_update_schedule(request: Request) -> JSONResponse:
         if skill_val and not storage.get_prompt_template_by_name(skill_val):
             return JSONResponse({"error": f"Skill not found: {skill_val}"}, status_code=400)
         updates["skill"] = skill_val
+    if "persona" in body:
+        persona_val = str(body["persona"]).strip()[:64]
+        # Re-validate only when the persona actually changes: the edit shelf
+        # always resends the current slug, and a schedule whose persona was
+        # since disabled (or the picker couldn't show) must stay editable for
+        # its other fields. A stale persona still fails loudly at dispatch,
+        # where the node re-resolves it.
+        if persona_val != (existing.get("persona") or ""):
+            persona_val, persona_err = _resolve_schedule_persona(storage, persona_val)
+            if persona_err:
+                return JSONResponse({"error": persona_err}, status_code=400)
+        updates["persona"] = persona_val
+    if "project_id" in body:
+        project_val = str(body["project_id"]).strip()[:64]
+        # Re-gate only when the project actually changes: the edit shelf
+        # resends the current value, and membership churn (or a project the
+        # editing admin can't see) must not block unrelated edits — the node
+        # re-gates against the owner at dispatch. On an actual change, the
+        # schedule dispatches under created_by and the node gates the attach
+        # against it, so a schedule created before the created_by fix ("")
+        # could never attach. When a project is assigned to such an orphaned
+        # schedule, adopt the editing admin as its owner (never overriding a
+        # real created_by) and persist it so the create-time check and the
+        # dispatch identity agree.
+        if project_val != (existing.get("project_id") or ""):
+            editing_admin = (
+                getattr(
+                    getattr(getattr(request, "state", None), "auth_result", None),
+                    "user_id",
+                    "",
+                )
+                or ""
+            )
+            owner = existing.get("created_by", "") or editing_admin
+            project_denied = _validate_schedule_project(storage, owner, project_val)
+            if project_denied is not None:
+                status_code, message = project_denied
+                return JSONResponse({"error": message}, status_code=status_code)
+            if project_val and not existing.get("created_by", ""):
+                updates["created_by"] = owner
+        updates["project_id"] = project_val
     if "enabled" in body:
         updates["enabled"] = bool(body["enabled"])
     if "notify_targets" in body:

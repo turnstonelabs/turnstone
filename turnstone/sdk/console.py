@@ -557,6 +557,8 @@ class AsyncTurnstoneConsole(_BaseClient):
         model: str = "",
         auto_approve: bool = False,
         auto_approve_tools: list[str] | None = None,
+        persona: str = "",
+        project_id: str = "",
         enabled: bool = True,
     ) -> ScheduleInfo:
         body: dict[str, Any] = {
@@ -577,6 +579,10 @@ class AsyncTurnstoneConsole(_BaseClient):
             body["model"] = model
         if auto_approve_tools:
             body["auto_approve_tools"] = auto_approve_tools
+        if persona:
+            body["persona"] = persona
+        if project_id:
+            body["project_id"] = project_id
         return await self._request(
             "POST", "/v1/api/admin/schedules", json_body=body, response_model=ScheduleInfo
         )
@@ -600,6 +606,8 @@ class AsyncTurnstoneConsole(_BaseClient):
         initial_message: Any = _UNSET,
         auto_approve: Any = _UNSET,
         auto_approve_tools: Any = _UNSET,
+        persona: Any = _UNSET,
+        project_id: Any = _UNSET,
         enabled: Any = _UNSET,
     ) -> ScheduleInfo:
         body: dict[str, Any] = {}
@@ -614,6 +622,8 @@ class AsyncTurnstoneConsole(_BaseClient):
             ("initial_message", initial_message),
             ("auto_approve", auto_approve),
             ("auto_approve_tools", auto_approve_tools),
+            ("persona", persona),
+            ("project_id", project_id),
             ("enabled", enabled),
         ]:
             if val is not _UNSET:

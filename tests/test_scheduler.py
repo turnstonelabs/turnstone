@@ -156,6 +156,52 @@ class TestSchedulerTick:
         assert run_kwargs["status"] == "dispatched"
         assert run_kwargs["ws_id"] == "ws_abc123"
 
+    def test_dispatch_passes_persona_and_project(self, mocks):
+        """persona + project_id ride to create_workstream; created_by becomes
+        the user_id the node gates the project attach against."""
+        collector, storage = mocks
+
+        task = _make_task(persona="researcher", project_id="proj_42")
+        storage.list_due_tasks.return_value = [task]
+        collector.get_nodes.return_value = ([_make_node()], 1)
+        collector.get_node_detail.return_value = {"server_url": "http://node-001:8080"}
+
+        scheduler = TaskScheduler(collector, storage)
+        with patch(
+            "turnstone.console.scheduler.TurnstoneServer.create_workstream",
+            return_value=_mock_create_response(),
+        ) as mock_create:
+            scheduler._tick()
+
+        mock_create.assert_called_once()
+        call_kwargs = mock_create.call_args[1]
+        assert call_kwargs["persona"] == "researcher"
+        assert call_kwargs["project_id"] == "proj_42"
+        assert call_kwargs["user_id"] == "u_admin"
+
+    def test_dispatch_defaults_persona_project_empty(self, mocks):
+        """A task row without persona/project keys dispatches with empty
+        strings — the node then resolves the current kind default / no attach."""
+        collector, storage = mocks
+
+        task = _make_task()
+        task.pop("persona", None)
+        task.pop("project_id", None)
+        storage.list_due_tasks.return_value = [task]
+        collector.get_nodes.return_value = ([_make_node()], 1)
+        collector.get_node_detail.return_value = {"server_url": "http://node-001:8080"}
+
+        scheduler = TaskScheduler(collector, storage)
+        with patch(
+            "turnstone.console.scheduler.TurnstoneServer.create_workstream",
+            return_value=_mock_create_response(),
+        ) as mock_create:
+            scheduler._tick()
+
+        call_kwargs = mock_create.call_args[1]
+        assert call_kwargs["persona"] == ""
+        assert call_kwargs["project_id"] == ""
+
     def test_dispatch_pool_mode(self, mocks):
         collector, storage = mocks
 

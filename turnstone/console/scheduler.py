@@ -318,6 +318,8 @@ class TaskScheduler:
                 auto_approve_tools=",".join(self._parse_tools(task)),
                 user_id=task.get("created_by", ""),
                 skill=task.get("skill", ""),
+                persona=task.get("persona", ""),
+                project_id=task.get("project_id", ""),
                 notify_targets=task.get("notify_targets", "[]"),
                 # Mark the resulting ChatSession as non-interactive-for-
                 # consent so OAuth-MCP errors get persisted to

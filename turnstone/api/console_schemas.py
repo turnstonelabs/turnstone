@@ -151,6 +151,10 @@ class ConsoleCreateWsRequest(BaseModel):
         default="",
         description="Persona slug; resolved and snapshotted at creation, empty = kind default",
     )
+    project_id: str = Field(
+        default="",
+        description="Project to attach the workstream to (validated against membership, empty = none)",
+    )
     resume_ws: str = Field(
         default="", description="Workstream ID to resume (loads previous conversation)"
     )

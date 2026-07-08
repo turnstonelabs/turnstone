@@ -1329,8 +1329,10 @@ function _populateScheduleSelect(selectId, url, labelKey, valueKey, opts) {
     .then(function (data) {
       const temp = sel.querySelector("[data-temporary]");
       if (temp) temp.remove();
-      const items = opts && opts.listKey ? data[opts.listKey] : data;
+      let items = opts && opts.listKey ? data[opts.listKey] : data;
       if (!Array.isArray(items)) return;
+      if (opts && typeof opts.filter === "function")
+        items = items.filter(opts.filter);
       items.forEach(function (item) {
         const opt = document.createElement("option");
         opt.value = item[valueKey];
@@ -1338,7 +1340,22 @@ function _populateScheduleSelect(selectId, url, labelKey, valueKey, opts) {
           opts && opts.display ? opts.display(item) : item[labelKey];
         sel.appendChild(opt);
       });
-      if (opts && opts.selected) sel.value = opts.selected;
+      if (opts && opts.selected) {
+        sel.value = opts.selected;
+        if (sel.value !== opts.selected) {
+          // The current value isn't in this list — it was filtered out
+          // (a disabled/wrong-kind persona) or is outside the caller-scoped
+          // feed (a private/archived project the editing admin can't see).
+          // Re-add it as a "(current)" option so it round-trips; without this
+          // the select falls back to the placeholder and saving an unrelated
+          // field would silently CLEAR the setting.
+          const keep = document.createElement("option");
+          keep.value = opts.selected;
+          keep.textContent = opts.selected + " (current)";
+          sel.appendChild(keep);
+          sel.value = opts.selected;
+        }
+      }
       // Caller hook for placeholder annotation / other post-load tweaks.
       // Used by the schedule modals to rewrite the bare "Default model"
       // placeholder with the resolved alias so the label matches the
@@ -1923,7 +1940,12 @@ function _schResetForm() {
   _schSetMode("daily");
 }
 
-function _schPopulateSelects(selectedModel, selectedSkill) {
+function _schPopulateSelects(
+  selectedModel,
+  selectedSkill,
+  selectedPersona,
+  selectedProject,
+) {
   _populateScheduleSelect("sch-model", "/v1/api/models", "alias", "alias", {
     listKey: "models",
     selected: selectedModel || "",
@@ -1945,6 +1967,32 @@ function _schPopulateSelects(selectedModel, selectedSkill) {
       },
     },
   );
+  // Schedules dispatch interactive workstreams, so only offer personas
+  // eligible for that kind; the label matches the home/create picker
+  // (display name, falling back to the slug).
+  _populateScheduleSelect("sch-persona", "/v1/api/personas", "name", "name", {
+    listKey: "personas",
+    selected: selectedPersona || "",
+    filter: function (p) {
+      return (p.applies_to_kinds || []).indexOf("interactive") !== -1;
+    },
+    display: function (p) {
+      return p.display_name || p.name;
+    },
+  });
+  _populateScheduleSelect(
+    "sch-project",
+    "/v1/api/projects",
+    "name",
+    "project_id",
+    {
+      listKey: "projects",
+      selected: selectedProject || "",
+      display: function (p) {
+        return p.name;
+      },
+    },
+  );
 }
 
 function _schOpen(title, tag, kind, submitLabel) {
@@ -1962,7 +2010,7 @@ function showCreateScheduleModal() {
   _schWire();
   _schResetForm();
   document.getElementById("sch-enabled-row").hidden = true;
-  _schPopulateSelects("", "");
+  _schPopulateSelects("", "", "", "");
   _schOpen("New schedule", "SCH-NEW", "create", "Create");
 }
 
@@ -1991,7 +2039,12 @@ function showEditScheduleModal(taskId) {
         ? s.target_mode
         : "";
       document.getElementById("sch-node-group").hidden = !isSpecificNode;
-      _schPopulateSelects(s.model || "", s.skill || "");
+      _schPopulateSelects(
+        s.model || "",
+        s.skill || "",
+        s.persona || "",
+        s.project_id || "",
+      );
       document.getElementById("sch-message").value = s.initial_message || "";
       document.getElementById("sch-autoapprove").checked = !!s.auto_approve;
       document.getElementById("sch-enabled").checked = !!s.enabled;
@@ -2036,6 +2089,8 @@ function _submitScheduleShelf() {
     target_mode: targetMode,
     model: (document.getElementById("sch-model").value || "").trim(),
     skill: (document.getElementById("sch-template").value || "").trim(),
+    persona: (document.getElementById("sch-persona").value || "").trim(),
+    project_id: (document.getElementById("sch-project").value || "").trim(),
     initial_message: message,
     auto_approve: document.getElementById("sch-autoapprove").checked,
     notify_targets: _collectNotifyTargets("sch"),

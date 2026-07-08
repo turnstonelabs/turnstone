@@ -337,6 +337,8 @@ async def test_create_schedule():
             schedule_type="cron",
             initial_message="Run nightly checks",
             cron_expr="0 2 * * *",
+            persona="researcher",
+            project_id="proj_1",
         )
         assert resp.task_id == "t1"
         body = captured_body[0]
@@ -344,6 +346,8 @@ async def test_create_schedule():
         assert body["schedule_type"] == "cron"
         assert body["cron_expr"] == "0 2 * * *"
         assert body["initial_message"] == "Run nightly checks"
+        assert body["persona"] == "researcher"
+        assert body["project_id"] == "proj_1"
         # Optional fields with defaults should not appear when not set
         assert "description" not in body
         assert "model" not in body
