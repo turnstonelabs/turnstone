@@ -1058,8 +1058,14 @@ class StorageBackend(Protocol):
         next_run: str,
         skill: str = "",
         notify_targets: str = "[]",
+        persona: str = "",
+        project_id: str = "",
     ) -> None:
-        """Create a scheduled task. No-op if task_id already exists."""
+        """Create a scheduled task. No-op if task_id already exists.
+
+        ``persona`` (slug) and ``project_id`` are stamped onto the workstream
+        each firing creates; empty = kind-default persona / no project.
+        """
         ...
 
     def get_scheduled_task(self, task_id: str) -> dict[str, Any] | None:

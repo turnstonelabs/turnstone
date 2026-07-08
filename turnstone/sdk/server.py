@@ -112,6 +112,7 @@ class AsyncTurnstoneServer(_BaseClient):
         ws_id: str = "",
         client_type: str = "",
         notify_targets: str = "",
+        project_id: str = "",
         attachments: list[AttachmentUpload] | None = None,
     ) -> CreateWorkstreamResponse:
         """Create a new workstream.
@@ -127,6 +128,8 @@ class AsyncTurnstoneServer(_BaseClient):
 
         *persona* selects the persona the workstream is created with
         (resolved and snapshotted server-side; empty = the kind default).
+        *project_id* attaches the workstream to a project (validated
+        server-side against the *user_id*'s membership; empty = none).
         """
         body: dict[str, Any] = {}
         if name:
@@ -141,6 +144,8 @@ class AsyncTurnstoneServer(_BaseClient):
             body["skill"] = skill
         if persona:
             body["persona"] = persona
+        if project_id:
+            body["project_id"] = project_id
         if initial_message:
             body["initial_message"] = initial_message
         if auto_approve_tools:
@@ -634,6 +639,7 @@ class TurnstoneServer:
         ws_id: str = "",
         client_type: str = "",
         notify_targets: str = "",
+        project_id: str = "",
         attachments: list[AttachmentUpload] | None = None,
     ) -> CreateWorkstreamResponse:
         return self._runner.run(
@@ -650,6 +656,7 @@ class TurnstoneServer:
                 ws_id=ws_id,
                 client_type=client_type,
                 notify_targets=notify_targets,
+                project_id=project_id,
                 attachments=attachments,
             )
         )

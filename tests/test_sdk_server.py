@@ -380,12 +380,16 @@ async def test_create_workstream_extended_params():
             auto_approve_tools="read_file,write_file",
             user_id="u42",
             ws_id="ws_custom",
+            persona="researcher",
+            project_id="proj_9",
         )
         assert captured_body["name"] == "ext"
         assert captured_body["initial_message"] == "hi"
         assert captured_body["auto_approve_tools"] == "read_file,write_file"
         assert captured_body["user_id"] == "u42"
         assert captured_body["ws_id"] == "ws_custom"
+        assert captured_body["persona"] == "researcher"
+        assert captured_body["project_id"] == "proj_9"
 
 
 @pytest.mark.anyio
@@ -406,3 +410,5 @@ async def test_create_workstream_omits_empty_params():
         assert "auto_approve_tools" not in captured_body
         assert "user_id" not in captured_body
         assert "ws_id" not in captured_body
+        assert "persona" not in captured_body
+        assert "project_id" not in captured_body

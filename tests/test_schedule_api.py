@@ -176,6 +176,206 @@ class TestScheduleAPI:
         assert resp.status_code == 400
         assert "future" in resp.json()["error"].lower()
 
+    @staticmethod
+    def _seed_persona(storage, name="researcher", kinds=None):
+        storage.create_persona(
+            {
+                "persona_id": f"id-{name}",
+                "name": name,
+                "display_name": name.title(),
+                "description": "",
+                "base_prompt": "You are a test persona.",
+                "applies_to_kinds": kinds or ["interactive"],
+            }
+        )
+
+    def test_create_with_persona_and_project(self, client, storage):
+        self._seed_persona(storage)
+        # Owned by the authenticated admin (created_by) → attachable.
+        storage.create_project("proj_1", "My Project", "test-admin")
+        resp = client.post(
+            "/v1/api/admin/schedules",
+            json=_cron_payload(persona="researcher", project_id="proj_1"),
+        )
+        assert resp.status_code == 200, resp.text
+        data = resp.json()
+        assert data["persona"] == "researcher"
+        assert data["project_id"] == "proj_1"
+
+    def test_create_defaults_persona_project_empty(self, client):
+        resp = client.post("/v1/api/admin/schedules", json=_cron_payload())
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["persona"] == ""
+        assert data["project_id"] == ""
+
+    def test_create_unknown_persona_rejected(self, client):
+        resp = client.post(
+            "/v1/api/admin/schedules",
+            json=_cron_payload(persona="ghost"),
+        )
+        assert resp.status_code == 400
+        assert "persona" in resp.json()["error"].lower()
+
+    def test_create_persona_wrong_kind_rejected(self, client, storage):
+        # A coordinator-only persona is refused — schedules only ever dispatch
+        # interactive workstreams, so the picker/validation are kind-scoped.
+        self._seed_persona(storage, name="orchestrator", kinds=["coordinator"])
+        resp = client.post(
+            "/v1/api/admin/schedules",
+            json=_cron_payload(persona="orchestrator"),
+        )
+        assert resp.status_code == 400
+
+    def test_create_unattachable_project_rejected(self, client, storage):
+        # A private project owned by someone else — the admin isn't a member.
+        storage.create_project("proj_x", "Theirs", "someone-else", visibility="private")
+        resp = client.post(
+            "/v1/api/admin/schedules",
+            json=_cron_payload(project_id="proj_x"),
+        )
+        assert resp.status_code == 403
+
+    def test_update_persona_and_project(self, client, storage):
+        self._seed_persona(storage, name="scribe")
+        storage.create_project("proj_2", "Proj Two", "test-admin")
+        task_id = client.post("/v1/api/admin/schedules", json=_cron_payload()).json()["task_id"]
+        resp = client.put(
+            f"/v1/api/admin/schedules/{task_id}",
+            json={"persona": "scribe", "project_id": "proj_2"},
+        )
+        assert resp.status_code == 200, resp.text
+        data = client.get(f"/v1/api/admin/schedules/{task_id}").json()
+        assert data["persona"] == "scribe"
+        assert data["project_id"] == "proj_2"
+
+    @staticmethod
+    def _legacy_task(storage, task_id="legacy"):
+        """A schedule from before the created_by fix — created_by is ''."""
+        storage.create_scheduled_task(
+            task_id=task_id,
+            name="Legacy",
+            description="",
+            schedule_type="cron",
+            cron_expr="0 9 * * *",
+            at_time="",
+            target_mode="auto",
+            model="",
+            initial_message="go",
+            auto_approve=False,
+            auto_approve_tools=[],
+            created_by="",
+            next_run="2099-01-01T09:00:00",
+        )
+
+    def test_update_assign_project_heals_empty_created_by(self, client, storage):
+        # Assigning a project to an orphaned schedule adopts the editing admin
+        # as owner so the attach — and every future dispatch — has an identity.
+        self._legacy_task(storage)
+        storage.create_project("proj_heal", "Heal", "test-admin")
+        resp = client.put(
+            "/v1/api/admin/schedules/legacy",
+            json={"project_id": "proj_heal"},
+        )
+        assert resp.status_code == 200, resp.text
+        row = storage.get_scheduled_task("legacy")
+        assert row["project_id"] == "proj_heal"
+        assert row["created_by"] == "test-admin"
+
+    def test_update_denied_project_does_not_heal_created_by(self, client, storage):
+        # Healing must not become an attach bypass: a project the editing admin
+        # can't reach is still 403, and created_by/project stay untouched.
+        self._legacy_task(storage, task_id="legacy2")
+        storage.create_project("proj_other", "Other", "someone-else", visibility="private")
+        resp = client.put(
+            "/v1/api/admin/schedules/legacy2",
+            json={"project_id": "proj_other"},
+        )
+        assert resp.status_code == 403
+        row = storage.get_scheduled_task("legacy2")
+        assert row["created_by"] == ""
+        assert row["project_id"] == ""
+
+    def test_update_project_keeps_existing_owner(self, client, storage):
+        # A schedule that already has a real owner is NOT re-owned by an editing
+        # admin — created_by is only adopted for the orphaned "" case.
+        self._seed_persona(storage, name="researcher")
+        storage.create_scheduled_task(
+            task_id="owned",
+            name="Owned",
+            description="",
+            schedule_type="cron",
+            cron_expr="0 9 * * *",
+            at_time="",
+            target_mode="auto",
+            model="",
+            initial_message="go",
+            auto_approve=False,
+            auto_approve_tools=[],
+            created_by="original-owner",
+            next_run="2099-01-01T09:00:00",
+        )
+        # A public project the original owner (and anyone) can attach to.
+        storage.create_project("proj_pub", "Pub", "someone-else", visibility="public")
+        resp = client.put(
+            "/v1/api/admin/schedules/owned",
+            json={"project_id": "proj_pub"},
+        )
+        assert resp.status_code == 200, resp.text
+        row = storage.get_scheduled_task("owned")
+        assert row["project_id"] == "proj_pub"
+        assert row["created_by"] == "original-owner"
+
+    def test_update_unchanged_persona_skips_revalidation(self, client, storage):
+        # A persona disabled after creation must not block editing other fields
+        # when the shelf resends the unchanged slug (it still fails at dispatch).
+        self._seed_persona(storage, name="researcher")
+        task_id = client.post(
+            "/v1/api/admin/schedules", json=_cron_payload(persona="researcher")
+        ).json()["task_id"]
+        storage.update_persona("id-researcher", enabled=False)
+        resp = client.put(
+            f"/v1/api/admin/schedules/{task_id}",
+            json={"name": "Renamed", "persona": "researcher"},
+        )
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["name"] == "Renamed"
+        assert resp.json()["persona"] == "researcher"
+
+    def test_update_unchanged_project_skips_regate(self, client, storage):
+        # Project attach isn't re-gated when unchanged, so a project deleted (or
+        # membership lost) out from under the schedule doesn't block edits.
+        storage.create_project("proj_keep", "Keep", "test-admin")
+        task_id = client.post(
+            "/v1/api/admin/schedules", json=_cron_payload(project_id="proj_keep")
+        ).json()["task_id"]
+        storage.delete_project("proj_keep")  # a re-gate would now 400
+        resp = client.put(
+            f"/v1/api/admin/schedules/{task_id}",
+            json={"name": "Renamed", "project_id": "proj_keep"},
+        )
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["project_id"] == "proj_keep"
+
+    def test_update_ignores_created_by_in_body(self, client, storage):
+        # created_by is never sourced from the request body — a spoofed value
+        # in the PUT payload is ignored (only the heal path from auth writes it).
+        task_id = client.post("/v1/api/admin/schedules", json=_cron_payload()).json()["task_id"]
+        client.put(
+            f"/v1/api/admin/schedules/{task_id}",
+            json={"name": "X", "created_by": "attacker"},
+        )
+        row = storage.get_scheduled_task(task_id)
+        assert row["created_by"] == "test-admin"
+
+    def test_update_unknown_persona_rejected(self, client):
+        task_id = client.post("/v1/api/admin/schedules", json=_cron_payload()).json()["task_id"]
+        resp = client.put(
+            f"/v1/api/admin/schedules/{task_id}",
+            json={"persona": "ghost"},
+        )
+        assert resp.status_code == 400
+
     def test_get_schedule(self, client):
         create_resp = client.post("/v1/api/admin/schedules", json=_cron_payload())
         task_id = create_resp.json()["task_id"]

@@ -1800,6 +1800,8 @@ class PostgreSQLBackend:
         next_run: str,
         skill: str = "",
         notify_targets: str = "[]",
+        persona: str = "",
+        project_id: str = "",
     ) -> None:
         from sqlalchemy.dialects import postgresql
 
@@ -1820,6 +1822,8 @@ class PostgreSQLBackend:
                     auto_approve=1 if auto_approve else 0,
                     auto_approve_tools=",".join(auto_approve_tools),
                     skill=skill,
+                    persona=persona,
+                    project_id=project_id,
                     notify_targets=notify_targets,
                     enabled=1,
                     created_by=created_by,
@@ -1862,8 +1866,14 @@ class PostgreSQLBackend:
             "auto_approve",
             "auto_approve_tools",
             "skill",
+            "persona",
+            "project_id",
             "notify_targets",
             "enabled",
+            # created_by is only ever set by the update handler adopting an
+            # orphaned (pre-fix "") schedule's owner from auth_result — never
+            # sourced from the request body, so this is not a spoofing surface.
+            "created_by",
             "last_run",
             "next_run",
             "updated",

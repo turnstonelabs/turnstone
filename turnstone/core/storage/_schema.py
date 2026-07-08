@@ -258,6 +258,14 @@ scheduled_tasks = sa.Table(
     sa.Column("auto_approve", sa.Integer, nullable=False, server_default="0"),
     sa.Column("auto_approve_tools", sa.Text, nullable=False, server_default=""),
     sa.Column("skill", sa.Text, nullable=False, server_default=""),
+    # persona/project_id: slug + project stamped onto the workstream each firing
+    # creates.  Empty = "kind default persona" / "no project", mirroring how an
+    # empty model/skill means "use the default".  Passed verbatim to
+    # create_workstream at dispatch, where the node resolves the persona and
+    # gates the project attach (scheduler.py::_dispatch_to_node).  Added in
+    # migration 066.
+    sa.Column("persona", sa.Text, nullable=False, server_default=""),
+    sa.Column("project_id", sa.Text, nullable=False, server_default=""),
     sa.Column("notify_targets", sa.Text, nullable=False, server_default="[]"),
     sa.Column("enabled", sa.Integer, nullable=False, server_default="1"),
     sa.Column("created_by", sa.Text, nullable=False, server_default=""),
