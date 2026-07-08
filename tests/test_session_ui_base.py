@@ -51,9 +51,8 @@ def _per_token_flush(monkeypatch: pytest.MonkeyPatch) -> None:
     (window/size coalescing, pending-batch visibility, flush-before-
     non-token ordering) is pinned in ``test_sse_token_batching.py``.
     """
-    import turnstone.core.session_ui_base as suib
 
-    monkeypatch.setattr(suib, "_TOKEN_BATCH_WINDOW_SECS", 0.0)
+    monkeypatch.setattr("turnstone.core.session_ui_base._TOKEN_BATCH_WINDOW_SECS", 0.0)
 
 
 # ---------------------------------------------------------------------------
