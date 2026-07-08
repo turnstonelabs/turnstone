@@ -688,3 +688,26 @@ def test_giveup_removes_visibility_handler() -> None:
     rvh = re.search(r"_removeVisibilityHandler\(\)\s*\{(.*?)\n  \}", body, re.S)
     assert rvh is not None
     assert "this._hiddenDisconnect = false" in rvh.group(1)
+
+
+def test_connectsse_defers_open_when_tab_hidden() -> None:
+    """PR #805 review (Copilot + R3): connectSSE is the single connect
+    chokepoint and must not open an EventSource into a hidden tab.  The
+    fresh-connect path (_loadHistoryThenConnect) has no timer guard, so a
+    first load in a background tab would otherwise open a throttled stream —
+    the slow-consumer overflow this PR exists to prevent.  The guard sits
+    AFTER the visibilitychange-handler install (so the show edge can
+    reconnect) and AFTER the wsId assignment (so it targets the right ws),
+    and BEFORE `new EventSource` (so nothing opens)."""
+    body = _INTERACTIVE.read_text(encoding="utf-8")
+    start = body.index("connectSSE(wsId) {")
+    open_at = body.index("new EventSource(evtUrl)", start)
+    head = body[start:open_at]  # connectSSE up to the EventSource open
+    assert "if (document.hidden) {" in head, (
+        "connectSSE must guard on document.hidden BEFORE opening the stream"
+    )
+    assert "this._hiddenDisconnect = true;" in head, (
+        "the deferred connect must mark _hiddenDisconnect so the show edge reconnects"
+    )
+    assert head.index("this.wsId = wsId;") < head.index("if (document.hidden) {")
+    assert head.index('addEventListener("visibilitychange"') < head.index("if (document.hidden) {")
