@@ -296,6 +296,24 @@ class TestGetContent:
         assert "default-src 'none'" in resp.headers.get("content-security-policy", "")
         assert resp.headers.get("content-disposition", "").startswith("inline;")
 
+    def test_get_content_non_latin1_filename_does_not_500(self, app_client):
+        # Starlette encodes header values as latin-1 and raises on anything
+        # else; an uploaded filename with CJK / em dashes must fold to an
+        # ASCII-safe Content-Disposition rather than 500 the serving route.
+        # Mirrors preview_response_headers' latin-1 fold.
+        client, _ = app_client
+        aid = _upload(client, "ws-A", "userA", "文書 — v1.md", b"x", "text/markdown")
+        resp = client.get(
+            f"/v1/api/workstreams/ws-A/attachments/{aid}/content",
+            headers=_auth("userA"),
+        )
+        assert resp.status_code == 200
+        assert resp.content == b"x"
+        # Non-ASCII folded to '?', ASCII kept — pinning the value proves the
+        # fold actually ran and the header is latin-1 clean (all codepoints
+        # < 0x80), not merely that the route didn't crash.
+        assert resp.headers["content-disposition"] == 'inline; filename="?? ? v1.md"'
+
     def test_get_content_forces_text_plain_for_text_kinds(self, app_client):
         # Uploading an HTML-ish file as text/html must NOT be served back
         # with Content-Type: text/html from our origin (XSS vector).

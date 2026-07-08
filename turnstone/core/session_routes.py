@@ -3670,6 +3670,7 @@ def make_export_handler(cfg: SessionEndpointConfig) -> Handler:
         from starlette.responses import Response as _Response
 
         from turnstone.core.export import WorkstreamNotFoundError, export_workstream
+        from turnstone.core.web_helpers import latin1_safe_filename
 
         # Conversation-only: never bundle children, always JSON.  A live
         # session whose storage row was deleted skips the fallback
@@ -3679,10 +3680,10 @@ def make_export_handler(cfg: SessionEndpointConfig) -> Handler:
             result = await asyncio.to_thread(export_workstream, storage, ws_id)
         except WorkstreamNotFoundError:
             return JSONResponse({"error": cfg.not_found_label}, status_code=404)
-        # ws_ids are hex so the filename is already safe, but mirror the
-        # attachment download handler's defensive strip of quotes/CR/LF
-        # so a future non-hex id can't break the Content-Disposition.
-        safe_name = result.filename.replace('"', "").replace("\r", "").replace("\n", "")
+        # ws_ids are hex so the filename is already safe, but run the shared
+        # sanitizer anyway so a future non-hex id can't break the
+        # Content-Disposition (latin-1 fold + control-char strip).
+        safe_name = latin1_safe_filename(result.filename)
         return _Response(
             result.data,
             media_type=result.content_type,
@@ -4388,6 +4389,8 @@ def make_attachment_handlers(cfg: SessionEndpointConfig) -> AttachmentHandlers:
     async def get_content(request: Request) -> Response:
         from starlette.responses import Response as _Response
 
+        from turnstone.core.web_helpers import latin1_safe_filename
+
         resolved = await _resolve_served_blob(request)
         if not isinstance(resolved, tuple):
             return resolved
@@ -4396,7 +4399,10 @@ def make_attachment_handlers(cfg: SessionEndpointConfig) -> AttachmentHandlers:
         # rendering if a user uploaded an HTML-ish text file.  Images keep their
         # sniffed MIME (allowlist is strict: png/jpeg/gif/webp).
         response_mime = "text/plain; charset=utf-8" if kind == "text" else stored_mime
-        safe_name = filename.replace('"', "").replace("\r", "").replace("\n", "")
+        # Uploaded filenames routinely carry CJK / em dashes (non-latin-1) and
+        # can carry control bytes — either would 500 the serving route, so run
+        # the shared header sanitizer rather than emit them verbatim.
+        safe_name = latin1_safe_filename(filename)
         headers = {
             "X-Content-Type-Options": "nosniff",
             "Content-Security-Policy": "default-src 'none'; sandbox",
