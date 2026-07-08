@@ -21,7 +21,7 @@ Named after the [Ruddy Turnstone](https://en.wikipedia.org/wiki/Ruddy_turnstone)
 ℋ :  s_{n+1} ~ T(s_n)   for n < τ*,    T = ρ ∘ (M_W ∘ π, E)
 ```
 
-[**the hypothesis →**](HYPOTHESIS.md)
+[**the primer →**](PRIMER.md)
 
 ### Release Tracks
 
