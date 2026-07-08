@@ -381,7 +381,10 @@ function _renderMarkdownBody(text) {
         "<pre><code" +
           (cssLang ? ' class="language-' + escapeHtml(cssLang) + '"' : "") +
           ">" +
-          escapeHtml(code.replace(/\n$/, "")) +
+          // Strip the trailing newline plus any whitespace an indented close
+          // dragged into the content (a `  ```` close would otherwise leave a
+          // whitespace-only last line in the code block).
+          escapeHtml(code.replace(/\n[ \t]*$/, "")) +
           "</code></pre>",
       );
       // Store the fence source WITHOUT the re-emitted indent/marker prefix so

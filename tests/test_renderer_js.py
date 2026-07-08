@@ -1710,13 +1710,26 @@ def test_blockquoted_fence_renders_as_code() -> None:
 
 
 def test_indented_fence_still_renders_as_code() -> None:
-    """The open anchor allows up to 3 spaces of indentation (CommonMark), so a
-    legitimately indented fence (e.g. under a list item) still renders as code
-    rather than as a paragraph of literal backticks.  A bare ``^`` anchor
-    would have dropped it."""
+    """The open anchor allows arbitrary leading indent, so a legitimately
+    indented fence (e.g. under a list item) still renders as code rather than a
+    paragraph of literal backticks.  (A bare ``^`` anchor would drop it; the
+    deeper 4-space-indent case is pinned separately.)"""
     out = _render("  ```py\n  x = 1\n  ```")
     assert "<pre><code" in out, "indented fence dropped (not rendered as code):\n" + out
     assert "x = 1" in out
+
+
+def test_indented_fence_close_leaves_no_trailing_whitespace_line() -> None:
+    """An indented closing line's leading spaces must NOT survive as a trailing
+    whitespace-only line inside the code block: the content strip removes a
+    trailing newline PLUS any indent the close dragged into the capture (a
+    `` ``` `` closed at column 0 is unaffected).  Copilot review, PR #804."""
+    out = _render("  ```py\n  x = 1\n  ```")
+    m = re.search(r"<code[^>]*>(.*?)</code>", out, re.S)
+    assert m, "no <code> block:\n" + out
+    assert m.group(1) == "  x = 1", "indented fence close left a trailing whitespace line: " + repr(
+        m.group(1)
+    )
 
 
 # ---------------------------------------------------------------------------
