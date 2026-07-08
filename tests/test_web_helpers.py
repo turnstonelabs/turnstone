@@ -184,3 +184,15 @@ class TestLatin1SafeFilename:
 
         # An all-CJK name folds to '???' (truthy) — must NOT hit the fallback.
         assert latin1_safe_filename("日本語", fallback="preview") == "???"
+
+    def test_fallback_is_also_sanitized(self):
+        from turnstone.core.web_helpers import latin1_safe_filename
+
+        # The fallback fires only when the name sanitizes to empty, and it is
+        # cleaned by the SAME rules — a caller can't reintroduce the crash /
+        # corruption through an unsafe fallback.
+        assert latin1_safe_filename("", fallback="—\x00.txt") == "?.txt"
+        self._assert_wire_safe(latin1_safe_filename("", fallback="bad\\\x00name"))
+        # If even the fallback sanitizes to empty, a safe constant backs it —
+        # never filename="".
+        assert latin1_safe_filename("", fallback='"\x00') == "download"
