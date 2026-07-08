@@ -636,8 +636,12 @@ export class PaneManager {
         const p = this._panes.get(id);
         return id !== keep && p && p.ephemeral;
       });
-    for (const id of doomed) this.close(id); // collapses its cell, then destroys
-    if (this._layout) this._exitLayout(keep); // a close() may have already exited
+    // close() destroys the pane AND renders/persists/notifies; a 2-cell split
+    // fully collapses inside it, so bail before repeating that work.  Only a
+    // 3+-cell split (or an empty doom list) still needs the exit + refresh here.
+    for (const id of doomed) this.close(id);
+    if (!this._layout) return;
+    this._exitLayout(keep);
     this._renderTabs();
     this._persist();
     this._notifyActive();

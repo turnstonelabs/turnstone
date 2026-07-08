@@ -827,11 +827,11 @@
   z-index: 13; /* above the ring overlay — a clean bar, not bar-plus-ring-line */
   pointer-events: none;
 }
-/* per-pane ✕ — on every visible pane.  Split mode: "hide this cell" (the TAB
-   stays — closeCell), but an ephemeral pane (the preview) closes outright;
-   single-pane: "close pane" (withheld from the unclosable Dashboard).  The
-   destructive modes flip the glyph to ✕ and wear .cell-unsplit--close.
-   Shell chrome floating over pane content: elevated panel +
+/* per-pane dismiss chip (.cell-unsplit) — on every visible pane.  Split mode:
+   "−" hides this cell (the TAB stays — closeCell), but an ephemeral pane (the
+   preview) shows "✕" and closes outright; single-pane: "✕" closes the pane
+   (withheld from the unclosable Dashboard).  The destructive "✕" modes wear
+   .cell-unsplit--close.  Shell chrome floating over pane content: elevated panel +
    hairline so it reads as the shell's, not the conversation's; sits clear of
    the 2px focus bar and the cell corner. */
 .cell-unsplit {
