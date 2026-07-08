@@ -16195,10 +16195,17 @@ class ChatSession:
             text = text[:max_content] + f"\n\n... [{len(text) - max_content} chars truncated] ...\n"
 
         # Phase 3: summarization API call.
-        # Use a generous max_tokens so thinking models don't starve the
-        # visible answer, and pass reasoning_effort="low" to avoid wasting
-        # budget on deep reasoning for a simple extraction task.  Temperature
-        # is left to the session/registry default rather than overridden here.
+        # Inherit the operator's per-model settings — reasoning_effort and
+        # (via the default) temperature from the session/registry — rather
+        # than forcing constants here: hard-coding reasoning_effort="low" and
+        # a fixed max_tokens kept breaking local-inference models whose
+        # registry entry advertises a different reasoning config or a tighter
+        # output limit.  max_tokens is the session budget, but capped to the
+        # ~25% window slice Phase 2 reserved above — the same bound the main
+        # turn puts on its response reserve (``_remaining_token_budget``).
+        # That honors a tighter registry max_tokens while keeping prompt +
+        # output from overflowing a small context window on strict runtimes
+        # (the old fixed 8192 was exactly this reserve for the 32k default).
         try:
             result = self._utility_completion(
                 [
@@ -16221,7 +16228,8 @@ class ChatSession:
                         ),
                     },
                 ],
-                max_tokens=8192,
+                max_tokens=min(self.max_tokens, self.context_window // 4),
+                reasoning_effort=self.reasoning_effort,
             )
             answer = result.content or ""
             if not answer:
