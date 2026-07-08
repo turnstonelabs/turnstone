@@ -114,12 +114,14 @@ class _ListenerQueue(queue.Queue[dict[str, Any]]):
         # one iteration) and by ``_enqueue_direct``'s fan-out snapshot.
         self.poisoned = False
         # Set at ws teardown by ``_broadcast_ws_closed_to_listeners``.
-        # The drain loop checks this BEFORE ``poisoned`` so a full/
-        # poisoned queue whose ws is *closing* unwinds as a CLEAN close —
-        # not a false ``stream_overflow`` frame + client reconnect.  It
+        # The drain loop consults this INSIDE its ``poisoned`` branch: a
+        # queue that is both poisoned AND closing unwinds as a CLEAN close
+        # rather than emitting a false ``stream_overflow`` frame + client
+        # reconnect.  (A healthy closing queue needs no flag — it drains
+        # its tail FIFO to the in-band ``ws_closed`` sentinel.)  The flag
         # has to travel out-of-band because a poisoned/full queue rejects
-        # the in-band ``ws_closed`` sentinel (the exact case the eviction-
-        # safe retry in ``_broadcast_ws_closed_to_listeners`` targets).
+        # that sentinel — the exact case the eviction-safe retry in
+        # ``_broadcast_ws_closed_to_listeners`` targets.
         self.closing = False
 
     def put_nowait(self, item: dict[str, Any]) -> None:

@@ -1241,6 +1241,20 @@ class Pane {
       this._visHandler = () => this._onVisibilityChange();
       document.addEventListener("visibilitychange", this._visHandler);
     }
+    // Never open an EventSource into a hidden (throttled) tab — including on a
+    // FIRST load in a background tab, where the close-on-hide handler never
+    // fires because there was no open stream to close (a throttled hidden tab
+    // is the worst-case slow consumer that overflows the server send queue).
+    // This is the single connect chokepoint, so it backstops every caller —
+    // fresh connect, degraded retry, recover beat, show edge; the wsId + the
+    // visibilitychange handler installed just above make the show edge
+    // reconnect (replay_ok from the ring). The timer callbacks keep their own
+    // pre-checks (the recover beat's also gates failCount), so this is the
+    // net that closes the fresh-connect gap they never covered.
+    if (document.hidden) {
+      this._hiddenDisconnect = true;
+      return;
+    }
     this.evtSource = new EventSource(evtUrl);
 
     this.evtSource.onopen = () => {
