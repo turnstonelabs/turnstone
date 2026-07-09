@@ -172,6 +172,60 @@ OPENAI_CAPABILITIES: dict[str, ModelCapabilities] = {
         supports_pdf=True,
         supports_reasoning_replay=True,
     ),
+    # GPT-5.6 (Sol / Terra / Luna) — released 2026-07-09.  The bare
+    # "gpt-5.6" alias routes to Sol (developers.openai.com/api/docs/guides/
+    # latest-model, 2026-07 check), so this catch-all row carries Sol's
+    # caps and also covers dated Sol snapshots ("gpt-5.6-2026-..") and the
+    # explicit "gpt-5.6-sol" id by longest-prefix match.  Sol is the ONLY
+    # 5.6 tier that unlocks the new "max" reasoning effort — the first
+    # COMMERCIAL OpenAI model to use it (KNOB_EFFORT_ORDER already ranks
+    # "max" for the Anthropic lane, so the ordinal snap and effort ladder
+    # need no change).  Sol also has a Sol-only "ultra" multi-agent mode
+    # that Turnstone does NOT expose (only "pro" is wired — see below).
+    # Default effort is "medium" like gpt-5.5; temperature is accepted only at
+    # reasoning_effort="none" (the "none"-in-values gate).  There is NO
+    # gpt-5.6-pro model: "pro" is now a reasoning.mode="pro" request param,
+    # not a separate model id.  Context window is not yet on the model page
+    # (limited preview); 1.05M mirrors the 5.4/5.5 lineage — override via
+    # the DB model definition if OpenAI publishes a different window (a
+    # smaller Luna window has been reported but is unconfirmed).
+    "gpt-5.6": ModelCapabilities(
+        context_window=1050000,
+        max_output_tokens=128000,
+        reasoning_effort_values=("none", "low", "medium", "high", "xhigh", "max"),
+        default_reasoning_effort="medium",
+        supports_tool_search=True,
+        supports_vision=True,
+        supports_pdf=True,
+        supports_reasoning_replay=True,
+        supports_verbosity=True,
+        supports_pro_mode=True,  # Sol-only reasoning.mode="pro"
+    ),
+    # GPT-5.6 Terra — balanced tier; Sol's ladder minus "max" (Sol-only),
+    # so the knob's "max" snaps to the "xhigh" ceiling.  No pro mode.
+    "gpt-5.6-terra": ModelCapabilities(
+        context_window=1050000,
+        max_output_tokens=128000,
+        reasoning_effort_values=("none", "low", "medium", "high", "xhigh"),
+        default_reasoning_effort="medium",
+        supports_tool_search=True,
+        supports_vision=True,
+        supports_pdf=True,
+        supports_reasoning_replay=True,
+        supports_verbosity=True,
+    ),
+    # GPT-5.6 Luna — fastest/cheapest tier; no "max" effort, no pro mode.
+    "gpt-5.6-luna": ModelCapabilities(
+        context_window=1050000,
+        max_output_tokens=128000,
+        reasoning_effort_values=("none", "low", "medium", "high", "xhigh"),
+        default_reasoning_effort="medium",
+        supports_tool_search=True,
+        supports_vision=True,
+        supports_pdf=True,
+        supports_reasoning_replay=True,
+        supports_verbosity=True,
+    ),
     # O-series reasoning models
     "o1": ModelCapabilities(
         context_window=200000,
@@ -370,6 +424,48 @@ def apply_cache_retention(kwargs: dict[str, Any], model: str) -> None:
     """
     if model.startswith("gpt-5"):
         kwargs["prompt_cache_retention"] = "24h"
+
+
+# ---------------------------------------------------------------------------
+# Output verbosity + reasoning mode (Responses API)
+# ---------------------------------------------------------------------------
+
+# Known-good enum values for the operator-declared ``verbosity`` /
+# ``reasoning_mode`` capability fields.  These arrive from the
+# model-definition capabilities JSON via
+# ``ChatSession._resolve_capabilities`` — a field-name-filtered
+# ``dataclasses.replace`` that does NOT validate values — so an operator
+# typo would otherwise ride straight to the wire and 400 every request.
+# The emission sites drop unknown values with a warning instead, mirroring
+# how ``model_registry`` clamps out-of-range temperature / max_tokens.
+VERBOSITY_LEVELS: frozenset[str] = frozenset({"low", "medium", "high"})
+REASONING_MODES: frozenset[str] = frozenset({"pro"})
+
+
+def apply_verbosity(kwargs: dict[str, Any], caps: ModelCapabilities) -> None:
+    """Set Responses-API output verbosity when the operator declared one.
+
+    ``verbosity`` (``"low"``/``"medium"``/``"high"``) is the GPT-5 family's
+    output-length lever, distinct from reasoning effort (you can ask for a
+    terse answer at high reasoning).  It is Responses-API-specific and nests
+    under ``text.verbosity`` — a top-level ``verbosity`` field 400s there —
+    so Turnstone emits it on this lane only.  ``supports_verbosity`` is the
+    static capability; ``caps.verbosity`` is the operator-declared value
+    (model-definition capabilities JSON), ``""`` = omit.  An unset value, or
+    one on a model that doesn't support it, is silently omitted (matching
+    ``apply_temperature``); a value outside ``VERBOSITY_LEVELS`` is dropped
+    with a warning (an operator typo must not 400 every request).
+    """
+    if not (caps.supports_verbosity and caps.verbosity):
+        return
+    if caps.verbosity not in VERBOSITY_LEVELS:
+        log.warning(
+            "openai.responses: ignoring unknown verbosity",
+            value=caps.verbosity,
+            expected=sorted(VERBOSITY_LEVELS),
+        )
+        return
+    kwargs.setdefault("text", {})["verbosity"] = caps.verbosity
 
 
 # ---------------------------------------------------------------------------
