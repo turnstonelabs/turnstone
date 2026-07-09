@@ -17,10 +17,12 @@ import structlog
 
 from turnstone.core.providers._openai_common import (
     OPENAI_COMPAT_DEFAULT,
+    REASONING_MODES,
     RETRYABLE_ERROR_NAMES,
     apply_cache_retention,
     apply_temperature,
     apply_tool_search,
+    apply_verbosity,
     extract_usage,
     format_citations,
     format_document_wrapper,
@@ -435,11 +437,28 @@ class OpenAIResponsesProvider:
 
         apply_temperature(kwargs, caps, temperature, reasoning_effort)
 
-        # Reasoning effort → {"effort": value} dict (Responses API format)
+        # Reasoning params → {"effort": ..., "mode": ...} (Responses format).
+        # "mode": "pro" (GPT-5.6 Sol) applies more model work before a single
+        # final answer; it rides with or without an effort level (effort
+        # defaults to medium in pro mode), and effort still rides without a
+        # mode.  Both are operator-declared and gated by their static
+        # capability, so a value on a model lacking the feature is dropped.
+        reasoning: dict[str, Any] = {}
         effort = resolve_reasoning_effort(caps, reasoning_effort)
         if effort:
-            kwargs["reasoning"] = {"effort": effort}
+            reasoning["effort"] = effort
+        if caps.supports_pro_mode and caps.reasoning_mode:
+            if caps.reasoning_mode in REASONING_MODES:
+                reasoning["mode"] = caps.reasoning_mode
+            else:
+                log.warning(
+                    "openai.responses: ignoring unknown reasoning mode",
+                    value=caps.reasoning_mode,
+                )
+        if reasoning:
+            kwargs["reasoning"] = reasoning
 
+        apply_verbosity(kwargs, caps)
         apply_cache_retention(kwargs, model)
         return kwargs
 

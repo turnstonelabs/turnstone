@@ -23,6 +23,7 @@ the affected golden and inspecting the diff.
 from __future__ import annotations
 
 import contextlib
+import dataclasses
 import json
 import os
 from pathlib import Path
@@ -308,3 +309,53 @@ def test_wire_payload_anthropic_compat(fixture_id: str) -> None:
     )
     assert "thinking" not in payload, "compat lane must never send the native thinking param"
     _assert_golden(f"anthropic_compat__{fixture_id}", payload)
+
+
+# GPT-5.6 Sol is the first COMMERCIAL OpenAI model to expose the "max"
+# reasoning effort (Terra/Luna cap at "xhigh"; see OPENAI_CAPABILITIES).
+# The base matrix above pins only the default-effort Responses shape
+# (gpt-5 → "medium"), so freeze a max-effort request to prove the new
+# level compiles onto the native ``reasoning={"effort": "max"}`` param.
+# Driving it through "gpt-5.6-sol" also exercises the longest-prefix
+# inheritance (that id resolves to the "gpt-5.6" row) on the real wire,
+# not just the capability lookup — over a bare turn and a tool round-trip.
+_OPENAI_MAX_FIXTURES = ("text", "toolcall_complete")
+
+
+@pytest.mark.parametrize("fixture_id", _OPENAI_MAX_FIXTURES)
+def test_wire_payload_openai_max(fixture_id: str) -> None:
+    messages, opts = _FIXTURES[fixture_id]
+    provider = OpenAIResponsesProvider()
+    payload = _capture(
+        provider,
+        model="gpt-5.6-sol",
+        messages=[dict(m) for m in messages],
+        reasoning_effort="max",
+        **opts,
+    )
+    assert payload["reasoning"] == {"effort": "max"}, "max must compile onto reasoning.effort"
+    _assert_golden(f"openai_responses_max__{fixture_id}", payload)
+
+
+def test_wire_payload_openai_verbosity_pro() -> None:
+    """Operator-declared verbosity + pro mode compile onto ``text.verbosity``
+    and ``reasoning.mode`` for GPT-5.6 Sol.  Both are default-off; an operator
+    turns them on via the model-definition capabilities JSON, which
+    ``ChatSession._resolve_capabilities`` merges into caps at request time —
+    modeled here by the ``dataclasses.replace`` override _capture forwards."""
+    provider = OpenAIResponsesProvider()
+    caps = dataclasses.replace(
+        provider.get_capabilities("gpt-5.6-sol"), verbosity="low", reasoning_mode="pro"
+    )
+    messages, opts = _FIXTURES["text"]
+    payload = _capture(
+        provider,
+        model="gpt-5.6-sol",
+        messages=[dict(m) for m in messages],
+        caps=caps,
+        reasoning_effort="high",
+        **opts,
+    )
+    assert payload["text"] == {"verbosity": "low"}
+    assert payload["reasoning"] == {"effort": "high", "mode": "pro"}
+    _assert_golden("openai_responses_verbosity_pro__text", payload)
