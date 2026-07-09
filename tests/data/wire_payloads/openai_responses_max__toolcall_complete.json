@@ -1,0 +1,55 @@
+{
+  "include": [
+    "reasoning.encrypted_content"
+  ],
+  "input": [
+    {
+      "content": "Weather in Paris?",
+      "role": "user",
+      "type": "message"
+    },
+    {
+      "arguments": "{\"city\": \"Paris\"}",
+      "call_id": "call_1",
+      "name": "get_weather",
+      "type": "function_call"
+    },
+    {
+      "call_id": "call_1",
+      "output": "18C, clear.",
+      "type": "function_call_output"
+    },
+    {
+      "content": "It's 18C and clear in Paris.",
+      "role": "assistant",
+      "type": "message"
+    }
+  ],
+  "max_output_tokens": 4096,
+  "model": "gpt-5.6-sol",
+  "prompt_cache_retention": "24h",
+  "reasoning": {
+    "effort": "max"
+  },
+  "store": false,
+  "stream": true,
+  "tools": [
+    {
+      "description": "Look up the weather for a city.",
+      "name": "get_weather",
+      "parameters": {
+        "properties": {
+          "city": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "city"
+        ],
+        "type": "object"
+      },
+      "strict": false,
+      "type": "function"
+    }
+  ]
+}

@@ -2212,6 +2212,40 @@ class TestOpenAIParameterGating:
         assert "temperature" not in kwargs
         assert kwargs["reasoning_effort"] == "medium"  # fell back from unsupported "low"
 
+    def test_gpt56_sol_max_effort_and_temperature(self) -> None:
+        """GPT-5.6 (Sol / bare alias): 1M context + tool search; accepts
+        the NEW "max" reasoning effort verbatim (first commercial OpenAI
+        model to use it); temperature only at reasoning_effort="none"."""
+        caps = lookup_openai_capabilities("gpt-5.6")
+        assert caps.context_window == 1050000
+        assert caps.supports_tool_search is True
+        assert caps.supports_vision is True
+        assert "max" in caps.reasoning_effort_values
+        kwargs: dict[str, Any] = {}
+        apply_temperature_and_effort(kwargs, caps, temperature=0.7, reasoning_effort="max")
+        assert "temperature" not in kwargs
+        assert kwargs["reasoning_effort"] == "max"
+        none_kwargs: dict[str, Any] = {}
+        apply_temperature_and_effort(none_kwargs, caps, temperature=0.7, reasoning_effort="none")
+        assert none_kwargs["temperature"] == 0.7
+        assert none_kwargs["reasoning_effort"] == "none"
+
+    def test_gpt56_sol_id_resolves_by_prefix(self) -> None:
+        """The explicit "gpt-5.6-sol" id and dated Sol snapshots inherit
+        the Sol/alias row (incl. "max") by longest-prefix match."""
+        assert "max" in lookup_openai_capabilities("gpt-5.6-sol").reasoning_effort_values
+        assert "max" in lookup_openai_capabilities("gpt-5.6-2026-07-09").reasoning_effort_values
+
+    def test_gpt56_terra_luna_max_snaps_to_xhigh_ceiling(self) -> None:
+        """GPT-5.6 Terra and Luna have no "max" (Sol-only); the knob's "max"
+        snaps DOWN to the declared "xhigh" ceiling rather than being dropped."""
+        for tier in ("gpt-5.6-terra", "gpt-5.6-luna"):
+            caps = lookup_openai_capabilities(tier)
+            assert "max" not in caps.reasoning_effort_values, tier
+            kwargs: dict[str, Any] = {}
+            apply_temperature_and_effort(kwargs, caps, temperature=0.7, reasoning_effort="max")
+            assert kwargs["reasoning_effort"] == "xhigh", tier
+
 
 class TestAnthropicOrphanedToolUse:
     """Verify _convert_messages synthesizes tool_results for orphaned tool_use."""
@@ -3919,6 +3953,10 @@ class TestOpenAIPromptCaching:
             "gpt-5.4-pro",
             "gpt-5.5",
             "gpt-5.5-pro",
+            "gpt-5.6",
+            "gpt-5.6-sol",
+            "gpt-5.6-terra",
+            "gpt-5.6-luna",
             "gpt-5-mini",
             "gpt-5-pro",
         ):
@@ -4315,6 +4353,104 @@ class TestResponsesParamBuilding:
             deferred_names=None,
         )
         assert kwargs["store"] is False
+
+    def _build(self, caps: ModelCapabilities, reasoning_effort: str = "medium") -> dict[str, Any]:
+        return self.provider._build_kwargs(
+            model="gpt-5.6-sol",
+            messages=[{"role": "user", "content": "Hi"}],
+            tools=None,
+            max_tokens=4096,
+            temperature=0.5,
+            reasoning_effort=reasoning_effort,
+            deferred_names=None,
+            capabilities=caps,
+        )
+
+    def test_verbosity_emitted_under_text_when_supported(self) -> None:
+        """Operator-declared verbosity nests under text.verbosity (never
+        top-level, which 400s on the Responses API)."""
+        kwargs = self._build(ModelCapabilities(supports_verbosity=True, verbosity="low"))
+        assert kwargs["text"] == {"verbosity": "low"}
+
+    def test_verbosity_omitted_when_unsupported(self) -> None:
+        """A verbosity value on a model that doesn't support it is dropped."""
+        kwargs = self._build(ModelCapabilities(supports_verbosity=False, verbosity="low"))
+        assert "text" not in kwargs
+
+    def test_verbosity_omitted_when_value_empty(self) -> None:
+        """Supported but unset (the default) → nothing sent, server default."""
+        kwargs = self._build(ModelCapabilities(supports_verbosity=True, verbosity=""))
+        assert "text" not in kwargs
+
+    def test_pro_mode_folds_into_reasoning(self) -> None:
+        """reasoning.mode='pro' rides alongside the effort in one dict."""
+        caps = ModelCapabilities(
+            supports_pro_mode=True,
+            reasoning_mode="pro",
+            reasoning_effort_values=("low", "medium", "high"),
+        )
+        kwargs = self._build(caps, reasoning_effort="high")
+        assert kwargs["reasoning"] == {"effort": "high", "mode": "pro"}
+
+    def test_pro_mode_rejected_when_unsupported(self) -> None:
+        """A pro reasoning_mode on Terra/Luna (supports_pro_mode False) is
+        dropped — effort still rides, mode does not."""
+        caps = ModelCapabilities(
+            supports_pro_mode=False,
+            reasoning_mode="pro",
+            reasoning_effort_values=("low", "medium", "high"),
+        )
+        kwargs = self._build(caps, reasoning_effort="high")
+        assert kwargs["reasoning"] == {"effort": "high"}
+
+    def test_pro_mode_without_effort_sends_mode_only(self) -> None:
+        """No declared effort (param omitted) but pro mode set → the
+        reasoning dict carries mode alone (effort defaults server-side)."""
+        caps = ModelCapabilities(supports_pro_mode=True, reasoning_mode="pro")
+        kwargs = self._build(caps, reasoning_effort="medium")
+        assert kwargs["reasoning"] == {"mode": "pro"}
+
+    def test_verbosity_unknown_value_dropped(self) -> None:
+        """A verbosity outside {low,medium,high} is dropped, not sent — an
+        operator typo must not 400 every request."""
+        kwargs = self._build(ModelCapabilities(supports_verbosity=True, verbosity="verbose"))
+        assert "text" not in kwargs
+
+    def test_pro_mode_unknown_value_dropped(self) -> None:
+        """An unknown reasoning_mode is dropped; a valid effort still rides."""
+        caps = ModelCapabilities(
+            supports_pro_mode=True,
+            reasoning_mode="ultra",
+            reasoning_effort_values=("low", "medium", "high"),
+        )
+        kwargs = self._build(caps, reasoning_effort="high")
+        assert kwargs["reasoning"] == {"effort": "high"}
+
+    def test_gpt56_terra_max_snaps_to_xhigh_on_responses_wire(self) -> None:
+        """Terra's knob "max" snaps to the xhigh ceiling on the ACTUAL
+        Responses wire path (_build_kwargs), not only the shared resolver."""
+        kwargs = self.provider._build_kwargs(
+            model="gpt-5.6-terra",
+            messages=[{"role": "user", "content": "Hi"}],
+            tools=None,
+            max_tokens=4096,
+            temperature=0.5,
+            reasoning_effort="max",
+            deferred_names=None,
+        )
+        assert kwargs["reasoning"] == {"effort": "xhigh"}
+
+    def test_gpt56_verbosity_and_pro_flags(self) -> None:
+        """The static rows carry the right capability flags: verbosity on all
+        three tiers, pro mode on Sol/alias only."""
+        sol = lookup_openai_capabilities("gpt-5.6-sol")
+        assert sol.supports_verbosity is True
+        assert sol.supports_pro_mode is True
+        assert lookup_openai_capabilities("gpt-5.6").supports_pro_mode is True
+        for tier in ("gpt-5.6-terra", "gpt-5.6-luna"):
+            caps = lookup_openai_capabilities(tier)
+            assert caps.supports_verbosity is True
+            assert caps.supports_pro_mode is False
 
     def _kwargs_with(self, tools: list[dict[str, Any]], caps: ModelCapabilities) -> dict[str, Any]:
         return self.provider._build_kwargs(
