@@ -14,6 +14,78 @@ experimental line:
 
 Earlier stable lines (`stable/1.6`, `stable/1.5`) are frozen.
 
+## [1.7.2]
+
+A feature-bearing patch for the 1.7 line. Rather than hold this work for the
+larger 1.8 churn, the fixes and the smaller features that had already
+stabilised on `main` are rolled into the stable line now: a rich preview
+pane, persona/project settings on scheduled tasks, and a batch of streaming,
+rendering, and nudge-delivery hardening.
+
+> **⚠️ Before upgrading:** 1.7.2 adds Alembic migration `066`, applied
+> automatically on first start. It adds two `Text NOT NULL DEFAULT ''`
+> columns (`persona`, `project_id`) to the `scheduled_tasks` table; existing
+> rows migrate to the empty default, which is byte-identical to pre-066
+> dispatch behaviour. The change is additive and reversible, but — as always
+> — back up your storage before upgrading (`pg_dump` for PostgreSQL; copy the
+> database file for SQLite).
+
+### Added
+
+- **Rich preview pane + `open_preview` tool** — a workstream can now open a
+  rendered preview (HTML, Markdown, and other kinds) in a pane beside the
+  conversation via the new `open_preview` tool. Guarded fetches stream under
+  a byte budget whose ceiling tracks the widest per-kind cap, preview blob
+  ids are salted, and a preflight probe handles legacy charsets and a
+  remote-assets opt-in. See `docs/tools.md`.
+- **`allow_private_network` opt-in for `web_fetch` / `open_preview`** —
+  private-address fetch and preview targets stay blocked by default; an
+  operator can opt a workstream in through the settings registry when a
+  private endpoint is genuinely intended. (Distinct from the 1.7.1 `[oidc]`
+  flag of the same name, which governs identity-provider discovery.)
+- **Persona + project settings on scheduled tasks** (migration `066`) — a
+  scheduled task can now pin the **persona** and **project** of the
+  workstream it dispatches, matching the levers a manually-created workstream
+  already carries. Both default to empty (kind-default persona / no project),
+  so existing schedules dispatch exactly as before.
+
+### Fixed
+
+- **Streaming fast-path overflow recovery** — fast-stream tokens are now
+  batched and overflowed SSE listeners recover instead of stalling (and
+  `connectSSE` no longer opens into a hidden background tab). The same
+  overflow-recovery companions were carried to the coordinator pane, so a
+  coordinator watching many children recovers dropped listeners the same way
+  the live-session view does.
+- **Renderer containment** — markdown sentinel-forgery and recursive-frame
+  content loss are contained, and an indented fence close no longer drags its
+  indent into the enclosed code content.
+- **Idle nudge / wake delivery** — nudge and wake delivery is hardened across
+  session eviction, cancellation, and identity rebinds; the wake gate now
+  requires a real nudge queue, refused wakes are logged, and
+  `initial_message_status` is typed as a closed enum on the wire.
+- **`web_fetch` extraction inherits model settings** — the completion that
+  extracts content from a fetched page now inherits the workstream's model
+  settings instead of falling back to defaults.
+- **UI panes** — ephemeral panes close on split-dismiss instead of orphaning
+  a tab, and an unsplit skips the redundant refresh after an ephemeral pane
+  closes.
+- **Shared code-highlight CSS** — renderer-output CSS is shared so the console
+  and coordinator panes highlight code identically.
+
+### Security
+
+- **`Content-Disposition` filenames made wire-safe** — download filenames
+  derived from user-controlled text are sanitised (latin-1- and
+  control-char-safe, quoting-safe) before they reach the `Content-Disposition`
+  response header, including the fallback path.
+
+### Documentation
+
+- **HYPOTHESIS.md: daemons + the outer loop, plus a plain-language PRIMER** —
+  the harness north-star document gains its daemon / outer-loop treatment and
+  a new top-level `PRIMER.md`.
+
 ## [1.7.1]
 
 A maintenance and hardening patch for the 1.7 line. No schema migrations;
