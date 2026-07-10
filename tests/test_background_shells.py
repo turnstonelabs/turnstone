@@ -20,8 +20,13 @@ import pytest
 from tests._proc_helpers import kill_pid as _kill_pid
 from tests._proc_helpers import pid_alive as _pid_alive
 from tests._proc_helpers import poll_until as _wait_until
+
+# Module alias (from-style, matching the symbol imports below) for tests
+# that monkeypatch module attributes (os.killpg, subprocess.Popen, ...).
+from turnstone.core import background_shells as bg_mod
 from turnstone.core.background_shells import (
     BackgroundShellRegistry,
+    FilterExecError,
     FilterTimeoutError,
     TooManyShellsError,
     UnknownShellError,
@@ -441,8 +446,6 @@ def test_kill_on_completed_shell_does_not_signal_group(registry, monkeypatch):
     """A completed shell's pgid is a stale snapshot the OS may have recycled
     to an unrelated process group — kill() must not signal it (the waiter's
     own group kill already ran at exit, when the pgid was fresh)."""
-    import turnstone.core.background_shells as bg_mod
-
     shell = registry.spawn("true")
     assert _wait_status(shell, "completed")
     calls = []
@@ -562,8 +565,6 @@ def test_thread_start_failure_leaves_no_orphan_record(registry, monkeypatch, tmp
     unregistered and the fresh group reaped — an orphan with never-started
     Thread objects would make every later close()/reap() join raise and
     abort session teardown."""
-    import turnstone.core.background_shells as bg_mod
-
     pidfile = tmp_path / "leader.pid"
     real_thread = bg_mod.threading.Thread
 
@@ -587,9 +588,6 @@ def test_thread_start_failure_leaves_no_orphan_record(registry, monkeypatch, tmp
 def test_filter_helper_failure_reports_exec_error_not_timeout(registry, monkeypatch):
     """A crashed helper must not tell the model its (fine) pattern was too
     slow — and must not consume the delta."""
-    import turnstone.core.background_shells as bg_mod
-    from turnstone.core.background_shells import FilterExecError
-
     shell = registry.spawn("echo hello")
     assert _wait_status(shell, "completed")
     monkeypatch.setattr(bg_mod.sys, "executable", "/bin/false")
@@ -643,9 +641,6 @@ def test_filter_helper_spawn_failure_is_exec_error(registry, monkeypatch):
     """A helper that fails to LAUNCH (fork pressure) must land in the same
     honest FilterExecError as a crashed helper — not escape as a raw
     OSError blaming nothing — and must not consume the delta."""
-    import turnstone.core.background_shells as bg_mod
-    from turnstone.core.background_shells import FilterExecError
-
     shell = registry.spawn("echo hello")
     assert _wait_status(shell, "completed")
 
