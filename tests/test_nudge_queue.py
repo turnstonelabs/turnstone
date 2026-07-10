@@ -98,6 +98,98 @@ class TestLenAndClear:
         q = NudgeQueue()
         assert q.clear() == 0
 
+    def test_clear_channels_drops_only_matching(self):
+        """The abandoned-generation path drops advisory channels but must
+        preserve ``"any"``-channel external events (watch fires,
+        background-shell exits) in order."""
+        q = NudgeQueue()
+        q.enqueue("tool_error", "1", "tool")
+        q.enqueue("watch_triggered", "2", "any")
+        q.enqueue("correction", "3", "user")
+        q.enqueue("background_shell_exit", "4", "any")
+        assert q.clear_channels({"tool", "user"}) == 2
+        assert q.pending() == [("watch_triggered", "2"), ("background_shell_exit", "4")]
+
+    def test_clear_channels_empty_returns_zero(self):
+        q = NudgeQueue()
+        assert q.clear_channels({"tool", "user"}) == 0
+
+    def test_demote_channel_retags_preserving_order_and_metadata(self):
+        """Cancel demotes 'any' → 'quiet': same entries, same order, same
+        metadata/valid_until — only wake eligibility changes."""
+        q = NudgeQueue()
+        q.enqueue("watch_triggered", "w", "any", metadata={"watch_name": "ci"})
+        q.enqueue("correction", "c", "user")
+        q.enqueue("background_shell_exit", "b", "any", valid_until=lambda: True)
+        assert q.demote_channel("any", "quiet") == 2
+        assert q.pending(channel="any") == []
+        assert q.pending(channel="quiet") == [
+            ("watch_triggered", "w"),
+            ("background_shell_exit", "b"),
+        ]
+        # Metadata and valid_until ride the demotion; USER_DRAIN delivers.
+        from turnstone.core.nudge_queue import USER_DRAIN, WAKE_PENDING
+
+        assert not q.has_pending(WAKE_PENDING - {"user"})  # no 'any' left
+        drained = q.drain(USER_DRAIN)
+        assert [(t, x, m) for t, x, m in drained] == [
+            ("watch_triggered", "w", {"watch_name": "ci"}),
+            ("correction", "c", None),
+            ("background_shell_exit", "b", None),
+        ]
+
+    def test_cap_channel_none_sees_demoted_entries(self):
+        """The watch soft cap counts across channels: entries a cancel
+        demoted to 'quiet' still occupy the budget, and drop-oldest evicts
+        the stalest regardless of channel."""
+        q = NudgeQueue()
+        q.enqueue("watch_triggered", "1", "any")
+        q.demote_channel("any", "quiet")
+        q.enqueue("watch_triggered", "2", "any")
+        assert q.cap_at_or_drop_oldest("watch_triggered", 2, channel=None) is True
+        assert q.pending() == [("watch_triggered", "2")]
+
+    def test_requeue_preserves_seq_for_chronology(self):
+        """A failed delivery gives entries back with their ORIGINAL seq, so
+        a re-queued poll-4 still sorts before the poll-5 that arrived during
+        the failed attempt — counters never run backwards."""
+        q = NudgeQueue()
+        q.enqueue("watch_triggered", "poll-4", "any")
+        (drained_entry,) = q.drain_entries({"any"})
+        q.enqueue("watch_triggered", "poll-5", "any")  # newer event lands
+        q.requeue(drained_entry, channel="quiet")
+        entries = q.drain_entries({"any", "quiet"})
+        entries.sort(key=lambda e: e.seq)
+        assert [e.text for e in entries] == ["poll-4", "poll-5"]
+
+    def test_requeue_positions_by_seq_for_fifo_drains(self):
+        """Positioned insertion: plain (unsorted) drains also see the
+        re-queued older entry first."""
+        q = NudgeQueue()
+        q.enqueue("a", "old", "quiet")
+        (old_entry,) = q.drain_entries({"quiet"})
+        q.enqueue("b", "new", "quiet")
+        q.requeue(old_entry)
+        assert [text for _t, text in q.pending()] == ["old", "new"]
+
+    def test_requeue_preserves_valid_until_and_metadata(self):
+        alive = {"value": True}
+        q = NudgeQueue()
+        q.enqueue("n", "x", "any", valid_until=lambda: alive["value"], metadata={"k": 1})
+        (entry,) = q.drain_entries({"any"})
+        q.requeue(entry, channel="quiet")
+        alive["value"] = False
+        assert q.drain({"quiet"}) == []  # predicate survived the round-trip
+
+    def test_quiet_is_outside_the_wake_gate(self):
+        from turnstone.core.nudge_queue import TOOL_DRAIN, USER_DRAIN, WAKE_PENDING
+
+        q = NudgeQueue()
+        q.enqueue("background_shell_exit", "b", "quiet")
+        assert not q.has_pending(WAKE_PENDING)
+        assert q.has_pending(USER_DRAIN)
+        assert q.has_pending(TOOL_DRAIN)
+
 
 class TestDropOldestByType:
     def test_drop_oldest_by_type_removes_earliest_match(self):

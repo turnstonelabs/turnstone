@@ -1,0 +1,17 @@
+{
+  "name": "kill_shell",
+  "description": "Terminate a background shell started with bash(run_in_background=true), killing its whole process group. Use it when the process is no longer needed or is misbehaving. Output already produced remains readable via bash_output afterwards.",
+  "parameters": {
+    "type": "object",
+    "properties": {
+      "id": {
+        "type": "string",
+        "description": "Background shell id to terminate, e.g. bash_1."
+      }
+    },
+    "required": ["id"]
+  },
+  "task_agent": true,
+  "auto_approve": true,
+  "primary_key": "id"
+}

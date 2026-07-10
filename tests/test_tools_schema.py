@@ -60,11 +60,11 @@ class TestToolsMetadata:
     """Validate the metadata extracted from JSON files."""
 
     def test_tool_count(self):
-        # 17 interactive tools + 12 coordinator-only tools.
-        assert len(TOOLS) == 29
+        # 19 interactive tools + 12 coordinator-only tools.
+        assert len(TOOLS) == 31
 
     def test_task_agent_tools_count(self):
-        assert len(TASK_AGENT_TOOLS) == 11
+        assert len(TASK_AGENT_TOOLS) == 13
 
     def test_coordinator_tools_count(self):
         from turnstone.core.tools import COORDINATOR_TOOLS
@@ -109,6 +109,12 @@ class TestToolsMetadata:
             "web_fetch",
             "web_search",
             "notify",
+            # Background-shell follow-ups: ``bash_output`` is read-only;
+            # ``kill_shell`` only signals process groups the session itself
+            # spawned via an approved bash call — strictly risk-reducing,
+            # so gating cleanup behind approval adds friction, not safety.
+            "bash_output",
+            "kill_shell",
             # Coordinator read-only tools (no-mutation, safe to auto-approve):
             "inspect_workstream",
             "list_workstreams",
@@ -128,6 +134,8 @@ class TestToolsMetadata:
             "web_search": "query",
             "open_preview": "target",
             "task_agent": "prompt",
+            "bash_output": "id",
+            "kill_shell": "id",
             "memory": "name",
             "recall": "query",
             "notify": "message",

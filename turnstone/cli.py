@@ -7,6 +7,7 @@ model auto-detection, workstream management, and the main() REPL entry point.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import logging
 import os
 import readline
@@ -920,6 +921,41 @@ def resolve_cli_persona_kwargs(
     return {}
 
 
+def _close_all_sessions(manager: SessionManager) -> None:
+    """Close EVERY loaded session at CLI exit — not just the active one.
+
+    ``ChatSession.close()`` removes MCP listeners AND reaps the workstream's
+    background shells (#817).  An active-only close would let a dev server
+    started in workstream 1 survive ``/new`` + ``/exit`` forever: its
+    detached process group outlives this process — the exact leaked-server
+    class #816 removed.
+
+    Two phases so total exit latency doesn't stack per workstream: the kill
+    signals land on EVERY session's shells first (microseconds each — after
+    which nothing can outlive us), then the per-session closes pay their
+    join budgets, which are near-zero once the kills have landed.  A Ctrl-C
+    during the close phase degrades gracefully instead of aborting the
+    sweep: the signals are already delivered, the remaining joins are
+    skipped, and the caller still runs MCP/registry shutdown.  Best-effort
+    per workstream either way — one bad teardown must not stop the rest.
+    """
+    loaded = [(ws.id, ws.session) for ws in manager.list_all() if ws.session is not None]
+    for _ws_id, session in loaded:
+        with contextlib.suppress(Exception):
+            session._background_shells.signal_all()
+    try:
+        for ws_id, session in loaded:
+            try:
+                session.close()
+            except Exception:
+                print(dim(f"  (workstream {ws_id[:8]} teardown error, continuing)"))
+    except KeyboardInterrupt:
+        # The kills above already landed; skipping the remaining joins
+        # leaks nothing — it only abandons wedged drain threads that die
+        # with this process anyway.
+        print(dim("  (interrupted — background shells already signalled)"))
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Interactive CLI for OpenAI-compatible models with tool calling.",
@@ -1389,9 +1425,7 @@ def main() -> None:
             except Exception as e:
                 print(f"\n{red(f'Error: {e}')}")
 
-    # Close active session (removes MCP listener) before shutting down MCP
-    if active and active.session:
-        active.session.close()
+    _close_all_sessions(manager)
     if mcp_client:
         mcp_client.shutdown()
     registry.shutdown()

@@ -4179,6 +4179,30 @@ async def _lifespan(app: Starlette) -> AsyncGenerator[None, None]:
     state_writer = getattr(app.state, "state_writer", None)
     if state_writer is not None:
         await asyncio.to_thread(state_writer.shutdown)
+    # Reap every loaded session's background shells (#817) before MCP
+    # teardown — a GRACEFUL server shutdown must not orphan detached
+    # process groups (the leaked-server class #816 removed; a hard crash
+    # remains the documented acceptance).  Two phases like the CLI exit:
+    # signal every session's shells first (instant — after this nothing
+    # can outlive us), then pay the bounded per-session join budgets off
+    # the event loop.  Session close() also removes MCP listeners, hence
+    # the ordering before mcp_client.shutdown().
+    mgr = WebUI._workstream_mgr
+    if mgr is not None:
+        loaded = [(ws.id, ws.session) for ws in mgr.list_all() if ws.session is not None]
+        for _ws_id, session in loaded:
+            with contextlib.suppress(Exception):
+                session._background_shells.signal_all()
+
+        def _close_loaded() -> None:
+            for ws_id, session in loaded:
+                try:
+                    session.close()
+                except Exception:
+                    log.exception("server.session_close_failed", ws_id=ws_id[:8])
+
+        if loaded:
+            await asyncio.to_thread(_close_loaded)
     # health_registry is stateless (no background threads) — nothing to stop
     if app.state.mcp_client:
         app.state.mcp_client.shutdown()

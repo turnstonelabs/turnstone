@@ -16,6 +16,23 @@ Earlier stable lines (`stable/1.6`, `stable/1.5`) are frozen.
 
 ## [Unreleased]
 
+### Added
+
+- **Background shells: `bash` gains `run_in_background`, plus `bash_output` /
+  `kill_shell`.** Setting `run_in_background=true` starts the command as a
+  detached shell and returns immediately with a `bash_N` handle — "start a dev
+  server, use it in a later call" is back as an explicit opt-in (the shape
+  follows the convention the major coding agents converged on). `bash_output`
+  returns only output produced since the previous read (optionally filtered by
+  a regex) plus status and exit code; `kill_shell` terminates the shell's
+  whole process group. Output is buffered per shell with a drop-oldest cap, so
+  a chatty server can't grow memory unbounded. When a background shell exits,
+  a system notice lands at the next seam (waking an idle workstream if
+  needed). Shells survive a generation cancel, die with the workstream, and
+  never outlive a task_agent that started them; anything a background shell
+  itself backgrounds is still reaped when that shell exits — the no-leak
+  guarantee below is unchanged.
+
 ### Fixed
 
 - **bash tool: never hang on a backgrounded child.** A command that left a
@@ -28,7 +45,8 @@ Earlier stable lines (`stable/1.6`, `stable/1.5`) are frozen.
   (`errors="replace"`) instead of being dropped as a spurious error.
   - **Behavior change:** a process the command backgrounds no longer survives
     the call — nothing persists across bash invocations. (First-class
-    "run this in the background" support is planned as a separate change.)
+    "run this in the background" support landed separately — see
+    `run_in_background` under Added.)
 
 ## [1.7.3]
 
