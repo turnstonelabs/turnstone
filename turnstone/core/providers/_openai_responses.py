@@ -454,6 +454,7 @@ class OpenAIResponsesProvider:
                 log.warning(
                     "openai.responses: ignoring unknown reasoning mode",
                     value=caps.reasoning_mode,
+                    expected=sorted(REASONING_MODES),
                 )
         if reasoning:
             kwargs["reasoning"] = reasoning
