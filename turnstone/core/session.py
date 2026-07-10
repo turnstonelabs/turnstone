@@ -48,6 +48,16 @@ from turnstone.core.attachments import (
     safe_attachment_label,
     unreadable_placeholder,
 )
+from turnstone.core.background_shells import (
+    _FILTER_MAX_LINE_CHARS,
+    BackgroundShell,
+    BackgroundShellRegistry,
+    FilterExecError,
+    FilterTimeoutError,
+    UnknownShellError,
+    drain_pipe_lines,
+    spawn_group_leader,
+)
 from turnstone.core.config import get_searxng_engines, get_searxng_url
 from turnstone.core.edit import find_occurrences, pick_nearest
 from turnstone.core.history_decoration import (
@@ -117,7 +127,15 @@ from turnstone.core.metacognition import (
     sanitize_payload,
     should_nudge,
 )
-from turnstone.core.nudge_queue import TOOL_DRAIN, USER_DRAIN, NudgeQueue
+from turnstone.core.nudge_queue import (
+    QUIET_CHANNEL,
+    QUIET_DRAIN,
+    TOOL_DRAIN,
+    USER_DRAIN,
+    WAKE_PENDING,
+    Entry,
+    NudgeQueue,
+)
 from turnstone.core.personas import (
     PersonaSnapshot,
     resolve_persona_for_kind,
@@ -388,6 +406,50 @@ _AGENT_STEP_COUNT_CAP: int = 100
 _active_read_files: contextvars.ContextVar[set[str] | None] = contextvars.ContextVar(
     "turnstone_active_read_files", default=None
 )
+
+# Owner scope for background shells (#817).  ``_exec_task`` sets it to the
+# task_agent's call_id for the sub-agent's duration: shells spawned inside
+# carry that owner tag, owner-scoped lookup keeps parallel agents (and the
+# parent) from touching each other's handles, and the agent's ``finally``
+# reaps its own.  ``None`` outside a sub-agent → main-session scope.
+_active_shell_owner: contextvars.ContextVar[str | None] = contextvars.ContextVar(
+    "turnstone_active_shell_owner", default=None
+)
+
+
+# Tools exempt from consecutive-identical-call repeat detection: delta-cursor
+# readers whose repeated identical call is the documented polling pattern.
+_REPEAT_EXEMPT_TOOLS: frozenset[str] = frozenset({"bash_output"})
+
+
+# ONE source of truth for recognized boolean-arg strings — both coercers
+# below derive from these, so a new provider quirk added here reaches every
+# tool at once instead of drifting per-tool.
+_TRUTHY_STRINGS: frozenset[str] = frozenset({"true", "1", "yes", "on"})
+_FALSY_STRINGS: frozenset[str] = frozenset({"false", "0", "no", "off", ""})
+_KNOWN_BOOL_STRINGS: frozenset[str] = _TRUTHY_STRINGS | _FALSY_STRINGS
+
+
+def _is_truthy_flag(value: Any) -> bool:
+    """A model-sent boolean arg: bool ``True`` or the string forms providers
+    intermittently emit ("true"/"1"/"yes", any case).  Everything else —
+    including ``None`` and ``False`` strings — is ``False``.  Used for flags
+    where silently taking the wrong branch is worse than being lenient
+    (``run_in_background``: a string-typed true would otherwise run the
+    command in the FOREGROUND and then group-kill the server the model
+    believed it detached).  ONE dialect for the whole file —
+    ``_coord_bool_arg`` delegates here — so a provider quirk honored on one
+    tool is never silently ignored on another."""
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return value.strip().lower() in _TRUTHY_STRINGS
+    if isinstance(value, (int, float)):
+        # Numeric booleans (run_in_background: 1) — same provider-drift
+        # class as the string forms.
+        return bool(value)
+    return False
+
 
 # Cap on the *content portion* (text after ``path:lineno:``) of an
 # emitted search result line. Defends the context budget against
@@ -1561,6 +1623,10 @@ class ChatSession:
         self._generation: int = 0  # monotonic counter; orphaned threads skip cleanup
         self._active_procs: set[subprocess.Popen[str]] = set()  # for force-kill
         self._procs_lock = threading.Lock()
+        # Detached shells from bash(run_in_background=true) (#817).  Deliberately
+        # NOT reaped by cancel(): stopping a generation must not kill a server
+        # the model detached on purpose.  close() reaps everything.
+        self._background_shells = BackgroundShellRegistry(on_exit=self._on_background_shell_exit)
         self._cancelled_partial_msg: dict[str, Any] | None = None
         self._pending_retry: str | None = None
         # True when a fatal exception's text has been persisted to
@@ -2887,59 +2953,116 @@ class ChatSession:
         """
         self._watch_runner = runner
         self._watch_wake_fn = wake_fn
-        nudge_queue = self._nudge_queue
-        ws_id = self._ws_id
 
         def _dispatch(reminder: dict[str, Any], watch_id: str) -> None:
             # ``reminder`` is the structured dict produced by
-            # :func:`build_watch_reminder`.  ``text`` carries the
-            # formatted body — sanitised here over the full string so
-            # steering-vector / control-char payloads sourced from
-            # arbitrary shell output can't tamper with the envelope at
-            # interpolation time.  The remaining fields ride as the
+            # :func:`build_watch_reminder`; the optional fields ride as the
             # queue entry's ``metadata`` → sibling keys on the
             # ``watch_triggered`` system turn, surfaced in the operator
-            # bubble (command preview + poll counter).
-            text = reminder.get("text", "") if isinstance(reminder, dict) else ""
-            sanitized = sanitize_payload(text)
-            if not sanitized:
-                # All control chars / empty after strip — silently drop.
+            # bubble (command preview + poll counter).  Sanitization, the
+            # drop-oldest soft cap (latest output is most useful) and the
+            # wake live on the shared external-event rail —
+            # ``self._watch_wake_fn`` is read at FIRE time there, so an
+            # identity rebind that re-invoked ``set_watch_runner`` is
+            # honored without rebuilding this closure.
+            if not isinstance(reminder, dict):
+                # Untrusted boundary: a non-dict reminder must drop silently
+                # (as the old empty-text early-return did), not TypeError out
+                # of the dispatch closure — WatchRunner would hold the row
+                # and re-fire it every tick.
                 return
-            # Soft cap drops oldest — latest output is most useful.
-            if nudge_queue.cap_at_or_drop_oldest(
-                "watch_triggered", _WATCH_QUEUE_SOFT_CAP, channel="any"
-            ):
-                log.warning(
-                    "watch_dispatch.queue_full ws=%s cap=%d dropped_oldest=True",
-                    ws_id,
-                    _WATCH_QUEUE_SOFT_CAP,
-                )
-
-            def _maybe_sanitize(v: Any) -> Any:
-                return sanitize_payload(v) if isinstance(v, str) else v
-
-            metadata = {
-                k: _maybe_sanitize(reminder[k])
-                for k in WATCH_REMINDER_OPTIONAL_KEYS
-                if k in reminder
-            }
-            nudge_queue.enqueue(
+            text = reminder.get("text", "")
+            metadata = {k: reminder[k] for k in WATCH_REMINDER_OPTIONAL_KEYS if k in reminder}
+            self._notify_external_event(
                 "watch_triggered",
-                sanitized,
-                "any",
+                text,
                 metadata=metadata or None,
+                soft_cap=_WATCH_QUEUE_SOFT_CAP,
             )
-            if wake_fn is not None:
-                try:
-                    wake_fn()
-                except Exception:
-                    log.warning("watch_dispatch.wake_failed ws=%s", ws_id, exc_info=True)
 
         self._watch_dispatch_fn = _dispatch
         runner.set_dispatch_fn(self._ws_id, _dispatch)
 
+    def _notify_external_event(
+        self,
+        nudge_type: str,
+        text: str,
+        *,
+        metadata: dict[str, Any] | None = None,
+        valid_until: Callable[[], bool] | None = None,
+        soft_cap: int | None = None,
+    ) -> None:
+        """THE external-event rail: sanitize → (cap) → enqueue ``"any"`` → wake.
+
+        Every producer of autonomous notices (watch fires, background-shell
+        exits) rides this one helper, so policy fixes — caps, sanitization,
+        wake-failure handling — can never silently apply to only one of
+        them.  ``sanitize_payload`` runs over the full text (and string
+        metadata values) so steering-vector / control-char payloads sourced
+        from arbitrary process output can't tamper with the envelope; an
+        all-control-chars text drops the event silently.  ``soft_cap``
+        drop-oldest counts across ALL channels (``channel=None``) so
+        entries a user cancel demoted to ``"quiet"`` still occupy the
+        budget.  The wake makes an already-idle workstream deliver the
+        entry now — busy workstreams are safe, ``session_worker.send``
+        downgrades to a no-op while a worker owns the session.
+        """
+        if not isinstance(text, str):
+            # Untrusted producers (watch reminder payloads) can carry a
+            # non-string text; sanitize_payload would TypeError and a raise
+            # out of a dispatch closure makes WatchRunner hold + re-fire the
+            # row every tick.  Drop silently, same as empty-after-sanitize.
+            log.debug("external_event.non_string_text ws=%s type=%s", self._ws_id, nudge_type)
+            return
+        sanitized = sanitize_payload(text)
+        if not sanitized:
+            return
+        if soft_cap is not None and self._nudge_queue.cap_at_or_drop_oldest(
+            nudge_type, soft_cap, channel=None
+        ):
+            log.warning(
+                "external_event.queue_full ws=%s type=%s cap=%d dropped_oldest=True",
+                self._ws_id,
+                nudge_type,
+                soft_cap,
+            )
+        clean_meta: dict[str, Any] | None = None
+        if metadata:
+            clean_meta = {
+                k: (sanitize_payload(v) if isinstance(v, str) else v) for k, v in metadata.items()
+            }
+        self._nudge_queue.enqueue(
+            nudge_type,
+            sanitized,
+            "any",
+            valid_until=valid_until,
+            metadata=clean_meta or None,
+        )
+        wake_fn = self._watch_wake_fn
+        if wake_fn is not None:
+            try:
+                wake_fn()
+            except Exception:
+                # The enqueue already happened; a raise here would abort the
+                # producer (e.g. WatchRunner._poll_watch before its watch-row
+                # update commits — re-firing the same reminder every tick).
+                log.warning(
+                    "external_event.wake_failed ws=%s type=%s",
+                    self._ws_id,
+                    nudge_type,
+                    exc_info=True,
+                )
+
     def close(self) -> None:
-        """Release resources (listener registrations, etc.)."""
+        """Release resources (listener registrations, etc.).
+
+        Instant signal operations run FIRST (judge cancel events, listener
+        deregistrations); the background-shell teardown runs last because it
+        is the only step with a blocking phase (a bounded thread-join, up to
+        ``_CLOSE_JOIN_BUDGET_S`` when a drain is wedged) and nothing here
+        depends on it — serializing instant steps behind it would keep judge
+        daemons burning inference for the whole join budget on every close.
+        """
         if self._judge_cancel_event is not None:
             self._judge_cancel_event.set()
         # Abort every in-flight judge daemon — with parallel task agents
@@ -2983,6 +3106,12 @@ class ChatSession:
                 self._coord_client.close()
             except Exception:
                 log.debug("chat_session.coord_client_close_failed", exc_info=True)
+        # Last: the only step with a blocking phase (see docstring).  Kill
+        # signals fire at its start; every teardown path funnels through
+        # close(), so nothing detached outlives the workstream.  Queued exit
+        # notices go stale with the registry (``valid_until``) and drop at
+        # the next drain.
+        self._background_shells.close()
         self._cleanup_skill_resources()
 
     def _drop_mcp_surface(self) -> None:
@@ -6321,18 +6450,32 @@ class ChatSession:
                 self._cancel_event.clear()
 
     def _drain_pending_advisories(self) -> None:
-        """Drop every pending nudge regardless of channel.
+        """Drop the abandoned generation's advisory nudges — not external events.
 
         Tool-channel nudges (``tool_error``, ``repeat``, ``denial``)
         queued earlier in this batch and user-channel nudges
         (``correction``, …) queued during ``_check_metacognitive_nudge``
-        but not yet drained share the same per-session
-        :class:`NudgeQueue`.
-        When a generation is abandoned (cancel, KeyboardInterrupt,
-        unexpected exception) the entire queue drops so nothing bleeds
-        into the next send's tool loop or next user turn.
+        are commentary ABOUT the generation being abandoned (cancel,
+        KeyboardInterrupt, unexpected exception) — they drop so nothing
+        stale bleeds into the next send's tool loop or user turn.
+
+        ``"any"``-channel entries survive but are DEMOTED to ``"quiet"``:
+        those are external events (``watch_triggered``,
+        ``background_shell_exit``) that happened regardless of the
+        generation's fate, and their producers promised the model a notice
+        — a background dev server that crashed during a cancelled turn must
+        still be announced at the next seam, or the model keeps talking to
+        a dead server.  But they must not CAUSE that seam: an abandoned
+        generation ends in ``_emit_state("idle")``, and a wake-eligible
+        entry there would make the ``IdleNudgeWatcher`` resume the
+        workstream seconds after the user pressed Stop.  ``"quiet"``
+        delivers at the next legitimate seam (user message, tool batch, or
+        a wake earned by a NEW event) without ever being the wake reason.
+        Stale entries are handled at drain time by their ``valid_until``
+        predicates.
         """
-        self._nudge_queue.clear()
+        self._nudge_queue.clear_channels({"tool", "user"})
+        self._nudge_queue.demote_channel("any", QUIET_CHANNEL)
 
     def _synthesize_cancelled_results(self, reason: str) -> None:
         """Synthesize tool_result messages for orphaned tool_calls after cancel.
@@ -7973,6 +8116,10 @@ class ChatSession:
                     "command": it.get("command", ""),
                     "timeout": it.get("timeout"),
                     "stop_on_error": bool(it.get("stop_on_error")),
+                    # Detachment is part of the intent: a backgrounded
+                    # process outlives the call (#817), which changes what
+                    # the judge is approving — never amputate it.
+                    "run_in_background": bool(it.get("run_in_background")),
                 }
             elif name == "write_file":
                 it["func_args"] = {
@@ -9232,6 +9379,8 @@ class ChatSession:
 
         preparers = {
             "bash": self._prepare_bash,
+            "bash_output": self._prepare_bash_output,
+            "kill_shell": self._prepare_kill_shell,
             "read_file": self._prepare_read_file,
             "search": self._prepare_search,
             "diff_file": self._prepare_diff,
@@ -9345,6 +9494,31 @@ class ChatSession:
         if is_multiline:
             preview = f"{DIM}{textwrap.indent(command, '    ')}{RESET}"
 
+        # ``is_background`` accepted as an undocumented alias (Gemini's shell
+        # tool trained that name); ``run_in_background`` is the documented one.
+        # Lenient coercion: a string-typed "true" must not silently run the
+        # command in the foreground (where the group kill would then reap the
+        # server the model believed it detached).
+        background = _is_truthy_flag(args.get("run_in_background")) or _is_truthy_flag(
+            args.get("is_background")
+        )
+        if background:
+            # Same approval gate as foreground — the command is what's
+            # dangerous, not the detachment.  ``timeout`` is ignored: there
+            # is no bounded wait to time out (documented in the schema).
+            return {
+                "call_id": call_id,
+                "func_name": "bash",
+                "header": f"\u2699 bash (background): {display_cmd}",
+                "preview": preview,
+                "needs_approval": True,
+                "approval_label": "bash",
+                "execute": self._exec_bash_background,
+                "command": command,
+                "run_in_background": True,
+                "stop_on_error": _is_truthy_flag(args.get("stop_on_error")),
+            }
+
         return {
             "call_id": call_id,
             "func_name": "bash",
@@ -9359,7 +9533,71 @@ class ChatSession:
             "execute": self._exec_bash,
             "command": command,
             "timeout": timeout,
-            "stop_on_error": args.get("stop_on_error") is True,
+            # Same lenient dialect as run_in_background — a string-typed
+            # "true" must add ``set -e``, not silently drop it.
+            "stop_on_error": _is_truthy_flag(args.get("stop_on_error")),
+        }
+
+    def _prepare_bash_output(self, call_id: str, args: dict[str, Any]) -> dict[str, Any]:
+        shell_id = str(args.get("id") or "").strip()
+        if not shell_id:
+            return {
+                "call_id": call_id,
+                "func_name": "bash_output",
+                "header": "\u2717 bash_output: missing id",
+                "preview": "",
+                "needs_approval": False,
+                "error": "Error: missing id (the bash_N handle returned when the shell started)",
+            }
+        filter_arg = args.get("filter")
+        if filter_arg is not None and not isinstance(filter_arg, str):
+            # An ill-typed filter must error, not silently run unfiltered —
+            # the unfiltered read would consume the whole delta the model
+            # wanted narrowed.
+            return {
+                "call_id": call_id,
+                "func_name": "bash_output",
+                "header": "\u2717 bash_output: invalid filter",
+                "preview": "",
+                "needs_approval": False,
+                "error": (
+                    f"Error: filter must be a regex string "
+                    f"(got {type(filter_arg).__name__}); no output was consumed"
+                ),
+            }
+        return {
+            "call_id": call_id,
+            "func_name": "bash_output",
+            "header": f"\u2699 bash_output: {shell_id}",
+            "preview": "",
+            "needs_approval": False,
+            "execute": self._exec_bash_output,
+            "shell_id": shell_id,
+            "filter": filter_arg or None,
+        }
+
+    def _prepare_kill_shell(self, call_id: str, args: dict[str, Any]) -> dict[str, Any]:
+        shell_id = str(args.get("id") or "").strip()
+        if not shell_id:
+            return {
+                "call_id": call_id,
+                "func_name": "kill_shell",
+                "header": "\u2717 kill_shell: missing id",
+                "preview": "",
+                "needs_approval": False,
+                "error": "Error: missing id (the bash_N handle returned when the shell started)",
+            }
+        # Auto-approved: the argument space is closed (this session's own
+        # registered shells) and killing one is strictly risk-reducing —
+        # the dangerous direction was gated when the shell was started.
+        return {
+            "call_id": call_id,
+            "func_name": "kill_shell",
+            "header": f"\u2699 kill_shell: {shell_id}",
+            "preview": "",
+            "needs_approval": False,
+            "execute": self._exec_kill_shell,
+            "shell_id": shell_id,
         }
 
     @property
@@ -10732,8 +10970,9 @@ class ChatSession:
         rather than draining again (the predicate-aware drain runs once, in
         ``deliver_wake_nudge_from_queue``).
         """
-        if self._wake_drained_reminders is not None:
-            entries = self._wake_drained_reminders
+        from_wake = self._wake_drained_reminders is not None
+        if from_wake:
+            entries = self._wake_drained_reminders or []
             self._wake_drained_reminders = None  # consume — only delivered once
         else:
             items = self._nudge_queue.drain(USER_DRAIN)
@@ -10743,12 +10982,24 @@ class ChatSession:
                 if meta:
                     entry.update(meta)
                 entries.append(entry)
-        for entry in entries:
+        for i, entry in enumerate(entries):
             source = str(entry.get("type") or "")
             if not source:
                 continue
             meta = {k: v for k, v in entry.items() if k not in ("type", "text")}
-            self._append_system_turn(source, str(entry.get("text") or ""), **meta)
+            try:
+                self._append_system_turn(source, str(entry.get("text") or ""), **meta)
+            except BaseException:
+                if from_wake:
+                    # Mid-batch failure on a wake: re-stash the un-emitted
+                    # TAIL (including the failing entry — its persistence is
+                    # UNKNOWN; at-least-once beats silently-eaten for an
+                    # exit notice that fires exactly once) so the wake
+                    # caller's finally can re-enqueue instead of losing the
+                    # suffix.  Non-wake callers drain directly and keep the
+                    # pre-existing best-effort semantics.
+                    self._wake_drained_reminders = entries[i:]
+                raise
 
     def _queue_tool_advisory(self, nudge_type: str, text: str) -> None:
         """Queue a metacognitive nudge for the next tool-result batch.
@@ -10805,16 +11056,34 @@ class ChatSession:
         post-retry stream failure leaves them in place — operator
         intervention is required for the underlying failure anyway.
         """
-        items = self._nudge_queue.drain(USER_DRAIN)
-        if not items:
+        # Two-pass drain: wake-eligible channels first.  ``"quiet"`` entries
+        # (external events demoted by a user cancel) ride a wake earned by
+        # others but never justify one — if every wake-eligible candidate
+        # evaporated at drain time (``valid_until``), bail WITHOUT touching
+        # the quiet entries: they stay queued for the next legitimate seam
+        # instead of resuming a workstream the user stopped.  The merged
+        # batch is re-sorted by queue insertion ``seq`` so cross-channel
+        # chronology survives the two passes (a demoted poll-4 fire must
+        # not render after the poll-5 fire that earned the wake).
+        drained = self._nudge_queue.drain_entries(WAKE_PENDING)
+        if not drained:
             return
+        drained += self._nudge_queue.drain_entries(QUIET_DRAIN)
+        drained.sort(key=lambda e: e.seq)
         self._wake_source_tag = "system_nudge"
         wake_reminders: list[dict[str, Any]] = []
-        for nudge_type, text, meta in items:
-            entry: dict[str, Any] = {"type": nudge_type, "text": text}
-            if meta:
-                entry.update(meta)
+        # Identity map from reminder dict → its source Entry: the failure
+        # path recovers each un-emitted entry by ``id(reminder)`` lookup,
+        # never by index arithmetic, so it stays correct even if a future
+        # edit filters or reorders the reminder list between here and
+        # ``_emit_pending_user_nudges``.
+        entry_by_reminder: dict[int, Entry] = {}
+        for queued in drained:
+            entry: dict[str, Any] = {"type": queued.nudge_type, "text": queued.text}
+            if queued.metadata:
+                entry.update(queued.metadata)
             wake_reminders.append(entry)
+            entry_by_reminder[id(entry)] = queued
         self._wake_drained_reminders = wake_reminders
         try:
             self.send("", from_wake=True)
@@ -10828,7 +11097,36 @@ class ChatSession:
             log.info("wake_nudge.cancelled ws=%s", self._ws_id[:8])
         finally:
             self._wake_source_tag = ""
+            undelivered = self._wake_drained_reminders
             self._wake_drained_reminders = None
+            if undelivered:
+                # The send died before ``_emit_pending_user_nudges`` finished
+                # the batch (it re-stashes the un-emitted TAIL on a mid-batch
+                # failure, and nulls the attr only when done).  Recovery is
+                # EXTERNAL-notices-only, and always to ``"quiet"``:
+                # ``requeue`` keeps seq (a re-queued poll-4 still renders
+                # before poll-5 on the retry) and the ``valid_until``
+                # predicate (a stale notice stays droppable), while quiet
+                # keeps the entry OUT of the wake gate.  A ``"user"``
+                # advisory is deliberately DROPPED instead: re-queueing it
+                # wake-eligible re-arms ``_retry_pending_wake``'s zero-
+                # backoff worker-exit gate — a repeatable pre-consumption
+                # send failure would respawn wake workers in an unbounded
+                # hot loop (persisting an orphan synthetic user turn per
+                # spin).  Losing a generation-scoped metacog hint on a
+                # rare failed wake is the strictly smaller harm.
+                for reminder in undelivered:
+                    recovered = entry_by_reminder.get(id(reminder))
+                    if recovered is None or not recovered.text:
+                        continue
+                    if recovered.channel == "user":
+                        log.debug(
+                            "wake_nudge.user_advisory_dropped ws=%s type=%s",
+                            self._ws_id[:8],
+                            recovered.nudge_type,
+                        )
+                        continue
+                    self._nudge_queue.requeue(recovered, channel=QUIET_CHANNEL)
 
     def _apply_post_execute_advisories(
         self,
@@ -10871,10 +11169,19 @@ class ChatSession:
         for i, (tc_id, output) in enumerate(results):
             tc = _tc_by_id.get(tc_id)
             if tc and isinstance(output, str):
+                # Delta-cursor readers (``_REPEAT_EXEMPT_TOOLS``): identical
+                # args ARE the documented usage (poll the same handle) and
+                # the result differs by construction — a "result is the
+                # same" warning would be factually false.  They are still
+                # RECORDED (never skipped): the detector's contract is that
+                # any different signature breaks a streak, so an exempt call
+                # interleaved between identical bash calls must keep those
+                # bash calls from reading as consecutive.
+                exempt = tc["function"]["name"] in _REPEAT_EXEMPT_TOOLS
                 raw = tc["function"]["name"] + ":" + tc["function"]["arguments"]
                 sig = hashlib.sha256(raw.encode()).hexdigest()
                 is_json = output.lstrip().startswith(("{", "["))
-                if self._repeat_detector.record(sig):
+                if self._repeat_detector.record(sig) and not exempt:
                     _repeat_detected = True
                     if not is_json:
                         output += (
@@ -10976,21 +11283,16 @@ class ChatSession:
         """Return ``args[key]`` as a bool with robust string coercion.
 
         Plain ``bool(x)`` treats ``"false"`` as truthy (non-empty string).
-        Accept actual bools verbatim; parse common string forms; return
-        ``default`` for anything else.
+        Accept actual bools verbatim; delegate the truthy dialect to
+        :func:`_is_truthy_flag` (ONE coercion dialect file-wide); return
+        ``default`` for a missing key or an unrecognized string.
         """
         val = args.get(key)
-        if isinstance(val, bool):
-            return val
-        if isinstance(val, str):
-            normalized = val.strip().lower()
-            if normalized in ("true", "1", "yes", "on"):
-                return True
-            if normalized in ("false", "0", "no", "off", ""):
-                return False
-        if isinstance(val, (int, float)) and not isinstance(val, bool):
-            return bool(val)
-        return default
+        if val is None:
+            return default
+        if isinstance(val, str) and val.strip().lower() not in _KNOWN_BOOL_STRINGS:
+            return default
+        return _is_truthy_flag(val)
 
     @staticmethod
     def _flatten_spawn_arg(value: Any, cap: int) -> str:
@@ -14031,25 +14333,19 @@ class ChatSession:
         call_id, command = item["call_id"], item["command"]
         timeout = item.get("timeout") or self.tool_timeout
         try:
-            with tempfile.NamedTemporaryFile(mode="w", suffix=".sh", delete=False) as f:
-                preamble = "set -o pipefail\n"
-                if item.get("stop_on_error"):
-                    preamble += "set -e\n"
-                f.write(preamble + command)
-                script_path = f.name
-            # Pre-bind so the ``finally`` can't raise ``UnboundLocalError`` and
-            # mask the real error if ``Popen`` below fails.
+            # Pre-bind so the ``finally`` can't raise ``UnboundLocalError``
+            # and mask the real error if the spawn below fails.
             proc: subprocess.Popen[str] | None = None
+            script_path: str | None = None
             try:
                 from turnstone.core.env import scrubbed_env
 
-                proc = subprocess.Popen(
-                    ["bash", script_path],
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
-                    text=True,
-                    errors="replace",
-                    start_new_session=True,
+                # Shared prologue with the background registry (script file +
+                # detached group leader + pgid snapshot) — one spawn recipe
+                # for both variants of the tool, so they cannot drift.
+                proc, pgid, script_path = spawn_group_leader(
+                    command,
+                    stop_on_error=item.get("stop_on_error") is True,
                     env=scrubbed_env(extra=self._skill_resource_env()),
                 )
                 with self._procs_lock:
@@ -14065,54 +14361,38 @@ class ChatSession:
                 stdout_parts: list[str] = []
                 stderr_lines: list[str] = []
 
-                def _drain(pipe: Any, sink: list[str], to_ui: bool) -> None:
+                # End-of-stream tolerance lives in the shared
+                # ``drain_pipe_lines`` (the drain half of the recipe both
+                # bash variants share); only the sinks differ — stdout also
+                # streams to the UI.
+                def _on_stdout(line: str) -> None:
+                    stdout_parts.append(line)
                     try:
-                        for line in pipe:
-                            sink.append(line)
-                            if to_ui:
-                                try:
-                                    self.ui.on_tool_output_chunk(call_id, line)
-                                except Exception:
-                                    log.debug(
-                                        "UI callback error during tool output",
-                                        exc_info=True,
-                                    )
-                    except (ValueError, OSError):
-                        # Pipe torn down by the session-group kill below is the
-                        # expected case; anything else must not kill the drain
-                        # silently.  (Undecodable bytes can't land here — the
-                        # ``errors="replace"`` on Popen pre-empts UnicodeDecodeError,
-                        # which is a ValueError that would otherwise drop all output.)
-                        log.debug("bash.drain_read_error", exc_info=True)
+                        self.ui.on_tool_output_chunk(call_id, line)
+                    except Exception:
+                        log.debug("UI callback error during tool output", exc_info=True)
 
                 assert proc.stdout is not None and proc.stderr is not None
                 stdout_thread = threading.Thread(
-                    target=_drain,
-                    args=(proc.stdout, stdout_parts, True),
+                    target=drain_pipe_lines,
+                    args=(proc.stdout, _on_stdout),
                     name=f"bash-drain-out-{call_id}",
                     daemon=True,
                 )
                 stderr_thread = threading.Thread(
-                    target=_drain,
-                    args=(proc.stderr, stderr_lines, False),
+                    target=drain_pipe_lines,
+                    args=(proc.stderr, stderr_lines.append),
                     name=f"bash-drain-err-{call_id}",
                     daemon=True,
                 )
                 stdout_thread.start()
                 stderr_thread.start()
 
-                # Snapshot the session-group id while the leader is alive
-                # (``start_new_session=True`` makes ``pgid == proc.pid``).  While
-                # any member survives, the group names only our own descendants;
-                # once they have all exited it is empty and the kill below is a
-                # harmless no-op.  (A pid-wraparound landing a fresh session
-                # leader on this exact id in the microseconds after a normal-exit
-                # reap is the standard accepted TOCTOU — negligible, and only when
-                # nothing needs killing anyway.)
-                try:
-                    pgid = os.getpgid(proc.pid)
-                except OSError:
-                    pgid = proc.pid
+                # ``pgid`` was snapshotted by ``spawn_group_leader`` while the
+                # leader was alive.  While any member survives, the group
+                # names only our own descendants; once they have all exited
+                # it is empty and the kill below is a harmless no-op (the
+                # accepted microseconds pid-wraparound TOCTOU).
 
                 # Wait for the tracked command, bounded by ``timeout`` and
                 # cooperatively cancellable.  Keyed on process exit, never pipe
@@ -14156,7 +14436,10 @@ class ChatSession:
                 if proc is not None:
                     with self._procs_lock:
                         self._active_procs.discard(proc)
-                os.unlink(script_path)
+                # ``spawn_group_leader`` already unlinked on a failed fork —
+                # ``script_path`` stays None on that path.
+                if script_path is not None:
+                    os.unlink(script_path)
 
             if timed_out.is_set():
                 raise subprocess.TimeoutExpired(cmd="bash", timeout=timeout)
@@ -14223,6 +14506,181 @@ class ChatSession:
             msg = f"Error executing command: {e}"
             self._report_tool_result(call_id, "bash", msg, is_error=True)
             return call_id, msg
+
+    def _exec_bash_background(self, item: dict[str, Any]) -> tuple[str, str]:
+        """Start ``command`` as a detached background shell (#817).
+
+        Returns immediately with the ``bash_N`` handle — the shell's later
+        output/exit is a NEW event (a NudgeQueue notice at the next seam),
+        never a deferred resolution of this call_id, so the canonical
+        trajectory stays faithful on replay.
+        """
+        call_id, command = item["call_id"], item["command"]
+        from turnstone.core.env import scrubbed_env
+
+        try:
+            shell = self._background_shells.spawn(
+                command,
+                env=scrubbed_env(extra=self._skill_resource_env()),
+                owner=_active_shell_owner.get(),
+                stop_on_error=item.get("stop_on_error") is True,
+            )
+        except (RuntimeError, OSError) as e:
+            # TooManyShellsError / registry-closed / spawn failure — all
+            # actionable by the model (kill one, or just don't background).
+            msg = f"Error: {e}"
+            self._report_tool_result(call_id, "bash", msg, is_error=True)
+            return call_id, msg
+        msg = (
+            f"Started background shell {shell.shell_id} (pid {shell.pid}). "
+            f'Read new output with bash_output(id="{shell.shell_id}"); stop it with '
+            f'kill_shell(id="{shell.shell_id}").'
+        )
+        if shell.owner is None:
+            msg += " It runs until it exits or is killed; a system notice will announce its exit."
+        else:
+            # Sub-agent scope: the shell dies with this agent.  Said here so
+            # the agent doesn't promise its parent a server that will be
+            # reaped the moment it returns.
+            msg += (
+                " It is scoped to this agent and will be terminated when the "
+                "agent finishes — do not report it to your caller as still "
+                "running; read/verify what you need before returning."
+            )
+        self._report_tool_result(call_id, "bash", msg)
+        return call_id, msg
+
+    def _exec_bash_output(self, item: dict[str, Any]) -> tuple[str, str]:
+        """Delta read of a background shell: only output since the last read."""
+        call_id, shell_id = item["call_id"], item["shell_id"]
+        filter_arg = item.get("filter")
+        try:
+            read = self._background_shells.read(
+                shell_id, owner=_active_shell_owner.get(), filter_pattern=filter_arg
+            )
+        except UnknownShellError as e:
+            msg = f"Error: {e}"
+            self._report_tool_result(call_id, "bash_output", msg, is_error=True)
+            return call_id, msg
+        except (FilterTimeoutError, FilterExecError) as e:
+            # A VALID pattern that blew the time bound, or a helper failure
+            # that wasn't the pattern's fault — either way nothing was
+            # consumed and the message says which and what to do.
+            msg = f"Error: {e}"
+            self._report_tool_result(call_id, "bash_output", msg, is_error=True)
+            return call_id, msg
+        except re.error as e:
+            msg = f"Error: invalid filter regex: {e}"
+            self._report_tool_result(call_id, "bash_output", msg, is_error=True)
+            return call_id, msg
+
+        if read.status == "completed":
+            state = f"completed, exit code {read.exit_code}"
+        else:
+            state = read.status
+        parts = [f"{shell_id} ({state})"]
+        if read.dropped_lines:
+            parts.append(f"[{read.dropped_lines} earlier line(s) dropped from the buffer]")
+        if read.clipped_lines:
+            # A "none matching" answer over clipped evidence must never be
+            # silent — the model would report a clean run whose error sat
+            # past the match window.
+            parts.append(
+                f"[{read.clipped_lines} line(s) longer than {_FILTER_MAX_LINE_CHARS} "
+                "chars were only partially visible to the filter; matches beyond "
+                "that window are not detected — read without a filter to see them]"
+            )
+        if read.lines:
+            if filter_arg:
+                parts.append(
+                    f"{len(read.lines)} of {read.new_line_count} new line(s) match the filter:"
+                )
+            else:
+                parts.append(f"{read.new_line_count} new line(s):")
+            parts.append("".join(read.lines).rstrip("\n"))
+        elif read.new_line_count:
+            parts.append(f"{read.new_line_count} new line(s), none matching the filter.")
+        else:
+            parts.append("No new output since the last read.")
+        full = "\n".join(parts)
+        output = self._truncate_output(full)
+        if len(output) < len(full):
+            # Unlike foreground bash (re-run to re-see), the delta cursor has
+            # already consumed the elided middle — say so, or a "no new
+            # output" follow-up reads as "nothing was missed".
+            output += (
+                "\n[the truncated middle was consumed and cannot be re-read; "
+                "use filter to narrow future reads]"
+            )
+        self._report_tool_result(call_id, "bash_output", output)
+        return call_id, output
+
+    def _exec_kill_shell(self, item: dict[str, Any]) -> tuple[str, str]:
+        """Kill a background shell's whole process group."""
+        call_id, shell_id = item["call_id"], item["shell_id"]
+        try:
+            shell = self._background_shells.kill(shell_id, owner=_active_shell_owner.get())
+        except UnknownShellError as e:
+            msg = f"Error: {e}"
+            self._report_tool_result(call_id, "kill_shell", msg, is_error=True)
+            return call_id, msg
+        if shell.status == "killed":
+            msg = (
+                f"Killed background shell {shell_id}. Output produced before the "
+                f'kill remains readable via bash_output(id="{shell_id}") until it '
+                "ages out of the recent-shells list."
+            )
+        elif shell.status == "running":
+            # SIGKILL was sent but the leader didn't exit within the join
+            # budget (uninterruptible sleep — NFS, a driver).  Outcome
+            # honesty: never tell the model a live process already exited.
+            msg = (
+                f"SIGKILL sent to background shell {shell_id}, but it has not "
+                "exited yet (possibly uninterruptible I/O). It may still die "
+                f'shortly — check bash_output(id="{shell_id}") before assuming '
+                "it is gone."
+            )
+        else:
+            msg = (
+                f"Background shell {shell_id} had already exited "
+                f"(status: {shell.status}, exit code {shell.exit_code}); nothing to kill."
+            )
+        self._report_tool_result(call_id, "kill_shell", msg)
+        return call_id, msg
+
+    def _on_background_shell_exit(self, shell: BackgroundShell) -> None:
+        """Waiter-thread callback: queue an exit notice for a detached shell.
+
+        Rides the watch rail: channel ``"any"`` (drains at whichever seam
+        fires first AND can wake an idle workstream — a ``"tool"`` entry
+        could do neither), an explicit wake for the already-idle case, and
+        a ``valid_until`` predicate so a notice whose shell is gone
+        (registry closed with the workstream) is dropped, not delivered.
+        Push the notice, let the model pull the detail via ``bash_output``
+        — bounds context.  Sub-agent shells get no notice: the sub-loop is
+        synchronous and polls; its shells die with it.
+        """
+        if shell.owner is not None:
+            return
+        cmd_excerpt = shell.command.split("\n")[0][:80]
+        unread = shell.unread_lines
+        registry = self._background_shells
+        shell_id = shell.shell_id
+        self._notify_external_event(
+            "background_shell_exit",
+            (
+                f"Background shell {shell_id} ({cmd_excerpt}) exited with code "
+                f"{shell.exit_code} — {unread} unread line(s); use "
+                f'bash_output(id="{shell_id}") to read them.'
+            ),
+            metadata={
+                "shell_id": shell_id,
+                "command": cmd_excerpt,
+                "exit_code": shell.exit_code,
+                "unread_lines": unread,
+            },
+            valid_until=lambda: registry.has(shell_id),
+        )
 
     @staticmethod
     def _read_text_lines(path: str) -> tuple[list[str], str, str | None]:
@@ -15174,6 +15632,10 @@ class ChatSession:
         # sibling's reads can't suppress THIS agent's blind-overwrite guard.  The
         # agent's own reads merge back to the parent in ``finally``.
         read_token = _active_read_files.set(set(self._current_read_files))
+        # Background shells spawned by this sub-agent carry its call_id as
+        # owner: scoped lookup (parallel agents + parent can't touch them)
+        # and bound to the agent's lifetime — reaped in ``finally`` below.
+        shell_token = _active_shell_owner.set(call_id)
         try:
             result = self._run_agent(
                 agent_turns,
@@ -15228,6 +15690,8 @@ class ChatSession:
             _active_read_files.reset(read_token)
             if sub_reads:
                 self._current_read_files.update(sub_reads)
+            _active_shell_owner.reset(shell_token)
+            self._background_shells.reap(owner=call_id)
             self._end_agent_scope()
             self._clear_agent_children(call_id)
             try:

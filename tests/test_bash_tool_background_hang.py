@@ -9,29 +9,13 @@ EOF) bounded by ``tool_timeout`` and kills the whole session group on exit, so
 the call always returns and never leaks the background child.
 """
 
-import contextlib
-import os
-import signal
 import threading
 import time
 
+from tests._proc_helpers import kill_pid as _kill_pid
+from tests._proc_helpers import pid_alive as _pid_alive
 from tests._session_helpers import NullUI, make_session
 from turnstone.core.trajectory import EffectStatus
-
-
-def _pid_alive(pid: int) -> bool:
-    try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        return True
-    return True
-
-
-def _kill_pid(pid: int) -> None:
-    with contextlib.suppress(OSError):
-        os.kill(pid, signal.SIGKILL)
 
 
 def _run_in_thread(fn, timeout):

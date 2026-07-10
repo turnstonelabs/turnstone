@@ -201,9 +201,9 @@ class TestSoftCap:
         # Oldest ("body-0") gone; newest ("overflow") present.
         assert "body-0" not in bodies
         assert "overflow" in bodies
-        # Warning logged.
-        assert any("watch_dispatch.queue_full" in r.message for r in caplog.records), (
-            "expected a watch_dispatch.queue_full warning record"
+        # Warning logged (the shared external-event rail owns the event now).
+        assert any("external_event.queue_full" in r.message for r in caplog.records), (
+            "expected an external_event.queue_full warning record"
         )
 
     def test_dispatch_soft_cap_does_not_evict_other_types(self, tmp_db):
@@ -457,8 +457,8 @@ class TestWakeFn:
         # Entry survived; the failure surfaced as a warning, not a raise
         # up into the poll loop.
         assert len(session._nudge_queue) == 1
-        assert any("watch_dispatch.wake_failed" in r.message for r in caplog.records), (
-            "expected a watch_dispatch.wake_failed warning record"
+        assert any("external_event.wake_failed" in r.message for r in caplog.records), (
+            "expected an external_event.wake_failed warning record"
         )
 
 

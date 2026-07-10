@@ -158,6 +158,10 @@ _NUDGE_MAP: dict[str, str] = {
     # consumers recognise the type.
     "idle_children": "",
     "watch_triggered": "",
+    # background_shell_exit (#817) likewise: per-fire text is composed by
+    # ``ChatSession._on_background_shell_exit`` and rides the shared
+    # external-event rail, never :func:`format_nudge`.
+    "background_shell_exit": "",
     # participant_joined likewise carries no static body — the per-fire text
     # ("<name> has joined this shared workstream…") is composed by its producer
     # (``ChatSession._maybe_note_new_participant``) and emitted via

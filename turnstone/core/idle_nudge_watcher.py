@@ -26,7 +26,7 @@ from typing import TYPE_CHECKING, Any
 
 from turnstone.core import session_worker
 from turnstone.core.log import get_logger
-from turnstone.core.nudge_queue import USER_DRAIN, NudgeQueue
+from turnstone.core.nudge_queue import WAKE_PENDING, NudgeQueue
 from turnstone.core.workstream import WorkstreamState
 
 if TYPE_CHECKING:
@@ -75,7 +75,7 @@ def wake_workstream_if_pending(ws: Workstream, *, trigger: str = "unspecified") 
       queue at its own seams (``ATTENTION``/``THINKING``/``RUNNING``
       all imply a live worker), and ``ERROR`` stays parked for the
       operator rather than burning inference unattended.
-    * nothing drainable under ``USER_DRAIN`` — tool-only entries
+    * nothing gate-eligible under ``WAKE_PENDING`` — tool-only/quiet entries
       belong to the next tool-result seam, not a synthetic empty user
       turn (``deliver_wake_nudge_from_queue`` would no-op on them).
 
@@ -102,7 +102,10 @@ def wake_workstream_if_pending(ws: Workstream, *, trigger: str = "unspecified") 
     if session is None or ws._closed or ws.state is not WorkstreamState.IDLE:
         return False
     nudge_queue = getattr(session, "_nudge_queue", None)
-    if not isinstance(nudge_queue, NudgeQueue) or not nudge_queue.has_pending(USER_DRAIN):
+    # Gate on WAKE_PENDING, not USER_DRAIN: ``"quiet"`` entries (external
+    # events demoted by a user cancel) deliver at the next legitimate seam
+    # but must never themselves wake the workstream the user just stopped.
+    if not isinstance(nudge_queue, NudgeQueue) or not nudge_queue.has_pending(WAKE_PENDING):
         return False
 
     deferred = False
@@ -135,7 +138,7 @@ class IdleNudgeWatcher:
     :func:`wake_workstream_if_pending` (the shared gate — see its
     docstring for the full gate order).  If the workstream's
     :class:`NudgeQueue` has any drainable entry for the wake's drain
-    filter (``USER_DRAIN`` — channels ``"user"`` or ``"any"``), the
+    gate (``WAKE_PENDING`` — channels ``"user"`` or ``"any"``), the
     gate dispatches via ``session_worker.send`` with a no-op
     ``enqueue`` callback.  Tool-only entries don't fire the wake —
     they belong to the next tool-result seam, not a synthetic empty

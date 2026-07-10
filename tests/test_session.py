@@ -1002,6 +1002,27 @@ class TestEvaluateIntentProjection:
         assert fa["edits"][0]["near_line"] == 42
         assert fa["replace_all"] is False
 
+    # -- bash: backgrounding is part of the intent (#817) -------------------
+
+    def test_bash_background_projects_run_in_background(self) -> None:
+        """The judge must know a bash command will run detached — a
+        backgrounded server/miner is a different intent than a bounded run.
+        Built via the real preparer so the prepared item can't silently drop
+        the flag before the projection reads it."""
+        session = _make_session()
+        item = session._prepare_bash(
+            "c1", {"command": "python -m http.server 8000", "run_in_background": True}
+        )
+        fa = _project_func_args(item)
+        assert fa["run_in_background"] is True
+        assert fa["command"] == "python -m http.server 8000"
+
+    def test_bash_foreground_projects_run_in_background_false(self) -> None:
+        session = _make_session()
+        item = session._prepare_bash("c1", {"command": "echo hi"})
+        fa = _project_func_args(item)
+        assert fa["run_in_background"] is False
+
     # -- skills: the dead-assignment bug -----------------------------------
 
     def test_skills_create_projection_is_not_empty(self) -> None:

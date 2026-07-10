@@ -1,0 +1,21 @@
+{
+  "name": "bash_output",
+  "description": "Read new output from a background shell started with bash(run_in_background=true). Returns only output produced since your previous bash_output call for that shell, plus its status (running / completed / killed) and exit code once it has exited. Stderr lines are prefixed with [stderr]. Poll this to monitor a long-running process. In the main session a system notice announces when the shell exits, so you do not need to poll a shell you are merely waiting on; inside a task agent there is no notice — poll before you finish.",
+  "parameters": {
+    "type": "object",
+    "properties": {
+      "id": {
+        "type": "string",
+        "description": "Background shell id, e.g. bash_1 (returned when the shell was started)."
+      },
+      "filter": {
+        "type": "string",
+        "description": "Optional regular expression; only new lines matching it are returned. Non-matching lines in this read are consumed and will not be returned by later calls."
+      }
+    },
+    "required": ["id"]
+  },
+  "task_agent": true,
+  "auto_approve": true,
+  "primary_key": "id"
+}
