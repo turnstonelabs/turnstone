@@ -432,6 +432,10 @@ _SEARCH_DRAIN_CHUNK: int = 8192
 # exits. The thread reads from a closed pipe at that point; a small
 # timeout keeps shutdown bounded if the OS hasn't propagated EOF yet.
 _SEARCH_DRAIN_JOIN_TIMEOUT: float = 2.0
+
+# Poll granularity while waiting for a bash command to exit — bounds how long a
+# cooperative cancel or the wall-clock ``timeout`` can go unnoticed.
+_BASH_WAIT_POLL_S: float = 0.1
 # Excluded directory patterns — hit by both backends. ripgrep also respects
 # ``.gitignore`` and skips hidden directories by default, so most of these
 # are belt-and-suspenders for the rg path; they're load-bearing for grep.
@@ -14033,6 +14037,9 @@ class ChatSession:
                     preamble += "set -e\n"
                 f.write(preamble + command)
                 script_path = f.name
+            # Pre-bind so the ``finally`` can't raise ``UnboundLocalError`` and
+            # mask the real error if ``Popen`` below fails.
+            proc: subprocess.Popen[str] | None = None
             try:
                 from turnstone.core.env import scrubbed_env
 
@@ -14041,67 +14048,114 @@ class ChatSession:
                     stdout=subprocess.PIPE,
                     stderr=subprocess.PIPE,
                     text=True,
+                    errors="replace",
                     start_new_session=True,
                     env=scrubbed_env(extra=self._skill_resource_env()),
                 )
                 with self._procs_lock:
                     self._active_procs.add(proc)
-                # Drain stderr in background thread to avoid pipe deadlock
+                # Drain stdout and stderr in background threads.  Reading the
+                # pipes to EOF in the foreground is unsafe: a command that
+                # backgrounds a long-lived child (``server &``) leaks the pipe
+                # write-end to that child, so EOF never arrives and the read —
+                # hence the whole tool call — would hang forever, with the
+                # timeout defeated once the tracked ``bash`` has exited.  Instead
+                # we wait on the tracked process bounded by ``timeout`` and tear
+                # down its whole session group on exit, reaping any such survivor.
+                stdout_parts: list[str] = []
                 stderr_lines: list[str] = []
 
-                def drain_stderr() -> None:
-                    assert proc.stderr is not None
-                    for line in proc.stderr:
-                        stderr_lines.append(line)
+                def _drain(pipe: Any, sink: list[str], to_ui: bool) -> None:
+                    try:
+                        for line in pipe:
+                            sink.append(line)
+                            if to_ui:
+                                try:
+                                    self.ui.on_tool_output_chunk(call_id, line)
+                                except Exception:
+                                    log.debug(
+                                        "UI callback error during tool output",
+                                        exc_info=True,
+                                    )
+                    except (ValueError, OSError):
+                        # Pipe torn down by the session-group kill below is the
+                        # expected case; anything else must not kill the drain
+                        # silently.  (Undecodable bytes can't land here — the
+                        # ``errors="replace"`` on Popen pre-empts UnicodeDecodeError,
+                        # which is a ValueError that would otherwise drop all output.)
+                        log.debug("bash.drain_read_error", exc_info=True)
 
-                stderr_thread = threading.Thread(target=drain_stderr, daemon=True)
+                assert proc.stdout is not None and proc.stderr is not None
+                stdout_thread = threading.Thread(
+                    target=_drain,
+                    args=(proc.stdout, stdout_parts, True),
+                    name=f"bash-drain-out-{call_id}",
+                    daemon=True,
+                )
+                stderr_thread = threading.Thread(
+                    target=_drain,
+                    args=(proc.stderr, stderr_lines, False),
+                    name=f"bash-drain-err-{call_id}",
+                    daemon=True,
+                )
+                stdout_thread.start()
                 stderr_thread.start()
 
-                # Stream stdout line-by-line with process-group timeout
-                stdout_parts: list[str] = []
+                # Snapshot the session-group id while the leader is alive
+                # (``start_new_session=True`` makes ``pgid == proc.pid``).  While
+                # any member survives, the group names only our own descendants;
+                # once they have all exited it is empty and the kill below is a
+                # harmless no-op.  (A pid-wraparound landing a fresh session
+                # leader on this exact id in the microseconds after a normal-exit
+                # reap is the standard accepted TOCTOU — negligible, and only when
+                # nothing needs killing anyway.)
+                try:
+                    pgid = os.getpgid(proc.pid)
+                except OSError:
+                    pgid = proc.pid
+
+                # Wait for the tracked command, bounded by ``timeout`` and
+                # cooperatively cancellable.  Keyed on process exit, never pipe
+                # EOF, so a leaked background child cannot extend the wait.
                 timed_out = threading.Event()
+                deadline = time.monotonic() + timeout
+                while True:
+                    if cancel.is_set():
+                        break
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        timed_out.set()
+                        break
+                    try:
+                        proc.wait(timeout=min(remaining, _BASH_WAIT_POLL_S))
+                        break
+                    except subprocess.TimeoutExpired:
+                        continue
 
-                def _on_timeout() -> None:
-                    if proc.poll() is not None:
-                        return  # process already exited
-                    timed_out.set()
-                    with contextlib.suppress(OSError, ProcessLookupError):
-                        try:
-                            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
-                        except OSError:
-                            with contextlib.suppress(OSError, ProcessLookupError):
-                                proc.kill()
+                # Terminate the whole session group on every exit path: reaps a
+                # backgrounded child that would otherwise leak (ports, PIDs) or
+                # hold the output pipe open, and forces the drain threads to EOF.
+                with contextlib.suppress(OSError, ProcessLookupError):
+                    os.killpg(pgid, signal.SIGKILL)
 
-                timer = threading.Timer(timeout, _on_timeout)
-                timer.start()
-                try:
-                    assert proc.stdout is not None
-                    for line in proc.stdout:
-                        stdout_parts.append(line)
-                        try:
-                            self.ui.on_tool_output_chunk(call_id, line)
-                        except Exception:
-                            log.debug("UI callback error during tool output", exc_info=True)
-                        # Check cancellation during long-running commands
-                        if cancel.is_set():
-                            with contextlib.suppress(OSError, ProcessLookupError):
-                                try:
-                                    os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
-                                except OSError:
-                                    with contextlib.suppress(OSError, ProcessLookupError):
-                                        proc.kill()
-                            raise GenerationCancelled()
-                finally:
-                    timer.cancel()
-
-                try:
+                with contextlib.suppress(subprocess.TimeoutExpired):
                     proc.wait(timeout=10)
-                except subprocess.TimeoutExpired:
-                    log.warning("Process did not exit after SIGKILL, pid=%d", proc.pid)
+                if proc.returncode is None:
+                    # Survived SIGKILL (uninterruptible sleep — NFS, a driver).
+                    # Restores the diagnostic the old Timer path emitted.
+                    log.warning("bash.survived_sigkill", pid=proc.pid)
+                # Writers are gone, so the drains hit EOF promptly.  They are
+                # daemon threads: a pathological double-``setsid`` grandchild
+                # that escaped the group cannot wedge shutdown — it leaks its
+                # drain (logged below) until it dies.
+                stdout_thread.join(timeout=5)
                 stderr_thread.join(timeout=5)
+                if stdout_thread.is_alive() or stderr_thread.is_alive():
+                    log.warning("bash.drain_leaked", call_id=call_id, pid=proc.pid)
             finally:
-                with self._procs_lock:
-                    self._active_procs.discard(proc)
+                if proc is not None:
+                    with self._procs_lock:
+                        self._active_procs.discard(proc)
                 os.unlink(script_path)
 
             if timed_out.is_set():
@@ -14110,9 +14164,9 @@ class ChatSession:
             # Distinguish user cancel from unexpected SIGKILL.
             # Popen.returncode is negative of the signal number when killed.
             if cancel.is_set() and proc.returncode == -signal.SIGKILL:
-                # SIGKILL'd mid-flight (the command was parked on a silent
-                # read, so the in-loop cooperative check never fired).  Its
-                # side effects are unobserved: record outcome UNKNOWN and
+                # SIGKILL'd mid-flight by our session-group kill once the
+                # bounded wait observed the cancel.  Its side effects are
+                # unobserved: record outcome UNKNOWN and
                 # mark it an error, not a clean empty success — a destructive
                 # command killed here must not read as "did not run" on
                 # replay.  Keep whatever partial stdout we captured.

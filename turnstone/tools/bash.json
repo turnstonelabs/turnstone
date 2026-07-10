@@ -1,6 +1,6 @@
 {
   "name": "bash",
-  "description": "Execute a bash command and return stdout + stderr. Use for running programs, git, tests, system commands, installing packages, etc. Environment questions ('What Python version?', 'Is X installed?') are tool-use tasks — e.g. bash(command='python --version'). For file creation use write_file instead; for man pages use man instead. Long output is truncated (head+tail preserved, middle elided). Stderr lines prefixed with [stderr].",
+  "description": "Execute a bash command and return stdout + stderr. Use for running programs, git, tests, system commands, installing packages, etc. Environment questions ('What Python version?', 'Is X installed?') are tool-use tasks — e.g. bash(command='python --version'). For file creation use write_file instead; for man pages use man instead. Long output is truncated (head+tail preserved, middle elided). Stderr lines prefixed with [stderr]. Runs to completion and returns: any process the command leaves running in the background (e.g. 'server &') is terminated when the command returns — nothing persists across calls.",
   "parameters": {
     "type": "object",
     "properties": {
