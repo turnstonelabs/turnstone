@@ -14574,8 +14574,11 @@ class ChatSession:
             self._report_tool_result(call_id, "bash_output", msg, is_error=True)
             return call_id, msg
 
-        if read.status == "completed":
-            state = f"completed, exit code {read.exit_code}"
+        # Exit code rides ANY exited state — the schema promises it "once
+        # the shell has exited", and a killed shell has one too (the signal
+        # number, negated).
+        if read.exit_code is not None:
+            state = f"{read.status}, exit code {read.exit_code}"
         else:
             state = read.status
         parts = [f"{shell_id} ({state})"]

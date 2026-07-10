@@ -219,6 +219,10 @@ def test_kill_shell_kills_and_reports(session):
     _cid, output = prepared["execute"](prepared)
     assert "killed" in output.lower()
     assert _wait_until(lambda: not _pid_alive(shell.pid))
+    # The schema promises the exit code for ANY exited state, killed included.
+    read_prepared = session._prepare_bash_output("r", {"id": shell.shell_id})
+    _cid, read_output = read_prepared["execute"](read_prepared)
+    assert "exit code" in read_output
 
 
 def test_kill_shell_unknown_id_reports_error(session):
