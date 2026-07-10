@@ -6296,13 +6296,23 @@ function _updateModelResponseControls() {
     const field = document.getElementById(spec.fieldId);
     const select = document.getElementById(spec.elementId);
     if (!field || !select) return;
+    // A value _captureModelResponseControls lifted out of the row's JSON
+    // stays visible (and re-saveable) while the identity still matches the
+    // row being edited, deliberately NOT consulting the capability
+    // baseline: the baseline arrives async (or never, on the compat lane),
+    // and yielding to it would hide the pinned value and silently drop it
+    // on save — the same lift-then-restore contract as server_compat,
+    // rerank calibration, and thinking_param. Wire safety is server-side:
+    // emission gates on the merged supports_* flag, so a pinned value on
+    // an unsupported model is inert; "Provider default" explicitly clears
+    // it. An explicit tile override (either polarity) supersedes the
+    // fallback — unchecking the tile is the operator's way to retire it.
     const capturedFallback =
       sameIdentity &&
       !(spec.supportKey in _modelCapsExplicit) &&
       _modelResponseValueValid(spec, select.value);
     const visible =
-      responseSurface &&
-      (_modelGetTile(spec.supportKey) || capturedFallback);
+      responseSurface && (_modelGetTile(spec.supportKey) || capturedFallback);
     field.hidden = !visible;
     anyVisible = anyVisible || visible;
   });
@@ -6344,10 +6354,18 @@ function _mergeModelResponseControls(caps) {
     _modelResponseInitialIdentity &&
     _modelIdentity() === _modelResponseInitialIdentity;
   _MODEL_RESPONSE_CONTROLS.forEach(function (spec) {
-    if (_modelResponseDirty[spec.key]) delete caps[spec.key];
+    // Dirty (select touched this session) lets the select override a
+    // stale JSON key, but only for the identity that made it dirty —
+    // after a model/provider/surface change the flag describes the OLD
+    // row, and honoring it would delete a key hand-typed into the
+    // Advanced JSON for the new one.
+    if (_modelResponseDirty[spec.key] && sameIdentity) delete caps[spec.key];
     else if (spec.key in caps) return; // Advanced JSON wins.
     const select = document.getElementById(spec.elementId);
     if (!select || !_modelResponseValueValid(spec, select.value)) return;
+    // Same capturedFallback contract as _updateModelResponseControls
+    // (rationale there): a lifted same-identity value must re-save, or an
+    // unrelated edit silently drops it from the row.
     const capturedFallback =
       sameIdentity && !(spec.supportKey in _modelCapsExplicit);
     if (_modelGetTile(spec.supportKey) || capturedFallback) {
