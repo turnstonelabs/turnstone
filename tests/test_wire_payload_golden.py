@@ -311,8 +311,8 @@ def test_wire_payload_anthropic_compat(fixture_id: str) -> None:
     _assert_golden(f"anthropic_compat__{fixture_id}", payload)
 
 
-# GPT-5.6 Sol is the first COMMERCIAL OpenAI model to expose the "max"
-# reasoning effort (Terra/Luna cap at "xhigh"; see OPENAI_CAPABILITIES).
+# GPT-5.6 is the first commercial OpenAI family to expose the "max"
+# reasoning effort across Sol, Terra, and Luna (see OPENAI_CAPABILITIES).
 # The base matrix above pins only the default-effort Responses shape
 # (gpt-5 → "medium"), so freeze a max-effort request to prove the new
 # level compiles onto the native ``reasoning={"effort": "max"}`` param.

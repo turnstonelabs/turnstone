@@ -131,9 +131,12 @@ Per-LLM-request token and tool call metrics:
   LLM response with prompt/completion tokens, cache tokens, tool call count,
   model, ws_id
 - **Prompt caching**: Anthropic automatic caching (`cache_control: ephemeral`)
-  and OpenAI extended retention (`prompt_cache_retention: 24h` for GPT-5.x)
-  are enabled by default. `cache_creation_tokens` and `cache_read_tokens` are
-  tracked per request in `usage_events` and surfaced in the Usage admin tab
+  and OpenAI caching are enabled by default. Pre-5.6 GPT-5 models request
+  `prompt_cache_retention: 24h`; GPT-5.6 uses
+  `prompt_cache_options: {"ttl": "30m"}`. GPT-5.6 cache writes use the
+  provider's 1.25× input-token rate. `cache_creation_tokens` and
+  `cache_read_tokens` are tracked per request in `usage_events` and surfaced
+  in the Usage admin tab
 - **Querying**: `GET /v1/api/admin/usage` with `group_by` (day/hour/model/user)
   and time range filtering — includes cache token aggregates
 - **Prometheus**: `turnstone_tokens_total{type="cache_creation|cache_read"}`

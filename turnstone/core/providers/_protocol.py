@@ -102,23 +102,6 @@ class ModelCapabilities:
     # this False: there, an empty values list means the model has no
     # effort control at all (o1-mini) and the param must be omitted.
     effort_passthrough: bool = False
-    # Responses-API output-length control (GPT-5 family): "low"/"medium"/
-    # "high", separate from reasoning effort.  ``supports_verbosity`` is the
-    # static capability; ``verbosity`` is the operator-declared value
-    # (model-definition capabilities JSON, merged via
-    # ``ChatSession._resolve_capabilities``), "" = omit.  Nests under
-    # ``text.verbosity`` on the Responses wire (a top-level ``verbosity``
-    # 400s there); the Chat/compat lane never emits it.  A value set on a
-    # model whose ``supports_verbosity`` is False is dropped, not sent.
-    supports_verbosity: bool = False
-    verbosity: str = ""
-    # Responses-API ``reasoning.mode`` (GPT-5.6 Sol): "pro" applies more
-    # model work before a single final answer.  ``supports_pro_mode`` is the
-    # static capability (Sol-only); ``reasoning_mode`` is the
-    # operator-declared value, "" = omit (normal reasoning).  There is no
-    # gpt-5.6-pro *model* — "pro" is this request-level mode instead.
-    supports_pro_mode: bool = False
-    reasoning_mode: str = ""
     supports_web_search: bool = False
     supports_tool_search: bool = False
     supports_vision: bool = False
@@ -170,6 +153,20 @@ class ModelCapabilities:
     rerank_threshold: float = 0.0
     rerank_scale: str = ""
     rerank_separated: bool = False
+    # Responses-API output-length control (GPT-5 family): "low"/"medium"/
+    # "high", separate from reasoning effort.  Appended rather than inserted
+    # above to preserve the public dataclass constructor's positional order.
+    # ``supports_verbosity`` is the static capability; ``verbosity`` is the
+    # operator-declared value (model-definition capabilities JSON, merged via
+    # ``ChatSession._resolve_capabilities``), "" = omit.  Nests under
+    # ``text.verbosity`` on the Responses wire.
+    supports_verbosity: bool = False
+    verbosity: str = ""
+    # Responses-API ``reasoning.mode`` for GPT-5.6.  ``supports_pro_mode`` is
+    # the static capability; ``reasoning_mode`` is the operator-declared value,
+    # "" = omit (standard reasoning).  There is no gpt-5.6-pro model.
+    supports_pro_mode: bool = False
+    reasoning_mode: str = ""
 
 
 # The session effort knob is ORDINAL — snapping must respect this order.

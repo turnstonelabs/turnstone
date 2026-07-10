@@ -16,7 +16,6 @@ import structlog
 from turnstone.core.providers._openai_common import (
     OPENAI_COMPAT_DEFAULT,
     RETRYABLE_ERROR_NAMES,
-    apply_cache_retention,
     apply_temperature_and_effort,
     apply_tool_search,
     extract_usage,
@@ -178,7 +177,6 @@ class OpenAIChatCompletionsProvider:
             "stream_options": {"include_usage": True},
         }
         apply_temperature_and_effort(kwargs, caps, temperature, reasoning_effort)
-        apply_cache_retention(kwargs, model)
         tools = self._apply_web_search(kwargs, caps, tools)
         tools = apply_tool_search(caps, tools, deferred_names)
         if tools:
@@ -313,7 +311,6 @@ class OpenAIChatCompletionsProvider:
             "stream": False,
         }
         apply_temperature_and_effort(kwargs, caps, temperature, reasoning_effort)
-        apply_cache_retention(kwargs, model)
         tools = self._apply_web_search(kwargs, caps, tools)
         tools = apply_tool_search(caps, tools, deferred_names)
         if tools:

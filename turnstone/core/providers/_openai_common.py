@@ -173,22 +173,11 @@ OPENAI_CAPABILITIES: dict[str, ModelCapabilities] = {
         supports_reasoning_replay=True,
     ),
     # GPT-5.6 (Sol / Terra / Luna) — released 2026-07-09.  The bare
-    # "gpt-5.6" alias routes to Sol (developers.openai.com/api/docs/guides/
-    # latest-model, 2026-07 check), so this catch-all row carries Sol's
-    # caps and also covers dated Sol snapshots ("gpt-5.6-2026-..") and the
-    # explicit "gpt-5.6-sol" id by longest-prefix match.  Sol is the ONLY
-    # 5.6 tier that unlocks the new "max" reasoning effort — the first
-    # COMMERCIAL OpenAI model to use it (KNOB_EFFORT_ORDER already ranks
-    # "max" for the Anthropic lane, so the ordinal snap and effort ladder
-    # need no change).  Sol also has a Sol-only "ultra" multi-agent mode
-    # that Turnstone does NOT expose (only "pro" is wired — see below).
-    # Default effort is "medium" like gpt-5.5; temperature is accepted only at
-    # reasoning_effort="none" (the "none"-in-values gate).  There is NO
-    # gpt-5.6-pro model: "pro" is now a reasoning.mode="pro" request param,
-    # not a separate model id.  Context window is not yet on the model page
-    # (limited preview); 1.05M mirrors the 5.4/5.5 lineage — override via
-    # the DB model definition if OpenAI publishes a different window (a
-    # smaller Luna window has been reported but is unconfirmed).
+    # "gpt-5.6" alias routes to Sol, so this catch-all row also covers the
+    # explicit "gpt-5.6-sol" id by longest-prefix match.  Every tier supports
+    # the family reasoning ladder through "max", output verbosity, and
+    # reasoning.mode="pro"; there is no separate gpt-5.6-pro model.  Default
+    # effort is "medium" and temperature is accepted only when effort="none".
     "gpt-5.6": ModelCapabilities(
         context_window=1050000,
         max_output_tokens=128000,
@@ -199,32 +188,33 @@ OPENAI_CAPABILITIES: dict[str, ModelCapabilities] = {
         supports_pdf=True,
         supports_reasoning_replay=True,
         supports_verbosity=True,
-        supports_pro_mode=True,  # Sol-only reasoning.mode="pro"
+        supports_pro_mode=True,
     ),
-    # GPT-5.6 Terra — balanced tier; Sol's ladder minus "max" (Sol-only),
-    # so the knob's "max" snaps to the "xhigh" ceiling.  No pro mode.
+    # GPT-5.6 Terra — balanced intelligence/cost tier.
     "gpt-5.6-terra": ModelCapabilities(
         context_window=1050000,
         max_output_tokens=128000,
-        reasoning_effort_values=("none", "low", "medium", "high", "xhigh"),
+        reasoning_effort_values=("none", "low", "medium", "high", "xhigh", "max"),
         default_reasoning_effort="medium",
         supports_tool_search=True,
         supports_vision=True,
         supports_pdf=True,
         supports_reasoning_replay=True,
         supports_verbosity=True,
+        supports_pro_mode=True,
     ),
-    # GPT-5.6 Luna — fastest/cheapest tier; no "max" effort, no pro mode.
+    # GPT-5.6 Luna — cost-sensitive, high-volume tier.
     "gpt-5.6-luna": ModelCapabilities(
         context_window=1050000,
         max_output_tokens=128000,
-        reasoning_effort_values=("none", "low", "medium", "high", "xhigh"),
+        reasoning_effort_values=("none", "low", "medium", "high", "xhigh", "max"),
         default_reasoning_effort="medium",
         supports_tool_search=True,
         supports_vision=True,
         supports_pdf=True,
         supports_reasoning_replay=True,
         supports_verbosity=True,
+        supports_pro_mode=True,
     ),
     # O-series reasoning models
     "o1": ModelCapabilities(
@@ -415,14 +405,15 @@ def apply_temperature_and_effort(
 
 
 def apply_cache_retention(kwargs: dict[str, Any], model: str) -> None:
-    """Enable 24-hour extended prompt cache retention for GPT-5.x models.
+    """Configure the prompt-cache lifetime supported by each GPT-5 generation.
 
-    OpenAI caching is automatic (no code changes for basic caching), but
-    the default TTL is only 5-10 minutes.  Extended retention keeps cached
-    KV tensors for up to 24 hours at no additional cost, which is valuable
-    for workstreams with bursty activity patterns.
+    GPT-5.6 replaces the deprecated ``prompt_cache_retention`` field with
+    ``prompt_cache_options.ttl``; 30 minutes is currently its only accepted
+    minimum lifetime.  Earlier GPT-5 models retain the 24-hour policy.
     """
-    if model.startswith("gpt-5"):
+    if model.startswith("gpt-5.6"):
+        kwargs["prompt_cache_options"] = {"ttl": "30m"}
+    elif model.startswith("gpt-5"):
         kwargs["prompt_cache_retention"] = "24h"
 
 
@@ -439,7 +430,7 @@ def apply_cache_retention(kwargs: dict[str, Any], model: str) -> None:
 # The emission sites drop unknown values with a warning instead, mirroring
 # how ``model_registry`` clamps out-of-range temperature / max_tokens.
 VERBOSITY_LEVELS: frozenset[str] = frozenset({"low", "medium", "high"})
-REASONING_MODES: frozenset[str] = frozenset({"pro"})
+REASONING_MODES: frozenset[str] = frozenset({"standard", "pro"})
 
 
 def apply_verbosity(kwargs: dict[str, Any], caps: ModelCapabilities) -> None:
@@ -456,7 +447,14 @@ def apply_verbosity(kwargs: dict[str, Any], caps: ModelCapabilities) -> None:
     ``apply_temperature``); a value outside ``VERBOSITY_LEVELS`` is dropped
     with a warning (an operator typo must not 400 every request).
     """
-    if not (caps.supports_verbosity and caps.verbosity):
+    if not caps.supports_verbosity or caps.verbosity == "":
+        return
+    if not isinstance(caps.verbosity, str):
+        log.warning(
+            "openai.responses: ignoring non-string verbosity",
+            value=caps.verbosity,
+            expected=sorted(VERBOSITY_LEVELS),
+        )
         return
     if caps.verbosity not in VERBOSITY_LEVELS:
         log.warning(
@@ -818,11 +816,13 @@ def extract_usage(usage_obj: Any) -> UsageInfo | None:
     if ptd is None:
         ptd = getattr(usage_obj, "input_tokens_details", None)
     cached = getattr(ptd, "cached_tokens", 0) if ptd is not None else 0
+    cache_written = getattr(ptd, "cache_write_tokens", 0) if ptd is not None else 0
 
     return UsageInfo(
         prompt_tokens=pt,
         completion_tokens=ct,
         total_tokens=tt if isinstance(tt, int) else (pt + ct),
+        cache_creation_tokens=cache_written if isinstance(cache_written, int) else 0,
         cache_read_tokens=cached if isinstance(cached, int) else 0,
     )
 
