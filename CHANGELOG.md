@@ -6,12 +6,193 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [PEP 440](https://peps.python.org/pep-0440/) for
 version numbers (`X.Y.Z`, with `X.Y.ZaN` / `bN` / `rcN` for pre-releases).
 
-Three release tracks are maintained — the current stable, one prior
-stable, and the experimental line:
+Two active release tracks are maintained — the current stable and the
+experimental line:
 
-- **`stable/1.5`** — patch-only (`v1.5.x`)
-- **`stable/1.6`** — patch-only (`v1.6.x`)
+- **`stable/1.7`** — patch-only (`v1.7.x`)
 - **`main`** — experimental (next major)
+
+Earlier stable lines (`stable/1.6`, `stable/1.5`) are frozen.
+
+## [Unreleased]
+
+### Fixed
+
+- **bash tool: never hang on a backgrounded child.** A command that left a
+  long-lived process running (`server &`, a daemon) could wedge the whole
+  workstream forever — the tool read stdout/stderr to EOF, which never arrived
+  because the child inherited the pipe, and the timeout watchdog bailed once the
+  foreground `bash` had exited. The tool now waits on the tracked process
+  (bounded by the tool timeout) and terminates its whole process group on
+  return, so the call always completes. Undecodable output is preserved
+  (`errors="replace"`) instead of being dropped as a spurious error.
+  - **Behavior change:** a process the command backgrounds no longer survives
+    the call — nothing persists across bash invocations. (First-class
+    "run this in the background" support is planned as a separate change.)
+
+## [1.7.3]
+
+A small feature and maintenance patch for the 1.7 line. No schema migrations
+and no new configuration knobs.
+
+### Added
+
+- **OpenAI GPT-5.6 (Sol/Terra/Luna) support** — the Responses provider
+  understands the GPT-5.6 family: the `reasoning.mode` control, the new
+  `max` effort tier, and `text.verbosity`, with golden wire payloads pinning
+  the request shapes. The `openai` dependency floor moves to `>=2.44`.
+
+### Changed
+
+- **Engineer base prompt hardened with process discipline** — the default
+  base prompt for non-coordinator sessions now works in phases scaled to the
+  size of the change, defaults to red-green for testable work, scopes to the
+  smallest sufficient diff, stops to report after repeated failed attempts
+  instead of thrashing, reports only observed results, and delegates
+  exploration to `task_agent`. Persona prompts freeze into the workstream
+  stamp at creation, so this reaches new workstreams only.
+
+### Fixed
+
+- **Unknown reasoning-mode warnings name the allowed modes** — a model
+  definition with an unrecognized reasoning mode now logs the valid options
+  instead of leaving the operator to guess.
+
+### Documentation
+
+- **HYPOTHESIS.md / PRIMER.md** — the control normal form is tightened and
+  the factored Q_E reading is carried into the glossary; the plain-language
+  PRIMER stays in sync.
+
+## [1.7.2]
+
+A feature-bearing patch for the 1.7 line. Rather than hold this work for the
+larger 1.8 churn, the fixes and the smaller features that had already
+stabilised on `main` are rolled into the stable line now: a rich preview
+pane, persona/project settings on scheduled tasks, and a batch of streaming,
+rendering, and nudge-delivery hardening.
+
+> **⚠️ Before upgrading:** 1.7.2 adds Alembic migration `066`, applied
+> automatically on first start. It adds two `Text NOT NULL DEFAULT ''`
+> columns (`persona`, `project_id`) to the `scheduled_tasks` table; existing
+> rows migrate to the empty default, which is byte-identical to pre-066
+> dispatch behaviour. The change is additive and reversible, but — as always
+> — back up your storage before upgrading (`pg_dump` for PostgreSQL; copy the
+> database file for SQLite).
+
+### Added
+
+- **Rich preview pane + `open_preview` tool** — a workstream can now open a
+  rendered preview (HTML, Markdown, and other kinds) in a pane beside the
+  conversation via the new `open_preview` tool. Guarded fetches stream under
+  a byte budget whose ceiling tracks the widest per-kind cap, preview blob
+  ids are salted, and a preflight probe handles legacy charsets and a
+  remote-assets opt-in. See `docs/tools.md`.
+- **`allow_private_network` opt-in for `web_fetch` / `open_preview`** —
+  private-address fetch and preview targets stay blocked by default; an
+  operator can opt a workstream in through the settings registry when a
+  private endpoint is genuinely intended. (Distinct from the 1.7.1 `[oidc]`
+  flag of the same name, which governs identity-provider discovery.)
+- **Persona + project settings on scheduled tasks** (migration `066`) — a
+  scheduled task can now pin the **persona** and **project** of the
+  workstream it dispatches, matching the levers a manually-created workstream
+  already carries. Both default to empty (kind-default persona / no project),
+  so existing schedules dispatch exactly as before.
+
+### Fixed
+
+- **Streaming fast-path overflow recovery** — fast-stream tokens are now
+  batched and overflowed SSE listeners recover instead of stalling (and
+  `connectSSE` no longer opens into a hidden background tab). The same
+  overflow-recovery companions were carried to the coordinator pane, so a
+  coordinator watching many children recovers dropped listeners the same way
+  the live-session view does.
+- **Renderer containment** — markdown sentinel-forgery and recursive-frame
+  content loss are contained, and an indented fence close no longer drags its
+  indent into the enclosed code content.
+- **Idle nudge / wake delivery** — nudge and wake delivery is hardened across
+  session eviction, cancellation, and identity rebinds; the wake gate now
+  requires a real nudge queue, refused wakes are logged, and
+  `initial_message_status` is typed as a closed enum on the wire.
+- **`web_fetch` extraction inherits model settings** — the completion that
+  extracts content from a fetched page now inherits the workstream's model
+  settings instead of falling back to defaults.
+- **UI panes** — ephemeral panes close on split-dismiss instead of orphaning
+  a tab, and an unsplit skips the redundant refresh after an ephemeral pane
+  closes.
+- **Shared code-highlight CSS** — renderer-output CSS is shared so the console
+  and coordinator panes highlight code identically.
+
+### Security
+
+- **`Content-Disposition` filenames made wire-safe** — download filenames
+  derived from user-controlled text are sanitised (latin-1- and
+  control-char-safe, quoting-safe) before they reach the `Content-Disposition`
+  response header, including the fallback path.
+
+### Documentation
+
+- **HYPOTHESIS.md: daemons + the outer loop, plus a plain-language PRIMER** —
+  the harness north-star document gains its daemon / outer-loop treatment and
+  a new top-level `PRIMER.md`.
+
+## [1.7.1]
+
+A maintenance and hardening patch for the 1.7 line. No schema migrations;
+the credential-redaction work below is additive and needs no configuration
+change. The one new operator-facing knob is the opt-in `[oidc]
+allow_private_network` flag (default off).
+
+### Security
+
+- **Credential redaction hardened across the tool-call surface** — the
+  redactor that scrubs secrets from tool arguments and log previews was
+  reworked on both the backend and the browser to close several leak paths
+  and to fix false-positive and performance issues. Malformed tool-call
+  arguments are now legalised before they reach the wire; the tool-args log
+  preview scrubs credentials and control characters; and the coordinator's
+  tool-call cards gain a matching client-side redaction pass so the JS and
+  backend redactors stay at parity. Pattern coverage now includes
+  `secret_access_key` / `aws_secret_access_key` multi-segment keys, bare
+  `token=` / `key=` forms (guarded by a negative lookbehind to avoid
+  false positives), and SQLAlchemy `+driver`-qualified connection-string
+  schemes matched case-insensitively.
+- **OIDC SSRF guard: `[oidc] allow_private_network` opt-in** — self-hosted
+  identity providers on private networks can now be reached by setting
+  `allow_private_network = true` under `[oidc]` (default off; the MCP OAuth
+  path stays strict). Rejections of discovered endpoints carry the opt-in
+  hint so the misconfiguration is self-explanatory. See `docs/oidc.md`.
+
+### Added
+
+- **Persona discoverability + forgiving name resolution** — personas are
+  now discoverable by agents, and persona-name resolution tolerates
+  case/whitespace variation; a not-found resolution reports the offending
+  input verbatim instead of a bare error.
+
+### Fixed
+
+- **MCP transport lifecycles routed through per-entry owner tasks**
+  (#787/#788) — static and pooled MCP transport lifecycles are now driven
+  by per-server / per-entry owner tasks, with a hardened disarm-sweep loop
+  guard and targeted exception handling in place of a broad `BaseException`
+  arm, so a dying transport can no longer spin the CPU or strand delivery.
+- **Client-construction failures surface as misconfiguration, not raw
+  500s** — a model whose client cannot be constructed now reports a factory
+  misconfiguration, and the raw exception text is kept out of the resulting
+  503 response.
+- **Postgres history search survives oversized rows** — a conversation row
+  exceeding Postgres' full-text limits no longer aborts history search.
+- **Agent-tool render is idempotent** — tool rendering no longer deep-copies
+  a tool definition until a description actually changes, so no-persona
+  sessions share the tool constant (correctness plus a hot-path allocation
+  win).
+- **Private-project workstream visibility scoped to members** — workstreams
+  in a private project are visible to project members only, not to every
+  admin; coordinator tenancy checks now use request-scoped storage.
+- **Pane hotkeys work off macOS and match across surfaces** — the pane
+  keyboard shortcuts no longer collide with browser accelerators on
+  non-macOS platforms and behave consistently across surfaces.
 
 ## [1.7.0]
 
