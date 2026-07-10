@@ -12,7 +12,6 @@ the call always returns and never leaks the background child.
 import contextlib
 import os
 import signal
-import tempfile
 import threading
 import time
 
@@ -48,14 +47,14 @@ def _run_in_thread(fn, timeout):
     return (not t.is_alive()), box.get("result")
 
 
-def test_backgrounded_child_does_not_hang_and_is_reaped():
+def test_backgrounded_child_does_not_hang_and_is_reaped(tmp_path):
     """Foreground exits immediately but leaves ``sleep 60 &`` holding the pipe.
 
     Old behaviour: infinite hang (EOF never arrives, watchdog bails once the
     tracked bash exits).  New behaviour: returns promptly and the background
     child is reaped by the session-group kill.
     """
-    pidfile = tempfile.mktemp(suffix=".pid")
+    pidfile = str(tmp_path / "bg.pid")
     # A generous tool_timeout proves the return comes from foreground-exit, not
     # from the deadline firing.
     session = make_session(tool_timeout=30)
@@ -82,8 +81,6 @@ def test_backgrounded_child_does_not_hang_and_is_reaped():
     finally:
         if bg_pid is not None:
             _kill_pid(bg_pid)
-        if os.path.exists(pidfile):
-            os.unlink(pidfile)
 
 
 def test_timeout_still_fires_with_backgrounded_child():
