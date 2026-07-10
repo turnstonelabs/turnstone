@@ -6185,7 +6185,7 @@ let _modelDefaultAlias = "";
 // and are re-merged on save. Reset per modal open.
 let _rerankCalFields = {};
 
-// Capability tile matrix — sparse-override semantics. The 9 tiles display
+// Capability tile matrix — sparse-override semantics. The tiles display
 // merge(dataclass defaults, known-model table baseline, explicit overrides);
 // only EXPLICIT keys persist (saved keys + tiles the user toggled), so a
 // known model keeps tracking future table updates instead of being pinned.
@@ -6197,6 +6197,8 @@ const _MODEL_CAP_KEYS = [
   "supports_web_search",
   "supports_temperature",
   "supports_effort",
+  "supports_verbosity",
+  "supports_pro_mode",
   "supports_transcription",
   "supports_speech_synthesis",
   "supports_audio_input",
@@ -6210,6 +6212,8 @@ const _MODEL_CAP_DEFAULTS = {
   supports_web_search: false,
   supports_temperature: true,
   supports_effort: false,
+  supports_verbosity: false,
+  supports_pro_mode: false,
   supports_transcription: false,
   supports_speech_synthesis: false,
   supports_audio_input: false,
@@ -6233,6 +6237,134 @@ function _modelRenderTiles() {
     else if (k in _modelCapsBaseline) el.checked = !!_modelCapsBaseline[k];
     else el.checked = _MODEL_CAP_DEFAULTS[k];
   });
+  _updateModelResponseControls();
+}
+
+const _MODEL_RESPONSE_CONTROLS = [
+  {
+    key: "verbosity",
+    supportKey: "supports_verbosity",
+    elementId: "model-output-verbosity",
+    fieldId: "model-output-verbosity-field",
+    values: ["low", "medium", "high"],
+  },
+  {
+    key: "reasoning_mode",
+    supportKey: "supports_pro_mode",
+    elementId: "model-reasoning-mode",
+    fieldId: "model-reasoning-mode-field",
+    values: ["standard", "pro"],
+  },
+];
+let _modelResponseInitialIdentity = "";
+let _modelResponseCurrentIdentity = "";
+let _modelResponseCaptured = {};
+let _modelResponseDirty = {};
+
+function _modelIdentity() {
+  const provider = document.getElementById("model-provider").value;
+  const model = document.getElementById("model-name").value.trim();
+  const surface =
+    provider === "openai-compatible"
+      ? document.getElementById("model-api-surface").value
+      : "";
+  return provider + "\n" + model + "\n" + surface;
+}
+
+function _modelUsesResponsesSurface() {
+  const provider = document.getElementById("model-provider").value;
+  if (provider === "openai") return true;
+  return (
+    provider === "openai-compatible" &&
+    document.getElementById("model-api-surface").value === "responses"
+  );
+}
+
+function _modelResponseValueValid(spec, value) {
+  return typeof value === "string" && spec.values.indexOf(value) !== -1;
+}
+
+function _updateModelResponseControls() {
+  const group = document.getElementById("model-response-controls");
+  if (!group) return;
+  const responseSurface = _modelUsesResponsesSurface();
+  const sameIdentity =
+    _modelResponseInitialIdentity &&
+    _modelIdentity() === _modelResponseInitialIdentity;
+  let anyVisible = false;
+  _MODEL_RESPONSE_CONTROLS.forEach(function (spec) {
+    const field = document.getElementById(spec.fieldId);
+    const select = document.getElementById(spec.elementId);
+    if (!field || !select) return;
+    const capturedFallback =
+      sameIdentity &&
+      !(spec.supportKey in _modelCapsExplicit) &&
+      _modelResponseValueValid(spec, select.value);
+    const visible =
+      responseSurface &&
+      (_modelGetTile(spec.supportKey) || capturedFallback);
+    field.hidden = !visible;
+    anyVisible = anyVisible || visible;
+  });
+  group.hidden = !anyVisible;
+}
+
+function _resetModelResponseControls() {
+  _MODEL_RESPONSE_CONTROLS.forEach(function (spec) {
+    const select = document.getElementById(spec.elementId);
+    if (select) select.value = "";
+  });
+  _modelResponseInitialIdentity = "";
+  _modelResponseCurrentIdentity = _modelIdentity();
+  _modelResponseCaptured = {};
+  _modelResponseDirty = {};
+  _updateModelResponseControls();
+}
+
+function _captureModelResponseControls(capsObj) {
+  if (!_modelUsesResponsesSurface()) return;
+  _MODEL_RESPONSE_CONTROLS.forEach(function (spec) {
+    const select = document.getElementById(spec.elementId);
+    if (!select) return;
+    const explicitlyUnsupported =
+      spec.supportKey in _modelCapsExplicit &&
+      !_modelCapsExplicit[spec.supportKey];
+    const value = capsObj[spec.key];
+    if (!explicitlyUnsupported && _modelResponseValueValid(spec, value)) {
+      select.value = value;
+      _modelResponseCaptured[spec.key] = value;
+      delete capsObj[spec.key];
+    }
+  });
+}
+
+function _mergeModelResponseControls(caps) {
+  if (!_modelUsesResponsesSurface()) return;
+  const sameIdentity =
+    _modelResponseInitialIdentity &&
+    _modelIdentity() === _modelResponseInitialIdentity;
+  _MODEL_RESPONSE_CONTROLS.forEach(function (spec) {
+    if (_modelResponseDirty[spec.key]) delete caps[spec.key];
+    else if (spec.key in caps) return; // Advanced JSON wins.
+    const select = document.getElementById(spec.elementId);
+    if (!select || !_modelResponseValueValid(spec, select.value)) return;
+    const capturedFallback =
+      sameIdentity && !(spec.supportKey in _modelCapsExplicit);
+    if (_modelGetTile(spec.supportKey) || capturedFallback) {
+      caps[spec.key] = select.value;
+    }
+  });
+}
+
+function _rememberModelResponseControl(spec) {
+  _modelResponseDirty[spec.key] = true;
+  if (_modelIdentity() !== _modelResponseInitialIdentity) return;
+  const select = document.getElementById(spec.elementId);
+  if (select && _modelResponseValueValid(spec, select.value)) {
+    _modelResponseCaptured[spec.key] = select.value;
+  } else {
+    delete _modelResponseCaptured[spec.key];
+  }
 }
 
 // Roles surfaced in the Models → Roles sub-tab.  Each entry maps a
@@ -6768,6 +6900,25 @@ function _renderModels(items) {
     if (m.max_tokens != null) overrides.push("max_tok=" + m.max_tokens);
     if (m.reasoning_effort != null)
       overrides.push("effort=" + m.reasoning_effort);
+    let displayCaps = m.capabilities;
+    if (typeof displayCaps === "string") {
+      try {
+        displayCaps = JSON.parse(displayCaps || "{}");
+      } catch (e) {
+        displayCaps = {};
+      }
+    }
+    if (!_isPlainObject(displayCaps)) displayCaps = {};
+    if (
+      displayCaps.supports_verbosity !== false &&
+      ["low", "medium", "high"].indexOf(displayCaps.verbosity) !== -1
+    )
+      overrides.push("verbosity=" + displayCaps.verbosity);
+    if (
+      displayCaps.supports_pro_mode !== false &&
+      ["standard", "pro"].indexOf(displayCaps.reasoning_mode) !== -1
+    )
+      overrides.push("mode=" + displayCaps.reasoning_mode);
     // Reasoning persistence flags surface only when non-default
     // (persist=False is the operator opt-out; replay=True is the
     // operator opt-in). Default values are silent.
@@ -6985,8 +7136,10 @@ function showCreateModelModal() {
   if (_calChip) _calChip.style.display = "none";
   const _recalBtn = document.getElementById("model-recalibrate-btn");
   if (_recalBtn) _recalBtn.hidden = true;
+  _modelCapsSeq++; // invalidate lookups from a prior shelf lifecycle
   _modelCapsBaseline = {};
   _modelCapsExplicit = {};
+  _resetModelResponseControls();
   _modelRenderTiles();
   document.getElementById("model-autofill").hidden = true;
   _refreshModelSuggestions();
@@ -7082,7 +7235,7 @@ function showEditModelModal(definitionId) {
           }
         },
       );
-      // Lift the 9 matrix keys out of the JSON into the tiles — they are
+      // Lift the capability keys out of the JSON into the tiles — they are
       // the row's explicit overrides and the textarea holds the remainder.
       _modelCapsExplicit = {};
       _MODEL_CAP_KEYS.forEach(function (k) {
@@ -7091,6 +7244,9 @@ function showEditModelModal(definitionId) {
           delete capsObj[k];
         }
       });
+      _modelResponseInitialIdentity = _modelIdentity();
+      _modelResponseCurrentIdentity = _modelResponseInitialIdentity;
+      _captureModelResponseControls(capsObj);
       _modelRenderTiles();
       _modelCapsRefreshBaseline();
       _scheduleEffortLadder();
@@ -7259,6 +7415,7 @@ function submitCreateModel() {
   Object.keys(_modelCapsExplicit).forEach(function (k) {
     if (!(k in caps)) caps[k] = _modelGetTile(k);
   });
+  _mergeModelResponseControls(caps);
 
   // Re-merge reranker calibration fields extracted on edit so an unrelated edit
   // doesn't silently drop the calibration. A field typed directly into the
@@ -7688,12 +7845,34 @@ function recalibrateModel() {
 }
 
 /* Capability auto-fill: when the user types a known model name or
-   changes the provider, look up static capabilities and pre-fill
-   context_window and the capabilities textarea. */
+   changes the provider, look up static capabilities and refresh the
+   context window, capability tiles, and conditional response controls. */
 let _capsTimer = null;
 let _modelCapsSeq = 0;
 function _onModelFieldChange() {
   clearTimeout(_capsTimer);
+  const nextIdentity = _modelIdentity();
+  if (
+    _modelResponseCurrentIdentity &&
+    nextIdentity !== _modelResponseCurrentIdentity
+  ) {
+    _MODEL_RESPONSE_CONTROLS.forEach(function (spec) {
+      const select = document.getElementById(spec.elementId);
+      if (!select) return;
+      const captured = _modelResponseCaptured[spec.key];
+      select.value =
+        nextIdentity === _modelResponseInitialIdentity &&
+        _modelResponseValueValid(spec, captured)
+          ? captured
+          : "";
+    });
+  }
+  _modelResponseCurrentIdentity = nextIdentity;
+  _modelCapsSeq++; // invalidate any capability lookup already in flight
+  _modelCapsBaseline = {};
+  const banner = document.getElementById("model-autofill");
+  if (banner) banner.hidden = true;
+  _modelRenderTiles();
   _capsTimer = setTimeout(_modelCapsRefreshBaseline, 500);
   _scheduleEffortLadder();
 }
@@ -7822,6 +8001,7 @@ function _modelCapsRefreshBaseline() {
   const provider = document.getElementById("model-provider").value;
   const modelName = document.getElementById("model-name").value.trim();
   const banner = document.getElementById("model-autofill");
+  const seq = ++_modelCapsSeq;
   if (
     !modelName ||
     provider === "openai-compatible" ||
@@ -7834,7 +8014,6 @@ function _modelCapsRefreshBaseline() {
   }
   // Two type-then-pause cycles can have both fetches in flight; a reordered
   // older response must not clobber the tiles (the _schPreviewSeq pattern).
-  const seq = ++_modelCapsSeq;
   authFetch(
     "/v1/api/admin/model-capabilities?provider=" +
       encodeURIComponent(provider) +
@@ -7918,6 +8097,7 @@ function _applyProviderDefaults() {
   if (serverFieldsRow) {
     serverFieldsRow.hidden = provider === "anthropic-compatible";
   }
+  _updateModelResponseControls();
 }
 
 /* Populate the model name datalist with known model prefixes for the
@@ -7957,14 +8137,26 @@ function _refreshModelSuggestions() {
   const tmEl = document.getElementById("model-thinking-mode");
   if (tmEl) tmEl.addEventListener("change", _toggleThinkingParam);
   if (tmEl) tmEl.addEventListener("change", _scheduleEffortLadder);
+  _MODEL_RESPONSE_CONTROLS.forEach(function (spec) {
+    const select = document.getElementById(spec.elementId);
+    if (select)
+      select.addEventListener("change", function () {
+        _rememberModelResponseControl(spec);
+      });
+  });
   ["model-thinking-param", "model-effort-param", "model-capabilities"].forEach(
     function (id) {
       const el = document.getElementById(id);
       if (el) el.addEventListener("input", _scheduleEffortLadder);
     },
   );
+  const rawCapsEl = document.getElementById("model-capabilities");
+  if (rawCapsEl)
+    rawCapsEl.addEventListener("input", function () {
+      _modelResponseDirty = {};
+    });
   const apiSurfEl = document.getElementById("model-api-surface");
-  if (apiSurfEl) apiSurfEl.addEventListener("change", _scheduleEffortLadder);
+  if (apiSurfEl) apiSurfEl.addEventListener("change", _onModelFieldChange);
   const grid = document.getElementById("model-capgrid");
   if (grid) {
     grid.addEventListener("change", function (e) {
@@ -7972,6 +8164,17 @@ function _refreshModelSuggestions() {
       if (!cap) return;
       // a toggle IS the override decision — the key persists from here on
       _modelCapsExplicit[cap] = e.target.checked;
+      if (cap === "supports_verbosity" || cap === "supports_pro_mode") {
+        const spec = _MODEL_RESPONSE_CONTROLS.find(function (item) {
+          return item.supportKey === cap;
+        });
+        if (spec && !e.target.checked) {
+          const select = document.getElementById(spec.elementId);
+          if (select) select.value = "";
+          delete _modelResponseCaptured[spec.key];
+        }
+        _updateModelResponseControls();
+      }
       if (cap === "supports_rerank") {
         const recalBtn = document.getElementById("model-recalibrate-btn");
         if (recalBtn)

@@ -677,6 +677,67 @@ def test_audio_roles_gated_to_openai_sdk_providers() -> None:
     assert '_providerCarriesAudio((md && md.provider) || "openai")' in body
 
 
+def test_model_response_controls_are_capability_driven_and_sparse() -> None:
+    """The model shelf surfaces Responses-only scalar controls without
+    hard-coding GPT-5.6 IDs or pinning inherited capability-table values."""
+    html = _CONSOLE_INDEX.read_text(encoding="utf-8")
+    admin = _CONSOLE_ADMIN_JS.read_text(encoding="utf-8")
+
+    assert 'id="model-response-controls"' in html
+    assert 'aria-labelledby="model-response-controls-title"' in html
+    assert 'id="model-output-verbosity"' in html
+    assert 'for="model-output-verbosity"' in html
+    assert 'id="model-reasoning-mode"' in html
+    assert 'for="model-reasoning-mode"' in html
+    for value in ("low", "medium", "high"):
+        assert f'<option value="{value}">' in html
+    for value in ("standard", "pro"):
+        assert f'<option value="{value}">' in html
+    assert 'data-cap="supports_verbosity"' in html
+    assert 'data-cap="supports_pro_mode"' in html
+
+    assert '"supports_verbosity"' in admin
+    assert '"supports_pro_mode"' in admin
+    surface = _slice_function_body(admin, "_modelUsesResponsesSurface")
+    assert surface is not None
+    assert 'provider === "openai"' in surface
+    assert 'provider === "openai-compatible"' in surface
+    assert 'value === "responses"' in surface
+    visibility = _slice_function_body(admin, "_updateModelResponseControls")
+    assert visibility is not None
+    assert "_modelGetTile(spec.supportKey)" in visibility
+    assert 'supportKey: "supports_verbosity"' in admin
+    assert 'supportKey: "supports_pro_mode"' in admin
+    assert "gpt-5.6" not in visibility, "visibility must come from capabilities, not model IDs"
+
+    assert "function _captureModelResponseControls(" in admin
+    assert "function _mergeModelResponseControls(" in admin
+    assert "_captureModelResponseControls(capsObj)" in admin
+    assert "_mergeModelResponseControls(caps)" in admin
+    assert "let _modelResponseCaptured = {};" in admin
+    assert "let _modelResponseDirty = {};" in admin
+    assert "_modelResponseCaptured[spec.key] = value" in admin
+    assert "nextIdentity === _modelResponseInitialIdentity" in admin
+    identity = _slice_function_body(admin, "_modelIdentity")
+    assert identity is not None
+    assert 'provider === "openai-compatible"' in identity
+    assert ': ""' in identity
+    assert "if (_modelResponseDirty[spec.key]) delete caps[spec.key]" in admin
+
+    create = _slice_function_body(admin, "showCreateModelModal")
+    assert create is not None
+    assert "_modelCapsSeq++" in create, "a fresh shelf must invalidate prior lookups"
+
+    assert "displayCaps.supports_verbosity !== false" in admin
+    assert "displayCaps.supports_pro_mode !== false" in admin
+
+    change = _slice_function_body(admin, "_onModelFieldChange")
+    assert change is not None
+    assert "_modelCapsSeq++" in change, "model changes must invalidate in-flight baselines"
+    assert "_modelCapsBaseline = {}" in change
+    assert 'apiSurfEl.addEventListener("change", _onModelFieldChange)' in admin
+
+
 def test_shared_utils_defines_set_markdown_helper() -> None:
     """The ``setMarkdown`` helper in ``shared/utils.js`` is the single
     audited entry point for rendering markdown content into a DOM
