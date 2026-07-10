@@ -722,7 +722,22 @@ def test_model_response_controls_are_capability_driven_and_sparse() -> None:
     assert identity is not None
     assert 'provider === "openai-compatible"' in identity
     assert ': ""' in identity
-    assert "if (_modelResponseDirty[spec.key]) delete caps[spec.key]" in admin
+    merge = _slice_function_body(admin, "_mergeModelResponseControls")
+    assert merge is not None
+    # The dirty flag (select touched) may only override Advanced JSON for
+    # the identity that made it dirty — a stale flag from a renamed row
+    # must not delete a hand-typed JSON key.
+    assert "if (_modelResponseDirty[spec.key] && sameIdentity) delete caps[spec.key]" in merge
+    # The captured-value fallback is load-bearing, not a gating bug: a value
+    # lifted out of the row JSON on edit-open must stay visible and re-save
+    # for the same identity even when the baseline table says unsupported.
+    # The baseline arrives async (or never, on the compat lane); yielding to
+    # it would silently drop the pinned value on an unrelated edit-save.
+    # Wire safety lives server-side (emission gates on merged supports_*).
+    for body in (visibility, merge):
+        assert "_modelGetTile(spec.supportKey) || capturedFallback" in body
+        assert "sameIdentity" in body
+        assert "!(spec.supportKey in _modelCapsExplicit)" in body
 
     create = _slice_function_body(admin, "showCreateModelModal")
     assert create is not None
