@@ -1744,6 +1744,46 @@
                 <option value="max">Max</option>
               </select>
 
+              <div
+                id="model-response-controls"
+                role="group"
+                aria-labelledby="model-response-controls-title"
+                hidden
+              >
+                <div class="sh-section" id="model-response-controls-title">
+                  Response controls
+                </div>
+                <div class="field-pair">
+                  <div id="model-output-verbosity-field" hidden>
+                    <label for="model-output-verbosity"
+                      >Output verbosity
+                      <span class="label-hint"
+                        >answer length, independent of effort</span
+                      ></label
+                    >
+                    <select id="model-output-verbosity">
+                      <option value="">Provider default</option>
+                      <option value="low">Low — concise</option>
+                      <option value="medium">Medium — balanced</option>
+                      <option value="high">High — detailed</option>
+                    </select>
+                  </div>
+                  <div id="model-reasoning-mode-field" hidden>
+                    <label for="model-reasoning-mode"
+                      >Reasoning mode
+                      <span class="label-hint"
+                        >Pro applies more work before answering</span
+                      ></label
+                    >
+                    <select id="model-reasoning-mode">
+                      <option value="">Provider default</option>
+                      <option value="standard">Standard</option>
+                      <option value="pro">Pro</option>
+                    </select>
+                  </div>
+                </div>
+              </div>
+
               <div id="model-server-compat-section" hidden>
                 <div class="sh-section">Server compatibility</div>
                 <div class="field-pair" id="model-server-fields-row">
@@ -1881,6 +1921,20 @@
                     class="cap-led"
                   ></span
                   ><span class="cap-name">Reasoning-effort control</span></label
+                >
+                <label class="cap"
+                  ><input
+                    type="checkbox"
+                    data-cap="supports_verbosity"
+                  /><span class="cap-led"></span
+                  ><span class="cap-name">Output verbosity</span></label
+                >
+                <label class="cap"
+                  ><input
+                    type="checkbox"
+                    data-cap="supports_pro_mode"
+                  /><span class="cap-led"></span
+                  ><span class="cap-name">Standard / Pro mode</span></label
                 >
                 <label class="cap"
                   ><input
