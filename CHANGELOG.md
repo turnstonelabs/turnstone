@@ -14,6 +14,40 @@ experimental line:
 
 Earlier stable lines (`stable/1.6`, `stable/1.5`) are frozen.
 
+## [1.7.3]
+
+A small feature and maintenance patch for the 1.7 line. No schema migrations
+and no new configuration knobs.
+
+### Added
+
+- **OpenAI GPT-5.6 (Sol/Terra/Luna) support** — the Responses provider
+  understands the GPT-5.6 family: the `reasoning.mode` control, the new
+  `max` effort tier, and `text.verbosity`, with golden wire payloads pinning
+  the request shapes. The `openai` dependency floor moves to `>=2.44`.
+
+### Changed
+
+- **Engineer base prompt hardened with process discipline** — the default
+  base prompt for non-coordinator sessions now works in phases scaled to the
+  size of the change, defaults to red-green for testable work, scopes to the
+  smallest sufficient diff, stops to report after repeated failed attempts
+  instead of thrashing, reports only observed results, and delegates
+  exploration to `task_agent`. Persona prompts freeze into the workstream
+  stamp at creation, so this reaches new workstreams only.
+
+### Fixed
+
+- **Unknown reasoning-mode warnings name the allowed modes** — a model
+  definition with an unrecognized reasoning mode now logs the valid options
+  instead of leaving the operator to guess.
+
+### Documentation
+
+- **HYPOTHESIS.md / PRIMER.md** — the control normal form is tightened and
+  the factored Q_E reading is carried into the glossary; the plain-language
+  PRIMER stays in sync.
+
 ## [1.7.2]
 
 A feature-bearing patch for the 1.7 line. Rather than hold this work for the
