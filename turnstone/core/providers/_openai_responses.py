@@ -438,7 +438,7 @@ class OpenAIResponsesProvider:
         apply_temperature(kwargs, caps, temperature, reasoning_effort)
 
         # Reasoning params → {"effort": ..., "mode": ...} (Responses format).
-        # "mode": "pro" (GPT-5.6 Sol) applies more model work before a single
+        # "mode": "pro" (GPT-5.6) applies more model work before a single
         # final answer; it rides with or without an effort level (effort
         # defaults to medium in pro mode), and effort still rides without a
         # mode.  Both are operator-declared and gated by their static
@@ -447,8 +447,14 @@ class OpenAIResponsesProvider:
         effort = resolve_reasoning_effort(caps, reasoning_effort)
         if effort:
             reasoning["effort"] = effort
-        if caps.supports_pro_mode and caps.reasoning_mode:
-            if caps.reasoning_mode in REASONING_MODES:
+        if caps.supports_pro_mode and caps.reasoning_mode != "":
+            if not isinstance(caps.reasoning_mode, str):
+                log.warning(
+                    "openai.responses: ignoring non-string reasoning mode",
+                    value=caps.reasoning_mode,
+                    expected=sorted(REASONING_MODES),
+                )
+            elif caps.reasoning_mode in REASONING_MODES:
                 reasoning["mode"] = caps.reasoning_mode
             else:
                 log.warning(
@@ -460,7 +466,8 @@ class OpenAIResponsesProvider:
             kwargs["reasoning"] = reasoning
 
         apply_verbosity(kwargs, caps)
-        apply_cache_retention(kwargs, model)
+        if not self._compat:
+            apply_cache_retention(kwargs, model)
         return kwargs
 
     # -- streaming -----------------------------------------------------------

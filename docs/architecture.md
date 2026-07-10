@@ -622,19 +622,19 @@ LLMProvider (protocol)
 |------|--------|
 | `StreamChunk` | `content_delta`, `reasoning_delta`, `tool_call_deltas`, `info_delta`, `usage`, `finish_reason`, `provider_blocks` |
 | `CompletionResult` | `content`, `tool_calls`, `finish_reason`, `usage`, `provider_blocks` |
-| `ModelCapabilities` | `context_window`, `max_output_tokens`, `supports_temperature`, `token_param`, `thinking_mode`, `supports_effort`, `supports_web_search`, `supports_tool_search`, `supports_vision`, `supports_reasoning_replay` |
+| `ModelCapabilities` | `context_window`, `max_output_tokens`, `supports_temperature`, `token_param`, `thinking_mode`, `supports_effort`, `supports_web_search`, `supports_tool_search`, `supports_vision`, `supports_reasoning_replay`, `supports_verbosity`, `verbosity`, `supports_pro_mode`, `reasoning_mode` |
 | `UsageInfo` | `prompt_tokens`, `completion_tokens`, `total_tokens`, `cache_creation_tokens`, `cache_read_tokens` |
 
 **OpenAIProvider** (`_openai.py`): passes messages through unchanged (they are
 already in OpenAI format), including multi-part content blocks (text + images)
-in tool results. Model capability lookup table covers GPT-5/5.1/5.2/5.3/5.4,
+in tool results. Model capability lookup covers GPT-5 through GPT-5.6,
 O-series, and search models (`gpt-5-search-api`) — all with `supports_vision`.
 For search models, injects `web_search_options` and removes the `web_search`
 function tool (the model always searches). Citations from `url_citation`
-annotations are formatted as footnotes. Extended prompt cache retention
-(`prompt_cache_retention: "24h"`) is enabled for GPT-5.x models at no
-additional cost. Cached token counts are extracted from
-`usage.prompt_tokens_details.cached_tokens`. Unknown models get permissive
+annotations are formatted as footnotes. Pre-5.6 GPT-5 models request extended
+prompt-cache retention (`prompt_cache_retention: "24h"`); GPT-5.6 uses
+`prompt_cache_options.ttl: "30m"`. Cache reads and writes are extracted from
+`cached_tokens` and `cache_write_tokens`. Unknown models get permissive
 defaults with `supports_vision=False` and use SearxNG for web search. The
 `openai-compatible` lane never consults this table at all — on either API
 surface (the responses pin is served by a compat-mode
@@ -642,8 +642,9 @@ surface (the responses pin is served by a compat-mode
 local server serves whatever the operator named it (vLLM
 `--served-model-name` is a free string), so a prefix collision with a cloud
 model id must not inherit that model's sampling/effort contract — every
-local model gets the plain defaults, and anything beyond them is declared on
-the model definition (capabilities JSON + `server_compat`), matching the
+local model gets the plain defaults, commercial prompt-cache controls are not
+injected by model-name prefix, and anything beyond those defaults is declared
+on the model definition (capabilities JSON + `server_compat`), matching the
 `anthropic-compatible` lane.
 
 **AnthropicProvider** (`_anthropic.py`): converts OpenAI-format messages to

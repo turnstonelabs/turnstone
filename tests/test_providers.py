@@ -16,6 +16,7 @@ from turnstone.core.providers._openai_common import (
     apply_cache_retention,
     apply_temperature_and_effort,
     apply_tool_search,
+    extract_usage,
     format_citations,
     lookup_openai_capabilities,
     sanitize_messages,
@@ -2236,15 +2237,14 @@ class TestOpenAIParameterGating:
         assert "max" in lookup_openai_capabilities("gpt-5.6-sol").reasoning_effort_values
         assert "max" in lookup_openai_capabilities("gpt-5.6-2026-07-09").reasoning_effort_values
 
-    def test_gpt56_terra_luna_max_snaps_to_xhigh_ceiling(self) -> None:
-        """GPT-5.6 Terra and Luna have no "max" (Sol-only); the knob's "max"
-        snaps DOWN to the declared "xhigh" ceiling rather than being dropped."""
+    def test_gpt56_terra_luna_support_max_effort(self) -> None:
+        """Every GPT-5.6 tier accepts the documented "max" effort."""
         for tier in ("gpt-5.6-terra", "gpt-5.6-luna"):
             caps = lookup_openai_capabilities(tier)
-            assert "max" not in caps.reasoning_effort_values, tier
+            assert "max" in caps.reasoning_effort_values, tier
             kwargs: dict[str, Any] = {}
             apply_temperature_and_effort(kwargs, caps, temperature=0.7, reasoning_effort="max")
-            assert kwargs["reasoning_effort"] == "xhigh", tier
+            assert kwargs["reasoning_effort"] == "max", tier
 
 
 class TestAnthropicOrphanedToolUse:
@@ -3495,6 +3495,31 @@ class TestModelCapabilitiesToolSearch:
         caps = ModelCapabilities()
         assert caps.supports_tool_search is False
 
+    def test_public_positional_prefix_remains_stable(self) -> None:
+        """New optional fields must not shift the exported constructor's existing slots."""
+        caps = ModelCapabilities(
+            100000,
+            10000,
+            False,
+            False,
+            False,
+            "max_tokens",
+            "manual",
+            "thinking",
+            "reasoning_effort",
+            True,
+            ("low",),
+            ("low",),
+            "low",
+            True,
+            True,
+            True,
+            True,
+        )
+        assert caps.supports_web_search is True
+        assert caps.supports_tool_search is True
+        assert caps.supports_vision is True
+
 
 class TestMidConversationSystemCapability:
     """supports_mid_conversation_system — NextOpus (claude-opus-4-8) only."""
@@ -3943,8 +3968,50 @@ class TestOpenAIPromptCaching:
     def setup_method(self) -> None:
         self.provider = OpenAIProvider()
 
-    def test_cache_retention_set_for_gpt5(self) -> None:
-        """GPT-5.x models get prompt_cache_retention=24h."""
+    @pytest.mark.parametrize("model", ("gpt-5.5-local-lora", "gpt-5.6-local-lora"))
+    def test_chat_compat_streaming_omits_commercial_cache_params(self, model: str) -> None:
+        """A local model name must not activate commercial OpenAI cache controls."""
+        client = MagicMock()
+        client.chat.completions.create.return_value = iter(())
+
+        list(
+            self.provider.create_streaming(
+                client=client,
+                model=model,
+                messages=[{"role": "user", "content": "hi"}],
+            )
+        )
+
+        sent = client.chat.completions.create.call_args.kwargs
+        assert "prompt_cache_retention" not in sent
+        assert "prompt_cache_options" not in sent
+
+    @pytest.mark.parametrize("model", ("gpt-5.5-local-lora", "gpt-5.6-local-lora"))
+    def test_chat_compat_completion_omits_commercial_cache_params(self, model: str) -> None:
+        """The non-streaming local lane has the same cache-parameter isolation."""
+        response = MagicMock()
+        response.choices = [
+            MagicMock(
+                message=MagicMock(content="hello", tool_calls=None, annotations=None),
+                finish_reason="stop",
+            )
+        ]
+        response.usage = None
+        client = MagicMock()
+        client.chat.completions.create.return_value = response
+
+        self.provider.create_completion(
+            client=client,
+            model=model,
+            messages=[{"role": "user", "content": "hi"}],
+        )
+
+        sent = client.chat.completions.create.call_args.kwargs
+        assert "prompt_cache_retention" not in sent
+        assert "prompt_cache_options" not in sent
+
+    def test_cache_retention_set_for_pre_gpt56_models(self) -> None:
+        """Pre-5.6 GPT-5 models retain the legacy 24-hour cache policy."""
         for model in (
             "gpt-5",
             "gpt-5.1",
@@ -3953,16 +4020,21 @@ class TestOpenAIPromptCaching:
             "gpt-5.4-pro",
             "gpt-5.5",
             "gpt-5.5-pro",
-            "gpt-5.6",
-            "gpt-5.6-sol",
-            "gpt-5.6-terra",
-            "gpt-5.6-luna",
             "gpt-5-mini",
             "gpt-5-pro",
         ):
             kwargs: dict[str, Any] = {}
             apply_cache_retention(kwargs, model)
             assert kwargs.get("prompt_cache_retention") == "24h", f"Failed for {model}"
+            assert "prompt_cache_options" not in kwargs
+
+    def test_gpt56_uses_prompt_cache_options(self) -> None:
+        """GPT-5.6 uses the replacement cache API introduced in SDK 2.45."""
+        for model in ("gpt-5.6", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"):
+            kwargs: dict[str, Any] = {}
+            apply_cache_retention(kwargs, model)
+            assert kwargs.get("prompt_cache_options") == {"ttl": "30m"}, model
+            assert "prompt_cache_retention" not in kwargs
 
     def test_cache_retention_not_set_for_non_gpt5(self) -> None:
         """Non-GPT-5 models do not get cache retention."""
@@ -3970,6 +4042,38 @@ class TestOpenAIPromptCaching:
             kwargs: dict[str, Any] = {}
             apply_cache_retention(kwargs, model)
             assert "prompt_cache_retention" not in kwargs, f"Unexpected retention for {model}"
+            assert "prompt_cache_options" not in kwargs, f"Unexpected options for {model}"
+
+    def test_cache_write_tokens_from_responses_usage(self) -> None:
+        """GPT-5.6 cache writes flow into normalized usage accounting."""
+        usage = MagicMock()
+        usage.prompt_tokens = None
+        usage.input_tokens = 100
+        usage.completion_tokens = None
+        usage.output_tokens = 20
+        usage.total_tokens = 120
+        usage.prompt_tokens_details = None
+        usage.input_tokens_details = MagicMock(cached_tokens=30, cache_write_tokens=70)
+
+        normalized = extract_usage(usage)
+
+        assert normalized is not None
+        assert normalized.cache_read_tokens == 30
+        assert normalized.cache_creation_tokens == 70
+
+    def test_cache_write_tokens_from_chat_usage(self) -> None:
+        """The Chat Completions usage shape reports the same cache-write metric."""
+        usage = MagicMock()
+        usage.prompt_tokens = 100
+        usage.completion_tokens = 20
+        usage.total_tokens = 120
+        usage.prompt_tokens_details = MagicMock(cached_tokens=30, cache_write_tokens=70)
+
+        normalized = extract_usage(usage)
+
+        assert normalized is not None
+        assert normalized.cache_read_tokens == 30
+        assert normalized.cache_creation_tokens == 70
 
     def test_streaming_cached_tokens_from_usage(self) -> None:
         """Streaming usage extracts cached_tokens from prompt_tokens_details."""
@@ -4393,8 +4497,7 @@ class TestResponsesParamBuilding:
         assert kwargs["reasoning"] == {"effort": "high", "mode": "pro"}
 
     def test_pro_mode_rejected_when_unsupported(self) -> None:
-        """A pro reasoning_mode on Terra/Luna (supports_pro_mode False) is
-        dropped — effort still rides, mode does not."""
+        """A pro mode on a model without reasoning-mode support is dropped."""
         caps = ModelCapabilities(
             supports_pro_mode=False,
             reasoning_mode="pro",
@@ -4409,6 +4512,16 @@ class TestResponsesParamBuilding:
         caps = ModelCapabilities(supports_pro_mode=True, reasoning_mode="pro")
         kwargs = self._build(caps, reasoning_effort="medium")
         assert kwargs["reasoning"] == {"mode": "pro"}
+
+    def test_standard_reasoning_mode_is_accepted(self) -> None:
+        """The SDK's explicit standard mode is valid even though omission is equivalent."""
+        caps = ModelCapabilities(
+            supports_pro_mode=True,
+            reasoning_mode="standard",
+            reasoning_effort_values=("low", "medium", "high"),
+        )
+        kwargs = self._build(caps, reasoning_effort="high")
+        assert kwargs["reasoning"] == {"effort": "high", "mode": "standard"}
 
     def test_verbosity_unknown_value_dropped(self) -> None:
         """A verbosity outside {low,medium,high} is dropped, not sent — an
@@ -4426,9 +4539,23 @@ class TestResponsesParamBuilding:
         kwargs = self._build(caps, reasoning_effort="high")
         assert kwargs["reasoning"] == {"effort": "high"}
 
-    def test_gpt56_terra_max_snaps_to_xhigh_on_responses_wire(self) -> None:
-        """Terra's knob "max" snaps to the xhigh ceiling on the ACTUAL
-        Responses wire path (_build_kwargs), not only the shared resolver."""
+    def test_verbosity_non_string_value_dropped(self) -> None:
+        """Malformed operator JSON must not crash request construction."""
+        kwargs = self._build(ModelCapabilities(supports_verbosity=True, verbosity=["low"]))
+        assert "text" not in kwargs
+
+    def test_pro_mode_non_string_value_dropped(self) -> None:
+        """Malformed operator JSON must not crash request construction."""
+        caps = ModelCapabilities(
+            supports_pro_mode=True,
+            reasoning_mode=["pro"],
+            reasoning_effort_values=("low", "medium", "high"),
+        )
+        kwargs = self._build(caps, reasoning_effort="high")
+        assert kwargs["reasoning"] == {"effort": "high"}
+
+    def test_gpt56_terra_max_reaches_responses_wire(self) -> None:
+        """Terra sends the documented max effort on the actual Responses path."""
         kwargs = self.provider._build_kwargs(
             model="gpt-5.6-terra",
             messages=[{"role": "user", "content": "Hi"}],
@@ -4438,19 +4565,14 @@ class TestResponsesParamBuilding:
             reasoning_effort="max",
             deferred_names=None,
         )
-        assert kwargs["reasoning"] == {"effort": "xhigh"}
+        assert kwargs["reasoning"] == {"effort": "max"}
 
     def test_gpt56_verbosity_and_pro_flags(self) -> None:
-        """The static rows carry the right capability flags: verbosity on all
-        three tiers, pro mode on Sol/alias only."""
-        sol = lookup_openai_capabilities("gpt-5.6-sol")
-        assert sol.supports_verbosity is True
-        assert sol.supports_pro_mode is True
-        assert lookup_openai_capabilities("gpt-5.6").supports_pro_mode is True
-        for tier in ("gpt-5.6-terra", "gpt-5.6-luna"):
+        """Every GPT-5.6 tier supports verbosity and pro reasoning mode."""
+        for tier in ("gpt-5.6", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"):
             caps = lookup_openai_capabilities(tier)
             assert caps.supports_verbosity is True
-            assert caps.supports_pro_mode is False
+            assert caps.supports_pro_mode is True
 
     def _kwargs_with(self, tools: list[dict[str, Any]], caps: ModelCapabilities) -> dict[str, Any]:
         return self.provider._build_kwargs(
@@ -4502,6 +4624,34 @@ class TestResponsesParamBuilding:
             deferred_names=None,
         )
         assert kwargs["prompt_cache_retention"] == "24h"
+
+    def test_compat_responses_omits_commercial_cache_params(self) -> None:
+        provider = type(self.provider)(compat=True)
+        for model in ("gpt-5.5-local-lora", "gpt-5.6-local-lora"):
+            kwargs = provider._build_kwargs(
+                model=model,
+                messages=[{"role": "user", "content": "Hi"}],
+                tools=None,
+                max_tokens=4096,
+                temperature=0.5,
+                reasoning_effort="medium",
+                deferred_names=None,
+            )
+            assert "prompt_cache_retention" not in kwargs, model
+            assert "prompt_cache_options" not in kwargs, model
+
+    def test_cache_options_for_gpt56(self) -> None:
+        kwargs = self.provider._build_kwargs(
+            model="gpt-5.6-sol",
+            messages=[{"role": "user", "content": "Hi"}],
+            tools=None,
+            max_tokens=4096,
+            temperature=0.5,
+            reasoning_effort="medium",
+            deferred_names=None,
+        )
+        assert kwargs["prompt_cache_options"] == {"ttl": "30m"}
+        assert "prompt_cache_retention" not in kwargs
 
     def test_instructions_from_system_messages(self) -> None:
         kwargs = self.provider._build_kwargs(

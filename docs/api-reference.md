@@ -458,7 +458,7 @@ Each item in `items` (shared by `tool_info` and `approve_request`):
 | `context_window`         | int    | Total context window size in tokens                  |
 | `pct`                    | float  | Percentage of context window used                    |
 | `effort`                 | string | Reasoning effort level (`low`/`medium`/`high`)       |
-| `cache_creation_tokens`  | int    | Tokens written to prompt cache (Anthropic)           |
+| `cache_creation_tokens`  | int    | Tokens written to prompt cache (Anthropic + OpenAI)  |
 | `cache_read_tokens`      | int    | Tokens served from prompt cache (Anthropic + OpenAI) |
 
 **`info`** -- an informational message (e.g. command output).
