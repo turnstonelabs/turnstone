@@ -2765,6 +2765,100 @@ class TestAgentChildRegistration:
         ]
         assert tool_results and tool_results[0]["tool_use_id"] == "toolu_01AB"
 
+    def test_agent_blank_provider_id_skips_native_lane(self):
+        # A server that leaves a tool-call id blank gets a uuid back-fill in
+        # the tool_calls mirror (_ensure_tool_call_ids) — but the native
+        # tool_use block keeps the blank id verbatim.  Carrying the lane for
+        # that turn would replay a native tool_use whose id matches no
+        # tool_result (Anthropic orphans the result and 400s).  The seam must
+        # skip the native lane for exactly that turn and fall back to the
+        # rebuild path, where every wire representation uses the back-filled
+        # id consistently.
+        from turnstone.core.providers._anthropic import AnthropicProvider
+
+        class _Block:
+            def __init__(self, **d):
+                self._d = d
+                for k, v in d.items():
+                    setattr(self, k, v)
+
+            def model_dump(self, **_kw):
+                return dict(self._d)
+
+        session = _make_session()
+        session._provider = AnthropicProvider()
+        session.ui.note_agent_child = MagicMock()
+
+        seen: list[dict] = []
+        call_count = [0]
+
+        def fake_stream(**kwargs):
+            seen.append(kwargs)
+            call_count[0] += 1
+            resp = MagicMock()
+            if call_count[0] == 1:
+                resp.content = [
+                    _Block(type="thinking", thinking="hm", signature="sig_b"),
+                    # Blank provider id — the back-fill case.
+                    _Block(type="tool_use", id="", name="read_file", input={"path": "x"}),
+                ]
+                resp.stop_reason = "tool_use"
+            else:
+                resp.content = [_Block(type="text", text="done")]
+                resp.stop_reason = "end_turn"
+            resp.usage = None
+            mgr = MagicMock()
+            mgr.__enter__ = MagicMock(
+                return_value=MagicMock(get_final_message=MagicMock(return_value=resp))
+            )
+            mgr.__exit__ = MagicMock(return_value=False)
+            return mgr
+
+        session.client.messages.stream = fake_stream
+
+        def fake_prepare(tc_dict, **_kwargs):
+            return {
+                "call_id": tc_dict["id"],
+                "func_name": "read_file",
+                "needs_approval": False,
+                "execute": lambda p: (p["call_id"], "contents"),
+            }
+
+        turns = [Turn.user("x")]
+        with (
+            patch.object(session, "_prepare_tool", side_effect=fake_prepare),
+            patch.object(session, "_resolve_replay_reasoning_to_model", return_value=True),
+        ):
+            session._run_agent(
+                turns,
+                tools=[{"type": "function", "function": {"name": "read_file", "parameters": {}}}],
+                label="task",
+                parent_call_id="task-1",
+            )
+
+        # The back-filled turn carries NO native lane.
+        assert turns[1].native is None
+        # The replay request rebuilds the turn: tool_use and tool_result agree
+        # on the back-filled uuid — no blank id, no orphan.
+        replay = seen[1]["messages"]
+        tool_uses = [
+            b
+            for m in replay
+            if m["role"] == "assistant" and isinstance(m.get("content"), list)
+            for b in m["content"]
+            if isinstance(b, dict) and b.get("type") == "tool_use"
+        ]
+        tool_results = [
+            b
+            for m in replay
+            if m["role"] == "user" and isinstance(m.get("content"), list)
+            for b in m["content"]
+            if isinstance(b, dict) and b.get("type") == "tool_result"
+        ]
+        assert tool_uses and tool_results
+        assert tool_uses[0]["id"]  # non-blank (uuid back-fill, restored)
+        assert tool_results[0]["tool_use_id"] == tool_uses[0]["id"]
+
     def test_agent_synthesizes_reasoning_and_attaches_vllm_replay_field(self):
         # Chat-Completions lane (vLLM): non-streaming ``reasoning_content`` is
         # captured into CompletionResult.reasoning, synthesized into the agent

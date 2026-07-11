@@ -1903,6 +1903,56 @@ class TestGoogleProviderFidelity:
         assert len(cleaned) == 2
         assert cleaned[0]["content"] == "hello"
 
+    def test_prepare_messages_swap_cannot_resurrect_malformed_arguments(self) -> None:
+        # The raw fidelity dicts carry the model's ORIGINAL arguments string;
+        # the sanitized top-level mirror is what the swap replaces.  A raw
+        # dict whose arguments are malformed must be legalized during the
+        # swap (thought_signature and id untouched) — otherwise every replay
+        # resurrects the malformed string the upstream sanitize pass fixed.
+        from turnstone.core.providers._google import GoogleProvider
+
+        prov = GoogleProvider()
+        msgs = [
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    # Mirror already legalized upstream.
+                    {"id": "c1", "type": "function", "function": {"name": "f", "arguments": "{}"}},
+                    {
+                        "id": "c2",
+                        "type": "function",
+                        "function": {"name": "g", "arguments": '{"ok": 1}'},
+                    },
+                ],
+                "_provider_content": [
+                    {
+                        "id": "c1",
+                        "type": "function",
+                        # Raw, unterminated — the model's original output.
+                        "function": {"name": "f", "arguments": '{"path": "/tmp'},
+                        "thought_signature": "sig123",
+                    },
+                    {
+                        "id": "c2",
+                        "type": "function",
+                        "function": {"name": "g", "arguments": '{"ok": 1}'},
+                        "thought_signature": "sig456",
+                    },
+                ],
+            },
+            {"role": "tool", "tool_call_id": "c1", "content": "ok"},
+            {"role": "tool", "tool_call_id": "c2", "content": "ok"},
+        ]
+        cleaned = prov._prepare_messages(msgs)
+        tcs = cleaned[0]["tool_calls"]
+        assert tcs[0]["function"]["arguments"] == "{}"  # legalized
+        assert tcs[0]["thought_signature"] == "sig123"  # fidelity preserved
+        assert tcs[0]["id"] == "c1"
+        # The valid sibling passes through byte-identical.
+        assert tcs[1]["function"]["arguments"] == '{"ok": 1}'
+        assert tcs[1]["thought_signature"] == "sig456"
+
     def test_non_streaming_captures_provider_blocks(self) -> None:
         from turnstone.core.providers._google import GoogleProvider
 
@@ -4357,6 +4407,28 @@ class TestOpenAIChatReasoningCapture:
         # leak a non-str into the result.
         result = self._complete(self._client(reasoning={"odd": True}))
         assert result.reasoning == ""
+
+    def test_structured_reasoning_does_not_shadow_reasoning_content(self) -> None:
+        # A truthy non-string in ``reasoning`` must not shadow valid text in
+        # ``reasoning_content`` — the first non-empty STRING wins.
+        result = self._complete(
+            self._client(reasoning={"content": "structured"}, reasoning_content="parsed text")
+        )
+        assert result.reasoning == "parsed text"
+
+    def test_streaming_delta_shares_the_same_guard(self) -> None:
+        # The streaming twin: a structured object in ``reasoning`` must not
+        # leak into reasoning_delta (it would TypeError the session's
+        # ``"".join`` accumulator) nor shadow the parsed string.
+        provider = OpenAIChatCompletionsProvider()
+        chunk = _openai_stream_chunk(
+            reasoning={"content": "structured"},  # type: ignore[arg-type] — the hostile input under test
+            reasoning_content="parsed text",
+            finish_reason="stop",
+        )
+        chunks = list(provider._iter_stream(iter([chunk])))
+        assert any(c.reasoning_delta == "parsed text" for c in chunks)
+        assert all(isinstance(c.reasoning_delta, str) for c in chunks)
 
 
 class TestResponsesMessageConversion:
