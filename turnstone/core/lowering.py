@@ -232,7 +232,7 @@ def tool_args_preview(arguments: Any) -> str:
     return _ARGS_PREVIEW_CONTROL_RE.sub(" ", redact_credentials(text))[:120]
 
 
-def _legalized_arguments(arguments: Any) -> str | None:
+def legalized_arguments(arguments: Any) -> str | None:
     """A wire-valid replacement for *arguments*, or ``None`` if already valid.
 
     A raw ``dict`` (an internal shape that reached the wire seat) is serialized;
@@ -276,7 +276,7 @@ def sanitize_tool_call_arguments(messages: list[dict[str, Any]]) -> list[dict[st
             fn = tc.get("function")
             if not isinstance(fn, dict):
                 continue
-            replacement = _legalized_arguments(fn.get("arguments"))
+            replacement = legalized_arguments(fn.get("arguments"))
             if replacement is None:
                 continue  # already wire-valid — leave byte-for-byte untouched
             if repaired is None:

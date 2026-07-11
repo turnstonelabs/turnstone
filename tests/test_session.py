@@ -2770,10 +2770,11 @@ class TestAgentChildRegistration:
         # the tool_calls mirror (_ensure_tool_call_ids) — but the native
         # tool_use block keeps the blank id verbatim.  Carrying the lane for
         # that turn would replay a native tool_use whose id matches no
-        # tool_result (Anthropic orphans the result and 400s).  The seam must
-        # skip the native lane for exactly that turn and fall back to the
-        # rebuild path, where every wire representation uses the back-filled
-        # id consistently.
+        # tool_result (Anthropic orphans the result and 400s).  The shared
+        # builder must drop the whole Messages-shaped lane for exactly that
+        # turn (a residual thinking block would REPLACE the rebuilt content
+        # and lose the tool_use) and fall back to the rebuild path, where
+        # every wire representation uses the back-filled id consistently.
         from turnstone.core.providers._anthropic import AnthropicProvider
 
         class _Block:
@@ -2858,6 +2859,82 @@ class TestAgentChildRegistration:
         assert tool_uses and tool_results
         assert tool_uses[0]["id"]  # non-blank (uuid back-fill, restored)
         assert tool_results[0]["tool_use_id"] == tool_uses[0]["id"]
+
+    def test_agent_blank_provider_id_keeps_synthesized_reasoning(self):
+        # The over-drop guard: a Chat-Completions server that BOTH leaves
+        # tool-call ids blank AND surfaces reasoning_content (llama.cpp,
+        # older vLLM) must still get its reasoning carried — the blank-id
+        # gate drops only the blocks a back-fill desyncs, and the
+        # synthesized reasoning_text lane has no client tool blocks at all.
+        from types import SimpleNamespace
+
+        from turnstone.core.providers._openai_chat import OpenAIChatCompletionsProvider
+        from turnstone.core.providers._openai_common import OPENAI_COMPAT_DEFAULT
+
+        session = _make_session()
+        session._provider = OpenAIChatCompletionsProvider()
+        session._model_alias = "loc"
+        session._registry = MagicMock()
+        session._registry.resolve_agent_alias.return_value = None
+        session._registry.resolve_agent_effort.return_value = None
+        session._registry.get_config.return_value = SimpleNamespace(
+            server_compat={"server_type": "vllm"}, replay_reasoning_to_model=True
+        )
+        session.ui.note_agent_child = MagicMock()
+
+        call_count = [0]
+
+        def fake_create(**kwargs):
+            call_count[0] += 1
+            resp = MagicMock()
+            choice = MagicMock()
+            if call_count[0] == 1:
+                choice.finish_reason = "tool_calls"
+                tc = MagicMock()
+                tc.id = ""  # blank — the back-fill case
+                tc.function.name = "read_file"
+                tc.function.arguments = '{"path": "x"}'
+                choice.message.tool_calls = [tc]
+                choice.message.content = None
+                choice.message.reasoning = None
+                choice.message.reasoning_content = "work it out"
+            else:
+                choice.finish_reason = "stop"
+                choice.message.tool_calls = None
+                choice.message.content = "done"
+                choice.message.reasoning = None
+                choice.message.reasoning_content = None
+            resp.choices = [choice]
+            resp.usage = MagicMock(prompt_tokens=1, completion_tokens=1)
+            return resp
+
+        session.client.chat.completions.create = fake_create
+
+        def fake_prepare(tc_dict, **_kwargs):
+            return {
+                "call_id": tc_dict["id"],
+                "func_name": "read_file",
+                "needs_approval": False,
+                "execute": lambda p: (p["call_id"], "contents"),
+            }
+
+        turns = [Turn.user("x")]
+        with (
+            patch.object(session, "_prepare_tool", side_effect=fake_prepare),
+            patch.object(session, "_resolve_capabilities", return_value=OPENAI_COMPAT_DEFAULT),
+            patch.object(session, "_provider_extra_params", return_value={}),
+        ):
+            session._run_agent(
+                turns,
+                tools=[{"type": "function", "function": {"name": "read_file"}}],
+                label="task",
+                parent_call_id="task-1",
+            )
+
+        # Reasoning survives the blank-id turn.
+        assert turns[1].native is not None
+        assert [b["type"] for b in turns[1].native.blocks] == ["reasoning_text"]
+        assert turns[1].native.blocks[0]["text"] == "work it out"
 
     def test_agent_synthesizes_reasoning_and_attaches_vllm_replay_field(self):
         # Chat-Completions lane (vLLM): non-streaming ``reasoning_content`` is
