@@ -100,14 +100,22 @@ class GoogleProvider(OpenAIChatCompletionsProvider):
                 # other tool types (e.g. code_execution) they will need
                 # their own round-trip handling here.
                 raw_tcs = [b for b in pc if isinstance(b, dict) and b.get("type") == "function"]
-                # A raw dict with a blank id predates the capture-time
-                # blank-id gate (the mirror's uuid back-fill never reached
-                # the fidelity lane); swapping it in would resurrect the
-                # blank id on every replay of that historical row.  Such
-                # turns keep the sanitized mirror instead — losing the raw
-                # lane, exactly what the capture-time gate now produces for
-                # new turns.
-                if raw_tcs and all(b.get("id") for b in raw_tcs):
+                # Swap ONLY when the raw lane is a faithful counterpart of
+                # the mirror: every raw dict carries an id (a blank id
+                # predates the capture-time blank-id gate — swapping it in
+                # would resurrect the blank id on every replay of that
+                # historical row), and the raw list is the same length as
+                # the mirror (a shorter list — a corrupted lane whose
+                # non-dict elements the extraction filtered — would DROP
+                # mirrored calls whose tool results remain in history and
+                # orphan them).  A turn failing either check keeps the
+                # sanitized mirror — losing the raw lane, exactly what the
+                # capture-time gate now produces for new degenerate turns.
+                if (
+                    raw_tcs
+                    and len(raw_tcs) == len(msg.get("tool_calls") or [])
+                    and all(b.get("id") for b in raw_tcs)
+                ):
                     # The raw dicts carry the model's ORIGINAL arguments;
                     # the mirror this swap replaces may have been legalized
                     # upstream (lowering.sanitize_tool_call_arguments), so

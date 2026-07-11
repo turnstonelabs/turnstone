@@ -2035,6 +2035,47 @@ class TestGoogleProviderFidelity:
         assert cleaned[0]["content"] == "x"
         assert "_provider_content" not in cleaned[0]
 
+    def test_prepare_messages_partial_lane_keeps_sanitized_mirror(self) -> None:
+        # A partially-corrupted lane (one valid raw dict + one garbage
+        # element) must not swap a SHORTER list over the mirror — that would
+        # drop a mirrored call whose tool result remains in history and
+        # orphan it.  The sanitized mirror stays.
+        from turnstone.core.providers._google import GoogleProvider
+
+        prov = GoogleProvider()
+        msgs = [
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "call_A",
+                        "type": "function",
+                        "function": {"name": "f", "arguments": "{}"},
+                    },
+                    {
+                        "id": "call_B",
+                        "type": "function",
+                        "function": {"name": "g", "arguments": "{}"},
+                    },
+                ],
+                "_provider_content": [
+                    {
+                        "id": "call_A",
+                        "type": "function",
+                        "function": {"name": "f", "arguments": "{}"},
+                        "thought_signature": "sig",
+                    },
+                    "garbage-string",
+                ],
+            },
+            {"role": "tool", "tool_call_id": "call_A", "content": "ok"},
+            {"role": "tool", "tool_call_id": "call_B", "content": "ok"},
+        ]
+        cleaned = prov._prepare_messages(msgs)
+        ids = [tc["id"] for tc in cleaned[0]["tool_calls"]]
+        assert ids == ["call_A", "call_B"]  # mirror kept — no orphaned call_B
+
     def test_prepare_messages_swap_passes_non_dict_function_through(self) -> None:
         # A degenerate fidelity block with function=None must pass through
         # untouched (the prior behaviour), not raise.
