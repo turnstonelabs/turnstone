@@ -2450,9 +2450,230 @@ class TestAgentChildRegistration:
                 parent_call_id="task-1",
             )
 
-        # Sub-agent tool ids are namespaced by the parent so the UI registry
-        # can't collide across concurrent task agents (local sequential ids).
-        session.ui.note_agent_child.assert_called_once_with("task-1::call_1", "task-1")
+        # Sub-agent tool ids are minted ``{parent}::r{run}s{step}::{provider_id}``
+        # so the UI registry can't collide across concurrent task agents, across
+        # turns within one agent (local sequential ids like "call_0"), or across
+        # runs whose PARENT id was itself reused.
+        session.ui.note_agent_child.assert_called_once_with("task-1::r1s1::call_1", "task-1")
+
+    def test_cross_turn_reused_provider_ids_stay_distinct(self):
+        # A local provider reuses "call_0" verbatim every response.  The minted
+        # id carries a per-agent step sequence, so the registry, the wire, the
+        # recall projection, and the cancel ledger all see two DISTINCT calls.
+        # Pre-mint both mapped to "task-1::call_0": the live card collapsed the
+        # rows (bug-3) while FIFO recall kept them apart — the two disagreed on
+        # identical input.
+        from turnstone.core.providers._openai_chat import OpenAIChatCompletionsProvider
+
+        session = _make_session()
+        session._provider = OpenAIChatCompletionsProvider()
+        session.ui.note_agent_child = MagicMock()
+
+        call_count = [0]
+
+        def fake_create(**_kwargs):
+            call_count[0] += 1
+            resp = MagicMock()
+            choice = MagicMock()
+            if call_count[0] <= 2:
+                choice.finish_reason = "tool_calls"
+                tc = MagicMock()
+                tc.id = "call_0"  # reused verbatim across turns
+                tc.function.name = "read_file"
+                tc.function.arguments = f'{{"path": "/tmp/f{call_count[0]}"}}'
+                choice.message.tool_calls = [tc]
+                choice.message.content = None
+            else:
+                choice.finish_reason = "stop"
+                choice.message.tool_calls = None
+                choice.message.content = "done"
+            resp.choices = [choice]
+            resp.usage = MagicMock(prompt_tokens=10, completion_tokens=5)
+            return resp
+
+        session.client.chat.completions.create = fake_create
+
+        def fake_prepare(tc_dict, **_kwargs):
+            n = call_count[0]
+            return {
+                "call_id": tc_dict["id"],
+                "func_name": "read_file",
+                "needs_approval": False,
+                "execute": lambda p, n=n: (p["call_id"], f"contents-{n}"),
+            }
+
+        agent_turns = [Turn.user("x")]
+        with patch.object(session, "_prepare_tool", side_effect=fake_prepare):
+            session._run_agent(
+                agent_turns,
+                tools=[{"type": "function", "function": {"name": "read_file"}}],
+                label="task",
+                parent_call_id="task-1",
+            )
+
+        # Registry: two registrations, distinct minted ids, same parent.
+        assert [c.args for c in session.ui.note_agent_child.call_args_list] == [
+            ("task-1::r1s1::call_0", "task-1"),
+            ("task-1::r1s2::call_0", "task-1"),
+        ]
+        # Recall projection: two steps, each paired to its OWN result.
+        steps = ChatSession._project_agent_steps(agent_turns)
+        assert [s["id"] for s in steps] == ["task-1::r1s1::call_0", "task-1::r1s2::call_0"]
+        assert [s["output"] for s in steps] == ["contents-1", "contents-2"]
+        # Cancel ledger agrees: both calls answered, no in-flight gap.
+        issued, first_gap = ChatSession._cancel_ledger(agent_turns)
+        assert issued == [("read_file", True), ("read_file", True)]
+        assert first_gap is None
+
+    @staticmethod
+    def _reusing_provider(session, tool_turns: int = 1):
+        """Fake create() reissuing id "call_0" for ``tool_turns`` turns, then
+        stopping — the local-server id-reuse shape.  Returns the counter."""
+        call_count = [0]
+
+        def fake_create(**_kwargs):
+            call_count[0] += 1
+            resp = MagicMock()
+            choice = MagicMock()
+            if call_count[0] <= tool_turns:
+                choice.finish_reason = "tool_calls"
+                tc = MagicMock()
+                tc.id = "call_0"
+                tc.function.name = "read_file"
+                tc.function.arguments = '{"path": "/tmp/x"}'
+                choice.message.tool_calls = [tc]
+                choice.message.content = None
+            else:
+                choice.finish_reason = "stop"
+                choice.message.tool_calls = None
+                choice.message.content = "done"
+            resp.choices = [choice]
+            resp.usage = MagicMock(prompt_tokens=10, completion_tokens=5)
+            return resp
+
+        session.client.chat.completions.create = fake_create
+        return call_count
+
+    def test_parent_id_reuse_across_runs_mints_distinct_child_ids(self):
+        # A local provider reuses "call_0" for the PARENT task_agent call too:
+        # two sequential runs share parent_call_id "call_0".  The session-level
+        # run counter keeps their minted CHILD ids distinct — with only the
+        # per-run step seq (the intermediate fix, before the run counter) both
+        # runs minted "call_0::s1::call_0" and the second agent's sub-tool
+        # steps grafted onto the first agent's DOM rows.
+        #
+        # SCOPE: this fixes child (sub-tool) ids only.  The parent CARD still
+        # keys on the raw reused parent id ("call_0") — stash_agent_trajectory,
+        # _tool_status, the card's own data-call-id row — so two runs with the
+        # same parent id still alias at the card level.  Parent ids are
+        # main-loop ids; de-colliding them is the main-loop id-hygiene
+        # follow-up (see legalize_tool_call_ids' docstring), not this change.
+        from turnstone.core.providers._openai_chat import OpenAIChatCompletionsProvider
+
+        session = _make_session()
+        session._provider = OpenAIChatCompletionsProvider()
+        session.ui.note_agent_child = MagicMock()
+
+        def fake_prepare(tc_dict, **_kwargs):
+            return {
+                "call_id": tc_dict["id"],
+                "func_name": "read_file",
+                "needs_approval": False,
+                "execute": lambda p: (p["call_id"], "contents"),
+            }
+
+        minted: list[str] = []
+        for _run in range(2):
+            self._reusing_provider(session)
+            with patch.object(session, "_prepare_tool", side_effect=fake_prepare):
+                session._run_agent(
+                    [Turn.user("x")],
+                    tools=[{"type": "function", "function": {"name": "read_file"}}],
+                    label="task",
+                    parent_call_id="call_0",
+                )
+            minted.append(session.ui.note_agent_child.call_args.args[0])
+
+        assert minted == ["call_0::r1s1::call_0", "call_0::r2s1::call_0"]
+        assert len(set(minted)) == 2
+
+    def test_agent_wire_is_validity_legalized(self):
+        # The agent seam bypasses the main-loop wire prep and builds its own
+        # history, so it runs the same two validity passes itself.  Drive one
+        # tool turn whose call carries both a minted "::" id (projected as
+        # defensive hardening) and malformed non-object arguments (a strict
+        # renderer json.loads and 400s them), then assert the REPLAY request
+        # the second _api_call sends carries the projected id (call/result
+        # pairing intact) and object-shaped arguments.  The internal id keeps
+        # the "::" form.
+        import json as _json
+        import re as _re
+
+        from turnstone.core.providers._openai_chat import OpenAIChatCompletionsProvider
+
+        session = _make_session()
+        session._provider = OpenAIChatCompletionsProvider()
+        session.ui.note_agent_child = MagicMock()
+
+        seen_messages: list[list[dict]] = []
+        call_count = [0]
+
+        def fake_create(**kwargs):
+            seen_messages.append(kwargs.get("messages") or [])
+            call_count[0] += 1
+            resp = MagicMock()
+            choice = MagicMock()
+            if call_count[0] == 1:
+                choice.finish_reason = "tool_calls"
+                tc = MagicMock()
+                tc.id = "call_0"
+                tc.function.name = "read_file"
+                # Malformed: unterminated JSON with a non-"length" finish
+                # reason — the sanitize pass's reason to exist.
+                tc.function.arguments = '{"path": "/tmp/x"'
+                choice.message.tool_calls = [tc]
+                choice.message.content = None
+            else:
+                choice.finish_reason = "stop"
+                choice.message.tool_calls = None
+                choice.message.content = "done"
+            resp.choices = [choice]
+            resp.usage = MagicMock(prompt_tokens=10, completion_tokens=5)
+            return resp
+
+        session.client.chat.completions.create = fake_create
+
+        def fake_prepare(tc_dict, **_kwargs):
+            return {
+                "call_id": tc_dict["id"],
+                "func_name": "read_file",
+                "needs_approval": False,
+                "execute": lambda p: (p["call_id"], "contents"),
+            }
+
+        with patch.object(session, "_prepare_tool", side_effect=fake_prepare):
+            session._run_agent(
+                [Turn.user("x")],
+                tools=[{"type": "function", "function": {"name": "read_file"}}],
+                label="task",
+                parent_call_id="task-1",
+            )
+
+        # Internal id (registry) keeps the minted "::" form.
+        internal = session.ui.note_agent_child.call_args.args[0]
+        assert internal == "task-1::r1s1::call_0"
+        # The SECOND request replays the tool turn: wire id is the legal
+        # projection, consistent between the call and its result; arguments
+        # are legalized to a JSON object.
+        replay = seen_messages[1]
+        wire_calls = [tc for m in replay if m.get("tool_calls") for tc in m["tool_calls"]]
+        wire_results = [m for m in replay if m.get("role") == "tool"]
+        assert wire_calls and wire_results
+        wire_id = wire_calls[0]["id"]
+        assert _re.fullmatch(r"[a-zA-Z0-9_-]{1,40}", wire_id), wire_id
+        assert wire_results[0]["tool_call_id"] == wire_id
+        assert wire_id != internal
+        assert isinstance(_json.loads(wire_calls[0]["function"]["arguments"]), dict)
 
 
 class TestRunAgentDenialMessage:
@@ -2633,6 +2854,9 @@ class TestProjectAgentSteps:
     def test_colliding_ids_paired_fifo_not_last_wins(self):
         # A local provider reuses id "call_0" across turns; FIFO pairing gives
         # each call its OWN result, not last-wins (which would show out-B twice).
+        # Parented runs can no longer produce this input (_run_agent mints
+        # unique ids), but the FIFO stays as honest pairing for input a mint
+        # never touched — an unparented run, or turns constructed directly.
         from turnstone.core.trajectory import ToolCall, Turn
 
         turns = [

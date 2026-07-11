@@ -35,6 +35,21 @@ Earlier stable lines (`stable/1.6`, `stable/1.5`) are frozen.
 
 ### Fixed
 
+- **task_agent: sub-tool ids no longer alias across a local model's reused
+  ids.** A local model that reissues per-response sequential tool-call ids
+  (`call_0` every turn) made two of a task agent's steps share one id — the
+  live card collapsed both onto one DOM row while `/history` recall kept them
+  apart, so the two views disagreed. Sub-tool ids are now minted
+  `{parent}::r{run}s{step}::{id}`, unique within the session (across an
+  agent's turns and across concurrent or sequential runs), and that one id
+  keys the nesting registry, the live rows, recall, and the cancel ledger.
+  As defensive hardening the agent loop also normalizes its self-built wire
+  history — projecting the composite ids to short plain tokens
+  (deterministically, so call/result pairing holds) and legalizing malformed
+  tool-call arguments, the same two validity passes the main loop already runs
+  — so an agent's history stays valid even on a backend stricter than the ones
+  it runs on today.
+
 - **bash tool: never hang on a backgrounded child.** A command that left a
   long-lived process running (`server &`, a daemon) could wedge the whole
   workstream forever — the tool read stdout/stderr to EOF, which never arrived
