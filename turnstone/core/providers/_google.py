@@ -23,13 +23,10 @@ from typing import TYPE_CHECKING, Any
 if TYPE_CHECKING:
     from collections.abc import Iterator
 
-from turnstone.core.log import get_logger
-from turnstone.core.lowering import legalized_arguments, tool_args_preview
+from turnstone.core.lowering import legalize_tool_call_entry
 from turnstone.core.providers._openai_chat import OpenAIChatCompletionsProvider
 from turnstone.core.providers._openai_common import sanitize_messages
 from turnstone.core.providers._protocol import ModelCapabilities, StreamChunk
-
-log = get_logger(__name__)
 
 # Default endpoint used when no base_url is configured.
 GOOGLE_DEFAULT_BASE_URL = "https://generativelanguage.googleapis.com/v1beta/openai/"
@@ -102,39 +99,23 @@ class GoogleProvider(OpenAIChatCompletionsProvider):
                 # Only type=="function" is expected today; if Gemini adds
                 # other tool types (e.g. code_execution) they will need
                 # their own round-trip handling here.
-                raw_tcs = [b for b in pc if b.get("type") == "function"]
-                if raw_tcs:
+                raw_tcs = [b for b in pc if isinstance(b, dict) and b.get("type") == "function"]
+                # A raw dict with a blank id predates the capture-time
+                # blank-id gate (the mirror's uuid back-fill never reached
+                # the fidelity lane); swapping it in would resurrect the
+                # blank id on every replay of that historical row.  Such
+                # turns keep the sanitized mirror instead — losing the raw
+                # lane, exactly what the capture-time gate now produces for
+                # new turns.
+                if raw_tcs and all(b.get("id") for b in raw_tcs):
                     # The raw dicts carry the model's ORIGINAL arguments;
-                    # the top-level mirror this swap replaces may have been
-                    # legalized upstream (lowering.sanitize_tool_call_arguments),
-                    # so re-apply the SAME legalization (shared helper — a
-                    # dict-shaped value is serialized, anything else invalid
-                    # collapses to "{}", and the standard breadcrumb is
-                    # logged) — otherwise the fidelity swap resurrects a
-                    # malformed arguments value on every replay.  A non-dict
-                    # ``function`` passes through untouched (someone else's
-                    # malformation, exactly like the sanitize pass).
-                    # Copy-on-write per offending entry; ids and
-                    # ``thought_signature`` stay untouched.
-                    fixed: list[dict[str, Any]] = []
-                    for b in raw_tcs:
-                        fn = b.get("function")
-                        replacement = (
-                            legalized_arguments(fn.get("arguments"))
-                            if isinstance(fn, dict)
-                            else None
-                        )
-                        if replacement is None:
-                            fixed.append(b)
-                            continue
-                        log.debug(
-                            "wire.tool_args_legalized",
-                            tool=fn.get("name", "?"),
-                            call_id=b.get("id", ""),
-                            raw_preview=tool_args_preview(fn.get("arguments")),
-                        )
-                        fixed.append({**b, "function": {**fn, "arguments": replacement}})
-                    msg["tool_calls"] = fixed
+                    # the mirror this swap replaces may have been legalized
+                    # upstream (lowering.sanitize_tool_call_arguments), so
+                    # re-apply the SAME per-entry legalizer — otherwise the
+                    # fidelity swap resurrects a malformed arguments value
+                    # on every replay.  Copy-on-write per offending entry;
+                    # ids and ``thought_signature`` stay untouched.
+                    msg["tool_calls"] = [legalize_tool_call_entry(b) or b for b in raw_tcs]
             cleaned.append(msg)
         return sanitize_messages(cleaned)
 

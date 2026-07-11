@@ -1983,6 +1983,58 @@ class TestGoogleProviderFidelity:
         assert json.loads(tc["function"]["arguments"]) == {"path": "/tmp/x"}
         assert tc["thought_signature"] == "sig1"
 
+    def test_prepare_messages_blank_id_raw_row_keeps_sanitized_mirror(self) -> None:
+        # A historical fidelity row whose raw dict carries a blank id (saved
+        # before the capture-time blank-id gate existed): swapping it in
+        # would resurrect the blank id on every replay, so the swap is
+        # skipped and the sanitized mirror — with its back-filled id — stays.
+        from turnstone.core.providers._google import GoogleProvider
+
+        prov = GoogleProvider()
+        msgs = [
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "call_backfilled",
+                        "type": "function",
+                        "function": {"name": "f", "arguments": "{}"},
+                    },
+                ],
+                "_provider_content": [
+                    {
+                        "id": "",
+                        "type": "function",
+                        "function": {"name": "f", "arguments": "{}"},
+                        "thought_signature": "sig",
+                    },
+                ],
+            },
+            {"role": "tool", "tool_call_id": "call_backfilled", "content": "ok"},
+        ]
+        cleaned = prov._prepare_messages(msgs)
+        tc = cleaned[0]["tool_calls"][0]
+        assert tc["id"] == "call_backfilled"  # mirror kept, raw lane not swapped
+        assert "thought_signature" not in tc
+
+    def test_prepare_messages_ignores_non_dict_provider_content_elements(self) -> None:
+        # A corrupted persisted lane with a non-dict element must not crash
+        # the request build.
+        from turnstone.core.providers._google import GoogleProvider
+
+        prov = GoogleProvider()
+        msgs = [
+            {
+                "role": "assistant",
+                "content": "x",
+                "_provider_content": ["garbage-string"],
+            },
+        ]
+        cleaned = prov._prepare_messages(msgs)
+        assert cleaned[0]["content"] == "x"
+        assert "_provider_content" not in cleaned[0]
+
     def test_prepare_messages_swap_passes_non_dict_function_through(self) -> None:
         # A degenerate fidelity block with function=None must pass through
         # untouched (the prior behaviour), not raise.

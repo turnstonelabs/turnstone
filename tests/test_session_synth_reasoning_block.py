@@ -389,9 +389,9 @@ class TestFinalizeProviderBlocks:
         assert [b["type"] for b in out] == ["thinking"]
 
     def test_blank_ids_drop_messages_shaped_lane_entirely(self) -> None:
-        # Anthropic-shaped lane with a blank-id tool_use: the client block is
-        # stripped, and the surviving thinking/text blocks must go with it —
-        # on the Messages translator a native lane REPLACES the rebuilt
+        # Anthropic-shaped lane with a blank-id tool_use: only reasoning_text
+        # may survive a blank-id turn, so the whole Messages-shaped lane goes
+        # — on that translator a surviving native lane REPLACES the rebuilt
         # content, so a lane missing its tool_use would orphan the mirror's
         # calls.
         session = _make_session()
@@ -403,11 +403,36 @@ class TestFinalizeProviderBlocks:
         out = session._finalize_provider_blocks(blocks, [], has_tool_calls=True, had_blank_ids=True)
         assert out == []
 
-    def test_blank_ids_keep_shape_invalid_reasoning_residuals(self) -> None:
-        # Google-shaped lane: the raw function dict (blank id) is stripped;
-        # the synthesized reasoning_text block survives — it is shape-invalid
-        # on the Messages translator by design, and the Google swap simply
-        # finds no function blocks and keeps the sanitized mirror.
+    def test_blank_ids_drop_asymmetric_thinking_lane_without_tool_blocks(self) -> None:
+        # Asymmetric capture (thinking/text present, tool_use absent, mirror
+        # blank-id): the rule is total — no client block needs to be present
+        # for the Messages-shaped lane to be dropped on a blank-id turn.
+        session = _make_session()
+        blocks = [
+            {"type": "thinking", "thinking": "x", "signature": "s"},
+            {"type": "text", "text": "t"},
+        ]
+        out = session._finalize_provider_blocks(blocks, [], has_tool_calls=True, had_blank_ids=True)
+        assert out == []
+
+    def test_blank_ids_drop_responses_reasoning_items(self) -> None:
+        # Responses reasoning items pair with their original sibling items;
+        # on a blank-id turn the function_call siblings are rebuilt from the
+        # back-filled mirror, so the reasoning items must go too.
+        session = _make_session()
+        blocks = [
+            {"type": "reasoning", "id": "rs_1", "summary": [], "encrypted_content": "enc"},
+            {"type": "function_call", "call_id": "", "name": "f", "arguments": "{}"},
+        ]
+        out = session._finalize_provider_blocks(blocks, [], has_tool_calls=True, had_blank_ids=True)
+        assert out == []
+
+    def test_blank_ids_keep_only_reasoning_text(self) -> None:
+        # Google-shaped lane: the raw function dict (blank id) is dropped;
+        # the synthesized reasoning_text block survives — it carries no id
+        # and is shape-invalid on the Messages translator by design, and the
+        # Google swap simply finds no function blocks and keeps the
+        # sanitized mirror.
         session = _make_session()
         blocks = [
             {"id": "", "type": "function", "function": {"name": "f", "arguments": "{}"}},

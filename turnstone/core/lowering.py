@@ -251,6 +251,33 @@ def legalized_arguments(arguments: Any) -> str | None:
     return "{}"
 
 
+def legalize_tool_call_entry(tc: dict[str, Any]) -> dict[str, Any] | None:
+    """A legalized copy of one wire tool-call entry, or ``None`` when its
+    ``arguments`` are already wire-valid — or its ``function`` is not a dict
+    (someone else's malformation to surface, not silently rename).
+
+    Emits the standard ``wire.tool_args_legalized`` breadcrumb when it fixes
+    an entry.  The ONE per-entry legalizer: shared by
+    :func:`sanitize_tool_call_arguments` and the Google fidelity swap
+    (``providers/_google.py``), which re-applies the same floor to the raw
+    provider dicts it swaps over the sanitized mirror — so the two seats
+    cannot drift on what "wire-valid" means or on the diagnosis trail.
+    """
+    fn = tc.get("function")
+    if not isinstance(fn, dict):
+        return None
+    replacement = legalized_arguments(fn.get("arguments"))
+    if replacement is None:
+        return None  # already wire-valid — leave byte-for-byte untouched
+    log.debug(
+        "wire.tool_args_legalized",
+        tool=fn.get("name", "?"),
+        call_id=tc.get("id", ""),
+        raw_preview=tool_args_preview(fn.get("arguments")),
+    )
+    return {**tc, "function": {**fn, "arguments": replacement}}
+
+
 def sanitize_tool_call_arguments(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Return *messages* with every assistant tool call's ``arguments`` made
     wire-valid — the legalize pass (see the module docstring).
@@ -273,21 +300,12 @@ def sanitize_tool_call_arguments(messages: list[dict[str, Any]]) -> list[dict[st
             continue
         repaired: list[dict[str, Any]] | None = None
         for ci, tc in enumerate(msg["tool_calls"]):
-            fn = tc.get("function")
-            if not isinstance(fn, dict):
+            fixed = legalize_tool_call_entry(tc)
+            if fixed is None:
                 continue
-            replacement = legalized_arguments(fn.get("arguments"))
-            if replacement is None:
-                continue  # already wire-valid — leave byte-for-byte untouched
             if repaired is None:
                 repaired = list(msg["tool_calls"])
-            log.debug(
-                "wire.tool_args_legalized",
-                tool=fn.get("name", "?"),
-                call_id=tc.get("id", ""),
-                raw_preview=tool_args_preview(fn.get("arguments")),
-            )
-            repaired[ci] = {**tc, "function": {**fn, "arguments": replacement}}
+            repaired[ci] = fixed
         if repaired is not None:
             if out is None:
                 out = list(messages)
