@@ -18,7 +18,15 @@ This module owns the three provider-neutral lowering passes:
   ``deepseek_v4``, which ``json.loads`` the arguments at request-render time)
   can't reject the whole request.  Mutates the transient wire copy only — the
   canonical trajectory keeps the raw output.  See
-  :func:`sanitize_tool_call_arguments`.
+  :func:`sanitize_tool_call_arguments`.  The id sibling,
+  :func:`legalize_tool_call_ids`, projects session-minted sub-agent tool ids
+  (``{parent}::r{run}s{step}::{provider_id}`` — long and ``::``-containing) to
+  deterministic safe tokens as DEFENSIVE hardening (no backend turnstone
+  targets is known to reject them; the prior ``::`` id format ran fine); it
+  runs at the AGENT wire seam (``ChatSession._run_agent``'s ``_api_call``)
+  only — main-loop ids are provider-issued or uuid-filled, and main-loop
+  assistant turns
+  carry a provider-native lane whose block ids must stay untouched.
 * **repair** (validity) — synthesizing cancellation results for orphaned client
   tool calls.  See :func:`repair_wire_messages`.
 
@@ -52,6 +60,7 @@ their own.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 from typing import Any
@@ -284,6 +293,94 @@ def sanitize_tool_call_arguments(messages: list[dict[str, Any]]) -> list[dict[st
             if out is None:
                 out = list(messages)
             out[idx] = {**msg, "tool_calls": repaired}
+    return messages if out is None else out
+
+
+# A conservative wire-legal shape for tool-call ids: alphanumerics, ``_`` and
+# ``-``, up to 40 chars — the tightest charset/length a provider wire is
+# plausibly strict about.  DEFENSIVE only: no backend turnstone targets is
+# known to require it — the deployment is lenient anthropic-compatible vLLM,
+# and the prior ``::``-containing id format replayed fine — so an id already
+# matching this passes through untouched and the projection is belt-and-braces.
+_WIRE_TOOL_ID_RE = re.compile(r"[a-zA-Z0-9_-]{1,40}")
+
+
+def wire_safe_tool_call_id(tc_id: str) -> str:
+    """Return *tc_id* unchanged if it already matches the conservative
+    wire-legal shape (:data:`_WIRE_TOOL_ID_RE`), else a deterministic safe
+    token (``tid_`` + 32 hex chars of its SHA-1, 36 chars total).
+
+    Determinism is the contract: the same original id maps to the same token
+    in the assistant ``tool_use`` and its ``tool_result`` (intra-request
+    pairing) and across successive requests that replay the same turns.
+    Provider-issued ids (their own echo) and ``_ensure_tool_call_ids``'s
+    uuid fills already match, so they pass through unchanged; only
+    session-minted composite ids (``{parent}::r{run}s{step}::{provider_id}``)
+    are projected.
+    """
+    if _WIRE_TOOL_ID_RE.fullmatch(tc_id):
+        return tc_id
+    return "tid_" + hashlib.sha1(tc_id.encode("utf-8", "surrogatepass")).hexdigest()[:32]
+
+
+def legalize_tool_call_ids(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Return *messages* with every tool-call id made wire-legal — the id
+    half of the legalize pass, applied at the AGENT wire seam.
+
+    Rewrites assistant ``tool_calls[*].id`` and tool ``tool_call_id`` through
+    :func:`wire_safe_tool_call_id`, so a minted ``::`` id is projected to a
+    plain token before the wire (call/result pairing survives via
+    determinism).  This is DEFENSIVE hardening — the ids replay fine on the
+    lenient anthropic-compatible deployment today; the projection just keeps
+    an agent's self-built history valid on a hypothetically stricter backend.
+    Empty and non-string ids are left alone — the empty back-fill belongs to
+    :func:`repair_wire_messages`'s domain, and a non-string is someone else's
+    malformation to surface, not silently rename.
+
+    Copy-on-write + identity-preserving, exactly like
+    :func:`sanitize_tool_call_arguments`: a conversation whose ids are all
+    legal returns the same object.  Applied at the AGENT seam only, where the
+    ``::`` mint is the sole illegal-id source; NOT wired into the main-loop
+    wire prep, because assistant turns there can carry a provider-native block
+    lane whose ids must stay byte-identical to the mirrored ``tool_calls``,
+    and projecting them would desync the two.  If the main loop ever needs the
+    same hygiene (a mid-session ``/model`` switch replays the prior backend's
+    ids — a vLLM ``chatcmpl-tool-`` + 32-hex id is 46 chars, long enough that a
+    backend with a short ``tool_call_id`` cap could reject it), the fix is
+    de-colliding + legalizing at ``_ensure_tool_call_ids`` in a way that also
+    rewrites the native lane — the broader main-loop id-hygiene follow-up, out
+    of scope here.
+    """
+    out: list[dict[str, Any]] | None = None  # copy-on-write: None until first fix
+    for idx, msg in enumerate(messages):
+        role = msg.get("role")
+        if role == "assistant" and msg.get("tool_calls"):
+            repaired: list[dict[str, Any]] | None = None
+            for ci, tc in enumerate(msg["tool_calls"]):
+                tc_id = tc.get("id")
+                if not isinstance(tc_id, str) or not tc_id:
+                    continue
+                safe = wire_safe_tool_call_id(tc_id)
+                if safe is tc_id:
+                    continue
+                if repaired is None:
+                    repaired = list(msg["tool_calls"])
+                log.debug("wire.tool_id_legalized", call_id=tc_id, wire_id=safe)
+                repaired[ci] = {**tc, "id": safe}
+            if repaired is not None:
+                if out is None:
+                    out = list(messages)
+                out[idx] = {**msg, "tool_calls": repaired}
+        elif role == "tool":
+            tc_id = msg.get("tool_call_id")
+            if not isinstance(tc_id, str) or not tc_id:
+                continue
+            safe = wire_safe_tool_call_id(tc_id)
+            if safe is tc_id:
+                continue
+            if out is None:
+                out = list(messages)
+            out[idx] = {**msg, "tool_call_id": safe}
     return messages if out is None else out
 
 
