@@ -15507,10 +15507,10 @@ class ChatSession:
             # the backend that produced them (and the translators' per-block
             # shape filters drop anything foreign).
             #
-            # ``had_blank_ids`` lets the shared builder drop exactly the
-            # blocks a uuid-back-fill desyncs (client tool blocks + their
-            # Messages-shaped siblings) while keeping the reasoning lane —
-            # see _finalize_provider_blocks.
+            # ``had_blank_ids`` makes the shared builder drop everything but
+            # the loose-text ``reasoning_text`` synth for this turn — any
+            # id-bearing or Messages-shaped block would desync from the
+            # uuid-back-filled mirror — see _finalize_provider_blocks.
             native_blocks = self._finalize_provider_blocks(
                 result.provider_blocks,
                 [result.reasoning],
