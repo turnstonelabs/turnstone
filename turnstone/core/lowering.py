@@ -308,7 +308,7 @@ _WIRE_TOOL_ID_RE = re.compile(r"[a-zA-Z0-9_-]{1,40}")
 def wire_safe_tool_call_id(tc_id: str) -> str:
     """Return *tc_id* unchanged if it already matches the conservative
     wire-legal shape (:data:`_WIRE_TOOL_ID_RE`), else a deterministic safe
-    token (``tid_`` + 32 hex chars of its SHA-1, 36 chars total).
+    token (``tid_`` + 32 hex chars of its SHA-256, 36 chars total).
 
     Determinism is the contract: the same original id maps to the same token
     in the assistant ``tool_use`` and its ``tool_result`` (intra-request
@@ -320,7 +320,7 @@ def wire_safe_tool_call_id(tc_id: str) -> str:
     """
     if _WIRE_TOOL_ID_RE.fullmatch(tc_id):
         return tc_id
-    return "tid_" + hashlib.sha1(tc_id.encode("utf-8", "surrogatepass")).hexdigest()[:32]
+    return "tid_" + hashlib.sha256(tc_id.encode("utf-8", "surrogatepass")).hexdigest()[:32]
 
 
 def legalize_tool_call_ids(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:

@@ -653,7 +653,7 @@ class Pane {
     if (!el) {
       let target = this._toolRow(callId);
       if (!target) {
-        // A minted sub-agent child id ("<parent>::<seq>::<id>") whose row hasn't
+        // A minted sub-agent child id ("<parent>::r{run}s{step}::<id>") whose row hasn't
         // nested yet must NOT graft its stream onto the last top-level batch —
         // that mislabels a sub-tool's output as a main-harness tool's.  Its row
         // arrives via the orphan flush; skip the chunk until then.
@@ -3491,7 +3491,7 @@ class Pane {
     }
     let target = this._toolRow(callId);
     if (!target) {
-      // A minted sub-agent child id ("<parent>::<seq>::<id>") whose row hasn't
+      // A minted sub-agent child id ("<parent>::r{run}s{step}::<id>") whose row hasn't
       // nested yet must NOT graft its output onto the last top-level batch row
       // — that mislabels a sub-tool's result as a main-harness tool's.  Its row
       // arrives via the orphan flush; skip until then.
