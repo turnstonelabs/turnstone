@@ -277,6 +277,41 @@ class TestConvertMessagesReasoningReplay:
         types = [it.get("type") for it in items]
         assert "reasoning" not in types
 
+    def test_agent_shaped_turn_pairs_reasoning_with_restored_call_ids(
+        self, provider: OpenAIResponsesProvider
+    ) -> None:
+        # The sub-agent wire shape (native lane carried, minted ids already
+        # restored to the provider originals by the lowering map): the stored
+        # reasoning item rides immediately before the function_call rebuilt
+        # from the SAME original call id, and the function_call_output pairs
+        # to it — the ordering + id agreement the Responses API requires when
+        # replaying reasoning across an agent's own tool loop.
+        messages = [
+            {"role": "user", "content": "go"},
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [{"id": "call_orig1", "function": {"name": "f", "arguments": "{}"}}],
+                "_provider_content": [
+                    {"type": "reasoning", "id": "rs_1", "summary": [], "encrypted_content": "enc"},
+                    {
+                        "type": "function_call",
+                        "call_id": "call_orig1",
+                        "name": "f",
+                        "arguments": "{}",
+                    },
+                ],
+            },
+            {"role": "tool", "tool_call_id": "call_orig1", "content": "out"},
+        ]
+        _, items = provider._convert_messages(messages, replay_reasoning_to_model=True)
+        types = [it.get("type") for it in items]
+        assert types == ["message", "reasoning", "function_call", "function_call_output"]
+        assert items[1]["id"] == "rs_1"
+        assert items[1]["encrypted_content"] == "enc"
+        assert items[2]["call_id"] == "call_orig1"
+        assert items[3]["call_id"] == "call_orig1"
+
     def test_no_reasoning_items_when_provider_content_lacks_reasoning(
         self, provider: OpenAIResponsesProvider
     ) -> None:

@@ -18,6 +18,27 @@ Earlier stable lines (`stable/1.6`, `stable/1.5`) are frozen.
 
 ### Added
 
+- **task_agent keeps its model's reasoning across its own tool loop — on
+  every provider lane.** A task agent's replayed turns now carry the
+  provider-native reasoning lane the model produced — Anthropic thinking
+  blocks with their signatures (commercial or an anthropic-compatible
+  server), OpenAI Responses reasoning items, Gemini `thought_signature`
+  fidelity blocks, and the reasoning text a vLLM `--reasoning-parser` /
+  llama.cpp `reasoning_format` surfaces on the Chat Completions lane —
+  instead of each turn being rebuilt from text + tool calls with the
+  reasoning dropped. On a thinking model this restores reasoning continuity
+  across the agent's own multi-turn tool use. On the wire the agent's
+  session-minted sub-tool ids are mapped back to the provider's own ids
+  (`restore_provider_tool_ids`), so the native block — replayed verbatim,
+  its signature never touched — the `tool_calls` mirror, and each tool
+  result always agree; internally the minted ids still key the live card,
+  recall, and the cancel ledger unchanged. Replay honors the same per-model
+  `replay_reasoning_to_model` flag the main loop uses on every lane: the
+  vLLM Chat-Completions field replay keeps its server-type gate, and
+  llama.cpp stays capture-only, matching main-loop behavior. The native
+  lane is finalized by the same shared builder as the main loop's, so the
+  two harnesses cannot drift.
+
 - **Background shells: `bash` gains `run_in_background`, plus `bash_output` /
   `kill_shell`.** Setting `run_in_background=true` starts the command as a
   detached shell and returns immediately with a `bash_N` handle — "start a dev
@@ -43,12 +64,10 @@ Earlier stable lines (`stable/1.6`, `stable/1.5`) are frozen.
   `{parent}::r{run}s{step}::{id}`, unique within the session (across an
   agent's turns and across concurrent or sequential runs), and that one id
   keys the nesting registry, the live rows, recall, and the cancel ledger.
-  As defensive hardening the agent loop also normalizes its self-built wire
-  history — projecting the composite ids to short plain tokens
-  (deterministically, so call/result pairing holds) and legalizing malformed
-  tool-call arguments, the same two validity passes the main loop already runs
-  — so an agent's history stays valid even on a backend stricter than the ones
-  it runs on today.
+  On the wire the agent's self-built history carries the provider's own ids,
+  restored from the mint map (see the reasoning-lane entry under Added), and
+  malformed tool-call arguments are legalized the same way the main loop's
+  wire prep does.
 
 - **bash tool: never hang on a backgrounded child.** A command that left a
   long-lived process running (`server &`, a daemon) could wedge the whole

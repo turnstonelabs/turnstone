@@ -69,8 +69,8 @@ from turnstone.core.lowering import (
     UNOBSERVED_OUTCOME_CLAUSE,
     drop_empty_user_turns,
     fold_system_turns,
-    legalize_tool_call_ids,
     repair_wire_messages,
+    restore_provider_tool_ids,
     sanitize_tool_call_arguments,
     tool_args_preview,
     wire_valid_arguments,
@@ -185,6 +185,7 @@ from turnstone.core.tools import (
 )
 from turnstone.core.trajectory import (
     EffectStatus,
+    ProviderNative,
     Role,
     TextBlock,
     ToolCall,
@@ -2119,6 +2120,7 @@ class ChatSession:
         self,
         provider_blocks: list[dict[str, Any]],
         reasoning_parts: list[str],
+        alias: str | None = None,
     ) -> list[dict[str, Any]]:
         """Stamp captured ``reasoning_parts`` as a synthetic ``reasoning_text``
         block when no reasoning-bearing block already appears in
@@ -2165,6 +2167,11 @@ class ChatSession:
         (:meth:`_maybe_attach_vllm_chat_reasoning`) reads
         ``cfg.server_compat`` directly rather than the synthetic
         block's tag.
+
+        *alias* names the model whose server produced the reasoning —
+        the sub-agent loop passes its own agent alias so the source tag
+        names the agent's server, not the session primary's.  ``None``
+        (the main-loop caller) keeps the primary-alias resolution.
         """
         text = "".join(reasoning_parts)
         if not text.strip():
@@ -2179,12 +2186,41 @@ class ChatSession:
             "type": "reasoning_text",
             "text": text,
         }
-        server_type = self._resolve_server_type()
+        server_type = self._resolve_server_type(alias)
         if server_type:
             block["source"] = server_type
         # Append rather than replace so non-reasoning fidelity blocks
         # (e.g. Google tool_calls with thought_signature) survive.
         return [*provider_blocks, block]
+
+    def _finalize_provider_blocks(
+        self,
+        provider_blocks: list[dict[str, Any]],
+        reasoning_parts: list[str],
+        *,
+        has_tool_calls: bool,
+        alias: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """Finalize an assistant turn's provider-native block lane: synthesize
+        the path-3 ``reasoning_text`` block when reasoning arrived only as
+        loose text (:meth:`_maybe_synth_reasoning_block`), then enforce the
+        native↔tool_calls mirror in memory — a truncation that cleared
+        ``tool_calls`` can leave an orphan client ``tool_use`` in the captured
+        blocks, which a same-provider replay would send with no matching
+        ``tool_result`` (see ``storage._utils.normalize_native_for_save``, the
+        save-time chokepoint with the same gate).
+
+        The ONE builder both harnesses share: the main-loop stream accumulator
+        and the sub-agent loop (``_run_agent``) finalize their captured blocks
+        here, so how a native lane is assembled cannot drift between them.
+        Returns a possibly-empty list; callers attach it only when non-empty.
+        """
+        provider_blocks = self._maybe_synth_reasoning_block(
+            provider_blocks, reasoning_parts, alias=alias
+        )
+        if provider_blocks and not has_tool_calls:
+            provider_blocks = strip_orphan_client_tool_blocks(provider_blocks)
+        return provider_blocks
 
     def _resolve_replay_reasoning_to_model(
         self,
@@ -7024,18 +7060,12 @@ class ChatSession:
 
         # Store raw provider content blocks for multi-turn preservation
         # (e.g. Anthropic web_search_tool_result with encrypted_content).
-        # Phase 3 path-3 capture: when no native blocks were emitted but
-        # ``reasoning_delta`` chunks accumulated text, synthesize a
-        # ``reasoning_text`` block so the captured reasoning survives
-        # past the live stream and surfaces on history reload.
-        provider_blocks = self._maybe_synth_reasoning_block(provider_blocks, reasoning_parts)
-        # Enforce the native↔tool_calls mirror in memory too.  A truncation that cleared
-        # tool_calls (finish_reason="length") can leave an orphan tool_use in the captured
-        # blocks; the save-time chokepoint fixes the persisted row, but a same-session
-        # continuation reads this in-memory copy, so strip the orphan here as well.
-        # See storage._utils.normalize_native_for_save.
-        if provider_blocks and not msg.get("tool_calls"):
-            provider_blocks = strip_orphan_client_tool_blocks(provider_blocks)
+        # Finalization (path-3 reasoning synthesis + the in-memory
+        # native↔tool_calls mirror gate) is shared with the sub-agent loop —
+        # see _finalize_provider_blocks.
+        provider_blocks = self._finalize_provider_blocks(
+            provider_blocks, reasoning_parts, has_tool_calls=bool(msg.get("tool_calls"))
+        )
         if provider_blocks:
             msg["_provider_content"] = provider_blocks
 
@@ -15264,32 +15294,38 @@ class ChatSession:
             turns: list[Turn],
             _tools: list[dict[str, Any]] | None = tools,
         ) -> CompletionResult:
-            # NOTE: Phase 5 vLLM ``reasoning`` field replay is intentionally
-            # NOT wired here.  Agent assistant messages are built from
-            # ``CompletionResult.content + tool_calls`` only (no
-            # ``_provider_content`` carried), so the helper would no-op
-            # every turn anyway.  Task agents are excluded from the
-            # persistence/replay contract — their conversation history
-            # is in-memory and rebuilt per ``_run_agent`` invocation.
             # Lower the trajectory once, not once per retry attempt — ``turns``
             # is invariant across attempts (the retry path only sleeps and
-            # re-sends the same messages).  Two validity passes, the same two
-            # the main-loop wire prep runs, both applied here because agent
-            # calls bypass that prep and build their own history:
+            # re-sends the same messages).  Agent calls bypass the main-loop
+            # wire prep and build their own history, so the seam runs its own
+            # passes:
             #   * ``sanitize_tool_call_arguments`` — a local model can emit an
             #     unterminated / non-object ``arguments`` with a non-``length``
             #     finish reason; a strict renderer (vLLM ``deepseek_v4``) then
             #     ``json.loads`` it and 400s every request that replays it.
             #     (Documented in-tree for the main loop; agents hit the same
             #     backends, so the same guard applies.)
-            #   * ``legalize_tool_call_ids`` — project the session-minted
-            #     ``::`` sub-tool ids to plain tokens, DEFENSIVE only: they
-            #     replay fine on the lenient anthropic-compatible deployment,
-            #     this just keeps the history valid on a hypothetically
-            #     stricter backend.  Deterministic, so call/result pairing
-            #     holds within and across requests; the minted id stays the
-            #     internal key (registry / DOM / recall) untouched.
-            wire = legalize_tool_call_ids(sanitize_tool_call_arguments(dicts_from_turns(turns)))
+            #   * ``restore_provider_tool_ids`` — map the session-minted ``::``
+            #     sub-tool ids back to the provider's own ids, so the
+            #     provider-native ``tool_use`` block (replayed verbatim below,
+            #     under a reasoning signature that must not be touched), the
+            #     ``tool_calls`` mirror, and the ``tool_result`` all agree on
+            #     the wire.  The minted id stays the internal key (registry /
+            #     DOM / recall / cancel ledger) untouched.
+            #   * ``_maybe_attach_vllm_chat_reasoning`` — Phase 5 replay for
+            #     the agent's own turns, live here since agent turns carry
+            #     ``_provider_content`` (reasoning included); the helper's
+            #     three gates (Chat-Completions provider, server_type vllm,
+            #     operator flag) all resolve against the AGENT's provider and
+            #     alias, exactly like the main loop's send paths.
+            # Agent trajectories stay excluded from the persistence/replay
+            # contract — history is in-memory, rebuilt per ``_run_agent``
+            # invocation; the native lane carried here serves the WITHIN-RUN
+            # reasoning continuity of the agent's own tool loop.
+            wire = restore_provider_tool_ids(
+                sanitize_tool_call_arguments(dicts_from_turns(turns)), wire_id_map
+            )
+            wire = self._maybe_attach_vllm_chat_reasoning(wire, agent_provider, agent_alias)
             last_err: Exception | None = None
             for attempt in range(self._MAX_RETRIES + 1):
                 try:
@@ -15332,10 +15368,14 @@ class ChatSession:
         # for the PARENT task_agent call too.  ``sub_step_seq`` is monotonic
         # across the WHOLE run, so ids stay distinct across turns even when
         # the provider reuses per-response ids ("call_0") for sub-tools.
+        # ``wire_id_map`` records minted → provider-original for every mint,
+        # read by ``restore_provider_tool_ids`` in ``_api_call`` (the id map
+        # IS the recovery path — never string-split the mint suffix).
         with self._agent_run_seq_lock:
             self._agent_run_seq += 1
             run_seq = self._agent_run_seq
         sub_step_seq = 0
+        wire_id_map: dict[str, str] = {}
         while max_tool_turns < 0 or turn < max_tool_turns:
             self._check_cancelled()
             try:
@@ -15387,15 +15427,19 @@ class ChatSession:
                 # id traceable and is what the frontend's "::" child checks
                 # key off.  Every downstream consumer (nesting registry,
                 # error-flags, DOM data-call-id, recall, cancel ledger) keys
-                # on this ONE id; the wire alone sees a deterministic legal
-                # projection instead (``legalize_tool_call_ids`` in
-                # ``_api_call`` — strict providers reject ``::`` ids), which
-                # preserves intra-request call/result pairing.  Skipped for a
-                # top-level run (no parent → no nesting).
+                # on this ONE id; the wire alone sees the provider's original
+                # ids restored from ``wire_id_map`` instead
+                # (``restore_provider_tool_ids`` in ``_api_call``), so the
+                # top-level mirror, the ``tool_result``, and the native
+                # ``tool_use`` block — which keeps the provider id verbatim
+                # and is never rewritten — agree on every request.  Skipped
+                # for a top-level run (no parent → no nesting).
                 if parent_call_id:
                     for tc in result.tool_calls:
                         sub_step_seq += 1
-                        tc["id"] = f"{parent_call_id}::r{run_seq}s{sub_step_seq}::{tc['id']}"
+                        original_id = tc["id"]
+                        tc["id"] = f"{parent_call_id}::r{run_seq}s{sub_step_seq}::{original_id}"
+                        wire_id_map[tc["id"]] = original_id
                 agent_tool_calls = tuple(
                     ToolCall(
                         id=tc["id"],
@@ -15404,7 +15448,29 @@ class ChatSession:
                     )
                     for tc in result.tool_calls
                 )
-            agent_turns.append(Turn.assistant(result.content or "", tool_calls=agent_tool_calls))
+            # Carry the provider-native lane (thinking blocks, signatures,
+            # Responses reasoning items, synthesized ``reasoning_text``) so
+            # the agent's own multi-turn tool loop keeps its reasoning
+            # continuity instead of re-reasoning from scratch each turn —
+            # the same fidelity the main loop keeps, finalized by the same
+            # shared builder.  ``producer`` is the agent's own provider: a
+            # run is pinned to one provider, so the blocks always replay to
+            # the backend that produced them (and the translators' per-block
+            # shape filters drop anything foreign).
+            native_blocks = self._finalize_provider_blocks(
+                result.provider_blocks,
+                [result.reasoning] if result.reasoning else [],
+                has_tool_calls=bool(result.tool_calls),
+                alias=agent_alias,
+            )
+            native = (
+                ProviderNative(producer=agent_provider.provider_name, blocks=tuple(native_blocks))
+                if native_blocks
+                else None
+            )
+            agent_turns.append(
+                Turn.assistant(result.content or "", tool_calls=agent_tool_calls, native=native)
+            )
 
             if not result.tool_calls:
                 content = result.content or "(no output)"

@@ -59,6 +59,12 @@ class CompletionResult:
     finish_reason: str = "stop"
     usage: UsageInfo | None = None
     provider_blocks: list[dict[str, Any]] = field(default_factory=list)
+    # Non-canonical reasoning text surfaced by Chat-Completions-lane servers
+    # (vLLM ``--reasoning-parser``, llama.cpp ``reasoning_format``) — the
+    # non-streaming twin of ``StreamChunk.reasoning_delta``.  Lanes whose
+    # reasoning rides ``provider_blocks`` natively (Anthropic ``thinking``,
+    # OpenAI Responses ``reasoning`` items) leave it empty.
+    reasoning: str = ""
 
 
 @dataclass(frozen=True)
