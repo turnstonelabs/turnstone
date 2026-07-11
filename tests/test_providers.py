@@ -3174,6 +3174,80 @@ class TestAnthropicProviderBlocks:
         assert assistant_msg["role"] == "assistant"
         assert assistant_msg["content"] == [{"type": "text", "text": "Hi there"}]
 
+    def test_agent_native_lane_with_restore_map_is_wire_consistent(self) -> None:
+        """The sub-agent wire shape: an assistant Turn carrying the provider-
+        native lane, its minted tool id restored to the provider original by
+        the lowering map.  The native blocks replay verbatim (thinking +
+        signature untouched) and the native tool_use id, the top-level
+        mirror, and the tool_result all agree."""
+        from turnstone.core.lowering import restore_provider_tool_ids
+        from turnstone.core.trajectory import (
+            ProviderNative,
+            ToolCall,
+            Turn,
+            dicts_from_turns,
+        )
+
+        thinking = {"type": "thinking", "thinking": "look first", "signature": "sig_1"}
+        tool_use = {"type": "tool_use", "id": "toolu_01X", "name": "f", "input": {}}
+        minted = "task-1::r1s1::toolu_01X"
+        turns = [
+            Turn.user("go"),
+            Turn.assistant(
+                "using f",
+                tool_calls=(ToolCall(id=minted, name="f", arguments="{}"),),
+                native=ProviderNative(
+                    producer="anthropic",
+                    blocks=(thinking, {"type": "text", "text": "using f"}, tool_use),
+                ),
+            ),
+            Turn.tool(minted, "out"),
+        ]
+        wire = restore_provider_tool_ids(dicts_from_turns(turns), {minted: "toolu_01X"})
+        _, converted = self.provider._convert_messages(wire, replay_reasoning_to_model=True)
+        assistant = converted[1]
+        assert [b["type"] for b in assistant["content"]] == ["thinking", "text", "tool_use"]
+        assert assistant["content"][0]["signature"] == "sig_1"
+        assert assistant["content"][2]["id"] == "toolu_01X"
+        tool_results = [b for b in converted[2]["content"] if b.get("type") == "tool_result"]
+        assert tool_results and tool_results[0]["tool_use_id"] == "toolu_01X"
+
+    def test_agent_native_lane_without_restore_map_orphans_the_result(self) -> None:
+        """Documents why the id map is a PREREQUISITE of carrying the native
+        lane, not hygiene: without it the tool_result arrives with the minted
+        id, matches no native tool_use, and the converter drops it as an
+        orphan — leaving an unanswered tool_use on the wire (a provider
+        rejection)."""
+        from turnstone.core.trajectory import (
+            ProviderNative,
+            ToolCall,
+            Turn,
+            dicts_from_turns,
+        )
+
+        tool_use = {"type": "tool_use", "id": "toolu_01X", "name": "f", "input": {}}
+        minted = "task-1::r1s1::toolu_01X"
+        turns = [
+            Turn.user("go"),
+            Turn.assistant(
+                "",
+                tool_calls=(ToolCall(id=minted, name="f", arguments="{}"),),
+                native=ProviderNative(producer="anthropic", blocks=(tool_use,)),
+            ),
+            Turn.tool(minted, "out"),
+        ]
+        _, converted = self.provider._convert_messages(
+            dicts_from_turns(turns), replay_reasoning_to_model=True
+        )
+        all_results = [
+            b
+            for m in converted
+            if isinstance(m.get("content"), list)
+            for b in m["content"]
+            if isinstance(b, dict) and b.get("type") == "tool_result"
+        ]
+        assert all_results == []
+
     def test_block_to_dict_with_model_dump(self) -> None:
         """_block_to_dict uses model_dump(exclude_none=True) when available."""
         from turnstone.core.providers._anthropic import _block_to_dict
@@ -4233,6 +4307,56 @@ class TestOpenAIResponsesProvider:
         caps = self.provider.get_capabilities("gpt-5.4")
         assert caps.context_window == 1050000
         assert caps.supports_tool_search is True
+
+
+class TestOpenAIChatReasoningCapture:
+    """Non-streaming ``create_completion`` surfaces the Chat-Completions
+    lane's non-canonical reasoning (vLLM ``--reasoning-parser``, llama.cpp
+    ``reasoning_format``) as ``CompletionResult.reasoning`` — the twin of the
+    streaming path's ``reasoning_delta`` extraction, same attribute pair and
+    precedence."""
+
+    @staticmethod
+    def _client(*, reasoning: Any = None, reasoning_content: Any = None) -> MagicMock:
+        msg = MagicMock()
+        msg.content = "ok"
+        msg.tool_calls = None
+        msg.annotations = None
+        msg.reasoning = reasoning
+        msg.reasoning_content = reasoning_content
+        choice = MagicMock()
+        choice.message = msg
+        choice.finish_reason = "stop"
+        resp = MagicMock()
+        resp.choices = [choice]
+        resp.usage = None
+        client = MagicMock()
+        client.chat.completions.create.return_value = resp
+        return client
+
+    def _complete(self, client: MagicMock):
+        provider = OpenAIChatCompletionsProvider()
+        return provider.create_completion(
+            client=client, model="m", messages=[{"role": "user", "content": "hi"}]
+        )
+
+    def test_reasoning_content_captured(self) -> None:
+        result = self._complete(self._client(reasoning_content="thought text"))
+        assert result.reasoning == "thought text"
+
+    def test_reasoning_attribute_takes_precedence(self) -> None:
+        result = self._complete(self._client(reasoning="direct", reasoning_content="parsed"))
+        assert result.reasoning == "direct"
+
+    def test_absent_reasoning_is_empty(self) -> None:
+        result = self._complete(self._client())
+        assert result.reasoning == ""
+
+    def test_non_string_reasoning_collapses_to_empty(self) -> None:
+        # A server surfacing a structured reasoning object (not text) must not
+        # leak a non-str into the result.
+        result = self._complete(self._client(reasoning={"odd": True}))
+        assert result.reasoning == ""
 
 
 class TestResponsesMessageConversion:

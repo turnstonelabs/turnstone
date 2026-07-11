@@ -344,6 +344,11 @@ class OpenAIChatCompletionsProvider:
         if annotations:
             content = format_citations(content, annotations)
 
+        # Non-canonical reasoning text (vLLM ``--reasoning-parser``, llama.cpp
+        # ``reasoning_format``) — same attribute pair, same precedence, as the
+        # streaming delta extraction above, so the two paths can't drift.
+        reasoning = getattr(msg, "reasoning", None) or getattr(msg, "reasoning_content", None)
+
         usage = extract_usage(getattr(response, "usage", None))
 
         result = CompletionResult(
@@ -352,6 +357,7 @@ class OpenAIChatCompletionsProvider:
             finish_reason=choice.finish_reason or "stop",
             usage=usage,
             provider_blocks=provider_blocks,
+            reasoning=reasoning if isinstance(reasoning, str) else "",
         )
         log.debug(
             "openai.chat.response",

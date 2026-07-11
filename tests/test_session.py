@@ -2567,7 +2567,7 @@ class TestAgentChildRegistration:
         # _tool_status, the card's own data-call-id row — so two runs with the
         # same parent id still alias at the card level.  Parent ids are
         # main-loop ids; de-colliding them is the main-loop id-hygiene
-        # follow-up (see legalize_tool_call_ids' docstring), not this change.
+        # follow-up, not this change.
         from turnstone.core.providers._openai_chat import OpenAIChatCompletionsProvider
 
         session = _make_session()
@@ -2597,17 +2597,16 @@ class TestAgentChildRegistration:
         assert minted == ["call_0::r1s1::call_0", "call_0::r2s1::call_0"]
         assert len(set(minted)) == 2
 
-    def test_agent_wire_is_validity_legalized(self):
+    def test_agent_wire_restores_provider_ids_and_sanitizes_args(self):
         # The agent seam bypasses the main-loop wire prep and builds its own
-        # history, so it runs the same two validity passes itself.  Drive one
-        # tool turn whose call carries both a minted "::" id (projected as
-        # defensive hardening) and malformed non-object arguments (a strict
+        # history, so it runs its own validity passes.  Drive one tool turn
+        # whose call carries a minted "::" id (mapped back to the provider's
+        # own id on the wire) and malformed non-object arguments (a strict
         # renderer json.loads and 400s them), then assert the REPLAY request
-        # the second _api_call sends carries the projected id (call/result
-        # pairing intact) and object-shaped arguments.  The internal id keeps
-        # the "::" form.
+        # the second _api_call sends carries the PROVIDER-ORIGINAL id on both
+        # the call and its result, and object-shaped arguments.  The internal
+        # id keeps the minted "::" form.
         import json as _json
-        import re as _re
 
         from turnstone.core.providers._openai_chat import OpenAIChatCompletionsProvider
 
@@ -2662,18 +2661,200 @@ class TestAgentChildRegistration:
         # Internal id (registry) keeps the minted "::" form.
         internal = session.ui.note_agent_child.call_args.args[0]
         assert internal == "task-1::r1s1::call_0"
-        # The SECOND request replays the tool turn: wire id is the legal
-        # projection, consistent between the call and its result; arguments
-        # are legalized to a JSON object.
+        # The SECOND request replays the tool turn: the wire carries the
+        # provider's own id, consistent between the call and its result (the
+        # shape the provider-native tool_use block also holds, so a native
+        # replay and a rebuild agree); arguments are legalized to a JSON
+        # object.
         replay = seen_messages[1]
         wire_calls = [tc for m in replay if m.get("tool_calls") for tc in m["tool_calls"]]
         wire_results = [m for m in replay if m.get("role") == "tool"]
         assert wire_calls and wire_results
-        wire_id = wire_calls[0]["id"]
-        assert _re.fullmatch(r"[a-zA-Z0-9_-]{1,40}", wire_id), wire_id
-        assert wire_results[0]["tool_call_id"] == wire_id
-        assert wire_id != internal
+        assert wire_calls[0]["id"] == "call_0"
+        assert wire_results[0]["tool_call_id"] == "call_0"
         assert isinstance(_json.loads(wire_calls[0]["function"]["arguments"]), dict)
+
+    def test_agent_carries_native_lane_and_replays_thinking_anthropic(self):
+        # The load-bearing fidelity pin: a thinking-model agent's SECOND
+        # request must carry the prior assistant turn's native lane verbatim
+        # — thinking block and signature untouched — with the provider's own
+        # tool_use id agreeing across the native block, the restored
+        # top-level mirror, and the tool_result.  Pre-native-lane, the seam
+        # rebuilt the turn from content + tool_calls and the model re-reasoned
+        # from scratch every tool turn (and commercial Anthropic rejects a
+        # thinking-enabled tool_use turn without its thinking block).
+        from turnstone.core.providers._anthropic import AnthropicProvider
+
+        class _Block:
+            def __init__(self, **d):
+                self._d = d
+                for k, v in d.items():
+                    setattr(self, k, v)
+
+            def model_dump(self, **_kw):
+                return dict(self._d)
+
+        session = _make_session()
+        session._provider = AnthropicProvider()
+        session.ui.note_agent_child = MagicMock()
+
+        seen: list[dict] = []
+        call_count = [0]
+
+        def fake_stream(**kwargs):
+            seen.append(kwargs)
+            call_count[0] += 1
+            resp = MagicMock()
+            if call_count[0] == 1:
+                resp.content = [
+                    _Block(type="thinking", thinking="check the file first", signature="sig_v1"),
+                    _Block(type="text", text="reading"),
+                    _Block(type="tool_use", id="toolu_01AB", name="read_file", input={"path": "x"}),
+                ]
+                resp.stop_reason = "tool_use"
+            else:
+                resp.content = [_Block(type="text", text="done")]
+                resp.stop_reason = "end_turn"
+            resp.usage = None
+            mgr = MagicMock()
+            mgr.__enter__ = MagicMock(
+                return_value=MagicMock(get_final_message=MagicMock(return_value=resp))
+            )
+            mgr.__exit__ = MagicMock(return_value=False)
+            return mgr
+
+        session.client.messages.stream = fake_stream
+
+        def fake_prepare(tc_dict, **_kwargs):
+            return {
+                "call_id": tc_dict["id"],
+                "func_name": "read_file",
+                "needs_approval": False,
+                "execute": lambda p: (p["call_id"], "contents"),
+            }
+
+        with (
+            patch.object(session, "_prepare_tool", side_effect=fake_prepare),
+            patch.object(session, "_resolve_replay_reasoning_to_model", return_value=True),
+        ):
+            session._run_agent(
+                [Turn.user("x")],
+                tools=[{"type": "function", "function": {"name": "read_file", "parameters": {}}}],
+                label="task",
+                parent_call_id="task-1",
+            )
+
+        # Internal key stays minted — the nesting registry saw the "::" id.
+        assert session.ui.note_agent_child.call_args.args[0] == "task-1::r1s1::toolu_01AB"
+        # Second request: the assistant wire turn IS the native lane.
+        replay = seen[1]["messages"]
+        assistant = next(
+            m for m in replay if m["role"] == "assistant" and isinstance(m.get("content"), list)
+        )
+        kinds = [b.get("type") for b in assistant["content"]]
+        assert kinds == ["thinking", "text", "tool_use"]
+        assert assistant["content"][0]["thinking"] == "check the file first"
+        assert assistant["content"][0]["signature"] == "sig_v1"  # byte-untouched
+        assert assistant["content"][2]["id"] == "toolu_01AB"  # provider-original
+        tool_results = [
+            b
+            for m in replay
+            if m["role"] == "user" and isinstance(m.get("content"), list)
+            for b in m["content"]
+            if isinstance(b, dict) and b.get("type") == "tool_result"
+        ]
+        assert tool_results and tool_results[0]["tool_use_id"] == "toolu_01AB"
+
+    def test_agent_synthesizes_reasoning_and_attaches_vllm_replay_field(self):
+        # Chat-Completions lane (vLLM): non-streaming ``reasoning_content`` is
+        # captured into CompletionResult.reasoning, synthesized into the agent
+        # turn's native lane as a ``reasoning_text`` block by the SAME
+        # finalize helper the main loop uses — source-tagged from the AGENT
+        # alias — and replayed on the next request as vLLM's non-standard
+        # ``reasoning`` field (Phase 5 at the agent seam; the internal
+        # ``_provider_content`` key itself never reaches the wire).
+        from types import SimpleNamespace
+
+        from turnstone.core.providers._openai_chat import OpenAIChatCompletionsProvider
+        from turnstone.core.providers._openai_common import OPENAI_COMPAT_DEFAULT
+
+        session = _make_session()
+        session._provider = OpenAIChatCompletionsProvider()
+        session._model_alias = "loc-qwen"
+        session._registry = MagicMock()
+        session._registry.resolve_agent_alias.return_value = None
+        session._registry.resolve_agent_effort.return_value = None
+        session._registry.get_config.return_value = SimpleNamespace(
+            server_compat={"server_type": "vllm"}, replay_reasoning_to_model=True
+        )
+        session.ui.note_agent_child = MagicMock()
+
+        seen_messages: list[list[dict]] = []
+        call_count = [0]
+
+        def fake_create(**kwargs):
+            seen_messages.append(kwargs.get("messages") or [])
+            call_count[0] += 1
+            resp = MagicMock()
+            choice = MagicMock()
+            if call_count[0] == 1:
+                choice.finish_reason = "tool_calls"
+                tc = MagicMock()
+                tc.id = "call_0"
+                tc.function.name = "read_file"
+                tc.function.arguments = '{"path": "x"}'
+                choice.message.tool_calls = [tc]
+                choice.message.content = None
+                choice.message.reasoning = None
+                choice.message.reasoning_content = "scan the repo first"
+            else:
+                choice.finish_reason = "stop"
+                choice.message.tool_calls = None
+                choice.message.content = "done"
+                choice.message.reasoning = None
+                choice.message.reasoning_content = None
+            resp.choices = [choice]
+            resp.usage = MagicMock(prompt_tokens=10, completion_tokens=5)
+            return resp
+
+        session.client.chat.completions.create = fake_create
+
+        def fake_prepare(tc_dict, **_kwargs):
+            return {
+                "call_id": tc_dict["id"],
+                "func_name": "read_file",
+                "needs_approval": False,
+                "execute": lambda p: (p["call_id"], "contents"),
+            }
+
+        turns = [Turn.user("x")]
+        with (
+            patch.object(session, "_prepare_tool", side_effect=fake_prepare),
+            patch.object(session, "_resolve_capabilities", return_value=OPENAI_COMPAT_DEFAULT),
+            patch.object(session, "_provider_extra_params", return_value={}),
+        ):
+            session._run_agent(
+                turns,
+                tools=[{"type": "function", "function": {"name": "read_file"}}],
+                label="task",
+                parent_call_id="task-1",
+            )
+
+        # The agent Turn carries the synthesized native lane, source-tagged
+        # via the agent alias (alias threading through the shared helper).
+        assistant_turn = turns[1]
+        assert assistant_turn.native is not None
+        assert assistant_turn.native.producer == "openai-compatible"
+        assert assistant_turn.native.blocks == (
+            {"type": "reasoning_text", "text": "scan the repo first", "source": "vllm"},
+        )
+        # The replay request carries the vLLM ``reasoning`` field on the
+        # assistant turn; the internal ``_provider_content`` key is stripped
+        # by the provider's sanitize before the wire.
+        replay = seen_messages[1]
+        assistant_wire = next(m for m in replay if m.get("role") == "assistant")
+        assert assistant_wire.get("reasoning") == "scan the repo first"
+        assert "_provider_content" not in assistant_wire
 
 
 class TestRunAgentDenialMessage:
