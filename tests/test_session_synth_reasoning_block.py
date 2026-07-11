@@ -361,3 +361,69 @@ class TestResolveServerType:
         session._registry = BrokenRegistry()
         session._model_alias = "x"
         assert session._resolve_server_type() == ""
+
+
+class TestFinalizeProviderBlocks:
+    """Direct unit tests for the shared native-lane builder
+    ``ChatSession._finalize_provider_blocks`` — in particular the
+    ``had_blank_ids`` gate (a uuid back-fill reaches only the tool_calls
+    mirror, so blocks that would replay the blank id must be dropped while
+    the reasoning lane survives)."""
+
+    def test_passthrough_without_blank_ids(self) -> None:
+        session = _make_session()
+        blocks = [
+            {"type": "thinking", "thinking": "x", "signature": "s"},
+            {"type": "tool_use", "id": "toolu_1", "name": "f", "input": {}},
+        ]
+        out = session._finalize_provider_blocks(blocks, [], has_tool_calls=True)
+        assert out is blocks
+
+    def test_no_tool_calls_strips_orphan_client_blocks(self) -> None:
+        session = _make_session()
+        blocks = [
+            {"type": "thinking", "thinking": "x", "signature": "s"},
+            {"type": "tool_use", "id": "toolu_1", "name": "f", "input": {}},
+        ]
+        out = session._finalize_provider_blocks(blocks, [], has_tool_calls=False)
+        assert [b["type"] for b in out] == ["thinking"]
+
+    def test_blank_ids_drop_messages_shaped_lane_entirely(self) -> None:
+        # Anthropic-shaped lane with a blank-id tool_use: the client block is
+        # stripped, and the surviving thinking/text blocks must go with it —
+        # on the Messages translator a native lane REPLACES the rebuilt
+        # content, so a lane missing its tool_use would orphan the mirror's
+        # calls.
+        session = _make_session()
+        blocks = [
+            {"type": "thinking", "thinking": "x", "signature": "s"},
+            {"type": "text", "text": "using f"},
+            {"type": "tool_use", "id": "", "name": "f", "input": {}},
+        ]
+        out = session._finalize_provider_blocks(blocks, [], has_tool_calls=True, had_blank_ids=True)
+        assert out == []
+
+    def test_blank_ids_keep_shape_invalid_reasoning_residuals(self) -> None:
+        # Google-shaped lane: the raw function dict (blank id) is stripped;
+        # the synthesized reasoning_text block survives — it is shape-invalid
+        # on the Messages translator by design, and the Google swap simply
+        # finds no function blocks and keeps the sanitized mirror.
+        session = _make_session()
+        blocks = [
+            {"id": "", "type": "function", "function": {"name": "f", "arguments": "{}"}},
+        ]
+        out = session._finalize_provider_blocks(
+            blocks, ["thinking text"], has_tool_calls=True, had_blank_ids=True
+        )
+        assert [b["type"] for b in out] == ["reasoning_text"]
+        assert out[0]["text"] == "thinking text"
+
+    def test_blank_ids_without_client_blocks_keep_the_lane(self) -> None:
+        # llama.cpp / older vLLM: blank tool ids AND loose reasoning text,
+        # but no client tool blocks at all — nothing can desync, so the
+        # synthesized reasoning lane must be kept (the over-drop case).
+        session = _make_session()
+        out = session._finalize_provider_blocks(
+            [], ["step by step"], has_tool_calls=True, had_blank_ids=True
+        )
+        assert [b["type"] for b in out] == ["reasoning_text"]

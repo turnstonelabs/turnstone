@@ -1953,6 +1953,58 @@ class TestGoogleProviderFidelity:
         assert tcs[1]["function"]["arguments"] == '{"ok": 1}'
         assert tcs[1]["thought_signature"] == "sig456"
 
+    def test_prepare_messages_swap_serializes_dict_arguments(self) -> None:
+        # The internal-shape case the shared legalize helper handles: a raw
+        # fidelity dict whose arguments landed as an unserialized dict is
+        # json.dumps'd — content preserved, not collapsed to "{}".
+        from turnstone.core.providers._google import GoogleProvider
+
+        prov = GoogleProvider()
+        msgs = [
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {"id": "c1", "type": "function", "function": {"name": "f", "arguments": "{}"}},
+                ],
+                "_provider_content": [
+                    {
+                        "id": "c1",
+                        "type": "function",
+                        "function": {"name": "f", "arguments": {"path": "/tmp/x"}},
+                        "thought_signature": "sig1",
+                    },
+                ],
+            },
+            {"role": "tool", "tool_call_id": "c1", "content": "ok"},
+        ]
+        cleaned = prov._prepare_messages(msgs)
+        tc = cleaned[0]["tool_calls"][0]
+        assert json.loads(tc["function"]["arguments"]) == {"path": "/tmp/x"}
+        assert tc["thought_signature"] == "sig1"
+
+    def test_prepare_messages_swap_passes_non_dict_function_through(self) -> None:
+        # A degenerate fidelity block with function=None must pass through
+        # untouched (the prior behaviour), not raise.
+        from turnstone.core.providers._google import GoogleProvider
+
+        prov = GoogleProvider()
+        msgs = [
+            {
+                "role": "assistant",
+                "content": "x",
+                "tool_calls": [
+                    {"id": "c1", "type": "function", "function": {"name": "f", "arguments": "{}"}},
+                ],
+                "_provider_content": [
+                    {"id": "c1", "type": "function", "function": None},
+                ],
+            },
+            {"role": "tool", "tool_call_id": "c1", "content": "ok"},
+        ]
+        cleaned = prov._prepare_messages(msgs)
+        assert cleaned[0]["tool_calls"][0]["function"] is None
+
     def test_non_streaming_captures_provider_blocks(self) -> None:
         from turnstone.core.providers._google import GoogleProvider
 

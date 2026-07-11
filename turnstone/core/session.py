@@ -2199,6 +2199,7 @@ class ChatSession:
         reasoning_parts: list[str],
         *,
         has_tool_calls: bool,
+        had_blank_ids: bool = False,
         alias: str | None = None,
     ) -> list[dict[str, Any]]:
         """Finalize an assistant turn's provider-native block lane: synthesize
@@ -2210,16 +2211,44 @@ class ChatSession:
         ``tool_result`` (see ``storage._utils.normalize_native_for_save``, the
         save-time chokepoint with the same gate).
 
+        *had_blank_ids* is the OTHER direction of that mirror: the caller's
+        ``_ensure_tool_call_ids`` back-fill reaches only the ``tool_calls``
+        mirror, so a client tool block in the lane still carries its blank
+        provider id verbatim and any replay of it desyncs from the mirror and
+        the results (Anthropic orphans the result and 400s; the Google swap
+        re-fills a fresh id and drops the real result).  The client tool
+        blocks are therefore stripped — and when any were present, the lane's
+        remaining Messages-shaped blocks (``thinking`` / ``text``) go with
+        them, because on the Anthropic translator a surviving native lane
+        REPLACES the rebuilt content wholesale and a lane missing its
+        ``tool_use`` would orphan every mirrored call.  Shape-invalid
+        residuals (the ``reasoning_text`` synth block, Responses ``reasoning``
+        items) are kept: they fall through that translator's per-block filter
+        by design, and their own translators pair them by ordinal, not id.
+
         The ONE builder both harnesses share: the main-loop stream accumulator
         and the sub-agent loop (``_run_agent``) finalize their captured blocks
         here, so how a native lane is assembled cannot drift between them.
         Returns a possibly-empty list; callers attach it only when non-empty.
         """
+        from turnstone.core.providers._anthropic import ANTHROPIC_VALID_BLOCK_TYPES
+
         provider_blocks = self._maybe_synth_reasoning_block(
             provider_blocks, reasoning_parts, alias=alias
         )
-        if provider_blocks and not has_tool_calls:
-            provider_blocks = strip_orphan_client_tool_blocks(provider_blocks)
+        if not provider_blocks:
+            return provider_blocks
+        if not has_tool_calls:
+            return strip_orphan_client_tool_blocks(provider_blocks)
+        if had_blank_ids:
+            stripped = strip_orphan_client_tool_blocks(provider_blocks)
+            if len(stripped) != len(provider_blocks):
+                stripped = [
+                    b
+                    for b in stripped
+                    if not (isinstance(b, dict) and b.get("type") in ANTHROPIC_VALID_BLOCK_TYPES)
+                ]
+            return stripped
         return provider_blocks
 
     def _resolve_replay_reasoning_to_model(
@@ -7031,7 +7060,13 @@ class ChatSession:
         content = "".join(content_parts)
         msg["content"] = content or ""
 
+        had_blank_ids = False
         if tool_calls_acc:
+            # Record blanks BEFORE the uuid back-fill (the back-fill reaches
+            # only this mirror; the native blocks keep the blank id verbatim)
+            # — threaded to _finalize_provider_blocks, which drops the blocks
+            # a back-filled id would desync.
+            had_blank_ids = any(not tc.get("id") for tc in tool_calls_acc.values())
             self._ensure_tool_call_ids(tool_calls_acc)
             ordered = [tool_calls_acc[i] for i in sorted(tool_calls_acc)]
             msg["tool_calls"] = ordered
@@ -7064,7 +7099,10 @@ class ChatSession:
         # native↔tool_calls mirror gate) is shared with the sub-agent loop —
         # see _finalize_provider_blocks.
         provider_blocks = self._finalize_provider_blocks(
-            provider_blocks, reasoning_parts, has_tool_calls=bool(msg.get("tool_calls"))
+            provider_blocks,
+            reasoning_parts,
+            has_tool_calls=bool(msg.get("tool_calls")),
+            had_blank_ids=had_blank_ids,
         )
         if provider_blocks:
             msg["_provider_content"] = provider_blocks
@@ -15426,8 +15464,8 @@ class ChatSession:
                 # Record blanks BEFORE the uuid back-fill: a back-filled id
                 # exists only in the tool_calls mirror — the native blocks
                 # keep the blank provider id verbatim (they are never
-                # rewritten), so a turn with a back-fill must not carry its
-                # native lane (see the gate below).
+                # rewritten), so the shared builder must drop the blocks the
+                # back-fill desyncs (see _finalize_provider_blocks).
                 had_blank_ids = any(not tc.get("id") for tc in result.tool_calls)
                 self._ensure_tool_call_ids(result.tool_calls)
                 # Mint each sub-agent tool id session-unique:
@@ -15472,22 +15510,16 @@ class ChatSession:
             # the backend that produced them (and the translators' per-block
             # shape filters drop anything foreign).
             #
-            # SKIPPED when a blank provider id was uuid-back-filled above:
-            # the back-fill reaches only the mirror, so the native tool_use
-            # block still carries the blank id and replaying it would desync
-            # from the restored tool_result (Anthropic orphans the result and
-            # 400s; Google re-fills a fresh uuid and drops the result).  The
-            # rebuild path keeps every wire representation on the back-filled
-            # id — the pre-native behaviour, for exactly the degenerate case.
-            native_blocks = (
-                []
-                if had_blank_ids
-                else self._finalize_provider_blocks(
-                    result.provider_blocks,
-                    [result.reasoning],
-                    has_tool_calls=bool(result.tool_calls),
-                    alias=agent_alias,
-                )
+            # ``had_blank_ids`` lets the shared builder drop exactly the
+            # blocks a uuid-back-fill desyncs (client tool blocks + their
+            # Messages-shaped siblings) while keeping the reasoning lane —
+            # see _finalize_provider_blocks.
+            native_blocks = self._finalize_provider_blocks(
+                result.provider_blocks,
+                [result.reasoning],
+                has_tool_calls=bool(result.tool_calls),
+                had_blank_ids=had_blank_ids,
+                alias=agent_alias,
             )
             native = (
                 ProviderNative(producer=agent_provider.provider_name, blocks=tuple(native_blocks))
