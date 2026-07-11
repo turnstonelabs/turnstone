@@ -12,14 +12,17 @@ this pins the behaviour the old ``_anthropic`` ``pc_tool_ids`` /
 from __future__ import annotations
 
 import json
+import re
 from typing import Any
 
 from turnstone.core.lowering import (
     CANCELLED_TOOL_RESULT,
     _find_orphaned_tool_calls,
+    legalize_tool_call_ids,
     repair_wire_messages,
     sanitize_tool_call_arguments,
     tool_args_preview,
+    wire_safe_tool_call_id,
     wire_valid_arguments,
 )
 
@@ -340,3 +343,76 @@ def test_pipeline_every_emitted_arguments_is_a_json_object() -> None:
     for m in out:
         for tc in m.get("tool_calls", []):
             assert isinstance(json.loads(tc["function"]["arguments"]), dict)
+
+
+# --------------------------------------------------------------------------- #
+# legalize_tool_call_ids — the agent-wire id projection (defensive hardening).
+#
+# Sub-agent tool ids are minted "{parent}::r{run}s{step}::{provider_id}" for
+# session-unique correlation (registry / DOM / recall).  These replay fine on
+# the lenient anthropic-compatible deployment, but the pass projects the long,
+# "::"-containing ids to a deterministic wire-safe token on the transient wire
+# copy so an agent's self-built history stays valid on a hypothetically
+# stricter backend, keeping assistant call / tool result pairing intact.
+# --------------------------------------------------------------------------- #
+def test_wire_safe_tool_call_id_passthrough_when_legal() -> None:
+    # Provider-issued ids (their own echo) and uuid-filled ids are untouched.
+    for tc_id in ("call_9dSVOCr8sPbk3f0oJU8IruBP", "toolu_01ABCdef", "call_" + "a" * 32):
+        assert wire_safe_tool_call_id(tc_id) is tc_id
+
+
+def test_wire_safe_tool_call_id_rewrites_illegal_charset_and_length() -> None:
+    minted = "call_0::r1s1::call_0"
+    long_id = "call_" + "a" * 60
+    for bad in (minted, long_id):
+        safe = wire_safe_tool_call_id(bad)
+        assert safe != bad
+        assert re.fullmatch(r"[a-zA-Z0-9_-]{1,40}", safe)
+    # Deterministic (pairing across messages and across requests), distinct inputs distinct.
+    assert wire_safe_tool_call_id(minted) == wire_safe_tool_call_id(minted)
+    assert wire_safe_tool_call_id(minted) != wire_safe_tool_call_id(long_id)
+
+
+def test_legalize_ids_identity_when_all_legal() -> None:
+    msgs = [_assistant_calls(_call("call_1", "{}")), _tool("call_1")]
+    assert legalize_tool_call_ids(msgs) is msgs
+
+
+def test_legalize_ids_rewrites_call_and_result_consistently() -> None:
+    minted = "task-1::r1s1::call_0"
+    msgs = [_assistant_calls(_call(minted, "{}")), _tool(minted)]
+    out = legalize_tool_call_ids(msgs)
+    wire_id = out[0]["tool_calls"][0]["id"]
+    assert re.fullmatch(r"[a-zA-Z0-9_-]{1,40}", wire_id)
+    assert out[1]["tool_call_id"] == wire_id  # pairing survives the projection
+    # Copy-on-write: the input messages (the canonical-adjacent dicts) are unmutated.
+    assert msgs[0]["tool_calls"][0]["id"] == minted
+    assert msgs[1]["tool_call_id"] == minted
+
+
+def test_legalize_ids_leaves_legal_siblings_untouched() -> None:
+    minted = "task-1::r1s2::call_1"
+    msgs = [
+        _assistant_calls(_call("call_ok", "{}"), _call(minted, "{}")),
+        _tool("call_ok"),
+        _tool(minted),
+    ]
+    out = legalize_tool_call_ids(msgs)
+    assert out[0]["tool_calls"][0]["id"] == "call_ok"
+    assert out[1]["tool_call_id"] == "call_ok"
+    assert out[0]["tool_calls"][1]["id"] == out[2]["tool_call_id"]
+    assert "::" not in out[0]["tool_calls"][1]["id"]
+
+
+def test_legalize_ids_skips_empty_and_non_string() -> None:
+    # Empty ids belong to repair_wire_messages' back-fill; non-strings are
+    # someone else's malformation — neither is this pass's to invent.
+    msgs = [
+        _assistant_calls(
+            {"id": "", "type": "function", "function": {"name": "b", "arguments": "{}"}}
+        ),
+        {"role": "tool", "tool_call_id": None, "content": "x"},
+    ]
+    out = legalize_tool_call_ids(msgs)
+    assert out[0]["tool_calls"][0]["id"] == ""
+    assert out[1]["tool_call_id"] is None

@@ -69,6 +69,7 @@ from turnstone.core.lowering import (
     UNOBSERVED_OUTCOME_CLAUSE,
     drop_empty_user_turns,
     fold_system_turns,
+    legalize_tool_call_ids,
     repair_wire_messages,
     sanitize_tool_call_arguments,
     tool_args_preview,
@@ -1531,6 +1532,13 @@ class ChatSession:
         self._apply_persona_snapshot(persona_snapshot)
         self._title_generated = False
         self._read_files: set[str] = set()
+        # Session-monotonic run counter for sub-agent id minting (see
+        # ``_run_agent``): the parent call id alone can repeat across runs (a
+        # local provider reuses per-response ids for the PARENT task_agent
+        # call too), so each run's minted child ids carry this tag.  Lock, not
+        # bare increment: runs start on the 4-wide task pool concurrently.
+        self._agent_run_seq = 0
+        self._agent_run_seq_lock = threading.Lock()
         # The canonical in-memory trajectory.  Wire prep (fold/repair) + the
         # provider translators still consume dicts, so ``_full_messages`` lowers
         # Turns→dicts at that boundary until those layers migrate.
@@ -15086,10 +15094,14 @@ class ChatSession:
     ) -> Iterator[tuple[ToolCall, Turn | None]]:
         """Yield ``(tool_call, result_turn_or_None)`` for every sub-tool the
         sub-agent issued, in order, pairing each call to its result FIFO per
-        call_id — a queue per id consumed once, NOT a last-wins dict, so a local
-        provider that reuses ids across turns (``call_0`` …) can't collapse
-        distinct calls onto one result.  Shared by :meth:`_project_agent_steps`
-        (recall) and :meth:`_cancel_ledger` (cancel disposition)."""
+        call_id.  Parented runs mint session-unique ids
+        (``{parent}::r{run}s{step}::{provider_id}``, see :meth:`_run_agent`),
+        so for them this is a plain unique-key pairing; the FIFO queue stays as
+        honest pairing for id-colliding input a mint never touched (an
+        unparented run, or turns constructed directly), where last-wins would
+        collapse distinct calls onto one result.  Shared by
+        :meth:`_project_agent_steps` (recall) and :meth:`_cancel_ledger`
+        (cancel disposition)."""
         pending: dict[str, collections.deque[Turn]] = {}
         for t in agent_turns:
             if t.role is Role.TOOL and t.tool_call_id:
@@ -15261,8 +15273,23 @@ class ChatSession:
             # is in-memory and rebuilt per ``_run_agent`` invocation.
             # Lower the trajectory once, not once per retry attempt — ``turns``
             # is invariant across attempts (the retry path only sleeps and
-            # re-sends the same messages).
-            wire = dicts_from_turns(turns)
+            # re-sends the same messages).  Two validity passes, the same two
+            # the main-loop wire prep runs, both applied here because agent
+            # calls bypass that prep and build their own history:
+            #   * ``sanitize_tool_call_arguments`` — a local model can emit an
+            #     unterminated / non-object ``arguments`` with a non-``length``
+            #     finish reason; a strict renderer (vLLM ``deepseek_v4``) then
+            #     ``json.loads`` it and 400s every request that replays it.
+            #     (Documented in-tree for the main loop; agents hit the same
+            #     backends, so the same guard applies.)
+            #   * ``legalize_tool_call_ids`` — project the session-minted
+            #     ``::`` sub-tool ids to plain tokens, DEFENSIVE only: they
+            #     replay fine on the lenient anthropic-compatible deployment,
+            #     this just keeps the history valid on a hypothetically
+            #     stricter backend.  Deterministic, so call/result pairing
+            #     holds within and across requests; the minted id stays the
+            #     internal key (registry / DOM / recall) untouched.
+            wire = legalize_tool_call_ids(sanitize_tool_call_arguments(dicts_from_turns(turns)))
             last_err: Exception | None = None
             for attempt in range(self._MAX_RETRIES + 1):
                 try:
@@ -15299,6 +15326,16 @@ class ChatSession:
             raise last_err
 
         turn = 0
+        # Mint tags for sub-tool ids (see the rewrite below).  ``run_seq`` is
+        # session-unique per _run_agent invocation — the parent call id alone
+        # can repeat across runs when a local provider reuses per-response ids
+        # for the PARENT task_agent call too.  ``sub_step_seq`` is monotonic
+        # across the WHOLE run, so ids stay distinct across turns even when
+        # the provider reuses per-response ids ("call_0") for sub-tools.
+        with self._agent_run_seq_lock:
+            self._agent_run_seq += 1
+            run_seq = self._agent_run_seq
+        sub_step_seq = 0
         while max_tool_turns < 0 or turn < max_tool_turns:
             self._check_cancelled()
             try:
@@ -15339,17 +15376,26 @@ class ChatSession:
             agent_tool_calls: tuple[ToolCall, ...] = ()
             if result.tool_calls:
                 self._ensure_tool_call_ids(result.tool_calls)
-                # Namespace sub-agent tool ids by the parent task_agent so the
-                # UI nesting registry can't collide across concurrent task
-                # agents whose (local) provider reuses sequential ids ("call_0").
-                # Tool-call ids are opaque correlation tokens — a provider
-                # validates only intra-request assistant/tool consistency on
-                # replay, never against its own prior generation — so rewriting
-                # them in this ephemeral sub-conversation is wire-safe.  Skipped
-                # for a top-level run (no parent → no nesting).
+                # Mint each sub-agent tool id session-unique:
+                # ``{parent}::r{run}s{step}::{provider_id}``.  The run tag
+                # de-collides RUNS (a reused parent id can't alias two agents'
+                # children); the step tag de-collides turns WITHIN one agent
+                # whose (local) provider reuses per-response sequential ids
+                # ("call_0") — pre-mint, that reuse collapsed the live card's
+                # DOM rows while FIFO recall kept them apart, so the two
+                # disagreed on identical input.  The parent segment keeps the
+                # id traceable and is what the frontend's "::" child checks
+                # key off.  Every downstream consumer (nesting registry,
+                # error-flags, DOM data-call-id, recall, cancel ledger) keys
+                # on this ONE id; the wire alone sees a deterministic legal
+                # projection instead (``legalize_tool_call_ids`` in
+                # ``_api_call`` — strict providers reject ``::`` ids), which
+                # preserves intra-request call/result pairing.  Skipped for a
+                # top-level run (no parent → no nesting).
                 if parent_call_id:
                     for tc in result.tool_calls:
-                        tc["id"] = f"{parent_call_id}::{tc['id']}"
+                        sub_step_seq += 1
+                        tc["id"] = f"{parent_call_id}::r{run_seq}s{sub_step_seq}::{tc['id']}"
                 agent_tool_calls = tuple(
                     ToolCall(
                         id=tc["id"],
@@ -15718,9 +15764,10 @@ class ChatSession:
         unknown/none on a multi-call turn.) Shared by the disposition string and
         its typed status so the two can't disagree.
 
-        Pairs via :meth:`_iter_agent_tool_results` (FIFO per call_id), so on a
-        provider that reuses ids a half-answered colliding pair is correctly read
-        as one answered + one in-flight gap, not (set-membership) both answered.
+        Pairs via :meth:`_iter_agent_tool_results`: parented runs carry minted
+        unique ids, and on un-minted id-colliding input (unparented / direct
+        construction) the FIFO still reads a half-answered colliding pair as
+        one answered + one in-flight gap, not (set-membership) both answered.
         """
         issued = [
             ((tc.name or "tool").strip(), res is not None)

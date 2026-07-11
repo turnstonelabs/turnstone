@@ -926,11 +926,14 @@ class SessionUIBase:
         with ``parent_call_id``.  Called by the session for each sub-tool a
         ``_run_agent`` issues, before the tool emits anything.
 
-        The session namespaces each sub-agent's child ids by parent
-        (``f"{parent_call_id}::{tc_id}"``) before registering them here, so the
-        key is unique even for local servers that assign per-response sequential
-        ids (``call_0``) — two task agents in the parent's 4-wide pool can't
-        collide and mis-nest steps."""
+        The session mints each sub-agent child id session-unique
+        (``f"{parent_call_id}::r{run}s{step}::{tc_id}"``) before registering
+        it here: the run tag de-collides agent runs (concurrent in the
+        parent's 4-wide pool, or sequential runs whose PARENT id a local
+        server reused), and the step tag de-collides that server's
+        per-response sequential sub-tool ids (``call_0``) across the SAME
+        agent's turns — one key names one call, so steps can't mis-nest or
+        collapse."""
         if not child_call_id or not parent_call_id:
             return
         with self._agent_children_lock:
