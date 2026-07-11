@@ -2213,42 +2213,39 @@ class ChatSession:
 
         *had_blank_ids* is the OTHER direction of that mirror: the caller's
         ``_ensure_tool_call_ids`` back-fill reaches only the ``tool_calls``
-        mirror, so a client tool block in the lane still carries its blank
-        provider id verbatim and any replay of it desyncs from the mirror and
-        the results (Anthropic orphans the result and 400s; the Google swap
-        re-fills a fresh id and drops the real result).  The client tool
-        blocks are therefore stripped — and when any were present, the lane's
-        remaining Messages-shaped blocks (``thinking`` / ``text``) go with
-        them, because on the Anthropic translator a surviving native lane
-        REPLACES the rebuilt content wholesale and a lane missing its
-        ``tool_use`` would orphan every mirrored call.  Shape-invalid
-        residuals (the ``reasoning_text`` synth block, Responses ``reasoning``
-        items) are kept: they fall through that translator's per-block filter
-        by design, and their own translators pair them by ordinal, not id.
+        mirror, so an id-bearing native block still carries the blank id
+        verbatim and any replay of it desyncs from the mirror and the results
+        (Anthropic orphans the result and 400s; the Google swap re-fills a
+        fresh id and drops the real result) — and on the Messages translator
+        a partially-surviving lane REPLACES the rebuilt content wholesale, so
+        a lane missing its ``tool_use`` would orphan every mirrored call.  On
+        a blank-id turn the ONLY block kept is the loose-text
+        ``reasoning_text`` synth: it carries no id, it is shape-invalid on
+        the Messages translator by design (can never displace the rebuild),
+        and real-world blank-id servers are Chat-Completions locals whose
+        reasoning IS that loose text — so the drop costs exactly nothing that
+        actually co-occurs.  Everything else (client tool blocks, thinking /
+        text siblings, Responses ``reasoning`` items whose pairing contract
+        needs their original sibling items) is dropped for that turn.
 
         The ONE builder both harnesses share: the main-loop stream accumulator
         and the sub-agent loop (``_run_agent``) finalize their captured blocks
         here, so how a native lane is assembled cannot drift between them.
         Returns a possibly-empty list; callers attach it only when non-empty.
         """
-        from turnstone.core.providers._anthropic import ANTHROPIC_VALID_BLOCK_TYPES
-
         provider_blocks = self._maybe_synth_reasoning_block(
             provider_blocks, reasoning_parts, alias=alias
         )
         if not provider_blocks:
             return provider_blocks
+        if had_blank_ids:
+            return [
+                b
+                for b in provider_blocks
+                if isinstance(b, dict) and b.get("type") == "reasoning_text"
+            ]
         if not has_tool_calls:
             return strip_orphan_client_tool_blocks(provider_blocks)
-        if had_blank_ids:
-            stripped = strip_orphan_client_tool_blocks(provider_blocks)
-            if len(stripped) != len(provider_blocks):
-                stripped = [
-                    b
-                    for b in stripped
-                    if not (isinstance(b, dict) and b.get("type") in ANTHROPIC_VALID_BLOCK_TYPES)
-                ]
-            return stripped
         return provider_blocks
 
     def _resolve_replay_reasoning_to_model(
