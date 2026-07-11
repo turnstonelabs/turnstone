@@ -15371,6 +15371,13 @@ class ChatSession:
         # ``wire_id_map`` records minted → provider-original for every mint,
         # read by ``restore_provider_tool_ids`` in ``_api_call`` (the id map
         # IS the recovery path — never string-split the mint suffix).
+        # LIFETIME INVARIANT: minted ids never outlive this invocation —
+        # the map is per-run, and with the native lane carried an unmapped
+        # minted id on the wire hard-orphans its tool_result (pinned by
+        # test_agent_native_lane_without_restore_map_orphans_the_result).
+        # A future resumable/background agent that rebuilds a trajectory
+        # containing prior-run minted ids must re-mint them (recording new
+        # map entries) or persist the map alongside the turns.
         with self._agent_run_seq_lock:
             self._agent_run_seq += 1
             run_seq = self._agent_run_seq
@@ -15414,7 +15421,14 @@ class ChatSession:
 
             # Append the assistant turn to the sub-harness trajectory.
             agent_tool_calls: tuple[ToolCall, ...] = ()
+            had_blank_ids = False
             if result.tool_calls:
+                # Record blanks BEFORE the uuid back-fill: a back-filled id
+                # exists only in the tool_calls mirror — the native blocks
+                # keep the blank provider id verbatim (they are never
+                # rewritten), so a turn with a back-fill must not carry its
+                # native lane (see the gate below).
+                had_blank_ids = any(not tc.get("id") for tc in result.tool_calls)
                 self._ensure_tool_call_ids(result.tool_calls)
                 # Mint each sub-agent tool id session-unique:
                 # ``{parent}::r{run}s{step}::{provider_id}``.  The run tag
@@ -15457,11 +15471,23 @@ class ChatSession:
             # run is pinned to one provider, so the blocks always replay to
             # the backend that produced them (and the translators' per-block
             # shape filters drop anything foreign).
-            native_blocks = self._finalize_provider_blocks(
-                result.provider_blocks,
-                [result.reasoning] if result.reasoning else [],
-                has_tool_calls=bool(result.tool_calls),
-                alias=agent_alias,
+            #
+            # SKIPPED when a blank provider id was uuid-back-filled above:
+            # the back-fill reaches only the mirror, so the native tool_use
+            # block still carries the blank id and replaying it would desync
+            # from the restored tool_result (Anthropic orphans the result and
+            # 400s; Google re-fills a fresh uuid and drops the result).  The
+            # rebuild path keeps every wire representation on the back-filled
+            # id — the pre-native behaviour, for exactly the degenerate case.
+            native_blocks = (
+                []
+                if had_blank_ids
+                else self._finalize_provider_blocks(
+                    result.provider_blocks,
+                    [result.reasoning],
+                    has_tool_calls=bool(result.tool_calls),
+                    alias=agent_alias,
+                )
             )
             native = (
                 ProviderNative(producer=agent_provider.provider_name, blocks=tuple(native_blocks))
