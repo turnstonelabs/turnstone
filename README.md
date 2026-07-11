@@ -51,7 +51,27 @@ Turnstone gives LLMs tools — shell, files, search, web, planning — and orche
 ## Quickstart
 
 ```bash
+Debian/Ubuntu:
+sudo apt install -y python3-full python3-pip python3-pip-whl
+
+Fedora:
+sudo dnf install python3 python3-devel python3-pip python3-pip-wheel
+
+RHEL-based:
+sudo dnf install python3 python3-devel python3-pip python3-pip-wheel
+
+Arch:
+sudo pacman -S python python-pip python-wheel
+
+curl https://pyenv.run | bash
+
+mkdir -p ~/turnstone && cd ~/turnstone
+python3 -m venv .venv
+source .venv/bin/activate
+
 pip install turnstone
+
+export TURNSTONE_JWT_SECRET=$(python3 -c 'import secrets; print(secrets.token_hex(32))' [turnstone.core.auth] node_id=turnstone_XXXX service=server)
 
 # Terminal REPL
 turnstone --base-url http://localhost:8000/v1
@@ -68,7 +88,7 @@ For PostgreSQL (recommended for production):
 ```bash
 export TURNSTONE_DB_BACKEND=postgresql
 export TURNSTONE_DB_URL="postgresql+psycopg://user:pass@localhost:5432/turnstone"
-turnstone-server --port 8080 --base-url http://localhost:8000/v1
+turnstone-server --port 8080 --base-url http://OAICOMPAT_SERVER_URL:PORT/v1
 ```
 
 ### Docker
