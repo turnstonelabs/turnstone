@@ -32,6 +32,27 @@ from turnstone.core.providers._protocol import (
 )
 from turnstone.core.trajectory import materialize_attachments
 
+
+def _reasoning_text(obj: Any) -> str:
+    """The non-canonical reasoning text off a Chat-Completions message or
+    streaming delta — ``reasoning`` (vLLM) preferred over
+    ``reasoning_content`` (llama.cpp, other parsers), first non-empty
+    STRING wins.
+
+    The type guard matters twice over: a server that puts a structured
+    object in ``reasoning`` must not shadow valid text sitting in
+    ``reasoning_content``, and a non-``str`` must never leak into the
+    session's reasoning accumulator (``"".join(...)`` downstream).  One
+    helper for both the streaming and non-streaming paths so the two
+    lanes cannot drift on precedence or guarding.
+    """
+    for attr in ("reasoning", "reasoning_content"):
+        value = getattr(obj, attr, None)
+        if isinstance(value, str) and value:
+            return value
+    return ""
+
+
 log = structlog.get_logger(__name__)
 
 
@@ -230,7 +251,7 @@ class OpenAIChatCompletionsProvider:
             delta = chunk.choices[0].delta
 
             # Reasoning field (vLLM --reasoning-parser, llama.cpp)
-            rc = getattr(delta, "reasoning", None) or getattr(delta, "reasoning_content", None)
+            rc = _reasoning_text(delta)
             if rc:
                 sc.reasoning_delta = rc
 
@@ -345,9 +366,9 @@ class OpenAIChatCompletionsProvider:
             content = format_citations(content, annotations)
 
         # Non-canonical reasoning text (vLLM ``--reasoning-parser``, llama.cpp
-        # ``reasoning_format``) — same attribute pair, same precedence, as the
-        # streaming delta extraction above, so the two paths can't drift.
-        reasoning = getattr(msg, "reasoning", None) or getattr(msg, "reasoning_content", None)
+        # ``reasoning_format``) — the shared extractor also serves the
+        # streaming delta path, so the two lanes cannot drift.
+        reasoning = _reasoning_text(msg)
 
         usage = extract_usage(getattr(response, "usage", None))
 
@@ -357,7 +378,7 @@ class OpenAIChatCompletionsProvider:
             finish_reason=choice.finish_reason or "stop",
             usage=usage,
             provider_blocks=provider_blocks,
-            reasoning=reasoning if isinstance(reasoning, str) else "",
+            reasoning=reasoning,
         )
         log.debug(
             "openai.chat.response",

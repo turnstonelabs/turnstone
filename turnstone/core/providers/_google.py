@@ -23,6 +23,7 @@ from typing import TYPE_CHECKING, Any
 if TYPE_CHECKING:
     from collections.abc import Iterator
 
+from turnstone.core.lowering import wire_valid_arguments
 from turnstone.core.providers._openai_chat import OpenAIChatCompletionsProvider
 from turnstone.core.providers._openai_common import sanitize_messages
 from turnstone.core.providers._protocol import ModelCapabilities, StreamChunk
@@ -100,6 +101,20 @@ class GoogleProvider(OpenAIChatCompletionsProvider):
                 # their own round-trip handling here.
                 raw_tcs = [b for b in pc if b.get("type") == "function"]
                 if raw_tcs:
+                    # The raw dicts carry the model's ORIGINAL arguments
+                    # string; the top-level mirror this swap replaces may
+                    # have been legalized upstream
+                    # (lowering.sanitize_tool_call_arguments), so re-apply
+                    # the same validity floor here — otherwise the fidelity
+                    # swap resurrects a malformed arguments string on every
+                    # replay.  Copy-on-write per offending entry; ids and
+                    # ``thought_signature`` stay untouched.
+                    raw_tcs = [
+                        b
+                        if wire_valid_arguments(b.get("function", {}).get("arguments"))
+                        else {**b, "function": {**b.get("function", {}), "arguments": "{}"}}
+                        for b in raw_tcs
+                    ]
                     msg["tool_calls"] = raw_tcs
             cleaned.append(msg)
         return sanitize_messages(cleaned)
