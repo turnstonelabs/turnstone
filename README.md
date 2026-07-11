@@ -88,7 +88,7 @@ For PostgreSQL (recommended for production):
 ```bash
 export TURNSTONE_DB_BACKEND=postgresql
 export TURNSTONE_DB_URL="postgresql+psycopg://user:pass@localhost:5432/turnstone"
-turnstone-server --port 8080 --base-url http://OAICOMPAT_SERVER_URL:PORT/v1
+nohup turnstone-server --port 8080 --base-url http://OAICOMPAT_SERVER_URL:PORT/v1 &
 ```
 
 ### Docker
