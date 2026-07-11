@@ -15404,15 +15404,24 @@ class ChatSession:
         # across the WHOLE run, so ids stay distinct across turns even when
         # the provider reuses per-response ids ("call_0") for sub-tools.
         # ``wire_id_map`` records minted → provider-original for every mint,
-        # read by ``restore_provider_tool_ids`` in ``_api_call`` (the id map
-        # IS the recovery path — never string-split the mint suffix).
+        # read by ``restore_provider_tool_ids`` in ``_api_call``.  The map is
+        # the recovery path — never string-split the mint suffix: the mint is
+        # not injective (parent and original are provider-controlled strings
+        # that may themselves contain ``::``-shaped substrings).
         # LIFETIME INVARIANT: minted ids never outlive this invocation —
         # the map is per-run, and with the native lane carried an unmapped
         # minted id on the wire hard-orphans its tool_result (pinned by
         # test_agent_native_lane_without_restore_map_orphans_the_result).
-        # A future resumable/background agent that rebuilds a trajectory
-        # containing prior-run minted ids must re-mint them (recording new
-        # map entries) or persist the map alongside the turns.
+        # If sub-turns ever become durable, persist the Turn-IR verbatim and
+        # RE-MINT at load (``run_seq`` is session-scoped, so stored tags
+        # can't be trusted across restarts), rebuilding this map from the
+        # native lane — its client tool blocks hold the provider originals,
+        # ordered 1:1 with the ``tool_calls`` mirror by construction (both
+        # are built from the same response in the same iteration on every
+        # lane).  Turns without native client tool blocks need no entries at
+        # all: wire ids only need intra-request consistency there.  Do NOT
+        # persist the map itself — it is derivable, and a second durable
+        # source of truth would have to be kept in lockstep with the turns.
         with self._agent_run_seq_lock:
             self._agent_run_seq += 1
             run_seq = self._agent_run_seq
