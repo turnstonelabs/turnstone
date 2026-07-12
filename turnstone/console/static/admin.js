@@ -5120,16 +5120,17 @@ function _wireMcpAudienceAutofill() {
 }
 
 function _onMcpAuthTypeChange() {
-  // Switching INTO sign-in passthrough: if the audience field still holds
-  // the URL-autofill artifact (operator typed the URL first, then picked
-  // this mode), blank it so the required-field check asks for a real
-  // identity-provider application identifier instead of silently
-  // persisting the MCP URL as the audience.
-  if (_selectedMcpAuthType() === "oauth_obo") {
-    const aud = document.getElementById("mcp-oauth-audience");
-    const urlVal = document.getElementById("mcp-url").value.trim();
-    if (aud && urlVal && aud.value.trim() === urlVal) aud.value = "";
-  }
+  // Audience and Scopes are auth-type-specific: for oauth_user the audience is
+  // an RFC 8707 resource indicator (~ the MCP URL) and scopes are AS-consent
+  // scopes; for sign-in passthrough the audience is the identity-provider-side
+  // application identifier and scopes (rfc8693 only) are the token-exchange
+  // scope. Carrying one type's value into the other passes validation and then
+  // fails every mint/consent, so clear both when the auth type changes — the
+  // operator re-enters the correct values for the new mode (the backend
+  // likewise refuses to carry these columns across a flip). A same-type edit
+  // never fires this (the radio didn't change), so pre-filled values are kept.
+  document.getElementById("mcp-oauth-audience").value = "";
+  document.getElementById("mcp-oauth-scopes").value = "";
   toggleMcpAuthFields();
 }
 
@@ -5179,11 +5180,7 @@ function _mcpResetForm() {
   document.getElementById("mcp-oauth-registration").value = "preregistered";
   document.getElementById("mcp-oauth-client-id").value = "";
   document.getElementById("mcp-oauth-client-secret").value = "";
-  const scopesReset = document.getElementById("mcp-oauth-scopes");
-  scopesReset.value = "";
-  // Create flow has no loaded row — the marker's absence tells
-  // _parseMcpForm to always include the field.
-  delete scopesReset.dataset.loaded;
+  document.getElementById("mcp-oauth-scopes").value = "";
   document.getElementById("mcp-oauth-audience").value = "";
   document.getElementById("mcp-create-error").classList.remove("is-visible");
   toggleMcpTransport();
@@ -5256,12 +5253,7 @@ function showEditMcpModal(serverId) {
         s.oauth_client_id || "";
       // Secret field always blank — write-only, never read back.
       document.getElementById("mcp-oauth-client-secret").value = "";
-      const scopesInput = document.getElementById("mcp-oauth-scopes");
-      scopesInput.value = s.oauth_scopes || "";
-      // Remember the loaded value so _parseMcpForm can omit an untouched
-      // pre-fill from the payload (the server treats a present field as an
-      // operator-set value).
-      scopesInput.dataset.loaded = s.oauth_scopes || "";
+      document.getElementById("mcp-oauth-scopes").value = s.oauth_scopes || "";
       document.getElementById("mcp-oauth-audience").value =
         s.oauth_audience || "";
       toggleMcpTransport();
@@ -5364,18 +5356,13 @@ function _parseMcpForm() {
     if (!audience)
       return { error: "Audience is required for sign-in passthrough servers" };
     payload.oauth_audience = audience;
-    // Include scopes only when the operator changed them from the loaded row
-    // value (or on create, where no loaded marker exists): the server treats
-    // a present field as an operator-set value, and re-submitting the
-    // untouched pre-fill on every save must not read as one.
-    const scopesInput = document.getElementById("mcp-oauth-scopes");
-    const scopesVal = scopesInput.value.trim();
-    if (
-      scopesInput.dataset.loaded === undefined ||
-      scopesVal !== scopesInput.dataset.loaded.trim()
-    ) {
-      payload.oauth_scopes = scopesVal;
-    }
+    // Always send the visible Scopes value — the backend distinguishes a
+    // same-type no-op re-send (dropped) from a genuine change / flip on its
+    // side, so the form doesn't need omit-when-unchanged logic (which used to
+    // collide with the backend's flip handling and silently drop scopes).
+    payload.oauth_scopes = document
+      .getElementById("mcp-oauth-scopes")
+      .value.trim();
   }
 
   return payload;

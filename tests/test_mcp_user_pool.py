@@ -1187,6 +1187,22 @@ class TestTokenRejectedDetail:
         assert "consent" not in obo_detail.lower()
         assert "administrator" in obo_detail.lower()
 
+    def test_obo_insufficient_scope_detail_points_at_admin_not_reconsent(self) -> None:
+        """Review finding: the 403 insufficient-scope branch was the one
+        user-actionable site not made obo-aware — it told obo users to
+        'Re-consent with new scopes' though no per-server consent flow exists
+        (consent_url is None, /start rejects obo). The obo detail names the real
+        remedy (an administrator widening access), the oauth_user one keeps the
+        step-up re-consent language."""
+        from turnstone.core.mcp_client import _insufficient_scope_detail
+
+        user_detail = _insufficient_scope_detail({"auth_type": "oauth_user"}, "tool")
+        assert "Re-consent" in user_detail
+
+        obo_detail = _insufficient_scope_detail({"auth_type": "oauth_obo"}, "tool")
+        assert "consent" not in obo_detail.lower()
+        assert "administrator" in obo_detail.lower()
+
 
 # ---------------------------------------------------------------------------
 # Background token-freshness sweep (oauth_user keep-hot, no connection warming)

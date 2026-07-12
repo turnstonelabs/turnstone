@@ -876,6 +876,30 @@ def test_phase8_xss_safe_render_in_build_mcp_error_embed() -> None:
     )
 
 
+def test_mcp_error_button_gated_on_consent_url_not_code_alone() -> None:
+    """Review finding: the chat error card rendered a Connect / Re-consent
+    button from the error CODE alone, so an oauth_obo error (consent_url=None,
+    since sign-in passthrough has no per-server consent flow and /start rejects
+    obo rows) produced a button that dead-ended in a 'no consent URL' toast.
+    The button must render only when a valid per-server consent URL is present —
+    obo errors show the card's honest detail text without a broken affordance."""
+    body = _INTERACTIVE_JS.read_text(encoding="utf-8")
+    start = body.index("function buildMcpErrorEmbed(")
+    rest = body[start:]
+    end_match = re.search(r"\n}\n", rest)
+    assert end_match is not None
+    fn = rest[: end_match.end()]
+    # The render gate combines the category with a consent-URL presence check.
+    assert "hasConsentAffordance" in fn, (
+        "buildMcpErrorEmbed must gate the action button on the presence of a "
+        "consent URL, not on the error category alone."
+    )
+    assert 'category === "actionable" && hasConsentAffordance' in fn, (
+        "the button-render condition must require BOTH an actionable category "
+        "and a real consent URL"
+    )
+
+
 def test_phase8_css_classes_present_in_stylesheet() -> None:
     """The MCP error-embed + connections classes app.js/interactive.js reference
     must keep their CSS rules (else the consent / connections UX silently loses

@@ -545,6 +545,47 @@ class TestCacheAndCredentialLookup:
         row = storage.get_mcp_user_token(USER, SERVER)
         assert row is not None and row["audience"] == AUDIENCE
 
+    def test_stale_scopes_cache_row_is_not_served_and_remints(self, storage: SQLiteBackend) -> None:
+        """Review finding: the read-side freshness gate is the AUTHORITATIVE
+        enforcement of a scope narrowing (the admin cache purge is best-effort).
+        Under rfc8693 a row minted with the OLD, wider scopes must NOT be served
+        after the server's scopes are narrowed — even if the purge failed — so
+        the privilege reduction takes effect on the next dispatch, not at TTL."""
+        _seed_obo_server(storage, oauth_scopes="api.read")  # server's CURRENT scopes
+        client = MagicMock(spec=httpx.AsyncClient)
+        client.post = AsyncMock(
+            side_effect=[
+                _mk_response(200, {"access_token": "subject-at", "expires_in": 300}),
+                _mk_response(200, {"access_token": "reminted-narrow", "expires_in": 3600}),
+            ]
+        )
+        state = _make_app_state(
+            storage,
+            http_client=client,
+            oidc_config=_make_oidc_config(obo_grant_profile="rfc8693"),
+        )
+        _seed_credential(state)
+        # Fresh, right-audience, refresh-less — but minted with the OLD wider scopes.
+        state.mcp_token_store.create_user_token(
+            USER,
+            SERVER,
+            access_token="wide-scope-at",
+            refresh_token=None,
+            expires_at=(datetime.now(UTC) + timedelta(seconds=3600)).strftime(_ISO),
+            scopes="api.read api.write",  # wider than the server's current api.read
+            as_issuer=ISSUER,
+            audience=AUDIENCE,
+        )
+
+        result = _mint(state)
+
+        # The wider-scope row is NOT served; a fresh mint for the current scopes runs.
+        assert result.kind == "token"
+        assert result.token == "reminted-narrow"
+        assert client.post.call_count == 2
+        row = storage.get_mcp_user_token(USER, SERVER)
+        assert row is not None and (row["scopes"] or "") == "api.read"
+
     def test_missing_credential_returns_missing_with_zero_http_calls(
         self, storage: SQLiteBackend
     ) -> None:
@@ -683,12 +724,14 @@ class TestFailureHandling:
         assert "obo_mint_rejected" in blob
         assert "AADSTS65001" in blob  # the actual IdP error text survives
 
-    def test_permanent_rejection_arms_cooldown_terminal_state(self, storage: SQLiteBackend) -> None:
-        """Review finding (2156): the obo permanent-rejection arm must arm the
-        cooldown, else — because the credential survives and a missing cache row
-        is mint-eligible — every subsequent dispatch re-runs the doomed
-        redemption and emits another token_revoked audit row forever. A second
-        immediate dispatch must NOT re-hit the IdP or re-audit."""
+    def test_permanent_rejection_no_cache_row_emits_no_revoke_audit(
+        self, storage: SQLiteBackend
+    ) -> None:
+        """Review finding: a permanent mint rejection with NO cache row (the
+        common missing-tenant-grant case — the user never had a token for this
+        server) must NOT emit a token_revoked audit for a row that never
+        existed. The cooldown is still armed as the terminal backstop (the
+        credential survives), so the second dispatch short-circuits."""
         _seed_obo_server(storage)
         client = MagicMock(spec=httpx.AsyncClient)
         client.post = AsyncMock(
@@ -712,10 +755,43 @@ class TestFailureHandling:
         # Terminal: the cooldown short-circuits the second dispatch entirely.
         assert second.kind == "refresh_failed_transient"
         assert client.post.call_count == 1  # NOT re-minted
-        # Exactly one revoke audit — not one per dispatch.
+        # No row was ever deleted → no bogus revoke audit.
+        events = storage.list_audit_events(action="mcp_server.oauth.token_revoked")
+        assert len(events) == 0
+        assert state.mcp_token_store.get_oidc_credential(USER, ISSUER) is not None
+
+    def test_permanent_rejection_with_cache_row_audits_exactly_once(
+        self, storage: SQLiteBackend
+    ) -> None:
+        """Companion: when a cache row DID exist, the permanent rejection deletes
+        it and audits token_revoked exactly ONCE. A later doomed re-mint (past
+        the cooldown) finds no row to delete and must NOT append a second audit
+        row — the crux of the audit-spam finding."""
+        _seed_obo_server(storage)
+        client = MagicMock(spec=httpx.AsyncClient)
+        client.post = AsyncMock(
+            return_value=_mk_response(400, {"error": "invalid_grant", "error_description": "dead"})
+        )
+        state = _make_app_state(storage, http_client=client, oidc_config=_make_oidc_config())
+        _seed_credential(state)
+        _seed_cache_row(state, expires_in_seconds=-1000, access_token="stale-at")  # forces a mint
+
+        from turnstone.core.mcp_oauth import _clear_refresh_backoff
+
+        async def _run() -> None:
+            # First dispatch: deletes the (stale) cache row + audits once.
+            await get_obo_access_token_classified(app_state=state, user_id=USER, server_name=SERVER)
+            # Clear the cooldown so the second dispatch actually re-mints (the
+            # weekend-of-scheduled-runs scenario), then dispatch again.
+            _clear_refresh_backoff(state, USER, SERVER)
+            await get_obo_access_token_classified(app_state=state, user_id=USER, server_name=SERVER)
+
+        asyncio.run(_run())
+
+        assert client.post.call_count == 2  # re-minted after the cooldown cleared
+        # But only ONE revoke audit — the second doomed mint found no row.
         events = storage.list_audit_events(action="mcp_server.oauth.token_revoked")
         assert len(events) == 1
-        assert state.mcp_token_store.get_oidc_credential(USER, ISSUER) is not None
 
     def test_force_refresh_during_cooldown_falls_through_on_fresh_cache(
         self, storage: SQLiteBackend

@@ -39,7 +39,6 @@ import httpx
 from turnstone.core.audit import record_audit
 from turnstone.core.log import get_logger
 from turnstone.core.mcp_crypto import (
-    USER_SCOPED_AUTH_TYPES,
     MCPTokenDecryptError,
     OIDCCredentialPlain,
     is_user_scoped_auth,
@@ -1500,19 +1499,62 @@ async def _revoke_after_refresh_failure(
     Drops the per-key refresh lock and backoff state — both safe to call when no
     entry exists — and returns ``refresh_failed`` so the dispatcher surfaces
     re-consent.
+
+    The ``token_revoked`` audit is emitted ONLY when a row was actually deleted.
+    This matters for oauth_obo: its shared credential survives a per-server
+    revoke, so after the first permanent rejection deletes the cache row, every
+    later dispatch/prime past the cooldown re-runs the doomed redemption and
+    lands here again with nothing to delete — auditing unconditionally would
+    append a fresh "token_revoked" row for a token that no longer exists on
+    every cycle, forever (misleading forensics + alert fatigue for operators
+    who alert on token_revoked). oauth_user cannot hit the empty-delete case (a
+    revoke there also removes the only refresh source, so no recurrence), so
+    this gate is a no-op for it.
     """
-    await asyncio.to_thread(token_store.delete_user_token, user_id, server_name)
-    await _audit_event(
-        app_state,
-        server_id=server_id_for_audit,
-        user_id=user_id,
-        action="mcp_server.oauth.token_revoked",
-        server_name=server_name,
-        detail={"reason": reason},
-    )
+    deleted = await asyncio.to_thread(token_store.delete_user_token, user_id, server_name)
+    if deleted:
+        await _audit_event(
+            app_state,
+            server_id=server_id_for_audit,
+            user_id=user_id,
+            action="mcp_server.oauth.token_revoked",
+            server_name=server_name,
+            detail={"reason": reason},
+        )
     _drop_refresh_lock(app_state, user_id, server_name)
     _clear_refresh_backoff(app_state, user_id, server_name)
     return TokenLookupResult(kind="refresh_failed")
+
+
+def _decrypt_failure_result(
+    app_state: Any,
+    user_id: str,
+    server_name: str,
+    exc: MCPTokenDecryptError,
+    *,
+    event: str | None,
+) -> TokenLookupResult:
+    """Map an ``MCPTokenDecryptError`` to a classified ``decrypt_failure`` result.
+
+    One construction of the (optional warning log + ``_no_token_result`` +
+    fingerprint-carrying ``TokenLookupResult``) shape, shared by the five
+    token/credential read sites in the oauth_user and oauth_obo state machines
+    (the raw ``get_user_token`` / ``get_oidc_credential`` calls each raise this
+    on a key rotated away, and each must keep the classified-result contract).
+    Pass the site's structured *event* name to log, or ``None`` for a re-read
+    whose first read already logged.
+    """
+    if event is not None:
+        log.warning(event, user_id=user_id, server_name=server_name, exc_info=True)
+    return _no_token_result(
+        app_state,
+        user_id,
+        server_name,
+        TokenLookupResult(
+            kind="decrypt_failure",
+            decrypt_fingerprints=tuple(exc.key_fingerprints_attempted),
+        ),
+    )
 
 
 async def get_user_access_token(*, app_state: Any, user_id: str, server_name: str) -> str | None:
@@ -1786,20 +1828,12 @@ async def get_user_access_token_classified(
     try:
         plain = await asyncio.to_thread(token_store.get_user_token, user_id, server_name)
     except MCPTokenDecryptError as exc:
-        log.warning(
-            "mcp_server.oauth.token_decrypt_failed_classified",
-            user_id=user_id,
-            server_name=server_name,
-            exc_info=True,
-        )
-        return _no_token_result(
+        return _decrypt_failure_result(
             app_state,
             user_id,
             server_name,
-            TokenLookupResult(
-                kind="decrypt_failure",
-                decrypt_fingerprints=tuple(exc.key_fingerprints_attempted),
-            ),
+            exc,
+            event="mcp_server.oauth.token_decrypt_failed_classified",
         )
     if plain is None:
         return _no_token_result(app_state, user_id, server_name, TokenLookupResult(kind="missing"))
@@ -1856,20 +1890,12 @@ async def get_user_access_token_classified(
         try:
             plain2 = await asyncio.to_thread(token_store.get_user_token, user_id, server_name)
         except MCPTokenDecryptError as exc:
-            log.warning(
-                "mcp_server.oauth.token_decrypt_failed_classified",
-                user_id=user_id,
-                server_name=server_name,
-                exc_info=True,
-            )
-            return _no_token_result(
+            return _decrypt_failure_result(
                 app_state,
                 user_id,
                 server_name,
-                TokenLookupResult(
-                    kind="decrypt_failure",
-                    decrypt_fingerprints=tuple(exc.key_fingerprints_attempted),
-                ),
+                exc,
+                event="mcp_server.oauth.token_decrypt_failed_classified",
             )
         if plain2 is None:
             return _no_token_result(
@@ -2185,20 +2211,12 @@ async def _read_obo_credential(
     try:
         credential = await asyncio.to_thread(token_store.get_oidc_credential, user_id, issuer)
     except MCPTokenDecryptError as exc:
-        log.warning(
-            "mcp_server.oauth.obo_credential_decrypt_failed",
-            user_id=user_id,
-            server_name=server_name,
-            exc_info=True,
-        )
-        return _no_token_result(
+        return _decrypt_failure_result(
             app_state,
             user_id,
             server_name,
-            TokenLookupResult(
-                kind="decrypt_failure",
-                decrypt_fingerprints=tuple(exc.key_fingerprints_attempted),
-            ),
+            exc,
+            event="mcp_server.oauth.obo_credential_decrypt_failed",
         )
     if credential is None:
         # No captured credential → the consent affordance is a re-login.
@@ -2206,10 +2224,12 @@ async def _read_obo_credential(
     return credential
 
 
-def _is_fresh_obo_cache_row(plain: MCPUserTokenPlain | None, current_audience: str) -> bool:
+def _is_fresh_obo_cache_row(
+    plain: MCPUserTokenPlain | None, current_audience: str, current_scopes: str
+) -> bool:
     """True when a cache row may be served as a minted obo access token.
 
-    Three conditions, all required (single source of truth for the pre-lock read
+    Four conditions, all required (single source of truth for the pre-lock read
     AND the post-lock re-read so they can't drift):
 
     - refresh_token is NULL — minted rows carry no refresh token; a
@@ -2219,12 +2239,20 @@ def _is_fresh_obo_cache_row(plain: MCPUserTokenPlain | None, current_audience: s
       for a since-narrowed audience must NOT be served, so an operator's
       privilege reduction takes effect immediately rather than at token TTL
       (the audience-change purge is best-effort; this is the authoritative gate);
+    - the row's scopes equal the server's CURRENT scopes — the same authoritative
+      gate for the rfc8693 exchange scope (which shapes the minted bearer's
+      privileges just like the audience): a scope NARROWING must take effect on
+      the next dispatch even if the admin's best-effort cache purge failed,
+      rather than serving the wider-privilege bearer until its TTL. Under the
+      entra leg scopes are inert, so the stored and current values track the
+      same server column and this term is a no-op there;
     - not at/near expiry.
     """
     return (
         plain is not None
         and plain["refresh_token"] is None
         and (plain.get("audience") or "") == current_audience
+        and (plain.get("scopes") or "") == current_scopes
         and not _token_needs_refresh(plain["expires_at"])
     )
 
@@ -2295,25 +2323,18 @@ async def get_obo_access_token_classified(
     try:
         plain = await asyncio.to_thread(token_store.get_user_token, user_id, server_name)
     except MCPTokenDecryptError as exc:
-        log.warning(
-            "mcp_server.oauth.obo_cache_decrypt_failed",
-            user_id=user_id,
-            server_name=server_name,
-            exc_info=True,
-        )
-        return _no_token_result(
+        return _decrypt_failure_result(
             app_state,
             user_id,
             server_name,
-            TokenLookupResult(
-                kind="decrypt_failure",
-                decrypt_fingerprints=tuple(exc.key_fingerprints_attempted),
-            ),
+            exc,
+            event="mcp_server.oauth.obo_cache_decrypt_failed",
         )
-    # Serve the cache only when it is a fresh, right-audience, refresh-less row
-    # (see _is_fresh_obo_cache_row). A stale-audience or refresh-bearing row
-    # falls through to a fresh mint (which overwrites it via _persist_obo_cache_row).
-    fresh = _is_fresh_obo_cache_row(plain, audience)
+    # Serve the cache only when it is a fresh, right-audience, right-scopes,
+    # refresh-less row (see _is_fresh_obo_cache_row). A stale-audience/-scopes or
+    # refresh-bearing row falls through to a fresh mint (which overwrites it via
+    # _persist_obo_cache_row).
+    fresh = _is_fresh_obo_cache_row(plain, audience, scopes)
     if fresh and not force_refresh and plain is not None:
         return _token_result(app_state, user_id, server_name, plain["access_token"])
 
@@ -2384,19 +2405,12 @@ async def get_obo_access_token_classified(
         try:
             plain2 = await asyncio.to_thread(token_store.get_user_token, user_id, server_name)
         except MCPTokenDecryptError as exc:
-            return _no_token_result(
-                app_state,
-                user_id,
-                server_name,
-                TokenLookupResult(
-                    kind="decrypt_failure",
-                    decrypt_fingerprints=tuple(exc.key_fingerprints_attempted),
-                ),
-            )
+            # First read already logged obo_cache_decrypt_failed; this re-read
+            # under the lock stays silent (event=None) to avoid a double line.
+            return _decrypt_failure_result(app_state, user_id, server_name, exc, event=None)
         # Same servability gate as the pre-lock read (refresh-less, right-audience,
-        # not-expired) — a stale-audience or refresh-bearing row falls through and
-        # re-mints.
-        if _is_fresh_obo_cache_row(plain2, audience) and plain2 is not None:
+        # right-scopes, not-expired) — a stale row falls through and re-mints.
+        if _is_fresh_obo_cache_row(plain2, audience, scopes) and plain2 is not None:
             if not force_refresh:
                 return _token_result(app_state, user_id, server_name, plain2["access_token"])
             # Obo cache rows are delete+create'd per mint and never touched by
@@ -4008,7 +4022,6 @@ __all__ = [
     "MCP_OAUTH_STATE_TTL_SECONDS",
     "OBO_GRANT_PROFILES",
     "TokenLookupResult",
-    "USER_SCOPED_AUTH_TYPES",
     "build_authorize_url",
     "close_mcp_oauth_state",
     "create_pending_state",

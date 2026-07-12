@@ -4453,7 +4453,20 @@ function buildMcpErrorEmbed(err, rawJson, onConsent) {
     body.appendChild(scopesLine);
   }
 
-  if (category === "actionable") {
+  // Render the Connect / Re-consent button only when the dispatcher actually
+  // supplied a per-server consent URL. An "actionable"-category code with no
+  // consent_url means there is no per-server consent flow for this server —
+  // sign-in passthrough (oauth_obo) mints from the user's Turnstone sign-in and
+  // is deliberately absent from the Settings connections list and rejected by
+  // /start — so a button here would dead-end ("no consent URL; open Settings"
+  // pointing at a panel with nothing to connect). In that case the honest
+  // remedy is the detail text (sign in again / ask your administrator), so we
+  // show the card without a broken affordance.
+  const consentUrl = err.consent_url;
+  const hasConsentAffordance =
+    typeof consentUrl === "string" &&
+    consentUrl.startsWith("/v1/api/mcp/oauth/start");
+  if (category === "actionable" && hasConsentAffordance) {
     const btn = document.createElement("button");
     btn.type = "button";
     btn.className = "mcp-error-action-btn";
@@ -4469,20 +4482,10 @@ function buildMcpErrorEmbed(err, rawJson, onConsent) {
         : "Connect to " + serverLabel,
     );
     btn.addEventListener("click", function () {
-      const consentUrl = err.consent_url;
-      if (!consentUrl || typeof consentUrl !== "string") {
-        // Defensive: should always be present per the dispatcher.  If a
-        // path forgets to include it the user can still connect via the
-        // Settings panel (gear icon).
-        showToast("No consent URL available; open Settings to connect.");
-        return;
-      }
-      // Defence-in-depth: reject anything that isn't path-relative to
-      // the dispatcher's known prefix. ``_build_consent_url`` always
-      // emits ``/v1/api/mcp/oauth/start?...`` — a non-prefix value
-      // would indicate a future producer drift or a compromised
-      // dispatcher, and ``window.open("javascript:...")`` would be
-      // catastrophic. Never rely on the producer-side guarantee alone.
+      // Defence-in-depth: the render gate already proved the prefix, but
+      // re-check at click time — a non-prefix value would indicate producer
+      // drift or a compromised dispatcher, and window.open("javascript:...")
+      // would be catastrophic. Never rely on the producer-side guarantee alone.
       if (!consentUrl.startsWith("/v1/api/mcp/oauth/start")) {
         showToast("Invalid consent URL");
         return;
