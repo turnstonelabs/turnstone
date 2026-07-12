@@ -730,6 +730,35 @@ class TestFailureHandling:
         assert state.mcp_token_store.get_oidc_credential(USER, ISSUER) is not None
         assert storage.get_mcp_user_token(USER, SERVER) is None  # nothing was cached
 
+    def test_oversized_error_body_on_client_error_is_ambiguous_not_transient(
+        self, storage: SQLiteBackend
+    ) -> None:
+        """Review finding: the shared body-size guard raised with the DEFAULT
+        (TRANSIENT) class before the non-200 was classified, so a permanent
+        dead-grant whose error body exceeded the cap would loop 'please retry'
+        forever and NEVER escalate (TRANSIENT doesn't advance the streak). An
+        over-sized CLIENT-error body is now classified AMBIGUOUS by status, so it
+        still advances the ambiguous streak and escalates to the honest re-login
+        / admin remedy after the threshold."""
+        from turnstone.core.mcp_oauth import _refresh_backoff_state
+
+        _seed_obo_server(storage)
+        client = MagicMock(spec=httpx.AsyncClient)
+        # 400 with an error body over the 64KB cap.
+        client.post = AsyncMock(
+            return_value=_mk_response(400, {"error": "invalid_grant", "pad": "x" * (70 * 1024)})
+        )
+        state = _make_app_state(storage, http_client=client, oidc_config=_make_oidc_config())
+        _seed_credential(state)
+
+        result = _mint(state)
+
+        # Immediate result is still a kept-token transient (streak below the
+        # escalation threshold), but the AMBIGUOUS class advanced the streak —
+        # the TRANSIENT default would have left it at 0 and never escalated.
+        assert result.kind == "refresh_failed_transient"
+        assert _refresh_backoff_state(state, USER, SERVER).ambiguous_streak == 1
+
     def test_permanent_rejection_logs_idp_error_text(self, storage: SQLiteBackend, caplog) -> None:
         """Review finding (2316): the permanent-rejection path must log the IdP
         error body (the token_revoked audit row carries only a reason code), so

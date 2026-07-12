@@ -6579,7 +6579,7 @@ class MCPClientManager:
             return _structured_error(
                 code="mcp_insufficient_scope",
                 server=server_name,
-                detail=_insufficient_scope_detail(server_row, kind),
+                detail=_pool_error_detail(server_row, "insufficient_scope", kind=kind),
                 scopes_required=list(scopes),
                 consent_url=_build_consent_url(server_row, scopes_required=list(scopes)),
             )
@@ -7290,22 +7290,19 @@ def _pool_error_detail(server_row: dict[str, Any], situation: str, *, kind: str 
 
 
 def _consent_missing_detail(server_row: dict[str, Any]) -> str:
-    """Detail for a ``missing`` token lookup (see :func:`_pool_error_detail`)."""
+    """Detail for a ``missing`` token lookup (see :func:`_pool_error_detail`).
+
+    Kept as a named wrapper (unlike the single-use situations, which call
+    :func:`_pool_error_detail` directly) because it has multiple callers.
+    """
     return _pool_error_detail(server_row, "missing")
 
 
-def _refresh_failed_detail(server_row: dict[str, Any]) -> str:
-    """Detail for a permanent ``refresh_failed`` lookup (see :func:`_pool_error_detail`)."""
-    return _pool_error_detail(server_row, "refresh_failed")
-
-
-def _insufficient_scope_detail(server_row: dict[str, Any], kind: str) -> str:
-    """Detail for a 403 insufficient_scope (see :func:`_pool_error_detail`)."""
-    return _pool_error_detail(server_row, "insufficient_scope", kind=kind)
-
-
 def _token_rejected_detail(server_row: dict[str, Any]) -> str:
-    """Detail for a 401 that survived one forced refresh (see :func:`_pool_error_detail`)."""
+    """Detail for a 401 that survived one forced refresh (see :func:`_pool_error_detail`).
+
+    Named wrapper because the three sync dispatchers each surface it.
+    """
     return _pool_error_detail(server_row, "token_rejected")
 
 
@@ -7349,7 +7346,7 @@ def _pool_lookup_error(
         return _structured_error(
             code="mcp_consent_required",
             server=server_name,
-            detail=_refresh_failed_detail(server_row),
+            detail=_pool_error_detail(server_row, "refresh_failed"),
             consent_url=_build_consent_url(server_row),
         )
     # kind == "token"

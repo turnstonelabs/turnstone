@@ -6022,11 +6022,9 @@ async def admin_delete_oidc_identity(request: Request) -> JSONResponse:
                 "admin.oidc_identity.credential_revoke_failed user=%s", user_id, exc_info=True
             )
         try:
-            obo_servers = [
-                row["name"]
-                for row in storage.list_mcp_servers()
-                if row.get("auth_type") == "oauth_obo"
-            ]
+            from turnstone.core.mcp_oauth import obo_server_names
+
+            obo_servers = sorted(obo_server_names(storage))
         except Exception:
             obo_servers = []
             log.warning(
@@ -10576,8 +10574,9 @@ async def admin_update_mcp_server(request: Request) -> JSONResponse:
     # consenting user's OAuth traffic. The persisted OAuth columns must be a pure
     # function of the target auth_type (the create handler enforces the same via
     # ``_oauth_columns_to_clear``). ``oauth_client_secret_ct`` is owned by a
-    # dedicated write path (see below).
-    target_auth = new_auth if new_auth is not None else old_auth
+    # dedicated write path (see below). ``target_auth`` is the effective
+    # post-update auth type — reused below by the write-time validators.
+    target_auth = new_auth if new_auth is not None else (old_auth or "static")
     if is_flip and new_auth is not None and is_user_scoped_auth(new_auth):
         # FLIP into a user-scoped type: the columns whose MEANING differs across
         # oauth_user↔oauth_obo must be recomputed from the body — present → that
@@ -10607,11 +10606,7 @@ async def admin_update_mcp_server(request: Request) -> JSONResponse:
     # oauth_user↔oauth_obo mixes semantically different rows (per-server-AS
     # refresh tokens vs minted cache) and would otherwise leave a live grant at
     # the old AS unrevoked and refresh-bearing rows in the mint cache.
-    auth_type_purge = (
-        new_auth is not None
-        and new_auth != old_auth
-        and (is_user_scoped_auth(old_auth) or is_user_scoped_auth(new_auth))
-    )
+    auth_type_purge = is_flip and (is_user_scoped_auth(old_auth) or is_user_scoped_auth(new_auth))
     # URL change on a pool-backed row needs the same purge: bearer tokens
     # are bound (via OAuth resource / audience) to the URL active at
     # mint/consent time, so sending them to a new URL is a token-binding
@@ -10629,7 +10624,7 @@ async def admin_update_mcp_server(request: Request) -> JSONResponse:
     # only guard the same-type edit here.)
     audience_changing = (
         is_user_scoped_auth(old_auth)
-        and (new_auth is None or new_auth == old_auth)
+        and not is_flip
         and "oauth_audience" in updates
         and (existing.get("oauth_audience") or "") != (updates["oauth_audience"] or "")
     )
@@ -10641,11 +10636,7 @@ async def admin_update_mcp_server(request: Request) -> JSONResponse:
     # edits deliberately do NOT purge (consent scopes bind per-grant at the
     # AS; step-up re-consent handles widening). The no-op normalization
     # above guarantees "in updates" here means a genuine change.
-    scopes_changing = (
-        old_auth == "oauth_obo"
-        and (new_auth is None or new_auth == old_auth)
-        and "oauth_scopes" in updates
-    )
+    scopes_changing = old_auth == "oauth_obo" and not is_flip and "oauth_scopes" in updates
     # Leaving oauth_user (to static/none OR to oauth_obo, which doesn't use the
     # per-server client secret) clears the encrypted secret column below.
     leaving_oauth_user = (
@@ -10654,8 +10645,10 @@ async def admin_update_mcp_server(request: Request) -> JSONResponse:
 
     # bug-2 / sec-1: validate token-store availability and JSON shape BEFORE
     # ``storage.update_mcp_server`` so a missing key doesn't leave partial
-    # column changes persisted.
-    auth_type_now = updates.get("auth_type", existing.get("auth_type", "static"))
+    # column changes persisted. ``target_auth`` (above) is the effective
+    # post-update auth type — one derivation feeds both the column scrub and
+    # these validators so they can't disagree on the row's type.
+    auth_type_now = target_auth
     err_resp = _require_token_store_for_oauth_secret(request, body, auth_type=auth_type_now)
     if err_resp is not None:
         return err_resp

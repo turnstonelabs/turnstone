@@ -1194,12 +1194,16 @@ class TestTokenRejectedDetail:
         (consent_url is None, /start rejects obo). The obo detail names the real
         remedy (an administrator widening access), the oauth_user one keeps the
         step-up re-consent language."""
-        from turnstone.core.mcp_client import _insufficient_scope_detail
+        from turnstone.core.mcp_client import _pool_error_detail
 
-        user_detail = _insufficient_scope_detail({"auth_type": "oauth_user"}, "tool")
+        user_detail = _pool_error_detail(
+            {"auth_type": "oauth_user"}, "insufficient_scope", kind="tool"
+        )
         assert "Re-consent" in user_detail
 
-        obo_detail = _insufficient_scope_detail({"auth_type": "oauth_obo"}, "tool")
+        obo_detail = _pool_error_detail(
+            {"auth_type": "oauth_obo"}, "insufficient_scope", kind="tool"
+        )
         assert "consent" not in obo_detail.lower()
         assert "administrator" in obo_detail.lower()
 

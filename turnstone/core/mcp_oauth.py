@@ -930,7 +930,21 @@ async def _hardened_token_post(
         raise MCPOAuthRefreshFailed(f"{request_label} request failed: {exc}") from exc
 
     if len(resp.content) > _MAX_TOKEN_BODY_BYTES:
-        raise MCPOAuthRefreshFailed(f"{endpoint_label} response body exceeds size limit")
+        # Classify by STATUS without reading the over-sized body (reading it to
+        # pin PERMANENT would defeat the guard). A client-error status — a likely
+        # dead grant — becomes AMBIGUOUS so it still escalates to re-consent after
+        # a streak, rather than the default TRANSIENT that would loop "please
+        # retry" forever on a permanently-dead grant whose error body happened to
+        # exceed the cap.
+        oversized_class = (
+            _RefreshFailureClass.AMBIGUOUS
+            if resp.status_code in (400, 401, 403)
+            else _RefreshFailureClass.TRANSIENT
+        )
+        raise MCPOAuthRefreshFailed(
+            f"{endpoint_label} response body exceeds size limit",
+            failure_class=oversized_class,
+        )
 
     if resp.status_code != 200:
         raise MCPOAuthRefreshFailed(
@@ -3588,6 +3602,24 @@ async def _handle_mcp_oauth_callback_inner(request: Request) -> Response:
     return RedirectResponse(pending["return_url"] or "/", status_code=302)
 
 
+def obo_server_names(storage: StorageBackend) -> set[str]:
+    """Names of all ``auth_type='oauth_obo'`` MCP servers (raises on storage error).
+
+    One definition of "which servers are sign-in passthrough", shared by the
+    connections-list filter (which hides obo cache rows) and the identity-delete
+    cache purge, so a change to how obo is recognised — or a second passthrough
+    auth type — can't leave one path silently missing servers (which would
+    expose obo rows in the connections list, or leave a deprovisioned user's
+    minted-token cache un-purged). Callers wrap their own try/except so each
+    keeps its context-specific fail-open logging.
+    """
+    return {
+        str(row.get("name") or "")
+        for row in storage.list_mcp_servers()
+        if str(row.get("auth_type") or "") == "oauth_obo"
+    }
+
+
 async def handle_mcp_oauth_list_connections(request: Request) -> Response:
     """``GET /v1/api/mcp/oauth/connections``.
 
@@ -3626,12 +3658,7 @@ async def _handle_mcp_oauth_list_connections_inner(request: Request) -> Response
     obo_names: set[str] = set()
     if storage is not None:
         try:
-            servers = await asyncio.to_thread(storage.list_mcp_servers)
-            obo_names = {
-                str(s.get("name") or "")
-                for s in servers
-                if str(s.get("auth_type") or "") == "oauth_obo"
-            }
+            obo_names = await asyncio.to_thread(obo_server_names, storage)
         except Exception:
             obo_names = set()
     return JSONResponse({"connections": [r for r in rows if r["server_name"] not in obo_names]})
