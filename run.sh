@@ -186,15 +186,32 @@ install_docker_ce_repo() {
     esac
 }
 
+# The distro IDs get.docker.com installs directly: it matches $ID against this
+# exact set (ignoring ID_LIKE) and aborts on anything else. Mirrors the dispatch
+# in get.docker.com, including its fedora-asahi-remix -> fedora alias.
+get_docker_com_supports() {
+    case "$1" in
+        ubuntu|debian|raspbian|centos|fedora|rhel|rocky|sles|fedora-asahi-remix) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
 install_docker() {
     case "$PKG" in
         apt|dnf|yum)
-            info "Installing Docker via the official get.docker.com script"
-            # get.docker.com aborts on distros it doesn't recognize by $ID; when it
-            # does, add Docker's repo for the family we detected instead.
-            if ! curl -fsSL https://get.docker.com | $SUDO sh; then
-                warn "get.docker.com doesn't recognize '${OS_ID:-this distro}' — using Docker's repository directly."
+            # Decide up front which installer applies, rather than treating every
+            # get.docker.com failure as "unsupported distro": for an ID it knows,
+            # let it run and surface any real failure (network, apt lock, EOL) via
+            # die instead of masking it with the repo path. Only unrecognized
+            # derivatives (Nobara, Mint, …) — which it would just abort on — skip
+            # straight to adding Docker's repo ourselves.
+            if [ -n "$OS_ID" ] && ! get_docker_com_supports "$OS_ID"; then
+                info "get.docker.com doesn't support '$OS_ID' — using Docker's official repository directly."
                 install_docker_ce_repo
+            else
+                info "Installing Docker via the official get.docker.com script"
+                curl -fsSL https://get.docker.com | $SUDO sh \
+                    || die "get.docker.com failed to install Docker (see the output above). Fix the issue and re-run — the script resumes."
             fi
             ;;
         pacman)
