@@ -101,6 +101,73 @@ def _cmd_create_user(args: argparse.Namespace) -> None:
         print("  (Save this token now — it cannot be retrieved again)")
 
 
+def _cmd_create_admin(args: argparse.Namespace) -> None:
+    """Create an admin user (or promote an existing one) with full access.
+
+    Unlike ``create-user`` — which creates a role-less user that logs into the
+    web UI read-only — this assigns the built-in admin role, mirroring the web
+    first-run setup wizard (``POST /api/auth/setup``).  Use it for headless
+    installs, or to unstick a ``create-user`` account that logs in only to hit
+    "Forbidden: token lacks 'approve' scope".
+    """
+    import getpass
+
+    from turnstone.core.auth import hash_password, is_valid_username
+
+    if not is_valid_username(args.username):
+        print("Error: invalid username (1-64 chars: letters, digits, . _ -)", file=sys.stderr)
+        sys.exit(1)
+
+    storage = _get_storage(args)
+
+    # The admin role is seeded by DB migrations; without it we'd leave the
+    # account read-only — the exact lockout this command exists to prevent.
+    if storage.get_role("builtin-admin") is None:
+        print(
+            "Error: the built-in admin role is missing — run database migrations first.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    # Promote an existing user (recovery path: create-user assigns no role).
+    existing = storage.get_user_by_username(args.username)
+    if existing is not None:
+        user_id = existing["user_id"]
+        already_admin = any(
+            r.get("role_id") == "builtin-admin" for r in storage.list_user_roles(user_id)
+        )
+        storage.assign_role(user_id, "builtin-admin", "")
+        if already_admin:
+            print(f"User '{args.username}' is already an admin (user {user_id}); no change.")
+        else:
+            print(f"Granted the admin role to existing user '{args.username}' (user {user_id}).")
+            print("  Log out and back in for the new access to take effect.")
+        return
+
+    # Create a fresh admin user.
+    password = args.password
+    if not password:
+        password = getpass.getpass("Password: ")
+        confirm = getpass.getpass("Confirm password: ")
+        if password != confirm:
+            print("Error: passwords do not match", file=sys.stderr)
+            sys.exit(1)
+    # Match the web setup wizard's floor for the most privileged account.
+    if len(password) < 8:
+        print("Error: password must be at least 8 characters", file=sys.stderr)
+        sys.exit(1)
+
+    display_name = args.name or args.username
+    user_id = uuid.uuid4().hex
+    pw_hash = hash_password(password)
+    storage.create_user(user_id, args.username, display_name, pw_hash)
+    storage.assign_role(user_id, "builtin-admin", "")
+    print(f"Created admin user: {user_id}")
+    print(f"  Username: {args.username}")
+    print(f"  Name: {display_name}")
+    print("  Role: admin (full access)")
+
+
 def _cmd_create_token(args: argparse.Namespace) -> None:
     from turnstone.core.auth import (
         generate_token,
@@ -596,6 +663,18 @@ def main() -> None:
     p_cu.add_argument("--token", action="store_true", help="Also create an initial API token")
     p_cu.add_argument("--scopes", default="read,write,approve", help="Scopes for initial token")
 
+    p_ca = sub.add_parser(
+        "create-admin",
+        help="Create an admin user (or promote an existing one) with full access",
+    )
+    p_ca.add_argument("--username", required=True, help="Login username")
+    p_ca.add_argument("--name", default="", help="Display name (defaults to the username)")
+    p_ca.add_argument(
+        "--password",
+        default="",
+        help="Password (prompted if omitted; ignored when promoting an existing user)",
+    )
+
     p_ct = sub.add_parser("create-token", help="Create an API token for a user")
     p_ct.add_argument("--user", required=True, help="User ID")
     p_ct.add_argument("--name", default="", help="Human label for the token")
@@ -690,6 +769,7 @@ def main() -> None:
 
     dispatch = {
         "create-user": _cmd_create_user,
+        "create-admin": _cmd_create_admin,
         "create-token": _cmd_create_token,
         "list-users": _cmd_list_users,
         "list-tokens": _cmd_list_tokens,

@@ -366,11 +366,14 @@ ${GREEN}${BOLD}Turnstone is running${RESET} (${NODE_COUNT} node$([ "$NODE_COUNT"
               ${DIM}cd $INSTALL_DIR && $DOCKER compose exec caddy cat /data/caddy/pki/authorities/local/root.crt${RESET}
 
   Finish setup
-    1. Create the first admin user:
-       ${DIM}cd $INSTALL_DIR && $DOCKER compose exec node-1 turnstone-admin create-user --username admin --name "Admin"${RESET}
-    2. Open ${url}, log in, and add a model backend in the ${BOLD}Models${RESET} tab —
+    1. Open ${BOLD}${url}${RESET} and create the admin account when prompted —
+       the first user created there gets full admin access.
+    2. Log in, then add a model backend in the ${BOLD}Models${RESET} tab —
        a local server (vLLM / llama.cpp) or an OpenAI / Anthropic / Gemini key.
        Nodes boot without a model and pick it up live; no restart needed.
+
+    ${DIM}No browser? Create the admin from the CLI instead:
+    cd $INSTALL_DIR && $DOCKER compose exec node-1 turnstone-admin create-admin --username admin --name "Admin"${RESET}
 
   Scale       Running ${scale}
 
