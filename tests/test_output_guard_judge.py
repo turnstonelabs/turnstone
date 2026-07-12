@@ -15,6 +15,7 @@ from turnstone.core.output_guard_judge import (
     OutputJudgeVerdict,
     _extract_json,
 )
+from turnstone.core.providers._protocol import ModelCapabilities
 
 
 def _make_provider(
@@ -66,6 +67,76 @@ def _make_judge(
     )
     judge._create_client = lambda: client  # type: ignore[method-assign]
     return judge
+
+
+class TestCapabilityThreading:
+    """#823: the output-guard judge threads resolved capabilities to
+    create_completion, like every other create_completion caller."""
+
+    @staticmethod
+    def _recording_provider() -> tuple[Any, dict[str, Any]]:
+        captured: dict[str, Any] = {}
+
+        def _cc(**kwargs: Any) -> Any:
+            captured.update(kwargs)
+            result = MagicMock()
+            result.content = '{"risk_level": "none", "flags": []}'
+            return result
+
+        provider = MagicMock()
+        provider.provider_name = "openai"
+        provider.get_capabilities = MagicMock(
+            return_value=ModelCapabilities(context_window=200_000)
+        )
+        provider.create_completion = MagicMock(side_effect=_cc)
+        return provider, captured
+
+    def test_fallback_threads_session_capabilities(self) -> None:
+        provider, captured = self._recording_provider()
+        sess_caps = ModelCapabilities(context_window=40_000, effort_passthrough=True)
+        client = MagicMock(base_url="http://s", api_key="k")
+        judge = OutputGuardJudge(
+            config=JudgeConfig(output_guard_llm=True),  # no alias → fallback
+            session_provider=provider,
+            session_client=client,
+            session_model="m",
+            session_capabilities=sess_caps,
+        )
+        judge._create_client = lambda: client  # type: ignore[method-assign]
+        assert judge._capabilities is sess_caps
+        v = judge.evaluate("a small, safe output", func_name="bash", call_id="c1")
+        assert v.succeeded
+        assert captured["capabilities"] is sess_caps
+
+    def test_alias_merges_operator_capabilities(self) -> None:
+        provider, captured = self._recording_provider()
+        provider.get_capabilities = MagicMock(return_value=ModelCapabilities(supports_tools=True))
+        cfg = MagicMock()
+        cfg.context_window = 64_000
+        cfg.capabilities = {"supports_tools": False}
+        registry = MagicMock()
+        registry.has_alias.return_value = True
+        registry.resolve.return_value = (
+            MagicMock(base_url="http://a", api_key="k"),
+            "local-9b",
+            cfg,
+        )
+        registry.get_provider.return_value = provider
+        client = MagicMock(base_url="http://s", api_key="k")
+        judge = OutputGuardJudge(
+            config=JudgeConfig(output_guard_llm=True, output_guard_model="og"),
+            session_provider=_make_provider(),
+            session_client=client,
+            session_model="m",
+            session_capabilities=MagicMock(context_window=100_000),
+            model_registry=registry,
+        )
+        judge._create_client = lambda: client  # type: ignore[method-assign]
+        assert judge._capabilities.supports_tools is False  # operator override applied
+        v = judge.evaluate("a small, safe output", func_name="bash", call_id="c1")
+        assert v.succeeded
+        assert captured["capabilities"] is judge._capabilities
+        assert captured["capabilities"].supports_tools is False
 
 
 class TestVerdictDataclass:
@@ -291,14 +362,16 @@ class TestOversizeGuard:
             session_provider=provider,
             session_client=MagicMock(base_url="http://test", api_key="k"),
             session_model="test-model",
-            context_window=40_000,  # the session's real window
+            # The session's real window rides in the resolved caps the caller
+            # passes; the guard must key off it, not provider.get_capabilities().
+            session_capabilities=MagicMock(context_window=40_000),
         )
         assert judge._judge_context_window == 40_000
 
     def test_zero_window_coerced_away_on_both_paths(self) -> None:
         """A config.toml context_window=0 (present but unusable) must not zero
         the guard: coerce to the session window (alias path) / the default."""
-        from turnstone.core.output_guard_judge import _DEFAULT_JUDGE_CONTEXT_WINDOW
+        from turnstone.core.judge import _DEFAULT_JUDGE_CONTEXT_WINDOW
 
         # Alias path: ModelConfig.context_window == 0 → session window.
         cfg = MagicMock()
@@ -313,7 +386,7 @@ class TestOversizeGuard:
             session_client=MagicMock(base_url="http://s", api_key="s"),
             session_model="m",
             model_registry=registry,
-            context_window=64_000,
+            session_capabilities=MagicMock(context_window=64_000),
         )
         assert alias_judge._judge_context_window == 64_000
 

@@ -71,7 +71,7 @@ def _make_judge(
         session_provider=provider,
         session_client=client,
         session_model="test-model",
-        context_window=100_000,
+        session_capabilities=MagicMock(context_window=100_000),
     )
 
 
@@ -892,14 +892,82 @@ class TestModelAliasResolution:
         alias_provider: MagicMock,
         alias_client: MagicMock,
         underlying_model: str,
+        *,
+        capabilities: dict[str, Any] | None = None,
     ) -> MagicMock:
         registry = MagicMock()
         cfg = MagicMock()
         cfg.context_window = 50_000
+        cfg.capabilities = capabilities if capabilities is not None else {}
         registry.has_alias.side_effect = lambda a: a == alias
         registry.resolve.return_value = (alias_client, underlying_model, cfg)
         registry.get_provider.return_value = alias_provider
         return registry
+
+    def test_alias_capabilities_merged_and_threaded_to_wire(self):
+        """#823: a judge alias's model-definition ``capabilities`` are merged
+        onto the provider base AND passed to ``create_completion`` — the same
+        contract as the session / utility / sub-agent lanes.  Without threading,
+        operator overrides (effort passthrough, tool support) were silently
+        ignored on judge calls; deleting ``capabilities=self._capabilities`` from
+        the call site, or breaking the merge, must fail here."""
+        from turnstone.core.providers._protocol import ModelCapabilities
+
+        base = ModelCapabilities(supports_tools=True, effort_passthrough=False)
+        alias_provider = _make_mock_provider(response_content=_good_verdict_json())
+        alias_provider.get_capabilities = MagicMock(return_value=base)
+        registry = self._make_alias_registry(
+            "judge-mini",
+            alias_provider,
+            MagicMock(base_url="https://a/v1", api_key="k"),
+            "local-9b",
+            capabilities={"supports_tools": False, "effort_passthrough": True},
+        )
+        judge = IntentJudge(
+            config=JudgeConfig(enabled=True, model="judge-mini"),
+            session_provider=_make_mock_provider(),
+            session_client=MagicMock(base_url="https://s/v1", api_key="s"),
+            session_model="session-model",
+            session_capabilities=MagicMock(context_window=100_000),
+            model_registry=registry,
+        )
+        # Merged at construction: overrides applied, untouched fields survive.
+        assert judge._capabilities.supports_tools is False
+        assert judge._capabilities.effort_passthrough is True
+        assert judge._capabilities.context_window == base.context_window
+        # ...and the SAME merged object reaches the wire.
+        judge._evaluate_single(
+            _make_item(),
+            [{"role": "user", "content": "x"}],
+            cancel_event=None,
+            client=MagicMock(),
+        )
+        passed = alias_provider.create_completion.call_args.kwargs["capabilities"]
+        assert passed is judge._capabilities
+
+    def test_fallback_threads_session_capabilities_to_wire(self):
+        """No judge alias → the judge inherits the session model AND the
+        session's resolved capabilities, threaded to ``create_completion``."""
+        from turnstone.core.providers._protocol import ModelCapabilities
+
+        sess_caps = ModelCapabilities(context_window=54_321, effort_passthrough=True)
+        provider = _make_mock_provider(response_content=_good_verdict_json())
+        judge = IntentJudge(
+            config=JudgeConfig(enabled=True, model=""),  # no alias → fallback
+            session_provider=provider,
+            session_client=MagicMock(base_url="https://s/v1", api_key="s"),
+            session_model="session-model",
+            session_capabilities=sess_caps,
+        )
+        assert judge._capabilities is sess_caps
+        assert judge._judge_context_window == 54_321
+        judge._evaluate_single(
+            _make_item(),
+            [{"role": "user", "content": "x"}],
+            cancel_event=None,
+            client=MagicMock(),
+        )
+        assert provider.create_completion.call_args.kwargs["capabilities"] is sess_caps
 
     def test_alias_uses_registry_provider_not_session_provider(self):
         """Judge with model=alias should resolve via registry — provider, client,
@@ -932,7 +1000,6 @@ class TestModelAliasResolution:
             session_provider=session_provider,
             session_client=session_client,
             session_model="session-default-model",
-            context_window=100_000,
             model_registry=registry,
         )
 
@@ -959,7 +1026,6 @@ class TestModelAliasResolution:
             session_provider=_make_mock_provider(),
             session_client=MagicMock(base_url="https://s/v1", api_key="s"),
             session_model="session-model",
-            context_window=100_000,
             model_registry=registry,
         )
         assert judge._judge_context_window == 50_000
@@ -980,7 +1046,7 @@ class TestModelAliasResolution:
             session_provider=_make_mock_provider(),
             session_client=MagicMock(base_url="http://s", api_key="s"),
             session_model="session-model",
-            context_window=100_000,
+            session_capabilities=MagicMock(context_window=100_000),
             model_registry=registry,
         )
         assert judge._judge_context_window == 100_000  # session window, not 0
@@ -1008,7 +1074,7 @@ class TestModelAliasResolution:
             session_provider=session_provider,
             session_client=session_client,
             session_model="session-default-model",
-            context_window=100_000,
+            session_capabilities=MagicMock(context_window=100_000),
             model_registry=registry,
         )
 
@@ -1031,7 +1097,6 @@ class TestModelAliasResolution:
             session_provider=session_provider,
             session_client=session_client,
             session_model="session-default-model",
-            context_window=100_000,
         )
 
         assert judge._provider is session_provider
