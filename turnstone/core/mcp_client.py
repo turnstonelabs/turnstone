@@ -2535,7 +2535,7 @@ class MCPClientManager:
         """
         if not user_id or self._loop is None:
             return
-        if not (self._oauth_user_server_names or self._obo_server_names):
+        if not self._pool_server_names:
             return
         if self._app_state is None or self._storage is None:
             return
@@ -2649,7 +2649,7 @@ class MCPClientManager:
             finally:
                 self._priming_keys.discard(key)
 
-        prime_names = self._oauth_user_server_names | self._obo_server_names
+        prime_names = self._pool_server_names
         if self._obo_server_names:
             # One raw existence SELECT (no decrypt) decides ALL obo servers for
             # this user: a user with no captured credential — a local-auth
@@ -4675,7 +4675,7 @@ class MCPClientManager:
         result: dict[str, dict[str, Any]] = {}
         for name in list(self._server_configs):
             result[name] = self.get_server_status(name, user_id, aggregate=aggregate)
-        for name in list(self._oauth_user_server_names | self._obo_server_names):
+        for name in list(self._pool_server_names):
             if name not in result:
                 result[name] = self.get_server_status(name, user_id, aggregate=aggregate)
         return result
@@ -4934,6 +4934,17 @@ class MCPClientManager:
         one definition over the two per-auth-type registries.
         """
         return self.server_auth_type(server_name) is not None
+
+    @property
+    def _pool_server_names(self) -> set[str]:
+        """Union of the per-auth-type pool registries (oauth_user + oauth_obo).
+
+        The set-level counterpart to :meth:`_is_pool_server`, so the iteration
+        sites (priming, keep-hot sweep, status) share ONE definition of "which
+        servers are pool-backed" — a future third pool-backed auth type is added
+        in one place instead of being missed at an ad-hoc inline union.
+        """
+        return self._oauth_user_server_names | self._obo_server_names
 
     @property
     def server_count(self) -> int:
@@ -7221,77 +7232,74 @@ def _build_consent_url(
     return f"/v1/api/mcp/oauth/start?{qs}"
 
 
-def _consent_missing_detail(server_row: dict[str, Any]) -> str:
-    """User-facing detail for a ``missing`` token lookup, per auth model.
+# User-facing remediation copy for every (auth model, failure situation) a
+# pool-backed dispatch can surface. Consolidated into ONE table so the
+# oauth_user-vs-oauth_obo split lives in a single place instead of a branch
+# fanned across four helpers: a lookup situation that must show obo re-login /
+# admin guidance can't silently keep oauth_user's "re-consent at a per-server
+# flow that doesn't exist for obo" copy — the exact wrong-remediation bug this
+# feature's review caught repeatedly. ``{kind}`` / ``{kind_cap}`` are filled per
+# call (only the insufficient_scope rows use them; other rows ignore them).
+_POOL_ERROR_DETAIL: dict[tuple[str, str], str] = {
+    ("oauth_user", "missing"): "No token for user. Consent flow required.",
+    ("oauth_obo", "missing"): (
+        "No sign-in credential for this account. Sign in to Turnstone again to reconnect."
+    ),
+    ("oauth_user", "refresh_failed"): "Refresh token rejected. Re-consent required.",
+    ("oauth_obo", "refresh_failed"): (
+        "Sign-in credential was rejected for this server. Sign in to Turnstone "
+        "again; if it keeps failing, your administrator may need to grant access."
+    ),
+    ("oauth_user", "insufficient_scope"): (
+        "{kind_cap} requires elevated scopes. Re-consent flow with new scopes required."
+    ),
+    ("oauth_obo", "insufficient_scope"): (
+        "This {kind} needs additional permissions your sign-in token does not "
+        "carry. Ask your administrator to grant the required access (add the "
+        "scope to the server, or widen your delegated permissions at the "
+        "identity provider)."
+    ),
+    ("oauth_user", "token_rejected"): "Refreshed token still rejected. Re-consent required.",
+    ("oauth_obo", "token_rejected"): (
+        "Server rejected a freshly issued sign-in token. This usually means the "
+        "server's audience setting doesn't match what the server expects — ask "
+        "your administrator to check it."
+    ),
+}
 
-    ``oauth_obo`` has no per-server consent flow — the missing thing is the
-    user's captured sign-in credential, so the affordance is a re-login
-    (``_build_consent_url`` already returns None for these servers, so no
-    per-server Connect button is advertised).
+
+def _pool_error_detail(server_row: dict[str, Any], situation: str, *, kind: str = "") -> str:
+    """Remediation copy for *situation* on *server_row*, chosen by auth model.
+
+    Single lookup into :data:`_POOL_ERROR_DETAIL` — the ONE place the
+    oauth_user-vs-oauth_obo decision is made — so no dispatch site can pair a
+    situation with the wrong auth model's copy. ``oauth_obo`` rows never have a
+    per-server consent flow (``_build_consent_url`` returns None), so their copy
+    points at a re-login / administrator remedy rather than a dead-end consent
+    card; everything else is treated as ``oauth_user``.
     """
-    if server_row.get("auth_type") == "oauth_obo":
-        return "No sign-in credential for this account. Sign in to Turnstone again to reconnect."
-    return "No token for user. Consent flow required."
+    model = "oauth_obo" if server_row.get("auth_type") == "oauth_obo" else "oauth_user"
+    return _POOL_ERROR_DETAIL[(model, situation)].format(kind=kind, kind_cap=kind.capitalize())
+
+
+def _consent_missing_detail(server_row: dict[str, Any]) -> str:
+    """Detail for a ``missing`` token lookup (see :func:`_pool_error_detail`)."""
+    return _pool_error_detail(server_row, "missing")
 
 
 def _refresh_failed_detail(server_row: dict[str, Any]) -> str:
-    """User-facing detail for a ``refresh_failed`` (permanent) lookup, per auth model.
-
-    For ``oauth_obo`` there is no per-server consent to redo and
-    ``_build_consent_url`` returns None, so "re-consent required" is a dead end —
-    the remedy is an admin tenant-grant fix or a re-login. Point the user there
-    instead of at a consent flow that does not exist for this auth type.
-    """
-    if server_row.get("auth_type") == "oauth_obo":
-        return (
-            "Sign-in credential was rejected for this server. Sign in to Turnstone "
-            "again; if it keeps failing, your administrator may need to grant access."
-        )
-    return "Refresh token rejected. Re-consent required."
+    """Detail for a permanent ``refresh_failed`` lookup (see :func:`_pool_error_detail`)."""
+    return _pool_error_detail(server_row, "refresh_failed")
 
 
 def _insufficient_scope_detail(server_row: dict[str, Any], kind: str) -> str:
-    """User-facing detail for a 403 insufficient_scope, per auth model.
-
-    ``oauth_user``: a per-server step-up re-consent with the widened scope set
-    is the remedy (``_build_consent_url`` attaches the affordance). ``oauth_obo``:
-    there is no per-server consent flow — the minted token's scopes come from
-    the user's captured sign-in (entra: the app's delegated permissions;
-    rfc8693: the server's configured ``oauth_scopes``), so a user-driven
-    step-up is impossible (``_build_consent_url`` returns None). Point at the
-    real fix — an administrator widening access — instead of a dead-end
-    re-consent card.
-    """
-    if server_row.get("auth_type") == "oauth_obo":
-        return (
-            f"This {kind} needs additional permissions your sign-in token does not "
-            "carry. Ask your administrator to grant the required access (add the "
-            "scope to the server, or widen your delegated permissions at the "
-            "identity provider)."
-        )
-    return (
-        f"{kind.capitalize()} requires elevated scopes. Re-consent flow with new scopes required."
-    )
+    """Detail for a 403 insufficient_scope (see :func:`_pool_error_detail`)."""
+    return _pool_error_detail(server_row, "insufficient_scope", kind=kind)
 
 
 def _token_rejected_detail(server_row: dict[str, Any]) -> str:
-    """User-facing detail for a 401 that survived one forced refresh (retry ceiling).
-
-    ``oauth_user``: the freshly refreshed bearer was rejected — per-server
-    re-consent is the actionable remedy (``_build_consent_url`` attaches the
-    Connect affordance). ``oauth_obo``: the bearer was JUST minted from the
-    captured credential and there is no per-server consent flow
-    (``_build_consent_url`` returns None), so "re-consent required" is a dead
-    end — the realistic causes are server-side (audience mismatch, upstream
-    auth misconfig, clock skew), so point at the administrator instead.
-    """
-    if server_row.get("auth_type") == "oauth_obo":
-        return (
-            "Server rejected a freshly issued sign-in token. This usually means the "
-            "server's audience setting doesn't match what the server expects — ask "
-            "your administrator to check it."
-        )
-    return "Refreshed token still rejected. Re-consent required."
+    """Detail for a 401 that survived one forced refresh (see :func:`_pool_error_detail`)."""
+    return _pool_error_detail(server_row, "token_rejected")
 
 
 def _pool_lookup_error(

@@ -1435,6 +1435,21 @@ def _refresh_backoff_state(app_state: Any, user_id: str, server_name: str) -> _R
     return state
 
 
+def _arm_cooldown(app_state: Any, user_id: str, server_name: str) -> _RefreshBackoffState:
+    """Stamp the per-(user, server) transient-failure cooldown clock to now.
+
+    Single definition of the "back off this pair" operation (previously written
+    inline at every failure site) so a change to how the cooldown is armed —
+    jitter, a min-interval, a second timestamp — is one edit, not four, and a
+    missed site can't silently keep hammering the AS/IdP on that path. Returns
+    the backoff state so a caller that also mutates the ambiguous streak reuses
+    the same object instead of re-fetching it.
+    """
+    state = _refresh_backoff_state(app_state, user_id, server_name)
+    state.last_failure_monotonic = time.monotonic()
+    return state
+
+
 def _clear_refresh_backoff(app_state: Any, user_id: str, server_name: str) -> None:
     """Drop the backoff state for ``(user_id, server_name)``.
 
@@ -1687,15 +1702,12 @@ async def _handle_refresh_failure(
         if arm_cooldown_on_permanent:
             # _revoke_after_refresh_failure cleared the backoff; re-arm the
             # cooldown as the terminal backstop for the surviving credential.
-            _refresh_backoff_state(
-                app_state, user_id, server_name
-            ).last_failure_monotonic = time.monotonic()
+            _arm_cooldown(app_state, user_id, server_name)
         return result
     # Transient or ambiguous: keep the token (a blip must never revoke a
     # user's consent) and arm the cooldown so a down AS isn't hit on
     # every later dispatch.
-    backoff = _refresh_backoff_state(app_state, user_id, server_name)
-    backoff.last_failure_monotonic = time.monotonic()
+    backoff = _arm_cooldown(app_state, user_id, server_name)
     if exc.failure_class is _RefreshFailureClass.AMBIGUOUS:
         backoff.ambiguous_streak += 1
         if backoff.ambiguous_streak >= _AMBIGUOUS_ESCALATION_THRESHOLD:
@@ -2383,9 +2395,7 @@ async def get_obo_access_token_classified(
         # on the next tick after the window lapses. (The write path also rejects
         # audience-less oauth_obo rows, so this branch is normally a typo'd
         # grant profile, not a common state.)
-        _refresh_backoff_state(
-            app_state, user_id, server_name
-        ).last_failure_monotonic = time.monotonic()
+        _arm_cooldown(app_state, user_id, server_name)
         log.error(
             "mcp_server.oauth.obo_misconfigured",
             server_name=server_name,
@@ -2396,12 +2406,16 @@ async def get_obo_access_token_classified(
         return TokenLookupResult(kind="refresh_failed_transient")
     issuer = str(getattr(oidc_config, "issuer", ""))
 
-    credential_result = await _read_obo_credential(
-        app_state, token_store, user_id, server_name, issuer
-    )
-    if isinstance(credential_result, TokenLookupResult):
-        return credential_result  # missing or decrypt_failure
-    # credential present (unlocked pre-check; re-read authoritatively under lock)
+    # Cheap pre-lock presence check: a raw existence read (NO decrypt) is enough
+    # to short-circuit the common "no captured credential" case before taking
+    # the pg advisory lock. The authoritative decrypt happens exactly once under
+    # the lock (credential2 below), where decrypt_failure is already classified —
+    # so the refresh token is never Fernet-decrypted twice per mint (which, at
+    # session-start priming across N obo servers, was N redundant decrypts per
+    # user). Mirrors the raw existence guard the priming path already uses.
+    if await asyncio.to_thread(storage.get_oidc_user_credential, user_id, issuer) is None:
+        # No captured credential → the consent affordance is a re-login.
+        return _no_token_result(app_state, user_id, server_name, TokenLookupResult(kind="missing"))
 
     lock = _refresh_lock_for(app_state, user_id, server_name)
     credential_key = f"__obo__:{issuer}"
@@ -2507,8 +2521,7 @@ async def get_obo_access_token_classified(
 
         access_token = tokens.get("access_token")
         if not isinstance(access_token, str) or not access_token:
-            backoff = _refresh_backoff_state(app_state, user_id, server_name)
-            backoff.last_failure_monotonic = time.monotonic()
+            backoff = _arm_cooldown(app_state, user_id, server_name)
             # A malformed 200 is a clean transient (not a dead grant): reset the
             # ambiguous streak, matching the sibling's _refresh_and_persist path.
             backoff.ambiguous_streak = 0
