@@ -2451,9 +2451,12 @@ async def get_obo_access_token_classified(
         from turnstone.core.oidc import maybe_rediscover_oidc
 
         await maybe_rediscover_oidc(app_state)
+        # Re-read only the DISCOVERY-derived state (enabled / token_endpoint) that
+        # rediscovery can change. ``obo_grant_profile`` is a static config field
+        # rediscovery never touches, so ``profile`` / ``mint`` computed above still
+        # hold — recomputing them would be dead work implying the profile can
+        # change across a heal (it cannot).
         oidc_config = getattr(app_state, "oidc_config", None)
-        profile = str(getattr(oidc_config, "obo_grant_profile", "") or "")
-        mint = _OBO_MINT_LEGS.get(profile)
     if (
         oidc_config is None
         or not getattr(oidc_config, "enabled", False)
