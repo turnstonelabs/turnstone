@@ -1,0 +1,579 @@
+"""Unit tests for the single-credential OBO mint engine (issue #551).
+
+Covers ``get_obo_access_token_classified`` and its grant legs
+(``_obo_mint_entra`` / ``_obo_mint_rfc8693``) in ``turnstone/core/mcp_oauth.py``.
+
+Request-body assertions follow the spike-verified wire shapes in
+BRIEFING.md ("Verified wire shapes") — every mock asserts the EXACT form
+payload posted to the IdP token endpoint (body-inspecting, not
+call-counting):
+
+- entra: ONE refresh-token grant carrying ``scope=<audience>/.default``
+  (or the per-server ``oauth_scopes`` override verbatim);
+- rfc8693: a refresh grant (NO scope key) for a subject token, then a
+  token-exchange grant with ``audience=<server oauth_audience>`` and the
+  per-server scope only when configured.
+
+Semantics pinned here:
+
+- minted tokens cache in ``mcp_user_tokens`` with ``refresh_token_ct``
+  NULL (cache, not custody);
+- rotation write-back persists the newest IdP refresh token on the
+  shared credential;
+- a PERMANENT rejection (AADSTS65001-style ``invalid_grant``) drops ONLY
+  the per-server cache row — the shared credential is NEVER auto-deleted,
+  so one mis-granted server cannot lock the user out of the rest;
+- transient failures keep everything and arm the per-(user, server)
+  cooldown that short-circuits the next attempt without an IdP call;
+- misconfiguration (unusable grant profile / missing audience) is
+  loud-but-retryable: ``refresh_failed_transient`` with zero IdP
+  round-trips and no exception.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import json
+from datetime import UTC, datetime, timedelta
+from types import SimpleNamespace
+from typing import Any
+from unittest.mock import AsyncMock, MagicMock
+
+import httpx
+import pytest
+
+from tests.conftest import make_mcp_token_cipher
+from turnstone.core.mcp_crypto import MCPTokenStore
+from turnstone.core.mcp_oauth import get_obo_access_token_classified
+from turnstone.core.oidc import OIDCConfig
+from turnstone.core.storage._sqlite import SQLiteBackend
+
+USER = "user-1"
+SERVER = "srv-obo"
+SERVER_ID = "srv-obo-id"
+ISSUER = "https://idp.test"
+TOKEN_ENDPOINT = "https://idp.test/token"
+AUDIENCE = "api://aud-a"
+
+_ISO = "%Y-%m-%dT%H:%M:%S"
+
+
+# ---------------------------------------------------------------------------
+# Fixtures / builders
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def storage(tmp_path: Any) -> SQLiteBackend:
+    return SQLiteBackend(str(tmp_path / "test.db"))
+
+
+def _make_oidc_config(**overrides: Any) -> OIDCConfig:
+    """Real ``OIDCConfig`` for the OBO engine (``obo_grant_profile`` defaults
+    to ``"entra"`` on the dataclass; tests override it explicitly)."""
+    defaults: dict[str, Any] = {
+        "enabled": True,
+        "issuer": ISSUER,
+        "client_id": "cid",
+        "client_secret": "csecret",
+        "token_endpoint": TOKEN_ENDPOINT,
+    }
+    defaults.update(overrides)
+    return OIDCConfig(**defaults)
+
+
+def _make_app_state(
+    storage: SQLiteBackend,
+    *,
+    http_client: httpx.AsyncClient,
+    oidc_config: OIDCConfig,
+) -> SimpleNamespace:
+    return SimpleNamespace(
+        auth_storage=storage,
+        mcp_token_store=MCPTokenStore(storage, make_mcp_token_cipher(), node_id="test"),
+        oidc_config=oidc_config,
+        oidc_http_client=http_client,
+        mcp_oauth_refresh_locks={},
+    )
+
+
+def _seed_obo_server(
+    storage: SQLiteBackend,
+    *,
+    oauth_scopes: str | None = None,
+    oauth_audience: str | None = AUDIENCE,
+) -> None:
+    storage.create_mcp_server(
+        server_id=SERVER_ID,
+        name=SERVER,
+        transport="streamable-http",
+        url="https://mcp.example.com/mcp",
+        auth_type="oauth_obo",
+        oauth_scopes=oauth_scopes,
+        oauth_audience=oauth_audience,
+    )
+
+
+def _seed_credential(state: SimpleNamespace, *, refresh_token: str = "rt-1") -> None:
+    state.mcp_token_store.upsert_oidc_credential(USER, ISSUER, refresh_token=refresh_token)
+
+
+def _seed_cache_row(
+    state: SimpleNamespace,
+    *,
+    expires_in_seconds: int,
+    access_token: str = "cached-at",
+) -> None:
+    expires_at = (datetime.now(UTC) + timedelta(seconds=expires_in_seconds)).strftime(_ISO)
+    state.mcp_token_store.create_user_token(
+        USER,
+        SERVER,
+        access_token=access_token,
+        refresh_token=None,
+        expires_at=expires_at,
+        scopes=None,
+        as_issuer=ISSUER,
+        audience=AUDIENCE,
+    )
+
+
+def _mk_response(status_code: int = 200, json_body: Any = None) -> MagicMock:
+    resp = MagicMock(spec=httpx.Response)
+    resp.status_code = status_code
+    resp.headers = {}
+    body = "" if json_body is None else str(json_body)
+    resp.content = body.encode("utf-8")
+    if json_body is not None:
+        resp.json.return_value = json_body
+    else:
+        resp.json.side_effect = ValueError("no body")
+    resp.text = body
+    return resp
+
+
+def _mint(state: SimpleNamespace) -> Any:
+    async def _run() -> Any:
+        return await get_obo_access_token_classified(
+            app_state=state, user_id=USER, server_name=SERVER
+        )
+
+    return asyncio.run(_run())
+
+
+# ---------------------------------------------------------------------------
+# entra leg — one RT redemption with scope=<audience>/.default
+# ---------------------------------------------------------------------------
+
+
+class TestEntraLeg:
+    def test_happy_path_mints_with_default_scope_and_caches(self, storage: SQLiteBackend) -> None:
+        """Case 1: one POST with the exact spike-verified Entra body; the mint
+        caches as a refresh-less ``mcp_user_tokens`` row with ``as_issuer`` /
+        ``audience`` populated and ``expires_at`` derived from ``expires_in``."""
+        _seed_obo_server(storage)  # empty oauth_scopes → scope falls back to /.default
+        client = MagicMock(spec=httpx.AsyncClient)
+        client.post = AsyncMock(
+            return_value=_mk_response(200, {"access_token": "at-minted", "expires_in": 3600})
+        )
+        state = _make_app_state(storage, http_client=client, oidc_config=_make_oidc_config())
+        _seed_credential(state)
+        before = datetime.now(UTC)
+
+        result = _mint(state)
+
+        assert result.kind == "token"
+        assert result.token == "at-minted"
+        # Exact wire shape (BRIEFING.md, Entra redemption) — full-dict equality
+        # also proves no stray keys (no resource=, no audience=) rode along.
+        assert client.post.call_count == 1
+        call = client.post.call_args
+        assert call.args == (TOKEN_ENDPOINT,)
+        assert call.kwargs["data"] == {
+            "grant_type": "refresh_token",
+            "refresh_token": "rt-1",
+            "client_id": "cid",
+            "client_secret": "csecret",
+            "scope": f"{AUDIENCE}/.default",
+        }
+        # Cache row: refresh-less (cache, not custody), issuer/audience stamped.
+        raw = storage.get_mcp_user_token(USER, SERVER)
+        assert raw is not None
+        assert raw["refresh_token_ct"] is None
+        assert raw["as_issuer"] == ISSUER
+        assert raw["audience"] == AUDIENCE
+        assert raw["expires_at"] is not None
+        expires = datetime.strptime(raw["expires_at"], _ISO).replace(tzinfo=UTC)
+        remaining = expires - before
+        assert timedelta(seconds=3500) <= remaining <= timedelta(seconds=3601)
+        plain = state.mcp_token_store.get_user_token(USER, SERVER)
+        assert plain is not None
+        assert plain["access_token"] == "at-minted"
+        assert plain["refresh_token"] is None
+
+    def test_per_server_oauth_scopes_override_replaces_default_scope(
+        self, storage: SQLiteBackend
+    ) -> None:
+        """Case 2: a server row with ``oauth_scopes`` set sends that value
+        verbatim as ``scope`` — NOT the ``<audience>/.default`` fallback."""
+        _seed_obo_server(storage, oauth_scopes="custom.scope")
+        client = MagicMock(spec=httpx.AsyncClient)
+        client.post = AsyncMock(
+            return_value=_mk_response(200, {"access_token": "at-minted", "expires_in": 3600})
+        )
+        state = _make_app_state(storage, http_client=client, oidc_config=_make_oidc_config())
+        _seed_credential(state)
+
+        result = _mint(state)
+
+        assert result.kind == "token"
+        assert client.post.call_count == 1
+        call = client.post.call_args
+        assert call.args == (TOKEN_ENDPOINT,)
+        assert call.kwargs["data"] == {
+            "grant_type": "refresh_token",
+            "refresh_token": "rt-1",
+            "client_id": "cid",
+            "client_secret": "csecret",
+            "scope": "custom.scope",
+        }
+        # The override is also stamped onto the cache row.
+        raw = storage.get_mcp_user_token(USER, SERVER)
+        assert raw is not None
+        assert raw["scopes"] == "custom.scope"
+
+    def test_rotated_refresh_token_written_back_to_credential(self, storage: SQLiteBackend) -> None:
+        """Case 5: Entra usually rotates the RT on redemption — the newest
+        value MUST be persisted to the shared credential (write-back rule)."""
+        _seed_obo_server(storage)
+        client = MagicMock(spec=httpx.AsyncClient)
+        client.post = AsyncMock(
+            return_value=_mk_response(
+                200,
+                {"access_token": "at-minted", "expires_in": 3600, "refresh_token": "rt-2"},
+            )
+        )
+        state = _make_app_state(storage, http_client=client, oidc_config=_make_oidc_config())
+        _seed_credential(state, refresh_token="rt-1")
+
+        result = _mint(state)
+
+        assert result.kind == "token"
+        cred = state.mcp_token_store.get_oidc_credential(USER, ISSUER)
+        assert cred is not None
+        assert cred["refresh_token"] == "rt-2"
+        # The rotated RT stays on the credential — the cache row is refresh-less.
+        raw = storage.get_mcp_user_token(USER, SERVER)
+        assert raw is not None
+        assert raw["refresh_token_ct"] is None
+
+
+# ---------------------------------------------------------------------------
+# rfc8693 leg — refresh grant for a subject token, then token exchange
+# ---------------------------------------------------------------------------
+
+
+class TestRfc8693Leg:
+    def test_happy_path_two_posts_exchange_and_rotation_write_back(
+        self, storage: SQLiteBackend
+    ) -> None:
+        """Case 3: exactly TWO POSTs with the spike-verified Keycloak shapes —
+        a scope-less refresh grant, then a token exchange whose
+        ``subject_token`` is the FIRST call's access token; the RT rotated by
+        call 1 is persisted to the credential."""
+        _seed_obo_server(storage)  # empty oauth_scopes → exchange carries NO scope key
+        client = MagicMock(spec=httpx.AsyncClient)
+        client.post = AsyncMock(
+            side_effect=[
+                _mk_response(
+                    200,
+                    {
+                        "access_token": "subject-at",
+                        "refresh_token": "rt-rotated",
+                        "expires_in": 300,
+                    },
+                ),
+                _mk_response(200, {"access_token": "exchanged-at", "expires_in": 600}),
+            ]
+        )
+        state = _make_app_state(
+            storage,
+            http_client=client,
+            oidc_config=_make_oidc_config(obo_grant_profile="rfc8693"),
+        )
+        _seed_credential(state, refresh_token="rt-1")
+
+        result = _mint(state)
+
+        assert result.kind == "token"
+        assert result.token == "exchanged-at"
+        assert client.post.call_count == 2
+        first, second = client.post.call_args_list
+        assert first.args == (TOKEN_ENDPOINT,)
+        # Refresh leg: full-dict equality proves NO scope key is sent.
+        assert first.kwargs["data"] == {
+            "grant_type": "refresh_token",
+            "refresh_token": "rt-1",
+            "client_id": "cid",
+            "client_secret": "csecret",
+        }
+        assert second.args == (TOKEN_ENDPOINT,)
+        assert second.kwargs["data"] == {
+            "grant_type": "urn:ietf:params:oauth:grant-type:token-exchange",
+            "client_id": "cid",
+            "client_secret": "csecret",
+            "subject_token": "subject-at",
+            "subject_token_type": "urn:ietf:params:oauth:token-type:access_token",
+            "audience": AUDIENCE,
+        }
+        # Rotation write-back from the FIRST leg persists on the credential.
+        cred = state.mcp_token_store.get_oidc_credential(USER, ISSUER)
+        assert cred is not None
+        assert cred["refresh_token"] == "rt-rotated"
+        # Cached mint is the EXCHANGED token, refresh-less.
+        plain = state.mcp_token_store.get_user_token(USER, SERVER)
+        assert plain is not None
+        assert plain["access_token"] == "exchanged-at"
+        assert plain["refresh_token"] is None
+
+    def test_per_server_scopes_carried_on_exchange_call(self, storage: SQLiteBackend) -> None:
+        """Case 3 (scoped): with ``oauth_scopes`` set, the SECOND call carries
+        ``scope`` (Keycloak optional audience scopes must be explicit) while
+        the refresh leg still sends none."""
+        _seed_obo_server(storage, oauth_scopes="custom.scope")
+        client = MagicMock(spec=httpx.AsyncClient)
+        client.post = AsyncMock(
+            side_effect=[
+                _mk_response(200, {"access_token": "subject-at", "expires_in": 300}),
+                _mk_response(200, {"access_token": "exchanged-at", "expires_in": 600}),
+            ]
+        )
+        state = _make_app_state(
+            storage,
+            http_client=client,
+            oidc_config=_make_oidc_config(obo_grant_profile="rfc8693"),
+        )
+        _seed_credential(state)
+
+        result = _mint(state)
+
+        assert result.kind == "token"
+        assert client.post.call_count == 2
+        first, second = client.post.call_args_list
+        assert first.kwargs["data"] == {
+            "grant_type": "refresh_token",
+            "refresh_token": "rt-1",
+            "client_id": "cid",
+            "client_secret": "csecret",
+        }
+        assert second.kwargs["data"] == {
+            "grant_type": "urn:ietf:params:oauth:grant-type:token-exchange",
+            "client_id": "cid",
+            "client_secret": "csecret",
+            "subject_token": "subject-at",
+            "subject_token_type": "urn:ietf:params:oauth:token-type:access_token",
+            "audience": AUDIENCE,
+            "scope": "custom.scope",
+        }
+
+    def test_subject_leg_missing_access_token_is_transient(self, storage: SQLiteBackend) -> None:
+        """A 200 refresh-leg body without ``access_token`` aborts BEFORE the
+        exchange call and classifies transient — a malformed IdP response must
+        not delete anything."""
+        _seed_obo_server(storage)
+        client = MagicMock(spec=httpx.AsyncClient)
+        client.post = AsyncMock(return_value=_mk_response(200, {"refresh_token": "rt-x"}))
+        state = _make_app_state(
+            storage,
+            http_client=client,
+            oidc_config=_make_oidc_config(obo_grant_profile="rfc8693"),
+        )
+        _seed_credential(state)
+
+        result = _mint(state)
+
+        assert result.kind == "refresh_failed_transient"
+        assert client.post.call_count == 1  # never reached the exchange leg
+        assert state.mcp_token_store.get_oidc_credential(USER, ISSUER) is not None
+
+
+# ---------------------------------------------------------------------------
+# Cache-row and credential lookup short-circuits
+# ---------------------------------------------------------------------------
+
+
+class TestCacheAndCredentialLookup:
+    def test_fresh_cache_row_returns_token_with_zero_http_calls(
+        self, storage: SQLiteBackend
+    ) -> None:
+        """Case 4: a fresh ``mcp_user_tokens`` row is served straight from the
+        cache — no IdP round-trip."""
+        _seed_obo_server(storage)
+        client = MagicMock(spec=httpx.AsyncClient)
+        client.post = AsyncMock()
+        state = _make_app_state(storage, http_client=client, oidc_config=_make_oidc_config())
+        _seed_credential(state)
+        _seed_cache_row(state, expires_in_seconds=3600, access_token="cached-at")
+
+        result = _mint(state)
+
+        assert result.kind == "token"
+        assert result.token == "cached-at"
+        assert client.post.call_count == 0
+
+    def test_missing_credential_returns_missing_with_zero_http_calls(
+        self, storage: SQLiteBackend
+    ) -> None:
+        """Case 6: no captured credential → ``missing`` (the dispatcher's
+        consent affordance is a re-login, not per-server consent); the IdP is
+        never contacted."""
+        _seed_obo_server(storage)
+        client = MagicMock(spec=httpx.AsyncClient)
+        client.post = AsyncMock()
+        state = _make_app_state(storage, http_client=client, oidc_config=_make_oidc_config())
+        # Deliberately NO upsert_oidc_credential.
+
+        result = _mint(state)
+
+        assert result.kind == "missing"
+        assert client.post.call_count == 0
+
+
+# ---------------------------------------------------------------------------
+# Failure handling — the load-bearing custody semantics
+# ---------------------------------------------------------------------------
+
+
+class TestFailureHandling:
+    def test_permanent_rejection_drops_cache_row_but_never_the_credential(
+        self, storage: SQLiteBackend
+    ) -> None:
+        """Case 7 (load-bearing): a verified AADSTS65001-style
+        ``invalid_grant`` classifies PERMANENT — the per-server cache row is
+        deleted (re-consent UX for THAT server) but the shared credential
+        survives, so one missing tenant grant can't lock the user out of
+        every other OBO server."""
+        _seed_obo_server(storage)
+        client = MagicMock(spec=httpx.AsyncClient)
+        client.post = AsyncMock(
+            return_value=_mk_response(
+                400,
+                {
+                    "error": "invalid_grant",
+                    "error_description": (
+                        "AADSTS65001: The user or administrator has not consented to use "
+                        "the application."
+                    ),
+                },
+            )
+        )
+        state = _make_app_state(storage, http_client=client, oidc_config=_make_oidc_config())
+        _seed_credential(state)
+        _seed_cache_row(state, expires_in_seconds=-1000, access_token="stale-at")
+
+        result = _mint(state)
+
+        assert result.kind == "refresh_failed"
+        # Cache row GONE...
+        assert storage.get_mcp_user_token(USER, SERVER) is None
+        # ...but the credential STILL EXISTS — never auto-deleted here.
+        assert state.mcp_token_store.get_oidc_credential(USER, ISSUER) is not None
+        # The revoke is audited through the shared choke point.
+        events = storage.list_audit_events(action="mcp_server.oauth.token_revoked")
+        assert len(events) == 1
+        assert events[0]["user_id"] == USER
+        assert events[0]["resource_id"] == SERVER_ID
+        detail = events[0]["detail"]
+        detail = json.loads(detail) if isinstance(detail, str) else detail
+        assert detail["reason"] == "obo_mint_rejected"
+
+    def test_transient_503_keeps_credential_and_cooldown_short_circuits_second_call(
+        self, storage: SQLiteBackend
+    ) -> None:
+        """Case 8: a 503 is transient — nothing is deleted — and the armed
+        cooldown makes an immediate second attempt return transient with NO
+        additional IdP call."""
+        _seed_obo_server(storage)
+        client = MagicMock(spec=httpx.AsyncClient)
+        client.post = AsyncMock(
+            return_value=_mk_response(503, {"error": "temporarily_unavailable"})
+        )
+        state = _make_app_state(storage, http_client=client, oidc_config=_make_oidc_config())
+        _seed_credential(state)
+
+        async def _run() -> tuple[Any, Any]:
+            first = await get_obo_access_token_classified(
+                app_state=state, user_id=USER, server_name=SERVER
+            )
+            second = await get_obo_access_token_classified(
+                app_state=state, user_id=USER, server_name=SERVER
+            )
+            return first, second
+
+        first, second = asyncio.run(_run())
+
+        assert first.kind == "refresh_failed_transient"
+        assert second.kind == "refresh_failed_transient"
+        # Cooldown short-circuit: the second call never reached the IdP.
+        assert client.post.call_count == 1
+        assert state.mcp_token_store.get_oidc_credential(USER, ISSUER) is not None
+
+    def test_missing_access_token_in_200_body_is_transient(self, storage: SQLiteBackend) -> None:
+        """Case 9: a 200 body without ``access_token`` is a malformed-IdP
+        blip — transient, credential kept, nothing cached."""
+        _seed_obo_server(storage)
+        client = MagicMock(spec=httpx.AsyncClient)
+        client.post = AsyncMock(return_value=_mk_response(200, {"expires_in": 3600}))
+        state = _make_app_state(storage, http_client=client, oidc_config=_make_oidc_config())
+        _seed_credential(state)
+
+        result = _mint(state)
+
+        assert result.kind == "refresh_failed_transient"
+        assert client.post.call_count == 1
+        assert state.mcp_token_store.get_oidc_credential(USER, ISSUER) is not None
+        assert storage.get_mcp_user_token(USER, SERVER) is None  # nothing was cached
+
+
+# ---------------------------------------------------------------------------
+# Misconfiguration — loud, retryable, and never an exception
+# ---------------------------------------------------------------------------
+
+
+class TestMisconfiguration:
+    @pytest.mark.parametrize("profile", ["", "id_jag"])
+    def test_unusable_grant_profile_is_transient_with_zero_http_calls(
+        self, storage: SQLiteBackend, profile: str
+    ) -> None:
+        """Case 10a: an empty or unknown ``obo_grant_profile`` is an
+        operator-fixable misconfig — retryable classification, zero IdP
+        calls, no exception (fixing config heals without re-consent)."""
+        _seed_obo_server(storage)
+        client = MagicMock(spec=httpx.AsyncClient)
+        client.post = AsyncMock()
+        state = _make_app_state(
+            storage,
+            http_client=client,
+            oidc_config=_make_oidc_config(obo_grant_profile=profile),
+        )
+        _seed_credential(state)  # credential present — config alone blocks the mint
+
+        result = _mint(state)
+
+        assert result.kind == "refresh_failed_transient"
+        assert client.post.call_count == 0
+
+    def test_missing_server_audience_is_transient_with_zero_http_calls(
+        self, storage: SQLiteBackend
+    ) -> None:
+        """Case 10b: a server row without ``oauth_audience`` cannot be minted
+        for — same retryable misconfig outcome, zero IdP calls."""
+        _seed_obo_server(storage, oauth_audience=None)
+        client = MagicMock(spec=httpx.AsyncClient)
+        client.post = AsyncMock()
+        state = _make_app_state(storage, http_client=client, oidc_config=_make_oidc_config())
+        _seed_credential(state)
+
+        result = _mint(state)
+
+        assert result.kind == "refresh_failed_transient"
+        assert client.post.call_count == 0
