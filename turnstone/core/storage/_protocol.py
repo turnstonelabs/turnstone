@@ -2369,17 +2369,9 @@ class StorageBackend(Protocol):
         (``auth_type`` in ``oauth_user`` / ``oauth_obo``) — both write
         ``mcp_pending_consent`` rows on a non-interactive dispatch failure, so
         an oauth_obo-only install must NOT short-circuit the badge to
-        ``{pending: 0}`` (that would hide the re-login affordance).
-        """
-        ...
-
-    def any_oauth_user_mcp_servers(self) -> bool:
-        """Install-level gate for OAuth-MCP features.
-
-        Returns True iff at least one ``mcp_servers`` row has
-        ``auth_type='oauth_user'``.  Used to short-circuit the pending-
-        consent badge endpoint to ``{pending: 0}`` on local-auth installs
-        with no OAuth MCP servers, so those code paths exercise zero new
+        ``{pending: 0}`` (that would hide the re-login affordance). Used to
+        short-circuit the pending-consent badge endpoint on local-auth installs
+        with no pool-backed MCP servers, so those code paths exercise zero new
         storage queries.
         """
         ...

@@ -32,7 +32,7 @@ import time
 import urllib.parse
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
-from typing import TYPE_CHECKING, Any, Literal
+from typing import TYPE_CHECKING, Any, Literal, NamedTuple
 
 import httpx
 
@@ -57,6 +57,8 @@ from turnstone.core.oauth_ssrf import (
 )
 
 if TYPE_CHECKING:
+    from collections.abc import Awaitable, Callable
+
     from starlette.requests import Request
     from starlette.responses import Response
 
@@ -1504,6 +1506,36 @@ async def get_user_access_token(*, app_state: Any, user_id: str, server_name: st
     return None
 
 
+class _FailureEvents(NamedTuple):
+    """Structured-log event names for :func:`_handle_refresh_failure`.
+
+    Passed as whole literals (not composed from a prefix) so every emitted
+    event name appears verbatim in source — operators' alerting greps for
+    e.g. ``mcp_server.oauth.refresh_transient_failure`` and must find it here.
+    ``permanent`` logs the IdP error text on a PERMANENT rejection before the
+    revoke; ``None`` suppresses it (preserves oauth_user's exact prior output).
+    """
+
+    transient: str
+    escalated: str
+    deferred: str
+    permanent: str | None
+
+
+_REFRESH_FAILURE_EVENTS = _FailureEvents(
+    transient="mcp_server.oauth.refresh_transient_failure",
+    escalated="mcp_server.oauth.refresh_ambiguous_escalated",
+    deferred="mcp_server.oauth.refresh_ambiguous_escalation_deferred",
+    permanent=None,  # oauth_user's permanent path logged no error-text line
+)
+_OBO_MINT_FAILURE_EVENTS = _FailureEvents(
+    transient="mcp_server.oauth.obo_mint_transient_failure",
+    escalated="mcp_server.oauth.obo_mint_ambiguous_escalated",
+    deferred="mcp_server.oauth.obo_mint_ambiguous_escalation_deferred",
+    permanent="mcp_server.oauth.obo_mint_rejected",  # carries the AS error body
+)
+
+
 async def _handle_refresh_failure(
     exc: MCPOAuthRefreshFailed,
     *,
@@ -1514,7 +1546,7 @@ async def _handle_refresh_failure(
     token_store: MCPTokenStore,
     revoke_on_failure: bool,
     revoke_ambiguous_escalation: bool,
-    event_prefix: str,
+    events: _FailureEvents,
     permanent_reason: str,
     escalation_reason: str,
     arm_cooldown_on_permanent: bool = False,
@@ -1525,7 +1557,7 @@ async def _handle_refresh_failure(
     Extracted so the two pool auth types can never drift on
     revoke/backoff/escalation semantics — a change to escalation policy applies
     to both. Behaviour for ``oauth_user`` is byte-identical to the previous
-    inline block (``event_prefix='refresh'``, ``arm_cooldown_on_permanent=False``).
+    inline block (``events=_REFRESH_FAILURE_EVENTS``, ``arm_cooldown_on_permanent=False``).
 
     ``arm_cooldown_on_permanent`` is the one divergence the two callers need:
     oauth_user's post-revoke lookup short-circuits to ``missing`` (its token row
@@ -1551,6 +1583,18 @@ async def _handle_refresh_failure(
         # signal (RFC 6749 §5.2), so revoke unconditionally — even under
         # background priming. Deferring it would strand the catalog cold
         # with the token still reading "consented" and no re-consent path.
+        if events.permanent is not None:
+            # Record the IdP error body BEFORE the revoke: it is the only place
+            # the AS's actual message survives (the token_revoked audit row
+            # carries just a reason code), and it is what lets an operator tell a
+            # missing tenant-grant / Conditional-Access challenge from a dead
+            # credential without wire-level capture.
+            log.warning(
+                events.permanent,
+                user_id=user_id,
+                server_name=server_name,
+                error=str(exc),
+            )
         result = await _revoke_after_refresh_failure(
             app_state,
             token_store,
@@ -1581,7 +1625,7 @@ async def _handle_refresh_failure(
             # transients never reach here, so an outage can't escalate.)
             if revoke_ambiguous_escalation:
                 log.warning(
-                    f"mcp_server.oauth.{event_prefix}_ambiguous_escalated",
+                    events.escalated,
                     user_id=user_id,
                     server_name=server_name,
                     streak=backoff.ambiguous_streak,
@@ -1602,7 +1646,7 @@ async def _handle_refresh_failure(
             # escalates on the user's next real call. Falls through to the
             # transient return below (token kept, lock retained).
             log.warning(
-                f"mcp_server.oauth.{event_prefix}_ambiguous_escalation_deferred",
+                events.deferred,
                 user_id=user_id,
                 server_name=server_name,
                 streak=backoff.ambiguous_streak,
@@ -1613,7 +1657,7 @@ async def _handle_refresh_failure(
         # run — only an uninterrupted streak escalates.
         backoff.ambiguous_streak = 0
     log.warning(
-        f"mcp_server.oauth.{event_prefix}_transient_failure",
+        events.transient,
         user_id=user_id,
         server_name=server_name,
         failure_class=exc.failure_class.value,
@@ -1849,7 +1893,7 @@ async def get_user_access_token_classified(
                 token_store=token_store,
                 revoke_on_failure=revoke_on_failure,
                 revoke_ambiguous_escalation=revoke_ambiguous_escalation,
-                event_prefix="refresh",
+                events=_REFRESH_FAILURE_EVENTS,
                 permanent_reason="refresh_failed",
                 escalation_reason="refresh_failed_ambiguous_escalated",
             )
@@ -1941,7 +1985,7 @@ async def _obo_token_post(
 async def _maybe_persist_rotation(
     resp: dict[str, Any],
     credential_refresh_token: str,
-    persist_rotation: Any,
+    persist_rotation: Callable[[str], Awaitable[None]],
 ) -> None:
     """Persist a rotated credential RT from *resp* when it differs from the current one."""
     rotated = resp.get("refresh_token")
@@ -1956,7 +2000,7 @@ async def _obo_mint_entra(
     audience: str,
     scopes: str,
     http_client: httpx.AsyncClient | None,
-    persist_rotation: Any,
+    persist_rotation: Callable[[str], Awaitable[None]],
 ) -> dict[str, Any]:
     """Entra leg: redeem the client-bound RT directly for the audience.
 
@@ -1971,9 +2015,12 @@ async def _obo_mint_entra(
     ``rfc8693``-only knob.
     """
     if scopes:
-        log.warning(
-            "obo: oauth_scopes is ignored for the entra grant leg (audience=%s uses "
-            "<audience>/.default); set scopes only on rfc8693 servers",
+        # The admin write path rejects scopes-with-entra (console
+        # _enforce_oauth_obo_requirements), so reaching here is a pre-existing
+        # row or a direct-API write — debug, not a per-mint warning flood.
+        log.debug(
+            "obo: oauth_scopes ignored for the entra grant leg (audience=%s uses "
+            "<audience>/.default); scopes apply only to rfc8693",
             audience,
         )
     resp = await _obo_token_post(
@@ -1999,7 +2046,7 @@ async def _obo_mint_rfc8693(
     audience: str,
     scopes: str,
     http_client: httpx.AsyncClient | None,
-    persist_rotation: Any,
+    persist_rotation: Callable[[str], Awaitable[None]],
 ) -> dict[str, Any]:
     """RFC 8693 leg: refresh grant for a subject token, then token exchange.
 
@@ -2196,14 +2243,24 @@ async def get_obo_access_token_classified(
                 decrypt_fingerprints=tuple(exc.key_fingerprints_attempted),
             ),
         )
-    if plain is not None and not force_refresh and not _token_needs_refresh(plain["expires_at"]):
+    # A cache row carrying a refresh token is NOT a valid obo mint-cache row
+    # (minted rows have refresh_token NULL) — it's a stale oauth_user leftover
+    # from an in-flight refresh that landed after an auth_type-flip purge, or a
+    # bad transition. Never serve it as a minted token; treat it as needing a
+    # fresh mint (which then overwrites it via _persist_obo_cache_row).
+    fresh_obo_row = (
+        plain is not None
+        and plain["refresh_token"] is None
+        and not _token_needs_refresh(plain["expires_at"])
+    )
+    if plain is not None and fresh_obo_row and not force_refresh:
         return _token_result(app_state, user_id, server_name, plain["access_token"])
 
     # Gate the cooldown short-circuit on actually needing a mint (cache absent or
     # stale), mirroring the oauth_user path: a force_refresh 401-retry on a
     # still-fresh cache must fall through to the locked re-read so it can pick up
     # a token a cluster-mate just minted, rather than fail transient in-cooldown.
-    needs_mint = plain is None or _token_needs_refresh(plain["expires_at"])
+    needs_mint = not fresh_obo_row
     if needs_mint and _refresh_in_cooldown(app_state, user_id, server_name):
         return TokenLookupResult(kind="refresh_failed_transient")
 
@@ -2275,7 +2332,13 @@ async def get_obo_access_token_classified(
                     decrypt_fingerprints=tuple(exc.key_fingerprints_attempted),
                 ),
             )
-        if plain2 is not None and not _token_needs_refresh(plain2["expires_at"]):
+        # Same stale-row guard as the pre-lock read: a refresh-bearing row is an
+        # oauth_user leftover, not a mint-cache hit — fall through and re-mint.
+        if (
+            plain2 is not None
+            and plain2["refresh_token"] is None
+            and not _token_needs_refresh(plain2["expires_at"])
+        ):
             if not force_refresh:
                 return _token_result(app_state, user_id, server_name, plain2["access_token"])
             last_refreshed = _parse_iso_to_utc(plain2.get("last_refreshed") or "")
@@ -2322,7 +2385,7 @@ async def get_obo_access_token_classified(
                 token_store=token_store,
                 revoke_on_failure=True,
                 revoke_ambiguous_escalation=True,
-                event_prefix="obo_mint",
+                events=_OBO_MINT_FAILURE_EVENTS,
                 permanent_reason="obo_mint_rejected",
                 escalation_reason="obo_mint_ambiguous_escalated",
                 # The shared credential survives a per-server revoke, so arm the

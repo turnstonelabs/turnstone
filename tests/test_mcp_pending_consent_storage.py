@@ -7,7 +7,7 @@ Validates protocol additions backing the dashboard pending-consent badge:
 - ``delete_mcp_pending_consent`` — single-row clear
 - ``delete_all_mcp_pending_consent_by_user`` — bulk clear
 - ``count_mcp_consented_users_by_server`` — admin status pill
-- ``any_oauth_user_mcp_servers`` — install-level gate
+- ``any_user_scoped_mcp_servers`` — install-level gate
 """
 
 from __future__ import annotations
@@ -204,10 +204,10 @@ class TestCountConsentedUsersByServer:
 
 
 class TestInstallGate:
-    def test_any_oauth_user_returns_false_on_empty(self, backend) -> None:
-        assert backend.any_oauth_user_mcp_servers() is False
+    def test_any_user_scoped_returns_false_on_empty(self, backend) -> None:
+        assert backend.any_user_scoped_mcp_servers() is False
 
-    def test_any_oauth_user_ignores_static_rows(self, backend) -> None:
+    def test_any_user_scoped_ignores_static_rows(self, backend) -> None:
         backend.create_mcp_server(
             server_id="srv-1",
             name="static-only",
@@ -221,9 +221,9 @@ class TestInstallGate:
             enabled=True,
             created_by="admin",
         )
-        assert backend.any_oauth_user_mcp_servers() is False
+        assert backend.any_user_scoped_mcp_servers() is False
 
-    def test_any_oauth_user_returns_true_when_one_exists(self, backend) -> None:
+    def test_any_user_scoped_returns_true_for_oauth_user(self, backend) -> None:
         backend.create_mcp_server(
             server_id="srv-2",
             name="oauth-srv",
@@ -238,13 +238,12 @@ class TestInstallGate:
             created_by="admin",
         )
         backend.update_mcp_server("srv-2", auth_type="oauth_user")
-        assert backend.any_oauth_user_mcp_servers() is True
+        assert backend.any_user_scoped_mcp_servers() is True
 
     def test_any_user_scoped_true_for_obo_only_install(self, backend) -> None:
         """#551: the pending-consent badge gate must fire for an oauth_obo-only
         install — obo dispatch writes pending rows, so short-circuiting to
-        {pending: 0} would hide the re-login affordance. The oauth_user-only
-        gate stays False (obo is not oauth_user)."""
+        {pending: 0} would hide the re-login affordance."""
         backend.create_mcp_server(
             server_id="srv-obo",
             name="obo-only",
@@ -260,7 +259,6 @@ class TestInstallGate:
         )
         backend.update_mcp_server("srv-obo", auth_type="oauth_obo")
         assert backend.any_user_scoped_mcp_servers() is True
-        assert backend.any_oauth_user_mcp_servers() is False
 
     def test_any_user_scoped_false_on_static_only(self, backend) -> None:
         backend.create_mcp_server(

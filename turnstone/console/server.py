@@ -6002,23 +6002,36 @@ async def admin_delete_oidc_identity(request: Request) -> JSONResponse:
 
     storage.delete_oidc_identity(issuer, subject)
 
-    # #551: unlinking the identity must also revoke the captured IdP refresh
-    # credential (keyed on (user_id, issuer)) — otherwise a deprovisioned user's
-    # scheduled/autonomous runs keep minting oauth_obo access tokens
-    # indefinitely (rotation write-back keeps the RT alive). Best-effort: a
-    # failure here must not leave the identity un-deleted.
+    # #551: unlinking the identity must revoke the captured IdP refresh
+    # credential (keyed on (user_id, issuer)) AND purge the already-minted
+    # oauth_obo access-token cache rows — otherwise a deprovisioned user's
+    # scheduled/autonomous runs keep executing MCP tool calls with the still-fresh
+    # cached bearer until it expires (deleting only the credential stops FUTURE
+    # mints but not the live cache). Best-effort: a failure must not leave the
+    # identity un-deleted.
+    user_id = identity["user_id"]
     credential_revoked = False
+    obo_cache_purged = 0
     token_store = getattr(request.app.state, "mcp_token_store", None)
     if token_store is not None:
         try:
-            credential_revoked = bool(
-                token_store.delete_oidc_credential(identity["user_id"], issuer)
-            )
+            credential_revoked = bool(token_store.delete_oidc_credential(user_id, issuer))
         except Exception:
             log.warning(
-                "admin.oidc_identity.credential_revoke_failed user=%s",
-                identity["user_id"],
-                exc_info=True,
+                "admin.oidc_identity.credential_revoke_failed user=%s", user_id, exc_info=True
+            )
+        try:
+            obo_servers = [
+                row["name"]
+                for row in storage.list_mcp_servers()
+                if row.get("auth_type") == "oauth_obo"
+            ]
+            for server_name in obo_servers:
+                if token_store.delete_user_token(user_id, server_name):
+                    obo_cache_purged += 1
+        except Exception:
+            log.warning(
+                "admin.oidc_identity.obo_cache_purge_failed user=%s", user_id, exc_info=True
             )
 
     audit_uid, ip = _audit_context(request)
@@ -6028,11 +6041,26 @@ async def admin_delete_oidc_identity(request: Request) -> JSONResponse:
         "oidc_identity.delete",
         "oidc_identity",
         f"{issuer}:{subject}",
-        {"user_id": identity["user_id"], "obo_credential_revoked": credential_revoked},
+        {
+            "user_id": user_id,
+            "obo_credential_revoked": credential_revoked,
+            "obo_cache_rows_purged": obo_cache_purged,
+        },
         ip,
     )
 
-    return JSONResponse({"status": "ok"})
+    # Note: warmed per-user pool sessions on server nodes hold the bearer
+    # in-memory and self-clear at token TTL / idle eviction; the console has no
+    # per-user cross-node eviction primitive. Credential + cache purge stop all
+    # FUTURE dispatch (next call re-reads the now-empty cache → mint → missing
+    # credential → re-login), bounding residual access to the current token TTL.
+    return JSONResponse(
+        {
+            "status": "ok",
+            "obo_credential_revoked": credential_revoked,
+            "obo_cache_rows_purged": obo_cache_purged,
+        }
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -9748,7 +9776,9 @@ def _enforce_oauth_user_https(auth_type: str, url: str | None) -> JSONResponse |
     so a misconfigured row never persists. Returns the error response or
     ``None`` when the input is acceptable.
     """
-    if auth_type not in ("oauth_user", "oauth_obo"):
+    from turnstone.core.mcp_oauth import is_user_scoped_auth
+
+    if not is_user_scoped_auth(auth_type):
         return None
     if not url:
         return None  # presence checked elsewhere; this helper only checks scheme
@@ -9762,7 +9792,7 @@ def _enforce_oauth_user_https(auth_type: str, url: str | None) -> JSONResponse |
 
 
 def _enforce_oauth_obo_requirements(
-    request: Request, auth_type: str, *, audience: str | None
+    request: Request, auth_type: str, *, audience: str | None, scopes: str | None
 ) -> JSONResponse | None:
     """Write-time validation for ``oauth_obo`` rows (issue #551).
 
@@ -9776,6 +9806,11 @@ def _enforce_oauth_obo_requirements(
     - **No ``oauth_audience``** → 400. The mint engine hard-requires the
       downstream audience; without it every tool call fails transient and logs
       ``obo_misconfigured``. Reject here, exactly as bad URL schemes are.
+    - **``oauth_scopes`` under the entra grant profile** → 400. Entra's ``scope``
+      is its only audience carrier (the leg pins ``<audience>/.default``), so a
+      per-server scope list is silently ignored at mint time — reject it at the
+      form instead of letting the operator believe it took effect. (The rfc8693
+      profile does use ``oauth_scopes``, so it is allowed there.)
     """
     if auth_type != "oauth_obo":
         return None
@@ -9791,6 +9826,20 @@ def _enforce_oauth_obo_requirements(
             },
             status_code=400,
         )
+    if (scopes or "").strip():
+        oidc_config = getattr(request.app.state, "oidc_config", None)
+        profile = str(getattr(oidc_config, "obo_grant_profile", "") or "")
+        if profile == "entra":
+            return JSONResponse(
+                {
+                    "error": (
+                        "oauth_scopes is not used by the entra grant profile "
+                        "(it mints <audience>/.default); leave it empty or switch "
+                        "the deployment to the rfc8693 profile"
+                    )
+                },
+                status_code=400,
+            )
     return None
 
 
@@ -10170,7 +10219,10 @@ async def admin_create_mcp_server(request: Request) -> JSONResponse:
 
     # #551: oauth_obo needs an encryption key + an audience at write time.
     err_resp = _enforce_oauth_obo_requirements(
-        request, auth_type, audience=_clean_oauth_text(body.get("oauth_audience"), max_length=2048)
+        request,
+        auth_type,
+        audience=_clean_oauth_text(body.get("oauth_audience"), max_length=2048),
+        scopes=_clean_oauth_text(body.get("oauth_scopes")),
     )
     if err_resp is not None:
         return err_resp
@@ -10396,7 +10448,7 @@ async def admin_update_mcp_server(request: Request) -> JSONResponse:
             }
         )
     elif new_auth == "oauth_obo":
-        # obo keeps audience/scopes (it needs them); clear oauth_user-only cols.
+        # obo keeps audience (it needs it); clear the oauth_user-only columns.
         updates.update(
             {
                 "oauth_client_id": None,
@@ -10405,6 +10457,13 @@ async def admin_update_mcp_server(request: Request) -> JSONResponse:
                 "oauth_as_issuer_cached": None,
             }
         )
+        # A FLIP into obo from oauth_user carries oauth_user's AS-consent scopes,
+        # which the rfc8693 mint leg would send verbatim as the exchange scope →
+        # invalid_scope → a permanent-failure loop with no operator-fixable
+        # remedy in the error. Clear stale scopes on the flip unless this same
+        # request supplies obo scopes explicitly.
+        if old_auth != "oauth_obo" and "oauth_scopes" not in body:
+            updates["oauth_scopes"] = None
     # Renaming a pool-backed row needs the same per-user-token purge as
     # delete: the tokens are keyed on the OLD ``server_name`` and a row
     # later created with that old name (with attacker-controlled URL)
@@ -10430,6 +10489,17 @@ async def admin_update_mcp_server(request: Request) -> JSONResponse:
         and "url" in updates
         and existing.get("url", "") != updates["url"]
     )
+    # Changing oauth_audience on a pool-backed row is a token-binding change too:
+    # minted obo bearers (and oauth_user tokens) are audience-scoped, so cached
+    # rows for the OLD audience must be purged or a privilege reduction silently
+    # doesn't take effect until they expire. (auth_type flips already purge, so
+    # only guard the same-type edit here.)
+    audience_changing = (
+        is_user_scoped_auth(old_auth)
+        and (new_auth is None or new_auth == old_auth)
+        and "oauth_audience" in updates
+        and (existing.get("oauth_audience") or "") != (updates["oauth_audience"] or "")
+    )
     # Leaving oauth_user (to static/none OR to oauth_obo, which doesn't use the
     # per-server client secret) clears the encrypted secret column below.
     leaving_oauth_user = (
@@ -10454,7 +10524,10 @@ async def admin_update_mcp_server(request: Request) -> JSONResponse:
     # #551: an oauth_obo row (whether newly flipped or edited) needs an
     # encryption key + an audience — validated against the post-update value.
     audience_now = updates.get("oauth_audience", existing.get("oauth_audience"))
-    err_resp = _enforce_oauth_obo_requirements(request, auth_type_now, audience=audience_now)
+    scopes_now = updates.get("oauth_scopes", existing.get("oauth_scopes"))
+    err_resp = _enforce_oauth_obo_requirements(
+        request, auth_type_now, audience=audience_now, scopes=scopes_now
+    )
     if err_resp is not None:
         return err_resp
 
@@ -10464,11 +10537,12 @@ async def admin_update_mcp_server(request: Request) -> JSONResponse:
     audit_uid, ip = _audit_context(request)
 
     # Purge per-user tokens + pending OAuth states keyed on the OLD name on
-    # rename, on any pool-backed auth_type transition, or on URL change for a
-    # pool-backed row. All cases would otherwise leave tokens
-    # orphaned-and-rebindable (the OAuth tables key on the mutable
-    # ``server_name`` and tokens are bound to the URL active at mint/consent time).
-    if name_changing or auth_type_purge or url_changing:
+    # rename, on any pool-backed auth_type transition, on URL change, or on
+    # audience change for a pool-backed row. All cases would otherwise leave
+    # tokens orphaned-and-rebindable or bound to a superseded URL/audience (the
+    # OAuth tables key on the mutable ``server_name`` and tokens are bound to the
+    # URL + audience active at mint/consent time).
+    if name_changing or auth_type_purge or url_changing or audience_changing:
         purge_target = existing.get("name", "")
         if purge_target:
             try:
@@ -10793,10 +10867,16 @@ async def admin_mcp_bulk_revoke(request: Request) -> JSONResponse:
     existing = storage.get_mcp_server_by_name(name)
     if existing is None:
         return JSONResponse({"error": "No such server"}, status_code=404)
-    # Both pool-backed types populate mcp_user_tokens (oauth_user: consent
-    # tokens; oauth_obo: minted cache rows), so bulk-revoke serves both — it is
-    # the documented remediation for the stale rows an oauth_user→oauth_obo flip
-    # leaves behind.
+    # Both pool-backed types populate mcp_user_tokens, but the semantics differ
+    # and must be honest (issue #551): for oauth_user, deleting the rows is a
+    # durable REVOCATION — users lose access until they re-consent. For
+    # oauth_obo, the per-server rows are a mint CACHE; the shared per-user
+    # credential survives (it is issuer-scoped, not per-server, and IdP-governed),
+    # so the next dispatch simply re-mints. Bulk-revoke on an obo server is
+    # therefore a cache FLUSH (force re-mint, e.g. after narrowing the audience),
+    # NOT a consent revocation — surfaced via a distinct audit event + response
+    # ``effect`` so an operator is never told access was cut when it re-mints.
+    is_obo = existing.get("auth_type") == "oauth_obo"
     if not is_user_scoped_auth(existing.get("auth_type")):
         return JSONResponse(
             {"error": "bulk-revoke is only valid for oauth_user or oauth_obo servers"},
@@ -10816,7 +10896,7 @@ async def admin_mcp_bulk_revoke(request: Request) -> JSONResponse:
     record_audit(
         storage,
         audit_uid,
-        "mcp_server.oauth.bulk_revoked",
+        "mcp_server.oauth.obo_cache_flushed" if is_obo else "mcp_server.oauth.bulk_revoked",
         "mcp_server",
         target_id,
         {
@@ -10824,6 +10904,7 @@ async def admin_mcp_bulk_revoke(request: Request) -> JSONResponse:
             "rows_deleted": deleted,
             "consented_users_before": consented_before,
             "upstream_revoke_outcome": "bulk_admin_no_upstream",
+            "effect": "cache_flush_remints" if is_obo else "revoked_until_reconsent",
         },
         ip,
     )
@@ -10833,6 +10914,9 @@ async def admin_mcp_bulk_revoke(request: Request) -> JSONResponse:
             "status": "ok",
             "rows_deleted": deleted,
             "consented_users_before": consented_before,
+            # Honest semantics: obo re-mints on next use (revoke at the IdP or
+            # unlink the identity to cut a user off); oauth_user needs re-consent.
+            "effect": "cache_flush_remints" if is_obo else "revoked_until_reconsent",
         }
     )
 

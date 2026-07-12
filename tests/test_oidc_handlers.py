@@ -1001,6 +1001,67 @@ class TestAdminOIDCIdentities:
         # Verify it's gone
         assert storage.get_oidc_identity("https://idp.example.com", "sub-456") is None
 
+    def test_delete_identity_revokes_credential_and_purges_obo_cache(
+        self, storage: SQLiteBackend
+    ) -> None:
+        """#551 follow-up: unlinking an identity must revoke the captured
+        credential AND purge the user's already-minted oauth_obo cache rows —
+        deleting only the credential leaves live cached bearers authorizing
+        dispatch until TTL. The response/audit report what was actually cut."""
+        from tests.conftest import make_mcp_token_cipher
+        from turnstone.core.mcp_crypto import MCPTokenStore
+
+        issuer = "https://idp.example.com"
+        store = MCPTokenStore(storage, make_mcp_token_cipher(), node_id="test")
+        app = Starlette(
+            routes=[
+                Mount(
+                    "/v1",
+                    routes=[
+                        Route(
+                            "/api/admin/oidc-identities",
+                            admin_delete_oidc_identity,
+                            methods=["DELETE"],
+                        )
+                    ],
+                )
+            ],
+            middleware=[Middleware(_InjectAuthMiddleware)],
+        )
+        app.state.auth_storage = storage
+        app.state.mcp_token_store = store
+        client = TestClient(app, raise_server_exceptions=False)
+
+        storage.create_oidc_identity(issuer, "sub-1", "user-x", "x@example.com")
+        store.upsert_oidc_credential("user-x", issuer, refresh_token="rt-live")
+        storage.create_mcp_server(
+            server_id="srv-obo",
+            name="obo-srv",
+            transport="streamable-http",
+            url="https://mcp.example.com/sse",
+            auth_type="oauth_obo",
+            oauth_audience="api://mcp-a",
+        )
+        store.create_user_token(
+            "user-x",
+            "obo-srv",
+            access_token="minted-at",
+            refresh_token=None,
+            expires_at="2026-12-31T00:00:00",
+            scopes=None,
+            as_issuer=issuer,
+            audience="api://mcp-a",
+        )
+
+        resp = client.delete(f"/v1/api/admin/oidc-identities?issuer={issuer}&subject=sub-1")
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        assert body["obo_credential_revoked"] is True
+        assert body["obo_cache_rows_purged"] == 1
+        # Credential gone → no future mints; cache row gone → no live cached bearer.
+        assert store.get_oidc_credential("user-x", issuer) is None
+        assert storage.get_mcp_user_token("user-x", "obo-srv") is None
+
     def test_delete_nonexistent_returns_404(self, admin_client: TestClient) -> None:
         resp = admin_client.delete(
             "/v1/api/admin/oidc-identities?issuer=https://no.such&subject=nope",

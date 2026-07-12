@@ -5034,16 +5034,6 @@ class PostgreSQLBackend:
             ).fetchall()
         return {row[0]: int(row[1] or 0) for row in rows}
 
-    def any_oauth_user_mcp_servers(self) -> bool:
-        with self._conn() as conn:
-            result = conn.execute(
-                sa.select(sa.literal(1))
-                .select_from(mcp_servers)
-                .where(mcp_servers.c.auth_type == "oauth_user")
-                .limit(1)
-            ).scalar()
-        return result is not None
-
     def any_user_scoped_mcp_servers(self) -> bool:
         with self._conn() as conn:
             result = conn.execute(
