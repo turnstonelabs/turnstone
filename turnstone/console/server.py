@@ -9875,7 +9875,17 @@ def _enforce_oauth_obo_requirements(
     if getattr(request.app.state, "mcp_token_store", None) is None:
         return JSONResponse({"error": _OAUTH_TOKEN_STORE_503_MSG}, status_code=503)
     oidc_config = getattr(request.app.state, "oidc_config", None)
-    if oidc_config is None or not getattr(oidc_config, "enabled", False):
+    # Accept a config that is enabled OR merely transiently un-discovered
+    # (``discovery_retryable`` — the IdP was unreachable at this process's boot).
+    # OIDC is still CONFIGURED there (issuer set); rejecting it would make every
+    # oauth_obo server un-editable/un-disable-able on the console — which never
+    # runs the runtime rediscovery that heals server nodes — until a manual
+    # restart. Reject only a genuinely absent / operator-disabled OIDC (neither
+    # flag set: no issuer configured).
+    oidc_configured = oidc_config is not None and (
+        getattr(oidc_config, "enabled", False) or getattr(oidc_config, "discovery_retryable", False)
+    )
+    if not oidc_configured:
         return JSONResponse(
             {
                 "error": (
@@ -10315,6 +10325,12 @@ async def admin_create_mcp_server(request: Request) -> JSONResponse:
     # Helper returns None when key is absent — fall back to the default.
     auth_type = auth_type_value if auth_type_value is not None else "static"
 
+    # Clean the OAuth text fields ONCE — reused by both the write-time validator
+    # and the persisted ``oauth_cols`` below, so the validated and persisted
+    # values (and the 2048 max_length) can't silently diverge.
+    clean_audience = _clean_oauth_text(body.get("oauth_audience"), max_length=2048)
+    clean_scopes = _clean_oauth_text(body.get("oauth_scopes"))
+
     # sec-1: oauth_user/oauth_obo must use https:// (loopback http allowed for dev).
     err_resp = _enforce_oauth_user_https(auth_type, str(body.get("url", "")).strip())
     if err_resp is not None:
@@ -10324,8 +10340,8 @@ async def admin_create_mcp_server(request: Request) -> JSONResponse:
     err_resp = _enforce_oauth_obo_requirements(
         request,
         auth_type,
-        audience=_clean_oauth_text(body.get("oauth_audience"), max_length=2048),
-        scopes=_clean_oauth_text(body.get("oauth_scopes")),
+        audience=clean_audience,
+        scopes=clean_scopes,
     )
     if err_resp is not None:
         return err_resp
@@ -10363,19 +10379,19 @@ async def admin_create_mcp_server(request: Request) -> JSONResponse:
     # handler applies on a flip: persist only the OAuth columns the target
     # auth_type actually uses, so a row created as oauth_obo can't carry a
     # client_id / registration_mode / AS-URL straight into a later oauth_user
-    # flip. (``oauth_as_issuer_cached`` is discovery-owned and not a create
-    # parameter, so it is dropped from the cleared set here.)
+    # flip. ``oauth_as_issuer_cached`` (nulled by the cleared set for a
+    # non-oauth_user type) IS a valid create parameter, so it passes through
+    # to ``create_mcp_server`` as its default None.
     oauth_cols: dict[str, Any] = {
         "oauth_client_id": _clean_oauth_text(body.get("oauth_client_id")),
-        "oauth_scopes": _clean_oauth_text(body.get("oauth_scopes")),
-        "oauth_audience": _clean_oauth_text(body.get("oauth_audience"), max_length=2048),
+        "oauth_scopes": clean_scopes,
+        "oauth_audience": clean_audience,
         "oauth_registration_mode": _clean_oauth_text(body.get("oauth_registration_mode")),
         "oauth_authorization_server_url": _clean_oauth_text(
             body.get("oauth_authorization_server_url"), max_length=2048
         ),
     }
     oauth_cols.update(_oauth_columns_to_clear(auth_type))
-    oauth_cols.pop("oauth_as_issuer_cached", None)
 
     storage.create_mcp_server(
         server_id=server_id,

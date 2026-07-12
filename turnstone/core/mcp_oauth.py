@@ -901,6 +901,7 @@ async def _hardened_token_post(
     http_client: httpx.AsyncClient | None,
     request_label: str,
     endpoint_label: str,
+    classify_oversized_by_status: bool = False,
 ) -> dict[str, Any]:
     """POST one token-grant request with the shared hardening skeleton.
 
@@ -919,6 +920,14 @@ async def _hardened_token_post(
     ``None`` a transient per-request client is used — the OBO mint path runs
     on the MCP loop and deliberately passes ``None`` (see
     :func:`get_obo_access_token_classified`).
+
+    ``classify_oversized_by_status`` controls how an OVER-sized error body is
+    classified. The oauth_user refresh path keeps the default (``False`` →
+    TRANSIENT), byte-identical to the pre-refactor behavior, so a large upstream
+    error can never escalate a pre-existing consent to re-consent. The OBO legs
+    pass ``True`` so an over-sized client-error body is AMBIGUOUS (it can't read
+    the body to pin PERMANENT without defeating the guard) and still escalates
+    to the honest re-login/admin remedy instead of looping "please retry".
     """
     try:
         if http_client is not None:
@@ -930,15 +939,9 @@ async def _hardened_token_post(
         raise MCPOAuthRefreshFailed(f"{request_label} request failed: {exc}") from exc
 
     if len(resp.content) > _MAX_TOKEN_BODY_BYTES:
-        # Classify by STATUS without reading the over-sized body (reading it to
-        # pin PERMANENT would defeat the guard). A client-error status — a likely
-        # dead grant — becomes AMBIGUOUS so it still escalates to re-consent after
-        # a streak, rather than the default TRANSIENT that would loop "please
-        # retry" forever on a permanently-dead grant whose error body happened to
-        # exceed the cap.
         oversized_class = (
             _RefreshFailureClass.AMBIGUOUS
-            if resp.status_code in (400, 401, 403)
+            if classify_oversized_by_status and resp.status_code in (400, 401, 403)
             else _RefreshFailureClass.TRANSIENT
         )
         raise MCPOAuthRefreshFailed(
@@ -1544,6 +1547,7 @@ async def _revoke_after_refresh_failure(
     server_id_for_audit: str,
     *,
     reason: str,
+    audit_when_absent: bool = True,
 ) -> TokenLookupResult:
     """Delete the stored token, emit a ``token_revoked`` audit, and drop locks.
 
@@ -1553,19 +1557,24 @@ async def _revoke_after_refresh_failure(
     entry exists — and returns ``refresh_failed`` so the dispatcher surfaces
     re-consent.
 
-    The ``token_revoked`` audit is emitted ONLY when a row was actually deleted.
-    This matters for oauth_obo: its shared credential survives a per-server
-    revoke, so after the first permanent rejection deletes the cache row, every
-    later dispatch/prime past the cooldown re-runs the doomed redemption and
-    lands here again with nothing to delete — auditing unconditionally would
-    append a fresh "token_revoked" row for a token that no longer exists on
-    every cycle, forever (misleading forensics + alert fatigue for operators
-    who alert on token_revoked). oauth_user cannot hit the empty-delete case (a
-    revoke there also removes the only refresh source, so no recurrence), so
-    this gate is a no-op for it.
+    ``audit_when_absent`` controls the audit when ``delete_user_token`` finds no
+    row:
+
+    - oauth_user (default ``True``): reaching a refresh-grant failure means a
+      grant EXISTED (you cannot refresh without a token), so a real grant died —
+      audit it even if a concurrent admin/user revoke deleted the row first, so
+      an operator's SIEM never misses the AS-rejected-the-grant signal. This is
+      the pre-refactor behavior (the audit was unconditional on main).
+    - oauth_obo (``False``): a mint needs no pre-existing cache row, so a
+      permanent rejection on a server the user never successfully minted for
+      lands here with nothing to delete; its shared credential also survives, so
+      every later dispatch/prime past the cooldown re-runs the doomed redemption
+      and returns here again. Auditing those would append a "token_revoked" row
+      for a token that never existed, forever — so obo audits only a real
+      deletion.
     """
     deleted = await asyncio.to_thread(token_store.delete_user_token, user_id, server_name)
-    if deleted:
+    if deleted or audit_when_absent:
         await _audit_event(
             app_state,
             server_id=server_id_for_audit,
@@ -1728,6 +1737,11 @@ async def _handle_refresh_failure(
             server_name,
             server_id_for_audit,
             reason=permanent_reason,
+            # ``arm_cooldown_on_permanent`` marks the obo path (shared credential
+            # survives the revoke); there, audit only a real deletion to avoid
+            # revocation rows for tokens that never existed. oauth_user audits
+            # unconditionally (a refresh failure means a grant existed).
+            audit_when_absent=not arm_cooldown_on_permanent,
         )
         if arm_cooldown_on_permanent:
             # _revoke_after_refresh_failure cleared the backoff; re-arm the
@@ -1763,6 +1777,7 @@ async def _handle_refresh_failure(
                     server_name,
                     server_id_for_audit,
                     reason=escalation_reason,
+                    audit_when_absent=not arm_cooldown_on_permanent,
                 )
                 if arm_cooldown_on_permanent:
                     # Same shared-credential backstop as the PERMANENT branch: an
@@ -2067,6 +2082,10 @@ async def _obo_token_post(
         http_client=http_client,
         request_label=label,
         endpoint_label=label,
+        # OBO: an over-sized client-error body escalates (AMBIGUOUS) rather than
+        # looping "please retry" — see _hardened_token_post. (oauth_user keeps
+        # the TRANSIENT default.)
+        classify_oversized_by_status=True,
     )
 
 

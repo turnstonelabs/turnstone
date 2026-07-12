@@ -730,11 +730,21 @@ async def maybe_rediscover_oidc(app_state: Any) -> None:
         return
     try:
         now = time.monotonic()
-        last = float(getattr(app_state, "oidc_rediscover_last", 0.0))
-        if now - last < _REDISCOVER_COOLDOWN_SECONDS:
+        # ``None`` (not 0.0) means "never probed" — otherwise the first probe
+        # within ~60s of the monotonic reference (host boot) would be suppressed
+        # by the cooldown against a phantom probe at time 0.
+        last = getattr(app_state, "oidc_rediscover_last", None)
+        if last is not None and now - float(last) < _REDISCOVER_COOLDOWN_SECONDS:
             return
         app_state.oidc_rediscover_last = now
-        fresh = await discover_oidc(cfg)
+        # Probe with enabled=True FORCED ON: discover_oidc PRESERVES the input's
+        # ``enabled`` on success (only ``load_oidc_config`` ever sets it True) and
+        # sets it False on any failure. Passing the disabled boot config verbatim
+        # would make a SUCCESSFUL rediscovery still return enabled=False, so the
+        # swap below would be unreachable and the feature inert. Forcing it True
+        # up front makes ``fresh.enabled`` a reliable success signal (a real
+        # failure clears it back to False).
+        fresh = await discover_oidc(dataclasses.replace(cfg, enabled=True))
         if not fresh.enabled:
             return  # still failing — next probe after the cooldown lapses
         app_state.oidc_config = dataclasses.replace(fresh, discovery_retryable=False)

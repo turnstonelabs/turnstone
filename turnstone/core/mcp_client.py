@@ -2535,8 +2535,8 @@ class MCPClientManager:
         """
         if not user_id or self._loop is None:
             return
-        if not self._pool_server_names:
-            return
+        if not self._oauth_user_server_names and not self._obo_server_names:
+            return  # no pool-backed servers — nothing to prime (no set allocation)
         if self._app_state is None or self._storage is None:
             return
         # run_coroutine_threadsafe keeps the task referenced by the loop while
@@ -5705,6 +5705,14 @@ class MCPClientManager:
         an obo pending row — written when the credential was missing — would
         persist forever after the user re-logs in.
 
+        Deliberately NOT gated to oauth_obo: for oauth_user it also clears the
+        dispatch-time transient badges written by
+        :meth:`_record_pending_consent_best_effort` (non-interactive runs), which
+        the sweep's ``_token_sweep_warned``-keyed clear never touches for a pair
+        it didn't proactively warn. The TTL map below bounds the cost to one
+        DELETE per pair per window, so the extra oauth_user coverage is close to
+        free rather than redundant.
+
         Deduped via the ``_pending_consent_cleared`` TTL map so it is NOT an
         unconditional per-call SQL write: after a DB-confirmed DELETE the pair
         is skipped for ``_PENDING_CONSENT_CLEAR_TTL_SECONDS``, then the DELETE
@@ -5755,13 +5763,17 @@ class MCPClientManager:
         """
         if len(self._pending_consent_cleared) < _PENDING_CONSENT_CLEARED_MAX:
             return
-        entries = list(self._pending_consent_cleared.items())
-        expired = [k for k, t in entries if now - t >= _PENDING_CONSENT_CLEAR_TTL_SECONDS]
-        for k in expired:
-            self._pending_consent_cleared.pop(k, None)
+        # Pass 1: drop expired entries (snapshot the items so concurrent mutation
+        # can't raise mid-iteration; ``pop`` tolerates an already-removed key).
+        for k, t in list(self._pending_consent_cleared.items()):
+            if now - t >= _PENDING_CONSENT_CLEAR_TTL_SECONDS:
+                self._pending_consent_cleared.pop(k, None)
+        # Pass 2: only if still over the cap, drop the oldest half of what
+        # REMAINS. Re-reading the map here means we sort just the live survivors
+        # — never re-targeting keys pass 1 already removed.
         if len(self._pending_consent_cleared) >= _PENDING_CONSENT_CLEARED_MAX:
-            by_age = sorted(entries, key=lambda kv: kv[1])
-            for k, _ in by_age[: len(by_age) // 2]:
+            survivors = sorted(self._pending_consent_cleared.items(), key=lambda kv: kv[1])
+            for k, _ in survivors[: len(survivors) // 2]:
                 self._pending_consent_cleared.pop(k, None)
 
     def _dispatch_pool_sync(

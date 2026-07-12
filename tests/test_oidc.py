@@ -2524,21 +2524,37 @@ class TestRuntimeRediscovery:
         return SimpleNamespace(oidc_config=cfg)
 
     def test_rediscover_swaps_enabled_config_on_success(self):
+        """Drives the REAL discover_oidc through a mocked HTTP discovery GET
+        (NOT a mock of discover_oidc itself): discover_oidc preserves the input
+        config's ``enabled`` on success and only clears it on failure, so a
+        probe started from the disabled boot config must first force enabled=True
+        or the recovered config never installs. An earlier version of this test
+        mocked discover_oidc to return enabled=True and so masked exactly that
+        dead-code bug."""
         from turnstone.core.oidc import maybe_rediscover_oidc
 
-        state = self._disabled_retryable_state()
-        recovered = dataclasses.replace(
-            state.oidc_config,
-            enabled=True,
-            token_endpoint="https://idp.example.com/token",
-            authorization_endpoint="https://idp.example.com/authorize",
-            jwks_uri="https://idp.example.com/jwks",
-        )
-        with patch(
-            "turnstone.core.oidc.discover_oidc", new=AsyncMock(return_value=recovered)
-        ) as disc:
-            asyncio.run(maybe_rediscover_oidc(state))
-        disc.assert_awaited_once()
+        state = self._disabled_retryable_state()  # issuer=https://idp.example.com
+        discovery_doc = {
+            "authorization_endpoint": "https://idp.example.com/authorize",
+            "token_endpoint": "https://idp.example.com/token",
+            "userinfo_endpoint": "https://idp.example.com/userinfo",
+            "jwks_uri": "https://idp.example.com/.well-known/jwks.json",
+        }
+        mock_response = MagicMock()
+        mock_response.json.return_value = discovery_doc
+        mock_response.raise_for_status = MagicMock()
+
+        async def _run():
+            client = _mock_async_client(lambda url: _async_return(mock_response))
+            with (
+                patch("socket.getaddrinfo", return_value=[(2, 1, 6, "", ("93.184.216.34", 0))]),
+                patch("httpx.AsyncClient", return_value=client),
+            ):
+                await maybe_rediscover_oidc(state)
+
+        asyncio.run(_run())
+
+        # The real discover_oidc succeeded and the recovered config was installed.
         assert state.oidc_config.enabled is True
         assert state.oidc_config.token_endpoint == "https://idp.example.com/token"
         # The healed config no longer advertises a retryable failure.

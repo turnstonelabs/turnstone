@@ -864,6 +864,53 @@ class TestUpdateMcpServer:
         assert r.status_code == 400, r.text
         assert "OIDC" in r.json()["error"]
 
+    def test_obo_editable_when_oidc_discovery_transiently_failed(self, client, storage):
+        """Review finding: the console never runs runtime OIDC rediscovery, so a
+        transient discovery failure at console boot (enabled=False,
+        discovery_retryable=True) must NOT make oauth_obo servers un-editable /
+        un-disable-able. OIDC is still CONFIGURED (issuer set) — the write gate
+        accepts a discovery_retryable config; it rejects only a genuinely absent
+        OIDC (neither flag set)."""
+        # Seed an obo row (created while OIDC was healthy).
+        storage.create_mcp_server(
+            server_id="obo-retry-id",
+            name="obo-retry",
+            transport="streamable-http",
+            url="https://mcp.example.com/sse",
+            auth_type="oauth_obo",
+            oauth_audience="api://mcp-a",
+        )
+        # Console process booted while the IdP was briefly unreachable.
+        client.app.state.oidc_config = SimpleNamespace(
+            enabled=False,
+            issuer="https://idp.example.com",
+            obo_grant_profile="entra",
+            capture_user_credential=True,
+            discovery_retryable=True,
+        )
+        # Disabling the misbehaving obo server must succeed, not 400.
+        r = client.put(
+            "/v1/api/admin/mcp-servers/obo-retry-id",
+            json={"enabled": False},
+        )
+        assert r.status_code == 200, r.text
+        assert r.json()["enabled"] is False
+
+        # A genuinely-absent OIDC (neither enabled nor retryable) still rejects.
+        client.app.state.oidc_config = SimpleNamespace(
+            enabled=False,
+            issuer="",
+            obo_grant_profile="entra",
+            capture_user_credential=True,
+            discovery_retryable=False,
+        )
+        r2 = client.put(
+            "/v1/api/admin/mcp-servers/obo-retry-id",
+            json={"enabled": True},
+        )
+        assert r2.status_code == 400
+        assert "OIDC" in r2.json()["error"]
+
     def test_create_obo_rejected_on_invalid_grant_profile(self, client):
         """Review finding: a typo'd deployment obo_grant_profile leaves the mint
         leg unresolved (obo_misconfigured per dispatch), so reject it at the

@@ -232,6 +232,35 @@ class TestRefreshFailureClassification:
         # Token survives a transient failure — no cluster-wide revoke; self-heals.
         assert state.mcp_token_store.get_user_token("user-1", "srv-oauth") is not None
 
+    def test_oversized_error_body_stays_transient_for_oauth_user(
+        self, storage: SQLiteBackend
+    ) -> None:
+        """Review finding: routing refresh_token() through the shared
+        _hardened_token_post must NOT change the oauth_user oversized-error
+        behavior. On main an over-cap error body was TRANSIENT (default class,
+        token kept, retryable forever); the OBO-only status-based escalation must
+        not leak onto oauth_user, or a large upstream error could escalate a
+        pre-existing consent to an unexpected re-consent. oauth_user keeps
+        TRANSIENT; the token survives."""
+        _seed_server(storage)
+        client = MagicMock(spec=httpx.AsyncClient)
+        client.get = AsyncMock(return_value=_mk_response(200, _good_as_metadata_doc()))
+        # 401 with an error body over the 64KB cap.
+        client.post = AsyncMock(
+            return_value=_mk_response(401, {"error": "invalid_grant", "pad": "x" * (70 * 1024)})
+        )
+        state = _make_app_state(storage, http_client=client)
+        _seed_token(state, expires_in_seconds=-1000)
+
+        result = self._lookup(state)
+
+        assert result.kind == "refresh_failed_transient"
+        # Kept (TRANSIENT), not revoked — and the ambiguous streak did not advance.
+        assert state.mcp_token_store.get_user_token("user-1", "srv-oauth") is not None
+        from turnstone.core.mcp_oauth import _refresh_backoff_state
+
+        assert _refresh_backoff_state(state, "user-1", "srv-oauth").ambiguous_streak == 0
+
     def test_permanent_invalid_grant_revokes(self, storage: SQLiteBackend) -> None:
         """Contrast: 400 invalid_grant IS permanent — deletion is correct and the
         eventual fix MUST preserve it."""
@@ -246,6 +275,32 @@ class TestRefreshFailureClassification:
 
         assert result.kind == "refresh_failed"
         assert state.mcp_token_store.get_user_token("user-1", "srv-oauth") is None
+
+    def test_permanent_revoke_audits_even_when_row_concurrently_deleted(
+        self, storage: SQLiteBackend
+    ) -> None:
+        """Review finding: gating the token_revoked audit on delete-returned-True
+        (the obo spam fix) must NOT suppress the oauth_user audit when a
+        concurrent admin/user revoke deletes the row first. For oauth_user a
+        refresh failure means a grant EXISTED (a real revocation), so the audit
+        fires even on an empty delete — an operator's SIEM must not miss it."""
+        from unittest.mock import patch
+
+        _seed_server(storage)
+        client = MagicMock(spec=httpx.AsyncClient)
+        client.get = AsyncMock(return_value=_mk_response(200, _good_as_metadata_doc()))
+        client.post = AsyncMock(return_value=_mk_response(400, {"error": "invalid_grant"}))
+        state = _make_app_state(storage, http_client=client)
+        _seed_token(state, expires_in_seconds=-1000)
+
+        # Simulate a concurrent external revoke: the dispatch-side delete finds
+        # the row already gone (returns False).
+        with patch.object(state.mcp_token_store, "delete_user_token", return_value=False):
+            result = self._lookup(state)
+
+        assert result.kind == "refresh_failed"
+        events = storage.list_audit_events(action="mcp_server.oauth.token_revoked")
+        assert len(events) == 1  # audited despite the empty delete
 
     def test_400_invalid_client_keeps_token(self, storage: SQLiteBackend) -> None:
         """A 400 ``invalid_client`` is operator-fixable, NOT a dead grant: keep
