@@ -4,8 +4,9 @@
 #
 #   curl -fsSL https://raw.githubusercontent.com/turnstonelabs/turnstone/main/run.sh | bash
 #
-# Autodetects your distro (Ubuntu/Debian, Fedora/RHEL, Arch, and WSL on any of
-# them) and:
+# Autodetects your distro — Ubuntu/Debian, Fedora/RHEL, Arch, their common
+# derivatives (Mint, Pop!_OS, Nobara, AlmaLinux, …), and WSL on any of them —
+# and:
 #   1. ensures git is installed, then clones the repo
 #   2. ensures Docker + the compose plugin are installed and the daemon is usable
 #   3. asks how many server nodes to run (1-10)
@@ -65,12 +66,18 @@ ask() {
 
 # -- distro / package manager detection --------------------------------------
 OS_ID=""; OS_LIKE=""; PKG=""; IS_WSL=0; SUDO=""
+# Extra os-release fields, captured only to pick Docker's upstream repo when
+# get.docker.com refuses a derivative it doesn't recognize (see install_docker).
+OS_PLATFORM_ID=""; OS_CODENAME=""; OS_UBUNTU_CODENAME=""
 
 detect_os() {
     if [ -r /etc/os-release ]; then
         # shellcheck disable=SC1091
         . /etc/os-release
         OS_ID="${ID:-}"; OS_LIKE="${ID_LIKE:-}"
+        OS_PLATFORM_ID="${PLATFORM_ID:-}"
+        OS_CODENAME="${VERSION_CODENAME:-}"
+        OS_UBUNTU_CODENAME="${UBUNTU_CODENAME:-}"
     fi
     if grep -qiE 'microsoft|wsl' /proc/version 2>/dev/null || [ -n "${WSL_DISTRO_NAME:-}" ]; then
         IS_WSL=1
@@ -130,11 +137,66 @@ clone_repo() {
 # -- docker -------------------------------------------------------------------
 DOCKER="docker"
 
+# Fallback when get.docker.com won't install here. That script keys off $ID alone
+# (never ID_LIKE), so it aborts with "Unsupported distribution '<id>'" on every
+# derivative — Nobara, Linux Mint, Pop!_OS, AlmaLinux, Oracle Linux, … — even
+# though the family is clear. We already know the family from detect_os, so we add
+# Docker's official CE repo for the matching upstream and install the same
+# packages get.docker.com would (including the compose plugin the rest of run.sh
+# relies on).
+install_docker_ce_repo() {
+    local up
+    case "$PKG" in
+        apt)
+            local codename arch
+            # UBUNTU_CODENAME is set by Ubuntu and every Ubuntu-derived distro
+            # (Mint/Pop!_OS/Zorin/…) and never by pure Debian, so it both routes
+            # the family and gives the exact codename Docker's repo expects.
+            if [ -n "$OS_UBUNTU_CODENAME" ]; then
+                up=ubuntu; codename="$OS_UBUNTU_CODENAME"
+            else
+                up=debian; codename="$OS_CODENAME"
+            fi
+            [ -n "$codename" ] || die "couldn't determine the $up release codename for Docker's repo — install Docker manually and re-run."
+            arch="$(dpkg --print-architecture 2>/dev/null || echo amd64)"
+            info "Adding Docker's $up repository ($codename)."
+            $SUDO install -m 0755 -d /etc/apt/keyrings
+            curl -fsSL "https://download.docker.com/linux/$up/gpg" | $SUDO tee /etc/apt/keyrings/docker.asc >/dev/null
+            $SUDO chmod a+r /etc/apt/keyrings/docker.asc
+            printf 'deb [arch=%s signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/%s %s stable\n' \
+                "$arch" "$up" "$codename" | $SUDO tee /etc/apt/sources.list.d/docker.list >/dev/null
+            $SUDO apt-get update -y
+            $SUDO apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+            ;;
+        dnf|yum)
+            # A Fedora spin and a RHEL clone can both carry "fedora" in ID_LIKE
+            # (Nobara's is "rhel centos fedora"), so ID_LIKE can't separate them.
+            # PLATFORM_ID can: Fedora is platform:fNN, Enterprise Linux platform:elN.
+            case "$OS_PLATFORM_ID" in
+                platform:f*)  up=fedora ;;
+                platform:el*) up=centos ;;
+                *) if [ -e /etc/fedora-release ]; then up=fedora; else up=centos; fi ;;
+            esac
+            info "Adding Docker's $up repository."
+            $SUDO curl -fsSL "https://download.docker.com/linux/$up/docker-ce.repo" \
+                -o /etc/yum.repos.d/docker-ce.repo \
+                || die "couldn't add Docker's $up repository — install Docker manually and re-run."
+            pkg_install docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+            ;;
+    esac
+}
+
 install_docker() {
     case "$PKG" in
         apt|dnf|yum)
             info "Installing Docker via the official get.docker.com script"
-            curl -fsSL https://get.docker.com | $SUDO sh ;;
+            # get.docker.com aborts on distros it doesn't recognize by $ID; when it
+            # does, add Docker's repo for the family we detected instead.
+            if ! curl -fsSL https://get.docker.com | $SUDO sh; then
+                warn "get.docker.com doesn't recognize '${OS_ID:-this distro}' — using Docker's repository directly."
+                install_docker_ce_repo
+            fi
+            ;;
         pacman)
             pkg_install docker docker-compose ;;
     esac
