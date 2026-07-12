@@ -14,6 +14,52 @@ experimental line:
 
 Earlier stable lines (`stable/1.6`, `stable/1.5`) are frozen.
 
+## [1.7.4]
+
+A feature-bearing patch for the 1.7 line, rolling up work that had stabilised
+on `main`. No schema migrations (head stays 066) and no new configuration knobs.
+
+### Added
+
+- **Background shells for the `bash` tool** — `run_in_background=true` starts a
+  command as a detached shell and returns a `bash_N` handle; new `bash_output`
+  (delta output since last read, optional regex filter, status/exit code) and
+  `kill_shell` (terminates the shell's process group) tools manage it. Output is
+  buffered with a drop-oldest cap, a system notice lands when a shell exits, and
+  shells die with their workstream — never outliving a `task_agent` that started
+  them.
+- **`task_agent` carries the model's native reasoning across its own tool loop** —
+  a task agent's replayed turns now preserve the provider-native reasoning lane
+  (Anthropic thinking blocks with signatures, OpenAI reasoning items, Gemini
+  `thought_signature`, vLLM/llama.cpp reasoning text) instead of rebuilding each
+  turn from text alone, restoring reasoning continuity for thinking models.
+- **Model-shelf response controls** — the console model shelf exposes verbosity
+  and reasoning-mode controls per identity.
+
+### Changed
+
+- **GPT-5.6 aligned with the GA API surface** — the Responses provider matches
+  GPT-5.6's GA shape (typed `reasoning.mode`, `prompt_cache_options`,
+  cache-write accounting); the `openai` floor moves to `>=2.45`.
+
+### Fixed
+
+- **`bash` never hangs on a backgrounded child** — a command that left a
+  long-lived process running no longer wedges the workstream; the tool waits on
+  the tracked process (bounded by the timeout) and reaps its whole process group.
+- **`task_agent` sub-tool ids are session-unique** — ids are minted
+  `{parent}::r{run}s{step}::{id}` so a local model reissuing sequential ids
+  (`call_0` each turn) no longer aliases two steps onto one live-card row while
+  `/history` keeps them apart.
+- **Judge completions honour model-definition capabilities** — a judge's
+  completion now threads its model's declared capabilities instead of assuming a
+  default surface.
+- **`create-admin` CLI** — adds an explicit admin-creation command; `run.sh` no
+  longer onboards into a role-less user.
+- **Install script Docker handling** — installs Docker on distros
+  `get.docker.com` rejects, and gates that path by `$ID` instead of trapping all
+  failures.
+
 ## [1.7.3]
 
 A small feature and maintenance patch for the 1.7 line. No schema migrations
