@@ -582,6 +582,56 @@ class TestCacheAndCredentialLookup:
         assert result.token == "cached-at"
         assert client.post.call_count == 0
 
+    def test_credential_present_hint_skips_the_pre_lock_existence_read(
+        self, storage: SQLiteBackend
+    ) -> None:
+        """Review finding: when a caller already established the captured
+        credential exists (priming does one read for ALL of a user's obo
+        servers), get_obo_access_token_classified must skip its per-server
+        pre-lock existence re-read — otherwise session start re-reads the
+        credential N+1 times. With credential_present=True only the authoritative
+        under-lock read remains (one raw read); without the hint there are two
+        (pre-lock existence + under-lock)."""
+        from unittest.mock import patch
+
+        _seed_obo_server(storage)
+
+        def _run_with_hint(hint: bool | None) -> tuple[Any, int]:
+            client = MagicMock(spec=httpx.AsyncClient)
+            client.post = AsyncMock(
+                return_value=_mk_response(200, {"access_token": "minted-at", "expires_in": 3600})
+            )
+            state = _make_app_state(storage, http_client=client, oidc_config=_make_oidc_config())
+            _seed_credential(state)
+            reads = {"n": 0}
+            real = storage.get_oidc_user_credential
+
+            def _counting(user_id, issuer):
+                reads["n"] += 1
+                return real(user_id, issuer)
+
+            async def _go() -> Any:
+                with patch.object(storage, "get_oidc_user_credential", side_effect=_counting):
+                    return await get_obo_access_token_classified(
+                        app_state=state,
+                        user_id=USER,
+                        server_name=SERVER,
+                        credential_present=hint,
+                    )
+
+            res = asyncio.run(_go())
+            # Clear the cache row so the next run mints again (independent count).
+            storage.delete_mcp_user_token(USER, SERVER)
+            return res, reads["n"]
+
+        result_hint, reads_hint = _run_with_hint(True)
+        assert result_hint.kind == "token"
+        assert reads_hint == 1  # pre-lock skipped; only the under-lock read
+
+        result_none, reads_none = _run_with_hint(None)
+        assert result_none.kind == "token"
+        assert reads_none == 2  # pre-lock existence + under-lock
+
     def test_stale_audience_cache_row_is_not_served_and_remints(
         self, storage: SQLiteBackend
     ) -> None:

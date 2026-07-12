@@ -2616,6 +2616,11 @@ class MCPClientManager:
                                 # (drop the cache row + arm cooldown) across every
                                 # user — defer that to the user's real dispatch.
                                 revoke_ambiguous_escalation=False,
+                                # The credential-presence gate above already
+                                # confirmed the captured credential exists for this
+                                # user (one read for ALL their obo servers), so skip
+                                # the per-server pre-lock existence re-read.
+                                credential_present=True,
                             )
                         else:
                             lookup = await get_user_access_token_classified(
@@ -2926,9 +2931,10 @@ class MCPClientManager:
             return
         try:
             await asyncio.to_thread(self._storage.delete_mcp_pending_consent, user_id, server_name)
-            now = time.monotonic()
-            self._prune_pending_consent_cleared(now)
-            self._pending_consent_cleared[(user_id, server_name)] = now
+            # Route through the shared helper (not an inline prune+stamp) so the
+            # two DB-confirmed clear sites can't drift — see
+            # _mark_pending_consent_cleared, which names this method as a caller.
+            self._mark_pending_consent_cleared((user_id, server_name), time.monotonic())
         except Exception:
             log.debug(
                 "MCP token sweep: pending-consent clear failed user=%s server=%s",

@@ -2342,6 +2342,7 @@ async def get_obo_access_token_classified(
     force_refresh: bool = False,
     revoke_ambiguous_escalation: bool = True,
     server_row: dict[str, Any] | None = None,
+    credential_present: bool | None = None,
 ) -> TokenLookupResult:
     """Tagged token lookup for ``auth_type='oauth_obo'`` servers.
 
@@ -2483,10 +2484,16 @@ async def get_obo_access_token_classified(
     # to short-circuit the common "no captured credential" case before taking
     # the pg advisory lock. The authoritative decrypt happens exactly once under
     # the lock (credential2 below), where decrypt_failure is already classified —
-    # so the refresh token is never Fernet-decrypted twice per mint (which, at
-    # session-start priming across N obo servers, was N redundant decrypts per
-    # user). Mirrors the raw existence guard the priming path already uses.
-    if await asyncio.to_thread(storage.get_oidc_user_credential, user_id, issuer) is None:
+    # so the refresh token is never Fernet-decrypted twice per mint. When the
+    # caller already established presence for this issuer (``credential_present``
+    # — the priming path does one existence read for ALL of a user's obo servers)
+    # this per-server read is skipped, so session-start priming doesn't re-read
+    # the credential N times.
+    if credential_present is None:
+        credential_present = (
+            await asyncio.to_thread(storage.get_oidc_user_credential, user_id, issuer) is not None
+        )
+    if not credential_present:
         # No captured credential → the consent affordance is a re-login.
         return _no_token_result(app_state, user_id, server_name, TokenLookupResult(kind="missing"))
 
