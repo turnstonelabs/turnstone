@@ -4652,6 +4652,43 @@ function loadAdminMcp() {
     });
 }
 
+function _wireMcpTokenDropButtons(el, attr, opts) {
+  // Shared binder for the two per-server token-drop list actions —
+  // "Bulk-revoke" (oauth_user consents) and "Flush cache" (oauth_obo minted
+  // tokens). Both post to the same bulk-revoke endpoint; only the operator-
+  // facing copy differs, so the confirm/fetch/toast/reload flow lives once.
+  el.querySelectorAll("[" + attr + "]").forEach(function (btn) {
+    btn.addEventListener("click", function () {
+      const name = this.getAttribute(attr);
+      const count = this.getAttribute("data-mcp-consent-count") || "?";
+      showConfirmModal(
+        opts.title,
+        opts.message(name, count),
+        opts.confirmLabel,
+        function () {
+          authFetch(
+            "/v1/api/admin/mcp-servers/" +
+              encodeURIComponent(name) +
+              "/bulk-revoke",
+            { method: "POST" },
+          )
+            .then(function (r) {
+              if (!r.ok) throw new Error();
+              return r.json();
+            })
+            .then(function (j) {
+              showToast(opts.successToast(name, j.rows_deleted || 0));
+              loadAdminMcp();
+            })
+            .catch(function () {
+              showToast(opts.failToast(name));
+            });
+        },
+      );
+    });
+  });
+}
+
 function _renderMcpServers(items) {
   const el = document.getElementById("admin-mcp-table");
   if (!items.length) {
@@ -4946,77 +4983,43 @@ function _renderMcpServers(items) {
       window.open(url, "_blank", "noopener");
     });
   });
-  el.querySelectorAll("[data-mcp-bulk-revoke]").forEach(function (btn) {
-    btn.addEventListener("click", function () {
-      const name = this.getAttribute("data-mcp-bulk-revoke");
-      const count = this.getAttribute("data-mcp-consent-count") || "?";
-      showConfirmModal(
-        "Bulk-revoke MCP consents",
+  _wireMcpTokenDropButtons(el, "data-mcp-bulk-revoke", {
+    title: "Bulk-revoke MCP consents",
+    message: function (name, count) {
+      return (
         "Drop all " +
-          count +
-          ' user consents for server "' +
-          name +
-          '"? Users will need to re-consent on next use. Upstream revoke is not attempted in bulk; tokens at the authorization server will expire naturally.',
-        "Bulk-revoke",
-        function () {
-          authFetch(
-            "/v1/api/admin/mcp-servers/" +
-              encodeURIComponent(name) +
-              "/bulk-revoke",
-            { method: "POST" },
-          )
-            .then(function (r) {
-              if (!r.ok) throw new Error();
-              return r.json();
-            })
-            .then(function (j) {
-              showToast(
-                "Bulk-revoked " + (j.rows_deleted || 0) + " row(s) for " + name,
-              );
-              loadAdminMcp();
-            })
-            .catch(function () {
-              showToast("Failed to bulk-revoke " + name);
-            });
-        },
+        count +
+        ' user consents for server "' +
+        name +
+        '"? Users will need to re-consent on next use. Upstream revoke is not attempted in bulk; tokens at the authorization server will expire naturally.'
       );
-    });
+    },
+    confirmLabel: "Bulk-revoke",
+    successToast: function (name, n) {
+      return "Bulk-revoked " + n + " row(s) for " + name;
+    },
+    failToast: function (name) {
+      return "Failed to bulk-revoke " + name;
+    },
   });
-  el.querySelectorAll("[data-mcp-cache-flush]").forEach(function (btn) {
-    btn.addEventListener("click", function () {
-      const name = this.getAttribute("data-mcp-cache-flush");
-      const count = this.getAttribute("data-mcp-consent-count") || "?";
-      showConfirmModal(
-        "Flush minted tokens",
+  _wireMcpTokenDropButtons(el, "data-mcp-cache-flush", {
+    title: "Flush minted tokens",
+    message: function (name, count) {
+      return (
         "Drop " +
-          count +
-          ' users’ minted tokens for server "' +
-          name +
-          '"? This forces a fresh mint on next use (e.g. after changing the audience). It does NOT cut off access — users re-mint from their org sign-in; to revoke a user, remove their access at your identity provider or unlink their identity.',
-        "Flush cache",
-        function () {
-          authFetch(
-            "/v1/api/admin/mcp-servers/" +
-              encodeURIComponent(name) +
-              "/bulk-revoke",
-            { method: "POST" },
-          )
-            .then(function (r) {
-              if (!r.ok) throw new Error();
-              return r.json();
-            })
-            .then(function (j) {
-              showToast(
-                "Flushed " + (j.rows_deleted || 0) + " token(s) for " + name,
-              );
-              loadAdminMcp();
-            })
-            .catch(function () {
-              showToast("Failed to flush cache for " + name);
-            });
-        },
+        count +
+        ' users’ minted tokens for server "' +
+        name +
+        '"? This forces a fresh mint on next use (e.g. after changing the audience). It does NOT cut off access — users re-mint from their org sign-in; to revoke a user, remove their access at your identity provider or unlink their identity.'
       );
-    });
+    },
+    confirmLabel: "Flush cache",
+    successToast: function (name, n) {
+      return "Flushed " + n + " token(s) for " + name;
+    },
+    failToast: function (name) {
+      return "Failed to flush cache for " + name;
+    },
   });
   el.querySelectorAll("[data-mcp-delete]").forEach(function (btn) {
     btn.addEventListener("click", function () {
@@ -5105,9 +5108,29 @@ function _wireMcpAudienceAutofill() {
   if (!urlInput || urlInput.dataset.audAutofill === "1") return;
   urlInput.dataset.audAutofill = "1";
   urlInput.addEventListener("blur", function () {
+    // oauth_user only: there the audience IS the server URL (resource
+    // indicator). For sign-in passthrough the audience is the identity-
+    // provider-side application identifier — prefilling the MCP URL there
+    // passes every validation layer and then fails every token mint, so
+    // the autofill stays off.
+    if (_selectedMcpAuthType() === "oauth_obo") return;
     const aud = document.getElementById("mcp-oauth-audience");
     if (aud && !aud.value.trim()) aud.value = urlInput.value.trim();
   });
+}
+
+function _onMcpAuthTypeChange() {
+  // Switching INTO sign-in passthrough: if the audience field still holds
+  // the URL-autofill artifact (operator typed the URL first, then picked
+  // this mode), blank it so the required-field check asks for a real
+  // identity-provider application identifier instead of silently
+  // persisting the MCP URL as the audience.
+  if (_selectedMcpAuthType() === "oauth_obo") {
+    const aud = document.getElementById("mcp-oauth-audience");
+    const urlVal = document.getElementById("mcp-url").value.trim();
+    if (aud && urlVal && aud.value.trim() === urlVal) aud.value = "";
+  }
+  toggleMcpAuthFields();
 }
 
 function _mcpWire() {
@@ -5118,7 +5141,7 @@ function _mcpWire() {
     .addEventListener("change", toggleMcpTransport);
   const authRadios = document.getElementsByName("mcp-auth-type");
   for (let i = 0; i < authRadios.length; i++) {
-    authRadios[i].addEventListener("change", toggleMcpAuthFields);
+    authRadios[i].addEventListener("change", _onMcpAuthTypeChange);
   }
   document
     .getElementById("mcp-create-submit")
@@ -5156,7 +5179,11 @@ function _mcpResetForm() {
   document.getElementById("mcp-oauth-registration").value = "preregistered";
   document.getElementById("mcp-oauth-client-id").value = "";
   document.getElementById("mcp-oauth-client-secret").value = "";
-  document.getElementById("mcp-oauth-scopes").value = "";
+  const scopesReset = document.getElementById("mcp-oauth-scopes");
+  scopesReset.value = "";
+  // Create flow has no loaded row — the marker's absence tells
+  // _parseMcpForm to always include the field.
+  delete scopesReset.dataset.loaded;
   document.getElementById("mcp-oauth-audience").value = "";
   document.getElementById("mcp-create-error").classList.remove("is-visible");
   toggleMcpTransport();
@@ -5229,7 +5256,12 @@ function showEditMcpModal(serverId) {
         s.oauth_client_id || "";
       // Secret field always blank — write-only, never read back.
       document.getElementById("mcp-oauth-client-secret").value = "";
-      document.getElementById("mcp-oauth-scopes").value = s.oauth_scopes || "";
+      const scopesInput = document.getElementById("mcp-oauth-scopes");
+      scopesInput.value = s.oauth_scopes || "";
+      // Remember the loaded value so _parseMcpForm can omit an untouched
+      // pre-fill from the payload (the server treats a present field as an
+      // operator-set value).
+      scopesInput.dataset.loaded = s.oauth_scopes || "";
       document.getElementById("mcp-oauth-audience").value =
         s.oauth_audience || "";
       toggleMcpTransport();
@@ -5332,9 +5364,18 @@ function _parseMcpForm() {
     if (!audience)
       return { error: "Audience is required for sign-in passthrough servers" };
     payload.oauth_audience = audience;
-    payload.oauth_scopes = document
-      .getElementById("mcp-oauth-scopes")
-      .value.trim();
+    // Include scopes only when the operator changed them from the loaded row
+    // value (or on create, where no loaded marker exists): the server treats
+    // a present field as an operator-set value, and re-submitting the
+    // untouched pre-fill on every save must not read as one.
+    const scopesInput = document.getElementById("mcp-oauth-scopes");
+    const scopesVal = scopesInput.value.trim();
+    if (
+      scopesInput.dataset.loaded === undefined ||
+      scopesVal !== scopesInput.dataset.loaded.trim()
+    ) {
+      payload.oauth_scopes = scopesVal;
+    }
   }
 
   return payload;

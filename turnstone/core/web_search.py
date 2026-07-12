@@ -21,7 +21,7 @@ from typing import TYPE_CHECKING, Any, Protocol
 import httpx
 
 from turnstone.core.log import get_logger
-from turnstone.core.mcp_oauth import is_user_scoped_auth
+from turnstone.core.mcp_crypto import is_user_scoped_auth
 
 if TYPE_CHECKING:
     from turnstone.core.mcp_client import MCPClientManager

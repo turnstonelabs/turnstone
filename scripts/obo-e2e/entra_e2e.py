@@ -107,7 +107,7 @@ def _make_app_state(
         auth_storage=storage,
         mcp_token_store=store,
         oidc_config=oidc_config,
-        oidc_http_client=http_client,
+        obo_http_client=http_client,
         mcp_oauth_refresh_locks={},
         mcp_oauth_refresh_backoff={},
     )

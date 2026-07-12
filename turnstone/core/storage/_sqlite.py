@@ -20,6 +20,7 @@ if TYPE_CHECKING:
 
 from turnstone.core.log import get_logger
 from turnstone.core.storage._protocol import (
+    USER_SCOPED_AUTH_TYPES,
     MCPOAuthPendingState,
     MCPPendingConsentRow,
     MCPUserToken,
@@ -5193,7 +5194,7 @@ class SQLiteBackend:
             result = conn.execute(
                 sa.select(sa.literal(1))
                 .select_from(mcp_servers)
-                .where(mcp_servers.c.auth_type.in_(("oauth_user", "oauth_obo")))
+                .where(mcp_servers.c.auth_type.in_(sorted(USER_SCOPED_AUTH_TYPES)))
                 .limit(1)
             ).scalar()
         return result is not None

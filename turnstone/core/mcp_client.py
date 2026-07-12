@@ -148,6 +148,17 @@ _MAX_PROMPTS_PER_SERVER = 1000
 # thundering herd of connects on every session start.
 _PRIME_MAX_CONCURRENCY = 4
 
+# How long a node trusts its own pending-consent DELETE before re-running it on
+# the next dispatch success. Bounds two things at once: the hot-path SQL rate
+# (at most one DELETE per (user, server) per window) and the staleness of a
+# consent badge written by ANOTHER node after this node's last clear.
+_PENDING_CONSENT_CLEAR_TTL_SECONDS = 300.0
+
+# Size threshold that triggers opportunistic pruning of the cleared-pairs TTL
+# map. Purely memory hygiene — a pruned pair costs one extra SQL DELETE on its
+# next success, never a correctness change.
+_PENDING_CONSENT_CLEARED_MAX = 4096
+
 
 # ``mcp.client.streamable_http._send_session_terminated_error`` synthesizes this
 # (non-standard, POSITIVE) JSON-RPC code *client-side* when a held
@@ -774,19 +785,18 @@ class MCPClientManager:
         # credential, so the priming / keep-alive-sweep / consent sites that
         # iterate ``_oauth_user_server_names`` deliberately exclude these.
         self._obo_server_names: set[str] = set()
-        # (user, server) pairs for which THIS node has written a pending-consent
-        # row. The dispatch-success clear consults it so the common (no pending
-        # row) path never issues an SQL DELETE — a per-node hint, not
-        # authoritative: cross-node the sweep / next same-node success reconciles.
-        # (user, server) pairs this node believes have NO pending-consent row —
-        # either cleared here, or never seen to fail here. The dispatch-success
-        # clear does its SQL DELETE only the FIRST time a pair reaches success
-        # since its last failure, then records it here so subsequent successes
-        # skip the SQL (keeps the hot path write-free). Crucially this is NOT
-        # gated on "we wrote the row": a fresh node / a node that didn't write
-        # the row still clears on its first success, so a badge written on
-        # another node self-heals cross-node. A write resets the pair (below).
-        self._pending_consent_cleared: set[tuple[str, str]] = set()
+        # (user, server) → monotonic time of this node's last DB-confirmed
+        # pending-consent DELETE. The dispatch-success clear skips its SQL
+        # DELETE while the entry is younger than the TTL (keeps the hot path
+        # write-free) and re-runs it once the entry ages out — so a
+        # pending-consent row written by ANOTHER node after this node's last
+        # clear still self-heals within one TTL window of active dispatching.
+        # (A pure cleared-once set suppressed the clear forever: node A's
+        # entry never invalidated when node B wrote a fresh row.) A failure
+        # observed on THIS node re-arms the pair immediately
+        # (_write_pending_consent pops it). Entries are pruned
+        # opportunistically on insert — memory hygiene, not correctness.
+        self._pending_consent_cleared: dict[tuple[str, str], float] = {}
 
         # Idle-eviction task handle. Scheduled lazily on the mcp-loop the
         # first time a pool entry is created (start() runs before pool
@@ -2640,6 +2650,29 @@ class MCPClientManager:
                 self._priming_keys.discard(key)
 
         prime_names = self._oauth_user_server_names | self._obo_server_names
+        if self._obo_server_names:
+            # One raw existence SELECT (no decrypt) decides ALL obo servers for
+            # this user: a user with no captured credential — a local-auth
+            # account, or capture disabled when they last logged in — would
+            # otherwise pay three SQL reads per obo server per session start
+            # (server row + cache row + credential) just to learn
+            # kind="missing". The oauth_user branch keeps its own deferred-row
+            # optimisation. On any read hiccup, fail open and let the
+            # per-server mint path classify it.
+            issuer = str(getattr(getattr(self._app_state, "oidc_config", None), "issuer", "") or "")
+            has_credential = False
+            if issuer:
+                try:
+                    has_credential = (
+                        await asyncio.to_thread(
+                            self._storage.get_oidc_user_credential, user_id, issuer
+                        )
+                        is not None
+                    )
+                except Exception:
+                    has_credential = True
+            if not has_credential:
+                prime_names -= self._obo_server_names
         await asyncio.gather(*(_prime_one(s) for s in list(prime_names)))
 
     # -- background token-freshness sweep (oauth_user grants) -----------------
@@ -2849,8 +2882,9 @@ class MCPClientManager:
             now_iso=datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S"),
         )
         # A fresh pending row exists again → un-mark the pair so the next
-        # successful dispatch (on any node) clears it.
-        self._pending_consent_cleared.discard((user_id, server_name))
+        # successful dispatch on this node clears it without waiting out the
+        # TTL (other nodes converge via their own TTL expiry).
+        self._pending_consent_cleared.pop((user_id, server_name), None)
 
     async def _persist_pending_consent_best_effort(self, user_id: str, server_name: str) -> bool:
         """Raise the dashboard pending-consent badge for a proactively-detected
@@ -2892,7 +2926,9 @@ class MCPClientManager:
             return
         try:
             await asyncio.to_thread(self._storage.delete_mcp_pending_consent, user_id, server_name)
-            self._pending_consent_cleared.add((user_id, server_name))
+            now = time.monotonic()
+            self._prune_pending_consent_cleared(now)
+            self._pending_consent_cleared[(user_id, server_name)] = now
         except Exception:
             log.debug(
                 "MCP token sweep: pending-consent clear failed user=%s server=%s",
@@ -4892,8 +4928,12 @@ class MCPClientManager:
         return None
 
     def _is_pool_server(self, server_name: str) -> bool:
-        """True when *server_name* uses per-user pool sessions (no static session)."""
-        return server_name in self._oauth_user_server_names or server_name in self._obo_server_names
+        """True when *server_name* uses per-user pool sessions (no static session).
+
+        Derived from :meth:`server_auth_type` so pool membership has exactly
+        one definition over the two per-auth-type registries.
+        """
+        return self.server_auth_type(server_name) is not None
 
     @property
     def server_count(self) -> int:
@@ -5654,23 +5694,27 @@ class MCPClientManager:
         an obo pending row — written when the credential was missing — would
         persist forever after the user re-logs in.
 
-        Deduped via ``_pending_consent_cleared`` so it is NOT an unconditional
-        per-call SQL write: the DELETE runs only the first time a pair reaches
-        success since its last failure, then the pair is recorded and subsequent
-        successes skip it — keeping the hot dispatch path free of per-call SQL.
-        Unlike a "we wrote the row" gate, this fires on ANY node's first success
-        (a fresh node's cleared-set is empty), so a badge written on another node
-        self-heals cross-node; a node restart also re-clears once. A new failure
-        removes the pair (``_write_pending_consent``) so the badge re-clears.
+        Deduped via the ``_pending_consent_cleared`` TTL map so it is NOT an
+        unconditional per-call SQL write: after a DB-confirmed DELETE the pair
+        is skipped for ``_PENDING_CONSENT_CLEAR_TTL_SECONDS``, then the DELETE
+        re-runs on the next success — bounding both the hot-path SQL rate (one
+        DELETE per pair per TTL) and the staleness of a badge written by
+        ANOTHER node after this node's last clear (a permanent cleared-set
+        suppressed that clear forever). A failure observed on this node
+        re-arms the pair immediately (``_write_pending_consent``); a node
+        restart clears once on first success.
         """
         key = (user_id, server_name)
-        if key in self._pending_consent_cleared:
-            return  # already cleared on this node since the last failure — no SQL
+        now = time.monotonic()
+        cleared_at = self._pending_consent_cleared.get(key)
+        if cleared_at is not None and now - cleared_at < _PENDING_CONSENT_CLEAR_TTL_SECONDS:
+            return  # cleared recently on this node — no SQL
         if self._storage is None:
             return
         try:
             self._storage.delete_mcp_pending_consent(user_id, server_name)
-            self._pending_consent_cleared.add(key)
+            self._prune_pending_consent_cleared(now)
+            self._pending_consent_cleared[key] = now
         except Exception:
             log.debug(
                 "mcp_pool.pending_consent_clear_failed user=%s server=%s",
@@ -5678,6 +5722,26 @@ class MCPClientManager:
                 server_name,
                 exc_info=True,
             )
+
+    def _prune_pending_consent_cleared(self, now: float) -> None:
+        """Drop aged entries when the TTL map grows large (memory hygiene).
+
+        Runs from dispatch threads, so it snapshots ``items()`` and removes
+        via ``pop`` — tolerant of concurrent same-map mutation (worst case a
+        minor over/under-prune, never an exception). Correctness never
+        depends on an entry being present: a dropped pair just re-runs one
+        SQL DELETE on its next success.
+        """
+        if len(self._pending_consent_cleared) < _PENDING_CONSENT_CLEARED_MAX:
+            return
+        entries = list(self._pending_consent_cleared.items())
+        expired = [k for k, t in entries if now - t >= _PENDING_CONSENT_CLEAR_TTL_SECONDS]
+        for k in expired:
+            self._pending_consent_cleared.pop(k, None)
+        if len(self._pending_consent_cleared) >= _PENDING_CONSENT_CLEARED_MAX:
+            by_age = sorted(entries, key=lambda kv: kv[1])
+            for k, _ in by_age[: len(by_age) // 2]:
+                self._pending_consent_cleared.pop(k, None)
 
     def _dispatch_pool_sync(
         self,
@@ -6018,7 +6082,8 @@ class MCPClientManager:
         JSON string when token state precludes dispatch. ``server_row``
         is supplied by ``_resolve_pool_target`` so this path doesn't
         re-issue the ``mcp_servers`` lookup; it's also pre-validated to
-        have ``auth_type='oauth_user'``.
+        be a pool-backed user-scoped auth type — ``oauth_user`` OR
+        ``oauth_obo`` (``_pool_token_lookup`` below branches on it).
 
         ``retry_count`` is supplied by :meth:`_dispatch_pool_sync` and
         bounds the auth_401 refresh-and-retry to one re-issue. The first
@@ -6049,49 +6114,10 @@ class MCPClientManager:
         lookup: TokenLookupResult = await self._pool_token_lookup(
             server_row, user_id, server_name, force_refresh=retry_count > 0
         )
-        if lookup.kind == "missing":
-            return _structured_error(
-                code="mcp_consent_required",
-                server=server_name,
-                detail=_consent_missing_detail(server_row),
-                consent_url=_build_consent_url(server_row),
-            )
-        if lookup.kind == "decrypt_failure":
-            return _structured_error(
-                code="mcp_token_undecryptable_key_unknown",
-                server=server_name,
-                detail=(
-                    "Stored token cannot be decrypted by any installed encryption key. "
-                    "Operator action required."
-                ),
-            )
-        if lookup.kind == "refresh_failed_transient":
-            # Transient refresh failure (AS/network blip) — the token was kept;
-            # a retry may succeed once the AS recovers. Retryable, NOT re-consent.
-            return _structured_error(
-                code="mcp_refresh_unavailable",
-                server=server_name,
-                detail="Token refresh temporarily failed; please retry.",
-            )
-        if lookup.kind == "refresh_failed":
-            # ``mcp_server.oauth.token_revoked`` audit was already emitted
-            # by ``get_user_access_token_classified`` when it deleted the
-            # row; no second audit needed here.
-            return _structured_error(
-                code="mcp_consent_required",
-                server=server_name,
-                detail=_refresh_failed_detail(server_row),
-                consent_url=_build_consent_url(server_row),
-            )
-        # kind == "token"
+        lookup_error = _pool_lookup_error(lookup, server_name, server_row)
+        if lookup_error is not None:
+            return lookup_error
         access_token = lookup.token or ""
-        if not access_token:
-            return _structured_error(
-                code="mcp_consent_required",
-                server=server_name,
-                detail="No token for user. Consent flow required.",
-                consent_url=_build_consent_url(server_row),
-            )
 
         # URL hygiene — pool dispatch transmits the per-user bearer; reject
         # plaintext schemes before they reach _connect_one_pool.
@@ -6172,7 +6198,7 @@ class MCPClientManager:
                 return _structured_error(
                     code="mcp_consent_required",
                     server=server_name,
-                    detail="Refreshed token still rejected. Re-consent required.",
+                    detail=_token_rejected_detail(server_row),
                     consent_url=_build_consent_url(server_row),
                 )
             if classification == "auth_403":
@@ -6231,45 +6257,10 @@ class MCPClientManager:
         lookup: TokenLookupResult = await self._pool_token_lookup(
             server_row, user_id, server_name, force_refresh=retry_count > 0
         )
-        if lookup.kind == "missing":
-            return _structured_error(
-                code="mcp_consent_required",
-                server=server_name,
-                detail=_consent_missing_detail(server_row),
-                consent_url=_build_consent_url(server_row),
-            )
-        if lookup.kind == "decrypt_failure":
-            return _structured_error(
-                code="mcp_token_undecryptable_key_unknown",
-                server=server_name,
-                detail=(
-                    "Stored token cannot be decrypted by any installed encryption key. "
-                    "Operator action required."
-                ),
-            )
-        if lookup.kind == "refresh_failed_transient":
-            # Transient refresh failure (AS/network blip) — the token was kept;
-            # a retry may succeed once the AS recovers. Retryable, NOT re-consent.
-            return _structured_error(
-                code="mcp_refresh_unavailable",
-                server=server_name,
-                detail="Token refresh temporarily failed; please retry.",
-            )
-        if lookup.kind == "refresh_failed":
-            return _structured_error(
-                code="mcp_consent_required",
-                server=server_name,
-                detail=_refresh_failed_detail(server_row),
-                consent_url=_build_consent_url(server_row),
-            )
+        lookup_error = _pool_lookup_error(lookup, server_name, server_row)
+        if lookup_error is not None:
+            return lookup_error
         access_token = lookup.token or ""
-        if not access_token:
-            return _structured_error(
-                code="mcp_consent_required",
-                server=server_name,
-                detail="No token for user. Consent flow required.",
-                consent_url=_build_consent_url(server_row),
-            )
 
         url = str(server_row.get("url") or "")
         try:
@@ -6321,7 +6312,7 @@ class MCPClientManager:
                 return _structured_error(
                     code="mcp_consent_required",
                     server=server_name,
-                    detail="Refreshed token still rejected. Re-consent required.",
+                    detail=_token_rejected_detail(server_row),
                     consent_url=_build_consent_url(server_row),
                 )
             if classification == "auth_403":
@@ -6387,45 +6378,10 @@ class MCPClientManager:
         lookup: TokenLookupResult = await self._pool_token_lookup(
             server_row, user_id, server_name, force_refresh=retry_count > 0
         )
-        if lookup.kind == "missing":
-            return _structured_error(
-                code="mcp_consent_required",
-                server=server_name,
-                detail=_consent_missing_detail(server_row),
-                consent_url=_build_consent_url(server_row),
-            )
-        if lookup.kind == "decrypt_failure":
-            return _structured_error(
-                code="mcp_token_undecryptable_key_unknown",
-                server=server_name,
-                detail=(
-                    "Stored token cannot be decrypted by any installed encryption key. "
-                    "Operator action required."
-                ),
-            )
-        if lookup.kind == "refresh_failed_transient":
-            # Transient refresh failure (AS/network blip) — the token was kept;
-            # a retry may succeed once the AS recovers. Retryable, NOT re-consent.
-            return _structured_error(
-                code="mcp_refresh_unavailable",
-                server=server_name,
-                detail="Token refresh temporarily failed; please retry.",
-            )
-        if lookup.kind == "refresh_failed":
-            return _structured_error(
-                code="mcp_consent_required",
-                server=server_name,
-                detail=_refresh_failed_detail(server_row),
-                consent_url=_build_consent_url(server_row),
-            )
+        lookup_error = _pool_lookup_error(lookup, server_name, server_row)
+        if lookup_error is not None:
+            return lookup_error
         access_token = lookup.token or ""
-        if not access_token:
-            return _structured_error(
-                code="mcp_consent_required",
-                server=server_name,
-                detail="No token for user. Consent flow required.",
-                consent_url=_build_consent_url(server_row),
-            )
 
         url = str(server_row.get("url") or "")
         try:
@@ -6477,7 +6433,7 @@ class MCPClientManager:
                 return _structured_error(
                     code="mcp_consent_required",
                     server=server_name,
-                    detail="Refreshed token still rejected. Re-consent required.",
+                    detail=_token_rejected_detail(server_row),
                     consent_url=_build_consent_url(server_row),
                 )
             if classification == "auth_403":
@@ -7285,6 +7241,80 @@ def _refresh_failed_detail(server_row: dict[str, Any]) -> str:
             "again; if it keeps failing, your administrator may need to grant access."
         )
     return "Refresh token rejected. Re-consent required."
+
+
+def _token_rejected_detail(server_row: dict[str, Any]) -> str:
+    """User-facing detail for a 401 that survived one forced refresh (retry ceiling).
+
+    ``oauth_user``: the freshly refreshed bearer was rejected — per-server
+    re-consent is the actionable remedy (``_build_consent_url`` attaches the
+    Connect affordance). ``oauth_obo``: the bearer was JUST minted from the
+    captured credential and there is no per-server consent flow
+    (``_build_consent_url`` returns None), so "re-consent required" is a dead
+    end — the realistic causes are server-side (audience mismatch, upstream
+    auth misconfig, clock skew), so point at the administrator instead.
+    """
+    if server_row.get("auth_type") == "oauth_obo":
+        return (
+            "Server rejected a freshly issued sign-in token. This usually means the "
+            "server's audience setting doesn't match what the server expects — ask "
+            "your administrator to check it."
+        )
+    return "Refreshed token still rejected. Re-consent required."
+
+
+def _pool_lookup_error(
+    lookup: TokenLookupResult, server_name: str, server_row: dict[str, Any]
+) -> str | None:
+    """Map a failed pool token lookup to its structured error; ``None`` on success.
+
+    Single copy of the lookup-kind → structured-error mapping shared by the
+    tool / resource / prompt dispatchers — previously three hand-synced
+    copies that every auth-model change had to edit in lockstep. Returns
+    ``None`` exactly when *lookup* carries a non-empty bearer.
+    """
+    if lookup.kind == "missing":
+        return _structured_error(
+            code="mcp_consent_required",
+            server=server_name,
+            detail=_consent_missing_detail(server_row),
+            consent_url=_build_consent_url(server_row),
+        )
+    if lookup.kind == "decrypt_failure":
+        return _structured_error(
+            code="mcp_token_undecryptable_key_unknown",
+            server=server_name,
+            detail=(
+                "Stored token cannot be decrypted by any installed encryption key. "
+                "Operator action required."
+            ),
+        )
+    if lookup.kind == "refresh_failed_transient":
+        # Transient refresh failure (AS/network blip) — the token was kept;
+        # a retry may succeed once the AS recovers. Retryable, NOT re-consent.
+        return _structured_error(
+            code="mcp_refresh_unavailable",
+            server=server_name,
+            detail="Token refresh temporarily failed; please retry.",
+        )
+    if lookup.kind == "refresh_failed":
+        # The ``mcp_server.oauth.token_revoked`` audit was already emitted by
+        # the classified lookup when it deleted the row; no second audit here.
+        return _structured_error(
+            code="mcp_consent_required",
+            server=server_name,
+            detail=_refresh_failed_detail(server_row),
+            consent_url=_build_consent_url(server_row),
+        )
+    # kind == "token"
+    if not (lookup.token or ""):
+        return _structured_error(
+            code="mcp_consent_required",
+            server=server_name,
+            detail="No token for user. Consent flow required.",
+            consent_url=_build_consent_url(server_row),
+        )
+    return None
 
 
 def _pool_cfg_from_row(row: dict[str, Any]) -> dict[str, Any]:

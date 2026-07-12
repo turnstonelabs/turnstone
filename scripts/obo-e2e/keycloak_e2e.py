@@ -148,7 +148,7 @@ async def _run(cfg: dict[str, str], refresh_token: str) -> None:
         auth_storage=storage,
         mcp_token_store=store,
         oidc_config=oidc_config,
-        oidc_http_client=client,
+        obo_http_client=client,
         mcp_oauth_refresh_locks={},
         mcp_oauth_refresh_backoff={},
     )

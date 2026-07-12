@@ -829,14 +829,11 @@ class TestUpdateMcpServer:
         assert r2.status_code == 200, r2.text
         assert r2.json()["oauth_scopes"] in (None, "")  # stale scopes cleared
 
-    def test_flip_to_obo_clears_scopes_even_when_form_resubmits_them(self, client):
-        """xhigh finding: the admin form pre-fills + re-submits the old oauth_user
-        scopes on a flip, so the clear must be robust to scopes BEING in the body
-        when they equal the existing row's value (else rfc8693 mints break)."""
+    def _create_oauth_user_row_with_scopes(self, client, name: str) -> str:
         r = client.post(
             "/v1/api/admin/mcp-servers",
             json={
-                "name": "flip-resend",
+                "name": name,
                 "transport": "streamable-http",
                 "url": "https://mcp.example.com/sse",
                 "auth_type": "oauth_user",
@@ -844,8 +841,19 @@ class TestUpdateMcpServer:
                 "oauth_audience": "api://mcp-a",
             },
         )
-        sid = r.json()["server_id"]
-        # Flip to obo AND re-send the identical stale scopes (what the UI does).
+        sid: str = r.json()["server_id"]
+        return sid
+
+    def test_flip_to_obo_resent_scopes_cleared_under_entra(self, client):
+        """Review finding: on a flip into obo the carried-over oauth_user
+        scopes are profile-dependent. Under entra they can never apply (the
+        leg pins <audience>/.default), so an equal-value re-send is treated
+        as the stale pre-fill and cleared — NOT rejected (the flip must not
+        400 on a value the operator never typed)."""
+        from types import SimpleNamespace
+
+        client.app.state.oidc_config = SimpleNamespace(obo_grant_profile="entra")
+        sid = self._create_oauth_user_row_with_scopes(client, "flip-resend-entra")
         r2 = client.put(
             f"/v1/api/admin/mcp-servers/{sid}",
             json={
@@ -857,8 +865,29 @@ class TestUpdateMcpServer:
         assert r2.status_code == 200, r2.text
         assert r2.json()["oauth_scopes"] in (None, "")  # carried-over value cleared
 
+    def test_flip_to_obo_resent_scopes_kept_under_rfc8693(self, client):
+        """Review finding: under rfc8693 oauth_scopes IS the token-exchange
+        scope — an operator flipping to obo and keeping the same value (the
+        Keycloak optional-audience scope can legitimately equal the old
+        consent scope string) must NOT have it silently nulled; only an
+        omitted field clears (previous test)."""
+        from types import SimpleNamespace
+
+        client.app.state.oidc_config = SimpleNamespace(obo_grant_profile="rfc8693")
+        sid = self._create_oauth_user_row_with_scopes(client, "flip-resend-rfc")
+        r2 = client.put(
+            f"/v1/api/admin/mcp-servers/{sid}",
+            json={
+                "auth_type": "oauth_obo",
+                "oauth_audience": "api://mcp-a",
+                "oauth_scopes": "openid profile offline_access",
+            },
+        )
+        assert r2.status_code == 200, r2.text
+        assert r2.json()["oauth_scopes"] == "openid profile offline_access"
+
     def test_entra_obo_row_with_scopes_stays_editable(self, client, storage):
-        """xhigh finding: a pre-existing oauth_obo row carrying scopes under the
+        """Review finding: a pre-existing oauth_obo row carrying scopes under the
         entra profile must stay editable — an unrelated PUT that doesn't touch
         scopes must NOT be rejected (the entra-scope reject fires only on a real
         scopes write)."""
@@ -893,7 +922,7 @@ class TestUpdateMcpServer:
         assert "oauth_scopes" in r2.json()["error"]
 
     def test_obo_server_reports_consented_users_count_for_flush_button(self, client, storage):
-        """xhigh finding: obo rows must report consented_users_count (users with a
+        """Review finding: obo rows must report consented_users_count (users with a
         minted cache row) so the console flush-cache action (gated on count>0)
         renders — previously only oauth_user rows got the count."""
         storage.create_mcp_server(
@@ -974,6 +1003,144 @@ class TestUpdateMcpServer:
                 .where(mcp_user_tokens.c.server_name == "aud-change")
             ).scalar()
         assert remaining == 0, "audience change must purge old-audience cache rows"
+
+    def _seed_obo_row_with_cache(self, client, storage, *, name: str, scopes: str | None) -> str:
+        import sqlalchemy as sa
+
+        from turnstone.core.storage._schema import mcp_user_tokens
+
+        r = client.post(
+            "/v1/api/admin/mcp-servers",
+            json={
+                "name": name,
+                "transport": "streamable-http",
+                "url": "https://mcp.example.com/sse",
+                "auth_type": "oauth_obo",
+                "oauth_audience": "api://aud",
+                **({"oauth_scopes": scopes} if scopes else {}),
+            },
+        )
+        sid: str = r.json()["server_id"]
+        with storage._engine.connect() as conn:
+            conn.execute(
+                sa.insert(mcp_user_tokens),
+                {
+                    "user_id": "u1",
+                    "server_name": name,
+                    "access_token_ct": b"\x00ct",
+                    "refresh_token_ct": None,
+                    "expires_at": "2026-12-31T00:00:00",
+                    "scopes": scopes,
+                    "as_issuer": "https://idp.test",
+                    "audience": "api://aud",
+                    "created": "2026-05-04T11:00:00",
+                    "last_refreshed": None,
+                },
+            )
+            conn.commit()
+        return sid
+
+    def _count_cache_rows(self, storage, name: str) -> int:
+        import sqlalchemy as sa
+
+        from turnstone.core.storage._schema import mcp_user_tokens
+
+        with storage._engine.connect() as conn:
+            count = conn.execute(
+                sa.select(sa.func.count())
+                .select_from(mcp_user_tokens)
+                .where(mcp_user_tokens.c.server_name == name)
+            ).scalar()
+        return int(count or 0)
+
+    def test_obo_scope_change_purges_cached_tokens(self, client, storage):
+        """Review finding: under rfc8693 the exchange scope shapes the minted
+        bearer's privileges exactly like the audience does — narrowing
+        oauth_scopes must purge cached rows or the reduction silently waits
+        out the token TTL (inconsistent with the audience purge)."""
+        from types import SimpleNamespace
+
+        client.app.state.oidc_config = SimpleNamespace(obo_grant_profile="rfc8693")
+        sid = self._seed_obo_row_with_cache(
+            client, storage, name="scope-change", scopes="api.read api.write"
+        )
+        r2 = client.put(
+            f"/v1/api/admin/mcp-servers/{sid}",
+            json={"oauth_scopes": "api.read"},
+        )
+        assert r2.status_code == 200, r2.text
+        assert self._count_cache_rows(storage, "scope-change") == 0, (
+            "scope change must purge cache rows minted with the old scopes"
+        )
+
+    def test_obo_scope_noop_resend_does_not_purge(self, client, storage):
+        """Review finding companion: the admin form re-submits the pre-filled
+        scopes on every save — an EQUAL value is normalized out of the update
+        and must not flush every user's minted tokens."""
+        from types import SimpleNamespace
+
+        client.app.state.oidc_config = SimpleNamespace(obo_grant_profile="rfc8693")
+        sid = self._seed_obo_row_with_cache(client, storage, name="scope-noop", scopes="api.read")
+        r2 = client.put(
+            f"/v1/api/admin/mcp-servers/{sid}",
+            json={"oauth_scopes": "api.read", "enabled": True},
+        )
+        assert r2.status_code == 200, r2.text
+        assert self._count_cache_rows(storage, "scope-noop") == 1, (
+            "a no-op scopes re-send must not purge the mint cache"
+        )
+
+    def test_flip_obo_to_oauth_user_clears_obo_audience_and_scopes(self, client, storage):
+        """Review finding: the obo-era oauth_audience is an IdP-side app
+        identifier, not the resource indicator oauth_user sends to its AS —
+        carried over, every consent yields a wrong-resource token that 401s
+        with no visible cause. The flip must clear it (and the rfc8693
+        exchange scopes) unless the request explicitly sets new values."""
+        from types import SimpleNamespace
+
+        client.app.state.oidc_config = SimpleNamespace(obo_grant_profile="rfc8693")
+        sid = self._seed_obo_row_with_cache(client, storage, name="flip-back", scopes="api.read")
+        r2 = client.put(
+            f"/v1/api/admin/mcp-servers/{sid}",
+            json={"auth_type": "oauth_user", "oauth_client_id": "client-xyz"},
+        )
+        assert r2.status_code == 200, r2.text
+        data = r2.json()
+        assert data["auth_type"] == "oauth_user"
+        assert data["oauth_audience"] in (None, ""), "obo app-id audience must not carry over"
+        assert data["oauth_scopes"] in (None, ""), "rfc8693 exchange scopes must not carry over"
+        # The flip is an auth-model change → mint-cache rows purged too.
+        assert self._count_cache_rows(storage, "flip-back") == 0
+
+    def test_entra_obo_equal_scope_resend_is_accepted(self, client, storage):
+        """Review finding: the admin form always re-submits the pre-filled
+        oauth_scopes, so a same-type edit of an entra-profile obo row carrying
+        legacy scopes must accept an EQUAL value (normalized to a no-op)
+        instead of 400ing — only a genuine scope CHANGE is rejected."""
+        from types import SimpleNamespace
+
+        # The legacy-scoped entra row arises from a deployment profile switch:
+        # the row is created while the profile is rfc8693 (scopes accepted),
+        # then the deployment flips to entra.
+        client.app.state.oidc_config = SimpleNamespace(obo_grant_profile="rfc8693")
+        sid = self._seed_obo_row_with_cache(
+            client, storage, name="entra-resend", scopes="legacy.scope"
+        )
+        client.app.state.oidc_config = SimpleNamespace(obo_grant_profile="entra")
+        # Equal re-send + unrelated change → accepted, scopes untouched.
+        r2 = client.put(
+            f"/v1/api/admin/mcp-servers/{sid}",
+            json={"oauth_scopes": "legacy.scope", "enabled": False},
+        )
+        assert r2.status_code == 200, r2.text
+        assert r2.json()["oauth_scopes"] == "legacy.scope"
+        # A genuine CHANGE to non-empty scopes still 400s under entra.
+        r3 = client.put(
+            f"/v1/api/admin/mcp-servers/{sid}",
+            json={"oauth_scopes": "new.scope"},
+        )
+        assert r3.status_code == 400
+        assert "entra" in r3.json()["error"]
 
     def test_create_obo_rejects_scopes_under_entra_profile(self, client):
         """#551 follow-up: oauth_scopes is meaningless for the entra grant leg
