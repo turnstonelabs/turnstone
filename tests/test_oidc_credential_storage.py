@@ -39,15 +39,37 @@ class TestUpsertAndGet:
         assert backend.get_oidc_user_credential("u2", ISS) is None
 
     def test_upsert_replaces_on_conflict(self, backend) -> None:
-        """A fresh login must overwrite a stale credential; ``created`` survives."""
+        """A fresh login must overwrite a stale credential; ``created`` survives.
+
+        Plants a distinctly-past ``created`` via direct SQL so the assertion
+        actually detects a reset (comparing two upserts milliseconds apart would
+        pass at second granularity even if the on-conflict clause reset created).
+        """
+        import sqlalchemy as sa
+
+        from turnstone.core.storage._schema import oidc_user_credentials
+
         backend.upsert_oidc_user_credential("u1", ISS, refresh_token_ct=b"ct-old")
-        first = backend.get_oidc_user_credential("u1", ISS)
-        assert first is not None
+        planted = "2020-01-01T00:00:00"
+        with backend._engine.connect() as conn:
+            conn.execute(
+                sa.update(oidc_user_credentials)
+                .where(
+                    (oidc_user_credentials.c.user_id == "u1")
+                    & (oidc_user_credentials.c.issuer == ISS)
+                )
+                .values(created=planted)
+            )
+            conn.commit()
+
         backend.upsert_oidc_user_credential("u1", ISS, refresh_token_ct=b"ct-new")
         second = backend.get_oidc_user_credential("u1", ISS)
         assert second is not None
         assert second["refresh_token_ct"] == b"ct-new"
-        assert second["created"] == first["created"]
+        # created is PRESERVED across the replace (not reset to now).
+        assert second["created"] == planted
+        # last_refreshed, by contrast, advances off the planted-past value.
+        assert second["last_refreshed"] != planted
 
 
 class TestRotationWriteBack:

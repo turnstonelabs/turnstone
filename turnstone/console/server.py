@@ -6002,6 +6002,25 @@ async def admin_delete_oidc_identity(request: Request) -> JSONResponse:
 
     storage.delete_oidc_identity(issuer, subject)
 
+    # #551: unlinking the identity must also revoke the captured IdP refresh
+    # credential (keyed on (user_id, issuer)) — otherwise a deprovisioned user's
+    # scheduled/autonomous runs keep minting oauth_obo access tokens
+    # indefinitely (rotation write-back keeps the RT alive). Best-effort: a
+    # failure here must not leave the identity un-deleted.
+    credential_revoked = False
+    token_store = getattr(request.app.state, "mcp_token_store", None)
+    if token_store is not None:
+        try:
+            credential_revoked = bool(
+                token_store.delete_oidc_credential(identity["user_id"], issuer)
+            )
+        except Exception:
+            log.warning(
+                "admin.oidc_identity.credential_revoke_failed user=%s",
+                identity["user_id"],
+                exc_info=True,
+            )
+
     audit_uid, ip = _audit_context(request)
     record_audit(
         storage,
@@ -6009,7 +6028,7 @@ async def admin_delete_oidc_identity(request: Request) -> JSONResponse:
         "oidc_identity.delete",
         "oidc_identity",
         f"{issuer}:{subject}",
-        {"user_id": identity["user_id"]},
+        {"user_id": identity["user_id"], "obo_credential_revoked": credential_revoked},
         ip,
     )
 

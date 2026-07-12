@@ -2362,6 +2362,17 @@ class StorageBackend(Protocol):
         """
         ...
 
+    def any_user_scoped_mcp_servers(self) -> bool:
+        """Install-level gate for the pending-consent badge (issue #551).
+
+        Returns True iff at least one ``mcp_servers`` row is pool-backed
+        (``auth_type`` in ``oauth_user`` / ``oauth_obo``) — both write
+        ``mcp_pending_consent`` rows on a non-interactive dispatch failure, so
+        an oauth_obo-only install must NOT short-circuit the badge to
+        ``{pending: 0}`` (that would hide the re-login affordance).
+        """
+        ...
+
     def any_oauth_user_mcp_servers(self) -> bool:
         """Install-level gate for OAuth-MCP features.
 

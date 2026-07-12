@@ -5044,6 +5044,16 @@ class PostgreSQLBackend:
             ).scalar()
         return result is not None
 
+    def any_user_scoped_mcp_servers(self) -> bool:
+        with self._conn() as conn:
+            result = conn.execute(
+                sa.select(sa.literal(1))
+                .select_from(mcp_servers)
+                .where(mcp_servers.c.auth_type.in_(("oauth_user", "oauth_obo")))
+                .limit(1)
+            ).scalar()
+        return result is not None
+
     # -- Model definitions -----------------------------------------------------
 
     def create_model_definition(

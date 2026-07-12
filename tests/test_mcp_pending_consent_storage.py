@@ -239,3 +239,41 @@ class TestInstallGate:
         )
         backend.update_mcp_server("srv-2", auth_type="oauth_user")
         assert backend.any_oauth_user_mcp_servers() is True
+
+    def test_any_user_scoped_true_for_obo_only_install(self, backend) -> None:
+        """#551: the pending-consent badge gate must fire for an oauth_obo-only
+        install — obo dispatch writes pending rows, so short-circuiting to
+        {pending: 0} would hide the re-login affordance. The oauth_user-only
+        gate stays False (obo is not oauth_user)."""
+        backend.create_mcp_server(
+            server_id="srv-obo",
+            name="obo-only",
+            transport="streamable-http",
+            command="",
+            args="[]",
+            url="https://example.com",
+            headers="{}",
+            env="{}",
+            auto_approve=False,
+            enabled=True,
+            created_by="admin",
+        )
+        backend.update_mcp_server("srv-obo", auth_type="oauth_obo")
+        assert backend.any_user_scoped_mcp_servers() is True
+        assert backend.any_oauth_user_mcp_servers() is False
+
+    def test_any_user_scoped_false_on_static_only(self, backend) -> None:
+        backend.create_mcp_server(
+            server_id="srv-s",
+            name="static-only",
+            transport="streamable-http",
+            command="",
+            args="[]",
+            url="https://example.com",
+            headers="{}",
+            env="{}",
+            auto_approve=False,
+            enabled=True,
+            created_by="admin",
+        )
+        assert backend.any_user_scoped_mcp_servers() is False

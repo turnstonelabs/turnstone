@@ -5609,6 +5609,29 @@ class MCPClientManager:
                 exc_info=True,
             )
 
+    def _clear_pending_consent_sync(self, user_id: str, server_name: str) -> None:
+        """Best-effort synchronous clear of a deferred-consent row on dispatch success.
+
+        Called from the sync dispatchers when a dispatch SUCCEEDS, so a stale
+        badge self-heals. This is the only clear path that covers oauth_obo: the
+        oauth_user clears live in the token sweep (which skips obo) and the
+        consent callback (which obo never runs), so without a success-side clear
+        an obo pending row — written when the credential was missing — would
+        persist forever after the user re-logs in. Delete is a no-op when no row
+        exists, so this is safe to call on every successful dispatch.
+        """
+        if self._storage is None:
+            return
+        try:
+            self._storage.delete_mcp_pending_consent(user_id, server_name)
+        except Exception:
+            log.debug(
+                "mcp_pool.pending_consent_clear_failed user=%s server=%s",
+                user_id,
+                server_name,
+                exc_info=True,
+            )
+
     def _dispatch_pool_sync(
         self,
         *,
@@ -5696,6 +5719,8 @@ class MCPClientManager:
                     user_id=user_id, server_name=server_name, result=result
                 )
             raise RuntimeError(result)
+        # Success clears any stale pending-consent badge (the obo self-heal path).
+        self._clear_pending_consent_sync(user_id, server_name)
         return result
 
     def _run_pool_dispatch_attempt(
@@ -5799,6 +5824,7 @@ class MCPClientManager:
                     user_id=user_id, server_name=server_name, result=result
                 )
             raise RuntimeError(result)
+        self._clear_pending_consent_sync(user_id, server_name)
         return result
 
     def _run_pool_dispatch_resource_attempt(
@@ -5890,6 +5916,7 @@ class MCPClientManager:
                     user_id=user_id, server_name=server_name, result=result
                 )
             raise RuntimeError(result)
+        self._clear_pending_consent_sync(user_id, server_name)
         return result
 
     def _run_pool_dispatch_prompt_attempt(

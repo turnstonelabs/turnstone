@@ -3668,7 +3668,7 @@ async def _install_gate_passes(app_state: Any, storage: Any) -> bool:
         cached_value, cached_at = cached
         if (now - cached_at) < _INSTALL_GATE_CACHE_TTL_S:
             return bool(cached_value)
-    value = bool(await asyncio.to_thread(storage.any_oauth_user_mcp_servers))
+    value = bool(await asyncio.to_thread(storage.any_user_scoped_mcp_servers))
     app_state._mcp_install_gate_cache = (value, now)
     return value
 
