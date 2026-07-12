@@ -896,7 +896,10 @@ class TestUpdateMcpServer:
         assert r.status_code == 200, r.text
         assert r.json()["enabled"] is False
 
-        # A genuinely-absent OIDC (neither enabled nor retryable) still rejects.
+        # Even with OIDC fully operator-disabled (neither flag set), a same-type
+        # edit of the EXISTING obo server is still allowed — the deployment
+        # checks only fire on create / flip-into-obo, so an operator is never
+        # locked out of disabling or editing a server (review finding R8-1).
         client.app.state.oidc_config = SimpleNamespace(
             enabled=False,
             issuer="",
@@ -908,8 +911,32 @@ class TestUpdateMcpServer:
             "/v1/api/admin/mcp-servers/obo-retry-id",
             json={"enabled": True},
         )
-        assert r2.status_code == 400
-        assert "OIDC" in r2.json()["error"]
+        assert r2.status_code == 200, r2.text
+
+    def test_create_new_obo_still_rejected_when_oidc_operator_disabled(self, client):
+        """The deployment gate still fires for a NEW obo enablement: creating a
+        fresh oauth_obo server (or flipping one into obo) while OIDC is fully
+        operator-disabled is rejected — only same-type edits of an existing obo
+        server skip the deployment checks."""
+        client.app.state.oidc_config = SimpleNamespace(
+            enabled=False,
+            issuer="",
+            obo_grant_profile="entra",
+            capture_user_credential=True,
+            discovery_retryable=False,
+        )
+        r = client.post(
+            "/v1/api/admin/mcp-servers",
+            json={
+                "name": "obo-new-nooidc",
+                "transport": "streamable-http",
+                "url": "https://mcp.example.com/sse",
+                "auth_type": "oauth_obo",
+                "oauth_audience": "api://mcp-a",
+            },
+        )
+        assert r.status_code == 400, r.text
+        assert "OIDC" in r.json()["error"]
 
     def test_create_obo_rejected_on_invalid_grant_profile(self, client):
         """Review finding: a typo'd deployment obo_grant_profile leaves the mint

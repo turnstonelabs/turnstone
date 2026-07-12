@@ -449,8 +449,14 @@ async def discover_oidc(
     setup across calls; when ``None`` a transient client is used (the
     legacy shape, kept so tests don't need lifecycle management).
     """
+    # Config-error branches force ``discovery_retryable=False`` (terminal): they
+    # reflect a bad CONFIG (no issuer, an SSRF-rejected URL), not a transient IdP
+    # outage, so a runtime re-probe would only fail identically forever. This is
+    # explicit rather than preserved-from-input because ``maybe_rediscover_oidc``
+    # probes with the retryable boot config (``discovery_retryable=True``); left
+    # preserved, a config-invalid IdP would re-probe every cooldown window.
     if not config.issuer:
-        return dataclasses.replace(config, enabled=False)
+        return dataclasses.replace(config, enabled=False, discovery_retryable=False)
 
     try:
         issuer_parsed = _validate_url_no_ssrf(
@@ -458,7 +464,7 @@ async def discover_oidc(
         )
     except OIDCError as exc:
         log.warning("OIDC issuer URL rejected: %s", exc)
-        return dataclasses.replace(config, enabled=False)
+        return dataclasses.replace(config, enabled=False, discovery_retryable=False)
 
     url = config.issuer.rstrip("/") + "/.well-known/openid-configuration"
     try:
@@ -517,8 +523,10 @@ async def discover_oidc(
                 allow_private=config.allow_private_network,
             )
         except OIDCError as exc:
+            # Config error (discovered endpoint fails SSRF/validation), not a
+            # transient outage — latch terminal so rediscovery stops re-probing.
             log.warning("OIDC discovered %s rejected (url=%s): %s", name, endpoint_url, exc)
-            return dataclasses.replace(config, enabled=False)
+            return dataclasses.replace(config, enabled=False, discovery_retryable=False)
 
     if userinfo_endpoint:
         try:
@@ -535,7 +543,8 @@ async def discover_oidc(
                 userinfo_endpoint,
                 exc,
             )
-            return dataclasses.replace(config, enabled=False)
+            # Config error — latch terminal (see the issuer-rejection branch).
+            return dataclasses.replace(config, enabled=False, discovery_retryable=False)
 
     log.info("OIDC discovery complete: %s", config.issuer)
     return dataclasses.replace(
@@ -746,7 +755,14 @@ async def maybe_rediscover_oidc(app_state: Any) -> None:
         # failure clears it back to False).
         fresh = await discover_oidc(dataclasses.replace(cfg, enabled=True))
         if not fresh.enabled:
-            return  # still failing — next probe after the cooldown lapses
+            if not fresh.discovery_retryable:
+                # Discovery now fails for a CONFIG reason (bad issuer, an
+                # SSRF-rejected endpoint), not a transient outage — latch that
+                # terminal config onto app_state so this node stops re-probing
+                # every cooldown window. Without installing it, app_state would
+                # keep the retryable flag and re-probe an IdP that can never heal.
+                app_state.oidc_config = fresh
+            return  # still disabled (transient → retry next window; terminal → latched)
         app_state.oidc_config = dataclasses.replace(fresh, discovery_retryable=False)
         log.info("OIDC discovery recovered at runtime: %s", fresh.issuer)
     finally:

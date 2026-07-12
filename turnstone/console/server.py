@@ -9842,9 +9842,26 @@ def _oauth_columns_to_clear(auth_type: str | None) -> dict[str, None]:
 
 
 def _enforce_oauth_obo_requirements(
-    request: Request, auth_type: str, *, audience: str | None, scopes: str | None
+    request: Request,
+    auth_type: str,
+    *,
+    audience: str | None,
+    scopes: str | None,
+    check_oidc_deployment: bool = True,
 ) -> JSONResponse | None:
     """Write-time validation for ``oauth_obo`` rows (issue #551).
+
+    ``check_oidc_deployment`` splits the checks by what they guard. The
+    DEPLOYMENT-level checks (token-encryption key, OIDC configured/enabled,
+    capture opt-in, valid grant profile) reject configuring a NEW obo mint that
+    could never work — they run on create and on a flip INTO obo. They are
+    SKIPPED for a same-type edit of an existing obo server (``False``): OIDC
+    being operator-disabled is a deployment state, not a per-server one, so
+    blocking every edit — including the natural remedy of setting
+    ``enabled=false`` — would only lock the operator out (the row can still be
+    DELETEd, but not disabled). The PER-SERVER validity checks (audience
+    required; ``oauth_scopes`` rejected under the entra profile) always run so a
+    same-type edit can't leave the row itself invalid.
 
     Rejects at the write choke point what would otherwise fail per-dispatch at
     runtime (or worse, at the next boot):
@@ -9872,61 +9889,60 @@ def _enforce_oauth_obo_requirements(
     """
     if auth_type != "oauth_obo":
         return None
-    if getattr(request.app.state, "mcp_token_store", None) is None:
-        return JSONResponse({"error": _OAUTH_TOKEN_STORE_503_MSG}, status_code=503)
-    oidc_config = getattr(request.app.state, "oidc_config", None)
-    # Accept a config that is enabled OR merely transiently un-discovered
-    # (``discovery_retryable`` — the IdP was unreachable at this process's boot).
-    # OIDC is still CONFIGURED there (issuer set); rejecting it would make every
-    # oauth_obo server un-editable/un-disable-able on the console — which never
-    # runs the runtime rediscovery that heals server nodes — until a manual
-    # restart. Reject only a genuinely absent / operator-disabled OIDC (neither
-    # flag set: no issuer configured).
-    oidc_configured = oidc_config is not None and (
-        getattr(oidc_config, "enabled", False) or getattr(oidc_config, "discovery_retryable", False)
-    )
-    if not oidc_configured:
-        return JSONResponse(
-            {
-                "error": (
-                    "auth_type=oauth_obo requires OIDC sign-in to be configured and "
-                    "enabled (it mints per-server tokens from each user's Turnstone "
-                    "sign-in). Configure [oidc] and capture_user_credential, or use "
-                    "auth_type=oauth_user for per-server consent."
-                )
-            },
-            status_code=400,
-        )
-    if not getattr(oidc_config, "capture_user_credential", False):
-        # The mint redeems the user's CAPTURED IdP refresh token; with capture
-        # off, login persists nothing, so every dispatch returns kind="missing"
-        # and the "sign in again" remedy can never succeed — a permanent
-        # misconfig this choke point exists to reject. (Enabling capture also
-        # requires the encryption key, checked at boot.)
-        return JSONResponse(
-            {
-                "error": (
-                    "auth_type=oauth_obo requires [oidc] capture_user_credential=true "
-                    "so each user's sign-in credential is captured for minting; it is "
-                    "currently disabled, so this server could never obtain a token."
-                )
-            },
-            status_code=400,
-        )
     profile = _obo_profile(request)
-    from turnstone.core.mcp_oauth import OBO_GRANT_PROFILES
-
-    if profile not in OBO_GRANT_PROFILES:
-        return JSONResponse(
-            {
-                "error": (
-                    f"[oidc] obo_grant_profile={profile!r} is not a valid grant profile "
-                    f"({', '.join(sorted(OBO_GRANT_PROFILES))}); fix the deployment "
-                    "config before configuring oauth_obo servers"
-                )
-            },
-            status_code=400,
+    if check_oidc_deployment:
+        if getattr(request.app.state, "mcp_token_store", None) is None:
+            return JSONResponse({"error": _OAUTH_TOKEN_STORE_503_MSG}, status_code=503)
+        oidc_config = getattr(request.app.state, "oidc_config", None)
+        # Accept a config that is enabled OR merely transiently un-discovered
+        # (``discovery_retryable`` — the IdP was unreachable at this process's
+        # boot). OIDC is still CONFIGURED there (issuer set); reject only a
+        # genuinely absent / operator-disabled OIDC (neither flag set).
+        oidc_configured = oidc_config is not None and (
+            getattr(oidc_config, "enabled", False)
+            or getattr(oidc_config, "discovery_retryable", False)
         )
+        if not oidc_configured:
+            return JSONResponse(
+                {
+                    "error": (
+                        "auth_type=oauth_obo requires OIDC sign-in to be configured and "
+                        "enabled (it mints per-server tokens from each user's Turnstone "
+                        "sign-in). Configure [oidc] and capture_user_credential, or use "
+                        "auth_type=oauth_user for per-server consent."
+                    )
+                },
+                status_code=400,
+            )
+        if not getattr(oidc_config, "capture_user_credential", False):
+            # The mint redeems the user's CAPTURED IdP refresh token; with capture
+            # off, login persists nothing, so every dispatch returns kind="missing"
+            # and the "sign in again" remedy can never succeed — a permanent
+            # misconfig this choke point exists to reject. (Enabling capture also
+            # requires the encryption key, checked at boot.)
+            return JSONResponse(
+                {
+                    "error": (
+                        "auth_type=oauth_obo requires [oidc] capture_user_credential=true "
+                        "so each user's sign-in credential is captured for minting; it is "
+                        "currently disabled, so this server could never obtain a token."
+                    )
+                },
+                status_code=400,
+            )
+        from turnstone.core.mcp_oauth import OBO_GRANT_PROFILES
+
+        if profile not in OBO_GRANT_PROFILES:
+            return JSONResponse(
+                {
+                    "error": (
+                        f"[oidc] obo_grant_profile={profile!r} is not a valid grant profile "
+                        f"({', '.join(sorted(OBO_GRANT_PROFILES))}); fix the deployment "
+                        "config before configuring oauth_obo servers"
+                    )
+                },
+                status_code=400,
+            )
     if not (audience or "").strip():
         return JSONResponse(
             {
@@ -10637,12 +10653,11 @@ async def admin_update_mcp_server(request: Request) -> JSONResponse:
     # minted obo bearers (and oauth_user tokens) are audience-scoped, so cached
     # rows for the OLD audience must be purged or a privilege reduction silently
     # doesn't take effect until they expire. (auth_type flips already purge, so
-    # only guard the same-type edit here.)
+    # only guard the same-type edit here.) Like ``scopes_changing`` below, the
+    # same-type no-op normalization above already dropped an equal re-sent value
+    # from ``updates``, so "in updates" already means a genuine change.
     audience_changing = (
-        is_user_scoped_auth(old_auth)
-        and not is_flip
-        and "oauth_audience" in updates
-        and (existing.get("oauth_audience") or "") != (updates["oauth_audience"] or "")
+        is_user_scoped_auth(old_auth) and not is_flip and "oauth_audience" in updates
     )
     # Changing oauth_scopes on an oauth_obo row is the same token-binding
     # change under the rfc8693 profile: the exchange scope shapes the minted
@@ -10686,8 +10701,16 @@ async def admin_update_mcp_server(request: Request) -> JSONResponse:
     # pre-filled field, so every unrelated save would 400.
     audience_now = updates.get("oauth_audience", existing.get("oauth_audience"))
     scopes_being_set = updates.get("oauth_scopes") if "oauth_scopes" in updates else None
+    # Run the DEPLOYMENT-level OIDC checks only when this write is a NEW obo
+    # enablement (a flip INTO obo); a same-type edit of an existing obo server
+    # keeps only the per-server validity checks, so an operator can still
+    # disable / edit an obo server after OIDC was operator-disabled.
     err_resp = _enforce_oauth_obo_requirements(
-        request, auth_type_now, audience=audience_now, scopes=scopes_being_set
+        request,
+        auth_type_now,
+        audience=audience_now,
+        scopes=scopes_being_set,
+        check_oidc_deployment=is_flip,
     )
     if err_resp is not None:
         return err_resp

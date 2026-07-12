@@ -2560,6 +2560,54 @@ class TestRuntimeRediscovery:
         # The healed config no longer advertises a retryable failure.
         assert state.oidc_config.discovery_retryable is False
 
+    def test_rediscover_latches_terminal_on_config_error_and_stops_probing(self):
+        """Review finding: probing with enabled forced True carries the
+        retryable boot flag into discover_oidc, whose config-error branches must
+        latch discovery_retryable=False (terminal) — and maybe_rediscover must
+        INSTALL that terminal config — or a config-invalid IdP (endpoint failing
+        SSRF/same-origin) re-probes every cooldown window forever. Drives the
+        real discover_oidc: the discovered token_endpoint is on a foreign host,
+        so validation rejects it as a config error."""
+        from turnstone.core.oidc import maybe_rediscover_oidc
+
+        state = self._disabled_retryable_state()  # issuer=https://idp.example.com
+        bad_doc = {
+            "authorization_endpoint": "https://idp.example.com/authorize",
+            "token_endpoint": "https://attacker.example/token",  # foreign host
+            "userinfo_endpoint": "https://idp.example.com/userinfo",
+            "jwks_uri": "https://idp.example.com/.well-known/jwks.json",
+        }
+        mock_response = MagicMock()
+        mock_response.json.return_value = bad_doc
+        mock_response.raise_for_status = MagicMock()
+
+        probes = {"n": 0}
+
+        async def _get(url):
+            probes["n"] += 1
+            return mock_response
+
+        async def _run():
+            client = _mock_async_client(_get)
+            with (
+                patch("socket.getaddrinfo", return_value=[(2, 1, 6, "", ("93.184.216.34", 0))]),
+                patch("httpx.AsyncClient", return_value=client),
+            ):
+                await maybe_rediscover_oidc(state)
+                # Same window: cooldown already gates a second probe.
+                await maybe_rediscover_oidc(state)
+                # Force the cooldown open — but the config is now terminal, so
+                # the retryable guard should short-circuit before any probe.
+                state.oidc_rediscover_last = None
+                await maybe_rediscover_oidc(state)
+
+        asyncio.run(_run())
+
+        # Still disabled, but LATCHED terminal (not retryable) — one probe only.
+        assert state.oidc_config.enabled is False
+        assert state.oidc_config.discovery_retryable is False
+        assert probes["n"] == 1
+
     def test_rediscover_cooldown_gates_repeat_probes(self):
         from turnstone.core.oidc import maybe_rediscover_oidc
 
