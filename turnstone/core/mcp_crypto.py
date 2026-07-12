@@ -90,6 +90,21 @@ class MCPUserTokenPlain(TypedDict):
     last_refreshed: str | None
 
 
+class OIDCCredentialPlain(TypedDict):
+    """Plaintext shape returned by ``MCPTokenStore.get_oidc_credential``.
+
+    Mirrors ``OIDCUserCredential`` (storage row shape) with the refresh
+    token decrypted — the per-(user, issuer) credential that
+    ``auth_type='oauth_obo'`` servers redeem on demand (issue #551).
+    """
+
+    user_id: str
+    issuer: str
+    refresh_token: str
+    created: str
+    last_refreshed: str
+
+
 class MCPUserTokenMetadata(TypedDict):
     """Non-secret subset of ``MCPUserToken`` for the settings UI.
 
@@ -377,6 +392,54 @@ class MCPTokenStore:
     def delete_user_token(self, user_id: str, server_name: str) -> bool:
         """Delete the user-token row. Returns True if existed."""
         return self._storage.delete_mcp_user_token(user_id, server_name)
+
+    # -- OIDC user credential (single-credential MCP minting, #551) -------------
+    #
+    # Same cipher envelope as the per-(user, server) tokens above; lives on
+    # this store so there is exactly one owner of the encryption keys.
+
+    def upsert_oidc_credential(self, user_id: str, issuer: str, *, refresh_token: str) -> None:
+        """Encrypt and create-or-replace the user's captured IdP refresh token."""
+        refresh_ct = self._cipher.encrypt(refresh_token.encode("utf-8"))
+        self._storage.upsert_oidc_user_credential(user_id, issuer, refresh_token_ct=refresh_ct)
+
+    def get_oidc_credential(self, user_id: str, issuer: str) -> OIDCCredentialPlain | None:
+        """Returns plaintext dict or None.
+
+        Raises ``MCPTokenDecryptError`` on key mismatch — caller MUST NOT
+        auto-delete the row (same contract as ``get_user_token``).
+        """
+        row = self._storage.get_oidc_user_credential(user_id, issuer)
+        if row is None:
+            return None
+        try:
+            refresh_pt = self._cipher.decrypt(row["refresh_token_ct"]).decode("utf-8")
+        except MCPTokenDecryptError as exc:
+            self._audit_decrypt_failure(f"oidc:{issuer}", exc.key_fingerprints_attempted)
+            raise
+        return OIDCCredentialPlain(
+            user_id=row["user_id"],
+            issuer=row["issuer"],
+            refresh_token=refresh_pt,
+            created=row["created"],
+            last_refreshed=row["last_refreshed"],
+        )
+
+    def update_oidc_credential_after_redeem(
+        self, user_id: str, issuer: str, *, refresh_token: str
+    ) -> bool:
+        """Rotation write-back: persist the newest refresh token after a
+        redemption returned one (both verified grant legs rotate).
+        Returns True when a row was updated.
+        """
+        refresh_ct = self._cipher.encrypt(refresh_token.encode("utf-8"))
+        return self._storage.update_oidc_user_credential_refresh(
+            user_id, issuer, refresh_token_ct=refresh_ct
+        )
+
+    def delete_oidc_credential(self, user_id: str, issuer: str) -> bool:
+        """Remove the captured credential (logout-all / admin revoke)."""
+        return self._storage.delete_oidc_user_credential(user_id, issuer)
 
     def list_user_token_metadata(self, user_id: str) -> list[MCPUserTokenMetadata]:
         """Return non-secret metadata for every token row owned by ``user_id``.

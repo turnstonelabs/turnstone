@@ -38,6 +38,23 @@ class OIDCIdentity(TypedDict):
     tid: str
 
 
+class OIDCUserCredential(TypedDict):
+    """Row shape for the per-(user, issuer) captured IdP refresh token.
+
+    ``refresh_token_ct`` is a Fernet ciphertext blob (same envelope as
+    ``mcp_user_tokens``); the storage layer returns it verbatim and
+    ``MCPTokenStore`` handles encrypt/decrypt.  One row per user per
+    issuer — the single credential that ``auth_type='oauth_obo'`` MCP
+    servers redeem on demand (issue #551).
+    """
+
+    user_id: str
+    issuer: str
+    refresh_token_ct: bytes
+    created: str
+    last_refreshed: str
+
+
 class OIDCPendingState(TypedDict):
     """Row shape returned when popping a pending OIDC authorization-flow state."""
 
@@ -995,6 +1012,39 @@ class StorageBackend(Protocol):
 
     def delete_oidc_identity(self, issuer: str, subject: str) -> bool:
         """Remove an OIDC identity link. Returns True if existed."""
+        ...
+
+    # -- OIDC user credential (single-credential MCP minting, #551) -------------
+
+    def upsert_oidc_user_credential(
+        self, user_id: str, issuer: str, *, refresh_token_ct: bytes
+    ) -> None:
+        """Create or replace the user's captured IdP refresh token.
+
+        Replace-on-conflict: a fresh login must overwrite a stale or
+        revoked credential.  ``created`` is preserved on replace;
+        ``last_refreshed`` is reset to now either way.
+        """
+        ...
+
+    def get_oidc_user_credential(self, user_id: str, issuer: str) -> OIDCUserCredential | None:
+        """Return the captured credential row or None."""
+        ...
+
+    def update_oidc_user_credential_refresh(
+        self, user_id: str, issuer: str, *, refresh_token_ct: bytes
+    ) -> bool:
+        """Rotation write-back after a redemption returned a new refresh token.
+
+        Both verified grant legs rotate (Entra returns a new RT per
+        redemption; Keycloak rotates on the refresh grant), so the mint
+        path MUST persist the newest token every time.  Returns True when
+        a row was updated.
+        """
+        ...
+
+    def delete_oidc_user_credential(self, user_id: str, issuer: str) -> bool:
+        """Remove the captured credential (logout-all / admin revoke). Returns True if existed."""
         ...
 
     # -- OIDC pending state ----------------------------------------------------

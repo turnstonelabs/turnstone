@@ -953,6 +953,23 @@ oidc_pending_states = sa.Table(
     sa.Column("created_at", sa.Text, nullable=False),
 )
 
+# One captured IdP refresh token per (user, issuer) — the single credential
+# that `auth_type='oauth_obo'` MCP servers redeem on demand (issue #551).
+# Deliberately separate from `oidc_identities`: this row is a Fernet-encrypted
+# secret with hot rotation writes on the mint path, while identity rows are
+# freely-read metadata.  Keyed (user_id, issuer) — the mint path enters with
+# user_id; issuer future-proofs multi-IdP (OIDCConfig is single-issuer today).
+oidc_user_credentials = sa.Table(
+    "oidc_user_credentials",
+    metadata,
+    sa.Column("user_id", sa.Text, nullable=False),
+    sa.Column("issuer", sa.Text, nullable=False),
+    sa.Column("refresh_token_ct", sa.LargeBinary, nullable=False),
+    sa.Column("created", sa.Text, nullable=False),
+    sa.Column("last_refreshed", sa.Text, nullable=False),
+    sa.PrimaryKeyConstraint("user_id", "issuer"),
+)
+
 # ---------------------------------------------------------------------------
 # MCP per-(user, server) OAuth tokens and pending authorization-flow state.
 # No FKs at the schema level (matches `oidc_*` tables; tests avoid orphan

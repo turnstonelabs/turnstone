@@ -26,6 +26,7 @@ from turnstone.core.storage._protocol import (
     MCPUserTokenMetadataRow,
     OIDCIdentity,
     OIDCPendingState,
+    OIDCUserCredential,
 )
 from turnstone.core.storage._schema import (
     api_tokens,
@@ -43,6 +44,7 @@ from turnstone.core.storage._schema import (
     model_definitions,
     oidc_identities,
     oidc_pending_states,
+    oidc_user_credentials,
     orgs,
     output_assessments,
     output_guard_patterns,
@@ -1502,6 +1504,9 @@ class PostgreSQLBackend:
             conn.execute(sa.delete(channel_users).where(channel_users.c.user_id == user_id))
             conn.execute(sa.delete(api_tokens).where(api_tokens.c.user_id == user_id))
             conn.execute(sa.delete(oidc_identities).where(oidc_identities.c.user_id == user_id))
+            conn.execute(
+                sa.delete(oidc_user_credentials).where(oidc_user_credentials.c.user_id == user_id)
+            )
             conn.execute(sa.delete(mcp_user_tokens).where(mcp_user_tokens.c.user_id == user_id))
             conn.execute(sa.delete(mcp_oauth_pending).where(mcp_oauth_pending.c.user_id == user_id))
             result = conn.execute(sa.delete(users).where(users.c.user_id == user_id))
@@ -5557,6 +5562,80 @@ class PostgreSQLBackend:
             result = conn.execute(
                 sa.delete(oidc_identities).where(
                     (oidc_identities.c.issuer == issuer) & (oidc_identities.c.subject == subject)
+                )
+            )
+            conn.commit()
+            return result.rowcount > 0
+
+    # -- OIDC user credential (single-credential MCP minting, #551) -------------
+
+    def upsert_oidc_user_credential(
+        self, user_id: str, issuer: str, *, refresh_token_ct: bytes
+    ) -> None:
+        """Create or replace the user's captured IdP refresh token."""
+        from sqlalchemy.dialects import postgresql
+
+        now = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S")
+        with self._conn() as conn:
+            stmt = postgresql.insert(oidc_user_credentials).values(
+                user_id=user_id,
+                issuer=issuer,
+                refresh_token_ct=refresh_token_ct,
+                created=now,
+                last_refreshed=now,
+            )
+            conn.execute(
+                stmt.on_conflict_do_update(
+                    index_elements=["user_id", "issuer"],
+                    set_={"refresh_token_ct": refresh_token_ct, "last_refreshed": now},
+                )
+            )
+            conn.commit()
+
+    def get_oidc_user_credential(self, user_id: str, issuer: str) -> OIDCUserCredential | None:
+        """Return the captured credential row or None."""
+        with self._conn() as conn:
+            row = conn.execute(
+                sa.select(oidc_user_credentials).where(
+                    (oidc_user_credentials.c.user_id == user_id)
+                    & (oidc_user_credentials.c.issuer == issuer)
+                )
+            ).fetchone()
+            if row is None:
+                return None
+            m = row._mapping
+            return OIDCUserCredential(
+                user_id=m["user_id"],
+                issuer=m["issuer"],
+                refresh_token_ct=bytes(m["refresh_token_ct"]),
+                created=m["created"],
+                last_refreshed=m["last_refreshed"],
+            )
+
+    def update_oidc_user_credential_refresh(
+        self, user_id: str, issuer: str, *, refresh_token_ct: bytes
+    ) -> bool:
+        """Persist the newest refresh token after a rotating redemption."""
+        now = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S")
+        with self._conn() as conn:
+            result = conn.execute(
+                sa.update(oidc_user_credentials)
+                .where(
+                    (oidc_user_credentials.c.user_id == user_id)
+                    & (oidc_user_credentials.c.issuer == issuer)
+                )
+                .values(refresh_token_ct=refresh_token_ct, last_refreshed=now)
+            )
+            conn.commit()
+            return result.rowcount > 0
+
+    def delete_oidc_user_credential(self, user_id: str, issuer: str) -> bool:
+        """Remove the captured credential. Returns True if existed."""
+        with self._conn() as conn:
+            result = conn.execute(
+                sa.delete(oidc_user_credentials).where(
+                    (oidc_user_credentials.c.user_id == user_id)
+                    & (oidc_user_credentials.c.issuer == issuer)
                 )
             )
             conn.commit()
