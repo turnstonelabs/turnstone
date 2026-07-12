@@ -201,7 +201,10 @@ def _enabled_oidc(profile: str = "entra") -> SimpleNamespace:
     bad-profile config instead to assert the rejection.
     """
     return SimpleNamespace(
-        enabled=True, issuer="https://idp.example.com", obo_grant_profile=profile
+        enabled=True,
+        issuer="https://idp.example.com",
+        obo_grant_profile=profile,
+        capture_user_credential=True,
     )
 
 
@@ -763,6 +766,84 @@ class TestUpdateMcpServer:
         data = r.json()
         assert data["auth_type"] == "oauth_obo"
         assert data["oauth_audience"] == "api://mcp-a"
+
+    def test_same_type_static_edit_cannot_inject_oauth_columns(self, client, storage):
+        """Review finding (SECURITY): the OAuth columns must be a pure function
+        of the target auth_type on EVERY write, not just a flip. A same-type
+        static edit that injects oauth_authorization_server_url must be scrubbed
+        to NULL — otherwise a later flip to oauth_user (which legitimately uses
+        that column) would inherit the attacker AS URL and redirect every
+        consenting user's OAuth traffic."""
+        r = client.post(
+            "/v1/api/admin/mcp-servers",
+            json={
+                "name": "static-inject",
+                "transport": "streamable-http",
+                "url": "https://mcp.example.com/sse",
+                "auth_type": "static",
+            },
+        )
+        sid = r.json()["server_id"]
+        # Same-type static edit trying to smuggle an oauth_user-only column.
+        r2 = client.put(
+            f"/v1/api/admin/mcp-servers/{sid}",
+            json={
+                "auth_type": "static",
+                "oauth_authorization_server_url": "https://attacker.example",
+            },
+        )
+        assert r2.status_code == 200, r2.text
+        row = storage.get_mcp_server(sid)
+        assert (row.get("oauth_authorization_server_url") or None) is None
+
+    def test_flip_to_oauth_user_does_not_inherit_stale_as_url(self, client, storage):
+        """Review finding (SECURITY): flipping a non-oauth_user row to oauth_user
+        must recompute the oauth_user-only columns from the request, never
+        inherit a stale/injected authorization_server_url left on the pre-flip
+        row (defence-in-depth for a value that predates the unconditional
+        scrub)."""
+        # Plant a static row that already carries a stale AS URL directly in DB.
+        storage.create_mcp_server(
+            server_id="stale-asurl-id",
+            name="stale-asurl",
+            transport="streamable-http",
+            url="https://mcp.example.com/sse",
+            auth_type="static",
+            oauth_authorization_server_url="https://attacker.example",
+        )
+        # Flip to oauth_user WITHOUT supplying an AS URL in the body.
+        r = client.put(
+            "/v1/api/admin/mcp-servers/stale-asurl-id",
+            json={"auth_type": "oauth_user", "oauth_client_id": "cli_x"},
+        )
+        assert r.status_code == 200, r.text
+        row = storage.get_mcp_server("stale-asurl-id")
+        assert (row.get("oauth_authorization_server_url") or None) is None
+        assert row.get("oauth_client_id") == "cli_x"
+
+    def test_create_obo_rejected_when_capture_disabled(self, client):
+        """Review finding: oauth_obo mints from the user's CAPTURED sign-in
+        credential, so with capture_user_credential off, login persists nothing
+        and every dispatch returns kind='missing' with an unsatisfiable remedy.
+        Reject at write time."""
+        client.app.state.oidc_config = SimpleNamespace(
+            enabled=True,
+            issuer="https://idp.example.com",
+            obo_grant_profile="entra",
+            capture_user_credential=False,
+        )
+        r = client.post(
+            "/v1/api/admin/mcp-servers",
+            json={
+                "name": "obo-no-capture",
+                "transport": "streamable-http",
+                "url": "https://mcp.example.com/sse",
+                "auth_type": "oauth_obo",
+                "oauth_audience": "api://mcp-a",
+            },
+        )
+        assert r.status_code == 400, r.text
+        assert "capture_user_credential" in r.json()["error"]
 
     def test_create_obo_rejected_when_oidc_disabled(self, client):
         """Review finding: oauth_obo mints from the user's OIDC sign-in, so an

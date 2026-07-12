@@ -762,7 +762,9 @@ class TestFailureHandling:
         common missing-tenant-grant case — the user never had a token for this
         server) must NOT emit a token_revoked audit for a row that never
         existed. The cooldown is still armed as the terminal backstop (the
-        credential survives), so the second dispatch short-circuits."""
+        credential survives), and — because the failure was PERMANENT — the
+        second dispatch surfaces the honest permanent classification during the
+        cooldown window (not a misleading retryable transient)."""
         _seed_obo_server(storage)
         client = MagicMock(spec=httpx.AsyncClient)
         client.post = AsyncMock(
@@ -783,8 +785,9 @@ class TestFailureHandling:
         first, second = asyncio.run(_run())
 
         assert first.kind == "refresh_failed"
-        # Terminal: the cooldown short-circuits the second dispatch entirely.
-        assert second.kind == "refresh_failed_transient"
+        # Terminal: the cooldown short-circuits the second dispatch — and reports
+        # the PERMANENT classification, not a retryable transient.
+        assert second.kind == "refresh_failed"
         assert client.post.call_count == 1  # NOT re-minted
         # No row was ever deleted → no bogus revoke audit.
         events = storage.list_audit_events(action="mcp_server.oauth.token_revoked")
@@ -867,35 +870,100 @@ class TestFailureHandling:
         assert result.token == "at-reminted"
         assert client.post.call_count == 1
 
-    def test_force_refresh_reuses_row_minted_while_waiting_for_lock(
+    def test_force_refresh_reuses_concurrently_minted_token_without_reminting(
         self, storage: SQLiteBackend
     ) -> None:
-        """Review finding: the under-lock "another caller already minted" reuse
-        gate keyed on ``last_refreshed``, which obo cache rows NEVER set
-        (delete+create hardcodes NULL) — so every serialized force_refresh
-        waiter re-ran a full IdP redemption. The gate now keys on ``created``
-        (the mint time under delete+create): a fresh row created at/after the
-        caller's lock-request time is served without a new mint."""
+        """Serialized force_refresh waiters must single-flight the re-mint: a
+        waiter that acquires the lock AFTER a peer already re-minted reuses the
+        peer's fresh token instead of running its own redundant IdP redemption.
+        The reuse is decided by token IDENTITY (the under-lock row holds a
+        DIFFERENT token than the rejected one this caller came in with), not by
+        mint time — so a same-second concurrent mint is still reused."""
+        from unittest.mock import patch
+
         _seed_obo_server(storage)
         client = MagicMock(spec=httpx.AsyncClient)
         client.post = AsyncMock()  # any IdP call would be a gate failure
         state = _make_app_state(storage, http_client=client, oidc_config=_make_oidc_config())
         _seed_credential(state)
-        # Seeded moments before the call: at second granularity its ``created``
-        # is >= the caller's lock-request time, exactly what a concurrent
-        # waiter observes after the winner persisted its mint.
-        _seed_cache_row(state, expires_in_seconds=3600, access_token="winner-minted-at")
 
-        async def _run() -> Any:
-            return await get_obo_access_token_classified(
-                app_state=state, user_id=USER, server_name=SERVER, force_refresh=True
-            )
+        def _fresh_row(access_token: str) -> Any:
+            return {
+                "user_id": USER,
+                "server_name": SERVER,
+                "access_token": access_token,
+                "refresh_token": None,
+                "expires_at": (datetime.now(UTC) + timedelta(seconds=3600)).strftime(_ISO),
+                "scopes": None,
+                "as_issuer": ISSUER,
+                "audience": AUDIENCE,
+                "created": datetime.now(UTC).strftime(_ISO),
+                "last_refreshed": None,
+            }
 
-        result = asyncio.run(_run())
+        # Pre-lock read returns the rejected token; the under-lock re-read returns
+        # a DIFFERENT token (a concurrent waiter re-minted while we held-waited).
+        reads = [_fresh_row("rejected-at"), _fresh_row("peer-reminted-at")]
+        with patch.object(state.mcp_token_store, "get_user_token", side_effect=reads):
+
+            async def _run() -> Any:
+                return await get_obo_access_token_classified(
+                    app_state=state, user_id=USER, server_name=SERVER, force_refresh=True
+                )
+
+            result = asyncio.run(_run())
 
         assert result.kind == "token"
-        assert result.token == "winner-minted-at"
-        assert client.post.call_count == 0
+        assert result.token == "peer-reminted-at"  # reused the peer's fresh token
+        assert client.post.call_count == 0  # no redundant redemption
+
+    def test_force_refresh_remints_when_cache_still_holds_rejected_token(
+        self, storage: SQLiteBackend
+    ) -> None:
+        """The other half of the identity gate: when the under-lock row still
+        holds the SAME token the caller came in with (no peer re-minted), a
+        force_refresh must RE-MINT — never re-serve the just-rejected bearer.
+        A mint-time gate at 1-second ``created`` granularity would wrongly
+        re-serve a token minted in the same second as the retry."""
+        from unittest.mock import patch
+
+        _seed_obo_server(storage)
+        client = MagicMock(spec=httpx.AsyncClient)
+        client.post = AsyncMock(
+            return_value=_mk_response(
+                200, {"access_token": "genuinely-reminted", "expires_in": 3600}
+            )
+        )
+        state = _make_app_state(storage, http_client=client, oidc_config=_make_oidc_config())
+        _seed_credential(state)
+
+        rejected = {
+            "user_id": USER,
+            "server_name": SERVER,
+            "access_token": "rejected-at",
+            "refresh_token": None,
+            "expires_at": (datetime.now(UTC) + timedelta(seconds=3600)).strftime(_ISO),
+            "scopes": None,
+            "as_issuer": ISSUER,
+            "audience": AUDIENCE,
+            "created": datetime.now(UTC).strftime(_ISO),
+            "last_refreshed": None,
+        }
+        # Both the pre-lock and under-lock reads return the SAME (rejected) token.
+        with patch.object(
+            state.mcp_token_store, "get_user_token", side_effect=[rejected, rejected]
+        ):
+
+            async def _run() -> Any:
+                return await get_obo_access_token_classified(
+                    app_state=state, user_id=USER, server_name=SERVER, force_refresh=True
+                )
+
+            result = asyncio.run(_run())
+
+        assert result.kind == "token"
+        assert result.token == "genuinely-reminted"  # re-minted, NOT re-served
+        assert client.post.call_count == 1
 
     def test_rotation_persist_failure_does_not_break_the_mint(self, storage: SQLiteBackend) -> None:
         """Review finding: a storage error inside the rotation-persist callback

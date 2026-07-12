@@ -7279,7 +7279,14 @@ def _pool_error_detail(server_row: dict[str, Any], situation: str, *, kind: str 
     card; everything else is treated as ``oauth_user``.
     """
     model = "oauth_obo" if server_row.get("auth_type") == "oauth_obo" else "oauth_user"
-    return _POOL_ERROR_DETAIL[(model, situation)].format(kind=kind, kind_cap=kind.capitalize())
+    template = _POOL_ERROR_DETAIL[(model, situation)]
+    # Only the insufficient_scope rows carry {kind}/{kind_cap}; the rest are
+    # plain strings. Format ONLY when a kind is supplied so a future message
+    # containing a literal brace (a scope/JSON example) can't raise inside this
+    # error-rendering path and turn a clean structured error into a 500.
+    if kind:
+        return template.format(kind=kind, kind_cap=kind.capitalize())
+    return template
 
 
 def _consent_missing_detail(server_row: dict[str, Any]) -> str:

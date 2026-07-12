@@ -1419,6 +1419,13 @@ class _RefreshBackoffState:
 
     last_failure_monotonic: float = 0.0
     ambiguous_streak: int = 0
+    # True when the failure that armed the current cooldown was a PERMANENT
+    # dead-grant (only the oauth_obo path arms a cooldown on permanent, because
+    # its shared credential survives the per-server revoke). The in-cooldown
+    # short-circuit reads this so it surfaces the honest permanent classification
+    # (re-login / admin remedy) instead of a misleading "retry" transient for the
+    # whole window. Reset to False whenever a transient/ambiguous failure arms.
+    last_failure_permanent: bool = False
 
 
 def _refresh_backoff_state(app_state: Any, user_id: str, server_name: str) -> _RefreshBackoffState:
@@ -1435,7 +1442,9 @@ def _refresh_backoff_state(app_state: Any, user_id: str, server_name: str) -> _R
     return state
 
 
-def _arm_cooldown(app_state: Any, user_id: str, server_name: str) -> _RefreshBackoffState:
+def _arm_cooldown(
+    app_state: Any, user_id: str, server_name: str, *, permanent: bool = False
+) -> _RefreshBackoffState:
     """Stamp the per-(user, server) transient-failure cooldown clock to now.
 
     Single definition of the "back off this pair" operation (previously written
@@ -1444,9 +1453,16 @@ def _arm_cooldown(app_state: Any, user_id: str, server_name: str) -> _RefreshBac
     missed site can't silently keep hammering the AS/IdP on that path. Returns
     the backoff state so a caller that also mutates the ambiguous streak reuses
     the same object instead of re-fetching it.
+
+    ``permanent`` records whether the failure that armed the cooldown was a
+    dead-grant (obo only): the in-cooldown short-circuit reads it to surface the
+    honest permanent vs. transient classification. A transient/ambiguous arm
+    resets it to False so a later transient window can't inherit a stale
+    permanent flag.
     """
     state = _refresh_backoff_state(app_state, user_id, server_name)
     state.last_failure_monotonic = time.monotonic()
+    state.last_failure_permanent = permanent
     return state
 
 
@@ -1701,8 +1717,10 @@ async def _handle_refresh_failure(
         )
         if arm_cooldown_on_permanent:
             # _revoke_after_refresh_failure cleared the backoff; re-arm the
-            # cooldown as the terminal backstop for the surviving credential.
-            _arm_cooldown(app_state, user_id, server_name)
+            # cooldown as the terminal backstop for the surviving credential, and
+            # mark it permanent so the in-cooldown short-circuit surfaces the
+            # honest dead-grant classification (not a misleading "retry").
+            _arm_cooldown(app_state, user_id, server_name, permanent=True)
         return result
     # Transient or ambiguous: keep the token (a blip must never revoke a
     # user's consent) and arm the cooldown so a down AS isn't hit on
@@ -1724,7 +1742,7 @@ async def _handle_refresh_failure(
                     streak=backoff.ambiguous_streak,
                     error=str(exc),
                 )
-                return await _revoke_after_refresh_failure(
+                escalation_result = await _revoke_after_refresh_failure(
                     app_state,
                     token_store,
                     user_id,
@@ -1732,6 +1750,16 @@ async def _handle_refresh_failure(
                     server_id_for_audit,
                     reason=escalation_reason,
                 )
+                if arm_cooldown_on_permanent:
+                    # Same shared-credential backstop as the PERMANENT branch: an
+                    # escalation is a treated-as-dead grant, but the revoke
+                    # cleared the cooldown, and for obo the credential survives —
+                    # so without re-arming, the very next dispatch immediately
+                    # re-mints against the still-failing IdP and re-escalates
+                    # each cycle. Re-arm (marked permanent for the honest
+                    # in-cooldown classification).
+                    _arm_cooldown(app_state, user_id, server_name, permanent=True)
+                return escalation_result
             # Background priming: an UNCLASSIFIABLE sustained rejection is
             # exactly where a bulk prime of servers the user may not be
             # using must not revoke consent. Defer the escalation-revoke to
@@ -2319,8 +2347,6 @@ async def get_obo_access_token_classified(
         log.debug("mcp_server.oauth.token_store_unconfigured")
         return TokenLookupResult(kind="missing")
 
-    t_lock_request_started = datetime.now(UTC).replace(microsecond=0)
-
     # Resolve the server row + audience FIRST (callers on the dispatch/priming
     # path pass server_row, so this is normally no SQL) — the fast-path cache
     # serve must validate the row's audience against the CURRENT one, so it can't
@@ -2363,6 +2389,14 @@ async def get_obo_access_token_classified(
     # still-fresh cache must fall through to the locked re-read so it can pick up
     # a token a cluster-mate just minted, rather than fail transient in-cooldown.
     if not fresh and _refresh_in_cooldown(app_state, user_id, server_name):
+        # Surface the classification that armed the cooldown: obo arms it on a
+        # PERMANENT dead-grant too (its credential survives the per-server
+        # revoke), and reporting that as a retryable "transient" for the whole
+        # window would tell the user to retry a permanently-broken server and
+        # flap against the honest re-login/admin affordance the mint returned.
+        backoff = _refresh_backoff_state(app_state, user_id, server_name)
+        if backoff.last_failure_permanent:
+            return TokenLookupResult(kind="refresh_failed")
         return TokenLookupResult(kind="refresh_failed_transient")
     if oidc_config is not None and not getattr(oidc_config, "enabled", False):
         # A node that booted during a transient IdP outage carries
@@ -2435,13 +2469,18 @@ async def get_obo_access_token_classified(
         if _is_fresh_obo_cache_row(plain2, audience, scopes) and plain2 is not None:
             if not force_refresh:
                 return _token_result(app_state, user_id, server_name, plain2["access_token"])
-            # Obo cache rows are delete+create'd per mint and never touched by
-            # update_user_token_after_refresh, so ``created`` IS the mint time
-            # (``last_refreshed`` stays NULL on this path — the oauth_user
-            # gate's column would never fire here, and every serialized
-            # force_refresh waiter would run its own redundant IdP redemption).
-            minted_at = _parse_iso_to_utc(plain2.get("created") or "")
-            if minted_at is not None and minted_at >= t_lock_request_started:
+            # force_refresh means the caller's bearer was rejected; serialized
+            # waiters must single-flight the re-mint (avoid N redundant IdP
+            # redemptions) WITHOUT re-serving the very token that was just
+            # rejected. Distinguish by token IDENTITY, not mint time: the pre-lock
+            # ``plain`` is the token this caller came in with (the rejected one);
+            # if the under-lock row now holds a DIFFERENT token, a concurrent
+            # waiter re-minted while we waited — reuse it. If it is the SAME
+            # token, nothing has changed, so fall through and re-mint. (Mint time
+            # can't distinguish these at the cache row's 1-second ``created``
+            # granularity — a same-second own-mint would read as "fresh".)
+            pre_lock_token = plain["access_token"] if plain is not None else None
+            if plain2["access_token"] != pre_lock_token:
                 return _token_result(app_state, user_id, server_name, plain2["access_token"])
 
         # Re-read the credential under the lock — a concurrent mint for a
@@ -3577,6 +3616,10 @@ async def _handle_mcp_oauth_list_connections_inner(request: Request) -> Response
     # "Disconnect" that silently undid itself — the row deletes, then
     # session-start priming re-mints from the surviving captured credential —
     # so the connections list shows only rows the user can actually revoke.
+    # Classify by the authoritative server ``auth_type`` (one read on this cold
+    # settings-page path) rather than inferring obo from a NULL refresh token:
+    # the auth_type is the source of truth, and a token-shape heuristic would
+    # silently hide any oauth_user row that ever lacked a refresh token.
     # Fail open on a server-list read error: worst case an obo row renders
     # and the revoke endpoint below still refuses it honestly.
     storage = _get_storage(request.app.state)

@@ -9889,6 +9889,22 @@ def _enforce_oauth_obo_requirements(
             },
             status_code=400,
         )
+    if not getattr(oidc_config, "capture_user_credential", False):
+        # The mint redeems the user's CAPTURED IdP refresh token; with capture
+        # off, login persists nothing, so every dispatch returns kind="missing"
+        # and the "sign in again" remedy can never succeed — a permanent
+        # misconfig this choke point exists to reject. (Enabling capture also
+        # requires the encryption key, checked at boot.)
+        return JSONResponse(
+            {
+                "error": (
+                    "auth_type=oauth_obo requires [oidc] capture_user_credential=true "
+                    "so each user's sign-in credential is captured for minting; it is "
+                    "currently disabled, so this server could never obtain a token."
+                )
+            },
+            status_code=400,
+        )
     profile = _obo_profile(request)
     from turnstone.core.mcp_oauth import OBO_GRANT_PROFILES
 
@@ -10551,22 +10567,36 @@ async def admin_update_mcp_server(request: Request) -> JSONResponse:
             ):
                 del updates[_noop_key]
 
-    # Clear the OAuth columns the target auth_type does NOT use (shared
-    # ``_oauth_columns_to_clear`` policy). ``oauth_client_secret_ct`` is owned by
-    # a dedicated write path (see below).
-    if is_flip:
-        target_auth = new_auth  # non-None: is_flip requires new_auth is not None
-        if is_user_scoped_auth(target_auth):
-            # FLIP into a user-scoped type: recompute the semantic columns from
-            # the body — present → that value, absent → NULL — so neither the
-            # old audience nor the old scopes can leak across the semantic
-            # boundary. The top-of-handler loop already copied any body value
-            # into ``updates``; forcing the key present here NULLs it when the
-            # body omitted it (e.g. an API PUT of just {"auth_type": ...}, or the
-            # console form clearing the field on the auth-type switch).
-            updates["oauth_audience"] = updates.get("oauth_audience")
-            updates["oauth_scopes"] = updates.get("oauth_scopes")
-        updates.update(_oauth_columns_to_clear(target_auth))
+    # Scrub the OAuth columns the target auth_type does NOT use — on EVERY write,
+    # not just a flip. This is a SECURITY invariant, not a flip nicety: a
+    # same-type edit can still inject a column the type doesn't use (e.g. an API
+    # PUT of {"auth_type":"static","oauth_authorization_server_url":"…attacker…"}
+    # onto a static row), which — because oauth_user legitimately USES that
+    # column — would then survive a later flip to oauth_user and redirect every
+    # consenting user's OAuth traffic. The persisted OAuth columns must be a pure
+    # function of the target auth_type (the create handler enforces the same via
+    # ``_oauth_columns_to_clear``). ``oauth_client_secret_ct`` is owned by a
+    # dedicated write path (see below).
+    target_auth = new_auth if new_auth is not None else old_auth
+    if is_flip and new_auth is not None and is_user_scoped_auth(new_auth):
+        # FLIP into a user-scoped type: the columns whose MEANING differs across
+        # oauth_user↔oauth_obo must be recomputed from the body — present → that
+        # value, absent → NULL — never inherited from the old model's row. For
+        # oauth_audience/oauth_scopes this is the semantic-boundary rule; for a
+        # flip INTO oauth_user the oauth_user-only columns (client_id /
+        # registration / AS-URL) are also recomputed, so a stale/injected value
+        # left on the pre-flip static/none/obo row cannot carry in (those models
+        # don't use these columns, so the operator supplies them fresh here).
+        updates["oauth_audience"] = updates.get("oauth_audience")
+        updates["oauth_scopes"] = updates.get("oauth_scopes")
+        if new_auth == "oauth_user":
+            for _user_col in (
+                "oauth_client_id",
+                "oauth_registration_mode",
+                "oauth_authorization_server_url",
+            ):
+                updates[_user_col] = updates.get(_user_col)
+    updates.update(_oauth_columns_to_clear(target_auth))
     # Renaming a pool-backed row needs the same per-user-token purge as
     # delete: the tokens are keyed on the OLD ``server_name`` and a row
     # later created with that old name (with attacker-controlled URL)
