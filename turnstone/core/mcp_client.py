@@ -5713,8 +5713,7 @@ class MCPClientManager:
             return
         try:
             self._storage.delete_mcp_pending_consent(user_id, server_name)
-            self._prune_pending_consent_cleared(now)
-            self._pending_consent_cleared[key] = now
+            self._mark_pending_consent_cleared(key, now)
         except Exception:
             log.debug(
                 "mcp_pool.pending_consent_clear_failed user=%s server=%s",
@@ -5722,6 +5721,17 @@ class MCPClientManager:
                 server_name,
                 exc_info=True,
             )
+
+    def _mark_pending_consent_cleared(self, key: tuple[str, str], now: float) -> None:
+        """Record a DB-confirmed pending-consent DELETE in the TTL map.
+
+        The single "prune-then-stamp" step shared by the two DB-confirmed clear
+        sites (:meth:`_clear_pending_consent_sync` on the hot dispatch path and
+        :meth:`_clear_pending_consent_best_effort` from the sweep) so the
+        bookkeeping order can't drift between them.
+        """
+        self._prune_pending_consent_cleared(now)
+        self._pending_consent_cleared[key] = now
 
     def _prune_pending_consent_cleared(self, now: float) -> None:
         """Drop aged entries when the TTL map grows large (memory hygiene).
@@ -6558,10 +6568,7 @@ class MCPClientManager:
             return _structured_error(
                 code="mcp_insufficient_scope",
                 server=server_name,
-                detail=(
-                    f"{kind.capitalize()} requires elevated scopes. "
-                    "Re-consent flow with new scopes required."
-                ),
+                detail=_insufficient_scope_detail(server_row, kind),
                 scopes_required=list(scopes),
                 consent_url=_build_consent_url(server_row, scopes_required=list(scopes)),
             )
@@ -7241,6 +7248,30 @@ def _refresh_failed_detail(server_row: dict[str, Any]) -> str:
             "again; if it keeps failing, your administrator may need to grant access."
         )
     return "Refresh token rejected. Re-consent required."
+
+
+def _insufficient_scope_detail(server_row: dict[str, Any], kind: str) -> str:
+    """User-facing detail for a 403 insufficient_scope, per auth model.
+
+    ``oauth_user``: a per-server step-up re-consent with the widened scope set
+    is the remedy (``_build_consent_url`` attaches the affordance). ``oauth_obo``:
+    there is no per-server consent flow — the minted token's scopes come from
+    the user's captured sign-in (entra: the app's delegated permissions;
+    rfc8693: the server's configured ``oauth_scopes``), so a user-driven
+    step-up is impossible (``_build_consent_url`` returns None). Point at the
+    real fix — an administrator widening access — instead of a dead-end
+    re-consent card.
+    """
+    if server_row.get("auth_type") == "oauth_obo":
+        return (
+            f"This {kind} needs additional permissions your sign-in token does not "
+            "carry. Ask your administrator to grant the required access (add the "
+            "scope to the server, or widen your delegated permissions at the "
+            "identity provider)."
+        )
+    return (
+        f"{kind.capitalize()} requires elevated scopes. Re-consent flow with new scopes required."
+    )
 
 
 def _token_rejected_detail(server_row: dict[str, Any]) -> str:

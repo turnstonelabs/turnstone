@@ -92,6 +92,8 @@ obo_grant_profile = "entra"             # "entra" | "rfc8693" — how tokens are
 
 In the admin MCP form, choose **Sign-in passthrough** and set **Audience** (required — the downstream resource the token is minted for, e.g. `api://<app-id>` on Entra or the client id on Keycloak). The client-id / secret / registration fields do not apply and are hidden.
 
+`oauth_obo` servers are accepted only when **OIDC sign-in is configured and enabled** and `[oidc] obo_grant_profile` is a valid profile — the write is rejected otherwise, since a row that can never mint would surface to users as a permanent "please retry" that never heals.
+
 ### Identity-provider setup
 
 **Entra (`obo_grant_profile = "entra"`):**
@@ -150,7 +152,7 @@ Additional indicators (circuit-breaker state, encryption-key mismatch) are expos
 | `none` / `static` → `oauth_user` | — | New code path activates for this server. Existing static headers (if any) are no longer sent. Users must authorize on first use. |
 | `oauth_user` → `none` / `static` | — | Existing `mcp_user_tokens` rows are **deleted**: the tokens are bound to the auth model + URL active at consent time, and rows left behind could silently rebind if a row with the old name/URL reappears. Switching back to `oauth_user` later starts clean — users re-consent on next use. This is **not reversible**; the AS-side grants are untouched (revoke upstream via the AS if needed). |
 | OAuth `client_id` or `client_secret` rotated | — | Existing tokens may stop refreshing if the AS treats them as bound to the previous client. Bulk-revoke after rotation. |
-| `oauth_user` ↔ `oauth_obo` | — | The per-user rows are **deleted** on the flip (they mean different things: per-server AS refresh tokens vs. minted cache). A flip into `oauth_obo` clears carried-over `oauth_scopes` under the `entra` profile (they cannot apply there); under `rfc8693` a scopes value submitted with the flip is kept as the token-exchange scope and the column is cleared only when the request omits it. A flip into `oauth_user` clears the obo-era `oauth_audience` (an IdP-side app identifier, not the resource indicator `oauth_user` needs) unless the request sets a new one. |
+| `oauth_user` ↔ `oauth_obo` | — | The per-user rows are **deleted** on the flip (they mean different things: per-server AS refresh tokens vs. minted cache). `oauth_audience` and `oauth_scopes` mean different things in each model (a resource indicator vs. an IdP app identifier; AS-consent scopes vs. an rfc8693 exchange scope), so on a flip they **never carry** — each is taken from the request for the target model or set NULL. The admin console clears these fields when you change the auth type, so re-enter the correct values for the new mode; via the API, supply them explicitly (a flip into `oauth_obo` with no `oauth_audience` is rejected, and a non-empty `oauth_scopes` under the `entra` profile is rejected since that leg pins `<audience>/.default`). |
 | `oauth_obo` → `none` / `static` | — | Minted cache rows are deleted. |
 | `oauth_obo` **audience**, **URL**, or **`oauth_scopes`** changed | — | Minted cache rows are **deleted** (tokens are bound to the audience/URL/scopes at mint time), forcing a fresh mint — so an audience or scope narrowing takes effect immediately, not at token expiry. |
 

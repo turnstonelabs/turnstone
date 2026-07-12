@@ -224,8 +224,11 @@ def load_oidc_config() -> OIDCConfig:
         "TURNSTONE_OIDC_OBO_GRANT_PROFILE", cfg, "obo_grant_profile", "entra"
     ).strip()
     # Validate against the operative mint-leg registry (single source of truth,
-    # so a new leg needs no second edit here). Lazy import: mcp_oauth pulls in
-    # the MCP stack, and it does not import this module, so there is no cycle.
+    # so a new leg needs no second edit here). Function-level import: oidc and
+    # mcp_oauth reference each other's runtime helpers (mcp_oauth's mint path
+    # imports this module's ``maybe_rediscover_oidc`` likewise lazily), so BOTH
+    # directions stay off the module-import graph to keep the cycle unrealised —
+    # neither module may import the other at module scope.
     from turnstone.core.mcp_oauth import OBO_GRANT_PROFILES
 
     if obo_grant_profile not in OBO_GRANT_PROFILES:

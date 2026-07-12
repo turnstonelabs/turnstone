@@ -5,6 +5,7 @@ from __future__ import annotations
 import base64
 import json
 import uuid
+from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -191,6 +192,19 @@ def _install_token_store(app, storage) -> None:
     )
 
 
+def _enabled_oidc(profile: str = "entra") -> SimpleNamespace:
+    """An OIDC config that satisfies the oauth_obo write-time gate.
+
+    oauth_obo mints from the user's captured sign-in, so the write choke point
+    requires OIDC enabled + a valid ``obo_grant_profile``. Tests exercising obo
+    writes install one of these; the finding-C tests install a disabled /
+    bad-profile config instead to assert the rejection.
+    """
+    return SimpleNamespace(
+        enabled=True, issuer="https://idp.example.com", obo_grant_profile=profile
+    )
+
+
 @pytest.fixture
 def client(storage):
     """TestClient wired to console admin MCP endpoints with full permissions."""
@@ -200,6 +214,10 @@ def client(storage):
     )
     app.state.auth_storage = storage
     _install_token_store(app, storage)
+    # Default: OIDC enabled under the entra profile so oauth_obo writes pass the
+    # requirement gate. Per-test overrides install rfc8693 / disabled / bad
+    # profile as needed.
+    app.state.oidc_config = _enabled_oidc("entra")
     return TestClient(app)
 
 
@@ -746,6 +764,68 @@ class TestUpdateMcpServer:
         assert data["auth_type"] == "oauth_obo"
         assert data["oauth_audience"] == "api://mcp-a"
 
+    def test_create_obo_rejected_when_oidc_disabled(self, client):
+        """Review finding: oauth_obo mints from the user's OIDC sign-in, so an
+        install with OIDC disabled can NEVER mint. Reject at write time (a
+        permanent misconfig otherwise surfaces per-dispatch as a retryable
+        transient that never heals)."""
+        client.app.state.oidc_config = SimpleNamespace(enabled=False, obo_grant_profile="entra")
+        r = client.post(
+            "/v1/api/admin/mcp-servers",
+            json={
+                "name": "obo-no-oidc",
+                "transport": "streamable-http",
+                "url": "https://mcp.example.com/sse",
+                "auth_type": "oauth_obo",
+                "oauth_audience": "api://mcp-a",
+            },
+        )
+        assert r.status_code == 400, r.text
+        assert "OIDC" in r.json()["error"]
+
+    def test_create_obo_rejected_on_invalid_grant_profile(self, client):
+        """Review finding: a typo'd deployment obo_grant_profile leaves the mint
+        leg unresolved (obo_misconfigured per dispatch), so reject it at the
+        write choke point rather than as a runtime transient."""
+        client.app.state.oidc_config = _enabled_oidc("bogus-profile")
+        r = client.post(
+            "/v1/api/admin/mcp-servers",
+            json={
+                "name": "obo-bad-profile",
+                "transport": "streamable-http",
+                "url": "https://mcp.example.com/sse",
+                "auth_type": "oauth_obo",
+                "oauth_audience": "api://mcp-a",
+            },
+        )
+        assert r.status_code == 400, r.text
+        assert "obo_grant_profile" in r.json()["error"]
+
+    def test_flip_user_to_obo_via_api_without_audience_is_rejected(self, client, storage):
+        """Review finding: a flip into obo must NOT carry the oauth_user-era
+        oauth_audience (a resource indicator, conventionally the MCP URL) — it
+        would pass the audience-required check and then fail every mint. An API
+        PUT of just {auth_type: oauth_obo} recomputes audience from the body
+        (absent → NULL) and is rejected loudly, not saved with the stale value."""
+        r = client.post(
+            "/v1/api/admin/mcp-servers",
+            json={
+                "name": "flip-api-noaud",
+                "transport": "streamable-http",
+                "url": "https://mcp.example.com/sse",
+                "auth_type": "oauth_user",
+                "oauth_client_id": "cli_x",
+                "oauth_audience": "https://mcp.example.com/sse",  # resource indicator
+            },
+        )
+        sid = r.json()["server_id"]
+        r2 = client.put(
+            f"/v1/api/admin/mcp-servers/{sid}",
+            json={"auth_type": "oauth_obo"},  # no audience in body
+        )
+        assert r2.status_code == 400, r2.text
+        assert "oauth_audience" in r2.json()["error"]
+
     def test_update_flip_oauth_user_to_obo_keeps_audience_and_purges_tokens(self, client, storage):
         """#551 (findings 10344 + 10326): flipping oauth_user→oauth_obo must NOT
         null oauth_audience (the mint engine needs it), and MUST purge the old
@@ -844,17 +924,17 @@ class TestUpdateMcpServer:
         sid: str = r.json()["server_id"]
         return sid
 
-    def test_flip_to_obo_resent_scopes_cleared_under_entra(self, client):
-        """Review finding: on a flip into obo the carried-over oauth_user
-        scopes are profile-dependent. Under entra they can never apply (the
-        leg pins <audience>/.default), so an equal-value re-send is treated
-        as the stale pre-fill and cleared — NOT rejected (the flip must not
-        400 on a value the operator never typed)."""
-        from types import SimpleNamespace
-
-        client.app.state.oidc_config = SimpleNamespace(obo_grant_profile="entra")
+    def test_flip_to_obo_under_entra_rejects_explicit_scopes_but_omit_clears(self, client):
+        """Redesign: a flip into obo recomputes scopes from the body (never
+        carries the old row's value across the semantic boundary). Under entra,
+        an EXPLICIT non-empty scopes value is rejected 400 — an honest visible
+        snap rather than a silent drop — while the console-realistic flip (the
+        form clears the semantic field on the auth-type switch, so scopes is
+        omitted/empty) succeeds with scopes NULL."""
+        client.app.state.oidc_config = _enabled_oidc("entra")
+        # Explicit non-empty scopes on the flip → 400 (they can't apply on entra).
         sid = self._create_oauth_user_row_with_scopes(client, "flip-resend-entra")
-        r2 = client.put(
+        rejected = client.put(
             f"/v1/api/admin/mcp-servers/{sid}",
             json={
                 "auth_type": "oauth_obo",
@@ -862,8 +942,16 @@ class TestUpdateMcpServer:
                 "oauth_scopes": "openid profile offline_access",
             },
         )
-        assert r2.status_code == 200, r2.text
-        assert r2.json()["oauth_scopes"] in (None, "")  # carried-over value cleared
+        assert rejected.status_code == 400
+        assert "entra" in rejected.json()["error"]
+        # The realistic flip (scopes field cleared → omitted) succeeds, NULL scopes.
+        sid2 = self._create_oauth_user_row_with_scopes(client, "flip-omit-entra")
+        ok = client.put(
+            f"/v1/api/admin/mcp-servers/{sid2}",
+            json={"auth_type": "oauth_obo", "oauth_audience": "api://mcp-a"},
+        )
+        assert ok.status_code == 200, ok.text
+        assert ok.json()["oauth_scopes"] in (None, "")  # not carried across the flip
 
     def test_flip_to_obo_resent_scopes_kept_under_rfc8693(self, client):
         """Review finding: under rfc8693 oauth_scopes IS the token-exchange
@@ -871,9 +959,7 @@ class TestUpdateMcpServer:
         Keycloak optional-audience scope can legitimately equal the old
         consent scope string) must NOT have it silently nulled; only an
         omitted field clears (previous test)."""
-        from types import SimpleNamespace
-
-        client.app.state.oidc_config = SimpleNamespace(obo_grant_profile="rfc8693")
+        client.app.state.oidc_config = _enabled_oidc("rfc8693")
         sid = self._create_oauth_user_row_with_scopes(client, "flip-resend-rfc")
         r2 = client.put(
             f"/v1/api/admin/mcp-servers/{sid}",
@@ -891,8 +977,6 @@ class TestUpdateMcpServer:
         entra profile must stay editable — an unrelated PUT that doesn't touch
         scopes must NOT be rejected (the entra-scope reject fires only on a real
         scopes write)."""
-        from types import SimpleNamespace
-
         # Seed an obo row that already has scopes (e.g. created under rfc8693).
         storage.create_mcp_server(
             server_id="entra-edit-id",
@@ -904,7 +988,7 @@ class TestUpdateMcpServer:
             oauth_scopes="custom.scope",
         )
         # Now the deployment is on the entra profile.
-        client.app.state.oidc_config = SimpleNamespace(obo_grant_profile="entra")
+        client.app.state.oidc_config = _enabled_oidc("entra")
 
         # An unrelated maintenance edit (disable) — does NOT touch scopes.
         r = client.put(
@@ -946,8 +1030,6 @@ class TestUpdateMcpServer:
             )
 
         # The list handler fans out node status; no cluster nodes in this test.
-        from types import SimpleNamespace
-
         client.app.state.collector = SimpleNamespace(get_all_nodes=lambda: [])
         client.app.state.proxy_client = MagicMock()
         r = client.get("/v1/api/admin/mcp-servers")
@@ -1058,9 +1140,7 @@ class TestUpdateMcpServer:
         bearer's privileges exactly like the audience does — narrowing
         oauth_scopes must purge cached rows or the reduction silently waits
         out the token TTL (inconsistent with the audience purge)."""
-        from types import SimpleNamespace
-
-        client.app.state.oidc_config = SimpleNamespace(obo_grant_profile="rfc8693")
+        client.app.state.oidc_config = _enabled_oidc("rfc8693")
         sid = self._seed_obo_row_with_cache(
             client, storage, name="scope-change", scopes="api.read api.write"
         )
@@ -1077,9 +1157,7 @@ class TestUpdateMcpServer:
         """Review finding companion: the admin form re-submits the pre-filled
         scopes on every save — an EQUAL value is normalized out of the update
         and must not flush every user's minted tokens."""
-        from types import SimpleNamespace
-
-        client.app.state.oidc_config = SimpleNamespace(obo_grant_profile="rfc8693")
+        client.app.state.oidc_config = _enabled_oidc("rfc8693")
         sid = self._seed_obo_row_with_cache(client, storage, name="scope-noop", scopes="api.read")
         r2 = client.put(
             f"/v1/api/admin/mcp-servers/{sid}",
@@ -1096,9 +1174,7 @@ class TestUpdateMcpServer:
         carried over, every consent yields a wrong-resource token that 401s
         with no visible cause. The flip must clear it (and the rfc8693
         exchange scopes) unless the request explicitly sets new values."""
-        from types import SimpleNamespace
-
-        client.app.state.oidc_config = SimpleNamespace(obo_grant_profile="rfc8693")
+        client.app.state.oidc_config = _enabled_oidc("rfc8693")
         sid = self._seed_obo_row_with_cache(client, storage, name="flip-back", scopes="api.read")
         r2 = client.put(
             f"/v1/api/admin/mcp-servers/{sid}",
@@ -1117,16 +1193,14 @@ class TestUpdateMcpServer:
         oauth_scopes, so a same-type edit of an entra-profile obo row carrying
         legacy scopes must accept an EQUAL value (normalized to a no-op)
         instead of 400ing — only a genuine scope CHANGE is rejected."""
-        from types import SimpleNamespace
-
         # The legacy-scoped entra row arises from a deployment profile switch:
         # the row is created while the profile is rfc8693 (scopes accepted),
         # then the deployment flips to entra.
-        client.app.state.oidc_config = SimpleNamespace(obo_grant_profile="rfc8693")
+        client.app.state.oidc_config = _enabled_oidc("rfc8693")
         sid = self._seed_obo_row_with_cache(
             client, storage, name="entra-resend", scopes="legacy.scope"
         )
-        client.app.state.oidc_config = SimpleNamespace(obo_grant_profile="entra")
+        client.app.state.oidc_config = _enabled_oidc("entra")
         # Equal re-send + unrelated change → accepted, scopes untouched.
         r2 = client.put(
             f"/v1/api/admin/mcp-servers/{sid}",
@@ -1146,9 +1220,7 @@ class TestUpdateMcpServer:
         """#551 follow-up: oauth_scopes is meaningless for the entra grant leg
         (it mints <audience>/.default), so the write path rejects it rather than
         silently ignoring it at mint time."""
-        from types import SimpleNamespace
-
-        client.app.state.oidc_config = SimpleNamespace(obo_grant_profile="entra")
+        client.app.state.oidc_config = _enabled_oidc("entra")
         r = client.post(
             "/v1/api/admin/mcp-servers",
             json={

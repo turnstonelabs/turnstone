@@ -9802,6 +9802,47 @@ def _enforce_oauth_user_https(auth_type: str, url: str | None) -> JSONResponse |
     return None
 
 
+def _obo_profile(request: Request) -> str:
+    """Deployment-level ``[oidc] obo_grant_profile`` (``""`` when OIDC absent).
+
+    One reader for the profile so the create handler, the update handler, and
+    the write-time enforcement never diverge on how they resolve it.
+    """
+    oidc_config = getattr(request.app.state, "oidc_config", None)
+    return str(getattr(oidc_config, "obo_grant_profile", "") or "")
+
+
+def _oauth_columns_to_clear(auth_type: str | None) -> dict[str, None]:
+    """OAuth columns to force-NULL for a row of *auth_type* (shared write policy).
+
+    Single source of the "which OAuth columns does this auth model use" policy,
+    consumed by both the create and update handlers so they cannot drift.
+    ``oauth_user`` uses every column (nothing cleared); ``oauth_obo`` uses
+    ``oauth_audience`` (+ ``oauth_scopes`` under rfc8693) but none of the
+    oauth_user-only columns; ``static``/``none`` use no OAuth columns at all.
+    ``oauth_client_secret_ct`` is owned by a dedicated write path and is not
+    included here. Callers that cannot persist ``oauth_as_issuer_cached`` (the
+    create path) drop that key.
+    """
+    if auth_type == "oauth_user":
+        return {}
+    if auth_type == "oauth_obo":
+        return {
+            "oauth_client_id": None,
+            "oauth_registration_mode": None,
+            "oauth_authorization_server_url": None,
+            "oauth_as_issuer_cached": None,
+        }
+    return {  # static / none
+        "oauth_client_id": None,
+        "oauth_scopes": None,
+        "oauth_audience": None,
+        "oauth_registration_mode": None,
+        "oauth_authorization_server_url": None,
+        "oauth_as_issuer_cached": None,
+    }
+
+
 def _enforce_oauth_obo_requirements(
     request: Request, auth_type: str, *, audience: str | None, scopes: str | None
 ) -> JSONResponse | None:
@@ -9814,6 +9855,14 @@ def _enforce_oauth_obo_requirements(
       per-user mint-cache rows AND makes ``initialize_mcp_crypto_state``
       ``SystemExit(1)`` at the next restart, so accepting one keyless plants a
       deferred whole-cluster boot failure.
+    - **OIDC not enabled / no captured-credential source** → 400. The mint
+      redeems the user's captured IdP credential, so an install with no
+      ``[oidc]`` issuer (or OIDC operator-disabled) can NEVER mint — every tool
+      call would return ``mcp_refresh_unavailable`` ("please retry") forever, a
+      permanent misconfig dressed as a transient. Reject at write time.
+    - **Invalid ``obo_grant_profile``** → 400. A typo'd deployment profile
+      leaves the mint leg unresolved (``obo_misconfigured`` per dispatch), so
+      surface it here rather than as a runtime transient that never heals.
     - **No ``oauth_audience``** → 400. The mint engine hard-requires the
       downstream audience; without it every tool call fails transient and logs
       ``obo_misconfigured``. Reject here, exactly as bad URL schemes are.
@@ -9827,6 +9876,33 @@ def _enforce_oauth_obo_requirements(
         return None
     if getattr(request.app.state, "mcp_token_store", None) is None:
         return JSONResponse({"error": _OAUTH_TOKEN_STORE_503_MSG}, status_code=503)
+    oidc_config = getattr(request.app.state, "oidc_config", None)
+    if oidc_config is None or not getattr(oidc_config, "enabled", False):
+        return JSONResponse(
+            {
+                "error": (
+                    "auth_type=oauth_obo requires OIDC sign-in to be configured and "
+                    "enabled (it mints per-server tokens from each user's Turnstone "
+                    "sign-in). Configure [oidc] and capture_user_credential, or use "
+                    "auth_type=oauth_user for per-server consent."
+                )
+            },
+            status_code=400,
+        )
+    profile = _obo_profile(request)
+    from turnstone.core.mcp_oauth import OBO_GRANT_PROFILES
+
+    if profile not in OBO_GRANT_PROFILES:
+        return JSONResponse(
+            {
+                "error": (
+                    f"[oidc] obo_grant_profile={profile!r} is not a valid grant profile "
+                    f"({', '.join(sorted(OBO_GRANT_PROFILES))}); fix the deployment "
+                    "config before configuring oauth_obo servers"
+                )
+            },
+            status_code=400,
+        )
     if not (audience or "").strip():
         return JSONResponse(
             {
@@ -9837,20 +9913,17 @@ def _enforce_oauth_obo_requirements(
             },
             status_code=400,
         )
-    if (scopes or "").strip():
-        oidc_config = getattr(request.app.state, "oidc_config", None)
-        profile = str(getattr(oidc_config, "obo_grant_profile", "") or "")
-        if profile == "entra":
-            return JSONResponse(
-                {
-                    "error": (
-                        "oauth_scopes is not used by the entra grant profile "
-                        "(it mints <audience>/.default); leave it empty or switch "
-                        "the deployment to the rfc8693 profile"
-                    )
-                },
-                status_code=400,
-            )
+    if (scopes or "").strip() and profile == "entra":
+        return JSONResponse(
+            {
+                "error": (
+                    "oauth_scopes is not used by the entra grant profile "
+                    "(it mints <audience>/.default); leave it empty or switch "
+                    "the deployment to the rfc8693 profile"
+                )
+            },
+            status_code=400,
+        )
     return None
 
 
@@ -10272,30 +10345,23 @@ async def admin_create_mcp_server(request: Request) -> JSONResponse:
     headers_dict = body.get("headers", {})
     env_dict = body.get("env", {})
 
-    # Column policy — mirror of the update handler's clearing rules: persist
-    # only the OAuth columns the target auth_type actually uses, so a later
-    # auth_type flip can't resurrect values the operator never intended for
-    # the new mode (the update path clears on TRANSITION; without the same
-    # policy here, a row CREATED as oauth_obo could carry a client_id /
-    # registration_mode / AS-URL straight into a later oauth_user flip).
-    oauth_client_id = _clean_oauth_text(body.get("oauth_client_id"))
-    oauth_scopes = _clean_oauth_text(body.get("oauth_scopes"))
-    oauth_audience = _clean_oauth_text(body.get("oauth_audience"), max_length=2048)
-    oauth_registration_mode = _clean_oauth_text(body.get("oauth_registration_mode"))
-    oauth_as_url = _clean_oauth_text(body.get("oauth_authorization_server_url"), max_length=2048)
-    if auth_type == "oauth_obo":
-        # obo uses audience (+ scopes under rfc8693) but none of the
-        # oauth_user-only columns.
-        oauth_client_id = None
-        oauth_registration_mode = None
-        oauth_as_url = None
-    elif auth_type != "oauth_user":
-        # static/none use no OAuth columns at all.
-        oauth_client_id = None
-        oauth_scopes = None
-        oauth_audience = None
-        oauth_registration_mode = None
-        oauth_as_url = None
+    # Column policy — the SAME ``_oauth_columns_to_clear`` rule the update
+    # handler applies on a flip: persist only the OAuth columns the target
+    # auth_type actually uses, so a row created as oauth_obo can't carry a
+    # client_id / registration_mode / AS-URL straight into a later oauth_user
+    # flip. (``oauth_as_issuer_cached`` is discovery-owned and not a create
+    # parameter, so it is dropped from the cleared set here.)
+    oauth_cols: dict[str, Any] = {
+        "oauth_client_id": _clean_oauth_text(body.get("oauth_client_id")),
+        "oauth_scopes": _clean_oauth_text(body.get("oauth_scopes")),
+        "oauth_audience": _clean_oauth_text(body.get("oauth_audience"), max_length=2048),
+        "oauth_registration_mode": _clean_oauth_text(body.get("oauth_registration_mode")),
+        "oauth_authorization_server_url": _clean_oauth_text(
+            body.get("oauth_authorization_server_url"), max_length=2048
+        ),
+    }
+    oauth_cols.update(_oauth_columns_to_clear(auth_type))
+    oauth_cols.pop("oauth_as_issuer_cached", None)
 
     storage.create_mcp_server(
         server_id=server_id,
@@ -10310,11 +10376,7 @@ async def admin_create_mcp_server(request: Request) -> JSONResponse:
         enabled=bool(body.get("enabled", True)),
         created_by=audit_uid,
         auth_type=auth_type,
-        oauth_client_id=oauth_client_id,
-        oauth_scopes=oauth_scopes,
-        oauth_audience=oauth_audience,
-        oauth_registration_mode=oauth_registration_mode,
-        oauth_authorization_server_url=oauth_as_url,
+        **oauth_cols,
     )
 
     # Encrypt + persist the operator-supplied client secret via the dedicated
@@ -10467,87 +10529,44 @@ async def admin_update_mcp_server(request: Request) -> JSONResponse:
 
     old_auth = existing.get("auth_type")
     new_auth = updates.get("auth_type")
+    # A flip is any auth_type transition. ``oauth_audience`` and ``oauth_scopes``
+    # keep their meaning only WITHIN an auth type — across oauth_user↔oauth_obo
+    # the audience is a resource indicator vs. an IdP-side app identifier, and
+    # the scopes are AS-consent scopes vs. an rfc8693 exchange scope — so on a
+    # flip they must NEVER carry from the old row; they are recomputed from the
+    # request body (or NULLed) for the target type below.
+    is_flip = new_auth is not None and new_auth != old_auth
 
-    # A request that re-sends oauth_scopes / oauth_audience equal to the row's
-    # current value is a no-op — drop it from ``updates``. The admin form
-    # pre-fills both fields and submits them on every save, and three rules
-    # below key on "this request SETS the column": the entra-profile scope
-    # rejection (without this, a pre-existing scoped row under the entra
-    # profile is un-editable — every unrelated save 400s), the mint-cache
-    # purge triggers (a no-op re-send must not flush every user's cache), and
-    # the flip-into-oauth_user clearing of obo-era values (a re-sent stale
-    # pre-fill must not masquerade as an explicit set).
-    for _noop_key in ("oauth_scopes", "oauth_audience"):
-        if _noop_key in updates and (updates[_noop_key] or None) == (
-            existing.get(_noop_key) or None
-        ):
-            del updates[_noop_key]
+    if not is_flip:
+        # SAME-TYPE edit: a re-send of oauth_scopes / oauth_audience equal to the
+        # row's current value is a genuine no-op — drop it from ``updates`` so the
+        # admin form's unconditional re-send of pre-filled fields doesn't (a)
+        # trip the mint-cache purge triggers or (b) trip the entra scope
+        # rejection that would otherwise make a legacy-scoped row un-editable.
+        # (On a flip this comparison is meaningless — the old value is in the
+        # other auth model's semantics — so it is skipped.)
+        for _noop_key in ("oauth_scopes", "oauth_audience"):
+            if _noop_key in updates and (updates[_noop_key] or None) == (
+                existing.get(_noop_key) or None
+            ):
+                del updates[_noop_key]
 
-    # Clear the OAuth columns the target auth_type does NOT use, so a stale
-    # client_id / audience can't leak back on a later flip. static/none use
-    # none; oauth_obo uses oauth_audience (+ oauth_scopes) but none of the
-    # oauth_user-only columns; oauth_user uses client_id / registration /
-    # AS-URL / scopes plus an audience with DIFFERENT semantics (RFC 8707
-    # resource indicator, not the obo IdP-side app identifier).
-    # ``oauth_client_secret_ct`` is owned by a dedicated write path (see below).
-    if new_auth and not is_user_scoped_auth(new_auth):
-        # → static/none: clear every OAuth column.
-        updates.update(
-            {
-                "oauth_client_id": None,
-                "oauth_scopes": None,
-                "oauth_audience": None,
-                "oauth_registration_mode": None,
-                "oauth_authorization_server_url": None,
-                "oauth_as_issuer_cached": None,
-            }
-        )
-    elif new_auth == "oauth_obo":
-        # obo keeps audience (it needs it); clear the oauth_user-only columns.
-        updates.update(
-            {
-                "oauth_client_id": None,
-                "oauth_registration_mode": None,
-                "oauth_authorization_server_url": None,
-                "oauth_as_issuer_cached": None,
-            }
-        )
-        # A FLIP into obo carries oauth_user's AS-consent scopes, which mean
-        # something different in each grant profile:
-        #   entra   — scopes are never used (the leg pins <audience>/.default),
-        #             so clear the carry-over unless this request typed a
-        #             genuinely NEW value (which the enforce step below then
-        #             rejects loudly rather than silently discarding);
-        #   rfc8693 — scopes ARE the token-exchange scope, so honor the
-        #             request verbatim: a value equal to the old consent
-        #             scopes is a deliberate keep (the operator sees the
-        #             field on the flip form), and only an OMITTED field
-        #             clears the oauth_user consent scopes (different
-        #             semantics under the new auth model).
-        if old_auth != "oauth_obo":
-            profile = str(
-                getattr(getattr(request.app.state, "oidc_config", None), "obo_grant_profile", "")
-                or ""
-            )
-            if profile == "entra":
-                if "oauth_scopes" not in updates:
-                    updates["oauth_scopes"] = None
-            elif "oauth_scopes" not in body:
-                updates["oauth_scopes"] = None
-    elif new_auth == "oauth_user" and old_auth != "oauth_user":
-        # Flipping INTO oauth_user: the obo-era oauth_audience is an IdP-side
-        # app identifier (api://<guid> on Entra, a client id on Keycloak), NOT
-        # the RFC 8707 resource indicator oauth_user passes to its per-server
-        # AS — carried over, build_authorize_url requests (and the token
-        # validator accepts) a wrong-resource token that 401s on every
-        # dispatch with no visible cause. Same for rfc8693 exchange scopes
-        # leaking into consent scopes. Clear both unless this request
-        # explicitly sets them. (On main this was structurally impossible —
-        # any non-oauth_user row had every OAuth column nulled.)
-        if "oauth_audience" not in updates:
-            updates["oauth_audience"] = None
-        if "oauth_scopes" not in updates and "oauth_scopes" not in body:
-            updates["oauth_scopes"] = None
+    # Clear the OAuth columns the target auth_type does NOT use (shared
+    # ``_oauth_columns_to_clear`` policy). ``oauth_client_secret_ct`` is owned by
+    # a dedicated write path (see below).
+    if is_flip:
+        target_auth = new_auth  # non-None: is_flip requires new_auth is not None
+        if is_user_scoped_auth(target_auth):
+            # FLIP into a user-scoped type: recompute the semantic columns from
+            # the body — present → that value, absent → NULL — so neither the
+            # old audience nor the old scopes can leak across the semantic
+            # boundary. The top-of-handler loop already copied any body value
+            # into ``updates``; forcing the key present here NULLs it when the
+            # body omitted it (e.g. an API PUT of just {"auth_type": ...}, or the
+            # console form clearing the field on the auth-type switch).
+            updates["oauth_audience"] = updates.get("oauth_audience")
+            updates["oauth_scopes"] = updates.get("oauth_scopes")
+        updates.update(_oauth_columns_to_clear(target_auth))
     # Renaming a pool-backed row needs the same per-user-token purge as
     # delete: the tokens are keyed on the OLD ``server_name`` and a row
     # later created with that old name (with attacker-controlled URL)
