@@ -2498,17 +2498,21 @@ class MCPClientManager:
             )
 
     def prime_user_pools(self, user_id: str) -> None:
-        """Fire-and-forget: warm THIS user's consented ``oauth_user`` pools.
+        """Fire-and-forget: warm THIS user's pool-backed servers (oauth_user + oauth_obo).
 
-        Called at ChatSession start so a per-user OAuth server's tools are
-        present automatically — no manual reconnect after a reboot/upgrade, and
-        no chicken-and-egg (the model can't dispatch a tool it can't see). Only
-        touches servers the user already has a stored token for; skips servers
-        already connected. Non-blocking: schedules onto the mcp-loop and returns
-        immediately. The per-user tool listeners (registered by ChatSession)
-        deliver the catalog to the live session when each prime completes.
+        Called at ChatSession start so a per-user server's tools are present
+        automatically — no manual reconnect after a reboot/upgrade, and no
+        chicken-and-egg (the model can't dispatch a tool it can't see). For
+        oauth_obo this is the ONLY way tools reach the catalog: there is no
+        consent flow, so nothing else would warm the pool and the documented
+        "mint on first dispatch" could never fire (the model would never see the
+        tool to dispatch it). Only touches servers the user already has a stored
+        token / captured credential for; skips servers already connected.
+        Non-blocking: schedules onto the mcp-loop and returns immediately.
         """
-        if not user_id or self._loop is None or not self._oauth_user_server_names:
+        if not user_id or self._loop is None:
+            return
+        if not (self._oauth_user_server_names or self._obo_server_names):
             return
         if self._app_state is None or self._storage is None:
             return
@@ -2555,28 +2559,38 @@ class MCPClientManager:
             try:
                 async with sem:
                     try:
-                        # Resolve via the guarded refresh state machine, but with
-                        # revoke_ambiguous_escalation=False: a genuinely-dead grant
-                        # (permanent AS rejection / expired-no-refresh) is still
-                        # revoked so the catalog isn't left cold behind a phantom
-                        # "consented" token, but a sustained-UNCLASSIFIABLE rejection
-                        # is deferred to lazy dispatch — priming runs for every
-                        # consented server, so an AS hiccup we can't classify must
-                        # not revoke consent for one the user may not be using this
-                        # session. Only kind == "token" warms the pool.
-                        lookup = await get_user_access_token_classified(
-                            app_state=self._app_state,
-                            user_id=user_id,
-                            server_name=server_name,
-                            revoke_ambiguous_escalation=False,
-                        )
-                        if lookup.kind != "token" or not lookup.token:
-                            return  # not consented / undecryptable / refresh failed — lazy paths handle it
                         server_row = await asyncio.to_thread(
                             self._storage.get_mcp_server_by_name, server_name
                         )
                         if not server_row:
                             return
+                        # Resolve via the same guarded state machine lazy dispatch
+                        # uses. For oauth_obo this MINTS from the user's captured
+                        # credential (missing credential → kind="missing", skipped,
+                        # the re-login rail handles it on real dispatch). For
+                        # oauth_user, revoke_ambiguous_escalation=False: a
+                        # genuinely-dead grant is still revoked so the catalog
+                        # isn't left cold behind a phantom "consented" token, but a
+                        # sustained-UNCLASSIFIABLE rejection is deferred to lazy
+                        # dispatch — priming runs for every server, so an AS hiccup
+                        # we can't classify must not revoke a server the user may
+                        # not be using this session. Only kind == "token" warms it.
+                        if str(server_row.get("auth_type") or "") == "oauth_obo":
+                            lookup = await get_obo_access_token_classified(
+                                app_state=self._app_state,
+                                user_id=user_id,
+                                server_name=server_name,
+                                server_row=server_row,
+                            )
+                        else:
+                            lookup = await get_user_access_token_classified(
+                                app_state=self._app_state,
+                                user_id=user_id,
+                                server_name=server_name,
+                                revoke_ambiguous_escalation=False,
+                            )
+                        if lookup.kind != "token" or not lookup.token:
+                            return  # not consented / no credential / refresh failed — lazy paths handle it
                         cfg = _pool_cfg_from_row(server_row)
                         await self._prime_user_server(key, cfg, lookup.token)
                         log.info(
@@ -2594,7 +2608,8 @@ class MCPClientManager:
             finally:
                 self._priming_keys.discard(key)
 
-        await asyncio.gather(*(_prime_one(s) for s in list(self._oauth_user_server_names)))
+        prime_names = self._oauth_user_server_names | self._obo_server_names
+        await asyncio.gather(*(_prime_one(s) for s in list(prime_names)))
 
     # -- background token-freshness sweep (oauth_user grants) -----------------
 

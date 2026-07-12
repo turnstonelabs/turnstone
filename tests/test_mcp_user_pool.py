@@ -1007,6 +1007,85 @@ class TestUserIdThreadThrough:
         assert mgr._user_pool_entries == {}
 
 
+class TestOboPriming:
+    """oauth_obo servers must be primed at session start — it is the ONLY path
+    that warms their pool + surfaces their tools (no consent flow exists), so a
+    regression here makes the whole feature inert (review finding, mcp_client.py
+    :2597)."""
+
+    def test_prime_routes_obo_server_through_mint_and_warms_pool(
+        self, running_loop_mgr, storage
+    ) -> None:
+        mgr, loop, _ = running_loop_mgr
+        cipher = make_mcp_token_cipher()
+        mgr.set_storage(storage)
+        mgr.set_app_state(_make_app_state(storage, cipher=cipher))
+        storage.create_mcp_server(
+            server_id="srv-obo",
+            name="obo-srv",
+            transport="streamable-http",
+            url="https://mcp.example.com/sse",
+            auth_type="oauth_obo",
+            oauth_audience="api://mcp-a",
+        )
+        mgr._obo_server_names = {"obo-srv"}
+        mgr._oauth_user_server_names = set()
+
+        warmed: list[tuple[Any, Any, str]] = []
+
+        async def _fake_prime_server(key: Any, cfg: Any, token: str) -> None:
+            warmed.append((key, cfg, token))
+
+        obo_lookup = AsyncMock(return_value=SimpleNamespace(kind="token", token="minted-at"))
+        user_lookup = AsyncMock()
+        with (
+            patch.object(mgr, "_prime_user_server", new=_fake_prime_server),
+            patch("turnstone.core.mcp_client.get_obo_access_token_classified", new=obo_lookup),
+            patch("turnstone.core.mcp_client.get_user_access_token_classified", new=user_lookup),
+        ):
+            _run_on_loop(loop, mgr._prime_user_pools("user-1"))
+
+        # The obo server was minted (not routed to the oauth_user path) and warmed.
+        obo_lookup.assert_awaited_once()
+        assert obo_lookup.await_args.kwargs["server_name"] == "obo-srv"
+        user_lookup.assert_not_awaited()
+        assert len(warmed) == 1
+        assert warmed[0][2] == "minted-at"
+
+    def test_prime_skips_obo_server_when_no_credential(self, running_loop_mgr, storage) -> None:
+        """A user without a captured credential yields kind='missing' from the
+        mint path → the pool is not warmed (the re-login rail handles it on real
+        dispatch), and nothing raises."""
+        mgr, loop, _ = running_loop_mgr
+        cipher = make_mcp_token_cipher()
+        mgr.set_storage(storage)
+        mgr.set_app_state(_make_app_state(storage, cipher=cipher))
+        storage.create_mcp_server(
+            server_id="srv-obo",
+            name="obo-srv",
+            transport="streamable-http",
+            url="https://mcp.example.com/sse",
+            auth_type="oauth_obo",
+            oauth_audience="api://mcp-a",
+        )
+        mgr._obo_server_names = {"obo-srv"}
+
+        warmed: list[Any] = []
+
+        async def _fake_prime_server(key: Any, cfg: Any, token: str) -> None:
+            warmed.append(key)
+
+        obo_lookup = AsyncMock(return_value=SimpleNamespace(kind="missing", token=None))
+        with (
+            patch.object(mgr, "_prime_user_server", new=_fake_prime_server),
+            patch("turnstone.core.mcp_client.get_obo_access_token_classified", new=obo_lookup),
+        ):
+            _run_on_loop(loop, mgr._prime_user_pools("user-1"))
+
+        obo_lookup.assert_awaited_once()
+        assert warmed == []
+
+
 # ---------------------------------------------------------------------------
 # Background token-freshness sweep (oauth_user keep-hot, no connection warming)
 # ---------------------------------------------------------------------------
