@@ -430,3 +430,38 @@ class TestReconcileSync:
         row["auth_type"] = "oauth_obo"
         mgr.reconcile_sync(_FakeStorage([row]))
         assert primed == []
+
+    def test_reprimes_on_pool_auth_type_flip(self) -> None:
+        """A server MIGRATED in place oauth_user -> oauth_obo (same name) re-primes
+        active users — a name-only diff would see the same name on both sides and
+        miss the flip."""
+        mgr = MCPClientManager({})
+        mgr._oauth_user_server_names = {"srv"}  # previously oauth_user
+        primed: list[str] = []
+        mgr.prime_user_pools = lambda uid: primed.append(uid)  # type: ignore[method-assign]
+        mgr.add_listener(lambda: None, user_id="u1")
+        row = _db_row("srv", transport="streamable-http", command="", url="https://srv:8443/")
+        row["auth_type"] = "oauth_obo"  # flipped in place
+        mgr.reconcile_sync(_FakeStorage([row]))
+        assert primed == ["u1"]
+        assert mgr._obo_server_names == {"srv"}
+        assert mgr._oauth_user_server_names == set()
+
+    def test_reprime_survives_prime_exception(self) -> None:
+        """One user's prime scheduling failure must not abort the loop or propagate
+        out of reconcile_sync (which would 500 the reload endpoint)."""
+        mgr = MCPClientManager({})
+        primed: list[str] = []
+
+        def _prime(uid: str) -> None:
+            if uid == "boom-user":
+                raise RuntimeError("scheduling blew up")
+            primed.append(uid)
+
+        mgr.prime_user_pools = _prime  # type: ignore[method-assign]
+        mgr.add_listener(lambda: None, user_id="boom-user")
+        mgr.add_listener(lambda: None, user_id="ok-user")
+        row = _db_row("azobo", transport="streamable-http", command="", url="https://azobo:8443/")
+        row["auth_type"] = "oauth_obo"
+        mgr.reconcile_sync(_FakeStorage([row]))  # must not raise
+        assert "ok-user" in primed  # the other user was still primed

@@ -4706,11 +4706,14 @@ class MCPClientManager:
             log.warning("reconcile_sync: failed to read mcp_servers table", exc_info=True)
             return {"added": [], "removed": [], "updated": []}
 
-        # Pool-backed (oauth_user / oauth_obo) names known BEFORE this
-        # reconcile — diffed against the refreshed sets below to spot servers
-        # that appeared since active sessions last primed (see the re-prime
-        # self-heal near the end of this method).
-        prev_pool_names = self._oauth_user_server_names | self._obo_server_names
+        # Prior (name -> pool auth_type) view, reconstructed from the tracked
+        # pool-name sets. Diffing auth_type — not just names — below catches a
+        # server MIGRATED in place between the two pool auth types
+        # (oauth_user <-> oauth_obo, the flip the OBO feature enables): a
+        # name-only diff sees the same name on both sides and misses it.
+        # Mirrors the explicit two-type split of the set rebuilds just below.
+        prev_pool_auth = {n: "oauth_user" for n in self._oauth_user_server_names}
+        prev_pool_auth.update(dict.fromkeys(self._obo_server_names, "oauth_obo"))
 
         # Refresh the in-memory oauth_user name cache from the rows we
         # just read — feeds :meth:`server_auth_type` so callers (e.g.
@@ -4722,9 +4725,13 @@ class MCPClientManager:
         self._obo_server_names = {
             row["name"] for row in rows if row.get("auth_type") == "oauth_obo"
         }
-        newly_added_pool = (
-            self._oauth_user_server_names | self._obo_server_names
-        ) - prev_pool_names
+        new_pool_auth = {n: "oauth_user" for n in self._oauth_user_server_names}
+        new_pool_auth.update(dict.fromkeys(self._obo_server_names, "oauth_obo"))
+        # Pool servers newly registered OR migrated between pool auth types
+        # since active sessions last primed.
+        newly_added_pool = {
+            name for name, at in new_pool_auth.items() if prev_pool_auth.get(name) != at
+        }
 
         desired = _db_servers_to_config(rows)
         desired_names = set(desired)
@@ -4785,31 +4792,48 @@ class MCPClientManager:
         # active session's user so a mid-session registration surfaces its
         # tools automatically — no reconnect or fresh workstream needed.
         if newly_added_pool:
-            self._reprime_active_users(newly_added_pool)
+            self._reprime_active_users(len(newly_added_pool))
 
         return {"added": added, "removed": removed, "updated": updated}
 
-    def _reprime_active_users(self, new_servers: set[str]) -> None:
-        """Re-warm active sessions' pools after new pool-backed servers appear.
+    def _reprime_active_users(self, changed_count: int) -> None:
+        """Schedule a pool re-warm for every active session's user after
+        *changed_count* pool-backed servers were newly registered or migrated
+        between pool auth types this reconcile (see :meth:`reconcile_sync`).
 
-        Called from :meth:`reconcile_sync` when a reconcile reveals an
-        oauth_user / oauth_obo server that active sessions never primed. Active
-        users come from the tool-listener registry (each open ChatSession
+        Active users come from the tool-listener registry (each open ChatSession
         registers ``(user_id, callback)`` via :meth:`add_listener`); the
         ``user_id=None`` global/admin listener is skipped. ``prime_user_pools``
-        is idempotent and fire-and-forget, so re-priming an already-warm pool
-        is a cheap skip and re-priming a user without the stored token /
-        captured credential is a no-op.
+        is fire-and-forget — it SCHEDULES the mint/connect onto the mcp-loop and
+        returns, no-opping for an already-warm pool, a user without a captured
+        credential, or a down loop — so the log below reports what was
+        SCHEDULED, not what completed. The call is guarded per-user (mirroring
+        the session.py call sites) so one user's scheduling failure can't abort
+        the loop or 500 the reload endpoint.
+
+        Fan-out note: only the infrequent, operator-driven reload path reaches
+        here and each user's mint concurrency is already capped
+        (``_PRIME_MAX_CONCURRENCY``); a shared cross-user mint cap is left as a
+        follow-up if IdP rate-limiting is ever observed under a large active-user
+        count.
         """
         with self._listeners_lock:
             user_ids = {uid for uid, _cb in self._listeners if uid}
         for user_id in user_ids:
-            self.prime_user_pools(user_id)
+            try:
+                self.prime_user_pools(user_id)
+            except Exception:
+                log.debug(
+                    "mcp reconcile re-prime scheduling failed user=%s",
+                    user_id,
+                    exc_info=True,
+                )
         if user_ids:
             log.info(
-                "MCP reconcile: re-primed %d active user(s) after %d new pool server(s) appeared",
+                "MCP reconcile: scheduled pool re-prime for %d active session "
+                "user(s) after %d pool server change(s)",
                 len(user_ids),
-                len(new_servers),
+                changed_count,
             )
 
     # -- query methods -------------------------------------------------------
