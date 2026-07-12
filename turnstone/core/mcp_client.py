@@ -778,7 +778,15 @@ class MCPClientManager:
         # row. The dispatch-success clear consults it so the common (no pending
         # row) path never issues an SQL DELETE — a per-node hint, not
         # authoritative: cross-node the sweep / next same-node success reconciles.
-        self._pending_consent_written: set[tuple[str, str]] = set()
+        # (user, server) pairs this node believes have NO pending-consent row —
+        # either cleared here, or never seen to fail here. The dispatch-success
+        # clear does its SQL DELETE only the FIRST time a pair reaches success
+        # since its last failure, then records it here so subsequent successes
+        # skip the SQL (keeps the hot path write-free). Crucially this is NOT
+        # gated on "we wrote the row": a fresh node / a node that didn't write
+        # the row still clears on its first success, so a badge written on
+        # another node self-heals cross-node. A write resets the pair (below).
+        self._pending_consent_cleared: set[tuple[str, str]] = set()
 
         # Idle-eviction task handle. Scheduled lazily on the mcp-loop the
         # first time a pool entry is created (start() runs before pool
@@ -2592,6 +2600,12 @@ class MCPClientManager:
                                 user_id=user_id,
                                 server_name=server_name,
                                 server_row=server_row,
+                                # Same as the oauth_user priming call below: a
+                                # sustained-UNCLASSIFIABLE IdP failure during a
+                                # bulk session-start prime must NOT escalate-revoke
+                                # (drop the cache row + arm cooldown) across every
+                                # user — defer that to the user's real dispatch.
+                                revoke_ambiguous_escalation=False,
                             )
                         else:
                             lookup = await get_user_access_token_classified(
@@ -2834,9 +2848,9 @@ class MCPClientManager:
             scopes_required=scopes_required,
             now_iso=datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S"),
         )
-        # Remember we wrote a row so the dispatch-success clear can skip its SQL
-        # DELETE on the common (no-pending) path.
-        self._pending_consent_written.add((user_id, server_name))
+        # A fresh pending row exists again → un-mark the pair so the next
+        # successful dispatch (on any node) clears it.
+        self._pending_consent_cleared.discard((user_id, server_name))
 
     async def _persist_pending_consent_best_effort(self, user_id: str, server_name: str) -> bool:
         """Raise the dashboard pending-consent badge for a proactively-detected
@@ -2878,7 +2892,7 @@ class MCPClientManager:
             return
         try:
             await asyncio.to_thread(self._storage.delete_mcp_pending_consent, user_id, server_name)
-            self._pending_consent_written.discard((user_id, server_name))
+            self._pending_consent_cleared.add((user_id, server_name))
         except Exception:
             log.debug(
                 "MCP token sweep: pending-consent clear failed user=%s server=%s",
@@ -5640,19 +5654,23 @@ class MCPClientManager:
         an obo pending row — written when the credential was missing — would
         persist forever after the user re-logs in.
 
-        Gated on this node's ``_pending_consent_written`` hint so the common case
-        (no pending row was ever written for this pair) issues ZERO SQL — the
-        DELETE runs only when we actually recorded a row, keeping the hot dispatch
-        path free of an unconditional per-call write.
+        Deduped via ``_pending_consent_cleared`` so it is NOT an unconditional
+        per-call SQL write: the DELETE runs only the first time a pair reaches
+        success since its last failure, then the pair is recorded and subsequent
+        successes skip it — keeping the hot dispatch path free of per-call SQL.
+        Unlike a "we wrote the row" gate, this fires on ANY node's first success
+        (a fresh node's cleared-set is empty), so a badge written on another node
+        self-heals cross-node; a node restart also re-clears once. A new failure
+        removes the pair (``_write_pending_consent``) so the badge re-clears.
         """
         key = (user_id, server_name)
-        if key not in self._pending_consent_written:
-            return
+        if key in self._pending_consent_cleared:
+            return  # already cleared on this node since the last failure — no SQL
         if self._storage is None:
             return
         try:
             self._storage.delete_mcp_pending_consent(user_id, server_name)
-            self._pending_consent_written.discard(key)
+            self._pending_consent_cleared.add(key)
         except Exception:
             log.debug(
                 "mcp_pool.pending_consent_clear_failed user=%s server=%s",

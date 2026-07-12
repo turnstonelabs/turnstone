@@ -62,7 +62,7 @@ if TYPE_CHECKING:
     from starlette.requests import Request
     from starlette.responses import Response
 
-    from turnstone.core.mcp_crypto import MCPTokenStore
+    from turnstone.core.mcp_crypto import MCPTokenStore, MCPUserTokenPlain
     from turnstone.core.storage._protocol import StorageBackend
 
 log = get_logger(__name__)
@@ -1993,6 +1993,11 @@ async def _maybe_persist_rotation(
         await persist_rotation(rotated)
 
 
+#: Audiences already warned about ignored entra scopes — dedupes the warning to
+#: once per audience per process (see _obo_mint_entra).
+_ENTRA_SCOPE_IGNORED_WARNED: set[str] = set()
+
+
 async def _obo_mint_entra(
     *,
     oidc_config: Any,
@@ -2014,13 +2019,19 @@ async def _obo_mint_entra(
     list would drop the audience and yield a wrong-audience token); they are a
     ``rfc8693``-only knob.
     """
-    if scopes:
-        # The admin write path rejects scopes-with-entra (console
-        # _enforce_oauth_obo_requirements), so reaching here is a pre-existing
-        # row or a direct-API write — debug, not a per-mint warning flood.
-        log.debug(
-            "obo: oauth_scopes ignored for the entra grant leg (audience=%s uses "
-            "<audience>/.default); scopes apply only to rfc8693",
+    if scopes and audience not in _ENTRA_SCOPE_IGNORED_WARNED:
+        # Entra ignores oauth_scopes (it pins <audience>/.default), so a
+        # configured scope restriction silently does not apply on this
+        # credential-minting path. The admin write path rejects NEW
+        # scopes-with-entra, but a deployment-level profile switch
+        # (rfc8693→entra) leaves pre-existing scoped rows — surface that ONCE
+        # per audience per process (not per mint) so it's visible at default log
+        # levels without flooding.
+        _ENTRA_SCOPE_IGNORED_WARNED.add(audience)
+        log.warning(
+            "obo: oauth_scopes is IGNORED for the entra grant leg (audience=%s mints "
+            "<audience>/.default) — a configured scope restriction is not applied; "
+            "clear oauth_scopes or use the rfc8693 profile",
             audience,
         )
     resp = await _obo_token_post(
@@ -2119,27 +2130,30 @@ async def _persist_obo_cache_row(
     issuer: str,
     audience: str,
 ) -> None:
-    """Create-or-update the per-(user, server) cache row (refresh_token=NULL)."""
-    updated = await asyncio.to_thread(
-        token_store.update_user_token_after_refresh,
+    """Write the per-(user, server) mint-cache row (refresh_token=NULL).
+
+    Delete-then-create rather than update-in-place: the row is pure cache (no
+    refresh token to preserve), and — crucially — a plain update would keep the
+    OLD ``audience`` / ``as_issuer`` / ``scopes`` columns
+    (``update_user_token_after_refresh`` rewrites only the token + expiry), so a
+    re-mint after an audience change would store the new token under the stale
+    audience and the read-side audience guard would re-mint on every dispatch
+    forever. Deleting first guarantees the row's audience matches what was minted.
+    Runs under the per-(user, server) lock, so the delete/create can't race a
+    concurrent mint for this pair.
+    """
+    await asyncio.to_thread(token_store.delete_user_token, user_id, server_name)
+    await asyncio.to_thread(
+        token_store.create_user_token,
         user_id,
         server_name,
         access_token=access_token,
         refresh_token=None,
         expires_at=expires_at,
+        scopes=scopes or None,
+        as_issuer=issuer,
+        audience=audience,
     )
-    if not updated:
-        await asyncio.to_thread(
-            token_store.create_user_token,
-            user_id,
-            server_name,
-            access_token=access_token,
-            refresh_token=None,
-            expires_at=expires_at,
-            scopes=scopes or None,
-            as_issuer=issuer,
-            audience=audience,
-        )
 
 
 async def _read_obo_credential(
@@ -2182,12 +2196,36 @@ async def _read_obo_credential(
     return credential
 
 
+def _is_fresh_obo_cache_row(plain: MCPUserTokenPlain | None, current_audience: str) -> bool:
+    """True when a cache row may be served as a minted obo access token.
+
+    Three conditions, all required (single source of truth for the pre-lock read
+    AND the post-lock re-read so they can't drift):
+
+    - refresh_token is NULL — minted rows carry no refresh token; a
+      refresh-bearing row is a stale oauth_user leftover (an in-flight refresh
+      that landed after an auth_type-flip purge) and must never be served;
+    - the row's audience equals the server's CURRENT audience — a token minted
+      for a since-narrowed audience must NOT be served, so an operator's
+      privilege reduction takes effect immediately rather than at token TTL
+      (the audience-change purge is best-effort; this is the authoritative gate);
+    - not at/near expiry.
+    """
+    return (
+        plain is not None
+        and plain["refresh_token"] is None
+        and (plain.get("audience") or "") == current_audience
+        and not _token_needs_refresh(plain["expires_at"])
+    )
+
+
 async def get_obo_access_token_classified(
     *,
     app_state: Any,
     user_id: str,
     server_name: str,
     force_refresh: bool = False,
+    revoke_ambiguous_escalation: bool = True,
     server_row: dict[str, Any] | None = None,
 ) -> TokenLookupResult:
     """Tagged token lookup for ``auth_type='oauth_obo'`` servers.
@@ -2225,6 +2263,25 @@ async def get_obo_access_token_classified(
 
     t_lock_request_started = datetime.now(UTC).replace(microsecond=0)
 
+    # Resolve the server row + audience FIRST (callers on the dispatch/priming
+    # path pass server_row, so this is normally no SQL) — the fast-path cache
+    # serve must validate the row's audience against the CURRENT one, so it can't
+    # run before the audience is known.
+    storage = _get_storage(app_state)
+    if storage is None:
+        return _no_token_result(app_state, user_id, server_name, TokenLookupResult(kind="missing"))
+    if server_row is None:
+        server_row = await asyncio.to_thread(storage.get_mcp_server_by_name, server_name)
+    if server_row is None:
+        return _no_token_result(app_state, user_id, server_name, TokenLookupResult(kind="missing"))
+    server_id_for_audit = str(server_row.get("server_id") or "")
+
+    oidc_config = getattr(app_state, "oidc_config", None)
+    profile = str(getattr(oidc_config, "obo_grant_profile", "") or "")
+    audience = str(server_row.get("oauth_audience") or "")
+    scopes = str(server_row.get("oauth_scopes") or "")
+    mint = _OBO_MINT_LEGS.get(profile)
+
     try:
         plain = await asyncio.to_thread(token_store.get_user_token, user_id, server_name)
     except MCPTokenDecryptError as exc:
@@ -2243,41 +2300,19 @@ async def get_obo_access_token_classified(
                 decrypt_fingerprints=tuple(exc.key_fingerprints_attempted),
             ),
         )
-    # A cache row carrying a refresh token is NOT a valid obo mint-cache row
-    # (minted rows have refresh_token NULL) — it's a stale oauth_user leftover
-    # from an in-flight refresh that landed after an auth_type-flip purge, or a
-    # bad transition. Never serve it as a minted token; treat it as needing a
-    # fresh mint (which then overwrites it via _persist_obo_cache_row).
-    fresh_obo_row = (
-        plain is not None
-        and plain["refresh_token"] is None
-        and not _token_needs_refresh(plain["expires_at"])
-    )
-    if plain is not None and fresh_obo_row and not force_refresh:
+    # Serve the cache only when it is a fresh, right-audience, refresh-less row
+    # (see _is_fresh_obo_cache_row). A stale-audience or refresh-bearing row
+    # falls through to a fresh mint (which overwrites it via _persist_obo_cache_row).
+    if _is_fresh_obo_cache_row(plain, audience) and not force_refresh and plain is not None:
         return _token_result(app_state, user_id, server_name, plain["access_token"])
 
     # Gate the cooldown short-circuit on actually needing a mint (cache absent or
     # stale), mirroring the oauth_user path: a force_refresh 401-retry on a
     # still-fresh cache must fall through to the locked re-read so it can pick up
     # a token a cluster-mate just minted, rather than fail transient in-cooldown.
-    needs_mint = not fresh_obo_row
+    needs_mint = not _is_fresh_obo_cache_row(plain, audience)
     if needs_mint and _refresh_in_cooldown(app_state, user_id, server_name):
         return TokenLookupResult(kind="refresh_failed_transient")
-
-    storage = _get_storage(app_state)
-    if storage is None:
-        return _no_token_result(app_state, user_id, server_name, TokenLookupResult(kind="missing"))
-    if server_row is None:
-        server_row = await asyncio.to_thread(storage.get_mcp_server_by_name, server_name)
-    if server_row is None:
-        return _no_token_result(app_state, user_id, server_name, TokenLookupResult(kind="missing"))
-    server_id_for_audit = str(server_row.get("server_id") or "")
-
-    oidc_config = getattr(app_state, "oidc_config", None)
-    profile = str(getattr(oidc_config, "obo_grant_profile", "") or "")
-    audience = str(server_row.get("oauth_audience") or "")
-    scopes = str(server_row.get("oauth_scopes") or "")
-    mint = _OBO_MINT_LEGS.get(profile)
     if (
         oidc_config is None
         or not getattr(oidc_config, "enabled", False)
@@ -2332,13 +2367,10 @@ async def get_obo_access_token_classified(
                     decrypt_fingerprints=tuple(exc.key_fingerprints_attempted),
                 ),
             )
-        # Same stale-row guard as the pre-lock read: a refresh-bearing row is an
-        # oauth_user leftover, not a mint-cache hit — fall through and re-mint.
-        if (
-            plain2 is not None
-            and plain2["refresh_token"] is None
-            and not _token_needs_refresh(plain2["expires_at"])
-        ):
+        # Same servability gate as the pre-lock read (refresh-less, right-audience,
+        # not-expired) — a stale-audience or refresh-bearing row falls through and
+        # re-mints.
+        if _is_fresh_obo_cache_row(plain2, audience) and plain2 is not None:
             if not force_refresh:
                 return _token_result(app_state, user_id, server_name, plain2["access_token"])
             last_refreshed = _parse_iso_to_utc(plain2.get("last_refreshed") or "")
@@ -2384,7 +2416,7 @@ async def get_obo_access_token_classified(
                 server_id_for_audit=server_id_for_audit,
                 token_store=token_store,
                 revoke_on_failure=True,
-                revoke_ambiguous_escalation=True,
+                revoke_ambiguous_escalation=revoke_ambiguous_escalation,
                 events=_OBO_MINT_FAILURE_EVENTS,
                 permanent_reason="obo_mint_rejected",
                 escalation_reason="obo_mint_ambiguous_escalated",

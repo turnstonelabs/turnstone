@@ -6026,13 +6026,24 @@ async def admin_delete_oidc_identity(request: Request) -> JSONResponse:
                 for row in storage.list_mcp_servers()
                 if row.get("auth_type") == "oauth_obo"
             ]
-            for server_name in obo_servers:
+        except Exception:
+            obo_servers = []
+            log.warning(
+                "admin.oidc_identity.obo_server_list_failed user=%s", user_id, exc_info=True
+            )
+        for server_name in obo_servers:
+            # Per-server try/except: a failure on one server must not leave the
+            # remaining servers' cached bearers un-purged for a deprovisioned user.
+            try:
                 if token_store.delete_user_token(user_id, server_name):
                     obo_cache_purged += 1
-        except Exception:
-            log.warning(
-                "admin.oidc_identity.obo_cache_purge_failed user=%s", user_id, exc_info=True
-            )
+            except Exception:
+                log.warning(
+                    "admin.oidc_identity.obo_cache_purge_failed user=%s server=%s",
+                    user_id,
+                    server_name,
+                    exc_info=True,
+                )
 
     audit_uid, ip = _audit_context(request)
     record_audit(
@@ -10081,13 +10092,19 @@ async def admin_list_mcp_servers(request: Request) -> JSONResponse:
     # stack the DB latency on top of the fan-out latency.  Skipped
     # entirely when no row is oauth_user so static-only installs
     # exercise zero new storage queries.
-    has_oauth_user = any(s.get("auth_type") == "oauth_user" for s in servers)
+    from turnstone.core.mcp_oauth import is_user_scoped_auth
+
+    # Both pool-backed types populate mcp_user_tokens (oauth_user: consents;
+    # oauth_obo: minted cache), so run the count for either — it drives the
+    # per-row pill: oauth_user's consented-users count and oauth_obo's
+    # flush-cache action (gated on count>0 in the UI).
+    has_user_scoped = any(is_user_scoped_auth(s.get("auth_type")) for s in servers)
     status_task: asyncio.Task[dict[str, dict[str, dict[str, Any]]]] = asyncio.create_task(
         _collect_mcp_status(request)
     )
     count_task: asyncio.Task[dict[str, int]] | None = (
         asyncio.create_task(asyncio.to_thread(storage.count_mcp_consented_users_grouped_by_server))
-        if has_oauth_user
+        if has_user_scoped
         else None
     )
 
@@ -10109,11 +10126,11 @@ async def admin_list_mcp_servers(request: Request) -> JSONResponse:
             status = node_servers.get(s["name"])
             if status:
                 per_node[node_id] = status
-        # Phase 9: surface the consented-users-count pill for
-        # oauth_user rows.  Aggregate was pre-computed above with a
+        # Surface the count for both pool-backed types (oauth_user consents /
+        # oauth_obo minted-token cache). Aggregate was pre-computed above with a
         # single bulk GROUP BY query; we just look up here.
         consent_count: int | None = None
-        if s.get("auth_type") == "oauth_user":
+        if is_user_scoped_auth(s.get("auth_type")):
             consent_count = consent_counts.get(s["name"], 0)
         s = _mask_mcp_secrets(s, reveal)
         result.append(_mcp_server_to_detail(s, per_node, consent_count))
@@ -10459,11 +10476,17 @@ async def admin_update_mcp_server(request: Request) -> JSONResponse:
         )
         # A FLIP into obo from oauth_user carries oauth_user's AS-consent scopes,
         # which the rfc8693 mint leg would send verbatim as the exchange scope →
-        # invalid_scope → a permanent-failure loop with no operator-fixable
-        # remedy in the error. Clear stale scopes on the flip unless this same
-        # request supplies obo scopes explicitly.
-        if old_auth != "oauth_obo" and "oauth_scopes" not in body:
-            updates["oauth_scopes"] = None
+        # invalid_scope → a permanent-failure loop. Clear the carried-over scopes
+        # on the flip. Robust to the admin form re-submitting the pre-filled old
+        # value: clear UNLESS the operator supplied a genuinely NEW value in this
+        # request (different from the existing row's scopes) — an equal value is
+        # the stale carry-over, not an intentional obo scope.
+        if old_auth != "oauth_obo":
+            body_scopes = (
+                _clean_oauth_text(body["oauth_scopes"]) if "oauth_scopes" in body else None
+            )
+            if body_scopes is None or body_scopes == (existing.get("oauth_scopes") or None):
+                updates["oauth_scopes"] = None
     # Renaming a pool-backed row needs the same per-user-token purge as
     # delete: the tokens are keyed on the OLD ``server_name`` and a row
     # later created with that old name (with attacker-controlled URL)
@@ -10522,11 +10545,16 @@ async def admin_update_mcp_server(request: Request) -> JSONResponse:
         return err_resp
 
     # #551: an oauth_obo row (whether newly flipped or edited) needs an
-    # encryption key + an audience — validated against the post-update value.
+    # encryption key + an audience — validated against the merged post-update
+    # audience. The entra-scope reject, though, must fire ONLY when this request
+    # actually SETS scopes ("oauth_scopes" in updates — from the body or the
+    # flip-clear above), not on the carried-over existing value: otherwise a
+    # pre-existing scoped row under the entra profile becomes un-editable (every
+    # maintenance PUT that doesn't clear scopes would 400).
     audience_now = updates.get("oauth_audience", existing.get("oauth_audience"))
-    scopes_now = updates.get("oauth_scopes", existing.get("oauth_scopes"))
+    scopes_being_set = updates.get("oauth_scopes") if "oauth_scopes" in updates else None
     err_resp = _enforce_oauth_obo_requirements(
-        request, auth_type_now, audience=audience_now, scopes=scopes_now
+        request, auth_type_now, audience=audience_now, scopes=scopes_being_set
     )
     if err_resp is not None:
         return err_resp

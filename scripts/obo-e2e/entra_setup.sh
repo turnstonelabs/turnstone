@@ -88,14 +88,19 @@ cmd_setup() {
   done
   [ -n "$ok" ] || { log "admin-consent failed after retries — grant manually in the portal (API permissions blade) and re-run the spike"; }
 
+  # Single-quote the values in the generated .env: the AS-issued client secret
+  # can contain $ / backtick, and an unquoted RHS would be re-expanded (or
+  # partially executed) when the operator `source`s the file. The heredoc still
+  # interpolates ${...} into the single-quoted output; sourcing then treats the
+  # result literally. (Azure secrets are base64-ish — no single quotes to escape.)
   umask 177
   cat > "$ENV_FILE" <<EOF
-export ENTRA_TENANT_ID=${tenant_id}
-export ENTRA_CLIENT_ID=${CLIENT_ID}
-export ENTRA_CLIENT_SECRET=${SECRET}
-export SPIKE_AUDIENCE_A=api://${APP_A}
-export SPIKE_AUDIENCE_B=api://${APP_B}
-export SPIKE_AUDIENCE_UNCONSENTED=api://${APP_C}
+export ENTRA_TENANT_ID='${tenant_id}'
+export ENTRA_CLIENT_ID='${CLIENT_ID}'
+export ENTRA_CLIENT_SECRET='${SECRET}'
+export SPIKE_AUDIENCE_A='api://${APP_A}'
+export SPIKE_AUDIENCE_B='api://${APP_B}'
+export SPIKE_AUDIENCE_UNCONSENTED='api://${APP_C}'
 export SPIKE_RUN_OBO=1
 EOF
   log "wrote ${ENV_FILE} (chmod 600). Next:"

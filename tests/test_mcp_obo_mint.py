@@ -123,6 +123,7 @@ def _seed_cache_row(
     *,
     expires_in_seconds: int,
     access_token: str = "cached-at",
+    audience: str = AUDIENCE,
 ) -> None:
     expires_at = (datetime.now(UTC) + timedelta(seconds=expires_in_seconds)).strftime(_ISO)
     state.mcp_token_store.create_user_token(
@@ -133,7 +134,7 @@ def _seed_cache_row(
         expires_at=expires_at,
         scopes=None,
         as_issuer=ISSUER,
-        audience=AUDIENCE,
+        audience=audience,
     )
 
 
@@ -491,6 +492,35 @@ class TestCacheAndCredentialLookup:
         assert result.kind == "token"
         assert result.token == "cached-at"
         assert client.post.call_count == 0
+
+    def test_stale_audience_cache_row_is_not_served_and_remints(
+        self, storage: SQLiteBackend
+    ) -> None:
+        """Review finding (audience guard): a cached token minted for a DIFFERENT
+        audience than the server's current one must NOT be served — an operator's
+        audience narrowing has to take effect immediately, not at token TTL. The
+        stale row is ignored and a fresh mint (for the current audience) runs."""
+        _seed_obo_server(storage)  # server oauth_audience = AUDIENCE (api://aud-a)
+        client = MagicMock(spec=httpx.AsyncClient)
+        client.post = AsyncMock(
+            return_value=_mk_response(200, {"access_token": "reminted-at", "expires_in": 3600})
+        )
+        state = _make_app_state(storage, http_client=client, oidc_config=_make_oidc_config())
+        _seed_credential(state)
+        # A fresh, refresh-less cache row — but for the OLD/broader audience.
+        _seed_cache_row(
+            state, expires_in_seconds=3600, access_token="old-aud-at", audience="api://old-broad"
+        )
+
+        result = _mint(state)
+
+        # Not served from the stale-audience cache; a real mint happened.
+        assert result.kind == "token"
+        assert result.token == "reminted-at"
+        assert client.post.call_count == 1
+        # The cache row is now for the current audience.
+        row = storage.get_mcp_user_token(USER, SERVER)
+        assert row is not None and row["audience"] == AUDIENCE
 
     def test_missing_credential_returns_missing_with_zero_http_calls(
         self, storage: SQLiteBackend

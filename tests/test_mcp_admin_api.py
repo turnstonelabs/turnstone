@@ -829,6 +829,103 @@ class TestUpdateMcpServer:
         assert r2.status_code == 200, r2.text
         assert r2.json()["oauth_scopes"] in (None, "")  # stale scopes cleared
 
+    def test_flip_to_obo_clears_scopes_even_when_form_resubmits_them(self, client):
+        """xhigh finding: the admin form pre-fills + re-submits the old oauth_user
+        scopes on a flip, so the clear must be robust to scopes BEING in the body
+        when they equal the existing row's value (else rfc8693 mints break)."""
+        r = client.post(
+            "/v1/api/admin/mcp-servers",
+            json={
+                "name": "flip-resend",
+                "transport": "streamable-http",
+                "url": "https://mcp.example.com/sse",
+                "auth_type": "oauth_user",
+                "oauth_scopes": "openid profile offline_access",
+                "oauth_audience": "api://mcp-a",
+            },
+        )
+        sid = r.json()["server_id"]
+        # Flip to obo AND re-send the identical stale scopes (what the UI does).
+        r2 = client.put(
+            f"/v1/api/admin/mcp-servers/{sid}",
+            json={
+                "auth_type": "oauth_obo",
+                "oauth_audience": "api://mcp-a",
+                "oauth_scopes": "openid profile offline_access",
+            },
+        )
+        assert r2.status_code == 200, r2.text
+        assert r2.json()["oauth_scopes"] in (None, "")  # carried-over value cleared
+
+    def test_entra_obo_row_with_scopes_stays_editable(self, client, storage):
+        """xhigh finding: a pre-existing oauth_obo row carrying scopes under the
+        entra profile must stay editable — an unrelated PUT that doesn't touch
+        scopes must NOT be rejected (the entra-scope reject fires only on a real
+        scopes write)."""
+        from types import SimpleNamespace
+
+        # Seed an obo row that already has scopes (e.g. created under rfc8693).
+        storage.create_mcp_server(
+            server_id="entra-edit-id",
+            name="entra-edit",
+            transport="streamable-http",
+            url="https://mcp.example.com/sse",
+            auth_type="oauth_obo",
+            oauth_audience="api://mcp-a",
+            oauth_scopes="custom.scope",
+        )
+        # Now the deployment is on the entra profile.
+        client.app.state.oidc_config = SimpleNamespace(obo_grant_profile="entra")
+
+        # An unrelated maintenance edit (disable) — does NOT touch scopes.
+        r = client.put(
+            "/v1/api/admin/mcp-servers/entra-edit-id",
+            json={"enabled": False},
+        )
+        assert r.status_code == 200, r.text  # NOT a 400 lockout
+
+        # But actively SETTING scopes under entra is still rejected.
+        r2 = client.put(
+            "/v1/api/admin/mcp-servers/entra-edit-id",
+            json={"oauth_scopes": "another.scope"},
+        )
+        assert r2.status_code == 400, r2.text
+        assert "oauth_scopes" in r2.json()["error"]
+
+    def test_obo_server_reports_consented_users_count_for_flush_button(self, client, storage):
+        """xhigh finding: obo rows must report consented_users_count (users with a
+        minted cache row) so the console flush-cache action (gated on count>0)
+        renders — previously only oauth_user rows got the count."""
+        storage.create_mcp_server(
+            server_id="obo-count-id",
+            name="obo-count",
+            transport="streamable-http",
+            url="https://mcp.example.com/sse",
+            auth_type="oauth_obo",
+            oauth_audience="api://mcp-a",
+        )
+        for i in range(2):
+            storage.create_mcp_user_token(
+                f"u{i}",
+                "obo-count",
+                access_token_ct=b"\x00ct",
+                refresh_token_ct=None,
+                expires_at="2026-12-31T00:00:00",
+                scopes=None,
+                as_issuer="https://idp.test",
+                audience="api://mcp-a",
+            )
+
+        # The list handler fans out node status; no cluster nodes in this test.
+        from types import SimpleNamespace
+
+        client.app.state.collector = SimpleNamespace(get_all_nodes=lambda: [])
+        client.app.state.proxy_client = MagicMock()
+        r = client.get("/v1/api/admin/mcp-servers")
+        assert r.status_code == 200, r.text
+        row = next(s for s in r.json()["servers"] if s["name"] == "obo-count")
+        assert row["consented_users_count"] == 2
+
     def test_obo_audience_change_purges_cached_tokens(self, client, storage):
         """#551 follow-up: changing an obo row's oauth_audience purges cached
         tokens minted for the OLD audience (they are audience-bound)."""
