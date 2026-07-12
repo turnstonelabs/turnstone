@@ -553,6 +553,8 @@ def initialize_mcp_crypto_state(app_state: object, *, node_id: str = "") -> None
        logging.
     2. Counts ``mcp_servers`` rows with ``auth_type='oauth_user'``. If
        any exist AND no key is configured, raises ``SystemExit(1)``.
+       Same enforcement when ``[oidc] capture_user_credential`` is
+       enabled (the captured IdP credential must be encrypted at rest).
     3. On success, sets ``app_state.mcp_token_cipher`` and
        ``app_state.mcp_token_store`` (both possibly ``None`` when no
        key + no oauth_user rows).
@@ -584,6 +586,26 @@ def initialize_mcp_crypto_state(app_state: object, *, node_id: str = "") -> None
             "print(Fernet.generate_key().decode())' "
             "and add it to your config.toml.",
             oauth_user_count,
+        )
+        raise SystemExit(1)
+
+    # Same enforcement for single-credential capture (issue #551): the
+    # captured IdP refresh token must never be persisted unencrypted.
+    # Runs after OIDC init (see docstring), so app_state.oidc_config is set.
+    oidc_config = getattr(app_state, "oidc_config", None)
+    if (
+        oidc_config is not None
+        and getattr(oidc_config, "enabled", False)
+        and getattr(oidc_config, "capture_user_credential", False)
+        and cipher_cfg is None
+    ):
+        log.error(
+            "oidc.capture: [oidc] capture_user_credential is enabled but no "
+            "[security] mcp_token_encryption_keys (rotation list) or "
+            "mcp_token_encryption_key (single) in config.toml. Generate a key with: "
+            "python -c 'from cryptography.fernet import Fernet; "
+            "print(Fernet.generate_key().decode())' "
+            "and add it to your config.toml."
         )
         raise SystemExit(1)
 

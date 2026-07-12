@@ -2109,6 +2109,35 @@ async def handle_oidc_callback(request: Request, audience: str, cookie_name: str
         _record_oidc_failure()
         return RedirectResponse("/?oidc_error=Authentication+failed", status_code=302)
 
+    # Capture the IdP refresh token as the user's single OBO credential
+    # (issue #551).  Best-effort: capture failure must not block login —
+    # the mint path surfaces a missing credential on the reconnect rail.
+    if oidc_config.capture_user_credential:
+        idp_refresh_token = tokens.get("refresh_token")
+        token_store = getattr(request.app.state, "mcp_token_store", None)
+        if not isinstance(idp_refresh_token, str) or not idp_refresh_token:
+            log.info(
+                "oidc.capture: no refresh_token in token response (user=%s) — "
+                "check the IdP allows offline_access for this client",
+                user["user_id"],
+            )
+        elif token_store is None:
+            log.warning(
+                "oidc.capture: enabled but no token encryption key configured — "
+                "credential NOT captured (user=%s)",
+                user["user_id"],
+            )
+        else:
+            try:
+                await asyncio.to_thread(
+                    token_store.upsert_oidc_credential,
+                    user["user_id"],
+                    oidc_config.issuer,
+                    refresh_token=idp_refresh_token,
+                )
+            except Exception:
+                log.exception("oidc.capture: failed to persist credential")
+
     # Load permissions and issue Turnstone JWT
     perms = await asyncio.to_thread(_load_user_permissions, storage, user["user_id"])
     scopes = _permissions_to_scopes(perms)

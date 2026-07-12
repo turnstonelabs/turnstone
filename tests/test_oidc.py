@@ -126,6 +126,84 @@ class TestLoadOIDCConfig:
 
         assert cfg.allow_private_network is False
 
+    def test_load_oidc_config_capture_user_credential_env(self, monkeypatch):
+        monkeypatch.setenv("TURNSTONE_OIDC_ISSUER", "https://auth.example.com")
+        monkeypatch.setenv("TURNSTONE_OIDC_CLIENT_ID", "cid")
+        monkeypatch.setenv("TURNSTONE_OIDC_CLIENT_SECRET", "csecret")
+        monkeypatch.setenv("TURNSTONE_OIDC_CAPTURE_USER_CREDENTIAL", "true")
+
+        with patch("turnstone.core.config.load_config", return_value={}):
+            cfg = load_oidc_config()
+
+        assert cfg.capture_user_credential is True
+
+    def test_load_oidc_config_capture_user_credential_toml(self, monkeypatch):
+        monkeypatch.setenv("TURNSTONE_OIDC_ISSUER", "https://auth.example.com")
+        monkeypatch.setenv("TURNSTONE_OIDC_CLIENT_ID", "cid")
+        monkeypatch.setenv("TURNSTONE_OIDC_CLIENT_SECRET", "csecret")
+        monkeypatch.delenv("TURNSTONE_OIDC_CAPTURE_USER_CREDENTIAL", raising=False)
+
+        with patch(
+            "turnstone.core.config.load_config",
+            return_value={"capture_user_credential": True},
+        ):
+            cfg = load_oidc_config()
+
+        assert cfg.capture_user_credential is True
+
+    def test_load_oidc_config_capture_default_off(self, monkeypatch):
+        monkeypatch.setenv("TURNSTONE_OIDC_ISSUER", "https://auth.example.com")
+        monkeypatch.setenv("TURNSTONE_OIDC_CLIENT_ID", "cid")
+        monkeypatch.setenv("TURNSTONE_OIDC_CLIENT_SECRET", "csecret")
+        monkeypatch.delenv("TURNSTONE_OIDC_CAPTURE_USER_CREDENTIAL", raising=False)
+
+        with patch("turnstone.core.config.load_config", return_value={}):
+            cfg = load_oidc_config()
+
+        assert cfg.capture_user_credential is False
+
+    def test_capture_appends_offline_access_to_scopes(self, monkeypatch):
+        """Enabling capture requests offline_access without operator scope edits."""
+        monkeypatch.setenv("TURNSTONE_OIDC_ISSUER", "https://auth.example.com")
+        monkeypatch.setenv("TURNSTONE_OIDC_CLIENT_ID", "cid")
+        monkeypatch.setenv("TURNSTONE_OIDC_CLIENT_SECRET", "csecret")
+        monkeypatch.delenv("TURNSTONE_OIDC_SCOPES", raising=False)
+
+        with patch(
+            "turnstone.core.config.load_config",
+            return_value={"capture_user_credential": True},
+        ):
+            cfg = load_oidc_config()
+
+        assert cfg.scopes == "openid email profile offline_access"
+
+    def test_capture_scope_append_is_idempotent(self, monkeypatch):
+        """An operator who already lists offline_access doesn't get it twice."""
+        monkeypatch.setenv("TURNSTONE_OIDC_ISSUER", "https://auth.example.com")
+        monkeypatch.setenv("TURNSTONE_OIDC_CLIENT_ID", "cid")
+        monkeypatch.setenv("TURNSTONE_OIDC_CLIENT_SECRET", "csecret")
+        monkeypatch.setenv("TURNSTONE_OIDC_SCOPES", "openid offline_access email")
+
+        with patch(
+            "turnstone.core.config.load_config",
+            return_value={"capture_user_credential": True},
+        ):
+            cfg = load_oidc_config()
+
+        assert cfg.scopes == "openid offline_access email"
+
+    def test_no_capture_leaves_scopes_untouched(self, monkeypatch):
+        monkeypatch.setenv("TURNSTONE_OIDC_ISSUER", "https://auth.example.com")
+        monkeypatch.setenv("TURNSTONE_OIDC_CLIENT_ID", "cid")
+        monkeypatch.setenv("TURNSTONE_OIDC_CLIENT_SECRET", "csecret")
+        monkeypatch.delenv("TURNSTONE_OIDC_SCOPES", raising=False)
+        monkeypatch.delenv("TURNSTONE_OIDC_CAPTURE_USER_CREDENTIAL", raising=False)
+
+        with patch("turnstone.core.config.load_config", return_value={}):
+            cfg = load_oidc_config()
+
+        assert cfg.scopes == "openid email profile"
+
     def test_load_oidc_config_disabled_when_missing(self, monkeypatch):
         monkeypatch.delenv("TURNSTONE_OIDC_ISSUER", raising=False)
         monkeypatch.delenv("TURNSTONE_OIDC_CLIENT_ID", raising=False)

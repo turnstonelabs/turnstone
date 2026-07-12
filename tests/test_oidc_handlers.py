@@ -728,6 +728,227 @@ class TestOIDCCallback:
 
 
 # ---------------------------------------------------------------------------
+# Single-credential capture tests (issue #551)
+# ---------------------------------------------------------------------------
+
+
+class TestOIDCCallbackCapture:
+    """Capture of the IdP refresh token at login (``capture_user_credential``)."""
+
+    def _capture_client(
+        self,
+        storage: SQLiteBackend,
+        oidc_config: OIDCConfig,
+        *,
+        capture: bool = True,
+        with_store: bool = True,
+    ) -> tuple[TestClient, Any, OIDCConfig]:
+        """Client wired like ``authorize_client`` plus a real MCPTokenStore."""
+        import dataclasses
+
+        from tests.conftest import make_mcp_token_cipher
+        from turnstone.core.mcp_crypto import MCPTokenStore
+
+        cfg = dataclasses.replace(oidc_config, capture_user_credential=capture)
+        app = Starlette(
+            routes=[
+                Mount("/v1", routes=[Route("/api/auth/oidc/callback", _oidc_callback)]),
+            ],
+        )
+        app.state.oidc_config = cfg
+        app.state.auth_storage = storage
+        app.state.jwt_secret = "test-jwt-secret-key-padded-32b!!"
+        app.state.jwks_data = {"keys": []}
+        app.state.login_limiter = None
+        store = MCPTokenStore(storage, make_mcp_token_cipher()) if with_store else None
+        app.state.mcp_token_store = store
+        return TestClient(app, raise_server_exceptions=False), store, cfg
+
+    def _login(
+        self,
+        client: TestClient,
+        storage: SQLiteBackend,
+        mock_exchange: AsyncMock,
+        mock_validate: Any,
+        mock_provision: Any,
+        *,
+        tokens: dict[str, Any],
+        state: str = "valid-state",
+    ) -> Any:
+        storage.create_oidc_pending_state(state, "test-nonce", "test-verifier", "test-audience")
+        mock_exchange.return_value = tokens
+        mock_validate.return_value = {
+            "sub": "user123",
+            "email": "u@example.com",
+            "nonce": "test-nonce",
+        }
+        mock_provision.return_value = {"user_id": "test-admin", "username": "testadmin"}
+        return client.get(
+            f"/v1/api/auth/oidc/callback?code=authcode&state={state}",
+            follow_redirects=False,
+        )
+
+    @patch("turnstone.core.auth.provision_oidc_user")
+    @patch("turnstone.core.auth.validate_id_token")
+    @patch("turnstone.core.auth.exchange_code", new_callable=AsyncMock)
+    def test_capture_persists_credential(
+        self,
+        mock_exchange: AsyncMock,
+        mock_validate: Any,
+        mock_provision: Any,
+        storage: SQLiteBackend,
+        oidc_config: OIDCConfig,
+    ) -> None:
+        client, store, cfg = self._capture_client(storage, oidc_config)
+        resp = self._login(
+            client,
+            storage,
+            mock_exchange,
+            mock_validate,
+            mock_provision,
+            tokens={"id_token": "fake.jwt.token", "access_token": "at", "refresh_token": "rt-1"},
+        )
+        assert resp.status_code == 302
+        assert "oidc_success=1" in resp.headers["location"]
+        assert store is not None
+        plain = store.get_oidc_credential("test-admin", cfg.issuer)
+        assert plain is not None
+        assert plain["refresh_token"] == "rt-1"
+
+    @patch("turnstone.core.auth.provision_oidc_user")
+    @patch("turnstone.core.auth.validate_id_token")
+    @patch("turnstone.core.auth.exchange_code", new_callable=AsyncMock)
+    def test_second_login_replaces_credential(
+        self,
+        mock_exchange: AsyncMock,
+        mock_validate: Any,
+        mock_provision: Any,
+        storage: SQLiteBackend,
+        oidc_config: OIDCConfig,
+    ) -> None:
+        client, store, cfg = self._capture_client(storage, oidc_config)
+        self._login(
+            client,
+            storage,
+            mock_exchange,
+            mock_validate,
+            mock_provision,
+            tokens={"id_token": "t", "refresh_token": "rt-old"},
+            state="s1",
+        )
+        self._login(
+            client,
+            storage,
+            mock_exchange,
+            mock_validate,
+            mock_provision,
+            tokens={"id_token": "t", "refresh_token": "rt-new"},
+            state="s2",
+        )
+        assert store is not None
+        plain = store.get_oidc_credential("test-admin", cfg.issuer)
+        assert plain is not None
+        assert plain["refresh_token"] == "rt-new"
+
+    @patch("turnstone.core.auth.provision_oidc_user")
+    @patch("turnstone.core.auth.validate_id_token")
+    @patch("turnstone.core.auth.exchange_code", new_callable=AsyncMock)
+    def test_no_refresh_token_logs_and_login_succeeds(
+        self,
+        mock_exchange: AsyncMock,
+        mock_validate: Any,
+        mock_provision: Any,
+        storage: SQLiteBackend,
+        oidc_config: OIDCConfig,
+    ) -> None:
+        client, store, cfg = self._capture_client(storage, oidc_config)
+        resp = self._login(
+            client,
+            storage,
+            mock_exchange,
+            mock_validate,
+            mock_provision,
+            tokens={"id_token": "fake.jwt.token", "access_token": "at"},
+        )
+        assert resp.status_code == 302
+        assert "oidc_success=1" in resp.headers["location"]
+        assert store is not None
+        assert store.get_oidc_credential("test-admin", cfg.issuer) is None
+
+    @patch("turnstone.core.auth.provision_oidc_user")
+    @patch("turnstone.core.auth.validate_id_token")
+    @patch("turnstone.core.auth.exchange_code", new_callable=AsyncMock)
+    def test_capture_disabled_persists_nothing(
+        self,
+        mock_exchange: AsyncMock,
+        mock_validate: Any,
+        mock_provision: Any,
+        storage: SQLiteBackend,
+        oidc_config: OIDCConfig,
+    ) -> None:
+        client, store, cfg = self._capture_client(storage, oidc_config, capture=False)
+        resp = self._login(
+            client,
+            storage,
+            mock_exchange,
+            mock_validate,
+            mock_provision,
+            tokens={"id_token": "t", "refresh_token": "rt-present"},
+        )
+        assert resp.status_code == 302
+        assert store is not None
+        assert store.get_oidc_credential("test-admin", cfg.issuer) is None
+
+    @patch("turnstone.core.auth.provision_oidc_user")
+    @patch("turnstone.core.auth.validate_id_token")
+    @patch("turnstone.core.auth.exchange_code", new_callable=AsyncMock)
+    def test_missing_store_login_still_succeeds(
+        self,
+        mock_exchange: AsyncMock,
+        mock_validate: Any,
+        mock_provision: Any,
+        storage: SQLiteBackend,
+        oidc_config: OIDCConfig,
+    ) -> None:
+        client, _store, _cfg = self._capture_client(storage, oidc_config, with_store=False)
+        resp = self._login(
+            client,
+            storage,
+            mock_exchange,
+            mock_validate,
+            mock_provision,
+            tokens={"id_token": "t", "refresh_token": "rt-1"},
+        )
+        assert resp.status_code == 302
+        assert "oidc_success=1" in resp.headers["location"]
+
+    @patch("turnstone.core.auth.provision_oidc_user")
+    @patch("turnstone.core.auth.validate_id_token")
+    @patch("turnstone.core.auth.exchange_code", new_callable=AsyncMock)
+    def test_store_failure_does_not_block_login(
+        self,
+        mock_exchange: AsyncMock,
+        mock_validate: Any,
+        mock_provision: Any,
+        storage: SQLiteBackend,
+        oidc_config: OIDCConfig,
+    ) -> None:
+        client, store, _cfg = self._capture_client(storage, oidc_config)
+        assert store is not None
+        with patch.object(store, "upsert_oidc_credential", side_effect=RuntimeError("boom")):
+            resp = self._login(
+                client,
+                storage,
+                mock_exchange,
+                mock_validate,
+                mock_provision,
+                tokens={"id_token": "t", "refresh_token": "rt-1"},
+            )
+        assert resp.status_code == 302
+        assert "oidc_success=1" in resp.headers["location"]
+
+
+# ---------------------------------------------------------------------------
 # Admin OIDC identity endpoint tests
 # ---------------------------------------------------------------------------
 

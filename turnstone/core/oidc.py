@@ -106,7 +106,8 @@ class OIDCConfig:
     Startup-config fields (set by :func:`load_oidc_config`):
         ``enabled``, ``issuer``, ``client_id``, ``client_secret``, ``scopes``,
         ``provider_name``, ``role_claim``, ``role_map``, ``password_enabled``,
-        ``redirect_base``, ``trusted_endpoint_hosts``, ``allow_private_network``.
+        ``redirect_base``, ``trusted_endpoint_hosts``, ``allow_private_network``,
+        ``capture_user_credential``.
 
     Discovery-derived fields (set by :func:`discover_oidc`; empty before
     discovery completes):
@@ -129,6 +130,11 @@ class OIDCConfig:
     # (and its same-origin discovered endpoints) to resolve to private
     # addresses. Link-local/multicast/reserved stay refused regardless.
     allow_private_network: bool = False
+    # Opt-in single-credential capture (issue #551): persist the user's IdP
+    # refresh token (encrypted) at login so `auth_type='oauth_obo'` MCP
+    # servers can mint per-server access tokens on demand.  Requires the
+    # [security] MCP token encryption key — enforced at startup.
+    capture_user_credential: bool = False
     # Discovered from .well-known/openid-configuration
     authorization_endpoint: str = ""
     token_endpoint: str = ""
@@ -197,6 +203,14 @@ def load_oidc_config() -> OIDCConfig:
     allow_private_network = _env_or_cfg_bool(
         "TURNSTONE_OIDC_ALLOW_PRIVATE_NETWORK", cfg, "allow_private_network", False
     )
+    capture_user_credential = _env_or_cfg_bool(
+        "TURNSTONE_OIDC_CAPTURE_USER_CREDENTIAL", cfg, "capture_user_credential", False
+    )
+    if capture_user_credential and "offline_access" not in scopes.split():
+        # The captured credential IS the offline_access refresh token; ask
+        # for it at login so operators don't have to edit two keys in step.
+        scopes = f"{scopes} offline_access".strip()
+        log.info("oidc.capture: appended offline_access to login scopes")
 
     # Role map: env var is "admin:builtin-admin,eng:builtin-operator"
     role_map_raw = os.environ.get("TURNSTONE_OIDC_ROLE_MAP", "").strip()
@@ -289,6 +303,7 @@ def load_oidc_config() -> OIDCConfig:
         redirect_base=redirect_base,
         trusted_endpoint_hosts=trusted_endpoint_hosts,
         allow_private_network=allow_private_network,
+        capture_user_credential=capture_user_credential,
     )
 
 
