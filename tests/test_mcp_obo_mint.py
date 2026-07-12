@@ -258,6 +258,41 @@ class TestEntraLeg:
         # audience-qualified .default — NOT the raw oauth_scopes value.
         assert call.kwargs["data"]["scope"] == "api://aud-a/.default"
 
+    def test_entra_cache_row_records_effective_scope_not_configured_scope(
+        self, storage: SQLiteBackend
+    ) -> None:
+        """Review finding: a server scoped under rfc8693 that survives a switch
+        to obo_grant_profile=entra mints <audience>/.default (ignoring
+        oauth_scopes). The cache row must record the EFFECTIVE scope actually
+        minted ('' — .default), NOT the configured 'custom.scope' — otherwise
+        _is_fresh_obo_cache_row would keep serving the broad .default bearer
+        believing it is the narrow configured one, and a scope narrowing that
+        can't apply under entra would look like it did."""
+        _seed_obo_server(storage, oauth_scopes="custom.scope")
+        client = MagicMock(spec=httpx.AsyncClient)
+        client.post = AsyncMock()
+        client.post.return_value = _mk_response(
+            200, {"access_token": "at-broad-default", "expires_in": 3600}
+        )
+        state = _make_app_state(storage, http_client=client, oidc_config=_make_oidc_config())
+        _seed_credential(state)
+
+        result = _mint(state)
+        assert result.kind == "token"
+        # The row records the effective (empty) scope, not "custom.scope".
+        row = storage.get_mcp_user_token(USER, SERVER)
+        assert row is not None
+        assert (row["scopes"] or "") == ""
+
+        # A second dispatch serves the cache honestly (fresh, right effective
+        # scope) with ZERO additional mints — no spurious re-mint from a
+        # scope-mismatch the entra leg could never resolve.
+        client.post.reset_mock()
+        result2 = _mint(state)
+        assert result2.kind == "token"
+        assert result2.token == "at-broad-default"
+        assert client.post.call_count == 0
+
     def test_rotated_refresh_token_written_back_to_credential(self, storage: SQLiteBackend) -> None:
         """Case 5: Entra usually rotates the RT on redemption — the newest
         value MUST be persisted to the shared credential (write-back rule)."""

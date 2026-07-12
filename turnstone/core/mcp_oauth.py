@@ -898,7 +898,7 @@ async def _hardened_token_post(
     *,
     token_endpoint: str,
     data: dict[str, str],
-    http_client: httpx.AsyncClient | None,
+    http_client: httpx.AsyncClient,
     request_label: str,
     endpoint_label: str,
     classify_oversized_by_status: bool = False,
@@ -916,10 +916,10 @@ async def _hardened_token_post(
 
     The two labels preserve each caller's historical error text verbatim
     (``refresh request failed`` vs ``refresh endpoint returned HTTP …``);
-    the OBO wrapper passes one string for both. When *http_client* is
-    ``None`` a transient per-request client is used — the OBO mint path runs
-    on the MCP loop and deliberately passes ``None`` (see
-    :func:`get_obo_access_token_classified`).
+    the OBO wrapper passes one string for both. Callers always supply
+    *http_client* — the oauth_user path its long-lived client, the OBO path a
+    single per-mint client opened in :func:`get_obo_access_token_classified` so
+    the rfc8693 legs reuse one connection.
 
     ``classify_oversized_by_status`` controls how an OVER-sized error body is
     classified. The oauth_user refresh path keeps the default (``False`` →
@@ -930,11 +930,7 @@ async def _hardened_token_post(
     to the honest re-login/admin remedy instead of looping "please retry".
     """
     try:
-        if http_client is not None:
-            resp = await http_client.post(token_endpoint, data=data, timeout=_DEFAULT_HTTP_TIMEOUT)
-        else:
-            async with httpx.AsyncClient(timeout=_DEFAULT_HTTP_TIMEOUT) as transient:
-                resp = await transient.post(token_endpoint, data=data)
+        resp = await http_client.post(token_endpoint, data=data, timeout=_DEFAULT_HTTP_TIMEOUT)
     except httpx.HTTPError as exc:
         raise MCPOAuthRefreshFailed(f"{request_label} request failed: {exc}") from exc
 
@@ -2063,7 +2059,7 @@ async def _obo_token_post(
     *,
     token_endpoint: str,
     data: dict[str, str],
-    http_client: httpx.AsyncClient | None,
+    http_client: httpx.AsyncClient,
     leg: str,
 ) -> dict[str, Any]:
     """POST one OBO grant-leg request; classify failures like a refresh.
@@ -2119,7 +2115,7 @@ async def _obo_mint_entra(
     credential_refresh_token: str,
     audience: str,
     scopes: str,
-    http_client: httpx.AsyncClient | None,
+    http_client: httpx.AsyncClient,
     persist_rotation: Callable[[str], Awaitable[None]],
 ) -> dict[str, Any]:
     """Entra leg: redeem the client-bound RT directly for the audience.
@@ -2173,7 +2169,7 @@ async def _obo_mint_rfc8693(
     credential_refresh_token: str,
     audience: str,
     scopes: str,
-    http_client: httpx.AsyncClient | None,
+    http_client: httpx.AsyncClient,
     persist_rotation: Callable[[str], Awaitable[None]],
 ) -> dict[str, Any]:
     """RFC 8693 leg: refresh grant for a subject token, then token exchange.
@@ -2397,6 +2393,16 @@ async def get_obo_access_token_classified(
     profile = str(getattr(oidc_config, "obo_grant_profile", "") or "")
     audience = str(server_row.get("oauth_audience") or "")
     scopes = str(server_row.get("oauth_scopes") or "")
+    # Scope the freshness gate + cache row to what the leg ACTUALLY mints, not to
+    # the configured column: the entra leg pins ``<audience>/.default`` and
+    # ignores oauth_scopes (an inert leftover after an rfc8693→entra profile
+    # switch). Recording the configured "Files.Read" there would make
+    # _is_fresh_obo_cache_row keep serving the broad ``.default`` bearer while
+    # believing it is narrow. rfc8693 DOES apply the scope, so there the two are
+    # the same. The RAW ``scopes`` is still passed to the mint below so the entra
+    # leg's once-per-audience "oauth_scopes ignored" warning still surfaces the
+    # misconfigured leftover to operators.
+    effective_scopes = "" if profile == "entra" else scopes
     mint = _OBO_MINT_LEGS.get(profile)
 
     try:
@@ -2413,7 +2419,7 @@ async def get_obo_access_token_classified(
     # refresh-less row (see _is_fresh_obo_cache_row). A stale-audience/-scopes or
     # refresh-bearing row falls through to a fresh mint (which overwrites it via
     # _persist_obo_cache_row).
-    fresh = _is_fresh_obo_cache_row(plain, audience, scopes)
+    fresh = _is_fresh_obo_cache_row(plain, audience, effective_scopes)
     if fresh and not force_refresh and plain is not None:
         return _token_result(app_state, user_id, server_name, plain["access_token"])
 
@@ -2499,7 +2505,7 @@ async def get_obo_access_token_classified(
             return _decrypt_failure_result(app_state, user_id, server_name, exc, event=None)
         # Same servability gate as the pre-lock read (refresh-less, right-audience,
         # right-scopes, not-expired) — a stale row falls through and re-mints.
-        if _is_fresh_obo_cache_row(plain2, audience, scopes) and plain2 is not None:
+        if _is_fresh_obo_cache_row(plain2, audience, effective_scopes) and plain2 is not None:
             if not force_refresh:
                 return _token_result(app_state, user_id, server_name, plain2["access_token"])
             # force_refresh means the caller's bearer was rejected; serialized
@@ -2563,11 +2569,11 @@ async def get_obo_access_token_classified(
         # client object and a pooled connection is bound to the loop that
         # created it, so sharing the login client here collides routinely —
         # the login exchange and the first mint hit the same IdP origin
-        # seconds apart by design. No long-lived mint client is kept:
-        # _obo_token_post uses a transient per-request client when this is
-        # None (mints are ~hourly per (user, server), not hot-path).
-        # ``obo_http_client`` is an injection seam for tests / e2e harnesses.
-        injected_client = getattr(app_state, "obo_http_client", None)
+        # seconds apart by design. No long-lived mint client is kept: a fresh
+        # one is opened per mint below (mints are ~hourly per (user, server),
+        # not hot-path). ``obo_http_client`` is an injection seam for tests /
+        # e2e harnesses; when unset a per-mint client is created here.
+        injected_client: httpx.AsyncClient | None = getattr(app_state, "obo_http_client", None)
         # One client for the whole mint: the rfc8693 leg makes TWO POSTs to the
         # same token endpoint, so a per-request transient would pay two TLS
         # handshakes. When no client is injected (production), open a single
@@ -2575,8 +2581,10 @@ async def get_obo_access_token_classified(
         # the refresh leg's pooled connection.
         try:
             async with contextlib.AsyncExitStack() as mint_stack:
-                mint_client = injected_client
-                if mint_client is None:
+                mint_client: httpx.AsyncClient
+                if injected_client is not None:
+                    mint_client = injected_client
+                else:
                     mint_client = await mint_stack.enter_async_context(
                         httpx.AsyncClient(timeout=_DEFAULT_HTTP_TIMEOUT)
                     )
@@ -2641,7 +2649,10 @@ async def get_obo_access_token_classified(
                 expires_at=_expires_at_from_response(
                     tokens, default_ttl_seconds=_OBO_DEFAULT_TTL_SECONDS
                 ),
-                scopes=scopes,
+                # Record the EFFECTIVE scope the leg minted (see effective_scopes),
+                # so the freshness gate compares like-for-like and never serves a
+                # broad entra .default token believing it is a narrow configured one.
+                scopes=effective_scopes,
                 issuer=issuer,
                 audience=audience,
             )
