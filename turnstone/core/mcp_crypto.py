@@ -596,13 +596,14 @@ def initialize_mcp_crypto_state(app_state: object, *, node_id: str = "") -> None
     1. ``load_mcp_token_cipher_config()`` — wrapped in try/except. Raises
        :class:`SystemExit(1)` on :class:`MCPTokenKeyConfigError` after
        logging.
-    2. Counts ``mcp_servers`` rows with ``auth_type='oauth_user'``. If
+    2. Counts ``mcp_servers`` rows with a user-scoped ``auth_type``
+       (``oauth_user`` or ``oauth_obo``; see ``is_user_scoped_auth``). If
        any exist AND no key is configured, raises ``SystemExit(1)``.
        Same enforcement when ``[oidc] capture_user_credential`` is
        enabled (the captured IdP credential must be encrypted at rest).
     3. On success, sets ``app_state.mcp_token_cipher`` and
        ``app_state.mcp_token_store`` (both possibly ``None`` when no
-       key + no oauth_user rows).
+       key + no user-scoped rows).
 
     The helper is shared by ``turnstone/server.py:_lifespan`` and
     ``turnstone/console/server.py:_lifespan``.  A separate

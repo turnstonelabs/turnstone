@@ -8,8 +8,9 @@ BRIEFING.md ("Verified wire shapes") — every mock asserts the EXACT form
 payload posted to the IdP token endpoint (body-inspecting, not
 call-counting):
 
-- entra: ONE refresh-token grant carrying ``scope=<audience>/.default``
-  (or the per-server ``oauth_scopes`` override verbatim);
+- entra: ONE refresh-token grant always carrying
+  ``scope=<audience>/.default`` (per-server ``oauth_scopes`` is ignored
+  on this leg — a bare scope list would drop the audience);
 - rfc8693: a refresh grant (NO scope key) for a subject token, then a
   token-exchange grant with ``audience=<server oauth_audience>`` and the
   per-server scope only when configured.
