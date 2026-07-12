@@ -38,7 +38,12 @@ import httpx
 
 from turnstone.core.audit import record_audit
 from turnstone.core.log import get_logger
-from turnstone.core.mcp_crypto import MCPTokenDecryptError
+from turnstone.core.mcp_crypto import (
+    USER_SCOPED_AUTH_TYPES,
+    MCPTokenDecryptError,
+    OIDCCredentialPlain,
+    is_user_scoped_auth,
+)
 from turnstone.core.mcp_http_parsers import (
     MAX_INSUFFICIENT_SCOPE_REPORTED,
     is_valid_scope_token,
@@ -1499,6 +1504,133 @@ async def get_user_access_token(*, app_state: Any, user_id: str, server_name: st
     return None
 
 
+async def _handle_refresh_failure(
+    exc: MCPOAuthRefreshFailed,
+    *,
+    app_state: Any,
+    user_id: str,
+    server_name: str,
+    server_id_for_audit: str,
+    token_store: MCPTokenStore,
+    revoke_on_failure: bool,
+    revoke_ambiguous_escalation: bool,
+    event_prefix: str,
+    permanent_reason: str,
+    escalation_reason: str,
+    arm_cooldown_on_permanent: bool = False,
+) -> TokenLookupResult:
+    """Shared failure classifier for the refresh-grant (oauth_user) and mint
+    (oauth_obo) token-lookup state machines.
+
+    Extracted so the two pool auth types can never drift on
+    revoke/backoff/escalation semantics — a change to escalation policy applies
+    to both. Behaviour for ``oauth_user`` is byte-identical to the previous
+    inline block (``event_prefix='refresh'``, ``arm_cooldown_on_permanent=False``).
+
+    ``arm_cooldown_on_permanent`` is the one divergence the two callers need:
+    oauth_user's post-revoke lookup short-circuits to ``missing`` (its token row
+    was deleted, so no AS call recurs), but oauth_obo's shared credential
+    survives a per-server revoke by design — so without arming the cooldown here
+    every subsequent dispatch would re-run the doomed IdP redemption and emit
+    another ``token_revoked`` audit row. Arming it gives the permanent-rejection
+    arm a terminal backstop (one redemption per cooldown window).
+    """
+    if not revoke_on_failure:
+        # Observe-only (background sweep): never revoke, never mutate the
+        # shared streak / cooldown. A permanent rejection surfaces as a
+        # dead grant to badge; anything else is a retryable transient the
+        # next tick (or a real dispatch) re-attempts. The 240s sweep
+        # cadence is its own rate limit, so skipping the cooldown here
+        # cannot hammer the AS.
+        if exc.failure_class is _RefreshFailureClass.PERMANENT:
+            return TokenLookupResult(kind="refresh_failed")
+        return TokenLookupResult(kind="refresh_failed_transient")
+    if exc.failure_class is _RefreshFailureClass.PERMANENT:
+        # The AS rejected the grant as dead (invalid_grant / invalid_scope
+        # / an OIDC interaction-required code): a reliable dead-grant
+        # signal (RFC 6749 §5.2), so revoke unconditionally — even under
+        # background priming. Deferring it would strand the catalog cold
+        # with the token still reading "consented" and no re-consent path.
+        result = await _revoke_after_refresh_failure(
+            app_state,
+            token_store,
+            user_id,
+            server_name,
+            server_id_for_audit,
+            reason=permanent_reason,
+        )
+        if arm_cooldown_on_permanent:
+            # _revoke_after_refresh_failure cleared the backoff; re-arm the
+            # cooldown as the terminal backstop for the surviving credential.
+            _refresh_backoff_state(
+                app_state, user_id, server_name
+            ).last_failure_monotonic = time.monotonic()
+        return result
+    # Transient or ambiguous: keep the token (a blip must never revoke a
+    # user's consent) and arm the cooldown so a down AS isn't hit on
+    # every later dispatch.
+    backoff = _refresh_backoff_state(app_state, user_id, server_name)
+    backoff.last_failure_monotonic = time.monotonic()
+    if exc.failure_class is _RefreshFailureClass.AMBIGUOUS:
+        backoff.ambiguous_streak += 1
+        if backoff.ambiguous_streak >= _AMBIGUOUS_ESCALATION_THRESHOLD:
+            # A persistent 400/401 rejection we can't map to a standard
+            # code most likely IS a dead grant the AS reports in a
+            # non-standard shape. Escalate to re-consent so the user
+            # isn't stranded on a retryable error forever. (Infra
+            # transients never reach here, so an outage can't escalate.)
+            if revoke_ambiguous_escalation:
+                log.warning(
+                    f"mcp_server.oauth.{event_prefix}_ambiguous_escalated",
+                    user_id=user_id,
+                    server_name=server_name,
+                    streak=backoff.ambiguous_streak,
+                    error=str(exc),
+                )
+                return await _revoke_after_refresh_failure(
+                    app_state,
+                    token_store,
+                    user_id,
+                    server_name,
+                    server_id_for_audit,
+                    reason=escalation_reason,
+                )
+            # Background priming: an UNCLASSIFIABLE sustained rejection is
+            # exactly where a bulk prime of servers the user may not be
+            # using must not revoke consent. Defer the escalation-revoke to
+            # lazy dispatch — the streak + armed cooldown persist, so it
+            # escalates on the user's next real call. Falls through to the
+            # transient return below (token kept, lock retained).
+            log.warning(
+                f"mcp_server.oauth.{event_prefix}_ambiguous_escalation_deferred",
+                user_id=user_id,
+                server_name=server_name,
+                streak=backoff.ambiguous_streak,
+                error=str(exc),
+            )
+    else:
+        # A clean infra/operator-fixable transient breaks any ambiguous
+        # run — only an uninterrupted streak escalates.
+        backoff.ambiguous_streak = 0
+    log.warning(
+        f"mcp_server.oauth.{event_prefix}_transient_failure",
+        user_id=user_id,
+        server_name=server_name,
+        failure_class=exc.failure_class.value,
+        ambiguous_streak=backoff.ambiguous_streak,
+        error=str(exc),
+    )
+    # Do NOT drop the refresh lock here: the token is kept, so the
+    # per-key asyncio.Lock must stay registered to keep serializing
+    # concurrent refreshes. Dropping it would let a second concurrent
+    # caller mint a fresh lock and refresh the same token in parallel —
+    # with refresh-token rotation that races to invalid_grant and a
+    # spurious revoke (the exact bug this path prevents). The async-with
+    # still releases the lock on return; the entry is pruned when the
+    # token is later refreshed or revoked.
+    return TokenLookupResult(kind="refresh_failed_transient")
+
+
 async def get_user_access_token_classified(
     *,
     app_state: Any,
@@ -1708,93 +1840,19 @@ async def get_user_access_token_classified(
                 existing_scopes=plain2.get("scopes") or "",
             )
         except MCPOAuthRefreshFailed as exc:
-            if not revoke_on_failure:
-                # Observe-only (background sweep): never revoke, never mutate the
-                # shared streak / cooldown. A permanent rejection surfaces as a
-                # dead grant to badge; anything else is a retryable transient the
-                # next tick (or a real dispatch) re-attempts. The 240s sweep
-                # cadence is its own rate limit, so skipping the cooldown here
-                # cannot hammer the AS.
-                if exc.failure_class is _RefreshFailureClass.PERMANENT:
-                    return TokenLookupResult(kind="refresh_failed")
-                return TokenLookupResult(kind="refresh_failed_transient")
-            if exc.failure_class is _RefreshFailureClass.PERMANENT:
-                # The AS rejected the grant as dead (invalid_grant / invalid_scope
-                # / an OIDC interaction-required code): a reliable dead-grant
-                # signal (RFC 6749 §5.2), so revoke unconditionally — even under
-                # background priming. Deferring it would strand the catalog cold
-                # with the token still reading "consented" and no re-consent path.
-                return await _revoke_after_refresh_failure(
-                    app_state,
-                    token_store,
-                    user_id,
-                    server_name,
-                    server_id_for_audit,
-                    reason="refresh_failed",
-                )
-            # Transient or ambiguous: keep the token (a blip must never revoke a
-            # user's consent) and arm the cooldown so a down AS isn't hit on
-            # every later dispatch.
-            backoff = _refresh_backoff_state(app_state, user_id, server_name)
-            backoff.last_failure_monotonic = time.monotonic()
-            if exc.failure_class is _RefreshFailureClass.AMBIGUOUS:
-                backoff.ambiguous_streak += 1
-                if backoff.ambiguous_streak >= _AMBIGUOUS_ESCALATION_THRESHOLD:
-                    # A persistent 400/401 rejection we can't map to a standard
-                    # code most likely IS a dead grant the AS reports in a
-                    # non-standard shape. Escalate to re-consent so the user
-                    # isn't stranded on a retryable error forever. (Infra
-                    # transients never reach here, so an outage can't escalate.)
-                    if revoke_ambiguous_escalation:
-                        log.warning(
-                            "mcp_server.oauth.refresh_ambiguous_escalated",
-                            user_id=user_id,
-                            server_name=server_name,
-                            streak=backoff.ambiguous_streak,
-                            error=str(exc),
-                        )
-                        return await _revoke_after_refresh_failure(
-                            app_state,
-                            token_store,
-                            user_id,
-                            server_name,
-                            server_id_for_audit,
-                            reason="refresh_failed_ambiguous_escalated",
-                        )
-                    # Background priming: an UNCLASSIFIABLE sustained rejection is
-                    # exactly where a bulk prime of servers the user may not be
-                    # using must not revoke consent. Defer the escalation-revoke to
-                    # lazy dispatch — the streak + armed cooldown persist, so it
-                    # escalates on the user's next real call. Falls through to the
-                    # transient return below (token kept, lock retained).
-                    log.warning(
-                        "mcp_server.oauth.refresh_ambiguous_escalation_deferred",
-                        user_id=user_id,
-                        server_name=server_name,
-                        streak=backoff.ambiguous_streak,
-                        error=str(exc),
-                    )
-            else:
-                # A clean infra/operator-fixable transient breaks any ambiguous
-                # run — only an uninterrupted streak escalates.
-                backoff.ambiguous_streak = 0
-            log.warning(
-                "mcp_server.oauth.refresh_transient_failure",
+            return await _handle_refresh_failure(
+                exc,
+                app_state=app_state,
                 user_id=user_id,
                 server_name=server_name,
-                failure_class=exc.failure_class.value,
-                ambiguous_streak=backoff.ambiguous_streak,
-                error=str(exc),
+                server_id_for_audit=server_id_for_audit,
+                token_store=token_store,
+                revoke_on_failure=revoke_on_failure,
+                revoke_ambiguous_escalation=revoke_ambiguous_escalation,
+                event_prefix="refresh",
+                permanent_reason="refresh_failed",
+                escalation_reason="refresh_failed_ambiguous_escalated",
             )
-            # Do NOT drop the refresh lock here: the token is kept, so the
-            # per-key asyncio.Lock must stay registered to keep serializing
-            # concurrent refreshes. Dropping it would let a second concurrent
-            # caller mint a fresh lock and refresh the same token in parallel —
-            # with refresh-token rotation that races to invalid_grant and a
-            # spurious revoke (the exact bug this path prevents). The async-with
-            # still releases the lock on return; the entry is pruned when the
-            # token is later refreshed or revoked.
-            return TokenLookupResult(kind="refresh_failed_transient")
         return _token_result(app_state, user_id, server_name, new_access)
 
 
@@ -1822,17 +1880,10 @@ async def get_user_access_token_classified(
 # is handled elsewhere.
 # ---------------------------------------------------------------------------
 
-#: Auth types whose connections and tokens are per-(user, server).  The MCP
-#: client keys its connection pool and per-user tool catalogs on this class.
-USER_SCOPED_AUTH_TYPES: frozenset[str] = frozenset({"oauth_user", "oauth_obo"})
-
-#: Grant legs a deployment may select via ``[oidc] obo_grant_profile``.
-OBO_GRANT_PROFILES: frozenset[str] = frozenset({"entra", "rfc8693"})
-
-
-def is_user_scoped_auth(auth_type: str | None) -> bool:
-    """True when *auth_type* uses per-(user, server) connections and tokens."""
-    return auth_type in USER_SCOPED_AUTH_TYPES
+#: Auth types whose connections and tokens are per-(user, server). Re-exported
+#: from :mod:`mcp_crypto` (the leaf module) so there is one source of truth; the
+#: MCP client keys its connection pool and per-user tool catalogs on this class.
+#: ``OBO_GRANT_PROFILES`` is derived from ``_OBO_MINT_LEGS`` below.
 
 
 async def _obo_token_post(
@@ -1879,6 +1930,25 @@ async def _obo_token_post(
     return typed
 
 
+# A leg persists a rotated CREDENTIAL refresh token the instant it obtains one,
+# via a caller-supplied ``persist_rotation`` callback bound to the credential
+# under the held lock. It is the ONLY channel by which a mint updates the stored
+# credential — the returned access-token dict's own ``refresh_token`` (if any) is
+# never written back to the credential, so an audience-scoped exchange RT (RFC
+# 8693 §2.2.1) cannot poison it.
+
+
+async def _maybe_persist_rotation(
+    resp: dict[str, Any],
+    credential_refresh_token: str,
+    persist_rotation: Any,
+) -> None:
+    """Persist a rotated credential RT from *resp* when it differs from the current one."""
+    rotated = resp.get("refresh_token")
+    if isinstance(rotated, str) and rotated and rotated != credential_refresh_token:
+        await persist_rotation(rotated)
+
+
 async def _obo_mint_entra(
     *,
     oidc_config: Any,
@@ -1886,25 +1956,40 @@ async def _obo_mint_entra(
     audience: str,
     scopes: str,
     http_client: httpx.AsyncClient | None,
+    persist_rotation: Any,
 ) -> dict[str, Any]:
     """Entra leg: redeem the client-bound RT directly for the audience.
 
     Wire shape verified against a real tenant (docs/design/obo-spike):
     ``grant_type=refresh_token`` + ``scope=<audience>/.default`` returns an
     audience-scoped access token and (usually) a rotated refresh token.
+
+    ``scope`` is Entra's ONLY audience carrier, so it always pins
+    ``<audience>/.default`` — the pre-consented-delegated-permissions model the
+    feature targets. Per-server ``oauth_scopes`` do NOT apply here (a bare scope
+    list would drop the audience and yield a wrong-audience token); they are a
+    ``rfc8693``-only knob.
     """
-    return await _obo_token_post(
+    if scopes:
+        log.warning(
+            "obo: oauth_scopes is ignored for the entra grant leg (audience=%s uses "
+            "<audience>/.default); set scopes only on rfc8693 servers",
+            audience,
+        )
+    resp = await _obo_token_post(
         token_endpoint=oidc_config.token_endpoint,
         data={
             "grant_type": "refresh_token",
             "refresh_token": credential_refresh_token,
             "client_id": oidc_config.client_id,
             "client_secret": oidc_config.client_secret,
-            "scope": scopes or f"{audience}/.default",
+            "scope": f"{audience}/.default",
         },
         http_client=http_client,
         leg="entra-redemption",
     )
+    await _maybe_persist_rotation(resp, credential_refresh_token, persist_rotation)
+    return resp
 
 
 async def _obo_mint_rfc8693(
@@ -1914,13 +1999,18 @@ async def _obo_mint_rfc8693(
     audience: str,
     scopes: str,
     http_client: httpx.AsyncClient | None,
+    persist_rotation: Any,
 ) -> dict[str, Any]:
     """RFC 8693 leg: refresh grant for a subject token, then token exchange.
 
     Chain verified on Keycloak 26.3 standard token exchange
-    (docs/design/obo-spike).  The refresh leg may rotate the credential —
-    the rotated value is propagated in the merged response so the caller's
-    write-back persists it; the exchanged token itself carries no RT.
+    (docs/design/obo-spike). Rotation ordering is correctness-critical: the
+    refresh leg may consume-and-rotate the credential RT, so its rotated value
+    is persisted IMMEDIATELY (before the exchange leg) — if the exchange then
+    fails, the stored credential already holds the live rotated RT rather than a
+    consumed one (else the next mint for every obo server would fail and lock the
+    user out). The exchange response's own ``refresh_token`` (RFC 8693 §2.2.1
+    permits one, audience-scoped) is deliberately NOT persisted to the credential.
     """
     subject = await _obo_token_post(
         token_endpoint=oidc_config.token_endpoint,
@@ -1933,6 +2023,9 @@ async def _obo_mint_rfc8693(
         http_client=http_client,
         leg="rfc8693-refresh",
     )
+    # Persist the credential rotation BEFORE the exchange call can fail.
+    await _maybe_persist_rotation(subject, credential_refresh_token, persist_rotation)
+
     subject_at = subject.get("access_token")
     if not isinstance(subject_at, str) or not subject_at:
         raise MCPOAuthRefreshFailed("obo rfc8693-refresh response missing access_token")
@@ -1949,22 +2042,23 @@ async def _obo_mint_rfc8693(
         # e.g. Keycloak optional audience scopes must be requested explicitly
         # or the exchange fails "Requested audience not available" (verified).
         exchange_data["scope"] = scopes
-    exchanged = await _obo_token_post(
+    return await _obo_token_post(
         token_endpoint=oidc_config.token_endpoint,
         data=exchange_data,
         http_client=http_client,
         leg="rfc8693-exchange",
     )
-    rotated = subject.get("refresh_token")
-    if isinstance(rotated, str) and rotated:
-        exchanged = {**exchanged, "refresh_token": rotated}
-    return exchanged
 
 
 _OBO_MINT_LEGS = {
     "entra": _obo_mint_entra,
     "rfc8693": _obo_mint_rfc8693,
 }
+
+#: Grant legs a deployment may select via ``[oidc] obo_grant_profile`` — derived
+#: from the operative registry so the two never drift (used by oidc config
+#: validation; there is no second hand-written copy).
+OBO_GRANT_PROFILES: frozenset[str] = frozenset(_OBO_MINT_LEGS)
 
 
 async def _persist_obo_cache_row(
@@ -2001,14 +2095,59 @@ async def _persist_obo_cache_row(
         )
 
 
+async def _read_obo_credential(
+    app_state: Any,
+    token_store: MCPTokenStore,
+    user_id: str,
+    server_name: str,
+    issuer: str,
+) -> TokenLookupResult | OIDCCredentialPlain:
+    """Read the captured IdP credential, classifying absence and undecryptability.
+
+    Returns the plaintext credential dict, or a ``TokenLookupResult`` when it is
+    ``missing`` (no credential → the dispatcher surfaces a re-login) or
+    ``decrypt_failure`` (key rotated away → operator action). The bare
+    ``get_oidc_credential`` raises ``MCPTokenDecryptError``; catching it here
+    keeps the mint path's classified-result contract intact (a raw exception
+    would escape ``_dispatch_pool`` into the session's generic error path).
+    """
+    try:
+        credential = await asyncio.to_thread(token_store.get_oidc_credential, user_id, issuer)
+    except MCPTokenDecryptError as exc:
+        log.warning(
+            "mcp_server.oauth.obo_credential_decrypt_failed",
+            user_id=user_id,
+            server_name=server_name,
+            exc_info=True,
+        )
+        return _no_token_result(
+            app_state,
+            user_id,
+            server_name,
+            TokenLookupResult(
+                kind="decrypt_failure",
+                decrypt_fingerprints=tuple(exc.key_fingerprints_attempted),
+            ),
+        )
+    if credential is None:
+        # No captured credential → the consent affordance is a re-login.
+        return _no_token_result(app_state, user_id, server_name, TokenLookupResult(kind="missing"))
+    return credential
+
+
 async def get_obo_access_token_classified(
     *,
     app_state: Any,
     user_id: str,
     server_name: str,
     force_refresh: bool = False,
+    server_row: dict[str, Any] | None = None,
 ) -> TokenLookupResult:
     """Tagged token lookup for ``auth_type='oauth_obo'`` servers.
+
+    ``server_row`` may be passed by a caller that already holds the
+    ``mcp_servers`` row (the dispatch path does) to save a per-call SQL
+    round-trip on this per-LLM-turn hot path; it is loaded lazily otherwise.
 
     Sibling of :func:`get_user_access_token_classified` sharing its result
     vocabulary, cache table, locks, and backoff — but "refresh" here is a
@@ -2060,13 +2199,19 @@ async def get_obo_access_token_classified(
     if plain is not None and not force_refresh and not _token_needs_refresh(plain["expires_at"]):
         return _token_result(app_state, user_id, server_name, plain["access_token"])
 
-    if _refresh_in_cooldown(app_state, user_id, server_name):
+    # Gate the cooldown short-circuit on actually needing a mint (cache absent or
+    # stale), mirroring the oauth_user path: a force_refresh 401-retry on a
+    # still-fresh cache must fall through to the locked re-read so it can pick up
+    # a token a cluster-mate just minted, rather than fail transient in-cooldown.
+    needs_mint = plain is None or _token_needs_refresh(plain["expires_at"])
+    if needs_mint and _refresh_in_cooldown(app_state, user_id, server_name):
         return TokenLookupResult(kind="refresh_failed_transient")
 
     storage = _get_storage(app_state)
     if storage is None:
         return _no_token_result(app_state, user_id, server_name, TokenLookupResult(kind="missing"))
-    server_row = await asyncio.to_thread(storage.get_mcp_server_by_name, server_name)
+    if server_row is None:
+        server_row = await asyncio.to_thread(storage.get_mcp_server_by_name, server_name)
     if server_row is None:
         return _no_token_result(app_state, user_id, server_name, TokenLookupResult(kind="missing"))
     server_id_for_audit = str(server_row.get("server_id") or "")
@@ -2085,7 +2230,15 @@ async def get_obo_access_token_classified(
     ):
         # Operator-fixable configuration problem — loud log, no revoke, and a
         # retryable classification so fixing the config heals without a
-        # re-consent round.
+        # re-consent round. Arm the cooldown so a misconfigured server on a busy
+        # deployment doesn't emit an error line + SQL per dispatch: the check is
+        # loud once per 30s window per (user, server), and a fixed config heals
+        # on the next tick after the window lapses. (The write path also rejects
+        # audience-less oauth_obo rows, so this branch is normally a typo'd
+        # grant profile, not a common state.)
+        _refresh_backoff_state(
+            app_state, user_id, server_name
+        ).last_failure_monotonic = time.monotonic()
         log.error(
             "mcp_server.oauth.obo_misconfigured",
             server_name=server_name,
@@ -2096,10 +2249,12 @@ async def get_obo_access_token_classified(
         return TokenLookupResult(kind="refresh_failed_transient")
     issuer = str(getattr(oidc_config, "issuer", ""))
 
-    credential = await asyncio.to_thread(token_store.get_oidc_credential, user_id, issuer)
-    if credential is None:
-        # No captured credential → the consent affordance is a re-login.
-        return _no_token_result(app_state, user_id, server_name, TokenLookupResult(kind="missing"))
+    credential_result = await _read_obo_credential(
+        app_state, token_store, user_id, server_name, issuer
+    )
+    if isinstance(credential_result, TokenLookupResult):
+        return credential_result  # missing or decrypt_failure
+    # credential present (unlocked pre-check; re-read authoritatively under lock)
 
     lock = _refresh_lock_for(app_state, user_id, server_name)
     credential_key = f"__obo__:{issuer}"
@@ -2129,10 +2284,22 @@ async def get_obo_access_token_classified(
 
         # Re-read the credential under the lock — a concurrent mint for a
         # different server may have rotated it; always redeem the newest.
-        credential2 = await asyncio.to_thread(token_store.get_oidc_credential, user_id, issuer)
-        if credential2 is None:
-            return _no_token_result(
-                app_state, user_id, server_name, TokenLookupResult(kind="missing")
+        credential2 = await _read_obo_credential(
+            app_state, token_store, user_id, server_name, issuer
+        )
+        if isinstance(credential2, TokenLookupResult):
+            return credential2  # missing or decrypt_failure
+
+        # The mint leg persists any credential-RT rotation the instant it obtains
+        # one, via this callback under the held credential lock — so on rfc8693 a
+        # rotation from the refresh leg survives an exchange-leg failure, and an
+        # audience-scoped exchange RT never reaches the credential.
+        async def _persist_rotation(new_credential_rt: str) -> None:
+            await asyncio.to_thread(
+                token_store.update_oidc_credential_after_redeem,
+                user_id,
+                issuer,
+                refresh_token=new_credential_rt,
             )
 
         http_client = getattr(app_state, "oidc_http_client", None)
@@ -2143,59 +2310,34 @@ async def get_obo_access_token_classified(
                 audience=audience,
                 scopes=scopes,
                 http_client=http_client,
+                persist_rotation=_persist_rotation,
             )
         except MCPOAuthRefreshFailed as exc:
-            if exc.failure_class is _RefreshFailureClass.PERMANENT:
-                log.warning(
-                    "mcp_server.oauth.obo_mint_rejected",
-                    user_id=user_id,
-                    server_name=server_name,
-                    error=str(exc),
-                )
-                # Drops ONLY the per-server cache row; the credential stays.
-                return await _revoke_after_refresh_failure(
-                    app_state,
-                    token_store,
-                    user_id,
-                    server_name,
-                    server_id_for_audit,
-                    reason="obo_mint_rejected",
-                )
-            backoff = _refresh_backoff_state(app_state, user_id, server_name)
-            backoff.last_failure_monotonic = time.monotonic()
-            if exc.failure_class is _RefreshFailureClass.AMBIGUOUS:
-                backoff.ambiguous_streak += 1
-                if backoff.ambiguous_streak >= _AMBIGUOUS_ESCALATION_THRESHOLD:
-                    log.warning(
-                        "mcp_server.oauth.obo_mint_ambiguous_escalated",
-                        user_id=user_id,
-                        server_name=server_name,
-                        streak=backoff.ambiguous_streak,
-                        error=str(exc),
-                    )
-                    return await _revoke_after_refresh_failure(
-                        app_state,
-                        token_store,
-                        user_id,
-                        server_name,
-                        server_id_for_audit,
-                        reason="obo_mint_ambiguous_escalated",
-                    )
-            else:
-                backoff.ambiguous_streak = 0
-            log.warning(
-                "mcp_server.oauth.obo_mint_transient_failure",
+            return await _handle_refresh_failure(
+                exc,
+                app_state=app_state,
                 user_id=user_id,
                 server_name=server_name,
-                failure_class=exc.failure_class.value,
-                error=str(exc),
+                server_id_for_audit=server_id_for_audit,
+                token_store=token_store,
+                revoke_on_failure=True,
+                revoke_ambiguous_escalation=True,
+                event_prefix="obo_mint",
+                permanent_reason="obo_mint_rejected",
+                escalation_reason="obo_mint_ambiguous_escalated",
+                # The shared credential survives a per-server revoke, so arm the
+                # cooldown as the terminal backstop (else every re-dispatch would
+                # re-run the doomed redemption + emit another token_revoked row).
+                arm_cooldown_on_permanent=True,
             )
-            return TokenLookupResult(kind="refresh_failed_transient")
 
         access_token = tokens.get("access_token")
         if not isinstance(access_token, str) or not access_token:
             backoff = _refresh_backoff_state(app_state, user_id, server_name)
             backoff.last_failure_monotonic = time.monotonic()
+            # A malformed 200 is a clean transient (not a dead grant): reset the
+            # ambiguous streak, matching the sibling's _refresh_and_persist path.
+            backoff.ambiguous_streak = 0
             log.warning(
                 "mcp_server.oauth.obo_mint_missing_access_token",
                 user_id=user_id,
@@ -2203,18 +2345,8 @@ async def get_obo_access_token_classified(
             )
             return TokenLookupResult(kind="refresh_failed_transient")
 
-        # Rotation write-back BEFORE the cache write: if the process dies
-        # between the two, a stale credential is the failure that strands
-        # users (verified: both legs rotate), a stale cache row just re-mints.
-        rotated = tokens.get("refresh_token")
-        if isinstance(rotated, str) and rotated and rotated != credential2["refresh_token"]:
-            await asyncio.to_thread(
-                token_store.update_oidc_credential_after_redeem,
-                user_id,
-                issuer,
-                refresh_token=rotated,
-            )
-
+        # Credential rotation was already persisted by the mint leg (see
+        # _persist_rotation); the cache write is the only remaining step.
         await _persist_obo_cache_row(
             token_store,
             user_id,

@@ -107,7 +107,7 @@ class OIDCConfig:
         ``enabled``, ``issuer``, ``client_id``, ``client_secret``, ``scopes``,
         ``provider_name``, ``role_claim``, ``role_map``, ``password_enabled``,
         ``redirect_base``, ``trusted_endpoint_hosts``, ``allow_private_network``,
-        ``capture_user_credential``.
+        ``capture_user_credential``, ``obo_grant_profile``.
 
     Discovery-derived fields (set by :func:`discover_oidc`; empty before
     discovery completes):
@@ -214,11 +214,17 @@ def load_oidc_config() -> OIDCConfig:
     obo_grant_profile = _env_or_cfg_str(
         "TURNSTONE_OIDC_OBO_GRANT_PROFILE", cfg, "obo_grant_profile", "entra"
     ).strip()
-    if obo_grant_profile not in ("entra", "rfc8693"):
+    # Validate against the operative mint-leg registry (single source of truth,
+    # so a new leg needs no second edit here). Lazy import: mcp_oauth pulls in
+    # the MCP stack, and it does not import this module, so there is no cycle.
+    from turnstone.core.mcp_oauth import OBO_GRANT_PROFILES
+
+    if obo_grant_profile not in OBO_GRANT_PROFILES:
         log.warning(
-            "oidc: unknown obo_grant_profile %r (expected 'entra' or 'rfc8693') — "
+            "oidc: unknown obo_grant_profile %r (expected one of %s) — "
             "oauth_obo MCP servers will not mint until this is fixed",
             obo_grant_profile,
+            ", ".join(sorted(OBO_GRANT_PROFILES)),
         )
     if capture_user_credential and "offline_access" not in scopes.split():
         # The captured credential IS the offline_access refresh token; ask

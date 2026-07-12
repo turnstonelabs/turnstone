@@ -5469,6 +5469,7 @@ class MCPClientManager:
                 user_id=user_id,
                 server_name=server_name,
                 force_refresh=force_refresh,
+                server_row=server_row,
             )
         return await get_user_access_token_classified(
             app_state=self._app_state,
@@ -5990,7 +5991,7 @@ class MCPClientManager:
             return _structured_error(
                 code="mcp_consent_required",
                 server=server_name,
-                detail="Refresh token rejected. Re-consent required.",
+                detail=_refresh_failed_detail(server_row),
                 consent_url=_build_consent_url(server_row),
             )
         # kind == "token"
@@ -6169,7 +6170,7 @@ class MCPClientManager:
             return _structured_error(
                 code="mcp_consent_required",
                 server=server_name,
-                detail="Refresh token rejected. Re-consent required.",
+                detail=_refresh_failed_detail(server_row),
                 consent_url=_build_consent_url(server_row),
             )
         access_token = lookup.token or ""
@@ -6325,7 +6326,7 @@ class MCPClientManager:
             return _structured_error(
                 code="mcp_consent_required",
                 server=server_name,
-                detail="Refresh token rejected. Re-consent required.",
+                detail=_refresh_failed_detail(server_row),
                 consent_url=_build_consent_url(server_row),
             )
         access_token = lookup.token or ""
@@ -7179,6 +7180,22 @@ def _consent_missing_detail(server_row: dict[str, Any]) -> str:
     if server_row.get("auth_type") == "oauth_obo":
         return "No sign-in credential for this account. Sign in to Turnstone again to reconnect."
     return "No token for user. Consent flow required."
+
+
+def _refresh_failed_detail(server_row: dict[str, Any]) -> str:
+    """User-facing detail for a ``refresh_failed`` (permanent) lookup, per auth model.
+
+    For ``oauth_obo`` there is no per-server consent to redo and
+    ``_build_consent_url`` returns None, so "re-consent required" is a dead end —
+    the remedy is an admin tenant-grant fix or a re-login. Point the user there
+    instead of at a consent flow that does not exist for this auth type.
+    """
+    if server_row.get("auth_type") == "oauth_obo":
+        return (
+            "Sign-in credential was rejected for this server. Sign in to Turnstone "
+            "again; if it keeps failing, your administrator may need to grant access."
+        )
+    return "Refresh token rejected. Re-consent required."
 
 
 def _pool_cfg_from_row(row: dict[str, Any]) -> dict[str, Any]:

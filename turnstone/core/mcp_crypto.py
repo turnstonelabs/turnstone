@@ -31,6 +31,21 @@ log = get_logger(__name__)
 _KEY_BYTES = 32  # Fernet requires 32 bytes
 _KEY_FINGERPRINT_BYTES = 8  # short hex prefix for audit/error fields
 
+# MCP auth types whose connections and per-user rows are keyed per-(user, server):
+# oauth_user (per-server browser consent + refresh token) and oauth_obo (minted
+# on demand from the user's single captured credential, issue #551). Defined
+# here — the leaf module both mcp_oauth and console import — so there is ONE
+# source of truth; mcp_oauth re-exports it. Both persist encrypted per-user rows,
+# so both force the token-encryption-key requirement at startup (see
+# initialize_mcp_crypto_state).
+USER_SCOPED_AUTH_TYPES: frozenset[str] = frozenset({"oauth_user", "oauth_obo"})
+
+
+def is_user_scoped_auth(auth_type: str | None) -> bool:
+    """True when *auth_type* uses per-(user, server) connections and tokens."""
+    return auth_type in USER_SCOPED_AUTH_TYPES
+
+
 # Operator-facing hint for malformed/missing keys.
 _KEY_GEN_HINT = (
     "regenerate with: python -c 'from cryptography.fernet import Fernet; "
@@ -575,15 +590,13 @@ def initialize_mcp_crypto_state(app_state: object, *, node_id: str = "") -> None
     storage = get_storage()
     # Both pool-backed types persist encrypted per-user rows (oauth_user:
     # tokens + refresh; oauth_obo: minted-token cache), so both force the
-    # key requirement.  Literal tuple rather than mcp_oauth's
-    # USER_SCOPED_AUTH_TYPES: importing mcp_oauth here would be a cycle.
-    oauth_user_count = sum(
-        1
-        for row in storage.list_mcp_servers()
-        if row.get("auth_type") in ("oauth_user", "oauth_obo")
+    # key requirement — USER_SCOPED_AUTH_TYPES is the single source of truth
+    # (defined above in this leaf module; mcp_oauth re-exports it).
+    user_scoped_count = sum(
+        1 for row in storage.list_mcp_servers() if is_user_scoped_auth(row.get("auth_type"))
     )
 
-    if oauth_user_count > 0 and cipher_cfg is None:
+    if user_scoped_count > 0 and cipher_cfg is None:
         log.error(
             "mcp.oauth: %d server(s) configured with auth_type='oauth_user'/'oauth_obo' but no "
             "[security] mcp_token_encryption_keys (rotation list) or "
@@ -591,7 +604,7 @@ def initialize_mcp_crypto_state(app_state: object, *, node_id: str = "") -> None
             "python -c 'from cryptography.fernet import Fernet; "
             "print(Fernet.generate_key().decode())' "
             "and add it to your config.toml.",
-            oauth_user_count,
+            user_scoped_count,
         )
         raise SystemExit(1)
 
