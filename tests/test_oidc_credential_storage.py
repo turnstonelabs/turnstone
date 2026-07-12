@@ -116,10 +116,28 @@ class TestTokenStoreWrappers:
     def test_redeem_write_back_round_trip(self, backend) -> None:
         store = MCPTokenStore(backend, make_mcp_token_cipher())
         store.upsert_oidc_credential("u1", ISS, refresh_token="rt-first")
-        assert store.update_oidc_credential_after_redeem("u1", ISS, refresh_token="rt-rotated")
+        # CAS matches the stored value → write lands.
+        assert store.update_oidc_credential_after_redeem(
+            "u1", ISS, refresh_token="rt-rotated", expected_current="rt-first"
+        )
         plain = store.get_oidc_credential("u1", ISS)
         assert plain is not None
         assert plain["refresh_token"] == "rt-rotated"
+
+    def test_redeem_write_back_cas_skips_when_credential_changed(self, backend) -> None:
+        """The rotation write is a no-op when the stored credential no longer
+        matches what the mint read (a concurrent login capture refreshed it) —
+        so a stale rotation can't clobber a fresh login token."""
+        store = MCPTokenStore(backend, make_mcp_token_cipher())
+        store.upsert_oidc_credential("u1", ISS, refresh_token="rt-login-fresh")
+        # Mint read "rt-old", but the stored value is now the fresh login token.
+        assert not store.update_oidc_credential_after_redeem(
+            "u1", ISS, refresh_token="rt-rotated-from-old", expected_current="rt-old"
+        )
+        # The fresh login token survived.
+        plain = store.get_oidc_credential("u1", ISS)
+        assert plain is not None
+        assert plain["refresh_token"] == "rt-login-fresh"
 
     def test_get_missing_returns_none(self, backend) -> None:
         store = MCPTokenStore(backend, make_mcp_token_cipher())

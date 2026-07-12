@@ -190,6 +190,23 @@ class TestOIDCAuthorize:
         resp = client.get("/v1/api/auth/oidc/authorize")
         assert resp.status_code == 404
 
+    def test_disabled_retryable_triggers_login_self_heal(self, storage: SQLiteBackend) -> None:
+        """Review finding: the LOGIN path must trigger runtime rediscovery too,
+        not just the obo mint path — otherwise a single-node install whose node
+        booted during a transient IdP outage stays login-dark forever. A
+        disabled+retryable config makes authorize call maybe_rediscover_oidc."""
+        from unittest.mock import AsyncMock, patch
+
+        app = Starlette(
+            routes=[Mount("/v1", routes=[Route("/api/auth/oidc/authorize", _oidc_authorize)])]
+        )
+        app.state.oidc_config = _make_oidc_config(enabled=False, discovery_retryable=True)
+        app.state.auth_storage = storage
+        client = TestClient(app, raise_server_exceptions=False)
+        with patch("turnstone.core.auth.maybe_rediscover_oidc", new=AsyncMock()) as heal:
+            client.get("/v1/api/auth/oidc/authorize")
+        heal.assert_awaited_once()
+
     def test_no_storage_returns_503(self) -> None:
         app = Starlette(
             routes=[Mount("/v1", routes=[Route("/api/auth/oidc/authorize", _oidc_authorize)])]

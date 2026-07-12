@@ -753,7 +753,19 @@ async def maybe_rediscover_oidc(app_state: Any) -> None:
         # swap below would be unreachable and the feature inert. Forcing it True
         # up front makes ``fresh.enabled`` a reliable success signal (a real
         # failure clears it back to False).
-        fresh = await discover_oidc(dataclasses.replace(cfg, enabled=True))
+        #
+        # Wrapped in ``except Exception`` exactly like the boot path
+        # (initialize_oidc_state): discover_oidc catches httpx/ValueError/OIDC
+        # errors, but the runtime SSRF/DNS validation can raise something outside
+        # that set, and this runs inside get_obo_access_token_classified — which
+        # promises a TokenLookupResult, never a raise. An unexpected failure just
+        # leaves OIDC disabled for this probe (retry next window); it must not
+        # escape into the caller's classified-result contract.
+        try:
+            fresh = await discover_oidc(dataclasses.replace(cfg, enabled=True))
+        except Exception:
+            log.warning("OIDC runtime rediscovery raised unexpectedly", exc_info=True)
+            return
         if not fresh.enabled:
             if not fresh.discovery_retryable:
                 # Discovery now fails for a CONFIG reason (bad issuer, an

@@ -455,12 +455,28 @@ class MCPTokenStore:
         )
 
     def update_oidc_credential_after_redeem(
-        self, user_id: str, issuer: str, *, refresh_token: str
+        self, user_id: str, issuer: str, *, refresh_token: str, expected_current: str
     ) -> bool:
         """Rotation write-back: persist the newest refresh token after a
         redemption returned one (both verified grant legs rotate).
-        Returns True when a row was updated.
+        Returns True when the row was updated.
+
+        Value compare-and-swap on *expected_current* (the refresh token the mint
+        read before redeeming): the write only lands when the STORED credential
+        still decrypts to that value. This stops a rotation from clobbering a
+        credential a concurrent LOGIN capture just refreshed — the capture writes
+        the freshest token during the mint's in-flight redemption POST, so by the
+        time this write-back runs the stored value already differs from
+        ``expected_current`` and the stale rotated token is dropped instead of
+        overwriting the fresh login one. (The compare can't be done on ciphertext
+        — Fernet is non-deterministic — so it decrypts the current row. The mint
+        holds the per-issuer credential lock, so the only racer is the unlocked
+        capture, narrowing the residual window to this method's own read→write
+        gap; a capture landing there self-heals on the user's next login.)
         """
+        current = self.get_oidc_credential(user_id, issuer)
+        if current is None or current["refresh_token"] != expected_current:
+            return False
         refresh_ct = self._cipher.encrypt(refresh_token.encode("utf-8"))
         return self._storage.update_oidc_user_credential_refresh(
             user_id, issuer, refresh_token_ct=refresh_ct

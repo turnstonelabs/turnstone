@@ -2544,6 +2544,11 @@ async def get_obo_access_token_classified(
                     user_id,
                     issuer,
                     refresh_token=new_credential_rt,
+                    # Value CAS against the RT this mint read: skips the write if
+                    # a concurrent login capture already refreshed the credential
+                    # (see update_oidc_credential_after_redeem), so a rotation
+                    # can't clobber a fresh login token.
+                    expected_current=credential2["refresh_token"],
                 )
             except Exception:
                 log.error(
@@ -2562,16 +2567,27 @@ async def get_obo_access_token_classified(
         # _obo_token_post uses a transient per-request client when this is
         # None (mints are ~hourly per (user, server), not hot-path).
         # ``obo_http_client`` is an injection seam for tests / e2e harnesses.
-        http_client = getattr(app_state, "obo_http_client", None)
+        injected_client = getattr(app_state, "obo_http_client", None)
+        # One client for the whole mint: the rfc8693 leg makes TWO POSTs to the
+        # same token endpoint, so a per-request transient would pay two TLS
+        # handshakes. When no client is injected (production), open a single
+        # transient here and thread it into both legs so the exchange leg reuses
+        # the refresh leg's pooled connection.
         try:
-            tokens = await mint(
-                oidc_config=oidc_config,
-                credential_refresh_token=credential2["refresh_token"],
-                audience=audience,
-                scopes=scopes,
-                http_client=http_client,
-                persist_rotation=_persist_rotation,
-            )
+            async with contextlib.AsyncExitStack() as mint_stack:
+                mint_client = injected_client
+                if mint_client is None:
+                    mint_client = await mint_stack.enter_async_context(
+                        httpx.AsyncClient(timeout=_DEFAULT_HTTP_TIMEOUT)
+                    )
+                tokens = await mint(
+                    oidc_config=oidc_config,
+                    credential_refresh_token=credential2["refresh_token"],
+                    audience=audience,
+                    scopes=scopes,
+                    http_client=mint_client,
+                    persist_rotation=_persist_rotation,
+                )
         except MCPOAuthRefreshFailed as exc:
             return await _handle_refresh_failure(
                 exc,
@@ -2609,18 +2625,33 @@ async def get_obo_access_token_classified(
         # expiry is never NULL for an obo row (see _OBO_DEFAULT_TTL_SECONDS): a
         # missing expires_in falls back to a conservative default so the
         # freshness gate can never serve a short-lived minted token forever.
-        await _persist_obo_cache_row(
-            token_store,
-            user_id,
-            server_name,
-            access_token=access_token,
-            expires_at=_expires_at_from_response(
-                tokens, default_ttl_seconds=_OBO_DEFAULT_TTL_SECONDS
-            ),
-            scopes=scopes,
-            issuer=issuer,
-            audience=audience,
-        )
+        #
+        # Best-effort: the mint already SUCCEEDED and ``access_token`` is a
+        # working bearer for THIS dispatch. A transient storage error on the
+        # cache write (delete+create) must not discard that token or escape the
+        # classified-result contract as a raw exception — return the token and
+        # let the next dispatch re-mint (the un-written cache row just means one
+        # extra mint, not a failed tool call).
+        try:
+            await _persist_obo_cache_row(
+                token_store,
+                user_id,
+                server_name,
+                access_token=access_token,
+                expires_at=_expires_at_from_response(
+                    tokens, default_ttl_seconds=_OBO_DEFAULT_TTL_SECONDS
+                ),
+                scopes=scopes,
+                issuer=issuer,
+                audience=audience,
+            )
+        except Exception:
+            log.warning(
+                "mcp_server.oauth.obo_cache_persist_failed",
+                user_id=user_id,
+                server_name=server_name,
+                exc_info=True,
+            )
         return _token_result(app_state, user_id, server_name, access_token)
 
 

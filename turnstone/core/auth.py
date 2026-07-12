@@ -44,6 +44,7 @@ from turnstone.core.oidc import (
     exchange_code,
     fetch_jwks,
     generate_pkce_verifier,
+    maybe_rediscover_oidc,
     provision_oidc_user,
     validate_id_token,
 )
@@ -1898,6 +1899,14 @@ async def handle_oidc_authorize(request: Request, audience: str) -> Response:
     from starlette.responses import JSONResponse, RedirectResponse
 
     oidc_config = getattr(request.app.state, "oidc_config", None)
+    if oidc_config is not None and not oidc_config.enabled:
+        # Self-heal a transient boot-time discovery outage: the LOGIN path is a
+        # rediscovery trigger too, not just the obo mint path. Without this, a
+        # single-node install (or one where every node booted during the outage)
+        # would keep login dark until an operator restart — the exact symptom
+        # maybe_rediscover_oidc exists to fix. No-op unless discovery_retryable.
+        await maybe_rediscover_oidc(request.app.state)
+        oidc_config = getattr(request.app.state, "oidc_config", None)
     if not oidc_config or not oidc_config.enabled:
         return JSONResponse({"error": "OIDC not configured"}, status_code=404)
 
@@ -1988,6 +1997,12 @@ async def handle_oidc_callback(request: Request, audience: str, cookie_name: str
     from starlette.responses import JSONResponse, RedirectResponse
 
     oidc_config = getattr(request.app.state, "oidc_config", None)
+    if oidc_config is not None and not oidc_config.enabled:
+        # Self-heal a transient boot-time discovery outage on the login path too
+        # (see handle_oidc_authorize). A user mid-flow whose authorize landed on
+        # a recovered node can still complete the callback here.
+        await maybe_rediscover_oidc(request.app.state)
+        oidc_config = getattr(request.app.state, "oidc_config", None)
     if not oidc_config or not oidc_config.enabled:
         return JSONResponse({"error": "OIDC not configured"}, status_code=404)
 
