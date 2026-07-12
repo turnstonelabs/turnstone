@@ -1087,27 +1087,35 @@ class TestOboPriming:
 
 
 class TestPendingConsentClearGate:
-    """The dispatch-success pending-consent clear must not issue SQL on the
-    common path (review finding: no new hot-path SQL) — it is gated on this
-    node's in-memory record of having written a pending row."""
+    """The dispatch-success pending-consent clear must (a) NOT issue SQL on every
+    call (no new hot-path SQL) yet (b) still clear cross-node. It clears once per
+    (user,server) per failure-cycle via the ``_pending_consent_cleared`` set."""
 
-    def test_clear_noops_without_a_recorded_write(self) -> None:
+    def test_first_success_clears_then_dedupes(self) -> None:
         mgr = MCPClientManager({})
         mgr._storage = MagicMock()
-        # No pending row was ever written for this pair.
-        mgr._clear_pending_consent_sync("u1", "srv")
-        mgr._storage.delete_mcp_pending_consent.assert_not_called()
-
-    def test_clear_deletes_and_forgets_after_a_recorded_write(self) -> None:
-        mgr = MCPClientManager({})
-        mgr._storage = MagicMock()
-        mgr._pending_consent_written.add(("u1", "srv"))
+        # First success on a fresh pair → one DELETE (self-heals a badge that may
+        # have been written on ANOTHER node — no "we wrote it" precondition).
         mgr._clear_pending_consent_sync("u1", "srv")
         mgr._storage.delete_mcp_pending_consent.assert_called_once_with("u1", "srv")
-        # The hint is cleared, so a second success does not re-issue the DELETE.
+        # Subsequent successes skip the SQL (deduped via the cleared set).
         mgr._storage.delete_mcp_pending_consent.reset_mock()
         mgr._clear_pending_consent_sync("u1", "srv")
+        mgr._clear_pending_consent_sync("u1", "srv")
         mgr._storage.delete_mcp_pending_consent.assert_not_called()
+
+    def test_a_new_failure_write_re_arms_the_clear(self) -> None:
+        mgr = MCPClientManager({})
+        mgr._storage = MagicMock()
+        mgr._clear_pending_consent_sync("u1", "srv")  # clears + marks cleared
+        mgr._storage.delete_mcp_pending_consent.reset_mock()
+        # A fresh pending-consent write un-marks the pair...
+        mgr._write_pending_consent(
+            "u1", "srv", error_code="mcp_consent_required", scopes_required=None
+        )
+        # ...so the next success clears again.
+        mgr._clear_pending_consent_sync("u1", "srv")
+        mgr._storage.delete_mcp_pending_consent.assert_called_once_with("u1", "srv")
 
 
 # ---------------------------------------------------------------------------
