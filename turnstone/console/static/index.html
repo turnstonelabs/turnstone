@@ -2457,47 +2457,77 @@
                     <span class="segmented-hint">recommended</span></span
                   >
                 </label>
+                <label class="segmented-option">
+                  <input
+                    type="radio"
+                    name="mcp-auth-type"
+                    id="mcp-auth-obo"
+                    value="oauth_obo"
+                  />
+                  <span class="segmented-indicator" aria-hidden="true"></span>
+                  <span class="segmented-text"
+                    >Sign-in passthrough
+                    <span class="segmented-hint"
+                      >uses your org login — no separate connect</span
+                    ></span
+                  >
+                </label>
               </div>
               <div id="mcp-oauth-fields" hidden>
-                <label for="mcp-oauth-as-url"
-                  >Authorization server URL
-                  <span class="label-hint"
-                    >optional — override discovery when the MCP server URL is
-                    not the OAuth issuer</span
-                  ></label
-                >
-                <input
-                  type="text"
-                  id="mcp-oauth-as-url"
-                  class="sh-mono"
-                  placeholder="https://auth.example.com"
-                />
-                <label for="mcp-oauth-registration">Client registration</label>
-                <select id="mcp-oauth-registration">
-                  <option value="preregistered">preregistered</option>
-                  <option value="dcr">dcr (Dynamic Client Registration)</option>
-                </select>
-                <label for="mcp-oauth-client-id">Client ID</label>
-                <input
-                  type="text"
-                  id="mcp-oauth-client-id"
-                  class="sh-mono"
-                  placeholder="(operator-issued client_id)"
-                />
-                <label for="mcp-oauth-client-secret"
-                  >Client secret
-                  <span class="label-hint"
-                    >write-only, never displayed</span
-                  ></label
-                >
-                <input
-                  type="password"
-                  id="mcp-oauth-client-secret"
-                  placeholder="***"
-                  autocomplete="off"
-                />
+                <p id="mcp-obo-note" class="label-hint" hidden>
+                  Each user's org sign-in mints an access token for this server
+                  on demand — no per-user connect step. Requires the audience
+                  below and matching delegated permissions in your identity
+                  provider.
+                </p>
+                <div id="mcp-oauth-user-only">
+                  <label for="mcp-oauth-as-url"
+                    >Authorization server URL
+                    <span class="label-hint"
+                      >optional — override discovery when the MCP server URL is
+                      not the OAuth issuer</span
+                    ></label
+                  >
+                  <input
+                    type="text"
+                    id="mcp-oauth-as-url"
+                    class="sh-mono"
+                    placeholder="https://auth.example.com"
+                  />
+                  <label for="mcp-oauth-registration"
+                    >Client registration</label
+                  >
+                  <select id="mcp-oauth-registration">
+                    <option value="preregistered">preregistered</option>
+                    <option value="dcr">
+                      dcr (Dynamic Client Registration)
+                    </option>
+                  </select>
+                  <label for="mcp-oauth-client-id">Client ID</label>
+                  <input
+                    type="text"
+                    id="mcp-oauth-client-id"
+                    class="sh-mono"
+                    placeholder="(operator-issued client_id)"
+                  />
+                  <label for="mcp-oauth-client-secret"
+                    >Client secret
+                    <span class="label-hint"
+                      >write-only, never displayed</span
+                    ></label
+                  >
+                  <input
+                    type="password"
+                    id="mcp-oauth-client-secret"
+                    placeholder="***"
+                    autocomplete="off"
+                  />
+                </div>
                 <label for="mcp-oauth-scopes"
-                  >Scopes <span class="label-hint">space-separated</span></label
+                  >Scopes
+                  <span class="label-hint" id="mcp-oauth-scopes-hint"
+                    >space-separated</span
+                  ></label
                 >
                 <input
                   type="text"
@@ -2507,7 +2537,9 @@
                 />
                 <label for="mcp-oauth-audience"
                   >Audience
-                  <span class="label-hint">auto-populated from URL</span></label
+                  <span class="label-hint" id="mcp-oauth-audience-hint"
+                    >auto-populated from URL</span
+                  ></label
                 >
                 <input
                   type="text"

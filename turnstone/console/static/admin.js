@@ -4781,7 +4781,11 @@ function _renderMcpServers(items) {
       : 'data-mcp-detail="' + escapeHtml(s.server_id) + '"';
     // Phase 9: surface the connect/bulk-revoke affordances only for
     // user-OAuth servers, and bulk-revoke only once a user has consented.
+    // oauth_obo has NO per-server connect (it uses the org sign-in); its
+    // "flush cache" drops minted tokens so users re-mint (honest label — it is
+    // not a durable revoke; that is governed by the identity provider).
     const isOauth = s.auth_type === "oauth_user";
+    const isObo = s.auth_type === "oauth_obo";
     const consentCount =
       typeof s.consented_users_count === "number" ? s.consented_users_count : 0;
     const actions = _kebabMenu([
@@ -4798,6 +4802,20 @@ function _renderMcpServers(items) {
               "Drop all " + consentCount + " user consents for this server",
             attrs: {
               "data-mcp-bulk-revoke": s.name,
+              "data-mcp-consent-count": consentCount,
+            },
+          }
+        : null,
+      isObo && consentCount > 0
+        ? {
+            label: "flush cache (" + consentCount + ")",
+            kind: "danger",
+            title:
+              "Drop " +
+              consentCount +
+              " users' minted tokens; they re-mint on next use unless access is removed at your identity provider",
+            attrs: {
+              "data-mcp-cache-flush": s.name,
               "data-mcp-consent-count": consentCount,
             },
           }
@@ -4964,6 +4982,42 @@ function _renderMcpServers(items) {
       );
     });
   });
+  el.querySelectorAll("[data-mcp-cache-flush]").forEach(function (btn) {
+    btn.addEventListener("click", function () {
+      const name = this.getAttribute("data-mcp-cache-flush");
+      const count = this.getAttribute("data-mcp-consent-count") || "?";
+      showConfirmModal(
+        "Flush minted tokens",
+        "Drop " +
+          count +
+          ' users’ minted tokens for server "' +
+          name +
+          '"? This forces a fresh mint on next use (e.g. after changing the audience). It does NOT cut off access — users re-mint from their org sign-in; to revoke a user, remove their access at your identity provider or unlink their identity.',
+        "Flush cache",
+        function () {
+          authFetch(
+            "/v1/api/admin/mcp-servers/" +
+              encodeURIComponent(name) +
+              "/bulk-revoke",
+            { method: "POST" },
+          )
+            .then(function (r) {
+              if (!r.ok) throw new Error();
+              return r.json();
+            })
+            .then(function (j) {
+              showToast(
+                "Flushed " + (j.rows_deleted || 0) + " token(s) for " + name,
+              );
+              loadAdminMcp();
+            })
+            .catch(function () {
+              showToast("Failed to flush cache for " + name);
+            });
+        },
+      );
+    });
+  });
   el.querySelectorAll("[data-mcp-delete]").forEach(function (btn) {
     btn.addEventListener("click", function () {
       const sid = this.getAttribute("data-mcp-delete");
@@ -5011,13 +5065,31 @@ function _selectedMcpAuthType() {
 
 function toggleMcpAuthFields() {
   const authType = _selectedMcpAuthType();
+  const isOauthUser = authType === "oauth_user";
+  const isObo = authType === "oauth_obo";
+  // The OAuth fields block is shared by oauth_user and oauth_obo; obo shows
+  // only the audience (+ scopes for the rfc8693 profile), hiding the
+  // oauth_user-only client/registration inputs it does not use.
   const oauthDiv = document.getElementById("mcp-oauth-fields");
-  if (oauthDiv) {
-    oauthDiv.hidden = authType !== "oauth_user";
-  }
+  if (oauthDiv) oauthDiv.hidden = !(isOauthUser || isObo);
+  const userOnly = document.getElementById("mcp-oauth-user-only");
+  if (userOnly) userOnly.hidden = !isOauthUser;
+  const oboNote = document.getElementById("mcp-obo-note");
+  if (oboNote) oboNote.hidden = !isObo;
+  // For obo the audience is required (the mint engine hard-requires it) and
+  // scopes apply only under the rfc8693 grant profile; retitle the hints so
+  // the operator isn't misled (no impl vocabulary in the copy).
+  const audHint = document.getElementById("mcp-oauth-audience-hint");
+  if (audHint)
+    audHint.textContent = isObo ? "required" : "auto-populated from URL";
+  const scopesHint = document.getElementById("mcp-oauth-scopes-hint");
+  if (scopesHint)
+    scopesHint.textContent = isObo
+      ? "only used by the rfc8693 sign-in profile"
+      : "space-separated";
   // The "Headers" textarea (inside mcp-http-fields) is only meaningful
-  // for static auth; hide it for 'none' / 'oauth_user' so operators
-  // don't accidentally configure stale credentials.
+  // for static auth; hide it for 'none' / 'oauth_user' / 'oauth_obo' so
+  // operators don't accidentally configure stale credentials.
   const headersInput = document.getElementById("mcp-headers");
   if (headersInput) {
     const headersLabel = document.querySelector('label[for="mcp-headers"]');
@@ -5079,6 +5151,7 @@ function _mcpResetForm() {
   document.getElementById("mcp-auth-static").checked = true;
   document.getElementById("mcp-auth-none").checked = false;
   document.getElementById("mcp-auth-oauth").checked = false;
+  document.getElementById("mcp-auth-obo").checked = false;
   document.getElementById("mcp-oauth-as-url").value = "";
   document.getElementById("mcp-oauth-registration").value = "preregistered";
   document.getElementById("mcp-oauth-client-id").value = "";
@@ -5146,6 +5219,8 @@ function showEditMcpModal(serverId) {
         authType === "static";
       document.getElementById("mcp-auth-oauth").checked =
         authType === "oauth_user";
+      document.getElementById("mcp-auth-obo").checked =
+        authType === "oauth_obo";
       document.getElementById("mcp-oauth-as-url").value =
         s.oauth_authorization_server_url || "";
       document.getElementById("mcp-oauth-registration").value =
@@ -5224,7 +5299,7 @@ function _parseMcpForm() {
       }
       payload.headers = hdrObj;
     } else {
-      // 'none' / 'oauth_user' — clear server-side static headers state.
+      // 'none' / 'oauth_user' / 'oauth_obo' — clear static headers state.
       payload.headers = {};
     }
   }
@@ -5248,6 +5323,18 @@ function _parseMcpForm() {
     const secret = document.getElementById("mcp-oauth-client-secret").value;
     // Submit only when the operator typed a value; redacted in audit log.
     if (secret) payload.oauth_client_secret = secret;
+  } else if (authType === "oauth_obo") {
+    // Sign-in passthrough uses only the audience (+ optional rfc8693 scopes);
+    // the client/registration/secret columns are oauth_user-only and cleared
+    // server-side. Audience is required — catch it here for an inline error
+    // rather than a round-trip 400.
+    const audience = document.getElementById("mcp-oauth-audience").value.trim();
+    if (!audience)
+      return { error: "Audience is required for sign-in passthrough servers" };
+    payload.oauth_audience = audience;
+    payload.oauth_scopes = document
+      .getElementById("mcp-oauth-scopes")
+      .value.trim();
   }
 
   return payload;
