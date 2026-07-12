@@ -1019,7 +1019,15 @@ class TestOboPriming:
         mgr, loop, _ = running_loop_mgr
         cipher = make_mcp_token_cipher()
         mgr.set_storage(storage)
-        mgr.set_app_state(_make_app_state(storage, cipher=cipher))
+        app_state = _make_app_state(storage, cipher=cipher)
+        # The priming pre-check reads oidc_config.issuer and requires a stored
+        # credential row (existence only, no decrypt) before running any
+        # per-server obo work.
+        app_state.oidc_config = SimpleNamespace(issuer="https://idp.example.com")
+        mgr.set_app_state(app_state)
+        storage.upsert_oidc_user_credential(
+            "user-1", "https://idp.example.com", refresh_token_ct=b"ct"
+        )
         storage.create_mcp_server(
             server_id="srv-obo",
             name="obo-srv",
@@ -1053,13 +1061,18 @@ class TestOboPriming:
         assert warmed[0][2] == "minted-at"
 
     def test_prime_skips_obo_server_when_no_credential(self, running_loop_mgr, storage) -> None:
-        """A user without a captured credential yields kind='missing' from the
-        mint path → the pool is not warmed (the re-login rail handles it on real
-        dispatch), and nothing raises."""
+        """A user without a captured credential is skipped BEFORE any
+        per-server obo work: one existence SELECT decides all obo servers
+        (credential-less users previously paid three SQL reads per obo server
+        per session start just to learn kind='missing'). The pool is not
+        warmed, the mint machinery never runs, and nothing raises — the
+        re-login rail handles it on real dispatch."""
         mgr, loop, _ = running_loop_mgr
         cipher = make_mcp_token_cipher()
         mgr.set_storage(storage)
-        mgr.set_app_state(_make_app_state(storage, cipher=cipher))
+        app_state = _make_app_state(storage, cipher=cipher)
+        app_state.oidc_config = SimpleNamespace(issuer="https://idp.example.com")
+        mgr.set_app_state(app_state)
         storage.create_mcp_server(
             server_id="srv-obo",
             name="obo-srv",
@@ -1082,14 +1095,16 @@ class TestOboPriming:
         ):
             _run_on_loop(loop, mgr._prime_user_pools("user-1"))
 
-        obo_lookup.assert_awaited_once()
+        obo_lookup.assert_not_awaited()
         assert warmed == []
 
 
 class TestPendingConsentClearGate:
-    """The dispatch-success pending-consent clear must (a) NOT issue SQL on every
-    call (no new hot-path SQL) yet (b) still clear cross-node. It clears once per
-    (user,server) per failure-cycle via the ``_pending_consent_cleared`` set."""
+    """The dispatch-success pending-consent clear must (a) NOT issue SQL on
+    every call (no new hot-path SQL) yet (b) still clear cross-node. The
+    ``_pending_consent_cleared`` TTL map dedupes the DELETE per (user, server)
+    per TTL window — a permanent cleared-set would suppress the clear forever
+    on a node that cleared before ANOTHER node wrote a fresh badge."""
 
     def test_first_success_clears_then_dedupes(self) -> None:
         mgr = MCPClientManager({})
@@ -1098,7 +1113,7 @@ class TestPendingConsentClearGate:
         # have been written on ANOTHER node — no "we wrote it" precondition).
         mgr._clear_pending_consent_sync("u1", "srv")
         mgr._storage.delete_mcp_pending_consent.assert_called_once_with("u1", "srv")
-        # Subsequent successes skip the SQL (deduped via the cleared set).
+        # Subsequent successes within the TTL skip the SQL.
         mgr._storage.delete_mcp_pending_consent.reset_mock()
         mgr._clear_pending_consent_sync("u1", "srv")
         mgr._clear_pending_consent_sync("u1", "srv")
@@ -1113,9 +1128,64 @@ class TestPendingConsentClearGate:
         mgr._write_pending_consent(
             "u1", "srv", error_code="mcp_consent_required", scopes_required=None
         )
-        # ...so the next success clears again.
+        # ...so the next success clears again without waiting out the TTL.
         mgr._clear_pending_consent_sync("u1", "srv")
         mgr._storage.delete_mcp_pending_consent.assert_called_once_with("u1", "srv")
+
+    def test_ttl_expiry_re_clears_cross_node_badges(self) -> None:
+        """The cross-node self-heal (review finding): node A cleared the pair,
+        then node B wrote a fresh badge — node A has no local signal, so its
+        cleared entry must AGE OUT and the next success re-run the DELETE.
+        With a permanent set the badge survived until node A restarted."""
+        from turnstone.core.mcp_client import _PENDING_CONSENT_CLEAR_TTL_SECONDS
+
+        mgr = MCPClientManager({})
+        mgr._storage = MagicMock()
+        mgr._clear_pending_consent_sync("u1", "srv")
+        mgr._storage.delete_mcp_pending_consent.reset_mock()
+        # Age the entry past the TTL (simulates time passing on node A while
+        # node B writes a badge this node never observes).
+        mgr._pending_consent_cleared[("u1", "srv")] -= _PENDING_CONSENT_CLEAR_TTL_SECONDS + 1
+        mgr._clear_pending_consent_sync("u1", "srv")
+        mgr._storage.delete_mcp_pending_consent.assert_called_once_with("u1", "srv")
+
+    def test_cleared_map_prunes_at_size_threshold(self) -> None:
+        """The TTL map is bounded: crossing the size threshold drops expired
+        entries (and worst-case the oldest half), so a long-lived node serving
+        many (user, server) pairs can't grow it without bound. Pruning is
+        memory hygiene only — a pruned pair just re-runs one DELETE later."""
+        from unittest.mock import patch as _patch
+
+        mgr = MCPClientManager({})
+        mgr._storage = MagicMock()
+        with _patch("turnstone.core.mcp_client._PENDING_CONSENT_CLEARED_MAX", 4):
+            for i in range(4):
+                mgr._clear_pending_consent_sync("u", f"srv-{i}")
+            assert len(mgr._pending_consent_cleared) == 4
+            # Age everything out; the next insert prunes the expired entries.
+            from turnstone.core.mcp_client import _PENDING_CONSENT_CLEAR_TTL_SECONDS
+
+            for key in list(mgr._pending_consent_cleared):
+                mgr._pending_consent_cleared[key] -= _PENDING_CONSENT_CLEAR_TTL_SECONDS + 1
+            mgr._clear_pending_consent_sync("u", "srv-new")
+            assert ("u", "srv-new") in mgr._pending_consent_cleared
+            assert len(mgr._pending_consent_cleared) == 1
+
+
+class TestTokenRejectedDetail:
+    def test_obo_rows_are_not_pointed_at_a_consent_flow(self) -> None:
+        """Review finding: the 401-retry-exhausted branches told oauth_obo
+        users 'Re-consent required' with consent_url=None — a dead end, since
+        no per-server consent flow exists for sign-in passthrough. The obo
+        detail points at the admin (audience/config) instead."""
+        from turnstone.core.mcp_client import _token_rejected_detail
+
+        user_detail = _token_rejected_detail({"auth_type": "oauth_user"})
+        assert "Re-consent required" in user_detail
+
+        obo_detail = _token_rejected_detail({"auth_type": "oauth_obo"})
+        assert "consent" not in obo_detail.lower()
+        assert "administrator" in obo_detail.lower()
 
 
 # ---------------------------------------------------------------------------

@@ -92,7 +92,7 @@ def _make_app_state(
         auth_storage=storage,
         mcp_token_store=MCPTokenStore(storage, make_mcp_token_cipher(), node_id="test"),
         oidc_config=oidc_config,
-        oidc_http_client=http_client,
+        obo_http_client=http_client,
         mcp_oauth_refresh_locks={},
     )
 
@@ -124,6 +124,7 @@ def _seed_cache_row(
     expires_in_seconds: int,
     access_token: str = "cached-at",
     audience: str = AUDIENCE,
+    created_seconds_ago: int = 0,
 ) -> None:
     expires_at = (datetime.now(UTC) + timedelta(seconds=expires_in_seconds)).strftime(_ISO)
     state.mcp_token_store.create_user_token(
@@ -136,6 +137,28 @@ def _seed_cache_row(
         as_issuer=ISSUER,
         audience=audience,
     )
+    if created_seconds_ago:
+        # Backdate the row via direct SQL: create_user_token stamps
+        # created=now, but the under-lock force_refresh gate treats a row
+        # whose ``created`` >= the caller's lock-request time as "another
+        # caller just minted" and reuses it — a row seeded in the same second
+        # as the call reads as exactly that. Tests exercising the RE-MINT
+        # path need a row that is unambiguously from the past.
+        import sqlalchemy as sa
+
+        from turnstone.core.storage._schema import mcp_user_tokens
+
+        backdated = (datetime.now(UTC) - timedelta(seconds=created_seconds_ago)).strftime(_ISO)
+        storage = state.auth_storage
+        with storage._engine.connect() as conn:
+            conn.execute(
+                sa.update(mcp_user_tokens)
+                .where(
+                    (mcp_user_tokens.c.user_id == USER) & (mcp_user_tokens.c.server_name == SERVER)
+                )
+                .values(created=backdated)
+            )
+            conn.commit()
 
 
 def _mk_response(status_code: int = 200, json_body: Any = None) -> MagicMock:
@@ -712,7 +735,15 @@ class TestFailureHandling:
         )
         state = _make_app_state(storage, http_client=client, oidc_config=_make_oidc_config())
         _seed_credential(state)
-        _seed_cache_row(state, expires_in_seconds=3600, access_token="stale-but-fresh-exp")
+        # Backdated so the under-lock reuse gate reads it as an OLD mint —
+        # this test is about the cooldown fall-through re-minting, not the
+        # same-second single-flight reuse (covered separately below).
+        _seed_cache_row(
+            state,
+            expires_in_seconds=3600,
+            access_token="stale-but-fresh-exp",
+            created_seconds_ago=30,
+        )
         # Arm the cooldown as if a prior mint just failed transiently.
         _refresh_backoff_state(state, USER, SERVER).last_failure_monotonic = time.monotonic()
 
@@ -728,6 +759,114 @@ class TestFailureHandling:
         assert result.kind == "token"
         assert result.token == "at-reminted"
         assert client.post.call_count == 1
+
+    def test_force_refresh_reuses_row_minted_while_waiting_for_lock(
+        self, storage: SQLiteBackend
+    ) -> None:
+        """Review finding: the under-lock "another caller already minted" reuse
+        gate keyed on ``last_refreshed``, which obo cache rows NEVER set
+        (delete+create hardcodes NULL) — so every serialized force_refresh
+        waiter re-ran a full IdP redemption. The gate now keys on ``created``
+        (the mint time under delete+create): a fresh row created at/after the
+        caller's lock-request time is served without a new mint."""
+        _seed_obo_server(storage)
+        client = MagicMock(spec=httpx.AsyncClient)
+        client.post = AsyncMock()  # any IdP call would be a gate failure
+        state = _make_app_state(storage, http_client=client, oidc_config=_make_oidc_config())
+        _seed_credential(state)
+        # Seeded moments before the call: at second granularity its ``created``
+        # is >= the caller's lock-request time, exactly what a concurrent
+        # waiter observes after the winner persisted its mint.
+        _seed_cache_row(state, expires_in_seconds=3600, access_token="winner-minted-at")
+
+        async def _run() -> Any:
+            return await get_obo_access_token_classified(
+                app_state=state, user_id=USER, server_name=SERVER, force_refresh=True
+            )
+
+        result = asyncio.run(_run())
+
+        assert result.kind == "token"
+        assert result.token == "winner-minted-at"
+        assert client.post.call_count == 0
+
+    def test_rotation_persist_failure_does_not_break_the_mint(self, storage: SQLiteBackend) -> None:
+        """Review finding: a storage error inside the rotation-persist callback
+        escaped the classified-result contract (only MCPOAuthRefreshFailed is
+        caught around mint()) and broke the in-flight dispatch — and on a
+        strict-rotation IdP the consumed RT stayed stored either way. The
+        persist is best-effort: the mint still returns its token (this
+        dispatch works); the stale credential surfaces on a LATER mint at
+        worst, instead of a raw exception now."""
+        from unittest.mock import patch
+
+        _seed_obo_server(storage)
+        client = MagicMock(spec=httpx.AsyncClient)
+        client.post = AsyncMock(
+            side_effect=[
+                _mk_response(
+                    200,
+                    {
+                        "access_token": "subject-at",
+                        "refresh_token": "rt-rotated",
+                        "expires_in": 300,
+                    },
+                ),
+                _mk_response(200, {"access_token": "exchanged-at", "expires_in": 600}),
+            ]
+        )
+        state = _make_app_state(
+            storage,
+            http_client=client,
+            oidc_config=_make_oidc_config(obo_grant_profile="rfc8693"),
+        )
+        _seed_credential(state, refresh_token="rt-1")
+
+        with patch.object(
+            state.mcp_token_store,
+            "update_oidc_credential_after_redeem",
+            side_effect=RuntimeError("transient db blip"),
+        ):
+            result = _mint(state)
+
+        assert result.kind == "token"
+        assert result.token == "exchanged-at"
+        # The stored credential still holds the OLD RT — the failed persist is
+        # logged, never raised.
+        cred = state.mcp_token_store.get_oidc_credential(USER, ISSUER)
+        assert cred is not None
+        assert cred["refresh_token"] == "rt-1"
+
+    def test_disabled_retryable_config_rediscovers_and_mints(self, storage: SQLiteBackend) -> None:
+        """Review finding: OIDC discovery ran boot-once — a node that booted
+        during a transient IdP outage kept enabled=False forever and every obo
+        mint on it failed "transient" until an operator restart. The mint path
+        now probes runtime re-discovery (cooldown-gated) before classifying
+        obo_misconfigured, so the node self-heals."""
+        import dataclasses as _dc
+        from unittest.mock import patch
+
+        _seed_obo_server(storage)
+        client = MagicMock(spec=httpx.AsyncClient)
+        client.post = AsyncMock(
+            return_value=_mk_response(200, {"access_token": "minted-at", "expires_in": 3600})
+        )
+        boot_failed = _dc.replace(
+            _make_oidc_config(), enabled=False, token_endpoint="", discovery_retryable=True
+        )
+        state = _make_app_state(storage, http_client=client, oidc_config=boot_failed)
+        _seed_credential(state)
+        healed = _make_oidc_config()  # enabled, token_endpoint populated
+
+        async def _fake_discover(cfg: Any, *, client: Any = None) -> Any:
+            return healed
+
+        with patch("turnstone.core.oidc.discover_oidc", new=_fake_discover):
+            result = _mint(state)
+
+        assert result.kind == "token"
+        assert result.token == "minted-at"
+        assert state.oidc_config.enabled is True
 
     def test_credential_decrypt_failure_is_classified_not_raised(
         self, storage: SQLiteBackend

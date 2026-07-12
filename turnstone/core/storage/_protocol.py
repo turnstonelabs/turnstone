@@ -13,6 +13,16 @@ if TYPE_CHECKING:
     from turnstone.core.workstream import WorkstreamKind
 
 
+#: MCP auth types whose connections and per-user token rows are keyed
+#: per-(user, server): ``oauth_user`` (per-server browser consent + refresh
+#: token) and ``oauth_obo`` (minted on demand from the user's single captured
+#: credential, issue #551). Defined here — the bottom of the import graph — so
+#: the backend SQL predicates (``any_user_scoped_mcp_servers``) and the
+#: application layer (via :mod:`turnstone.core.mcp_crypto`, which re-exports
+#: it) agree on ONE set that cannot drift.
+USER_SCOPED_AUTH_TYPES: frozenset[str] = frozenset({"oauth_user", "oauth_obo"})
+
+
 class StorageConflictError(Exception):
     """Raised by storage methods when a unique-constraint violation occurs.
 

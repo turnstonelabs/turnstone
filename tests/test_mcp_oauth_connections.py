@@ -353,6 +353,33 @@ class TestListConnections:
             ):
                 assert forbidden not in row, f"secret field {forbidden!r} leaked in {row!r}"
 
+    def test_list_connections_hides_obo_mint_cache_rows(
+        self, storage: SQLiteBackend, http_client_mock: MagicMock
+    ) -> None:
+        """Review finding: obo cache rows in the connections list offered a
+        "Disconnect" that silently undid itself (session-start priming
+        re-mints from the captured credential). The list shows only rows the
+        user can actually revoke — obo mint-cache rows are hidden."""
+        token_store = _make_token_store(storage)
+        _seed_oauth_user_server(storage)
+        _seed_user_token(token_store)
+        storage.create_mcp_server(
+            server_id="srv-obo-id",
+            name="srv-obo",
+            transport="streamable-http",
+            url="https://mcp-obo.example.com/sse",
+            auth_type="oauth_obo",
+            oauth_audience="api://mcp-obo",
+        )
+        _seed_user_token(token_store, server_name="srv-obo", refresh_token=None)
+
+        app = _build_app(storage=storage, http_client=http_client_mock, token_store=token_store)
+        with TestClient(app) as client:
+            resp = client.get("/v1/api/mcp/oauth/connections")
+        assert resp.status_code == 200
+        names = [c["server_name"] for c in resp.json()["connections"]]
+        assert names == ["srv-oauth"]
+
 
 # ---------------------------------------------------------------------------
 # DELETE /connections/{server_name}
@@ -360,6 +387,31 @@ class TestListConnections:
 
 
 class TestRevokeConnection:
+    def test_revoke_connection_obo_server_409_and_keeps_row(
+        self, storage: SQLiteBackend, http_client_mock: MagicMock
+    ) -> None:
+        """Review finding: DELETE on an obo server returned 204, audited
+        token_revoked, and then priming silently re-minted from the surviving
+        captured credential — a disconnect that undoes itself. The endpoint
+        refuses honestly (409) and leaves the mint-cache row untouched."""
+        token_store = _make_token_store(storage)
+        storage.create_mcp_server(
+            server_id="srv-obo-id",
+            name="srv-obo",
+            transport="streamable-http",
+            url="https://mcp-obo.example.com/sse",
+            auth_type="oauth_obo",
+            oauth_audience="api://mcp-obo",
+        )
+        _seed_user_token(token_store, server_name="srv-obo", refresh_token=None)
+
+        app = _build_app(storage=storage, http_client=http_client_mock, token_store=token_store)
+        with TestClient(app) as client:
+            resp = client.delete("/v1/api/mcp/oauth/connections/srv-obo")
+        assert resp.status_code == 409
+        assert "sign-in" in resp.json()["error"].lower()
+        assert token_store.get_user_token("user-1", "srv-obo") is not None
+
     def test_revoke_connection_unauthenticated_401(
         self, storage: SQLiteBackend, http_client_mock: MagicMock
     ) -> None:

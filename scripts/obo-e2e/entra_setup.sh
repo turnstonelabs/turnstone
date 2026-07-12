@@ -68,14 +68,22 @@ cmd_setup() {
     --web-redirect-uris "http://localhost:8765/callback" \
     --query appId -o tsv)
   az ad sp create --id "$CLIENT_ID" >/dev/null 2>&1 || true
+  # No stderr suppression here: the secret is load-bearing (it lands in .env),
+  # so under `set -e` a reset failure must abort LOUDLY, not silently.
   SECRET=$(az ad app credential reset --id "$CLIENT_ID" \
-    --display-name spike --years 1 --query password -o tsv 2>/dev/null)
+    --display-name spike --years 1 --query password -o tsv)
 
   log "adding delegated permissions (a, b — NOT c)..."
+  # Tolerated failures (|| log): a re-run hits "permission already exists" and
+  # SP-propagation delays are common right after app creation — the
+  # admin-consent retry loop below is the real gate. `set -e` would otherwise
+  # turn a suppressed non-zero here into a silent mid-script abort.
   az ad app permission add --id "$CLIENT_ID" \
-    --api "$APP_A" --api-permissions "${SCOPE_A}=Scope" 2>/dev/null
+    --api "$APP_A" --api-permissions "${SCOPE_A}=Scope" \
+    || log "  warn: permission add for a failed (may already exist); admin-consent below will confirm"
   az ad app permission add --id "$CLIENT_ID" \
-    --api "$APP_B" --api-permissions "${SCOPE_B}=Scope" 2>/dev/null
+    --api "$APP_B" --api-permissions "${SCOPE_B}=Scope" \
+    || log "  warn: permission add for b failed (may already exist); admin-consent below will confirm"
 
   log "granting admin consent (retries while SPs propagate)..."
   local ok=""

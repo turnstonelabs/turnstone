@@ -887,6 +887,60 @@ async def exchange_code(
     return doc
 
 
+async def _hardened_token_post(
+    *,
+    token_endpoint: str,
+    data: dict[str, str],
+    http_client: httpx.AsyncClient | None,
+    request_label: str,
+    endpoint_label: str,
+) -> dict[str, Any]:
+    """POST one token-grant request with the shared hardening skeleton.
+
+    Single implementation of the POST → body-size cap →
+    :func:`_classify_refresh_failure` → JSON-object-validation chain used by
+    both the oauth_user refresh and the OBO mint legs, so the two grant
+    paths cannot drift. Raises :class:`MCPOAuthRefreshFailed` on any
+    failure; a non-200 carries the conservative classification — an explicit
+    dead-grant / re-consent code revokes consent; infra (5xx/429) and
+    operator-fixable codes keep the token; an unrecognised 400/401 is
+    ambiguous and the caller escalates only after a sustained run.
+
+    The two labels preserve each caller's historical error text verbatim
+    (``refresh request failed`` vs ``refresh endpoint returned HTTP …``);
+    the OBO wrapper passes one string for both. When *http_client* is
+    ``None`` a transient per-request client is used — the OBO mint path runs
+    on the MCP loop and deliberately passes ``None`` (see
+    :func:`get_obo_access_token_classified`).
+    """
+    try:
+        if http_client is not None:
+            resp = await http_client.post(token_endpoint, data=data, timeout=_DEFAULT_HTTP_TIMEOUT)
+        else:
+            async with httpx.AsyncClient(timeout=_DEFAULT_HTTP_TIMEOUT) as transient:
+                resp = await transient.post(token_endpoint, data=data)
+    except httpx.HTTPError as exc:
+        raise MCPOAuthRefreshFailed(f"{request_label} request failed: {exc}") from exc
+
+    if len(resp.content) > _MAX_TOKEN_BODY_BYTES:
+        raise MCPOAuthRefreshFailed(f"{endpoint_label} response body exceeds size limit")
+
+    if resp.status_code != 200:
+        raise MCPOAuthRefreshFailed(
+            f"{endpoint_label} returned HTTP {resp.status_code}: {_format_as_error(resp)}",
+            failure_class=_classify_refresh_failure(resp),
+        )
+
+    try:
+        doc = resp.json()
+    except ValueError as exc:
+        raise MCPOAuthRefreshFailed(f"{request_label} body is not valid JSON: {exc}") from exc
+    if not isinstance(doc, dict):
+        raise MCPOAuthRefreshFailed(f"{request_label} body is not a JSON object")
+    typed: dict[str, Any] = doc
+    return typed
+
+
 async def refresh_token(
     *,
     as_metadata: ASMetadata,
@@ -914,36 +968,13 @@ async def refresh_token(
     if scopes:
         data["scope"] = scopes
 
-    try:
-        resp = await http_client.post(
-            as_metadata.token_endpoint,
-            data=data,
-            timeout=_DEFAULT_HTTP_TIMEOUT,
-        )
-    except httpx.HTTPError as exc:
-        raise MCPOAuthRefreshFailed(f"refresh request failed: {exc}") from exc
-
-    if len(resp.content) > _MAX_TOKEN_BODY_BYTES:
-        raise MCPOAuthRefreshFailed("refresh endpoint response body exceeds size limit")
-
-    if resp.status_code != 200:
-        # Classify the rejection (see _classify_refresh_failure): an explicit
-        # dead-grant / re-consent code revokes consent; infra (5xx/429) and
-        # operator-fixable codes keep the token; an unrecognised 400/401 is
-        # ambiguous and the caller escalates only after a sustained run.
-        raise MCPOAuthRefreshFailed(
-            f"refresh endpoint returned HTTP {resp.status_code}: {_format_as_error(resp)}",
-            failure_class=_classify_refresh_failure(resp),
-        )
-
-    try:
-        doc = resp.json()
-    except ValueError as exc:
-        raise MCPOAuthRefreshFailed(f"refresh body is not valid JSON: {exc}") from exc
-
-    if not isinstance(doc, dict):
-        raise MCPOAuthRefreshFailed("refresh body is not a JSON object")
-    return doc
+    return await _hardened_token_post(
+        token_endpoint=as_metadata.token_endpoint,
+        data=data,
+        http_client=http_client,
+        request_label="refresh",
+        endpoint_label="refresh endpoint",
+    )
 
 
 async def revoke_token_at_as(
@@ -1924,11 +1955,6 @@ async def get_user_access_token_classified(
 # is handled elsewhere.
 # ---------------------------------------------------------------------------
 
-#: Auth types whose connections and tokens are per-(user, server). Re-exported
-#: from :mod:`mcp_crypto` (the leaf module) so there is one source of truth; the
-#: MCP client keys its connection pool and per-user tool catalogs on this class.
-#: ``OBO_GRANT_PROFILES`` is derived from ``_OBO_MINT_LEGS`` below.
-
 
 async def _obo_token_post(
     *,
@@ -1939,39 +1965,21 @@ async def _obo_token_post(
 ) -> dict[str, Any]:
     """POST one OBO grant-leg request; classify failures like a refresh.
 
-    Mirrors :func:`refresh_token`'s hardening (body size cap, JSON-object
-    validation) and raises :class:`MCPOAuthRefreshFailed` with the same
-    conservative :func:`_classify_refresh_failure` mapping, so the OBO state
-    machine reacts to AS rejections exactly like the oauth_user one — a
-    verified AADSTS65001 (missing tenant grant) classifies PERMANENT via
+    Label-binding wrapper over :func:`_hardened_token_post` (the shared
+    body-size-cap / JSON-object-validation / conservative
+    :func:`_classify_refresh_failure` skeleton), so the OBO state machine
+    reacts to AS rejections exactly like the oauth_user one — a verified
+    AADSTS65001 (missing tenant grant) classifies PERMANENT via
     ``invalid_grant``.
     """
-    try:
-        if http_client is not None:
-            resp = await http_client.post(token_endpoint, data=data, timeout=_DEFAULT_HTTP_TIMEOUT)
-        else:
-            async with httpx.AsyncClient(timeout=_DEFAULT_HTTP_TIMEOUT) as transient:
-                resp = await transient.post(token_endpoint, data=data)
-    except httpx.HTTPError as exc:
-        raise MCPOAuthRefreshFailed(f"obo {leg} request failed: {exc}") from exc
-
-    if len(resp.content) > _MAX_TOKEN_BODY_BYTES:
-        raise MCPOAuthRefreshFailed(f"obo {leg} response body exceeds size limit")
-
-    if resp.status_code != 200:
-        raise MCPOAuthRefreshFailed(
-            f"obo {leg} returned HTTP {resp.status_code}: {_format_as_error(resp)}",
-            failure_class=_classify_refresh_failure(resp),
-        )
-
-    try:
-        doc = resp.json()
-    except ValueError as exc:
-        raise MCPOAuthRefreshFailed(f"obo {leg} body is not valid JSON: {exc}") from exc
-    if not isinstance(doc, dict):
-        raise MCPOAuthRefreshFailed(f"obo {leg} body is not a JSON object")
-    typed: dict[str, Any] = doc
-    return typed
+    label = f"obo {leg}"
+    return await _hardened_token_post(
+        token_endpoint=token_endpoint,
+        data=data,
+        http_client=http_client,
+        request_label=label,
+        endpoint_label=label,
+    )
 
 
 # A leg persists a rotated CREDENTIAL refresh token the instant it obtains one,
@@ -2029,10 +2037,12 @@ async def _obo_mint_entra(
         # levels without flooding.
         _ENTRA_SCOPE_IGNORED_WARNED.add(audience)
         log.warning(
-            "obo: oauth_scopes is IGNORED for the entra grant leg (audience=%s mints "
-            "<audience>/.default) — a configured scope restriction is not applied; "
-            "clear oauth_scopes or use the rfc8693 profile",
-            audience,
+            "mcp_server.oauth.obo_entra_scopes_ignored",
+            audience=audience,
+            hint=(
+                "oauth_scopes is not applied on the entra grant leg (it mints "
+                "<audience>/.default); clear oauth_scopes or use the rfc8693 profile"
+            ),
         )
     resp = await _obo_token_post(
         token_endpoint=oidc_config.token_endpoint,
@@ -2303,16 +2313,32 @@ async def get_obo_access_token_classified(
     # Serve the cache only when it is a fresh, right-audience, refresh-less row
     # (see _is_fresh_obo_cache_row). A stale-audience or refresh-bearing row
     # falls through to a fresh mint (which overwrites it via _persist_obo_cache_row).
-    if _is_fresh_obo_cache_row(plain, audience) and not force_refresh and plain is not None:
+    fresh = _is_fresh_obo_cache_row(plain, audience)
+    if fresh and not force_refresh and plain is not None:
         return _token_result(app_state, user_id, server_name, plain["access_token"])
 
     # Gate the cooldown short-circuit on actually needing a mint (cache absent or
     # stale), mirroring the oauth_user path: a force_refresh 401-retry on a
     # still-fresh cache must fall through to the locked re-read so it can pick up
     # a token a cluster-mate just minted, rather than fail transient in-cooldown.
-    needs_mint = not _is_fresh_obo_cache_row(plain, audience)
-    if needs_mint and _refresh_in_cooldown(app_state, user_id, server_name):
+    if not fresh and _refresh_in_cooldown(app_state, user_id, server_name):
         return TokenLookupResult(kind="refresh_failed_transient")
+    if oidc_config is not None and not getattr(oidc_config, "enabled", False):
+        # A node that booted during a transient IdP outage carries
+        # enabled=False with discovery_retryable=True; without a runtime
+        # retry, every obo mint on this node would fail "transient" until an
+        # operator restarts it (the login path's lazy retry covers only JWKS,
+        # not discovery). Cooldown-gated and single-flight; a no-op when OIDC
+        # is operator-disabled or the boot failure was a config rejection.
+        # Lazy import: oidc.load_oidc_config imports OBO_GRANT_PROFILES from
+        # this module (also lazily), so neither module may import the other
+        # at module level.
+        from turnstone.core.oidc import maybe_rediscover_oidc
+
+        await maybe_rediscover_oidc(app_state)
+        oidc_config = getattr(app_state, "oidc_config", None)
+        profile = str(getattr(oidc_config, "obo_grant_profile", "") or "")
+        mint = _OBO_MINT_LEGS.get(profile)
     if (
         oidc_config is None
         or not getattr(oidc_config, "enabled", False)
@@ -2373,8 +2399,13 @@ async def get_obo_access_token_classified(
         if _is_fresh_obo_cache_row(plain2, audience) and plain2 is not None:
             if not force_refresh:
                 return _token_result(app_state, user_id, server_name, plain2["access_token"])
-            last_refreshed = _parse_iso_to_utc(plain2.get("last_refreshed") or "")
-            if last_refreshed is not None and last_refreshed >= t_lock_request_started:
+            # Obo cache rows are delete+create'd per mint and never touched by
+            # update_user_token_after_refresh, so ``created`` IS the mint time
+            # (``last_refreshed`` stays NULL on this path — the oauth_user
+            # gate's column would never fire here, and every serialized
+            # force_refresh waiter would run its own redundant IdP redemption).
+            minted_at = _parse_iso_to_utc(plain2.get("created") or "")
+            if minted_at is not None and minted_at >= t_lock_request_started:
                 return _token_result(app_state, user_id, server_name, plain2["access_token"])
 
         # Re-read the credential under the lock — a concurrent mint for a
@@ -2390,14 +2421,40 @@ async def get_obo_access_token_classified(
         # rotation from the refresh leg survives an exchange-leg failure, and an
         # audience-scoped exchange RT never reaches the credential.
         async def _persist_rotation(new_credential_rt: str) -> None:
-            await asyncio.to_thread(
-                token_store.update_oidc_credential_after_redeem,
-                user_id,
-                issuer,
-                refresh_token=new_credential_rt,
-            )
+            # Swallow storage failures: the mint itself succeeded, so the
+            # caller still gets a working access token. On a strict-rotation
+            # IdP the stored credential may now hold a consumed RT — the NEXT
+            # mint then fails invalid_grant and surfaces the re-login rail.
+            # Raising here would be strictly worse: the rotated RT is lost
+            # either way, and a raw storage exception would additionally
+            # escape the classified-result contract (only
+            # MCPOAuthRefreshFailed is caught around mint()) and break the
+            # in-flight dispatch too.
+            try:
+                await asyncio.to_thread(
+                    token_store.update_oidc_credential_after_redeem,
+                    user_id,
+                    issuer,
+                    refresh_token=new_credential_rt,
+                )
+            except Exception:
+                log.error(
+                    "mcp_server.oauth.obo_rotation_persist_failed",
+                    user_id=user_id,
+                    server_name=server_name,
+                    exc_info=True,
+                )
 
-        http_client = getattr(app_state, "oidc_http_client", None)
+        # The login flow's oidc_http_client lives on the uvicorn loop; this
+        # function runs on the MCP loop thread. httpx pools connections per
+        # client object and a pooled connection is bound to the loop that
+        # created it, so sharing the login client here collides routinely —
+        # the login exchange and the first mint hit the same IdP origin
+        # seconds apart by design. No long-lived mint client is kept:
+        # _obo_token_post uses a transient per-request client when this is
+        # None (mints are ~hourly per (user, server), not hot-path).
+        # ``obo_http_client`` is an injection seam for tests / e2e harnesses.
+        http_client = getattr(app_state, "obo_http_client", None)
         try:
             tokens = await mint(
                 oidc_config=oidc_config,
@@ -3474,7 +3531,26 @@ async def _handle_mcp_oauth_list_connections_inner(request: Request) -> Response
         return JSONResponse({"error": "Authentication required"}, status_code=401)
 
     rows = await asyncio.to_thread(token_store.list_user_token_metadata, user_id)
-    return JSONResponse({"connections": list(rows)})
+    # Hide oauth_obo mint-cache rows: they are cache artifacts of sign-in
+    # passthrough, not per-server consents. Listing them offered a
+    # "Disconnect" that silently undid itself — the row deletes, then
+    # session-start priming re-mints from the surviving captured credential —
+    # so the connections list shows only rows the user can actually revoke.
+    # Fail open on a server-list read error: worst case an obo row renders
+    # and the revoke endpoint below still refuses it honestly.
+    storage = _get_storage(request.app.state)
+    obo_names: set[str] = set()
+    if storage is not None:
+        try:
+            servers = await asyncio.to_thread(storage.list_mcp_servers)
+            obo_names = {
+                str(s.get("name") or "")
+                for s in servers
+                if str(s.get("auth_type") or "") == "oauth_obo"
+            }
+        except Exception:
+            obo_names = set()
+    return JSONResponse({"connections": [r for r in rows if r["server_name"] not in obo_names]})
 
 
 async def handle_mcp_oauth_revoke_connection(request: Request) -> Response:
@@ -3634,6 +3710,27 @@ async def _handle_mcp_oauth_revoke_connection_inner(request: Request) -> Respons
     server_id_for_audit = ""
     if server_row is not None:
         server_id_for_audit = str(server_row.get("server_id") or "")
+
+    if server_row is not None and str(server_row.get("auth_type") or "") == "oauth_obo":
+        # Sign-in passthrough rows are mint-cache, not per-server consent:
+        # deleting the row here would 204, audit token_revoked, and then
+        # session-start priming would silently re-mint from the surviving
+        # captured credential — a "disconnect" that undoes itself. Refuse
+        # honestly instead (the admin bulk path exposes the same truth as
+        # effect=cache_flush_remints; removing the sign-in credential is the
+        # real revocation lever). The listing endpoint hides these rows, so
+        # this is a backstop for direct API calls.
+        return JSONResponse(
+            {
+                "error": (
+                    "This server uses your Turnstone sign-in, not a per-server "
+                    "connection — there is nothing to disconnect here. Access "
+                    "ends when your sign-in credential is removed or an "
+                    "administrator disables the server."
+                )
+            },
+            status_code=409,
+        )
 
     # Local delete — authoritative. Even if the upstream revoke fails or
     # is unsupported, the consent is invalidated for this deployment.

@@ -8,8 +8,9 @@ import dataclasses
 import hashlib
 import types
 import urllib.parse
+from types import SimpleNamespace
 from typing import Any
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx
 import jwt as pyjwt
@@ -2456,6 +2457,129 @@ class TestDiscoverOIDC:
 
             result = asyncio.run(_run())
             assert result.enabled is False
+
+
+# ---------------------------------------------------------------------------
+# Runtime re-discovery (boot-time transient failure self-heal)
+# ---------------------------------------------------------------------------
+
+
+class TestRuntimeRediscovery:
+    """A node that boots during a transient IdP outage keeps enabled=False
+    forever without a runtime retry — OIDC login stays dark and every
+    oauth_obo mint on the node fails "transient" until an operator restarts
+    it. ``maybe_rediscover_oidc`` heals that, cooldown-gated; config-caused
+    discovery failures (bad issuer, SSRF rejection) are NOT retried."""
+
+    _PUBLIC_ADDR = [(2, 1, 6, "", ("93.184.216.34", 0))]
+
+    def test_fetch_failure_marks_config_retryable(self):
+        """The transient branch (IdP unreachable) sets discovery_retryable."""
+        config = _make_config(
+            authorization_endpoint="", token_endpoint="", userinfo_endpoint="", jwks_uri=""
+        )
+
+        async def _raise_connect(url):
+            raise httpx.ConnectError("boom")
+
+        async def _run():
+            client = _mock_async_client(_raise_connect)
+            with (
+                patch("socket.getaddrinfo", return_value=self._PUBLIC_ADDR),
+                patch("httpx.AsyncClient", return_value=client),
+            ):
+                return await discover_oidc(config)
+
+        result = asyncio.run(_run())
+        assert result.enabled is False
+        assert result.discovery_retryable is True
+
+    def test_config_rejection_is_not_retryable(self):
+        """An SSRF-rejected issuer is a config problem — retrying is pointless."""
+        config = _make_config(
+            issuer="https://auth.internal.example",
+            authorization_endpoint="",
+            token_endpoint="",
+            userinfo_endpoint="",
+            jwks_uri="",
+        )
+
+        async def _run():
+            with patch("socket.getaddrinfo", return_value=[(2, 1, 6, "", ("10.0.0.5", 0))]):
+                return await discover_oidc(config)
+
+        result = asyncio.run(_run())
+        assert result.enabled is False
+        assert result.discovery_retryable is False
+
+    def _disabled_retryable_state(self) -> SimpleNamespace:
+        cfg = _make_config(
+            enabled=False,
+            authorization_endpoint="",
+            token_endpoint="",
+            userinfo_endpoint="",
+            jwks_uri="",
+        )
+        cfg = dataclasses.replace(cfg, discovery_retryable=True)
+        return SimpleNamespace(oidc_config=cfg)
+
+    def test_rediscover_swaps_enabled_config_on_success(self):
+        from turnstone.core.oidc import maybe_rediscover_oidc
+
+        state = self._disabled_retryable_state()
+        recovered = dataclasses.replace(
+            state.oidc_config,
+            enabled=True,
+            token_endpoint="https://idp.example.com/token",
+            authorization_endpoint="https://idp.example.com/authorize",
+            jwks_uri="https://idp.example.com/jwks",
+        )
+        with patch(
+            "turnstone.core.oidc.discover_oidc", new=AsyncMock(return_value=recovered)
+        ) as disc:
+            asyncio.run(maybe_rediscover_oidc(state))
+        disc.assert_awaited_once()
+        assert state.oidc_config.enabled is True
+        assert state.oidc_config.token_endpoint == "https://idp.example.com/token"
+        # The healed config no longer advertises a retryable failure.
+        assert state.oidc_config.discovery_retryable is False
+
+    def test_rediscover_cooldown_gates_repeat_probes(self):
+        from turnstone.core.oidc import maybe_rediscover_oidc
+
+        state = self._disabled_retryable_state()
+        still_down = state.oidc_config  # discover keeps returning disabled
+        with patch(
+            "turnstone.core.oidc.discover_oidc", new=AsyncMock(return_value=still_down)
+        ) as disc:
+            asyncio.run(maybe_rediscover_oidc(state))
+            asyncio.run(maybe_rediscover_oidc(state))
+            asyncio.run(maybe_rediscover_oidc(state))
+        # One IdP probe per cooldown window, however many callers ask.
+        disc.assert_awaited_once()
+        assert state.oidc_config.enabled is False
+
+    def test_rediscover_noop_when_not_retryable_or_enabled(self):
+        from turnstone.core.oidc import maybe_rediscover_oidc
+
+        # Operator-disabled (retryable False): never probes.
+        state = SimpleNamespace(
+            oidc_config=_make_config(
+                enabled=False,
+                authorization_endpoint="",
+                token_endpoint="",
+                userinfo_endpoint="",
+                jwks_uri="",
+            )
+        )
+        with patch("turnstone.core.oidc.discover_oidc", new=AsyncMock()) as disc:
+            asyncio.run(maybe_rediscover_oidc(state))
+        disc.assert_not_awaited()
+        # Already enabled: never probes.
+        state2 = SimpleNamespace(oidc_config=_make_config(enabled=True))
+        with patch("turnstone.core.oidc.discover_oidc", new=AsyncMock()) as disc2:
+            asyncio.run(maybe_rediscover_oidc(state2))
+        disc2.assert_not_awaited()
 
 
 # ---------------------------------------------------------------------------

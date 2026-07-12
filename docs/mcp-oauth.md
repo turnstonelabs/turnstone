@@ -19,7 +19,7 @@ The MCP server admin form exposes three authorization modes ("Multitenant Author
 | `oauth_user` *(recommended for user-data servers)* | Each user authorizes separately via OAuth 2.1 + PKCE; Turnstone stores per-user tokens encrypted at rest. | MCP servers that expose user-specific data or that want per-user audit attribution. |
 | `oauth_obo` *(sign-in passthrough)* | Each user's Turnstone **org sign-in** (OIDC) mints a per-server access token on demand — no separate per-server consent. One captured credential per user covers every `oauth_obo` server. | Enterprise deployments where the identity provider governs access (Entra, Keycloak) and you want zero per-user connect clicks. See the dedicated section below. |
 
-Switching `auth_type` away from `oauth_user` / `oauth_obo` orphans (oauth_user) or purges (on transition, per below) existing per-user rows. Use the admin **bulk-revoke** / **flush cache** affordance on the server row to clear them, or let them expire naturally.
+Switching `auth_type` away from `oauth_user` / `oauth_obo` **deletes** that server's per-user rows (consents / minted cache) — see the transition table below. Switching back later starts clean: users re-consent (or re-mint) on next use. The admin **bulk-revoke** / **flush cache** affordance clears rows without an auth-type change.
 
 ---
 
@@ -126,7 +126,7 @@ The captured credential is a single per-user secret that can mint for every `oau
 
 4. **Step-up scope**: when a tool call hits `403` with `WWW-Authenticate: error="insufficient_scope"`, Turnstone emits `mcp_insufficient_scope` with the parsed scope set; the dashboard offers a "Connect with additional scopes" affordance that opens `/v1/api/mcp/oauth/start?server=<name>&scopes=<extra>` so the union of original + new scopes flows into the AS authorize request.
 
-5. **User revoke** (settings modal): `DELETE /v1/api/mcp/oauth/connections/{server_name}` runs the authoritative local delete + best-effort RFC 7009 upstream revoke (fire-and-forget, capped at 256 concurrent in-flight tasks).
+5. **User revoke** (settings modal): `DELETE /v1/api/mcp/oauth/connections/{server_name}` runs the authoritative local delete + best-effort RFC 7009 upstream revoke (fire-and-forget, capped at 256 concurrent in-flight tasks). `oauth_obo` servers are excluded: their rows are mint cache, not consents — deleting one only forces a re-mint — so the connections list hides them and the endpoint refuses them with `409` (revocation for sign-in passthrough happens at the identity layer: unlink the identity or revoke at the IdP).
 
 6. **Admin bulk-revoke** (Phase 9): `POST /v1/api/admin/mcp-servers/{name}/bulk-revoke` drops every user's token for the server. Upstream RFC 7009 revoke is intentionally **not** attempted in bulk (avoids N upstream HTTP calls per admin click); tokens at the AS expire naturally. Use the per-user revoke endpoint if you need guaranteed upstream invalidation.
 
@@ -148,13 +148,13 @@ Additional indicators (circuit-breaker state, encryption-key mismatch) are expos
 | From | To | What happens |
 |---|---|---|
 | `none` / `static` → `oauth_user` | — | New code path activates for this server. Existing static headers (if any) are no longer sent. Users must authorize on first use. |
-| `oauth_user` → `none` / `static` | — | Existing `mcp_user_tokens` rows are **orphaned** — inert without a matching `auth_type`. Use admin bulk-revoke to drop them, or let them expire. Switching back to `oauth_user` later re-activates the orphaned rows if they haven't been deleted. |
+| `oauth_user` → `none` / `static` | — | Existing `mcp_user_tokens` rows are **deleted**: the tokens are bound to the auth model + URL active at consent time, and rows left behind could silently rebind if a row with the old name/URL reappears. Switching back to `oauth_user` later starts clean — users re-consent on next use. This is **not reversible**; the AS-side grants are untouched (revoke upstream via the AS if needed). |
 | OAuth `client_id` or `client_secret` rotated | — | Existing tokens may stop refreshing if the AS treats them as bound to the previous client. Bulk-revoke after rotation. |
-| `oauth_user` ↔ `oauth_obo` | — | The per-user rows are **purged** on the flip (they mean different things: per-server AS refresh tokens vs. minted cache). A flip into `oauth_obo` also clears the stale `oauth_scopes` (they were the AS-consent scopes; the mint leg would otherwise send them). |
-| `oauth_obo` → `none` / `static` | — | Minted cache rows are purged. |
-| `oauth_obo` **audience** or **URL** changed | — | Minted cache rows for the old audience/URL are **purged** (tokens are audience/URL-bound), forcing a fresh mint. |
+| `oauth_user` ↔ `oauth_obo` | — | The per-user rows are **deleted** on the flip (they mean different things: per-server AS refresh tokens vs. minted cache). A flip into `oauth_obo` clears carried-over `oauth_scopes` under the `entra` profile (they cannot apply there); under `rfc8693` a scopes value submitted with the flip is kept as the token-exchange scope and the column is cleared only when the request omits it. A flip into `oauth_user` clears the obo-era `oauth_audience` (an IdP-side app identifier, not the resource indicator `oauth_user` needs) unless the request sets a new one. |
+| `oauth_obo` → `none` / `static` | — | Minted cache rows are deleted. |
+| `oauth_obo` **audience**, **URL**, or **`oauth_scopes`** changed | — | Minted cache rows are **deleted** (tokens are bound to the audience/URL/scopes at mint time), forcing a fresh mint — so an audience or scope narrowing takes effect immediately, not at token expiry. |
 
-The orphan-by-default behavior (for `oauth_user` → `none`/`static`) is chosen so switching back is non-destructive. Transitions **into or out of** `oauth_obo`, and audience/URL edits, purge instead — the bindings are semantic and a stale row must never be served.
+Every transition that changes what a stored row *means* deletes the rows outright — a stale consent or minted token must never be served under new semantics. There is no orphan-and-reactivate path.
 
 ---
 
