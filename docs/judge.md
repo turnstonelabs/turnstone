@@ -249,8 +249,14 @@ are withheld from the live surfaces (a reused call_id must never ride a stale
 `approve` into Smart Approvals) but still persist with
 `user_decision = "superseded"` so the audit trail records the judge's answer.
 
-Sub-agents (plan agent, task agent) are exempt from intent validation -- they
-always get full tool visibility without judge evaluation.
+Sub-agent (task agent) tool calls are judge-gated too. Each runs the same
+intent pipeline as its own `agent_gate` generation, grounded in that sub-agent's
+own trajectory -- its task prompt is the delegation contract the operator
+approved, so "does this call serve the task" is the right local question.
+Agent-gate generations never occupy the main loop's supersede slot (parallel
+siblings would otherwise make each other's verdicts look stale); per-cycle
+generation checks enforce staleness instead, and `judge.cancel_on_approval`
+fires per gate exactly like the main loop.
 
 ---
 

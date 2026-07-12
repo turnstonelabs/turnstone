@@ -8015,7 +8015,7 @@ class ChatSession:
                 session_provider=self._provider,
                 session_client=self.client,
                 session_model=self.model,
-                context_window=caps.context_window,
+                session_capabilities=caps,
                 rule_registry=self._rule_registry,
                 model_registry=self._registry,
             )
@@ -8047,10 +8047,11 @@ class ChatSession:
                 session_client=self.client,
                 session_model=self.model,
                 model_registry=self._registry,
-                # Session's real (config/registry-aware) window, so the oversize
-                # guard is accurate when output_guard_model is unset — same
+                # Session's resolved (config/registry-aware) capabilities, so the
+                # oversize guard's window is accurate and operator-declared caps
+                # reach the judge wire when output_guard_model is unset — same
                 # source IntentJudge gets via _ensure_judge.
-                context_window=self._get_capabilities().context_window,
+                session_capabilities=self._get_capabilities(),
             )
         except Exception:
             log.warning("output_guard_judge.init_failed", exc_info=True)
