@@ -55,7 +55,9 @@ from turnstone.core.mcp_http_parsers import (
 from turnstone.core.mcp_oauth import (
     TokenLookupResult,
     emit_oauth_failure_audit,
+    get_obo_access_token_classified,
     get_user_access_token_classified,
+    is_user_scoped_auth,
 )
 
 if TYPE_CHECKING:
@@ -766,6 +768,12 @@ class MCPClientManager:
         # backend resolution) can answer "is this server pool-backed?"
         # without a SQL roundtrip.
         self._oauth_user_server_names: set[str] = set()
+        # Sibling registry for auth_type='oauth_obo' servers (issue #551):
+        # also pool-backed (per-user sessions), but with NO per-server
+        # consent flow — tokens mint from the user's single captured
+        # credential, so the priming / keep-alive-sweep / consent sites that
+        # iterate ``_oauth_user_server_names`` deliberately exclude these.
+        self._obo_server_names: set[str] = set()
 
         # Idle-eviction task handle. Scheduled lazily on the mcp-loop the
         # first time a pool entry is created (start() runs before pool
@@ -4470,12 +4478,13 @@ class MCPClientManager:
         :meth:`_oauth_user_server_status`). Both are ignored for static servers,
         whose session is process-global.
         """
-        # auth_type='oauth_user' servers hold NO process-global session — they
-        # are warmed per-user into the pool — so the static-session check below
-        # would always report them "connecting". Derive their status from the
-        # REQUESTING user's warm pool entry instead, so the console pill reflects
-        # that user's real reachability once their pool is primed.
-        if name in self._oauth_user_server_names:
+        # Pool-backed servers (oauth_user / oauth_obo) hold NO process-global
+        # session — they are warmed per-user into the pool — so the
+        # static-session check below would always report them "connecting".
+        # Derive their status from the REQUESTING user's warm pool entry
+        # instead, so the console pill reflects that user's real reachability
+        # once their pool is primed.
+        if self._is_pool_server(name):
             return self._oauth_user_server_status(name, user_id, aggregate=aggregate)
         state = self._static_servers.get(name)
         connected = state is not None and state.session is not None
@@ -4560,7 +4569,7 @@ class MCPClientManager:
             "url": "",
             "circuit_open": cb_open,
             "consecutive_failures": self._consecutive_failures.get(name, 0),
-            "auth_type": "oauth_user",
+            "auth_type": self.server_auth_type(name) or "oauth_user",
             "user_pools": len(warm),
             "last_refresh_at": last_refresh[0] if last_refresh is not None else None,
             "last_refresh_outcome": last_refresh[1] if last_refresh is not None else None,
@@ -4580,7 +4589,7 @@ class MCPClientManager:
         result: dict[str, dict[str, Any]] = {}
         for name in list(self._server_configs):
             result[name] = self.get_server_status(name, user_id, aggregate=aggregate)
-        for name in list(self._oauth_user_server_names):
+        for name in list(self._oauth_user_server_names | self._obo_server_names):
             if name not in result:
                 result[name] = self.get_server_status(name, user_id, aggregate=aggregate)
         return result
@@ -4611,6 +4620,9 @@ class MCPClientManager:
         # roundtrip.
         self._oauth_user_server_names = {
             row["name"] for row in rows if row.get("auth_type") == "oauth_user"
+        }
+        self._obo_server_names = {
+            row["name"] for row in rows if row.get("auth_type") == "oauth_obo"
         }
 
         desired = _db_servers_to_config(rows)
@@ -4811,18 +4823,27 @@ class MCPClientManager:
         return user_map is not None and name in user_map
 
     def server_auth_type(self, server_name: str) -> str | None:
-        """Return ``'oauth_user'`` for pool-backed servers, else ``None``.
+        """Return the pool-backed auth type (``'oauth_user'`` / ``'oauth_obo'``), else ``None``.
 
         In-memory accessor for the per-turn callers that need to
         distinguish pool-backed servers from static-path ones without a
         SQL roundtrip. ``None`` means "either static-path or unknown" —
         the boot-time / per-node web_search resolver only uses this as
-        a defence-in-depth gate, so a missing-cache miss is safe (the
-        outer ``is_mcp_tool`` check already proves the server is in
-        ``_tool_map``, which by construction excludes oauth_user).
+        a defence-in-depth gate (via :func:`is_user_scoped_auth`), so a
+        missing-cache miss is safe (the outer ``is_mcp_tool`` check
+        already proves the server is in ``_tool_map``, which by
+        construction excludes pool-backed servers).
         Populated by ``reconcile_sync`` and ``create_mcp_client``.
         """
-        return "oauth_user" if server_name in self._oauth_user_server_names else None
+        if server_name in self._oauth_user_server_names:
+            return "oauth_user"
+        if server_name in self._obo_server_names:
+            return "oauth_obo"
+        return None
+
+    def _is_pool_server(self, server_name: str) -> bool:
+        """True when *server_name* uses per-user pool sessions (no static session)."""
+        return server_name in self._oauth_user_server_names or server_name in self._obo_server_names
 
     @property
     def server_count(self) -> int:
@@ -4962,7 +4983,7 @@ class MCPClientManager:
             # Per-user pools are managed separately; ``__`` names can never
             # connect (``_connect_one``'s reserved-delimiter guard), so retrying
             # them forever would only spam ``log.error`` every interval.
-            if name not in self._oauth_user_server_names and "__" not in name
+            if not self._is_pool_server(name) and "__" not in name
         ]
         if not names:
             return self._static_health_check_s
@@ -5422,9 +5443,39 @@ class MCPClientManager:
         if not server_name or not original:
             return None
         row = self._lookup_server_row(server_name)
-        if row is None or row.get("auth_type") != "oauth_user":
+        if row is None or not is_user_scoped_auth(row.get("auth_type")):
             return None
         return server_name, original, row
+
+    async def _pool_token_lookup(
+        self,
+        server_row: dict[str, Any],
+        user_id: str,
+        server_name: str,
+        *,
+        force_refresh: bool,
+    ) -> TokenLookupResult:
+        """Classified token lookup routed by the server's auth model.
+
+        ``oauth_obo`` servers mint from the user's single captured
+        credential (:func:`get_obo_access_token_classified`); everything
+        else keeps the per-(user, server) refresh-grant path. Both share
+        the ``TokenLookupResult`` vocabulary, so the dispatcher's error
+        mapping below is auth-model-agnostic.
+        """
+        if str(server_row.get("auth_type") or "") == "oauth_obo":
+            return await get_obo_access_token_classified(
+                app_state=self._app_state,
+                user_id=user_id,
+                server_name=server_name,
+                force_refresh=force_refresh,
+            )
+        return await get_user_access_token_classified(
+            app_state=self._app_state,
+            user_id=user_id,
+            server_name=server_name,
+            force_refresh=force_refresh,
+        )
 
     def _lookup_server_row(self, server_name: str) -> dict[str, Any] | None:
         """Return the ``mcp_servers`` row for *server_name*, or None."""
@@ -5470,7 +5521,7 @@ class MCPClientManager:
         else:
             server_name = mapping[0]
         row = self._lookup_server_row(server_name)
-        if row is None or row.get("auth_type") != "oauth_user":
+        if row is None or not is_user_scoped_auth(row.get("auth_type")):
             return None
         return server_name, uri, row
 
@@ -5496,7 +5547,7 @@ class MCPClientManager:
         if not server_name or not original:
             return None
         row = self._lookup_server_row(server_name)
-        if row is None or row.get("auth_type") != "oauth_user":
+        if row is None or not is_user_scoped_auth(row.get("auth_type")):
             return None
         return server_name, original, row
 
@@ -5905,17 +5956,14 @@ class MCPClientManager:
         # this retry; the local cached token is the one the AS just
         # rejected, so reading it back without ``force_refresh=True``
         # would re-attempt with the same (rejected) bearer.
-        lookup: TokenLookupResult = await get_user_access_token_classified(
-            app_state=self._app_state,
-            user_id=user_id,
-            server_name=server_name,
-            force_refresh=retry_count > 0,
+        lookup: TokenLookupResult = await self._pool_token_lookup(
+            server_row, user_id, server_name, force_refresh=retry_count > 0
         )
         if lookup.kind == "missing":
             return _structured_error(
                 code="mcp_consent_required",
                 server=server_name,
-                detail="No token for user. Consent flow required.",
+                detail=_consent_missing_detail(server_row),
                 consent_url=_build_consent_url(server_row),
             )
         if lookup.kind == "decrypt_failure":
@@ -6090,17 +6138,14 @@ class MCPClientManager:
         if self._app_state is None:
             raise RuntimeError("Pool dispatch requires set_app_state() to have been called")
 
-        lookup: TokenLookupResult = await get_user_access_token_classified(
-            app_state=self._app_state,
-            user_id=user_id,
-            server_name=server_name,
-            force_refresh=retry_count > 0,
+        lookup: TokenLookupResult = await self._pool_token_lookup(
+            server_row, user_id, server_name, force_refresh=retry_count > 0
         )
         if lookup.kind == "missing":
             return _structured_error(
                 code="mcp_consent_required",
                 server=server_name,
-                detail="No token for user. Consent flow required.",
+                detail=_consent_missing_detail(server_row),
                 consent_url=_build_consent_url(server_row),
             )
         if lookup.kind == "decrypt_failure":
@@ -6249,17 +6294,14 @@ class MCPClientManager:
         if self._app_state is None:
             raise RuntimeError("Pool dispatch requires set_app_state() to have been called")
 
-        lookup: TokenLookupResult = await get_user_access_token_classified(
-            app_state=self._app_state,
-            user_id=user_id,
-            server_name=server_name,
-            force_refresh=retry_count > 0,
+        lookup: TokenLookupResult = await self._pool_token_lookup(
+            server_row, user_id, server_name, force_refresh=retry_count > 0
         )
         if lookup.kind == "missing":
             return _structured_error(
                 code="mcp_consent_required",
                 server=server_name,
-                detail="No token for user. Consent flow required.",
+                detail=_consent_missing_detail(server_row),
                 consent_url=_build_consent_url(server_row),
             )
         if lookup.kind == "decrypt_failure":
@@ -7126,6 +7168,19 @@ def _build_consent_url(
     return f"/v1/api/mcp/oauth/start?{qs}"
 
 
+def _consent_missing_detail(server_row: dict[str, Any]) -> str:
+    """User-facing detail for a ``missing`` token lookup, per auth model.
+
+    ``oauth_obo`` has no per-server consent flow — the missing thing is the
+    user's captured sign-in credential, so the affordance is a re-login
+    (``_build_consent_url`` already returns None for these servers, so no
+    per-server Connect button is advertised).
+    """
+    if server_row.get("auth_type") == "oauth_obo":
+        return "No sign-in credential for this account. Sign in to Turnstone again to reconnect."
+    return "No token for user. Consent flow required."
+
+
 def _pool_cfg_from_row(row: dict[str, Any]) -> dict[str, Any]:
     """Build a streamable-http MCP-client cfg from an ``mcp_servers`` row.
 
@@ -7164,15 +7219,15 @@ def _pool_cfg_from_row(row: dict[str, Any]) -> dict[str, Any]:
 def _db_servers_to_config(rows: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
     """Convert mcp_servers DB rows to the config dict format.
 
-    Skips ``auth_type='oauth_user'`` rows: they need per-user bearer
-    tokens fetched at dispatch time via the OAuth flow, so auto-connecting
-    them at startup with empty headers fails handshake and trips the
-    circuit breaker. The upcoming per-user pool integration brings them
-    online lazily once a user has consented.
+    Skips pool-backed rows (``auth_type='oauth_user'`` / ``'oauth_obo'``):
+    they need per-user bearer tokens fetched at dispatch time, so
+    auto-connecting them at startup with empty headers fails handshake and
+    trips the circuit breaker. The per-user pool brings them online lazily —
+    on consent for oauth_user, on first dispatch for oauth_obo.
     """
     result: dict[str, dict[str, Any]] = {}
     for row in rows:
-        if row.get("auth_type") == "oauth_user":
+        if is_user_scoped_auth(row.get("auth_type")):
             continue
         name = row["name"]
         cfg: dict[str, Any] = {"type": row["transport"]}
@@ -7264,14 +7319,16 @@ def create_mcp_client(
     # Check DB first to know which servers are DB-managed
     db_names: set[str] = set()
     oauth_user_names: set[str] = set()
+    obo_names: set[str] = set()
     if storage is not None:
         try:
             rows = storage.list_mcp_servers(enabled_only=True)
             if rows:
                 db_names = {r["name"] for r in rows}
-                # Cache oauth_user names so per-turn callers (web_search
+                # Cache pool-backed names so per-turn callers (web_search
                 # backend resolution) can answer auth_type without SQL.
                 oauth_user_names = {r["name"] for r in rows if r.get("auth_type") == "oauth_user"}
+                obo_names = {r["name"] for r in rows if r.get("auth_type") == "oauth_obo"}
         except Exception:
             log.warning("Failed to load DB-managed MCP servers", exc_info=True)
 
@@ -7283,5 +7340,6 @@ def create_mcp_client(
     # Mark DB-sourced servers so reconcile_sync won't remove config-file servers
     mgr._db_managed = {name for name in servers if name in db_names}
     mgr._oauth_user_server_names = oauth_user_names
+    mgr._obo_server_names = obo_names
     mgr.start()
     return mgr

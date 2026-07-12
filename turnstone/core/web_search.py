@@ -21,6 +21,7 @@ from typing import TYPE_CHECKING, Any, Protocol
 import httpx
 
 from turnstone.core.log import get_logger
+from turnstone.core.mcp_oauth import is_user_scoped_auth
 
 if TYPE_CHECKING:
     from turnstone.core.mcp_client import MCPClientManager
@@ -237,14 +238,15 @@ def resolve_web_search_client(
             # the bearer can't be (RFC §3, invariant 8 corollary).
             if mcp_client.is_mcp_tool(prefixed):
                 # Defence-in-depth: even if a future change widens
-                # ``_tool_map`` to include oauth_user names by accident,
+                # ``_tool_map`` to include pool-backed names by accident,
                 # refuse the backend explicitly. ``server_auth_type``
                 # is an in-memory accessor — this resolver is invoked
                 # per LLM turn, so a SQL hop here would amplify token
-                # cost on every chat round.
-                if mcp_client.server_auth_type(server) == "oauth_user":
+                # cost on every chat round. oauth_obo is equally
+                # unusable here: minting needs a signed-in user.
+                if is_user_scoped_auth(mcp_client.server_auth_type(server)):
                     log.warning(
-                        "web_search_backend %r points at oauth_user MCP server; "
+                        "web_search_backend %r points at a per-user-auth MCP server; "
                         "per-node web search cannot use per-user tokens — disabling",
                         backend,
                     )

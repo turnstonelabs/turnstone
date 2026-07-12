@@ -573,13 +573,19 @@ def initialize_mcp_crypto_state(app_state: object, *, node_id: str = "") -> None
         raise SystemExit(1) from exc
 
     storage = get_storage()
+    # Both pool-backed types persist encrypted per-user rows (oauth_user:
+    # tokens + refresh; oauth_obo: minted-token cache), so both force the
+    # key requirement.  Literal tuple rather than mcp_oauth's
+    # USER_SCOPED_AUTH_TYPES: importing mcp_oauth here would be a cycle.
     oauth_user_count = sum(
-        1 for row in storage.list_mcp_servers() if row.get("auth_type") == "oauth_user"
+        1
+        for row in storage.list_mcp_servers()
+        if row.get("auth_type") in ("oauth_user", "oauth_obo")
     )
 
     if oauth_user_count > 0 and cipher_cfg is None:
         log.error(
-            "mcp.oauth: %d server(s) configured with auth_type='oauth_user' but no "
+            "mcp.oauth: %d server(s) configured with auth_type='oauth_user'/'oauth_obo' but no "
             "[security] mcp_token_encryption_keys (rotation list) or "
             "mcp_token_encryption_key (single) in config.toml. Generate a key with: "
             "python -c 'from cryptography.fernet import Fernet; "

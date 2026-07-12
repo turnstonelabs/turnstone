@@ -9682,7 +9682,7 @@ async def admin_registry_install(request: Request) -> JSONResponse:
 
 _MCP_NAME_RE = re.compile(r"^[a-zA-Z0-9._-]+$")
 _MCP_MAX_SERVERS = 200  # fallback; prefer cluster.mcp_max_servers from storage
-_MCP_AUTH_TYPES = frozenset({"none", "static", "oauth_user"})
+_MCP_AUTH_TYPES = frozenset({"none", "static", "oauth_user", "oauth_obo"})
 
 
 def _clean_oauth_text(value: Any, *, max_length: int = 512) -> str | None:
@@ -9714,20 +9714,22 @@ def _parse_auth_type(body: dict[str, Any]) -> tuple[str | None, JSONResponse | N
     auth_type = str(body["auth_type"]).strip()
     if auth_type not in _MCP_AUTH_TYPES:
         return None, JSONResponse(
-            {"error": "auth_type must be 'none', 'static', or 'oauth_user'"},
+            {"error": "auth_type must be 'none', 'static', 'oauth_user', or 'oauth_obo'"},
             status_code=400,
         )
     return auth_type, None
 
 
 def _enforce_oauth_user_https(auth_type: str, url: str | None) -> JSONResponse | None:
-    """Reject oauth_user MCP server URLs that aren't https (or loopback http).
+    """Reject per-user-auth MCP server URLs that aren't https (or loopback http).
 
-    Belt-and-braces with :func:`turnstone.core.mcp_client._validate_oauth_user_url`
+    Applies to both pool-backed types — ``oauth_user`` and ``oauth_obo`` —
+    since both transmit per-user bearers to the server URL. Belt-and-braces
+    with :func:`turnstone.core.mcp_client._validate_oauth_user_url`
     so a misconfigured row never persists. Returns the error response or
     ``None`` when the input is acceptable.
     """
-    if auth_type != "oauth_user":
+    if auth_type not in ("oauth_user", "oauth_obo"):
         return None
     if not url:
         return None  # presence checked elsewhere; this helper only checks scheme
