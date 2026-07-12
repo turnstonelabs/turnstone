@@ -111,3 +111,52 @@ class TestInitializeMcpCryptoState:
         ):
             initialize_mcp_crypto_state(state, node_id="n1")
         assert exc_info.value.code == 1
+
+    def test_capture_key_guard_fires_even_when_oidc_discovery_failed(
+        self, backend, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """Review finding: the capture-credential key guard must NOT depend on
+        oidc_config.enabled. A node that boots while the IdP is unreachable comes
+        up enabled=False (discovery_retryable=True); gating the guard on enabled
+        would silently skip the loud boot-time failure exactly then, and runtime
+        rediscovery later re-enables OIDC so the first login persists a refresh
+        token with no key. capture_user_credential=True + no key must SystemExit
+        regardless of the (transient) discovery state — no oauth_obo rows exist,
+        so only the capture guard can catch this."""
+        _patch_security(monkeypatch, {})  # no encryption key
+        # enabled=False models a boot-time discovery failure; capture opt-in on.
+        state = types.SimpleNamespace(
+            oidc_config=types.SimpleNamespace(
+                enabled=False,
+                issuer="https://idp.example.com",
+                capture_user_credential=True,
+                discovery_retryable=True,
+            )
+        )
+        with (
+            caplog.at_level("ERROR", logger="turnstone.core.mcp_crypto"),
+            pytest.raises(SystemExit) as exc_info,
+        ):
+            initialize_mcp_crypto_state(state, node_id="n1")
+        assert exc_info.value.code == 1
+        messages = " ".join(record.message for record in caplog.records)
+        assert "capture_user_credential" in messages
+
+    def test_capture_with_key_starts_even_when_oidc_disabled(
+        self, backend, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The converse: capture opt-in WITH a key installed boots cleanly even
+        while discovery is down — the cipher/store land so a later rediscovery's
+        first capture has somewhere encrypted to persist."""
+        _patch_security(monkeypatch, {"mcp_token_encryption_key": Fernet.generate_key().decode()})
+        state = types.SimpleNamespace(
+            oidc_config=types.SimpleNamespace(
+                enabled=False,
+                issuer="https://idp.example.com",
+                capture_user_credential=True,
+                discovery_retryable=True,
+            )
+        )
+        initialize_mcp_crypto_state(state, node_id="n1")
+        assert isinstance(state.mcp_token_cipher, MCPTokenCipher)
+        assert isinstance(state.mcp_token_store, MCPTokenStore)

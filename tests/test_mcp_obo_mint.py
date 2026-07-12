@@ -454,6 +454,37 @@ class TestRfc8693Leg:
         # server; the credential survives so the user's other servers are fine.
         assert result.kind == "refresh_failed"
 
+    def test_mint_without_expires_in_gets_bounded_expiry_not_cached_forever(
+        self, storage: SQLiteBackend
+    ) -> None:
+        """Review finding: a mint response omitting the (RFC 8693-optional)
+        expires_in must NOT cache expires_at=NULL — the freshness gate reads NULL
+        as never-expiring (correct for opaque oauth_user tokens, wrong for a
+        short-lived minted obo token), so it would be served indefinitely and
+        defeat audience/scope-narrowing that relies on TTL turnover. A missing
+        expiry falls back to a bounded default so the row re-mints soon."""
+        from datetime import datetime as _dt
+
+        from turnstone.core.mcp_oauth import _OBO_DEFAULT_TTL_SECONDS
+
+        _seed_obo_server(storage)
+        client = MagicMock(spec=httpx.AsyncClient)
+        # Entra-shaped single-POST mint, but the IdP omits expires_in.
+        client.post = AsyncMock(return_value=_mk_response(200, {"access_token": "at-no-exp"}))
+        state = _make_app_state(storage, http_client=client, oidc_config=_make_oidc_config())
+        _seed_credential(state)
+
+        result = _mint(state)
+
+        assert result.kind == "token"
+        row = storage.get_mcp_user_token(USER, SERVER)
+        assert row is not None
+        # Not NULL — a bounded expiry within the default TTL window was stamped.
+        assert row["expires_at"] is not None
+        parsed = _dt.strptime(row["expires_at"], "%Y-%m-%dT%H:%M:%S").replace(tzinfo=UTC)
+        remaining = (parsed - datetime.now(UTC)).total_seconds()
+        assert 0 < remaining <= _OBO_DEFAULT_TTL_SECONDS + 5
+
     def test_exchange_response_refresh_token_never_overwrites_credential(
         self, storage: SQLiteBackend
     ) -> None:

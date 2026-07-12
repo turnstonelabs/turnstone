@@ -4462,6 +4462,13 @@ function buildMcpErrorEmbed(err, rawJson, onConsent) {
   // pointing at a panel with nothing to connect). In that case the honest
   // remedy is the detail text (sign in again / ask your administrator), so we
   // show the card without a broken affordance.
+  //
+  // This never wrongly hides a needed button for oauth_user: the backend
+  // invariant is that _build_consent_url returns a /v1/api/mcp/oauth/start URL
+  // for EVERY oauth_user row and None only for non-oauth_user auth types, so an
+  // oauth_user actionable error always carries a valid consent_url and always
+  // renders its button. The removed click-time "open Settings" fallback guarded
+  // a producer path that that invariant makes unreachable.
   const consentUrl = err.consent_url;
   const hasConsentAffordance =
     typeof consentUrl === "string" &&

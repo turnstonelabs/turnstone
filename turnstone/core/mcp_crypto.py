@@ -619,12 +619,22 @@ def initialize_mcp_crypto_state(app_state: object, *, node_id: str = "") -> None
         raise SystemExit(1)
 
     # Same enforcement for single-credential capture (issue #551): the
-    # captured IdP refresh token must never be persisted unencrypted.
-    # Runs after OIDC init (see docstring), so app_state.oidc_config is set.
+    # captured IdP refresh token must never be persisted unencrypted. This is
+    # gated ONLY on the operator's ``capture_user_credential`` opt-in — NOT on
+    # ``oidc_config.enabled``. Enabled reflects whether OIDC *discovery*
+    # succeeded, which is transient: a node that boots while the IdP is briefly
+    # unreachable comes up enabled=False (discovery_retryable=True), and
+    # runtime rediscovery re-enables OIDC later — at which point the very first
+    # login's capture step would persist a refresh token. Gating the key
+    # requirement on ``enabled`` would silently skip the loud boot-time failure
+    # exactly when the IdP is down at boot, then quietly no-op capture forever
+    # once OIDC heals. The opt-in flag is a static config value (preserved
+    # across the discovery-failure ``dataclasses.replace``), so keying on it
+    # makes the requirement independent of discovery state. Runs after OIDC
+    # init (see docstring), so app_state.oidc_config is set.
     oidc_config = getattr(app_state, "oidc_config", None)
     if (
         oidc_config is not None
-        and getattr(oidc_config, "enabled", False)
         and getattr(oidc_config, "capture_user_credential", False)
         and cipher_cfg is None
     ):

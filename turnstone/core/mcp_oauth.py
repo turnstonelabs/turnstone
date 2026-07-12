@@ -76,6 +76,14 @@ MCP_OAUTH_DISCOVERY_CACHE_TTL_SECONDS = 86400
 _DEFAULT_HTTP_TIMEOUT = 10.0
 _ACCESS_TOKEN_REFRESH_SKEW_SECONDS = 60
 _PENDING_CLEANUP_INTERVAL_S = 60.0
+# Fallback lifetime for a minted obo cache row when the IdP omits the
+# RFC 8693-optional ``expires_in``. Unlike oauth_user tokens (a missing expiry
+# means an opaque token cached until a 401), an obo minted access token is
+# always short-lived, so a NULL expiry must NOT read as "never expires" in the
+# freshness gate. Conservative so the row re-mints soon rather than being served
+# long past its real lifetime (which would also defeat audience/scope narrowing
+# that relies on TTL turnover).
+_OBO_DEFAULT_TTL_SECONDS = 300
 
 # Limits on PRM/AS body sizes — defensive against runaway responses.
 _MAX_DISCOVERY_BODY_BYTES = 256 * 1024
@@ -2512,13 +2520,19 @@ async def get_obo_access_token_classified(
             return TokenLookupResult(kind="refresh_failed_transient")
 
         # Credential rotation was already persisted by the mint leg (see
-        # _persist_rotation); the cache write is the only remaining step.
+        # _persist_rotation); the cache write is the only remaining step. The
+        # expiry is never NULL for an obo row (see _OBO_DEFAULT_TTL_SECONDS): a
+        # missing expires_in falls back to a conservative default so the
+        # freshness gate can never serve a short-lived minted token forever.
+        obo_expires_at = _expires_at_from_response(tokens) or (
+            datetime.now(UTC) + timedelta(seconds=_OBO_DEFAULT_TTL_SECONDS)
+        ).strftime("%Y-%m-%dT%H:%M:%S")
         await _persist_obo_cache_row(
             token_store,
             user_id,
             server_name,
             access_token=access_token,
-            expires_at=_expires_at_from_response(tokens),
+            expires_at=obo_expires_at,
             scopes=scopes,
             issuer=issuer,
             audience=audience,

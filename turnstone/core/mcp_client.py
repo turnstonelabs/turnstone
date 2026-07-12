@@ -7339,10 +7339,14 @@ def _pool_lookup_error(
         )
     # kind == "token"
     if not (lookup.token or ""):
+        # A classified lookup returns kind=="token" only with a real token, so
+        # this empty-token fallback is barely reachable — but keep it
+        # auth-model-aware like the sibling ``missing`` branch above, so an obo
+        # row never shows per-server-consent copy + a null consent_url.
         return _structured_error(
             code="mcp_consent_required",
             server=server_name,
-            detail="No token for user. Consent flow required.",
+            detail=_consent_missing_detail(server_row),
             consent_url=_build_consent_url(server_row),
         )
     return None
