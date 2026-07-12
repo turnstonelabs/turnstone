@@ -698,6 +698,114 @@ class TestUpdateMcpServer:
             ).scalar()
         assert count_after == 0, "URL change must purge per-user tokens"
 
+    def test_admin_create_oauth_obo_requires_audience(self, client):
+        """#551: an oauth_obo row without oauth_audience is rejected at the
+        write choke point (the mint engine hard-requires it)."""
+        r = client.post(
+            "/v1/api/admin/mcp-servers",
+            json={
+                "name": "obo-no-aud",
+                "transport": "streamable-http",
+                "url": "https://mcp.example.com/sse",
+                "auth_type": "oauth_obo",
+            },
+        )
+        assert r.status_code == 400, r.text
+        assert "oauth_audience" in r.json()["error"]
+
+    def test_admin_create_oauth_obo_without_token_store_returns_503(self, client_no_token_store):
+        """#551: creating an oauth_obo row with no encryption key is rejected —
+        accepting it would SystemExit the whole cluster at the next boot."""
+        r = client_no_token_store.post(
+            "/v1/api/admin/mcp-servers",
+            json={
+                "name": "obo-no-key",
+                "transport": "streamable-http",
+                "url": "https://mcp.example.com/sse",
+                "auth_type": "oauth_obo",
+                "oauth_audience": "api://mcp-a",
+            },
+        )
+        assert r.status_code == 503, r.text
+        assert "mcp_token_encryption_key" in r.json()["error"]
+
+    def test_admin_create_oauth_obo_happy_path(self, client):
+        """A well-formed oauth_obo row persists with its audience intact."""
+        r = client.post(
+            "/v1/api/admin/mcp-servers",
+            json={
+                "name": "obo-ok",
+                "transport": "streamable-http",
+                "url": "https://mcp.example.com/sse",
+                "auth_type": "oauth_obo",
+                "oauth_audience": "api://mcp-a",
+            },
+        )
+        assert r.status_code == 200, r.text
+        data = r.json()
+        assert data["auth_type"] == "oauth_obo"
+        assert data["oauth_audience"] == "api://mcp-a"
+
+    def test_update_flip_oauth_user_to_obo_keeps_audience_and_purges_tokens(self, client, storage):
+        """#551 (findings 10344 + 10326): flipping oauth_user→oauth_obo must NOT
+        null oauth_audience (the mint engine needs it), and MUST purge the old
+        per-user consent-token rows (they carry per-server-AS refresh tokens that
+        the mint cache invariant forbids)."""
+        import sqlalchemy as sa
+
+        from turnstone.core.storage._schema import mcp_user_tokens
+
+        r = client.post(
+            "/v1/api/admin/mcp-servers",
+            json={
+                "name": "flip-to-obo",
+                "transport": "streamable-http",
+                "url": "https://mcp.example.com/sse",
+                "auth_type": "oauth_user",
+                "oauth_client_id": "cli_x",
+                "oauth_audience": "api://mcp-a",
+            },
+        )
+        assert r.status_code == 200, r.text
+        sid = r.json()["server_id"]
+
+        with storage._engine.connect() as conn:
+            conn.execute(
+                sa.insert(mcp_user_tokens),
+                {
+                    "user_id": "u1",
+                    "server_name": "flip-to-obo",
+                    "access_token_ct": b"\x00ct-a",
+                    "refresh_token_ct": b"\x00ct-r",
+                    "expires_at": "2026-12-31T00:00:00",
+                    "scopes": "openid",
+                    "as_issuer": "https://auth.example.com",
+                    "audience": "api://mcp-a",
+                    "created": "2026-05-04T11:00:00",
+                    "last_refreshed": None,
+                },
+            )
+            conn.commit()
+
+        r2 = client.put(
+            f"/v1/api/admin/mcp-servers/{sid}",
+            json={"auth_type": "oauth_obo", "oauth_audience": "api://mcp-a"},
+        )
+        assert r2.status_code == 200, r2.text
+        data = r2.json()
+        assert data["auth_type"] == "oauth_obo"
+        assert data["oauth_audience"] == "api://mcp-a"  # NOT nulled
+        # The oauth_user-only client_id is cleared.
+        assert data["oauth_client_id"] in (None, "")
+        # Old consent-token rows purged.
+        with storage._engine.connect() as conn:
+            remaining = conn.execute(
+                sa.select(sa.func.count())
+                .select_from(mcp_user_tokens)
+                .where(mcp_user_tokens.c.server_name == "flip-to-obo")
+            ).scalar()
+        assert remaining == 0, "oauth_user→oauth_obo flip must purge stale per-user rows"
+
     def test_update_invalid_auth_type(self, client):
         created = _create_server(client, name="bad-auth-update")
         sid = created["server_id"]

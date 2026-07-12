@@ -9742,6 +9742,39 @@ def _enforce_oauth_user_https(auth_type: str, url: str | None) -> JSONResponse |
     return None
 
 
+def _enforce_oauth_obo_requirements(
+    request: Request, auth_type: str, *, audience: str | None
+) -> JSONResponse | None:
+    """Write-time validation for ``oauth_obo`` rows (issue #551).
+
+    Rejects at the write choke point what would otherwise fail per-dispatch at
+    runtime (or worse, at the next boot):
+
+    - **No token-encryption key** → 503. An oauth_obo row persists encrypted
+      per-user mint-cache rows AND makes ``initialize_mcp_crypto_state``
+      ``SystemExit(1)`` at the next restart, so accepting one keyless plants a
+      deferred whole-cluster boot failure.
+    - **No ``oauth_audience``** → 400. The mint engine hard-requires the
+      downstream audience; without it every tool call fails transient and logs
+      ``obo_misconfigured``. Reject here, exactly as bad URL schemes are.
+    """
+    if auth_type != "oauth_obo":
+        return None
+    if getattr(request.app.state, "mcp_token_store", None) is None:
+        return JSONResponse({"error": _OAUTH_TOKEN_STORE_503_MSG}, status_code=503)
+    if not (audience or "").strip():
+        return JSONResponse(
+            {
+                "error": (
+                    "auth_type=oauth_obo requires oauth_audience "
+                    "(the downstream resource the access token is minted for)"
+                )
+            },
+            status_code=400,
+        )
+    return None
+
+
 def _get_mcp_max_servers(request: Request) -> int:
     """Read cluster.mcp_max_servers via ConfigStore (validated + cached)."""
     config_store = getattr(request.app.state, "config_store", None)
@@ -10111,8 +10144,15 @@ async def admin_create_mcp_server(request: Request) -> JSONResponse:
     # Helper returns None when key is absent — fall back to the default.
     auth_type = auth_type_value if auth_type_value is not None else "static"
 
-    # sec-1: oauth_user must use https:// (loopback http allowed for dev).
+    # sec-1: oauth_user/oauth_obo must use https:// (loopback http allowed for dev).
     err_resp = _enforce_oauth_user_https(auth_type, str(body.get("url", "")).strip())
+    if err_resp is not None:
+        return err_resp
+
+    # #551: oauth_obo needs an encryption key + an audience at write time.
+    err_resp = _enforce_oauth_obo_requirements(
+        request, auth_type, audience=_clean_oauth_text(body.get("oauth_audience"), max_length=2048)
+    )
     if err_resp is not None:
         return err_resp
 
@@ -10315,33 +10355,17 @@ async def admin_update_mcp_server(request: Request) -> JSONResponse:
         if _oauth_url_key in body:
             updates[_oauth_url_key] = _clean_oauth_text(body[_oauth_url_key], max_length=2048)
 
-    # When auth_type is changed away from oauth_user, clear the OAuth
-    # columns so a stale client_id / audience can't leak back if the
-    # row is later flipped to a different oauth_user provider.
-    # ``oauth_client_secret_ct`` is owned by a dedicated write path
-    # (not the generic update); the matching clear-on-transition is
-    # applied below via ``token_store.set_oauth_client_secret(..., None)``
-    # (or a direct storage call when no encryption key is configured).
-    transitioning_away_from_oauth_user = (
-        updates.get("auth_type") in {"static", "none"} and existing.get("auth_type") == "oauth_user"
-    )
-    # Renaming an oauth_user row needs the same per-user-token purge as
-    # delete: the tokens are keyed on the OLD ``server_name`` and a row
-    # later created with that old name (with attacker-controlled URL)
-    # would otherwise silently rebind them.
-    name_changing = "name" in updates and existing.get("name", "") != updates["name"]
-    # URL change on an oauth_user row needs the same purge: bearer tokens
-    # are bound (via OAuth resource / audience) to the URL active at
-    # consent time, so sending them to a new URL is a token-binding
-    # violation. A compromised admin who flips the URL to an attacker
-    # endpoint would otherwise replay every user's bearer there silently.
-    # Re-consent forces fresh token issuance bound to the new resource.
-    url_changing = (
-        existing.get("auth_type") == "oauth_user"
-        and "url" in updates
-        and existing.get("url", "") != updates["url"]
-    )
-    if updates.get("auth_type") and updates["auth_type"] != "oauth_user":
+    from turnstone.core.mcp_oauth import is_user_scoped_auth
+
+    old_auth = existing.get("auth_type")
+    new_auth = updates.get("auth_type")
+    # Clear the OAuth columns the target auth_type does NOT use, so a stale
+    # client_id / audience can't leak back on a later flip. static/none use
+    # none; oauth_obo uses oauth_audience (+ oauth_scopes) but none of the
+    # oauth_user-only columns; oauth_user uses them all.
+    # ``oauth_client_secret_ct`` is owned by a dedicated write path (see below).
+    if new_auth and not is_user_scoped_auth(new_auth):
+        # → static/none: clear every OAuth column.
         updates.update(
             {
                 "oauth_client_id": None,
@@ -10352,6 +10376,46 @@ async def admin_update_mcp_server(request: Request) -> JSONResponse:
                 "oauth_as_issuer_cached": None,
             }
         )
+    elif new_auth == "oauth_obo":
+        # obo keeps audience/scopes (it needs them); clear oauth_user-only cols.
+        updates.update(
+            {
+                "oauth_client_id": None,
+                "oauth_registration_mode": None,
+                "oauth_authorization_server_url": None,
+                "oauth_as_issuer_cached": None,
+            }
+        )
+    # Renaming a pool-backed row needs the same per-user-token purge as
+    # delete: the tokens are keyed on the OLD ``server_name`` and a row
+    # later created with that old name (with attacker-controlled URL)
+    # would otherwise silently rebind them.
+    name_changing = "name" in updates and existing.get("name", "") != updates["name"]
+    # Any auth_type transition touching a pool-backed type (oauth_user or
+    # oauth_obo) purges the per-user rows: leaving to static/none orphans them;
+    # oauth_user↔oauth_obo mixes semantically different rows (per-server-AS
+    # refresh tokens vs minted cache) and would otherwise leave a live grant at
+    # the old AS unrevoked and refresh-bearing rows in the mint cache.
+    auth_type_purge = (
+        new_auth is not None
+        and new_auth != old_auth
+        and (is_user_scoped_auth(old_auth) or is_user_scoped_auth(new_auth))
+    )
+    # URL change on a pool-backed row needs the same purge: bearer tokens
+    # are bound (via OAuth resource / audience) to the URL active at
+    # mint/consent time, so sending them to a new URL is a token-binding
+    # violation. A compromised admin who flips the URL to an attacker
+    # endpoint would otherwise replay every user's bearer there silently.
+    url_changing = (
+        is_user_scoped_auth(old_auth)
+        and "url" in updates
+        and existing.get("url", "") != updates["url"]
+    )
+    # Leaving oauth_user (to static/none OR to oauth_obo, which doesn't use the
+    # per-server client secret) clears the encrypted secret column below.
+    leaving_oauth_user = (
+        old_auth == "oauth_user" and new_auth is not None and new_auth != "oauth_user"
+    )
 
     # bug-2 / sec-1: validate token-store availability and JSON shape BEFORE
     # ``storage.update_mcp_server`` so a missing key doesn't leave partial
@@ -10368,18 +10432,24 @@ async def admin_update_mcp_server(request: Request) -> JSONResponse:
     if err_resp is not None:
         return err_resp
 
+    # #551: an oauth_obo row (whether newly flipped or edited) needs an
+    # encryption key + an audience — validated against the post-update value.
+    audience_now = updates.get("oauth_audience", existing.get("oauth_audience"))
+    err_resp = _enforce_oauth_obo_requirements(request, auth_type_now, audience=audience_now)
+    if err_resp is not None:
+        return err_resp
+
     if updates:
         storage.update_mcp_server(server_id, **updates)
 
     audit_uid, ip = _audit_context(request)
 
-    # Purge per-user tokens + pending OAuth states keyed on the OLD
-    # name on rename, on ``oauth_user → static/none`` transition, or
-    # on URL change for an oauth_user row. All three cases would
-    # otherwise leave tokens orphaned-and-rebindable because the OAuth
-    # tables key on the mutable ``server_name`` and tokens are bound
-    # to the URL active at consent time.
-    if name_changing or transitioning_away_from_oauth_user or url_changing:
+    # Purge per-user tokens + pending OAuth states keyed on the OLD name on
+    # rename, on any pool-backed auth_type transition, or on URL change for a
+    # pool-backed row. All cases would otherwise leave tokens
+    # orphaned-and-rebindable (the OAuth tables key on the mutable
+    # ``server_name`` and tokens are bound to the URL active at mint/consent time).
+    if name_changing or auth_type_purge or url_changing:
         purge_target = existing.get("name", "")
         if purge_target:
             try:
@@ -10391,11 +10461,11 @@ async def admin_update_mcp_server(request: Request) -> JSONResponse:
                     exc_info=True,
                 )
 
-    # sec-2: when the row is leaving ``oauth_user``, also clear the encrypted
-    # client secret column.  Operators expect "disable OAuth" to revoke
-    # credentials; leaving stale ciphertext that resurfaces if the row is
-    # flipped back is surprising and a footgun.
-    if transitioning_away_from_oauth_user:
+    # sec-2: when the row is leaving ``oauth_user`` (to static/none or to
+    # oauth_obo), also clear the encrypted client secret column.  Operators
+    # expect "disable OAuth" to revoke credentials; leaving stale ciphertext
+    # that resurfaces if the row is flipped back is surprising and a footgun.
+    if leaving_oauth_user:
         token_store = getattr(request.app.state, "mcp_token_store", None)
         if token_store is not None:
             token_store.set_oauth_client_secret(server_id, None)
@@ -10699,12 +10769,18 @@ async def admin_mcp_bulk_revoke(request: Request) -> JSONResponse:
     if not name or "__" in name:
         return JSONResponse({"error": "invalid server name"}, status_code=400)
 
+    from turnstone.core.mcp_oauth import is_user_scoped_auth
+
     existing = storage.get_mcp_server_by_name(name)
     if existing is None:
         return JSONResponse({"error": "No such server"}, status_code=404)
-    if existing.get("auth_type") != "oauth_user":
+    # Both pool-backed types populate mcp_user_tokens (oauth_user: consent
+    # tokens; oauth_obo: minted cache rows), so bulk-revoke serves both — it is
+    # the documented remediation for the stale rows an oauth_user→oauth_obo flip
+    # leaves behind.
+    if not is_user_scoped_auth(existing.get("auth_type")):
         return JSONResponse(
-            {"error": "bulk-revoke is only valid for auth_type=oauth_user servers"},
+            {"error": "bulk-revoke is only valid for oauth_user or oauth_obo servers"},
             status_code=400,
         )
 
