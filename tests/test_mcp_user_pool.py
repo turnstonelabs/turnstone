@@ -1086,6 +1086,30 @@ class TestOboPriming:
         assert warmed == []
 
 
+class TestPendingConsentClearGate:
+    """The dispatch-success pending-consent clear must not issue SQL on the
+    common path (review finding: no new hot-path SQL) — it is gated on this
+    node's in-memory record of having written a pending row."""
+
+    def test_clear_noops_without_a_recorded_write(self) -> None:
+        mgr = MCPClientManager({})
+        mgr._storage = MagicMock()
+        # No pending row was ever written for this pair.
+        mgr._clear_pending_consent_sync("u1", "srv")
+        mgr._storage.delete_mcp_pending_consent.assert_not_called()
+
+    def test_clear_deletes_and_forgets_after_a_recorded_write(self) -> None:
+        mgr = MCPClientManager({})
+        mgr._storage = MagicMock()
+        mgr._pending_consent_written.add(("u1", "srv"))
+        mgr._clear_pending_consent_sync("u1", "srv")
+        mgr._storage.delete_mcp_pending_consent.assert_called_once_with("u1", "srv")
+        # The hint is cleared, so a second success does not re-issue the DELETE.
+        mgr._storage.delete_mcp_pending_consent.reset_mock()
+        mgr._clear_pending_consent_sync("u1", "srv")
+        mgr._storage.delete_mcp_pending_consent.assert_not_called()
+
+
 # ---------------------------------------------------------------------------
 # Background token-freshness sweep (oauth_user keep-hot, no connection warming)
 # ---------------------------------------------------------------------------

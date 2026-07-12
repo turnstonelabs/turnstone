@@ -806,6 +806,99 @@ class TestUpdateMcpServer:
             ).scalar()
         assert remaining == 0, "oauth_user→oauth_obo flip must purge stale per-user rows"
 
+    def test_flip_to_obo_clears_stale_oauth_user_scopes(self, client):
+        """#551 follow-up: flipping oauth_user→oauth_obo without supplying new
+        scopes must CLEAR the old AS-consent scopes — otherwise the rfc8693 mint
+        leg would send them and loop on invalid_scope."""
+        r = client.post(
+            "/v1/api/admin/mcp-servers",
+            json={
+                "name": "flip-scopes",
+                "transport": "streamable-http",
+                "url": "https://mcp.example.com/sse",
+                "auth_type": "oauth_user",
+                "oauth_scopes": "openid profile offline_access",
+                "oauth_audience": "api://mcp-a",
+            },
+        )
+        sid = r.json()["server_id"]
+        r2 = client.put(
+            f"/v1/api/admin/mcp-servers/{sid}",
+            json={"auth_type": "oauth_obo", "oauth_audience": "api://mcp-a"},
+        )
+        assert r2.status_code == 200, r2.text
+        assert r2.json()["oauth_scopes"] in (None, "")  # stale scopes cleared
+
+    def test_obo_audience_change_purges_cached_tokens(self, client, storage):
+        """#551 follow-up: changing an obo row's oauth_audience purges cached
+        tokens minted for the OLD audience (they are audience-bound)."""
+        import sqlalchemy as sa
+
+        from turnstone.core.storage._schema import mcp_user_tokens
+
+        r = client.post(
+            "/v1/api/admin/mcp-servers",
+            json={
+                "name": "aud-change",
+                "transport": "streamable-http",
+                "url": "https://mcp.example.com/sse",
+                "auth_type": "oauth_obo",
+                "oauth_audience": "api://old-aud",
+            },
+        )
+        sid = r.json()["server_id"]
+        with storage._engine.connect() as conn:
+            conn.execute(
+                sa.insert(mcp_user_tokens),
+                {
+                    "user_id": "u1",
+                    "server_name": "aud-change",
+                    "access_token_ct": b"\x00ct",
+                    "refresh_token_ct": None,
+                    "expires_at": "2026-12-31T00:00:00",
+                    "scopes": None,
+                    "as_issuer": "https://idp.test",
+                    "audience": "api://old-aud",
+                    "created": "2026-05-04T11:00:00",
+                    "last_refreshed": None,
+                },
+            )
+            conn.commit()
+
+        r2 = client.put(
+            f"/v1/api/admin/mcp-servers/{sid}",
+            json={"oauth_audience": "api://new-aud"},
+        )
+        assert r2.status_code == 200, r2.text
+        with storage._engine.connect() as conn:
+            remaining = conn.execute(
+                sa.select(sa.func.count())
+                .select_from(mcp_user_tokens)
+                .where(mcp_user_tokens.c.server_name == "aud-change")
+            ).scalar()
+        assert remaining == 0, "audience change must purge old-audience cache rows"
+
+    def test_create_obo_rejects_scopes_under_entra_profile(self, client):
+        """#551 follow-up: oauth_scopes is meaningless for the entra grant leg
+        (it mints <audience>/.default), so the write path rejects it rather than
+        silently ignoring it at mint time."""
+        from types import SimpleNamespace
+
+        client.app.state.oidc_config = SimpleNamespace(obo_grant_profile="entra")
+        r = client.post(
+            "/v1/api/admin/mcp-servers",
+            json={
+                "name": "obo-entra-scopes",
+                "transport": "streamable-http",
+                "url": "https://mcp.example.com/sse",
+                "auth_type": "oauth_obo",
+                "oauth_audience": "api://mcp-a",
+                "oauth_scopes": "custom.scope",
+            },
+        )
+        assert r.status_code == 400, r.text
+        assert "oauth_scopes" in r.json()["error"]
+
     def test_update_invalid_auth_type(self, client):
         created = _create_server(client, name="bad-auth-update")
         sid = created["server_id"]

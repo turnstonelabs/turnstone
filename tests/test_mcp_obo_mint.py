@@ -605,6 +605,31 @@ class TestFailureHandling:
         assert state.mcp_token_store.get_oidc_credential(USER, ISSUER) is not None
         assert storage.get_mcp_user_token(USER, SERVER) is None  # nothing was cached
 
+    def test_permanent_rejection_logs_idp_error_text(self, storage: SQLiteBackend, caplog) -> None:
+        """Review finding (2316): the permanent-rejection path must log the IdP
+        error body (the token_revoked audit row carries only a reason code), so
+        an operator can tell a missing tenant grant from a dead credential."""
+        import logging
+
+        _seed_obo_server(storage)
+        client = MagicMock(spec=httpx.AsyncClient)
+        client.post = AsyncMock(
+            return_value=_mk_response(
+                400,
+                {"error": "invalid_grant", "error_description": "AADSTS65001: no consent"},
+            )
+        )
+        state = _make_app_state(storage, http_client=client, oidc_config=_make_oidc_config())
+        _seed_credential(state)
+
+        with caplog.at_level(logging.WARNING, logger="turnstone.mcp"):
+            result = _mint(state)
+
+        assert result.kind == "refresh_failed"
+        blob = " ".join(r.getMessage() + str(getattr(r, "__dict__", "")) for r in caplog.records)
+        assert "obo_mint_rejected" in blob
+        assert "AADSTS65001" in blob  # the actual IdP error text survives
+
     def test_permanent_rejection_arms_cooldown_terminal_state(self, storage: SQLiteBackend) -> None:
         """Review finding (2156): the obo permanent-rejection arm must arm the
         cooldown, else — because the credential survives and a missing cache row

@@ -774,6 +774,11 @@ class MCPClientManager:
         # credential, so the priming / keep-alive-sweep / consent sites that
         # iterate ``_oauth_user_server_names`` deliberately exclude these.
         self._obo_server_names: set[str] = set()
+        # (user, server) pairs for which THIS node has written a pending-consent
+        # row. The dispatch-success clear consults it so the common (no pending
+        # row) path never issues an SQL DELETE — a per-node hint, not
+        # authoritative: cross-node the sweep / next same-node success reconciles.
+        self._pending_consent_written: set[tuple[str, str]] = set()
 
         # Idle-eviction task handle. Scheduled lazily on the mcp-loop the
         # first time a pool entry is created (start() runs before pool
@@ -2525,12 +2530,14 @@ class MCPClientManager:
             log.debug("mcp pool prime skipped: loop closed user=%s", user_id)
 
     async def _prime_user_pools(self, user_id: str) -> None:
-        """Warm THIS user's consented ``oauth_user`` pools (runs on the mcp-loop).
+        """Warm THIS user's pool-backed servers — oauth_user AND oauth_obo (runs on the mcp-loop).
 
         Best-effort and transient-safe: each token is resolved via the SAME
-        guarded refresh state machine the lazy-dispatch path uses
-        (:func:`get_user_access_token_classified`). That refreshes an expired /
-        near-expiry access token and persists it, but a TRANSIENT AS/network
+        guarded state machine the lazy-dispatch path uses — for oauth_user
+        :func:`get_user_access_token_classified` (refresh grant), for oauth_obo
+        :func:`get_obo_access_token_classified` (mint from the captured
+        credential). That refreshes/mints an expired / near-expiry access token
+        and persists it, but a TRANSIENT AS/network
         failure keeps the token (``kind=refresh_failed_transient``, no revoke)
         and is simply skipped here — only a genuinely PERMANENT rejection (the
         user must re-consent anyway) clears it. This closes the chicken-and-egg
@@ -2559,23 +2566,27 @@ class MCPClientManager:
             try:
                 async with sem:
                     try:
-                        server_row = await asyncio.to_thread(
-                            self._storage.get_mcp_server_by_name, server_name
-                        )
-                        if not server_row:
-                            return
+                        # Branch on the in-memory obo registry (no SQL) to pick the
+                        # lookup path. For oauth_obo we need the row up front (mint
+                        # takes server_row + it feeds cfg); for oauth_user we defer
+                        # the row fetch until AFTER a successful lookup so a user
+                        # with no token pays no SELECT (the pre-obo behaviour).
                         # Resolve via the same guarded state machine lazy dispatch
-                        # uses. For oauth_obo this MINTS from the user's captured
-                        # credential (missing credential → kind="missing", skipped,
-                        # the re-login rail handles it on real dispatch). For
-                        # oauth_user, revoke_ambiguous_escalation=False: a
-                        # genuinely-dead grant is still revoked so the catalog
-                        # isn't left cold behind a phantom "consented" token, but a
-                        # sustained-UNCLASSIFIABLE rejection is deferred to lazy
-                        # dispatch — priming runs for every server, so an AS hiccup
-                        # we can't classify must not revoke a server the user may
-                        # not be using this session. Only kind == "token" warms it.
-                        if str(server_row.get("auth_type") or "") == "oauth_obo":
+                        # uses. For oauth_obo this MINTS from the captured credential
+                        # (missing credential → kind="missing", skipped — the
+                        # re-login rail handles it on real dispatch). For oauth_user,
+                        # revoke_ambiguous_escalation=False: a genuinely-dead grant is
+                        # still revoked so the catalog isn't left cold behind a
+                        # phantom "consented" token, but a sustained-UNCLASSIFIABLE
+                        # rejection is deferred to lazy dispatch. Only kind=="token"
+                        # warms the pool.
+                        server_row: dict[str, Any] | None = None
+                        if server_name in self._obo_server_names:
+                            server_row = await asyncio.to_thread(
+                                self._storage.get_mcp_server_by_name, server_name
+                            )
+                            if not server_row:
+                                return
                             lookup = await get_obo_access_token_classified(
                                 app_state=self._app_state,
                                 user_id=user_id,
@@ -2591,6 +2602,12 @@ class MCPClientManager:
                             )
                         if lookup.kind != "token" or not lookup.token:
                             return  # not consented / no credential / refresh failed — lazy paths handle it
+                        if server_row is None:
+                            server_row = await asyncio.to_thread(
+                                self._storage.get_mcp_server_by_name, server_name
+                            )
+                            if not server_row:
+                                return
                         cfg = _pool_cfg_from_row(server_row)
                         await self._prime_user_server(key, cfg, lookup.token)
                         log.info(
@@ -2817,6 +2834,9 @@ class MCPClientManager:
             scopes_required=scopes_required,
             now_iso=datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S"),
         )
+        # Remember we wrote a row so the dispatch-success clear can skip its SQL
+        # DELETE on the common (no-pending) path.
+        self._pending_consent_written.add((user_id, server_name))
 
     async def _persist_pending_consent_best_effort(self, user_id: str, server_name: str) -> bool:
         """Raise the dashboard pending-consent badge for a proactively-detected
@@ -2858,6 +2878,7 @@ class MCPClientManager:
             return
         try:
             await asyncio.to_thread(self._storage.delete_mcp_pending_consent, user_id, server_name)
+            self._pending_consent_written.discard((user_id, server_name))
         except Exception:
             log.debug(
                 "MCP token sweep: pending-consent clear failed user=%s server=%s",
@@ -5617,13 +5638,21 @@ class MCPClientManager:
         oauth_user clears live in the token sweep (which skips obo) and the
         consent callback (which obo never runs), so without a success-side clear
         an obo pending row — written when the credential was missing — would
-        persist forever after the user re-logs in. Delete is a no-op when no row
-        exists, so this is safe to call on every successful dispatch.
+        persist forever after the user re-logs in.
+
+        Gated on this node's ``_pending_consent_written`` hint so the common case
+        (no pending row was ever written for this pair) issues ZERO SQL — the
+        DELETE runs only when we actually recorded a row, keeping the hot dispatch
+        path free of an unconditional per-call write.
         """
+        key = (user_id, server_name)
+        if key not in self._pending_consent_written:
+            return
         if self._storage is None:
             return
         try:
             self._storage.delete_mcp_pending_consent(user_id, server_name)
+            self._pending_consent_written.discard(key)
         except Exception:
             log.debug(
                 "mcp_pool.pending_consent_clear_failed user=%s server=%s",
