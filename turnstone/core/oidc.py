@@ -135,6 +135,11 @@ class OIDCConfig:
     # servers can mint per-server access tokens on demand.  Requires the
     # [security] MCP token encryption key — enforced at startup.
     capture_user_credential: bool = False
+    # Grant leg used to redeem the captured credential for per-server access
+    # tokens: "entra" (refresh-token redemption with scope=<audience>/.default)
+    # or "rfc8693" (refresh grant + standard token exchange).  The IdP
+    # determines the leg, so this is deployment-level, not per-server.
+    obo_grant_profile: str = "entra"
     # Discovered from .well-known/openid-configuration
     authorization_endpoint: str = ""
     token_endpoint: str = ""
@@ -206,6 +211,15 @@ def load_oidc_config() -> OIDCConfig:
     capture_user_credential = _env_or_cfg_bool(
         "TURNSTONE_OIDC_CAPTURE_USER_CREDENTIAL", cfg, "capture_user_credential", False
     )
+    obo_grant_profile = _env_or_cfg_str(
+        "TURNSTONE_OIDC_OBO_GRANT_PROFILE", cfg, "obo_grant_profile", "entra"
+    ).strip()
+    if obo_grant_profile not in ("entra", "rfc8693"):
+        log.warning(
+            "oidc: unknown obo_grant_profile %r (expected 'entra' or 'rfc8693') — "
+            "oauth_obo MCP servers will not mint until this is fixed",
+            obo_grant_profile,
+        )
     if capture_user_credential and "offline_access" not in scopes.split():
         # The captured credential IS the offline_access refresh token; ask
         # for it at login so operators don't have to edit two keys in step.
@@ -304,6 +318,7 @@ def load_oidc_config() -> OIDCConfig:
         trusted_endpoint_hosts=trusted_endpoint_hosts,
         allow_private_network=allow_private_network,
         capture_user_credential=capture_user_credential,
+        obo_grant_profile=obo_grant_profile,
     )
 
 
