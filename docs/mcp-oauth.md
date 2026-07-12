@@ -17,8 +17,9 @@ The MCP server admin form exposes three authorization modes ("Multitenant Author
 | `none` | No headers attached. Open MCP server (or one gated by network policy only). | Internal MCP servers on a trusted network. |
 | `static` | One static bearer token, configured per server, sent on every request from every user. | Service-to-service MCP servers where per-user attribution doesn't matter, or single-tenant deployments. |
 | `oauth_user` *(recommended for user-data servers)* | Each user authorizes separately via OAuth 2.1 + PKCE; Turnstone stores per-user tokens encrypted at rest. | MCP servers that expose user-specific data or that want per-user audit attribution. |
+| `oauth_obo` *(sign-in passthrough)* | Each user's Turnstone **org sign-in** (OIDC) mints a per-server access token on demand — no separate per-server consent. One captured credential per user covers every `oauth_obo` server. | Enterprise deployments where the identity provider governs access (Entra, Keycloak) and you want zero per-user connect clicks. See the dedicated section below. |
 
-Switching `auth_type` away from `oauth_user` orphans existing per-user tokens. Use the admin **bulk-revoke** affordance on the server row (Phase 9) to clear them, or let them expire naturally — they're inert without the matching `auth_type` value.
+Switching `auth_type` away from `oauth_user` / `oauth_obo` orphans (oauth_user) or purges (on transition, per below) existing per-user rows. Use the admin **bulk-revoke** / **flush cache** affordance on the server row to clear them, or let them expire naturally.
 
 ---
 
@@ -65,6 +66,56 @@ Keep this in `config.toml` rather than environment variables. An in-process LLM 
 
 ---
 
+## `auth_type=oauth_obo` — single-credential sign-in passthrough
+
+Where `oauth_user` makes each user complete a **separate** browser consent per MCP server, `oauth_obo` reuses the user's Turnstone **org sign-in** (OIDC). Turnstone captures one refresh credential per user at login and, on each tool call, mints a short-lived access token scoped to that server's audience. There is no per-server connect step, and one credential covers every `oauth_obo` server. This is the right shape when your identity provider already governs who may reach each backend (an Entra tenant with Entra-protected MCP servers; a Keycloak realm with token exchange).
+
+Access is governed **downstream** by the IdP: a user can only mint a token for a server their delegated permissions allow. Removing that grant at the IdP cuts the user off regardless of their Turnstone state.
+
+### Deployment configuration (`[oidc]` in `config.toml`)
+
+`oauth_obo` requires OIDC SSO to be configured (it is the credential source), plus:
+
+```toml
+[oidc]
+# ... your existing issuer / client_id / client_secret ...
+capture_user_credential = true          # persist the IdP refresh token at login
+obo_grant_profile = "entra"             # "entra" | "rfc8693" — how tokens are minted
+```
+
+- **`capture_user_credential`** (default `false`): when enabled, Turnstone appends `offline_access` to the login scopes and stores the returned refresh token, encrypted with the same `[security] mcp_token_encryption_key` as `oauth_user` tokens. **The encryption key is required** — Turnstone refuses to start with an `oauth_obo` row (or capture enabled) and no key.
+- **`obo_grant_profile`** picks the mint mechanism (the IdP determines which one is valid; this is deployment-wide, not per-server):
+  - **`entra`** — redeems the user's refresh token directly for a token scoped to `<audience>/.default`. `oauth_scopes` on the server row is **not used** (the admin form rejects it under this profile).
+  - **`rfc8693`** — a refresh grant for a subject token, then an RFC 8693 token exchange for the server audience. Per-server `oauth_scopes` **are** sent on the exchange (some IdPs require the audience scope explicitly).
+
+### Adding an `oauth_obo` server
+
+In the admin MCP form, choose **Sign-in passthrough** and set **Audience** (required — the downstream resource the token is minted for, e.g. `api://<app-id>` on Entra or the client id on Keycloak). The client-id / secret / registration fields do not apply and are hidden.
+
+### Identity-provider setup
+
+**Entra (`obo_grant_profile = "entra"`):**
+1. Turnstone's app registration must hold **delegated permissions** to each MCP server's exposed API, with **admin consent granted** (or the MCP app listed in Turnstone's `preAuthorizedApplications`).
+2. Set the server row's Audience to the MCP app's Application ID URI (`api://<guid>`).
+3. **Gotcha (verified):** admin-consent issued *immediately* after creating the app/service principal can silently skip a not-yet-propagated resource — the only symptom is `AADSTS65001` at mint time. Verify the delegated grant landed (`az ad app permission list-grants` / the portal's *API permissions* blade shows *Granted*), or grant it explicitly per resource. A missing grant surfaces in Turnstone as a re-login prompt on the affected server (same rail as a revoked credential), and the `mcp_server.oauth.obo_mint_rejected` log line carries the raw `AADSTS…` text.
+
+**Keycloak / RFC 8693 (`obo_grant_profile = "rfc8693"`):**
+1. Enable **standard token exchange** on Turnstone's client.
+2. Grant the audience: add an audience client scope for each MCP client and attach it to Turnstone's client (optional scopes must be requested — set the server row's Scopes to that scope, or the exchange returns *"Requested audience not available"*).
+3. Set the server row's Audience to the downstream client id.
+
+### Revocation & custody
+
+The captured credential is a single per-user secret that can mint for every `oauth_obo` server, so treat it like any long-lived credential:
+
+- **Cut off one user:** unlink their OIDC identity in the admin console (**Users → OIDC identities → delete**). This revokes the captured credential **and** purges their minted cache rows, so future mints fail and cached tokens are dropped. (Warmed in-memory sessions on server nodes self-expire at the access-token TTL; there is no cross-node per-user session-kill.) Removing the user's access at the IdP is the authoritative cut-off.
+- **Flush a server's minted tokens** (e.g. after narrowing its audience): the server row's **flush cache** action drops all users' cached tokens for that server. This is **not** a revocation — users re-mint on next use from their still-valid sign-in. It is surfaced honestly (audit `mcp_server.oauth.obo_cache_flushed`, response `effect: cache_flush_remints`) so it is never mistaken for cutting access.
+- Per-server revocation in the `oauth_user` sense does not exist for `oauth_obo` — the credential is issuer-scoped and IdP-governed. Revoke at the IdP.
+
+> **Interim for Entra without OBO:** if you don't want host-side minting, admin consent + `preAuthorizedApplications` on each MCP app registration removes the second consent prompt for the plain `oauth_user` flow too (a tenant-config change, no Turnstone code). Tracked in issue #682. It does not remove the per-server connect clicks or per-(user, server) token custody — that is what `oauth_obo` is for.
+
+---
+
 ## Lifecycle
 
 1. **First tool call** for a user against an `oauth_user` MCP server: pool dispatch finds no stored token, returns `mcp_consent_required` to the agent. Dashboard renders an inline "Connect" action card.
@@ -99,8 +150,11 @@ Additional indicators (circuit-breaker state, encryption-key mismatch) are expos
 | `none` / `static` → `oauth_user` | — | New code path activates for this server. Existing static headers (if any) are no longer sent. Users must authorize on first use. |
 | `oauth_user` → `none` / `static` | — | Existing `mcp_user_tokens` rows are **orphaned** — inert without a matching `auth_type`. Use admin bulk-revoke to drop them, or let them expire. Switching back to `oauth_user` later re-activates the orphaned rows if they haven't been deleted. |
 | OAuth `client_id` or `client_secret` rotated | — | Existing tokens may stop refreshing if the AS treats them as bound to the previous client. Bulk-revoke after rotation. |
+| `oauth_user` ↔ `oauth_obo` | — | The per-user rows are **purged** on the flip (they mean different things: per-server AS refresh tokens vs. minted cache). A flip into `oauth_obo` also clears the stale `oauth_scopes` (they were the AS-consent scopes; the mint leg would otherwise send them). |
+| `oauth_obo` → `none` / `static` | — | Minted cache rows are purged. |
+| `oauth_obo` **audience** or **URL** changed | — | Minted cache rows for the old audience/URL are **purged** (tokens are audience/URL-bound), forcing a fresh mint. |
 
-The orphan-by-default behavior is chosen so switching back to `oauth_user` is non-destructive. Bulk-revoke is the explicit cleanup path.
+The orphan-by-default behavior (for `oauth_user` → `none`/`static`) is chosen so switching back is non-destructive. Transitions **into or out of** `oauth_obo`, and audience/URL edits, purge instead — the bindings are semantic and a stale row must never be served.
 
 ---
 
@@ -113,5 +167,9 @@ The orphan-by-default behavior is chosen so switching back to `oauth_user` is no
 | `mcp_oauth_url_insecure` | MCP server URL is `http://` (not `https://`) on a non-loopback host | Use `https://`. Per-user bearers must not transit cleartext. |
 | Tools fail in scheduled / Discord / Slack runs | OAuth-MCP requires browser-based consent | Users must pre-consent via the web UI. Phase 9 dashboard badge surfaces deferred consents from these runs on next login. |
 | Circuit breaker open repeatedly | Transport-level errors on the MCP server (DNS, TLS, 5xx) | Check the per-server error pill; auth errors do not trip the breaker. |
+| **`oauth_obo`**: every tool call fails, log shows `obo_misconfigured` | Server row has no Audience, or `obo_grant_profile` is unset/unknown | Set the Audience on the server row; set `[oidc] obo_grant_profile` to `entra` or `rfc8693`. |
+| **`oauth_obo`**: `obo_mint_rejected` with `AADSTS65001` | Turnstone's app lacks the (admin-consented) delegated grant to this MCP app — often admin consent that didn't propagate | Grant + admin-consent the delegated permission for this resource; verify it shows *Granted*. See the Entra gotcha above. |
+| **`oauth_obo`**: "Sign in to Turnstone again" on one server | Captured credential missing/rejected, or a Conditional Access challenge | User re-logs into Turnstone (re-captures the credential). If it persists, check the IdP grant / CA policy. |
+| **`oauth_obo`**: tools don't appear at all for a user | User has not signed in since `capture_user_credential` was enabled (no credential captured) | User logs out and back in via OIDC so the refresh credential is captured. |
 
 See also: `docs/operations/mcp-oauth-headless.md` for the cron / channel-driven run caveat.
