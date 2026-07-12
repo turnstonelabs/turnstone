@@ -15,7 +15,7 @@ import re
 import threading
 import time
 import uuid
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields, replace
 from functools import partial
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -30,7 +30,7 @@ from turnstone.core.log import get_logger
 if TYPE_CHECKING:
     from collections.abc import Callable
 
-    from turnstone.core.providers._protocol import LLMProvider
+    from turnstone.core.providers._protocol import LLMProvider, ModelCapabilities
 
 log = get_logger(__name__)
 
@@ -844,6 +844,33 @@ def _positive_window(*candidates: Any, floor: int = _DEFAULT_JUDGE_CONTEXT_WINDO
     return floor
 
 
+def _resolve_model_capabilities(provider: LLMProvider, model: str, cfg: Any) -> ModelCapabilities:
+    """Provider base capabilities with a model definition's ``capabilities``
+    overrides applied — the same lowering ``ChatSession._resolve_capabilities``
+    performs for the session, utility, and sub-agent completion lanes.
+
+    The judges are the only completion callers that live outside ``ChatSession``,
+    so they cannot reach ``self._resolve_capabilities``; this mirrors it so a
+    judge alias honors operator-declared capabilities (effort passthrough, tool
+    support, temperature, verbosity) exactly like the main loop.  ``cfg`` is the
+    alias's ``ModelConfig``; a missing or non-dict ``capabilities`` is ignored
+    rather than raised — capability resolution must never crash a judge turn.
+
+    It does NOT fold in ``ModelConfig.context_window``: that is a separate field,
+    not part of the capabilities JSON, and the caller sizes the judge's window
+    budget off it directly (the static caps table reports 200000 for local
+    models, which would silently over-budget them).
+    """
+    caps = provider.get_capabilities(model)
+    overrides = getattr(cfg, "capabilities", None)
+    if isinstance(overrides, dict) and overrides:
+        names = {f.name for f in fields(type(caps))}
+        applied = {k: v for k, v in overrides.items() if k in names}
+        if applied:
+            caps = replace(caps, **applied)
+    return caps
+
+
 def honest_truncate(text: str, budget: int) -> str:
     """Return *text* untouched when it fits *budget* characters, otherwise the
     leading ``budget`` characters followed by an explicit note of exactly how
@@ -971,13 +998,21 @@ class IntentJudge:
         session_provider: LLMProvider,
         session_client: Any,
         session_model: str,
-        context_window: int = 200_000,
+        session_capabilities: ModelCapabilities | None = None,
         rule_registry: Any | None = None,
         model_registry: Any | None = None,
     ) -> None:
         self._config = config
-        self._context_window = context_window
         self._rule_registry = rule_registry
+        # The caller (ChatSession) resolves the session model's real caps from
+        # _get_capabilities (config/registry-aware) and passes them in; they are
+        # this judge's wire capabilities and window when it inherits the session
+        # model.  The window is taken ONLY from these resolved caps (else a
+        # floor) — NEVER provider.get_capabilities(), whose static 200000 for a
+        # local model would blind the budget to overflow.
+        session_window = (
+            session_capabilities.context_window if session_capabilities is not None else None
+        )
 
         # Resolve judge model via ModelRegistry alias, otherwise self-
         # consistency on the session model.  ``judge.model`` is alias-only
@@ -1001,6 +1036,9 @@ class IntentJudge:
                         self._provider.provider_name,
                     )
                     self._model = model_name
+                    self._capabilities = _resolve_model_capabilities(
+                        self._provider, self._model, model_cfg
+                    )
                     # Use the registry's per-model context window, NOT
                     # ``provider.get_capabilities().context_window``: the static
                     # capability table returns 200000 for every model absent
@@ -1013,7 +1051,8 @@ class IntentJudge:
                     # the session ``context_window`` then a floor, so it neither
                     # aborts resolution nor zeroes the budgets.
                     self._judge_context_window = _positive_window(
-                        getattr(model_cfg, "context_window", None), context_window
+                        getattr(model_cfg, "context_window", None),
+                        session_window,
                     )
                     resolved = True
             except Exception:
@@ -1034,8 +1073,15 @@ class IntentJudge:
                 session_provider.provider_name,
             )
             self._model = session_model
+            # Wire caps: the caller's resolved session caps, or the provider's
+            # static table as a last resort for degraded / legacy callers.
+            self._capabilities = (
+                session_capabilities
+                if session_capabilities is not None
+                else session_provider.get_capabilities(session_model)
+            )
             # Coerce here too, defensively against a non-positive session window.
-            self._judge_context_window = _positive_window(context_window)
+            self._judge_context_window = _positive_window(session_window)
 
     # -- Client lifecycle helpers -------------------------------------------
 
@@ -1336,6 +1382,13 @@ class IntentJudge:
                         max_tokens=2048,
                         temperature=0.0,
                         reasoning_effort="medium",
+                        # Thread the judge model's operator-declared capabilities
+                        # onto the wire like every other lane — resolved from the
+                        # judge alias's model definition, or the session model on
+                        # fallback.  Without this the provider would fall back to
+                        # its static capability table and silently ignore the
+                        # definition's overrides on judge calls alone.
+                        capabilities=self._capabilities,
                     ),
                     timeout=per_call_timeout,
                     cancel_event=cancel_event,

@@ -50,8 +50,8 @@ from turnstone.core.deadline import (
 )
 from turnstone.core.judge import (
     _CHARS_PER_TOKEN,
-    _DEFAULT_JUDGE_CONTEXT_WINDOW,
     _positive_window,
+    _resolve_model_capabilities,
 )
 from turnstone.core.log import get_logger
 
@@ -59,7 +59,7 @@ if TYPE_CHECKING:
     import threading
 
     from turnstone.core.judge import JudgeConfig
-    from turnstone.core.providers._protocol import LLMProvider
+    from turnstone.core.providers._protocol import LLMProvider, ModelCapabilities
 
 log = get_logger(__name__)
 
@@ -247,7 +247,7 @@ class OutputGuardJudge:
     Construction resolves the configured ``judge.output_guard_model``
     alias inline; on resolution failure (alias unset or unknown) the
     session model is used as a fallback.  Mirrors :class:`IntentJudge`'s
-    own resolution at ``judge.py:917-960``.
+    own alias resolution.
 
     The HTTP client is lazy-initialised on the first ``evaluate()`` call
     and reused for the lifetime of the judge instance — see
@@ -267,16 +267,23 @@ class OutputGuardJudge:
         session_client: Any,
         session_model: str,
         model_registry: Any | None = None,
-        context_window: int = _DEFAULT_JUDGE_CONTEXT_WINDOW,
+        session_capabilities: ModelCapabilities | None = None,
     ) -> None:
         self._config = config
-        # Alias resolution mirrors IntentJudge.__init__ at judge.py:917-960.
+        # Caller's resolved session-model caps (config/registry-aware): the wire
+        # capabilities + window when this judge inherits the session model, and
+        # the alias path's window fallback.  The window comes ONLY from these
+        # (else a floor), never provider.get_capabilities() — see below.
+        session_window = (
+            session_capabilities.context_window if session_capabilities is not None else None
+        )
+        # Alias resolution mirrors IntentJudge.__init__.
         # An empty / unset alias falls through to the session model silently;
         # a set-but-unknown alias logs a warning and also falls through.
         # Judge model's context window drives the oversize-output guard in
         # ``evaluate``.  It comes from the registry's ModelConfig on the alias
-        # path and the session's real window (``context_window``, resolved by
-        # the caller from _get_capabilities) on the fallback path — NEVER
+        # path and the session's real window (``session_capabilities``, resolved
+        # by the caller from _get_capabilities) on the fallback path — NEVER
         # ``provider.get_capabilities()``, which returns a static 200000 for
         # every model absent from its table (i.e. every local / self-hosted
         # judge), so a guard keyed off it would never trip for the small-window
@@ -296,8 +303,12 @@ class OutputGuardJudge:
                     )
                     self._model = model_name
                     self._judge_model_alias = config.output_guard_model
+                    self._capabilities = _resolve_model_capabilities(
+                        self._provider, self._model, model_cfg
+                    )
                     self._judge_context_window = _positive_window(
-                        getattr(model_cfg, "context_window", None), context_window
+                        getattr(model_cfg, "context_window", None),
+                        session_window,
                     )
                     resolved = True
             except Exception:
@@ -321,12 +332,19 @@ class OutputGuardJudge:
             )
             self._model = session_model
             self._judge_model_alias = ""
+            # Wire caps: the caller's resolved session caps, or the provider's
+            # static table as a last resort for degraded / legacy callers.
+            self._capabilities = (
+                session_capabilities
+                if session_capabilities is not None
+                else session_provider.get_capabilities(session_model)
+            )
             # Session-model fallback: use the session's real context window
             # (the caller resolved it from _get_capabilities, config/registry-
             # aware) — NOT provider.get_capabilities(), which reports 200000 for
             # a local session model and would leave the guard blind to overflow,
             # the very failure this fixes.  Mirrors IntentJudge's fallback.
-            self._judge_context_window = _positive_window(context_window)
+            self._judge_context_window = _positive_window(session_window)
 
         # Lazy-init in _create_client(); reused across evaluate() calls.
         # Session swaps the entire OutputGuardJudge on credential / model
@@ -341,7 +359,7 @@ class OutputGuardJudge:
 
         Reads ``base_url`` and ``api_key`` from the client and returns
         the dict ``turnstone.core.providers.create_client`` accepts.
-        Inlined from IntentJudge's helper at ``judge.py:965-969``.
+        Inlined from IntentJudge's ``_extract_client_config``.
         """
         base_url = str(getattr(client, "base_url", getattr(client, "_base_url", "")))
         api_key = getattr(client, "api_key", "") or ""
@@ -491,6 +509,10 @@ class OutputGuardJudge:
                     max_tokens=512,
                     temperature=0.0,
                     reasoning_effort="low",
+                    # Operator-declared capabilities reach the wire like every
+                    # other lane — from the output_guard alias's definition, or
+                    # the session model on fallback.  See IntentJudge for why.
+                    capabilities=self._capabilities,
                 ),
                 timeout=timeout,
                 cancel_event=cancel_event,
