@@ -4706,6 +4706,12 @@ class MCPClientManager:
             log.warning("reconcile_sync: failed to read mcp_servers table", exc_info=True)
             return {"added": [], "removed": [], "updated": []}
 
+        # Pool-backed (oauth_user / oauth_obo) names known BEFORE this
+        # reconcile — diffed against the refreshed sets below to spot servers
+        # that appeared since active sessions last primed (see the re-prime
+        # self-heal near the end of this method).
+        prev_pool_names = self._oauth_user_server_names | self._obo_server_names
+
         # Refresh the in-memory oauth_user name cache from the rows we
         # just read — feeds :meth:`server_auth_type` so callers (e.g.
         # ``web_search.resolve_web_search_client``) avoid a per-turn SQL
@@ -4716,6 +4722,9 @@ class MCPClientManager:
         self._obo_server_names = {
             row["name"] for row in rows if row.get("auth_type") == "oauth_obo"
         }
+        newly_added_pool = (
+            self._oauth_user_server_names | self._obo_server_names
+        ) - prev_pool_names
 
         desired = _db_servers_to_config(rows)
         desired_names = set(desired)
@@ -4767,7 +4776,41 @@ class MCPClientManager:
                 len(removed),
                 len(updated),
             )
+
+        # Self-heal: a pool-backed (oauth_user / oauth_obo) server registered
+        # while a user's ChatSession was already open would otherwise never
+        # reach that session — ``prime_user_pools`` runs once at session start,
+        # and for oauth_obo priming is the ONLY path tools take into the
+        # catalog (there is no consent flow to warm it later). Re-prime every
+        # active session's user so a mid-session registration surfaces its
+        # tools automatically — no reconnect or fresh workstream needed.
+        if newly_added_pool:
+            self._reprime_active_users(newly_added_pool)
+
         return {"added": added, "removed": removed, "updated": updated}
+
+    def _reprime_active_users(self, new_servers: set[str]) -> None:
+        """Re-warm active sessions' pools after new pool-backed servers appear.
+
+        Called from :meth:`reconcile_sync` when a reconcile reveals an
+        oauth_user / oauth_obo server that active sessions never primed. Active
+        users come from the tool-listener registry (each open ChatSession
+        registers ``(user_id, callback)`` via :meth:`add_listener`); the
+        ``user_id=None`` global/admin listener is skipped. ``prime_user_pools``
+        is idempotent and fire-and-forget, so re-priming an already-warm pool
+        is a cheap skip and re-priming a user without the stored token /
+        captured credential is a no-op.
+        """
+        with self._listeners_lock:
+            user_ids = {uid for uid, _cb in self._listeners if uid}
+        for user_id in user_ids:
+            self.prime_user_pools(user_id)
+        if user_ids:
+            log.info(
+                "MCP reconcile: re-primed %d active user(s) after %d new pool server(s) appeared",
+                len(user_ids),
+                len(new_servers),
+            )
 
     # -- query methods -------------------------------------------------------
 

@@ -402,3 +402,31 @@ class TestReconcileSync:
         assert result == {"added": [], "removed": [], "updated": []}
         # Existing server untouched
         assert "srv" in mgr._server_configs
+
+    def test_reprimes_active_users_on_new_pool_server(self) -> None:
+        """A newly-appeared oauth_obo server re-primes active sessions' users so
+        a mid-session registration surfaces without a fresh workstream."""
+        mgr = MCPClientManager({})
+        primed: list[str] = []
+        mgr.prime_user_pools = lambda uid: primed.append(uid)  # type: ignore[method-assign]
+        mgr.add_listener(lambda: None, user_id="u1")
+        mgr.add_listener(lambda: None, user_id="u2")
+        mgr.add_listener(lambda: None, user_id=None)  # global/admin — skipped
+        row = _db_row("azobo", transport="streamable-http", command="", url="https://azobo:8443/")
+        row["auth_type"] = "oauth_obo"
+        mgr.reconcile_sync(_FakeStorage([row]))
+        assert sorted(primed) == ["u1", "u2"]
+        assert mgr._obo_server_names == {"azobo"}
+
+    def test_no_reprime_when_pool_server_already_known(self) -> None:
+        """Reconcile that reveals no NEW pool server does not re-prime — avoids
+        re-warming every active session on every unrelated reload."""
+        mgr = MCPClientManager({})
+        mgr._obo_server_names = {"azobo"}  # already known before this reconcile
+        primed: list[str] = []
+        mgr.prime_user_pools = lambda uid: primed.append(uid)  # type: ignore[method-assign]
+        mgr.add_listener(lambda: None, user_id="u1")
+        row = _db_row("azobo", transport="streamable-http", command="", url="https://azobo:8443/")
+        row["auth_type"] = "oauth_obo"
+        mgr.reconcile_sync(_FakeStorage([row]))
+        assert primed == []
