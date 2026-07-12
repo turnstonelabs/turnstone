@@ -910,6 +910,40 @@ class TestValidateDiscoveredEndpoint:
 
         asyncio.run(_run())
 
+    def test_discover_accepts_entra_userinfo_on_graph(self):
+        """discover_oidc accepts Entra's cross-host userinfo on graph.microsoft.com
+        via the built-in allow-list, so Azure AD OIDC works out of the box with no
+        trusted_endpoint_hosts override."""
+        tenant = "11111111-1111-1111-1111-111111111111"
+        config = _make_config(
+            issuer=f"https://login.microsoftonline.com/{tenant}/v2.0",
+            authorization_endpoint="",
+            token_endpoint="",
+            userinfo_endpoint="",
+            jwks_uri="",
+        )
+        discovery_doc = {
+            "authorization_endpoint": f"https://login.microsoftonline.com/{tenant}/oauth2/v2.0/authorize",
+            "token_endpoint": f"https://login.microsoftonline.com/{tenant}/oauth2/v2.0/token",
+            "userinfo_endpoint": "https://graph.microsoft.com/oidc/userinfo",
+            "jwks_uri": f"https://login.microsoftonline.com/{tenant}/discovery/v2.0/keys",
+        }
+        mock_response = MagicMock()
+        mock_response.json.return_value = discovery_doc
+        mock_response.raise_for_status = MagicMock()
+
+        async def _run():
+            client = _mock_async_client(lambda url: _async_return(mock_response))
+            with (
+                patch("socket.getaddrinfo", return_value=self._PUBLIC_ADDR),
+                patch("httpx.AsyncClient", return_value=client),
+            ):
+                result = await discover_oidc(config)
+            assert result.enabled is True
+            assert result.userinfo_endpoint == "https://graph.microsoft.com/oidc/userinfo"
+
+        asyncio.run(_run())
+
     def test_discover_rejects_http_endpoint(self):
         """discover_oidc returns enabled=False when an endpoint is http:// in prod."""
         config = _make_config(

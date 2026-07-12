@@ -77,17 +77,17 @@ IdP from redirecting the token-exchange POST (which carries
 being aimed at internal services.
 
 A few public IdPs legitimately split endpoints across hostnames. Google
-is the canonical example:
+and Microsoft Entra ID are the canonical examples:
 
-| Field | Hostname |
-|-------|----------|
-| issuer | `accounts.google.com` |
-| token_endpoint | `oauth2.googleapis.com` |
-| jwks_uri | `www.googleapis.com` |
-| userinfo_endpoint | `openidconnect.googleapis.com` |
+| IdP | Issuer host | Cross-host endpoint(s) |
+|-----|-------------|------------------------|
+| Google | `accounts.google.com` | `oauth2.googleapis.com`, `www.googleapis.com`, `openidconnect.googleapis.com` |
+| Microsoft Entra | `login.microsoftonline.com` | `graph.microsoft.com` (userinfo) |
 
-Google's set is built in — operators using `https://accounts.google.com`
-need no extra configuration.
+Both sets are built in — operators using `https://accounts.google.com` or
+`https://login.microsoftonline.com/<tenant>/v2.0` need no extra
+configuration. (Entra's discovery document advertises `userinfo_endpoint`
+on `graph.microsoft.com`, distinct from the issuer host.)
 
 For other IdPs whose discovery document references a non-issuer host,
 extend the allow-list explicitly:

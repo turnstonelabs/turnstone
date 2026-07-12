@@ -42,6 +42,20 @@ KNOWN_TRUSTED_OAUTH_ENDPOINT_HOSTS: dict[str, frozenset[str]] = {
             "openidconnect.googleapis.com",
         }
     ),
+    # Microsoft Entra ID (commercial cloud). The tenant issuer is
+    # login.microsoftonline.com/<tenant>/v2.0, but its discovery document
+    # advertises userinfo_endpoint on graph.microsoft.com — a distinct host.
+    # Without this entry, discovery rejects the cross-host userinfo and
+    # disables OIDC, so every Azure AD deployment would need a manual
+    # trusted_endpoint_hosts override to log in. (Sovereign clouds —
+    # login.microsoftonline.us / *.chinacloudapi.cn — use their own graph
+    # hosts and can be added the same way.)
+    "login.microsoftonline.com": frozenset(
+        {
+            "login.microsoftonline.com",
+            "graph.microsoft.com",
+        }
+    ),
 }
 
 
