@@ -474,9 +474,10 @@ def test_evict_session_keeps_catalog_and_fires_no_listener(
 
     mgr._evict_session(("user-1", "pool-srv"))
 
-    # Session dropped; catalog RETAINED.
+    # Session dropped; catalog RETAINED; dead bearer copy cleared.
     entry = mgr._user_pool_entries[("user-1", "pool-srv")]
     assert entry.session is None
+    assert entry.bound_token is None
     assert entry.tools is not None
     # User map intact — the live session's merged tool list is untouched.
     assert "user-1" in mgr._user_tool_map
@@ -571,6 +572,8 @@ def test_close_pool_entry_if_idle_cools_entry_for_live_session_user(
 
     _connect_pool(mgr, loop, user_id="user-1", server_name="pool-srv")
     key = ("user-1", "pool-srv")
+    # Retention also requires the server to still exist as a pool server.
+    mgr._oauth_user_server_names = {"pool-srv"}
     assert mgr.is_mcp_tool("mcp__pool-srv__do_thing", user_id="user-1") is True
     assert mgr._user_pool_entries[key].in_flight == 0
     # Seed the debounce dict so the prune-on-close is observable.
@@ -591,11 +594,13 @@ def test_close_pool_entry_if_idle_cools_entry_for_live_session_user(
 
     _run_on_loop(loop, mgr._close_pool_entry_if_idle(key))
 
-    # Entry cooled, not dropped: transport gone, catalog intact.
+    # Entry cooled, not dropped: transport gone, catalog intact, dead
+    # bearer copy cleared with the transport.
     entry = mgr._user_pool_entries.get(key)
     assert entry is not None, "cooled entry must survive TTL eviction"
     assert entry.session is None
     assert entry.owner_task is None
+    assert entry.bound_token is None
     assert entry.tools is not None
     # The lock object must survive with the entry — an in-flight
     # dispatcher's next acquire needs the same lock.
@@ -644,6 +649,9 @@ def test_close_pool_entry_if_idle_drops_entry_without_live_listener(
 
     _connect_pool(mgr, loop, user_id="user-1", server_name="pool-srv")
     key = ("user-1", "pool-srv")
+    # Registry seeded so the DROP below is attributable to the missing
+    # listener alone, not to registry-liveness.
+    mgr._oauth_user_server_names = {"pool-srv"}
     assert mgr.is_mcp_tool("mcp__pool-srv__do_thing", user_id="user-1") is True
     assert mgr._user_pool_entries[key].in_flight == 0
     # Seed the debounce dict so the perf-1 prune is observable.
@@ -1875,6 +1883,7 @@ def test_close_pool_entry_if_idle_cooling_keeps_resources_and_prompts(
 
     _connect_pool(mgr, loop, user_id="user-1", server_name="pool-srv")
     key = ("user-1", "pool-srv")
+    mgr._oauth_user_server_names = {"pool-srv"}
 
     res_calls = [0]
     prompt_calls = [0]

@@ -1713,6 +1713,14 @@ class ChatSession:
             # for OTHER users do not wake this session.
             self._mcp_prompt_cb = self._on_mcp_prompts_changed
             self._mcp_client.add_prompt_listener(self._mcp_prompt_cb, user_id=self._mcp_user_id)
+            # Re-read now that the listeners exist: a pool-catalog change
+            # firing between the get_tools above and the registrations just
+            # made fanned out before this session could hear it, and its
+            # only notification is gone. One re-read converges the merged
+            # lists with the post-registration state.
+            mcp_tools = self._mcp_client.get_tools(user_id=self._mcp_user_id)
+            self._tools = merge_mcp_tools(INTERACTIVE_TOOLS, mcp_tools)
+            self._task_tools = merge_mcp_tools(TASK_AGENT_TOOLS, mcp_tools)
             # Proactively warm this user's per-user OAuth (oauth_user) pools so
             # their tools are present without a manual reconnect (e.g. after a
             # reboot/upgrade, or right after consent). Fire-and-forget — the
