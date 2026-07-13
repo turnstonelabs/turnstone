@@ -121,12 +121,24 @@ def resolve_capabilities(
     if cfg is ...:
         cfg = _get_config_or_none(registry, alias)
     if cfg is not None:
-        overrides_raw = getattr(cfg, "capabilities", None)
-        if isinstance(overrides_raw, dict) and overrides_raw:
-            names = {f.name for f in fields(type(caps))}
-            overrides = {k: v for k, v in overrides_raw.items() if k in names}
-            if overrides:
-                caps = replace(caps, **overrides)
+        caps = apply_capability_overrides(caps, getattr(cfg, "capabilities", None))
+    return caps
+
+
+def apply_capability_overrides(caps: ModelCapabilities, overrides_raw: Any) -> ModelCapabilities:
+    """Field-filtered merge of an operator ``capabilities`` dict onto *caps*.
+
+    The ONE merge shared by the request path (:func:`resolve_capabilities`)
+    and the admin-UI effort-ladder projection — callers holding a raw
+    overrides dict use this directly instead of faking a ModelConfig.
+    Unknown keys are ignored (the registry accepts free-form dicts) and a
+    non-dict value degrades to "no overrides".
+    """
+    if isinstance(overrides_raw, dict) and overrides_raw:
+        names = {f.name for f in fields(type(caps))}
+        overrides = {k: v for k, v in overrides_raw.items() if k in names}
+        if overrides:
+            caps = replace(caps, **overrides)
     return caps
 
 
@@ -161,9 +173,10 @@ def _server_type_of(cfg: Any) -> str:
 
     Reads ``cfg.server_compat`` (the dedicated dataclass field hoisted by
     both model_registry loader paths) — NOT ``cfg.capabilities``.  The ONE
-    reader of the field path: :func:`resolve_server_type` and the Phase 5
-    gate in :func:`maybe_attach_vllm_chat_reasoning` both go through here,
-    so a loader shape change cannot desync them.
+    reader of the field path: the Phase 5 gate in
+    :func:`maybe_attach_vllm_chat_reasoning` and the synth-block source
+    tagging in :func:`synth_reasoning_block` both go through here, so a
+    loader shape change cannot desync them.
     """
     sc = getattr(cfg, "server_compat", None)
     if isinstance(sc, dict):
@@ -171,14 +184,65 @@ def _server_type_of(cfg: Any) -> str:
     return ""
 
 
-def resolve_server_type(registry: ModelRegistry | None, alias: str) -> str:
-    """``server_compat.server_type`` for an alias (``""`` on any miss).
+def _store_get_or_none(config_store: Any, key: str) -> Any | None:
+    """Best-effort ConfigStore read for a lane rung: value or ``None``.
 
-    Best-effort lookup — synth-block source tagging is informational,
-    never load-bearing.
+    A broken store degrades the rung to unset — settings lookups must
+    never crash lane resolution.  The registered defaults for the
+    sampling keys ARE the unset sentinels (``None`` / ``""``), so a
+    never-stored key falls through the ladder instead of manufacturing
+    a wire value (``ConfigStore.get`` returns the SettingDef default on
+    a miss, never ``None`` for a registered key — the admin UI shows
+    that same default, so sentinel defaults keep the UI and the wire in
+    agreement).
     """
-    cfg = _get_config_or_none(registry, alias)
-    return _server_type_of(cfg) if cfg is not None else ""
+    try:
+        return config_store.get(key)
+    except Exception:
+        log.debug("config_store %s lookup failed", key, exc_info=True)
+        return None
+
+
+def resolve_temperature_setting(cfg: Any | None, config_store: Any | None) -> float | None:
+    """The operator rungs of the temperature assignment scheme.
+
+    ``ModelConfig.temperature`` (the alias's per-model value; ``0.0`` is
+    a valid explicit choice) → stored global ``model.temperature`` →
+    ``None``.  ``None`` means no operator spoke: the field is omitted
+    from the wire and the inference engine's own default applies.  Code
+    never supplies a number here — the ONE resolver shared by
+    :func:`resolve_lane`, the session factories, and the ``/model``
+    switch, so every surface samples identically on the same alias.
+    """
+    temperature = getattr(cfg, "temperature", None) if cfg is not None else None
+    if temperature is None and config_store is not None:
+        temperature = _store_get_or_none(config_store, "model.temperature")
+    return temperature
+
+
+def resolve_effort_setting(
+    cfg: Any | None,
+    config_store: Any | None,
+    *,
+    role_key: str = "",
+) -> str | None:
+    """The operator rungs of the reasoning-effort assignment scheme.
+
+    ``ModelConfig.reasoning_effort`` → *role_key* setting (a role-scoped
+    override such as ``coordinator.reasoning_effort``) → stored global
+    ``model.reasoning_effort`` → ``None``.  Empty string at any rung
+    means "unset" (it is a valid settings choice meaning fall through),
+    distinct from the explicit ``"none"`` effort value.  The in-code
+    model-definition rung (``caps.default_reasoning_effort``) applies at
+    the call site (:func:`model_turn`), NOT here — a lane's resolved
+    effort is operator intent only.
+    """
+    effort = getattr(cfg, "reasoning_effort", None) if cfg is not None else None
+    if not effort and config_store is not None and role_key:
+        effort = _store_get_or_none(config_store, role_key)
+    if not effort and config_store is not None:
+        effort = _store_get_or_none(config_store, "model.reasoning_effort")
+    return effort or None
 
 
 def resolve_replay_reasoning_to_model(
@@ -270,19 +334,18 @@ class ModelLane:
     the lane runs outside the registry (then every registry-backed pass
     degrades to its documented miss behavior).
 
-    *temperature* is the lane's inherited sampling temperature — the ladder
-    ``ModelConfig.temperature`` → global ``model.temperature`` setting →
-    ``None`` (field omitted from the wire; server default).  House rule:
-    code never pins a temperature; callers pass an explicit value only when
-    relaying an operator/user-resolved knob (the session's own value on the
-    session-model lanes).  Sub-agent, judge, and single-shot lanes inherit
-    their OWN model's ladder.
-
-    *reasoning_effort* rides the same ladder with a different terminal:
-    ``ModelConfig.reasoning_effort`` → global ``model.reasoning_effort``
-    setting → the lane capabilities' ``default_reasoning_effort``.  Effort
-    always resolves to a concrete value (it gates thinking modes, so wire
-    omission is not the unset semantics the way it is for temperature).
+    *temperature* / *reasoning_effort* are the lane's OPERATOR-resolved
+    sampling knobs — the assignment scheme's operator rungs only
+    (per-model alias value → stored global setting → ``None``; see
+    :func:`resolve_temperature_setting` / :func:`resolve_effort_setting`).
+    ``None`` means no operator spoke.  For temperature that is terminal:
+    the field is omitted from the wire and the inference engine's own
+    default applies.  For effort, :func:`model_turn` applies two more
+    rungs below the lane — a caller-supplied request-shaped default,
+    then the in-code model definition (``caps.default_reasoning_effort``)
+    — before omitting.  House rule: code never pins either knob; callers
+    pass an explicit value only when relaying an operator/user-resolved
+    knob (the session's own value on the session-model lanes).
     """
 
     provider: LLMProvider
@@ -315,14 +378,16 @@ def resolve_lane(
     pass.  ``...`` (the sentinel default) means "resolve for me" —
     ``None`` is a valid resolved value for *extra_params*.
 
-    The lane temperature climbs the documented ladder
-    (``ModelConfig.temperature`` docstring: "None = use global default
-    from ConfigStore"): the alias's per-model value, else the operator's
-    global ``model.temperature`` when *config_store* is supplied, else
-    ``None`` — which the providers translate to omitting the field so the
-    SERVER default applies.  This mirrors the session_factory / ``/model``
-    switch resolution so a judge or single-shot lane samples exactly like
-    the main loop on the same model.
+    The lane sampling knobs resolve through the shared operator rungs
+    (:func:`resolve_temperature_setting` / :func:`resolve_effort_setting`
+    — the SAME resolvers the session factories and the ``/model`` switch
+    use, so a judge or single-shot lane samples exactly like the main
+    loop on the same model): the alias's per-model value, else the
+    operator's stored global setting when *config_store* is supplied,
+    else ``None``.  The registered defaults for both settings are the
+    unset sentinels, so an untouched install resolves ``None`` — the
+    providers then OMIT the field and the inference engine's own default
+    applies.
 
     All resolved facets read ONE defensively-fetched ModelConfig, so a
     registry hot-reload mid-resolution cannot mix config generations, and
@@ -336,28 +401,6 @@ def resolve_lane(
         if extra_params is ...
         else extra_params
     )
-    temperature = getattr(cfg, "temperature", None) if cfg is not None else None
-    if temperature is None and config_store is not None:
-        try:
-            temperature = config_store.get("model.temperature")
-        except Exception:
-            # Best-effort global rung — a broken store degrades to the
-            # server default, never crashes lane resolution.
-            log.debug("config_store model.temperature lookup failed", exc_info=True)
-            temperature = None
-    # Effort ladder: per-model config → global setting → the lane caps'
-    # per-provider default.  Empty string at any rung means "unset" (it is
-    # a valid settings choice meaning fall through), distinct from the
-    # explicit "none" effort value.
-    effort = getattr(cfg, "reasoning_effort", None) if cfg is not None else None
-    if not effort and config_store is not None:
-        try:
-            effort = config_store.get("model.reasoning_effort") or None
-        except Exception:
-            log.debug("config_store model.reasoning_effort lookup failed", exc_info=True)
-            effort = None
-    if not effort:
-        effort = caps.default_reasoning_effort if caps is not None else None
     return ModelLane(
         provider=provider,
         client=client,
@@ -366,8 +409,8 @@ def resolve_lane(
         capabilities=caps,
         extra_params=extra,
         registry=registry,
-        temperature=temperature,
-        reasoning_effort=effort or None,
+        temperature=resolve_temperature_setting(cfg, config_store),
+        reasoning_effort=resolve_effort_setting(cfg, config_store),
     )
 
 
@@ -572,6 +615,7 @@ def model_turn(
     max_tokens: int = 4096,
     temperature: float | None = None,
     reasoning_effort: str | None = None,
+    default_reasoning_effort: str | None = None,
     mint: Callable[[str], str] | None = None,
     wire_id_map: dict[str, str] | None = None,
     resolve_attachments: Callable[[list[str]], dict[str, Any]] | None = None,
@@ -589,9 +633,14 @@ def model_turn(
     so a caller's retry loop just calls again.
 
     *temperature* / *reasoning_effort* ``None`` (the defaults) inherit the
-    lane's resolved ladder (per-model config → global setting → server
-    default for temperature / caps default for effort).  House rule: never
-    pin either in code; pass an explicit value only to relay an
+    lane's operator-resolved knobs (per-model config → stored global
+    setting).  When no operator spoke, temperature is OMITTED from the
+    wire (the inference engine's default rules); effort falls through
+    *default_reasoning_effort* — a request-shaped default for lanes whose
+    token budget constrains thinking (title gen, the output guard), which
+    any operator value beats — then the in-code model definition
+    (``caps.default_reasoning_effort``), then omission.  House rule: never
+    pin either knob in code; pass an explicit value only to relay an
     operator- or user-resolved knob (the session's own knobs, a CLI flag).
 
     *resolve_attachments* materializes by-reference ``AttachmentRef``
@@ -631,18 +680,19 @@ def model_turn(
         wire_id_map if wire_id_map is not None else {},
     )
     wire = maybe_attach_vllm_chat_reasoning(wire, lane.provider, lane.registry, lane.alias, cfg=cfg)
-    # Effort always resolves to a concrete value (ladder terminal = caps
-    # default); the trailing fallback covers a hand-built lane that skipped
-    # resolve_lane.  Temperature may stay None — the providers then OMIT
-    # the field so the server default applies (house rule: a Python-level
-    # constant anywhere on this path is a hidden pin).  Direct keyword call
-    # (not **kwargs) so strict mypy checks the module's most important
-    # invocation against the Protocol.
+    # The effort assignment scheme's lower rungs: explicit relay → lane
+    # (operator) → caller's request-shaped default → in-code model
+    # definition → None.  None/unset knobs are OMITTED from the wire so
+    # the inference engine's default rules (house rule: a Python-level
+    # constant anywhere on this path is a hidden pin).  Direct keyword
+    # call (not **kwargs) so strict mypy checks the module's most
+    # important invocation against the Protocol.
     effective_effort = (
         reasoning_effort
-        if reasoning_effort is not None
-        else lane.reasoning_effort
-        or (lane.capabilities.default_reasoning_effort if lane.capabilities else "medium")
+        or lane.reasoning_effort
+        or default_reasoning_effort
+        or (lane.capabilities.default_reasoning_effort if lane.capabilities else None)
+        or None
     )
     result = lane.provider.create_completion(
         client=lane.client,

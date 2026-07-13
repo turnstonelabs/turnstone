@@ -42,9 +42,6 @@
     }
   ],
   "model": "claude-opus-4-8",
-  "output_config": {
-    "effort": "medium"
-  },
   "thinking": {
     "display": "summarized",
     "type": "adaptive"

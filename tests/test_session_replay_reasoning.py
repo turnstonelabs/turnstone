@@ -634,10 +634,10 @@ class TestUtilityCompletionPassesFlag:
         mock_provider.create_completion = capture_completion
         session._provider = mock_provider
         caps = ModelCapabilities(max_output_tokens=0, supports_reasoning_replay=True)
-        with (
-            patch.object(session, "_get_capabilities", return_value=caps),
-            patch.object(session, "_provider_extra_params", return_value=None),
-        ):
+        # No _provider_extra_params patch: _utility_completion resolves
+        # extra_params inside resolve_lane (module seam), which a
+        # session-attribute patch cannot intercept.
+        with patch.object(session, "_get_capabilities", return_value=caps):
             session._utility_completion(
                 [Turn.user("summarize")],
                 max_tokens=512,

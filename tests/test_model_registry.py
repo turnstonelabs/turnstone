@@ -1188,8 +1188,11 @@ class TestSessionModelCommand:
         assert session.max_tokens == 2048
         assert session.reasoning_effort == "high"
 
-    def test_model_switch_none_params_reverts_to_global(self) -> None:
-        """Switching to a model with no overrides reverts to global defaults."""
+    def test_model_switch_none_params_reverts_to_unset(self) -> None:
+        """Switching to a model with no overrides re-resolves the knobs for
+        the NEW alias: nothing configured → unset (wire omission).  The old
+        model's override must not leak onto the new lane — pre-scheme, a
+        store-less session kept the stale 1.5 forever."""
         reg = ModelRegistry(
             models={
                 "hot": ModelConfig("hot", "x", "x", "hot-model", temperature=1.5),
@@ -1199,10 +1202,8 @@ class TestSessionModelCommand:
         )
         session = _make_session(registry=reg, model_alias="hot")
         session.temperature = 1.5  # as set by per-model override
-        # Without a config_store, fallback keeps current value (CLI sessions).
-        # With a config_store, it would revert to the global default.
         session.handle_command("/model plain")
-        assert session.temperature == 1.5  # no config_store → keeps current
+        assert session.temperature is None
 
     def test_model_switch_unknown_alias(self) -> None:
         reg = ModelRegistry(

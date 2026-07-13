@@ -100,7 +100,13 @@ class ModelCapabilities:
     supports_effort: bool = False
     effort_levels: tuple[str, ...] = ()
     reasoning_effort_values: tuple[str, ...] = ()
-    default_reasoning_effort: str = "medium"
+    # The model definition's own default effort — the in-code rung of the
+    # assignment scheme (alias > stored config > this > omit).  Empty =
+    # the definition declares no default: the effort param is omitted and
+    # the serving side's own default rules.  Commercial rows declare
+    # their documented defaults explicitly; local lanes stay silent so an
+    # unconfigured box keeps its template/server behavior.
+    default_reasoning_effort: str = ""
     # Local-lane contract: with NO declared ``reasoning_effort_values``
     # the session knob is forwarded VERBATIM instead of omitted — the
     # user's effort setting always reaches the wire, and the serving
@@ -203,8 +209,11 @@ def snap_reasoning_effort(reasoning_effort: str, declared: tuple[str, ...]) -> s
     return min(at_or_above)[1] if at_or_above else max(rankable)[1]
 
 
-def resolve_reasoning_effort(caps: ModelCapabilities, reasoning_effort: str) -> str | None:
+def resolve_reasoning_effort(caps: ModelCapabilities, reasoning_effort: str | None) -> str | None:
     """Return the validated reasoning effort value, or ``None`` to omit.
+
+    ``None``/empty input means no rung of the assignment scheme resolved
+    a value: the param is omitted and the serving side's default rules.
 
     Declared values match verbatim; off-list knob values round UP onto
     the declared list, capped at its ceiling (``snap_reasoning_effort``).
@@ -273,7 +282,7 @@ EFFORT_TEMPLATE_FALLBACK_PARAM = "reasoning_effort"
 
 def reasoning_template_kwargs(
     caps: ModelCapabilities,
-    reasoning_effort: str,
+    reasoning_effort: str | None,
     *,
     fallback_effort_param: str = "",
 ) -> dict[str, Any]:
@@ -282,22 +291,26 @@ def reasoning_template_kwargs(
     On local model servers the reasoning levers live in the chat template:
     a boolean toggle (``caps.thinking_param``) and a graded effort key
     (``caps.effort_param``, else *fallback_effort_param* on lanes with no
-    flat effort channel).  The session effort knob drives both, mirroring
-    the native Anthropic contracts: ``"manual"`` maps ``"none"``/empty to
-    an explicit ``false`` (``_reasoning_params`` parity — the knob is the
-    switch), while ``"adaptive"`` always sends ``true`` (the model
-    self-regulates; the native adaptive branch never lets the knob
-    force-disable thinking).  The effort value is validated via
-    ``resolve_reasoning_effort`` when the model declares
-    ``reasoning_effort_values`` (off-list knob values round up onto the
-    declared list, capped at its ceiling); with no declared values the
-    knob is forwarded as-is and the template is the authority on
-    validity.
+    flat effort channel).  The effort knob drives both, mirroring the
+    native Anthropic contracts: ``"manual"`` maps a concrete level to an
+    explicit ``true`` and the explicit ``"none"`` knob to an explicit
+    ``false`` (``_reasoning_params`` parity — the knob is the switch),
+    while an UNSET knob (``None``/empty: no rung of the assignment scheme
+    resolved a value) injects nothing — the template's own default rules.
+    ``"adaptive"`` always sends ``true`` (the model self-regulates; the
+    native adaptive branch never lets the knob force-disable thinking).
+    The effort value is validated via ``resolve_reasoning_effort`` when
+    the model declares ``reasoning_effort_values`` (off-list knob values
+    round up onto the declared list, capped at its ceiling); with no
+    declared values the knob is forwarded as-is and the template is the
+    authority on validity.
     """
     updates: dict[str, Any] = {}
-    effort_on = bool(reasoning_effort) and reasoning_effort != "none"
+    explicit_off = reasoning_effort == "none"
+    effort_on = bool(reasoning_effort) and not explicit_off
     if caps.thinking_mode == "manual":
-        updates[caps.thinking_param] = effort_on
+        if effort_on or explicit_off:
+            updates[caps.thinking_param] = effort_on
     elif caps.thinking_mode == "adaptive":
         updates[caps.thinking_param] = True
     # A declared effort_param is an operator opt-in at any thinking_mode
@@ -320,7 +333,7 @@ def reasoning_template_kwargs(
 
 def merge_reasoning_template_kwargs(
     caps: ModelCapabilities,
-    reasoning_effort: str,
+    reasoning_effort: str | None,
     extra_params: dict[str, Any] | None,
     *,
     fallback_effort_param: str = "",
@@ -422,7 +435,7 @@ class LLMProvider(Protocol):
         tools: list[dict[str, Any]] | None = None,
         max_tokens: int = 4096,
         temperature: float | None = None,
-        reasoning_effort: str = "medium",
+        reasoning_effort: str | None = None,
         extra_params: dict[str, Any] | None = None,
         deferred_names: frozenset[str] | None = None,
         cancel_ref: list[Any] | None = None,
@@ -470,7 +483,7 @@ class LLMProvider(Protocol):
         tools: list[dict[str, Any]] | None = None,
         max_tokens: int = 4096,
         temperature: float | None = None,
-        reasoning_effort: str = "medium",
+        reasoning_effort: str | None = None,
         extra_params: dict[str, Any] | None = None,
         deferred_names: frozenset[str] | None = None,
         capabilities: ModelCapabilities | None = None,

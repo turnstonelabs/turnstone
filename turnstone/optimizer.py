@@ -232,8 +232,6 @@ def _diversify_prompts(
     cases: list[dict[str, Any]],
     n_variants: int,
     provider: LLMProvider | None = None,
-    temperature: float | None = None,
-    reasoning_effort: str | None = None,
 ) -> dict[str, list[str]]:
     """Generate paraphrased prompt variants for each test case.
 
@@ -241,8 +239,10 @@ def _diversify_prompts(
     user_prompt is always included as the first variant.
     """
     prov = provider or create_provider("openai")
-    # Temperature is not pinned (house rule) — sampling diversity for the
-    # paraphraser belongs in the diversifier model's own configuration.
+    # Sampling is not pinned and NOT coupled to run_optimization's
+    # --temperature/--reasoning-effort (those knobs belong to the model
+    # under test): this registry-less lane omits both fields and the
+    # diversifier model's serving defaults rule.
     lane = resolve_lane(prov, client, model)
     result: dict[str, list[str]] = {}
 
@@ -302,8 +302,6 @@ def _diversify_prompts(
                 lane,
                 [Turn.system(DIVERSIFIER_SYSTEM), Turn.user(user_content)],
                 max_tokens=8192,
-                temperature=temperature,
-                reasoning_effort=reasoning_effort,
             )
             raw = (cr.content or "").strip()
             # Strip reasoning tags
@@ -365,8 +363,6 @@ def _observe_and_update_optimizer(
     optimizer_system: str,
     iterations: list[dict[str, Any]],
     provider: LLMProvider | None = None,
-    temperature: float | None = None,
-    reasoning_effort: str | None = None,
 ) -> str:
     """Analyze optimizer behavior and return a modified OPTIMIZER_SYSTEM."""
     parts: list[str] = []
@@ -456,8 +452,6 @@ def _observe_and_update_optimizer(
         resolve_lane(prov, client, model),
         [Turn.system(OBSERVER_SYSTEM), Turn.user(user_content)],
         max_tokens=8192,
-        temperature=temperature,
-        reasoning_effort=reasoning_effort,
     )
 
     result = cr.content or optimizer_system
@@ -666,8 +660,6 @@ def _run_analyst(
     test_cases: list[dict[str, Any]],
     iteration_result: dict[str, Any],
     provider: LLMProvider | None = None,
-    temperature: float | None = None,
-    reasoning_effort: str | None = None,
     optimize_tools: bool = False,
     tool_overrides: dict[str, dict[str, Any]] | None = None,
 ) -> str:
@@ -771,8 +763,8 @@ def _run_analyst(
     ]
 
     # Multi-turn loop: let the analyst call tools up to 5 rounds.
-    # Temperature is not pinned (house rule) — the analyst model's own
-    # configuration governs sampling.
+    # Sampling is not pinned and not coupled to the test model's knobs —
+    # this registry-less lane omits both fields (serving defaults rule).
     lane = resolve_lane(prov, client, model)
     max_turns = 5
     for _turn in range(max_turns):
@@ -781,8 +773,6 @@ def _run_analyst(
             turns,
             tools=_ANALYST_TOOLS,
             max_tokens=8192,
-            temperature=temperature,
-            reasoning_effort=reasoning_effort,
         )
 
         # Same degenerate-repetition cap as before (shared guard — see
@@ -865,8 +855,6 @@ def _propose_tool_overrides(
     iteration_result: dict[str, Any],
     analyst_output: str,
     provider: LLMProvider | None = None,
-    temperature: float | None = None,
-    reasoning_effort: str | None = None,
 ) -> dict[str, dict[str, Any]]:
     """Propose tool description overrides based on failure analysis.
 
@@ -922,8 +910,6 @@ def _propose_tool_overrides(
         resolve_lane(prov, client, model),
         [Turn.system(TOOL_OPTIMIZER_SYSTEM), Turn.user(user_content)],
         max_tokens=8192,
-        temperature=temperature,
-        reasoning_effort=reasoning_effort,
     )
 
     raw = (cr.content or "").strip()
@@ -985,8 +971,6 @@ def _propose_prompt_modification(
     history: list[dict[str, Any]],
     optimizer_system: str = OPTIMIZER_SYSTEM,
     provider: LLMProvider | None = None,
-    temperature: float | None = None,
-    reasoning_effort: str | None = None,
     parent_scores: dict[str, float] | None = None,
     analyst_output: str = "",
     tool_overrides: dict[str, dict[str, Any]] | None = None,
@@ -1067,8 +1051,6 @@ def _propose_prompt_modification(
         resolve_lane(prov, client, model),
         [Turn.system(optimizer_system), Turn.user(user_content)],
         max_tokens=16384,
-        temperature=temperature,
-        reasoning_effort=reasoning_effort,
     )
 
     new_prompt = cr.content or current_prompt
@@ -1425,8 +1407,6 @@ def run_optimization(
             cases=cases,
             n_variants=diversify,
             provider=div_provider,
-            temperature=temperature,
-            reasoning_effort=reasoning_effort,
         )
         results["meta"]["diversify"] = diversify
         results["meta"]["prompt_variants"] = prompt_variants
@@ -1560,8 +1540,6 @@ def run_optimization(
                         current_optimizer_system,
                         results["iterations"],
                         provider=obs_provider,
-                        temperature=temperature,
-                        reasoning_effort=reasoning_effort,
                     )
                     if new_opt != current_optimizer_system:
                         opt_diff = _simple_diff(current_optimizer_system, new_opt)
@@ -1601,8 +1579,6 @@ def run_optimization(
                         test_cases=opt_cases,
                         iteration_result=opt_result,
                         provider=ana_provider,
-                        temperature=temperature,
-                        reasoning_effort=reasoning_effort,
                         optimize_tools=optimize_tools,
                         tool_overrides=selected.tool_overrides or None,
                     )
@@ -1629,8 +1605,6 @@ def run_optimization(
                         iteration_result=opt_result,
                         analyst_output=analyst_output,
                         provider=tool_opt_provider,
-                        temperature=temperature,
-                        reasoning_effort=reasoning_effort,
                     )
                     if new_tool_overrides != selected.tool_overrides:
                         added_tools = set(new_tool_overrides) - set(selected.tool_overrides)
@@ -1678,8 +1652,6 @@ def run_optimization(
                         history=results["iterations"],
                         optimizer_system=current_optimizer_system,
                         provider=opt_provider,
-                        temperature=temperature,
-                        reasoning_effort=reasoning_effort,
                         parent_scores=parent_scores,
                         analyst_output=analyst_output,
                         tool_overrides=new_tool_overrides or None,
@@ -1897,7 +1869,9 @@ def main() -> None:
         "--temperature",
         type=float,
         default=0.7,
-        help="Sampling temperature (default: 0.7)",
+        help="Sampling temperature for the model under test (default: 0.7; "
+        "meta lanes — diversifier/observer/analyst/optimizers — inherit "
+        "their own model's serving defaults)",
     )
     parser.add_argument(
         "--max-tokens",
@@ -1909,7 +1883,8 @@ def main() -> None:
         "--reasoning-effort",
         default="medium",
         choices=["low", "medium", "high"],
-        help="Reasoning effort (default: medium)",
+        help="Reasoning effort for the model under test (default: medium; "
+        "meta lanes inherit their own model's defaults)",
     )
     parser.add_argument(
         "--context-window",

@@ -362,7 +362,7 @@ def apply_temperature(
     kwargs: dict[str, Any],
     caps: ModelCapabilities,
     temperature: float | None,
-    reasoning_effort: str,
+    reasoning_effort: str | None,
 ) -> None:
     """Conditionally add temperature to *kwargs*.
 
@@ -373,14 +373,17 @@ def apply_temperature(
     - Models with ``supports_temperature=False`` (GPT-5 base, O-series)
       never receive temperature.
     - Models that list ``"none"`` in their effort values (GPT-5.1/5.2)
-      only receive temperature when reasoning is inactive.
+      only receive temperature when reasoning is EXPLICITLY off.  An
+      unset effort (``None``/empty) leaves the server default in charge,
+      which may have reasoning active (gpt-5.5/5.6 default medium) — so
+      unset skips temperature too.
     """
     if temperature is None:
         return
     if not caps.supports_temperature:
         return
-    if "none" in caps.reasoning_effort_values and reasoning_effort not in ("none", ""):
-        return  # Skip temperature when reasoning is active
+    if "none" in caps.reasoning_effort_values and reasoning_effort != "none":
+        return  # Skip temperature unless reasoning is explicitly off
     kwargs["temperature"] = temperature
 
 
@@ -388,7 +391,7 @@ def apply_temperature_and_effort(
     kwargs: dict[str, Any],
     caps: ModelCapabilities,
     temperature: float | None,
-    reasoning_effort: str,
+    reasoning_effort: str | None,
 ) -> None:
     """Conditionally add temperature and reasoning_effort to *kwargs*.
 

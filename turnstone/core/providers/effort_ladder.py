@@ -95,21 +95,17 @@ def effort_ladder_for_model(
     """Ladder for a stored model row: provider defaults + operator overrides.
 
     Delegates the override merge to
-    :func:`turnstone.core.model_turn.resolve_capabilities` — the ONE
+    :func:`turnstone.core.model_turn.apply_capability_overrides` — the ONE
     field-filtered merge every lane's requests use — so the admin-UI
     effort projection can never drift from the wire.  Callers holding a
     raw DB row must parse the ``capabilities`` JSON string first
     (``model_registry`` does the same) — this function takes a dict.
     """
-    from types import SimpleNamespace
-
-    from turnstone.core.model_turn import resolve_capabilities
+    from turnstone.core.model_turn import apply_capability_overrides
     from turnstone.core.providers import create_provider
 
     provider = create_provider(provider_name, api_surface=api_surface or None)
-    caps = resolve_capabilities(
-        provider, model, "", None, cfg=SimpleNamespace(capabilities=capability_overrides or {})
-    )
+    caps = apply_capability_overrides(provider.get_capabilities(model), capability_overrides or {})
     return effort_ladder(provider_name, caps, api_surface)
 
 

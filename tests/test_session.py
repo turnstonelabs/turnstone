@@ -268,8 +268,10 @@ class TestChatSessionConstruction:
         assert session.reasoning_effort == "high"
 
     def test_default_reasoning_effort(self, tmp_db):
+        # Unset by default: no rung of the assignment scheme spoke, so the
+        # wire omits the effort param (no hidden "medium" constructor pin).
         session = _make_session()
-        assert session.reasoning_effort == "medium"
+        assert session.reasoning_effort is None
 
 
 # ---------------------------------------------------------------------------

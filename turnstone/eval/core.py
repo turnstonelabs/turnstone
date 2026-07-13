@@ -314,6 +314,11 @@ class HeadlessSession(ChatSession):
             registry=self._registry,
             capabilities=self._get_capabilities(),
         )
+        # System prompts live as wire dicts on the session; bridge them to
+        # Turn IR once — they are invariant for the run (only __init__ /
+        # set_skill recompose them, both before send_headless).  Only the
+        # growing ``self.messages`` concatenation happens per turn.
+        system_turns = turns_from_dicts(self.system_messages)
 
         for turn in range(max_turns):
             if self._cancelled.is_set():
@@ -323,9 +328,7 @@ class HeadlessSession(ChatSession):
                 _log(f"{log_prefix}  turn {turn}: calling API...", dim=True)
 
             t0 = time.monotonic()
-            # System prompts live as wire dicts on the session; bridge them to
-            # Turn IR so the whole trajectory lowers through the shared seam.
-            turns = turns_from_dicts(self.system_messages) + self.messages
+            turns = system_turns + self.messages
 
             if self._cancelled.is_set():
                 break

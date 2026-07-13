@@ -42,9 +42,6 @@
     }
   ],
   "model": "claude-sonnet-4-6",
-  "output_config": {
-    "effort": "medium"
-  },
   "temperature": 1.0,
   "thinking": {
     "type": "adaptive"

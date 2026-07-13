@@ -131,8 +131,10 @@ from turnstone.core.model_turn import (
     model_turn,
     provider_extra_params,
     resolve_capabilities,
+    resolve_effort_setting,
     resolve_lane,
     resolve_replay_reasoning_to_model,
+    resolve_temperature_setting,
 )
 from turnstone.core.nudge_queue import (
     QUIET_CHANNEL,
@@ -1291,10 +1293,10 @@ class ChatSession:
         model: str,
         ui: SessionUI,
         instructions: str | None,
-        temperature: float,
+        temperature: float | None,
         max_tokens: int,
         tool_timeout: int,
-        reasoning_effort: str = "medium",
+        reasoning_effort: str | None = None,
         context_window: int = 32768,
         compact_max_tokens: int = 32768,
         auto_compact_pct: float = DEFAULT_AUTO_COMPACT_PCT,
@@ -2129,8 +2131,10 @@ class ChatSession:
         config = {
             "model": self.model,
             "model_alias": self._model_alias or "",
-            "temperature": str(self.temperature),
-            "reasoning_effort": self.reasoning_effort,
+            # Unset knobs persist as "" — None means "no operator spoke"
+            # (wire omission) and must survive the resume round-trip.
+            "temperature": "" if self.temperature is None else str(self.temperature),
+            "reasoning_effort": self.reasoning_effort or "",
             "max_tokens": str(self.max_tokens),
             "instructions": self.instructions or "",
             "skill": self._skill_name or "",
@@ -3503,9 +3507,12 @@ class ChatSession:
                     self.model,
                 )
             if "temperature" in config:
-                self.temperature = float(config["temperature"])
+                # "" = unset (wire omission); "None" guards rows written
+                # by the brief str(None) era of _save_config.
+                raw_temp = config["temperature"]
+                self.temperature = float(raw_temp) if raw_temp not in (None, "", "None") else None
             if "reasoning_effort" in config:
-                self.reasoning_effort = config["reasoning_effort"]
+                self.reasoning_effort = config["reasoning_effort"] or None
             if "max_tokens" in config:
                 self.max_tokens = int(config["max_tokens"])
             if "instructions" in config:
@@ -4771,10 +4778,14 @@ class ChatSession:
         — the same operator/registry-resolved value the main turn uses — rather
         than a hard-coded constant: utility calls should not silently override an
         explicit ``[models.*]`` temperature.  ``reasoning_effort`` ``None``
-        inherits the lane's ladder (per-model config → global setting → caps
-        default) — callers relaying the session's user-facing effort knob
-        (web-fetch extraction) pass it explicitly.  extra_params resolve
-        inside the lane from the same single config fetch as the rest.
+        inherits the lane's operator rungs, then the request-shaped
+        ``default_reasoning_effort="low"``: these calls run inside small
+        token budgets, and an unconstrained thinking pass can consume the
+        whole budget and return empty content (the #676 signature) — any
+        operator or model-definition value still beats the default.
+        Callers relaying the session's user-facing effort knob (web-fetch
+        extraction) pass it explicitly.  extra_params resolve inside the
+        lane from the same single config fetch as the rest.
         """
         caps = self._get_capabilities()
         clamped = min(max_tokens, caps.max_output_tokens) if caps.max_output_tokens else max_tokens
@@ -4793,6 +4804,7 @@ class ChatSession:
             max_tokens=clamped,
             temperature=self.temperature if temperature is None else temperature,
             reasoning_effort=reasoning_effort,
+            default_reasoning_effort="low",
         )
         # Utility completions (title gen, compaction, web-fetch extraction)
         # bypass the streaming on_status path — record their usage so the
@@ -7085,7 +7097,9 @@ class ChatSession:
         if not self._last_usage:
             return
         usage: dict[str, Any] = {**self._last_usage, "model": self.model}
-        self.ui.on_status(usage, self.context_window, self.reasoning_effort)
+        # "" = no effort resolved anywhere (the wire omitted the param);
+        # the UI protocol keeps a plain str.
+        self.ui.on_status(usage, self.context_window, self.reasoning_effort or "")
 
     # -- Conversation compaction ------------------------------------------------
 
@@ -15077,15 +15091,17 @@ class ChatSession:
         # operator flags (replay-reasoning, Phase 5 vLLM attach) re-resolve
         # inside ``model_turn`` through the carried registry, so mid-session
         # admin toggles keep applying exactly as they did pre-extraction.
-        # Temperature follows the AGENT model's own ladder (its ModelConfig,
-        # else the global ``model.temperature``) — relaying the session
-        # model's value here would make a task alias's configured
-        # temperature unreachable (house rule: the model's configuration is
-        # the source of truth).
+        # Session-knob relay is SAME-LANE ONLY: on the fall-through (agent
+        # runs the session's own model) the workstream/user-resolved session
+        # temperature and effort apply to sub-agent calls exactly as they do
+        # to the main loop; on a distinct task alias neither relays — a
+        # relay there would make the task alias's own configured knobs
+        # unreachable (the model's configuration is the source of truth).
         # Agent trajectories stay excluded from the persistence/replay
         # contract — history is in-memory, rebuilt per ``_run_agent``
         # invocation; the native lane carried here serves the WITHIN-RUN
         # reasoning continuity of the agent's own tool loop.
+        same_lane = (agent_alias or "") == (self._model_alias or "")
         lane = resolve_lane(
             agent_provider,
             agent_client,
@@ -15116,7 +15132,9 @@ class ChatSession:
                         turns,
                         tools=_tools,
                         max_tokens=self.max_tokens,
-                        reasoning_effort=reasoning_effort or self.reasoning_effort,
+                        temperature=self.temperature if same_lane else None,
+                        reasoning_effort=reasoning_effort
+                        or (self.reasoning_effort if same_lane else None),
                         mint=mint,
                         wire_id_map=wire_id_map,
                     )
@@ -17023,25 +17041,20 @@ class ChatSession:
                 self.context_window = cfg.context_window
                 if not self._manual_tool_truncation:
                     self.tool_truncation = int(cfg.context_window * self._chars_per_token * 0.5)
-                # Apply per-model sampling overrides, falling back to global
-                # defaults — mirrors session_factory() resolution logic so
-                # switching away from a model with overrides doesn't leak them.
+                # Re-resolve the sampling knobs for the new alias through the
+                # SAME shared resolvers session_factory uses, so switching
+                # away from a model with overrides doesn't leak them and
+                # every surface samples identically on the same alias.
+                # Unset resolves to None (wire omission), replacing any prior
+                # model's value.
                 cs = self._config_store
-                self.temperature = (
-                    cfg.temperature
-                    if cfg.temperature is not None
-                    else (cs.get("model.temperature") if cs else self.temperature)
-                )
+                self.temperature = resolve_temperature_setting(cfg, cs)
                 self.max_tokens = (
                     cfg.max_tokens
                     if cfg.max_tokens is not None
                     else (cs.get("model.max_tokens") if cs else self.max_tokens)
                 )
-                self.reasoning_effort = (
-                    cfg.reasoning_effort
-                    if cfg.reasoning_effort is not None
-                    else (cs.get("model.reasoning_effort") if cs else self.reasoning_effort)
-                )
+                self.reasoning_effort = resolve_effort_setting(cfg, cs)
                 self._init_system_messages()
                 self._save_config()
                 self.ui.on_info(f"Switched to {cyan(arg)}: {model_name}")
@@ -17060,7 +17073,8 @@ class ChatSession:
             valid = ("low", "medium", "high")
             aliases = {"med": "medium", "lo": "low", "hi": "high"}
             if not arg:
-                self.ui.on_info(f"Reasoning effort: {cyan(self.reasoning_effort)}")
+                shown = self.reasoning_effort or "model default"
+                self.ui.on_info(f"Reasoning effort: {cyan(shown)}")
             else:
                 value = aliases.get(arg.lower(), arg.lower())
                 if value in valid:

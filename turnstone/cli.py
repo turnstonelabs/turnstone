@@ -301,7 +301,7 @@ class TerminalUI(SessionUI):
         total_tok = usage["prompt_tokens"] + usage["completion_tokens"]
         pct = total_tok / context_window * 100 if context_window > 0 else 0
         parts = [f"{total_tok:,} / {context_window:,} tokens ({pct:.0f}%)"]
-        if effort != "medium":
+        if effort and effort != "medium":
             parts.append(f"reasoning: {effort}")
         sys.stdout.write(f"\n  {DIM}[{' · '.join(parts)}]{RESET}\n")
         sys.stdout.flush()
@@ -998,8 +998,11 @@ def main() -> None:
     parser.add_argument(
         "--temperature",
         type=float,
-        default=0.5,
-        help="Sampling temperature (default: 0.5)",
+        default=None,
+        help=(
+            "Sampling temperature (default: the model's configured value, "
+            "else the field is omitted and the serving default applies)"
+        ),
     )
     parser.add_argument(
         "--max-tokens",
@@ -1015,9 +1018,12 @@ def main() -> None:
     )
     parser.add_argument(
         "--reasoning-effort",
-        default="medium",
-        choices=["none", "minimal", "low", "medium", "high", "xhigh", "max"],
-        help="Reasoning effort level (default: medium)",
+        default="",
+        choices=["", "none", "minimal", "low", "medium", "high", "xhigh", "max"],
+        help=(
+            "Reasoning effort level (default: the model's configured or "
+            "declared value, else the serving default)"
+        ),
     )
     parser.add_argument(
         "--provider",
@@ -1258,16 +1264,30 @@ def main() -> None:
     ) -> ChatSession:
         assert ui is not None, "session_factory requires a non-None UI"
         del project_id
+        from turnstone.core.model_turn import (
+            resolve_effort_setting,
+            resolve_temperature_setting,
+        )
+
         r_client, r_model, r_cfg = registry.resolve(model_alias)
+        # An explicit CLI flag is the user speaking; otherwise the knobs
+        # ride the shared assignment scheme (the CLI has no ConfigStore,
+        # so the rungs are the model config, then unset = wire omission).
+        eff_temperature = (
+            args.temperature
+            if args.temperature is not None
+            else resolve_temperature_setting(r_cfg, None)
+        )
+        eff_effort = args.reasoning_effort or resolve_effort_setting(r_cfg, None)
         return ChatSession(
             client=r_client,
             model=r_model,
             ui=ui,
             instructions=args.instructions,
-            temperature=args.temperature,
+            temperature=eff_temperature,
             max_tokens=args.max_tokens,
             tool_timeout=args.tool_timeout,
-            reasoning_effort=args.reasoning_effort,
+            reasoning_effort=eff_effort,
             context_window=r_cfg.context_window,
             compact_max_tokens=args.compact_max_tokens,
             auto_compact_pct=args.auto_compact_pct,

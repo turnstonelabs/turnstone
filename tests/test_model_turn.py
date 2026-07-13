@@ -69,6 +69,28 @@ def _lane(provider: _FakeProvider, **kw: Any) -> ModelLane:
     return ModelLane(provider=provider, client=object(), model="m", **kw)
 
 
+def _real_semantics_store(**stored: Any) -> SimpleNamespace:
+    """A ConfigStore fake with the REAL ``get()`` semantics.
+
+    A stored key returns its value; a never-stored key returns the
+    SETTINGS registry default — which for the sampling keys IS the unset
+    sentinel (``None`` / ``""``).  The old fakes returned ``None`` on any
+    miss, which masked the default-on-miss collision the round-2 review
+    caught: never fake a store rung more forgiving than the real one.
+    """
+    from turnstone.core.settings_registry import SETTINGS
+
+    def _get(key: str, default: Any = ...) -> Any:
+        if key in stored:
+            return stored[key]
+        if default is not ...:
+            return default
+        defn = SETTINGS.get(key)
+        return defn.default if defn else None
+
+    return SimpleNamespace(get=_get)
+
+
 def test_model_turn_lowers_turns_and_threads_lane_config() -> None:
     caps = ModelCapabilities(max_output_tokens=1234)
     extra = {"chat_template_kwargs": {"enable_thinking": True}}
@@ -388,11 +410,12 @@ def test_temperature_unresolved_passes_none_and_wire_omits_it() -> None:
 
 
 def test_resolve_lane_global_config_store_rung() -> None:
-    # ModelConfig.temperature=None means "use the global default from
-    # ConfigStore" (the documented ladder) — resolve_lane climbs it.
+    # The global rung fires only when the operator actually STORED a
+    # value; the registry default is the unset sentinel (None), so an
+    # untouched install resolves None → the wire omits the field.
     provider = _FakeProvider([])
     registry = _fake_registry(temperature=None)
-    store = SimpleNamespace(get=lambda key: 1.0 if key == "model.temperature" else None)
+    store = _real_semantics_store(**{"model.temperature": 1.0})
     lane = resolve_lane(provider, object(), "m", alias="ali", registry=registry, config_store=store)
     assert lane.temperature == 1.0
     # The per-model value wins over the global rung.
@@ -401,34 +424,90 @@ def test_resolve_lane_global_config_store_rung() -> None:
         provider, object(), "m", alias="ali", registry=registry2, config_store=store
     )
     assert lane2.temperature == 0.3
+    # Never-stored global → None (the round-2 headline: ConfigStore.get
+    # must NOT manufacture a wire value on a miss).
+    lane3 = resolve_lane(
+        provider,
+        object(),
+        "m",
+        alias="ali",
+        registry=_fake_registry(temperature=None),
+        config_store=_real_semantics_store(),
+    )
+    assert lane3.temperature is None
 
 
-def test_resolve_lane_reasoning_effort_ladder() -> None:
-    # Effort rides the same ladder as temperature with a caps terminal:
-    # per-model config -> global setting -> caps default_reasoning_effort.
+def test_resolve_lane_reasoning_effort_operator_rungs() -> None:
+    # The lane carries the OPERATOR rungs only: per-model config → stored
+    # global setting → None.  The in-code model definition (caps default)
+    # applies at the model_turn call, so an operator-silent lane stays
+    # None — the assignment scheme's "if not set, we don't send it".
     provider = _FakeProvider([])
     # Per-model config wins.
     reg = _fake_registry()
     reg.get_config.return_value.reasoning_effort = "high"
     lane = resolve_lane(provider, object(), "m", alias="ali", registry=reg)
     assert lane.reasoning_effort == "high"
-    # Global setting rung.
+    # Stored global setting rung.
     reg2 = _fake_registry()
     reg2.get_config.return_value.reasoning_effort = None
-    store = SimpleNamespace(get=lambda key: "low" if key == "model.reasoning_effort" else None)
+    store = _real_semantics_store(**{"model.reasoning_effort": "low"})
     lane2 = resolve_lane(provider, object(), "m", alias="ali", registry=reg2, config_store=store)
     assert lane2.reasoning_effort == "low"
-    # Terminal: the lane capabilities' per-provider default.
-    lane3 = resolve_lane(provider, object(), "m")
-    assert lane3.reasoning_effort == ModelCapabilities().default_reasoning_effort
+    # Empty string at any rung is the unset sentinel (a valid settings
+    # choice meaning fall through) — with a never-stored global (registry
+    # default IS "") the lane stays operator-silent.
+    reg3 = _fake_registry()
+    reg3.get_config.return_value.reasoning_effort = ""
+    lane3 = resolve_lane(
+        provider, object(), "m", alias="ali", registry=reg3, config_store=_real_semantics_store()
+    )
+    assert lane3.reasoning_effort is None
+    # Bare lane (no registry, no store): None.
+    assert resolve_lane(provider, object(), "m").reasoning_effort is None
 
 
-def test_model_turn_effort_unresolved_falls_to_caps_default() -> None:
-    # No caller value, bare lane -> the caps default reaches the provider
-    # (effort always resolves concrete; wire omission is temperature-only).
+def test_model_turn_effort_lower_rungs() -> None:
+    # Below the lane's operator rungs, model_turn applies: caller
+    # request-shaped default → in-code model definition (caps) → None
+    # (wire omission — no hidden "medium" constant anywhere).
+    # Bare hand-built lane: nothing anywhere → the provider receives None.
     provider = _FakeProvider([CompletionResult(content="")])
     model_turn(_lane(provider), [Turn.user("x")])
-    assert provider.calls[0]["reasoning_effort"] == "medium"
+    assert provider.calls[0]["reasoning_effort"] is None
+
+    # In-code model definition rung: a declared caps default applies.
+    caps = ModelCapabilities(default_reasoning_effort="high")
+    provider2 = _FakeProvider([CompletionResult(content="")])
+    model_turn(_lane(provider2, capabilities=caps), [Turn.user("x")])
+    assert provider2.calls[0]["reasoning_effort"] == "high"
+
+    # A caller request-shaped default (budget-coupled lanes: utility,
+    # output guard) beats the model-generic caps default…
+    provider3 = _FakeProvider([CompletionResult(content="")])
+    model_turn(
+        _lane(provider3, capabilities=caps), [Turn.user("x")], default_reasoning_effort="low"
+    )
+    assert provider3.calls[0]["reasoning_effort"] == "low"
+
+    # …loses to an operator value on the lane…
+    provider4 = _FakeProvider([CompletionResult(content="")])
+    model_turn(
+        _lane(provider4, capabilities=caps, reasoning_effort="xhigh"),
+        [Turn.user("x")],
+        default_reasoning_effort="low",
+    )
+    assert provider4.calls[0]["reasoning_effort"] == "xhigh"
+
+    # …and to an explicit relay (the "none" knob stays distinct from unset).
+    provider5 = _FakeProvider([CompletionResult(content="")])
+    model_turn(
+        _lane(provider5, capabilities=caps),
+        [Turn.user("x")],
+        reasoning_effort="none",
+        default_reasoning_effort="low",
+    )
+    assert provider5.calls[0]["reasoning_effort"] == "none"
 
 
 def test_model_turn_fetches_config_once_per_call() -> None:

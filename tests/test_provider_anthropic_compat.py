@@ -151,7 +151,9 @@ class TestCompatWireShape:
         must never surface as wire ``extra_body`` — a leaked key would change
         every real-Anthropic request that threads a thinking override.
         Negative-tested: fails when the ``_INTERNAL_EXTRA_PARAMS`` exclusion
-        is removed from ``_build_thinking_and_kwargs``.
+        is removed from ``_build_thinking_and_kwargs``.  The effort knob is
+        explicit: unset effort means thinking OFF (the budget override
+        modifies a thinking block, it never creates one).
         """
         provider = AnthropicProvider()
         client = _capture_client()
@@ -160,6 +162,7 @@ class TestCompatWireShape:
                 client=client,
                 model="claude-sonnet-4-5",
                 messages=[{"role": "user", "content": "hi"}],
+                reasoning_effort="medium",
                 extra_params={"thinking_budget_tokens": 2048},
             )
         )
@@ -228,12 +231,20 @@ class TestCompatReasoningControl:
         assert "thinking" not in kwargs
         assert kwargs["temperature"] == 0.6  # never forced to 1.0 on compat
 
-    @pytest.mark.parametrize("knob", ["none", ""])
-    def test_manual_toggle_off(self, knob: str) -> None:
-        """Effort "none"/empty disables thinking — native manual-mode parity;
-        no effort key rides when thinking is off."""
-        kwargs = self._stream_kwargs(self._MANUAL_CAPS, knob)
+    def test_manual_toggle_explicit_off(self) -> None:
+        """The explicit "none" knob disables thinking — native manual-mode
+        parity; no effort key rides when thinking is off."""
+        kwargs = self._stream_kwargs(self._MANUAL_CAPS, "none")
         assert kwargs["extra_body"] == {"chat_template_kwargs": {"enable_thinking": False}}
+        assert "thinking" not in kwargs
+
+    def test_manual_unset_injects_nothing(self) -> None:
+        """An UNSET knob (no rung of the assignment scheme resolved a
+        value) injects no toggle at all — the template's own default
+        rules, matching "if not set, we don't send it".  Distinct from
+        the explicit "none" off-switch above."""
+        kwargs = self._stream_kwargs(self._MANUAL_CAPS, "")
+        assert "extra_body" not in kwargs
         assert "thinking" not in kwargs
 
     def test_adaptive_always_on(self) -> None:

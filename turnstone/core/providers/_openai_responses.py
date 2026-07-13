@@ -355,7 +355,7 @@ class OpenAIResponsesProvider:
         tools: list[dict[str, Any]] | None,
         max_tokens: int,
         temperature: float | None,
-        reasoning_effort: str,
+        reasoning_effort: str | None,
         deferred_names: frozenset[str] | None,
         capabilities: ModelCapabilities | None = None,
         replay_reasoning_to_model: bool = True,
@@ -372,10 +372,10 @@ class OpenAIResponsesProvider:
            turns (the SDK's ``ResponseReasoningItemParam`` shape).
 
         The AND-gate against ``caps.supports_reasoning_replay`` lives
-        upstream in ``ChatSession._resolve_replay_reasoning_to_model``
-        (single source of truth across providers).  Production callers
-        always thread the session-resolved flag, so this method trusts
-        the bool it receives.
+        upstream in ``model_turn.resolve_replay_reasoning_to_model``
+        (single source of truth across providers; the session wrapper
+        delegates there).  Production callers always thread the resolved
+        flag, so this method trusts the bool it receives.
         """
         caps = capabilities or self.get_capabilities(model)
 
@@ -481,7 +481,7 @@ class OpenAIResponsesProvider:
         tools: list[dict[str, Any]] | None = None,
         max_tokens: int = 4096,
         temperature: float | None = None,
-        reasoning_effort: str = "medium",
+        reasoning_effort: str | None = None,
         extra_params: dict[str, Any] | None = None,
         deferred_names: frozenset[str] | None = None,
         cancel_ref: list[Any] | None = None,
@@ -491,8 +491,9 @@ class OpenAIResponsesProvider:
         # AND ``_convert_messages`` round-tripping stored reasoning
         # items as input.  The AND-gate against
         # ``caps.supports_reasoning_replay`` lives in
-        # ``ChatSession._resolve_replay_reasoning_to_model`` — single
-        # source of truth across providers.
+        # ``model_turn.resolve_replay_reasoning_to_model`` — single
+        # source of truth across providers (the session wrapper
+        # delegates there).
         replay_reasoning_to_model: bool = True,
         extra_headers: dict[str, str] | None = None,
         resolve_attachments: Callable[[list[str]], dict[str, Any]] | None = None,
@@ -677,7 +678,7 @@ class OpenAIResponsesProvider:
         tools: list[dict[str, Any]] | None = None,
         max_tokens: int = 4096,
         temperature: float | None = None,
-        reasoning_effort: str = "medium",
+        reasoning_effort: str | None = None,
         extra_params: dict[str, Any] | None = None,
         deferred_names: frozenset[str] | None = None,
         capabilities: ModelCapabilities | None = None,

@@ -35,9 +35,6 @@
     }
   ],
   "model": "claude-sonnet-4-6",
-  "output_config": {
-    "effort": "medium"
-  },
   "system": "Output-guard: deploy output looked clean.",
   "temperature": 1.0,
   "thinking": {

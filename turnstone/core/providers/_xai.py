@@ -165,7 +165,7 @@ class XAIProvider(OpenAIResponsesProvider):
         tools: list[dict[str, Any]] | None,
         max_tokens: int,
         temperature: float | None,
-        reasoning_effort: str,
+        reasoning_effort: str | None,
         deferred_names: frozenset[str] | None,
         capabilities: ModelCapabilities | None = None,
         replay_reasoning_to_model: bool = True,

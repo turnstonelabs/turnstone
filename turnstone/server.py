@@ -58,6 +58,7 @@ from turnstone.core.auth import (
 from turnstone.core.idle_nudge_watcher import wake_workstream_if_pending
 from turnstone.core.log import get_logger
 from turnstone.core.metrics import metrics as _metrics
+from turnstone.core.model_turn import resolve_effort_setting, resolve_temperature_setting
 from turnstone.core.ratelimit import resolve_client_ip
 from turnstone.core.session import ChatSession, GenerationCancelled, SessionUI  # noqa: F401
 from turnstone.core.session_manager import SessionManager
@@ -5021,22 +5022,16 @@ def main() -> None:
             except Exception as e:
                 log.warning("Failed to resolve judge_model %r: %s", judge_model, e)
 
-        # Per-model sampling overrides take priority over global defaults
-        eff_temperature = (
-            r_cfg.temperature
-            if r_cfg.temperature is not None
-            else config_store.get("model.temperature")
-        )
+        # Sampling knobs ride the shared assignment scheme (alias > stored
+        # config > unset); unset means the wire omits the field and the
+        # inference engine's own default rules.
+        eff_temperature = resolve_temperature_setting(r_cfg, config_store)
         eff_max_tokens = (
             r_cfg.max_tokens
             if r_cfg.max_tokens is not None
             else config_store.get("model.max_tokens")
         )
-        eff_reasoning_effort = (
-            r_cfg.reasoning_effort
-            if r_cfg.reasoning_effort is not None
-            else config_store.get("model.reasoning_effort")
-        )
+        eff_reasoning_effort = resolve_effort_setting(r_cfg, config_store)
 
         return ChatSession(
             client=r_client,

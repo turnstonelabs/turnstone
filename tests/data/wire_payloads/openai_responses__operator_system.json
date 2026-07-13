@@ -29,9 +29,6 @@
   "max_output_tokens": 4096,
   "model": "gpt-5",
   "prompt_cache_retention": "24h",
-  "reasoning": {
-    "effort": "medium"
-  },
   "store": false,
   "stream": true,
   "tools": [

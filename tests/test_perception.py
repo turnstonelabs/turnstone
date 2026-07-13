@@ -2,11 +2,11 @@
 
 from __future__ import annotations
 
-from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any
 
 import pytest
 
+from tests._session_helpers import mock_completion_result
 from turnstone.core import perception
 
 if TYPE_CHECKING:
@@ -44,20 +44,16 @@ class _StubProvider:
         messages: list[dict[str, Any]],
         resolve_attachments: Any = None,
         **_: Any,
-    ) -> SimpleNamespace:
+    ) -> Any:
         self.calls += 1
         self.last_messages = messages
         self.last_resolve = resolve_attachments
         if self.calls <= self._fail_times:
             raise RuntimeError("backend down")
-        return SimpleNamespace(
-            content=self._content,
-            tool_calls=None,
-            finish_reason="stop",
-            usage=None,
-            provider_blocks=[],
-            reasoning="",
-        )
+        # Shared field inventory: when model_turn's re-ingest reads a new
+        # CompletionResult field, mock_completion_result is the ONE
+        # definition to extend and this suite moves with it.
+        return mock_completion_result(self._content)
 
 
 @pytest.fixture(autouse=True)

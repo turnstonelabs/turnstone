@@ -22,7 +22,11 @@ const ALIAS_SETTING_KEYS = [
 // opposed to "no value" — distinct from the literal "none" choice (e.g.
 // reasoning_effort="none" actually disables reasoning, very different
 // from leaving it unset).
-const INHERIT_EMPTY_LABEL_KEYS = ["model.task_effort"];
+const INHERIT_EMPTY_LABEL_KEYS = [
+  "model.task_effort",
+  "model.reasoning_effort",
+  "coordinator.reasoning_effort",
+];
 
 // ---------------------------------------------------------------------------
 // Admin information architecture — the single source of truth for the rail's
@@ -4274,6 +4278,13 @@ function _renderSettingRow(item) {
       item.max_value !== null && item.max_value !== undefined
         ? ' max="' + item.max_value + '"'
         : "";
+    // A null registry default means "unset = inherit" (e.g.
+    // model.temperature): blank is a saveable state, not a validation
+    // error — the save handler maps it to reset-to-default.
+    const nullableAttr =
+      item.default_value === null
+        ? ' data-nullable="1" placeholder="(inherit model default)"'
+        : "";
     html +=
       '<input type="number" data-setting-key="' +
       escapedKey +
@@ -4286,6 +4297,7 @@ function _renderSettingRow(item) {
       '"' +
       minAttr +
       maxAttr +
+      nullableAttr +
       ">";
   } else {
     // str
@@ -4448,6 +4460,16 @@ function _saveSettingValue(key) {
     value = inp.checked;
   } else if (inp.type === "number") {
     if (inp.value === "") {
+      if (inp.getAttribute("data-nullable") === "1") {
+        // Blank on a nullable-default setting means "inherit": clear any
+        // stored override (reset), or nothing to do if already default.
+        if (document.querySelector('[data-reset-key="' + key + '"]')) {
+          _resetSetting(key);
+        } else if (saveBtn) {
+          saveBtn.classList.remove("visible");
+        }
+        return;
+      }
       showToast("Value is required");
       return;
     }

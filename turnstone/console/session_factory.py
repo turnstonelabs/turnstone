@@ -23,6 +23,7 @@ from typing import TYPE_CHECKING
 
 from turnstone.console.coordinator_alias import resolve_coordinator_alias
 from turnstone.core.log import get_logger
+from turnstone.core.model_turn import resolve_effort_setting, resolve_temperature_setting
 from turnstone.core.session import ChatSession
 from turnstone.core.workstream import WorkstreamKind
 from turnstone.prompts import ClientType
@@ -168,25 +169,17 @@ def build_console_session_factory(
                     e,
                 )
 
-        eff_temperature = (
-            r_cfg.temperature
-            if r_cfg.temperature is not None
-            else config_store.get("model.temperature")
-        )
+        # Sampling knobs ride the shared assignment scheme (alias >
+        # stored config > unset); the coordinator role setting slots in
+        # as a role rung.  Unset means the wire omits the field.
+        eff_temperature = resolve_temperature_setting(r_cfg, config_store)
         eff_max_tokens = (
             r_cfg.max_tokens
             if r_cfg.max_tokens is not None
             else config_store.get("model.max_tokens")
         )
-        # Coordinator has its own effort setting; fall back to model-level
-        # override, then global default.
-        eff_reasoning_effort = (
-            r_cfg.reasoning_effort
-            if r_cfg.reasoning_effort is not None
-            else (
-                config_store.get("coordinator.reasoning_effort")
-                or config_store.get("model.reasoning_effort")
-            )
+        eff_reasoning_effort = resolve_effort_setting(
+            r_cfg, config_store, role_key="coordinator.reasoning_effort"
         )
 
         coord_client = coord_client_factory(ws_id or "", uid)

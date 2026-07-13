@@ -30,7 +30,7 @@ from types import SimpleNamespace
 from typing import Any
 
 from tests._session_helpers import make_session as _make_session
-from turnstone.core.model_turn import resolve_server_type, synth_reasoning_block
+from turnstone.core.model_turn import _server_type_of, synth_reasoning_block
 from turnstone.core.providers._anthropic import (
     ANTHROPIC_VALID_BLOCK_TYPES,
     AnthropicProvider,
@@ -78,7 +78,7 @@ class TestSynthReasoningBlock:
         assert out[0]["source"] == "vllm"
 
     def test_synth_handles_registry_exception(self) -> None:
-        # resolve_server_type silently returns "" on any lookup error
+        # The defensive config fetch degrades to None on any lookup error
         # — synth still fires but omits the source field.
         class BrokenRegistry:
             def get_config(self, alias: str) -> Any:
@@ -299,47 +299,32 @@ class TestStreamResponseSynthBlockIntegration:
         assert provider_content[0]["source"] == "vllm"
 
 
-class TestResolveServerType:
-    """Direct unit tests for ``model_turn.resolve_server_type``, the one
-    reader of ``server_compat.server_type``."""
+class TestServerTypeOf:
+    """Direct unit tests for ``model_turn._server_type_of``, the one
+    reader of ``server_compat.server_type`` (the Phase 5 vLLM gate and
+    the synth-block source tagging both go through it)."""
 
-    def test_returns_empty_when_no_registry(self) -> None:
-        assert resolve_server_type(None, "some-alias") == ""
-
-    def test_returns_empty_when_no_alias(self) -> None:
-        registry = SimpleNamespace(
-            get_config=lambda alias: SimpleNamespace(capabilities={}, server_compat={})
-        )
-        assert resolve_server_type(registry, "") == ""
-
-    def test_returns_server_type_when_present(self) -> None:
+    def test_reads_server_type_when_present(self) -> None:
         # Mirrors production ModelConfig shape: server_compat lives at
         # the top-level dataclass field, NOT inside capabilities.  Both
         # model_registry loader paths pop("server_compat") out of caps
         # before construction (see model_registry.py:401, 485).
-        registry = SimpleNamespace(
-            get_config=lambda alias: SimpleNamespace(
-                capabilities={},
-                server_compat={"server_type": "llama.cpp"},
-            )
+        cfg = SimpleNamespace(
+            capabilities={},
+            server_compat={"server_type": "llama.cpp"},
         )
-        assert resolve_server_type(registry, "local-model") == "llama.cpp"
+        assert _server_type_of(cfg) == "llama.cpp"
 
     def test_returns_empty_when_server_compat_missing(self) -> None:
-        registry = SimpleNamespace(
-            get_config=lambda alias: SimpleNamespace(
-                capabilities={"context_window": 32768},
-                server_compat={},
-            )
+        cfg = SimpleNamespace(
+            capabilities={"context_window": 32768},
+            server_compat={},
         )
-        assert resolve_server_type(registry, "local-model") == ""
+        assert _server_type_of(cfg) == ""
 
-    def test_returns_empty_on_exception(self) -> None:
-        class BrokenRegistry:
-            def get_config(self, alias: str) -> Any:
-                raise RuntimeError("boom")
-
-        assert resolve_server_type(BrokenRegistry(), "x") == ""
+    def test_returns_empty_on_non_dict_server_compat(self) -> None:
+        assert _server_type_of(SimpleNamespace(server_compat=None)) == ""
+        assert _server_type_of(SimpleNamespace()) == ""
 
 
 class TestFinalizeProviderBlocks:

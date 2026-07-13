@@ -540,7 +540,12 @@ class OutputGuardJudge:
             config_store=self._config_store,
         )
         # Temperature deliberately not pinned (house rule) — the lane
-        # inherits the guard model's configured temperature.
+        # inherits the guard model's configured temperature.  The effort
+        # default is request shape, not a pin: screening runs inside a
+        # 512-token cap, and an unconstrained thinking pass would consume
+        # the whole budget and return empty content (the stage would
+        # silently no-op to heuristic-only).  Any operator or
+        # model-definition effort value beats it.
         try:
             result = run_with_deadline(
                 lambda: model_turn(
@@ -548,6 +553,7 @@ class OutputGuardJudge:
                     judge_turns,
                     tools=None,
                     max_tokens=512,
+                    default_reasoning_effort="low",
                 ),
                 timeout=timeout,
                 cancel_event=cancel_event,

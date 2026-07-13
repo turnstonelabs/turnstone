@@ -145,7 +145,7 @@ class OpenAIChatCompletionsProvider:
         self,
         extra_params: dict[str, Any] | None,
         caps: ModelCapabilities,
-        reasoning_effort: str,
+        reasoning_effort: str | None,
     ) -> dict[str, Any] | None:
         """Build the final ``extra_body``, injecting reasoning params if needed.
 
@@ -178,7 +178,7 @@ class OpenAIChatCompletionsProvider:
         tools: list[dict[str, Any]] | None = None,
         max_tokens: int = 4096,
         temperature: float | None = None,
-        reasoning_effort: str = "medium",
+        reasoning_effort: str | None = None,
         extra_params: dict[str, Any] | None = None,
         deferred_names: frozenset[str] | None = None,
         cancel_ref: list[Any] | None = None,
@@ -313,7 +313,7 @@ class OpenAIChatCompletionsProvider:
         tools: list[dict[str, Any]] | None = None,
         max_tokens: int = 4096,
         temperature: float | None = None,
-        reasoning_effort: str = "medium",
+        reasoning_effort: str | None = None,
         extra_params: dict[str, Any] | None = None,
         deferred_names: frozenset[str] | None = None,
         capabilities: ModelCapabilities | None = None,

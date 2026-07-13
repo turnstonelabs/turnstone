@@ -275,7 +275,7 @@ _ANTHROPIC_CAPABILITIES: dict[str, ModelCapabilities] = {
 
 
 def _map_reasoning_to_effort(
-    reasoning_effort: str,
+    reasoning_effort: str | None,
     valid_levels: tuple[str, ...],
 ) -> str | None:
     """Map turnstone reasoning_effort to Anthropic effort parameter.
@@ -404,7 +404,7 @@ class AnthropicProvider:
     def _build_thinking_and_kwargs(
         self,
         caps: ModelCapabilities,
-        reasoning_effort: str,
+        reasoning_effort: str | None,
         extra_params: dict[str, Any] | None,
         max_tokens: int,
         temperature: float | None,
@@ -828,7 +828,7 @@ class AnthropicProvider:
 
     def _reasoning_params(
         self,
-        reasoning_effort: str,
+        reasoning_effort: str | None,
         extra_params: dict[str, Any] | None,
         max_tokens: int = 4096,
     ) -> dict[str, Any]:
@@ -865,7 +865,7 @@ class AnthropicProvider:
         tools: list[dict[str, Any]] | None = None,
         max_tokens: int = 4096,
         temperature: float | None = None,
-        reasoning_effort: str = "medium",
+        reasoning_effort: str | None = None,
         extra_params: dict[str, Any] | None = None,
         deferred_names: frozenset[str] | None = None,
         cancel_ref: list[Any] | None = None,
@@ -1079,7 +1079,7 @@ class AnthropicProvider:
         tools: list[dict[str, Any]] | None = None,
         max_tokens: int = 4096,
         temperature: float | None = None,
-        reasoning_effort: str = "medium",
+        reasoning_effort: str | None = None,
         extra_params: dict[str, Any] | None = None,
         deferred_names: frozenset[str] | None = None,
         capabilities: ModelCapabilities | None = None,

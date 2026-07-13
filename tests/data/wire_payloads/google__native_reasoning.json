@@ -26,7 +26,6 @@
     }
   ],
   "model": "gemini-2.5-pro",
-  "reasoning_effort": "medium",
   "stream": true,
   "stream_options": {
     "include_usage": true
