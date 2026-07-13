@@ -55,6 +55,47 @@ def _reasoning_text(obj: Any) -> str:
 log = structlog.get_logger(__name__)
 
 
+class ToolCallSlotter:
+    """Wire-index → logical-slot assignment for streamed tool-call deltas.
+
+    Shared by the base iterator and ``GoogleProvider``'s raw fidelity tap
+    (both observe the same delta sequence, so their assignments agree and
+    the normalized mirror can never desync from the raw ``provider_blocks``
+    lane).  Index-degenerate compat servers (historical vLLM/llama.cpp
+    builds) emit every parallel call at index 0 — a delta opens a NEW slot
+    when its id contradicts the slot's id, or when it announces a name for
+    a slot that already accumulated arguments (the id-less whole-delta
+    shape: name+arguments per call, so a second announcement after
+    arguments is a second call).  Id-less argument fragments keep
+    following their index's current slot.
+    """
+
+    def __init__(self) -> None:
+        self._slot_for_index: dict[int, int] = {}
+        self._slot_ids: dict[int, str] = {}
+        self._slot_has_args: set[int] = set()
+        self._next_slot = 0
+
+    def slot_for(self, wire_index: int, tc_id: str, *, has_name: bool, has_args: bool) -> int:
+        slot = self._slot_for_index.get(wire_index)
+        id_conflict = (
+            slot is not None
+            and tc_id
+            and self._slot_ids.get(slot, "")
+            and self._slot_ids[slot] != tc_id
+        )
+        reannounce = slot is not None and has_name and slot in self._slot_has_args
+        if slot is None or id_conflict or reannounce:
+            slot = self._next_slot
+            self._next_slot += 1
+            self._slot_for_index[wire_index] = slot
+        if tc_id:
+            self._slot_ids[slot] = tc_id
+        if has_args:
+            self._slot_has_args.add(slot)
+        return slot
+
+
 class OpenAIChatCompletionsProvider:
     """Provider for local OpenAI-compatible servers (vLLM, llama.cpp, SGLang).
 
@@ -202,16 +243,10 @@ class OpenAIChatCompletionsProvider:
         tool_call_count = 0
         last_finish_reason: str | None = None
         completion_tokens: int | None = None
-        # Remap wire indexes onto logical slots: index-degenerate compat
-        # servers (historical vLLM/llama.cpp builds) emit every parallel
-        # tool call at index 0 — a delta whose id contradicts its index's
-        # current call opens a new slot, mirroring the Anthropic iterator's
-        # per-block index assignment.  Id-less argument fragments keep
-        # following their index's current slot, so downstream accumulators
-        # (drain_stream, the chat loop) can key by index safely.
-        slot_for_index: dict[int, int] = {}
-        slot_ids: dict[int, str] = {}
-        next_slot = 0
+        # Remap wire indexes onto logical slots (see ToolCallSlotter) so
+        # downstream accumulators (drain_stream, the chat loop) can key by
+        # index safely even on index-degenerate compat servers.
+        slotter = ToolCallSlotter()
         for chunk in stream:
             sc = StreamChunk()
 
@@ -246,25 +281,22 @@ class OpenAIChatCompletionsProvider:
             # Tool calls
             if delta.tool_calls:
                 for tc_delta in delta.tool_calls:
-                    wire_index = tc_delta.index
                     tc_id = tc_delta.id or ""
-                    slot = slot_for_index.get(wire_index)
-                    if slot is None or (
-                        tc_id and slot_ids.get(slot, "") and slot_ids[slot] != tc_id
-                    ):
-                        slot = next_slot
-                        next_slot += 1
-                        slot_for_index[wire_index] = slot
-                    if tc_id:
-                        slot_ids[slot] = tc_id
+                    fn = tc_delta.function
+                    slot = slotter.slot_for(
+                        tc_delta.index,
+                        tc_id,
+                        has_name=bool(fn and fn.name),
+                        has_args=bool(fn and fn.arguments),
+                    )
                     tcd = ToolCallDelta(index=slot)
                     if tc_id:
                         tcd.id = tc_id
-                    if tc_delta.function:
-                        if tc_delta.function.name:
-                            tcd.name = tc_delta.function.name
-                        if tc_delta.function.arguments:
-                            tcd.arguments_delta = tc_delta.function.arguments
+                    if fn:
+                        if fn.name:
+                            tcd.name = fn.name
+                        if fn.arguments:
+                            tcd.arguments_delta = fn.arguments
                     sc.tool_call_deltas.append(tcd)
                     tool_call_count += 1
 

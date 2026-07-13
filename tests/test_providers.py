@@ -743,6 +743,15 @@ class TestOpenAIProvider:
         assert result.tool_calls[0]["function"]["arguments"] == '{"path": "foo.py"}'
         assert result.finish_reason == "tool_calls"
 
+    def _drain_chunks(self, chunks: list[Any]):
+        client = MagicMock()
+        client.chat.completions.create.return_value = chunks
+        return drain_stream(
+            self.provider.create_streaming(
+                client=client, model="m", messages=[{"role": "user", "content": "x"}]
+            )
+        )
+
     def test_streaming_remaps_index_degenerate_parallel_calls(self) -> None:
         # Historical compat servers (older vLLM, some llama.cpp builds)
         # stream every parallel call at index 0 as whole deltas.  The
@@ -750,52 +759,70 @@ class TestOpenAIProvider:
         # index's current call, so BOTH consumers (drain_stream and the
         # chat loop's accumulator) see distinct calls; id-less argument
         # fragments keep following their index's current slot.
-        def _tc_chunk(tc_id: str, name: str, args: str) -> SimpleNamespace:
-            tc = SimpleNamespace(
-                index=0, id=tc_id, function=SimpleNamespace(name=name, arguments=args)
-            )
-            delta = SimpleNamespace(
-                content=None,
-                tool_calls=[tc],
-                reasoning=None,
-                reasoning_content=None,
-                annotations=None,
-            )
-            return SimpleNamespace(
-                choices=[SimpleNamespace(finish_reason=None, delta=delta)], usage=None
-            )
-
-        finish = SimpleNamespace(
-            choices=[
-                SimpleNamespace(
-                    finish_reason="tool_calls",
-                    delta=SimpleNamespace(
-                        content=None,
-                        tool_calls=None,
-                        reasoning=None,
-                        reasoning_content=None,
-                        annotations=None,
-                    ),
-                )
-            ],
-            usage=None,
-        )
-        chunks = [
-            _tc_chunk("a", "read", '{"p": 1}'),
-            _tc_chunk("b", "write", '{"p": 2}'),
-            finish,
-        ]
-        client = MagicMock()
-        client.chat.completions.create.return_value = chunks
-
-        result = drain_stream(
-            self.provider.create_streaming(
-                client=client, model="m", messages=[{"role": "user", "content": "x"}]
-            )
+        result = self._drain_chunks(
+            [
+                _openai_stream_chunk(
+                    tool_calls=[
+                        _openai_tool_call_delta(
+                            index=0, tc_id="a", name="read", arguments='{"p": 1}'
+                        )
+                    ]
+                ),
+                _openai_stream_chunk(
+                    tool_calls=[
+                        _openai_tool_call_delta(
+                            index=0, tc_id="b", name="write", arguments='{"p": 2}'
+                        )
+                    ]
+                ),
+                _openai_stream_chunk(finish_reason="tool_calls"),
+            ]
         )
         assert [tc["id"] for tc in result.tool_calls] == ["a", "b"]
         assert result.tool_calls[0]["function"]["arguments"] == '{"p": 1}'
         assert result.tool_calls[1]["function"]["arguments"] == '{"p": 2}'
+
+    def test_streaming_splits_idless_degenerate_parallel_calls(self) -> None:
+        # The same degenerate servers may omit ids entirely: a delta that
+        # ANNOUNCES a name for a slot that already accumulated arguments is
+        # a second whole call, not a fragment — without the split, two
+        # id-less calls fuse into one with concatenated garbage arguments.
+        result = self._drain_chunks(
+            [
+                _openai_stream_chunk(
+                    tool_calls=[_openai_tool_call_delta(index=0, name="read", arguments='{"a": 1}')]
+                ),
+                _openai_stream_chunk(
+                    tool_calls=[
+                        _openai_tool_call_delta(index=0, name="write", arguments='{"b": 2}')
+                    ]
+                ),
+                _openai_stream_chunk(finish_reason="tool_calls"),
+            ]
+        )
+        assert [tc["function"]["name"] for tc in result.tool_calls] == ["read", "write"]
+        assert result.tool_calls[0]["function"]["arguments"] == '{"a": 1}'
+        assert result.tool_calls[1]["function"]["arguments"] == '{"b": 2}'
+
+    def test_fragmented_single_call_does_not_split(self) -> None:
+        # The normal well-behaved shape — name announced once, arguments
+        # streamed in fragments — must stay ONE call.
+        result = self._drain_chunks(
+            [
+                _openai_stream_chunk(
+                    tool_calls=[_openai_tool_call_delta(index=0, tc_id="a", name="read")]
+                ),
+                _openai_stream_chunk(
+                    tool_calls=[_openai_tool_call_delta(index=0, arguments='{"p": ')]
+                ),
+                _openai_stream_chunk(
+                    tool_calls=[_openai_tool_call_delta(index=0, arguments='"x"}')]
+                ),
+                _openai_stream_chunk(finish_reason="tool_calls"),
+            ]
+        )
+        assert len(result.tool_calls) == 1
+        assert result.tool_calls[0]["function"]["arguments"] == '{"p": "x"}'
 
     def test_drained_stream_usage(self) -> None:
         client = MagicMock()
@@ -2261,6 +2288,39 @@ class TestGoogleProviderFidelity:
         assert fc.provider_blocks[0]["thought_signature"] == "sig_stream"
         assert fc.provider_blocks[0]["id"] == "call_abc"
         assert fc.provider_blocks[0]["function"]["name"] == "write_file"
+
+    def test_tap_slots_degenerate_calls_like_the_mirror(self) -> None:
+        # The raw fidelity tap and the base iterator slot the SAME delta
+        # sequence identically: two wire-index-0 calls with distinct ids
+        # yield TWO raw dicts, each keeping its own thought_signature — a
+        # fused single dict would fail _prepare_messages' length gate and
+        # silently drop the signature lane from the replay.
+        from turnstone.core.providers._google import GoogleProvider
+
+        prov = GoogleProvider()
+
+        def _tc(tc_id: str, name: str, args: str, sig: str) -> MagicMock:
+            tcd = _openai_tool_call_delta(index=0, tc_id=tc_id, name=name, arguments=args)
+            tcd.__pydantic_extra__ = {"thought_signature": sig}
+            return tcd
+
+        chunks = [
+            _openai_stream_chunk(tool_calls=[_tc("c1", "read", '{"a": 1}', "sig_a")]),
+            _openai_stream_chunk(tool_calls=[_tc("c2", "write", '{"b": 2}', "sig_b")]),
+            _openai_stream_chunk(finish_reason="tool_calls"),
+        ]
+        client = MagicMock()
+        client.chat.completions.create.return_value = chunks
+
+        result = drain_stream(
+            prov.create_streaming(
+                client=client, model="gemini-2.5-pro", messages=[{"role": "user", "content": "x"}]
+            )
+        )
+        assert len(result.tool_calls) == 2
+        assert len(result.provider_blocks) == 2
+        assert [b["thought_signature"] for b in result.provider_blocks] == ["sig_a", "sig_b"]
+        assert [b["id"] for b in result.provider_blocks] == ["c1", "c2"]
 
     def test_base_chat_lane_emits_no_provider_blocks(self) -> None:
         """The base chat lane carries NO provider_blocks for tool calls —
@@ -5357,6 +5417,48 @@ class TestResponsesDrainedStream:
         events = [SimpleNamespace(type="error", code="invalid_request", message="bad tool schema")]
         with pytest.raises(RuntimeError, match="bad tool schema"):
             self._drain(events)
+
+    def test_terminal_without_payload_keeps_collected_blocks(self) -> None:
+        # The collected output_item.done blocks came from the stream, not
+        # the missing terminal payload — a payload-less terminal must not
+        # drop them (reasoning items lost = replay degradation).
+        item = SimpleNamespace(type="reasoning", summary=[])
+        item.model_dump = lambda **_kw: {"type": "reasoning", "summary": []}  # type: ignore[method-assign]
+        events = [
+            SimpleNamespace(type="response.output_item.done", item=item),
+            SimpleNamespace(type="response.completed", response=None),
+        ]
+        result = self._drain(events)
+        assert result.finish_reason == "stop"
+        assert result.provider_blocks == [{"type": "reasoning", "summary": []}]
+
+    def test_truncation_rebuild_recovers_annotations(self) -> None:
+        # The message item open at truncation never got output_item.done,
+        # so its annotations were never collected — the terminal rebuild
+        # walks them so truncated web-search turns keep their Sources.
+        ann = MagicMock()
+        ann.type = "url_citation"
+        ann.url_citation = MagicMock(title="Cite", url="https://cite.test")
+        part = SimpleNamespace(type="output_text", text="truncated bod", annotations=[ann])
+        msg_item = SimpleNamespace(type="message", content=[part], status="incomplete")
+        msg_item.model_dump = lambda **_kw: {"type": "message", "content": []}  # type: ignore[method-assign]
+        usage = SimpleNamespace(
+            input_tokens=10,
+            output_tokens=5,
+            total_tokens=15,
+            input_tokens_details=SimpleNamespace(cached_tokens=0),
+        )
+        events = [
+            SimpleNamespace(type="response.output_text.delta", delta="truncated bod"),
+            SimpleNamespace(
+                type="response.incomplete",
+                response=SimpleNamespace(status="incomplete", usage=usage, output=[msg_item]),
+            ),
+        ]
+        result = self._drain(events)
+        assert result.finish_reason == "length"
+        assert "Sources:" in result.content
+        assert "[Cite](https://cite.test)" in result.content
 
     def test_transient_error_event_is_retryable(self) -> None:
         from turnstone.core.providers._openai_responses import ResponsesStreamFailedError

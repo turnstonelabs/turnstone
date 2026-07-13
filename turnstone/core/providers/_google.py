@@ -24,7 +24,10 @@ if TYPE_CHECKING:
     from collections.abc import Iterator
 
 from turnstone.core.lowering import legalize_tool_call_entry
-from turnstone.core.providers._openai_chat import OpenAIChatCompletionsProvider
+from turnstone.core.providers._openai_chat import (
+    OpenAIChatCompletionsProvider,
+    ToolCallSlotter,
+)
 from turnstone.core.providers._openai_common import sanitize_messages
 from turnstone.core.providers._protocol import ModelCapabilities, StreamChunk
 
@@ -137,8 +140,17 @@ class GoogleProvider(OpenAIChatCompletionsProvider):
         delegates all chunk processing to the base class.  The accumulated
         raw tool-call dicts are emitted as ``provider_blocks`` on the
         final chunk so the session stores them as ``_provider_content``.
+
+        The tap keys its raw dicts through its OWN :class:`ToolCallSlotter`
+        over the same delta sequence the base iterator slots, so the raw
+        fidelity lane and the normalized ``tool_calls`` mirror assign call
+        identity identically — a desync (one fused raw dict vs two mirror
+        calls on an index-degenerate stream) would fail
+        ``_prepare_messages``' length gate and silently drop
+        ``thought_signature`` from the replay.
         """
         raw_tool_calls: dict[int, dict[str, Any]] = {}
+        slotter = ToolCallSlotter()
 
         def _tap(raw_stream: Any) -> Any:
             """Pass-through iterator that captures tool-call extras."""
@@ -147,21 +159,27 @@ class GoogleProvider(OpenAIChatCompletionsProvider):
                     delta = chunk.choices[0].delta
                     if delta.tool_calls:
                         for tc_delta in delta.tool_calls:
-                            idx = tc_delta.index
-                            if idx not in raw_tool_calls:
-                                raw_tool_calls[idx] = {
+                            fn = tc_delta.function
+                            slot = slotter.slot_for(
+                                tc_delta.index,
+                                tc_delta.id or "",
+                                has_name=bool(fn and fn.name),
+                                has_args=bool(fn and fn.arguments),
+                            )
+                            if slot not in raw_tool_calls:
+                                raw_tool_calls[slot] = {
                                     "id": "",
                                     "type": "function",
                                     "function": {"name": "", "arguments": ""},
                                 }
-                            raw_tc = raw_tool_calls[idx]
+                            raw_tc = raw_tool_calls[slot]
                             if tc_delta.id:
                                 raw_tc["id"] = tc_delta.id
-                            if tc_delta.function:
-                                if tc_delta.function.name:
-                                    raw_tc["function"]["name"] = tc_delta.function.name
-                                if tc_delta.function.arguments:
-                                    raw_tc["function"]["arguments"] += tc_delta.function.arguments
+                            if fn:
+                                if fn.name:
+                                    raw_tc["function"]["name"] = fn.name
+                                if fn.arguments:
+                                    raw_tc["function"]["arguments"] += fn.arguments
                             # Capture provider-specific extras (e.g. thought_signature)
                             extras = getattr(tc_delta, "__pydantic_extra__", None)
                             if extras:

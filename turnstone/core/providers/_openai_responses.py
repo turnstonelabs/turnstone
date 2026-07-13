@@ -48,6 +48,16 @@ log = structlog.get_logger(__name__)
 _TRANSIENT_FAILURE_CODES = frozenset({"server_error", "rate_limit_exceeded"})
 
 
+def _raise_responses_failure(error_code: str, error_msg: str) -> None:
+    """One classification ladder for BOTH in-band failure shapes (`error`
+    events and ``response.failed``) — a one-sided edit would make the same
+    API failure retryable through one event type and fatal through the
+    other."""
+    if error_code in _TRANSIENT_FAILURE_CODES:
+        raise ResponsesStreamFailedError(f"Responses API error ({error_code}): {error_msg}")
+    raise RuntimeError(f"Responses API error ({error_code or 'unknown'}): {error_msg}")
+
+
 class ResponsesStreamFailedError(RuntimeError):
     """A TRANSIENT in-band ``response.failed`` terminal event.
 
@@ -671,38 +681,49 @@ class OpenAIResponsesProvider:
                 if not response:
                     # A terminal event without its payload (lax compat
                     # server) is still a terminal signal — emit the finish
-                    # reason implied by the event type so the drain's
-                    # complete-or-error gate sees a completed stream, just
-                    # without usage/blocks.
-                    last_finish = "stop" if event_type == "response.completed" else "length"
-                    yield StreamChunk(finish_reason=last_finish)
-                    continue
-                if response:
-                    status = getattr(response, "status", "completed")
-                    last_finish = "stop" if status == "completed" else "length"
-                    usage = extract_usage(getattr(response, "usage", None))
-                    if usage:
-                        completion_tokens = usage.completion_tokens
-                    # Prefer the terminal response's own output items over
-                    # the incrementally collected ones: an item still being
-                    # generated at truncation never receives its
-                    # ``output_item.done`` event, and storing a reasoning
-                    # item without its required following item makes the
-                    # next turn's replay a 400.
-                    final_items = [
-                        item.model_dump()
-                        for item in (getattr(response, "output", None) or [])
-                        if hasattr(item, "model_dump")
-                    ]
-                    if final_items:
-                        provider_blocks = final_items
+                    # reason implied by the event type, keeping the blocks
+                    # already collected from output_item.done events (they
+                    # came from the stream, not the missing payload); only
+                    # usage is genuinely unavailable.
                     sc = StreamChunk(
-                        finish_reason=last_finish,
-                        usage=usage,
+                        finish_reason="stop" if event_type == "response.completed" else "length"
                     )
                     if provider_blocks:
                         sc.provider_blocks = provider_blocks
                     yield sc
+                    continue
+                status = getattr(response, "status", "completed")
+                last_finish = "stop" if status == "completed" else "length"
+                usage = extract_usage(getattr(response, "usage", None))
+                if usage:
+                    completion_tokens = usage.completion_tokens
+                # Prefer the terminal response's own output items over the
+                # incrementally collected ones: an item still being
+                # generated at truncation never receives its
+                # ``output_item.done`` event, and storing a reasoning item
+                # without its required following item makes the next
+                # turn's replay a 400.  Its annotations were likewise
+                # never collected — walk them here (format_citations
+                # dedupes by URL, so re-seeing .done'd items is harmless).
+                out_items = getattr(response, "output", None) or []
+                final_items = [
+                    item.model_dump() for item in out_items if hasattr(item, "model_dump")
+                ]
+                if final_items:
+                    provider_blocks = final_items
+                    for item in out_items:
+                        if getattr(item, "type", "") == "message":
+                            for content_part in getattr(item, "content", []) or []:
+                                part_anns = getattr(content_part, "annotations", None)
+                                if part_anns:
+                                    annotations.extend(part_anns)
+                sc = StreamChunk(
+                    finish_reason=last_finish,
+                    usage=usage,
+                )
+                if provider_blocks:
+                    sc.provider_blocks = provider_blocks
+                yield sc
                 continue
 
             # -- in-band error event (ResponseErrorEvent) --
@@ -711,29 +732,19 @@ class OpenAIResponsesProvider:
             # stream exhausts finish-less and the real API message is lost
             # behind a misleading IncompleteStreamError.
             if event_type == "error":
-                error_msg = getattr(event, "message", "Unknown error") or "Unknown error"
-                error_code = getattr(event, "code", "") or ""
-                if error_code in _TRANSIENT_FAILURE_CODES:
-                    raise ResponsesStreamFailedError(
-                        f"Responses API error ({error_code}): {error_msg}"
-                    )
-                raise RuntimeError(f"Responses API error ({error_code or 'unknown'}): {error_msg}")
+                _raise_responses_failure(
+                    getattr(event, "code", "") or "",
+                    getattr(event, "message", "Unknown error") or "Unknown error",
+                )
 
             # -- error --
             if event_type == "response.failed":
                 response = getattr(event, "response", None)
                 error = getattr(response, "error", None) if response else None
-                error_msg = getattr(error, "message", "Unknown error") if error else "Unknown error"
-                error_code = getattr(error, "code", "") if error else ""
-                # Only transient in-band failures are worth the caller's
-                # backoff ladder; a deterministic rejection (invalid prompt,
-                # image fetch, policy) re-fails identically on every retry
-                # and must surface immediately, as it did pre-#831.
-                if error_code in _TRANSIENT_FAILURE_CODES:
-                    raise ResponsesStreamFailedError(
-                        f"Responses API error ({error_code}): {error_msg}"
-                    )
-                raise RuntimeError(f"Responses API error ({error_code or 'unknown'}): {error_msg}")
+                _raise_responses_failure(
+                    (getattr(error, "code", "") if error else "") or "",
+                    (getattr(error, "message", "") if error else "") or "Unknown error",
+                )
 
         log.debug(
             "openai.responses.response",

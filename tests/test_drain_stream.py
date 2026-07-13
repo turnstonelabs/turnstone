@@ -271,6 +271,21 @@ class TestInfoDelta:
 
 
 class TestErrorPropagation:
+    def test_httpx_transport_error_becomes_retryable_incomplete(self):
+        # Streaming moves the body read out of the SDK's wrapped request:
+        # a mid-body wire failure surfaces as a raw httpx.TransportError
+        # no retry predicate recognizes.  The drain re-raises it (chained,
+        # message preserved) as the retryable IncompleteStreamError.
+        import httpx
+
+        def chunks():
+            yield StreamChunk(content_delta="partial")
+            raise httpx.RemoteProtocolError("peer closed connection")
+
+        with pytest.raises(IncompleteStreamError, match="RemoteProtocolError") as excinfo:
+            drain_stream(chunks())
+        assert isinstance(excinfo.value.__cause__, httpx.RemoteProtocolError)
+
     def test_mid_stream_exception_propagates_verbatim(self):
         # Retry/deadline/fallback policy is the caller's — the drain adds
         # no exception translation, exactly like the old transport.

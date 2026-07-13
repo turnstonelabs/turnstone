@@ -142,8 +142,15 @@ def drain_stream(chunks: Iterator[StreamChunk]) -> CompletionResult:
 
     Raises whatever the underlying stream raises — retry/deadline/fallback
     policy stays with the caller, exactly as with the old non-streaming
-    transport.
+    transport — EXCEPT httpx transport failures: streaming moves the body
+    read out of the SDK's ``APIConnectionError``-wrapped request into raw
+    iteration, so a mid-body connection drop or read timeout surfaces as a
+    bare ``httpx.TransportError`` no retry predicate recognizes.  Those
+    are re-raised (chained) as :class:`IncompleteStreamError`, restoring
+    the wire-blip retryability the non-streaming transport had.
     """
+    import httpx  # noqa: PLC0415 — heavyweight; deferred off the type-module import path
+
     content_parts: list[str] = []
     reasoning_parts: list[str] = []
     trailing_info_parts: list[str] = []
@@ -152,7 +159,16 @@ def drain_stream(chunks: Iterator[StreamChunk]) -> CompletionResult:
     finish_reason: str | None = None
     provider_blocks: list[dict[str, Any]] = []
 
-    for sc in chunks:
+    iterator = iter(chunks)
+    while True:
+        try:
+            sc = next(iterator)
+        except StopIteration:
+            break
+        except httpx.TransportError as exc:
+            raise IncompleteStreamError(
+                f"stream transport failed mid-response ({type(exc).__name__}: {exc})"
+            ) from exc
         if sc.content_delta:
             content_parts.append(sc.content_delta)
         if sc.reasoning_delta:
