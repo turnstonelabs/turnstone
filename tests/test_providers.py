@@ -48,7 +48,12 @@ def _openai_stream_chunk(
     usage: MagicMock | None = None,
     empty_choices: bool = False,
 ) -> MagicMock:
-    """Build a mock OpenAI streaming chunk."""
+    """Build a mock OpenAI streaming chunk.
+
+    Shape twin of ``tests/_session_helpers.fake_chat_stream`` (which
+    builds whole scripted streams on SimpleNamespace); consolidate onto
+    one fake when either next changes shape.
+    """
     chunk = MagicMock()
     if empty_choices:
         chunk.choices = []
@@ -569,9 +574,12 @@ class TestOpenAIProvider:
                 messages=[{"role": "user", "content": "hi"}],
             )
         )
-        assert len(results) == 2
+        # Third chunk: the finish-reason-less shim stamps the clean end
+        # of a content-bearing stream as "stop".
+        assert len(results) == 3
         assert results[0].content_delta == "Hello"
         assert results[1].content_delta == " world"
+        assert results[2].finish_reason == "stop"
 
     def test_streaming_reasoning(self) -> None:
         chunks = [
@@ -612,11 +620,14 @@ class TestOpenAIProvider:
                 messages=[{"role": "user", "content": "read a file"}],
             )
         )
-        assert len(results) == 3
+        # Fourth chunk: the finish-reason-less shim (tool calls count as
+        # delivered output).
+        assert len(results) == 4
         assert results[0].tool_call_deltas[0].id == "call_1"
         assert results[0].tool_call_deltas[0].name == "read_file"
         assert results[1].tool_call_deltas[0].arguments_delta == '{"path":'
         assert results[2].tool_call_deltas[0].arguments_delta == '"foo.py"}'
+        assert results[3].finish_reason == "stop"
 
     def test_streaming_usage(self) -> None:
         usage = MagicMock()
@@ -803,6 +814,62 @@ class TestOpenAIProvider:
         assert [tc["function"]["name"] for tc in result.tool_calls] == ["read", "write"]
         assert result.tool_calls[0]["function"]["arguments"] == '{"a": 1}'
         assert result.tool_calls[1]["function"]["arguments"] == '{"b": 2}'
+
+    def test_repeated_id_and_name_header_fragments_stay_one_call(self) -> None:
+        # Some compat servers repeat the full id+name header on EVERY
+        # argument fragment.  Id equality proves same call — the
+        # reannounce split applies only to ID-LESS deltas, so this shape
+        # merges into one call with valid arguments (round-5 regression:
+        # the ungated heuristic split it into duplicate half-JSON calls).
+        result = self._drain_chunks(
+            [
+                _openai_stream_chunk(
+                    tool_calls=[
+                        _openai_tool_call_delta(
+                            index=0, tc_id="call_A", name="read_file", arguments='{"path": '
+                        )
+                    ]
+                ),
+                _openai_stream_chunk(
+                    tool_calls=[
+                        _openai_tool_call_delta(
+                            index=0, tc_id="call_A", name="read_file", arguments='"/tmp/x"}'
+                        )
+                    ]
+                ),
+                _openai_stream_chunk(finish_reason="tool_calls"),
+            ]
+        )
+        assert len(result.tool_calls) == 1
+        assert result.tool_calls[0]["function"]["arguments"] == '{"path": "/tmp/x"}'
+
+    def test_finishless_stream_with_content_completes_as_stop(self) -> None:
+        # Lax-server tolerance (the deleted non-streaming `or "stop"`
+        # default): a stream that ends CLEANLY after delivering content —
+        # abrupt deaths raise httpx errors instead — is a completed
+        # generation even if no chunk ever carried finish_reason.
+        result = self._drain_chunks(
+            [
+                _openai_stream_chunk(content="complete answer"),
+            ]
+        )
+        assert result.content == "complete answer"
+        assert result.finish_reason == "stop"
+
+    def test_finishless_stream_with_no_output_still_raises(self) -> None:
+        # The shim is content-gated: an empty clean-close stream (dead
+        # generation, zero-chunk fakes) still hits the drain's
+        # complete-or-error gate.
+        from turnstone.core.providers import IncompleteStreamError
+
+        client = MagicMock()
+        client.chat.completions.create.return_value = []
+        with pytest.raises(IncompleteStreamError):
+            drain_stream(
+                self.provider.create_streaming(
+                    client=client, model="m", messages=[{"role": "user", "content": "x"}]
+                )
+            )
 
     def test_fragmented_single_call_does_not_split(self) -> None:
         # The normal well-behaved shape — name announced once, arguments

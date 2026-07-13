@@ -40,11 +40,12 @@ Earlier stable lines (`stable/1.6`, `stable/1.5`) are frozen.
   *reject* unknown fields (pre-2024 llama.cpp/proxy builds) will 400 —
   such a server already couldn't serve turnstone's chat loop, but a
   judge/utility alias pointed at one worked on 1.7 and needs to move to
-  a current server. A compat server whose streams never carry a finish
-  reason at all (each provider's terminal marker — Chat Completions'
-  final `finish_reason`, Anthropic's `message_stop`, Responses'
-  terminal event — all count) fails these lanes loudly for the same
-  reason; every maintained inference server sends one. Legacy models
+  a current server. Streams that end cleanly after delivering output
+  complete even when the server never sets a finish reason (each lane
+  accepts its own terminal marker; the chat lane treats a clean
+  end-of-stream with content as completion) — only streams that die
+  mid-generation, deliver nothing, or drop the connection fail, and
+  those retry before surfacing. Legacy models
   that reject streaming requests outright (o1-era) likewise need a
   model alias pointing at a current model — the unread
   `supports_streaming` capability flag (and its admin tile) is gone.

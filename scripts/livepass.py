@@ -399,7 +399,7 @@ CONSOLE_TEMPLATE = """<!doctype html>
               known: true,
               capabilities: {
                 context_window: 200000, supports_tools: true,
-                supports_streaming: true, supports_vision: true,
+                supports_vision: true,
                 supports_web_search: true, supports_temperature: true,
                 supports_effort: true,
               },

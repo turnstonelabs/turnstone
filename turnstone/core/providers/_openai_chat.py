@@ -63,11 +63,16 @@ class ToolCallSlotter:
     the normalized mirror can never desync from the raw ``provider_blocks``
     lane).  Index-degenerate compat servers (historical vLLM/llama.cpp
     builds) emit every parallel call at index 0 — a delta opens a NEW slot
-    when its id contradicts the slot's id, or when it announces a name for
-    a slot that already accumulated arguments (the id-less whole-delta
-    shape: name+arguments per call, so a second announcement after
-    arguments is a second call).  Id-less argument fragments keep
-    following their index's current slot.
+    when its id contradicts the slot's id, or when an ID-LESS delta
+    announces a name for a slot that already accumulated arguments (the
+    id-less whole-delta shape: name+arguments per call, so a second
+    announcement after arguments is a second call).  A delta whose id
+    MATCHES the slot's is always the same call, however many times the
+    server repeats the name header per fragment.  Residual ambiguity:
+    an id-less server that repeats the name on every argument fragment is
+    indistinguishable from the whole-delta shape and splits wrongly — ids
+    are the only disambiguator, and the whole-delta emission is the shape
+    observed in the wild.
     """
 
     def __init__(self) -> None:
@@ -84,7 +89,7 @@ class ToolCallSlotter:
             and self._slot_ids.get(slot, "")
             and self._slot_ids[slot] != tc_id
         )
-        reannounce = slot is not None and has_name and slot in self._slot_has_args
+        reannounce = slot is not None and not tc_id and has_name and slot in self._slot_has_args
         if slot is None or id_conflict or reannounce:
             slot = self._next_slot
             self._next_slot += 1
@@ -321,6 +326,20 @@ class OpenAIChatCompletionsProvider:
             tool_call_deltas=tool_call_count,
             completion_tokens=completion_tokens,
         )
+
+        # Finish-reason-less compat tolerance (the deleted non-streaming
+        # path's `finish_reason or "stop"` default): a stream that ended
+        # CLEANLY — the SDK ends iteration on [DONE]; an abrupt connection
+        # death raises httpx.TransportError out of this generator — after
+        # delivering content is a completed generation on a lax server
+        # that never sets finish_reason.  Emit the finish BEFORE the
+        # citation footer so the drain folds the footer as trailing info.
+        # A clean-exhaustion stream with NO output still yields nothing,
+        # so the drain's complete-or-error gate keeps catching dead/empty
+        # streams.
+        if last_finish_reason is None and (content_len or tool_call_count):
+            last_finish_reason = "stop"
+            yield StreamChunk(finish_reason="stop")
 
         # Emit accumulated citations as a final info chunk
         if annotations:

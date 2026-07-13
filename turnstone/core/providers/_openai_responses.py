@@ -8,7 +8,7 @@ of the Chat Completions endpoint.
 from __future__ import annotations
 
 import json
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, NoReturn
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterator
@@ -48,7 +48,20 @@ log = structlog.get_logger(__name__)
 _TRANSIENT_FAILURE_CODES = frozenset({"server_error", "rate_limit_exceeded"})
 
 
-def _raise_responses_failure(error_code: str, error_msg: str) -> None:
+def _extend_message_annotations(item: Any, annotations: list[Any]) -> None:
+    """Collect url_citation annotations off a message output item's text
+    parts — ONE walk shared by the ``output_item.done`` handler and the
+    terminal-payload rebuild so the two cannot drift (``content`` may be
+    ``None`` on partial items)."""
+    if getattr(item, "type", "") != "message":
+        return
+    for content_part in getattr(item, "content", None) or []:
+        part_anns = getattr(content_part, "annotations", None)
+        if part_anns:
+            annotations.extend(part_anns)
+
+
+def _raise_responses_failure(error_code: str, error_msg: str) -> NoReturn:
     """One classification ladder for BOTH in-band failure shapes (`error`
     events and ``response.failed``) — a one-sided edit would make the same
     API failure retryable through one event type and fatal through the
@@ -663,12 +676,7 @@ class OpenAIResponsesProvider:
                     item_dict = item.model_dump() if hasattr(item, "model_dump") else {}
                     if item_dict:
                         provider_blocks.append(item_dict)
-                    # Collect annotations from completed text parts
-                    if getattr(item, "type", "") == "message":
-                        for content_part in getattr(item, "content", []):
-                            part_anns = getattr(content_part, "annotations", None)
-                            if part_anns:
-                                annotations.extend(part_anns)
+                    _extend_message_annotations(item, annotations)
                 continue
 
             # -- terminal response event --
@@ -678,23 +686,17 @@ class OpenAIResponsesProvider:
             # finish reason, final usage, AND collected provider_blocks.
             if event_type in ("response.completed", "response.incomplete"):
                 response = getattr(event, "response", None)
-                if not response:
-                    # A terminal event without its payload (lax compat
-                    # server) is still a terminal signal — emit the finish
-                    # reason implied by the event type, keeping the blocks
-                    # already collected from output_item.done events (they
-                    # came from the stream, not the missing payload); only
-                    # usage is genuinely unavailable.
-                    sc = StreamChunk(
-                        finish_reason="stop" if event_type == "response.completed" else "length"
-                    )
-                    if provider_blocks:
-                        sc.provider_blocks = provider_blocks
-                    yield sc
-                    continue
-                status = getattr(response, "status", "completed")
+                # A terminal event without its payload (lax compat server)
+                # is still a terminal signal: derive the finish reason from
+                # the event type, keep the blocks already collected from
+                # output_item.done events — only usage (and the rebuild
+                # below) genuinely needs the payload.
+                if response is not None:
+                    status = getattr(response, "status", "")
+                else:
+                    status = "completed" if event_type == "response.completed" else "incomplete"
                 last_finish = "stop" if status == "completed" else "length"
-                usage = extract_usage(getattr(response, "usage", None))
+                usage = extract_usage(getattr(response, "usage", None)) if response else None
                 if usage:
                     completion_tokens = usage.completion_tokens
                 # Prefer the terminal response's own output items over the
@@ -705,18 +707,14 @@ class OpenAIResponsesProvider:
                 # turn's replay a 400.  Its annotations were likewise
                 # never collected — walk them here (format_citations
                 # dedupes by URL, so re-seeing .done'd items is harmless).
-                out_items = getattr(response, "output", None) or []
+                out_items = (getattr(response, "output", None) or []) if response else []
                 final_items = [
                     item.model_dump() for item in out_items if hasattr(item, "model_dump")
                 ]
                 if final_items:
                     provider_blocks = final_items
                     for item in out_items:
-                        if getattr(item, "type", "") == "message":
-                            for content_part in getattr(item, "content", []) or []:
-                                part_anns = getattr(content_part, "annotations", None)
-                                if part_anns:
-                                    annotations.extend(part_anns)
+                        _extend_message_annotations(item, annotations)
                 sc = StreamChunk(
                     finish_reason=last_finish,
                     usage=usage,

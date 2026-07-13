@@ -120,9 +120,13 @@ def drain_stream(chunks: Iterator[StreamChunk]) -> CompletionResult:
 
     - A stream that exhausts with NO finish reason raises
       :class:`IncompleteStreamError` (retryable) — every adapter emits one
-      on a healthy stream, so its absence means the generation died
-      mid-response.  Partial text must never be handed to a caller that
-      stores it as a complete result (a compaction summary, a title).
+      on a healthy stream (the chat iterator shims ``"stop"`` for lax
+      finish-reason-less servers once content arrived), so its absence
+      means the generation died mid-response.  Partial text must never be
+      handed to a caller that stores it as a complete result (a
+      compaction summary, a title).  A transport blip AFTER the finish
+      reason keeps the completed result and forfeits only trailing
+      metadata.
     - ``usage`` merges via :func:`merge_usage` — Anthropic splits prompt
       and completion tokens across separate events.
     - Tool calls accumulate by ``ToolCallDelta.index``: ``id``/``name``
@@ -166,6 +170,12 @@ def drain_stream(chunks: Iterator[StreamChunk]) -> CompletionResult:
         except StopIteration:
             break
         except httpx.TransportError as exc:
+            if finish_reason is not None:
+                # The generation already completed (finish reason in hand);
+                # the blip only cost trailing metadata — a usage-only chunk
+                # or the citation footer.  Keep the complete result rather
+                # than discarding it for a retry that re-pays the tokens.
+                break
             raise IncompleteStreamError(
                 f"stream transport failed mid-response ({type(exc).__name__}: {exc})"
             ) from exc
