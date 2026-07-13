@@ -828,14 +828,18 @@ _SPEC_ARGUMENTS_LITERAL_RE = re.compile(r"\$ARGUMENTS\b(?!\[)")
 # small ``max_tokens`` lets the reasoning pass swallow the entire budget so the
 # title text never lands (``finish_reason=length``, empty ``content`` → skip).
 # This hits auto-title and refresh alike (shared path) on any thinking model.
-# So give the think pass room (``_TITLE_MAX_TOKENS``), then recover the title
-# from ``content``: reuse :meth:`ChatSession._strip_reasoning` (the canonical
-# ``<think>``/``<reasoning>`` remover, for lanes that leave reasoning inline
-# rather than in ``reasoning_content``), take the first non-empty line (a model
-# that appends an explanation shouldn't fold prose into the title), then peel a
-# ``Title:`` label and wrapping markdown/quote decoration.  Internal punctuation
-# is preserved so ``.NET``, ``CI/CD``, ``v1.6.0`` survive.
-_TITLE_MAX_TOKENS = 2048
+# Code deliberately does NOT bound the thinking (no effort value survives the
+# assignment scheme unless the operator set one), so the budget must fit a
+# full thinking pass at the MODEL'S OWN default — the prompt's hard word cap
+# keeps the visible answer trivially cheap, and ``_TITLE_MAX_TOKENS`` carries
+# the rest.  Recover the title from ``content``: reuse
+# :meth:`ChatSession._strip_reasoning` (the canonical ``<think>``/
+# ``<reasoning>`` remover, for lanes that leave reasoning inline rather than
+# in ``reasoning_content``), take the first non-empty line (a model that
+# appends an explanation shouldn't fold prose into the title), then peel a
+# ``Title:`` label and wrapping markdown/quote decoration.  Internal
+# punctuation is preserved so ``.NET``, ``CI/CD``, ``v1.6.0`` survive.
+_TITLE_MAX_TOKENS = 8192
 # Match the manual-rename (alias) cap so generated and hand-set titles share
 # one length bound.
 _TITLE_MAX_CHARS = 80
@@ -3323,7 +3327,8 @@ class ChatSession:
                         "# Instructions\n\n"
                         "You are a conversation title generator. "
                         "The user will show you the opening of a conversation. "
-                        "Respond with ONLY a short title (3-8 words). "
+                        "Respond with ONLY a short title of AT MOST 3 words — "
+                        "this is a hard rule; 2-3 words is ideal. "
                         "Do NOT answer the conversation. Do NOT explain. "
                         "Output ONLY the title text, nothing else."
                     ),
@@ -4778,14 +4783,18 @@ class ChatSession:
         — the same operator/registry-resolved value the main turn uses — rather
         than a hard-coded constant: utility calls should not silently override an
         explicit ``[models.*]`` temperature.  ``reasoning_effort`` ``None``
-        inherits the lane's operator rungs, then the request-shaped
-        ``default_reasoning_effort="low"``: these calls run inside small
-        token budgets, and an unconstrained thinking pass can consume the
-        whole budget and return empty content (the #676 signature) — any
-        operator or model-definition value still beats the default.
-        Callers relaying the session's user-facing effort knob (web-fetch
-        extraction) pass it explicitly.  extra_params resolve inside the
-        lane from the same single config fetch as the rest.
+        inherits the lane's full assignment scheme (operator rungs → model
+        definition → omit) with NO code-supplied default: a code-chosen
+        effort is an unvetted token on local vocabularies and can flip
+        template thinking toggles the operator never engaged.  These calls
+        run inside small token budgets, so on thinking models the operator
+        must budget effort via the alias/model definition — an unbounded
+        thinking pass consuming the whole budget surfaces as the documented
+        empty-content signature (#676), and the max_tokens here are sized
+        generously for exactly that reason.  Callers relaying the session's
+        user-facing effort knob (web-fetch extraction) pass it explicitly.
+        extra_params resolve inside the lane from the same single config
+        fetch as the rest.
         """
         caps = self._get_capabilities()
         clamped = min(max_tokens, caps.max_output_tokens) if caps.max_output_tokens else max_tokens
@@ -4804,7 +4813,6 @@ class ChatSession:
             max_tokens=clamped,
             temperature=self.temperature if temperature is None else temperature,
             reasoning_effort=reasoning_effort,
-            default_reasoning_effort="low",
         )
         # Utility completions (title gen, compaction, web-fetch extraction)
         # bypass the streaming on_status path — record their usage so the

@@ -468,46 +468,39 @@ def test_resolve_lane_reasoning_effort_operator_rungs() -> None:
 
 
 def test_model_turn_effort_lower_rungs() -> None:
-    # Below the lane's operator rungs, model_turn applies: caller
-    # request-shaped default → in-code model definition (caps) → None
-    # (wire omission — no hidden "medium" constant anywhere).
+    # Below the lane's operator rungs, model_turn applies exactly one more
+    # rung — the in-code model definition (caps) — then None (wire
+    # omission).  There is deliberately NO caller-default rung: a
+    # code-chosen effort is an unvetted token on local vocabularies
+    # (effort_passthrough forwards verbatim) and flips template thinking
+    # toggles the operator never engaged.
     # Bare hand-built lane: nothing anywhere → the provider receives None.
     provider = _FakeProvider([CompletionResult(content="")])
     model_turn(_lane(provider), [Turn.user("x")])
     assert provider.calls[0]["reasoning_effort"] is None
 
-    # In-code model definition rung: a declared caps default applies.
+    # In-code model definition rung: a declared caps default applies…
     caps = ModelCapabilities(default_reasoning_effort="high")
     provider2 = _FakeProvider([CompletionResult(content="")])
     model_turn(_lane(provider2, capabilities=caps), [Turn.user("x")])
     assert provider2.calls[0]["reasoning_effort"] == "high"
 
-    # A caller request-shaped default (budget-coupled lanes: utility,
-    # output guard) beats the model-generic caps default…
+    # …loses to an operator value on the lane…
     provider3 = _FakeProvider([CompletionResult(content="")])
     model_turn(
-        _lane(provider3, capabilities=caps), [Turn.user("x")], default_reasoning_effort="low"
-    )
-    assert provider3.calls[0]["reasoning_effort"] == "low"
-
-    # …loses to an operator value on the lane…
-    provider4 = _FakeProvider([CompletionResult(content="")])
-    model_turn(
-        _lane(provider4, capabilities=caps, reasoning_effort="xhigh"),
+        _lane(provider3, capabilities=caps, reasoning_effort="xhigh"),
         [Turn.user("x")],
-        default_reasoning_effort="low",
     )
-    assert provider4.calls[0]["reasoning_effort"] == "xhigh"
+    assert provider3.calls[0]["reasoning_effort"] == "xhigh"
 
     # …and to an explicit relay (the "none" knob stays distinct from unset).
-    provider5 = _FakeProvider([CompletionResult(content="")])
+    provider4 = _FakeProvider([CompletionResult(content="")])
     model_turn(
-        _lane(provider5, capabilities=caps),
+        _lane(provider4, capabilities=caps),
         [Turn.user("x")],
         reasoning_effort="none",
-        default_reasoning_effort="low",
     )
-    assert provider5.calls[0]["reasoning_effort"] == "none"
+    assert provider4.calls[0]["reasoning_effort"] == "none"
 
 
 def test_model_turn_fetches_config_once_per_call() -> None:

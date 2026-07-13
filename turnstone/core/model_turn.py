@@ -615,7 +615,6 @@ def model_turn(
     max_tokens: int = 4096,
     temperature: float | None = None,
     reasoning_effort: str | None = None,
-    default_reasoning_effort: str | None = None,
     mint: Callable[[str], str] | None = None,
     wire_id_map: dict[str, str] | None = None,
     resolve_attachments: Callable[[list[str]], dict[str, Any]] | None = None,
@@ -634,13 +633,14 @@ def model_turn(
 
     *temperature* / *reasoning_effort* ``None`` (the defaults) inherit the
     lane's operator-resolved knobs (per-model config → stored global
-    setting).  When no operator spoke, temperature is OMITTED from the
-    wire (the inference engine's default rules); effort falls through
-    *default_reasoning_effort* — a request-shaped default for lanes whose
-    token budget constrains thinking (title gen, the output guard), which
-    any operator value beats — then the in-code model definition
-    (``caps.default_reasoning_effort``), then omission.  House rule: never
-    pin either knob in code; pass an explicit value only to relay an
+    setting).  When no operator spoke, effort falls through the in-code
+    model definition (``caps.default_reasoning_effort``), then both knobs
+    are OMITTED from the wire — the inference engine's default rules.
+    House rule: never pin either knob in code — there is deliberately no
+    caller-supplied default rung, because a code-chosen effort value is
+    an unvetted token on local vocabularies (``effort_passthrough``
+    forwards it verbatim) and flips template thinking toggles the
+    operator never engaged.  Pass an explicit value only to relay an
     operator- or user-resolved knob (the session's own knobs, a CLI flag).
 
     *resolve_attachments* materializes by-reference ``AttachmentRef``
@@ -681,16 +681,14 @@ def model_turn(
     )
     wire = maybe_attach_vllm_chat_reasoning(wire, lane.provider, lane.registry, lane.alias, cfg=cfg)
     # The effort assignment scheme's lower rungs: explicit relay → lane
-    # (operator) → caller's request-shaped default → in-code model
-    # definition → None.  None/unset knobs are OMITTED from the wire so
-    # the inference engine's default rules (house rule: a Python-level
-    # constant anywhere on this path is a hidden pin).  Direct keyword
-    # call (not **kwargs) so strict mypy checks the module's most
-    # important invocation against the Protocol.
+    # (operator) → in-code model definition → None.  None/unset knobs are
+    # OMITTED from the wire so the inference engine's default rules
+    # (house rule: a Python-level constant anywhere on this path is a
+    # hidden pin).  Direct keyword call (not **kwargs) so strict mypy
+    # checks the module's most important invocation against the Protocol.
     effective_effort = (
         reasoning_effort
         or lane.reasoning_effort
-        or default_reasoning_effort
         or (lane.capabilities.default_reasoning_effort if lane.capabilities else None)
         or None
     )

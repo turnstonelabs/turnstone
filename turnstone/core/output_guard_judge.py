@@ -539,13 +539,14 @@ class OutputGuardJudge:
             capabilities=self._capabilities,
             config_store=self._config_store,
         )
-        # Temperature deliberately not pinned (house rule) — the lane
-        # inherits the guard model's configured temperature.  The effort
-        # default is request shape, not a pin: screening runs inside a
-        # 512-token cap, and an unconstrained thinking pass would consume
-        # the whole budget and return empty content (the stage would
-        # silently no-op to heuristic-only).  Any operator or
-        # model-definition effort value beats it.
+        # Sampling deliberately not pinned (house rule) — the lane inherits
+        # the guard model's full assignment scheme, effort included: a
+        # code-chosen effort is an unvetted token on local vocabularies
+        # and can flip template thinking toggles the operator never
+        # engaged.  On a thinking model whose effort the operator leaves
+        # unbounded, a pass that consumes the whole 512-token cap parses
+        # to a labelled llm_error verdict (heuristic tier stands) — the
+        # remediation is an effort value on the guard's model alias.
         try:
             result = run_with_deadline(
                 lambda: model_turn(
@@ -553,7 +554,6 @@ class OutputGuardJudge:
                     judge_turns,
                     tools=None,
                     max_tokens=512,
-                    default_reasoning_effort="low",
                 ),
                 timeout=timeout,
                 cancel_event=cancel_event,
