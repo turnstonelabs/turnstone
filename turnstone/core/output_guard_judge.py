@@ -51,9 +51,10 @@ from turnstone.core.deadline import (
 from turnstone.core.judge import (
     _CHARS_PER_TOKEN,
     _positive_window,
-    _resolve_model_capabilities,
 )
 from turnstone.core.log import get_logger
+from turnstone.core.model_turn import model_turn, resolve_capabilities, resolve_lane
+from turnstone.core.trajectory import Turn
 
 if TYPE_CHECKING:
     import threading
@@ -270,6 +271,9 @@ class OutputGuardJudge:
         session_capabilities: ModelCapabilities | None = None,
     ) -> None:
         self._config = config
+        # Carried into the per-evaluation ModelLane so extra_params and the
+        # live operator flags resolve from the registry like every other lane.
+        self._model_registry = model_registry
         # Caller's resolved session-model caps (config/registry-aware): the wire
         # capabilities + window when this judge inherits the session model, and
         # the alias path's window fallback.  The window comes ONLY from these
@@ -303,8 +307,10 @@ class OutputGuardJudge:
                     )
                     self._model = model_name
                     self._judge_model_alias = config.output_guard_model
-                    self._capabilities = _resolve_model_capabilities(
-                        self._provider, self._model, model_cfg
+                    # Shared lane resolver (model_turn); ModelConfig.context_window
+                    # stays separate and is sized into the guard window below.
+                    self._capabilities = resolve_capabilities(
+                        self._provider, self._model, config.output_guard_model, model_registry
                     )
                     self._judge_context_window = _positive_window(
                         getattr(model_cfg, "context_window", None),
@@ -442,11 +448,10 @@ class OutputGuardJudge:
         start = time.monotonic()
         verdict_id = uuid.uuid4().hex
         timeout = max(self._config.output_guard_llm_timeout, 1.0)
-        judge_messages = [
-            {"role": "system", "content": _SYSTEM_PROMPT},
-            {
-                "role": "user",
-                "content": self._user_prompt(
+        judge_turns = [
+            Turn.system(_SYSTEM_PROMPT),
+            Turn.user(
+                self._user_prompt(
                     output,
                     func_name=func_name,
                     tool_description=tool_description,
@@ -454,8 +459,8 @@ class OutputGuardJudge:
                     heuristic_risk=heuristic_risk,
                     heuristic_flags=heuristic_flags,
                     heuristic_annotations=heuristic_annotations,
-                ),
-            },
+                )
+            ),
         ]
 
         # Oversize guard.  The heuristic stage has already run and its verdict
@@ -466,7 +471,7 @@ class OutputGuardJudge:
         # warning, and return a LABELLED error verdict so the skip surfaces as a
         # distinct ``llm_error`` audit row (reason = "output_too_large…") the
         # operator can see, rather than a silent no-op.
-        prompt_chars = sum(len(str(m["content"])) for m in judge_messages)
+        prompt_chars = sum(len(t.text) for t in judge_turns)
         est_tokens = int(prompt_chars / _CHARS_PER_TOKEN)
         if est_tokens > self._judge_context_window * _MAX_PROMPT_RATIO:
             log.warning(
@@ -499,20 +504,25 @@ class OutputGuardJudge:
         # worker is non-daemon, and concurrent.futures joins it from an atexit
         # hook regardless of shutdown(wait=False) — so a wedged upstream call
         # would otherwise hang shutdown.)
+        # Single-shot lane: constructor-resolved capabilities, extra_params
+        # and live operator flags from the registry like every other lane.
+        lane = resolve_lane(
+            self._provider,
+            client,
+            self._model,
+            alias=self._judge_model_alias,
+            registry=self._model_registry,
+            capabilities=self._capabilities,
+        )
         try:
             result = run_with_deadline(
-                lambda: self._provider.create_completion(
-                    client=client,
-                    model=self._model,
-                    messages=judge_messages,
+                lambda: model_turn(
+                    lane,
+                    judge_turns,
                     tools=None,
                     max_tokens=512,
                     temperature=0.0,
                     reasoning_effort="low",
-                    # Operator-declared capabilities reach the wire like every
-                    # other lane — from the output_guard alias's definition, or
-                    # the session model on fallback.  See IntentJudge for why.
-                    capabilities=self._capabilities,
                 ),
                 timeout=timeout,
                 cancel_event=cancel_event,

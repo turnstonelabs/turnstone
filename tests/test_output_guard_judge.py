@@ -34,12 +34,23 @@ def _make_provider(
             time.sleep(delay)
         if raises is not None:
             raise raises
-        result = MagicMock()
-        result.content = content
-        return result
+        return _mock_result(content)
 
     provider.create_completion = _create_completion
     return provider
+
+
+def _mock_result(content: str) -> MagicMock:
+    """A provider result shaped like ``CompletionResult`` — the guard's call
+    runs through ``model_turn``, whose re-ingest reads every field below."""
+    result = MagicMock()
+    result.content = content
+    result.tool_calls = None
+    result.finish_reason = "stop"
+    result.usage = None
+    result.provider_blocks = []
+    result.reasoning = ""
+    return result
 
 
 def _make_judge(
@@ -79,9 +90,7 @@ class TestCapabilityThreading:
 
         def _cc(**kwargs: Any) -> Any:
             captured.update(kwargs)
-            result = MagicMock()
-            result.content = '{"risk_level": "none", "flags": []}'
-            return result
+            return _mock_result('{"risk_level": "none", "flags": []}')
 
         provider = MagicMock()
         provider.provider_name = "openai"
@@ -121,6 +130,9 @@ class TestCapabilityThreading:
             "local-9b",
             cfg,
         )
+        # The unified lane resolver (model_turn.resolve_capabilities) fetches
+        # the config itself rather than taking resolve()'s copy.
+        registry.get_config.return_value = cfg
         registry.get_provider.return_value = provider
         client = MagicMock(base_url="http://s", api_key="k")
         judge = OutputGuardJudge(
