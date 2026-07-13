@@ -14,7 +14,6 @@ import concurrent.futures
 import contextlib
 import contextvars
 import copy
-import dataclasses
 import difflib
 import functools
 import hashlib
@@ -60,9 +59,6 @@ from turnstone.core.background_shells import (
 )
 from turnstone.core.config import get_searxng_engines, get_searxng_url
 from turnstone.core.edit import find_occurrences, pick_nearest
-from turnstone.core.history_decoration import (
-    attach_vllm_chat_reasoning_field,
-)
 from turnstone.core.log import get_logger
 from turnstone.core.lowering import (
     TIMEOUT_OUTCOME_CLAUSE,
@@ -70,7 +66,6 @@ from turnstone.core.lowering import (
     drop_empty_user_turns,
     fold_system_turns,
     repair_wire_messages,
-    restore_provider_tool_ids,
     sanitize_tool_call_arguments,
     tool_args_preview,
     wire_valid_arguments,
@@ -128,6 +123,19 @@ from turnstone.core.metacognition import (
     sanitize_payload,
     should_nudge,
 )
+from turnstone.core.model_turn import (
+    ModelLane,
+    ModelTurnResult,
+    ensure_tool_call_ids,
+    finalize_provider_blocks,
+    maybe_attach_vllm_chat_reasoning,
+    model_turn,
+    provider_extra_params,
+    resolve_capabilities,
+    resolve_replay_reasoning_to_model,
+    resolve_server_type,
+    synth_reasoning_block,
+)
 from turnstone.core.nudge_queue import (
     QUIET_CHANNEL,
     QUIET_DRAIN,
@@ -165,7 +173,6 @@ from turnstone.core.storage._utils import (
     COMPACTION_SUMMARY_LABEL,
     attachment_to_content_part,
     normalize_search_terms,
-    strip_orphan_client_tool_blocks,
 )
 from turnstone.core.tool_advisory import (
     make_system_turn,
@@ -185,7 +192,6 @@ from turnstone.core.tools import (
 )
 from turnstone.core.trajectory import (
     EffectStatus,
-    ProviderNative,
     Role,
     TextBlock,
     ToolCall,
@@ -217,7 +223,7 @@ if TYPE_CHECKING:
     from turnstone.core.healthcheck import BackendHealthTracker, HealthTrackerRegistry
     from turnstone.core.judge import IntentJudge, JudgeConfig
     from turnstone.core.mcp_client import MCPClientManager
-    from turnstone.core.model_registry import ModelConfig, ModelRegistry
+    from turnstone.core.model_registry import ModelRegistry
     from turnstone.core.output_guard import OutputAssessment
     from turnstone.core.output_guard_judge import OutputGuardJudge, OutputJudgeVerdict
     from turnstone.core.providers import (
@@ -225,6 +231,7 @@ if TYPE_CHECKING:
         LLMProvider,
         ModelCapabilities,
         StreamChunk,
+        UsageInfo,
     )
     from turnstone.core.rerank import RerankClient, Reranker
     from turnstone.core.web_search import WebSearchClient
@@ -1025,11 +1032,6 @@ def _substitute_skill_args(
 # - ``reasoning_text`` — synthetic (path-3 capture; included so
 #   re-running this code path against an already-synthesized list is
 #   idempotent).
-_REASONING_BEARING_BLOCK_TYPES: frozenset[str] = frozenset(
-    {"thinking", "redacted_thinking", "reasoning", "reasoning_text"}
-)
-
-
 # ---------------------------------------------------------------------------
 # SessionUI protocol — the contract every frontend must implement
 # ---------------------------------------------------------------------------
@@ -2051,16 +2053,12 @@ class ChatSession:
         model: str,
         alias: str | None = None,
     ) -> ModelCapabilities:
-        """Get model capabilities, applying config.toml overrides if present."""
-        caps = provider.get_capabilities(model)
-        if self._registry and alias:
-            cfg: ModelConfig = self._registry.get_config(alias)
-            if cfg.capabilities:
-                fields = {f.name for f in dataclasses.fields(type(caps))}
-                overrides = {k: v for k, v in cfg.capabilities.items() if k in fields}
-                if overrides:
-                    caps = dataclasses.replace(caps, **overrides)
-        return caps
+        """Get model capabilities, applying config.toml overrides if present.
+
+        Delegates to :func:`turnstone.core.model_turn.resolve_capabilities` —
+        the one resolution path every lane shares (#827).
+        """
+        return resolve_capabilities(provider, model, alias or "", self._registry)
 
     def _get_capabilities(self, provider: Any = None, model: str = "") -> ModelCapabilities:
         """Get capabilities for a model. Cached for the primary session model."""
@@ -2074,47 +2072,12 @@ class ChatSession:
         return self._resolve_capabilities(p, m, "")
 
     def _resolve_server_type(self, alias: str | None = None) -> str:
-        """Read ``server_compat.server_type`` for an alias from the registry.
+        """Delegate to :func:`turnstone.core.model_turn.resolve_server_type`.
 
-        Used by :meth:`_maybe_synth_reasoning_block` to tag synthetic
-        path-3 reasoning blocks with their origin server (vllm,
-        llama.cpp, sglang, etc.) — informational metadata for UI
-        rehydration.  Returns ``""`` on any lookup miss.
-
-        Phase 5 (:meth:`_maybe_attach_vllm_chat_reasoning`) does NOT
-        call this resolver — it reads ``cfg.server_compat["server_type"]``
-        directly off the single ``cfg`` it already fetched for the
-        ``replay_reasoning_to_model`` flag check, to avoid a second
-        ``registry.get_config`` round-trip.  Both readers MUST stay
-        aligned on the same field path; if you change one, change the
-        other.
-
-        Reads ``cfg.server_compat`` (the dedicated dataclass field set
-        by the model_registry loader) — NOT ``cfg.capabilities``.  Both
-        loader paths (DB at ``model_registry.py:401`` and config.toml at
-        ``model_registry.py:485``) ``caps.pop("server_compat", {})`` and
-        hoist the dict to the top-level field, so the capabilities dict
-        never carries server_compat in production.
+        ``None`` *alias* (the main-loop caller) resolves to the session's
+        primary alias; full semantics documented on the module function.
         """
-        target_alias = alias or self._model_alias or ""
-        if not self._registry or not target_alias:
-            return ""
-        try:
-            cfg: ModelConfig = self._registry.get_config(target_alias)
-            sc = cfg.server_compat if isinstance(cfg.server_compat, dict) else None
-            if isinstance(sc, dict):
-                return str(sc.get("server_type") or "")
-        except Exception:
-            # Best-effort lookup — synth-block source tagging is
-            # informational, never load-bearing.  Log at debug so a
-            # repeated registry-lookup failure during a session shows
-            # up under DEBUG triage but doesn't spam normal logs.
-            log.debug(
-                "_resolve_server_type lookup failed for alias=%s; defaulting to empty",
-                target_alias,
-                exc_info=True,
-            )
-        return ""
+        return resolve_server_type(self._registry, alias or self._model_alias or "")
 
     def _maybe_synth_reasoning_block(
         self,
@@ -2122,76 +2085,20 @@ class ChatSession:
         reasoning_parts: list[str],
         alias: str | None = None,
     ) -> list[dict[str, Any]]:
-        """Stamp captured ``reasoning_parts`` as a synthetic ``reasoning_text``
-        block when no reasoning-bearing block already appears in
-        ``provider_blocks``.
+        """Delegate to :func:`turnstone.core.model_turn.synth_reasoning_block`.
 
-        Anthropic emits native ``thinking`` blocks; OpenAI Responses
-        emits native ``reasoning`` items via ``output_item.done``.
-        Both populate ``provider_blocks`` with reasoning-bearing
-        shapes during streaming and need no synthesis here.
-
-        OpenAI Chat Completions (vLLM ``--reasoning-parser``, llama.cpp
-        ``reasoning_format``, Gemini's ``/v1beta/openai/`` endpoint
-        when it surfaces ``reasoning_content``) streams reasoning as
-        ``reasoning_delta`` chunks but never emits a reasoning-bearing
-        provider block.  Without this synthesis the captured text would
-        be dropped at the end of the stream — visible live, invisible
-        on page reload.
-
-        Crucially, GoogleProvider attaches raw tool_call dicts as
-        ``provider_blocks`` on the finish chunk for ``thought_signature``
-        round-trip (``_google.py:_iter_stream``).  An earlier version
-        bailed out whenever ``provider_blocks`` was non-empty, which
-        silently lost reasoning text on Google + reasoning_delta turns.
-        The fix tests for reasoning-bearing block types specifically
-        (see ``_REASONING_BEARING_BLOCK_TYPES``) and APPENDS the
-        synthetic block to the existing list rather than replacing it
-        — preserving Google's tool-call fidelity blocks alongside the
-        new synthetic reasoning entry.
-
-        The synthetic block uses ``type="reasoning_text"`` (NOT
-        ``"thinking"``) so it falls through Phase 2's
-        ``ANTHROPIC_VALID_BLOCK_TYPES`` shape filter on cross-model
-        resumption — protecting against operator-switches from a
-        local-model session to Anthropic, which would otherwise hit
-        Anthropic's input boundary with an unsigned ``thinking`` block.
-
-        The optional ``source`` field tags the block with the
-        originating server (``vllm``, ``llamacpp``, ``sglang``, etc.)
-        resolved via :meth:`_resolve_server_type`, which reads
-        ``cfg.server_compat["server_type"]`` (the dedicated dataclass
-        field hoisted by the model_registry loader, NOT
-        ``cfg.capabilities``).  The synthetic block's ``source`` field
-        itself is informational metadata; Phase 5's vLLM replay path
-        (:meth:`_maybe_attach_vllm_chat_reasoning`) reads
-        ``cfg.server_compat`` directly rather than the synthetic
-        block's tag.
-
-        *alias* names the model whose server produced the reasoning —
-        the sub-agent loop passes its own agent alias so the source tag
-        names the agent's server, not the session primary's.  ``None``
-        (the main-loop caller) keeps the primary-alias resolution.
+        *alias* names the model whose server produced the reasoning; ``None``
+        (the main-loop caller) resolves to the session's primary alias.  Full
+        semantics (the Google fidelity-block append rule, the
+        ``reasoning_text``-not-``thinking`` cross-model guard) documented on
+        the module function.
         """
-        text = "".join(reasoning_parts)
-        if not text.strip():
-            return provider_blocks
-        # Native reasoning already present — Anthropic / OpenAI
-        # Responses path.  No synth needed; return reference unchanged
-        # so the existing identity contract holds.
-        for b in provider_blocks:
-            if isinstance(b, dict) and b.get("type") in _REASONING_BEARING_BLOCK_TYPES:
-                return provider_blocks
-        block: dict[str, Any] = {
-            "type": "reasoning_text",
-            "text": text,
-        }
-        server_type = self._resolve_server_type(alias)
-        if server_type:
-            block["source"] = server_type
-        # Append rather than replace so non-reasoning fidelity blocks
-        # (e.g. Google tool_calls with thought_signature) survive.
-        return [*provider_blocks, block]
+        return synth_reasoning_block(
+            provider_blocks,
+            reasoning_parts,
+            registry=self._registry,
+            alias=alias or self._model_alias or "",
+        )
 
     def _finalize_provider_blocks(
         self,
@@ -2202,51 +2109,22 @@ class ChatSession:
         had_blank_ids: bool = False,
         alias: str | None = None,
     ) -> list[dict[str, Any]]:
-        """Finalize an assistant turn's provider-native block lane: synthesize
-        the path-3 ``reasoning_text`` block when reasoning arrived only as
-        loose text (:meth:`_maybe_synth_reasoning_block`), then enforce the
-        native↔tool_calls mirror in memory — a truncation that cleared
-        ``tool_calls`` can leave an orphan client ``tool_use`` in the captured
-        blocks, which a same-provider replay would send with no matching
-        ``tool_result`` (see ``storage._utils.normalize_native_for_save``, the
-        save-time chokepoint with the same gate).
+        """Delegate to :func:`turnstone.core.model_turn.finalize_provider_blocks`
+        — the ONE native-lane builder every harness shares (main-loop stream
+        accumulator here; sub-agent loop and judges via ``model_turn``).
 
-        *had_blank_ids* is the OTHER direction of that mirror: the caller's
-        ``_ensure_tool_call_ids`` back-fill reaches only the ``tool_calls``
-        mirror, so an id-bearing native block still carries the blank id
-        verbatim and any replay of it desyncs from the mirror and the results
-        (Anthropic orphans the result and 400s; the Google swap re-fills a
-        fresh id and drops the real result) — and on the Messages translator
-        a partially-surviving lane REPLACES the rebuilt content wholesale, so
-        a lane missing its ``tool_use`` would orphan every mirrored call.  On
-        a blank-id turn the ONLY block kept is the loose-text
-        ``reasoning_text`` synth: it carries no id, it is shape-invalid on
-        the Messages translator by design (can never displace the rebuild),
-        and real-world blank-id servers are Chat-Completions locals whose
-        reasoning IS that loose text — so the drop costs exactly nothing that
-        actually co-occurs.  Everything else (client tool blocks, thinking /
-        text siblings, Responses ``reasoning`` items whose pairing contract
-        needs their original sibling items) is dropped for that turn.
-
-        The ONE builder both harnesses share: the main-loop stream accumulator
-        and the sub-agent loop (``_run_agent``) finalize their captured blocks
-        here, so how a native lane is assembled cannot drift between them.
-        Returns a possibly-empty list; callers attach it only when non-empty.
+        ``None`` *alias* (the main-loop caller) resolves to the session's
+        primary alias; the blank-id mirror gate and orphan-strip semantics
+        are documented on the module function.
         """
-        provider_blocks = self._maybe_synth_reasoning_block(
-            provider_blocks, reasoning_parts, alias=alias
+        return finalize_provider_blocks(
+            provider_blocks,
+            reasoning_parts,
+            has_tool_calls=has_tool_calls,
+            had_blank_ids=had_blank_ids,
+            registry=self._registry,
+            alias=alias or self._model_alias or "",
         )
-        if not provider_blocks:
-            return provider_blocks
-        if had_blank_ids:
-            return [
-                b
-                for b in provider_blocks
-                if isinstance(b, dict) and b.get("type") == "reasoning_text"
-            ]
-        if not has_tool_calls:
-            return strip_orphan_client_tool_blocks(provider_blocks)
-        return provider_blocks
 
     def _resolve_replay_reasoning_to_model(
         self,
@@ -2254,42 +2132,16 @@ class ChatSession:
         *,
         caps: ModelCapabilities | None = None,
     ) -> bool:
-        """Read ``ModelConfig.replay_reasoning_to_model`` for an alias.
+        """Delegate to
+        :func:`turnstone.core.model_turn.resolve_replay_reasoning_to_model`.
 
-        Used by the streaming + non-streaming wire-build paths to gate
-        verbatim reasoning-block replay (Phase 2 of the reasoning-
-        persistence feature).  The resolver's miss-fallback is
-        ``False``: when no registry / alias is available, or the lookup
-        raises, return ``False`` so the provider-side strip path runs.
-        Losing the strip on operator-flagged-on models would be a
-        worse default than losing the replay on operator-flagged-off
-        models — replaying reasoning text against an unknown operator
-        preference shouldn't happen.  The False-on-miss matches the
-        ``model_definitions`` server-side default for the column, so
-        cold workstreams behave the same as unconfigured ones.
-
-        When ``caps`` is provided, the operator flag is AND-gated with
-        ``caps.supports_reasoning_replay`` so a model lacking the
-        capability silently skips replay even when the operator flag
-        is set.  Mirrors the gate in
-        ``OpenAIResponsesProvider._build_kwargs`` and protects against
-        future Claude entries (or other Anthropic-shaped surfaces)
-        shipping with ``supports_reasoning_replay=False``.  When
-        ``caps`` is omitted the resolver returns the operator flag
-        unchanged — back-compat for callers that haven't been updated
-        to thread caps yet.
+        ``None`` *alias* (the main-loop caller) resolves to the session's
+        primary alias; False-on-miss and the caps AND-gate are documented on
+        the module function.
         """
-        target_alias = alias or self._model_alias or ""
-        if not self._registry or not target_alias:
-            return False
-        try:
-            cfg: ModelConfig = self._registry.get_config(target_alias)
-            operator_on = bool(cfg.replay_reasoning_to_model)
-        except Exception:
-            return False
-        if caps is None:
-            return operator_on
-        return operator_on and bool(caps.supports_reasoning_replay)
+        return resolve_replay_reasoning_to_model(
+            self._registry, alias or self._model_alias or "", caps=caps
+        )
 
     def _maybe_attach_vllm_chat_reasoning(
         self,
@@ -2297,58 +2149,17 @@ class ChatSession:
         provider: LLMProvider,
         alias: str | None = None,
     ) -> list[dict[str, Any]]:
-        """Conditionally attach vLLM's non-standard ``reasoning`` field to
-        outgoing assistant messages so a vLLM-served reasoning model can
-        thread CoT across turns.
+        """Delegate to
+        :func:`turnstone.core.model_turn.maybe_attach_vllm_chat_reasoning`
+        (Phase 5 of reasoning persistence).
 
-        Phase 5 of reasoning-persistence — parallel path to Paths 1+2,
-        not a modification.  Three gates:
-
-        1. Provider is ``OpenAIChatCompletionsProvider`` (Chat Completions
-           surface, not Responses or Anthropic — those have their own
-           replay paths with loud-failure-protected dual-gates).
-        2. ``server_compat.server_type == "vllm"`` — bounds blast radius
-           to vLLM; canonical OpenAI / llama.cpp / sglang never see the
-           non-standard field.
-        3. Operator-set ``ModelConfig.replay_reasoning_to_model`` — same
-           per-model toggle PR #498 added; defaults False.
-
-        The static ``supports_reasoning_replay`` capability gate that
-        guards Paths 1+2 is intentionally NOT used here.  vLLM's chat
-        template silently drops ``reasoning`` if the loaded template
-        doesn't read ``reasoning_content`` — the gate would add code-
-        edit friction (capability tables live in
-        ``providers/_openai_common.py``, not the admin UI) without
-        preventing the silent failure that's the actual misconfiguration
-        risk.  Paths 1+2 keep the dual-gate because their failure mode
-        is loud (Anthropic 400 on unsigned thinking, OpenAI Responses
-        400 on ResponseReasoningItemParam for non-reasoning models);
-        Path C's failure is silent so the gate doesn't help.
-
-        Returns *messages* unchanged when any gate fails.
+        ``None`` *alias* (the main-loop caller) resolves to the session's
+        primary alias; the three gates and the deliberate absence of the
+        static capability gate are documented on the module function.
         """
-        from turnstone.core.providers._openai_chat import OpenAIChatCompletionsProvider
-
-        if not isinstance(provider, OpenAIChatCompletionsProvider):
-            return messages
-        target_alias = alias or self._model_alias or ""
-        if not self._registry or not target_alias:
-            return messages
-        try:
-            cfg = self._registry.get_config(target_alias)
-        except Exception:
-            return messages
-        # Read both gate fields off the single ``cfg`` we already
-        # fetched, rather than re-entering ``_resolve_server_type``
-        # (which would do a second ``get_config`` call).  Mirrors the
-        # field location ``_resolve_server_type`` reads, so the two
-        # gates stay aligned if the loader ever changes shape.
-        sc = cfg.server_compat if isinstance(cfg.server_compat, dict) else None
-        if not isinstance(sc, dict) or sc.get("server_type") != "vllm":
-            return messages
-        if not bool(cfg.replay_reasoning_to_model):
-            return messages
-        return attach_vllm_chat_reasoning_field(messages)
+        return maybe_attach_vllm_chat_reasoning(
+            messages, provider, self._registry, alias or self._model_alias or ""
+        )
 
     def _save_config(self) -> None:
         """Persist LLM-affecting config so resumed workstreams behave identically."""
@@ -4964,35 +4775,14 @@ class ChatSession:
         provider: LLMProvider | None = None,
         model_alias: str | None = None,
     ) -> dict[str, Any] | None:
-        """Build provider-specific extra parameters.
+        """Delegate to :func:`turnstone.core.model_turn.provider_extra_params`.
 
-        Forwards operator-supplied ``server_compat["extra_body"]`` overrides
-        (``skip_special_tokens``, ``reasoning_format``, or explicit
-        ``chat_template_kwargs``) to the OpenAI SDK ``extra_body`` on the
-        OpenAI-shaped lanes, and to the Anthropic SDK ``extra_body`` on the
-        anthropic-compatible lane.  Entries set here are static operator
-        pins — they win over the dynamic knob mapping below.
-
-        Reasoning params (the ``enable_thinking``/``thinking`` toggle and
-        the ``effort_param`` graded key) are added separately by the
-        providers via ``merge_reasoning_template_kwargs``, driven by
-        ``ModelCapabilities`` and the session effort knob — the Responses
-        API surface handles reasoning natively and ignores ``extra_body``.
-
-        *model_alias* selects which stored config supplies server compat
-        settings.  When ``None``, defaults to the session's primary alias.
+        ``None`` *provider* / *model_alias* resolve to the session's primary
+        provider and alias; which lanes consume ``extra_body`` is documented
+        on the module function.
         """
-        from turnstone.core.server_compat import merge_server_compat
-
         prov = provider or self._provider
-        # extra_body consumers: the OpenAI-shaped providers, plus the
-        # anthropic-compatible lane (server_compat extra_body rides the
-        # Anthropic SDK's extra_body).  Real Anthropic and Google keep
-        # their own param paths handled inside their providers.
-        if prov.provider_name not in ("openai", "openai-compatible", "anthropic-compatible"):
-            return None
-        extra = merge_server_compat(None, self._get_server_compat(model_alias))
-        return extra or None
+        return provider_extra_params(prov, self._registry, model_alias or self._model_alias or "")
 
     def _get_server_compat(self, model_alias: str | None = None) -> dict[str, Any]:
         """Get server compatibility settings from a model config.
@@ -5049,19 +4839,19 @@ class ChatSession:
         # Utility completions (title gen, compaction, web-fetch extraction)
         # bypass the streaming on_status path — record their usage so the
         # governance dashboard reflects this spend.
-        self._record_aux_usage(result)
+        self._record_aux_usage(result.usage)
         return result
 
-    def _record_aux_usage(self, result: CompletionResult, *, model: str | None = None) -> None:
+    def _record_aux_usage(self, usage: UsageInfo | None, *, model: str | None = None) -> None:
         """Persist token usage for a non-streaming auxiliary completion.
 
         Title generation, compaction, web-fetch summarisation, and
-        task sub-agents all run via ``create_completion`` and bypass
-        the streaming ``on_status`` accounting path; without this their
-        spend never reaches the usage dashboard. Delegates to the UI's
-        ``on_aux_usage`` hook (which owns the storage write + any node
-        metrics), mirroring how ``_print_status_line`` routes main-loop
-        usage through ``on_status``.
+        task sub-agents all run outside the streaming ``on_status``
+        accounting path; without this their spend never reaches the
+        usage dashboard. Delegates to the UI's ``on_aux_usage`` hook
+        (which owns the storage write + any node metrics), mirroring how
+        ``_print_status_line`` routes main-loop usage through
+        ``on_status``.
 
         ``model`` defaults to the session model (utility calls share it);
         sub-agent callers pass the agent's own model so per-model
@@ -5069,7 +4859,7 @@ class ChatSession:
         minimal UI stubs (some tests, replay shims) predate it and should
         skip recording rather than crash a title-gen or sub-agent turn.
         """
-        u = result.usage
+        u = usage
         if u is None:
             return
         record = getattr(self.ui, "on_aux_usage", None)
@@ -9271,14 +9061,10 @@ class ChatSession:
     def _ensure_tool_call_ids(tool_calls: list[dict[str, Any]] | dict[int, dict[str, Any]]) -> None:
         """Fill in missing tool call IDs with synthetic UUIDs.
 
-        Some local servers (llama.cpp, older vLLM) omit or leave the id
-        blank; an empty tool_call_id corrupts subsequent turns because
-        the matching tool-result message can't reference the call.
+        Delegates to :func:`turnstone.core.model_turn.ensure_tool_call_ids`
+        (the re-ingest half of the shared plant-call seam).
         """
-        items = tool_calls.values() if isinstance(tool_calls, dict) else tool_calls
-        for tc in items:
-            if not tc.get("id"):
-                tc["id"] = f"call_{uuid.uuid4().hex}"
+        ensure_tool_call_ids(tool_calls)
 
     def _safe_prepare_tool(self, tc: dict[str, Any]) -> dict[str, Any]:
         """Wrap :meth:`_prepare_tool` so a single failing preparer is
@@ -15326,63 +15112,54 @@ class ChatSession:
             model_alias=agent_alias,
         )
 
+        # The agent's resolved lane.  Caps and extra_params are computed once
+        # per run (above, against the agent's own alias); the live per-call
+        # operator flags (replay-reasoning, Phase 5 vLLM attach) re-resolve
+        # inside ``model_turn`` through the carried registry, so mid-session
+        # admin toggles keep applying exactly as they did pre-extraction.
+        # Agent trajectories stay excluded from the persistence/replay
+        # contract — history is in-memory, rebuilt per ``_run_agent``
+        # invocation; the native lane carried here serves the WITHIN-RUN
+        # reasoning continuity of the agent's own tool loop.
+        lane = ModelLane(
+            provider=agent_provider,
+            client=agent_client,
+            model=agent_model,
+            alias=agent_alias or "",
+            capabilities=agent_caps,
+            extra_params=agent_extra,
+            registry=self._registry,
+        )
+
         def _api_call(
             turns: list[Turn],
             _tools: list[dict[str, Any]] | None = tools,
-        ) -> CompletionResult:
-            # Lower the trajectory once, not once per retry attempt — ``turns``
-            # is invariant across attempts (the retry path only sleeps and
-            # re-sends the same messages).  Agent calls bypass the main-loop
-            # wire prep and build their own history, so the seam runs its own
-            # passes:
-            #   * ``sanitize_tool_call_arguments`` — a local model can emit an
-            #     unterminated / non-object ``arguments`` with a non-``length``
-            #     finish reason; a strict renderer (vLLM ``deepseek_v4``) then
-            #     ``json.loads`` it and 400s every request that replays it.
-            #     (Documented in-tree for the main loop; agents hit the same
-            #     backends, so the same guard applies.)
-            #   * ``restore_provider_tool_ids`` — map the session-minted ``::``
-            #     sub-tool ids back to the provider's own ids, so the
-            #     provider-native ``tool_use`` block (replayed verbatim below,
-            #     under a reasoning signature that must not be touched), the
-            #     ``tool_calls`` mirror, and the ``tool_result`` all agree on
-            #     the wire.  The minted id stays the internal key (registry /
-            #     DOM / recall / cancel ledger) untouched.
-            #   * ``_maybe_attach_vllm_chat_reasoning`` — Phase 5 replay for
-            #     the agent's own turns, live here since agent turns carry
-            #     ``_provider_content`` (reasoning included); the helper's
-            #     three gates (Chat-Completions provider, server_type vllm,
-            #     operator flag) all resolve against the AGENT's provider and
-            #     alias, exactly like the main loop's send paths.
-            # Agent trajectories stay excluded from the persistence/replay
-            # contract — history is in-memory, rebuilt per ``_run_agent``
-            # invocation; the native lane carried here serves the WITHIN-RUN
-            # reasoning continuity of the agent's own tool loop.
-            wire = restore_provider_tool_ids(
-                sanitize_tool_call_arguments(dicts_from_turns(turns)), wire_id_map
-            )
-            wire = self._maybe_attach_vllm_chat_reasoning(wire, agent_provider, agent_alias)
+        ) -> ModelTurnResult:
+            # One plant call per attempt through ``model_turn`` — the seam
+            # passes (sanitize, minted-id restore, Phase 5 reasoning attach)
+            # and the native-lane re-ingest live there now, shared with every
+            # lane (#827).  Retry policy stays HERE: the sub-harness owns its
+            # backoff and salvage semantics, and ``model_turn`` is policy-free
+            # by contract.  Re-lowering per attempt is fine — the passes are
+            # deterministic and ``turns``/``wire_id_map`` are invariant across
+            # attempts (the retry path only sleeps and re-sends).
             last_err: Exception | None = None
             for attempt in range(self._MAX_RETRIES + 1):
                 try:
-                    agent_result = agent_provider.create_completion(
-                        client=agent_client,
-                        model=agent_model,
-                        messages=wire,
+                    agent_result = model_turn(
+                        lane,
+                        turns,
                         tools=_tools,
                         max_tokens=self.max_tokens,
                         temperature=self.temperature,
                         reasoning_effort=reasoning_effort or self.reasoning_effort,
-                        extra_params=agent_extra,
-                        capabilities=agent_caps,
-                        replay_reasoning_to_model=self._resolve_replay_reasoning_to_model(
-                            agent_alias, caps=agent_caps
-                        ),
+                        mint=mint,
+                        wire_id_map=wire_id_map,
                     )
                     # Sub-agent turns bypass on_status — record per-turn so
                     # task-agent spend is visible in the dashboard, attributed
                     # to the agent's own model.
-                    self._record_aux_usage(agent_result, model=agent_model)
+                    self._record_aux_usage(agent_result.usage, model=agent_model)
                     return agent_result
                 except Exception as e:
                     ename = type(e).__name__
@@ -15398,17 +15175,18 @@ class ChatSession:
             raise last_err
 
         turn = 0
-        # Mint tags for sub-tool ids (see the rewrite below).  ``run_seq`` is
-        # session-unique per _run_agent invocation — the parent call id alone
-        # can repeat across runs when a local provider reuses per-response ids
-        # for the PARENT task_agent call too.  ``sub_step_seq`` is monotonic
-        # across the WHOLE run, so ids stay distinct across turns even when
-        # the provider reuses per-response ids ("call_0") for sub-tools.
-        # ``wire_id_map`` records minted → provider-original for every mint,
-        # read by ``restore_provider_tool_ids`` in ``_api_call``.  The map is
-        # the recovery path — never string-split the mint suffix: the mint is
-        # not injective (parent and original are provider-controlled strings
-        # that may themselves contain ``::``-shaped substrings).
+        # Mint tags for sub-tool ids.  ``run_seq`` is session-unique per
+        # _run_agent invocation — the parent call id alone can repeat across
+        # runs when a local provider reuses per-response ids for the PARENT
+        # task_agent call too.  ``sub_step_seq`` is monotonic across the
+        # WHOLE run, so ids stay distinct across turns even when the provider
+        # reuses per-response ids ("call_0") for sub-tools.
+        # ``wire_id_map`` records minted → provider-original for every mint
+        # (written inside ``model_turn`` at re-ingest, read back by its
+        # restore pass on the next call).  The map is the recovery path —
+        # never string-split the mint suffix: the mint is not injective
+        # (parent and original are provider-controlled strings that may
+        # themselves contain ``::``-shaped substrings).
         # LIFETIME INVARIANT: minted ids never outlive this invocation —
         # the map is per-run, and with the native lane carried an unmapped
         # minted id on the wire hard-orphans its tool_result (pinned by
@@ -15428,6 +15206,27 @@ class ChatSession:
             run_seq = self._agent_run_seq
         sub_step_seq = 0
         wire_id_map: dict[str, str] = {}
+
+        def _mint_sub_id(original_id: str) -> str:
+            # ``{parent}::r{run}s{step}::{provider_id}``: the run tag
+            # de-collides RUNS (a reused parent id can't alias two agents'
+            # children); the step tag de-collides turns WITHIN one agent
+            # whose (local) provider reuses per-response sequential ids
+            # ("call_0") — pre-mint, that reuse collapsed the live card's
+            # DOM rows while FIFO recall kept them apart, so the two
+            # disagreed on identical input.  The parent segment keeps the
+            # id traceable and is what the frontend's "::" child checks
+            # key off.  Every downstream consumer (nesting registry,
+            # error-flags, DOM data-call-id, recall, cancel ledger) keys
+            # on this ONE id; the wire alone sees the provider's original
+            # ids restored from ``wire_id_map``.
+            nonlocal sub_step_seq
+            sub_step_seq += 1
+            return f"{parent_call_id}::r{run_seq}s{sub_step_seq}::{original_id}"
+
+        # Minting only nests sub-tools under a parent task_agent call — a
+        # top-level run (no parent → no nesting) keeps provider ids as-is.
+        mint: Callable[[str], str] | None = _mint_sub_id if parent_call_id else None
         while max_tool_turns < 0 or turn < max_tool_turns:
             self._check_cancelled()
             try:
@@ -15465,77 +15264,11 @@ class ChatSession:
                 return "(content filter)"
 
             # Append the assistant turn to the sub-harness trajectory.
-            agent_tool_calls: tuple[ToolCall, ...] = ()
-            had_blank_ids = False
-            if result.tool_calls:
-                # Record blanks BEFORE the uuid back-fill: a back-filled id
-                # exists only in the tool_calls mirror — the native blocks
-                # keep the blank provider id verbatim (they are never
-                # rewritten), so the shared builder must drop the blocks the
-                # back-fill desyncs (see _finalize_provider_blocks).
-                had_blank_ids = any(not tc.get("id") for tc in result.tool_calls)
-                self._ensure_tool_call_ids(result.tool_calls)
-                # Mint each sub-agent tool id session-unique:
-                # ``{parent}::r{run}s{step}::{provider_id}``.  The run tag
-                # de-collides RUNS (a reused parent id can't alias two agents'
-                # children); the step tag de-collides turns WITHIN one agent
-                # whose (local) provider reuses per-response sequential ids
-                # ("call_0") — pre-mint, that reuse collapsed the live card's
-                # DOM rows while FIFO recall kept them apart, so the two
-                # disagreed on identical input.  The parent segment keeps the
-                # id traceable and is what the frontend's "::" child checks
-                # key off.  Every downstream consumer (nesting registry,
-                # error-flags, DOM data-call-id, recall, cancel ledger) keys
-                # on this ONE id; the wire alone sees the provider's original
-                # ids restored from ``wire_id_map`` instead
-                # (``restore_provider_tool_ids`` in ``_api_call``), so the
-                # top-level mirror, the ``tool_result``, and the native
-                # ``tool_use`` block — which keeps the provider id verbatim
-                # and is never rewritten — agree on every request.  Skipped
-                # for a top-level run (no parent → no nesting).
-                if parent_call_id:
-                    for tc in result.tool_calls:
-                        sub_step_seq += 1
-                        original_id = tc["id"]
-                        tc["id"] = f"{parent_call_id}::r{run_seq}s{sub_step_seq}::{original_id}"
-                        wire_id_map[tc["id"]] = original_id
-                agent_tool_calls = tuple(
-                    ToolCall(
-                        id=tc["id"],
-                        name=tc.get("function", {}).get("name", ""),
-                        arguments=tc.get("function", {}).get("arguments", ""),
-                    )
-                    for tc in result.tool_calls
-                )
-            # Carry the provider-native lane (thinking blocks, signatures,
-            # Responses reasoning items, synthesized ``reasoning_text``) so
-            # the agent's own multi-turn tool loop keeps its reasoning
-            # continuity instead of re-reasoning from scratch each turn —
-            # the same fidelity the main loop keeps, finalized by the same
-            # shared builder.  ``producer`` is the agent's own provider: a
-            # run is pinned to one provider, so the blocks always replay to
-            # the backend that produced them (and the translators' per-block
-            # shape filters drop anything foreign).
-            #
-            # ``had_blank_ids`` makes the shared builder drop everything but
-            # the loose-text ``reasoning_text`` synth for this turn — any
-            # id-bearing or Messages-shaped block would desync from the
-            # uuid-back-filled mirror — see _finalize_provider_blocks.
-            native_blocks = self._finalize_provider_blocks(
-                result.provider_blocks,
-                [result.reasoning],
-                has_tool_calls=bool(result.tool_calls),
-                had_blank_ids=had_blank_ids,
-                alias=agent_alias,
-            )
-            native = (
-                ProviderNative(producer=agent_provider.provider_name, blocks=tuple(native_blocks))
-                if native_blocks
-                else None
-            )
-            agent_turns.append(
-                Turn.assistant(result.content or "", tool_calls=agent_tool_calls, native=native)
-            )
+            # ``model_turn`` already ran the whole re-ingest: blank-id
+            # back-fill, the sub-tool mint (recorded in ``wire_id_map``),
+            # and the native-lane finalize via the shared builder
+            # (:func:`turnstone.core.model_turn.finalize_provider_blocks`).
+            agent_turns.append(result.turn)
 
             if not result.tool_calls:
                 content = result.content or "(no output)"

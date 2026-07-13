@@ -387,8 +387,8 @@ def attach_vllm_chat_reasoning_field(
     All three gates (provider isinstance, ``server_type == "vllm"``,
     operator flag ``replay_reasoning_to_model``) MUST be checked by the
     caller — this helper assumes the decision has already been made.
-    See ``ChatSession._maybe_attach_vllm_chat_reasoning`` for the
-    integration point.
+    See ``model_turn.maybe_attach_vllm_chat_reasoning`` for the
+    integration point (every lane routes through it).
     """
     out: list[dict[str, Any]] = []
     for msg in messages:

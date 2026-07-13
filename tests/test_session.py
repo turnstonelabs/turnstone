@@ -2735,7 +2735,13 @@ class TestAgentChildRegistration:
 
         with (
             patch.object(session, "_prepare_tool", side_effect=fake_prepare),
-            patch.object(session, "_resolve_replay_reasoning_to_model", return_value=True),
+            # The agent seam resolves the operator flag through model_turn's
+            # module-level resolver (not the session wrapper), so the pin
+            # patches the module function — the seam production reads.
+            patch(
+                "turnstone.core.model_turn.resolve_replay_reasoning_to_model",
+                return_value=True,
+            ),
         ):
             session._run_agent(
                 [Turn.user("x")],
@@ -2828,7 +2834,13 @@ class TestAgentChildRegistration:
         turns = [Turn.user("x")]
         with (
             patch.object(session, "_prepare_tool", side_effect=fake_prepare),
-            patch.object(session, "_resolve_replay_reasoning_to_model", return_value=True),
+            # Pin the operator flag ON at the model_turn seam (where the
+            # agent path resolves it) so the lane-drop below is attributable
+            # to the blank-id gate alone, not a False replay flag.
+            patch(
+                "turnstone.core.model_turn.resolve_replay_reasoning_to_model",
+                return_value=True,
+            ),
         ):
             session._run_agent(
                 turns,
@@ -7700,25 +7712,20 @@ def test_web_fetch_extraction_caps_max_tokens_to_window_reserve():
 def test_record_aux_usage_skips_when_usage_missing():
     """A provider that reports no usage object must not emit a phantom
     zero-token row."""
-    from turnstone.core.providers._protocol import CompletionResult
-
     ui = _AuxRecordingUI()
     session = _make_session(ui=ui)
-    session._record_aux_usage(CompletionResult(content="x", usage=None))
+    session._record_aux_usage(None)
     assert ui.aux_calls == []
 
 
 def test_record_aux_usage_noop_without_ui_hook():
     """Minimal UI stubs predating on_aux_usage (e.g. NullUI) must not crash
     a title-gen or sub-agent turn — recording silently no-ops."""
-    from turnstone.core.providers._protocol import CompletionResult, UsageInfo
+    from turnstone.core.providers._protocol import UsageInfo
 
     session = _make_session(ui=NullUI())  # NullUI has no on_aux_usage
     session._record_aux_usage(
-        CompletionResult(
-            content="x",
-            usage=UsageInfo(prompt_tokens=1, completion_tokens=1, total_tokens=2),
-        )
+        UsageInfo(prompt_tokens=1, completion_tokens=1, total_tokens=2)
     )  # no exception raised == pass
 
 
@@ -7727,15 +7734,12 @@ def test_record_aux_usage_attributes_explicit_model():
     _api_call passes model=agent_model so plan/task spend attributes to the
     sub-agent's model, not the coordinating session's. Verify the override
     reaches on_aux_usage rather than defaulting to self.model."""
-    from turnstone.core.providers._protocol import CompletionResult, UsageInfo
+    from turnstone.core.providers._protocol import UsageInfo
 
     ui = _AuxRecordingUI()
     session = _make_session(ui=ui)  # session model == "test-model"
     session._record_aux_usage(
-        CompletionResult(
-            content="plan output",
-            usage=UsageInfo(prompt_tokens=900, completion_tokens=60, total_tokens=960),
-        ),
+        UsageInfo(prompt_tokens=900, completion_tokens=60, total_tokens=960),
         model="plan-model-xyz",
     )
 
