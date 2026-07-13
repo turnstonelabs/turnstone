@@ -697,7 +697,7 @@ class MCPClientManager:
         # callers (ChatSession) never iterate ``_user_pool_entries``
         # concurrently with the mcp-loop's mutations of the same dict
         # (insert in ``_ensure_pool_entry`` / pop in
-        # ``_close_pool_entry_if_idle`` / ``_evict_session``).
+        # ``_close_pool_entry_if_idle`` / ``_evict_session_drop_catalog``).
         self._user_tools: dict[str, list[dict[str, Any]]] = {}
 
         # Per-user resource catalog. Mirrors ``_user_tool_map`` /
@@ -2965,12 +2965,61 @@ class MCPClientManager:
                 # — a transport-layer group must not kill the loop.
                 log.warning("MCP pool eviction iteration failed", exc_info=True)
 
+    def _user_has_live_listener(self, user_id: str) -> bool:
+        """True when *user_id* has a registered user-scoped tool listener.
+
+        A live listener means a live ChatSession whose merged tool list
+        is derived from this user's pool catalog — the signal the
+        eviction passes use to decide cool-vs-drop (#836). Admin
+        (``None``) listeners don't count: they track catalog state for
+        operator tooling, not a user's model-visible tool list.
+        """
+        with self._listeners_lock:
+            return any(uid == user_id for uid, _cb in self._listeners)
+
+    @staticmethod
+    def _entry_has_catalog(entry: PoolEntryState) -> bool:
+        """True when the entry carries a discovered catalog worth retaining.
+
+        Never-connected stubs (``_ensure_pool_entry`` allocated, connect
+        failed before discovery) and revoke-cleared entries
+        (:meth:`_evict_session_drop_catalog`) carry none — retaining
+        those serves nobody, so the eviction passes full-drop them even
+        when the user has a live session.
+        """
+        return entry.tools is not None or entry.resources is not None or entry.prompts is not None
+
+    def _warm_pool_count(self) -> int:
+        """Count pool entries still holding connection resources.
+
+        Warm = an open session OR a live owner task (an owner parked
+        after ``_evict_session`` still holds the transport until the
+        close protocol runs). Cooled catalog-only entries hold neither.
+        """
+        return sum(
+            1
+            for e in self._user_pool_entries.values()
+            if e.session is not None or e.owner_task is not None
+        )
+
     async def _evict_idle_pool_entries(self) -> None:
         """Evict pool entries past the idle TTL or above the LRU cap.
 
         Skips any key whose ``open_lock`` is currently held or whose
         ``in_flight`` counter is non-zero — eviction never blocks on a
         contested lock or an active dispatch; the next tick retries.
+
+        Both passes close TRANSPORTS. Whether the ENTRY (and with it the
+        user's catalog contribution) survives is decided per user in
+        :meth:`_close_pool_entry_if_idle`: a user with a live session
+        keeps a cooled catalog-only entry so their model-visible tool
+        list never silently shrinks (#836); a user without one gets the
+        full drop. The LRU cap therefore bounds WARM entries — the
+        connection resources (transport, httpx client, owner task) are
+        what the cap exists to limit. Cooled entries hold none of
+        those; they are bounded by live-session users × pool servers
+        and reaped by the TTL pass within a tick of their user's last
+        listener going away.
         """
         if not self._user_pool_entries:
             return
@@ -2982,37 +3031,70 @@ class MCPClientManager:
         ttl_targets: list[tuple[str, str]] = []
         for key, entry in list(self._user_pool_entries.items()):
             last = self._user_pool_last_used.get(key, entry.last_used)
-            if (now - last) >= ttl:
-                ttl_targets.append(key)
+            if (now - last) < ttl:
+                continue
+            if (
+                entry.session is None
+                and entry.owner_task is None
+                and self._entry_has_catalog(entry)
+                and self._user_has_live_listener(key[0])
+            ):
+                # Already cooled — nothing to close. Retained for the
+                # live session's tool list; the tick after that user's
+                # last listener is removed, this stops matching and the
+                # entry takes the full-drop path below.
+                continue
+            ttl_targets.append(key)
         if ttl_targets:
             await asyncio.gather(
                 *(self._close_pool_entry_if_idle(k) for k in ttl_targets),
                 return_exceptions=True,
             )
 
-        # Second pass: LRU cap. Iterate the canonical entry map (not the
-        # last_used view) so brand-new entries that were created via
-        # ``_ensure_pool_entry`` but haven't dispatched yet are still
-        # eviction-eligible.
-        if len(self._user_pool_entries) <= self._user_pool_lru_max:
+        # Second pass: LRU cap over warm entries. Iterate the canonical
+        # entry map (not the last_used view) so brand-new entries that
+        # were created via ``_ensure_pool_entry`` but haven't dispatched
+        # yet are still eviction-eligible.
+        warm = [
+            (key, entry)
+            for key, entry in self._user_pool_entries.items()
+            if entry.session is not None or entry.owner_task is not None
+        ]
+        if len(warm) <= self._user_pool_lru_max:
             return
         ordered = sorted(
-            self._user_pool_entries.items(),
+            warm,
             key=lambda kv: self._user_pool_last_used.get(kv[0], kv[1].last_used),
         )
         # Compute the eviction batch up front; we re-check the cap after
         # each close (in-flight skips can leave us still over).
         for key, _entry in ordered:
-            if len(self._user_pool_entries) <= self._user_pool_lru_max:
+            if self._warm_pool_count() <= self._user_pool_lru_max:
                 break
             await self._close_pool_entry_if_idle(key)
 
     async def _close_pool_entry_if_idle(self, key: tuple[str, str]) -> None:
-        """Close ``key`` iff its open_lock is uncontested AND in_flight==0.
+        """Close ``key``'s transport iff its open_lock is uncontested AND in_flight==0.
 
         Best-effort: a contested lock or an active dispatch causes the
         function to return without mutation; the next eviction tick
         retries.
+
+        What happens to the ENTRY depends on whether the user still has
+        a live session (:meth:`_user_has_live_listener`) and the entry
+        carries a discovered catalog (:meth:`_entry_has_catalog`):
+
+        - live listener + catalog → the entry is COOLED: transport torn down,
+          catalog kept, no rebuild, no listener fan-out. The user's
+          merged tool list is untouched and the next dispatch or prime
+          reconnects — the evict-session-keep-entry shape of
+          ``_on_pool_owner_death``. Dropping the catalog here instead
+          silently removed the server's tools from live sessions with
+          no re-prime path (#836).
+        - otherwise → full drop: entry popped, per-user catalogs
+          rebuilt, listeners notified (reaching only admin/``None``
+          listeners — operator tooling tracking catalog state). This
+          keeps departed users' entries from outliving their sessions.
         """
         entry = self._user_pool_entries.get(key)
         if entry is None:
@@ -3043,16 +3125,26 @@ class MCPClientManager:
             if entry.in_flight > 0:
                 return
             await self._teardown_pool_entry(key)
-            self._user_pool_entries.pop(key, None)
-            self._user_pool_last_used.pop(key, None)
-            # Mirror ``_evict_session``'s catalog cleanup: dropping the
-            # entry without rebuilding the per-user catalogs would leave
-            # ``is_mcp_tool`` / per-user resource & prompt maps returning
-            # stale entries whose backing pool is gone, and ChatSession's
-            # tool / resource / prompt lists would never rebuild because
-            # no listener fires.
+            # Prune the push-notification debounce stamp with the
+            # transport either way — a future reconnect's first
+            # ``list_changed`` must refresh immediately.
             self._last_pool_notification_refresh.pop(key, None)
             user_id, _server_name = key
+            if self._entry_has_catalog(entry) and self._user_has_live_listener(user_id):
+                # Cooled: entry + catalog stay, so the live session's
+                # tool list and ``is_mcp_tool`` are untouched. Nothing
+                # changed catalog-wise → no rebuild, no fan-out. The
+                # entry's ``open_lock`` must survive with it (an
+                # in-flight dispatcher's next acquire needs the same
+                # lock object), so skip the ``evicted`` cleanup too.
+                return
+            self._user_pool_entries.pop(key, None)
+            self._user_pool_last_used.pop(key, None)
+            # Dropping the entry without rebuilding the per-user
+            # catalogs would leave ``is_mcp_tool`` / per-user resource &
+            # prompt maps returning stale entries whose backing pool is
+            # gone for good (this user has no live session left to
+            # re-warm it lazily).
             self._rebuild_user_tool_map(user_id)
             self._rebuild_user_resource_map(user_id)
             self._rebuild_user_prompt_map(user_id)
@@ -6573,7 +6665,7 @@ class MCPClientManager:
         return _decode_prompt_result(sdk_result)
 
     def _evict_session(self, key: tuple[str, str]) -> None:
-        """Drop the cached session AND catalog on a pool entry.
+        """Drop the cached session on a pool entry; KEEP the catalog.
 
         Owner/streams left for reconnect. Auth/transport branches both call
         this — the next connect's ``_connect_one_pool`` tears down the stale
@@ -6584,39 +6676,63 @@ class MCPClientManager:
         following reconnect is reaped by idle eviction, which drives the same
         protocol.
 
-        Catalog cleanup (Phase 7 / 7b): clearing ``entry.tools`` /
-        ``entry.resources`` / ``entry.prompts`` here ensures an
-        evicted-then-not-yet-reconnected entry contributes no stale
-        entries to ``_user_tool_map`` / ``_user_resource_map`` /
-        ``_user_prompt_map``. Without this, ``is_mcp_tool`` /
-        ``is_mcp_prompt`` / pool resource resolution could return True
-        for names whose backing pool is gone, then the resolver would
-        dispatch into a session-less entry and the next call would
-        surface as a generic transport error instead of a clean
-        reconnect path.
+        The catalog (``entry.tools`` / ``resources`` / ``prompts``) is
+        deliberately RETAINED — the evict-session-keep-entry shape of
+        ``_on_pool_owner_death`` (#836). Clearing it here removed the
+        server's tools from the user's live sessions on the first failed
+        dispatch (a transport blip, a 403, a double-401): the per-user
+        maps rebuilt empty, the session-side ``is_mcp_tool`` gate
+        closed, and with no re-prime path for a live session the tools
+        never came back — which also made the breaker's half-open
+        recovery and the consent / step-up cards unreachable (the model
+        could no longer emit the name they need to fire). A session-less
+        entry stays fully dispatchable: tool-name resolution never reads
+        the catalog (``_resolve_pool_target`` is name + server-row
+        based) and ``_dispatch_pool_with_entry`` connect-or-reuses,
+        re-running discovery — post-reconnect drift self-corrects and
+        the catalog-refresh notification fans out then.
         """
         evict = self._user_pool_entries.get(key)
         if evict is not None:
             evict.session = None
-            evict.tools = None
-            evict.resources = None
-            evict.prompts = None
-            # Prune the debounce stamp in lockstep with the entry — the
-            # dict grows otherwise (slow leak) across (user, server)
-            # churn. Mirrors the cleanup in ``_close_pool_entry_if_idle``.
+            # Prune the push-notification debounce stamp so a
+            # reconnect's first ``list_changed`` refreshes immediately.
             self._last_pool_notification_refresh.pop(key, None)
-            user_id, _server_name = key
-            self._rebuild_user_tool_map(user_id)
-            self._rebuild_user_resource_map(user_id)
-            self._rebuild_user_prompt_map(user_id)
-            # Wake the user's session so its merged tool / resource /
-            # prompt lists shrink back to static-only until the next
-            # connect populates the entry. Admin (None) listeners also
-            # fire — operator tooling tracking pool catalog state
-            # observes the drop.
-            self._notify_user_tool_listeners(user_id)
-            self._notify_user_resource_listeners(user_id)
-            self._notify_user_prompt_listeners(user_id)
+
+    def _evict_session_drop_catalog(self, key: tuple[str, str]) -> None:
+        """Drop the cached session AND the entry's catalog contribution.
+
+        The explicit-revocation flavor of :meth:`_evict_session`, used
+        by :meth:`evict_user_session` (the OAuth disconnect handler):
+        the user asked for the server to be disconnected, so their live
+        sessions SHOULD see the tools leave — the opposite of the
+        dispatch-failure paths, where the catalog is retained (#836).
+        Clearing the catalog also makes the eviction passes treat the
+        entry as a droppable stub (``_entry_has_catalog`` is False), so
+        it doesn't linger cooled behind a live listener.
+
+        Owner/streams left for reconnect teardown exactly as in
+        :meth:`_evict_session` (the one-cancel close protocol).
+        """
+        evict = self._user_pool_entries.get(key)
+        if evict is None:
+            return
+        evict.session = None
+        evict.tools = None
+        evict.resources = None
+        evict.prompts = None
+        self._last_pool_notification_refresh.pop(key, None)
+        user_id, _server_name = key
+        self._rebuild_user_tool_map(user_id)
+        self._rebuild_user_resource_map(user_id)
+        self._rebuild_user_prompt_map(user_id)
+        # Wake the user's sessions so their merged tool / resource /
+        # prompt lists shrink now, not at the next turn boundary. Admin
+        # (None) listeners also fire — operator tooling tracking pool
+        # catalog state observes the drop.
+        self._notify_user_tool_listeners(user_id)
+        self._notify_user_resource_listeners(user_id)
+        self._notify_user_prompt_listeners(user_id)
 
     async def _handle_auth_403(
         self,
@@ -7073,22 +7189,24 @@ class MCPClientManager:
         return _decode_prompt_result(result)
 
     def evict_user_session(self, user_id: str, server_name: str) -> None:
-        """Drop the cached pool session for ``(user_id, server_name)``.
+        """Drop the cached pool session AND catalog for ``(user_id, server_name)``.
 
-        Sync entry point for callers (e.g. the OAuth revoke handler)
-        that mutate token state from outside the mcp-loop and need the
-        next dispatch to reconnect with fresh credentials. Idempotent —
+        Sync entry point for the OAuth revoke handler: the user
+        explicitly disconnected the server, so the session is dropped
+        and — unlike the dispatch-failure eviction (#836) — the user's
+        catalog view of the server is removed and their live sessions
+        notified (:meth:`_evict_session_drop_catalog`). Idempotent —
         a missing key is a silent no-op. Fire-and-forget: schedules
-        :meth:`_evict_session` on the mcp-loop and returns immediately
-        without waiting for the future. Best-effort: a closed loop or
-        scheduling failure logs at info level; never raises.
+        onto the mcp-loop and returns immediately without waiting for
+        the future. Best-effort: a closed loop or scheduling failure
+        logs at info level; never raises.
         """
         if self._loop is None:
             return
         key = (user_id, server_name)
 
         async def _do_evict() -> None:
-            self._evict_session(key)
+            self._evict_session_drop_catalog(key)
 
         try:
             asyncio.run_coroutine_threadsafe(_do_evict(), self._loop)

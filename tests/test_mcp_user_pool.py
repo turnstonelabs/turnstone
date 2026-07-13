@@ -400,6 +400,145 @@ class TestEviction:
         # All entries removed from the dict regardless.
         assert mgr._user_pool_entries == {}
 
+    @staticmethod
+    def _fake_tools(server_name: str, i: int) -> list[dict]:
+        return [
+            {
+                "type": "function",
+                "function": {
+                    "name": f"mcp__{server_name}__t{i}",
+                    "description": "",
+                    "parameters": {"type": "object", "properties": {}},
+                },
+            }
+        ]
+
+    def test_idle_eviction_cools_entries_for_live_listener_users(self, running_loop_mgr) -> None:
+        """TTL eviction cools (retains) a live-listener user's
+        catalog-bearing entry and full-drops a listener-less user's —
+        the #836 split. A second tick must not disturb the cooled entry
+        (the already-cooled skip)."""
+        mgr, loop, _ = running_loop_mgr
+        mgr._user_pool_idle_ttl_s = 0.0  # everything is stale
+
+        async def _seed() -> None:
+            for i in range(2):
+                entry = await mgr._ensure_pool_entry((f"u{i}", "pool-srv"))
+                entry.session = MagicMock()
+                entry.tools = self._fake_tools("pool-srv", i)
+
+        _run_on_loop(loop, _seed())
+        # u0 has a live session (tool listener); u1 does not.
+        mgr.add_listener(lambda: None, user_id="u0")
+
+        _run_on_loop(loop, mgr._evict_idle_pool_entries())
+
+        # u0: cooled — retained without a session, catalog intact.
+        cooled = mgr._user_pool_entries.get(("u0", "pool-srv"))
+        assert cooled is not None
+        assert cooled.session is None
+        assert cooled.tools is not None
+        # u1: full drop.
+        assert ("u1", "pool-srv") not in mgr._user_pool_entries
+
+        # Second tick: the cooled entry is skipped, not re-processed.
+        _run_on_loop(loop, mgr._evict_idle_pool_entries())
+        assert ("u0", "pool-srv") in mgr._user_pool_entries
+
+    def test_idle_eviction_drops_catalogless_stub_despite_live_listener(
+        self, running_loop_mgr
+    ) -> None:
+        """A cold, never-discovered stub (``_ensure_pool_entry``
+        allocated, connect failed before discovery) carries no catalog
+        worth retaining — TTL eviction drops it even for a live-listener
+        user, so revoke-cleared and connect-failed entries can't
+        accumulate as zombies behind an open session."""
+        mgr, loop, _ = running_loop_mgr
+        mgr._user_pool_idle_ttl_s = 0.0
+
+        async def _seed() -> None:
+            await mgr._ensure_pool_entry(("u-stub", "pool-srv"))
+
+        _run_on_loop(loop, _seed())
+        mgr.add_listener(lambda: None, user_id="u-stub")
+
+        _run_on_loop(loop, mgr._evict_idle_pool_entries())
+        assert ("u-stub", "pool-srv") not in mgr._user_pool_entries
+
+    def test_lru_cap_ignores_cooled_entries(self, running_loop_mgr) -> None:
+        """The LRU cap bounds WARM entries (connection resources), not
+        cooled catalog-only ones — cooled entries neither count toward
+        the cap nor get evicted by it."""
+        mgr, loop, _ = running_loop_mgr
+        mgr._user_pool_idle_ttl_s = 999_999.0  # TTL effectively disabled
+        mgr._user_pool_lru_max = 2
+
+        async def _seed() -> None:
+            base = time.monotonic()
+            # Three cooled entries (no session/owner, catalog present).
+            for i in range(3):
+                key = (f"cool{i}", "pool-srv")
+                entry = await mgr._ensure_pool_entry(key)
+                entry.tools = self._fake_tools("pool-srv", i)
+                entry.last_used = base + i
+                mgr._user_pool_last_used[key] = base + i
+            # Two warm entries, newer than the cooled ones.
+            for i in range(2):
+                key = (f"warm{i}", "pool-srv")
+                entry = await mgr._ensure_pool_entry(key)
+                entry.session = MagicMock()
+                entry.tools = self._fake_tools("pool-srv", 10 + i)
+                entry.last_used = base + 10 + i
+                mgr._user_pool_last_used[key] = base + 10 + i
+
+        _run_on_loop(loop, _seed())
+        for i in range(3):
+            mgr.add_listener(lambda: None, user_id=f"cool{i}")
+
+        _run_on_loop(loop, mgr._evict_idle_pool_entries())
+
+        # Warm count (2) is at the cap — nothing evicted, cooled
+        # entries (which would be "oldest" by last_used) untouched.
+        assert len(mgr._user_pool_entries) == 5
+        assert all((f"cool{i}", "pool-srv") in mgr._user_pool_entries for i in range(3))
+
+    def test_lru_cap_cools_live_listener_entries(self, running_loop_mgr) -> None:
+        """Over the cap, warm entries of live-listener users are COOLED
+        (transport closed, entry + catalog retained) oldest-first until
+        the warm count meets the cap — cap pressure must not reintroduce
+        the #836 tool loss for live sessions."""
+        mgr, loop, _ = running_loop_mgr
+        mgr._user_pool_idle_ttl_s = 999_999.0
+        mgr._user_pool_lru_max = 1
+
+        async def _seed() -> None:
+            base = time.monotonic()
+            for i in range(3):
+                key = (f"u{i}", "pool-srv")
+                entry = await mgr._ensure_pool_entry(key)
+                entry.session = MagicMock()
+                entry.tools = self._fake_tools("pool-srv", i)
+                entry.last_used = base + i
+                mgr._user_pool_last_used[key] = base + i
+
+        _run_on_loop(loop, _seed())
+        for i in range(3):
+            mgr.add_listener(lambda: None, user_id=f"u{i}")
+
+        _run_on_loop(loop, mgr._evict_idle_pool_entries())
+
+        # All three entries survive with catalogs; only the newest is
+        # still warm.
+        assert len(mgr._user_pool_entries) == 3
+        warm = [
+            key
+            for key, e in mgr._user_pool_entries.items()
+            if e.session is not None or e.owner_task is not None
+        ]
+        assert warm == [("u2", "pool-srv")]
+        for i in range(3):
+            assert mgr._user_pool_entries[(f"u{i}", "pool-srv")].tools is not None
+
 
 # ---------------------------------------------------------------------------
 # Dispatch state machine
