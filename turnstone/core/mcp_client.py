@@ -2082,6 +2082,10 @@ class MCPClientManager:
         entry.close_requested = None
         if entry.session is not None:
             entry.session = None
+            # Third session-drop site of the bearer-clearing sweep (with
+            # _teardown_pool_entry and _evict_session): the copy is dead
+            # without a session, and the entry may now cool indefinitely.
+            entry.bound_token = None
             user_id, server_name = key
             log.info(
                 "MCP pool transport terminated user=%s server=%s; session evicted for reconnect",
@@ -3016,6 +3020,10 @@ class MCPClientManager:
         """
         return entry.session is not None or entry.owner_task is not None
 
+    def _warm_pool_count(self) -> int:
+        """Live count of entries holding connection resources (:meth:`_entry_is_warm`)."""
+        return sum(1 for e in self._user_pool_entries.values() if self._entry_is_warm(e))
+
     def _retain_cooled(
         self,
         key: tuple[str, str],
@@ -3041,6 +3049,14 @@ class MCPClientManager:
         Single copy of the policy — the TTL pass's already-cooled skip
         and :meth:`_close_pool_entry_if_idle`'s cool-vs-drop decision
         must never diverge.
+
+        Accepted residual: the two pool-name registries are replaced by
+        ``reconcile_sync`` on a server thread as two adjacent stores, so
+        a same-tick read here can theoretically observe a flip
+        mid-swap (in neither set) and full-drop a cooled entry. The
+        window is one bytecode boundary, and the same reconcile's
+        flip re-prime restores the catalog seconds later — an atomic
+        single-source registry is not worth the churn for that.
         """
         user_id, server_name = key
         if not self._entry_has_catalog(entry):
@@ -3130,17 +3146,16 @@ class MCPClientManager:
             warm,
             key=lambda kv: self._user_pool_last_used.get(kv[0], kv[1].last_used),
         )
-        # Count actual closes instead of rescanning the whole map per
-        # iteration; a skip (contested lock / in-flight) leaves the
-        # entry warm, so re-read the entry itself to learn the outcome.
-        over = len(warm) - self._user_pool_lru_max
+        # Re-check the LIVE warm count each iteration — concurrent
+        # tasks change the warm set during this pass's awaits
+        # (revocation evictions, owner deaths, new connects), and a
+        # snapshot delta would keep closing healthy transports below
+        # the cap or stop above it. O(entries) per close is fine at
+        # cap scale; cooled entries are excluded from the count.
         for key, _entry in ordered:
-            if over <= 0:
+            if self._warm_pool_count() <= self._user_pool_lru_max:
                 break
             await self._close_pool_entry_if_idle(key)
-            current = self._user_pool_entries.get(key)
-            if current is None or not self._entry_is_warm(current):
-                over -= 1
 
     async def _close_pool_entry_if_idle(self, key: tuple[str, str]) -> None:
         """Close ``key``'s transport iff its open_lock is uncontested AND in_flight==0.
@@ -3207,14 +3222,18 @@ class MCPClientManager:
                 # in-flight dispatcher's next acquire needs the same
                 # lock object), so skip the ``evicted`` cleanup too.
                 return
+            had_catalog = self._entry_has_catalog(entry)
             self._user_pool_entries.pop(key, None)
             self._user_pool_last_used.pop(key, None)
-            # Dropping the entry without rebuilding the per-user
-            # catalogs would leave ``is_mcp_tool`` / per-user resource &
-            # prompt maps returning stale entries whose backing pool is
-            # gone for good (departed user, or a server no longer in
-            # the pool registries).
-            self._rebuild_and_notify_user_catalogs(user_id)
+            if had_catalog:
+                # Dropping the entry without rebuilding the per-user
+                # catalogs would leave ``is_mcp_tool`` / per-user
+                # resource & prompt maps returning stale entries whose
+                # backing pool is gone for good (departed user, or a
+                # server no longer in the pool registries). A
+                # catalog-less stub contributed nothing — skip the
+                # zero-delta fan-out.
+                self._rebuild_and_notify_user_catalogs(user_id)
             evicted = True
         finally:
             lock.release()
@@ -4880,12 +4899,14 @@ class MCPClientManager:
         # just read — feeds :meth:`server_auth_type` so callers (e.g.
         # ``web_search.resolve_web_search_client``) avoid a per-turn SQL
         # roundtrip.
-        self._oauth_user_server_names = {
-            row["name"] for row in rows if row.get("auth_type") == "oauth_user"
-        }
-        self._obo_server_names = {
-            row["name"] for row in rows if row.get("auth_type") == "oauth_obo"
-        }
+        # Build both sets BEFORE storing so the two attribute stores are
+        # adjacent: cross-thread readers (the eviction tick's
+        # _retain_cooled) see at most a single-bytecode tear window on a
+        # flip instead of a full row iteration between the swaps.
+        new_oauth_user_names = {row["name"] for row in rows if row.get("auth_type") == "oauth_user"}
+        new_obo_names = {row["name"] for row in rows if row.get("auth_type") == "oauth_obo"}
+        self._oauth_user_server_names = new_oauth_user_names
+        self._obo_server_names = new_obo_names
         new_pool_auth = {n: "oauth_user" for n in self._oauth_user_server_names}
         new_pool_auth.update(dict.fromkeys(self._obo_server_names, "oauth_obo"))
         # Pool servers newly registered OR migrated between pool auth types
@@ -6383,14 +6404,21 @@ class MCPClientManager:
         )
         lookup_error = _pool_lookup_error(lookup, server_name, server_row)
         if lookup_error is not None:
-            if lookup.kind in _DEAD_GRANT_LOOKUP_KINDS:
+            if self._lookup_grant_dead(lookup):
                 # The grant is GONE (revoked / permanently rejected) —
                 # converge this node's live sessions now instead of
                 # leaving tools dangling behind a consent card for
                 # access the user no longer holds (#836 cross-node
                 # disconnect). Re-consent restores them via the
-                # consent-completion prime.
-                await self._drop_catalog_locked((user_id, server_name))
+                # consent-completion prime. SCHEDULED, not awaited: the
+                # drop waits on open_lock, which a same-key dispatch
+                # may hold across its entire SDK call — awaiting here
+                # let a token-side error stall past the sync timeout
+                # and charge the breaker it is documented to bypass.
+                self._spawn_background(
+                    self._drop_catalog_locked((user_id, server_name)),
+                    f"dead-grant catalog drop for '{server_name}'",
+                )
             return lookup_error
         access_token = lookup.token or ""
 
@@ -6470,10 +6498,13 @@ class MCPClientManager:
                     user_id,
                     type(exc).__name__,
                 )
-                # Refreshed bearer also rejected — the grant is dead at
-                # the AS; drop the catalog so this node's live sessions
-                # converge (#836) instead of re-offering revoked tools.
-                await self._drop_catalog_locked(key)
+                # No catalog drop here: the forced refresh SUCCEEDED,
+                # so the grant is alive at the AS — this second 401 is
+                # the resource server rejecting a fresh bearer (JWKS
+                # lag, audience misconfig, clock skew). Retention lets
+                # the next dispatch self-heal once the RS recovers
+                # (#836); a genuinely revoked grant converges via the
+                # token-lookup drop instead (the row is gone by then).
                 return _structured_error(
                     code="mcp_consent_required",
                     server=server_name,
@@ -6538,14 +6569,21 @@ class MCPClientManager:
         )
         lookup_error = _pool_lookup_error(lookup, server_name, server_row)
         if lookup_error is not None:
-            if lookup.kind in _DEAD_GRANT_LOOKUP_KINDS:
+            if self._lookup_grant_dead(lookup):
                 # The grant is GONE (revoked / permanently rejected) —
                 # converge this node's live sessions now instead of
                 # leaving tools dangling behind a consent card for
                 # access the user no longer holds (#836 cross-node
                 # disconnect). Re-consent restores them via the
-                # consent-completion prime.
-                await self._drop_catalog_locked((user_id, server_name))
+                # consent-completion prime. SCHEDULED, not awaited: the
+                # drop waits on open_lock, which a same-key dispatch
+                # may hold across its entire SDK call — awaiting here
+                # let a token-side error stall past the sync timeout
+                # and charge the breaker it is documented to bypass.
+                self._spawn_background(
+                    self._drop_catalog_locked((user_id, server_name)),
+                    f"dead-grant catalog drop for '{server_name}'",
+                )
             return lookup_error
         access_token = lookup.token or ""
 
@@ -6596,10 +6634,13 @@ class MCPClientManager:
                     user_id,
                     type(exc).__name__,
                 )
-                # Refreshed bearer also rejected — the grant is dead at
-                # the AS; drop the catalog so this node's live sessions
-                # converge (#836) instead of re-offering revoked tools.
-                await self._drop_catalog_locked(key)
+                # No catalog drop here: the forced refresh SUCCEEDED,
+                # so the grant is alive at the AS — this second 401 is
+                # the resource server rejecting a fresh bearer (JWKS
+                # lag, audience misconfig, clock skew). Retention lets
+                # the next dispatch self-heal once the RS recovers
+                # (#836); a genuinely revoked grant converges via the
+                # token-lookup drop instead (the row is gone by then).
                 return _structured_error(
                     code="mcp_consent_required",
                     server=server_name,
@@ -6671,14 +6712,21 @@ class MCPClientManager:
         )
         lookup_error = _pool_lookup_error(lookup, server_name, server_row)
         if lookup_error is not None:
-            if lookup.kind in _DEAD_GRANT_LOOKUP_KINDS:
+            if self._lookup_grant_dead(lookup):
                 # The grant is GONE (revoked / permanently rejected) —
                 # converge this node's live sessions now instead of
                 # leaving tools dangling behind a consent card for
                 # access the user no longer holds (#836 cross-node
                 # disconnect). Re-consent restores them via the
-                # consent-completion prime.
-                await self._drop_catalog_locked((user_id, server_name))
+                # consent-completion prime. SCHEDULED, not awaited: the
+                # drop waits on open_lock, which a same-key dispatch
+                # may hold across its entire SDK call — awaiting here
+                # let a token-side error stall past the sync timeout
+                # and charge the breaker it is documented to bypass.
+                self._spawn_background(
+                    self._drop_catalog_locked((user_id, server_name)),
+                    f"dead-grant catalog drop for '{server_name}'",
+                )
             return lookup_error
         access_token = lookup.token or ""
 
@@ -6729,10 +6777,13 @@ class MCPClientManager:
                     user_id,
                     type(exc).__name__,
                 )
-                # Refreshed bearer also rejected — the grant is dead at
-                # the AS; drop the catalog so this node's live sessions
-                # converge (#836) instead of re-offering revoked tools.
-                await self._drop_catalog_locked(key)
+                # No catalog drop here: the forced refresh SUCCEEDED,
+                # so the grant is alive at the AS — this second 401 is
+                # the resource server rejecting a fresh bearer (JWKS
+                # lag, audience misconfig, clock skew). Retention lets
+                # the next dispatch self-heal once the RS recovers
+                # (#836); a genuinely revoked grant converges via the
+                # token-lookup drop instead (the row is gone by then).
                 return _structured_error(
                     code="mcp_consent_required",
                     server=server_name,
@@ -6829,12 +6880,41 @@ class MCPClientManager:
         evict = self._user_pool_entries.get(key)
         if evict is None:
             return
+        if not self._entry_has_catalog(evict):
+            # Already catalog-less (repeat drop from a racing dispatch,
+            # or a never-discovered stub) — nothing to clear, and a
+            # zero-delta fan-out would wake every session of the user
+            # to rebuild an unchanged list.
+            return
         evict.tools = None
         evict.resources = None
         evict.prompts = None
         # Wake the user's sessions so their merged tool / resource /
         # prompt lists shrink now, not at the next turn boundary.
         self._rebuild_and_notify_user_catalogs(key[0])
+
+    def _lookup_grant_dead(self, lookup: TokenLookupResult) -> bool:
+        """Single source of truth: does this failed lookup prove the grant is GONE?
+
+        True only when the infrastructure that could know is actually
+        wired — the obo lookup returns kind="missing" for an
+        unconfigured token store / storage too, and dropping a catalog
+        on a boot-ordering window would strand live sessions until a
+        fresh prime. With the stores present, "missing" (row /
+        credential absent — revoked, disconnected, or unlinked) and
+        "refresh_failed" (the AS / mint durably rejected the grant) are
+        authoritative; the barely-reachable empty-token fallback maps
+        to the same consent_required verdict and classifies the same
+        way. Transient refresh failures and decrypt failures keep the
+        catalog: access still exists.
+        """
+        if getattr(self._app_state, "mcp_token_store", None) is None:
+            return False
+        if self._storage is None:
+            return False
+        if lookup.kind in ("missing", "refresh_failed"):
+            return True
+        return lookup.kind == "token" and not (lookup.token or "")
 
     async def _drop_catalog_locked(self, key: tuple[str, str]) -> None:
         """Serialize a catalog drop against an in-flight connect.
@@ -7323,14 +7403,11 @@ class MCPClientManager:
             return
         key = (user_id, server_name)
 
-        async def _do_evict() -> None:
+        try:
             # Locked: an in-flight connect completing its discovery
             # after an unserialized drop would republish (resurrect)
             # the revoked catalog with nothing left to clear it.
-            await self._drop_catalog_locked(key)
-
-        try:
-            asyncio.run_coroutine_threadsafe(_do_evict(), self._loop)
+            asyncio.run_coroutine_threadsafe(self._drop_catalog_locked(key), self._loop)
         except RuntimeError as exc:
             log.info(
                 "mcp_pool.evict_user_session_failed server=%s user=%s error=%s",
@@ -7628,14 +7705,6 @@ def _token_rejected_detail(server_row: dict[str, Any]) -> str:
     Named wrapper because the three sync dispatchers each surface it.
     """
     return _pool_error_detail(server_row, "token_rejected")
-
-
-# Lookup kinds meaning the user's grant is durably gone (revoked /
-# permanently rejected) — the dispatchers drop the (user, server)
-# catalog on these so live sessions converge with the revocation
-# (#836). Transient refresh failures and operator-actionable decrypt
-# failures deliberately keep the catalog: access still exists.
-_DEAD_GRANT_LOOKUP_KINDS: frozenset[str] = frozenset({"missing", "refresh_failed"})
 
 
 def _pool_lookup_error(

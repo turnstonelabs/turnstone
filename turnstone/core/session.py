@@ -1700,9 +1700,11 @@ class ChatSession:
         elif self._mcp_client:
             # ``self._mcp_client`` (not the raw kwarg) so an MCP-off persona
             # falls through to the no-MCP branch below.
-            mcp_tools = self._mcp_client.get_tools(user_id=self._mcp_user_id)
-            self._tools = merge_mcp_tools(INTERACTIVE_TOOLS, mcp_tools)
-            self._task_tools = merge_mcp_tools(TASK_AGENT_TOOLS, mcp_tools)
+            # Constants first — the attributes must exist for a listener
+            # callback firing mid-construction; the ONE authoritative
+            # merged read runs after the registrations below.
+            self._tools = list(INTERACTIVE_TOOLS)
+            self._task_tools = list(TASK_AGENT_TOOLS)
             # Register for tool-change notifications from MCP servers.
             # ``user_id`` is the listener identity component — pool-only
             # changes for OTHER users must not fire this callback.
@@ -1718,11 +1720,10 @@ class ChatSession:
             # for OTHER users do not wake this session.
             self._mcp_prompt_cb = self._on_mcp_prompts_changed
             self._mcp_client.add_prompt_listener(self._mcp_prompt_cb, user_id=self._mcp_user_id)
-            # Re-read now that the listeners exist: a pool-catalog change
-            # firing between the get_tools above and the registrations just
-            # made fanned out before this session could hear it, and its
-            # only notification is gone. One re-read converges the merged
-            # lists with the post-registration state.
+            # Single authoritative read, AFTER the registrations: a
+            # catalog change firing earlier than this fans out to the
+            # listeners just registered, so nothing can slip between
+            # read and register with its only notification unheard.
             mcp_tools = self._mcp_client.get_tools(user_id=self._mcp_user_id)
             self._tools = merge_mcp_tools(INTERACTIVE_TOOLS, mcp_tools)
             self._task_tools = merge_mcp_tools(TASK_AGENT_TOOLS, mcp_tools)

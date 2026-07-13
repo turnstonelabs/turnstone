@@ -521,6 +521,38 @@ class TestEviction:
         assert blocked, "drop must wait for the in-flight connect's open_lock"
         assert cleared, "drop must win once the connect completes — no resurrection"
 
+    def test_lookup_grant_dead_requires_wired_infrastructure(self, running_loop_mgr) -> None:
+        """kind='missing' is authoritative only when the stores that
+        could know are wired: the obo lookup returns 'missing' for an
+        unconfigured token store / storage too, and a boot-window blip
+        must not clear a user's catalog (it can't re-prime until a new
+        session). With the stores present, missing / refresh_failed /
+        the empty-token fallback classify as dead; transient and
+        decrypt failures never do."""
+        mgr, _loop, _ = running_loop_mgr
+
+        missing = SimpleNamespace(kind="missing", token=None)
+        # No app_state at all → not authoritative.
+        assert mgr._lookup_grant_dead(missing) is False
+        # Token store present but storage unwired → not authoritative.
+        mgr._app_state = SimpleNamespace(mcp_token_store=object())
+        mgr._storage = None
+        assert mgr._lookup_grant_dead(missing) is False
+        # Fully wired → authoritative.
+        mgr._storage = object()
+        assert mgr._lookup_grant_dead(missing) is True
+        assert mgr._lookup_grant_dead(SimpleNamespace(kind="refresh_failed", token=None)) is True
+        assert mgr._lookup_grant_dead(SimpleNamespace(kind="token", token="")) is True
+        assert mgr._lookup_grant_dead(SimpleNamespace(kind="token", token="tok")) is False
+        assert (
+            mgr._lookup_grant_dead(SimpleNamespace(kind="refresh_failed_transient", token=None))
+            is False
+        )
+        assert mgr._lookup_grant_dead(SimpleNamespace(kind="decrypt_failure", token=None)) is False
+        # Token store unconfigured on a wired app_state → not authoritative.
+        mgr._app_state = SimpleNamespace(mcp_token_store=None)
+        assert mgr._lookup_grant_dead(missing) is False
+
     def test_status_reports_cooled_catalog_as_idle(self, running_loop_mgr) -> None:
         """A cooled entry's catalog is still model-visible, so status
         must not report '0 tools' for it: counts fall back to the
@@ -719,6 +751,9 @@ class TestDispatchStateMachine:
         # kind="missing" is a DEAD grant: the retained catalog drops and
         # the live session is notified — tools leave instead of dangling
         # behind a consent card for access the user no longer holds.
+        # The drop is SCHEDULED (never awaited on the dispatch path, which
+        # may be parked behind a long same-key call) — flush the loop.
+        _run_on_loop(loop, asyncio.sleep(0.05))
         assert mgr._user_pool_entries[("user-1", "pool-srv")].tools is None
         assert mgr.is_mcp_tool("mcp__pool-srv__do_thing", user_id="user-1") is False
         assert fired[0] == 1
@@ -788,7 +823,9 @@ class TestDispatchStateMachine:
             )
         payload = json.loads(str(exc_info.value))
         assert payload["error"]["code"] == "mcp_consent_required"
-        # kind="refresh_failed" is likewise a DEAD grant → catalog drops.
+        # kind="refresh_failed" is likewise a DEAD grant → catalog drops
+        # (scheduled — flush the loop before asserting).
+        _run_on_loop(loop, asyncio.sleep(0.05))
         assert mgr._user_pool_entries[("user-1", "pool-srv")].tools is None
         assert fired[0] == 1
 

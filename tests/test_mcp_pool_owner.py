@@ -370,6 +370,10 @@ class TestPoolTransportOwnerLifecycle:
         assert owner.done()
         assert entry.session is None  # evicted by the done-callback
         assert entry.owner_task is None
+        # Third session-drop site of the bearer-clearing sweep: the entry
+        # may now cool indefinitely, so the dead plaintext bearer copy
+        # must not cool with it.
+        assert entry.bound_token is None
         assert key in mgr._user_pool_entries  # entry kept
         assert entry.tools == [
             {"name": "mcp__pool-srv__ping", "server": "pool-srv"}
