@@ -4247,6 +4247,7 @@ class ChatSession:
                 # memoized description.
                 registry=self._registry,
                 config_store=self._config_store,
+                capabilities=caps,
             )
         if not text:
             return None
@@ -4758,7 +4759,7 @@ class ChatSession:
         *,
         max_tokens: int = 4096,
         temperature: float | None = None,
-        reasoning_effort: str = "low",
+        reasoning_effort: str | None = None,
     ) -> ModelTurnResult:
         """Run a lightweight internal completion (title gen, compaction,
         extraction) through ``model_turn`` on the session's primary lane.
@@ -4769,9 +4770,11 @@ class ChatSession:
         ``temperature`` defaults to the session temperature (``self.temperature``)
         — the same operator/registry-resolved value the main turn uses — rather
         than a hard-coded constant: utility calls should not silently override an
-        explicit ``[models.*]`` temperature.  The provider still drops it for
-        models that forbid temperature (GPT-5 base, O-series) or pins it (Claude
-        with thinking), so this only governs models that genuinely accept one.
+        explicit ``[models.*]`` temperature.  ``reasoning_effort`` ``None``
+        inherits the lane's ladder (per-model config → global setting → caps
+        default) — callers relaying the session's user-facing effort knob
+        (web-fetch extraction) pass it explicitly.  extra_params resolve
+        inside the lane from the same single config fetch as the rest.
         """
         caps = self._get_capabilities()
         clamped = min(max_tokens, caps.max_output_tokens) if caps.max_output_tokens else max_tokens
@@ -4782,7 +4785,6 @@ class ChatSession:
             alias=self._model_alias or "",
             registry=self._registry,
             capabilities=caps,
-            extra_params=self._provider_extra_params(),
             config_store=self._config_store,
         )
         result = model_turn(
@@ -15070,13 +15072,6 @@ class ChatSession:
         if not agent_caps.supports_web_search and not self._resolve_search_client():
             tools = _without_tool(tools, "web_search")
 
-        # Build extra params for agent calls — resolve server compat from the
-        # agent's own model alias, not the session's primary model.
-        agent_extra = self._provider_extra_params(
-            provider=agent_provider,
-            model_alias=agent_alias,
-        )
-
         # The agent's resolved lane.  Caps and extra_params are computed once
         # per run (above, against the agent's own alias); the live per-call
         # operator flags (replay-reasoning, Phase 5 vLLM attach) re-resolve
@@ -15098,7 +15093,6 @@ class ChatSession:
             alias=agent_alias or "",
             registry=self._registry,
             capabilities=agent_caps,
-            extra_params=agent_extra,
             config_store=self._config_store,
         )
 

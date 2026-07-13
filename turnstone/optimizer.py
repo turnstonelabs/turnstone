@@ -232,6 +232,8 @@ def _diversify_prompts(
     cases: list[dict[str, Any]],
     n_variants: int,
     provider: LLMProvider | None = None,
+    temperature: float | None = None,
+    reasoning_effort: str | None = None,
 ) -> dict[str, list[str]]:
     """Generate paraphrased prompt variants for each test case.
 
@@ -300,7 +302,8 @@ def _diversify_prompts(
                 lane,
                 [Turn.system(DIVERSIFIER_SYSTEM), Turn.user(user_content)],
                 max_tokens=8192,
-                reasoning_effort="low",
+                temperature=temperature,
+                reasoning_effort=reasoning_effort,
             )
             raw = (cr.content or "").strip()
             # Strip reasoning tags
@@ -362,6 +365,8 @@ def _observe_and_update_optimizer(
     optimizer_system: str,
     iterations: list[dict[str, Any]],
     provider: LLMProvider | None = None,
+    temperature: float | None = None,
+    reasoning_effort: str | None = None,
 ) -> str:
     """Analyze optimizer behavior and return a modified OPTIMIZER_SYSTEM."""
     parts: list[str] = []
@@ -451,7 +456,8 @@ def _observe_and_update_optimizer(
         resolve_lane(prov, client, model),
         [Turn.system(OBSERVER_SYSTEM), Turn.user(user_content)],
         max_tokens=8192,
-        reasoning_effort="low",
+        temperature=temperature,
+        reasoning_effort=reasoning_effort,
     )
 
     result = cr.content or optimizer_system
@@ -660,6 +666,8 @@ def _run_analyst(
     test_cases: list[dict[str, Any]],
     iteration_result: dict[str, Any],
     provider: LLMProvider | None = None,
+    temperature: float | None = None,
+    reasoning_effort: str | None = None,
     optimize_tools: bool = False,
     tool_overrides: dict[str, dict[str, Any]] | None = None,
 ) -> str:
@@ -773,7 +781,8 @@ def _run_analyst(
             turns,
             tools=_ANALYST_TOOLS,
             max_tokens=8192,
-            reasoning_effort="medium",
+            temperature=temperature,
+            reasoning_effort=reasoning_effort,
         )
 
         # Same degenerate-repetition cap as before (shared guard — see
@@ -856,6 +865,8 @@ def _propose_tool_overrides(
     iteration_result: dict[str, Any],
     analyst_output: str,
     provider: LLMProvider | None = None,
+    temperature: float | None = None,
+    reasoning_effort: str | None = None,
 ) -> dict[str, dict[str, Any]]:
     """Propose tool description overrides based on failure analysis.
 
@@ -911,7 +922,8 @@ def _propose_tool_overrides(
         resolve_lane(prov, client, model),
         [Turn.system(TOOL_OPTIMIZER_SYSTEM), Turn.user(user_content)],
         max_tokens=8192,
-        reasoning_effort="medium",
+        temperature=temperature,
+        reasoning_effort=reasoning_effort,
     )
 
     raw = (cr.content or "").strip()
@@ -973,6 +985,8 @@ def _propose_prompt_modification(
     history: list[dict[str, Any]],
     optimizer_system: str = OPTIMIZER_SYSTEM,
     provider: LLMProvider | None = None,
+    temperature: float | None = None,
+    reasoning_effort: str | None = None,
     parent_scores: dict[str, float] | None = None,
     analyst_output: str = "",
     tool_overrides: dict[str, dict[str, Any]] | None = None,
@@ -1053,7 +1067,8 @@ def _propose_prompt_modification(
         resolve_lane(prov, client, model),
         [Turn.system(optimizer_system), Turn.user(user_content)],
         max_tokens=16384,
-        reasoning_effort="medium",
+        temperature=temperature,
+        reasoning_effort=reasoning_effort,
     )
 
     new_prompt = cr.content or current_prompt
@@ -1410,6 +1425,8 @@ def run_optimization(
             cases=cases,
             n_variants=diversify,
             provider=div_provider,
+            temperature=temperature,
+            reasoning_effort=reasoning_effort,
         )
         results["meta"]["diversify"] = diversify
         results["meta"]["prompt_variants"] = prompt_variants
@@ -1543,6 +1560,8 @@ def run_optimization(
                         current_optimizer_system,
                         results["iterations"],
                         provider=obs_provider,
+                        temperature=temperature,
+                        reasoning_effort=reasoning_effort,
                     )
                     if new_opt != current_optimizer_system:
                         opt_diff = _simple_diff(current_optimizer_system, new_opt)
@@ -1582,6 +1601,8 @@ def run_optimization(
                         test_cases=opt_cases,
                         iteration_result=opt_result,
                         provider=ana_provider,
+                        temperature=temperature,
+                        reasoning_effort=reasoning_effort,
                         optimize_tools=optimize_tools,
                         tool_overrides=selected.tool_overrides or None,
                     )
@@ -1608,6 +1629,8 @@ def run_optimization(
                         iteration_result=opt_result,
                         analyst_output=analyst_output,
                         provider=tool_opt_provider,
+                        temperature=temperature,
+                        reasoning_effort=reasoning_effort,
                     )
                     if new_tool_overrides != selected.tool_overrides:
                         added_tools = set(new_tool_overrides) - set(selected.tool_overrides)
@@ -1655,6 +1678,8 @@ def run_optimization(
                         history=results["iterations"],
                         optimizer_system=current_optimizer_system,
                         provider=opt_provider,
+                        temperature=temperature,
+                        reasoning_effort=reasoning_effort,
                         parent_scores=parent_scores,
                         analyst_output=analyst_output,
                         tool_overrides=new_tool_overrides or None,

@@ -78,6 +78,7 @@ def describe(
     alias: str = "",
     registry: Any | None = None,
     config_store: Any | None = None,
+    capabilities: Any | None = None,
 ) -> str:
     """Perceive ``parts`` via the perception model, returning the text.
 
@@ -108,8 +109,17 @@ def describe(
             ),
         )
     ]
+    # *capabilities* passthrough: the session caller already resolved the
+    # alias's caps for the modality gate — reusing them keeps the gate and
+    # the wire on ONE config generation (resolve_lane's stated purpose).
     lane = resolve_lane(
-        provider, client, model, alias=alias, registry=registry, config_store=config_store
+        provider,
+        client,
+        model,
+        alias=alias,
+        registry=registry,
+        config_store=config_store,
+        capabilities=capabilities,
     )
     try:
         result = model_turn(
@@ -149,6 +159,7 @@ def describe_cached(
     prompt: str = _DESCRIBE_PROMPT,
     registry: Any | None = None,
     config_store: Any | None = None,
+    capabilities: Any | None = None,
 ) -> str:
     """Memoized, non-raising :func:`describe` for the wire fallback.
 
@@ -170,6 +181,7 @@ def describe_cached(
             alias=alias,
             registry=registry,
             config_store=config_store,
+            capabilities=capabilities,
         )
     except PerceptionBackendError as exc:
         log.warning("perception fallback failed (alias=%s): %s", alias, exc)

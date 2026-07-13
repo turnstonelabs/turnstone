@@ -42,7 +42,6 @@
   ],
   "model": "qwen3.6-27b",
   "system": "Output-guard: deploy output looked clean.",
-  "temperature": 0.5,
   "tools": [
     {
       "description": "Look up the weather for a city.",

@@ -403,6 +403,34 @@ def test_resolve_lane_global_config_store_rung() -> None:
     assert lane2.temperature == 0.3
 
 
+def test_resolve_lane_reasoning_effort_ladder() -> None:
+    # Effort rides the same ladder as temperature with a caps terminal:
+    # per-model config -> global setting -> caps default_reasoning_effort.
+    provider = _FakeProvider([])
+    # Per-model config wins.
+    reg = _fake_registry()
+    reg.get_config.return_value.reasoning_effort = "high"
+    lane = resolve_lane(provider, object(), "m", alias="ali", registry=reg)
+    assert lane.reasoning_effort == "high"
+    # Global setting rung.
+    reg2 = _fake_registry()
+    reg2.get_config.return_value.reasoning_effort = None
+    store = SimpleNamespace(get=lambda key: "low" if key == "model.reasoning_effort" else None)
+    lane2 = resolve_lane(provider, object(), "m", alias="ali", registry=reg2, config_store=store)
+    assert lane2.reasoning_effort == "low"
+    # Terminal: the lane capabilities' per-provider default.
+    lane3 = resolve_lane(provider, object(), "m")
+    assert lane3.reasoning_effort == ModelCapabilities().default_reasoning_effort
+
+
+def test_model_turn_effort_unresolved_falls_to_caps_default() -> None:
+    # No caller value, bare lane -> the caps default reaches the provider
+    # (effort always resolves concrete; wire omission is temperature-only).
+    provider = _FakeProvider([CompletionResult(content="")])
+    model_turn(_lane(provider), [Turn.user("x")])
+    assert provider.calls[0]["reasoning_effort"] == "medium"
+
+
 def test_model_turn_fetches_config_once_per_call() -> None:
     # ONE get_config per plant call feeds both live flags (replay + vLLM
     # attach) — a hot-reload between them cannot mix config generations

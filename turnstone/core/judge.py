@@ -1403,7 +1403,6 @@ class IntentJudge:
                         judge_turns,
                         tools=None if is_last_turn else tools,
                         max_tokens=2048,
-                        reasoning_effort="medium",
                     ),
                     timeout=per_call_timeout,
                     cancel_event=cancel_event,

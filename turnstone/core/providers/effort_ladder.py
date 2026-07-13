@@ -28,7 +28,6 @@ Two documented approximations:
 
 from __future__ import annotations
 
-import dataclasses
 from typing import Any
 
 # _map_reasoning_to_effort is Anthropic-lane semantics shared with the
@@ -95,20 +94,22 @@ def effort_ladder_for_model(
 ) -> list[dict[str, str]]:
     """Ladder for a stored model row: provider defaults + operator overrides.
 
-    Mirrors ``ChatSession._resolve_capabilities`` — overrides are
-    field-filtered and applied over the provider's per-model defaults.
-    Callers holding a raw DB row must parse the ``capabilities`` JSON
-    string first (``model_registry`` does the same) — this function
-    takes a dict.
+    Delegates the override merge to
+    :func:`turnstone.core.model_turn.resolve_capabilities` — the ONE
+    field-filtered merge every lane's requests use — so the admin-UI
+    effort projection can never drift from the wire.  Callers holding a
+    raw DB row must parse the ``capabilities`` JSON string first
+    (``model_registry`` does the same) — this function takes a dict.
     """
+    from types import SimpleNamespace
+
+    from turnstone.core.model_turn import resolve_capabilities
     from turnstone.core.providers import create_provider
 
-    caps = create_provider(provider_name, api_surface=api_surface or None).get_capabilities(model)
-    if capability_overrides:
-        fields = {f.name for f in dataclasses.fields(type(caps))}
-        overrides = {k: v for k, v in capability_overrides.items() if k in fields}
-        if overrides:
-            caps = dataclasses.replace(caps, **overrides)
+    provider = create_provider(provider_name, api_surface=api_surface or None)
+    caps = resolve_capabilities(
+        provider, model, "", None, cfg=SimpleNamespace(capabilities=capability_overrides or {})
+    )
     return effort_ladder(provider_name, caps, api_surface)
 
 

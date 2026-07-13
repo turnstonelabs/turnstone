@@ -313,7 +313,6 @@ class HeadlessSession(ChatSession):
             alias=self._model_alias or "",
             registry=self._registry,
             capabilities=self._get_capabilities(),
-            extra_params=self._provider_extra_params(),
         )
 
         for turn in range(max_turns):

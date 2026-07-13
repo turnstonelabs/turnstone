@@ -55,7 +55,7 @@ def _build_registry() -> dict[str, SettingDef]:
         SettingDef(
             "model.temperature",
             "float",
-            0.5,
+            1.0,
             "Default sampling temperature (overridden by per-model settings)",
             "model",
             min_value=0.0,

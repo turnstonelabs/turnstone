@@ -270,12 +270,19 @@ class ModelLane:
     the lane runs outside the registry (then every registry-backed pass
     degrades to its documented miss behavior).
 
-    *temperature* is the lane's inherited sampling temperature (the alias's
-    ``ModelConfig.temperature``, or ``None`` for the provider default).
-    House rule: code never pins a temperature — many modern models
-    misbehave below 1.0, so the model's own configuration is the source of
-    truth; callers pass an explicit value only when relaying an
-    operator-resolved knob (the session's, for the agent seam).
+    *temperature* is the lane's inherited sampling temperature — the ladder
+    ``ModelConfig.temperature`` → global ``model.temperature`` setting →
+    ``None`` (field omitted from the wire; server default).  House rule:
+    code never pins a temperature; callers pass an explicit value only when
+    relaying an operator/user-resolved knob (the session's own value on the
+    session-model lanes).  Sub-agent, judge, and single-shot lanes inherit
+    their OWN model's ladder.
+
+    *reasoning_effort* rides the same ladder with a different terminal:
+    ``ModelConfig.reasoning_effort`` → global ``model.reasoning_effort``
+    setting → the lane capabilities' ``default_reasoning_effort``.  Effort
+    always resolves to a concrete value (it gates thinking modes, so wire
+    omission is not the unset semantics the way it is for temperature).
     """
 
     provider: LLMProvider
@@ -286,6 +293,7 @@ class ModelLane:
     extra_params: dict[str, Any] | None = None
     registry: ModelRegistry | None = None
     temperature: float | None = None
+    reasoning_effort: str | None = None
 
 
 def resolve_lane(
@@ -337,6 +345,19 @@ def resolve_lane(
             # server default, never crashes lane resolution.
             log.debug("config_store model.temperature lookup failed", exc_info=True)
             temperature = None
+    # Effort ladder: per-model config → global setting → the lane caps'
+    # per-provider default.  Empty string at any rung means "unset" (it is
+    # a valid settings choice meaning fall through), distinct from the
+    # explicit "none" effort value.
+    effort = getattr(cfg, "reasoning_effort", None) if cfg is not None else None
+    if not effort and config_store is not None:
+        try:
+            effort = config_store.get("model.reasoning_effort") or None
+        except Exception:
+            log.debug("config_store model.reasoning_effort lookup failed", exc_info=True)
+            effort = None
+    if not effort:
+        effort = caps.default_reasoning_effort if caps is not None else None
     return ModelLane(
         provider=provider,
         client=client,
@@ -346,6 +367,7 @@ def resolve_lane(
         extra_params=extra,
         registry=registry,
         temperature=temperature,
+        reasoning_effort=effort or None,
     )
 
 
@@ -409,6 +431,7 @@ def synth_reasoning_block(
     *,
     registry: ModelRegistry | None = None,
     alias: str = "",
+    cfg: Any | EllipsisType = ...,
 ) -> list[dict[str, Any]]:
     """Stamp captured loose reasoning text as a synthetic ``reasoning_text``
     block when no reasoning-bearing block already exists.
@@ -436,7 +459,9 @@ def synth_reasoning_block(
         if isinstance(b, dict) and b.get("type") in REASONING_BEARING_BLOCK_TYPES:
             return provider_blocks
     block: dict[str, Any] = {"type": "reasoning_text", "text": text}
-    server_type = resolve_server_type(registry, alias)
+    if cfg is ...:
+        cfg = _get_config_or_none(registry, alias)
+    server_type = _server_type_of(cfg) if cfg is not None else ""
     if server_type:
         block["source"] = server_type
     return [*provider_blocks, block]
@@ -450,6 +475,7 @@ def finalize_provider_blocks(
     had_blank_ids: bool = False,
     registry: ModelRegistry | None = None,
     alias: str = "",
+    cfg: Any | EllipsisType = ...,
 ) -> list[dict[str, Any]]:
     """Finalize an assistant turn's provider-native block lane.
 
@@ -483,7 +509,7 @@ def finalize_provider_blocks(
     Returns a possibly-empty list; callers attach it only when non-empty.
     """
     provider_blocks = synth_reasoning_block(
-        provider_blocks, reasoning_parts, registry=registry, alias=alias
+        provider_blocks, reasoning_parts, registry=registry, alias=alias, cfg=cfg
     )
     if not provider_blocks:
         return provider_blocks
@@ -545,7 +571,7 @@ def model_turn(
     tools: list[dict[str, Any]] | None = None,
     max_tokens: int = 4096,
     temperature: float | None = None,
-    reasoning_effort: str = "medium",
+    reasoning_effort: str | None = None,
     mint: Callable[[str], str] | None = None,
     wire_id_map: dict[str, str] | None = None,
     resolve_attachments: Callable[[list[str]], dict[str, Any]] | None = None,
@@ -562,10 +588,11 @@ def model_turn(
     per call is deliberate: the passes are deterministic and copy-on-write,
     so a caller's retry loop just calls again.
 
-    *temperature* ``None`` (the default) inherits the lane's resolved
-    value — the alias's ``ModelConfig.temperature``, or the provider
-    default when unset.  House rule: never pin a temperature in code; pass
-    an explicit float only to relay an operator-resolved knob.
+    *temperature* / *reasoning_effort* ``None`` (the defaults) inherit the
+    lane's resolved ladder (per-model config → global setting → server
+    default for temperature / caps default for effort).  House rule: never
+    pin either in code; pass an explicit value only to relay an
+    operator- or user-resolved knob (the session's own knobs, a CLI flag).
 
     *resolve_attachments* materializes by-reference ``AttachmentRef``
     content at the provider translator (``{type: kind, attachment_id}``
@@ -604,26 +631,34 @@ def model_turn(
         wire_id_map if wire_id_map is not None else {},
     )
     wire = maybe_attach_vllm_chat_reasoning(wire, lane.provider, lane.registry, lane.alias, cfg=cfg)
-    call_kwargs: dict[str, Any] = {
-        "client": lane.client,
-        "model": lane.model,
-        "messages": wire,
-        "tools": tools,
-        "max_tokens": max_tokens,
-        # None temperature flows through to the providers, which OMIT the
-        # field from the wire so the server default applies (house rule: a
-        # Python-level constant anywhere on this path is a hidden pin).
-        "temperature": temperature if temperature is not None else lane.temperature,
-        "reasoning_effort": reasoning_effort,
-        "extra_params": lane.extra_params,
-        "capabilities": lane.capabilities,
-        "replay_reasoning_to_model": resolve_replay_reasoning_to_model(
+    # Effort always resolves to a concrete value (ladder terminal = caps
+    # default); the trailing fallback covers a hand-built lane that skipped
+    # resolve_lane.  Temperature may stay None — the providers then OMIT
+    # the field so the server default applies (house rule: a Python-level
+    # constant anywhere on this path is a hidden pin).  Direct keyword call
+    # (not **kwargs) so strict mypy checks the module's most important
+    # invocation against the Protocol.
+    effective_effort = (
+        reasoning_effort
+        if reasoning_effort is not None
+        else lane.reasoning_effort
+        or (lane.capabilities.default_reasoning_effort if lane.capabilities else "medium")
+    )
+    result = lane.provider.create_completion(
+        client=lane.client,
+        model=lane.model,
+        messages=wire,
+        tools=tools,
+        max_tokens=max_tokens,
+        temperature=temperature if temperature is not None else lane.temperature,
+        reasoning_effort=effective_effort,
+        extra_params=lane.extra_params,
+        capabilities=lane.capabilities,
+        replay_reasoning_to_model=resolve_replay_reasoning_to_model(
             lane.registry, lane.alias, caps=lane.capabilities, cfg=cfg
         ),
-    }
-    if resolve_attachments is not None:
-        call_kwargs["resolve_attachments"] = resolve_attachments
-    result = lane.provider.create_completion(**call_kwargs)
+        resolve_attachments=resolve_attachments,
+    )
 
     raw_calls: list[dict[str, Any]] = list(result.tool_calls or [])
     # Record blanks BEFORE the uuid back-fill: a back-filled id exists only
@@ -670,6 +705,7 @@ def model_turn(
         had_blank_ids=had_blank_ids,
         registry=lane.registry,
         alias=lane.alias,
+        cfg=cfg,
     )
     native = (
         ProviderNative(producer=lane.provider.provider_name, blocks=tuple(native_blocks))

@@ -177,7 +177,7 @@ class OpenAIChatCompletionsProvider:
         messages: list[dict[str, Any]],
         tools: list[dict[str, Any]] | None = None,
         max_tokens: int = 4096,
-        temperature: float = 0.5,
+        temperature: float | None = None,
         reasoning_effort: str = "medium",
         extra_params: dict[str, Any] | None = None,
         deferred_names: frozenset[str] | None = None,
@@ -417,7 +417,7 @@ class OpenAIChatCompletionsProvider:
         wire — vLLM ``--reasoning-parser``, llama.cpp
         ``reasoning_format``, and Gemini's OpenAI-compat endpoint all
         surface reasoning as non-canonical ``delta.reasoning_content``
-        Pydantic extras.  ``ChatSession._maybe_synth_reasoning_block``
+        Pydantic extras.  ``model_turn.synth_reasoning_block``
         captures these into a single ``{type: "reasoning_text", text,
         source?}`` block when no native ``provider_blocks`` were
         emitted.  This extractor unwraps those for UI rehydration.
