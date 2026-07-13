@@ -2157,10 +2157,17 @@ async def handle_oidc_callback(request: Request, audience: str, cookie_name: str
                 # obo catalog (credential unlinked / mint rejected) has
                 # no consent flow to heal through, so warm this user's
                 # pools now — live sessions pick the tools back up via
-                # their listeners. Fire-and-forget; a failure changes
-                # nothing about login.
+                # their listeners. Gated on a LIVE session: routine SSO
+                # re-logins by users with nothing open must not fan out
+                # mints and transport connects at deployment scale.
+                # Fire-and-forget; a failure changes nothing about login.
                 mcp_client = getattr(request.app.state, "mcp_client", None)
-                if mcp_client is not None and hasattr(mcp_client, "prime_user_pools"):
+                if (
+                    mcp_client is not None
+                    and hasattr(mcp_client, "prime_user_pools")
+                    and hasattr(mcp_client, "has_live_session_listener")
+                    and mcp_client.has_live_session_listener(user["user_id"])
+                ):
                     try:
                         mcp_client.prime_user_pools(user["user_id"])
                     except Exception:
