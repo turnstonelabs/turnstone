@@ -4,11 +4,13 @@ from __future__ import annotations
 
 import base64
 import json
+import logging
 import uuid
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import httpx
 import pytest
 from starlette.applications import Starlette
 from starlette.middleware import Middleware
@@ -1935,6 +1937,28 @@ class TestNotifyNodesMcpReload:
         assert "refused" in result["n1"]["error"]
 
     @pytest.mark.anyio
+    async def test_records_error_on_non_2xx(self):
+        """A node replying non-2xx (e.g. 503) is recorded as an error, not
+        counted as a reached node — raise_for_status() routes the status into
+        the error path so a stale node trips the 'did not reach' WARNING, and
+        the (unused) response body is never consulted."""
+        http_req = httpx.Request("POST", "http://n1:8000/x")
+        resp = MagicMock()
+        resp.raise_for_status.side_effect = httpx.HTTPStatusError(
+            "503", request=http_req, response=httpx.Response(503, request=http_req)
+        )
+        client = AsyncMock()
+        client.post.return_value = resp
+        req = _fake_request(
+            {"node_id": "n1", "server_url": "http://n1:8000"},
+            proxy_client=client,
+        )
+        result = await _notify_nodes_mcp_reload(req)
+        assert "n1" in result
+        assert "error" in result["n1"]
+        resp.json.assert_not_called()
+
+    @pytest.mark.anyio
     async def test_empty_cluster(self):
         req = _fake_request()
         result = await _notify_nodes_mcp_reload(req)
@@ -2024,10 +2048,29 @@ class TestAdminMcpReloadEndpoint:
         assert data["results"]["n1"] == {"reloaded": 2}
         assert "error" in data["results"]["n2"]
 
+    def test_reload_fails_loud_without_fanout_infra(self, storage: SQLiteBackend) -> None:
+        """F4 guard: the operator reload drains + reports, so with storage and
+        admin.mcp permission but no collector/proxy_client on app.state it must
+        fail loudly (500) — never silently 200 with empty results (which a
+        re-introduced None-guard would do)."""
+        app = Starlette(
+            routes=_ROUTES,
+            middleware=[Middleware(_InjectAuthMiddleware)],
+        )
+        app.state.auth_storage = storage
+        # Deliberately omit app.state.collector / proxy_client.
+        c = TestClient(app, raise_server_exceptions=False)
+        r = c.post("/v1/api/admin/mcp-servers/reload")
+        assert r.status_code == 500
+
 
 class TestMcpWriteAutoReload:
-    """create / update / delete auto-notify nodes so a write reaches them (and
-    active per-user pools re-prime) without a separate /reload."""
+    """create / update / delete schedule a node reload (after the 200) so a
+    write reaches nodes — and active per-user pools re-prime — without a
+    separate /reload. The fan-out rides only the success response; an error
+    return schedules nothing. (The error paths tested here return before the
+    row is written; a post-write secret-apply failure is a separate pre-existing
+    partial-write path, not exercised here.)"""
 
     def test_create_notifies_nodes(self, client: TestClient) -> None:
         with patch(
@@ -2059,6 +2102,86 @@ class TestMcpWriteAutoReload:
             r = client.delete(f"/v1/api/admin/mcp-servers/{sid}")
         assert r.status_code == 200
         notify.assert_awaited_once()
+
+    def test_delete_does_not_notify_on_missing_server(self, client: TestClient) -> None:
+        """A 404 (server not found) returns before the success response, so no
+        node reload is scheduled — the fan-out rides only the success path."""
+        with patch(
+            "turnstone.console.server._notify_nodes_mcp_reload",
+            new_callable=AsyncMock,
+            return_value={},
+        ) as notify:
+            r = client.delete("/v1/api/admin/mcp-servers/does-not-exist")
+        assert r.status_code == 404
+        notify.assert_not_awaited()
+
+    def test_update_does_not_notify_on_missing_server(self, client: TestClient) -> None:
+        """A 404 on update likewise schedules no reload."""
+        with patch(
+            "turnstone.console.server._notify_nodes_mcp_reload",
+            new_callable=AsyncMock,
+            return_value={},
+        ) as notify:
+            r = client.put("/v1/api/admin/mcp-servers/does-not-exist", json={"enabled": False})
+        assert r.status_code == 404
+        notify.assert_not_awaited()
+
+    def test_create_does_not_notify_on_secret_store_503(
+        self, client_no_token_store: TestClient
+    ) -> None:
+        """A create that 503s on the OAuth-secret token-store gate returns an
+        error before any write — so no reload is scheduled."""
+        with patch(
+            "turnstone.console.server._notify_nodes_mcp_reload",
+            new_callable=AsyncMock,
+            return_value={},
+        ) as notify:
+            r = client_no_token_store.post(
+                "/v1/api/admin/mcp-servers",
+                json={
+                    "name": "no-notify-503",
+                    "transport": "streamable-http",
+                    "url": "https://mcp.example.com/sse",
+                    "auth_type": "oauth_user",
+                    "oauth_client_id": "cli_abc",
+                    "oauth_client_secret": "secret-value",
+                },
+            )
+        assert r.status_code == 503, r.text
+        notify.assert_not_awaited()
+
+    def test_write_warns_when_reload_reaches_no_node(
+        self, client: TestClient, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """A background fan-out that leaves nodes unreached is surfaced at
+        WARNING (not swallowed at debug) — operators need a signal the cluster
+        catalog may be stale, since there is no periodic node reconcile."""
+        with (
+            patch(
+                "turnstone.console.server._notify_nodes_mcp_reload",
+                new_callable=AsyncMock,
+                return_value={"n1": {"error": "Connection refused"}},
+            ),
+            caplog.at_level(logging.WARNING),
+        ):
+            _create_server(client, name="warn-on-stale")
+        assert any("did not reach" in r.getMessage() for r in caplog.records)
+
+    def test_write_warns_when_reload_fan_out_raises(
+        self, client: TestClient, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """A systemic fan-out fault (the whole reload raises) is logged at
+        WARNING rather than lost, for the same reason."""
+        with (
+            patch(
+                "turnstone.console.server._notify_nodes_mcp_reload",
+                new_callable=AsyncMock,
+                side_effect=RuntimeError("collector exploded"),
+            ),
+            caplog.at_level(logging.WARNING),
+        ):
+            _create_server(client, name="warn-on-fault")
+        assert any("fan-out failed after admin write" in r.getMessage() for r in caplog.records)
 
 
 # ---------------------------------------------------------------------------

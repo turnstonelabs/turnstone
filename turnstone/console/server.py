@@ -9726,11 +9726,13 @@ async def admin_registry_install(request: Request) -> JSONResponse:
         ip,
     )
 
-    # Auto-reload nodes for one-click UX
-    await _notify_nodes_mcp_reload(request)
-
     server_row = storage.get_mcp_server(server_id)
-    return JSONResponse(_mcp_server_to_detail(_mask_mcp_secrets(server_row or {})))
+    # Auto-reload nodes for one-click UX — scheduled after the response so the
+    # install isn't blocked on cluster fan-out (see _schedule_mcp_reload).
+    return JSONResponse(
+        _mcp_server_to_detail(_mask_mcp_secrets(server_row or {})),
+        background=_schedule_mcp_reload(request),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -10454,13 +10456,14 @@ async def admin_create_mcp_server(request: Request) -> JSONResponse:
         ip,
     )
 
-    # Auto-reload nodes so the new server reaches them (and per-user pools
-    # re-prime for active sessions) without a separate /reload — mirrors the
-    # registry-install path.
-    await _notify_nodes_mcp_reload(request)
-
     server = storage.get_mcp_server(server_id)
-    return JSONResponse(_mcp_server_to_detail(_mask_mcp_secrets(server or {})))
+    # Auto-reload nodes so the new server reaches them (and per-user pools
+    # re-prime for active sessions) without a separate /reload — scheduled after
+    # the response so the write isn't blocked on cluster fan-out.
+    return JSONResponse(
+        _mcp_server_to_detail(_mask_mcp_secrets(server or {})),
+        background=_schedule_mcp_reload(request),
+    )
 
 
 async def admin_get_mcp_server(request: Request) -> JSONResponse:
@@ -10806,12 +10809,14 @@ async def admin_update_mcp_server(request: Request) -> JSONResponse:
         ip,
     )
 
-    # Auto-reload nodes so the edit (incl. a pool auth_type flip) reaches them
-    # and active sessions re-prime, without a separate /reload.
-    await _notify_nodes_mcp_reload(request)
-
     server = storage.get_mcp_server(server_id)
-    return JSONResponse(_mcp_server_to_detail(_mask_mcp_secrets(server or {})))
+    # Auto-reload nodes so the edit (incl. a pool auth_type flip) reaches them
+    # and active sessions re-prime — scheduled after the response so the write
+    # isn't blocked on cluster fan-out.
+    return JSONResponse(
+        _mcp_server_to_detail(_mask_mcp_secrets(server or {})),
+        background=_schedule_mcp_reload(request),
+    )
 
 
 async def admin_delete_mcp_server(request: Request) -> JSONResponse:
@@ -10863,25 +10868,23 @@ async def admin_delete_mcp_server(request: Request) -> JSONResponse:
         ip,
     )
 
-    # Auto-reload nodes so they drop the removed server without a separate
-    # /reload.
-    await _notify_nodes_mcp_reload(request)
-
-    return JSONResponse({"status": "ok"})
+    # Auto-reload nodes so they drop the removed server — scheduled after the
+    # response so the delete isn't blocked on cluster fan-out.
+    return JSONResponse({"status": "ok"}, background=_schedule_mcp_reload(request))
 
 
 async def _notify_nodes_mcp_reload(request: Request) -> dict[str, Any]:
     """Tell all nodes to re-read the mcp_servers DB table and reconcile.
 
-    Best-effort: if the cluster fan-out infra isn't present (e.g. a minimal
-    test app), the DB write has already landed and nodes pick the change up on
-    their next reconcile — so skip rather than 500 the caller.
+    Drain-style: awaited inline only by the operator-triggered ``POST /reload``,
+    which reports the per-node results and must fail loudly if the fan-out infra
+    is absent. Admin *writes* (create/update/delete/registry-install) never await
+    this — they schedule it best-effort via ``_schedule_mcp_reload`` so a write's
+    response isn't blocked on (nor failed by) cluster reachability.
     """
-    collector: ClusterCollector | None = getattr(request.app.state, "collector", None)
-    client: httpx.AsyncClient | None = getattr(request.app.state, "proxy_client", None)
-    if collector is None or client is None:
-        return {}
+    collector: ClusterCollector = request.app.state.collector
     nodes = collector.get_all_nodes()
+    client: httpx.AsyncClient = request.app.state.proxy_client
     headers = _proxy_auth_headers(request)
     sem = asyncio.Semaphore(_get_fan_out_limit(request))
 
@@ -10897,6 +10900,9 @@ async def _notify_nodes_mcp_reload(request: Request) -> dict[str, Any]:
                     headers=headers,
                     timeout=30,
                 )
+                # A non-2xx reply is a failed reload, not a reached node (httpx
+                # does not raise on status); surface it as an error so _run warns.
+                resp.raise_for_status()
                 return node_id, resp.json()
             except Exception as exc:
                 log.debug("Failed to notify node %s for MCP reload", node_id, exc_info=True)
@@ -10904,6 +10910,49 @@ async def _notify_nodes_mcp_reload(request: Request) -> dict[str, Any]:
 
     results = await asyncio.gather(*[_notify(n) for n in nodes])
     return {nid: data for nid, data in results if data is not None}
+
+
+def _schedule_mcp_reload(request: Request) -> BackgroundTask:
+    """Best-effort node-reload fan-out to run AFTER an admin MCP write's 200.
+
+    Returned as a ``BackgroundTask`` — the "trigger, not drain" contract also
+    used by ``_cascade_cancel_to_children``: the admin write's response is never
+    blocked on the per-node fan-out (each node POST can hit a 30s timeout under
+    the fan-out semaphore), so a fan-out failure can't fail a write that already
+    committed.
+
+    There is no periodic node→DB reconcile — a node that misses this reload
+    keeps serving a stale MCP catalog until the next ``POST /reload`` (or a node
+    restart). So ``_run`` does NOT swallow failures: any unreached node (or a
+    systemic fan-out fault) is logged at WARNING (visible at the default INFO
+    level), and the per-node status view surfaces the divergence. Only
+    ``POST /reload`` awaits the fan-out inline, where draining and reporting
+    per-node results to the operator is the point.
+    """
+
+    async def _run() -> None:
+        try:
+            results = await _notify_nodes_mcp_reload(request)
+        except Exception:
+            log.warning(
+                "auto mcp-reload fan-out failed after admin write; nodes may serve a "
+                "stale MCP catalog until the next POST /reload",
+                exc_info=True,
+            )
+            return
+        unreached = sorted(
+            nid for nid, data in results.items() if isinstance(data, dict) and "error" in data
+        )
+        if unreached:
+            log.warning(
+                "auto mcp-reload did not reach %d of %d node(s) after admin write "
+                "(stale MCP catalog until next reload): %s",
+                len(unreached),
+                len(results),
+                ", ".join(unreached),
+            )
+
+    return BackgroundTask(_run)
 
 
 async def _notify_nodes_mcp_action(request: Request, action: str, name: str) -> dict[str, Any]:
@@ -10932,6 +10981,9 @@ async def _notify_nodes_mcp_action(request: Request, action: str, name: str) -> 
                     headers=headers,
                     timeout=30,
                 )
+                # A non-2xx reply is a failed action, not a reached node (httpx
+                # does not raise on status); surface it as an error to the operator.
+                resp.raise_for_status()
                 return node_id, resp.json()
             except Exception as exc:
                 log.debug(
