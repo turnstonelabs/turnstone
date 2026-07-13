@@ -27,6 +27,7 @@ import httpx
 import pytest
 
 from tests._session_helpers import make_session as _make_session
+from tests._session_helpers import mock_completion_result
 from turnstone.core.providers._anthropic import AnthropicProvider
 from turnstone.core.providers._openai_chat import OpenAIChatCompletionsProvider
 from turnstone.core.providers._openai_responses import OpenAIResponsesProvider
@@ -403,14 +404,7 @@ class TestCallSitesInvokeMaybeAttach:
 
         def capture_completion(**kwargs: Any) -> Any:
             captured.update(kwargs)
-            return SimpleNamespace(
-                content="",
-                tool_calls=None,
-                finish_reason="stop",
-                usage=None,
-                provider_blocks=[],
-                reasoning="",
-            )
+            return mock_completion_result("")
 
         provider = OpenAIChatCompletionsProvider()
         provider.create_completion = capture_completion  # type: ignore[method-assign]

@@ -949,6 +949,29 @@ class TestModelAliasResolution:
         # alias's configured value, inherited through the lane.
         assert alias_provider.create_completion.call_args.kwargs["temperature"] == 0.3
 
+    def test_constructor_resolves_from_one_config_fetch(self):
+        """The constructor consumes the ModelConfig that registry.resolve()
+        already returned (the ``cfg=`` pass-through) — ZERO independent
+        get_config fetches, so a registry hot-reload between two lookups
+        cannot bind the resolved client/window to a different capability
+        generation."""
+        alias_provider = _make_mock_provider(response_content=_good_verdict_json())
+        registry = self._make_alias_registry(
+            "judge-mini",
+            alias_provider,
+            MagicMock(base_url="https://a/v1", api_key="k"),
+            "local-9b",
+        )
+        IntentJudge(
+            config=JudgeConfig(enabled=True, model="judge-mini"),
+            session_provider=_make_mock_provider(),
+            session_client=MagicMock(base_url="https://s/v1", api_key="s"),
+            session_model="session-model",
+            session_capabilities=MagicMock(context_window=100_000),
+            model_registry=registry,
+        )
+        assert registry.get_config.call_count == 0
+
     def test_fallback_threads_session_capabilities_to_wire(self):
         """No judge alias → the judge inherits the session model AND the
         session's resolved capabilities, threaded to ``create_completion``."""

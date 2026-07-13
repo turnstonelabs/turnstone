@@ -30,7 +30,7 @@ from typing import Any
 
 from openai import OpenAI
 
-from turnstone.core.model_turn import ModelLane, model_turn
+from turnstone.core.model_turn import cap_tool_calls, model_turn, resolve_lane
 from turnstone.core.providers import LLMProvider, create_client, create_provider
 from turnstone.core.session import ChatSession
 from turnstone.core.storage import get_storage, init_storage, reset_storage
@@ -306,14 +306,14 @@ class HeadlessSession(ChatSession):
         # The eval lane — resolved once per run, like the sub-agent seam.
         # ``temperature`` relays the harness's operator-resolved knob per
         # call below (house rule: relay, never pin).
-        lane = ModelLane(
-            provider=self._provider,
-            client=self.client,
-            model=self.model,
+        lane = resolve_lane(
+            self._provider,
+            self.client,
+            self.model,
             alias=self._model_alias or "",
+            registry=self._registry,
             capabilities=self._get_capabilities(),
             extra_params=self._provider_extra_params(),
-            registry=self._registry,
         )
 
         for turn in range(max_turns):
@@ -345,18 +345,10 @@ class HeadlessSession(ChatSession):
                 self._total_usage["prompt"] += result.usage.prompt_tokens
                 self._total_usage["completion"] += result.usage.completion_tokens
 
-            # Cap parallel tool calls to prevent degenerate repetition.  The
-            # cap applies to the mirror AND the appended turn; a capped turn
-            # drops its native lane rather than replaying orphan native
-            # tool_use blocks the mirror no longer carries.
-            capped_calls = (result.tool_calls or [])[:10]
-            assistant_turn = result.turn
-            if len(result.tool_calls) > len(capped_calls):
-                assistant_turn = Turn(
-                    role=Role.ASSISTANT,
-                    content=assistant_turn.content,
-                    tool_calls=assistant_turn.tool_calls[: len(capped_calls)],
-                )
+            # Cap parallel tool calls to prevent degenerate repetition
+            # (shared guard — see model_turn.cap_tool_calls for the
+            # native-lane-drop rationale on capped turns).
+            capped_calls, assistant_turn = cap_tool_calls(result, 10)
 
             self.messages.append(assistant_turn)
             msg_len = len(result.content or "")

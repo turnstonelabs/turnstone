@@ -164,7 +164,7 @@ class XAIProvider(OpenAIResponsesProvider):
         messages: list[dict[str, Any]],
         tools: list[dict[str, Any]] | None,
         max_tokens: int,
-        temperature: float,
+        temperature: float | None,
         reasoning_effort: str,
         deferred_names: frozenset[str] | None,
         capabilities: ModelCapabilities | None = None,

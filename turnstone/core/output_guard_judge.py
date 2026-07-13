@@ -270,11 +270,14 @@ class OutputGuardJudge:
         model_registry: Any | None = None,
         session_capabilities: ModelCapabilities | None = None,
         session_model_alias: str = "",
+        config_store: Any | None = None,
     ) -> None:
         self._config = config
-        # Carried into the per-evaluation ModelLane so extra_params and the
-        # live operator flags resolve from the registry like every other lane.
+        # Carried into the per-evaluation ModelLane so extra_params, the
+        # live operator flags, and the temperature ladder resolve from the
+        # registry like every other lane.
         self._model_registry = model_registry
+        self._config_store = config_store
         # Caller's resolved session-model caps (config/registry-aware): the wire
         # capabilities + window when this judge inherits the session model, and
         # the alias path's window fallback.  The window comes ONLY from these
@@ -308,10 +311,17 @@ class OutputGuardJudge:
                     )
                     self._model = model_name
                     self._judge_model_alias = config.output_guard_model
+                    self._lane_alias = config.output_guard_model
                     # Shared lane resolver (model_turn); ModelConfig.context_window
                     # stays separate and is sized into the guard window below.
+                    # ``cfg=model_cfg`` reuses the config resolve() already
+                    # fetched — one lookup, one generation.
                     self._capabilities = resolve_capabilities(
-                        self._provider, self._model, config.output_guard_model, model_registry
+                        self._provider,
+                        self._model,
+                        config.output_guard_model,
+                        model_registry,
+                        cfg=model_cfg,
                     )
                     self._judge_context_window = _positive_window(
                         getattr(model_cfg, "context_window", None),
@@ -338,10 +348,18 @@ class OutputGuardJudge:
                 session_client, session_provider.provider_name
             )
             self._model = session_model
-            # Inherit the session's registry alias so the lane resolves
-            # extra_params / replay flag exactly like every other lane on
-            # the same model (see IntentJudge's fallback for the rationale).
-            self._judge_model_alias = session_model_alias
+            # AUDIT label keeps its pre-#827 fallback semantics: "" here so
+            # recorded verdicts show ``judge_model = self._model`` (the raw
+            # model id), not the session alias — threading the alias into
+            # this field would silently change recorded judge_model values
+            # across the upgrade on default-config installs.
+            self._judge_model_alias = ""
+            # LANE alias inherits the session's registry alias so the lane
+            # resolves extra_params / replay flag / temperature exactly like
+            # every other lane on the same model (see IntentJudge's fallback
+            # for the rationale).  Lane resolution and audit labeling are
+            # different roles — hence two fields.
+            self._lane_alias = session_model_alias
             # Wire caps: the caller's resolved session caps, or the provider's
             # static table as a last resort for degraded / legacy callers.
             self._capabilities = (
@@ -508,15 +526,18 @@ class OutputGuardJudge:
         # worker is non-daemon, and concurrent.futures joins it from an atexit
         # hook regardless of shutdown(wait=False) — so a wedged upstream call
         # would otherwise hang shutdown.)
-        # Single-shot lane: constructor-resolved capabilities, extra_params
-        # and live operator flags from the registry like every other lane.
+        # Single-shot lane: constructor-frozen capabilities (window-coupled,
+        # refreshed on judge swap — see IntentJudge's lane note), extra_params
+        # / live flags / temperature ladder from the registry like every
+        # other lane.  ``_lane_alias``, not the audit label.
         lane = resolve_lane(
             self._provider,
             client,
             self._model,
-            alias=self._judge_model_alias,
+            alias=self._lane_alias,
             registry=self._model_registry,
             capabilities=self._capabilities,
+            config_store=self._config_store,
         )
         # Temperature deliberately not pinned (house rule) — the lane
         # inherits the guard model's configured temperature.

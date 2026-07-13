@@ -407,7 +407,7 @@ class AnthropicProvider:
         reasoning_effort: str,
         extra_params: dict[str, Any] | None,
         max_tokens: int,
-        temperature: float,
+        temperature: float | None,
         converted_msgs: list[dict[str, Any]],
         system_prompt: str,
         model: str,
@@ -453,7 +453,10 @@ class AnthropicProvider:
             # 90% input cost reduction on cache hits; 1.25x write on first turn.
             "cache_control": {"type": "ephemeral"},
         }
-        if caps.supports_temperature:
+        # None temperature is never written — the request omits the field so
+        # the server default applies (house rule: no code pins).  The
+        # thinking branches above still force 1.0 where the API requires it.
+        if caps.supports_temperature and temperature is not None:
             kwargs["temperature"] = temperature
         if system_prompt:
             kwargs["system"] = system_prompt
@@ -1075,7 +1078,7 @@ class AnthropicProvider:
         messages: list[dict[str, Any]],
         tools: list[dict[str, Any]] | None = None,
         max_tokens: int = 4096,
-        temperature: float = 0.5,
+        temperature: float | None = None,
         reasoning_effort: str = "medium",
         extra_params: dict[str, Any] | None = None,
         deferred_names: frozenset[str] | None = None,

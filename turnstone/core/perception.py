@@ -75,6 +75,9 @@ def describe(
     model: str,
     parts: list[dict[str, Any]],
     prompt: str = _DESCRIBE_PROMPT,
+    alias: str = "",
+    registry: Any | None = None,
+    config_store: Any | None = None,
 ) -> str:
     """Perceive ``parts`` via the perception model, returning the text.
 
@@ -82,10 +85,16 @@ def describe(
     image/PDF-page perception, ``input_audio`` for audio.  The trajectory
     carries them by reference; ``model_turn`` hands the resolver to the
     provider translator, which materializes the placeholder into these exact
-    parts (one ref may expand to many, e.g. a rasterized PDF).  Temperature
-    is not pinned (house rule) — the perception model's own configuration
-    governs sampling.  Raises :class:`PerceptionBackendError` if the backend
-    call fails.  Never caches — see :func:`describe_cached`.
+    parts (one ref may expand to many, e.g. a rasterized PDF).
+
+    *alias* / *registry* / *config_store* make the perception lane a real
+    lane: the alias's capability overrides, ``server_compat.extra_body``
+    pins, and the temperature ladder (per-model → global
+    ``model.temperature`` → server default; house rule: no code pins) all
+    reach the wire, so an operator can actually remediate a degraded,
+    memoized description from the Models tab.  Raises
+    :class:`PerceptionBackendError` if the backend call fails.  Never
+    caches — see :func:`describe_cached`.
     """
     if not parts:
         return ""
@@ -99,7 +108,9 @@ def describe(
             ),
         )
     ]
-    lane = resolve_lane(provider, client, model)
+    lane = resolve_lane(
+        provider, client, model, alias=alias, registry=registry, config_store=config_store
+    )
     try:
         result = model_turn(
             lane,
@@ -136,6 +147,8 @@ def describe_cached(
     content_hash: str,
     parts: list[dict[str, Any]],
     prompt: str = _DESCRIBE_PROMPT,
+    registry: Any | None = None,
+    config_store: Any | None = None,
 ) -> str:
     """Memoized, non-raising :func:`describe` for the wire fallback.
 
@@ -154,6 +167,9 @@ def describe_cached(
             model=model,
             parts=parts,
             prompt=prompt,
+            alias=alias,
+            registry=registry,
+            config_store=config_store,
         )
     except PerceptionBackendError as exc:
         log.warning("perception fallback failed (alias=%s): %s", alias, exc)

@@ -469,7 +469,7 @@ class LLMProvider(Protocol):
         messages: list[dict[str, Any]],
         tools: list[dict[str, Any]] | None = None,
         max_tokens: int = 4096,
-        temperature: float = 0.5,
+        temperature: float | None = None,
         reasoning_effort: str = "medium",
         extra_params: dict[str, Any] | None = None,
         deferred_names: frozenset[str] | None = None,
@@ -479,6 +479,12 @@ class LLMProvider(Protocol):
         resolve_attachments: Callable[[list[str]], dict[str, Any]] | None = None,
     ) -> CompletionResult:
         """Create a non-streaming request, returning a normalized result.
+
+        ``temperature=None`` (the default) means the field is OMITTED from
+        the wire request and the server's own default applies — it must
+        never be replaced by a Python-level constant (house rule: code
+        never pins a temperature; ``model_turn`` resolves the operator's
+        ladder and passes ``None`` when nothing is configured).
 
         ``replay_reasoning_to_model`` mirrors the per-model
         ``model_definitions`` operator flag.  Anthropic uses it to

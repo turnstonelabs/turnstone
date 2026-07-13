@@ -7715,6 +7715,21 @@ def test_web_fetch_extraction_caps_max_tokens_to_window_reserve():
     assert kw["max_tokens"] == 2048  # context_window // 4, not the 16384 session value
 
 
+def test_resolve_capabilities_raises_loudly_on_registry_failure():
+    """The session lane must NOT silently cache degraded static-table caps:
+    a get_config failure on the session's own alias PROPAGATES (pre-#827
+    semantics) — the never-crash defensive fetch is a judge-constructor
+    property, and applying it here would let one transient registry hiccup
+    pin wrong capabilities (window, thinking mode, token param) onto the
+    session cache for its whole lifetime."""
+    session = _make_session()
+    session._registry = MagicMock()
+    session._registry.get_config.side_effect = ValueError("Unknown model alias")
+    session._model_alias = "primary"
+    with pytest.raises(ValueError):
+        session._get_capabilities()
+
+
 def test_record_aux_usage_skips_when_usage_missing():
     """A provider that reports no usage object must not emit a phantom
     zero-token row."""
