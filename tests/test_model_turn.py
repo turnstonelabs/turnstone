@@ -14,6 +14,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
+from tests._session_helpers import as_stream
 from turnstone.core.model_turn import (
     ModelLane,
     finalize_provider_blocks,
@@ -26,7 +27,6 @@ from turnstone.core.providers._protocol import (
     CompletionResult,
     ModelCapabilities,
     StreamChunk,
-    ToolCallDelta,
     UsageInfo,
 )
 from turnstone.core.trajectory import Role, ToolCall, Turn
@@ -34,8 +34,9 @@ from turnstone.core.trajectory import Role, ToolCall, Turn
 
 class _FakeProvider:
     """Records every ``create_streaming`` call; replays scripted results
-    as single-chunk streams (multi-chunk accumulation is pinned by the
-    dedicated ``drain_stream`` unit tests)."""
+    as single-chunk streams via the shared ``as_stream`` adapter
+    (multi-chunk accumulation is pinned by the dedicated ``drain_stream``
+    unit tests)."""
 
     provider_name = "openai-compatible"
 
@@ -48,25 +49,7 @@ class _FakeProvider:
 
     def create_streaming(self, **kwargs: Any) -> list[StreamChunk]:
         self.calls.append(kwargs)
-        result = self.results.pop(0)
-        return [
-            StreamChunk(
-                content_delta=result.content or "",
-                reasoning_delta=result.reasoning or "",
-                tool_call_deltas=[
-                    ToolCallDelta(
-                        index=i,
-                        id=tc.get("id", ""),
-                        name=tc.get("function", {}).get("name", ""),
-                        arguments_delta=tc.get("function", {}).get("arguments", ""),
-                    )
-                    for i, tc in enumerate(result.tool_calls or [])
-                ],
-                usage=result.usage,
-                finish_reason=result.finish_reason or "stop",
-                provider_blocks=list(result.provider_blocks or []),
-            )
-        ]
+        return as_stream(self.results.pop(0))
 
 
 def _fake_registry(

@@ -609,8 +609,7 @@ LLMProvider (protocol)
 
 | Method | Purpose |
 |--------|---------|
-| `create_streaming()` | Streaming request, yields normalized `StreamChunk` objects |
-| `create_completion()` | Non-streaming request, returns `CompletionResult` |
+| `create_streaming()` | The one transport: streaming request, yields normalized `StreamChunk` objects (single-shot callers accumulate via `drain_stream()` into a `CompletionResult`) |
 | `get_capabilities()` | Per-model flags (`ModelCapabilities`) |
 | `convert_tools()` | Translate OpenAI tool schemas to provider format |
 | `retryable_error_names` | Exception class names that trigger retry |
