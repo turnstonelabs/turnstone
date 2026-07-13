@@ -170,25 +170,39 @@ def fake_chat_stream(
     return chunks
 
 
-def scripted_chat_client(*scripts: Any) -> Any:
-    """A fake ``client.chat.completions.create`` that follows a script.
+class _ScriptedClient:
+    """Callable client-method fake following a script of stream builders.
 
     Call N returns the stream described by ``scripts[N]``; the last script
-    repeats for any further calls.  Each script is a dict of
-    :func:`fake_chat_stream` kwargs or a pre-built chunk list.  The
-    returned callable records every call's kwargs on ``.calls`` — read
-    ``len(fn.calls)`` where a test previously kept its own counter cell,
-    and ``fn.calls[i]["messages"]`` where it captured request bodies.
+    repeats for any further calls.  Each script is a dict of kwargs for
+    the bound stream builder, or a pre-built return value.  Records every
+    call's kwargs on ``.calls`` — read ``len(fn.calls)`` where a test
+    previously kept its own counter cell, and ``fn.calls[i]["messages"]``
+    where it captured request bodies.
     """
 
-    def _create(**kwargs: Any) -> Any:
-        _create.calls.append(kwargs)  # type: ignore[attr-defined]
-        i = min(len(_create.calls) - 1, len(scripts) - 1)  # type: ignore[attr-defined]
-        script = scripts[i]
-        return fake_chat_stream(**script) if isinstance(script, dict) else script
+    def __init__(self, scripts: tuple[Any, ...], to_stream: Any) -> None:
+        self._scripts = scripts
+        self._to_stream = to_stream
+        self.calls: list[dict[str, Any]] = []
 
-    _create.calls = []  # type: ignore[attr-defined]
-    return _create
+    def __call__(self, **kwargs: Any) -> Any:
+        self.calls.append(kwargs)
+        script = self._scripts[min(len(self.calls) - 1, len(self._scripts) - 1)]
+        return self._to_stream(**script) if isinstance(script, dict) else script
+
+
+def scripted_chat_client(*scripts: Any) -> _ScriptedClient:
+    """A scripted ``client.chat.completions.create`` — dict scripts are
+    :func:`fake_chat_stream` kwargs."""
+    return _ScriptedClient(scripts, fake_chat_stream)
+
+
+def scripted_anthropic_client(*scripts: Any) -> _ScriptedClient:
+    """A scripted ``client.messages.stream`` — dict scripts are
+    :func:`fake_anthropic_stream` kwargs (``blocks`` plus optional
+    ``stop_reason``/``usage``)."""
+    return _ScriptedClient(scripts, lambda **kw: fake_anthropic_stream(**kw))
 
 
 class FakeAnthropicBlock:

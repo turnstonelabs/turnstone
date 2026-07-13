@@ -123,34 +123,11 @@ class TestToolCallAssembly:
         )
         assert result.tool_calls[0]["id"] == ""
 
-    def test_index_degenerate_parallel_calls_get_distinct_slots(self):
-        # Historical compat servers (older vLLM, some llama.cpp builds)
-        # stream every parallel call at index 0 as whole deltas.  A delta
-        # whose id differs from its slot's opens a NEW call — without this,
-        # distinct calls fuse into one entry with concatenated garbage
-        # arguments.  Id-less fragments keep following their index's
-        # current call.
-        result = drain_stream(
-            iter(
-                [
-                    StreamChunk(
-                        tool_call_deltas=[
-                            ToolCallDelta(index=0, id="a", name="read", arguments_delta='{"p": 1}')
-                        ]
-                    ),
-                    StreamChunk(
-                        tool_call_deltas=[
-                            ToolCallDelta(index=0, id="b", name="write", arguments_delta='{"p": ')
-                        ]
-                    ),
-                    StreamChunk(tool_call_deltas=[ToolCallDelta(index=0, arguments_delta="2}")]),
-                    StreamChunk(finish_reason="tool_calls"),
-                ]
-            )
-        )
-        assert [tc["id"] for tc in result.tool_calls] == ["a", "b"]
-        assert result.tool_calls[0]["function"]["arguments"] == '{"p": 1}'
-        assert result.tool_calls[1]["function"]["arguments"] == '{"p": 2}'
+    # Index-degenerate parallel-call de-fusion lives in the CHAT ADAPTER's
+    # iterator (so the interactive loop is fixed too) — pinned in
+    # test_providers.py::TestOpenAIProvider::
+    # test_streaming_remaps_index_degenerate_parallel_calls.  The drain
+    # accumulates by index verbatim; adapters own index sanity.
 
 
 class TestUsageMerge:

@@ -14,8 +14,8 @@ import pytest
 from tests._session_helpers import (
     FakeAnthropicBlock,
     as_stream,
-    fake_anthropic_stream,
     mock_completion_result,
+    scripted_anthropic_client,
     scripted_chat_client,
 )
 from turnstone.core.session import _IMAGE_EXTENSIONS, _IMAGE_SIZE_CAP, ChatSession
@@ -2588,28 +2588,22 @@ class TestAgentChildRegistration:
         session._provider = AnthropicProvider()
         session.ui.note_agent_child = MagicMock()
 
-        seen: list[dict] = []
-        call_count = [0]
-
-        def fake_stream(**kwargs):
-            seen.append(kwargs)
-            call_count[0] += 1
-            if call_count[0] == 1:
-                return fake_anthropic_stream(
-                    [
-                        FakeAnthropicBlock(
-                            type="thinking", thinking="check the file first", signature="sig_v1"
-                        ),
-                        FakeAnthropicBlock(type="text", text="reading"),
-                        FakeAnthropicBlock(
-                            type="tool_use", id="toolu_01AB", name="read_file", input={"path": "x"}
-                        ),
-                    ],
-                    stop_reason="tool_use",
-                )
-            return fake_anthropic_stream([FakeAnthropicBlock(type="text", text="done")])
-
-        session.client.messages.stream = fake_stream
+        client_fn = scripted_anthropic_client(
+            {
+                "blocks": [
+                    FakeAnthropicBlock(
+                        type="thinking", thinking="check the file first", signature="sig_v1"
+                    ),
+                    FakeAnthropicBlock(type="text", text="reading"),
+                    FakeAnthropicBlock(
+                        type="tool_use", id="toolu_01AB", name="read_file", input={"path": "x"}
+                    ),
+                ],
+                "stop_reason": "tool_use",
+            },
+            {"blocks": [FakeAnthropicBlock(type="text", text="done")]},
+        )
+        session.client.messages.stream = client_fn
 
         def fake_prepare(tc_dict, **_kwargs):
             return {
@@ -2639,7 +2633,7 @@ class TestAgentChildRegistration:
         # Internal key stays minted — the nesting registry saw the "::" id.
         assert session.ui.note_agent_child.call_args.args[0] == "task-1::r1s1::toolu_01AB"
         # Second request: the assistant wire turn IS the native lane.
-        replay = seen[1]["messages"]
+        replay = client_fn.calls[1]["messages"]
         assistant = next(
             m for m in replay if m["role"] == "assistant" and isinstance(m.get("content"), list)
         )
@@ -2672,26 +2666,20 @@ class TestAgentChildRegistration:
         session._provider = AnthropicProvider()
         session.ui.note_agent_child = MagicMock()
 
-        seen: list[dict] = []
-        call_count = [0]
-
-        def fake_stream(**kwargs):
-            seen.append(kwargs)
-            call_count[0] += 1
-            if call_count[0] == 1:
-                return fake_anthropic_stream(
-                    [
-                        FakeAnthropicBlock(type="thinking", thinking="hm", signature="sig_b"),
-                        # Blank provider id — the back-fill case.
-                        FakeAnthropicBlock(
-                            type="tool_use", id="", name="read_file", input={"path": "x"}
-                        ),
-                    ],
-                    stop_reason="tool_use",
-                )
-            return fake_anthropic_stream([FakeAnthropicBlock(type="text", text="done")])
-
-        session.client.messages.stream = fake_stream
+        client_fn = scripted_anthropic_client(
+            {
+                "blocks": [
+                    FakeAnthropicBlock(type="thinking", thinking="hm", signature="sig_b"),
+                    # Blank provider id — the back-fill case.
+                    FakeAnthropicBlock(
+                        type="tool_use", id="", name="read_file", input={"path": "x"}
+                    ),
+                ],
+                "stop_reason": "tool_use",
+            },
+            {"blocks": [FakeAnthropicBlock(type="text", text="done")]},
+        )
+        session.client.messages.stream = client_fn
 
         def fake_prepare(tc_dict, **_kwargs):
             return {
@@ -2731,7 +2719,7 @@ class TestAgentChildRegistration:
         # The replay request carries the native lane verbatim — thinking and
         # signature intact — with tool_use and tool_result agreeing on the
         # manufactured id: no blank id, no orphan, no lost reasoning.
-        replay = seen[1]["messages"]
+        replay = client_fn.calls[1]["messages"]
         assistant = next(
             m for m in replay if m["role"] == "assistant" and isinstance(m.get("content"), list)
         )

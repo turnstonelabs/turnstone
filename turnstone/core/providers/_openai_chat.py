@@ -202,6 +202,16 @@ class OpenAIChatCompletionsProvider:
         tool_call_count = 0
         last_finish_reason: str | None = None
         completion_tokens: int | None = None
+        # Remap wire indexes onto logical slots: index-degenerate compat
+        # servers (historical vLLM/llama.cpp builds) emit every parallel
+        # tool call at index 0 — a delta whose id contradicts its index's
+        # current call opens a new slot, mirroring the Anthropic iterator's
+        # per-block index assignment.  Id-less argument fragments keep
+        # following their index's current slot, so downstream accumulators
+        # (drain_stream, the chat loop) can key by index safely.
+        slot_for_index: dict[int, int] = {}
+        slot_ids: dict[int, str] = {}
+        next_slot = 0
         for chunk in stream:
             sc = StreamChunk()
 
@@ -236,9 +246,20 @@ class OpenAIChatCompletionsProvider:
             # Tool calls
             if delta.tool_calls:
                 for tc_delta in delta.tool_calls:
-                    tcd = ToolCallDelta(index=tc_delta.index)
-                    if tc_delta.id:
-                        tcd.id = tc_delta.id
+                    wire_index = tc_delta.index
+                    tc_id = tc_delta.id or ""
+                    slot = slot_for_index.get(wire_index)
+                    if slot is None or (
+                        tc_id and slot_ids.get(slot, "") and slot_ids[slot] != tc_id
+                    ):
+                        slot = next_slot
+                        next_slot += 1
+                        slot_for_index[wire_index] = slot
+                    if tc_id:
+                        slot_ids[slot] = tc_id
+                    tcd = ToolCallDelta(index=slot)
+                    if tc_id:
+                        tcd.id = tc_id
                     if tc_delta.function:
                         if tc_delta.function.name:
                             tcd.name = tc_delta.function.name

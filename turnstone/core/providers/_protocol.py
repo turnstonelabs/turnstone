@@ -127,12 +127,9 @@ def drain_stream(chunks: Iterator[StreamChunk]) -> CompletionResult:
       and completion tokens across separate events.
     - Tool calls accumulate by ``ToolCallDelta.index``: ``id``/``name``
       are whole values (last truthy wins), ``arguments_delta``
-      concatenates.  A delta carrying an id DIFFERENT from its slot's
-      opens a new call instead — index-degenerate compat servers
-      (historical vLLM/llama.cpp builds emit every parallel call at
-      index 0) would otherwise fuse distinct calls into garbage
-      arguments.  Deltas without ids keep routing to their index's
-      current call: fragments follow their call's announcement.
+      concatenates.  Adapters own index sanity — the chat iterator
+      remaps index-degenerate wire deltas onto distinct slots before
+      they reach any accumulator (this one or the chat loop's).
     - ``provider_blocks`` replaces on each non-empty emission — every
       adapter attaches its full block list exactly once, on or after the
       terminal chunk.
@@ -150,12 +147,7 @@ def drain_stream(chunks: Iterator[StreamChunk]) -> CompletionResult:
     content_parts: list[str] = []
     reasoning_parts: list[str] = []
     trailing_info_parts: list[str] = []
-    # Slots in arrival order, each remembering its wire index — the result
-    # sorts by (index, arrival) so well-formed streams keep the array order
-    # the retired non-streaming body had, and collision-opened slots stay
-    # in arrival order behind their shared index.
-    tool_slots: list[tuple[int, dict[str, Any]]] = []
-    slot_for_index: dict[int, int] = {}
+    tool_calls_acc: dict[int, dict[str, Any]] = {}
     usage: UsageInfo | None = None
     finish_reason: str | None = None
     provider_blocks: list[dict[str, Any]] = []
@@ -166,19 +158,10 @@ def drain_stream(chunks: Iterator[StreamChunk]) -> CompletionResult:
         if sc.reasoning_delta:
             reasoning_parts.append(sc.reasoning_delta)
         for tcd in sc.tool_call_deltas:
-            slot = slot_for_index.get(tcd.index)
-            if slot is None or (
-                tcd.id and tool_slots[slot][1]["id"] and tool_slots[slot][1]["id"] != tcd.id
-            ):
-                slot = len(tool_slots)
-                slot_for_index[tcd.index] = slot
-                tool_slots.append(
-                    (
-                        tcd.index,
-                        {"id": "", "type": "function", "function": {"name": "", "arguments": ""}},
-                    )
-                )
-            tc = tool_slots[slot][1]
+            tc = tool_calls_acc.setdefault(
+                tcd.index,
+                {"id": "", "type": "function", "function": {"name": "", "arguments": ""}},
+            )
             if tcd.id:
                 tc["id"] = tcd.id
             if tcd.name:
@@ -205,7 +188,7 @@ def drain_stream(chunks: Iterator[StreamChunk]) -> CompletionResult:
     for info in trailing_info_parts:
         content += "\n\n" + info
 
-    tool_calls = [tc for _, tc in sorted(tool_slots, key=lambda pair: pair[0])]
+    tool_calls = [tool_calls_acc[i] for i in sorted(tool_calls_acc)]
     return CompletionResult(
         content=content,
         tool_calls=tool_calls or None,

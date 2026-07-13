@@ -668,6 +668,15 @@ class OpenAIResponsesProvider:
             # finish reason, final usage, AND collected provider_blocks.
             if event_type in ("response.completed", "response.incomplete"):
                 response = getattr(event, "response", None)
+                if not response:
+                    # A terminal event without its payload (lax compat
+                    # server) is still a terminal signal — emit the finish
+                    # reason implied by the event type so the drain's
+                    # complete-or-error gate sees a completed stream, just
+                    # without usage/blocks.
+                    last_finish = "stop" if event_type == "response.completed" else "length"
+                    yield StreamChunk(finish_reason=last_finish)
+                    continue
                 if response:
                     status = getattr(response, "status", "completed")
                     last_finish = "stop" if status == "completed" else "length"
@@ -695,6 +704,20 @@ class OpenAIResponsesProvider:
                         sc.provider_blocks = provider_blocks
                     yield sc
                 continue
+
+            # -- in-band error event (ResponseErrorEvent) --
+            # The SDK YIELDS `error` SSE events rather than raising, and no
+            # response.failed necessarily follows — without this branch the
+            # stream exhausts finish-less and the real API message is lost
+            # behind a misleading IncompleteStreamError.
+            if event_type == "error":
+                error_msg = getattr(event, "message", "Unknown error") or "Unknown error"
+                error_code = getattr(event, "code", "") or ""
+                if error_code in _TRANSIENT_FAILURE_CODES:
+                    raise ResponsesStreamFailedError(
+                        f"Responses API error ({error_code}): {error_msg}"
+                    )
+                raise RuntimeError(f"Responses API error ({error_code or 'unknown'}): {error_msg}")
 
             # -- error --
             if event_type == "response.failed":

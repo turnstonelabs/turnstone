@@ -29,17 +29,25 @@ Earlier stable lines (`stable/1.6`, `stable/1.5`) are frozen.
   blocking read that can hit client read-timeouts — the same reason the
   Anthropic adapter already streamed internally — and judge timeouts now
   *abort* the underlying HTTP read instead of abandoning a worker thread
-  on a dead call. Caveats: these lanes now carry the same
-  `stream_options: {include_usage: true}` the chat loop always sent —
-  OpenAI-compatible servers old enough to *ignore* it stop producing
-  usage rows on these lanes, and servers strict enough to *reject*
-  unknown fields (pre-2024 llama.cpp/proxy builds) will 400 — such a
-  server already couldn't serve turnstone's chat loop, but a
+  on a dead call. These lanes are also complete-or-error now: a stream
+  that ends without any finish signal is treated as a generation that
+  died mid-response and retried, instead of storing the partial text as
+  a clean result (previously a half-generated compaction summary could
+  silently replace real history). Caveats: these lanes now carry the
+  same `stream_options: {include_usage: true}` the chat loop always
+  sent — OpenAI-compatible servers old enough to *ignore* it stop
+  producing usage rows on these lanes, and servers strict enough to
+  *reject* unknown fields (pre-2024 llama.cpp/proxy builds) will 400 —
+  such a server already couldn't serve turnstone's chat loop, but a
   judge/utility alias pointed at one worked on 1.7 and needs to move to
-  a current server. Legacy models that reject streaming requests
-  outright (o1-era) likewise need a model alias pointing at a current
-  model — the unread `supports_streaming` capability flag (and its
-  admin tile) is gone.
+  a current server. A compat server whose streams never carry a finish
+  reason at all (each provider's terminal marker — Chat Completions'
+  final `finish_reason`, Anthropic's `message_stop`, Responses'
+  terminal event — all count) fails these lanes loudly for the same
+  reason; every maintained inference server sends one. Legacy models
+  that reject streaming requests outright (o1-era) likewise need a
+  model alias pointing at a current model — the unread
+  `supports_streaming` capability flag (and its admin tile) is gone.
 
 - **One turn interface for every model call: `core/model_turn.py` (#827).**
   Judges (intent + output guard), perception, title generation, compaction,

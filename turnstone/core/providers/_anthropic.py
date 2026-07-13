@@ -926,6 +926,7 @@ class AnthropicProvider:
         # Capture raw content blocks for multi-turn preservation
         raw_blocks: dict[int, dict[str, Any]] = {}
         saw_text_block = False
+        emitted_finish = False
 
         for event in stream:
             sc = StreamChunk()
@@ -1064,7 +1065,20 @@ class AnthropicProvider:
                     )
                 if hasattr(event.delta, "stop_reason") and event.delta.stop_reason:
                     sc.finish_reason = _normalize_finish_reason(event.delta.stop_reason)
+                    emitted_finish = True
                     # Emit all raw content blocks for multi-turn preservation
+                    if raw_blocks:
+                        sc.provider_blocks = [raw_blocks[i] for i in sorted(raw_blocks)]
+
+            elif event_type == "message_stop":
+                # Terminal marker: the message completed even if the compat
+                # server's message_delta never carried a stop_reason (the
+                # official API always sends one; the retired non-streaming
+                # path defaulted missing stop_reason to end_turn).  Without
+                # this, the drain's complete-or-error gate fails a stream
+                # whose content actually arrived intact.
+                if not emitted_finish:
+                    sc.finish_reason = "stop"
                     if raw_blocks:
                         sc.provider_blocks = [raw_blocks[i] for i in sorted(raw_blocks)]
 

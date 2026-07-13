@@ -743,6 +743,60 @@ class TestOpenAIProvider:
         assert result.tool_calls[0]["function"]["arguments"] == '{"path": "foo.py"}'
         assert result.finish_reason == "tool_calls"
 
+    def test_streaming_remaps_index_degenerate_parallel_calls(self) -> None:
+        # Historical compat servers (older vLLM, some llama.cpp builds)
+        # stream every parallel call at index 0 as whole deltas.  The
+        # iterator opens a new slot when a delta's id contradicts its
+        # index's current call, so BOTH consumers (drain_stream and the
+        # chat loop's accumulator) see distinct calls; id-less argument
+        # fragments keep following their index's current slot.
+        def _tc_chunk(tc_id: str, name: str, args: str) -> SimpleNamespace:
+            tc = SimpleNamespace(
+                index=0, id=tc_id, function=SimpleNamespace(name=name, arguments=args)
+            )
+            delta = SimpleNamespace(
+                content=None,
+                tool_calls=[tc],
+                reasoning=None,
+                reasoning_content=None,
+                annotations=None,
+            )
+            return SimpleNamespace(
+                choices=[SimpleNamespace(finish_reason=None, delta=delta)], usage=None
+            )
+
+        finish = SimpleNamespace(
+            choices=[
+                SimpleNamespace(
+                    finish_reason="tool_calls",
+                    delta=SimpleNamespace(
+                        content=None,
+                        tool_calls=None,
+                        reasoning=None,
+                        reasoning_content=None,
+                        annotations=None,
+                    ),
+                )
+            ],
+            usage=None,
+        )
+        chunks = [
+            _tc_chunk("a", "read", '{"p": 1}'),
+            _tc_chunk("b", "write", '{"p": 2}'),
+            finish,
+        ]
+        client = MagicMock()
+        client.chat.completions.create.return_value = chunks
+
+        result = drain_stream(
+            self.provider.create_streaming(
+                client=client, model="m", messages=[{"role": "user", "content": "x"}]
+            )
+        )
+        assert [tc["id"] for tc in result.tool_calls] == ["a", "b"]
+        assert result.tool_calls[0]["function"]["arguments"] == '{"p": 1}'
+        assert result.tool_calls[1]["function"]["arguments"] == '{"p": 2}'
+
     def test_drained_stream_usage(self) -> None:
         client = MagicMock()
         client.chat.completions.create.return_value = fake_chat_stream(
@@ -1173,6 +1227,36 @@ class TestAnthropicProvider:
         assert result.provider_blocks, "expected the text block in provider_blocks"
         citations = result.provider_blocks[0].get("citations")
         assert citations == [{"type": "web_search_result_location", "url": "https://x.test"}]
+
+    @patch("turnstone.core.providers._anthropic._ensure_anthropic")
+    def test_message_stop_supplies_missing_stop_reason(self, mock_ensure: MagicMock) -> None:
+        # Compat tolerance: a /v1/messages shim that streams content and
+        # message_stop but never a message_delta stop_reason.  message_stop
+        # is a genuine terminal marker, so the drained stream completes
+        # (blocks intact) instead of failing a generation that arrived.
+        events = [
+            _anthropic_event("content_block_start", block_type="text", index=0),
+            _anthropic_event(
+                "content_block_delta", delta_type="text_delta", text="intact", index=0
+            ),
+            _anthropic_event("content_block_stop", index=0),
+            _anthropic_event("message_stop"),
+        ]
+        stream_ctx = MagicMock()
+        stream_ctx.__enter__ = MagicMock(return_value=iter(events))
+        stream_ctx.__exit__ = MagicMock(return_value=False)
+        client = MagicMock()
+        client.messages.stream.return_value = stream_ctx
+
+        result = drain_stream(
+            self.provider.create_streaming(
+                client=client,
+                model="claude-sonnet-4-20250514",
+                messages=[{"role": "user", "content": "hi"}],
+            )
+        )
+        assert result.content == "intact"
+        assert result.finish_reason == "stop"
 
     @patch("turnstone.core.providers._anthropic._ensure_anthropic")
     def test_drained_stream_usage(self, mock_ensure: MagicMock) -> None:
@@ -5265,6 +5349,36 @@ class TestResponsesDrainedStream:
         assert result.finish_reason == "length"
         assert [b["type"] for b in result.provider_blocks] == ["reasoning", "message"]
 
+    def test_error_event_surfaces_real_api_message(self) -> None:
+        # The SDK YIELDS in-band `error` SSE events (ResponseErrorEvent)
+        # rather than raising; without a branch the stream exhausts
+        # finish-less and the real API message hides behind a misleading
+        # IncompleteStreamError.  Deterministic codes stop retries.
+        events = [SimpleNamespace(type="error", code="invalid_request", message="bad tool schema")]
+        with pytest.raises(RuntimeError, match="bad tool schema"):
+            self._drain(events)
+
+    def test_transient_error_event_is_retryable(self) -> None:
+        from turnstone.core.providers._openai_responses import ResponsesStreamFailedError
+
+        events = [SimpleNamespace(type="error", code="server_error", message="overloaded")]
+        with pytest.raises(ResponsesStreamFailedError, match="overloaded"):
+            self._drain(events)
+
+    def test_terminal_event_without_payload_still_finishes(self) -> None:
+        # A lax compat server may emit the terminal event with no response
+        # payload — it is still a terminal signal, so the drained stream
+        # completes (without usage/blocks) instead of raising
+        # IncompleteStreamError over a generation that fully arrived.
+        events = [
+            SimpleNamespace(type="response.output_text.delta", delta="all here"),
+            SimpleNamespace(type="response.completed", response=None),
+        ]
+        result = self._drain(events)
+        assert result.content == "all here"
+        assert result.finish_reason == "stop"
+        assert result.usage is None
+
     def test_transient_failed_event_raises_typed_retryable_error(self) -> None:
         # A TRANSIENT in-band response.failed (server_error / rate limit)
         # raises the typed error the provider advertises as retryable —
@@ -5304,3 +5418,20 @@ class TestResponsesDrainedStream:
             self._drain(events)
         assert not isinstance(excinfo.value, ResponsesStreamFailedError)
         assert type(excinfo.value).__name__ not in self.provider.retryable_error_names
+
+
+class TestTransportRetryability:
+    """Every provider must advertise the shared transport error as
+    retryable — the drain raises IncompleteStreamError for ALL lanes, so a
+    provider omitting it silently loses retry-on-dead-stream (the
+    complete-or-error contract's second half)."""
+
+    @pytest.mark.parametrize(
+        "provider_name",
+        ["openai", "openai-compatible", "anthropic", "anthropic-compatible", "google", "xai"],
+    )
+    def test_incomplete_stream_error_is_retryable(self, provider_name: str) -> None:
+        from turnstone.core.providers import create_provider
+
+        provider = create_provider(provider_name)
+        assert "IncompleteStreamError" in provider.retryable_error_names
