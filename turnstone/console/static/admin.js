@@ -4738,6 +4738,10 @@ function _renderMcpServers(items) {
     let dotClass = "mcp-status-dot disabled";
     let rowClass = "mcp-row-disabled";
     let statusText = "disabled";
+    // Pool-backed (oauth_user/oauth_obo) servers hold NO cluster-level session —
+    // they connect per-user on demand — so "connecting"/"idle" reads as broken
+    // when the resting state (zero warm users) is normal.
+    const isPool = s.auth_type === "oauth_user" || s.auth_type === "oauth_obo";
     if (!s.enabled) {
       statusText = "disabled";
     } else if (anyConnected) {
@@ -4748,6 +4752,10 @@ function _renderMcpServers(items) {
       dotClass = "mcp-status-dot error";
       rowClass = "mcp-row-error";
       statusText = "error";
+    } else if (isPool) {
+      dotClass = "mcp-status-dot disabled";
+      rowClass = "mcp-row-disabled";
+      statusText = "per-user";
     } else if (s.enabled && s.source !== "config" && nodeIds.length === 0) {
       dotClass = "mcp-status-dot connecting";
       rowClass = "mcp-row-disabled";
