@@ -90,9 +90,14 @@ def resolve_capabilities(
     caps = provider.get_capabilities(model)
     if registry and alias:
         cfg = registry.get_config(alias)
-        if cfg.capabilities:
+        overrides_raw = getattr(cfg, "capabilities", None)
+        # Defensive dict-check (inherited from the judges' old mirror): a
+        # malformed capabilities value must degrade to "no overrides", not
+        # raise — a raise inside a judge constructor would silently downgrade
+        # the judge to the session model.
+        if isinstance(overrides_raw, dict) and overrides_raw:
             fields = {f.name for f in dataclasses.fields(type(caps))}
-            overrides = {k: v for k, v in cfg.capabilities.items() if k in fields}
+            overrides = {k: v for k, v in overrides_raw.items() if k in fields}
             if overrides:
                 caps = dataclasses.replace(caps, **overrides)
     return caps

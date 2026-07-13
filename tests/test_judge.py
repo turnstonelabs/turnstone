@@ -10,10 +10,32 @@ from typing import Any
 from unittest.mock import MagicMock
 
 from turnstone.core.judge import IntentJudge, IntentVerdict, JudgeConfig, evaluate_heuristic
+from turnstone.core.trajectory import Role
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+
+def _mock_result(
+    content: str = "",
+    tool_calls: list[dict[str, Any]] | None = None,
+) -> MagicMock:
+    """A provider result shaped like ``CompletionResult``.
+
+    The judge's calls run through ``model_turn``, whose re-ingest iterates
+    ``tool_calls``/``provider_blocks`` and joins ``reasoning`` — a bare
+    MagicMock attribute would TypeError, so every field the seam reads is
+    pinned to a real value.
+    """
+    result = MagicMock()
+    result.content = content
+    result.tool_calls = tool_calls
+    result.finish_reason = "stop"
+    result.usage = None
+    result.provider_blocks = []
+    result.reasoning = ""
+    return result
 
 
 def _make_mock_provider(
@@ -30,16 +52,10 @@ def _make_mock_provider(
     caps.max_output_tokens = 4096
     provider.get_capabilities.return_value = caps
 
-    result = MagicMock()
-    result.content = response_content
-    result.tool_calls = tool_calls
-    result.finish_reason = "stop"
-    result.usage = None
-
     if side_effect:
         provider.create_completion.side_effect = side_effect
     else:
-        provider.create_completion.return_value = result
+        provider.create_completion.return_value = _mock_result(response_content, tool_calls)
 
     provider.convert_tools.side_effect = lambda tools, **kw: tools
 
@@ -375,22 +391,21 @@ class TestMultiTurnToolUse:
         provider.convert_tools.side_effect = lambda tools, **kw: tools
 
         # Turn 1: tool call
-        turn1 = MagicMock()
-        turn1.content = ""
-        turn1.tool_calls = [
-            {
-                "id": "tc_judge_1",
-                "function": {
-                    "name": "read_file",
-                    "arguments": json.dumps({"path": "/nonexistent/file.txt"}),
-                },
-            }
-        ]
+        turn1 = _mock_result(
+            "",
+            [
+                {
+                    "id": "tc_judge_1",
+                    "function": {
+                        "name": "read_file",
+                        "arguments": json.dumps({"path": "/nonexistent/file.txt"}),
+                    },
+                }
+            ],
+        )
 
         # Turn 2: verdict
-        turn2 = MagicMock()
-        turn2.content = _good_verdict_json()
-        turn2.tool_calls = None
+        turn2 = _mock_result(_good_verdict_json())
 
         provider.create_completion.side_effect = [turn1, turn2]
 
@@ -416,22 +431,21 @@ class TestMultiTurnToolUse:
         provider.convert_tools.side_effect = lambda tools, **kw: tools
 
         # Every turn returns a tool call
-        tool_result = MagicMock()
-        tool_result.content = ""
-        tool_result.tool_calls = [
-            {
-                "id": "tc_loop",
-                "function": {
-                    "name": "read_file",
-                    "arguments": json.dumps({"path": "/tmp/x"}),
-                },
-            }
-        ]
+        tool_result = _mock_result(
+            "",
+            [
+                {
+                    "id": "tc_loop",
+                    "function": {
+                        "name": "read_file",
+                        "arguments": json.dumps({"path": "/tmp/x"}),
+                    },
+                }
+            ],
+        )
 
         # Last turn (no tools param) returns text content
-        final = MagicMock()
-        final.content = _good_verdict_json()
-        final.tool_calls = None
+        final = _mock_result(_good_verdict_json())
 
         # Turns 0-3: tool_call; turn 4 (last, tools=None): final verdict
         provider.create_completion.side_effect = [
@@ -468,12 +482,12 @@ class TestContextPreparation:
 
         result = judge._prepare_context(_make_item(), messages)
 
-        # Should have system message + single user message with transcript
+        # Should have a system Turn + single user Turn with the transcript
         assert len(result) == 2
-        assert result[0]["role"] == "system"
-        assert result[1]["role"] == "user"
-        assert "pending human approval" in result[1]["content"]
-        assert "Conversation context:" in result[1]["content"]
+        assert result[0].role is Role.SYSTEM
+        assert result[1].role is Role.USER
+        assert "pending human approval" in result[1].text
+        assert "Conversation context:" in result[1].text
 
 
 class TestArgBudget:
@@ -541,7 +555,7 @@ class TestArgBudget:
         )
         # Each included history turn renders one "ASSISTANT:" line; the
         # big-argument call fits strictly fewer of them.
-        assert big[1]["content"].count("ASSISTANT:") < small[1]["content"].count("ASSISTANT:")
+        assert big[1].text.count("ASSISTANT:") < small[1].text.count("ASSISTANT:")
 
 
 # ---------------------------------------------------------------------------
@@ -901,6 +915,9 @@ class TestModelAliasResolution:
         cfg.capabilities = capabilities if capabilities is not None else {}
         registry.has_alias.side_effect = lambda a: a == alias
         registry.resolve.return_value = (alias_client, underlying_model, cfg)
+        # The unified lane resolver (model_turn.resolve_capabilities) fetches
+        # the config itself rather than taking resolve()'s copy.
+        registry.get_config.return_value = cfg
         registry.get_provider.return_value = alias_provider
         return registry
 
