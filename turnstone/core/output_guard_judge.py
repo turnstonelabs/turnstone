@@ -13,7 +13,7 @@ Design:
   already in hand.
 - JSON-in-content verdict.  4-strategy parser inlined from
   :meth:`IntentJudge._parse_verdict`.
-- Wall-clock deadline via :func:`turnstone.core.deadline.run_with_deadline`,
+- Wall-clock deadline via :func:`turnstone.core.deadline.run_abortable_with_deadline`,
   which runs the call on a *daemon* worker and polls the cancel event each
   second.  A timeout or cancel abandons the call rather than waiting it out,
   and the daemon worker can never block process or interpreter exit — unlike
@@ -46,8 +46,7 @@ from turnstone.core import fence
 from turnstone.core.deadline import (
     DeadlineCancelledError,
     DeadlineExceededError,
-    StreamAbortRef,
-    run_with_deadline,
+    run_abortable_with_deadline,
 )
 from turnstone.core.judge import (
     _CHARS_PER_TOKEN,
@@ -457,7 +456,7 @@ class OutputGuardJudge:
         field leave it at its default — the prompt skips empty sections.
 
         Timeout enforcement is real wall-clock: the upstream call runs on a
-        daemon worker via :func:`~turnstone.core.deadline.run_with_deadline`
+        daemon worker via :func:`~turnstone.core.deadline.run_abortable_with_deadline`
         and is abandoned on the timeout / cancel path, so a hung upstream LLM
         call neither blocks return nor pins interpreter exit.
         """
@@ -548,23 +547,21 @@ class OutputGuardJudge:
         # unbounded, a pass that consumes the whole 512-token cap parses
         # to a labelled llm_error verdict (heuristic tier stands) — the
         # remediation is an effort value on the guard's model alias.
-        # The abort ref closes the abandoned worker's HTTP stream on the
+        # The abort wiring closes the abandoned worker's HTTP stream on the
         # timeout/cancel paths so the daemon thread exits promptly instead
         # of blocking on the read until the upstream's next chunk.
-        abort_ref = StreamAbortRef()
         try:
-            result = run_with_deadline(
-                lambda: model_turn(
+            result = run_abortable_with_deadline(
+                lambda ref: model_turn(
                     lane,
                     judge_turns,
                     tools=None,
                     max_tokens=512,
-                    cancel_ref=abort_ref,
+                    cancel_ref=ref,
                 ),
                 timeout=timeout,
                 cancel_event=cancel_event,
                 thread_name="output-guard-judge",
-                on_abandon=abort_ref.abort,
             )
         except DeadlineCancelledError:
             return self._error_verdict(verdict_id, call_id, start, "cancelled")

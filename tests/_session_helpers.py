@@ -80,6 +80,7 @@ def fake_chat_stream(
     prompt_tokens: int = 10,
     completion_tokens: int = 5,
     reasoning_content: str | None = None,
+    reasoning: str | None = None,
 ) -> list[Any]:
     """Fake OpenAI Chat Completions SSE chunks for driving the REAL
     ``OpenAIChatCompletionsProvider`` through a fake SDK client::
@@ -102,20 +103,25 @@ def fake_chat_stream(
         content_val: str | None = None,
         tcs: list[Any] | None = None,
         rc: str | None = None,
+        rsn: str | None = None,
     ) -> SimpleNamespace:
         return SimpleNamespace(
             content=content_val,
             tool_calls=tcs,
-            reasoning=None,
+            reasoning=rsn,
             reasoning_content=rc,
             annotations=None,
         )
 
     chunks: list[Any] = []
-    if reasoning_content is not None:
+    if reasoning_content is not None or reasoning is not None:
         chunks.append(
             SimpleNamespace(
-                choices=[SimpleNamespace(finish_reason=None, delta=_delta(rc=reasoning_content))],
+                choices=[
+                    SimpleNamespace(
+                        finish_reason=None, delta=_delta(rc=reasoning_content, rsn=reasoning)
+                    )
+                ],
                 usage=None,
             )
         )
@@ -162,6 +168,41 @@ def fake_chat_stream(
         )
     )
     return chunks
+
+
+def scripted_chat_client(*scripts: Any) -> Any:
+    """A fake ``client.chat.completions.create`` that follows a script.
+
+    Call N returns the stream described by ``scripts[N]``; the last script
+    repeats for any further calls.  Each script is a dict of
+    :func:`fake_chat_stream` kwargs or a pre-built chunk list.  The
+    returned callable records every call's kwargs on ``.calls`` — read
+    ``len(fn.calls)`` where a test previously kept its own counter cell,
+    and ``fn.calls[i]["messages"]`` where it captured request bodies.
+    """
+
+    def _create(**kwargs: Any) -> Any:
+        _create.calls.append(kwargs)  # type: ignore[attr-defined]
+        i = min(len(_create.calls) - 1, len(scripts) - 1)  # type: ignore[attr-defined]
+        script = scripts[i]
+        return fake_chat_stream(**script) if isinstance(script, dict) else script
+
+    _create.calls = []  # type: ignore[attr-defined]
+    return _create
+
+
+class FakeAnthropicBlock:
+    """A full-content Anthropic content-block fake for
+    :func:`fake_anthropic_stream` — plain attributes plus the
+    ``model_dump()`` the provider's block capture reads."""
+
+    def __init__(self, **fields: Any) -> None:
+        self._fields = fields
+        for key, value in fields.items():
+            setattr(self, key, value)
+
+    def model_dump(self, **_kw: Any) -> dict[str, Any]:
+        return dict(self._fields)
 
 
 def fake_anthropic_stream(

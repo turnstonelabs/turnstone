@@ -42,15 +42,23 @@ from turnstone.core.trajectory import materialize_attachments
 log = structlog.get_logger(__name__)
 
 
-class ResponsesStreamFailedError(RuntimeError):
-    """An in-band ``response.failed`` terminal event (HTTP 200 stream).
+# response.failed error codes that indicate a transient server-side
+# condition — the only ones worth retrying (the API's other codes are
+# deterministic request rejections).
+_TRANSIENT_FAILURE_CODES = frozenset({"server_error", "rate_limit_exceeded"})
 
-    Typed (and listed in the provider's ``retryable_error_names``) so
-    retry loops treat an in-band failure — typically a transient
-    server-side error delivered inside an otherwise healthy stream —
-    like the wire-level errors it stands in for, instead of stopping on
-    a bare ``RuntimeError``.  Callers that give up after retries keep
-    their normal degrade paths (judges fall back to the heuristic tier).
+
+class ResponsesStreamFailedError(RuntimeError):
+    """A TRANSIENT in-band ``response.failed`` terminal event.
+
+    Raised only for ``_TRANSIENT_FAILURE_CODES`` (server error, rate
+    limit) — and listed in the provider's ``retryable_error_names`` — so
+    retry loops treat those like the wire-level errors they stand in
+    for.  Deterministic in-band failures (invalid prompt, image fetch,
+    policy) raise plain ``RuntimeError`` and stop retry loops on attempt
+    zero, exactly as the retired non-streaming lane's HTTP errors did.
+    Callers that give up keep their degrade paths (judges fall back to
+    the heuristic tier).
     """
 
 
@@ -666,6 +674,19 @@ class OpenAIResponsesProvider:
                     usage = extract_usage(getattr(response, "usage", None))
                     if usage:
                         completion_tokens = usage.completion_tokens
+                    # Prefer the terminal response's own output items over
+                    # the incrementally collected ones: an item still being
+                    # generated at truncation never receives its
+                    # ``output_item.done`` event, and storing a reasoning
+                    # item without its required following item makes the
+                    # next turn's replay a 400.
+                    final_items = [
+                        item.model_dump()
+                        for item in (getattr(response, "output", None) or [])
+                        if hasattr(item, "model_dump")
+                    ]
+                    if final_items:
+                        provider_blocks = final_items
                     sc = StreamChunk(
                         finish_reason=last_finish,
                         usage=usage,
@@ -680,7 +701,16 @@ class OpenAIResponsesProvider:
                 response = getattr(event, "response", None)
                 error = getattr(response, "error", None) if response else None
                 error_msg = getattr(error, "message", "Unknown error") if error else "Unknown error"
-                raise ResponsesStreamFailedError(f"Responses API error: {error_msg}")
+                error_code = getattr(error, "code", "") if error else ""
+                # Only transient in-band failures are worth the caller's
+                # backoff ladder; a deterministic rejection (invalid prompt,
+                # image fetch, policy) re-fails identically on every retry
+                # and must surface immediately, as it did pre-#831.
+                if error_code in _TRANSIENT_FAILURE_CODES:
+                    raise ResponsesStreamFailedError(
+                        f"Responses API error ({error_code}): {error_msg}"
+                    )
+                raise RuntimeError(f"Responses API error ({error_code or 'unknown'}): {error_msg}")
 
         log.debug(
             "openai.responses.response",

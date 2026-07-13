@@ -839,5 +839,8 @@ RETRYABLE_ERROR_NAMES: frozenset[str] = frozenset(
         "RateLimitError",
         "Timeout",
         "APITimeoutError",
+        # Transport-level: the drained stream ended with no finish signal
+        # (generation died mid-response) — re-run like a wire error.
+        "IncompleteStreamError",
     }
 )

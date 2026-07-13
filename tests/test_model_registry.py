@@ -8,6 +8,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+from tests._session_helpers import fake_chat_stream
 from turnstone.core.model_registry import (
     ModelConfig,
     ModelRegistry,
@@ -1301,16 +1302,11 @@ class TestSessionAgentModel:
 
         # Mock the API to capture what model was used
         captured_model = None
-        mock_response = MagicMock()
-        mock_response.choices = [MagicMock()]
-        mock_response.choices[0].message.content = "done"
-        mock_response.choices[0].message.tool_calls = None
-        mock_response.choices[0].finish_reason = "stop"
 
         def fake_create(**kwargs: Any) -> Any:
             nonlocal captured_model
             captured_model = kwargs.get("model")
-            return mock_response
+            return fake_chat_stream(content="done")
 
         # Get the agent client from the registry and patch it
         agent_client = reg.get_client("agent")
@@ -1327,15 +1323,10 @@ class TestSessionAgentModel:
     def _capture_on(client: Any) -> dict[str, Any]:
         """Patch *client* (registry-resolved or session.client) to capture kwargs."""
         captured: dict[str, Any] = {}
-        mock_response = MagicMock()
-        mock_response.choices = [MagicMock()]
-        mock_response.choices[0].message.content = "done"
-        mock_response.choices[0].message.tool_calls = None
-        mock_response.choices[0].finish_reason = "stop"
 
         def fake_create(**kwargs: Any) -> Any:
             captured.update(kwargs)
-            return mock_response
+            return fake_chat_stream(content="done")
 
         client.chat.completions.create = fake_create
         return captured

@@ -4415,31 +4415,9 @@ class TestOpenAIChatReasoningCapture:
 
     @staticmethod
     def _client(*, reasoning: Any = None, reasoning_content: Any = None) -> MagicMock:
-        delta = SimpleNamespace(
-            content="ok",
-            tool_calls=None,
-            annotations=None,
-            reasoning=reasoning,
-            reasoning_content=reasoning_content,
+        chunks = fake_chat_stream(
+            content="ok", reasoning=reasoning, reasoning_content=reasoning_content
         )
-        chunks = [
-            SimpleNamespace(choices=[SimpleNamespace(finish_reason=None, delta=delta)], usage=None),
-            SimpleNamespace(
-                choices=[
-                    SimpleNamespace(
-                        finish_reason="stop",
-                        delta=SimpleNamespace(
-                            content=None,
-                            tool_calls=None,
-                            annotations=None,
-                            reasoning=None,
-                            reasoning_content=None,
-                        ),
-                    )
-                ],
-                usage=None,
-            ),
-        ]
         client = MagicMock()
         client.chat.completions.create.return_value = chunks
         return client
@@ -5252,21 +5230,77 @@ class TestResponsesDrainedStream:
         result = self._drain(events)
         assert result.content == "[Refused: cannot help with that]"
 
-    def test_failed_event_raises_typed_retryable_error(self) -> None:
-        # An in-band response.failed terminal event raises the TYPED error,
-        # whose name the provider advertises as retryable — retry loops keep
-        # retrying a transient in-band failure instead of hard-stopping on a
-        # bare RuntimeError (the retired non-streaming lane degraded instead).
+    def test_truncation_rebuilds_blocks_from_terminal_response_output(self) -> None:
+        # The item being generated at max_output_tokens truncation never
+        # receives output_item.done; only the terminal response.output has
+        # it.  Storing the .done-collected list alone would keep a
+        # reasoning item without its required following item — the next
+        # turn's replay 400s.  The terminal event's own output wins.
+        def _item(d: dict) -> SimpleNamespace:
+            item = SimpleNamespace(**{k: v for k, v in d.items() if k != "model_dump"})
+            item.model_dump = lambda d=d, **_kw: d  # type: ignore[method-assign]
+            return item
+
+        reasoning_item = _item({"type": "reasoning", "id": "rs_1", "summary": []})
+        partial_msg = _item({"type": "message", "content": [], "status": "incomplete"})
+        usage = SimpleNamespace(
+            input_tokens=10,
+            output_tokens=5,
+            total_tokens=15,
+            input_tokens_details=SimpleNamespace(cached_tokens=0),
+        )
+        events = [
+            # Only the reasoning item completed before truncation.
+            SimpleNamespace(type="response.output_item.done", item=reasoning_item),
+            SimpleNamespace(
+                type="response.incomplete",
+                response=SimpleNamespace(
+                    status="incomplete",
+                    usage=usage,
+                    output=[reasoning_item, partial_msg],
+                ),
+            ),
+        ]
+        result = self._drain(events)
+        assert result.finish_reason == "length"
+        assert [b["type"] for b in result.provider_blocks] == ["reasoning", "message"]
+
+    def test_transient_failed_event_raises_typed_retryable_error(self) -> None:
+        # A TRANSIENT in-band response.failed (server_error / rate limit)
+        # raises the typed error the provider advertises as retryable —
+        # retry loops re-run it like the wire errors it stands in for.
         from turnstone.core.providers._openai_responses import ResponsesStreamFailedError
 
         events = [
             SimpleNamespace(
                 type="response.failed",
                 response=SimpleNamespace(
-                    status="failed", error=SimpleNamespace(message="model overloaded")
+                    status="failed",
+                    error=SimpleNamespace(message="model overloaded", code="server_error"),
                 ),
             )
         ]
         with pytest.raises(ResponsesStreamFailedError, match="model overloaded"):
             self._drain(events)
         assert "ResponsesStreamFailedError" in self.provider.retryable_error_names
+
+    def test_deterministic_failed_event_is_not_retryable(self) -> None:
+        # Deterministic in-band rejections (invalid prompt, image fetch,
+        # policy) re-fail identically on every attempt — they surface as
+        # plain RuntimeError so retry loops stop on attempt zero instead
+        # of running the whole backoff ladder against a doomed request.
+        from turnstone.core.providers._openai_responses import ResponsesStreamFailedError
+
+        events = [
+            SimpleNamespace(
+                type="response.failed",
+                response=SimpleNamespace(
+                    status="failed",
+                    error=SimpleNamespace(message="prompt was rejected", code="invalid_prompt"),
+                ),
+            )
+        ]
+        with pytest.raises(RuntimeError, match="invalid_prompt") as excinfo:
+            self._drain(events)
+        assert not isinstance(excinfo.value, ResponsesStreamFailedError)
+        assert type(excinfo.value).__name__ not in self.provider.retryable_error_names

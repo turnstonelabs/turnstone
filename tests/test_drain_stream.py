@@ -17,6 +17,8 @@ from turnstone.core.providers import (
     UsageInfo,
     drain_stream,
 )
+from turnstone.core.providers._openai_common import RETRYABLE_ERROR_NAMES
+from turnstone.core.providers._protocol import IncompleteStreamError
 
 
 class TestContentAndReasoning:
@@ -40,20 +42,25 @@ class TestContentAndReasoning:
                     StreamChunk(reasoning_delta="think "),
                     StreamChunk(reasoning_delta="hard"),
                     StreamChunk(content_delta="answer"),
+                    StreamChunk(finish_reason="stop"),
                 ]
             )
         )
         assert result.reasoning == "think hard"
         assert result.content == "answer"
 
-    def test_empty_stream_yields_defaults(self):
-        result = drain_stream(iter([]))
-        assert result.content == ""
-        assert result.reasoning == ""
-        assert result.tool_calls is None
-        assert result.finish_reason == "stop"
-        assert result.usage is None
-        assert result.provider_blocks == []
+    def test_stream_without_finish_reason_raises_incomplete(self):
+        # Complete-or-error: every adapter emits a finish reason on a
+        # healthy stream, so its absence means the generation died
+        # mid-response — partial text must never be stored as a complete
+        # result (compaction summary, title).  Typed and retryable.
+        assert "IncompleteStreamError" in RETRYABLE_ERROR_NAMES
+        with pytest.raises(IncompleteStreamError):
+            drain_stream(iter([StreamChunk(content_delta="half a summar")]))
+
+    def test_empty_stream_raises_incomplete(self):
+        with pytest.raises(IncompleteStreamError):
+            drain_stream(iter([]))
 
 
 class TestToolCallAssembly:
@@ -70,6 +77,7 @@ class TestToolCallAssembly:
                     StreamChunk(
                         tool_call_deltas=[ToolCallDelta(index=0, arguments_delta='"x.py"}')]
                     ),
+                    StreamChunk(finish_reason="tool_calls"),
                 ]
             )
         )
@@ -95,6 +103,7 @@ class TestToolCallAssembly:
                             ToolCallDelta(index=1, arguments_delta='{"k": 1}'),
                         ]
                     ),
+                    StreamChunk(finish_reason="tool_calls"),
                 ]
             )
         )
@@ -105,9 +114,43 @@ class TestToolCallAssembly:
         # Google compat can stream blank tool ids — the drain must hand them
         # through untouched so model_turn's pairwise blank-id repair sees them.
         result = drain_stream(
-            iter([StreamChunk(tool_call_deltas=[ToolCallDelta(index=0, name="f")])])
+            iter(
+                [
+                    StreamChunk(tool_call_deltas=[ToolCallDelta(index=0, name="f")]),
+                    StreamChunk(finish_reason="tool_calls"),
+                ]
+            )
         )
         assert result.tool_calls[0]["id"] == ""
+
+    def test_index_degenerate_parallel_calls_get_distinct_slots(self):
+        # Historical compat servers (older vLLM, some llama.cpp builds)
+        # stream every parallel call at index 0 as whole deltas.  A delta
+        # whose id differs from its slot's opens a NEW call — without this,
+        # distinct calls fuse into one entry with concatenated garbage
+        # arguments.  Id-less fragments keep following their index's
+        # current call.
+        result = drain_stream(
+            iter(
+                [
+                    StreamChunk(
+                        tool_call_deltas=[
+                            ToolCallDelta(index=0, id="a", name="read", arguments_delta='{"p": 1}')
+                        ]
+                    ),
+                    StreamChunk(
+                        tool_call_deltas=[
+                            ToolCallDelta(index=0, id="b", name="write", arguments_delta='{"p": ')
+                        ]
+                    ),
+                    StreamChunk(tool_call_deltas=[ToolCallDelta(index=0, arguments_delta="2}")]),
+                    StreamChunk(finish_reason="tool_calls"),
+                ]
+            )
+        )
+        assert [tc["id"] for tc in result.tool_calls] == ["a", "b"]
+        assert result.tool_calls[0]["function"]["arguments"] == '{"p": 1}'
+        assert result.tool_calls[1]["function"]["arguments"] == '{"p": 2}'
 
 
 class TestUsageMerge:
@@ -144,6 +187,7 @@ class TestUsageMerge:
             iter(
                 [
                     StreamChunk(content_delta="x"),
+                    StreamChunk(finish_reason="stop"),
                     StreamChunk(
                         usage=UsageInfo(prompt_tokens=10, completion_tokens=5, total_tokens=15)
                     ),
@@ -233,33 +277,20 @@ class TestInfoDelta:
         )
         assert result.content == "\n\nSources:\n- x"
 
-    def test_finishless_stream_still_folds_terminal_citations(self):
-        # A lax compat server may never send finish_reason (a shape the
-        # adapters tolerate); the adapters' post-loop citations footer is
-        # then the stream's final suffix and must still fold into content.
-        result = drain_stream(
-            iter(
-                [
-                    StreamChunk(content_delta="body"),
-                    StreamChunk(info_delta="Sources:\n- x"),
-                ]
+    def test_finishless_stream_raises_even_with_trailing_info(self):
+        # A stream that dies after a status ping must NOT return the ping
+        # as content (nor the partial body as a clean result) — the
+        # complete-or-error gate turns the whole stream into a retryable
+        # error instead of guessing which trailing info was a citation.
+        with pytest.raises(IncompleteStreamError):
+            drain_stream(
+                iter(
+                    [
+                        StreamChunk(content_delta="body"),
+                        StreamChunk(info_delta="[Searching: kubernetes CVEs]"),
+                    ]
+                )
             )
-        )
-        assert result.content == "body\n\nSources:\n- x"
-        assert result.finish_reason == "stop"
-
-    def test_finishless_interleaved_ping_still_dropped(self):
-        # Info followed by real payload is a status ping, not the terminal
-        # footer — dropped even when the stream never sends finish_reason.
-        result = drain_stream(
-            iter(
-                [
-                    StreamChunk(info_delta="[Searching: x]"),
-                    StreamChunk(content_delta="answer"),
-                ]
-            )
-        )
-        assert result.content == "answer"
 
 
 class TestErrorPropagation:

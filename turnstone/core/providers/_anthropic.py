@@ -1103,6 +1103,8 @@ class AnthropicProvider:
                 "InternalServerError",
                 "APIError",
                 "OverloadedError",
+                # Transport-level: drained stream ended without a stop reason.
+                "IncompleteStreamError",
             }
         )
 

@@ -12,10 +12,11 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from tests._session_helpers import (
+    FakeAnthropicBlock,
     as_stream,
     fake_anthropic_stream,
-    fake_chat_stream,
     mock_completion_result,
+    scripted_chat_client,
 )
 from turnstone.core.session import _IMAGE_EXTENSIONS, _IMAGE_SIZE_CAP, ChatSession
 from turnstone.core.trajectory import (
@@ -2059,26 +2060,20 @@ class TestAgentOutputGuard:
             session, "_evaluate_output", wraps=lambda cid, o, fn, **_kw: (o, None)
         ) as mock_eval:
             # Simulate _run_agent getting a tool call response then a text response
-            call_count = [0]
-
-            def fake_create(**kwargs):
-                call_count[0] += 1
-                if call_count[0] == 1:
-                    # First call: model returns a tool call
-                    return fake_chat_stream(
-                        tool_calls=[
-                            {
-                                "id": "call_1",
-                                "name": "read_file",
-                                "arguments": '{"path": "/tmp/test"}',
-                            }
-                        ],
-                        finish_reason="tool_calls",
-                    )
-                # Second call: model returns text (done)
-                return fake_chat_stream(content="Done")
-
-            session.client.chat.completions.create = fake_create
+            # Script: a tool-call turn, then text (done).
+            session.client.chat.completions.create = scripted_chat_client(
+                {
+                    "tool_calls": [
+                        {
+                            "id": "call_1",
+                            "name": "read_file",
+                            "arguments": '{"path": "/tmp/test"}',
+                        }
+                    ],
+                    "finish_reason": "tool_calls",
+                },
+                {"content": "Done"},
+            )
 
             # Mock tool preparation to return a simple output
             def fake_prepare(tc_dict, **kwargs):
@@ -2117,24 +2112,19 @@ class TestAgentOutputGuard:
         session._provider = OpenAIChatCompletionsProvider()
 
         with patch.object(session, "_evaluate_output") as mock_eval:
-            call_count = [0]
-
-            def fake_create(**kwargs):
-                call_count[0] += 1
-                if call_count[0] == 1:
-                    return fake_chat_stream(
-                        tool_calls=[
-                            {
-                                "id": "call_1",
-                                "name": "read_file",
-                                "arguments": '{"path": "/tmp/test"}',
-                            }
-                        ],
-                        finish_reason="tool_calls",
-                    )
-                return fake_chat_stream(content="Done")
-
-            session.client.chat.completions.create = fake_create
+            session.client.chat.completions.create = scripted_chat_client(
+                {
+                    "tool_calls": [
+                        {
+                            "id": "call_1",
+                            "name": "read_file",
+                            "arguments": '{"path": "/tmp/test"}',
+                        }
+                    ],
+                    "finish_reason": "tool_calls",
+                },
+                {"content": "Done"},
+            )
 
             def fake_prepare(tc_dict, **kwargs):
                 return {
@@ -2172,11 +2162,7 @@ class TestAgentOutputGuard:
         with patch.object(
             session, "_evaluate_output", wraps=lambda cid, o, fn, **_kw: (o, None)
         ) as mock_eval:
-
-            def fake_create(**_kwargs):
-                return fake_chat_stream(content=synth)
-
-            session.client.chat.completions.create = fake_create
+            session.client.chat.completions.create = scripted_chat_client({"content": synth})
 
             result = session._run_agent(
                 [Turn.user("test")],
@@ -2204,11 +2190,9 @@ class TestAgentOutputGuard:
         with patch.object(
             session, "_evaluate_output", wraps=lambda cid, o, fn: (o, None)
         ) as mock_eval:
-
-            def fake_create(**_kwargs):
-                return fake_chat_stream(content=partial, finish_reason="length")
-
-            session.client.chat.completions.create = fake_create
+            session.client.chat.completions.create = scripted_chat_client(
+                {"content": partial, "finish_reason": "length"}
+            )
             result = session._run_agent(
                 [Turn.user("test")],
                 tools=[{"type": "function", "function": {"name": "read_file"}}],
@@ -2323,28 +2307,20 @@ class TestAgentOutputGuard:
         session.agent_max_turns = 1  # one tool turn, then forced synthesis
 
         forced = "Forced synthesis after hitting the tool-turn ceiling."
-        call_count = [0]
 
         with patch.object(
             session, "_evaluate_output", wraps=lambda cid, o, fn, **_kw: (o, None)
         ) as mock_eval:
-
-            def fake_create(**_kwargs):
-                call_count[0] += 1
-                if call_count[0] == 1:
-                    # First call: tool call, eats the turn budget.
-                    return fake_chat_stream(
-                        tool_calls=[
-                            {
-                                "id": "call_1",
-                                "name": "read_file",
-                                "arguments": '{"path": "/tmp/x"}',
-                            }
-                        ],
-                        finish_reason="tool_calls",
-                    )
-                # Forced synthesis turn.
-                return fake_chat_stream(content=forced)
+            # Script: a tool call eats the turn budget, then forced synthesis.
+            fake_create = scripted_chat_client(
+                {
+                    "tool_calls": [
+                        {"id": "call_1", "name": "read_file", "arguments": '{"path": "/tmp/x"}'}
+                    ],
+                    "finish_reason": "tool_calls",
+                },
+                {"content": forced},
+            )
 
             session.client.chat.completions.create = fake_create
 
@@ -2383,20 +2359,15 @@ class TestAgentChildRegistration:
         session._provider = OpenAIChatCompletionsProvider()
         session.ui.note_agent_child = MagicMock()
 
-        call_count = [0]
-
-        def fake_create(**_kwargs):
-            call_count[0] += 1
-            if call_count[0] == 1:
-                return fake_chat_stream(
-                    tool_calls=[
-                        {"id": "call_1", "name": "read_file", "arguments": '{"path": "/tmp/x"}'}
-                    ],
-                    finish_reason="tool_calls",
-                )
-            return fake_chat_stream(content="done")
-
-        session.client.chat.completions.create = fake_create
+        session.client.chat.completions.create = scripted_chat_client(
+            {
+                "tool_calls": [
+                    {"id": "call_1", "name": "read_file", "arguments": '{"path": "/tmp/x"}'}
+                ],
+                "finish_reason": "tool_calls",
+            },
+            {"content": "done"},
+        )
 
         def fake_prepare(tc_dict, **_kwargs):
             return {
@@ -2433,28 +2404,22 @@ class TestAgentChildRegistration:
         session._provider = OpenAIChatCompletionsProvider()
         session.ui.note_agent_child = MagicMock()
 
-        call_count = [0]
+        def _reused_call(path: str) -> dict:
+            # id reused verbatim across turns — the local-server shape.
+            return {
+                "tool_calls": [{"id": "call_0", "name": "read_file", "arguments": path}],
+                "finish_reason": "tool_calls",
+            }
 
-        def fake_create(**_kwargs):
-            call_count[0] += 1
-            if call_count[0] <= 2:
-                return fake_chat_stream(
-                    tool_calls=[
-                        {
-                            # reused verbatim across turns
-                            "id": "call_0",
-                            "name": "read_file",
-                            "arguments": f'{{"path": "/tmp/f{call_count[0]}"}}',
-                        }
-                    ],
-                    finish_reason="tool_calls",
-                )
-            return fake_chat_stream(content="done")
-
-        session.client.chat.completions.create = fake_create
+        client_fn = scripted_chat_client(
+            _reused_call('{"path": "/tmp/f1"}'),
+            _reused_call('{"path": "/tmp/f2"}'),
+            {"content": "done"},
+        )
+        session.client.chat.completions.create = client_fn
 
         def fake_prepare(tc_dict, **_kwargs):
-            n = call_count[0]
+            n = len(client_fn.calls)
             return {
                 "call_id": tc_dict["id"],
                 "func_name": "read_file",
@@ -2488,22 +2453,16 @@ class TestAgentChildRegistration:
     @staticmethod
     def _reusing_provider(session, tool_turns: int = 1):
         """Fake create() reissuing id "call_0" for ``tool_turns`` turns, then
-        stopping — the local-server id-reuse shape.  Returns the counter."""
-        call_count = [0]
-
-        def fake_create(**_kwargs):
-            call_count[0] += 1
-            if call_count[0] <= tool_turns:
-                return fake_chat_stream(
-                    tool_calls=[
-                        {"id": "call_0", "name": "read_file", "arguments": '{"path": "/tmp/x"}'}
-                    ],
-                    finish_reason="tool_calls",
-                )
-            return fake_chat_stream(content="done")
-
-        session.client.chat.completions.create = fake_create
-        return call_count
+        stopping — the local-server id-reuse shape."""
+        reused = {
+            "tool_calls": [
+                {"id": "call_0", "name": "read_file", "arguments": '{"path": "/tmp/x"}'}
+            ],
+            "finish_reason": "tool_calls",
+        }
+        session.client.chat.completions.create = scripted_chat_client(
+            *([reused] * tool_turns), {"content": "done"}
+        )
 
     def test_parent_id_reuse_across_runs_mints_distinct_child_ids(self):
         # A local provider reuses "call_0" for the PARENT task_agent call too:
@@ -2565,28 +2524,22 @@ class TestAgentChildRegistration:
         session._provider = OpenAIChatCompletionsProvider()
         session.ui.note_agent_child = MagicMock()
 
-        seen_messages: list[list[dict]] = []
-        call_count = [0]
-
-        def fake_create(**kwargs):
-            seen_messages.append(kwargs.get("messages") or [])
-            call_count[0] += 1
-            if call_count[0] == 1:
-                return fake_chat_stream(
-                    tool_calls=[
-                        {
-                            "id": "call_0",
-                            "name": "read_file",
-                            # Malformed: unterminated JSON with a non-"length"
-                            # finish reason — the sanitize pass's reason to exist.
-                            "arguments": '{"path": "/tmp/x"',
-                        }
-                    ],
-                    finish_reason="tool_calls",
-                )
-            return fake_chat_stream(content="done")
-
-        session.client.chat.completions.create = fake_create
+        client_fn = scripted_chat_client(
+            {
+                "tool_calls": [
+                    {
+                        "id": "call_0",
+                        "name": "read_file",
+                        # Malformed: unterminated JSON with a non-"length"
+                        # finish reason — the sanitize pass's reason to exist.
+                        "arguments": '{"path": "/tmp/x"',
+                    }
+                ],
+                "finish_reason": "tool_calls",
+            },
+            {"content": "done"},
+        )
+        session.client.chat.completions.create = client_fn
 
         def fake_prepare(tc_dict, **_kwargs):
             return {
@@ -2612,7 +2565,7 @@ class TestAgentChildRegistration:
         # shape the provider-native tool_use block also holds, so a native
         # replay and a rebuild agree); arguments are legalized to a JSON
         # object.
-        replay = seen_messages[1]
+        replay = client_fn.calls[1].get("messages") or []
         wire_calls = [tc for m in replay if m.get("tool_calls") for tc in m["tool_calls"]]
         wire_results = [m for m in replay if m.get("role") == "tool"]
         assert wire_calls and wire_results
@@ -2631,15 +2584,6 @@ class TestAgentChildRegistration:
         # thinking-enabled tool_use turn without its thinking block).
         from turnstone.core.providers._anthropic import AnthropicProvider
 
-        class _Block:
-            def __init__(self, **d):
-                self._d = d
-                for k, v in d.items():
-                    setattr(self, k, v)
-
-            def model_dump(self, **_kw):
-                return dict(self._d)
-
         session = _make_session()
         session._provider = AnthropicProvider()
         session.ui.note_agent_child = MagicMock()
@@ -2653,17 +2597,17 @@ class TestAgentChildRegistration:
             if call_count[0] == 1:
                 return fake_anthropic_stream(
                     [
-                        _Block(
+                        FakeAnthropicBlock(
                             type="thinking", thinking="check the file first", signature="sig_v1"
                         ),
-                        _Block(type="text", text="reading"),
-                        _Block(
+                        FakeAnthropicBlock(type="text", text="reading"),
+                        FakeAnthropicBlock(
                             type="tool_use", id="toolu_01AB", name="read_file", input={"path": "x"}
                         ),
                     ],
                     stop_reason="tool_use",
                 )
-            return fake_anthropic_stream([_Block(type="text", text="done")])
+            return fake_anthropic_stream([FakeAnthropicBlock(type="text", text="done")])
 
         session.client.messages.stream = fake_stream
 
@@ -2724,15 +2668,6 @@ class TestAgentChildRegistration:
         # fallback (pinned in test_model_turn).
         from turnstone.core.providers._anthropic import AnthropicProvider
 
-        class _Block:
-            def __init__(self, **d):
-                self._d = d
-                for k, v in d.items():
-                    setattr(self, k, v)
-
-            def model_dump(self, **_kw):
-                return dict(self._d)
-
         session = _make_session()
         session._provider = AnthropicProvider()
         session.ui.note_agent_child = MagicMock()
@@ -2746,13 +2681,15 @@ class TestAgentChildRegistration:
             if call_count[0] == 1:
                 return fake_anthropic_stream(
                     [
-                        _Block(type="thinking", thinking="hm", signature="sig_b"),
+                        FakeAnthropicBlock(type="thinking", thinking="hm", signature="sig_b"),
                         # Blank provider id — the back-fill case.
-                        _Block(type="tool_use", id="", name="read_file", input={"path": "x"}),
+                        FakeAnthropicBlock(
+                            type="tool_use", id="", name="read_file", input={"path": "x"}
+                        ),
                     ],
                     stop_reason="tool_use",
                 )
-            return fake_anthropic_stream([_Block(type="text", text="done")])
+            return fake_anthropic_stream([FakeAnthropicBlock(type="text", text="done")])
 
         session.client.messages.stream = fake_stream
 
@@ -2833,28 +2770,19 @@ class TestAgentChildRegistration:
         )
         session.ui.note_agent_child = MagicMock()
 
-        call_count = [0]
-
-        def fake_create(**kwargs):
-            call_count[0] += 1
-            if call_count[0] == 1:
-                return fake_chat_stream(
-                    tool_calls=[
-                        {
-                            # blank id — the back-fill case
-                            "id": "",
-                            "name": "read_file",
-                            "arguments": '{"path": "x"}',
-                        }
-                    ],
-                    finish_reason="tool_calls",
-                    reasoning_content="work it out",
-                    prompt_tokens=1,
-                    completion_tokens=1,
-                )
-            return fake_chat_stream(content="done", prompt_tokens=1, completion_tokens=1)
-
-        session.client.chat.completions.create = fake_create
+        session.client.chat.completions.create = scripted_chat_client(
+            {
+                "tool_calls": [
+                    # blank id — the back-fill case
+                    {"id": "", "name": "read_file", "arguments": '{"path": "x"}'}
+                ],
+                "finish_reason": "tool_calls",
+                "reasoning_content": "work it out",
+                "prompt_tokens": 1,
+                "completion_tokens": 1,
+            },
+            {"content": "done", "prompt_tokens": 1, "completion_tokens": 1},
+        )
 
         def fake_prepare(tc_dict, **_kwargs):
             return {
@@ -2906,23 +2834,15 @@ class TestAgentChildRegistration:
         )
         session.ui.note_agent_child = MagicMock()
 
-        seen_messages: list[list[dict]] = []
-        call_count = [0]
-
-        def fake_create(**kwargs):
-            seen_messages.append(kwargs.get("messages") or [])
-            call_count[0] += 1
-            if call_count[0] == 1:
-                return fake_chat_stream(
-                    tool_calls=[
-                        {"id": "call_0", "name": "read_file", "arguments": '{"path": "x"}'}
-                    ],
-                    finish_reason="tool_calls",
-                    reasoning_content="scan the repo first",
-                )
-            return fake_chat_stream(content="done")
-
-        session.client.chat.completions.create = fake_create
+        client_fn = scripted_chat_client(
+            {
+                "tool_calls": [{"id": "call_0", "name": "read_file", "arguments": '{"path": "x"}'}],
+                "finish_reason": "tool_calls",
+                "reasoning_content": "scan the repo first",
+            },
+            {"content": "done"},
+        )
+        session.client.chat.completions.create = client_fn
 
         def fake_prepare(tc_dict, **_kwargs):
             return {
@@ -2956,7 +2876,7 @@ class TestAgentChildRegistration:
         # The replay request carries the vLLM ``reasoning`` field on the
         # assistant turn; the internal ``_provider_content`` key is stripped
         # by the provider's sanitize before the wire.
-        replay = seen_messages[1]
+        replay = client_fn.calls[1].get("messages") or []
         assistant_wire = next(m for m in replay if m.get("role") == "assistant")
         assert assistant_wire.get("reasoning") == "scan the repo first"
         assert "_provider_content" not in assistant_wire
@@ -2976,20 +2896,15 @@ class TestRunAgentDenialMessage:
         session = _make_session()
         session._provider = OpenAIChatCompletionsProvider()
 
-        call_count = [0]
-
-        def fake_create(**_kwargs):
-            call_count[0] += 1
-            if call_count[0] == 1:
-                return fake_chat_stream(
-                    tool_calls=[
-                        {"id": "call_1", "name": "notify", "arguments": '{"message": "hi"}'}
-                    ],
-                    finish_reason="tool_calls",
-                )
-            return fake_chat_stream(content="done")
-
-        session.client.chat.completions.create = fake_create
+        session.client.chat.completions.create = scripted_chat_client(
+            {
+                "tool_calls": [
+                    {"id": "call_1", "name": "notify", "arguments": '{"message": "hi"}'}
+                ],
+                "finish_reason": "tool_calls",
+            },
+            {"content": "done"},
+        )
         # approve_tools is the real two-phase gate: on denial it stamps a
         # specific denial_msg on the item AND returns the reason as its 2nd
         # value.  The sub-agent must honour both, not overwrite them.
@@ -3275,20 +3190,15 @@ class TestSubAgentErrorRecall:
 
         session = _make_session()
         session._provider = OpenAIChatCompletionsProvider()
-        calls = [0]
-
-        def fake_create(**_kwargs):
-            calls[0] += 1
-            if calls[0] == 1:
-                return fake_chat_stream(
-                    tool_calls=[
-                        {"id": "call_1", "name": "bash", "arguments": '{"command":"false"}'}
-                    ],
-                    finish_reason="tool_calls",
-                )
-            return fake_chat_stream(content="done")
-
-        session.client.chat.completions.create = fake_create
+        session.client.chat.completions.create = scripted_chat_client(
+            {
+                "tool_calls": [
+                    {"id": "call_1", "name": "bash", "arguments": '{"command":"false"}'}
+                ],
+                "finish_reason": "tool_calls",
+            },
+            {"content": "done"},
+        )
 
         def fake_prepare(tc_dict, **_kwargs):
             cid = tc_dict["id"]

@@ -7,7 +7,7 @@ knowing provider-specific details.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 
 if TYPE_CHECKING:
@@ -67,6 +67,21 @@ class CompletionResult:
     reasoning: str = ""
 
 
+class IncompleteStreamError(RuntimeError):
+    """The stream ended without any terminal/finish signal.
+
+    Every adapter emits a finish reason on a healthy stream (Chat
+    Completions' final choice chunk, Anthropic's ``message_delta`` stop
+    reason, Responses' terminal event); a stream that exhausts without
+    one is a generation that died mid-response behind a proxy/ASGI layer
+    that closed the body cleanly.  Typed and listed in every provider's
+    ``retryable_error_names`` so callers re-run it like the wire errors
+    it stands in for — restoring the retired non-streaming transport's
+    complete-or-error contract for single-shot lanes (the interactive
+    loop keeps showing partial output live; this gate is drain-only).
+    """
+
+
 def merge_usage(acc: UsageInfo | None, new: UsageInfo) -> UsageInfo:
     """Merge one stream-chunk usage report into an accumulator, per-field max.
 
@@ -82,13 +97,7 @@ def merge_usage(acc: UsageInfo | None, new: UsageInfo) -> UsageInfo:
     moves onto ``model_turn`` (#832).
     """
     if acc is None:
-        return UsageInfo(
-            prompt_tokens=new.prompt_tokens,
-            completion_tokens=new.completion_tokens,
-            total_tokens=new.total_tokens,
-            cache_creation_tokens=new.cache_creation_tokens,
-            cache_read_tokens=new.cache_read_tokens,
-        )
+        return replace(new)
     prompt = max(acc.prompt_tokens, new.prompt_tokens)
     completion = max(acc.completion_tokens, new.completion_tokens)
     return UsageInfo(
@@ -106,25 +115,33 @@ def drain_stream(chunks: Iterator[StreamChunk]) -> CompletionResult:
     The ONE non-streaming transport: single-shot callers (``model_turn``)
     sample through the provider's streaming entry and accumulate here, so
     the streaming and non-streaming lanes cannot drift apart per adapter.
-    Accumulation mirrors the main loop's chunk consumer (``ChatSession``):
+    Accumulation mirrors the main loop's chunk consumer (``ChatSession``),
+    plus the complete-or-error gate the interactive loop doesn't need:
 
-    - ``usage`` merges per-field ``max`` across chunks — Anthropic splits
-      prompt tokens (``message_start``) and completion tokens
-      (``message_delta``) into separate events, so neither first-wins nor
-      last-wins sees both.
+    - A stream that exhausts with NO finish reason raises
+      :class:`IncompleteStreamError` (retryable) — every adapter emits one
+      on a healthy stream, so its absence means the generation died
+      mid-response.  Partial text must never be handed to a caller that
+      stores it as a complete result (a compaction summary, a title).
+    - ``usage`` merges via :func:`merge_usage` — Anthropic splits prompt
+      and completion tokens across separate events.
     - Tool calls accumulate by ``ToolCallDelta.index``: ``id``/``name``
-      are whole values (last truthy wins), ``arguments_delta`` concatenates.
+      are whole values (last truthy wins), ``arguments_delta``
+      concatenates.  A delta carrying an id DIFFERENT from its slot's
+      opens a new call instead — index-degenerate compat servers
+      (historical vLLM/llama.cpp builds emit every parallel call at
+      index 0) would otherwise fuse distinct calls into garbage
+      arguments.  Deltas without ids keep routing to their index's
+      current call: fragments follow their call's announcement.
     - ``provider_blocks`` replaces on each non-empty emission — every
       adapter attaches its full block list exactly once, on or after the
       terminal chunk.
-    - ``info_delta`` interleaved with the data is transient status (server-
-      side search pings) that the non-streaming lane never surfaced — drop
-      it.  ``info_delta`` AFTER the finish reason, or forming the stream's
-      final suffix when a lax server never sent a finish reason, is the
-      citations footer (``format_citations("", annotations).strip()``);
-      folding it back as ``content + "\\n\\n" + info`` byte-matches the
-      non-streaming lane's ``format_citations(content, annotations)``
-      append.
+    - ``info_delta`` before the finish reason is transient status (server-
+      side search pings) that the non-streaming lane never surfaced —
+      dropped.  ``info_delta`` after the finish reason is the citations
+      footer (``format_citations("", annotations).strip()``); folding it
+      back as ``content + "\\n\\n" + info`` byte-matches the non-streaming
+      lane's ``format_citations(content, annotations)`` append.
 
     Raises whatever the underlying stream raises — retry/deadline/fallback
     policy stays with the caller, exactly as with the old non-streaming
@@ -133,8 +150,12 @@ def drain_stream(chunks: Iterator[StreamChunk]) -> CompletionResult:
     content_parts: list[str] = []
     reasoning_parts: list[str] = []
     trailing_info_parts: list[str] = []
-    suffix_info_parts: list[str] = []
-    tool_calls_acc: dict[int, dict[str, Any]] = {}
+    # Slots in arrival order, each remembering its wire index — the result
+    # sorts by (index, arrival) so well-formed streams keep the array order
+    # the retired non-streaming body had, and collision-opened slots stay
+    # in arrival order behind their shared index.
+    tool_slots: list[tuple[int, dict[str, Any]]] = []
+    slot_for_index: dict[int, int] = {}
     usage: UsageInfo | None = None
     finish_reason: str | None = None
     provider_blocks: list[dict[str, Any]] = []
@@ -145,10 +166,19 @@ def drain_stream(chunks: Iterator[StreamChunk]) -> CompletionResult:
         if sc.reasoning_delta:
             reasoning_parts.append(sc.reasoning_delta)
         for tcd in sc.tool_call_deltas:
-            tc = tool_calls_acc.setdefault(
-                tcd.index,
-                {"id": "", "type": "function", "function": {"name": "", "arguments": ""}},
-            )
+            slot = slot_for_index.get(tcd.index)
+            if slot is None or (
+                tcd.id and tool_slots[slot][1]["id"] and tool_slots[slot][1]["id"] != tcd.id
+            ):
+                slot = len(tool_slots)
+                slot_for_index[tcd.index] = slot
+                tool_slots.append(
+                    (
+                        tcd.index,
+                        {"id": "", "type": "function", "function": {"name": "", "arguments": ""}},
+                    )
+                )
+            tc = tool_slots[slot][1]
             if tcd.id:
                 tc["id"] = tcd.id
             if tcd.name:
@@ -161,34 +191,25 @@ def drain_stream(chunks: Iterator[StreamChunk]) -> CompletionResult:
             finish_reason = sc.finish_reason
         if sc.provider_blocks:
             provider_blocks = sc.provider_blocks
-        if sc.info_delta:
-            if finish_reason is not None:
-                trailing_info_parts.append(sc.info_delta)
-            else:
-                # Candidate citations footer on a finish-less stream —
-                # kept only while nothing but info follows it (below).
-                suffix_info_parts.append(sc.info_delta)
-        if (
-            sc.content_delta
-            or sc.reasoning_delta
-            or sc.tool_call_deltas
-            or sc.usage is not None
-            or sc.finish_reason
-            or sc.provider_blocks
-        ):
-            # Real payload after a pre-finish info chunk: that info was an
-            # interleaved status ping, not the terminal citations footer.
-            suffix_info_parts.clear()
+        # Pre-finish info is transient status — intentionally dropped;
+        # only the trailing (post-finish) citations footer folds back.
+        if sc.info_delta and finish_reason is not None:
+            trailing_info_parts.append(sc.info_delta)
+
+    if finish_reason is None:
+        raise IncompleteStreamError(
+            "stream ended without a finish reason — generation died mid-response"
+        )
 
     content = "".join(content_parts)
-    for info in trailing_info_parts + suffix_info_parts:
+    for info in trailing_info_parts:
         content += "\n\n" + info
 
-    tool_calls = [tool_calls_acc[i] for i in sorted(tool_calls_acc)]
+    tool_calls = [tc for _, tc in sorted(tool_slots, key=lambda pair: pair[0])]
     return CompletionResult(
         content=content,
         tool_calls=tool_calls or None,
-        finish_reason=finish_reason or "stop",
+        finish_reason=finish_reason,
         usage=usage,
         provider_blocks=provider_blocks,
         reasoning="".join(reasoning_parts),

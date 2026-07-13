@@ -77,6 +77,37 @@ class StreamAbortRef(list[Any]):
                 stream.close()
 
 
+def run_abortable_with_deadline(
+    fn: Callable[[StreamAbortRef], _T],
+    *,
+    timeout: float,
+    cancel_event: threading.Event | None = None,
+    poll: float = 1.0,
+    thread_name: str = "deadline-worker",
+) -> _T:
+    """:func:`run_with_deadline` with the stream-abort wiring built in.
+
+    Mints a :class:`StreamAbortRef`, hands it to *fn* (thread it into the
+    provider call as ``cancel_ref``), and aborts it on either abandonment
+    path — the three-point pairing (ref + ``cancel_ref`` + ``on_abandon``)
+    cannot be half-wired.  The canonical deadline-bounded sampling shape::
+
+        run_abortable_with_deadline(
+            lambda ref: model_turn(lane, turns, cancel_ref=ref, ...),
+            timeout=...,
+        )
+    """
+    abort_ref = StreamAbortRef()
+    return run_with_deadline(
+        lambda: fn(abort_ref),
+        timeout=timeout,
+        cancel_event=cancel_event,
+        poll=poll,
+        thread_name=thread_name,
+        on_abandon=abort_ref.abort,
+    )
+
+
 def run_with_deadline(
     fn: Callable[[], _T],
     *,

@@ -84,8 +84,8 @@ end note
 
 loop up to 3 turns (timeout budget)
 
-    Judge -> LLM : create_completion(\nmodel, judge_messages,\ntools=[read_file, list_directory])
-    LLM --> Judge : CompletionResult
+    Judge -> LLM : model_turn(lane, judge_turns,\ntools=[read_file, list_directory])\nvia drained create_streaming
+    LLM --> Judge : ModelTurnResult
 
     alt tool_calls present (turn < 3)
         Judge -> Judge : _exec_read_only_tool()
