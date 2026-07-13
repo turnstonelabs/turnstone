@@ -28,8 +28,7 @@ Two xAI-specific extensions over the inherited Responses behaviour:
 2. **Prompt-cache hinting.**  The ``x-grok-conv-id`` request header
    maximises cache-hit rate on multi-turn conversations.  This module
    does not populate it; callers thread it via ``extra_headers`` on
-   :meth:`create_streaming` / :meth:`create_completion` once they
-   know the workstream id.
+   :meth:`create_streaming` once they know the workstream id.
 
 A static :data:`GROK_CAPABILITIES` table covers the five chat models
 listed at docs.x.ai/developers/models (May 2026).  Aliases such as

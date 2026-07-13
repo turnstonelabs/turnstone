@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any
 from unittest.mock import MagicMock
 
+from tests._session_helpers import as_stream
 from tests._session_helpers import mock_completion_result as _mock_result
 from turnstone.core.judge import IntentJudge, IntentVerdict, JudgeConfig, evaluate_heuristic
 from turnstone.core.trajectory import Role
@@ -33,9 +34,11 @@ def _make_mock_provider(
     provider.get_capabilities.return_value = caps
 
     if side_effect:
-        provider.create_completion.side_effect = side_effect
+        provider.create_streaming.side_effect = side_effect
     else:
-        provider.create_completion.return_value = _mock_result(response_content, tool_calls)
+        provider.create_streaming.return_value = as_stream(
+            _mock_result(response_content, tool_calls)
+        )
 
     provider.convert_tools.side_effect = lambda tools, **kw: tools
 
@@ -252,9 +255,8 @@ class TestErrorHandling:
     def test_empty_content_returns_none(self):
         """Provider returns empty content, no tool calls."""
         provider = _make_mock_provider(response_content="")
-        result_mock = provider.create_completion.return_value
-        result_mock.tool_calls = None
-        result_mock.content = ""
+        result_mock = _mock_result("", None)
+        provider.create_streaming.return_value = as_stream(result_mock)
 
         judge = _make_judge(provider)
         result = judge._evaluate_single(
@@ -268,10 +270,9 @@ class TestErrorHandling:
     def test_empty_content_length_stop_no_retry(self):
         """When finish_reason is 'length', don't retry — return None immediately."""
         provider = _make_mock_provider(response_content="")
-        result_mock = provider.create_completion.return_value
-        result_mock.tool_calls = None
-        result_mock.content = ""
+        result_mock = _mock_result("", None)
         result_mock.finish_reason = "length"
+        provider.create_streaming.return_value = as_stream(result_mock)
 
         judge = _make_judge(provider)
         result = judge._evaluate_single(
@@ -282,7 +283,7 @@ class TestErrorHandling:
         )
         assert result is None
         # Should have been called exactly once — no retries
-        assert provider.create_completion.call_count == 1
+        assert provider.create_streaming.call_count == 1
 
 
 # ---------------------------------------------------------------------------
@@ -328,7 +329,7 @@ class TestCancelEventSemantics:
         assert all(v.tier == "llm_fallback" for v in results)
         assert all("cancelled" in v.reasoning for v in results)
         # ...and no inference was spent after the abort signal.
-        assert provider.create_completion.call_count == 0
+        assert provider.create_streaming.call_count == 0
 
     def test_unfired_event_runs_every_item_with_default_config(self):
         """The run-to-completion contract: with cancel_on_approval=False
@@ -351,7 +352,7 @@ class TestCancelEventSemantics:
 
         assert [v.call_id for v in results] == ["tc_0", "tc_1", "tc_2"]
         assert all(v.tier == "llm" for v in results)
-        assert provider.create_completion.call_count == 3
+        assert provider.create_streaming.call_count == 3
 
 
 # ---------------------------------------------------------------------------
@@ -387,7 +388,7 @@ class TestMultiTurnToolUse:
         # Turn 2: verdict
         turn2 = _mock_result(_good_verdict_json())
 
-        provider.create_completion.side_effect = [turn1, turn2]
+        provider.create_streaming.side_effect = [as_stream(turn1), as_stream(turn2)]
 
         judge = _make_judge(provider)
         verdict = judge._evaluate_single(
@@ -398,7 +399,7 @@ class TestMultiTurnToolUse:
         )
         assert verdict is not None
         assert verdict.tier == "llm"
-        assert provider.create_completion.call_count == 2
+        assert provider.create_streaming.call_count == 2
 
     def test_max_turns_reached(self):
         """Provider keeps requesting tools — stops at _JUDGE_MAX_TURNS."""
@@ -428,12 +429,12 @@ class TestMultiTurnToolUse:
         final = _mock_result(_good_verdict_json())
 
         # Turns 0-3: tool_call; turn 4 (last, tools=None): final verdict
-        provider.create_completion.side_effect = [
-            tool_result,
-            tool_result,
-            tool_result,
-            tool_result,
-            final,
+        provider.create_streaming.side_effect = [
+            as_stream(tool_result),
+            as_stream(tool_result),
+            as_stream(tool_result),
+            as_stream(tool_result),
+            as_stream(final),
         ]
 
         judge = _make_judge(provider)
@@ -443,8 +444,8 @@ class TestMultiTurnToolUse:
             cancel_event=None,
             client=MagicMock(),
         )
-        # Should have called create_completion exactly _JUDGE_MAX_TURNS times
-        assert provider.create_completion.call_count == 5
+        # Should have called create_streaming exactly _JUDGE_MAX_TURNS times
+        assert provider.create_streaming.call_count == 5
 
 
 # ---------------------------------------------------------------------------
@@ -907,7 +908,7 @@ class TestModelAliasResolution:
 
     def test_alias_capabilities_merged_and_threaded_to_wire(self):
         """#823: a judge alias's model-definition ``capabilities`` are merged
-        onto the provider base AND passed to ``create_completion`` — the same
+        onto the provider base AND passed to ``create_streaming`` — the same
         contract as the session / utility / sub-agent lanes.  Without threading,
         operator overrides (effort passthrough, tool support) were silently
         ignored on judge calls; deleting ``capabilities=self._capabilities`` from
@@ -943,11 +944,11 @@ class TestModelAliasResolution:
             cancel_event=None,
             client=MagicMock(),
         )
-        passed = alias_provider.create_completion.call_args.kwargs["capabilities"]
+        passed = alias_provider.create_streaming.call_args.kwargs["capabilities"]
         assert passed is judge._capabilities
         # House rule: the judge pins no temperature — the wire carries the
         # alias's configured value, inherited through the lane.
-        assert alias_provider.create_completion.call_args.kwargs["temperature"] == 0.3
+        assert alias_provider.create_streaming.call_args.kwargs["temperature"] == 0.3
 
     def test_constructor_resolves_from_one_config_fetch(self):
         """The constructor consumes the ModelConfig that registry.resolve()
@@ -974,7 +975,7 @@ class TestModelAliasResolution:
 
     def test_fallback_threads_session_capabilities_to_wire(self):
         """No judge alias → the judge inherits the session model AND the
-        session's resolved capabilities, threaded to ``create_completion``."""
+        session's resolved capabilities, threaded to ``create_streaming``."""
         from turnstone.core.providers._protocol import ModelCapabilities
 
         sess_caps = ModelCapabilities(context_window=54_321, effort_passthrough=True)
@@ -994,7 +995,7 @@ class TestModelAliasResolution:
             cancel_event=None,
             client=MagicMock(),
         )
-        assert provider.create_completion.call_args.kwargs["capabilities"] is sess_caps
+        assert provider.create_streaming.call_args.kwargs["capabilities"] is sess_caps
 
     def test_alias_uses_registry_provider_not_session_provider(self):
         """Judge with model=alias should resolve via registry — provider, client,

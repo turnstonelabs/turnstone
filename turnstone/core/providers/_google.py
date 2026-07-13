@@ -127,24 +127,6 @@ class GoogleProvider(OpenAIChatCompletionsProvider):
             cleaned.append(msg)
         return sanitize_messages(cleaned)
 
-    # -- tool-call extraction (non-streaming fidelity) -------------------------
-
-    def _extract_tool_calls(
-        self, sdk_tool_calls: list[Any]
-    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
-        """Capture raw tool-call dicts alongside the normalised ones.
-
-        ``model_dump()`` includes ``thought_signature`` and any other
-        provider-specific fields.  The raw dicts are returned as
-        ``provider_blocks`` so the session stores them in
-        ``_provider_content`` for round-trip fidelity.
-        """
-        tool_calls, _ = super()._extract_tool_calls(sdk_tool_calls)
-        # model_dump() on the Pydantic SDK objects captures thought_signature
-        # and any other provider-specific fields alongside the standard ones.
-        provider_blocks = [tc.model_dump(exclude_none=True) for tc in sdk_tool_calls]
-        return tool_calls, provider_blocks
-
     # -- streaming -----------------------------------------------------------
 
     def _iter_stream(self, stream: Any) -> Iterator[StreamChunk]:

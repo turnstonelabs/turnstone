@@ -23,6 +23,7 @@ from typing import TYPE_CHECKING, Any
 from turnstone.core.deadline import (
     DeadlineCancelledError,
     DeadlineExceededError,
+    StreamAbortRef,
     run_with_deadline,
 )
 from turnstone.core.log import get_logger
@@ -1386,6 +1387,11 @@ class IntentJudge:
             # Per-turn timeout: each turn gets a fresh budget so local
             # models aren't penalised for slow earlier turns.
             per_call_timeout = max(self._config.timeout, 5.0)  # at least 5s
+            # Fresh per turn — aborting turn N's stream must never touch a
+            # later turn's.  On the abandon paths below, closing the stream
+            # makes the daemon worker's blocked HTTP read raise promptly
+            # instead of pinning the thread until the next upstream chunk.
+            abort_ref = StreamAbortRef()
             try:
                 # Each turn runs on its own daemon worker (1s cancel polling).
                 # A timeout or cancel abandons the call without pinning a
@@ -1403,14 +1409,17 @@ class IntentJudge:
                         judge_turns,
                         tools=None if is_last_turn else tools,
                         max_tokens=2048,
+                        cancel_ref=abort_ref,
                     ),
                     timeout=per_call_timeout,
                     cancel_event=cancel_event,
                     thread_name="judge-api",
                 )
             except DeadlineCancelledError:
+                abort_ref.abort()
                 return None
             except DeadlineExceededError:
+                abort_ref.abort()
                 log.info("judge.turn.timeout", turn=turn + 1, timeout=per_call_timeout)
                 # Safety net: if we have a partial result from a previous turn,
                 # try to parse a verdict from it before giving up.

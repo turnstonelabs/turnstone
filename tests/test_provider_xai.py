@@ -305,18 +305,16 @@ class TestExtraHeadersForwarding:
         kwargs = client.responses.create.call_args.kwargs
         assert "extra_headers" not in kwargs
 
-    def test_responses_completion_forwards_extra_headers(self, provider: XAIProvider) -> None:
+    def test_responses_streaming_forwards_conv_id_header(self, provider: XAIProvider) -> None:
         client = MagicMock()
-        response = MagicMock()
-        response.output = []
-        response.status = "completed"
-        response.usage = None
-        client.responses.create.return_value = response
-        provider.create_completion(
-            client=client,
-            model="grok-4.3",
-            messages=[{"role": "user", "content": "hi"}],
-            extra_headers={"x-grok-conv-id": "ws_xyz"},
+        client.responses.create.return_value = iter([])
+        list(
+            provider.create_streaming(
+                client=client,
+                model="grok-4.3",
+                messages=[{"role": "user", "content": "hi"}],
+                extra_headers={"x-grok-conv-id": "ws_xyz"},
+            )
         )
         kwargs = client.responses.create.call_args.kwargs
         assert kwargs.get("extra_headers") == {"x-grok-conv-id": "ws_xyz"}

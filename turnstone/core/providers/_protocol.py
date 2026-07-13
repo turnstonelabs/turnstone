@@ -67,6 +67,99 @@ class CompletionResult:
     reasoning: str = ""
 
 
+def drain_stream(chunks: Iterator[StreamChunk]) -> CompletionResult:
+    """Drain a ``create_streaming`` iterator into a ``CompletionResult``.
+
+    The ONE non-streaming transport: single-shot callers (``model_turn``)
+    sample through the provider's streaming entry and accumulate here, so
+    the streaming and non-streaming lanes cannot drift apart per adapter.
+    Accumulation mirrors the main loop's chunk consumer (``ChatSession``):
+
+    - ``usage`` merges per-field ``max`` across chunks — Anthropic splits
+      prompt tokens (``message_start``) and completion tokens
+      (``message_delta``) into separate events, so neither first-wins nor
+      last-wins sees both.
+    - Tool calls accumulate by ``ToolCallDelta.index``: ``id``/``name``
+      are whole values (last truthy wins), ``arguments_delta`` concatenates.
+    - ``provider_blocks`` replaces on each non-empty emission — every
+      adapter attaches its full block list exactly once, on or after the
+      terminal chunk.
+    - ``info_delta`` BEFORE the finish reason is transient status (server-
+      side search pings) that the non-streaming lane never surfaced — drop
+      it.  ``info_delta`` AFTER the finish reason is the citations footer
+      (``format_citations("", annotations).strip()``); folding it back as
+      ``content + "\\n\\n" + info`` byte-matches the non-streaming lane's
+      ``format_citations(content, annotations)`` append.
+
+    Raises whatever the underlying stream raises — retry/deadline/fallback
+    policy stays with the caller, exactly as with the old non-streaming
+    transport.
+    """
+    content_parts: list[str] = []
+    reasoning_parts: list[str] = []
+    trailing_info_parts: list[str] = []
+    tool_calls_acc: dict[int, dict[str, Any]] = {}
+    usage: UsageInfo | None = None
+    finish_reason: str | None = None
+    provider_blocks: list[dict[str, Any]] = []
+
+    for sc in chunks:
+        if sc.content_delta:
+            content_parts.append(sc.content_delta)
+        if sc.reasoning_delta:
+            reasoning_parts.append(sc.reasoning_delta)
+        for tcd in sc.tool_call_deltas:
+            tc = tool_calls_acc.setdefault(
+                tcd.index,
+                {"id": "", "type": "function", "function": {"name": "", "arguments": ""}},
+            )
+            if tcd.id:
+                tc["id"] = tcd.id
+            if tcd.name:
+                tc["function"]["name"] = tcd.name
+            if tcd.arguments_delta:
+                tc["function"]["arguments"] += tcd.arguments_delta
+        if sc.usage is not None:
+            if usage is None:
+                usage = UsageInfo(
+                    prompt_tokens=sc.usage.prompt_tokens,
+                    completion_tokens=sc.usage.completion_tokens,
+                    total_tokens=sc.usage.total_tokens,
+                    cache_creation_tokens=sc.usage.cache_creation_tokens,
+                    cache_read_tokens=sc.usage.cache_read_tokens,
+                )
+            else:
+                usage.prompt_tokens = max(usage.prompt_tokens, sc.usage.prompt_tokens)
+                usage.completion_tokens = max(usage.completion_tokens, sc.usage.completion_tokens)
+                usage.total_tokens = usage.prompt_tokens + usage.completion_tokens
+                usage.cache_creation_tokens = max(
+                    usage.cache_creation_tokens, sc.usage.cache_creation_tokens
+                )
+                usage.cache_read_tokens = max(usage.cache_read_tokens, sc.usage.cache_read_tokens)
+        if sc.finish_reason:
+            finish_reason = sc.finish_reason
+        if sc.provider_blocks:
+            provider_blocks = sc.provider_blocks
+        # Pre-finish info is transient status — intentionally dropped;
+        # only the trailing (post-finish) citations footer folds back.
+        if sc.info_delta and finish_reason is not None:
+            trailing_info_parts.append(sc.info_delta)
+
+    content = "".join(content_parts)
+    for info in trailing_info_parts:
+        content += "\n\n" + info
+
+    tool_calls = [tool_calls_acc[i] for i in sorted(tool_calls_acc)]
+    return CompletionResult(
+        content=content,
+        tool_calls=tool_calls or None,
+        finish_reason=finish_reason or "stop",
+        usage=usage,
+        provider_blocks=provider_blocks,
+        reasoning="".join(reasoning_parts),
+    )
+
+
 @dataclass(frozen=True)
 class ModelCapabilities:
     """Describes what a specific model supports — used by providers to
@@ -76,7 +169,6 @@ class ModelCapabilities:
     context_window: int = 200000
     max_output_tokens: int = 64000
     supports_temperature: bool = True
-    supports_streaming: bool = True
     supports_tools: bool = True
     token_param: str = "max_completion_tokens"
     thinking_mode: str = "none"  # "none" | "manual" | "adaptive"
@@ -457,12 +549,22 @@ class LLMProvider(Protocol):
         first chunk.  The caller can then close it from another thread to
         abort a blocked HTTP read immediately.
 
+        This is the ONLY transport — single-shot callers drain it through
+        :func:`drain_stream` instead of a separate non-streaming entry
+        (retired on #831), so per-adapter request shaping cannot drift
+        between the two consumption styles.
+
+        ``temperature=None`` (the default) means the field is OMITTED from
+        the wire request and the server's own default applies — it must
+        never be replaced by a Python-level constant (house rule: code
+        never pins a temperature; ``model_turn`` resolves the operator's
+        ladder and passes ``None`` when nothing is configured).
+
         ``replay_reasoning_to_model`` defaults to ``True`` here (and on
-        every concrete provider's ``create_streaming`` /
-        ``create_completion``) for back-compat with direct callers that
-        haven't been updated to thread the resolver — eval scripts,
-        ad-hoc tests, third-party harnesses.  This is INTENTIONALLY
-        the opposite of the operator-side default
+        every concrete provider's ``create_streaming``) for back-compat
+        with direct callers that haven't been updated to thread the
+        resolver — eval scripts, ad-hoc tests, third-party harnesses.
+        This is INTENTIONALLY the opposite of the operator-side default
         (``ModelConfig.replay_reasoning_to_model = False``,
         ``model_definitions`` server_default ``0``); the resolver in
         ``ChatSession`` reads the operator value and passes it
@@ -471,40 +573,6 @@ class LLMProvider(Protocol):
         ``OpenAIResponsesProvider._convert_messages``) default ``False``
         because they're called BY the public entry points — once the
         resolver-driven value lands, it's already explicit.
-        """
-        ...
-
-    def create_completion(
-        self,
-        *,
-        client: Any,
-        model: str,
-        messages: list[dict[str, Any]],
-        tools: list[dict[str, Any]] | None = None,
-        max_tokens: int = 4096,
-        temperature: float | None = None,
-        reasoning_effort: str | None = None,
-        extra_params: dict[str, Any] | None = None,
-        deferred_names: frozenset[str] | None = None,
-        capabilities: ModelCapabilities | None = None,
-        replay_reasoning_to_model: bool = True,
-        extra_headers: dict[str, str] | None = None,
-        resolve_attachments: Callable[[list[str]], dict[str, Any]] | None = None,
-    ) -> CompletionResult:
-        """Create a non-streaming request, returning a normalized result.
-
-        ``temperature=None`` (the default) means the field is OMITTED from
-        the wire request and the server's own default applies — it must
-        never be replaced by a Python-level constant (house rule: code
-        never pins a temperature; ``model_turn`` resolves the operator's
-        ladder and passes ``None`` when nothing is configured).
-
-        ``replay_reasoning_to_model`` mirrors the per-model
-        ``model_definitions`` operator flag.  Anthropic uses it to
-        gate the verbatim ``_provider_content`` replay (Phase 2);
-        other providers accept the kwarg for Protocol conformance and
-        ignore it (chat-template ``<think>`` content isn't part of
-        their wire-side replay path).
         """
         ...
 

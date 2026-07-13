@@ -14,7 +14,6 @@ from typing import TYPE_CHECKING, Any
 from turnstone.core.attachments import safe_attachment_label
 from turnstone.core.providers._protocol import (
     EFFORT_TEMPLATE_FALLBACK_PARAM,
-    CompletionResult,
     ModelCapabilities,
     StreamChunk,
     ToolCallDelta,
@@ -1067,115 +1066,6 @@ class AnthropicProvider:
 
             if has_content or sc.finish_reason or sc.usage or sc.info_delta:
                 yield sc
-
-    # -- non-streaming -------------------------------------------------------
-
-    def create_completion(
-        self,
-        *,
-        client: Any,
-        model: str,
-        messages: list[dict[str, Any]],
-        tools: list[dict[str, Any]] | None = None,
-        max_tokens: int = 4096,
-        temperature: float | None = None,
-        reasoning_effort: str | None = None,
-        extra_params: dict[str, Any] | None = None,
-        deferred_names: frozenset[str] | None = None,
-        capabilities: ModelCapabilities | None = None,
-        replay_reasoning_to_model: bool = True,
-        extra_headers: dict[str, str] | None = None,
-        resolve_attachments: Callable[[list[str]], dict[str, Any]] | None = None,
-    ) -> CompletionResult:
-        messages = materialize_attachments(messages, resolve_attachments)
-        caps = capabilities or self.get_capabilities(model)
-        system_prompt, converted_msgs = self._convert_messages(
-            messages,
-            replay_reasoning_to_model=replay_reasoning_to_model,
-            supports_mid_conversation_system=caps.supports_mid_conversation_system,
-        )
-        kwargs = self._build_thinking_and_kwargs(
-            caps,
-            reasoning_effort,
-            extra_params,
-            max_tokens,
-            temperature,
-            converted_msgs,
-            system_prompt,
-            model,
-            tools,
-            deferred_names,
-        )
-        if extra_headers:
-            kwargs["extra_headers"] = extra_headers
-
-        # Use streaming internally to avoid the Anthropic SDK's 10-minute
-        # timeout on non-streaming requests.  get_final_message() returns the
-        # same Message object as messages.create() would.
-        # Mirror create_streaming's defensive __enter__/__exit__ pattern so
-        # resources are cleaned up even if __enter__ fails.
-        manager = client.messages.stream(**kwargs)
-        try:
-            stream = manager.__enter__()
-        except BaseException:
-            manager.__exit__(*sys.exc_info())
-            raise
-        try:
-            response = stream.get_final_message()
-        except BaseException:
-            manager.__exit__(*sys.exc_info())
-            raise
-        else:
-            manager.__exit__(None, None, None)
-
-        # Extract content and tool_calls from content blocks.
-        # Skip server-side blocks (server_tool_use, web_search_tool_result)
-        # which are handled server-side and don't require client execution.
-        content_parts: list[str] = []
-        tool_calls: list[dict[str, Any]] = []
-        provider_blocks: list[dict[str, Any]] = []
-        for block in response.content:
-            provider_blocks.append(_block_to_dict(block))
-            if block.type == "text":
-                content_parts.append(block.text)
-            elif block.type == "tool_use":
-                tool_calls.append(
-                    {
-                        "id": block.id,
-                        "type": "function",
-                        "function": {
-                            "name": block.name,
-                            "arguments": json.dumps(block.input),
-                        },
-                    }
-                )
-            # server_tool_use, web_search_tool_result — captured in provider_blocks
-
-        finish_reason = _normalize_finish_reason(response.stop_reason or "end_turn")
-
-        usage = None
-        if hasattr(response, "usage") and response.usage:
-            u = response.usage
-            inp = getattr(u, "input_tokens", 0) or 0
-            out = getattr(u, "output_tokens", 0) or 0
-            cc = getattr(u, "cache_creation_input_tokens", 0) or 0
-            cr = getattr(u, "cache_read_input_tokens", 0) or 0
-            total_input = inp + cc + cr
-            usage = UsageInfo(
-                prompt_tokens=total_input,
-                completion_tokens=out,
-                total_tokens=total_input + out,
-                cache_creation_tokens=cc,
-                cache_read_tokens=cr,
-            )
-
-        return CompletionResult(
-            content="\n".join(content_parts),
-            tool_calls=tool_calls if tool_calls else None,
-            finish_reason=finish_reason,
-            usage=usage,
-            provider_blocks=provider_blocks,
-        )
 
     # -- retryable errors ----------------------------------------------------
 

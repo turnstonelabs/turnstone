@@ -31,7 +31,6 @@ from turnstone.core.providers._openai_common import (
     sanitize_messages,
 )
 from turnstone.core.providers._protocol import (
-    CompletionResult,
     ModelCapabilities,
     StreamChunk,
     ToolCallDelta,
@@ -573,6 +572,21 @@ class OpenAIResponsesProvider:
                     yield sc
                 continue
 
+            # -- refusal parts --
+            # Emitted whole on the ``done`` event (not per-delta), matching
+            # how the Responses API's non-streaming shape carries refusals
+            # (one whole content part) — handling the deltas too would
+            # double-emit.
+            if event_type == "response.refusal.done":
+                refusal_text = getattr(event, "refusal", "")
+                sc = StreamChunk(content_delta=f"[Refused: {refusal_text}]")
+                content_len += len(sc.content_delta)
+                if first:
+                    sc.is_first = True
+                    first = False
+                yield sc
+                continue
+
             # -- new tool call (function_call output item added) --
             if event_type == "response.output_item.added":
                 item = getattr(event, "item", None)
@@ -627,8 +641,12 @@ class OpenAIResponsesProvider:
                                 annotations.extend(part_anns)
                 continue
 
-            # -- response completed --
-            if event_type == "response.completed":
+            # -- terminal response event --
+            # ``response.incomplete`` is the real terminal event for a
+            # max-output-tokens truncation (status "incomplete"); handling
+            # only ``response.completed`` dropped the truncated run's
+            # finish reason, final usage, AND collected provider_blocks.
+            if event_type in ("response.completed", "response.incomplete"):
                 response = getattr(event, "response", None)
                 if response:
                     status = getattr(response, "status", "completed")
@@ -666,118 +684,6 @@ class OpenAIResponsesProvider:
             citation_text = format_citations("", annotations).strip()
             if citation_text:
                 yield StreamChunk(info_delta=citation_text)
-
-    # -- non-streaming -------------------------------------------------------
-
-    def create_completion(
-        self,
-        *,
-        client: Any,
-        model: str,
-        messages: list[dict[str, Any]],
-        tools: list[dict[str, Any]] | None = None,
-        max_tokens: int = 4096,
-        temperature: float | None = None,
-        reasoning_effort: str | None = None,
-        extra_params: dict[str, Any] | None = None,
-        deferred_names: frozenset[str] | None = None,
-        capabilities: ModelCapabilities | None = None,
-        # See create_streaming above for the Phase 3 reasoning-persistence rationale.
-        replay_reasoning_to_model: bool = True,
-        extra_headers: dict[str, str] | None = None,
-        resolve_attachments: Callable[[list[str]], dict[str, Any]] | None = None,
-    ) -> CompletionResult:
-        messages = materialize_attachments(messages, resolve_attachments)
-        if extra_params:
-            log.debug("openai.responses: extra_params ignored (not supported by Responses API)")
-        kwargs = self._build_kwargs(
-            model,
-            messages,
-            tools,
-            max_tokens,
-            temperature,
-            reasoning_effort,
-            deferred_names,
-            capabilities=capabilities,
-            replay_reasoning_to_model=replay_reasoning_to_model,
-        )
-        if extra_headers:
-            kwargs["extra_headers"] = extra_headers
-
-        log.debug(
-            "openai.responses.request",
-            model=model,
-            stream=False,
-            max_tokens=max_tokens,
-            input_items=len(kwargs.get("input", [])),
-            tool_count=len(kwargs.get("tools", [])),
-        )
-
-        response = client.responses.create(**kwargs)
-        return self._parse_response(response)
-
-    def _parse_response(self, response: Any) -> CompletionResult:
-        """Convert a Responses API ``Response`` object to ``CompletionResult``."""
-        content_parts: list[str] = []
-        tool_calls: list[dict[str, Any]] = []
-        provider_blocks: list[dict[str, Any]] = []
-        all_annotations: list[Any] = []
-
-        for item in getattr(response, "output", []):
-            item_type = getattr(item, "type", "")
-
-            if item_type == "message":
-                for content_part in getattr(item, "content", []):
-                    part_type = getattr(content_part, "type", "")
-                    if part_type == "output_text":
-                        content_parts.append(getattr(content_part, "text", ""))
-                        anns = getattr(content_part, "annotations", None)
-                        if anns:
-                            all_annotations.extend(anns)
-                    elif part_type == "refusal":
-                        content_parts.append(f"[Refused: {getattr(content_part, 'refusal', '')}]")
-
-            elif item_type == "function_call":
-                tool_calls.append(
-                    {
-                        "id": getattr(item, "call_id", ""),
-                        "type": "function",
-                        "function": {
-                            "name": getattr(item, "name", ""),
-                            "arguments": getattr(item, "arguments", ""),
-                        },
-                    }
-                )
-
-            # Capture all output items for provider_blocks (multi-turn)
-            item_dict = item.model_dump() if hasattr(item, "model_dump") else {}
-            if item_dict:
-                provider_blocks.append(item_dict)
-
-        content = "".join(content_parts)
-        if all_annotations:
-            content = format_citations(content, all_annotations)
-
-        status = getattr(response, "status", "completed")
-        finish_reason = "stop" if status == "completed" else "length"
-        usage = extract_usage(getattr(response, "usage", None))
-
-        result = CompletionResult(
-            content=content,
-            tool_calls=tool_calls if tool_calls else None,
-            finish_reason=finish_reason,
-            usage=usage,
-            provider_blocks=provider_blocks,
-        )
-        log.debug(
-            "openai.responses.response",
-            stream=False,
-            finish_reason=finish_reason,
-            content_length=len(content),
-            tool_call_count=len(tool_calls),
-            completion_tokens=usage.completion_tokens if usage else None,
-        )
-        return result
 
     # -- tool conversion (public interface) ----------------------------------
 

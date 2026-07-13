@@ -23,7 +23,6 @@ from turnstone.core.providers._openai_common import (
     sanitize_messages,
 )
 from turnstone.core.providers._protocol import (
-    CompletionResult,
     ModelCapabilities,
     StreamChunk,
     ToolCallDelta,
@@ -83,32 +82,6 @@ class OpenAIChatCompletionsProvider:
         """
         return sanitize_messages(messages)
 
-    # -- tool-call extraction -------------------------------------------------
-
-    def _extract_tool_calls(
-        self, sdk_tool_calls: list[Any]
-    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
-        """Extract normalised tool-call dicts from SDK objects.
-
-        Returns ``(tool_calls, provider_blocks)``.  The base implementation
-        returns an empty ``provider_blocks`` list.  Subclasses (e.g.
-        ``GoogleProvider``) override this to capture provider-specific
-        fields (like ``thought_signature``) in ``provider_blocks`` for
-        round-trip fidelity.
-        """
-        tool_calls = [
-            {
-                "id": tc.id,
-                "type": "function",
-                "function": {
-                    "name": tc.function.name,
-                    "arguments": tc.function.arguments,
-                },
-            }
-            for tc in sdk_tool_calls
-        ]
-        return tool_calls, []
-
     # -- web search ----------------------------------------------------------
 
     @staticmethod
@@ -165,7 +138,7 @@ class OpenAIChatCompletionsProvider:
 
     # Phase 2 of the reasoning-persistence feature plumbs an optional
     # ``replay_reasoning_to_model`` kwarg through every provider's
-    # ``create_streaming`` / ``create_completion``.  OpenAI Chat (and
+    # ``create_streaming``.  OpenAI Chat (and
     # the local-model server flavours that route through this adapter)
     # have no first-class reasoning shape on the wire, so the kwarg is
     # accepted for Protocol conformance and ignored here.
@@ -301,94 +274,6 @@ class OpenAIChatCompletionsProvider:
             citation_text = format_citations("", annotations).strip()
             if citation_text:
                 yield StreamChunk(info_delta=citation_text)
-
-    # -- non-streaming -------------------------------------------------------
-
-    def create_completion(
-        self,
-        *,
-        client: Any,
-        model: str,
-        messages: list[dict[str, Any]],
-        tools: list[dict[str, Any]] | None = None,
-        max_tokens: int = 4096,
-        temperature: float | None = None,
-        reasoning_effort: str | None = None,
-        extra_params: dict[str, Any] | None = None,
-        deferred_names: frozenset[str] | None = None,
-        capabilities: ModelCapabilities | None = None,
-        # See create_streaming above for the Phase 2 reasoning-persistence rationale.
-        replay_reasoning_to_model: bool = True,
-        extra_headers: dict[str, str] | None = None,
-        resolve_attachments: Callable[[list[str]], dict[str, Any]] | None = None,
-    ) -> CompletionResult:
-        messages = materialize_attachments(messages, resolve_attachments)
-        caps = capabilities or self.get_capabilities(model)
-        messages = self._prepare_messages(messages)
-        kwargs: dict[str, Any] = {
-            "model": model,
-            "messages": messages,
-            caps.token_param: max_tokens,
-            "stream": False,
-        }
-        apply_temperature_and_effort(kwargs, caps, temperature, reasoning_effort)
-        tools = self._apply_web_search(kwargs, caps, tools)
-        tools = apply_tool_search(caps, tools, deferred_names)
-        if tools:
-            kwargs["tools"] = tools
-        extra_body = self._finalize_extra_body(extra_params, caps, reasoning_effort)
-        if extra_body:
-            kwargs["extra_body"] = extra_body
-        if extra_headers:
-            kwargs["extra_headers"] = extra_headers
-
-        log.debug(
-            "openai.chat.request",
-            model=model,
-            stream=False,
-            max_tokens=max_tokens,
-            message_count=len(messages),
-            tool_count=len(tools) if tools else 0,
-        )
-        response = client.chat.completions.create(**kwargs)
-        choice = response.choices[0]
-        msg = choice.message
-
-        tool_calls = None
-        provider_blocks: list[dict[str, Any]] = []
-        if msg.tool_calls:
-            tool_calls, provider_blocks = self._extract_tool_calls(msg.tool_calls)
-
-        # Extract url_citation annotations from web search models
-        content = msg.content or ""
-        annotations = getattr(msg, "annotations", None)
-        if annotations:
-            content = format_citations(content, annotations)
-
-        # Non-canonical reasoning text (vLLM ``--reasoning-parser``, llama.cpp
-        # ``reasoning_format``) — the shared extractor also serves the
-        # streaming delta path, so the two lanes cannot drift.
-        reasoning = _reasoning_text(msg)
-
-        usage = extract_usage(getattr(response, "usage", None))
-
-        result = CompletionResult(
-            content=content,
-            tool_calls=tool_calls,
-            finish_reason=choice.finish_reason or "stop",
-            usage=usage,
-            provider_blocks=provider_blocks,
-            reasoning=reasoning,
-        )
-        log.debug(
-            "openai.chat.response",
-            stream=False,
-            finish_reason=result.finish_reason,
-            content_length=len(content),
-            tool_call_count=len(tool_calls) if tool_calls else 0,
-            completion_tokens=usage.completion_tokens if usage else None,
-        )
-        return result
 
     # -- tool conversion -----------------------------------------------------
 

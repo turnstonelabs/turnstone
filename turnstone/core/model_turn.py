@@ -4,8 +4,8 @@
 ``list[Turn]`` to wire dicts, invoke the provider once, and re-ingest the
 response as an assistant :class:`~turnstone.core.trajectory.Turn` carrying
 the provider-native lane.  Any lane that samples the model belongs here;
-a call site that still builds messages and hits ``create_completion``
-directly is migration debt, tracked on #827 (transport retirement #831,
+a call site that still builds raw OpenAI-dict messages and invokes the
+provider directly is migration debt, tracked on #827 (transport retirement #831,
 main loop #832).  Grep for callers — not this docstring — for current
 coverage, and mirror wire-shaping changes into any straggler until that
 list is empty.
@@ -52,6 +52,7 @@ from turnstone.core.lowering import (
     restore_provider_tool_ids,
     sanitize_tool_call_arguments,
 )
+from turnstone.core.providers._protocol import drain_stream
 from turnstone.core.storage._utils import (
     _CLIENT_TOOL_CALL_BLOCK_TYPES,
     strip_orphan_client_tool_blocks,
@@ -620,6 +621,7 @@ def model_turn(
     mint: Callable[[str], str] | None = None,
     wire_id_map: dict[str, str] | None = None,
     resolve_attachments: Callable[[list[str]], dict[str, Any]] | None = None,
+    cancel_ref: list[Any] | None = None,
 ) -> ModelTurnResult:
     """Advance a trajectory by one model turn: lower, sample, re-ingest.
 
@@ -665,6 +667,12 @@ def model_turn(
     can't pair does the finalize gate drop the lane to its
     ``reasoning_text`` synth (see :func:`finalize_provider_blocks`).
 
+    *cancel_ref* is the abort seam: the provider appends the live SDK
+    stream object (which has ``.close()``) before the first chunk, so a
+    deadline daemon can abort the blocked HTTP read from another thread
+    instead of abandoning it (transport is a drained ``create_streaming``
+    — see :func:`drain_stream`).
+
     Raises whatever the provider raises — retry/deadline/fallback policy
     is the caller's.
     """
@@ -694,20 +702,23 @@ def model_turn(
         or (lane.capabilities.default_reasoning_effort if lane.capabilities else None)
         or None
     )
-    result = lane.provider.create_completion(
-        client=lane.client,
-        model=lane.model,
-        messages=wire,
-        tools=tools,
-        max_tokens=max_tokens,
-        temperature=temperature if temperature is not None else lane.temperature,
-        reasoning_effort=effective_effort,
-        extra_params=lane.extra_params,
-        capabilities=lane.capabilities,
-        replay_reasoning_to_model=resolve_replay_reasoning_to_model(
-            lane.registry, lane.alias, caps=lane.capabilities, cfg=cfg
-        ),
-        resolve_attachments=resolve_attachments,
+    result = drain_stream(
+        lane.provider.create_streaming(
+            client=lane.client,
+            model=lane.model,
+            messages=wire,
+            tools=tools,
+            max_tokens=max_tokens,
+            temperature=temperature if temperature is not None else lane.temperature,
+            reasoning_effort=effective_effort,
+            extra_params=lane.extra_params,
+            cancel_ref=cancel_ref,
+            capabilities=lane.capabilities,
+            replay_reasoning_to_model=resolve_replay_reasoning_to_model(
+                lane.registry, lane.alias, caps=lane.capabilities, cfg=cfg
+            ),
+            resolve_attachments=resolve_attachments,
+        )
     )
 
     raw_calls: list[dict[str, Any]] = list(result.tool_calls or [])

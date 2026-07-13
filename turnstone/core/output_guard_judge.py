@@ -46,6 +46,7 @@ from turnstone.core import fence
 from turnstone.core.deadline import (
     DeadlineCancelledError,
     DeadlineExceededError,
+    StreamAbortRef,
     run_with_deadline,
 )
 from turnstone.core.judge import (
@@ -547,6 +548,10 @@ class OutputGuardJudge:
         # unbounded, a pass that consumes the whole 512-token cap parses
         # to a labelled llm_error verdict (heuristic tier stands) — the
         # remediation is an effort value on the guard's model alias.
+        # The abort ref closes the abandoned worker's HTTP stream on the
+        # timeout/cancel paths so the daemon thread exits promptly instead
+        # of blocking on the read until the upstream's next chunk.
+        abort_ref = StreamAbortRef()
         try:
             result = run_with_deadline(
                 lambda: model_turn(
@@ -554,14 +559,17 @@ class OutputGuardJudge:
                     judge_turns,
                     tools=None,
                     max_tokens=512,
+                    cancel_ref=abort_ref,
                 ),
                 timeout=timeout,
                 cancel_event=cancel_event,
                 thread_name="output-guard-judge",
             )
         except DeadlineCancelledError:
+            abort_ref.abort()
             return self._error_verdict(verdict_id, call_id, start, "cancelled")
         except DeadlineExceededError:
+            abort_ref.abort()
             return self._error_verdict(verdict_id, call_id, start, "timeout")
         except Exception as e:
             return self._error_verdict(

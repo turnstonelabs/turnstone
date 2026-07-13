@@ -18,6 +18,23 @@ Earlier stable lines (`stable/1.6`, `stable/1.5`) are frozen.
 
 ### Added
 
+- **One provider transport: every model call now streams (#831).**
+  The per-adapter non-streaming entry (`create_completion`) is retired;
+  single-shot lanes — judges, titles, compaction, web-fetch extraction,
+  perception, eval, optimizer — sample through the same streaming entry
+  the chat loop uses and accumulate via one shared drain, so request
+  shaping can no longer drift between the two consumption styles. Two
+  operator-visible consequences: long single-shot generations (a thinking
+  model composing a title, a slow local judge) no longer sit in a single
+  blocking read that can hit client read-timeouts — the same reason the
+  Anthropic adapter already streamed internally — and judge timeouts now
+  *abort* the underlying HTTP read instead of abandoning a worker thread
+  on a dead call. Caveats: OpenAI-compatible servers old enough to ignore
+  `stream_options.include_usage` stop producing usage rows on these
+  lanes, and legacy models that reject streaming requests outright
+  (o1-era) need a model alias pointing at a current model — the unread
+  `supports_streaming` capability flag (and its admin tile) is gone.
+
 - **One turn interface for every model call: `core/model_turn.py` (#827).**
   Judges (intent + output guard), perception, title generation, compaction,
   web-fetch extraction, the eval harness, the optimizer's meta lanes, and
@@ -100,6 +117,17 @@ Earlier stable lines (`stable/1.6`, `stable/1.5`) are frozen.
     knob in that workstream. New workstreams inherit from the start.
 
 ### Fixed
+
+- **OpenAI Responses streaming: truncated and refused responses no longer
+  vanish.** A response that hit `max_output_tokens` terminates the stream
+  with `response.incomplete`, which the stream consumer did not handle —
+  the turn was mislabeled `finish_reason: stop` and its final usage and
+  collected output items were dropped. Refusal parts had no streaming
+  handler at all, so a refusal rendered as empty content instead of the
+  `[Refused: …]` text the non-streaming path produced. Both now match:
+  truncation maps to `length` with usage/items intact, refusals render
+  in content. Applies to the chat loop and every drained single-shot
+  lane (#831).
 
 - **task_agent: sub-tool ids no longer alias across a local model's reused
   ids.** A local model that reissues per-response sequential tool-call ids

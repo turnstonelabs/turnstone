@@ -11,7 +11,12 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from tests._session_helpers import mock_completion_result
+from tests._session_helpers import (
+    as_stream,
+    fake_anthropic_stream,
+    fake_chat_stream,
+    mock_completion_result,
+)
 from turnstone.core.session import _IMAGE_EXTENSIONS, _IMAGE_SIZE_CAP, ChatSession
 from turnstone.core.trajectory import (
     Turn,
@@ -1716,7 +1721,7 @@ class TestTitleRetry:
         # Mock provider to raise
         session._provider = MagicMock()
         session._provider.get_capabilities.return_value = ModelCapabilities()
-        session._provider.create_completion.side_effect = RuntimeError("API error")
+        session._provider.create_streaming.side_effect = RuntimeError("API error")
 
         session._generate_title()
 
@@ -1737,7 +1742,7 @@ class TestTitleRetry:
         result.content = "Test Title"
         session._provider = MagicMock()
         session._provider.get_capabilities.return_value = ModelCapabilities()
-        session._provider.create_completion.return_value = result
+        session._provider.create_streaming.return_value = as_stream(result)
 
         with patch("turnstone.core.session.update_workstream_title"):
             session._generate_title()
@@ -1765,7 +1770,7 @@ class TestTitleRetry:
         )
         session._provider = MagicMock()
         session._provider.get_capabilities.return_value = ModelCapabilities()
-        session._provider.create_completion.return_value = result
+        session._provider.create_streaming.return_value = as_stream(result)
 
         captured: dict[str, str] = {}
         with patch(
@@ -1778,7 +1783,7 @@ class TestTitleRetry:
         # Reasoning gets room to finish rather than a 200-token squeeze that
         # the think pass swallows whole (the empty-content regression); and the
         # title call forces no temperature — it defers to the session value.
-        _, kw = session._provider.create_completion.call_args
+        _, kw = session._provider.create_streaming.call_args
         assert kw["max_tokens"] == _TITLE_MAX_TOKENS
         assert kw["temperature"] == session.temperature
 
@@ -1796,7 +1801,7 @@ class TestTitleRetry:
         result.content = "<think>still reasoning, never closed before the cap"
         session._provider = MagicMock()
         session._provider.get_capabilities.return_value = ModelCapabilities()
-        session._provider.create_completion.return_value = result
+        session._provider.create_streaming.return_value = as_stream(result)
 
         with patch("turnstone.core.session.update_workstream_title") as upd:
             session._generate_title()
@@ -1826,7 +1831,7 @@ class TestTitleRetry:
             result.content = content
             session._provider = MagicMock()
             session._provider.get_capabilities.return_value = ModelCapabilities()
-            session._provider.create_completion.return_value = result
+            session._provider.create_streaming.return_value = as_stream(result)
 
             captured: dict[str, str] = {}
             with patch(
@@ -1849,7 +1854,7 @@ class TestTitleRetry:
         result.content = "Story " * 40  # 240 chars on one line
         session._provider = MagicMock()
         session._provider.get_capabilities.return_value = ModelCapabilities()
-        session._provider.create_completion.return_value = result
+        session._provider.create_streaming.return_value = as_stream(result)
 
         captured: dict[str, str] = {}
         with patch(
@@ -1876,14 +1881,14 @@ class TestTitleRetry:
         result.content = "Test Title"
         session._provider = MagicMock()
         session._provider.get_capabilities.return_value = ModelCapabilities()
-        session._provider.create_completion.return_value = result
+        session._provider.create_streaming.return_value = as_stream(result)
 
         # Simulate resume() changing ws_id while title generation is in flight
         def _change_ws_id(*args, **kwargs):
             session._ws_id = "different-ws-id"
-            return result
+            return as_stream(result)
 
-        session._provider.create_completion.side_effect = _change_ws_id
+        session._provider.create_streaming.side_effect = _change_ws_id
 
         with patch("turnstone.core.session.update_workstream_title") as mock_update:
             session._generate_title()
@@ -2058,28 +2063,20 @@ class TestAgentOutputGuard:
 
             def fake_create(**kwargs):
                 call_count[0] += 1
-                resp = MagicMock()
                 if call_count[0] == 1:
                     # First call: model returns a tool call
-                    choice = MagicMock()
-                    choice.finish_reason = "tool_calls"
-                    tc = MagicMock()
-                    tc.id = "call_1"
-                    tc.function.name = "read_file"
-                    tc.function.arguments = '{"path": "/tmp/test"}'
-                    choice.message.tool_calls = [tc]
-                    choice.message.content = None
-                    resp.choices = [choice]
-                    resp.usage = MagicMock(prompt_tokens=10, completion_tokens=5)
-                else:
-                    # Second call: model returns text (done)
-                    choice = MagicMock()
-                    choice.finish_reason = "stop"
-                    choice.message.tool_calls = None
-                    choice.message.content = "Done"
-                    resp.choices = [choice]
-                    resp.usage = MagicMock(prompt_tokens=10, completion_tokens=5)
-                return resp
+                    return fake_chat_stream(
+                        tool_calls=[
+                            {
+                                "id": "call_1",
+                                "name": "read_file",
+                                "arguments": '{"path": "/tmp/test"}',
+                            }
+                        ],
+                        finish_reason="tool_calls",
+                    )
+                # Second call: model returns text (done)
+                return fake_chat_stream(content="Done")
 
             session.client.chat.completions.create = fake_create
 
@@ -2124,26 +2121,18 @@ class TestAgentOutputGuard:
 
             def fake_create(**kwargs):
                 call_count[0] += 1
-                resp = MagicMock()
                 if call_count[0] == 1:
-                    choice = MagicMock()
-                    choice.finish_reason = "tool_calls"
-                    tc = MagicMock()
-                    tc.id = "call_1"
-                    tc.function.name = "read_file"
-                    tc.function.arguments = '{"path": "/tmp/test"}'
-                    choice.message.tool_calls = [tc]
-                    choice.message.content = None
-                    resp.choices = [choice]
-                    resp.usage = MagicMock(prompt_tokens=10, completion_tokens=5)
-                else:
-                    choice = MagicMock()
-                    choice.finish_reason = "stop"
-                    choice.message.tool_calls = None
-                    choice.message.content = "Done"
-                    resp.choices = [choice]
-                    resp.usage = MagicMock(prompt_tokens=10, completion_tokens=5)
-                return resp
+                    return fake_chat_stream(
+                        tool_calls=[
+                            {
+                                "id": "call_1",
+                                "name": "read_file",
+                                "arguments": '{"path": "/tmp/test"}',
+                            }
+                        ],
+                        finish_reason="tool_calls",
+                    )
+                return fake_chat_stream(content="Done")
 
             session.client.chat.completions.create = fake_create
 
@@ -2185,14 +2174,7 @@ class TestAgentOutputGuard:
         ) as mock_eval:
 
             def fake_create(**_kwargs):
-                resp = MagicMock()
-                choice = MagicMock()
-                choice.finish_reason = "stop"
-                choice.message.tool_calls = None
-                choice.message.content = synth
-                resp.choices = [choice]
-                resp.usage = MagicMock(prompt_tokens=10, completion_tokens=5)
-                return resp
+                return fake_chat_stream(content=synth)
 
             session.client.chat.completions.create = fake_create
 
@@ -2224,14 +2206,7 @@ class TestAgentOutputGuard:
         ) as mock_eval:
 
             def fake_create(**_kwargs):
-                resp = MagicMock()
-                choice = MagicMock()
-                choice.finish_reason = "length"
-                choice.message.tool_calls = None
-                choice.message.content = partial
-                resp.choices = [choice]
-                resp.usage = MagicMock(prompt_tokens=10, completion_tokens=5)
-                return resp
+                return fake_chat_stream(content=partial, finish_reason="length")
 
             session.client.chat.completions.create = fake_create
             result = session._run_agent(
@@ -2356,25 +2331,20 @@ class TestAgentOutputGuard:
 
             def fake_create(**_kwargs):
                 call_count[0] += 1
-                resp = MagicMock()
-                choice = MagicMock()
                 if call_count[0] == 1:
                     # First call: tool call, eats the turn budget.
-                    choice.finish_reason = "tool_calls"
-                    tc = MagicMock()
-                    tc.id = "call_1"
-                    tc.function.name = "read_file"
-                    tc.function.arguments = '{"path": "/tmp/x"}'
-                    choice.message.tool_calls = [tc]
-                    choice.message.content = None
-                else:
-                    # Forced synthesis turn.
-                    choice.finish_reason = "stop"
-                    choice.message.tool_calls = None
-                    choice.message.content = forced
-                resp.choices = [choice]
-                resp.usage = MagicMock(prompt_tokens=10, completion_tokens=5)
-                return resp
+                    return fake_chat_stream(
+                        tool_calls=[
+                            {
+                                "id": "call_1",
+                                "name": "read_file",
+                                "arguments": '{"path": "/tmp/x"}',
+                            }
+                        ],
+                        finish_reason="tool_calls",
+                    )
+                # Forced synthesis turn.
+                return fake_chat_stream(content=forced)
 
             session.client.chat.completions.create = fake_create
 
@@ -2417,23 +2387,14 @@ class TestAgentChildRegistration:
 
         def fake_create(**_kwargs):
             call_count[0] += 1
-            resp = MagicMock()
-            choice = MagicMock()
             if call_count[0] == 1:
-                choice.finish_reason = "tool_calls"
-                tc = MagicMock()
-                tc.id = "call_1"
-                tc.function.name = "read_file"
-                tc.function.arguments = '{"path": "/tmp/x"}'
-                choice.message.tool_calls = [tc]
-                choice.message.content = None
-            else:
-                choice.finish_reason = "stop"
-                choice.message.tool_calls = None
-                choice.message.content = "done"
-            resp.choices = [choice]
-            resp.usage = MagicMock(prompt_tokens=10, completion_tokens=5)
-            return resp
+                return fake_chat_stream(
+                    tool_calls=[
+                        {"id": "call_1", "name": "read_file", "arguments": '{"path": "/tmp/x"}'}
+                    ],
+                    finish_reason="tool_calls",
+                )
+            return fake_chat_stream(content="done")
 
         session.client.chat.completions.create = fake_create
 
@@ -2476,23 +2437,19 @@ class TestAgentChildRegistration:
 
         def fake_create(**_kwargs):
             call_count[0] += 1
-            resp = MagicMock()
-            choice = MagicMock()
             if call_count[0] <= 2:
-                choice.finish_reason = "tool_calls"
-                tc = MagicMock()
-                tc.id = "call_0"  # reused verbatim across turns
-                tc.function.name = "read_file"
-                tc.function.arguments = f'{{"path": "/tmp/f{call_count[0]}"}}'
-                choice.message.tool_calls = [tc]
-                choice.message.content = None
-            else:
-                choice.finish_reason = "stop"
-                choice.message.tool_calls = None
-                choice.message.content = "done"
-            resp.choices = [choice]
-            resp.usage = MagicMock(prompt_tokens=10, completion_tokens=5)
-            return resp
+                return fake_chat_stream(
+                    tool_calls=[
+                        {
+                            # reused verbatim across turns
+                            "id": "call_0",
+                            "name": "read_file",
+                            "arguments": f'{{"path": "/tmp/f{call_count[0]}"}}',
+                        }
+                    ],
+                    finish_reason="tool_calls",
+                )
+            return fake_chat_stream(content="done")
 
         session.client.chat.completions.create = fake_create
 
@@ -2536,23 +2493,14 @@ class TestAgentChildRegistration:
 
         def fake_create(**_kwargs):
             call_count[0] += 1
-            resp = MagicMock()
-            choice = MagicMock()
             if call_count[0] <= tool_turns:
-                choice.finish_reason = "tool_calls"
-                tc = MagicMock()
-                tc.id = "call_0"
-                tc.function.name = "read_file"
-                tc.function.arguments = '{"path": "/tmp/x"}'
-                choice.message.tool_calls = [tc]
-                choice.message.content = None
-            else:
-                choice.finish_reason = "stop"
-                choice.message.tool_calls = None
-                choice.message.content = "done"
-            resp.choices = [choice]
-            resp.usage = MagicMock(prompt_tokens=10, completion_tokens=5)
-            return resp
+                return fake_chat_stream(
+                    tool_calls=[
+                        {"id": "call_0", "name": "read_file", "arguments": '{"path": "/tmp/x"}'}
+                    ],
+                    finish_reason="tool_calls",
+                )
+            return fake_chat_stream(content="done")
 
         session.client.chat.completions.create = fake_create
         return call_count
@@ -2623,25 +2571,20 @@ class TestAgentChildRegistration:
         def fake_create(**kwargs):
             seen_messages.append(kwargs.get("messages") or [])
             call_count[0] += 1
-            resp = MagicMock()
-            choice = MagicMock()
             if call_count[0] == 1:
-                choice.finish_reason = "tool_calls"
-                tc = MagicMock()
-                tc.id = "call_0"
-                tc.function.name = "read_file"
-                # Malformed: unterminated JSON with a non-"length" finish
-                # reason — the sanitize pass's reason to exist.
-                tc.function.arguments = '{"path": "/tmp/x"'
-                choice.message.tool_calls = [tc]
-                choice.message.content = None
-            else:
-                choice.finish_reason = "stop"
-                choice.message.tool_calls = None
-                choice.message.content = "done"
-            resp.choices = [choice]
-            resp.usage = MagicMock(prompt_tokens=10, completion_tokens=5)
-            return resp
+                return fake_chat_stream(
+                    tool_calls=[
+                        {
+                            "id": "call_0",
+                            "name": "read_file",
+                            # Malformed: unterminated JSON with a non-"length"
+                            # finish reason — the sanitize pass's reason to exist.
+                            "arguments": '{"path": "/tmp/x"',
+                        }
+                    ],
+                    finish_reason="tool_calls",
+                )
+            return fake_chat_stream(content="done")
 
         session.client.chat.completions.create = fake_create
 
@@ -2707,24 +2650,20 @@ class TestAgentChildRegistration:
         def fake_stream(**kwargs):
             seen.append(kwargs)
             call_count[0] += 1
-            resp = MagicMock()
             if call_count[0] == 1:
-                resp.content = [
-                    _Block(type="thinking", thinking="check the file first", signature="sig_v1"),
-                    _Block(type="text", text="reading"),
-                    _Block(type="tool_use", id="toolu_01AB", name="read_file", input={"path": "x"}),
-                ]
-                resp.stop_reason = "tool_use"
-            else:
-                resp.content = [_Block(type="text", text="done")]
-                resp.stop_reason = "end_turn"
-            resp.usage = None
-            mgr = MagicMock()
-            mgr.__enter__ = MagicMock(
-                return_value=MagicMock(get_final_message=MagicMock(return_value=resp))
-            )
-            mgr.__exit__ = MagicMock(return_value=False)
-            return mgr
+                return fake_anthropic_stream(
+                    [
+                        _Block(
+                            type="thinking", thinking="check the file first", signature="sig_v1"
+                        ),
+                        _Block(type="text", text="reading"),
+                        _Block(
+                            type="tool_use", id="toolu_01AB", name="read_file", input={"path": "x"}
+                        ),
+                    ],
+                    stop_reason="tool_use",
+                )
+            return fake_anthropic_stream([_Block(type="text", text="done")])
 
         session.client.messages.stream = fake_stream
 
@@ -2804,24 +2743,16 @@ class TestAgentChildRegistration:
         def fake_stream(**kwargs):
             seen.append(kwargs)
             call_count[0] += 1
-            resp = MagicMock()
             if call_count[0] == 1:
-                resp.content = [
-                    _Block(type="thinking", thinking="hm", signature="sig_b"),
-                    # Blank provider id — the back-fill case.
-                    _Block(type="tool_use", id="", name="read_file", input={"path": "x"}),
-                ]
-                resp.stop_reason = "tool_use"
-            else:
-                resp.content = [_Block(type="text", text="done")]
-                resp.stop_reason = "end_turn"
-            resp.usage = None
-            mgr = MagicMock()
-            mgr.__enter__ = MagicMock(
-                return_value=MagicMock(get_final_message=MagicMock(return_value=resp))
-            )
-            mgr.__exit__ = MagicMock(return_value=False)
-            return mgr
+                return fake_anthropic_stream(
+                    [
+                        _Block(type="thinking", thinking="hm", signature="sig_b"),
+                        # Blank provider id — the back-fill case.
+                        _Block(type="tool_use", id="", name="read_file", input={"path": "x"}),
+                    ],
+                    stop_reason="tool_use",
+                )
+            return fake_anthropic_stream([_Block(type="text", text="done")])
 
         session.client.messages.stream = fake_stream
 
@@ -2906,27 +2837,22 @@ class TestAgentChildRegistration:
 
         def fake_create(**kwargs):
             call_count[0] += 1
-            resp = MagicMock()
-            choice = MagicMock()
             if call_count[0] == 1:
-                choice.finish_reason = "tool_calls"
-                tc = MagicMock()
-                tc.id = ""  # blank — the back-fill case
-                tc.function.name = "read_file"
-                tc.function.arguments = '{"path": "x"}'
-                choice.message.tool_calls = [tc]
-                choice.message.content = None
-                choice.message.reasoning = None
-                choice.message.reasoning_content = "work it out"
-            else:
-                choice.finish_reason = "stop"
-                choice.message.tool_calls = None
-                choice.message.content = "done"
-                choice.message.reasoning = None
-                choice.message.reasoning_content = None
-            resp.choices = [choice]
-            resp.usage = MagicMock(prompt_tokens=1, completion_tokens=1)
-            return resp
+                return fake_chat_stream(
+                    tool_calls=[
+                        {
+                            # blank id — the back-fill case
+                            "id": "",
+                            "name": "read_file",
+                            "arguments": '{"path": "x"}',
+                        }
+                    ],
+                    finish_reason="tool_calls",
+                    reasoning_content="work it out",
+                    prompt_tokens=1,
+                    completion_tokens=1,
+                )
+            return fake_chat_stream(content="done", prompt_tokens=1, completion_tokens=1)
 
         session.client.chat.completions.create = fake_create
 
@@ -2986,27 +2912,15 @@ class TestAgentChildRegistration:
         def fake_create(**kwargs):
             seen_messages.append(kwargs.get("messages") or [])
             call_count[0] += 1
-            resp = MagicMock()
-            choice = MagicMock()
             if call_count[0] == 1:
-                choice.finish_reason = "tool_calls"
-                tc = MagicMock()
-                tc.id = "call_0"
-                tc.function.name = "read_file"
-                tc.function.arguments = '{"path": "x"}'
-                choice.message.tool_calls = [tc]
-                choice.message.content = None
-                choice.message.reasoning = None
-                choice.message.reasoning_content = "scan the repo first"
-            else:
-                choice.finish_reason = "stop"
-                choice.message.tool_calls = None
-                choice.message.content = "done"
-                choice.message.reasoning = None
-                choice.message.reasoning_content = None
-            resp.choices = [choice]
-            resp.usage = MagicMock(prompt_tokens=10, completion_tokens=5)
-            return resp
+                return fake_chat_stream(
+                    tool_calls=[
+                        {"id": "call_0", "name": "read_file", "arguments": '{"path": "x"}'}
+                    ],
+                    finish_reason="tool_calls",
+                    reasoning_content="scan the repo first",
+                )
+            return fake_chat_stream(content="done")
 
         session.client.chat.completions.create = fake_create
 
@@ -3066,23 +2980,14 @@ class TestRunAgentDenialMessage:
 
         def fake_create(**_kwargs):
             call_count[0] += 1
-            resp = MagicMock()
-            choice = MagicMock()
             if call_count[0] == 1:
-                choice.finish_reason = "tool_calls"
-                tc = MagicMock()
-                tc.id = "call_1"
-                tc.function.name = "notify"
-                tc.function.arguments = '{"message": "hi"}'
-                choice.message.tool_calls = [tc]
-                choice.message.content = None
-            else:
-                choice.finish_reason = "stop"
-                choice.message.tool_calls = None
-                choice.message.content = "done"
-            resp.choices = [choice]
-            resp.usage = MagicMock(prompt_tokens=10, completion_tokens=5)
-            return resp
+                return fake_chat_stream(
+                    tool_calls=[
+                        {"id": "call_1", "name": "notify", "arguments": '{"message": "hi"}'}
+                    ],
+                    finish_reason="tool_calls",
+                )
+            return fake_chat_stream(content="done")
 
         session.client.chat.completions.create = fake_create
         # approve_tools is the real two-phase gate: on denial it stamps a
@@ -3374,23 +3279,14 @@ class TestSubAgentErrorRecall:
 
         def fake_create(**_kwargs):
             calls[0] += 1
-            resp = MagicMock()
-            choice = MagicMock()
             if calls[0] == 1:
-                choice.finish_reason = "tool_calls"
-                tc = MagicMock()
-                tc.id = "call_1"
-                tc.function.name = "bash"
-                tc.function.arguments = '{"command":"false"}'
-                choice.message.tool_calls = [tc]
-                choice.message.content = None
-            else:
-                choice.finish_reason = "stop"
-                choice.message.tool_calls = None
-                choice.message.content = "done"
-            resp.choices = [choice]
-            resp.usage = MagicMock(prompt_tokens=10, completion_tokens=5)
-            return resp
+                return fake_chat_stream(
+                    tool_calls=[
+                        {"id": "call_1", "name": "bash", "arguments": '{"command":"false"}'}
+                    ],
+                    finish_reason="tool_calls",
+                )
+            return fake_chat_stream(content="done")
 
         session.client.chat.completions.create = fake_create
 
@@ -7605,15 +7501,17 @@ def test_utility_completion_records_aux_usage():
     session = _make_session(ui=ui)
     session._provider = MagicMock()
     session._provider.get_capabilities.return_value = ModelCapabilities()
-    session._provider.create_completion.return_value = CompletionResult(
-        content="A Generated Title",
-        usage=UsageInfo(
-            prompt_tokens=120,
-            completion_tokens=8,
-            total_tokens=128,
-            cache_creation_tokens=4,
-            cache_read_tokens=16,
-        ),
+    session._provider.create_streaming.return_value = as_stream(
+        CompletionResult(
+            content="A Generated Title",
+            usage=UsageInfo(
+                prompt_tokens=120,
+                completion_tokens=8,
+                total_tokens=128,
+                cache_creation_tokens=4,
+                cache_read_tokens=16,
+            ),
+        )
     )
 
     session._utility_completion([Turn.user("hi")])
@@ -7639,14 +7537,14 @@ def test_utility_completion_defers_temperature_to_session():
     session.temperature = 0.42
     session._provider = MagicMock()
     session._provider.get_capabilities.return_value = ModelCapabilities()
-    session._provider.create_completion.return_value = CompletionResult(content="x")
+    session._provider.create_streaming.return_value = as_stream(CompletionResult(content="x"))
 
     session._utility_completion([Turn.user("hi")])
-    _, kw = session._provider.create_completion.call_args
+    _, kw = session._provider.create_streaming.call_args
     assert kw["temperature"] == 0.42  # deferred to the session/registry value
 
     session._utility_completion([Turn.user("hi")], temperature=0.9)
-    _, kw2 = session._provider.create_completion.call_args
+    _, kw2 = session._provider.create_streaming.call_args
     assert kw2["temperature"] == 0.9  # explicit override still honored
 
 

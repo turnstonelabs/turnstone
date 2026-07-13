@@ -7,6 +7,7 @@ import time
 from typing import Any
 from unittest.mock import MagicMock
 
+from tests._session_helpers import as_stream
 from tests._session_helpers import mock_completion_result as _mock_result
 from turnstone.core import fence
 from turnstone.core.judge import JudgeConfig
@@ -22,7 +23,7 @@ from turnstone.core.providers._protocol import ModelCapabilities
 def _make_provider(
     content: str = "", *, delay: float = 0.0, raises: Exception | None = None
 ) -> Any:
-    """Build a mock LLMProvider whose create_completion returns the given content."""
+    """Build a mock LLMProvider whose create_streaming returns the given content."""
     provider = MagicMock()
     provider.provider_name = "openai"
     # The judge reads context_window at construction for its oversize guard.
@@ -30,14 +31,14 @@ def _make_provider(
     caps.context_window = 200_000
     provider.get_capabilities = MagicMock(return_value=caps)
 
-    def _create_completion(**_kwargs: Any) -> Any:
+    def _create_streaming(**_kwargs: Any) -> Any:
         if delay:
             time.sleep(delay)
         if raises is not None:
             raise raises
-        return _mock_result(content)
+        return as_stream(_mock_result(content))
 
-    provider.create_completion = _create_completion
+    provider.create_streaming = _create_streaming
     return provider
 
 
@@ -70,7 +71,7 @@ def _make_judge(
 
 class TestCapabilityThreading:
     """#823: the output-guard judge threads resolved capabilities to
-    create_completion, like every other create_completion caller."""
+    create_streaming, like every other sampling lane."""
 
     @staticmethod
     def _recording_provider() -> tuple[Any, dict[str, Any]]:
@@ -78,14 +79,14 @@ class TestCapabilityThreading:
 
         def _cc(**kwargs: Any) -> Any:
             captured.update(kwargs)
-            return _mock_result('{"risk_level": "none", "flags": []}')
+            return as_stream(_mock_result('{"risk_level": "none", "flags": []}'))
 
         provider = MagicMock()
         provider.provider_name = "openai"
         provider.get_capabilities = MagicMock(
             return_value=ModelCapabilities(context_window=200_000)
         )
-        provider.create_completion = MagicMock(side_effect=_cc)
+        provider.create_streaming = MagicMock(side_effect=_cc)
         return provider, captured
 
     def test_fallback_threads_session_capabilities(self) -> None:

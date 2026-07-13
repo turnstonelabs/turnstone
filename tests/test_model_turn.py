@@ -25,13 +25,17 @@ from turnstone.core.model_turn import (
 from turnstone.core.providers._protocol import (
     CompletionResult,
     ModelCapabilities,
+    StreamChunk,
+    ToolCallDelta,
     UsageInfo,
 )
 from turnstone.core.trajectory import Role, ToolCall, Turn
 
 
 class _FakeProvider:
-    """Records every ``create_completion`` call; replays scripted results."""
+    """Records every ``create_streaming`` call; replays scripted results
+    as single-chunk streams (multi-chunk accumulation is pinned by the
+    dedicated ``drain_stream`` unit tests)."""
 
     provider_name = "openai-compatible"
 
@@ -42,9 +46,27 @@ class _FakeProvider:
     def get_capabilities(self, model: str) -> ModelCapabilities:
         return ModelCapabilities()
 
-    def create_completion(self, **kwargs: Any) -> CompletionResult:
+    def create_streaming(self, **kwargs: Any) -> list[StreamChunk]:
         self.calls.append(kwargs)
-        return self.results.pop(0)
+        result = self.results.pop(0)
+        return [
+            StreamChunk(
+                content_delta=result.content or "",
+                reasoning_delta=result.reasoning or "",
+                tool_call_deltas=[
+                    ToolCallDelta(
+                        index=i,
+                        id=tc.get("id", ""),
+                        name=tc.get("function", {}).get("name", ""),
+                        arguments_delta=tc.get("function", {}).get("arguments", ""),
+                    )
+                    for i, tc in enumerate(result.tool_calls or [])
+                ],
+                usage=result.usage,
+                finish_reason=result.finish_reason or "stop",
+                provider_blocks=list(result.provider_blocks or []),
+            )
+        ]
 
 
 def _fake_registry(
@@ -125,7 +147,9 @@ def test_model_turn_returns_usage_verbatim() -> None:
     usage = UsageInfo(prompt_tokens=9, completion_tokens=1, total_tokens=10)
     provider = _FakeProvider([CompletionResult(content="", usage=usage)])
     result = model_turn(_lane(provider), [Turn.user("x")])
-    assert result.usage is usage
+    # Value equality, not identity: ``drain_stream`` max-merges usage across
+    # chunks into its own instance so it never mutates the provider's object.
+    assert result.usage == usage
 
 
 def test_mint_rewrites_mirror_records_map_and_native_keeps_original() -> None:

@@ -18,10 +18,11 @@ first, and never pins shutdown.
 
 from __future__ import annotations
 
+import contextlib
 import queue
 import threading
 import time
-from typing import TYPE_CHECKING, TypeVar
+from typing import TYPE_CHECKING, Any, TypeVar
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -35,6 +36,43 @@ class DeadlineExceededError(Exception):
 
 class DeadlineCancelledError(Exception):
     """The cancel event fired before the call completed."""
+
+
+class StreamAbortRef(list[Any]):
+    """A provider ``cancel_ref`` that can abort the abandoned call's stream.
+
+    Providers append the live SDK stream handle (which has ``.close()``)
+    before yielding the first chunk.  A caller that abandons the daemon
+    worker (deadline/cancel) then calls :meth:`abort` — the captured
+    stream is closed so the worker's blocked HTTP read raises promptly and
+    the thread exits, instead of staying pinned until the provider sends
+    its next SSE chunk (or forever, on a wedged upstream).
+
+    The append hook covers the arrival race: if the abort fires while the
+    worker is still inside the SDK's connect (no handle captured yet), the
+    handle is closed the moment it arrives.  Both paths tolerate double
+    close (SDK ``close()`` is idempotent) so no lock is needed — mirrors
+    ``ChatSession``'s ``_CancelRef``.
+    """
+
+    __slots__ = ("_aborted",)
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._aborted = False
+
+    def append(self, stream: Any) -> None:
+        super().append(stream)
+        if self._aborted:
+            with contextlib.suppress(Exception):
+                stream.close()
+
+    def abort(self) -> None:
+        """Close any captured stream; late arrivals close on append."""
+        self._aborted = True
+        for stream in list(self):
+            with contextlib.suppress(Exception):
+                stream.close()
 
 
 def run_with_deadline(

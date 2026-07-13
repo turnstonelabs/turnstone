@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import json
+from types import SimpleNamespace
 from typing import Any
 from unittest.mock import MagicMock, PropertyMock, patch
 
 import pytest
 
+from tests._session_helpers import fake_anthropic_stream, fake_chat_stream
 from turnstone.core.lowering import repair_wire_messages
 from turnstone.core.providers._openai import OpenAIProvider
 from turnstone.core.providers._openai_chat import OpenAIChatCompletionsProvider
@@ -28,6 +30,7 @@ from turnstone.core.providers._protocol import (
     StreamChunk,
     ToolCallDelta,
     UsageInfo,
+    drain_stream,
 )
 
 # ---------------------------------------------------------------------------
@@ -701,51 +704,35 @@ class TestOpenAIProvider:
         assert results[1].is_first is False
         assert results[2].is_first is False
 
-    def test_completion_basic(self) -> None:
-        response = MagicMock()
-        response.choices = [MagicMock()]
-        response.choices[0].message.content = "Hello world"
-        response.choices[0].message.tool_calls = None
-        response.choices[0].finish_reason = "stop"
-        response.usage.prompt_tokens = 10
-        response.usage.completion_tokens = 5
-        response.usage.total_tokens = 15
-
+    def test_drained_stream_basic(self) -> None:
         client = MagicMock()
-        client.chat.completions.create.return_value = response
+        client.chat.completions.create.return_value = fake_chat_stream(content="Hello world")
 
-        result = self.provider.create_completion(
-            client=client,
-            model="gpt-4o",
-            messages=[{"role": "user", "content": "hi"}],
+        result = drain_stream(
+            self.provider.create_streaming(
+                client=client,
+                model="gpt-4o",
+                messages=[{"role": "user", "content": "hi"}],
+            )
         )
         assert isinstance(result, CompletionResult)
         assert result.content == "Hello world"
         assert result.tool_calls is None
         assert result.finish_reason == "stop"
 
-    def test_completion_with_tools(self) -> None:
-        tc = MagicMock()
-        tc.id = "call_abc"
-        tc.function.name = "read_file"
-        tc.function.arguments = '{"path": "foo.py"}'
-
-        response = MagicMock()
-        response.choices = [MagicMock()]
-        response.choices[0].message.content = None
-        response.choices[0].message.tool_calls = [tc]
-        response.choices[0].finish_reason = "tool_calls"
-        response.usage.prompt_tokens = 8
-        response.usage.completion_tokens = 12
-        response.usage.total_tokens = 20
-
+    def test_drained_stream_with_tools(self) -> None:
         client = MagicMock()
-        client.chat.completions.create.return_value = response
+        client.chat.completions.create.return_value = fake_chat_stream(
+            tool_calls=[{"id": "call_abc", "name": "read_file", "arguments": '{"path": "foo.py"}'}],
+            finish_reason="tool_calls",
+        )
 
-        result = self.provider.create_completion(
-            client=client,
-            model="gpt-4o",
-            messages=[{"role": "user", "content": "read"}],
+        result = drain_stream(
+            self.provider.create_streaming(
+                client=client,
+                model="gpt-4o",
+                messages=[{"role": "user", "content": "read"}],
+            )
         )
         assert result.content == ""
         assert result.tool_calls is not None
@@ -756,23 +743,18 @@ class TestOpenAIProvider:
         assert result.tool_calls[0]["function"]["arguments"] == '{"path": "foo.py"}'
         assert result.finish_reason == "tool_calls"
 
-    def test_completion_usage(self) -> None:
-        response = MagicMock()
-        response.choices = [MagicMock()]
-        response.choices[0].message.content = "ok"
-        response.choices[0].message.tool_calls = None
-        response.choices[0].finish_reason = "stop"
-        response.usage.prompt_tokens = 100
-        response.usage.completion_tokens = 50
-        response.usage.total_tokens = 150
-
+    def test_drained_stream_usage(self) -> None:
         client = MagicMock()
-        client.chat.completions.create.return_value = response
+        client.chat.completions.create.return_value = fake_chat_stream(
+            content="ok", prompt_tokens=100, completion_tokens=50
+        )
 
-        result = self.provider.create_completion(
-            client=client,
-            model="gpt-4o",
-            messages=[{"role": "user", "content": "hi"}],
+        result = drain_stream(
+            self.provider.create_streaming(
+                client=client,
+                model="gpt-4o",
+                messages=[{"role": "user", "content": "hi"}],
+            )
         )
         assert result.usage is not None
         assert result.usage.prompt_tokens == 100
@@ -1087,31 +1069,18 @@ class TestAnthropicProvider:
         assert _normalize_finish_reason("other_reason") == "other_reason"
 
     @patch("turnstone.core.providers._anthropic._ensure_anthropic")
-    def test_completion_basic(self, mock_ensure: MagicMock) -> None:
-        text_block = MagicMock()
-        text_block.type = "text"
-        text_block.text = "Hello world"
-
-        response = MagicMock()
-        response.content = [text_block]
-        response.stop_reason = "end_turn"
-        response.usage = MagicMock()
-        response.usage.input_tokens = 10
-        response.usage.output_tokens = 5
-        response.usage.cache_creation_input_tokens = 0
-        response.usage.cache_read_input_tokens = 0
-
+    def test_drained_stream_basic(self, mock_ensure: MagicMock) -> None:
         client = MagicMock()
-        stream_ctx = MagicMock()
-        stream_ctx.__enter__ = MagicMock(return_value=stream_ctx)
-        stream_ctx.__exit__ = MagicMock(return_value=False)
-        stream_ctx.get_final_message.return_value = response
-        client.messages.stream.return_value = stream_ctx
+        client.messages.stream.return_value = fake_anthropic_stream(
+            [SimpleNamespace(type="text", text="Hello world")]
+        )
 
-        result = self.provider.create_completion(
-            client=client,
-            model="claude-sonnet-4-20250514",
-            messages=[{"role": "user", "content": "hi"}],
+        result = drain_stream(
+            self.provider.create_streaming(
+                client=client,
+                model="claude-sonnet-4-20250514",
+                messages=[{"role": "user", "content": "hi"}],
+            )
         )
         assert isinstance(result, CompletionResult)
         assert result.content == "Hello world"
@@ -1119,37 +1088,24 @@ class TestAnthropicProvider:
         assert result.finish_reason == "stop"
 
     @patch("turnstone.core.providers._anthropic._ensure_anthropic")
-    def test_completion_with_tool_use(self, mock_ensure: MagicMock) -> None:
-        text_block = MagicMock()
-        text_block.type = "text"
-        text_block.text = "Let me read that."
-
-        tool_block = MagicMock()
-        tool_block.type = "tool_use"
-        tool_block.id = "toolu_abc"
-        tool_block.name = "read_file"
-        tool_block.input = {"path": "foo.py"}
-
-        response = MagicMock()
-        response.content = [text_block, tool_block]
-        response.stop_reason = "tool_use"
-        response.usage = MagicMock()
-        response.usage.input_tokens = 15
-        response.usage.output_tokens = 20
-        response.usage.cache_creation_input_tokens = 0
-        response.usage.cache_read_input_tokens = 0
-
+    def test_drained_stream_with_tool_use(self, mock_ensure: MagicMock) -> None:
         client = MagicMock()
-        stream_ctx = MagicMock()
-        stream_ctx.__enter__ = MagicMock(return_value=stream_ctx)
-        stream_ctx.__exit__ = MagicMock(return_value=False)
-        stream_ctx.get_final_message.return_value = response
-        client.messages.stream.return_value = stream_ctx
+        client.messages.stream.return_value = fake_anthropic_stream(
+            [
+                SimpleNamespace(type="text", text="Let me read that."),
+                SimpleNamespace(
+                    type="tool_use", id="toolu_abc", name="read_file", input={"path": "foo.py"}
+                ),
+            ],
+            stop_reason="tool_use",
+        )
 
-        result = self.provider.create_completion(
-            client=client,
-            model="claude-sonnet-4-20250514",
-            messages=[{"role": "user", "content": "read foo.py"}],
+        result = drain_stream(
+            self.provider.create_streaming(
+                client=client,
+                model="claude-sonnet-4-20250514",
+                messages=[{"role": "user", "content": "read foo.py"}],
+            )
         )
         assert result.content == "Let me read that."
         assert result.finish_reason == "tool_calls"
@@ -1162,31 +1118,24 @@ class TestAnthropicProvider:
         assert json.loads(tc["function"]["arguments"]) == {"path": "foo.py"}
 
     @patch("turnstone.core.providers._anthropic._ensure_anthropic")
-    def test_completion_usage(self, mock_ensure: MagicMock) -> None:
-        text_block = MagicMock()
-        text_block.type = "text"
-        text_block.text = "ok"
-
-        response = MagicMock()
-        response.content = [text_block]
-        response.stop_reason = "end_turn"
-        response.usage = MagicMock()
-        response.usage.input_tokens = 100
-        response.usage.output_tokens = 50
-        response.usage.cache_creation_input_tokens = 0
-        response.usage.cache_read_input_tokens = 0
-
+    def test_drained_stream_usage(self, mock_ensure: MagicMock) -> None:
         client = MagicMock()
-        stream_ctx = MagicMock()
-        stream_ctx.__enter__ = MagicMock(return_value=stream_ctx)
-        stream_ctx.__exit__ = MagicMock(return_value=False)
-        stream_ctx.get_final_message.return_value = response
-        client.messages.stream.return_value = stream_ctx
+        client.messages.stream.return_value = fake_anthropic_stream(
+            [SimpleNamespace(type="text", text="ok")],
+            usage=SimpleNamespace(
+                input_tokens=100,
+                output_tokens=50,
+                cache_creation_input_tokens=0,
+                cache_read_input_tokens=0,
+            ),
+        )
 
-        result = self.provider.create_completion(
-            client=client,
-            model="claude-sonnet-4-20250514",
-            messages=[{"role": "user", "content": "hi"}],
+        result = drain_stream(
+            self.provider.create_streaming(
+                client=client,
+                model="claude-sonnet-4-20250514",
+                messages=[{"role": "user", "content": "hi"}],
+            )
         )
         assert result.usage is not None
         assert result.usage.prompt_tokens == 100
@@ -2098,52 +2047,6 @@ class TestGoogleProviderFidelity:
         cleaned = prov._prepare_messages(msgs)
         assert cleaned[0]["tool_calls"][0]["function"] is None
 
-    def test_non_streaming_captures_provider_blocks(self) -> None:
-        from turnstone.core.providers._google import GoogleProvider
-
-        prov = GoogleProvider()
-
-        # Build a mock response with thought_signature in __pydantic_extra__
-        mock_tc = MagicMock()
-        mock_tc.id = "c1"
-        mock_tc.function.name = "write_file"
-        mock_tc.function.arguments = '{"path":"test.txt"}'
-        mock_tc.model_dump.return_value = {
-            "id": "c1",
-            "type": "function",
-            "function": {"name": "write_file", "arguments": '{"path":"test.txt"}'},
-            "thought_signature": "sig_abc",
-        }
-
-        mock_msg = MagicMock()
-        mock_msg.tool_calls = [mock_tc]
-        mock_msg.content = ""
-        mock_msg.annotations = None
-
-        mock_choice = MagicMock()
-        mock_choice.message = mock_msg
-        mock_choice.finish_reason = "tool_calls"
-
-        mock_response = MagicMock()
-        mock_response.choices = [mock_choice]
-        mock_response.usage = None
-
-        mock_client = MagicMock()
-        mock_client.chat.completions.create.return_value = mock_response
-
-        result = prov.create_completion(
-            client=mock_client,
-            model="gemini-2.5-pro",
-            messages=[{"role": "user", "content": "test"}],
-        )
-
-        # Normalised tool_calls should NOT have thought_signature
-        assert result.tool_calls is not None
-        assert "thought_signature" not in result.tool_calls[0]
-        # provider_blocks should have the raw dict WITH thought_signature
-        assert len(result.provider_blocks) == 1
-        assert result.provider_blocks[0]["thought_signature"] == "sig_abc"
-
     def test_prepare_messages_base_class_unchanged(self) -> None:
         """Base class _prepare_messages just calls sanitize_messages."""
         from turnstone.core.providers._openai_chat import OpenAIChatCompletionsProvider
@@ -2218,18 +2121,26 @@ class TestGoogleProviderFidelity:
         assert fc.provider_blocks[0]["id"] == "call_abc"
         assert fc.provider_blocks[0]["function"]["name"] == "write_file"
 
-    def test_base_extract_tool_calls_returns_empty_provider_blocks(self) -> None:
-        """Base class _extract_tool_calls returns empty provider_blocks."""
+    def test_base_chat_lane_emits_no_provider_blocks(self) -> None:
+        """The base chat lane carries NO provider_blocks for tool calls —
+        only the Google subclass's tap captures raw dicts.  Pinned on the
+        drained stream (the one transport) so a base-lane regression that
+        started manufacturing blocks would surface here."""
         from turnstone.core.providers._openai_chat import OpenAIChatCompletionsProvider
 
         prov = OpenAIChatCompletionsProvider()
-        mock_tc = MagicMock()
-        mock_tc.id = "c1"
-        mock_tc.function.name = "test"
-        mock_tc.function.arguments = "{}"
-        tool_calls, provider_blocks = prov._extract_tool_calls([mock_tc])
-        assert len(tool_calls) == 1
-        assert provider_blocks == []
+        client = MagicMock()
+        client.chat.completions.create.return_value = fake_chat_stream(
+            tool_calls=[{"id": "c1", "name": "test", "arguments": "{}"}],
+            finish_reason="tool_calls",
+        )
+        result = drain_stream(
+            prov.create_streaming(
+                client=client, model="m", messages=[{"role": "user", "content": "x"}]
+            )
+        )
+        assert result.tool_calls is not None and len(result.tool_calls) == 1
+        assert result.provider_blocks == []
 
 
 # ===========================================================================
@@ -2868,39 +2779,25 @@ class TestAnthropicWebSearch:
 
         assert _normalize_finish_reason("pause_turn") == "stop"
 
-    def test_completion_skips_server_blocks(self) -> None:
-        """create_completion should skip server_tool_use and web_search_tool_result."""
-        # Build mock response with mixed block types
-        text_block = MagicMock()
-        text_block.type = "text"
-        text_block.text = "Here are the results."
-
-        server_tu_block = MagicMock()
-        server_tu_block.type = "server_tool_use"
-
-        search_result_block = MagicMock()
-        search_result_block.type = "web_search_tool_result"
-
-        response = MagicMock()
-        response.content = [server_tu_block, search_result_block, text_block]
-        response.stop_reason = "end_turn"
-        response.usage.input_tokens = 100
-        response.usage.output_tokens = 50
-        response.usage.cache_creation_input_tokens = 0
-        response.usage.cache_read_input_tokens = 0
-
+    def test_drained_stream_skips_server_blocks(self) -> None:
+        """Server-side blocks surface as transient info (dropped by the
+        drain), never as content or client tool calls."""
         client = MagicMock()
-        stream_ctx = MagicMock()
-        stream_ctx.__enter__ = MagicMock(return_value=stream_ctx)
-        stream_ctx.__exit__ = MagicMock(return_value=False)
-        stream_ctx.get_final_message.return_value = response
-        client.messages.stream.return_value = stream_ctx
+        client.messages.stream.return_value = fake_anthropic_stream(
+            [
+                SimpleNamespace(type="server_tool_use", id="srvtoolu_1", name="web_search"),
+                SimpleNamespace(type="web_search_tool_result"),
+                SimpleNamespace(type="text", text="Here are the results."),
+            ]
+        )
 
         with patch("turnstone.core.providers._anthropic._ensure_anthropic"):
-            result = self.provider.create_completion(
-                client=client,
-                model="claude-opus-4-6",
-                messages=[{"role": "user", "content": "search test"}],
+            result = drain_stream(
+                self.provider.create_streaming(
+                    client=client,
+                    model="claude-opus-4-6",
+                    messages=[{"role": "user", "content": "search test"}],
+                )
             )
         assert result.content == "Here are the results."
         assert result.tool_calls is None
@@ -3225,34 +3122,25 @@ class TestOpenAIWebSearch:
             t.get("function", {}).get("name") == "web_search" for t in call_kwargs.get("tools", [])
         )
 
-    def test_completion_with_annotations(self) -> None:
-        """Non-streaming completion with search model should format citations."""
+    def test_drained_stream_folds_citations_into_content(self) -> None:
+        """The trailing citation info chunk folds back into drained content —
+        the #831 parity rule for what non-streaming citation embedding did."""
         ann = MagicMock()
         ann.type = "url_citation"
         ann.url_citation = MagicMock(title="Test", url="https://test.com")
 
-        msg = MagicMock()
-        msg.content = "Found information."
-        msg.annotations = [ann]
-        msg.tool_calls = None
-
-        choice = MagicMock()
-        choice.message = msg
-        choice.finish_reason = "stop"
-
-        response = MagicMock()
-        response.choices = [choice]
-        response.usage.prompt_tokens = 50
-        response.usage.completion_tokens = 20
-        response.usage.total_tokens = 70
+        chunks = fake_chat_stream(content="Found information.")
+        chunks[0].choices[0].delta.annotations = [ann]
 
         client = MagicMock()
-        client.chat.completions.create.return_value = response
+        client.chat.completions.create.return_value = chunks
 
-        result = self.provider.create_completion(
-            client=client,
-            model="gpt-5-search-api",
-            messages=[{"role": "user", "content": "search test"}],
+        result = drain_stream(
+            self.provider.create_streaming(
+                client=client,
+                model="gpt-5-search-api",
+                messages=[{"role": "user", "content": "search test"}],
+            )
         )
         assert "Found information." in result.content
         assert "Sources:" in result.content
@@ -4161,33 +4049,25 @@ class TestAnthropicPromptCaching:
         assert u.cache_creation_tokens == 0
 
     @patch("turnstone.core.providers._anthropic._ensure_anthropic")
-    def test_completion_cache_metrics(self, mock_ensure: MagicMock) -> None:
-        """Non-streaming completion extracts cache metrics."""
-        response = MagicMock()
-        text_block = MagicMock()
-        text_block.type = "text"
-        text_block.text = "Hello"
-        response.content = [text_block]
-        response.stop_reason = "end_turn"
-
-        usage = MagicMock()
-        usage.input_tokens = 200
-        usage.output_tokens = 30
-        usage.cache_creation_input_tokens = 150
-        usage.cache_read_input_tokens = 50
-        response.usage = usage
-
+    def test_drained_stream_cache_metrics(self, mock_ensure: MagicMock) -> None:
+        """The drained transport carries cache metrics through the max-merge."""
         client = MagicMock()
-        stream_ctx = MagicMock()
-        stream_ctx.__enter__ = MagicMock(return_value=stream_ctx)
-        stream_ctx.__exit__ = MagicMock(return_value=False)
-        stream_ctx.get_final_message.return_value = response
-        client.messages.stream.return_value = stream_ctx
+        client.messages.stream.return_value = fake_anthropic_stream(
+            [SimpleNamespace(type="text", text="Hello")],
+            usage=SimpleNamespace(
+                input_tokens=200,
+                output_tokens=30,
+                cache_creation_input_tokens=150,
+                cache_read_input_tokens=50,
+            ),
+        )
 
-        result = self.provider.create_completion(
-            client=client,
-            model="claude-sonnet-4-6",
-            messages=[{"role": "user", "content": "hi"}],
+        result = drain_stream(
+            self.provider.create_streaming(
+                client=client,
+                model="claude-sonnet-4-6",
+                messages=[{"role": "user", "content": "hi"}],
+            )
         )
         u = result.usage
         assert u is not None
@@ -4249,30 +4129,6 @@ class TestOpenAIPromptCaching:
                 model=model,
                 messages=[{"role": "user", "content": "hi"}],
             )
-        )
-
-        sent = client.chat.completions.create.call_args.kwargs
-        assert "prompt_cache_retention" not in sent
-        assert "prompt_cache_options" not in sent
-
-    @pytest.mark.parametrize("model", ("gpt-5.5-local-lora", "gpt-5.6-local-lora"))
-    def test_chat_compat_completion_omits_commercial_cache_params(self, model: str) -> None:
-        """The non-streaming local lane has the same cache-parameter isolation."""
-        response = MagicMock()
-        response.choices = [
-            MagicMock(
-                message=MagicMock(content="hello", tool_calls=None, annotations=None),
-                finish_reason="stop",
-            )
-        ]
-        response.usage = None
-        client = MagicMock()
-        client.chat.completions.create.return_value = response
-
-        self.provider.create_completion(
-            client=client,
-            model=model,
-            messages=[{"role": "user", "content": "hi"}],
         )
 
         sent = client.chat.completions.create.call_args.kwargs
@@ -4375,34 +4231,19 @@ class TestOpenAIPromptCaching:
         assert u.cache_read_tokens == 80
         assert u.cache_creation_tokens == 0
 
-    def test_completion_cached_tokens(self) -> None:
-        """Non-streaming completion extracts cached_tokens."""
-        response = MagicMock()
-        msg = MagicMock()
-        msg.content = "Hello"
-        msg.tool_calls = None
-        msg.annotations = None
-        choice = MagicMock()
-        choice.message = msg
-        choice.finish_reason = "stop"
-        response.choices = [choice]
-
-        usage = MagicMock()
-        usage.prompt_tokens = 200
-        usage.completion_tokens = 30
-        usage.total_tokens = 230
-        ptd = MagicMock()
-        ptd.cached_tokens = 150
-        usage.prompt_tokens_details = ptd
-        response.usage = usage
-
+    def test_drained_stream_cached_tokens(self) -> None:
+        """Cached-token details on the trailing usage chunk survive the drain."""
+        chunks = fake_chat_stream(content="hi", prompt_tokens=200, completion_tokens=30)
+        chunks[-1].usage.prompt_tokens_details = SimpleNamespace(cached_tokens=150)
         client = MagicMock()
-        client.chat.completions.create.return_value = response
+        client.chat.completions.create.return_value = chunks
 
-        result = self.provider.create_completion(
-            client=client,
-            model="gpt-5.1",
-            messages=[{"role": "user", "content": "hi"}],
+        result = drain_stream(
+            self.provider.create_streaming(
+                client=client,
+                model="gpt-5.1",
+                messages=[{"role": "user", "content": "hi"}],
+            )
         )
         u = result.usage
         assert u is not None
@@ -4505,34 +4346,49 @@ class TestOpenAIResponsesProvider:
 
 
 class TestOpenAIChatReasoningCapture:
-    """Non-streaming ``create_completion`` surfaces the Chat-Completions
-    lane's non-canonical reasoning (vLLM ``--reasoning-parser``, llama.cpp
-    ``reasoning_format``) as ``CompletionResult.reasoning`` — the twin of the
-    streaming path's ``reasoning_delta`` extraction, same attribute pair and
-    precedence."""
+    """The drained stream surfaces the Chat-Completions lane's non-canonical
+    reasoning (vLLM ``--reasoning-parser``, llama.cpp ``reasoning_format``)
+    as ``CompletionResult.reasoning`` — the shared ``_reasoning_text``
+    extractor owns the attribute pair and precedence, so delta and message
+    shapes cannot drift."""
 
     @staticmethod
     def _client(*, reasoning: Any = None, reasoning_content: Any = None) -> MagicMock:
-        msg = MagicMock()
-        msg.content = "ok"
-        msg.tool_calls = None
-        msg.annotations = None
-        msg.reasoning = reasoning
-        msg.reasoning_content = reasoning_content
-        choice = MagicMock()
-        choice.message = msg
-        choice.finish_reason = "stop"
-        resp = MagicMock()
-        resp.choices = [choice]
-        resp.usage = None
+        delta = SimpleNamespace(
+            content="ok",
+            tool_calls=None,
+            annotations=None,
+            reasoning=reasoning,
+            reasoning_content=reasoning_content,
+        )
+        chunks = [
+            SimpleNamespace(choices=[SimpleNamespace(finish_reason=None, delta=delta)], usage=None),
+            SimpleNamespace(
+                choices=[
+                    SimpleNamespace(
+                        finish_reason="stop",
+                        delta=SimpleNamespace(
+                            content=None,
+                            tool_calls=None,
+                            annotations=None,
+                            reasoning=None,
+                            reasoning_content=None,
+                        ),
+                    )
+                ],
+                usage=None,
+            ),
+        ]
         client = MagicMock()
-        client.chat.completions.create.return_value = resp
+        client.chat.completions.create.return_value = chunks
         return client
 
     def _complete(self, client: MagicMock):
         provider = OpenAIChatCompletionsProvider()
-        return provider.create_completion(
-            client=client, model="m", messages=[{"role": "user", "content": "hi"}]
+        return drain_stream(
+            provider.create_streaming(
+                client=client, model="m", messages=[{"role": "user", "content": "hi"}]
+            )
         )
 
     def test_reasoning_content_captured(self) -> None:
@@ -5216,95 +5072,111 @@ class TestResponsesStreaming:
         assert "complete" in info[1].info_delta
 
 
-class TestResponsesCompletion:
-    """Tests for non-streaming Responses API completion."""
+class TestResponsesDrainedStream:
+    """The drained Responses stream reproduces what ``_parse_response`` used
+    to extract from a whole ``Response`` object — content, tool calls,
+    provider_blocks, status→finish mapping (``response.incomplete`` is the
+    real truncation terminal), and usage."""
 
     def setup_method(self) -> None:
-        from turnstone.core.providers._openai_responses import OpenAIResponsesProvider
+        from turnstone.core.providers import OpenAIResponsesProvider
 
         self.provider = OpenAIResponsesProvider()
 
-    def _make_response(
-        self,
-        text: str = "Hello",
-        tool_calls: list[dict[str, Any]] | None = None,
+    @staticmethod
+    def _make_events(
+        text: str = "",
+        tool_calls: list[dict[str, str]] | None = None,
         status: str = "completed",
-    ) -> MagicMock:
-        resp = MagicMock()
-        resp.status = status
-        resp.usage = MagicMock()
-        resp.usage.input_tokens = 10
-        resp.usage.output_tokens = 5
-        resp.usage.total_tokens = 15
-        resp.usage.input_tokens_details = MagicMock(cached_tokens=0)
-        # Remove Chat Completions attributes
-        del resp.usage.prompt_tokens
-        del resp.usage.completion_tokens
-        del resp.usage.prompt_tokens_details
-
-        output: list[Any] = []
+    ) -> list[Any]:
+        events: list[Any] = []
         if text:
-            msg = MagicMock()
-            msg.type = "message"
-            text_part = MagicMock()
-            text_part.type = "output_text"
-            text_part.text = text
-            text_part.annotations = []
-            msg.content = [text_part]
-            msg.model_dump.return_value = {
+            events.append(SimpleNamespace(type="response.output_text.delta", delta=text))
+            msg_item = SimpleNamespace(type="message", content=[])
+            msg_item.model_dump = lambda **_kw: {  # type: ignore[method-assign]
                 "type": "message",
                 "content": [{"type": "output_text", "text": text}],
             }
-            output.append(msg)
-        if tool_calls:
-            for tc in tool_calls:
-                item = MagicMock()
-                item.type = "function_call"
-                item.call_id = tc["id"]
-                item.name = tc["name"]
-                item.arguments = tc["arguments"]
-                item.model_dump.return_value = {
-                    "type": "function_call",
-                    "call_id": tc["id"],
-                    "name": tc["name"],
-                    "arguments": tc["arguments"],
-                }
-                output.append(item)
-        resp.output = output
-        return resp
+            events.append(SimpleNamespace(type="response.output_item.done", item=msg_item))
+        for tc in tool_calls or []:
+            item = SimpleNamespace(
+                type="function_call",
+                call_id=tc["id"],
+                id=f"item_{tc['id']}",
+                name=tc["name"],
+            )
+            item.model_dump = lambda tc=tc, **_kw: {  # type: ignore[method-assign]
+                "type": "function_call",
+                "call_id": tc["id"],
+                "name": tc["name"],
+                "arguments": tc["arguments"],
+            }
+            events.append(SimpleNamespace(type="response.output_item.added", item=item))
+            events.append(
+                SimpleNamespace(
+                    type="response.function_call_arguments.delta",
+                    item_id=f"item_{tc['id']}",
+                    delta=tc["arguments"],
+                )
+            )
+            events.append(SimpleNamespace(type="response.output_item.done", item=item))
+        terminal_type = "response.completed" if status == "completed" else "response.incomplete"
+        usage = SimpleNamespace(
+            input_tokens=10,
+            output_tokens=5,
+            total_tokens=15,
+            input_tokens_details=SimpleNamespace(cached_tokens=0),
+        )
+        events.append(
+            SimpleNamespace(
+                type=terminal_type,
+                response=SimpleNamespace(status=status, usage=usage),
+            )
+        )
+        return events
+
+    def _drain(self, events: list[Any]):
+        client = MagicMock()
+        client.responses.create.return_value = events
+        return drain_stream(
+            self.provider.create_streaming(
+                client=client, model="gpt-5.1", messages=[{"role": "user", "content": "hi"}]
+            )
+        )
 
     def test_basic_text_completion(self) -> None:
-        resp = self._make_response(text="Hello world")
-        result = self.provider._parse_response(resp)
+        result = self._drain(self._make_events(text="Hello world"))
         assert result.content == "Hello world"
         assert result.tool_calls is None
         assert result.finish_reason == "stop"
 
     def test_completion_with_tool_calls(self) -> None:
-        resp = self._make_response(
-            text="",
-            tool_calls=[{"id": "call_1", "name": "read_file", "arguments": '{"path": "/tmp"}'}],
+        result = self._drain(
+            self._make_events(
+                tool_calls=[{"id": "call_1", "name": "read_file", "arguments": '{"path": "/tmp"}'}]
+            )
         )
-        result = self.provider._parse_response(resp)
         assert result.tool_calls is not None
         assert len(result.tool_calls) == 1
         assert result.tool_calls[0]["id"] == "call_1"
         assert result.tool_calls[0]["function"]["name"] == "read_file"
 
     def test_provider_blocks_captured(self) -> None:
-        resp = self._make_response(text="Hello")
-        result = self.provider._parse_response(resp)
+        result = self._drain(self._make_events(text="Hello"))
         assert len(result.provider_blocks) > 0
         assert result.provider_blocks[0]["type"] == "message"
 
     def test_incomplete_status_maps_to_length(self) -> None:
-        resp = self._make_response(text="Partial", status="incomplete")
-        result = self.provider._parse_response(resp)
+        # ``response.incomplete`` terminal event: finish maps to length and
+        # the final usage/blocks still attach (the un-widened handler used
+        # to drop all three on truncated runs).
+        result = self._drain(self._make_events(text="Partial", status="incomplete"))
         assert result.finish_reason == "length"
+        assert result.usage is not None
+        assert result.provider_blocks
 
     def test_usage_extraction(self) -> None:
-        resp = self._make_response(text="Hi")
-        result = self.provider._parse_response(resp)
+        result = self._drain(self._make_events(text="Hi"))
         assert result.usage is not None
         assert result.usage.prompt_tokens == 10
         assert result.usage.completion_tokens == 5
