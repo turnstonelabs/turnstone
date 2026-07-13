@@ -27,6 +27,7 @@ from typing import Any
 from unittest.mock import MagicMock, patch
 
 from tests._session_helpers import make_session as _make_session
+from turnstone.core.trajectory import Turn
 
 
 def _registry_with_flag(persist: bool = True, replay: bool = False) -> Any:
@@ -626,7 +627,14 @@ class TestUtilityCompletionPassesFlag:
 
         def capture_completion(**kwargs: Any) -> Any:
             captured.update(kwargs)
-            return SimpleNamespace(content="title", finish_reason="stop", usage=None)
+            return SimpleNamespace(
+                content="title",
+                tool_calls=None,
+                finish_reason="stop",
+                usage=None,
+                provider_blocks=[],
+                reasoning="",
+            )
 
         mock_provider = MagicMock()
         mock_provider.create_completion = capture_completion
@@ -637,7 +645,7 @@ class TestUtilityCompletionPassesFlag:
             patch.object(session, "_provider_extra_params", return_value=None),
         ):
             session._utility_completion(
-                messages=[{"role": "user", "content": "summarize"}],
+                [Turn.user("summarize")],
                 max_tokens=512,
                 temperature=0.3,
             )

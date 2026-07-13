@@ -27,8 +27,10 @@ from typing import Any
 
 from openai import OpenAI
 
+from turnstone.core.model_turn import model_turn, resolve_lane
 from turnstone.core.providers import LLMProvider, create_provider
 from turnstone.core.session import ChatSession
+from turnstone.core.trajectory import Role, Turn
 from turnstone.eval.core import (
     _MCP_ONLY_TOOLS,
     BOLD,
@@ -237,6 +239,9 @@ def _diversify_prompts(
     user_prompt is always included as the first variant.
     """
     prov = provider or create_provider("openai")
+    # Temperature is not pinned (house rule) — sampling diversity for the
+    # paraphraser belongs in the diversifier model's own configuration.
+    lane = resolve_lane(prov, client, model)
     result: dict[str, list[str]] = {}
 
     for ci, case in enumerate(cases):
@@ -291,15 +296,10 @@ def _diversify_prompts(
         )
 
         try:
-            cr = prov.create_completion(
-                client=client,
-                model=model,
-                messages=[
-                    {"role": "system", "content": DIVERSIFIER_SYSTEM},
-                    {"role": "user", "content": user_content},
-                ],
+            cr = model_turn(
+                lane,
+                [Turn.system(DIVERSIFIER_SYSTEM), Turn.user(user_content)],
                 max_tokens=8192,
-                temperature=0.8,
                 reasoning_effort="low",
             )
             raw = (cr.content or "").strip()
@@ -447,15 +447,10 @@ def _observe_and_update_optimizer(
     )
 
     prov = provider or create_provider("openai")
-    cr = prov.create_completion(
-        client=client,
-        model=model,
-        messages=[
-            {"role": "system", "content": OBSERVER_SYSTEM},
-            {"role": "user", "content": user_content},
-        ],
+    cr = model_turn(
+        resolve_lane(prov, client, model),
+        [Turn.system(OBSERVER_SYSTEM), Turn.user(user_content)],
         max_tokens=8192,
-        temperature=0.3,
         reasoning_effort="low",
     )
 
@@ -762,52 +757,50 @@ def _run_analyst(
         )
 
     prov = provider or create_provider("openai")
-    messages: list[dict[str, Any]] = [
-        {"role": "system", "content": analyst_system},
-        {"role": "user", "content": user_content},
+    turns: list[Turn] = [
+        Turn.system(analyst_system),
+        Turn.user(user_content),
     ]
 
-    # Multi-turn loop: let the analyst call tools up to 5 rounds
+    # Multi-turn loop: let the analyst call tools up to 5 rounds.
+    # Temperature is not pinned (house rule) — the analyst model's own
+    # configuration governs sampling.
+    lane = resolve_lane(prov, client, model)
     max_turns = 5
     for _turn in range(max_turns):
-        cr = prov.create_completion(
-            client=client,
-            model=model,
-            messages=messages,
+        mtr = model_turn(
+            lane,
+            turns,
             tools=_ANALYST_TOOLS,
             max_tokens=8192,
-            temperature=0.3,
             reasoning_effort="medium",
         )
 
-        assistant_msg: dict[str, Any] = {
-            "role": "assistant",
-            "content": cr.content or None,
-        }
-        if cr.tool_calls:
-            assistant_msg["tool_calls"] = cr.tool_calls[:5]
-        messages.append(assistant_msg)
+        # Same degenerate-repetition cap as before; a capped turn drops its
+        # native lane rather than replay orphan native tool blocks the
+        # mirror no longer carries.
+        capped = mtr.tool_calls[:5]
+        assistant_turn = mtr.turn
+        if len(mtr.tool_calls) > len(capped):
+            assistant_turn = Turn.assistant(
+                mtr.content, tool_calls=mtr.turn.tool_calls[: len(capped)]
+            )
+        turns.append(assistant_turn)
 
-        if not cr.tool_calls:
+        if not capped:
             break
 
         # Execute tool calls
-        for tc in assistant_msg["tool_calls"]:
+        for tc in capped:
             func_name = tc["function"]["name"]
             output = _exec_analyst_tool(func_name, tc["function"]["arguments"])
-            messages.append(
-                {
-                    "role": "tool",
-                    "tool_call_id": tc["id"],
-                    "content": output,
-                }
-            )
+            turns.append(Turn.tool(tc["id"], output))
 
     # Extract final text response
     result = ""
-    for msg in reversed(messages):
-        if msg["role"] == "assistant" and msg.get("content"):
-            result = msg["content"]
+    for t in reversed(turns):
+        if t.role is Role.ASSISTANT and t.text:
+            result = t.text
             break
 
     # Strip reasoning tags if present
@@ -920,15 +913,10 @@ def _propose_tool_overrides(
     )
 
     prov = provider or create_provider("openai")
-    cr = prov.create_completion(
-        client=client,
-        model=model,
-        messages=[
-            {"role": "system", "content": TOOL_OPTIMIZER_SYSTEM},
-            {"role": "user", "content": user_content},
-        ],
+    cr = model_turn(
+        resolve_lane(prov, client, model),
+        [Turn.system(TOOL_OPTIMIZER_SYSTEM), Turn.user(user_content)],
         max_tokens=8192,
-        temperature=0.3,
         reasoning_effort="medium",
     )
 
@@ -1067,15 +1055,10 @@ def _propose_prompt_modification(
     )
 
     prov = provider or create_provider("openai")
-    cr = prov.create_completion(
-        client=client,
-        model=model,
-        messages=[
-            {"role": "system", "content": optimizer_system},
-            {"role": "user", "content": user_content},
-        ],
+    cr = model_turn(
+        resolve_lane(prov, client, model),
+        [Turn.system(optimizer_system), Turn.user(user_content)],
         max_tokens=16384,
-        temperature=0.6,
         reasoning_effort="medium",
     )
 

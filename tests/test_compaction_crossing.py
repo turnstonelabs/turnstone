@@ -115,7 +115,7 @@ class TestSummaryTurnProvenance:
             session._generate_title()
 
         uc.assert_called_once()
-        prompt = uc.call_args[0][0][-1]["content"]
+        prompt = uc.call_args[0][0][-1].text
         assert COMPACTION_SUMMARY_LABEL in prompt  # titled FROM the real message
 
 

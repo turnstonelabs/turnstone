@@ -506,6 +506,7 @@ def model_turn(
     reasoning_effort: str = "medium",
     mint: Callable[[str], str] | None = None,
     wire_id_map: dict[str, str] | None = None,
+    resolve_attachments: Callable[[list[str]], dict[str, Any]] | None = None,
 ) -> ModelTurnResult:
     """Advance a trajectory by one model turn: lower, sample, re-ingest.
 
@@ -523,6 +524,13 @@ def model_turn(
     value — the alias's ``ModelConfig.temperature``, or the provider
     default when unset.  House rule: never pin a temperature in code; pass
     an explicit float only to relay an operator-resolved knob.
+
+    *resolve_attachments* materializes by-reference ``AttachmentRef``
+    content at the provider translator (``{type: kind, attachment_id}``
+    placeholders → inline parts; one id may expand to several parts, e.g.
+    a rasterized PDF).  Turn IR never carries inline media bytes — a lane
+    with non-text content passes refs plus this resolver, exactly like the
+    main loop's wire path.
 
     *mint* rewrites each returned tool call's id (provider-original →
     caller-scoped) before the Turn is built; the native blocks keep the
@@ -563,6 +571,8 @@ def model_turn(
             lane.registry, lane.alias, caps=lane.capabilities
         ),
     }
+    if resolve_attachments is not None:
+        call_kwargs["resolve_attachments"] = resolve_attachments
     effective_temperature = temperature if temperature is not None else lane.temperature
     if effective_temperature is not None:
         call_kwargs["temperature"] = effective_temperature

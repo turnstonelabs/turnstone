@@ -30,6 +30,7 @@ from tests._session_helpers import make_session as _make_session
 from turnstone.core.providers._anthropic import AnthropicProvider
 from turnstone.core.providers._openai_chat import OpenAIChatCompletionsProvider
 from turnstone.core.providers._openai_responses import OpenAIResponsesProvider
+from turnstone.core.trajectory import turns_from_dicts
 
 
 def _vllm_registry(*, replay: bool = True, alias: str = "qwen3") -> Any:
@@ -403,7 +404,12 @@ class TestCallSitesInvokeMaybeAttach:
         def capture_completion(**kwargs: Any) -> Any:
             captured.update(kwargs)
             return SimpleNamespace(
-                content="", tool_calls=[], usage=None, raw_blocks=None, provider_blocks=None
+                content="",
+                tool_calls=None,
+                finish_reason="stop",
+                usage=None,
+                provider_blocks=[],
+                reasoning="",
             )
 
         provider = OpenAIChatCompletionsProvider()
@@ -417,7 +423,7 @@ class TestCallSitesInvokeMaybeAttach:
             ),
         ):
             session._utility_completion(
-                messages=[_assistant_msg_with_thinking("from utility")],
+                turns_from_dicts([_assistant_msg_with_thinking("from utility")]),
             )
 
         msgs_sent = captured["messages"]

@@ -685,7 +685,7 @@ class TestChunkedCompaction:
         recorded: list[int] = []
 
         def fake_uc(messages, **_kwargs):
-            body = messages[1]["content"]
+            body = messages[1].text
             prefix = session._COMPACT_USER_PREFIX
             if body.startswith(prefix):
                 body = body[len(prefix) :]

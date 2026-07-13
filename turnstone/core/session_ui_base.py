@@ -3145,7 +3145,7 @@ class SessionUIBase:
 
         Title generation, conversation compaction, web-fetch
         summarisation, and task sub-agents all run through the
-        provider's non-streaming ``create_completion`` and never reach
+        non-streaming ``model_turn`` seam and never reach
         :meth:`on_status` — so without this their tokens are invisible to
         the governance usage dashboard, undercounting real consumption
         (potentially by a large factor for agent-heavy workstreams).

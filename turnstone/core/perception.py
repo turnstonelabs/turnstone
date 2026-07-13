@@ -20,10 +20,11 @@ configured STT model still wins for audio — perception only fills the remainin
 gap.  Point it at an omni model (text+vision+audio) to cover every modality from
 one alias; a vision-only model covers image/PDF and is simply skipped for audio.
 
-The call goes through the provider abstraction's ``create_completion`` (the same
-path the intent judge uses for its secondary model), so any provider works; the
-parts are OpenAI-shaped (``image_url`` / ``input_audio``) and the provider
-translates them to its own wire form.
+The call goes through :func:`turnstone.core.model_turn.model_turn` (the shared
+plant-call seam, #827), so any provider works: the trajectory carries the
+attachment by reference and the pre-built OpenAI-shaped parts (``image_url`` /
+``input_audio``) materialize at the provider translator via the
+``resolve_attachments`` callback, exactly like the main loop's wire path.
 """
 
 from __future__ import annotations
@@ -32,11 +33,24 @@ import threading
 from typing import TYPE_CHECKING, Any
 
 from turnstone.core.log import get_logger
+from turnstone.core.model_turn import model_turn, resolve_lane
+from turnstone.core.trajectory import AttachmentRef, Role, TextBlock, Turn
 
 if TYPE_CHECKING:
     from turnstone.core.providers._protocol import LLMProvider
 
 log = get_logger(__name__)
+
+# The single by-reference id inside a perception trajectory.  Perception
+# trajectories are ephemeral one-shot requests (never persisted, never
+# displayed), so the id only needs intra-request consistency between the
+# placeholder and the resolver mapping.
+_PERCEPTION_REF_ID = "perception-input"
+
+# Placeholder ``kind`` per part shape — cosmetic for an ephemeral trajectory
+# (the resolver replaces the placeholder wholesale) but kept honest for
+# debuggability.
+_PART_KINDS = {"image_url": "image", "input_audio": "audio"}
 
 # Config key naming the model used for perception fallbacks.
 PERCEPTION_SETTING = "perception.model_alias"
@@ -64,21 +78,34 @@ def describe(
 ) -> str:
     """Perceive ``parts`` via the perception model, returning the text.
 
-    ``parts`` are OpenAI-shaped content parts — ``image_url`` for image/PDF-page
-    perception, ``input_audio`` for audio (the provider translates them to its
-    own wire shape).  Raises :class:`PerceptionBackendError` if the backend call
-    fails.  Never caches — see :func:`describe_cached`.
+    ``parts`` are pre-built OpenAI-shaped content parts — ``image_url`` for
+    image/PDF-page perception, ``input_audio`` for audio.  The trajectory
+    carries them by reference; ``model_turn`` hands the resolver to the
+    provider translator, which materializes the placeholder into these exact
+    parts (one ref may expand to many, e.g. a rasterized PDF).  Temperature
+    is not pinned (house rule) — the perception model's own configuration
+    governs sampling.  Raises :class:`PerceptionBackendError` if the backend
+    call fails.  Never caches — see :func:`describe_cached`.
     """
     if not parts:
         return ""
-    messages = [{"role": "user", "content": [{"type": "text", "text": prompt}, *parts]}]
+    kind = _PART_KINDS.get(str(parts[0].get("type", "")), "document")
+    turns = [
+        Turn(
+            role=Role.USER,
+            content=(
+                TextBlock(prompt),
+                AttachmentRef(attachment_id=_PERCEPTION_REF_ID, kind=kind),
+            ),
+        )
+    ]
+    lane = resolve_lane(provider, client, model)
     try:
-        result = provider.create_completion(
-            client=client,
-            model=model,
-            messages=messages,
+        result = model_turn(
+            lane,
+            turns,
             max_tokens=4096,
-            temperature=0.2,
+            resolve_attachments=lambda _ids: {_PERCEPTION_REF_ID: parts},
         )
     except Exception as exc:
         raise PerceptionBackendError(f"perception backend failed: {exc}") from exc

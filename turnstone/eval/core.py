@@ -30,11 +30,12 @@ from typing import Any
 
 from openai import OpenAI
 
+from turnstone.core.model_turn import ModelLane, model_turn
 from turnstone.core.providers import LLMProvider, create_client, create_provider
 from turnstone.core.session import ChatSession
 from turnstone.core.storage import get_storage, init_storage, reset_storage
 from turnstone.core.tools import INTERACTIVE_TOOLS, PRIMARY_KEY_MAP
-from turnstone.core.trajectory import Role, turn_from_dict
+from turnstone.core.trajectory import Role, Turn, turn_from_dict, turns_from_dicts
 
 # Eval evaluates interactive-session agent behaviour — coordinator tools
 # require a console-hosted session and aren't exercised by the harness.
@@ -299,8 +300,21 @@ class HeadlessSession(ChatSession):
             tool: str, args: dict, result: str (truncated), turn: int
         """
         self.tool_call_log = []
-        self.messages.append(turn_from_dict({"role": "user", "content": user_input}))
+        self.messages.append(Turn.user(user_input))
         self._msg_tokens.append(max(1, int(len(user_input) / self._chars_per_token)))
+
+        # The eval lane — resolved once per run, like the sub-agent seam.
+        # ``temperature`` relays the harness's operator-resolved knob per
+        # call below (house rule: relay, never pin).
+        lane = ModelLane(
+            provider=self._provider,
+            client=self.client,
+            model=self.model,
+            alias=self._model_alias or "",
+            capabilities=self._get_capabilities(),
+            extra_params=self._provider_extra_params(),
+            registry=self._registry,
+        )
 
         for turn in range(max_turns):
             if self._cancelled.is_set():
@@ -310,20 +324,20 @@ class HeadlessSession(ChatSession):
                 _log(f"{log_prefix}  turn {turn}: calling API...", dim=True)
 
             t0 = time.monotonic()
-            msgs = self._full_messages()
+            # System prompts live as wire dicts on the session; bridge them to
+            # Turn IR so the whole trajectory lowers through the shared seam.
+            turns = turns_from_dicts(self.system_messages) + self.messages
 
             if self._cancelled.is_set():
                 break
 
-            result = self._provider.create_completion(
-                client=self.client,
-                model=self.model,
-                messages=msgs,
+            result = model_turn(
+                lane,
+                turns,
                 tools=self._eval_tools,
                 max_tokens=self.max_tokens,
                 temperature=self.temperature,
                 reasoning_effort=self.reasoning_effort,
-                extra_params=self._provider_extra_params(),
             )
             elapsed = time.monotonic() - t0
 
@@ -331,17 +345,21 @@ class HeadlessSession(ChatSession):
                 self._total_usage["prompt"] += result.usage.prompt_tokens
                 self._total_usage["completion"] += result.usage.completion_tokens
 
-            assistant_msg: dict[str, Any] = {
-                "role": "assistant",
-                "content": result.content or None,
-            }
+            # Cap parallel tool calls to prevent degenerate repetition.  The
+            # cap applies to the mirror AND the appended turn; a capped turn
+            # drops its native lane rather than replaying orphan native
+            # tool_use blocks the mirror no longer carries.
+            capped_calls = (result.tool_calls or [])[:10]
+            assistant_turn = result.turn
+            if len(result.tool_calls) > len(capped_calls):
+                assistant_turn = Turn(
+                    role=Role.ASSISTANT,
+                    content=assistant_turn.content,
+                    tool_calls=assistant_turn.tool_calls[: len(capped_calls)],
+                )
 
-            if result.tool_calls:
-                # Cap parallel tool calls to prevent degenerate repetition
-                assistant_msg["tool_calls"] = result.tool_calls[:10]
-
-            self.messages.append(turn_from_dict(assistant_msg))
-            msg_len = len(assistant_msg.get("content") or "")
+            self.messages.append(assistant_turn)
+            msg_len = len(result.content or "")
             self._msg_tokens.append(max(1, int(msg_len / self._chars_per_token)))
 
             # Log usage and content
@@ -355,27 +373,27 @@ class HeadlessSession(ChatSession):
                     f"{log_prefix}  turn {turn}: response in {elapsed:.1f}s{toks}",
                     dim=True,
                 )
-                if assistant_msg["content"]:
-                    text = assistant_msg["content"][:200]
-                    if len(assistant_msg["content"]) > 200:
+                if result.content:
+                    text = result.content[:200]
+                    if len(result.content) > 200:
                         text += "..."
                     _log(f"{log_prefix}    content: {text}", dim=True)
 
-            if not result.tool_calls:
+            if not capped_calls:
                 if verbose:
                     _log(f"{log_prefix}  turn {turn}: no tool calls, done", dim=True)
                 break
 
             # Log tool calls
             if verbose:
-                names = [tc["function"]["name"] for tc in result.tool_calls]
+                names = [tc["function"]["name"] for tc in capped_calls]
                 _log(f"{log_prefix}  turn {turn}: tools -> {names}")
 
             # Execute tools (NullUI discards session output; tools return
             # results as strings, not via stdout)
-            results, _ = self._execute_tools(assistant_msg["tool_calls"])
+            results, _ = self._execute_tools(capped_calls)
 
-            for tc, (tc_id, raw_output) in zip(assistant_msg["tool_calls"], results, strict=False):
+            for tc, (tc_id, raw_output) in zip(capped_calls, results, strict=False):
                 # Flatten list content (image tool results) to text for logging
                 if isinstance(raw_output, list):
                     output = " ".join(
@@ -415,6 +433,9 @@ class HeadlessSession(ChatSession):
                     _log(f"{log_prefix}    {func_name}({arg_summary})", dim=False)
                     _log(f"{log_prefix}      -> {result_preview}", dim=True)
 
+                # ``raw_output`` may be multipart (image tool results carry
+                # by-reference parts) — the dict↔Turn strangler bridge is the
+                # canonical adapter for that shape.
                 tool_msg = {
                     "role": "tool",
                     "tool_call_id": tc_id,

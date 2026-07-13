@@ -11,6 +11,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+from tests._session_helpers import mock_completion_result
 from turnstone.core.session import _IMAGE_EXTENSIONS, _IMAGE_SIZE_CAP, ChatSession
 from turnstone.core.trajectory import (
     Turn,
@@ -1730,7 +1731,7 @@ class TestTitleRetry:
                 {"role": "assistant", "content": "Hi there"},
             ]
         )
-        result = MagicMock()
+        result = mock_completion_result()
         result.content = "Test Title"
         session._provider = MagicMock()
         session._provider.get_capabilities.return_value = ModelCapabilities()
@@ -1755,7 +1756,7 @@ class TestTitleRetry:
         session = _make_session()
         session._title_generated = True
         session.messages = turns_from_dicts([{"role": "user", "content": "hi"}])
-        result = MagicMock()
+        result = mock_completion_result()
         result.content = (
             "<think>The user greets me; a fitting title would be...</think>\n\n"
             '**"Cluster Routing Deep-Dive"**'
@@ -1789,7 +1790,7 @@ class TestTitleRetry:
         session = _make_session()
         session._title_generated = True
         session.messages = turns_from_dicts([{"role": "user", "content": "hi"}])
-        result = MagicMock()
+        result = mock_completion_result()
         result.content = "<think>still reasoning, never closed before the cap"
         session._provider = MagicMock()
         session._provider.get_capabilities.return_value = ModelCapabilities()
@@ -1819,7 +1820,7 @@ class TestTitleRetry:
             session = _make_session()
             session._title_generated = True
             session.messages = turns_from_dicts([{"role": "user", "content": "hi"}])
-            result = MagicMock()
+            result = mock_completion_result()
             result.content = content
             session._provider = MagicMock()
             session._provider.get_capabilities.return_value = ModelCapabilities()
@@ -1842,7 +1843,7 @@ class TestTitleRetry:
         session = _make_session()
         session._title_generated = True
         session.messages = turns_from_dicts([{"role": "user", "content": "hi"}])
-        result = MagicMock()
+        result = mock_completion_result()
         result.content = "Story " * 40  # 240 chars on one line
         session._provider = MagicMock()
         session._provider.get_capabilities.return_value = ModelCapabilities()
@@ -1869,7 +1870,7 @@ class TestTitleRetry:
             ]
         )
         original_ws_id = session._ws_id
-        result = MagicMock()
+        result = mock_completion_result()
         result.content = "Test Title"
         session._provider = MagicMock()
         session._provider.get_capabilities.return_value = ModelCapabilities()
@@ -7613,7 +7614,7 @@ def test_utility_completion_records_aux_usage():
         ),
     )
 
-    session._utility_completion([{"role": "user", "content": "hi"}])
+    session._utility_completion([Turn.user("hi")])
 
     assert len(ui.aux_calls) == 1
     rec = ui.aux_calls[0]
@@ -7638,11 +7639,11 @@ def test_utility_completion_defers_temperature_to_session():
     session._provider.get_capabilities.return_value = ModelCapabilities()
     session._provider.create_completion.return_value = CompletionResult(content="x")
 
-    session._utility_completion([{"role": "user", "content": "hi"}])
+    session._utility_completion([Turn.user("hi")])
     _, kw = session._provider.create_completion.call_args
     assert kw["temperature"] == 0.42  # deferred to the session/registry value
 
-    session._utility_completion([{"role": "user", "content": "hi"}], temperature=0.9)
+    session._utility_completion([Turn.user("hi")], temperature=0.9)
     _, kw2 = session._provider.create_completion.call_args
     assert kw2["temperature"] == 0.9  # explicit override still honored
 

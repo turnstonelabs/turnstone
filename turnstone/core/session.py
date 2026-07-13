@@ -225,7 +225,6 @@ if TYPE_CHECKING:
     from turnstone.core.output_guard import OutputAssessment
     from turnstone.core.output_guard_judge import OutputGuardJudge, OutputJudgeVerdict
     from turnstone.core.providers import (
-        CompletionResult,
         LLMProvider,
         ModelCapabilities,
         StreamChunk,
@@ -3311,18 +3310,15 @@ class ChatSession:
 
             result = self._utility_completion(
                 [
-                    {
-                        "role": "system",
-                        "content": (
-                            "# Instructions\n\n"
-                            "You are a conversation title generator. "
-                            "The user will show you the opening of a conversation. "
-                            "Respond with ONLY a short title (3-8 words). "
-                            "Do NOT answer the conversation. Do NOT explain. "
-                            "Output ONLY the title text, nothing else."
-                        ),
-                    },
-                    {"role": "user", "content": snippet},
+                    Turn.system(
+                        "# Instructions\n\n"
+                        "You are a conversation title generator. "
+                        "The user will show you the opening of a conversation. "
+                        "Respond with ONLY a short title (3-8 words). "
+                        "Do NOT answer the conversation. Do NOT explain. "
+                        "Output ONLY the title text, nothing else."
+                    ),
+                    Turn.user(snippet),
                 ],
                 max_tokens=_TITLE_MAX_TOKENS,
             )
@@ -4745,18 +4741,17 @@ class ChatSession:
 
     def _utility_completion(
         self,
-        messages: list[dict[str, Any]],
+        turns: list[Turn],
         *,
         max_tokens: int = 4096,
         temperature: float | None = None,
         reasoning_effort: str = "low",
-    ) -> CompletionResult:
-        """Run a lightweight internal completion (title gen, compaction, extraction).
+    ) -> ModelTurnResult:
+        """Run a lightweight internal completion (title gen, compaction,
+        extraction) through ``model_turn`` on the session's primary lane.
 
-        Threads ``reasoning_effort`` through both the direct keyword (for
-        commercial providers) and ``extra_params`` (for local model servers)
-        so callers don't need to duplicate it.  ``max_tokens`` is clamped to
-        the model's advertised output limit so small models don't error.
+        ``max_tokens`` is clamped to the model's advertised output limit so
+        small models don't error.
 
         ``temperature`` defaults to the session temperature (``self.temperature``)
         — the same operator/registry-resolved value the main turn uses — rather
@@ -4767,17 +4762,21 @@ class ChatSession:
         """
         caps = self._get_capabilities()
         clamped = min(max_tokens, caps.max_output_tokens) if caps.max_output_tokens else max_tokens
-        messages = self._maybe_attach_vllm_chat_reasoning(messages, self._provider)
-        result = self._provider.create_completion(
+        lane = ModelLane(
+            provider=self._provider,
             client=self.client,
             model=self.model,
-            messages=messages,
+            alias=self._model_alias or "",
+            capabilities=caps,
+            extra_params=self._provider_extra_params(),
+            registry=self._registry,
+        )
+        result = model_turn(
+            lane,
+            turns,
             max_tokens=clamped,
             temperature=self.temperature if temperature is None else temperature,
             reasoning_effort=reasoning_effort,
-            extra_params=self._provider_extra_params(),
-            capabilities=caps,
-            replay_reasoning_to_model=self._resolve_replay_reasoning_to_model(caps=caps),
         )
         # Utility completions (title gen, compaction, web-fetch extraction)
         # bypass the streaming on_status path — record their usage so the
@@ -7365,10 +7364,10 @@ class ChatSession:
         so the caller can abort the whole compaction before any message swap.
         """
         summary_msgs = [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": self._COMPACT_USER_PREFIX + body},
+            Turn.system(system_prompt),
+            Turn.user(self._COMPACT_USER_PREFIX + body),
         ]
-        result: CompletionResult | None = None
+        result: ModelTurnResult | None = None
         for attempt in range(self._MAX_RETRIES + 1):
             try:
                 result = self._utility_completion(
@@ -15359,7 +15358,7 @@ class ChatSession:
                 # it.  No consumer evaluates ``.text`` on a sub-agent tool turn
                 # today.  The proper by-reference representation needs the
                 # attachment resolver wired into this sub-agent's
-                # ``create_completion`` (it currently isn't) plus content-
+                # ``model_turn`` call (it currently isn't) plus content-
                 # addressed byte storage — deferred to the recall/persist work
                 # where that attachment path is already in scope.
                 agent_turns.append(Turn.tool(tc_dict["id"], output, is_error=is_tool_error))
@@ -16589,24 +16588,18 @@ class ChatSession:
         try:
             result = self._utility_completion(
                 [
-                    {
-                        "role": "system",
-                        "content": (
-                            "You are a web content extraction assistant. "
-                            "Answer the user's question using ONLY the "
-                            "provided page content. Be concise and factual. "
-                            "If the content doesn't contain the answer, say so."
-                        ),
-                    },
-                    {
-                        "role": "user",
-                        "content": (
-                            f"Page URL: {url}\n"
-                            f"Page content ({original_len} chars):\n\n"
-                            f"{text}\n\n---\n"
-                            f"Question: {question}"
-                        ),
-                    },
+                    Turn.system(
+                        "You are a web content extraction assistant. "
+                        "Answer the user's question using ONLY the "
+                        "provided page content. Be concise and factual. "
+                        "If the content doesn't contain the answer, say so."
+                    ),
+                    Turn.user(
+                        f"Page URL: {url}\n"
+                        f"Page content ({original_len} chars):\n\n"
+                        f"{text}\n\n---\n"
+                        f"Question: {question}"
+                    ),
                 ],
                 max_tokens=min(self.max_tokens, self.context_window // 4),
                 reasoning_effort=self.reasoning_effort,
