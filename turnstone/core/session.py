@@ -1725,16 +1725,19 @@ class ChatSession:
             # catalog change firing earlier than this fans out to the
             # listeners just registered, so nothing can slip between
             # read and register with its only notification unheard.
-            seq_before = self._mcp_tools_change_seq
-            mcp_tools = self._mcp_client.get_tools(user_id=self._mcp_user_id)
-            self._tools = merge_mcp_tools(INTERACTIVE_TOOLS, mcp_tools)
-            self._task_tools = merge_mcp_tools(TASK_AGENT_TOOLS, mcp_tools)
-            if self._mcp_tools_change_seq != seq_before:
-                # The mirror race: a listener callback fired between the
-                # read above and these assignments — its fresher merge
-                # was just clobbered by our staler snapshot. Re-running
-                # the callback converges on the current maps.
-                self._on_mcp_tools_changed()
+            seq_before = self._mcp_tools_change_seq - 1
+            while self._mcp_tools_change_seq != seq_before:
+                # Re-read until stable: a listener callback firing
+                # between a read and its assignments would have its
+                # fresher merge clobbered by our staler snapshot (its
+                # only notification already consumed). NEVER call
+                # _on_mcp_tools_changed here — it dereferences tool-
+                # search state initialized later in construction; the
+                # downstream init consumes these converged lists.
+                seq_before = self._mcp_tools_change_seq
+                mcp_tools = self._mcp_client.get_tools(user_id=self._mcp_user_id)
+                self._tools = merge_mcp_tools(INTERACTIVE_TOOLS, mcp_tools)
+                self._task_tools = merge_mcp_tools(TASK_AGENT_TOOLS, mcp_tools)
             # Proactively warm this user's per-user OAuth (oauth_user) pools so
             # their tools are present without a manual reconnect (e.g. after a
             # reboot/upgrade, or right after consent). Fire-and-forget — the

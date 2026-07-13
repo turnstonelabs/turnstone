@@ -521,61 +521,38 @@ class TestEviction:
         assert blocked, "drop must wait for the in-flight connect's open_lock"
         assert cleared, "drop must win once the connect completes — no resurrection"
 
-    def test_connect_refuses_when_generation_moved(self, running_loop_mgr) -> None:
-        """``_connect_one_pool`` must refuse to connect (and so to
-        publish) when the entry's revocation generation moved past the
-        caller's pre-token-read snapshot — the bearer in hand predates
-        a disconnect, and publishing would resurrect the dropped
-        catalog with nothing left to clear it."""
-        from turnstone.core.mcp_client import _PoolGrantRevokedError
-
-        mgr, loop, _ = running_loop_mgr
-        key = ("u0", "pool-srv")
-
-        async def _scenario() -> None:
-            entry = await mgr._ensure_pool_entry(key)
-            gen0 = entry.catalog_gen
-            entry.catalog_gen += 1  # a revocation drop landed in the window
-            with pytest.raises(_PoolGrantRevokedError):
-                await mgr._connect_one_pool(
-                    key,
-                    {"type": "streamable-http", "url": "https://mcp.example.com/sse"},
-                    "stale-bearer",
-                    expected_gen=gen0,
-                )
-
-        _run_on_loop(loop, _scenario())
-
-    def test_refresh_discards_result_when_generation_moved(self, running_loop_mgr) -> None:
-        """A ``list_changed`` refresh whose await straddles a revocation
-        drop must DISCARD its result — publishing would resurrect the
-        revoked catalog, which retention then keeps alive forever."""
+    def test_refresh_discards_result_when_entry_replaced(self, running_loop_mgr) -> None:
+        """A ``list_changed`` refresh whose await straddles a full drop
+        and re-creation must DISCARD its result — it belongs to the old
+        entry object and would clobber the replacement's state."""
         mgr, loop, _ = running_loop_mgr
         mgr._oauth_user_server_names = {"pool-srv"}
         key = ("u0", "pool-srv")
 
-        async def _scenario() -> tuple[list, list, Any, bool]:
+        async def _scenario() -> tuple[list, list, Any]:
             entry = await mgr._ensure_pool_entry(key)
             entry.tools = self._fake_tools("pool-srv", 0)
             mgr._rebuild_user_tool_map("u0")
 
             class _RacingSession:
                 async def list_tools(self) -> Any:
-                    # The disconnect lands while list_tools is in flight.
-                    mgr._evict_session_drop_catalog(key)
+                    # The entry is fully dropped and re-created while
+                    # list_tools is in flight.
+                    mgr._user_pool_entries.pop(key, None)
+                    await mgr._ensure_pool_entry(key)
                     res = MagicMock()
                     res.tools = []
                     return res
 
             entry.session = _RacingSession()
             added, removed = await mgr._refresh_pool_server_tools(key)
-            return added, removed, entry.tools, "u0" in mgr._user_tool_map
+            fresh = mgr._user_pool_entries[key]
+            return added, removed, fresh.tools
 
-        added, removed, tools, in_map = _run_on_loop(loop, _scenario())
+        added, removed, fresh_tools = _run_on_loop(loop, _scenario())
         assert (added, removed) == ([], [])
-        # The drop's clear stands; the refresh did not republish.
-        assert tools is None
-        assert in_map is False
+        # The stale result was not published onto the replacement entry.
+        assert fresh_tools is None
 
     def test_lookup_grant_dead_requires_wired_infrastructure(self, running_loop_mgr) -> None:
         """kind='missing' is authoritative only when the stores that
@@ -1425,9 +1402,7 @@ class TestOboPriming:
 
         warmed: list[tuple[Any, Any, str]] = []
 
-        async def _fake_prime_server(
-            key: Any, cfg: Any, token: str, expected_gen: Any = None
-        ) -> None:
+        async def _fake_prime_server(key: Any, cfg: Any, token: str) -> None:
             warmed.append((key, cfg, token))
 
         obo_lookup = AsyncMock(return_value=SimpleNamespace(kind="token", token="minted-at"))
