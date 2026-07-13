@@ -2025,6 +2025,42 @@ class TestAdminMcpReloadEndpoint:
         assert "error" in data["results"]["n2"]
 
 
+class TestMcpWriteAutoReload:
+    """create / update / delete auto-notify nodes so a write reaches them (and
+    active per-user pools re-prime) without a separate /reload."""
+
+    def test_create_notifies_nodes(self, client: TestClient) -> None:
+        with patch(
+            "turnstone.console.server._notify_nodes_mcp_reload",
+            new_callable=AsyncMock,
+            return_value={},
+        ) as notify:
+            _create_server(client, name="auto-reload-create")
+        notify.assert_awaited_once()
+
+    def test_update_notifies_nodes(self, client: TestClient) -> None:
+        sid = _create_server(client, name="auto-reload-update")["server_id"]
+        with patch(
+            "turnstone.console.server._notify_nodes_mcp_reload",
+            new_callable=AsyncMock,
+            return_value={},
+        ) as notify:
+            r = client.put(f"/v1/api/admin/mcp-servers/{sid}", json={"enabled": False})
+        assert r.status_code == 200
+        notify.assert_awaited_once()
+
+    def test_delete_notifies_nodes(self, client: TestClient) -> None:
+        sid = _create_server(client, name="auto-reload-delete")["server_id"]
+        with patch(
+            "turnstone.console.server._notify_nodes_mcp_reload",
+            new_callable=AsyncMock,
+            return_value={},
+        ) as notify:
+            r = client.delete(f"/v1/api/admin/mcp-servers/{sid}")
+        assert r.status_code == 200
+        notify.assert_awaited_once()
+
+
 # ---------------------------------------------------------------------------
 # Node reload endpoint: POST /v1/api/_internal/mcp-reload
 # ---------------------------------------------------------------------------
