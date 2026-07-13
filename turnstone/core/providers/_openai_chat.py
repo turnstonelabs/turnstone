@@ -312,7 +312,7 @@ class OpenAIChatCompletionsProvider:
         messages: list[dict[str, Any]],
         tools: list[dict[str, Any]] | None = None,
         max_tokens: int = 4096,
-        temperature: float = 0.5,
+        temperature: float | None = None,
         reasoning_effort: str = "medium",
         extra_params: dict[str, Any] | None = None,
         deferred_names: frozenset[str] | None = None,

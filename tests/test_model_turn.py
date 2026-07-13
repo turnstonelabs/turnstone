@@ -368,12 +368,50 @@ def test_temperature_caller_value_wins_over_lane() -> None:
     assert provider.calls[0]["temperature"] == 0.9
 
 
-def test_temperature_omitted_when_unresolved() -> None:
-    # No caller value, no lane value → the kwarg is omitted entirely and
-    # the provider default applies (house rule: code never pins one).
+def test_temperature_unresolved_passes_none_and_wire_omits_it() -> None:
+    # No caller value, no lane value → model_turn passes temperature=None,
+    # and the PROVIDER layer omits the field from the wire so the server
+    # default applies (house rule: code never pins one).  Both halves are
+    # pinned: a Python-signature default of 0.5 anywhere on this path is a
+    # hidden universal pin — the exact bug the second xhigh review caught.
     provider = _FakeProvider([CompletionResult(content="")])
     model_turn(_lane(provider), [Turn.user("x")])
-    assert "temperature" not in provider.calls[0]
+    assert provider.calls[0]["temperature"] is None
+
+    from turnstone.core.providers._openai_common import apply_temperature
+
+    kwargs: dict[str, Any] = {}
+    apply_temperature(kwargs, ModelCapabilities(), None, "medium")
+    assert "temperature" not in kwargs  # None never reaches the wire
+    apply_temperature(kwargs, ModelCapabilities(), 1.0, "medium")
+    assert kwargs["temperature"] == 1.0  # a real value still does
+
+
+def test_resolve_lane_global_config_store_rung() -> None:
+    # ModelConfig.temperature=None means "use the global default from
+    # ConfigStore" (the documented ladder) — resolve_lane climbs it.
+    provider = _FakeProvider([])
+    registry = _fake_registry(temperature=None)
+    store = SimpleNamespace(get=lambda key: 1.0 if key == "model.temperature" else None)
+    lane = resolve_lane(provider, object(), "m", alias="ali", registry=registry, config_store=store)
+    assert lane.temperature == 1.0
+    # The per-model value wins over the global rung.
+    registry2 = _fake_registry(temperature=0.3)
+    lane2 = resolve_lane(
+        provider, object(), "m", alias="ali", registry=registry2, config_store=store
+    )
+    assert lane2.temperature == 0.3
+
+
+def test_model_turn_fetches_config_once_per_call() -> None:
+    # ONE get_config per plant call feeds both live flags (replay + vLLM
+    # attach) — a hot-reload between them cannot mix config generations
+    # within a single request.
+    registry = _fake_registry(replay=True)
+    provider = _FakeProvider([CompletionResult(content="")])
+    lane = _lane(provider, alias="ali", registry=registry)
+    model_turn(lane, [Turn.user("x")])
+    assert registry.get_config.call_count == 1
 
 
 def test_resolve_lane_inherits_config_temperature() -> None:

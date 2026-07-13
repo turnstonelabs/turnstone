@@ -124,7 +124,6 @@ from turnstone.core.metacognition import (
     should_nudge,
 )
 from turnstone.core.model_turn import (
-    ModelLane,
     ModelTurnResult,
     ensure_tool_call_ids,
     finalize_provider_blocks,
@@ -132,6 +131,7 @@ from turnstone.core.model_turn import (
     model_turn,
     provider_extra_params,
     resolve_capabilities,
+    resolve_lane,
     resolve_replay_reasoning_to_model,
 )
 from turnstone.core.nudge_queue import (
@@ -2043,9 +2043,14 @@ class ChatSession:
         """Get model capabilities, applying config.toml overrides if present.
 
         Delegates to :func:`turnstone.core.model_turn.resolve_capabilities` —
-        the one resolution path every lane shares (#827).
+        the one resolution path every lane shares (#827) — but fetches the
+        config ITSELF, uncaught: a registry failure on the session's own
+        alias must raise loudly (pre-#827 semantics), never silently cache
+        degraded static-table caps for the session lifetime.  The defensive
+        never-crash fetch is a judge-constructor property, not a session one.
         """
-        return resolve_capabilities(provider, model, alias or "", self._registry)
+        cfg = self._registry.get_config(alias) if (self._registry and alias) else None
+        return resolve_capabilities(provider, model, alias or "", self._registry, cfg=cfg)
 
     def _get_capabilities(self, provider: Any = None, model: str = "") -> ModelCapabilities:
         """Get capabilities for a model. Cached for the primary session model."""
@@ -4234,6 +4239,14 @@ class ChatSession:
                 alias=alias,
                 content_hash=content_hash,
                 parts=parts,
+                # Thread the registry + config store so the perception lane
+                # resolves the alias's extra_params / capability overrides /
+                # temperature ladder like every other lane — without these,
+                # operator settings on the perception alias never reach the
+                # wire and there is no remediation path for a degraded,
+                # memoized description.
+                registry=self._registry,
+                config_store=self._config_store,
             )
         if not text:
             return None
@@ -4762,14 +4775,15 @@ class ChatSession:
         """
         caps = self._get_capabilities()
         clamped = min(max_tokens, caps.max_output_tokens) if caps.max_output_tokens else max_tokens
-        lane = ModelLane(
-            provider=self._provider,
-            client=self.client,
-            model=self.model,
+        lane = resolve_lane(
+            self._provider,
+            self.client,
+            self.model,
             alias=self._model_alias or "",
+            registry=self._registry,
             capabilities=caps,
             extra_params=self._provider_extra_params(),
-            registry=self._registry,
+            config_store=self._config_store,
         )
         result = model_turn(
             lane,
@@ -7754,6 +7768,8 @@ class ChatSession:
                 # model — thread its alias too, so the lane resolves
                 # extra_params / live flags like every other session lane.
                 session_model_alias=self._model_alias or "",
+                # For the temperature ladder's global rung (model.temperature).
+                config_store=self._config_store,
             )
         except Exception:
             log.warning("judge.init_failed", exc_info=True)
@@ -7789,6 +7805,8 @@ class ChatSession:
                 # source IntentJudge gets via _ensure_judge.
                 session_capabilities=self._get_capabilities(),
                 session_model_alias=self._model_alias or "",
+                # For the temperature ladder's global rung (model.temperature).
+                config_store=self._config_store,
             )
         except Exception:
             log.warning("output_guard_judge.init_failed", exc_info=True)
@@ -15064,18 +15082,24 @@ class ChatSession:
         # operator flags (replay-reasoning, Phase 5 vLLM attach) re-resolve
         # inside ``model_turn`` through the carried registry, so mid-session
         # admin toggles keep applying exactly as they did pre-extraction.
+        # Temperature follows the AGENT model's own ladder (its ModelConfig,
+        # else the global ``model.temperature``) — relaying the session
+        # model's value here would make a task alias's configured
+        # temperature unreachable (house rule: the model's configuration is
+        # the source of truth).
         # Agent trajectories stay excluded from the persistence/replay
         # contract — history is in-memory, rebuilt per ``_run_agent``
         # invocation; the native lane carried here serves the WITHIN-RUN
         # reasoning continuity of the agent's own tool loop.
-        lane = ModelLane(
-            provider=agent_provider,
-            client=agent_client,
-            model=agent_model,
+        lane = resolve_lane(
+            agent_provider,
+            agent_client,
+            agent_model,
             alias=agent_alias or "",
+            registry=self._registry,
             capabilities=agent_caps,
             extra_params=agent_extra,
-            registry=self._registry,
+            config_store=self._config_store,
         )
 
         def _api_call(
@@ -15098,7 +15122,6 @@ class ChatSession:
                         turns,
                         tools=_tools,
                         max_tokens=self.max_tokens,
-                        temperature=self.temperature,
                         reasoning_effort=reasoning_effort or self.reasoning_effort,
                         mint=mint,
                         wire_id_map=wire_id_map,

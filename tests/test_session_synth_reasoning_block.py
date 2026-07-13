@@ -1,14 +1,16 @@
-"""Tests for ChatSession synthetic ``reasoning_text`` block stamping (Phase 3 path 3).
+"""Tests for the synthetic ``reasoning_text`` block stamping (Phase 3 path 3).
 
 Path 3 covers OpenAI Chat Completions endpoints — vLLM with
 ``--reasoning-parser``, llama.cpp with ``reasoning_format``, Gemini's
 ``/v1beta/openai/`` endpoint, and any other server that surfaces
 ``delta.reasoning_content`` Pydantic extras.  These have no native
-provider_blocks shape on the wire, so ``ChatSession._stream_response``
-captures the streamed reasoning text into ``reasoning_parts`` and
-``_maybe_synth_reasoning_block`` stamps it onto ``_provider_content``
-as a synthetic ``{type: "reasoning_text"}`` block at the end of the
-turn.
+provider_blocks shape on the wire, so the captured reasoning text is
+stamped onto ``_provider_content`` as a synthetic
+``{type: "reasoning_text"}`` block at the end of the turn by
+``model_turn.synth_reasoning_block`` — the one synthesizer every lane
+runs (the main loop reaches it through ``ChatSession._stream_response``
+→ ``_finalize_provider_blocks``; agents and judges through
+``model_turn``).
 
 These tests pin:
 1. The synthesizer fires only when no native blocks were emitted AND

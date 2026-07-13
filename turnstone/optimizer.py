@@ -27,7 +27,7 @@ from typing import Any
 
 from openai import OpenAI
 
-from turnstone.core.model_turn import model_turn, resolve_lane
+from turnstone.core.model_turn import cap_tool_calls, model_turn, resolve_lane
 from turnstone.core.providers import LLMProvider, create_provider
 from turnstone.core.session import ChatSession
 from turnstone.core.trajectory import Role, Turn
@@ -776,15 +776,9 @@ def _run_analyst(
             reasoning_effort="medium",
         )
 
-        # Same degenerate-repetition cap as before; a capped turn drops its
-        # native lane rather than replay orphan native tool blocks the
-        # mirror no longer carries.
-        capped = mtr.tool_calls[:5]
-        assistant_turn = mtr.turn
-        if len(mtr.tool_calls) > len(capped):
-            assistant_turn = Turn.assistant(
-                mtr.content, tool_calls=mtr.turn.tool_calls[: len(capped)]
-            )
+        # Same degenerate-repetition cap as before (shared guard — see
+        # model_turn.cap_tool_calls for the native-lane-drop rationale).
+        capped, assistant_turn = cap_tool_calls(mtr, 5)
         turns.append(assistant_turn)
 
         if not capped:

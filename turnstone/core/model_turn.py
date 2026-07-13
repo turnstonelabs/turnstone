@@ -98,7 +98,7 @@ def resolve_capabilities(
     alias: str,
     registry: ModelRegistry | None,
     *,
-    cfg: Any | None = None,
+    cfg: Any | EllipsisType = ...,
 ) -> ModelCapabilities:
     """Provider static capabilities, merged with registry alias overrides.
 
@@ -109,14 +109,16 @@ def resolve_capabilities(
     judges' old mirror — capability resolution must never crash a judge
     turn).  *cfg* accepts a pre-fetched ModelConfig so a caller resolving
     several lane facets reads ONE config generation (see
-    :func:`resolve_lane`); omitted, the config is fetched defensively.
+    :func:`resolve_lane`); ``None`` means "fetched and missed" (no second
+    lookup), and the ``...`` sentinel default means "fetch defensively for
+    me".
     NOTE the window landmine documented on #826:
     ``ModelConfig.context_window`` is a separate top-level column and is
     deliberately NOT merged here; callers that need the operator window
     must read it off the config themselves.
     """
     caps = provider.get_capabilities(model)
-    if cfg is None:
+    if cfg is ...:
         cfg = _get_config_or_none(registry, alias)
     if cfg is not None:
         overrides_raw = getattr(cfg, "capabilities", None)
@@ -133,7 +135,7 @@ def provider_extra_params(
     registry: ModelRegistry | None,
     alias: str,
     *,
-    cfg: Any | None = None,
+    cfg: Any | EllipsisType = ...,
 ) -> dict[str, Any] | None:
     """Operator ``server_compat["extra_body"]`` pins for the OpenAI-shaped
     lanes (and the anthropic-compatible lane, whose SDK also takes
@@ -147,7 +149,7 @@ def provider_extra_params(
 
     if provider.provider_name not in ("openai", "openai-compatible", "anthropic-compatible"):
         return None
-    if cfg is None:
+    if cfg is ...:
         cfg = _get_config_or_none(registry, alias)
     server_compat = getattr(cfg, "server_compat", None) if cfg is not None else None
     extra = merge_server_compat(None, server_compat if isinstance(server_compat, dict) else {})
@@ -184,6 +186,7 @@ def resolve_replay_reasoning_to_model(
     alias: str,
     *,
     caps: ModelCapabilities | None = None,
+    cfg: Any | EllipsisType = ...,
 ) -> bool:
     """Operator ``ModelConfig.replay_reasoning_to_model`` for an alias.
 
@@ -197,13 +200,15 @@ def resolve_replay_reasoning_to_model(
     ``caps.supports_reasoning_replay`` (mirrors the gate in
     ``OpenAIResponsesProvider._build_kwargs``); omitted, the operator flag
     passes through unchanged for callers that haven't threaded caps.
+    *cfg* follows the shared sentinel contract (``...`` = fetch for me,
+    ``None`` = fetched-and-missed) so ``model_turn`` reads ONE config
+    generation per call across both per-call flags.
     """
-    if not registry or not alias:
+    if cfg is ...:
+        cfg = _get_config_or_none(registry, alias)
+    if cfg is None:
         return False
-    try:
-        operator_on = bool(registry.get_config(alias).replay_reasoning_to_model)
-    except Exception:
-        return False
+    operator_on = bool(getattr(cfg, "replay_reasoning_to_model", False))
     if caps is None:
         return operator_on
     return operator_on and bool(caps.supports_reasoning_replay)
@@ -214,6 +219,8 @@ def maybe_attach_vllm_chat_reasoning(
     provider: LLMProvider,
     registry: ModelRegistry | None,
     alias: str,
+    *,
+    cfg: Any | EllipsisType = ...,
 ) -> list[dict[str, Any]]:
     """Phase 5 of reasoning persistence: attach vLLM's non-standard
     ``reasoning`` field to outgoing assistant messages so a vLLM-served
@@ -235,7 +242,8 @@ def maybe_attach_vllm_chat_reasoning(
 
     if not isinstance(provider, OpenAIChatCompletionsProvider):
         return messages
-    cfg = _get_config_or_none(registry, alias)
+    if cfg is ...:
+        cfg = _get_config_or_none(registry, alias)
     if cfg is None:
         return messages
     # Both gate fields read off the single ``cfg`` fetch (no second
@@ -289,6 +297,7 @@ def resolve_lane(
     registry: ModelRegistry | None = None,
     capabilities: ModelCapabilities | None = None,
     extra_params: dict[str, Any] | None | EllipsisType = ...,
+    config_store: Any | None = None,
 ) -> ModelLane:
     """Build a :class:`ModelLane`, resolving what the caller didn't supply.
 
@@ -297,6 +306,15 @@ def resolve_lane(
     agent run's per-alias resolution) don't pay for or drift from a second
     pass.  ``...`` (the sentinel default) means "resolve for me" —
     ``None`` is a valid resolved value for *extra_params*.
+
+    The lane temperature climbs the documented ladder
+    (``ModelConfig.temperature`` docstring: "None = use global default
+    from ConfigStore"): the alias's per-model value, else the operator's
+    global ``model.temperature`` when *config_store* is supplied, else
+    ``None`` — which the providers translate to omitting the field so the
+    SERVER default applies.  This mirrors the session_factory / ``/model``
+    switch resolution so a judge or single-shot lane samples exactly like
+    the main loop on the same model.
 
     All resolved facets read ONE defensively-fetched ModelConfig, so a
     registry hot-reload mid-resolution cannot mix config generations, and
@@ -310,6 +328,15 @@ def resolve_lane(
         if extra_params is ...
         else extra_params
     )
+    temperature = getattr(cfg, "temperature", None) if cfg is not None else None
+    if temperature is None and config_store is not None:
+        try:
+            temperature = config_store.get("model.temperature")
+        except Exception:
+            # Best-effort global rung — a broken store degrades to the
+            # server default, never crashes lane resolution.
+            log.debug("config_store model.temperature lookup failed", exc_info=True)
+            temperature = None
     return ModelLane(
         provider=provider,
         client=client,
@@ -318,7 +345,7 @@ def resolve_lane(
         capabilities=caps,
         extra_params=extra,
         registry=registry,
-        temperature=getattr(cfg, "temperature", None) if cfg is not None else None,
+        temperature=temperature,
     )
 
 
@@ -496,6 +523,21 @@ class ModelTurnResult:
         return self.turn.text
 
 
+def cap_tool_calls(result: ModelTurnResult, max_calls: int) -> tuple[list[dict[str, Any]], Turn]:
+    """Degenerate-repetition guard shared by the bounded tool loops (eval,
+    optimizer analyst): cap the mirror at *max_calls* and return the turn to
+    append.  A capped turn is rebuilt WITHOUT its native lane — a full lane
+    beside a truncated mirror would replay orphan native tool blocks the
+    mirror no longer carries (the same native↔mirror rule
+    :func:`finalize_provider_blocks` enforces).
+    """
+    capped = result.tool_calls[:max_calls]
+    turn = result.turn
+    if len(result.tool_calls) > len(capped):
+        turn = Turn.assistant(result.content, tool_calls=turn.tool_calls[: len(capped)])
+    return capped, turn
+
+
 def model_turn(
     lane: ModelLane,
     turns: Sequence[Turn],
@@ -553,29 +595,34 @@ def model_turn(
             "model_turn: mint requires wire_id_map — minted ids are "
             "unrestorable on the wire without the recovery map"
         )
+    # ONE config fetch per plant call feeds both live per-call flags — a
+    # registry hot-reload cannot hand the replay gate and the attach gate
+    # different config generations within a single request.
+    cfg = _get_config_or_none(lane.registry, lane.alias)
     wire = restore_provider_tool_ids(
         sanitize_tool_call_arguments(dicts_from_turns(list(turns))),
         wire_id_map if wire_id_map is not None else {},
     )
-    wire = maybe_attach_vllm_chat_reasoning(wire, lane.provider, lane.registry, lane.alias)
+    wire = maybe_attach_vllm_chat_reasoning(wire, lane.provider, lane.registry, lane.alias, cfg=cfg)
     call_kwargs: dict[str, Any] = {
         "client": lane.client,
         "model": lane.model,
         "messages": wire,
         "tools": tools,
         "max_tokens": max_tokens,
+        # None temperature flows through to the providers, which OMIT the
+        # field from the wire so the server default applies (house rule: a
+        # Python-level constant anywhere on this path is a hidden pin).
+        "temperature": temperature if temperature is not None else lane.temperature,
         "reasoning_effort": reasoning_effort,
         "extra_params": lane.extra_params,
         "capabilities": lane.capabilities,
         "replay_reasoning_to_model": resolve_replay_reasoning_to_model(
-            lane.registry, lane.alias, caps=lane.capabilities
+            lane.registry, lane.alias, caps=lane.capabilities, cfg=cfg
         ),
     }
     if resolve_attachments is not None:
         call_kwargs["resolve_attachments"] = resolve_attachments
-    effective_temperature = temperature if temperature is not None else lane.temperature
-    if effective_temperature is not None:
-        call_kwargs["temperature"] = effective_temperature
     result = lane.provider.create_completion(**call_kwargs)
 
     raw_calls: list[dict[str, Any]] = list(result.tool_calls or [])

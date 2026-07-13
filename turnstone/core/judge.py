@@ -977,12 +977,15 @@ class IntentJudge:
         rule_registry: Any | None = None,
         model_registry: Any | None = None,
         session_model_alias: str = "",
+        config_store: Any | None = None,
     ) -> None:
         self._config = config
         self._rule_registry = rule_registry
-        # Carried into the per-evaluation ModelLane so extra_params and the
-        # live operator flags resolve from the registry like every other lane.
+        # Carried into the per-evaluation ModelLane so extra_params, the
+        # live operator flags, and the temperature ladder (per-model value →
+        # global ``model.temperature``) resolve like every other lane.
         self._model_registry = model_registry
+        self._config_store = config_store
         # The caller (ChatSession) resolves the session model's real caps from
         # _get_capabilities (config/registry-aware) and passes them in; they are
         # this judge's wire capabilities and window when it inherits the session
@@ -1022,8 +1025,12 @@ class IntentJudge:
                     # sized into the judge's window budget right below (the
                     # static caps table reports 200000 for local models, which
                     # would silently over-budget them).
+                    # ``cfg=model_cfg`` reuses the config resolve() already
+                    # fetched — one lookup, one generation; a hot-reload
+                    # between two fetches cannot mix client/window with
+                    # foreign capability overrides.
                     self._capabilities = resolve_capabilities(
-                        self._provider, self._model, config.model, model_registry
+                        self._provider, self._model, config.model, model_registry, cfg=model_cfg
                     )
                     # Use the registry's per-model context window, NOT
                     # ``provider.get_capabilities().context_window``: the static
@@ -1329,8 +1336,14 @@ class IntentJudge:
             tools = list(_JUDGE_TOOL_SCHEMAS)
 
         # The judge's resolved lane for this evaluation: fresh client per run
-        # (thread isolation), constructor-resolved capabilities, extra_params
-        # and live operator flags from the registry like every other lane.
+        # (thread isolation), extra_params / live flags / temperature ladder
+        # from the registry like every other lane.  Capabilities are
+        # DELIBERATELY the constructor-frozen set (not re-resolved here):
+        # the judge's window budget was sized against them at construction,
+        # and the session swaps the whole judge on model/credential change —
+        # an in-place capabilities edit to the same alias applies on the
+        # next judge swap, keeping caps and window from ever disagreeing
+        # within one judge lifetime.
         lane = resolve_lane(
             self._provider,
             client,
@@ -1338,6 +1351,7 @@ class IntentJudge:
             alias=self._alias,
             registry=self._model_registry,
             capabilities=self._capabilities,
+            config_store=self._config_store,
         )
 
         # Multi-turn judge loop

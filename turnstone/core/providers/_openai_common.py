@@ -361,16 +361,22 @@ def lookup_openai_capabilities(model: str) -> ModelCapabilities:
 def apply_temperature(
     kwargs: dict[str, Any],
     caps: ModelCapabilities,
-    temperature: float,
+    temperature: float | None,
     reasoning_effort: str,
 ) -> None:
     """Conditionally add temperature to *kwargs*.
 
+    - ``None`` temperature is never written: the request omits the field
+      so the SERVER default applies.  House rule: code never pins a
+      temperature — a Python-level constant here would silently re-pin
+      every lane that deliberately left it unresolved.
     - Models with ``supports_temperature=False`` (GPT-5 base, O-series)
       never receive temperature.
     - Models that list ``"none"`` in their effort values (GPT-5.1/5.2)
       only receive temperature when reasoning is inactive.
     """
+    if temperature is None:
+        return
     if not caps.supports_temperature:
         return
     if "none" in caps.reasoning_effort_values and reasoning_effort not in ("none", ""):
@@ -381,7 +387,7 @@ def apply_temperature(
 def apply_temperature_and_effort(
     kwargs: dict[str, Any],
     caps: ModelCapabilities,
-    temperature: float,
+    temperature: float | None,
     reasoning_effort: str,
 ) -> None:
     """Conditionally add temperature and reasoning_effort to *kwargs*.
