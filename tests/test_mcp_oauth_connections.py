@@ -806,13 +806,15 @@ class TestEvictUserSession:
             mgr._last_pool_notification_refresh = {}  # type: ignore[attr-defined]
             evicted: list[tuple[str, str]] = []
 
-            def _fake_evict(key: tuple[str, str]) -> None:
+            async def _fake_evict(key: tuple[str, str]) -> None:
                 evicted.append(key)
 
-            # The revoke entry point must take the DROP-CATALOG flavor —
-            # the user asked for the disconnect, so their live sessions
-            # see the tools leave (unlike dispatch-failure eviction, #836).
-            mgr._evict_session_drop_catalog = _fake_evict  # type: ignore[method-assign]
+            # The revoke entry point must take the LOCKED drop-catalog
+            # path — the user asked for the disconnect, so their live
+            # sessions see the tools leave (unlike dispatch-failure
+            # eviction, #836), serialized against an in-flight connect
+            # so a completing discovery can't resurrect the catalog.
+            mgr._drop_catalog_locked = _fake_evict  # type: ignore[method-assign]
 
             # Run the dispatch on a separate thread so the loop can drain.
             import threading
