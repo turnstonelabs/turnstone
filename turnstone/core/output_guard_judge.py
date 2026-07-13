@@ -548,7 +548,6 @@ class OutputGuardJudge:
                     judge_turns,
                     tools=None,
                     max_tokens=512,
-                    reasoning_effort="low",
                 ),
                 timeout=timeout,
                 cancel_event=cancel_event,

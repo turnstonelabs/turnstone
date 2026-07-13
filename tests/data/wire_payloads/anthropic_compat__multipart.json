@@ -28,6 +28,5 @@
       "role": "user"
     }
   ],
-  "model": "qwen3.6-27b",
-  "temperature": 0.5
+  "model": "qwen3.6-27b"
 }

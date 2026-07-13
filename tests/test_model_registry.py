@@ -1467,16 +1467,22 @@ class TestSessionAgentModel:
         silently dropped on the agent path."""
         reg = self._three_model_registry()  # no agent_model / plan_model set
         session = _make_session(registry=reg, model_alias="main")
-        # Probe what _run_agent passes to _provider_extra_params and
-        # _resolve_capabilities by recording the model_alias on each call.
-        captured_extra_alias: list[str | None] = []
+        # Probe the lane resolution: extra_params now resolve INSIDE
+        # resolve_lane (single config fetch) rather than via the session's
+        # pre-resolution wrapper, so spy on the module seam; capability
+        # resolution still routes through the session wrapper.
+        from unittest.mock import patch
+
+        import turnstone.core.model_turn as mt
+
+        captured_lane_alias: list[str | None] = []
         captured_resolve_alias: list[str | None] = []
-        original_extra = session._provider_extra_params
+        original_lane = mt.resolve_lane
         original_resolve = session._resolve_capabilities
 
-        def spy_extra(*args: Any, **kwargs: Any) -> Any:
-            captured_extra_alias.append(kwargs.get("model_alias"))
-            return original_extra(*args, **kwargs)
+        def spy_lane(*args: Any, **kwargs: Any) -> Any:
+            captured_lane_alias.append(kwargs.get("alias"))
+            return original_lane(*args, **kwargs)
 
         def spy_resolve(*args: Any, **kwargs: Any) -> Any:
             # _resolve_capabilities(provider, model, alias)
@@ -1484,15 +1490,15 @@ class TestSessionAgentModel:
             captured_resolve_alias.append(alias)
             return original_resolve(*args, **kwargs)
 
-        session._provider_extra_params = spy_extra  # type: ignore[method-assign]
         session._resolve_capabilities = spy_resolve  # type: ignore[method-assign]
 
         self._capture_on(session.client)  # patch client.chat.completions.create
-        session._run_agent([Turn.user("x")], label="plan")
+        with patch("turnstone.core.session.resolve_lane", side_effect=spy_lane):
+            session._run_agent([Turn.user("x")], label="plan")
 
-        assert captured_extra_alias and captured_extra_alias[-1] == "main", (
-            f"agent fallback path did not inherit primary alias for extra_params: "
-            f"{captured_extra_alias!r}"
+        assert captured_lane_alias and captured_lane_alias[-1] == "main", (
+            f"agent fallback path did not inherit primary alias for the lane: "
+            f"{captured_lane_alias!r}"
         )
         assert captured_resolve_alias and captured_resolve_alias[-1] == "main", (
             f"agent fallback path did not inherit primary alias for caps: "

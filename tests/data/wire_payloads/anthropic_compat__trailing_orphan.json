@@ -40,7 +40,6 @@
     }
   ],
   "model": "qwen3.6-27b",
-  "temperature": 0.5,
   "tools": [
     {
       "description": "Look up the weather for a city.",

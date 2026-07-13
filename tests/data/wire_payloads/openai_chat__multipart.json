@@ -22,6 +22,5 @@
   "stream": true,
   "stream_options": {
     "include_usage": true
-  },
-  "temperature": 0.5
+  }
 }
