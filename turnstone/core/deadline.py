@@ -52,7 +52,9 @@ class StreamAbortRef(list[Any]):
     worker is still inside the SDK's connect (no handle captured yet), the
     handle is closed the moment it arrives.  Both paths tolerate double
     close (SDK ``close()`` is idempotent) so no lock is needed — mirrors
-    ``ChatSession``'s ``_CancelRef``.
+    ``ChatSession``'s ``_CancelRef``, which adopts this class when the
+    main loop moves onto ``model_turn`` (#832); until then a hardening
+    fix here must be mirrored there.
     """
 
     __slots__ = ("_aborted",)
@@ -82,6 +84,7 @@ def run_with_deadline(
     cancel_event: threading.Event | None = None,
     poll: float = 1.0,
     thread_name: str = "deadline-worker",
+    on_abandon: Callable[[], None] | None = None,
 ) -> _T:
     """Run ``fn()`` on a daemon thread, bounded by ``timeout``/``cancel_event``.
 
@@ -90,6 +93,14 @@ def run_with_deadline(
     :class:`DeadlineCancelledError` if ``cancel_event`` fires first.  On either
     abort the worker thread is abandoned; being a daemon it cannot block
     process or interpreter exit.
+
+    ``on_abandon`` runs (best-effort) right before either abandonment raise —
+    the one hook for releasing whatever the worker is blocked on, so callers
+    can't wire one abort path and forget the other.  The canonical use is
+    ``on_abandon=abort_ref.abort`` with a :class:`StreamAbortRef` threaded
+    into the provider call as ``cancel_ref``: the abandoned worker's blocked
+    HTTP read raises promptly instead of pinning the thread until the next
+    upstream chunk.
 
     ``poll`` bounds how often ``cancel_event`` is checked (and thus the worst-
     case latency from a cancel to this function returning).
@@ -103,6 +114,12 @@ def run_with_deadline(
             box.put((False, exc))
 
     threading.Thread(target=_runner, name=thread_name, daemon=True).start()
+
+    def _abandon(exc: Exception) -> None:
+        if on_abandon is not None:
+            with contextlib.suppress(Exception):
+                on_abandon()
+        raise exc
 
     deadline = time.monotonic() + timeout
     while True:
@@ -119,10 +136,10 @@ def run_with_deadline(
             raise payload  # type: ignore[misc]  # ok=False ⇒ payload is the raised exc
 
         if cancel_event is not None and cancel_event.is_set():
-            raise DeadlineCancelledError
+            _abandon(DeadlineCancelledError())
         remaining = deadline - time.monotonic()
         if remaining <= 0:
-            raise DeadlineExceededError
+            _abandon(DeadlineExceededError())
         try:
             ok, payload = box.get(timeout=min(remaining, poll))
         except queue.Empty:

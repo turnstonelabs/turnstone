@@ -29,11 +29,17 @@ Earlier stable lines (`stable/1.6`, `stable/1.5`) are frozen.
   blocking read that can hit client read-timeouts — the same reason the
   Anthropic adapter already streamed internally — and judge timeouts now
   *abort* the underlying HTTP read instead of abandoning a worker thread
-  on a dead call. Caveats: OpenAI-compatible servers old enough to ignore
-  `stream_options.include_usage` stop producing usage rows on these
-  lanes, and legacy models that reject streaming requests outright
-  (o1-era) need a model alias pointing at a current model — the unread
-  `supports_streaming` capability flag (and its admin tile) is gone.
+  on a dead call. Caveats: these lanes now carry the same
+  `stream_options: {include_usage: true}` the chat loop always sent —
+  OpenAI-compatible servers old enough to *ignore* it stop producing
+  usage rows on these lanes, and servers strict enough to *reject*
+  unknown fields (pre-2024 llama.cpp/proxy builds) will 400 — such a
+  server already couldn't serve turnstone's chat loop, but a
+  judge/utility alias pointed at one worked on 1.7 and needs to move to
+  a current server. Legacy models that reject streaming requests
+  outright (o1-era) likewise need a model alias pointing at a current
+  model — the unread `supports_streaming` capability flag (and its
+  admin tile) is gone.
 
 - **One turn interface for every model call: `core/model_turn.py` (#827).**
   Judges (intent + output guard), perception, title generation, compaction,

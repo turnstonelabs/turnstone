@@ -564,12 +564,11 @@ class OutputGuardJudge:
                 timeout=timeout,
                 cancel_event=cancel_event,
                 thread_name="output-guard-judge",
+                on_abandon=abort_ref.abort,
             )
         except DeadlineCancelledError:
-            abort_ref.abort()
             return self._error_verdict(verdict_id, call_id, start, "cancelled")
         except DeadlineExceededError:
-            abort_ref.abort()
             return self._error_verdict(verdict_id, call_id, start, "timeout")
         except Exception as e:
             return self._error_verdict(

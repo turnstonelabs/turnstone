@@ -1388,9 +1388,9 @@ class IntentJudge:
             # models aren't penalised for slow earlier turns.
             per_call_timeout = max(self._config.timeout, 5.0)  # at least 5s
             # Fresh per turn — aborting turn N's stream must never touch a
-            # later turn's.  On the abandon paths below, closing the stream
-            # makes the daemon worker's blocked HTTP read raise promptly
-            # instead of pinning the thread until the next upstream chunk.
+            # later turn's.  run_with_deadline's abandon hook closes it so
+            # the daemon worker's blocked HTTP read raises promptly instead
+            # of pinning the thread until the next upstream chunk.
             abort_ref = StreamAbortRef()
             try:
                 # Each turn runs on its own daemon worker (1s cancel polling).
@@ -1414,12 +1414,11 @@ class IntentJudge:
                     timeout=per_call_timeout,
                     cancel_event=cancel_event,
                     thread_name="judge-api",
+                    on_abandon=abort_ref.abort,
                 )
             except DeadlineCancelledError:
-                abort_ref.abort()
                 return None
             except DeadlineExceededError:
-                abort_ref.abort()
                 log.info("judge.turn.timeout", turn=turn + 1, timeout=per_call_timeout)
                 # Safety net: if we have a partial result from a previous turn,
                 # try to parse a verdict from it before giving up.

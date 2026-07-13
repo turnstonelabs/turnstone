@@ -67,6 +67,39 @@ class CompletionResult:
     reasoning: str = ""
 
 
+def merge_usage(acc: UsageInfo | None, new: UsageInfo) -> UsageInfo:
+    """Merge one stream-chunk usage report into an accumulator, per-field max.
+
+    Anthropic splits a request's usage across events (``message_start``
+    carries prompt tokens with completion 0; ``message_delta`` carries
+    completion tokens and may omit prompt tokens), so neither first-wins
+    nor last-wins sees both — the max-merge does.  ``total_tokens`` is
+    recomputed from the merged parts.  Returns a fresh ``UsageInfo`` and
+    never mutates ``new`` (the provider's object).
+
+    ``ChatSession``'s inline chunk consumer implements the same rule over
+    its dict-shaped accumulator; it adopts this helper when the main loop
+    moves onto ``model_turn`` (#832).
+    """
+    if acc is None:
+        return UsageInfo(
+            prompt_tokens=new.prompt_tokens,
+            completion_tokens=new.completion_tokens,
+            total_tokens=new.total_tokens,
+            cache_creation_tokens=new.cache_creation_tokens,
+            cache_read_tokens=new.cache_read_tokens,
+        )
+    prompt = max(acc.prompt_tokens, new.prompt_tokens)
+    completion = max(acc.completion_tokens, new.completion_tokens)
+    return UsageInfo(
+        prompt_tokens=prompt,
+        completion_tokens=completion,
+        total_tokens=prompt + completion,
+        cache_creation_tokens=max(acc.cache_creation_tokens, new.cache_creation_tokens),
+        cache_read_tokens=max(acc.cache_read_tokens, new.cache_read_tokens),
+    )
+
+
 def drain_stream(chunks: Iterator[StreamChunk]) -> CompletionResult:
     """Drain a ``create_streaming`` iterator into a ``CompletionResult``.
 
@@ -84,12 +117,14 @@ def drain_stream(chunks: Iterator[StreamChunk]) -> CompletionResult:
     - ``provider_blocks`` replaces on each non-empty emission — every
       adapter attaches its full block list exactly once, on or after the
       terminal chunk.
-    - ``info_delta`` BEFORE the finish reason is transient status (server-
+    - ``info_delta`` interleaved with the data is transient status (server-
       side search pings) that the non-streaming lane never surfaced — drop
-      it.  ``info_delta`` AFTER the finish reason is the citations footer
-      (``format_citations("", annotations).strip()``); folding it back as
-      ``content + "\\n\\n" + info`` byte-matches the non-streaming lane's
-      ``format_citations(content, annotations)`` append.
+      it.  ``info_delta`` AFTER the finish reason, or forming the stream's
+      final suffix when a lax server never sent a finish reason, is the
+      citations footer (``format_citations("", annotations).strip()``);
+      folding it back as ``content + "\\n\\n" + info`` byte-matches the
+      non-streaming lane's ``format_citations(content, annotations)``
+      append.
 
     Raises whatever the underlying stream raises — retry/deadline/fallback
     policy stays with the caller, exactly as with the old non-streaming
@@ -98,6 +133,7 @@ def drain_stream(chunks: Iterator[StreamChunk]) -> CompletionResult:
     content_parts: list[str] = []
     reasoning_parts: list[str] = []
     trailing_info_parts: list[str] = []
+    suffix_info_parts: list[str] = []
     tool_calls_acc: dict[int, dict[str, Any]] = {}
     usage: UsageInfo | None = None
     finish_reason: str | None = None
@@ -120,33 +156,32 @@ def drain_stream(chunks: Iterator[StreamChunk]) -> CompletionResult:
             if tcd.arguments_delta:
                 tc["function"]["arguments"] += tcd.arguments_delta
         if sc.usage is not None:
-            if usage is None:
-                usage = UsageInfo(
-                    prompt_tokens=sc.usage.prompt_tokens,
-                    completion_tokens=sc.usage.completion_tokens,
-                    total_tokens=sc.usage.total_tokens,
-                    cache_creation_tokens=sc.usage.cache_creation_tokens,
-                    cache_read_tokens=sc.usage.cache_read_tokens,
-                )
-            else:
-                usage.prompt_tokens = max(usage.prompt_tokens, sc.usage.prompt_tokens)
-                usage.completion_tokens = max(usage.completion_tokens, sc.usage.completion_tokens)
-                usage.total_tokens = usage.prompt_tokens + usage.completion_tokens
-                usage.cache_creation_tokens = max(
-                    usage.cache_creation_tokens, sc.usage.cache_creation_tokens
-                )
-                usage.cache_read_tokens = max(usage.cache_read_tokens, sc.usage.cache_read_tokens)
+            usage = merge_usage(usage, sc.usage)
         if sc.finish_reason:
             finish_reason = sc.finish_reason
         if sc.provider_blocks:
             provider_blocks = sc.provider_blocks
-        # Pre-finish info is transient status — intentionally dropped;
-        # only the trailing (post-finish) citations footer folds back.
-        if sc.info_delta and finish_reason is not None:
-            trailing_info_parts.append(sc.info_delta)
+        if sc.info_delta:
+            if finish_reason is not None:
+                trailing_info_parts.append(sc.info_delta)
+            else:
+                # Candidate citations footer on a finish-less stream —
+                # kept only while nothing but info follows it (below).
+                suffix_info_parts.append(sc.info_delta)
+        if (
+            sc.content_delta
+            or sc.reasoning_delta
+            or sc.tool_call_deltas
+            or sc.usage is not None
+            or sc.finish_reason
+            or sc.provider_blocks
+        ):
+            # Real payload after a pre-finish info chunk: that info was an
+            # interleaved status ping, not the terminal citations footer.
+            suffix_info_parts.clear()
 
     content = "".join(content_parts)
-    for info in trailing_info_parts:
+    for info in trailing_info_parts + suffix_info_parts:
         content += "\n\n" + info
 
     tool_calls = [tool_calls_acc[i] for i in sorted(tool_calls_acc)]

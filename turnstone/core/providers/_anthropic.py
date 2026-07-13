@@ -925,6 +925,7 @@ class AnthropicProvider:
         server_tool_blocks: dict[int, dict[str, str]] = {}
         # Capture raw content blocks for multi-turn preservation
         raw_blocks: dict[int, dict[str, Any]] = {}
+        saw_text_block = False
 
         for event in stream:
             sc = StreamChunk()
@@ -933,6 +934,15 @@ class AnthropicProvider:
             if event_type == "content_block_start":
                 block = event.content_block
                 raw_blocks[event.index] = _block_to_dict(block)
+                if block.type == "text":
+                    # Separate consecutive text blocks the way the Messages
+                    # API's non-streaming shape reads when joined — without
+                    # this, a web-search turn's post-results text block fuses
+                    # onto the pre-search sentence.  Emitted as a plain
+                    # content delta so it never lands in the raw block.
+                    if saw_text_block:
+                        sc.content_delta = "\n"
+                    saw_text_block = True
                 if block.type == "tool_use":
                     idx = next_tool_index
                     tool_block_to_index[event.index] = idx
@@ -983,6 +993,20 @@ class AnthropicProvider:
                         raw_blocks[event.index]["signature"] = (
                             raw_blocks[event.index].get("signature", "") + delta.signature
                         )
+                elif delta.type == "citations_delta":
+                    # Text-block citations (web-search models) arrive one
+                    # citation object per delta.  They must ride the raw
+                    # block for replay — Anthropic requires citations to be
+                    # passed back unmodified alongside their
+                    # web_search_tool_result blocks on later turns.
+                    if event.index in raw_blocks:
+                        citation = getattr(delta, "citation", None)
+                        if citation is not None:
+                            raw_blocks[event.index].setdefault("citations", []).append(
+                                citation.model_dump()
+                                if hasattr(citation, "model_dump")
+                                else citation
+                            )
                 elif delta.type == "input_json_delta":
                     if event.index in server_tool_blocks:
                         # Accumulate server tool input (search query)

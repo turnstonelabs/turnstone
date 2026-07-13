@@ -233,6 +233,34 @@ class TestInfoDelta:
         )
         assert result.content == "\n\nSources:\n- x"
 
+    def test_finishless_stream_still_folds_terminal_citations(self):
+        # A lax compat server may never send finish_reason (a shape the
+        # adapters tolerate); the adapters' post-loop citations footer is
+        # then the stream's final suffix and must still fold into content.
+        result = drain_stream(
+            iter(
+                [
+                    StreamChunk(content_delta="body"),
+                    StreamChunk(info_delta="Sources:\n- x"),
+                ]
+            )
+        )
+        assert result.content == "body\n\nSources:\n- x"
+        assert result.finish_reason == "stop"
+
+    def test_finishless_interleaved_ping_still_dropped(self):
+        # Info followed by real payload is a status ping, not the terminal
+        # footer — dropped even when the stream never sends finish_reason.
+        result = drain_stream(
+            iter(
+                [
+                    StreamChunk(info_delta="[Searching: x]"),
+                    StreamChunk(content_delta="answer"),
+                ]
+            )
+        )
+        assert result.content == "answer"
+
 
 class TestErrorPropagation:
     def test_mid_stream_exception_propagates_verbatim(self):

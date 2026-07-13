@@ -42,6 +42,18 @@ from turnstone.core.trajectory import materialize_attachments
 log = structlog.get_logger(__name__)
 
 
+class ResponsesStreamFailedError(RuntimeError):
+    """An in-band ``response.failed`` terminal event (HTTP 200 stream).
+
+    Typed (and listed in the provider's ``retryable_error_names``) so
+    retry loops treat an in-band failure — typically a transient
+    server-side error delivered inside an otherwise healthy stream —
+    like the wire-level errors it stands in for, instead of stopping on
+    a bare ``RuntimeError``.  Callers that give up after retries keep
+    their normal degrade paths (judges fall back to the heuristic tier).
+    """
+
+
 def convert_content_parts(parts: list[Any]) -> list[dict[str, Any]]:
     """Convert Chat Completions content parts to Responses API format.
 
@@ -668,7 +680,7 @@ class OpenAIResponsesProvider:
                 response = getattr(event, "response", None)
                 error = getattr(response, "error", None) if response else None
                 error_msg = getattr(error, "message", "Unknown error") if error else "Unknown error"
-                raise RuntimeError(f"Responses API error: {error_msg}")
+                raise ResponsesStreamFailedError(f"Responses API error: {error_msg}")
 
         log.debug(
             "openai.responses.response",
@@ -697,7 +709,7 @@ class OpenAIResponsesProvider:
 
     @property
     def retryable_error_names(self) -> frozenset[str]:
-        return RETRYABLE_ERROR_NAMES
+        return RETRYABLE_ERROR_NAMES | {"ResponsesStreamFailedError"}
 
     # -- reasoning extraction ------------------------------------------------
 

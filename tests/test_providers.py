@@ -1118,6 +1118,63 @@ class TestAnthropicProvider:
         assert json.loads(tc["function"]["arguments"]) == {"path": "foo.py"}
 
     @patch("turnstone.core.providers._anthropic._ensure_anthropic")
+    def test_drained_stream_separates_text_blocks(self, mock_ensure: MagicMock) -> None:
+        # The retired non-streaming lane joined text blocks with "\n"; the
+        # iterator now emits the separator at each subsequent text block
+        # start, so drained content keeps the block boundary (web-search
+        # responses interleave text / server-tool / text).
+        client = MagicMock()
+        client.messages.stream.return_value = fake_anthropic_stream(
+            [
+                SimpleNamespace(type="text", text="Before the search."),
+                SimpleNamespace(type="text", text="After the results."),
+            ]
+        )
+
+        result = drain_stream(
+            self.provider.create_streaming(
+                client=client,
+                model="claude-sonnet-4-20250514",
+                messages=[{"role": "user", "content": "hi"}],
+            )
+        )
+        assert result.content == "Before the search.\nAfter the results."
+
+    @patch("turnstone.core.providers._anthropic._ensure_anthropic")
+    def test_streaming_captures_text_block_citations(self, mock_ensure: MagicMock) -> None:
+        # citations_delta events must land on the raw block: Anthropic
+        # requires citations to replay unmodified alongside their
+        # web_search_tool_result blocks on later turns, and the retired
+        # non-streaming lane preserved them via model_dump.
+        start = _anthropic_event("content_block_start", block_type="text", index=0)
+        # A real dict from model_dump so the raw block accepts the
+        # citations append (a MagicMock auto-dict would swallow it).
+        start.content_block.model_dump.return_value = {"type": "text", "text": ""}
+        cite = _anthropic_event("content_block_delta", delta_type="citations_delta", index=0)
+        cite.delta.citation = {"type": "web_search_result_location", "url": "https://x.test"}
+        text = _anthropic_event(
+            "content_block_delta", delta_type="text_delta", text="cited claim", index=0
+        )
+        finish = _anthropic_event("message_delta", stop_reason="end_turn", usage_output_tokens=1)
+
+        stream_ctx = MagicMock()
+        stream_ctx.__enter__ = MagicMock(return_value=iter([start, cite, text, finish]))
+        stream_ctx.__exit__ = MagicMock(return_value=False)
+        client = MagicMock()
+        client.messages.stream.return_value = stream_ctx
+
+        result = drain_stream(
+            self.provider.create_streaming(
+                client=client,
+                model="claude-sonnet-4-20250514",
+                messages=[{"role": "user", "content": "hi"}],
+            )
+        )
+        assert result.provider_blocks, "expected the text block in provider_blocks"
+        citations = result.provider_blocks[0].get("citations")
+        assert citations == [{"type": "web_search_result_location", "url": "https://x.test"}]
+
+    @patch("turnstone.core.providers._anthropic._ensure_anthropic")
     def test_drained_stream_usage(self, mock_ensure: MagicMock) -> None:
         client = MagicMock()
         client.messages.stream.return_value = fake_anthropic_stream(
@@ -2767,9 +2824,13 @@ class TestAnthropicWebSearch:
         chunks = list(self.provider._iter_anthropic_stream(events))
         text_chunks = [c for c in chunks if c.content_delta]
         info_chunks = [c for c in chunks if c.info_delta]
-        assert len(text_chunks) == 2
-        assert text_chunks[0].content_delta == "Let me search."
-        assert text_chunks[1].content_delta == "Based on the results..."
+        # Three content chunks: the second text BLOCK opens with the "\n"
+        # separator (matching the retired non-streaming join), then its text.
+        assert [c.content_delta for c in text_chunks] == [
+            "Let me search.",
+            "\n",
+            "Based on the results...",
+        ]
         assert len(info_chunks) == 1
         assert "test query" in info_chunks[0].info_delta
 
@@ -5180,3 +5241,32 @@ class TestResponsesDrainedStream:
         assert result.usage is not None
         assert result.usage.prompt_tokens == 10
         assert result.usage.completion_tokens == 5
+
+    def test_refusal_renders_in_content(self) -> None:
+        # The response.refusal.done handler (CHANGELOG "refusals render in
+        # content") — a refused turn must not drain to empty content.
+        events = [
+            SimpleNamespace(type="response.refusal.done", refusal="cannot help with that"),
+            *self._make_events(),
+        ]
+        result = self._drain(events)
+        assert result.content == "[Refused: cannot help with that]"
+
+    def test_failed_event_raises_typed_retryable_error(self) -> None:
+        # An in-band response.failed terminal event raises the TYPED error,
+        # whose name the provider advertises as retryable — retry loops keep
+        # retrying a transient in-band failure instead of hard-stopping on a
+        # bare RuntimeError (the retired non-streaming lane degraded instead).
+        from turnstone.core.providers._openai_responses import ResponsesStreamFailedError
+
+        events = [
+            SimpleNamespace(
+                type="response.failed",
+                response=SimpleNamespace(
+                    status="failed", error=SimpleNamespace(message="model overloaded")
+                ),
+            )
+        ]
+        with pytest.raises(ResponsesStreamFailedError, match="model overloaded"):
+            self._drain(events)
+        assert "ResponsesStreamFailedError" in self.provider.retryable_error_names
