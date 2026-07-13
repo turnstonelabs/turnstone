@@ -10454,6 +10454,11 @@ async def admin_create_mcp_server(request: Request) -> JSONResponse:
         ip,
     )
 
+    # Auto-reload nodes so the new server reaches them (and per-user pools
+    # re-prime for active sessions) without a separate /reload — mirrors the
+    # registry-install path.
+    await _notify_nodes_mcp_reload(request)
+
     server = storage.get_mcp_server(server_id)
     return JSONResponse(_mcp_server_to_detail(_mask_mcp_secrets(server or {})))
 
@@ -10801,6 +10806,10 @@ async def admin_update_mcp_server(request: Request) -> JSONResponse:
         ip,
     )
 
+    # Auto-reload nodes so the edit (incl. a pool auth_type flip) reaches them
+    # and active sessions re-prime, without a separate /reload.
+    await _notify_nodes_mcp_reload(request)
+
     server = storage.get_mcp_server(server_id)
     return JSONResponse(_mcp_server_to_detail(_mask_mcp_secrets(server or {})))
 
@@ -10854,14 +10863,25 @@ async def admin_delete_mcp_server(request: Request) -> JSONResponse:
         ip,
     )
 
+    # Auto-reload nodes so they drop the removed server without a separate
+    # /reload.
+    await _notify_nodes_mcp_reload(request)
+
     return JSONResponse({"status": "ok"})
 
 
 async def _notify_nodes_mcp_reload(request: Request) -> dict[str, Any]:
-    """Tell all nodes to re-read the mcp_servers DB table and reconcile."""
-    collector: ClusterCollector = request.app.state.collector
+    """Tell all nodes to re-read the mcp_servers DB table and reconcile.
+
+    Best-effort: if the cluster fan-out infra isn't present (e.g. a minimal
+    test app), the DB write has already landed and nodes pick the change up on
+    their next reconcile — so skip rather than 500 the caller.
+    """
+    collector: ClusterCollector | None = getattr(request.app.state, "collector", None)
+    client: httpx.AsyncClient | None = getattr(request.app.state, "proxy_client", None)
+    if collector is None or client is None:
+        return {}
     nodes = collector.get_all_nodes()
-    client: httpx.AsyncClient = request.app.state.proxy_client
     headers = _proxy_auth_headers(request)
     sem = asyncio.Semaphore(_get_fan_out_limit(request))
 
