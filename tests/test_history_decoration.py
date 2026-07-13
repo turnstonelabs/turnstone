@@ -509,8 +509,8 @@ class TestExtractReasoningForHistory:
 
     def test_first_block_reasoning_text_dispatches_to_openai_chat(self) -> None:
         # Phase 3 path 3: synthetic ``reasoning_text`` blocks (stamped
-        # by ChatSession._maybe_synth_reasoning_block for vLLM /
-        # llama.cpp / Gemini-compat conversations) dispatch to
+        # by model_turn.synth_reasoning_block for vLLM / llama.cpp /
+        # Gemini-compat conversations) dispatch to
         # OpenAIChatCompletionsProvider.extract_reasoning_text.
         from turnstone.core.history_decoration import extract_reasoning_for_history
 

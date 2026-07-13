@@ -229,8 +229,9 @@ class TestReasoningAuditLogDiscipline:
     def test_synth_reasoning_block_via_stream_response_does_not_log_reasoning(
         self,
     ) -> None:
-        """Drives ChatSession._stream_response (which calls
-        _maybe_synth_reasoning_block at end-of-stream) with a fake
+        """Drives ChatSession._stream_response (which invokes
+        model_turn.synth_reasoning_block at end-of-stream via
+        _finalize_provider_blocks) with a fake
         ``reasoning_delta=_MARKER`` chunk; asserts no log call carried
         the marker text."""
         session = make_session()
@@ -258,7 +259,7 @@ class TestReasoningAuditLogDiscipline:
             if _payload_contains_marker(args, kwargs)
         ]
         assert offending == [], (
-            f"_stream_response + _maybe_synth_reasoning_block leaked reasoning "
+            f"_stream_response + synth_reasoning_block leaked reasoning "
             f"text into INFO+ logs: {offending}"
         )
 

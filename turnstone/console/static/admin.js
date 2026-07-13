@@ -4435,8 +4435,13 @@ function _onSettingChange(inp) {
     dirty = String(current) !== String(orig);
   }
 
-  // Disable save for empty number fields (server will reject)
-  const emptyNumber = inp.type === "number" && current === "";
+  // Disable save for empty number fields (server will reject) — EXCEPT
+  // nullable-default settings, where blank is a saveable state meaning
+  // "inherit" (the save handler maps it to reset-to-default).
+  const emptyNumber =
+    inp.type === "number" &&
+    current === "" &&
+    inp.getAttribute("data-nullable") !== "1";
   if (dirty && !emptyNumber) {
     saveBtn.classList.add("visible");
   } else {

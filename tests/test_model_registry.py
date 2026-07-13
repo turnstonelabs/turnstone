@@ -1188,11 +1188,13 @@ class TestSessionModelCommand:
         assert session.max_tokens == 2048
         assert session.reasoning_effort == "high"
 
-    def test_model_switch_none_params_reverts_to_unset(self) -> None:
-        """Switching to a model with no overrides re-resolves the knobs for
-        the NEW alias: nothing configured → unset (wire omission).  The old
-        model's override must not leak onto the new lane — pre-scheme, a
-        store-less session kept the stale 1.5 forever."""
+    def test_model_switch_storeless_keeps_explicit_knobs(self) -> None:
+        """On a STORE-LESS session (the CLI), the current knobs are the
+        user's explicit flags — the only authority that exists — so a
+        switch to an override-free alias keeps them (mirroring the
+        max_tokens fallback).  With a ConfigStore the shared resolvers
+        re-resolve for the new alias instead (unset → None → wire
+        omission), so per-model overrides don't leak between aliases."""
         reg = ModelRegistry(
             models={
                 "hot": ModelConfig("hot", "x", "x", "hot-model", temperature=1.5),
@@ -1201,9 +1203,15 @@ class TestSessionModelCommand:
             default="hot",
         )
         session = _make_session(registry=reg, model_alias="hot")
-        session.temperature = 1.5  # as set by per-model override
+        session.temperature = 0.9  # user's explicit --temperature flag
+        session.reasoning_effort = "high"  # user's explicit /reason choice
         session.handle_command("/model plain")
-        assert session.temperature is None
+        assert session.temperature == 0.9
+        assert session.reasoning_effort == "high"
+        # A per-model override on the TARGET alias still wins over the
+        # carried knob.
+        session.handle_command("/model hot")
+        assert session.temperature == 1.5
 
     def test_model_switch_unknown_alias(self) -> None:
         reg = ModelRegistry(

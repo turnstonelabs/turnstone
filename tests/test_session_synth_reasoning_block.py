@@ -214,10 +214,11 @@ class TestStreamResponseSynthBlockIntegration:
     """Integration test: drives a fake reasoning-emitting stream
     through ``ChatSession._stream_response`` and asserts the
     synthesizer wires up correctly.  Pins the call site at
-    ``session.py`` (where ``_maybe_synth_reasoning_block`` is invoked
-    on the assembled provider_blocks before stamping ``_provider_content``)
-    — without this, a future refactor that drops the synthesizer call
-    would silently break path-3 capture (vLLM/llama.cpp/Gemini-compat
+    ``session.py`` (where ``model_turn.synth_reasoning_block`` is
+    invoked — via ``_finalize_provider_blocks`` — on the assembled
+    provider_blocks before stamping ``_provider_content``) — without
+    this, a future refactor that drops the synthesizer call would
+    silently break path-3 capture (vLLM/llama.cpp/Gemini-compat
     reasoning would be visible live but invisible on history reload).
     """
 

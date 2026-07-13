@@ -831,16 +831,16 @@ def _build_registry() -> dict[str, SettingDef]:
         SettingDef(
             "coordinator.reasoning_effort",
             "str",
-            "medium",
+            "",
             "Reasoning effort for coordinator sessions (empty = inherit from model.reasoning_effort)",
             "coordinator",
             choices=["", "none", "minimal", "low", "medium", "high", "xhigh", "max"],
-            help="Reasoning effort for coordinator sessions. Coordinators benefit from "
-            "medium-or-higher effort when juggling multiple child workstreams. Use "
-            "'low' only when your coordinator handles simple, one-off dispatch "
-            "workflows. (Empty here means “inherit” — the per-model "
-            "override on the alias wins, otherwise model.reasoning_effort. Use "
-            "‘none’ to actually disable reasoning.)",
+            help="Reasoning effort for coordinator sessions. When empty (the default), "
+            "coordinators inherit like every other lane: the per-model override on "
+            "the alias wins, then model.reasoning_effort, then the model's own "
+            "declared or serving-side default. Coordinators juggling many child "
+            "workstreams often benefit from an explicit medium-or-higher value here. "
+            "Use ‘none’ to actually disable reasoning.",
         ),
         SettingDef(
             "coordinator.max_active",

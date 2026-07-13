@@ -340,12 +340,14 @@ class ModelLane:
     :func:`resolve_temperature_setting` / :func:`resolve_effort_setting`).
     ``None`` means no operator spoke.  For temperature that is terminal:
     the field is omitted from the wire and the inference engine's own
-    default applies.  For effort, :func:`model_turn` applies two more
-    rungs below the lane — a caller-supplied request-shaped default,
-    then the in-code model definition (``caps.default_reasoning_effort``)
-    — before omitting.  House rule: code never pins either knob; callers
-    pass an explicit value only when relaying an operator/user-resolved
-    knob (the session's own value on the session-model lanes).
+    default applies.  For effort, :func:`model_turn` applies exactly one
+    more rung below the lane — the in-code model definition
+    (``caps.default_reasoning_effort``) — before omitting; there is
+    deliberately NO caller-supplied default rung (a code-chosen effort
+    token is unvetted on local vocabularies).  House rule: code never
+    pins either knob; callers pass an explicit value only when relaying
+    an operator/user-resolved knob (the session's own value on the
+    session-model lanes).
     """
 
     provider: LLMProvider

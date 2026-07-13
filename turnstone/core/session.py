@@ -4837,18 +4837,17 @@ class ChatSession:
         minimal UI stubs (some tests, replay shims) predate it and should
         skip recording rather than crash a title-gen or sub-agent turn.
         """
-        u = usage
-        if u is None:
+        if usage is None:
             return
         record = getattr(self.ui, "on_aux_usage", None)
         if record is None:
             return
         record(
             {
-                "prompt_tokens": u.prompt_tokens,
-                "completion_tokens": u.completion_tokens,
-                "cache_creation_tokens": u.cache_creation_tokens,
-                "cache_read_tokens": u.cache_read_tokens,
+                "prompt_tokens": usage.prompt_tokens,
+                "completion_tokens": usage.completion_tokens,
+                "cache_creation_tokens": usage.cache_creation_tokens,
+                "cache_read_tokens": usage.cache_read_tokens,
                 "model": model or self.model,
             }
         )
@@ -5158,7 +5157,15 @@ class ChatSession:
                     tools=self._get_active_tools(),
                     max_tokens=self.max_tokens,
                     temperature=self.temperature,
-                    reasoning_effort=self.reasoning_effort,
+                    # The in-code model-definition rung applies here exactly as
+                    # it does in model_turn's effective computation — the main
+                    # loop must sample identically to every auxiliary lane on
+                    # the same alias (resolve_lane's stated contract).  Session
+                    # effort (operator/user rungs) wins; unset falls to the
+                    # caps declaration; None omits the param.
+                    reasoning_effort=(
+                        self.reasoning_effort or resolved_caps.default_reasoning_effort or None
+                    ),
                     extra_params=self._provider_extra_params(
                         provider=prov, model_alias=model_alias
                     ),
@@ -17054,15 +17061,25 @@ class ChatSession:
                 # away from a model with overrides doesn't leak them and
                 # every surface samples identically on the same alias.
                 # Unset resolves to None (wire omission), replacing any prior
-                # model's value.
+                # model's value.  STORE-LESS sessions (the CLI) are the
+                # exception: there the current knobs ARE the user's explicit
+                # flags (--temperature / /reason) — the only authority that
+                # exists — so the switch keeps them unless the new alias
+                # declares its own (mirrors the max_tokens fallback below).
                 cs = self._config_store
-                self.temperature = resolve_temperature_setting(cfg, cs)
+                if cs:
+                    self.temperature = resolve_temperature_setting(cfg, cs)
+                    self.reasoning_effort = resolve_effort_setting(cfg, cs)
+                else:
+                    if cfg.temperature is not None:
+                        self.temperature = cfg.temperature
+                    if cfg.reasoning_effort:
+                        self.reasoning_effort = cfg.reasoning_effort
                 self.max_tokens = (
                     cfg.max_tokens
                     if cfg.max_tokens is not None
                     else (cs.get("model.max_tokens") if cs else self.max_tokens)
                 )
-                self.reasoning_effort = resolve_effort_setting(cfg, cs)
                 self._init_system_messages()
                 self._save_config()
                 self.ui.on_info(f"Switched to {cyan(arg)}: {model_name}")

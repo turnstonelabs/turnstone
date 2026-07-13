@@ -301,7 +301,9 @@ class TerminalUI(SessionUI):
         total_tok = usage["prompt_tokens"] + usage["completion_tokens"]
         pct = total_tok / context_window * 100 if context_window > 0 else 0
         parts = [f"{total_tok:,} / {context_window:,} tokens ({pct:.0f}%)"]
-        if effort and effort != "medium":
+        # Any resolved effort shows — "medium" is no longer a code default
+        # to hide, it only appears when someone explicitly chose it.
+        if effort:
             parts.append(f"reasoning: {effort}")
         sys.stdout.write(f"\n  {DIM}[{' · '.join(parts)}]{RESET}\n")
         sys.stdout.flush()
