@@ -976,6 +976,7 @@ class IntentJudge:
         session_capabilities: ModelCapabilities | None = None,
         rule_registry: Any | None = None,
         model_registry: Any | None = None,
+        session_model_alias: str = "",
     ) -> None:
         self._config = config
         self._rule_registry = rule_registry
@@ -1058,7 +1059,12 @@ class IntentJudge:
                 session_provider.provider_name,
             )
             self._model = session_model
-            self._alias = ""
+            # Inherit the session's registry alias so the lane resolves
+            # extra_params / replay flag / vLLM attach exactly like every
+            # other lane on the same model — with alias "" (no registry
+            # alias, or a legacy caller) each registry pass degrades to its
+            # documented miss behavior, matching the pre-#827 judges.
+            self._alias = session_model_alias
             # Wire caps: the caller's resolved session caps, or the provider's
             # static table as a last resort for degraded / legacy callers.
             self._capabilities = (
@@ -1372,6 +1378,10 @@ class IntentJudge:
                 # non-daemon thread that would block interpreter exit — the old
                 # single-slot ThreadPoolExecutor left a stuck worker that
                 # poisoned the pool, which is why the restart dance existed.
+                # Temperature is deliberately NOT pinned (house rule): the
+                # lane inherits the judge model's configured temperature —
+                # many modern models misbehave below 1.0, so the model's own
+                # configuration beats a hard determinism pin.
                 result = run_with_deadline(
                     partial(
                         model_turn,
@@ -1379,7 +1389,6 @@ class IntentJudge:
                         judge_turns,
                         tools=None if is_last_turn else tools,
                         max_tokens=2048,
-                        temperature=0.0,
                         reasoning_effort="medium",
                     ),
                     timeout=per_call_timeout,

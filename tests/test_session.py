@@ -2771,16 +2771,15 @@ class TestAgentChildRegistration:
         ]
         assert tool_results and tool_results[0]["tool_use_id"] == "toolu_01AB"
 
-    def test_agent_blank_provider_id_skips_native_lane(self):
+    def test_agent_blank_provider_id_repairs_native_lane(self):
         # A server that leaves a tool-call id blank gets a uuid back-fill in
-        # the tool_calls mirror (_ensure_tool_call_ids) — but the native
-        # tool_use block keeps the blank id verbatim.  Carrying the lane for
-        # that turn would replay a native tool_use whose id matches no
-        # tool_result (Anthropic orphans the result and 400s).  The shared
-        # builder must drop the whole Messages-shaped lane for exactly that
-        # turn (a residual thinking block would REPLACE the rebuilt content
-        # and lose the tool_use) and fall back to the rebuild path, where
-        # every wire representation uses the back-filled id consistently.
+        # the tool_calls mirror — and model_turn's pairwise repair writes the
+        # SAME manufactured id into the blank native client block, so the
+        # lane survives with every representation agreeing (native tool_use,
+        # mirror, tool_result).  Pre-repair the whole Messages-shaped lane
+        # was dropped for the turn, losing the thinking block's reasoning
+        # continuity; the total drop remains only as the pairing-mismatch
+        # fallback (pinned in test_model_turn).
         from turnstone.core.providers._anthropic import AnthropicProvider
 
         class _Block:
@@ -2835,8 +2834,8 @@ class TestAgentChildRegistration:
         with (
             patch.object(session, "_prepare_tool", side_effect=fake_prepare),
             # Pin the operator flag ON at the model_turn seam (where the
-            # agent path resolves it) so the lane-drop below is attributable
-            # to the blank-id gate alone, not a False replay flag.
+            # agent path resolves it) so the lane content below is
+            # attributable to the repair alone, not a False replay flag.
             patch(
                 "turnstone.core.model_turn.resolve_replay_reasoning_to_model",
                 return_value=True,
@@ -2849,18 +2848,26 @@ class TestAgentChildRegistration:
                 parent_call_id="task-1",
             )
 
-        # The back-filled turn carries NO native lane.
-        assert turns[1].native is None
-        # The replay request rebuilds the turn: tool_use and tool_result agree
-        # on the back-filled uuid — no blank id, no orphan.
+        # The repaired turn KEEPS its native lane: thinking survives, and the
+        # tool_use block carries the manufactured (back-filled) id.
+        assert turns[1].native is not None
+        native_types = [b.get("type") for b in turns[1].native.blocks]
+        assert native_types == ["thinking", "tool_use"]
+        manufactured = turns[1].native.blocks[1]["id"]
+        assert manufactured.startswith("call_")
+        # The mirror's minted id maps back to the manufactured id on the wire.
+        assert turns[1].tool_calls[0].id == f"task-1::r1s1::{manufactured}"
+        # The replay request carries the native lane verbatim — thinking and
+        # signature intact — with tool_use and tool_result agreeing on the
+        # manufactured id: no blank id, no orphan, no lost reasoning.
         replay = seen[1]["messages"]
-        tool_uses = [
-            b
-            for m in replay
-            if m["role"] == "assistant" and isinstance(m.get("content"), list)
-            for b in m["content"]
-            if isinstance(b, dict) and b.get("type") == "tool_use"
-        ]
+        assistant = next(
+            m for m in replay if m["role"] == "assistant" and isinstance(m.get("content"), list)
+        )
+        kinds = [b.get("type") for b in assistant["content"]]
+        assert kinds == ["thinking", "tool_use"]
+        assert assistant["content"][0]["signature"] == "sig_b"  # byte-untouched
+        assert assistant["content"][1]["id"] == manufactured
         tool_results = [
             b
             for m in replay
@@ -2868,9 +2875,7 @@ class TestAgentChildRegistration:
             for b in m["content"]
             if isinstance(b, dict) and b.get("type") == "tool_result"
         ]
-        assert tool_uses and tool_results
-        assert tool_uses[0]["id"]  # non-blank (uuid back-fill, restored)
-        assert tool_results[0]["tool_use_id"] == tool_uses[0]["id"]
+        assert tool_results and tool_results[0]["tool_use_id"] == manufactured
 
     def test_agent_blank_provider_id_keeps_synthesized_reasoning(self):
         # The over-drop guard: a Chat-Completions server that BOTH leaves

@@ -43,3 +43,27 @@ def make_session(**kwargs: Any) -> ChatSession:
     }
     defaults.update(kwargs)
     return ChatSession(**defaults)
+
+
+def mock_completion_result(
+    content: str = "",
+    tool_calls: list[dict[str, Any]] | None = None,
+) -> MagicMock:
+    """A provider result shaped like ``CompletionResult``.
+
+    Callers that route through ``model_turn`` (judges, task agents, and
+    every lane #827 migrates) hit its re-ingest, which iterates
+    ``tool_calls``/``provider_blocks`` and joins ``reasoning`` — a bare
+    MagicMock attribute would TypeError deep inside the seam, so every
+    field the re-ingest reads is pinned to a real value here.  ONE shared
+    definition: when the re-ingest starts reading a new CompletionResult
+    field, add it here and every suite moves together.
+    """
+    result = MagicMock()
+    result.content = content
+    result.tool_calls = tool_calls
+    result.finish_reason = "stop"
+    result.usage = None
+    result.provider_blocks = []
+    result.reasoning = ""
+    return result

@@ -9,33 +9,13 @@ from pathlib import Path
 from typing import Any
 from unittest.mock import MagicMock
 
+from tests._session_helpers import mock_completion_result as _mock_result
 from turnstone.core.judge import IntentJudge, IntentVerdict, JudgeConfig, evaluate_heuristic
 from turnstone.core.trajectory import Role
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
-
-
-def _mock_result(
-    content: str = "",
-    tool_calls: list[dict[str, Any]] | None = None,
-) -> MagicMock:
-    """A provider result shaped like ``CompletionResult``.
-
-    The judge's calls run through ``model_turn``, whose re-ingest iterates
-    ``tool_calls``/``provider_blocks`` and joins ``reasoning`` — a bare
-    MagicMock attribute would TypeError, so every field the seam reads is
-    pinned to a real value.
-    """
-    result = MagicMock()
-    result.content = content
-    result.tool_calls = tool_calls
-    result.finish_reason = "stop"
-    result.usage = None
-    result.provider_blocks = []
-    result.reasoning = ""
-    return result
 
 
 def _make_mock_provider(
@@ -913,6 +893,10 @@ class TestModelAliasResolution:
         cfg = MagicMock()
         cfg.context_window = 50_000
         cfg.capabilities = capabilities if capabilities is not None else {}
+        # Judges inherit the alias's configured temperature (house rule: no
+        # code pins) — give the mock config a real value so the lane
+        # resolution path is exercised, not a MagicMock leak.
+        cfg.temperature = 0.3
         registry.has_alias.side_effect = lambda a: a == alias
         registry.resolve.return_value = (alias_client, underlying_model, cfg)
         # The unified lane resolver (model_turn.resolve_capabilities) fetches
@@ -961,6 +945,9 @@ class TestModelAliasResolution:
         )
         passed = alias_provider.create_completion.call_args.kwargs["capabilities"]
         assert passed is judge._capabilities
+        # House rule: the judge pins no temperature — the wire carries the
+        # alias's configured value, inherited through the lane.
+        assert alias_provider.create_completion.call_args.kwargs["temperature"] == 0.3
 
     def test_fallback_threads_session_capabilities_to_wire(self):
         """No judge alias → the judge inherits the session model AND the

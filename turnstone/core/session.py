@@ -133,8 +133,6 @@ from turnstone.core.model_turn import (
     provider_extra_params,
     resolve_capabilities,
     resolve_replay_reasoning_to_model,
-    resolve_server_type,
-    synth_reasoning_block,
 )
 from turnstone.core.nudge_queue import (
     QUIET_CHANNEL,
@@ -1022,16 +1020,6 @@ def _substitute_skill_args(
     return rendered
 
 
-# Block types that carry reasoning content across providers.  Used by
-# ``ChatSession._maybe_synth_reasoning_block`` to decide whether
-# captured ``reasoning_parts`` need a synthetic ``reasoning_text``
-# block: if any of these types already appear in ``provider_blocks``,
-# native lane handles persistence and synthesis is a no-op.
-# - ``thinking`` / ``redacted_thinking`` — Anthropic native
-# - ``reasoning`` — OpenAI Responses native
-# - ``reasoning_text`` — synthetic (path-3 capture; included so
-#   re-running this code path against an already-synthesized list is
-#   idempotent).
 # ---------------------------------------------------------------------------
 # SessionUI protocol — the contract every frontend must implement
 # ---------------------------------------------------------------------------
@@ -2070,35 +2058,6 @@ class ChatSession:
                 self._cached_capabilities = self._resolve_capabilities(p, m, self._model_alias)
             return self._cached_capabilities
         return self._resolve_capabilities(p, m, "")
-
-    def _resolve_server_type(self, alias: str | None = None) -> str:
-        """Delegate to :func:`turnstone.core.model_turn.resolve_server_type`.
-
-        ``None`` *alias* (the main-loop caller) resolves to the session's
-        primary alias; full semantics documented on the module function.
-        """
-        return resolve_server_type(self._registry, alias or self._model_alias or "")
-
-    def _maybe_synth_reasoning_block(
-        self,
-        provider_blocks: list[dict[str, Any]],
-        reasoning_parts: list[str],
-        alias: str | None = None,
-    ) -> list[dict[str, Any]]:
-        """Delegate to :func:`turnstone.core.model_turn.synth_reasoning_block`.
-
-        *alias* names the model whose server produced the reasoning; ``None``
-        (the main-loop caller) resolves to the session's primary alias.  Full
-        semantics (the Google fidelity-block append rule, the
-        ``reasoning_text``-not-``thinking`` cross-model guard) documented on
-        the module function.
-        """
-        return synth_reasoning_block(
-            provider_blocks,
-            reasoning_parts,
-            registry=self._registry,
-            alias=alias or self._model_alias or "",
-        )
 
     def _finalize_provider_blocks(
         self,
@@ -4783,22 +4742,6 @@ class ChatSession:
         """
         prov = provider or self._provider
         return provider_extra_params(prov, self._registry, model_alias or self._model_alias or "")
-
-    def _get_server_compat(self, model_alias: str | None = None) -> dict[str, Any]:
-        """Get server compatibility settings from a model config.
-
-        *model_alias* selects the config to read.  Falls back to the
-        session's primary alias when ``None``.  The returned dict is the
-        live ``ModelConfig.server_compat`` reference — callers must not
-        mutate it.  ``merge_server_compat`` reads only.
-        """
-        alias = model_alias or self._model_alias
-        if self._registry and alias:
-            try:
-                return self._registry.get_config(alias).server_compat
-            except (ValueError, KeyError):
-                pass
-        return {}
 
     def _utility_completion(
         self,
@@ -7808,6 +7751,10 @@ class ChatSession:
                 session_capabilities=caps,
                 rule_registry=self._rule_registry,
                 model_registry=self._registry,
+                # On judge.model-unset fallback the judge inherits the session
+                # model — thread its alias too, so the lane resolves
+                # extra_params / live flags like every other session lane.
+                session_model_alias=self._model_alias or "",
             )
         except Exception:
             log.warning("judge.init_failed", exc_info=True)
@@ -7842,6 +7789,7 @@ class ChatSession:
                 # reach the judge wire when output_guard_model is unset — same
                 # source IntentJudge gets via _ensure_judge.
                 session_capabilities=self._get_capabilities(),
+                session_model_alias=self._model_alias or "",
             )
         except Exception:
             log.warning("output_guard_judge.init_failed", exc_info=True)

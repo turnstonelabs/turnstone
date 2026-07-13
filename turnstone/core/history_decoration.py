@@ -260,7 +260,7 @@ def _make_provider_factory(module_path: str, class_name: str) -> Callable[[], LL
 #   (present when ``include=["reasoning.encrypted_content"]`` is
 #   requested AND the response carries raw reasoning text).
 # * ``"reasoning_text"`` — synthetic, stamped by
-#   ``ChatSession._maybe_synth_reasoning_block`` for Chat Completions
+#   ``model_turn.synth_reasoning_block`` for Chat Completions
 #   paths (vLLM, llama.cpp, Gemini-compat) where reasoning surfaces
 #   only as ``reasoning_delta`` chunks with no native block shape.
 _anthropic_factory = _make_provider_factory(

@@ -269,6 +269,7 @@ class OutputGuardJudge:
         session_model: str,
         model_registry: Any | None = None,
         session_capabilities: ModelCapabilities | None = None,
+        session_model_alias: str = "",
     ) -> None:
         self._config = config
         # Carried into the per-evaluation ModelLane so extra_params and the
@@ -337,7 +338,10 @@ class OutputGuardJudge:
                 session_client, session_provider.provider_name
             )
             self._model = session_model
-            self._judge_model_alias = ""
+            # Inherit the session's registry alias so the lane resolves
+            # extra_params / replay flag exactly like every other lane on
+            # the same model (see IntentJudge's fallback for the rationale).
+            self._judge_model_alias = session_model_alias
             # Wire caps: the caller's resolved session caps, or the provider's
             # static table as a last resort for degraded / legacy callers.
             self._capabilities = (
@@ -514,6 +518,8 @@ class OutputGuardJudge:
             registry=self._model_registry,
             capabilities=self._capabilities,
         )
+        # Temperature deliberately not pinned (house rule) — the lane
+        # inherits the guard model's configured temperature.
         try:
             result = run_with_deadline(
                 lambda: model_turn(
@@ -521,7 +527,6 @@ class OutputGuardJudge:
                     judge_turns,
                     tools=None,
                     max_tokens=512,
-                    temperature=0.0,
                     reasoning_effort="low",
                 ),
                 timeout=timeout,

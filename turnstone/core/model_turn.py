@@ -3,10 +3,12 @@
 ``model_turn()`` is the single lower-and-sample surface: lower a
 ``list[Turn]`` to wire dicts, invoke the provider once, and re-ingest the
 response as an assistant :class:`~turnstone.core.trajectory.Turn` carrying
-the provider-native lane.  Every out-of-main-loop lane (task-agent
-sub-harness, intent judge, output-guard judge, utility completions,
-perception, eval) runs its model calls through here, so message shaping
-cannot drift between lanes (#827).
+the provider-native lane.  Any lane that samples the model belongs here;
+a call site that still builds messages and hits ``create_completion``
+directly is migration debt, tracked on #827 (transport retirement #831,
+main loop #832).  Grep for callers — not this docstring — for current
+coverage, and mirror wire-shaping changes into any straggler until that
+list is empty.
 
 Contract, held deliberately narrow:
 
@@ -29,9 +31,8 @@ Contract, held deliberately narrow:
 
 from __future__ import annotations
 
-import contextlib
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, fields, replace
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
@@ -51,7 +52,10 @@ from turnstone.core.lowering import (
     restore_provider_tool_ids,
     sanitize_tool_call_arguments,
 )
-from turnstone.core.storage._utils import strip_orphan_client_tool_blocks
+from turnstone.core.storage._utils import (
+    _CLIENT_TOOL_CALL_BLOCK_TYPES,
+    strip_orphan_client_tool_blocks,
+)
 from turnstone.core.trajectory import ProviderNative, ToolCall, Turn, dicts_from_turns
 
 log = get_logger(__name__)
@@ -70,36 +74,57 @@ REASONING_BEARING_BLOCK_TYPES: frozenset[str] = frozenset(
 # happens.  ``ChatSession`` delegates its wrappers here; the judges build
 # lanes directly (their #826-era mirror resolver is gone).
 # --------------------------------------------------------------------------- #
+def _get_config_or_none(registry: ModelRegistry | None, alias: str) -> Any | None:
+    """One defensive ``get_config`` fetch shared by the lane resolvers.
+
+    A miss (alias deleted or registry hot-reloaded mid-lookup) degrades to
+    ``None`` — resolution paths must never crash a caller's construction:
+    pre-extraction, a judge constructor read caps off the already-fetched
+    ModelConfig and could not fail here, and a raise would silently
+    downgrade the judge to the session model.
+    """
+    if not registry or not alias:
+        return None
+    try:
+        return registry.get_config(alias)
+    except Exception:
+        log.debug("get_config failed for alias=%s; resolving without it", alias, exc_info=True)
+        return None
+
+
 def resolve_capabilities(
     provider: LLMProvider,
     model: str,
     alias: str,
     registry: ModelRegistry | None,
+    *,
+    cfg: Any | None = None,
 ) -> ModelCapabilities:
     """Provider static capabilities, merged with registry alias overrides.
 
     Only keys that name real :class:`ModelCapabilities` fields are applied —
     unknown keys in an operator's ``capabilities`` JSON are ignored rather
-    than raising, because the registry accepts free-form dicts.  NOTE the
-    window landmine documented on #826: ``ModelConfig.context_window`` is a
-    separate top-level column and is deliberately NOT merged here; callers
-    that need the operator window must read it off the config themselves.
+    than raising, because the registry accepts free-form dicts, and a
+    malformed non-dict value degrades to "no overrides" (inherited from the
+    judges' old mirror — capability resolution must never crash a judge
+    turn).  *cfg* accepts a pre-fetched ModelConfig so a caller resolving
+    several lane facets reads ONE config generation (see
+    :func:`resolve_lane`); omitted, the config is fetched defensively.
+    NOTE the window landmine documented on #826:
+    ``ModelConfig.context_window`` is a separate top-level column and is
+    deliberately NOT merged here; callers that need the operator window
+    must read it off the config themselves.
     """
-    import dataclasses
-
     caps = provider.get_capabilities(model)
-    if registry and alias:
-        cfg = registry.get_config(alias)
+    if cfg is None:
+        cfg = _get_config_or_none(registry, alias)
+    if cfg is not None:
         overrides_raw = getattr(cfg, "capabilities", None)
-        # Defensive dict-check (inherited from the judges' old mirror): a
-        # malformed capabilities value must degrade to "no overrides", not
-        # raise — a raise inside a judge constructor would silently downgrade
-        # the judge to the session model.
         if isinstance(overrides_raw, dict) and overrides_raw:
-            fields = {f.name for f in dataclasses.fields(type(caps))}
-            overrides = {k: v for k, v in overrides_raw.items() if k in fields}
+            names = {f.name for f in fields(type(caps))}
+            overrides = {k: v for k, v in overrides_raw.items() if k in names}
             if overrides:
-                caps = dataclasses.replace(caps, **overrides)
+                caps = replace(caps, **overrides)
     return caps
 
 
@@ -107,6 +132,8 @@ def provider_extra_params(
     provider: LLMProvider,
     registry: ModelRegistry | None,
     alias: str,
+    *,
+    cfg: Any | None = None,
 ) -> dict[str, Any] | None:
     """Operator ``server_compat["extra_body"]`` pins for the OpenAI-shaped
     lanes (and the anthropic-compatible lane, whose SDK also takes
@@ -114,43 +141,42 @@ def provider_extra_params(
     inside their providers.  Reasoning params (``enable_thinking`` /
     ``effort_param``) are NOT built here — the providers add them via
     ``merge_reasoning_template_kwargs`` from capabilities + the effort knob.
+    *cfg* accepts a pre-fetched ModelConfig (see :func:`resolve_lane`).
     """
     from turnstone.core.server_compat import merge_server_compat
 
     if provider.provider_name not in ("openai", "openai-compatible", "anthropic-compatible"):
         return None
-    server_compat: dict[str, Any] = {}
-    if registry and alias:
-        with contextlib.suppress(ValueError, KeyError):
-            server_compat = registry.get_config(alias).server_compat
-    extra = merge_server_compat(None, server_compat)
+    if cfg is None:
+        cfg = _get_config_or_none(registry, alias)
+    server_compat = getattr(cfg, "server_compat", None) if cfg is not None else None
+    extra = merge_server_compat(None, server_compat if isinstance(server_compat, dict) else {})
     return extra or None
+
+
+def _server_type_of(cfg: Any) -> str:
+    """``server_compat.server_type`` off a fetched ModelConfig (``""`` on miss).
+
+    Reads ``cfg.server_compat`` (the dedicated dataclass field hoisted by
+    both model_registry loader paths) — NOT ``cfg.capabilities``.  The ONE
+    reader of the field path: :func:`resolve_server_type` and the Phase 5
+    gate in :func:`maybe_attach_vllm_chat_reasoning` both go through here,
+    so a loader shape change cannot desync them.
+    """
+    sc = getattr(cfg, "server_compat", None)
+    if isinstance(sc, dict):
+        return str(sc.get("server_type") or "")
+    return ""
 
 
 def resolve_server_type(registry: ModelRegistry | None, alias: str) -> str:
     """``server_compat.server_type`` for an alias (``""`` on any miss).
 
-    Reads ``cfg.server_compat`` (the dedicated dataclass field hoisted by
-    both model_registry loader paths) — NOT ``cfg.capabilities``.  The
-    Phase 5 gate in :func:`maybe_attach_vllm_chat_reasoning` reads the same
-    field path directly off its own ``get_config`` fetch; if you change one
-    reader, change the other.
+    Best-effort lookup — synth-block source tagging is informational,
+    never load-bearing.
     """
-    if not registry or not alias:
-        return ""
-    try:
-        sc = registry.get_config(alias).server_compat
-        if isinstance(sc, dict):
-            return str(sc.get("server_type") or "")
-    except Exception:
-        # Best-effort lookup — synth-block source tagging is informational,
-        # never load-bearing.
-        log.debug(
-            "resolve_server_type lookup failed for alias=%s; defaulting to empty",
-            alias,
-            exc_info=True,
-        )
-    return ""
+    cfg = _get_config_or_none(registry, alias)
+    return _server_type_of(cfg) if cfg is not None else ""
 
 
 def resolve_replay_reasoning_to_model(
@@ -209,18 +235,14 @@ def maybe_attach_vllm_chat_reasoning(
 
     if not isinstance(provider, OpenAIChatCompletionsProvider):
         return messages
-    if not registry or not alias:
-        return messages
-    try:
-        cfg = registry.get_config(alias)
-    except Exception:
+    cfg = _get_config_or_none(registry, alias)
+    if cfg is None:
         return messages
     # Both gate fields read off the single ``cfg`` fetch (no second
-    # ``get_config`` round-trip); field path mirrors resolve_server_type.
-    sc = cfg.server_compat if isinstance(cfg.server_compat, dict) else None
-    if not isinstance(sc, dict) or sc.get("server_type") != "vllm":
+    # ``get_config`` round-trip); the field path is owned by _server_type_of.
+    if _server_type_of(cfg) != "vllm":
         return messages
-    if not bool(cfg.replay_reasoning_to_model):
+    if not bool(getattr(cfg, "replay_reasoning_to_model", False)):
         return messages
     return attach_vllm_chat_reasoning_field(messages)
 
@@ -239,6 +261,13 @@ class ModelLane:
     *alias* is the registry alias used for config resolution, ``""`` when
     the lane runs outside the registry (then every registry-backed pass
     degrades to its documented miss behavior).
+
+    *temperature* is the lane's inherited sampling temperature (the alias's
+    ``ModelConfig.temperature``, or ``None`` for the provider default).
+    House rule: code never pins a temperature — many modern models
+    misbehave below 1.0, so the model's own configuration is the source of
+    truth; callers pass an explicit value only when relaying an
+    operator-resolved knob (the session's, for the agent seam).
     """
 
     provider: LLMProvider
@@ -248,6 +277,7 @@ class ModelLane:
     capabilities: ModelCapabilities | None = None
     extra_params: dict[str, Any] | None = None
     registry: ModelRegistry | None = None
+    temperature: float | None = None
 
 
 def resolve_lane(
@@ -267,10 +297,18 @@ def resolve_lane(
     agent run's per-alias resolution) don't pay for or drift from a second
     pass.  ``...`` (the sentinel default) means "resolve for me" —
     ``None`` is a valid resolved value for *extra_params*.
+
+    All resolved facets read ONE defensively-fetched ModelConfig, so a
+    registry hot-reload mid-resolution cannot mix config generations, and
+    an alias that raced away degrades every facet to its miss behavior
+    instead of raising into the caller's constructor.
     """
-    caps = capabilities or resolve_capabilities(provider, model, alias, registry)
+    cfg = _get_config_or_none(registry, alias)
+    caps = capabilities or resolve_capabilities(provider, model, alias, registry, cfg=cfg)
     extra = (
-        provider_extra_params(provider, registry, alias) if extra_params is ... else extra_params
+        provider_extra_params(provider, registry, alias, cfg=cfg)
+        if extra_params is ...
+        else extra_params
     )
     return ModelLane(
         provider=provider,
@@ -280,6 +318,7 @@ def resolve_lane(
         capabilities=caps,
         extra_params=extra,
         registry=registry,
+        temperature=getattr(cfg, "temperature", None) if cfg is not None else None,
     )
 
 
@@ -297,6 +336,44 @@ def ensure_tool_call_ids(tool_calls: list[dict[str, Any]] | dict[int, dict[str, 
     for tc in items:
         if not tc.get("id"):
             tc["id"] = f"call_{uuid.uuid4().hex}"
+
+
+def backfill_blank_native_tool_ids(
+    provider_blocks: list[dict[str, Any]],
+    mirror_calls: list[dict[str, Any]],
+) -> bool:
+    """Manufacture ids for BLANK-id native client tool blocks from the
+    uuid-back-filled mirror, restoring the native↔mirror id agreement that
+    the blank-id drop rule otherwise enforces by discarding the lane.
+
+    Pairing is positional: the native client tool blocks and the
+    ``tool_calls`` mirror are built from the same response in the same
+    iteration on every lane (the #825 pairing invariant, the same 1:1
+    ordering the durable-subturn re-mint design relies on).  Only a BLANK
+    id is ever written — a non-blank provider id may sit under a reasoning
+    signature and is never rewritten, which inherently protects the
+    signed-lane providers (Anthropic never emits blank ids; the observed
+    blank-id servers are Chat-Completions locals and Google's OpenAI-compat
+    endpoint, whose fidelity blocks are plain mirror-shaped dicts).
+
+    Returns ``True`` when the pairing matched and every client block now
+    carries an id — the caller may then keep the full native lane
+    (``thought_signature`` survives, unblocking the Gemini judge's evidence
+    loop).  Returns ``False`` on any count mismatch, leaving the caller to
+    the total reasoning_text-only drop, which remains the safe fallback the
+    #825 review converged on.
+    """
+    client_blocks = [
+        b
+        for b in provider_blocks
+        if isinstance(b, dict) and b.get("type") in _CLIENT_TOOL_CALL_BLOCK_TYPES
+    ]
+    if len(client_blocks) != len(mirror_calls):
+        return False
+    for block, tc in zip(client_blocks, mirror_calls, strict=True):
+        if not block.get("id"):
+            block["id"] = tc["id"]
+    return all(b.get("id") for b in client_blocks)
 
 
 def synth_reasoning_block(
@@ -359,16 +436,19 @@ def finalize_provider_blocks(
 
     *had_blank_ids* is the OTHER direction of that mirror: the
     :func:`ensure_tool_call_ids` back-fill reaches only the ``tool_calls``
-    mirror, so an id-bearing native block still carries the blank id
-    verbatim and any replay of it desyncs from the mirror and the results
-    (Anthropic orphans the result and 400s; the Google swap re-fills a
-    fresh id and drops the real result) — and on the Messages translator a
-    partially-surviving lane REPLACES the rebuilt content wholesale, so a
-    lane missing its ``tool_use`` would orphan every mirrored call.  On a
-    blank-id turn the ONLY block kept is the loose-text ``reasoning_text``
-    synth: it carries no id, it is shape-invalid on the Messages
-    translator by design, and real-world blank-id servers are
-    Chat-Completions locals whose reasoning IS that loose text.
+    mirror, so an id-bearing native block still carrying a blank id
+    desyncs from the mirror and the results on replay (Anthropic orphans
+    the result and 400s; the Google swap re-fills a fresh id and drops the
+    real result) — and on the Messages translator a partially-surviving
+    lane REPLACES the rebuilt content wholesale, so a lane missing its
+    ``tool_use`` would orphan every mirrored call.  ``model_turn`` first
+    attempts the pairwise repair (:func:`backfill_blank_native_tool_ids`,
+    manufactured ids written into the blank native blocks) and only passes
+    ``had_blank_ids=True`` when the repair could not pair; on that path
+    the ONLY block kept is the loose-text ``reasoning_text`` synth: it
+    carries no id, it is shape-invalid on the Messages translator by
+    design, and real-world blank-id servers are Chat-Completions locals
+    whose reasoning IS that loose text.
 
     The ONE builder every harness shares: the main-loop stream accumulator,
     the sub-agent loop, and (via :func:`model_turn`) the judges finalize
@@ -422,12 +502,10 @@ def model_turn(
     *,
     tools: list[dict[str, Any]] | None = None,
     max_tokens: int = 4096,
-    temperature: float = 0.5,
+    temperature: float | None = None,
     reasoning_effort: str = "medium",
     mint: Callable[[str], str] | None = None,
     wire_id_map: dict[str, str] | None = None,
-    extra_headers: dict[str, str] | None = None,
-    resolve_attachments: Callable[[list[str]], dict[str, Any]] | None = None,
 ) -> ModelTurnResult:
     """Advance a trajectory by one model turn: lower, sample, re-ingest.
 
@@ -441,58 +519,78 @@ def model_turn(
     per call is deliberate: the passes are deterministic and copy-on-write,
     so a caller's retry loop just calls again.
 
+    *temperature* ``None`` (the default) inherits the lane's resolved
+    value — the alias's ``ModelConfig.temperature``, or the provider
+    default when unset.  House rule: never pin a temperature in code; pass
+    an explicit float only to relay an operator-resolved knob.
+
     *mint* rewrites each returned tool call's id (provider-original →
     caller-scoped) before the Turn is built; the native blocks keep the
     provider ids verbatim (they are never rewritten — they may sit under a
     reasoning signature).  Every ``minted → original`` pair is recorded
-    into *wire_id_map* (caller-owned, threaded back in on the next call so
-    the restore pass can undo the mint on the wire).  Blank provider ids
-    are uuid-back-filled first; the pre-back-fill blank state feeds the
-    finalize gate (see :func:`finalize_provider_blocks`).
+    into *wire_id_map*, which is therefore REQUIRED with *mint* (caller-
+    owned, threaded back in on the next call so the restore pass can undo
+    the mint on the wire — minted ids without the map are unrestorable and
+    would orphan every tool result).  Blank provider ids are
+    uuid-back-filled first, then :func:`backfill_blank_native_tool_ids`
+    repairs the native lane's blank ids pairwise; only when that repair
+    can't pair does the finalize gate drop the lane to its
+    ``reasoning_text`` synth (see :func:`finalize_provider_blocks`).
 
     Raises whatever the provider raises — retry/deadline/fallback policy
     is the caller's.
     """
+    if mint is not None and wire_id_map is None:
+        raise ValueError(
+            "model_turn: mint requires wire_id_map — minted ids are "
+            "unrestorable on the wire without the recovery map"
+        )
     wire = restore_provider_tool_ids(
         sanitize_tool_call_arguments(dicts_from_turns(list(turns))),
         wire_id_map if wire_id_map is not None else {},
     )
     wire = maybe_attach_vllm_chat_reasoning(wire, lane.provider, lane.registry, lane.alias)
-    result = lane.provider.create_completion(
-        client=lane.client,
-        model=lane.model,
-        messages=wire,
-        tools=tools,
-        max_tokens=max_tokens,
-        temperature=temperature,
-        reasoning_effort=reasoning_effort,
-        extra_params=lane.extra_params,
-        capabilities=lane.capabilities,
-        replay_reasoning_to_model=resolve_replay_reasoning_to_model(
+    call_kwargs: dict[str, Any] = {
+        "client": lane.client,
+        "model": lane.model,
+        "messages": wire,
+        "tools": tools,
+        "max_tokens": max_tokens,
+        "reasoning_effort": reasoning_effort,
+        "extra_params": lane.extra_params,
+        "capabilities": lane.capabilities,
+        "replay_reasoning_to_model": resolve_replay_reasoning_to_model(
             lane.registry, lane.alias, caps=lane.capabilities
         ),
-        extra_headers=extra_headers,
-        resolve_attachments=resolve_attachments,
-    )
+    }
+    effective_temperature = temperature if temperature is not None else lane.temperature
+    if effective_temperature is not None:
+        call_kwargs["temperature"] = effective_temperature
+    result = lane.provider.create_completion(**call_kwargs)
 
     raw_calls: list[dict[str, Any]] = list(result.tool_calls or [])
     # Record blanks BEFORE the uuid back-fill: a back-filled id exists only
-    # in the tool_calls mirror — the native blocks keep the blank provider
-    # id verbatim, so the finalize gate must drop the blocks the back-fill
-    # desyncs.
+    # in the tool_calls mirror until the pairwise native repair below runs.
     had_blank_ids = any(not tc.get("id") for tc in raw_calls)
     ensure_tool_call_ids(raw_calls)
+    if had_blank_ids and backfill_blank_native_tool_ids(result.provider_blocks, raw_calls):
+        # The native client blocks now carry the manufactured ids — the
+        # mirror, the native lane, and (via the map-restored wire) the tool
+        # results agree again, so the lane can be kept: thought_signature
+        # survives on Google's blank-id compat responses instead of the
+        # turn degrading to loose reasoning text.
+        had_blank_ids = False
     if mint is not None:
+        assert wire_id_map is not None  # enforced by the guard above
         for tc in raw_calls:
             original_id = tc["id"]
             minted = mint(original_id)
             if minted != original_id:
                 tc["id"] = minted
-                if wire_id_map is not None:
-                    # Recovery is by MAP ONLY — never string-split the mint
-                    # (parent and original are provider-controlled strings
-                    # that may themselves contain the delimiter).
-                    wire_id_map[minted] = original_id
+                # Recovery is by MAP ONLY — never string-split the mint
+                # (parent and original are provider-controlled strings
+                # that may themselves contain the delimiter).
+                wire_id_map[minted] = original_id
 
     tool_calls = tuple(
         ToolCall(

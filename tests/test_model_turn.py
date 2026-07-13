@@ -12,6 +12,8 @@ from types import SimpleNamespace
 from typing import Any
 from unittest.mock import MagicMock
 
+import pytest
+
 from turnstone.core.model_turn import (
     ModelLane,
     finalize_provider_blocks,
@@ -50,11 +52,13 @@ def _fake_registry(
     capabilities: dict[str, Any] | None = None,
     server_compat: dict[str, Any] | None = None,
     replay: bool = False,
+    temperature: float | None = None,
 ) -> MagicMock:
     cfg = SimpleNamespace(
         capabilities=capabilities or {},
         server_compat=server_compat or {},
         replay_reasoning_to_model=replay,
+        temperature=temperature,
     )
     reg = MagicMock()
     reg.get_config.return_value = cfg
@@ -156,23 +160,89 @@ def test_restore_maps_minted_ids_back_on_the_wire() -> None:
     assert tool["tool_call_id"] == "call_0"
 
 
-def test_blank_ids_backfill_and_reduce_native_lane_to_reasoning_text() -> None:
+def test_blank_ids_repair_native_lane_pairwise() -> None:
+    # Google-compat shape: blank id on BOTH the mirror and the raw fidelity
+    # block.  The manufactured uuid lands in both (positional pairing), so
+    # the thought_signature-bearing block SURVIVES instead of the turn
+    # degrading to loose reasoning text — the unblock for the Gemini judge
+    # evidence loop on blank-id compat responses.
     provider = _FakeProvider(
         [
             CompletionResult(
                 content="",
-                tool_calls=[{"id": "", "type": "function", "function": {"name": "f"}}],
-                provider_blocks=[{"type": "tool_use", "id": "", "name": "f"}],
+                tool_calls=[
+                    {"id": "", "type": "function", "function": {"name": "f", "arguments": "{}"}}
+                ],
+                provider_blocks=[
+                    {
+                        "id": "",
+                        "type": "function",
+                        "function": {"name": "f", "arguments": "{}"},
+                        "thought_signature": "sig123",
+                    }
+                ],
                 reasoning="thought",
             )
         ]
     )
     result = model_turn(_lane(provider), [Turn.user("x")])
 
-    # uuid back-fill reaches the mirror …
+    manufactured = result.tool_calls[0]["id"]
+    assert manufactured.startswith("call_")
+    assert result.turn.native is not None
+    blocks = list(result.turn.native.blocks)
+    # The fidelity block survives, id-agreeing with the mirror, signature
+    # untouched; the loose reasoning still synthesizes alongside it.
+    assert blocks[0]["id"] == manufactured
+    assert blocks[0]["thought_signature"] == "sig123"
+    assert blocks[-1]["type"] == "reasoning_text"
+
+
+def test_blank_id_repair_never_rewrites_nonblank_ids() -> None:
+    provider = _FakeProvider(
+        [
+            CompletionResult(
+                content="",
+                tool_calls=[
+                    {"id": "call_7", "type": "function", "function": {"name": "a"}},
+                    {"id": "", "type": "function", "function": {"name": "b"}},
+                ],
+                provider_blocks=[
+                    {"id": "call_7", "type": "function", "function": {"name": "a"}},
+                    {"id": "", "type": "function", "function": {"name": "b"}},
+                ],
+            )
+        ]
+    )
+    result = model_turn(_lane(provider), [Turn.user("x")])
+    assert result.turn.native is not None
+    blocks = list(result.turn.native.blocks)
+    # Provider-assigned id untouched (it may sit under a signature) …
+    assert blocks[0]["id"] == "call_7"
+    # … only the blank one was manufactured, agreeing with its mirror twin.
+    assert blocks[1]["id"] == result.tool_calls[1]["id"]
+    assert blocks[1]["id"].startswith("call_")
+
+
+def test_blank_id_pairing_mismatch_falls_back_to_reasoning_text_drop() -> None:
+    # Two mirror calls but only one client block: no trustworthy pairing —
+    # the total drop rule (the #825-converged fallback) keeps only the
+    # loose-text reasoning synth.
+    provider = _FakeProvider(
+        [
+            CompletionResult(
+                content="",
+                tool_calls=[
+                    {"id": "", "type": "function", "function": {"name": "a"}},
+                    {"id": "", "type": "function", "function": {"name": "b"}},
+                ],
+                provider_blocks=[{"type": "function", "id": "", "function": {"name": "a"}}],
+                reasoning="thought",
+            )
+        ]
+    )
+    result = model_turn(_lane(provider), [Turn.user("x")])
     assert result.tool_calls[0]["id"].startswith("call_")
-    # … while the desynced native blocks are dropped down to the loose-text
-    # reasoning synth (the blank-id mirror gate).
     assert result.turn.native is not None
     assert [b["type"] for b in result.turn.native.blocks] == ["reasoning_text"]
     assert result.turn.native.blocks[0]["text"] == "thought"
@@ -274,3 +344,65 @@ def test_finalize_keeps_full_lane_with_tool_calls_and_clean_ids() -> None:
     ]
     out = finalize_provider_blocks(blocks, [""], has_tool_calls=True)
     assert out == blocks
+
+
+def test_mint_without_wire_id_map_raises() -> None:
+    provider = _FakeProvider([])
+    with pytest.raises(ValueError, match="wire_id_map"):
+        model_turn(_lane(provider), [Turn.user("x")], mint=lambda o: f"p::{o}")
+    # Nothing reached the provider — the guard fires before lowering.
+    assert provider.calls == []
+
+
+def test_temperature_inherits_lane_value_when_caller_omits() -> None:
+    provider = _FakeProvider([CompletionResult(content="")])
+    lane = _lane(provider, temperature=1.3)
+    model_turn(lane, [Turn.user("x")])
+    assert provider.calls[0]["temperature"] == 1.3
+
+
+def test_temperature_caller_value_wins_over_lane() -> None:
+    provider = _FakeProvider([CompletionResult(content="")])
+    lane = _lane(provider, temperature=1.3)
+    model_turn(lane, [Turn.user("x")], temperature=0.9)
+    assert provider.calls[0]["temperature"] == 0.9
+
+
+def test_temperature_omitted_when_unresolved() -> None:
+    # No caller value, no lane value → the kwarg is omitted entirely and
+    # the provider default applies (house rule: code never pins one).
+    provider = _FakeProvider([CompletionResult(content="")])
+    model_turn(_lane(provider), [Turn.user("x")])
+    assert "temperature" not in provider.calls[0]
+
+
+def test_resolve_lane_inherits_config_temperature() -> None:
+    provider = _FakeProvider([])
+    registry = _fake_registry(temperature=0.7)
+    lane = resolve_lane(provider, object(), "m", alias="ali", registry=registry)
+    assert lane.temperature == 0.7
+    # Exactly ONE config fetch feeds caps + extra_params + temperature —
+    # no cross-generation mixing on a registry hot-reload.
+    assert registry.get_config.call_count == 1
+
+
+def test_resolve_lane_survives_get_config_raise() -> None:
+    provider = _FakeProvider([])
+    registry = MagicMock()
+    registry.get_config.side_effect = ValueError("Unknown model alias")
+    lane = resolve_lane(provider, object(), "m", alias="gone", registry=registry)
+    # Every facet degrades to its miss behavior instead of raising into a
+    # caller's constructor (the judge alias-resolution abort case).
+    assert lane.capabilities is not None
+    assert lane.extra_params is None
+    assert lane.temperature is None
+
+
+def test_resolve_capabilities_survives_get_config_raise() -> None:
+    from turnstone.core.model_turn import resolve_capabilities
+
+    provider = _FakeProvider([])
+    registry = MagicMock()
+    registry.get_config.side_effect = KeyError("gone")
+    caps = resolve_capabilities(provider, "m", "gone", registry)
+    assert caps == ModelCapabilities()

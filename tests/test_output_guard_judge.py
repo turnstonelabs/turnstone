@@ -7,6 +7,7 @@ import time
 from typing import Any
 from unittest.mock import MagicMock
 
+from tests._session_helpers import mock_completion_result as _mock_result
 from turnstone.core import fence
 from turnstone.core.judge import JudgeConfig
 from turnstone.core.output_guard_judge import (
@@ -38,19 +39,6 @@ def _make_provider(
 
     provider.create_completion = _create_completion
     return provider
-
-
-def _mock_result(content: str) -> MagicMock:
-    """A provider result shaped like ``CompletionResult`` — the guard's call
-    runs through ``model_turn``, whose re-ingest reads every field below."""
-    result = MagicMock()
-    result.content = content
-    result.tool_calls = None
-    result.finish_reason = "stop"
-    result.usage = None
-    result.provider_blocks = []
-    result.reasoning = ""
-    return result
 
 
 def _make_judge(
