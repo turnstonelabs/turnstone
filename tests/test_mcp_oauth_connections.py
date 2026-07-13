@@ -804,6 +804,7 @@ class TestEvictUserSession:
             mgr._loop = loop  # type: ignore[attr-defined]
             mgr._user_pool_entries = {}  # type: ignore[attr-defined]
             mgr._last_pool_notification_refresh = {}  # type: ignore[attr-defined]
+            mgr._background_tasks = set()  # type: ignore[attr-defined]
             evicted: list[tuple[str, str]] = []
 
             async def _fake_evict(key: tuple[str, str]) -> None:

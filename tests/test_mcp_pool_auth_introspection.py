@@ -571,6 +571,7 @@ class TestDispatcherAuthFlows:
             *,
             auth_capture: Any = None,
             auth_fired_event: Any = None,
+            expected_gen: Any = None,
         ) -> Any:
             entry = await self_inner._ensure_pool_entry(key)
             sess = MagicMock()
@@ -980,6 +981,7 @@ class TestBreakerInvariant:
             *,
             auth_capture: Any = None,
             auth_fired_event: Any = None,
+            expected_gen: Any = None,
         ) -> Any:
             entry = await self_inner._ensure_pool_entry(key)
             sess = MagicMock()
@@ -1600,7 +1602,11 @@ class TestPoolPrimingAndTokenRotation:
         primed: list[tuple[tuple[str, str], str]] = []
 
         async def _fake_prime(
-            self_inner: MCPClientManager, key: tuple[str, str], cfg: dict[str, Any], token: str
+            self_inner: MCPClientManager,
+            key: tuple[str, str],
+            cfg: dict[str, Any],
+            token: str,
+            expected_gen: Any = None,
         ) -> int:
             primed.append((key, token))
             return 3
@@ -1631,7 +1637,11 @@ class TestPoolPrimingAndTokenRotation:
         primed: list[tuple[tuple[str, str], str]] = []
 
         async def _fake_prime(
-            self_inner: MCPClientManager, key: tuple[str, str], cfg: dict[str, Any], token: str
+            self_inner: MCPClientManager,
+            key: tuple[str, str],
+            cfg: dict[str, Any],
+            token: str,
+            expected_gen: Any = None,
         ) -> int:
             primed.append((key, token))
             return 3
@@ -1671,7 +1681,11 @@ class TestPoolPrimingAndTokenRotation:
         primed: list[tuple[str, str]] = []
 
         async def _fake_prime(
-            self_inner: MCPClientManager, key: tuple[str, str], cfg: dict[str, Any], token: str
+            self_inner: MCPClientManager,
+            key: tuple[str, str],
+            cfg: dict[str, Any],
+            token: str,
+            expected_gen: Any = None,
         ) -> int:
             primed.append(key)
             return 0
@@ -1806,7 +1820,11 @@ class TestPoolPrimingAndTokenRotation:
         primed: list[tuple[str, str]] = []
 
         async def _fake_prime(
-            self_inner: MCPClientManager, key: tuple[str, str], cfg: dict[str, Any], token: str
+            self_inner: MCPClientManager,
+            key: tuple[str, str],
+            cfg: dict[str, Any],
+            token: str,
+            expected_gen: Any = None,
         ) -> int:
             primed.append(key)
             return 0
@@ -1858,7 +1876,11 @@ class TestPoolPrimingAndTokenRotation:
         done = threading.Event()
 
         async def _fake_prime(
-            self_inner: MCPClientManager, key: tuple[str, str], cfg: dict[str, Any], token: str
+            self_inner: MCPClientManager,
+            key: tuple[str, str],
+            cfg: dict[str, Any],
+            token: str,
+            expected_gen: Any = None,
         ) -> int:
             captured["key"] = key
             captured["token"] = token
@@ -1918,6 +1940,7 @@ class TestPoolPrimingAndTokenRotation:
             *,
             auth_capture: Any = None,
             auth_fired_event: Any = None,
+            expected_gen: Any = None,
         ) -> Any:
             reconnect_tokens.append(access_token)
             entry = await self_inner._ensure_pool_entry(key)
@@ -1954,7 +1977,11 @@ class TestPoolPrimingAndTokenRotation:
         primed: list[tuple[str, str]] = []
 
         async def _fake_prime(
-            self_inner: MCPClientManager, key: tuple[str, str], cfg: dict[str, Any], token: str
+            self_inner: MCPClientManager,
+            key: tuple[str, str],
+            cfg: dict[str, Any],
+            token: str,
+            expected_gen: Any = None,
         ) -> int:
             primed.append(key)
             return 0
@@ -1978,7 +2005,11 @@ class TestPoolPrimingAndTokenRotation:
         self._wire(mgr, storage, cipher)
 
         async def _fake_prime(
-            self_inner: MCPClientManager, key: tuple[str, str], cfg: dict[str, Any], token: str
+            self_inner: MCPClientManager,
+            key: tuple[str, str],
+            cfg: dict[str, Any],
+            token: str,
+            expected_gen: Any = None,
         ) -> int:
             return 1
 

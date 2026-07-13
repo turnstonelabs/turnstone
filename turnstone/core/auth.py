@@ -2152,6 +2152,23 @@ async def handle_oidc_callback(request: Request, audience: str, cookie_name: str
                 )
             except Exception:
                 log.exception("oidc.capture: failed to persist credential")
+            else:
+                # Re-login is the OBO restore moment (#836): a dropped
+                # obo catalog (credential unlinked / mint rejected) has
+                # no consent flow to heal through, so warm this user's
+                # pools now — live sessions pick the tools back up via
+                # their listeners. Fire-and-forget; a failure changes
+                # nothing about login.
+                mcp_client = getattr(request.app.state, "mcp_client", None)
+                if mcp_client is not None and hasattr(mcp_client, "prime_user_pools"):
+                    try:
+                        mcp_client.prime_user_pools(user["user_id"])
+                    except Exception:
+                        log.debug(
+                            "oidc.capture: post-capture pool prime scheduling failed user=%s",
+                            user["user_id"],
+                            exc_info=True,
+                        )
 
     # Load permissions and issue Turnstone JWT
     perms = await asyncio.to_thread(_load_user_permissions, storage, user["user_id"])

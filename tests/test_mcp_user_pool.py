@@ -521,6 +521,62 @@ class TestEviction:
         assert blocked, "drop must wait for the in-flight connect's open_lock"
         assert cleared, "drop must win once the connect completes — no resurrection"
 
+    def test_connect_refuses_when_generation_moved(self, running_loop_mgr) -> None:
+        """``_connect_one_pool`` must refuse to connect (and so to
+        publish) when the entry's revocation generation moved past the
+        caller's pre-token-read snapshot — the bearer in hand predates
+        a disconnect, and publishing would resurrect the dropped
+        catalog with nothing left to clear it."""
+        from turnstone.core.mcp_client import _PoolGrantRevokedError
+
+        mgr, loop, _ = running_loop_mgr
+        key = ("u0", "pool-srv")
+
+        async def _scenario() -> None:
+            entry = await mgr._ensure_pool_entry(key)
+            gen0 = entry.catalog_gen
+            entry.catalog_gen += 1  # a revocation drop landed in the window
+            with pytest.raises(_PoolGrantRevokedError):
+                await mgr._connect_one_pool(
+                    key,
+                    {"type": "streamable-http", "url": "https://mcp.example.com/sse"},
+                    "stale-bearer",
+                    expected_gen=gen0,
+                )
+
+        _run_on_loop(loop, _scenario())
+
+    def test_refresh_discards_result_when_generation_moved(self, running_loop_mgr) -> None:
+        """A ``list_changed`` refresh whose await straddles a revocation
+        drop must DISCARD its result — publishing would resurrect the
+        revoked catalog, which retention then keeps alive forever."""
+        mgr, loop, _ = running_loop_mgr
+        mgr._oauth_user_server_names = {"pool-srv"}
+        key = ("u0", "pool-srv")
+
+        async def _scenario() -> tuple[list, list, Any, bool]:
+            entry = await mgr._ensure_pool_entry(key)
+            entry.tools = self._fake_tools("pool-srv", 0)
+            mgr._rebuild_user_tool_map("u0")
+
+            class _RacingSession:
+                async def list_tools(self) -> Any:
+                    # The disconnect lands while list_tools is in flight.
+                    mgr._evict_session_drop_catalog(key)
+                    res = MagicMock()
+                    res.tools = []
+                    return res
+
+            entry.session = _RacingSession()
+            added, removed = await mgr._refresh_pool_server_tools(key)
+            return added, removed, entry.tools, "u0" in mgr._user_tool_map
+
+        added, removed, tools, in_map = _run_on_loop(loop, _scenario())
+        assert (added, removed) == ([], [])
+        # The drop's clear stands; the refresh did not republish.
+        assert tools is None
+        assert in_map is False
+
     def test_lookup_grant_dead_requires_wired_infrastructure(self, running_loop_mgr) -> None:
         """kind='missing' is authoritative only when the stores that
         could know are wired: the obo lookup returns 'missing' for an
@@ -1369,7 +1425,9 @@ class TestOboPriming:
 
         warmed: list[tuple[Any, Any, str]] = []
 
-        async def _fake_prime_server(key: Any, cfg: Any, token: str) -> None:
+        async def _fake_prime_server(
+            key: Any, cfg: Any, token: str, expected_gen: Any = None
+        ) -> None:
             warmed.append((key, cfg, token))
 
         obo_lookup = AsyncMock(return_value=SimpleNamespace(kind="token", token="minted-at"))
@@ -1387,6 +1445,60 @@ class TestOboPriming:
         user_lookup.assert_not_awaited()
         assert len(warmed) == 1
         assert warmed[0][2] == "minted-at"
+
+    def test_prime_drops_retained_catalog_on_dead_grant(self, running_loop_mgr, storage) -> None:
+        """Priming is a convergence point (#836): a NEW session's prime
+        that finds the grant durably GONE must drop the retained catalog
+        that other live sessions still serve (e.g. a disconnect made on
+        another node) — not just skip the server."""
+        mgr, loop, _ = running_loop_mgr
+        cipher = make_mcp_token_cipher()
+        mgr.set_storage(storage)
+        app_state = _make_app_state(storage, cipher=cipher)
+        mgr.set_app_state(app_state)
+        storage.create_mcp_server(
+            server_id="srv-o",
+            name="pool-srv",
+            transport="streamable-http",
+            url="https://mcp.example.com/sse",
+            auth_type="oauth_user",
+        )
+        mgr._oauth_user_server_names = {"pool-srv"}
+        key = ("user-1", "pool-srv")
+
+        async def _seed() -> None:
+            entry = await mgr._ensure_pool_entry(key)
+            entry.tools = [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "mcp__pool-srv__t",
+                        "description": "",
+                        "parameters": {"type": "object", "properties": {}},
+                    },
+                }
+            ]
+            mgr._rebuild_user_tool_map("user-1")
+
+        _run_on_loop(loop, _seed())
+        fired = [0]
+
+        def _cb() -> None:
+            fired[0] += 1
+
+        mgr.add_listener(_cb, user_id="user-1")
+        assert mgr.is_mcp_tool("mcp__pool-srv__t", user_id="user-1") is True
+
+        dead = AsyncMock(return_value=SimpleNamespace(kind="missing", token=None))
+        with patch("turnstone.core.mcp_client.get_user_access_token_classified", new=dead):
+            _run_on_loop(loop, mgr._prime_user_pools("user-1"))
+            # The drop is scheduled — flush the loop before asserting.
+            _run_on_loop(loop, asyncio.sleep(0.05))
+
+        entry = mgr._user_pool_entries[key]
+        assert entry.tools is None
+        assert mgr.is_mcp_tool("mcp__pool-srv__t", user_id="user-1") is False
+        assert fired[0] == 1
 
     def test_prime_skips_obo_server_when_no_credential(self, running_loop_mgr, storage) -> None:
         """A user without a captured credential is skipped BEFORE any

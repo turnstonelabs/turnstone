@@ -1705,6 +1705,7 @@ class ChatSession:
             # merged read runs after the registrations below.
             self._tools = list(INTERACTIVE_TOOLS)
             self._task_tools = list(TASK_AGENT_TOOLS)
+            self._mcp_tools_change_seq = 0
             # Register for tool-change notifications from MCP servers.
             # ``user_id`` is the listener identity component — pool-only
             # changes for OTHER users must not fire this callback.
@@ -1724,9 +1725,16 @@ class ChatSession:
             # catalog change firing earlier than this fans out to the
             # listeners just registered, so nothing can slip between
             # read and register with its only notification unheard.
+            seq_before = self._mcp_tools_change_seq
             mcp_tools = self._mcp_client.get_tools(user_id=self._mcp_user_id)
             self._tools = merge_mcp_tools(INTERACTIVE_TOOLS, mcp_tools)
             self._task_tools = merge_mcp_tools(TASK_AGENT_TOOLS, mcp_tools)
+            if self._mcp_tools_change_seq != seq_before:
+                # The mirror race: a listener callback fired between the
+                # read above and these assignments — its fresher merge
+                # was just clobbered by our staler snapshot. Re-running
+                # the callback converges on the current maps.
+                self._on_mcp_tools_changed()
             # Proactively warm this user's per-user OAuth (oauth_user) pools so
             # their tools are present without a manual reconnect (e.g. after a
             # reboot/upgrade, or right after consent). Fire-and-forget — the
@@ -2693,6 +2701,12 @@ class ChatSession:
         # is fixed at COORDINATOR_TOOLS.  Ignore MCP server changes.
         if self._kind == WorkstreamKind.COORDINATOR:
             return
+        # Monotonic change marker: the constructor snapshots this around
+        # its authoritative post-registration read and re-runs this
+        # callback if it advanced — otherwise a notification landing
+        # between that read and its assignments is clobbered by the
+        # staler snapshot (its only notification already consumed).
+        self._mcp_tools_change_seq += 1
         # Pass the effective user_id (acting user on shared workstreams,
         # owner otherwise) so the merged tool list includes that user's
         # pool catalog. The static path is included by ``get_tools``
