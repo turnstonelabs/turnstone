@@ -18,6 +18,20 @@ Earlier stable lines (`stable/1.6`, `stable/1.5`) are frozen.
 
 ### Added
 
+- **One turn interface for every model call: `core/model_turn.py` (#827).**
+  Judges (intent + output guard), perception, title generation, compaction,
+  web-fetch extraction, the eval harness, the optimizer's meta lanes, and
+  task agents all advance a trajectory through the same plant-call
+  primitive the agent seam pioneered — Turn IR in, one shared lowering
+  (argument sanitize → minted-id restore → vLLM reasoning attach), one
+  shared re-ingest (blank-id repair → native-lane finalize). The judges'
+  hand-built OpenAI-dict path is gone, and with it the Gemini judge's
+  tool-blindness: evidence tools now work on Google models because the
+  native lane round-trips `thought_signature` (with pairwise repair for
+  blank-id compat responses). Provider adapters still take lowered wire
+  dicts — the transport collapse and main-loop migration are tracked as
+  #831 / #832.
+
 - **task_agent keeps its model's reasoning across its own tool loop — on
   every provider lane.** A task agent's replayed turns now carry the
   provider-native reasoning lane the model produced — Anthropic thinking
@@ -53,6 +67,37 @@ Earlier stable lines (`stable/1.6`, `stable/1.5`) are frozen.
   never outlive a task_agent that started them; anything a background shell
   itself backgrounds is still reaped when that shell exits — the no-leak
   guarantee below is unchanged.
+
+### Changed
+
+- **Sampling knobs (temperature, reasoning effort) now ride one assignment
+  scheme: per-model alias value → operator-stored global setting → the
+  model definition's declared default (effort only) → field omitted.**
+  Turnstone previously manufactured values onto every unconfigured
+  request — a hidden `temperature: 0.5` and a `reasoning_effort: "medium"`
+  baked in at three layers — overriding serving-side defaults like a vLLM
+  model's `generation_config`. Unconfigured installs now send neither
+  field and the inference engine's own defaults rule; `model.temperature`
+  is blank by default ("inherit each model's own default") and
+  `model.reasoning_effort` defaults to the empty "inherit" choice. The
+  per-model → global resolution lives in one shared resolver used by the
+  session factories, the `/model` switch, and every `model_turn` lane, so
+  the same alias samples identically on every surface. CLI
+  `--temperature` / `--reasoning-effort` likewise default to inherit.
+
+  **Upgrade notes:**
+  - The empty (`""`) reasoning-effort choice changed meaning from
+    "explicitly disable thinking" to "inherit the model/serving default".
+    On local manual-thinking models (e.g. Qwen templates with
+    `enable_thinking`), a stored `""` previously sent
+    `enable_thinking: false`; it now sends nothing, so the template's own
+    default (often thinking ON) applies. Use **`none`** to actually
+    disable reasoning.
+  - Workstreams saved by earlier versions carry the old defaults
+    (`temperature=0.5`, `reasoning_effort=medium`) in their persisted
+    config and keep that exact behavior on resume; they pick up the new
+    inherit semantics the next time you change the model or a sampling
+    knob in that workstream. New workstreams inherit from the start.
 
 ### Fixed
 
