@@ -809,7 +809,10 @@ class TestEvictUserSession:
             def _fake_evict(key: tuple[str, str]) -> None:
                 evicted.append(key)
 
-            mgr._evict_session = _fake_evict  # type: ignore[method-assign]
+            # The revoke entry point must take the DROP-CATALOG flavor —
+            # the user asked for the disconnect, so their live sessions
+            # see the tools leave (unlike dispatch-failure eviction, #836).
+            mgr._evict_session_drop_catalog = _fake_evict  # type: ignore[method-assign]
 
             # Run the dispatch on a separate thread so the loop can drain.
             import threading
