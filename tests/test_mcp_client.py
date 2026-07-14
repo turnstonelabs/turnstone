@@ -1110,6 +1110,9 @@ class TestLastRefreshTracking:
             return_value=MagicMock(resourceTemplates=[])
         )
         mock_session.list_prompts = AsyncMock(return_value=MagicMock(prompts=[]))
+        # Config present: outcome writes are config-gated (a removed server
+        # must leave no stale row), so the tracked server must be configured.
+        mgr._server_configs[name] = {"type": "stdio", "command": "x"}
         _seed_static_state(
             mgr,
             name,
@@ -1137,16 +1140,22 @@ class TestLastRefreshTracking:
         asyncio.run(_run())
 
     def test_last_refresh_written_on_tool_refresh_failure(self) -> None:
-        """When ``_refresh_server_tools`` raises, the outcome reflects
-        the exception class and the exception still propagates."""
+        """When ``_refresh_server_tools`` raises, ``_refresh_server``
+        propagates the exception; the OUTCOME row is written by the
+        caller's ``_record_refresh_failure`` (one config-gated place),
+        which the spawned ``_refresh_server_logged`` wrapper routes
+        through."""
 
         async def _run() -> None:
             mgr = MCPClientManager({})
             mock_session = self._seed_minimal(mgr)
             mock_session.list_tools = AsyncMock(side_effect=RuntimeError("upstream down"))
 
+            # _refresh_server itself propagates (the caller records).
             with pytest.raises(RuntimeError, match="upstream down"):
                 await mgr._refresh_server("srv")
+            # The caller (here the logged wrapper) records the outcome.
+            await mgr._refresh_server_logged("srv")
 
             entry = mgr._last_refresh.get("srv")
             assert entry is not None
@@ -1171,15 +1180,16 @@ class TestLastRefreshTracking:
             mock_session.list_resources = AsyncMock(side_effect=ValueError("res boom"))
             mock_session.list_prompts = AsyncMock(side_effect=KeyError("prompts boom"))
 
+            # _refresh_server raises the first exception (positional gather
+            # order: resources arg #2 before prompts arg #3); the caller
+            # records that class as the outcome.
             with pytest.raises((ValueError, KeyError)):
                 await mgr._refresh_server("srv")
+            await mgr._refresh_server_logged("srv")
 
             entry = mgr._last_refresh.get("srv")
             assert entry is not None
             _, outcome = entry
-            # Either of the two failing tasks could be "first" in
-            # gather's results list ordering — the order is positional
-            # so resources (arg #2) comes before prompts (arg #3).
             assert outcome == "error:ValueError"
 
         asyncio.run(_run())
@@ -3625,18 +3635,83 @@ class TestStaticNotificationRefresh:
         assert refreshed == ["srv", "srv", "srv"], "retry must run the FULL three-kind pass"
         assert "srv" not in mgr._static_refresh_retry
 
+    def test_push_refresh_failure_writes_outcome(self, running_loop_mgr) -> None:
+        """A push-driven refresh failure must update last_refresh_outcome
+        (not just the error pill) — the pill and outcome are ONE source of
+        truth, so a green 'ok' outcome persisting under a red error row is
+        a contradictory signal."""
+        mgr, loop, _thread = running_loop_mgr
+        mgr._server_configs["srv"] = {"type": "http", "url": "http://x/mcp"}
+        mgr._last_refresh["srv"] = (1.0, "ok")  # stale prior success
+
+        async def _boom(_name: str) -> tuple[list[str], list[str]]:
+            raise TimeoutError("slow")
+
+        async def _scenario() -> None:
+            mgr._static_connect_lock_for("srv")
+            _seed_static_state(mgr, "srv", session=MagicMock())
+            await mgr._run_static_notification_refresh("srv", "tools", _boom)
+
+        _run_on_loop(loop, _scenario())
+        assert mgr.last_refresh_outcome("srv") == "error:TimeoutError"
+
+    def test_push_refresh_success_writes_outcome(self, running_loop_mgr) -> None:
+        """A successful push refresh must clear a prior error outcome —
+        else last_refresh_outcome keeps reporting the stale failure."""
+        mgr, loop, _thread = running_loop_mgr
+        mgr._server_configs["srv"] = {"type": "http", "url": "http://x/mcp"}
+        mgr._last_refresh["srv"] = (1.0, "error:TimeoutError")
+        mgr._last_error["srv"] = "Refresh failed: TimeoutError"
+
+        async def _ok(_name: str) -> tuple[list[str], list[str]]:
+            return [], []
+
+        async def _scenario() -> None:
+            mgr._static_connect_lock_for("srv")
+            _seed_static_state(mgr, "srv", session=MagicMock())
+            await mgr._run_static_notification_refresh("srv", "tools", _ok)
+
+        _run_on_loop(loop, _scenario())
+        assert mgr.last_refresh_outcome("srv") == "ok"
+        assert "srv" not in mgr._last_error
+
+    def test_remove_server_pops_last_refresh_outcome(self) -> None:
+        """Removal must drop the outcome row — a stale row would make
+        last_refresh_outcome report a departed server's last result, and a
+        re-add before its first refresh would read it."""
+        mgr = MCPClientManager({})  # no loop → direct-mutation branch
+        _seed_static_state(mgr, "srv", session=None)
+        mgr._server_configs["srv"] = {"type": "http", "url": "http://x/mcp"}
+        mgr._last_refresh["srv"] = (1.0, "ok")
+        mgr.remove_server_sync("srv")
+        assert mgr.last_refresh_outcome("srv") is None
+
+    def test_refresh_failure_for_removed_server_leaves_no_stale_row(self) -> None:
+        """A failure observed for a just-removed server must NOT stamp a
+        stale error outcome (removal doesn't resurrect the row): the write
+        is config-gated."""
+        mgr = MCPClientManager({})
+        # NOT configured (removed).
+        mgr._record_refresh_failure("gone", RuntimeError("x"), context="Refresh")
+        assert mgr.last_refresh_outcome("gone") is None
+        assert "gone" not in mgr._static_refresh_retry
+
     def test_session_drop_clears_refresh_retry(self, running_loop_mgr) -> None:
         """Every session drop clears the retry flag — the reconnect's
-        full rediscovery supersedes the pending retry."""
+        full rediscovery supersedes the pending retry. But the refresh
+        OUTCOME persists across a drop (only REMOVAL clears it): a
+        transient reconnect must not erase the last-known status."""
         mgr, loop, _thread = running_loop_mgr
 
         async def _scenario() -> None:
             state = _seed_static_state(mgr, "srv", session=MagicMock())
             mgr._static_refresh_retry.add("srv")
+            mgr._last_refresh["srv"] = (1.0, "ok")
             mgr._drop_static_session_and_stamp("srv", state)
 
         _run_on_loop(loop, _scenario())
         assert "srv" not in mgr._static_refresh_retry
+        assert mgr.last_refresh_outcome("srv") == "ok", "outcome persists across a session drop"
 
     def test_refresh_all_arms_retry_on_busy_skip(self, running_loop_mgr) -> None:
         """An operator-requested pass that busy-skips a server must report

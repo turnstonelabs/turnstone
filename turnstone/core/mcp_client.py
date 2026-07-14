@@ -1362,6 +1362,14 @@ class MCPClientManager:
         server's first push with no runner covering it.
         """
         self._static_refresh_retry.discard(name)
+        if markers:
+            # REMOVAL (markers=True): the server is gone, so its refresh
+            # OUTCOME must go too — a stale ``_last_refresh`` row would make
+            # ``last_refresh_outcome`` report the departed server's last
+            # result (and a re-add before its first refresh would read it).
+            # NOT on a session drop (markers=False): the outcome legitimately
+            # persists across a reconnect.
+            self._last_refresh.pop(name, None)
         for kind in _LIST_CHANGED_KINDS.values():
             self._last_notification_refresh.pop((name, kind), None)
             if markers:
@@ -1896,7 +1904,11 @@ class MCPClientManager:
 
         def _record(exc: BaseException | None) -> None:
             if exc is None:
-                self._last_error.pop(name, None)
+                # Update the outcome (not just the pill): a successful push
+                # must clear a prior ``error:`` row, or last_refresh_outcome
+                # (the pill / endpoint source of truth) contradicts itself —
+                # a green "ok" would be missing while the red error persists.
+                self._record_refresh_success(name)
             else:
                 self._record_refresh_failure(
                     name, exc, context=f"Static {kind} refresh after notification"
@@ -4289,11 +4301,13 @@ class MCPClientManager:
         "improve logging" edit cannot silently reintroduce the leak at one
         hand-synced copy.
 
-        Also arms the health-tick refresh retry: there is no periodic
-        refresh pass, so this is what converges a catalog whose one
-        ``list_changed`` push failed on a transient blip. Config-gated —
-        a failure observed for a just-removed server must not park a
-        retry flag nothing will ever drain.
+        Also stamps the ``error:<Class>`` outcome and arms the health-tick
+        refresh retry — the ONE place a static refresh FAILURE is recorded,
+        so the push path (which used to touch only ``_last_error``) and the
+        full-pass path agree on ``last_refresh_outcome``. Both the outcome
+        stamp and the retry arm are config-gated: a failure observed for a
+        just-removed server must not leave a stale ``error:`` row (removal
+        does not resurrect the outcome) or park a retry nothing will drain.
         """
         log.warning(
             "%s failed for MCP server '%s' exc=%s: %s",
@@ -4303,7 +4317,24 @@ class MCPClientManager:
             exc,
         )
         self._set_error(name, f"Refresh failed: {type(exc).__name__}: {exc}")
+        if name in self._server_configs:
+            self._last_refresh[name] = (time.time(), f"error:{type(exc).__name__}")
         self._arm_refresh_retry(name)
+
+    def _record_refresh_success(self, name: str) -> None:
+        """Record a static-path refresh SUCCESS — the outcome twin of
+        :meth:`_record_refresh_failure`.
+
+        Clears the error pill and stamps the ``ok`` outcome, config-gated
+        so a success observed for a just-removed server leaves no stale
+        row. Used by every static success path (the full pass and the
+        push-driven single-kind refresh) so ``last_refresh_outcome`` — the
+        single source of truth for the CLI / endpoint / admin pill — is
+        updated after a push refresh too, not just a full pass.
+        """
+        self._last_error.pop(name, None)
+        if name in self._server_configs:
+            self._last_refresh[name] = (time.time(), "ok")
 
     def last_refresh_outcome(self, name: str) -> str | None:
         """Authoritative last-refresh outcome for static server *name*.
@@ -4459,10 +4490,11 @@ class MCPClientManager:
                 (r for r in results if isinstance(r, BaseException)), None
             )
             if first_exc is not None:
-                self._last_refresh[name] = (
-                    time.time(),
-                    f"error:{type(first_exc).__name__}",
-                )
+                # The outcome row is written by the caller's
+                # ``_record_refresh_failure`` (every caller — ``_refresh_all``
+                # and ``_refresh_server_logged`` — routes the raise through
+                # it), config-gated in one place; writing here too would be
+                # an ungated duplicate.
                 raise first_exc
             tool_diff = results[0]
             # ``return_exceptions=True`` widens the static type; on the all-
@@ -4470,8 +4502,7 @@ class MCPClientManager:
             # tool-diff entry to the documented ``(added, removed)`` shape.
             assert isinstance(tool_diff, tuple)
             added, removed = tool_diff
-            self._last_error.pop(name, None)
-            self._last_refresh[name] = (time.time(), "ok")
+            self._record_refresh_success(name)
             return added, removed
 
     async def _refresh_server_logged(self, name: str) -> None:
@@ -4583,7 +4614,11 @@ class MCPClientManager:
                         # left ``results[name]`` UNSET, omitting the server
                         # from the returned dict, so an operator refreshing
                         # that one server saw a bare "refresh complete" with
-                        # no line at all.
+                        # no line at all. Drop any stale outcome row too, so
+                        # ``last_refresh_outcome`` doesn't report the gone
+                        # server's prior ``ok`` (deterministic even if the
+                        # concurrent removal hasn't popped it yet).
+                        self._last_refresh.pop(name, None)
                         results[name] = None
                     continue
                 refreshed = await self._refresh_server(name)
@@ -4611,13 +4646,17 @@ class MCPClientManager:
                 # reconnect/refresh must stay isolated to this server, not
                 # abort the whole refresh pass. Redaction + retry-arm live
                 # in the shared helper.
+                # ``_record_refresh_failure`` stamps the (config-gated)
+                # ``error:<Class>`` outcome and the pill in one place — see
+                # the eviction note below for why the write must not be
+                # duplicated (ungated) here.
                 self._record_refresh_failure(name, exc, context="Refresh")
                 # None, NOT ``([], [])``: a failure produced no catalog, and
                 # ``([], [])`` is reserved for "ran, no changes" — rendering
                 # a failure as "no changes" is the operator lie the sentinel
                 # exists to prevent. Consumers disambiguate None (skipped vs
-                # failed) via ``last_refresh_outcome``, which the
-                # ``error:<Class>`` write at the end of this block sets.
+                # failed) via ``last_refresh_outcome``, which
+                # ``_record_refresh_failure`` set above.
                 results[name] = None
                 # A dead transport leaves a non-None but unusable session, so
                 # the reconnect branch at the top of this loop (gated on
@@ -4631,20 +4670,6 @@ class MCPClientManager:
                     dead_state = self._static_servers.get(name)
                     if dead_state is not None:
                         self._drop_static_session_and_stamp(name, dead_state)
-                # Overwrite unconditionally with the freshest observed
-                # outcome.  Two cases produce the write:
-                # (1) Reconnect branch: ``_connect_one`` raised before
-                #     ``_refresh_server`` could write — no prior entry
-                #     from this iteration exists yet, so the write is
-                #     the only fresh signal.
-                # (2) ``_refresh_server`` branch: it already wrote a
-                #     fresh ``error:<ClassName>`` before re-raising, so
-                #     the outer overwrite is a no-op for the value.
-                # Using ``setdefault`` here would preserve a stale prior
-                # ``"ok"`` from the previous successful refresh when the
-                # current attempt fails — the admin pill would show
-                # "ok" for a broken server.
-                self._last_refresh[name] = (time.time(), f"error:{type(exc).__name__}")
 
         # Final sync to clean up templates from servers that are no longer connected
         try:
