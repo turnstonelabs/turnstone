@@ -3053,7 +3053,11 @@ class TestStaticNotificationRefresh:
         mgr._last_notification_refresh[("srv", "tools")] = 456.0
         _run_on_loop(loop, mgr._run_static_notification_refresh("srv", "tools", _ok))
         assert mgr._last_notification_refresh[("srv", "tools")] == 456.0
-        assert "srv" not in mgr._last_error  # success clears the error
+        # A single-kind push SUCCESS does NOT clear the server error pill:
+        # it refreshed one kind, not the whole server, so it can't declare
+        # health (a different kind may still be broken). The prior failure's
+        # error stands until the full-pass retry clears it.
+        assert "srv" in mgr._last_error
 
     def test_notification_refresh_catches_exception_group(self, running_loop_mgr) -> None:
         """A wedged anyio transport surfaces session-op failures as
@@ -3429,6 +3433,36 @@ class TestStaticNotificationRefresh:
         assert ("srv", "tools") not in mgr._last_notification_refresh, "stamp must roll back"
         assert ("srv", "tools") not in mgr._static_refresh_pending, "marker must roll back"
 
+    def test_first_notification_not_debounced_near_boot(self, running_loop_mgr) -> None:
+        """The FIRST (server, kind) notification must never be debounced —
+        even when ``time.monotonic()`` is < the debounce window (a node
+        whose process started < 5s after boot). An absent stamp (None), not
+        a 0.0 default, means 'never refreshed → always admit'."""
+        mgr, loop, _thread = running_loop_mgr
+        refreshed: list[str] = []
+
+        async def _rec(name: str) -> tuple[list[str], list[str]]:
+            refreshed.append(name)
+            return [], []
+
+        mgr._refresh_server_tools = _rec  # type: ignore[method-assign]
+        handler = mgr._make_static_notification_handler("srv")
+
+        async def _fire() -> None:
+            mgr._static_connect_lock_for("srv")
+            _seed_static_state(mgr, "srv", session=MagicMock())
+            note = mcp_types.ServerNotification(
+                mcp_types.ToolListChangedNotification(method="notifications/tools/list_changed")
+            )
+            # monotonic() < _NOTIFICATION_DEBOUNCE: a 0.0-default compare
+            # would debounce this first push; the None sentinel admits it.
+            with patch("turnstone.core.mcp_client.time.monotonic", return_value=2.0):
+                await handler(note)
+
+        _run_on_loop(loop, _fire())
+        _drain_background(mgr, loop)
+        assert refreshed == ["srv"], "the first notification must not be debounced near boot"
+
     def test_same_kind_debounce_drop_arms_retry(self, running_loop_mgr) -> None:
         """A SAME-kind push landing in the debounce window AFTER the
         previous runner completed (no runner queued) is genuinely lost to
@@ -3655,25 +3689,31 @@ class TestStaticNotificationRefresh:
         _run_on_loop(loop, _scenario())
         assert mgr.last_refresh_outcome("srv") == "error:TimeoutError"
 
-    def test_push_refresh_success_writes_outcome(self, running_loop_mgr) -> None:
-        """A successful push refresh must clear a prior error outcome —
-        else last_refresh_outcome keeps reporting the stale failure."""
+    def test_push_refresh_success_does_not_declare_server_healthy(self, running_loop_mgr) -> None:
+        """A single-kind push SUCCESS must NOT clear the server error pill
+        or stamp 'ok': ``_last_error`` / ``_last_refresh`` are server-scoped
+        but the push refreshed only ONE kind, so a tools-still-broken server
+        must not go green because its prompts push succeeded. The full-pass
+        health-tick retry (armed by the tools failure) is the authority on
+        'ok'."""
         mgr, loop, _thread = running_loop_mgr
         mgr._server_configs["srv"] = {"type": "http", "url": "http://x/mcp"}
         mgr._last_refresh["srv"] = (1.0, "error:TimeoutError")
-        mgr._last_error["srv"] = "Refresh failed: TimeoutError"
+        mgr._last_error["srv"] = "Refresh failed: TimeoutError"  # tools broken
 
         async def _ok(_name: str) -> tuple[list[str], list[str]]:
-            return [], []
+            return [], []  # prompts push succeeds
 
         async def _scenario() -> None:
             mgr._static_connect_lock_for("srv")
             _seed_static_state(mgr, "srv", session=MagicMock())
-            await mgr._run_static_notification_refresh("srv", "tools", _ok)
+            await mgr._run_static_notification_refresh("srv", "prompts", _ok)
 
         _run_on_loop(loop, _scenario())
-        assert mgr.last_refresh_outcome("srv") == "ok"
-        assert "srv" not in mgr._last_error
+        # The tools error stands — the prompts success did not paint the
+        # whole server healthy.
+        assert mgr.last_refresh_outcome("srv") == "error:TimeoutError"
+        assert "srv" in mgr._last_error
 
     def test_remove_server_pops_last_refresh_outcome(self) -> None:
         """Removal must drop the outcome row — a stale row would make

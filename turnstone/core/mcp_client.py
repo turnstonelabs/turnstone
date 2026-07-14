@@ -1655,8 +1655,15 @@ class MCPClientManager:
             return
         marker = (key, kind)
         now = time.monotonic()
-        last = stamps.get(marker, 0.0)
-        if now - last < self._NOTIFICATION_DEBOUNCE:
+        last = stamps.get(marker)
+        # ``None`` sentinel, not a ``0.0`` default: the FIRST notification
+        # for a (key, kind) must never be debounced. ``time.monotonic()``
+        # counts from boot, so on a node whose process started < DEBOUNCE
+        # seconds after boot, ``now - 0.0 < DEBOUNCE`` would debounce the
+        # very first push — dropped with no recovery on the pool path
+        # (``on_debounce_drop=None``). An absent stamp = never refreshed =
+        # always admit.
+        if last is not None and now - last < self._NOTIFICATION_DEBOUNCE:
             log.debug(
                 "Debouncing %s notification from %s (%.1fs since last refresh)",
                 kind,
@@ -1831,27 +1838,37 @@ class MCPClientManager:
         next notification of any kind.
         """
 
+        # Built ONCE per handler (not per message): the SDK invokes the
+        # handler for every server->client message, and rebuilding the
+        # 3-entry dict + closure on each — before the isinstance/debounce/
+        # coalesce early-returns even run — was pure per-message garbage on
+        # the receive path. Bound off ``self`` here (not a module table) so
+        # instance-level overrides set before handler construction still
+        # apply and mypy checks the attribute references; nothing overrides
+        # a refresher AFTER the handler exists.
+        refreshers: dict[str, Callable[[str], Awaitable[Any]]] = {
+            "tools": self._refresh_server_tools,
+            "resources": self._refresh_server_resources,
+            "prompts": self._refresh_server_prompts,
+        }
+
+        def _on_debounce_drop() -> None:
+            self._arm_refresh_retry(name)
+
         async def _on_notification(
             msg: Any,  # RequestResponder | ServerNotification | Exception
         ) -> None:
-            # Refreshers bound at dispatch time (not a module-level name
-            # table) so instance-level overrides keep working and mypy
-            # checks the attribute references.
             self._admit_list_changed(
                 msg,
                 name,
                 stamps=self._last_notification_refresh,
                 pending=self._static_refresh_pending,
-                refreshers={
-                    "tools": self._refresh_server_tools,
-                    "resources": self._refresh_server_resources,
-                    "prompts": self._refresh_server_prompts,
-                },
+                refreshers=refreshers,
                 runner=self._run_static_notification_refresh,
                 origin=f"'{name}'",
                 label_prefix="static",
                 label_target=name,
-                on_debounce_drop=lambda: self._arm_refresh_retry(name),
+                on_debounce_drop=_on_debounce_drop,
             )
 
         return _on_notification
@@ -1904,15 +1921,22 @@ class MCPClientManager:
 
         def _record(exc: BaseException | None) -> None:
             if exc is None:
-                # Update the outcome (not just the pill): a successful push
-                # must clear a prior ``error:`` row, or last_refresh_outcome
-                # (the pill / endpoint source of truth) contradicts itself —
-                # a green "ok" would be missing while the red error persists.
-                self._record_refresh_success(name)
-            else:
-                self._record_refresh_failure(
-                    name, exc, context=f"Static {kind} refresh after notification"
-                )
+                # A single-kind push SUCCESS does NOT declare the whole
+                # server healthy: ``_last_error`` / ``_last_refresh`` are
+                # server-scoped, but this refreshed only ONE kind. Stamping
+                # "ok" / clearing the pill here would paint a green,
+                # 200-OK server whose OTHER kind's catalog is still broken
+                # (a tools push failing while a prompts push succeeds). So
+                # a push success leaves the server-level outcome untouched
+                # — only the FULL pass (``_refresh_server`` ->
+                # ``_record_refresh_success``) is the authority on "ok",
+                # and a prior failure's armed health-tick retry runs that
+                # pass to converge. A push FAILURE still records (a known
+                # broken kind IS a broken server).
+                return
+            self._record_refresh_failure(
+                name, exc, context=f"Static {kind} refresh after notification"
+            )
 
         await self._run_list_changed_refresh(
             name,
@@ -2268,22 +2292,29 @@ class MCPClientManager:
         """
         user_id, server_name = key
 
+        # Built ONCE per handler (not per message) — see the static twin
+        # (:meth:`_make_static_notification_handler`) for why: the SDK calls
+        # the handler on every server->client message, and rebuilding this
+        # dict each time was per-message garbage on the receive path. Bound
+        # off ``self`` here so instance overrides set before construction
+        # apply and mypy checks the references.
+        refreshers: dict[
+            str, Callable[[tuple[str, str]], Awaitable[tuple[list[str], list[str]]]]
+        ] = {
+            "tools": self._refresh_pool_server_tools,
+            "resources": self._refresh_pool_server_resources,
+            "prompts": self._refresh_pool_server_prompts,
+        }
+
         async def _on_pool_notification(
             msg: Any,  # RequestResponder | ServerNotification | Exception
         ) -> None:
-            # Refreshers bound at dispatch time (not a module-level name
-            # table) so instance-level overrides keep working and mypy
-            # checks the attribute references.
             self._admit_list_changed(
                 msg,
                 key,
                 stamps=self._last_pool_notification_refresh,
                 pending=self._pool_refresh_pending,
-                refreshers={
-                    "tools": self._refresh_pool_server_tools,
-                    "resources": self._refresh_pool_server_resources,
-                    "prompts": self._refresh_pool_server_prompts,
-                },
+                refreshers=refreshers,
                 runner=self._run_notification_refresh,
                 origin=f"pool user={user_id} server={server_name}",
                 label_prefix="pool",
@@ -4336,6 +4367,18 @@ class MCPClientManager:
         if name in self._server_configs:
             self._last_refresh[name] = (time.time(), "ok")
 
+    def _record_refresh_skipped(self, name: str) -> None:
+        """Stamp the ``skipped`` outcome — the third outcome helper.
+
+        Config-gated like its ``success`` / ``failure`` siblings so the
+        three ``skipped`` sites in :meth:`_refresh_all` share ONE gate and
+        cannot drift (the drift class #842's shared helpers exist to
+        prevent). Does NOT touch the error pill: a skip is a non-event,
+        not a resolution — a prior failure's pill and armed retry stand.
+        """
+        if name in self._server_configs:
+            self._last_refresh[name] = (time.time(), "skipped")
+
     def last_refresh_outcome(self, name: str) -> str | None:
         """Authoritative last-refresh outcome for static server *name*.
 
@@ -4576,8 +4619,7 @@ class MCPClientManager:
                             "Refresh pass for '%s' skipped: reconnect in flight",
                             name,
                         )
-                        if name in self._server_configs:
-                            self._last_refresh[name] = (time.time(), "skipped")
+                        self._record_refresh_skipped(name)
                         results[name] = None
                         continue
                     # Attempt reconnect via the shared lazy primitive — it owns
@@ -4597,8 +4639,7 @@ class MCPClientManager:
                             # every other skip branch) so the endpoint /
                             # pill don't read a STALE prior ``ok`` and
                             # report a never-run refresh as current.
-                            if name in self._server_configs:
-                                self._last_refresh[name] = (time.time(), "skipped")
+                            self._record_refresh_skipped(name)
                             results[name] = None
                             continue
                         post = self._static_servers.get(name)
@@ -4606,7 +4647,7 @@ class MCPClientManager:
                             [t["function"]["name"] for t in post.tools] if post is not None else []
                         )
                         results[name] = (new_names, [])
-                        self._last_refresh[name] = (time.time(), "ok")
+                        self._record_refresh_success(name)
                     else:
                         # Removed from config between the top-of-loop
                         # session check and this cfg lookup. Report the
@@ -4633,9 +4674,8 @@ class MCPClientManager:
                     # health-tick retry so the request isn't silently
                     # dropped (mirrors ``_refresh_server_logged``;
                     # config-gated, so removed servers arm nothing).
-                    if name in self._server_configs:
-                        self._arm_refresh_retry(name)
-                        self._last_refresh[name] = (time.time(), "skipped")
+                    self._arm_refresh_retry(name)
+                    self._record_refresh_skipped(name)
                     results[name] = None
                     continue
                 added, removed = refreshed
