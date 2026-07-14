@@ -206,14 +206,13 @@ Earlier stable lines (`stable/1.6`, `stable/1.5`) are frozen.
   threads consistently to every operator surface off one source of truth
   (the per-server `last_refresh_outcome`): a busy-skip and a genuine failure
   are each reported distinctly from a real "no changes" — `/mcp refresh`
-  prints "skipped" or "failed" rather than a false "no changes", the
+  prints "skipped" or "failed" rather than a false "no changes", and the
   node-internal refresh endpoint returns `202 skipped` instead of a
-  misleading `200 ok` for a refresh that never ran, and the admin console's
-  refresh pill paints a benign "skipped" in a neutral tint rather than
-  failure-red. A single-kind push refresh no longer paints the whole server
-  healthy: because the error/outcome state is server-scoped, a successful
-  tools push while the prompts catalog is still broken (or vice versa) no
-  longer clears the failure — only a full refresh pass declares "ok".
+  misleading `200 ok` for a refresh that never ran. A single-kind push
+  refresh no longer paints the whole server healthy: because the
+  error/outcome state is server-scoped, a successful tools push while the
+  prompts catalog is still broken (or vice versa) no longer clears the
+  failure — only a full refresh pass declares "ok".
 
 - **OpenAI Responses streaming: truncated and refused responses no longer
   vanish.** A response that hit `max_output_tokens` terminates the stream
