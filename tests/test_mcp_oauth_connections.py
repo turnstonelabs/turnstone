@@ -807,7 +807,7 @@ class TestEvictUserSession:
             mgr._background_tasks = set()  # type: ignore[attr-defined]
             evicted: list[tuple[str, str]] = []
 
-            async def _fake_evict(key: tuple[str, str]) -> None:
+            async def _fake_evict(key: tuple[str, str], **_kwargs: object) -> None:
                 evicted.append(key)
 
             # The revoke entry point must take the LOCKED drop-catalog

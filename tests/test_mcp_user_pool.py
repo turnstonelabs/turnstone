@@ -583,10 +583,13 @@ class TestEviction:
     def test_dead_grant_drop_skips_freshly_reconnected_entry(self, running_loop_mgr) -> None:
         """A dead-grant drop parked behind ``open_lock`` must NOT clear a
         catalog that a re-consent prime published while it waited: a
-        live session at drop time proves a connect succeeded after the
-        failed lookup, i.e. the grant is alive again. The explicit
-        revocation path (skip_if_connected=False) still clears warm
-        entries — that is its purpose."""
+        live session DIFFERENT from the one observed when the grant
+        died proves a connect succeeded after the failed lookup, i.e.
+        the grant is alive again. Direct calls without an observation
+        (``observed_session=None`` — the cold case) treat any live
+        session as newer. The explicit revocation path
+        (skip_if_connected=False) still clears warm entries — that is
+        its purpose."""
         mgr, loop, _ = running_loop_mgr
         mgr._oauth_user_server_names = {"pool-srv"}
         key = ("u0", "pool-srv")
@@ -613,20 +616,77 @@ class TestEviction:
         assert dropped is None
         assert revoked is None
 
-    def test_notification_refresh_failure_returns_debounce_stamp(self, running_loop_mgr) -> None:
-        """A failed spawned ``list_changed`` refresh must return the
-        debounce stamp so the server's next notification retries — a
-        consumed stamp with no retry silently drops the catalog change
-        for the whole debounce window."""
+    def test_dead_grant_drop_evicts_warm_pre_observation_session(self, running_loop_mgr) -> None:
+        """#836 warm case: the grant dies while the transport is warm
+        (cross-node disconnect, IdP revocation). Failed lookups
+        short-circuit dispatch before touching the session, so no 401
+        ever evicts it — the drop itself must. A session that was
+        ALREADY live when the dead grant was observed proves nothing;
+        only a session that CHANGED since the observation (a later
+        successful connect) proves the grant lives again."""
+        mgr, loop, _ = running_loop_mgr
+        mgr._app_state = SimpleNamespace(mcp_token_store=object())
+        mgr._storage = object()
+        mgr._oauth_user_server_names = {"pool-srv"}
+        key = ("u0", "pool-srv")
+        fired = [0]
+
+        def _cb() -> None:
+            fired[0] += 1
+
+        mgr.add_listener(_cb, user_id="u0")
+        dead = SimpleNamespace(kind="missing", token=None)
+
+        async def _warm_then_schedule() -> None:
+            entry = await mgr._ensure_pool_entry(key)
+            entry.tools = _fake_pool_tools("pool-srv", "t")
+            mgr._rebuild_user_tool_map("u0")
+            entry.session = MagicMock()  # warm BEFORE the failed lookup
+            mgr._schedule_dead_grant_drop(dead, key)
+
+        _run_on_loop(loop, _warm_then_schedule())
+        _drain_background(mgr, loop)
+        entry = mgr._user_pool_entries[key]
+        assert entry.tools is None, "pre-observation warm session must not block the drop"
+        assert entry.session is None
+        assert mgr.is_mcp_tool("mcp__pool-srv__t", user_id="u0") is False
+        assert fired[0] == 1
+
+        # A session that CHANGED after the observation (re-consent
+        # prime reconnected before the parked drop ran) is genuine
+        # evidence — the drop must spare it.
+        async def _reseed_and_swap() -> None:
+            fresh = mgr._user_pool_entries[key]
+            fresh.tools = _fake_pool_tools("pool-srv", "t")
+            mgr._rebuild_user_tool_map("u0")
+            fresh.session = MagicMock()  # observed at schedule time
+            mgr._schedule_dead_grant_drop(dead, key)
+            fresh.session = MagicMock()  # re-consent connect lands first
+
+        _run_on_loop(loop, _reseed_and_swap())
+        _drain_background(mgr, loop)
+        entry = mgr._user_pool_entries[key]
+        assert entry.tools is not None, "drop must spare a session newer than its observation"
+
+    def test_notification_refresh_failure_keeps_debounce_stamp(self, running_loop_mgr) -> None:
+        """A failed spawned refresh must KEEP the debounce stamp:
+        popping it re-arms the handler on every notification, so a
+        fast-failing server spawns unthrottled refresh tasks at its
+        notification rate. The bounded cost — a change announced in
+        the remainder of the failed window waits for the server's next
+        ``list_changed`` or the entry's next reconnect — is the lesser
+        failure (teardown pops the stamp, so a reconnect's first
+        notification refreshes immediately)."""
         mgr, loop, _ = running_loop_mgr
         key = ("u0", "pool-srv")
+        _run_on_loop(loop, mgr._ensure_pool_entry(key))
         mgr._last_pool_notification_refresh[key] = 123.0
 
         async def _boom(_key: tuple[str, str]) -> tuple[list[str], list[str]]:
             raise TimeoutError("slow server")
 
         _run_on_loop(loop, mgr._run_notification_refresh(key, "tools", _boom))
-        assert key not in mgr._last_pool_notification_refresh
+        assert mgr._last_pool_notification_refresh[key] == 123.0
 
         async def _ok(_key: tuple[str, str]) -> tuple[list[str], list[str]]:
             return [], []
@@ -634,6 +694,86 @@ class TestEviction:
         mgr._last_pool_notification_refresh[key] = 456.0
         _run_on_loop(loop, mgr._run_notification_refresh(key, "tools", _ok))
         assert mgr._last_pool_notification_refresh[key] == 456.0
+
+    def test_notification_refresh_catches_exception_group(self, running_loop_mgr) -> None:
+        """A wedged anyio transport surfaces session-op failures as
+        ``BaseExceptionGroup`` — which ``except Exception`` misses. An
+        escaping group reaches ``_spawn_background``'s failure log,
+        whose ``exc_info`` serializes the chained httpx request
+        carrying ``Authorization: Bearer <token>``. The runner must
+        swallow the group (and keep the stamp) like any other refresh
+        failure. The member below is a BaseException so the group does
+        NOT collapse to ``ExceptionGroup`` (which ``Exception`` would
+        catch) — the anyio stray-cancel shape."""
+        mgr, loop, _ = running_loop_mgr
+        key = ("u0", "pool-srv")
+        _run_on_loop(loop, mgr._ensure_pool_entry(key))
+        mgr._last_pool_notification_refresh[key] = 123.0
+
+        async def _wedge(_key: tuple[str, str]) -> tuple[list[str], list[str]]:
+            raise BaseExceptionGroup("wedged transport", [asyncio.CancelledError()])
+
+        _run_on_loop(loop, mgr._run_notification_refresh(key, "tools", _wedge))
+        assert mgr._last_pool_notification_refresh[key] == 123.0
+
+    def test_notification_refresh_serializes_on_open_lock(self, running_loop_mgr) -> None:
+        """The runner must take ``open_lock`` before refreshing: an
+        unserialized refresh races an in-flight connect's discovery
+        wiring (which would overwrite the refresh's newer catalog with
+        its older snapshot) and sibling same-key refreshes (the slower
+        list call publishing the older catalog last)."""
+        mgr, loop, _ = running_loop_mgr
+        key = ("u0", "pool-srv")
+        refreshed: list[tuple[str, str]] = []
+
+        async def _rec(k: tuple[str, str]) -> tuple[list[str], list[str]]:
+            refreshed.append(k)
+            return [], []
+
+        async def _scenario() -> bool:
+            entry = await mgr._ensure_pool_entry(key)
+            await entry.open_lock.acquire()
+            task = asyncio.ensure_future(mgr._run_notification_refresh(key, "tools", _rec))
+            for _ in range(3):
+                await asyncio.sleep(0)
+            held_back = len(refreshed) == 0
+            entry.open_lock.release()
+            await task
+            return held_back
+
+        held_back = _run_on_loop(loop, _scenario())
+        assert held_back, "refresh must wait for open_lock"
+        assert refreshed == [key]
+
+    def test_notification_refresh_discards_when_entry_replaced_while_waiting(
+        self, running_loop_mgr
+    ) -> None:
+        """An entry replaced (full drop + re-create) while the runner
+        waited on the OLD entry's lock must not be refreshed by it:
+        the notification belonged to the old transport, the
+        replacement publishes its own discovery, and the runner holds
+        a lock the new entry does not share."""
+        mgr, loop, _ = running_loop_mgr
+        key = ("u0", "pool-srv")
+        refreshed: list[tuple[str, str]] = []
+
+        async def _rec(k: tuple[str, str]) -> tuple[list[str], list[str]]:
+            refreshed.append(k)
+            return [], []
+
+        async def _scenario() -> None:
+            entry = await mgr._ensure_pool_entry(key)
+            await entry.open_lock.acquire()
+            task = asyncio.ensure_future(mgr._run_notification_refresh(key, "tools", _rec))
+            for _ in range(3):
+                await asyncio.sleep(0)
+            mgr._user_pool_entries.pop(key, None)
+            await mgr._ensure_pool_entry(key)
+            entry.open_lock.release()
+            await task
+
+        _run_on_loop(loop, _scenario())
+        assert refreshed == []
 
     def test_list_changed_handler_spawns_refresh_off_receive_loop(self, running_loop_mgr) -> None:
         """The notification handler must SPAWN the refresh, not await it:
@@ -652,6 +792,9 @@ class TestEviction:
         handler = mgr._make_pool_notification_handler(key)
 
         async def _fire() -> bool:
+            # The runner refreshes through the entry's ``open_lock``;
+            # without an entry it (correctly) discards the notification.
+            await mgr._ensure_pool_entry(key)
             note = mcp_types.ServerNotification(
                 mcp_types.ToolListChangedNotification(method="notifications/tools/list_changed")
             )
@@ -1653,6 +1796,54 @@ class TestOboPriming:
 
         entry = mgr._user_pool_entries[key]
         assert entry.tools is None
+        assert mgr.is_mcp_tool("mcp__obo-srv__t", user_id="user-1") is False
+        assert fired[0] == 1
+
+    def test_prime_drops_warm_obo_entry_when_credential_gone(
+        self, running_loop_mgr, storage
+    ) -> None:
+        """The gate's dead-grant drop must converge WARM obo entries
+        too: with the credential unlinked, dispatches fail the
+        classified lookup before ever touching the session, so no 401
+        evicts it — and a session that predates the gate's observation
+        must not read as re-consent evidence."""
+        mgr, loop, _ = running_loop_mgr
+        cipher = make_mcp_token_cipher()
+        mgr.set_storage(storage)
+        app_state = _make_app_state(storage, cipher=cipher)
+        app_state.oidc_config = SimpleNamespace(issuer="https://idp.example.com")
+        mgr.set_app_state(app_state)
+        storage.create_mcp_server(
+            server_id="srv-obo",
+            name="obo-srv",
+            transport="streamable-http",
+            url="https://mcp.example.com/sse",
+            auth_type="oauth_obo",
+            oauth_audience="api://mcp-a",
+        )
+        mgr._obo_server_names = {"obo-srv"}
+        key = ("user-1", "obo-srv")
+
+        async def _seed_warm() -> None:
+            entry = await mgr._ensure_pool_entry(key)
+            entry.tools = _fake_pool_tools("obo-srv", "t")
+            mgr._rebuild_user_tool_map("user-1")
+            entry.session = MagicMock()  # warm at observation time
+
+        _run_on_loop(loop, _seed_warm())
+        fired = [0]
+
+        def _cb() -> None:
+            fired[0] += 1
+
+        mgr.add_listener(_cb, user_id="user-1")
+
+        _run_on_loop(loop, mgr._prime_user_pools("user-1"))
+        _drain_background(mgr, loop)
+
+        entry = mgr._user_pool_entries[key]
+        assert entry.tools is None
+        assert entry.session is None
         assert mgr.is_mcp_tool("mcp__obo-srv__t", user_id="user-1") is False
         assert fired[0] == 1
 
