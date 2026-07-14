@@ -518,7 +518,7 @@ class TestProviderPdfCapabilities:
             lookup_openai_capabilities,
         )
 
-        assert lookup_openai_capabilities("gpt-5").supports_pdf is True
+        assert lookup_openai_capabilities("gpt-5.4").supports_pdf is True
         # Unknown / local models stay False (PDF → client-side fallback).
         assert OPENAI_DEFAULT.supports_pdf is False
 

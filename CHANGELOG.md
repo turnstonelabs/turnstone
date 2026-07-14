@@ -45,10 +45,10 @@ Earlier stable lines (`stable/1.6`, `stable/1.5`) are frozen.
   accepts its own terminal marker; the chat lane treats a clean
   end-of-stream with content as completion) — only streams that die
   mid-generation, deliver nothing, or drop the connection fail, and
-  those retry before surfacing. Legacy models
-  that reject streaming requests outright (o1-era) likewise need a
-  model alias pointing at a current model — the unread
-  `supports_streaming` capability flag (and its admin tile) is gone.
+  those retry before surfacing. The unread `supports_streaming`
+  capability flag (and its admin tile) is gone; the o-series models it
+  described are dropped from the capability table entirely (see
+  Removed).
 
 - **One turn interface for every model call: `core/model_turn.py` (#827).**
   Judges (intent + output guard), perception, title generation, compaction,
@@ -130,6 +130,21 @@ Earlier stable lines (`stable/1.6`, `stable/1.5`) are frozen.
     config and keep that exact behavior on resume; they pick up the new
     inherit semantics the next time you change the model or a sampling
     knob in that workstream. New workstreams inherit from the start.
+
+### Removed
+
+- **O-series and pre-5.4 GPT-5 rows dropped from the OpenAI capability
+  table.** `o1`, `o1-mini`, `o3`, `o3-mini`, `o3-pro`, `o4-mini`,
+  `gpt-5`, `gpt-5-mini`, `gpt-5-nano`, `gpt-5-pro`, `gpt-5.1`,
+  `gpt-5.1-codex-max`, `gpt-5.2`, `gpt-5.2-pro`, and `gpt-5.3` no longer
+  have built-in capability rows — these models are effectively unused in
+  the field. The table floor is now `gpt-5.4`; the search-api and
+  audio/STT/TTS rows are unchanged. An alias still pinning one of the
+  removed ids resolves to the generic commercial defaults (temperature
+  sent, no declared reasoning-effort vocabulary, 200K window), which
+  those models may reject — declare the contract on the model
+  definition's capabilities JSON if you must stay on one, or move to a
+  current model.
 
 ### Fixed
 

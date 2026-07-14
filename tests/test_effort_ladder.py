@@ -200,21 +200,24 @@ class TestFlatParamLanes:
         assert eff["xhigh"] == "xhigh"
         assert eff["max"] == "xhigh"
 
-    def test_openai_o3_registry_row(self) -> None:
-        """o-series (except o1-mini) accept low/medium/high; no declared
-        "none" level, so the knob's off position omits the param."""
-        eff = _as_map(effort_ladder_for_model("openai", "o3", None))
+    def test_openai_always_reasoning_row_snaps_without_none(self) -> None:
+        """Always-reasoning rows (gpt-5.4-pro: medium/high/xhigh) declare no
+        "none" level, so the knob's off position omits the param and low
+        positions snap UP onto the declared floor."""
+        eff = _as_map(effort_ladder_for_model("openai", "gpt-5.4-pro", None))
         assert eff["none"] == "default"
-        assert eff["minimal"] == "low"
+        assert eff["minimal"] == "medium"
         assert eff["medium"] == "medium"
-        assert eff["xhigh"] == eff["max"] == "high"
-
-    def test_openai_codex_max_has_xhigh(self) -> None:
-        """gpt-5.1-codex-max must not prefix-fall onto the gpt-5.1 row
-        (which lacks xhigh) — xhigh reaches the wire verbatim."""
-        eff = _as_map(effort_ladder_for_model("openai", "gpt-5.1-codex-max", None))
-        assert eff["xhigh"] == "xhigh"
         assert eff["max"] == "xhigh"
+
+    def test_openai_pro_row_wins_longest_prefix(self) -> None:
+        """gpt-5.4-pro must not prefix-fall onto the gpt-5.4 row (which
+        declares "none") — the pro ladder has no off position, so the
+        longest-prefix row must win or the knob would wrongly omit."""
+        eff = _as_map(effort_ladder_for_model("openai", "gpt-5.4-pro", None))
+        assert eff["none"] == "default"
+        base = _as_map(effort_ladder_for_model("openai", "gpt-5.4", None))
+        assert base["none"] == "none"
 
     def test_anthropic_effort_applies_even_with_thinking_mode_none(self) -> None:
         """output_config gates on supports_effort alone at request time."""
