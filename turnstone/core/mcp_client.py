@@ -4110,22 +4110,31 @@ class MCPClientManager:
     async def _reap_bounded(self, tasks: tuple[asyncio.Task[Any], ...]) -> None:
         """Await already-cancelled *tasks* under a grace deadline.
 
-        Uses ``asyncio.shield`` so THIS await is immune to the caller's
-        own in-flight cancellation (an expired ``asyncio.timeout`` scope
-        has already delivered its single cancel), and ``asyncio.wait``
-        with a timeout so a child that refuses to honour ``cancel()``
-        cannot block indefinitely. Exceptions on done tasks are retrieved
-        (marking them handled); any straggler is logged and abandoned.
+        ``asyncio.wait`` with a timeout so a child that refuses to honour
+        ``cancel()`` cannot block indefinitely — the expired outer
+        ``asyncio.timeout`` fires only once, so this await would otherwise
+        be unbounded on a wedged child. Exceptions on done tasks are
+        retrieved (marking them handled); a straggler is logged and
+        abandoned (a cancelled local task the loop will GC).
+
+        An EXTERNAL ``CancelledError`` (shutdown, an operator cancel of
+        the refresh runner) is honoured, NOT swallowed: it is re-raised
+        after a best-effort retrieval of any already-done task's
+        exception, so a shutdown signal delivered during the reap window
+        is not dropped on the floor.
         """
         try:
-            done, pending = await asyncio.shield(
-                asyncio.wait(set(tasks), timeout=self._OWNER_CANCEL_GRACE_S)
-            )
+            _done, pending = await asyncio.wait(set(tasks), timeout=self._OWNER_CANCEL_GRACE_S)
         except asyncio.CancelledError:
-            done, pending = {t for t in tasks if t.done()}, {t for t in tasks if not t.done()}
-        for task in done:
-            with contextlib.suppress(BaseException):
-                task.exception()
+            for task in tasks:
+                if task.done():
+                    with contextlib.suppress(BaseException):
+                        task.exception()
+            raise
+        for task in tasks:
+            if task.done():
+                with contextlib.suppress(BaseException):
+                    task.exception()
         if pending:
             log.warning(
                 "MCP resource-list reap: %d task(s) ignored cancellation; abandoning",
@@ -4553,8 +4562,12 @@ class MCPClientManager:
                             # Deliberate skip: removed concurrently, or a
                             # sibling call is still in flight on the old
                             # stack. Not a failure — the next refresh or
-                            # health tick retries; report it as the skip
-                            # it is.
+                            # health tick retries. Stamp ``skipped`` (like
+                            # every other skip branch) so the endpoint /
+                            # pill don't read a STALE prior ``ok`` and
+                            # report a never-run refresh as current.
+                            if name in self._server_configs:
+                                self._last_refresh[name] = (time.time(), "skipped")
                             results[name] = None
                             continue
                         post = self._static_servers.get(name)
@@ -4563,6 +4576,15 @@ class MCPClientManager:
                         )
                         results[name] = (new_names, [])
                         self._last_refresh[name] = (time.time(), "ok")
+                    else:
+                        # Removed from config between the top-of-loop
+                        # session check and this cfg lookup. Report the
+                        # skip explicitly — falling through to ``continue``
+                        # left ``results[name]`` UNSET, omitting the server
+                        # from the returned dict, so an operator refreshing
+                        # that one server saw a bare "refresh complete" with
+                        # no line at all.
+                        results[name] = None
                     continue
                 refreshed = await self._refresh_server(name)
                 if refreshed is None:

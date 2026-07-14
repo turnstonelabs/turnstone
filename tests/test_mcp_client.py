@@ -3661,6 +3661,49 @@ class TestStaticNotificationRefresh:
         assert "srv" in mgr._static_refresh_retry
         assert mgr._last_refresh["srv"][1] == "skipped"
 
+    def test_refresh_all_disconnected_reconnect_deferral_stamps_skipped(
+        self, running_loop_mgr
+    ) -> None:
+        """A disconnected server whose reconnect DEFERS (``_ensure_static_connected``
+        returns None: sibling call in flight on the old stack) must stamp
+        ``skipped``, not leave a STALE prior ``ok`` — else the endpoint /
+        pill report a never-run refresh as current. Lock NOT held here (an
+        in_flight defer, not a busy lock), so it reaches the reconnect
+        branch."""
+        mgr, loop, _thread = running_loop_mgr
+        mgr._server_configs["srv"] = {"type": "http", "url": "http://x/mcp"}
+        mgr._last_refresh["srv"] = (1.0, "ok")  # stale prior success
+
+        async def _defer(_name: str, _cfg: dict[str, Any], **_kw: Any) -> Any:
+            return None  # reconnect deferred
+
+        mgr._ensure_static_connected = _defer  # type: ignore[method-assign]
+
+        async def _scenario() -> dict[str, tuple[list[str], list[str]] | None]:
+            _seed_static_state(mgr, "srv", session=None)  # disconnected
+            return await mgr._refresh_all("srv")
+
+        results = _run_on_loop(loop, _scenario())
+        assert results == {"srv": None}
+        assert mgr.last_refresh_outcome("srv") == "skipped", "stale 'ok' must be overwritten"
+
+    def test_refresh_all_reports_server_removed_mid_pass(self, running_loop_mgr) -> None:
+        """A server removed from config between the session check and the
+        cfg lookup must still appear in the result dict (as None), not be
+        silently omitted — an operator refreshing that one server got a
+        bare 'refresh complete' with no line at all."""
+        mgr, loop, _thread = running_loop_mgr
+
+        async def _scenario() -> dict[str, tuple[list[str], list[str]] | None]:
+            # Target present at the top (state exists, disconnected) but
+            # NO config → the cfg lookup finds nothing (removed mid-pass).
+            _seed_static_state(mgr, "srv", session=None)
+            return await mgr._refresh_all("srv")
+
+        results = _run_on_loop(loop, _scenario())
+        assert "srv" in results, "a removed-mid-pass server must not vanish from results"
+        assert results["srv"] is None
+
     def test_refresh_all_skips_disconnected_server_with_reconnect_in_flight(
         self, running_loop_mgr
     ) -> None:
@@ -3851,6 +3894,30 @@ class TestStaticNotificationRefresh:
         assert sibling_events == ["cancelled"], (
             "the hung sibling must be cancelled and reaped inside the scope"
         )
+
+    def test_reap_bounded_reraises_external_cancel(self) -> None:
+        """An EXTERNAL cancel delivered during the reap window must be
+        HONOURED (re-raised), not swallowed — else a shutdown/cancel of
+        the refresh runner is silently dropped and the frame completes via
+        its original error path instead."""
+        mgr = MCPClientManager({})
+
+        async def _run() -> None:
+            async def _quick() -> None:
+                return None
+
+            t1 = asyncio.ensure_future(_quick())
+            t2 = asyncio.ensure_future(_quick())
+            await asyncio.gather(t1, t2)  # both done before the reap
+            # asyncio.wait raising CancelledError models an external cancel
+            # landing on the reap await.
+            with (
+                patch("asyncio.wait", side_effect=asyncio.CancelledError()),
+                pytest.raises(asyncio.CancelledError),
+            ):
+                await mgr._reap_bounded((t1, t2))
+
+        asyncio.run(_run())
 
     def test_remove_server_clears_markers_and_stamps(self) -> None:
         """``remove_server_sync`` must clear the server's coalesce

@@ -3469,9 +3469,12 @@ def internal_mcp_refresh_one(request: Request) -> JSONResponse:
     # public status projection whitelists ``last_refresh_outcome`` out (it
     # encodes the error class, which read-scope deliberately coarsens to
     # ``has_error``), so it cannot be recovered from the stripped dict.
+    #
+    # Error is checked BEFORE the skip: a live error pill (a server in a
+    # genuine failure state whose refresh was skipped because its lock was
+    # busy) MUST surface as 500 — reporting a benign 202 for an erroring
+    # server would let a status-code-keyed caller treat it as healthy.
     status = _public_server_status(mcp_mgr, name)
-    if mcp_mgr.last_refresh_outcome(name) == "skipped":
-        return JSONResponse({"status": "skipped", "server": status}, status_code=202)
     if status.get("error"):
         log.warning(
             "internal_mcp_refresh_one: refresh reported error for %s: %s", name, status["error"]
@@ -3480,6 +3483,8 @@ def internal_mcp_refresh_one(request: Request) -> JSONResponse:
             {"status": "error", "error": "refresh failed", "server": status},
             status_code=500,
         )
+    if mcp_mgr.last_refresh_outcome(name) == "skipped":
+        return JSONResponse({"status": "skipped", "server": status}, status_code=202)
     return JSONResponse({"status": "ok", "server": status})
 
 

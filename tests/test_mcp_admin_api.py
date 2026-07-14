@@ -2607,6 +2607,30 @@ class TestInternalMcpRefreshOneEndpoint:
         assert "command" not in data["server"]  # stripped
         mgr.last_refresh_outcome.assert_called_with("srv")
 
+    def test_refresh_one_error_beats_skip_returns_500(self, node_app_factory) -> None:
+        # A skip on a server that ALSO carries a live error pill must
+        # surface as 500, not a benign 202 — a status-code-keyed caller
+        # would otherwise treat a genuinely erroring server as healthy.
+        mgr = MagicMock()
+        mgr.refresh_sync.return_value = {"srv": None}
+        mgr.last_refresh_outcome.return_value = "skipped"
+        mgr.get_server_status.return_value = {
+            "connected": False,
+            "tools": 0,
+            "resources": 0,
+            "prompts": 0,
+            "error": "Refresh failed: connection refused",
+            "transport": "stdio",
+            "command": "secret",
+            "url": "",
+            "circuit_open": True,
+            "consecutive_failures": 5,
+        }
+        c = node_app_factory(mgr)
+        r = c.post("/v1/api/_internal/mcp-refresh/srv")
+        assert r.status_code == 500, "a live error must win over the skip"
+        assert r.json()["status"] == "error"
+
     def test_refresh_one_invalid_name_returns_400(self, node_app_factory) -> None:
         # sec-4: name validation symmetric with console side.
         mgr = MagicMock()
