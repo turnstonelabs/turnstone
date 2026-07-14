@@ -944,6 +944,15 @@ class AnthropicProvider:
         emitted_finish = False
         delivered_output = False
 
+        def _attach_terminal_blocks(chunk: StreamChunk) -> None:
+            # Every terminal path (message_delta stop_reason, message_stop
+            # shim, lax-gateway end-of-stream shim) attaches the full
+            # sorted raw-block list identically — one implementation so
+            # replay fidelity cannot depend on WHICH terminal path a
+            # stream happened to take.
+            if raw_blocks:
+                chunk.provider_blocks = [raw_blocks[i] for i in sorted(raw_blocks)]
+
         for event in stream:
             sc = StreamChunk()
             event_type = event.type
@@ -951,6 +960,15 @@ class AnthropicProvider:
             if event_type == "content_block_start":
                 block = event.content_block
                 raw_blocks[event.index] = _block_to_dict(block)
+                # Whole-block emission (lax anthropic-compatible gateways):
+                # a block's content may arrive pre-populated inside
+                # content_block_start with no following deltas.  The real
+                # API sends start blocks EMPTY (text ""/input {}) and
+                # streams the content as deltas, so emitting the start
+                # payload never double-counts there — but skipping it made
+                # every drained lane return a clean-looking empty result
+                # where the retired non-streaming path (SDK
+                # get_final_message accumulation) returned the content.
                 if block.type == "text":
                     # Separate consecutive text blocks the way the Messages
                     # API's non-streaming shape reads when joined — without
@@ -960,13 +978,27 @@ class AnthropicProvider:
                     if saw_text_block:
                         sc.content_delta = "\n"
                     saw_text_block = True
+                    # Type-guarded like _reasoning_text: duck-typed blocks
+                    # must never leak a non-str into the accumulators.
+                    start_text = getattr(block, "text", "")
+                    if isinstance(start_text, str) and start_text:
+                        sc.content_delta = (sc.content_delta or "") + start_text
+                elif block.type == "thinking":
+                    start_thinking = getattr(block, "thinking", "")
+                    if isinstance(start_thinking, str) and start_thinking:
+                        sc.reasoning_delta = start_thinking
                 if block.type == "tool_use":
                     idx = next_tool_index
                     tool_block_to_index[event.index] = idx
                     next_tool_index += 1
-                    sc.tool_call_deltas.append(
-                        ToolCallDelta(index=idx, id=block.id, name=block.name)
-                    )
+                    tcd = ToolCallDelta(index=idx, id=block.id, name=block.name)
+                    start_input = getattr(block, "input", None)
+                    if isinstance(start_input, dict) and start_input:
+                        # Non-empty start input = the whole call arrived in
+                        # one block; the real API sends {} here and streams
+                        # input_json_delta events instead.
+                        tcd.arguments_delta = json.dumps(start_input)
+                    sc.tool_call_deltas.append(tcd)
                 elif block.type == "server_tool_use":
                     # Server-side tool (web search) — track for query accumulation
                     server_tool_blocks[event.index] = {
@@ -1083,8 +1115,7 @@ class AnthropicProvider:
                     sc.finish_reason = _normalize_finish_reason(event.delta.stop_reason)
                     emitted_finish = True
                     # Emit all raw content blocks for multi-turn preservation
-                    if raw_blocks:
-                        sc.provider_blocks = [raw_blocks[i] for i in sorted(raw_blocks)]
+                    _attach_terminal_blocks(sc)
 
             elif event_type == "message_stop":
                 # Terminal marker: the message completed even if the compat
@@ -1096,8 +1127,7 @@ class AnthropicProvider:
                 if not emitted_finish:
                     sc.finish_reason = "stop"
                     emitted_finish = True
-                    if raw_blocks:
-                        sc.provider_blocks = [raw_blocks[i] for i in sorted(raw_blocks)]
+                    _attach_terminal_blocks(sc)
 
             elif event_type == "message_start":
                 if hasattr(event.message, "usage") and event.message.usage:
@@ -1135,8 +1165,7 @@ class AnthropicProvider:
         # generation died mid-response.
         if finish_reason_optional and not emitted_finish and delivered_output:
             sc = StreamChunk(finish_reason="stop")
-            if raw_blocks:
-                sc.provider_blocks = [raw_blocks[i] for i in sorted(raw_blocks)]
+            _attach_terminal_blocks(sc)
             yield sc
 
     # -- retryable errors ----------------------------------------------------

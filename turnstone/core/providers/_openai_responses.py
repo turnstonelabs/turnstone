@@ -543,6 +543,7 @@ class OpenAIResponsesProvider:
         messages = materialize_attachments(messages, resolve_attachments)
         if extra_params:
             log.debug("openai.responses: extra_params ignored (not supported by Responses API)")
+        caps = capabilities or self.get_capabilities(model)
         kwargs = self._build_kwargs(
             model,
             messages,
@@ -551,7 +552,7 @@ class OpenAIResponsesProvider:
             temperature,
             reasoning_effort,
             deferred_names,
-            capabilities=capabilities,
+            capabilities=caps,
             replay_reasoning_to_model=replay_reasoning_to_model,
         )
         kwargs["stream"] = True
@@ -570,7 +571,6 @@ class OpenAIResponsesProvider:
         stream = client.responses.create(**kwargs)
         if cancel_ref is not None:
             cancel_ref.append(stream)
-        caps = capabilities or self.get_capabilities(model)
         return self._iter_stream(stream, finish_reason_optional=caps.finish_reason_optional)
 
     def _iter_stream(
@@ -707,14 +707,13 @@ class OpenAIResponsesProvider:
             # finish reason, final usage, AND collected provider_blocks.
             if event_type in ("response.completed", "response.incomplete"):
                 response = getattr(event, "response", None)
-                # A terminal event without its payload (lax compat server)
-                # is still a terminal signal: derive the finish reason from
-                # the event type, keep the blocks already collected from
-                # output_item.done events — only usage (and the rebuild
-                # below) genuinely needs the payload.
-                if response is not None:
-                    status = getattr(response, "status", "")
-                else:
+                # A terminal event without a usable status — payload absent
+                # entirely (lax compat server) OR a slim payload omitting
+                # the field — is still a terminal signal: the event type
+                # itself says whether the run completed.  Only usage (and
+                # the rebuild below) genuinely needs the payload.
+                status = (getattr(response, "status", "") if response is not None else "") or ""
+                if not status:
                     status = "completed" if event_type == "response.completed" else "incomplete"
                 last_finish = "stop" if status == "completed" else "length"
                 usage = extract_usage(getattr(response, "usage", None)) if response else None
@@ -744,6 +743,57 @@ class OpenAIResponsesProvider:
                         annotations = []
                         for item in out_items:
                             _extend_message_annotations(item, annotations)
+                # Under-streaming gateway parity: the retired non-streaming
+                # path read content and tool calls off this same terminal
+                # payload, so output that exists ONLY in the final blocks —
+                # a buffering proxy that never fired output_text.delta /
+                # output_item.added events — must be emitted here or the
+                # drained result is a clean-looking empty success.  Gated
+                # on NOTHING of that kind having streamed: the normal
+                # event flow already emitted these, and a partially
+                # under-streaming server (some deltas, fuller terminal) is
+                # indistinguishable from a complete stream without diffing.
+                if content_len == 0:
+                    parts_text: list[str] = []
+                    for block in provider_blocks:
+                        if not (isinstance(block, dict) and block.get("type") == "message"):
+                            continue
+                        for part in block.get("content") or []:
+                            if not isinstance(part, dict):
+                                continue
+                            if part.get("type") == "output_text" and part.get("text"):
+                                parts_text.append(part["text"])
+                            elif part.get("type") == "refusal" and part.get("refusal"):
+                                parts_text.append(f"[Refused: {part['refusal']}]")
+                    harvested = "".join(parts_text)
+                    if harvested:
+                        content_len = len(harvested)
+                        hc = StreamChunk(content_delta=harvested)
+                        if first:
+                            hc.is_first = True
+                            first = False
+                        yield hc
+                if tool_call_count == 0:
+                    for block in provider_blocks:
+                        if not (isinstance(block, dict) and block.get("type") == "function_call"):
+                            continue
+                        idx = next_tool_idx
+                        next_tool_idx += 1
+                        tool_call_count += 1
+                        tc_chunk = StreamChunk(
+                            tool_call_deltas=[
+                                ToolCallDelta(
+                                    index=idx,
+                                    id=block.get("call_id", "") or "",
+                                    name=block.get("name", "") or "",
+                                    arguments_delta=block.get("arguments", "") or "",
+                                )
+                            ]
+                        )
+                        if first:
+                            tc_chunk.is_first = True
+                            first = False
+                        yield tc_chunk
                 sc = StreamChunk(
                     finish_reason=last_finish,
                     usage=usage,

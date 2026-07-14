@@ -1417,6 +1417,82 @@ class TestAnthropicProvider:
         assert result.finish_reason == "stop"
         assert result.provider_blocks
 
+    @staticmethod
+    def _whole_block_stream(events: list[Any]) -> MagicMock:
+        # A lax gateway emitting pre-populated content_block_start events
+        # (whole-block emission, no deltas) — fake_anthropic_stream
+        # deliberately strips start blocks to the real API's empty shape,
+        # so these are built raw.
+        mgr = MagicMock()
+        mgr.__enter__ = MagicMock(return_value=events)
+        mgr.__exit__ = MagicMock(return_value=False)
+        return mgr
+
+    @patch("turnstone.core.providers._anthropic._ensure_anthropic")
+    def test_whole_block_start_text_reaches_content(self, mock_ensure: MagicMock) -> None:
+        # Text delivered inside content_block_start with no text_delta
+        # events: the retired non-streaming path (SDK get_final_message)
+        # returned it, so the drained lane must too — not a clean-looking
+        # empty result.
+        client = MagicMock()
+        client.messages.stream.return_value = self._whole_block_stream(
+            [
+                SimpleNamespace(
+                    type="content_block_start",
+                    index=0,
+                    content_block=SimpleNamespace(type="text", text="whole answer"),
+                ),
+                SimpleNamespace(type="content_block_stop", index=0),
+                SimpleNamespace(type="message_stop"),
+            ]
+        )
+        result = drain_stream(
+            self.provider.create_streaming(
+                client=client,
+                model="claude-sonnet-4-20250514",
+                messages=[{"role": "user", "content": "hi"}],
+            )
+        )
+        assert result.content == "whole answer"
+        assert result.finish_reason == "stop"
+
+    @patch("turnstone.core.providers._anthropic._ensure_anthropic")
+    def test_whole_block_start_tool_use_reaches_arguments(self, mock_ensure: MagicMock) -> None:
+        # A tool_use block whose input arrives pre-populated in the start
+        # event (no input_json_delta events) must still produce a call
+        # with arguments — a fused-empty call is an action that silently
+        # never executes.
+        client = MagicMock()
+        client.messages.stream.return_value = self._whole_block_stream(
+            [
+                SimpleNamespace(
+                    type="content_block_start",
+                    index=0,
+                    content_block=SimpleNamespace(
+                        type="tool_use", id="toolu_1", name="read_file", input={"path": "x"}
+                    ),
+                ),
+                SimpleNamespace(type="content_block_stop", index=0),
+                SimpleNamespace(
+                    type="message_delta",
+                    usage=None,
+                    delta=SimpleNamespace(stop_reason="tool_use"),
+                ),
+            ]
+        )
+        result = drain_stream(
+            self.provider.create_streaming(
+                client=client,
+                model="claude-sonnet-4-20250514",
+                messages=[{"role": "user", "content": "hi"}],
+            )
+        )
+        assert result.tool_calls is not None
+        assert len(result.tool_calls) == 1
+        assert result.tool_calls[0]["id"] == "toolu_1"
+        assert result.tool_calls[0]["function"]["name"] == "read_file"
+        assert json.loads(result.tool_calls[0]["function"]["arguments"]) == {"path": "x"}
+
     @patch("turnstone.core.providers._anthropic._ensure_anthropic")
     def test_drained_stream_with_tool_use(self, mock_ensure: MagicMock) -> None:
         client = MagicMock()
@@ -5711,6 +5787,67 @@ class TestResponsesDrainedStream:
         result = self._drain(events)
         assert result.tool_calls is not None
         assert [tc["function"]["name"] for tc in result.tool_calls] == ["alpha", "beta", "gamma"]
+
+    def test_terminal_only_text_reaches_content(self) -> None:
+        # A buffering gateway that emits NO output_text.delta /
+        # output_item.done events and delivers the whole output only in
+        # the terminal payload: the retired non-streaming path read
+        # content off this same payload, so the drain must too — not
+        # return a clean-looking empty success.
+        terminal_item = SimpleNamespace(type="message", content=[])
+        terminal_item.model_dump = lambda **_kw: {  # type: ignore[method-assign]
+            "type": "message",
+            "content": [{"type": "output_text", "text": "Full answer"}],
+        }
+        events = [
+            SimpleNamespace(
+                type="response.completed",
+                response=SimpleNamespace(status="completed", usage=None, output=[terminal_item]),
+            ),
+        ]
+        result = self._drain(events)
+        assert result.content == "Full answer"
+        assert result.finish_reason == "stop"
+
+    def test_terminal_only_tool_calls_reach_result(self) -> None:
+        # Same under-streaming shape for tool calls: a function_call item
+        # present only in the terminal payload must reach
+        # CompletionResult.tool_calls, or the action is silently never
+        # executed.
+        terminal_item = SimpleNamespace(type="function_call")
+        terminal_item.model_dump = lambda **_kw: {  # type: ignore[method-assign]
+            "type": "function_call",
+            "call_id": "call_9",
+            "name": "read_file",
+            "arguments": '{"path": "/tmp/x"}',
+        }
+        events = [
+            SimpleNamespace(
+                type="response.completed",
+                response=SimpleNamespace(status="completed", usage=None, output=[terminal_item]),
+            ),
+        ]
+        result = self._drain(events)
+        assert result.tool_calls is not None
+        assert len(result.tool_calls) == 1
+        assert result.tool_calls[0]["id"] == "call_9"
+        assert result.tool_calls[0]["function"]["name"] == "read_file"
+        assert result.tool_calls[0]["function"]["arguments"] == '{"path": "/tmp/x"}'
+
+    def test_status_less_completed_payload_maps_to_stop(self) -> None:
+        # A slim compat payload that omits ``status`` on response.completed:
+        # the event type itself says the run completed — labeling it
+        # "length" would fire truncation policies on complete output.
+        events = self._make_events(text="Hello")[:-1]
+        events.append(
+            SimpleNamespace(
+                type="response.completed",
+                response=SimpleNamespace(usage=None),  # no status attribute
+            )
+        )
+        result = self._drain(events)
+        assert result.content == "Hello"
+        assert result.finish_reason == "stop"
 
     def test_completed_terminal_keeps_done_items_without_rebuild(self) -> None:
         # Happy path: every item got its ``output_item.done`` and the

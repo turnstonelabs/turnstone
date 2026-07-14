@@ -161,7 +161,7 @@ from turnstone.core.preview import (
     resolve_preview_kind,
     transcode_text,
 )
-from turnstone.core.providers import create_provider
+from turnstone.core.providers import accumulate_tool_call_delta, create_provider
 from turnstone.core.ratelimit import TokenBucket
 from turnstone.core.safety import is_command_blocked, sanitize_command
 from turnstone.core.settings_registry import DEFAULT_AUTO_COMPACT_PCT
@@ -6719,20 +6719,11 @@ class ChatSession:
                     if in_think:
                         in_think = False
                     for tcd in chunk.tool_call_deltas:
-                        idx = tcd.index
-                        if idx not in tool_calls_acc:
-                            tool_calls_acc[idx] = {
-                                "id": "",
-                                "type": "function",
-                                "function": {"name": "", "arguments": ""},
-                            }
-                        tc = tool_calls_acc[idx]
-                        if tcd.id:
-                            tc["id"] = tcd.id
-                        if tcd.name:
-                            tc["function"]["name"] = tcd.name
-                        if tcd.arguments_delta:
-                            tc["function"]["arguments"] += tcd.arguments_delta
+                        # THE tool-call merge rule, shared with drain_stream
+                        # and the Google raw-fidelity capture — the chat
+                        # loop and every drained lane assemble identical
+                        # calls from identical wire streams.
+                        accumulate_tool_call_delta(tool_calls_acc, tcd)
 
                 # Informational messages (e.g. server-side web search status)
                 if chunk.info_delta:
@@ -15134,11 +15125,19 @@ class ChatSession:
             # One plant call per attempt through ``model_turn`` — the seam
             # passes (sanitize, minted-id restore, Phase 5 reasoning attach)
             # and the native-lane re-ingest live there now, shared with every
-            # lane (#827).  Retry policy stays HERE: the sub-harness owns its
-            # backoff and salvage semantics, and ``model_turn`` is policy-free
-            # by contract.  Re-lowering per attempt is fine — the passes are
-            # deterministic and ``turns``/``wire_id_map`` are invariant across
-            # attempts (the retry path only sleeps and re-sends).
+            # lane (#827).  Retry policy at THIS layer stays here: the
+            # sub-harness owns its backoff and salvage semantics.
+            # ``model_turn`` itself re-issues only drain-time mid-stream
+            # deaths (2 attempts, its own short backoff — the request-level
+            # retry the SDK gave the retired non-streaming transport), so
+            # the two ladders stack multiplicatively on transient-shaped
+            # failures; both are short, and a deterministic failure (e.g. a
+            # server that never sends finish reasons) burns
+            # (_MAX_RETRIES+1) x (drain attempts) calls before the
+            # remediation error surfaces.  Re-lowering per attempt is fine —
+            # the passes are deterministic and ``turns``/``wire_id_map`` are
+            # invariant across attempts (the retry path only sleeps and
+            # re-sends).
             last_err: Exception | None = None
             for attempt in range(self._MAX_RETRIES + 1):
                 try:

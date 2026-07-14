@@ -119,10 +119,10 @@ def accumulate_tool_call_delta(
     fragment), ``arguments_delta`` concatenates.  Returns the (possibly
     fresh) accumulator entry so callers can hang provider extras off it.
 
-    Serves :func:`drain_stream` and ``GoogleProvider``'s raw-fidelity
-    capture today; ``ChatSession``'s inline chunk consumer keeps its own
-    copy until the main loop moves onto ``model_turn`` (#832) — a merge-
-    rule change before then must be mirrored there.
+    Serves :func:`drain_stream`, ``GoogleProvider``'s raw-fidelity
+    capture, and ``ChatSession``'s inline chunk consumer — every
+    accumulator in the tree, so the chat loop and the drained lanes
+    cannot assemble different calls from the same wire stream.
     """
     tc = acc.setdefault(
         tcd.index,
@@ -203,7 +203,17 @@ def drain_stream(chunks: Iterator[StreamChunk]) -> CompletionResult:
                 # The generation already completed (finish reason in hand);
                 # the blip only cost trailing metadata — a usage-only chunk
                 # or the citation footer.  Keep the complete result rather
-                # than discarding it for a retry that re-pays the tokens.
+                # than discarding it for a retry that re-pays the tokens —
+                # but say so: on the chat lane the usage chunk trails the
+                # finish reason, so this result may report usage=None and
+                # the call's spend goes missing from usage accounting.
+                import structlog  # noqa: PLC0415 — deferred with httpx off the type-module path
+
+                structlog.get_logger(__name__).warning(
+                    "drain_stream.post_finish_blip",
+                    error_type=type(exc).__name__,
+                    usage_captured=usage is not None,
+                )
                 break
             raise IncompleteStreamError(
                 f"stream transport failed mid-response ({type(exc).__name__}: {exc})"

@@ -769,6 +769,11 @@ def model_turn(
             )
             if delay > 0:
                 time.sleep(delay)
+            if bool(getattr(cancel_ref, "aborted", False)):
+                # The deadline abandoned this worker while it was backing
+                # off — die with the original failure instead of
+                # resurrecting the request from an abandoned thread.
+                raise
 
     raw_calls: list[dict[str, Any]] = list(result.tool_calls or [])
     # Record blanks BEFORE the uuid back-fill: a back-filled id exists only

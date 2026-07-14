@@ -169,6 +169,28 @@ def test_model_turn_does_not_retry_unrecognized_errors() -> None:
     assert len(provider.calls) == 1
 
 
+def test_model_turn_abort_during_backoff_suppresses_reissue(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The deadline can abandon the worker while it sleeps between
+    # attempts — the wake-up must die with the original failure, not
+    # issue one more full request from an abandoned thread.
+    import turnstone.core.model_turn as model_turn_mod
+    from turnstone.core.deadline import StreamAbortRef
+
+    ref = StreamAbortRef()
+    monkeypatch.setattr(model_turn_mod, "time", SimpleNamespace(sleep=lambda _delay: ref.abort()))
+    provider = _FlakyProvider(
+        [IncompleteStreamError("transient death"), CompletionResult(content="never")]
+    )
+    lane = ModelLane(provider=provider, client=object(), model="m")
+
+    with pytest.raises(IncompleteStreamError, match="transient death"):
+        model_turn(lane, [Turn.user("x")], cancel_ref=ref)
+
+    assert len(provider.calls) == 1
+
+
 def test_model_turn_does_not_retry_after_abort() -> None:
     # A deadline that closed the stream must not have the request
     # resurrected behind its back: the closed stream dies with an error

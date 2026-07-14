@@ -16,6 +16,7 @@ from turnstone.core.providers._protocol import (
     StreamChunk,
     ToolCallDelta,
     UsageInfo,
+    accumulate_tool_call_delta,
     drain_stream,
 )
 from turnstone.core.providers._xai import XAI_DEFAULT_BASE_URL, XAIProvider
@@ -32,6 +33,7 @@ __all__ = [
     "ToolCallDelta",
     "UsageInfo",
     "XAIProvider",
+    "accumulate_tool_call_delta",
     "create_client",
     "create_provider",
     "drain_stream",
