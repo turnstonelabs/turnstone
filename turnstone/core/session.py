@@ -3059,12 +3059,17 @@ class ChatSession:
         lines: list[str] = []
         for srv, diff in sorted(results.items()):
             if diff is None:
-                # Skipped, NOT refreshed: another operation held the
-                # server's lock (a reconnect / a push refresh), or it was
-                # removed mid-pass. Reported distinctly from "no changes"
-                # so the operator isn't told a stale server is current;
-                # the health-tick retry runs the real refresh shortly.
-                lines.append(f"  {srv}: {dim('skipped (busy — retry scheduled)')}")
+                # No catalog produced — the refresh either was SKIPPED
+                # (lock held by a concurrent reconnect/push refresh, or
+                # removed mid-pass) or FAILED. Disambiguate via the
+                # authoritative outcome so the operator is never told a
+                # stale/broken server is current. Both are distinct from
+                # "no changes".
+                outcome = self._mcp_client.last_refresh_outcome(srv) or ""
+                if outcome.startswith("error"):
+                    lines.append(f"  {srv}: {RED}refresh failed{RESET} ({dim(outcome)})")
+                else:
+                    lines.append(f"  {srv}: {dim('skipped (busy — retry scheduled)')}")
                 continue
             added, removed = diff
             if added or removed:

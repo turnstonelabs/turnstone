@@ -2823,6 +2823,13 @@ h3.skill-spec-heading {
   background: color-mix(in srgb, var(--warn) 15%, transparent);
   color: var(--warn);
 }
+/* "skipped" is benign and transient (the server's lock was busy; a retry
+   is scheduled) — an info tint, NOT the warn red the error pill uses, so a
+   healthy busy server is not painted as failed. */
+.mcp-refresh-pill-skip {
+  background: color-mix(in srgb, var(--accent) 15%, transparent);
+  color: var(--accent);
+}
 
 .mcp-detail-modal::before {
   background: linear-gradient(

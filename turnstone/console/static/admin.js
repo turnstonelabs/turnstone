@@ -4811,8 +4811,13 @@ function _renderMcpServers(items) {
         ageShort = Math.floor(ageSeconds / 3600) + "h";
       else ageShort = Math.floor(ageSeconds / 86400) + "d";
       const outcomeText = newestRefreshOutcome || "unknown";
-      const pillCls =
-        outcomeText === "ok" ? "mcp-refresh-pill-ok" : "mcp-refresh-pill-err";
+      // "skipped" is benign (lock busy, retry scheduled) — a neutral info
+      // pill, not the error-red any-non-ok used to paint; only genuine
+      // "error:*" outcomes are failures.
+      let pillCls;
+      if (outcomeText === "ok") pillCls = "mcp-refresh-pill-ok";
+      else if (outcomeText === "skipped") pillCls = "mcp-refresh-pill-skip";
+      else pillCls = "mcp-refresh-pill-err";
       const pillTitle =
         "Last refresh " +
         new Date(newestRefreshAt * 1000).toISOString() +

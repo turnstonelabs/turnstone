@@ -1499,6 +1499,36 @@ class TestSessionRefresh:
         session.ui.on_error.assert_called_once()
         assert "MCP refresh failed" in session.ui.on_error.call_args[0][0]
 
+    def test_mcp_refresh_renders_skip_distinctly(self, tmp_db):
+        # A None result (busy-skip) with a "skipped" outcome must NOT render
+        # as "no changes" — the operator would think the server is current.
+        mock_mcp = MagicMock()
+        mock_mcp.get_tools.return_value = [_fake_openai_tool()]
+        mock_mcp.server_names = ["srv"]
+        mock_mcp.refresh_sync.return_value = {"srv": None}
+        mock_mcp.last_refresh_outcome.return_value = "skipped"
+        session = self._make_session(mcp_client=mock_mcp)
+
+        session.handle_command("/mcp refresh")
+        rendered = session.ui.on_info.call_args[0][0]
+        assert "skipped" in rendered
+        assert "no changes" not in rendered
+
+    def test_mcp_refresh_renders_failure_distinctly(self, tmp_db):
+        # A None result whose outcome is an error must render as a failure,
+        # NOT as "no changes" (the pre-#839 lie the None sentinel closes).
+        mock_mcp = MagicMock()
+        mock_mcp.get_tools.return_value = [_fake_openai_tool()]
+        mock_mcp.server_names = ["srv"]
+        mock_mcp.refresh_sync.return_value = {"srv": None}
+        mock_mcp.last_refresh_outcome.return_value = "error:ConnectionError"
+        session = self._make_session(mcp_client=mock_mcp)
+
+        session.handle_command("/mcp refresh")
+        rendered = session.ui.on_info.call_args[0][0]
+        assert "failed" in rendered
+        assert "no changes" not in rendered
+
 
 # ---------------------------------------------------------------------------
 # MCP Resources
@@ -2593,12 +2623,17 @@ class TestCircuitBreaker:
             mock_session.list_prompts = AsyncMock(side_effect=dead)
             _seed_static_state(mgr, "test", session=mock_session)
 
-            await mgr._refresh_all("test")
+            results = await mgr._refresh_all("test")
 
             # Dead session evicted → next refresh tick / dispatch reconnects.
             assert mgr._static_servers["test"].session is None
             ts, outcome = mgr._last_refresh["test"]
             assert outcome == "error:ClosedResourceError"
+            # A FAILURE reports None, NOT ([], []) — rendering a failed
+            # refresh as "no changes" is the operator lie the sentinel
+            # closes; the outcome disambiguates None (error vs skipped).
+            assert results["test"] is None
+            assert mgr.last_refresh_outcome("test") == "error:ClosedResourceError"
 
         asyncio.run(_run())
 
@@ -3357,6 +3392,32 @@ class TestStaticNotificationRefresh:
         assert sorted(refreshed) == ["prompts", "tools"], (
             "a same-window different-kind notification must spawn its own refresh"
         )
+
+    def test_scheduling_failure_rolls_back_stamp_and_marker(self, running_loop_mgr) -> None:
+        """If _spawn_background raises (loop tearing down), BOTH the coalesce
+        marker and the debounce stamp we just wrote must be rolled back —
+        else a same-kind push landing in the window afterward is debounced
+        against a stamp for a refresh that never spawned, and (on the pool
+        path, no on_debounce_drop) never recovers."""
+        mgr, loop, _thread = running_loop_mgr
+        handler = mgr._make_static_notification_handler("srv")
+
+        def _boom(coro: Any, _label: str) -> None:
+            coro.close()  # avoid "coroutine was never awaited" — prod is loop-teardown
+            raise RuntimeError("loop closing")
+
+        async def _fire() -> None:
+            mgr._static_connect_lock_for("srv")
+            _seed_static_state(mgr, "srv", session=MagicMock())
+            note = mcp_types.ServerNotification(
+                mcp_types.ToolListChangedNotification(method="notifications/tools/list_changed")
+            )
+            with patch.object(mgr, "_spawn_background", side_effect=_boom):
+                await handler(note)  # must swallow the scheduling failure
+
+        _run_on_loop(loop, _fire())
+        assert ("srv", "tools") not in mgr._last_notification_refresh, "stamp must roll back"
+        assert ("srv", "tools") not in mgr._static_refresh_pending, "marker must roll back"
 
     def test_same_kind_debounce_drop_arms_retry(self, running_loop_mgr) -> None:
         """A SAME-kind push landing in the debounce window AFTER the

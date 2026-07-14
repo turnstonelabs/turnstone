@@ -202,7 +202,15 @@ Earlier stable lines (`stable/1.6`, `stable/1.5`) are frozen.
   stranding a live session and published catalog with the config already
   gone), and `reconcile_sync` retries a removal that timed out instead of
   marking it done — previously a DB-driven delete of a busy server could be a
-  silent, permanent no-op until process restart.
+  silent, permanent no-op until process restart. A refresh outcome now
+  threads consistently to every operator surface off one source of truth
+  (the per-server `last_refresh_outcome`): a busy-skip and a genuine failure
+  are each reported distinctly from a real "no changes" — `/mcp refresh`
+  prints "skipped" or "failed" rather than a false "no changes", the
+  node-internal refresh endpoint returns `202 skipped` instead of a
+  misleading `200 ok` for a refresh that never ran, and the admin console's
+  refresh pill paints a benign "skipped" in a neutral tint rather than
+  failure-red.
 
 - **OpenAI Responses streaming: truncated and refused responses no longer
   vanish.** A response that hit `max_output_tokens` terminates the stream
