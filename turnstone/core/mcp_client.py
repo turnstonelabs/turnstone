@@ -1674,12 +1674,16 @@ class MCPClientManager:
                 f"{label_prefix} {kind} refresh for '{label_target}'",
             )
         except Exception as exc:
-            # Scheduling failed (loop shutting down) — release the
-            # coalesce marker or this key+kind never refreshes again.
-            # Structured fields only — ``exc_info=True`` would serialize
-            # the chained ``httpx.Request`` whose headers carry the
-            # bearer (configured for auth_type=static, minted for pool).
+            # Scheduling failed (loop shutting down) — release BOTH the
+            # coalesce marker and the debounce stamp we just wrote, or a
+            # same-kind push landing inside the window afterward is
+            # debounced against a stamp for a refresh that never spawned
+            # (the pool path has no on_debounce_drop recovery). Structured
+            # fields only — ``exc_info=True`` would serialize the chained
+            # ``httpx.Request`` whose headers carry the bearer (configured
+            # for auth_type=static, minted for pool).
             pending.discard(marker)
+            stamps.pop(marker, None)
             log.warning(
                 "list_changed refresh scheduling failed for %s exc=%s",
                 origin,
@@ -4292,6 +4296,19 @@ class MCPClientManager:
         self._set_error(name, f"Refresh failed: {type(exc).__name__}: {exc}")
         self._arm_refresh_retry(name)
 
+    def last_refresh_outcome(self, name: str) -> str | None:
+        """Authoritative last-refresh outcome for static server *name*.
+
+        One of ``"ok"``, ``"skipped"``, ``"error:<Class>"``, or ``None``
+        (no refresh since start). The single source of truth every
+        operator surface renders from — the ``refresh_sync`` diff tuple
+        says only WHAT changed, not whether the pass ran, was skipped, or
+        failed. Static-only (reads ``_last_refresh`` directly); no
+        oauth_user status routing.
+        """
+        row = self._last_refresh.get(name)
+        return row[1] if row is not None else None
+
     def _arm_refresh_retry(self, name: str) -> None:
         """Arm the health-tick refresh retry for *name* — the ONE gate copy.
 
@@ -4480,14 +4497,23 @@ class MCPClientManager:
         """Refresh tools, resources, and prompts for one or all servers.
 
         For disconnected servers (in config but not connected), attempts
-        reconnect.  Returns ``{server: (added, removed)}`` per server —
-        or ``None`` for a server whose refresh was SKIPPED (another
-        operation held its lock, or it was removed/evicted mid-pass).
-        ``None`` is a distinct shape on purpose: rendering a skip as
-        ``([], [])`` told the operator "refreshed, no changes" for a
-        server that was never refreshed at all. Skips on live servers
-        also stamp a ``skipped`` ``_last_refresh`` row so the admin pill
-        tells the same story.
+        reconnect. Per-server value:
+
+        * ``(added, removed)`` — the refresh RAN to completion; the tuple
+          is the tool diff (``([], [])`` = ran, no changes). Outcome
+          ``ok``.
+        * ``None`` — the refresh produced NO catalog, either SKIPPED
+          (another operation held the lock, or removed/evicted mid-pass;
+          outcome ``skipped``) or FAILED (it ran and errored; outcome
+          ``error:<Class>``). Consumers disambiguate via the
+          ``last_refresh_outcome`` status field.
+
+        ``None`` is a distinct shape on purpose: rendering either a skip
+        or a failure as ``([], [])`` told the operator "refreshed, no
+        changes" for a server that was never refreshed / whose refresh
+        failed. The ``_last_refresh`` status row carries the authoritative
+        outcome for every operator surface (CLI, HTTP endpoint, admin
+        pill) so they render consistently off ONE source of truth.
         """
         results: dict[str, tuple[list[str], list[str]] | None] = {}
         targets = [server_name] if server_name else list(self._server_configs.keys())
@@ -4564,7 +4590,13 @@ class MCPClientManager:
                 # abort the whole refresh pass. Redaction + retry-arm live
                 # in the shared helper.
                 self._record_refresh_failure(name, exc, context="Refresh")
-                results[name] = ([], [])
+                # None, NOT ``([], [])``: a failure produced no catalog, and
+                # ``([], [])`` is reserved for "ran, no changes" — rendering
+                # a failure as "no changes" is the operator lie the sentinel
+                # exists to prevent. Consumers disambiguate None (skipped vs
+                # failed) via ``last_refresh_outcome``, which the
+                # ``error:<Class>`` write at the end of this block sets.
+                results[name] = None
                 # A dead transport leaves a non-None but unusable session, so
                 # the reconnect branch at the top of this loop (gated on
                 # ``session is None``) would never fire and every later pass
@@ -4605,13 +4637,13 @@ class MCPClientManager:
     ) -> dict[str, tuple[list[str], list[str]] | None]:
         """Refresh tools synchronously (blocks the calling thread).
 
-        Returns ``{server: (added_names, removed_names)}`` per server, or
-        ``{server: None}`` when that server's refresh was SKIPPED (its
-        lock was held by a concurrent reconnect/refresh, or it was
-        removed mid-pass). Callers MUST distinguish ``None`` from
-        ``([], [])``: the latter is a refresh that ran and found no
-        changes; ``None`` is a refresh that never ran, deferred to the
-        health-tick retry.
+        Returns ``{server: (added_names, removed_names)}`` for a refresh
+        that RAN (``([], [])`` = no changes), or ``{server: None}`` when
+        it produced no catalog — SKIPPED (lock held by a concurrent
+        reconnect/refresh, or removed mid-pass) or FAILED. Callers MUST
+        NOT render ``None`` as "no changes"; consult
+        :meth:`last_refresh_outcome` (or the status ``last_refresh_outcome``
+        field) to distinguish ``skipped`` from ``error:<Class>``.
         """
         assert self._loop is not None
         future = asyncio.run_coroutine_threadsafe(self._refresh_all(server_name), self._loop)
