@@ -2498,6 +2498,11 @@ async def get_obo_access_token_classified(
         )
     if not credential_present:
         # No captured credential → the consent affordance is a re-login.
+        # kind="missing" here means DURABLY absent (no row, not a read
+        # blip) — the obo credential gate in MCPClientManager
+        # ``_prime_user_pools`` synthesizes this exact verdict for its
+        # retained-catalog drops when it skips this lookup wholesale;
+        # keep that site in lock-step if this classification splits.
         return _no_token_result(app_state, user_id, server_name, TokenLookupResult(kind="missing"))
 
     lock = _refresh_lock_for(app_state, user_id, server_name)
