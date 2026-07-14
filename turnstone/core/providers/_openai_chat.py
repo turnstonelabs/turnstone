@@ -55,50 +55,120 @@ def _reasoning_text(obj: Any) -> str:
 log = structlog.get_logger(__name__)
 
 
+class _ArgsScanner:
+    """Incremental JSON-completeness state over streamed argument fragments.
+
+    Tracks bracket depth and string state character-by-character so the
+    slotter can ask, at any fragment boundary, whether the arguments
+    accumulated so far form a syntactically CLOSED value.  Arguments are
+    JSON objects per the tool-call spec, so depth-tracking suffices; a
+    server streaming non-JSON arguments never reads complete, which
+    degrades the slotter to plain per-index accumulation (the pre-slotter
+    behavior) for that slot.
+    """
+
+    __slots__ = ("depth", "escaped", "in_string", "saw_token")
+
+    def __init__(self) -> None:
+        self.depth = 0
+        self.in_string = False
+        self.escaped = False
+        self.saw_token = False
+
+    def feed(self, fragment: str) -> None:
+        for ch in fragment:
+            if self.in_string:
+                if self.escaped:
+                    self.escaped = False
+                elif ch == "\\":
+                    self.escaped = True
+                elif ch == '"':
+                    self.in_string = False
+                continue
+            if ch in " \t\r\n":
+                continue
+            self.saw_token = True
+            if ch == '"':
+                self.in_string = True
+            elif ch in "{[":
+                self.depth += 1
+            elif ch in "}]":
+                self.depth -= 1
+
+    @property
+    def complete(self) -> bool:
+        return self.saw_token and self.depth <= 0 and not self.in_string
+
+
 class ToolCallSlotter:
     """Wire-index → logical-slot assignment for streamed tool-call deltas.
 
-    Shared by the base iterator and ``GoogleProvider``'s raw fidelity tap
-    (both observe the same delta sequence, so their assignments agree and
-    the normalized mirror can never desync from the raw ``provider_blocks``
-    lane).  Index-degenerate compat servers (historical vLLM/llama.cpp
-    builds) emit every parallel call at index 0 — a delta opens a NEW slot
-    when its id contradicts the slot's id, or when an ID-LESS delta
-    announces a name for a slot that already accumulated arguments (the
-    id-less whole-delta shape: name+arguments per call, so a second
-    announcement after arguments is a second call).  A delta whose id
-    MATCHES the slot's is always the same call, however many times the
-    server repeats the name header per fragment.  Residual ambiguity:
-    an id-less server that repeats the name on every argument fragment is
-    indistinguishable from the whole-delta shape and splits wrongly — ids
-    are the only disambiguator, and the whole-delta emission is the shape
-    observed in the wild.
+    One slotter (the base iterator's) drives both the normalized
+    ``tool_calls`` mirror and ``GoogleProvider``'s raw fidelity capture
+    (via the ``on_tool_call_delta`` hook), so the two lanes assign call
+    identity identically by construction.  Index-degenerate compat
+    servers (historical vLLM/llama.cpp builds) emit every parallel call
+    at index 0; ids, names, and argument JSON completeness decide where
+    one call ends and the next begins:
+
+    - A delta whose id CONTRADICTS the slot's id is a new call; a delta
+      whose id MATCHES is the same call, however many times the server
+      repeats the name header per fragment.  Ids are authoritative both
+      ways.
+    - An id-less delta with NO name is always an arguments continuation.
+    - An id-less delta announcing a DIFFERENT name than the slot's is a
+      new call (two functions cannot be one call).
+    - An id-less re-announcement of the SAME name splits only when the
+      slot's accumulated arguments are syntactically complete JSON (the
+      previous call is over — this starts the next parallel call).
+      Mid-JSON, the name is a redundant per-fragment header and the
+      delta merges.  With NO arguments accumulated yet: a re-announce
+      that itself carries arguments merges (name-first emission, the
+      arguments are starting now); a bare re-announce splits (the
+      id-less whole-delta shape — two zero-argument parallel calls).
+
+    Residual ambiguity, resolved toward the shapes observed in the wild:
+    a same-name re-announce on an empty slot that carries arguments is
+    read as one call (not a zero-arg call followed by an arg-ful twin),
+    and a trailing bare same-name re-announce after complete arguments
+    is read as a second zero-arg call (not a redundant footer).  Only
+    ids disambiguate those; servers that omit them choose the bet.
     """
 
     def __init__(self) -> None:
         self._slot_for_index: dict[int, int] = {}
         self._slot_ids: dict[int, str] = {}
-        self._slot_has_args: set[int] = set()
+        self._slot_names: dict[int, str] = {}
+        self._slot_args: dict[int, _ArgsScanner] = {}
         self._next_slot = 0
 
-    def slot_for(self, wire_index: int, tc_id: str, *, has_name: bool, has_args: bool) -> int:
+    def slot_for(self, wire_index: int, tc_id: str, name: str, args: str) -> int:
         slot = self._slot_for_index.get(wire_index)
-        id_conflict = (
-            slot is not None
-            and tc_id
-            and self._slot_ids.get(slot, "")
-            and self._slot_ids[slot] != tc_id
-        )
-        reannounce = slot is not None and not tc_id and has_name and slot in self._slot_has_args
-        if slot is None or id_conflict or reannounce:
+        if slot is None or self._is_new_call(slot, tc_id, name, args):
             slot = self._next_slot
             self._next_slot += 1
             self._slot_for_index[wire_index] = slot
         if tc_id:
             self._slot_ids[slot] = tc_id
-        if has_args:
-            self._slot_has_args.add(slot)
+        if name:
+            self._slot_names[slot] = name
+        if args:
+            self._slot_args.setdefault(slot, _ArgsScanner()).feed(args)
         return slot
+
+    def _is_new_call(self, slot: int, tc_id: str, name: str, args: str) -> bool:
+        slot_id = self._slot_ids.get(slot, "")
+        if tc_id:
+            return bool(slot_id) and tc_id != slot_id
+        if not name:
+            return False
+        slot_name = self._slot_names.get(slot, "")
+        if slot_name and name != slot_name:
+            return True
+        scanner = self._slot_args.get(slot)
+        if scanner is not None:
+            return scanner.complete
+        return not args
 
 
 class OpenAIChatCompletionsProvider:
@@ -238,13 +308,30 @@ class OpenAIChatCompletionsProvider:
         stream = client.chat.completions.create(**kwargs)
         if cancel_ref is not None:
             cancel_ref.append(stream)
-        return self._iter_stream(stream)
+        return self._iter_stream(stream, finish_reason_optional=caps.finish_reason_optional)
 
-    def _iter_stream(self, stream: Any) -> Iterator[StreamChunk]:
-        """Convert OpenAI Chat Completions stream chunks to StreamChunks."""
+    def _iter_stream(
+        self,
+        stream: Any,
+        *,
+        finish_reason_optional: bool = False,
+        on_tool_call_delta: Callable[[int, Any], None] | None = None,
+    ) -> Iterator[StreamChunk]:
+        """Convert OpenAI Chat Completions stream chunks to StreamChunks.
+
+        *finish_reason_optional* is the model capability of the same name:
+        it arms the lax-server finish shim at the end of this generator.
+
+        *on_tool_call_delta* is called with ``(slot, raw_sdk_delta)`` for
+        every tool-call delta, AFTER slot assignment — the seam a subclass
+        uses to capture provider extras (``GoogleProvider``'s
+        ``thought_signature``) keyed by the SAME slot the normalized
+        mirror uses, so the raw and mirror lanes cannot desync.
+        """
         first = True
         annotations: list[Any] = []
         content_len = 0
+        reasoning_len = 0
         tool_call_count = 0
         last_finish_reason: str | None = None
         completion_tokens: int | None = None
@@ -277,6 +364,7 @@ class OpenAIChatCompletionsProvider:
             rc = _reasoning_text(delta)
             if rc:
                 sc.reasoning_delta = rc
+                reasoning_len += len(rc)
 
             # Content
             if delta.content:
@@ -288,20 +376,18 @@ class OpenAIChatCompletionsProvider:
                 for tc_delta in delta.tool_calls:
                     tc_id = tc_delta.id or ""
                     fn = tc_delta.function
-                    slot = slotter.slot_for(
-                        tc_delta.index,
-                        tc_id,
-                        has_name=bool(fn and fn.name),
-                        has_args=bool(fn and fn.arguments),
-                    )
+                    name = (fn.name if fn else None) or ""
+                    args = (fn.arguments if fn else None) or ""
+                    slot = slotter.slot_for(tc_delta.index, tc_id, name, args)
+                    if on_tool_call_delta is not None:
+                        on_tool_call_delta(slot, tc_delta)
                     tcd = ToolCallDelta(index=slot)
                     if tc_id:
                         tcd.id = tc_id
-                    if fn:
-                        if fn.name:
-                            tcd.name = fn.name
-                        if fn.arguments:
-                            tcd.arguments_delta = fn.arguments
+                    if name:
+                        tcd.name = name
+                    if args:
+                        tcd.arguments_delta = args
                     sc.tool_call_deltas.append(tcd)
                     tool_call_count += 1
 
@@ -318,28 +404,41 @@ class OpenAIChatCompletionsProvider:
             if has_content or sc.finish_reason or sc.usage:
                 yield sc
 
+        # Finish-reason-less lax-server tolerance (the deleted non-streaming
+        # path's `finish_reason or "stop"` default), armed ONLY by the
+        # operator-declared ``finish_reason_optional`` capability: on a
+        # server that never sends finish reasons, a stream that ended
+        # CLEANLY — the SDK ends iteration on [DONE]; an abrupt connection
+        # death raises httpx.TransportError out of this generator — after
+        # delivering output is a completed generation.  Everywhere else a
+        # clean finish-less end is indistinguishable from a generation
+        # that died behind a clean-closing proxy/ASGI layer, so the shim
+        # stays DISARMED and the drain's complete-or-error gate raises
+        # (retryable) instead of blessing possibly-truncated text.
+        # Reasoning counts as delivered output — a thinking model that
+        # spent its budget before emitting content is still a completed
+        # generation (the retired non-streaming path returned it with
+        # empty content).  Emit the finish BEFORE the citation footer so
+        # the drain folds the footer as trailing info.  A clean-exhaustion
+        # stream with NO output still yields nothing, so dead/empty
+        # streams keep failing the gate even when the shim is armed.
+        if (
+            finish_reason_optional
+            and last_finish_reason is None
+            and (content_len or reasoning_len or tool_call_count)
+        ):
+            last_finish_reason = "stop"
+            yield StreamChunk(finish_reason="stop")
+
         log.debug(
             "openai.chat.response",
             stream=True,
             finish_reason=last_finish_reason,
             content_length=content_len,
+            reasoning_length=reasoning_len,
             tool_call_deltas=tool_call_count,
             completion_tokens=completion_tokens,
         )
-
-        # Finish-reason-less compat tolerance (the deleted non-streaming
-        # path's `finish_reason or "stop"` default): a stream that ended
-        # CLEANLY — the SDK ends iteration on [DONE]; an abrupt connection
-        # death raises httpx.TransportError out of this generator — after
-        # delivering content is a completed generation on a lax server
-        # that never sets finish_reason.  Emit the finish BEFORE the
-        # citation footer so the drain folds the footer as trailing info.
-        # A clean-exhaustion stream with NO output still yields nothing,
-        # so the drain's complete-or-error gate keeps catching dead/empty
-        # streams.
-        if last_finish_reason is None and (content_len or tool_call_count):
-            last_finish_reason = "stop"
-            yield StreamChunk(finish_reason="stop")
 
         # Emit accumulated citations as a final info chunk
         if annotations:

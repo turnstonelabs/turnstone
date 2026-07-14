@@ -700,21 +700,29 @@ class OpenAIResponsesProvider:
                 if usage:
                     completion_tokens = usage.completion_tokens
                 # Prefer the terminal response's own output items over the
-                # incrementally collected ones: an item still being
-                # generated at truncation never receives its
-                # ``output_item.done`` event, and storing a reasoning item
-                # without its required following item makes the next
-                # turn's replay a 400.  Its annotations were likewise
-                # never collected — walk them here (format_citations
-                # dedupes by URL, so re-seeing .done'd items is harmless).
+                # incrementally collected ones — but only when the two can
+                # DISAGREE: on truncation (an item still being generated
+                # never receives its ``output_item.done`` event, and
+                # storing a reasoning item without its required following
+                # item makes the next turn's replay a 400) or when the
+                # collected count differs from the terminal output (a lax
+                # server dropped ``.done`` events).  On the happy path the
+                # ``.done`` items ARE the terminal items, so the rebuild is
+                # skipped — it would re-serialize every output item and
+                # double every already-collected annotation once per turn.
+                # A rebuild replaces BOTH lanes: blocks from the terminal
+                # output, annotations from a fresh walk of it (annotations
+                # have no other source than these item walks).
                 out_items = (getattr(response, "output", None) or []) if response else []
-                final_items = [
-                    item.model_dump() for item in out_items if hasattr(item, "model_dump")
-                ]
-                if final_items:
-                    provider_blocks = final_items
-                    for item in out_items:
-                        _extend_message_annotations(item, annotations)
+                if status != "completed" or len(out_items) != len(provider_blocks):
+                    final_items = [
+                        item.model_dump() for item in out_items if hasattr(item, "model_dump")
+                    ]
+                    if final_items:
+                        provider_blocks = final_items
+                        annotations = []
+                        for item in out_items:
+                            _extend_message_annotations(item, annotations)
                 sc = StreamChunk(
                     finish_reason=last_finish,
                     usage=usage,
@@ -769,9 +777,15 @@ class OpenAIResponsesProvider:
 
     # -- retryable errors ----------------------------------------------------
 
+    # Computed once at class creation — the retry predicate consults this
+    # per error, and a per-access union allocates a fresh frozenset each time.
+    _RETRYABLE_WITH_STREAM_FAILURES: frozenset[str] = RETRYABLE_ERROR_NAMES | {
+        "ResponsesStreamFailedError"
+    }
+
     @property
     def retryable_error_names(self) -> frozenset[str]:
-        return RETRYABLE_ERROR_NAMES | {"ResponsesStreamFailedError"}
+        return self._RETRYABLE_WITH_STREAM_FAILURES
 
     # -- reasoning extraction ------------------------------------------------
 

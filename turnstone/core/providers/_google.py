@@ -21,15 +21,17 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
-    from collections.abc import Iterator
+    from collections.abc import Callable, Iterator
 
 from turnstone.core.lowering import legalize_tool_call_entry
-from turnstone.core.providers._openai_chat import (
-    OpenAIChatCompletionsProvider,
-    ToolCallSlotter,
-)
+from turnstone.core.providers._openai_chat import OpenAIChatCompletionsProvider
 from turnstone.core.providers._openai_common import sanitize_messages
-from turnstone.core.providers._protocol import ModelCapabilities, StreamChunk
+from turnstone.core.providers._protocol import (
+    ModelCapabilities,
+    StreamChunk,
+    ToolCallDelta,
+    accumulate_tool_call_delta,
+)
 
 # Default endpoint used when no base_url is configured.
 GOOGLE_DEFAULT_BASE_URL = "https://generativelanguage.googleapis.com/v1beta/openai/"
@@ -132,64 +134,59 @@ class GoogleProvider(OpenAIChatCompletionsProvider):
 
     # -- streaming -----------------------------------------------------------
 
-    def _iter_stream(self, stream: Any) -> Iterator[StreamChunk]:
-        """Wrap the base stream to capture raw tool-call metadata.
+    def _iter_stream(
+        self,
+        stream: Any,
+        *,
+        finish_reason_optional: bool = False,
+        on_tool_call_delta: Callable[[int, Any], None] | None = None,
+    ) -> Iterator[StreamChunk]:
+        """Wrap the base iterator to capture raw tool-call metadata.
 
-        Taps the raw SDK stream to accumulate provider-specific fields
-        (e.g. ``thought_signature``) from each tool-call delta, then
-        delegates all chunk processing to the base class.  The accumulated
-        raw tool-call dicts are emitted as ``provider_blocks`` on the
-        final chunk so the session stores them as ``_provider_content``.
+        Registers an ``on_tool_call_delta`` capture with the base
+        iterator to accumulate provider-specific fields (e.g.
+        ``thought_signature``) from each raw SDK tool-call delta, then
+        delegates all chunk processing to the base class.  The
+        accumulated raw tool-call dicts are emitted as
+        ``provider_blocks`` on the final chunk so the session stores
+        them as ``_provider_content``.
 
-        The tap keys its raw dicts through its OWN :class:`ToolCallSlotter`
-        over the same delta sequence the base iterator slots, so the raw
-        fidelity lane and the normalized ``tool_calls`` mirror assign call
-        identity identically — a desync (one fused raw dict vs two mirror
-        calls on an index-degenerate stream) would fail
-        ``_prepare_messages``' length gate and silently drop
-        ``thought_signature`` from the replay.
+        The capture receives the SAME slot the base's
+        :class:`ToolCallSlotter` assigned to the normalized
+        ``tool_calls`` mirror — one slotter drives both lanes, so call
+        identity cannot desync between them (a desync — one fused raw
+        dict vs two mirror calls on an index-degenerate stream — would
+        fail ``_prepare_messages``' length gate and silently drop
+        ``thought_signature`` from the replay).
         """
         raw_tool_calls: dict[int, dict[str, Any]] = {}
-        slotter = ToolCallSlotter()
 
-        def _tap(raw_stream: Any) -> Any:
-            """Pass-through iterator that captures tool-call extras."""
-            for chunk in raw_stream:
-                if chunk.choices:
-                    delta = chunk.choices[0].delta
-                    if delta.tool_calls:
-                        for tc_delta in delta.tool_calls:
-                            fn = tc_delta.function
-                            slot = slotter.slot_for(
-                                tc_delta.index,
-                                tc_delta.id or "",
-                                has_name=bool(fn and fn.name),
-                                has_args=bool(fn and fn.arguments),
-                            )
-                            if slot not in raw_tool_calls:
-                                raw_tool_calls[slot] = {
-                                    "id": "",
-                                    "type": "function",
-                                    "function": {"name": "", "arguments": ""},
-                                }
-                            raw_tc = raw_tool_calls[slot]
-                            if tc_delta.id:
-                                raw_tc["id"] = tc_delta.id
-                            if fn:
-                                if fn.name:
-                                    raw_tc["function"]["name"] = fn.name
-                                if fn.arguments:
-                                    raw_tc["function"]["arguments"] += fn.arguments
-                            # Capture provider-specific extras (e.g. thought_signature)
-                            extras = getattr(tc_delta, "__pydantic_extra__", None)
-                            if extras:
-                                for k, v in extras.items():
-                                    if k not in ("index", "id", "type", "function"):
-                                        raw_tc.setdefault(k, v)
-                yield chunk
+        def _capture(slot: int, tc_delta: Any) -> None:
+            fn = tc_delta.function
+            raw_tc = accumulate_tool_call_delta(
+                raw_tool_calls,
+                ToolCallDelta(
+                    index=slot,
+                    id=tc_delta.id or "",
+                    name=(fn.name if fn else None) or "",
+                    arguments_delta=(fn.arguments if fn else None) or "",
+                ),
+            )
+            # Capture provider-specific extras (e.g. thought_signature)
+            extras = getattr(tc_delta, "__pydantic_extra__", None)
+            if extras:
+                for k, v in extras.items():
+                    if k not in ("index", "id", "type", "function"):
+                        raw_tc.setdefault(k, v)
+            if on_tool_call_delta is not None:
+                on_tool_call_delta(slot, tc_delta)
 
         # Delegate all chunk processing to the base class
-        for sc in super()._iter_stream(_tap(stream)):
+        for sc in super()._iter_stream(
+            stream,
+            finish_reason_optional=finish_reason_optional,
+            on_tool_call_delta=_capture,
+        ):
             # Attach provider_blocks on the finish-reason chunk
             if sc.finish_reason and raw_tool_calls:
                 sc.provider_blocks = [raw_tool_calls[i] for i in sorted(raw_tool_calls)]

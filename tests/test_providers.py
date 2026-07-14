@@ -574,12 +574,12 @@ class TestOpenAIProvider:
                 messages=[{"role": "user", "content": "hi"}],
             )
         )
-        # Third chunk: the finish-reason-less shim stamps the clean end
-        # of a content-bearing stream as "stop".
-        assert len(results) == 3
+        # No synthesized finish chunk: the lax-server shim is disarmed by
+        # default (``finish_reason_optional=False``), so a clean finish-less
+        # end stays visibly finish-less for the drain gate to catch.
+        assert len(results) == 2
         assert results[0].content_delta == "Hello"
         assert results[1].content_delta == " world"
-        assert results[2].finish_reason == "stop"
 
     def test_streaming_reasoning(self) -> None:
         chunks = [
@@ -620,14 +620,13 @@ class TestOpenAIProvider:
                 messages=[{"role": "user", "content": "read a file"}],
             )
         )
-        # Fourth chunk: the finish-reason-less shim (tool calls count as
-        # delivered output).
-        assert len(results) == 4
+        # No synthesized finish chunk: the lax-server shim is disarmed by
+        # default (``finish_reason_optional=False``).
+        assert len(results) == 3
         assert results[0].tool_call_deltas[0].id == "call_1"
         assert results[0].tool_call_deltas[0].name == "read_file"
         assert results[1].tool_call_deltas[0].arguments_delta == '{"path":'
         assert results[2].tool_call_deltas[0].arguments_delta == '"foo.py"}'
-        assert results[3].finish_reason == "stop"
 
     def test_streaming_usage(self) -> None:
         usage = MagicMock()
@@ -754,12 +753,15 @@ class TestOpenAIProvider:
         assert result.tool_calls[0]["function"]["arguments"] == '{"path": "foo.py"}'
         assert result.finish_reason == "tool_calls"
 
-    def _drain_chunks(self, chunks: list[Any]):
+    def _drain_chunks(self, chunks: list[Any], capabilities: ModelCapabilities | None = None):
         client = MagicMock()
         client.chat.completions.create.return_value = chunks
         return drain_stream(
             self.provider.create_streaming(
-                client=client, model="m", messages=[{"role": "user", "content": "x"}]
+                client=client,
+                model="m",
+                messages=[{"role": "user", "content": "x"}],
+                capabilities=capabilities,
             )
         )
 
@@ -843,33 +845,48 @@ class TestOpenAIProvider:
         assert len(result.tool_calls) == 1
         assert result.tool_calls[0]["function"]["arguments"] == '{"path": "/tmp/x"}'
 
-    def test_finishless_stream_with_content_completes_as_stop(self) -> None:
-        # Lax-server tolerance (the deleted non-streaming `or "stop"`
-        # default): a stream that ends CLEANLY after delivering content —
-        # abrupt deaths raise httpx errors instead — is a completed
-        # generation even if no chunk ever carried finish_reason.
+    def test_finishless_stream_raises_by_default(self) -> None:
+        # On a default lane a clean finish-less end is indistinguishable
+        # from a generation that died behind a clean-closing proxy/ASGI
+        # layer — the drain refuses to bless possibly-truncated text and
+        # raises (retryable) instead of storing half an answer.
+        from turnstone.core.providers import IncompleteStreamError
+
+        with pytest.raises(IncompleteStreamError):
+            self._drain_chunks([_openai_stream_chunk(content="half an ans")])
+
+    def test_finishless_stream_completes_with_declared_tolerance(self) -> None:
+        # ``finish_reason_optional`` (operator-declared: this server never
+        # sends finish reasons) re-arms the deleted non-streaming
+        # `or "stop"` default for clean ends that delivered output.
         result = self._drain_chunks(
-            [
-                _openai_stream_chunk(content="complete answer"),
-            ]
+            [_openai_stream_chunk(content="complete answer")],
+            capabilities=ModelCapabilities(finish_reason_optional=True),
         )
         assert result.content == "complete answer"
         assert result.finish_reason == "stop"
 
+    def test_finishless_reasoning_only_stream_completes_with_tolerance(self) -> None:
+        # Reasoning counts as delivered output: a thinking model that spent
+        # its budget before emitting content is a completed generation on a
+        # lax server (the retired non-streaming path returned it with empty
+        # content and the reasoning captured), not a doomed retry loop.
+        result = self._drain_chunks(
+            [_openai_stream_chunk(reasoning_content="thought hard")],
+            capabilities=ModelCapabilities(finish_reason_optional=True),
+        )
+        assert result.content == ""
+        assert result.reasoning == "thought hard"
+        assert result.finish_reason == "stop"
+
     def test_finishless_stream_with_no_output_still_raises(self) -> None:
-        # The shim is content-gated: an empty clean-close stream (dead
-        # generation, zero-chunk fakes) still hits the drain's
-        # complete-or-error gate.
+        # The shim is output-gated even when ARMED: an empty clean-close
+        # stream (dead generation, zero-chunk fakes) still hits the
+        # drain's complete-or-error gate.
         from turnstone.core.providers import IncompleteStreamError
 
-        client = MagicMock()
-        client.chat.completions.create.return_value = []
         with pytest.raises(IncompleteStreamError):
-            drain_stream(
-                self.provider.create_streaming(
-                    client=client, model="m", messages=[{"role": "user", "content": "x"}]
-                )
-            )
+            self._drain_chunks([], capabilities=ModelCapabilities(finish_reason_optional=True))
 
     def test_fragmented_single_call_does_not_split(self) -> None:
         # The normal well-behaved shape — name announced once, arguments
@@ -884,6 +901,83 @@ class TestOpenAIProvider:
                 ),
                 _openai_stream_chunk(
                     tool_calls=[_openai_tool_call_delta(index=0, arguments='"x"}')]
+                ),
+                _openai_stream_chunk(finish_reason="tool_calls"),
+            ]
+        )
+        assert len(result.tool_calls) == 1
+        assert result.tool_calls[0]["function"]["arguments"] == '{"p": "x"}'
+
+    def test_idless_zero_arg_parallel_calls_split(self) -> None:
+        # Two id-less whole-delta announcements with NO arguments are two
+        # zero-argument parallel calls (the empty-args twin of the
+        # whole-delta shape) — fusing them would silently drop an action.
+        result = self._drain_chunks(
+            [
+                _openai_stream_chunk(
+                    tool_calls=[_openai_tool_call_delta(index=0, name="refresh_state")]
+                ),
+                _openai_stream_chunk(
+                    tool_calls=[_openai_tool_call_delta(index=0, name="refresh_state")]
+                ),
+                _openai_stream_chunk(finish_reason="tool_calls"),
+            ]
+        )
+        assert [tc["function"]["name"] for tc in result.tool_calls] == [
+            "refresh_state",
+            "refresh_state",
+        ]
+
+    def test_idless_redundant_name_fragments_merge(self) -> None:
+        # An id-less server that repeats the name header on every argument
+        # fragment: mid-JSON the re-announce is a header, not a new call —
+        # the slotter consults argument completeness, so the fragments
+        # reassemble instead of splitting into malformed half-JSON calls.
+        result = self._drain_chunks(
+            [
+                _openai_stream_chunk(
+                    tool_calls=[_openai_tool_call_delta(index=0, name="read", arguments='{"p": ')]
+                ),
+                _openai_stream_chunk(
+                    tool_calls=[_openai_tool_call_delta(index=0, name="read", arguments='"x"}')]
+                ),
+                _openai_stream_chunk(finish_reason="tool_calls"),
+            ]
+        )
+        assert len(result.tool_calls) == 1
+        assert result.tool_calls[0]["function"]["arguments"] == '{"p": "x"}'
+
+    def test_idless_name_mismatch_always_splits(self) -> None:
+        # A different name can never be the same call, whatever the
+        # argument state — catches a zero-arg call followed by an arg-ful
+        # sibling at the same wire index.
+        result = self._drain_chunks(
+            [
+                _openai_stream_chunk(
+                    tool_calls=[_openai_tool_call_delta(index=0, name="refresh_state")]
+                ),
+                _openai_stream_chunk(
+                    tool_calls=[
+                        _openai_tool_call_delta(index=0, name="read", arguments='{"p": "x"}')
+                    ]
+                ),
+                _openai_stream_chunk(finish_reason="tool_calls"),
+            ]
+        )
+        assert [tc["function"]["name"] for tc in result.tool_calls] == ["refresh_state", "read"]
+        assert result.tool_calls[1]["function"]["arguments"] == '{"p": "x"}'
+
+    def test_idless_name_first_then_args_with_repeated_name_merges(self) -> None:
+        # Name announced first (no arguments), then arguments arrive
+        # carrying the SAME name again: one call whose arguments are
+        # starting, not a zero-arg call plus an arg-ful twin.
+        result = self._drain_chunks(
+            [
+                _openai_stream_chunk(tool_calls=[_openai_tool_call_delta(index=0, name="read")]),
+                _openai_stream_chunk(
+                    tool_calls=[
+                        _openai_tool_call_delta(index=0, name="read", arguments='{"p": "x"}')
+                    ]
                 ),
                 _openai_stream_chunk(finish_reason="tool_calls"),
             ]
@@ -5417,6 +5511,50 @@ class TestResponsesDrainedStream:
         assert result.finish_reason == "length"
         assert result.usage is not None
         assert result.provider_blocks
+
+    def test_completed_terminal_keeps_done_items_without_rebuild(self) -> None:
+        # Happy path: every item got its ``output_item.done`` and the
+        # terminal payload carries the same number of items — the rebuild
+        # (a full re-serialization of every output item plus a second
+        # annotations walk) is skipped and the ``.done``-collected blocks
+        # are kept as-is.
+        done_item = SimpleNamespace(type="message", content=[])
+        done_item.model_dump = lambda **_kw: {"type": "message", "origin": "done"}  # type: ignore[method-assign]
+        terminal_item = SimpleNamespace(type="message", content=[])
+        terminal_item.model_dump = lambda **_kw: {  # type: ignore[method-assign]
+            "type": "message",
+            "origin": "terminal",
+        }
+        events = [
+            SimpleNamespace(type="response.output_text.delta", delta="Hi"),
+            SimpleNamespace(type="response.output_item.done", item=done_item),
+            SimpleNamespace(
+                type="response.completed",
+                response=SimpleNamespace(status="completed", usage=None, output=[terminal_item]),
+            ),
+        ]
+        result = self._drain(events)
+        assert result.provider_blocks == [{"type": "message", "origin": "done"}]
+
+    def test_completed_terminal_rebuilds_when_done_events_missing(self) -> None:
+        # A lax server that drops ``output_item.done`` events: the terminal
+        # output holds more items than were collected, so the blocks are
+        # rebuilt from the terminal payload (count mismatch — the same
+        # repair path as truncation's never-done'd trailing item).
+        terminal_item = SimpleNamespace(type="message", content=[])
+        terminal_item.model_dump = lambda **_kw: {  # type: ignore[method-assign]
+            "type": "message",
+            "origin": "terminal",
+        }
+        events = [
+            SimpleNamespace(type="response.output_text.delta", delta="Hi"),
+            SimpleNamespace(
+                type="response.completed",
+                response=SimpleNamespace(status="completed", usage=None, output=[terminal_item]),
+            ),
+        ]
+        result = self._drain(events)
+        assert result.provider_blocks == [{"type": "message", "origin": "terminal"}]
 
     def test_usage_extraction(self) -> None:
         result = self._drain(self._make_events(text="Hi"))

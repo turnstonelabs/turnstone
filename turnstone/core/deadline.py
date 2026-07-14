@@ -76,6 +76,17 @@ class StreamAbortRef(list[Any]):
             with contextlib.suppress(Exception):
                 stream.close()
 
+    @property
+    def aborted(self) -> bool:
+        """Whether :meth:`abort` has fired.
+
+        ``model_turn``'s drain-retry gate reads this (duck-typed off any
+        ``cancel_ref``): an aborted stream dies with a transport error
+        that looks retryable, and re-issuing the request would resurrect
+        a call its deadline already abandoned.
+        """
+        return self._aborted
+
 
 def run_abortable_with_deadline(
     fn: Callable[[StreamAbortRef], _T],

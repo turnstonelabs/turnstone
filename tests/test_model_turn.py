@@ -25,6 +25,7 @@ from turnstone.core.model_turn import (
 )
 from turnstone.core.providers._protocol import (
     CompletionResult,
+    IncompleteStreamError,
     ModelCapabilities,
     StreamChunk,
     UsageInfo,
@@ -72,6 +73,92 @@ def _fake_registry(
 
 def _lane(provider: _FakeProvider, **kw: Any) -> ModelLane:
     return ModelLane(provider=provider, client=object(), model="m", **kw)
+
+
+class _FlakyProvider:
+    """Scripted drain-time deaths: each script entry is either a
+    ``CompletionResult`` (streamed normally) or an exception instance
+    (raised mid-iteration — AFTER ``create_streaming`` returned, exactly
+    where a real mid-body wire death surfaces)."""
+
+    provider_name = "openai-compatible"
+    retryable_error_names: frozenset[str] = frozenset({"IncompleteStreamError"})
+
+    def __init__(self, script: list[Any]) -> None:
+        self.script = list(script)
+        self.calls: list[dict[str, Any]] = []
+
+    def get_capabilities(self, model: str) -> ModelCapabilities:
+        return ModelCapabilities()
+
+    def create_streaming(self, **kwargs: Any) -> Any:
+        self.calls.append(kwargs)
+        item = self.script.pop(0)
+
+        def _iter() -> Any:
+            if isinstance(item, BaseException):
+                raise item
+            yield from as_stream(item)
+
+        return _iter()
+
+
+def test_model_turn_retries_transient_mid_stream_death() -> None:
+    # The retired non-streaming transport read the whole body inside the
+    # SDK's retried request, so single-shot lanes never saw a mid-body wire
+    # blip — the drain-scoped loop is that retry's new home.
+    provider = _FlakyProvider(
+        [
+            IncompleteStreamError("stream died mid-response"),
+            CompletionResult(content="second try"),
+        ]
+    )
+    lane = ModelLane(provider=provider, client=object(), model="m")
+
+    result = model_turn(lane, [Turn.user("x")])
+
+    assert result.content == "second try"
+    assert len(provider.calls) == 2
+
+
+def test_model_turn_gives_up_after_retry_budget() -> None:
+    provider = _FlakyProvider([IncompleteStreamError(f"death {i}") for i in range(5)])
+    lane = ModelLane(provider=provider, client=object(), model="m")
+
+    with pytest.raises(IncompleteStreamError):
+        model_turn(lane, [Turn.user("x")])
+
+    # One initial issue + _DRAIN_RETRIES re-issues, then it propagates.
+    assert len(provider.calls) == 3
+
+
+def test_model_turn_does_not_retry_unrecognized_errors() -> None:
+    provider = _FlakyProvider([RuntimeError("schema violation")])
+    lane = ModelLane(provider=provider, client=object(), model="m")
+
+    with pytest.raises(RuntimeError, match="schema violation"):
+        model_turn(lane, [Turn.user("x")])
+
+    assert len(provider.calls) == 1
+
+
+def test_model_turn_does_not_retry_after_abort() -> None:
+    # A deadline that closed the stream must not have the request
+    # resurrected behind its back: the closed stream dies with an error
+    # that LOOKS retryable, but the aborted cancel_ref gates the re-issue.
+    from turnstone.core.deadline import StreamAbortRef
+
+    provider = _FlakyProvider(
+        [IncompleteStreamError("closed by abort"), CompletionResult(content="never")]
+    )
+    lane = ModelLane(provider=provider, client=object(), model="m")
+    ref = StreamAbortRef()
+    ref.abort()
+
+    with pytest.raises(IncompleteStreamError):
+        model_turn(lane, [Turn.user("x")], cancel_ref=ref)
+
+    assert len(provider.calls) == 1
 
 
 def _real_semantics_store(**stored: Any) -> SimpleNamespace:

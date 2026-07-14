@@ -61,6 +61,11 @@ from turnstone.core.trajectory import ProviderNative, ToolCall, Turn, dicts_from
 
 log = get_logger(__name__)
 
+# Mid-stream death re-issue budget — parity with the SDK request-level
+# retry (openai/anthropic default ``max_retries=2``) that covered the
+# whole body read on the retired non-streaming transport.
+_DRAIN_RETRIES = 2
+
 # Block types that carry model reasoning natively.  Anthropic emits
 # ``thinking``/``redacted_thinking`` blocks, OpenAI Responses emits
 # ``reasoning`` items, and ``reasoning_text`` is our own synthetic
@@ -674,7 +679,16 @@ def model_turn(
     — see :func:`drain_stream`).
 
     Raises whatever the provider raises — retry/deadline/fallback policy
-    is the caller's.
+    is the caller's — EXCEPT transient mid-stream deaths: a failure the
+    provider's own ``retryable_error_names`` recognizes, raised while
+    DRAINING (``IncompleteStreamError`` and friends), is re-issued in
+    place up to ``_DRAIN_RETRIES`` times.  The retired non-streaming
+    transport read the whole body inside the SDK's retried request, so
+    single-shot callers never saw a mid-body wire blip; this loop is
+    that retry's new home (request-time failures still get the SDK's own
+    policy inside ``create_streaming`` and propagate unchanged).  An
+    aborted *cancel_ref* suppresses retries — a deadline that closed the
+    stream must not have the request resurrected behind its back.
     """
     if mint is not None and wire_id_map is None:
         raise ValueError(
@@ -702,8 +716,14 @@ def model_turn(
         or (lane.capabilities.default_reasoning_effort if lane.capabilities else None)
         or None
     )
-    result = drain_stream(
-        lane.provider.create_streaming(
+    attempt = 0
+    while True:
+        # ``create_streaming`` stays OUTSIDE the try: every adapter issues
+        # the HTTP request eagerly in its body (inside the SDK's own
+        # request-level retry), so an exception from it is a request-time
+        # failure that already got its retries; only drain-time failures
+        # are mid-stream deaths the SDK could never see.
+        chunks = lane.provider.create_streaming(
             client=lane.client,
             model=lane.model,
             messages=wire,
@@ -719,7 +739,23 @@ def model_turn(
             ),
             resolve_attachments=resolve_attachments,
         )
-    )
+        try:
+            result = drain_stream(chunks)
+            break
+        except Exception as exc:
+            attempt += 1
+            if (
+                attempt > _DRAIN_RETRIES
+                or bool(getattr(cancel_ref, "aborted", False))
+                or type(exc).__name__ not in lane.provider.retryable_error_names
+            ):
+                raise
+            log.warning(
+                "model_turn.drain_retry",
+                error_type=type(exc).__name__,
+                attempt=attempt,
+                model=lane.model,
+            )
 
     raw_calls: list[dict[str, Any]] = list(result.tool_calls or [])
     # Record blanks BEFORE the uuid back-fill: a back-filled id exists only

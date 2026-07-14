@@ -109,6 +109,34 @@ def merge_usage(acc: UsageInfo | None, new: UsageInfo) -> UsageInfo:
     )
 
 
+def accumulate_tool_call_delta(
+    acc: dict[int, dict[str, Any]], tcd: ToolCallDelta
+) -> dict[str, Any]:
+    """Fold one ``ToolCallDelta`` into a per-index tool-call accumulator.
+
+    THE tool-call merge rule, in one place: ``id``/``name`` are whole
+    values (last truthy wins — servers may re-send them on every
+    fragment), ``arguments_delta`` concatenates.  Returns the (possibly
+    fresh) accumulator entry so callers can hang provider extras off it.
+
+    Serves :func:`drain_stream` and ``GoogleProvider``'s raw-fidelity
+    capture today; ``ChatSession``'s inline chunk consumer keeps its own
+    copy until the main loop moves onto ``model_turn`` (#832) — a merge-
+    rule change before then must be mirrored there.
+    """
+    tc = acc.setdefault(
+        tcd.index,
+        {"id": "", "type": "function", "function": {"name": "", "arguments": ""}},
+    )
+    if tcd.id:
+        tc["id"] = tcd.id
+    if tcd.name:
+        tc["function"]["name"] = tcd.name
+    if tcd.arguments_delta:
+        tc["function"]["arguments"] += tcd.arguments_delta
+    return tc
+
+
 def drain_stream(chunks: Iterator[StreamChunk]) -> CompletionResult:
     """Drain a ``create_streaming`` iterator into a ``CompletionResult``.
 
@@ -120,20 +148,21 @@ def drain_stream(chunks: Iterator[StreamChunk]) -> CompletionResult:
 
     - A stream that exhausts with NO finish reason raises
       :class:`IncompleteStreamError` (retryable) — every adapter emits one
-      on a healthy stream (the chat iterator shims ``"stop"`` for lax
-      finish-reason-less servers once content arrived), so its absence
-      means the generation died mid-response.  Partial text must never be
-      handed to a caller that stores it as a complete result (a
+      on a healthy stream (a server that genuinely never sends one needs
+      ``finish_reason_optional`` declared in its model capabilities; the
+      chat iterator then shims ``"stop"`` once output arrived), so its
+      absence means the generation died mid-response.  Partial text must
+      never be handed to a caller that stores it as a complete result (a
       compaction summary, a title).  A transport blip AFTER the finish
       reason keeps the completed result and forfeits only trailing
       metadata.
     - ``usage`` merges via :func:`merge_usage` — Anthropic splits prompt
       and completion tokens across separate events.
-    - Tool calls accumulate by ``ToolCallDelta.index``: ``id``/``name``
-      are whole values (last truthy wins), ``arguments_delta``
-      concatenates.  Adapters own index sanity — the chat iterator
-      remaps index-degenerate wire deltas onto distinct slots before
-      they reach any accumulator (this one or the chat loop's).
+    - Tool calls accumulate by ``ToolCallDelta.index`` via
+      :func:`accumulate_tool_call_delta`.  Adapters own index sanity —
+      the chat iterator remaps index-degenerate wire deltas onto
+      distinct slots before they reach any accumulator (this one or the
+      chat loop's).
     - ``provider_blocks`` replaces on each non-empty emission — every
       adapter attaches its full block list exactly once, on or after the
       terminal chunk.
@@ -184,16 +213,7 @@ def drain_stream(chunks: Iterator[StreamChunk]) -> CompletionResult:
         if sc.reasoning_delta:
             reasoning_parts.append(sc.reasoning_delta)
         for tcd in sc.tool_call_deltas:
-            tc = tool_calls_acc.setdefault(
-                tcd.index,
-                {"id": "", "type": "function", "function": {"name": "", "arguments": ""}},
-            )
-            if tcd.id:
-                tc["id"] = tcd.id
-            if tcd.name:
-                tc["function"]["name"] = tcd.name
-            if tcd.arguments_delta:
-                tc["function"]["arguments"] += tcd.arguments_delta
+            accumulate_tool_call_delta(tool_calls_acc, tcd)
         if sc.usage is not None:
             usage = merge_usage(usage, sc.usage)
         if sc.finish_reason:
@@ -207,7 +227,9 @@ def drain_stream(chunks: Iterator[StreamChunk]) -> CompletionResult:
 
     if finish_reason is None:
         raise IncompleteStreamError(
-            "stream ended without a finish reason — generation died mid-response"
+            "stream ended without a finish reason — generation died mid-response "
+            "(a server that never sends finish reasons needs finish_reason_optional "
+            "declared in its model capabilities)"
         )
 
     content = "".join(content_parts)
@@ -336,6 +358,19 @@ class ModelCapabilities:
     # "" = omit (standard reasoning).  There is no gpt-5.6-pro model.
     supports_pro_mode: bool = False
     reasoning_mode: str = ""
+    # Chat-lane lax-server tolerance (operator-declared, model-definition
+    # capabilities JSON): this server never sends ``finish_reason``, so a
+    # stream that ends CLEANLY after delivering output (content, reasoning,
+    # or tool calls) is a completed generation — the chat iterator shims
+    # ``finish_reason="stop"`` and :func:`drain_stream`'s complete-or-error
+    # gate passes.  Leave False (the default) for every server that
+    # reliably sends finish reasons: there, a clean finish-less end IS a
+    # died-mid-generation stream (worker crashed behind a clean-closing
+    # proxy/ASGI layer) and blessing it would store partial text as a
+    # complete result.  SSE has no body framing, so the two cases are one
+    # wire shape — this flag is the operator asserting which server class
+    # they run.  Honored by the Chat Completions lane only.
+    finish_reason_optional: bool = False
 
 
 # The session effort knob is ORDINAL — snapping must respect this order.
