@@ -2145,6 +2145,22 @@ async def create_workstream(request: Request) -> JSONResponse:
     auth = getattr(getattr(request, "state", None), "auth_result", None)
     uid: str = getattr(auth, "user_id", "") or ""
 
+    # Optional deployment gate (server.require_project): refuse to create a chat
+    # that isn't filed under a project.  Exemptions fail OPEN to "allowed":
+    #   * resume_ws         -> resuming an existing workstream (already has a project)
+    #   * service scope     -> cluster machinery / scheduled automation
+    #   * admin.coordinator -> coordinator spawns; children inherit the parent's project
+    _cs = getattr(request.app.state, "config_store", None)
+    if _cs is not None and _cs.get("server.require_project") and not project_id and not resume_ws:
+        _exempt = auth is not None and (
+            auth.has_scope("service") or auth.has_permission("admin.coordinator")
+        )
+        if not _exempt:
+            return JSONResponse(
+                {"error": "This deployment requires every chat to be assigned to a project."},
+                status_code=400,
+            )
+
     # Pool — pick any available node
     if node_id == "pool":
         node_id = _pick_best_node(collector)

@@ -2830,7 +2830,17 @@ async def list_projects(request: Request) -> JSONResponse:
     )
     storage = get_storage()
     rows = storage.list_projects_for_user(uid, include_archived=include_archived) if storage else []
-    return JSONResponse({"projects": [_project_view(r) for r in rows], "total": len(rows)})
+    # Surface the deployment's require-project gate so the composer can drop its
+    # "No project" option (the create endpoint enforces it regardless).
+    cs = getattr(request.app.state, "config_store", None)
+    require_project = bool(cs.get("server.require_project")) if cs is not None else False
+    return JSONResponse(
+        {
+            "projects": [_project_view(r) for r in rows],
+            "total": len(rows),
+            "require_project": require_project,
+        }
+    )
 
 
 async def create_project(request: Request) -> JSONResponse:

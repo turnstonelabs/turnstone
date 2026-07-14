@@ -21,6 +21,7 @@ let _loaded = false; // has the first refresh attempt completed (ok or failed)?
 let _lastError = null; // last failure: HTTP status, 0 for network/parse, null when ok
 let _inflight = null; // shared pending refresh so concurrent callers coalesce
 let _fingerprint = null; // last fired map signature, for change-detection
+let _requireProject = false; // deployment gate: chats must be filed under a project
 const _subs = []; // () => void, fired after each CHANGED refresh
 
 function _fp(rows) {
@@ -85,6 +86,7 @@ export function refreshProjects() {
     .then(function (data) {
       if (data) {
         _lastError = null;
+        _requireProject = !!data.require_project;
         _setCache(data.projects || []);
       }
       return _cache;
@@ -142,6 +144,14 @@ export function projectChoices() {
   });
 }
 
+/** Whether this deployment requires every chat to be filed under a project
+ *  (mirrors `server.require_project`).  Populated by the last successful
+ *  refresh; false until then and on failure, so the composer fails OPEN (the
+ *  create endpoint is the authoritative gate). */
+export function requireProject() {
+  return _requireProject;
+}
+
 /** Subscribe to post-refresh changes (rail re-render, picker repopulate).
  *  Idempotent — the same callback is registered at most once. */
 export function onProjectsChange(cb) {
@@ -171,6 +181,7 @@ window.TurnstoneProjects = {
   projectsError: projectsError,
   projectName: projectName,
   projectChoices: projectChoices,
+  requireProject: requireProject,
   onProjectsChange: onProjectsChange,
   createProject: createProject,
 };
