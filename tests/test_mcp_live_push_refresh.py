@@ -30,7 +30,6 @@ Self-contained (spawns its own server; no LLM backend, no network beyond
 
 from __future__ import annotations
 
-import socket
 import subprocess
 import sys
 import textwrap
@@ -40,6 +39,7 @@ from unittest.mock import patch
 
 import pytest
 
+from tests.conftest import _free_port, _wait_session_live, _wait_tcp_ready
 from turnstone.core.mcp_client import MCPClientManager
 
 if TYPE_CHECKING:
@@ -79,33 +79,6 @@ SERVER_SRC = textwrap.dedent(
         mcp.run(transport="streamable-http")
     '''
 ).lstrip()
-
-
-def _free_port() -> int:
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        s.bind(("127.0.0.1", 0))
-        return int(s.getsockname()[1])
-
-
-def _wait_tcp_ready(port: int, timeout: float) -> bool:
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        try:
-            with socket.create_connection(("127.0.0.1", port), timeout=0.3):
-                return True
-        except OSError:
-            time.sleep(0.05)
-    return False
-
-
-def _wait_session_live(mgr: MCPClientManager, name: str, timeout: float) -> bool:
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        state = mgr._static_servers.get(name)
-        if state is not None and state.session is not None:
-            return True
-        time.sleep(0.05)
-    return False
 
 
 def _wait_tool_visible(mgr: MCPClientManager, server: str, tool: str, timeout: float) -> bool:

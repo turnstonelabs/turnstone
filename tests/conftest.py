@@ -4,6 +4,7 @@ import asyncio
 import contextlib
 import logging
 import os
+import socket
 import threading
 import time
 from typing import TYPE_CHECKING, Any
@@ -241,6 +242,41 @@ def _drain_background(mgr: MCPClientManager, loop: asyncio.AbstractEventLoop) ->
             await asyncio.gather(*tasks, return_exceptions=True)
 
     _run_on_loop(loop, _drain())
+
+
+def _free_port() -> int:
+    """Grab an ephemeral localhost port for a live-server subprocess.
+
+    Shared by the live MCP smoke tests (flaky-server, push-refresh) so
+    the socket-probe helpers stay in one place instead of drifting per
+    file.
+    """
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind(("127.0.0.1", 0))
+        return int(s.getsockname()[1])
+
+
+def _wait_tcp_ready(port: int, timeout: float) -> bool:
+    """Poll until something accepts TCP on 127.0.0.1:*port* (live tests)."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        try:
+            with socket.create_connection(("127.0.0.1", port), timeout=0.3):
+                return True
+        except OSError:
+            time.sleep(0.05)
+    return False
+
+
+def _wait_session_live(mgr: MCPClientManager, name: str, timeout: float) -> bool:
+    """Poll until static server *name* has a live session (live tests)."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        state = mgr._static_servers.get(name)
+        if state is not None and state.session is not None:
+            return True
+        time.sleep(0.05)
+    return False
 
 
 def make_oidc_test_config(**overrides: Any) -> OIDCConfig:

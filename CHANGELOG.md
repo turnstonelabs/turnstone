@@ -177,10 +177,20 @@ Earlier stable lines (`stable/1.6`, `stable/1.5`) are frozen.
   per-user pool paths — a tools push no longer swallows a prompts push
   arriving in the same 5-second window (previously the second push was
   dropped outright, and the change stayed invisible until the server pushed
-  that kind again). The resource-refresh fan-out on both paths also no
-  longer orphans its sibling list call when one of the pair fails fast —
-  both calls now complete inside the timeout scope before the failure is
-  re-raised.
+  that kind again). The resource-refresh fan-out on both paths no longer
+  orphans its sibling list call when one of the pair fails fast — the real
+  error surfaces immediately (not masked as a 30-second timeout) and the
+  surviving sibling is cancelled inside the timeout scope. A push refresh
+  that fails while the connection stays up is now retried automatically on
+  the next health-loop tick until one completes — previously a single
+  transient blip left the shared catalog stale for every user on the node
+  until an operator intervened, since a server that already announced its
+  change never announces it again. And an operator `/mcp refresh` no longer
+  parks behind a busy per-server connect lock (a slow reconnect attempt
+  could eat the whole 30-second refresh budget and fail the pass for every
+  healthy server behind it) — the busy server is skipped, since whatever
+  holds the lock publishes a fresher catalog than the skipped pass would
+  have.
 
 - **OpenAI Responses streaming: truncated and refused responses no longer
   vanish.** A response that hit `max_output_tokens` terminates the stream
