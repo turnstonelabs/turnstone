@@ -23,6 +23,7 @@ from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import mcp.types as mcp_types
 import pytest
 
 from tests.conftest import make_mcp_token_cipher, stop_loop_thread
@@ -149,6 +150,40 @@ def _run_on_loop(loop: asyncio.AbstractEventLoop, coro: Any) -> Any:
     """Submit *coro* to *loop*, wait for the result with a 5s timeout."""
     fut = asyncio.run_coroutine_threadsafe(coro, loop)
     return fut.result(timeout=5)
+
+
+def _fake_pool_tools(server_name: str, tool_name: str) -> list[dict[str, Any]]:
+    """One OpenAI-format tool entry, shaped as the pool catalog seeds expect.
+
+    Single copy — ``_rebuild_user_tool_map`` / ``is_mcp_tool`` consume
+    this shape, and divergent per-test copies silently stop exercising
+    the real catalog format when the schema evolves.
+    """
+    return [
+        {
+            "type": "function",
+            "function": {
+                "name": f"mcp__{server_name}__{tool_name}",
+                "description": "",
+                "parameters": {"type": "object", "properties": {}},
+            },
+        }
+    ]
+
+
+def _drain_background(mgr: MCPClientManager, loop: asyncio.AbstractEventLoop) -> None:
+    """Deterministically await the manager's tracked background tasks.
+
+    Replaces fixed sleeps for synchronizing with scheduled dead-grant
+    drops / spawned refreshes: exact, and immune to slow-runner flake.
+    """
+
+    async def _drain() -> None:
+        tasks = [t for t in list(mgr._background_tasks) if not t.done()]
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+
+    _run_on_loop(loop, _drain())
 
 
 # ---------------------------------------------------------------------------
@@ -402,16 +437,7 @@ class TestEviction:
 
     @staticmethod
     def _fake_tools(server_name: str, i: int) -> list[dict]:
-        return [
-            {
-                "type": "function",
-                "function": {
-                    "name": f"mcp__{server_name}__t{i}",
-                    "description": "",
-                    "parameters": {"type": "object", "properties": {}},
-                },
-            }
-        ]
+        return _fake_pool_tools(server_name, f"t{i}")
 
     def test_idle_eviction_cools_entries_for_live_listener_users(self, running_loop_mgr) -> None:
         """TTL eviction cools (retains) a live-listener user's
@@ -553,6 +579,93 @@ class TestEviction:
         assert (added, removed) == ([], [])
         # The stale result was not published onto the replacement entry.
         assert fresh_tools is None
+
+    def test_dead_grant_drop_skips_freshly_reconnected_entry(self, running_loop_mgr) -> None:
+        """A dead-grant drop parked behind ``open_lock`` must NOT clear a
+        catalog that a re-consent prime published while it waited: a
+        live session at drop time proves a connect succeeded after the
+        failed lookup, i.e. the grant is alive again. The explicit
+        revocation path (skip_if_connected=False) still clears warm
+        entries — that is its purpose."""
+        mgr, loop, _ = running_loop_mgr
+        mgr._oauth_user_server_names = {"pool-srv"}
+        key = ("u0", "pool-srv")
+
+        async def _scenario() -> tuple[Any, Any, Any]:
+            entry = await mgr._ensure_pool_entry(key)
+            entry.tools = _fake_pool_tools("pool-srv", "t")
+            entry.session = MagicMock()  # re-consent prime reconnected
+            await mgr._drop_catalog_locked(key, skip_if_connected=True)
+            kept = entry.tools
+            # Cold entry (no session): the dead-grant drop proceeds.
+            entry.session = None
+            await mgr._drop_catalog_locked(key, skip_if_connected=True)
+            dropped = entry.tools
+            # Revocation flavor clears even a warm entry.
+            entry.tools = _fake_pool_tools("pool-srv", "t")
+            entry.session = MagicMock()
+            await mgr._drop_catalog_locked(key)
+            revoked = entry.tools
+            return kept, dropped, revoked
+
+        kept, dropped, revoked = _run_on_loop(loop, _scenario())
+        assert kept is not None, "drop must skip an entry a fresh grant reconnected"
+        assert dropped is None
+        assert revoked is None
+
+    def test_notification_refresh_failure_returns_debounce_stamp(self, running_loop_mgr) -> None:
+        """A failed spawned ``list_changed`` refresh must return the
+        debounce stamp so the server's next notification retries — a
+        consumed stamp with no retry silently drops the catalog change
+        for the whole debounce window."""
+        mgr, loop, _ = running_loop_mgr
+        key = ("u0", "pool-srv")
+        mgr._last_pool_notification_refresh[key] = 123.0
+
+        async def _boom(_key: tuple[str, str]) -> tuple[list[str], list[str]]:
+            raise TimeoutError("slow server")
+
+        _run_on_loop(loop, mgr._run_notification_refresh(key, "tools", _boom))
+        assert key not in mgr._last_pool_notification_refresh
+
+        async def _ok(_key: tuple[str, str]) -> tuple[list[str], list[str]]:
+            return [], []
+
+        mgr._last_pool_notification_refresh[key] = 456.0
+        _run_on_loop(loop, mgr._run_notification_refresh(key, "tools", _ok))
+        assert mgr._last_pool_notification_refresh[key] == 456.0
+
+    def test_list_changed_handler_spawns_refresh_off_receive_loop(self, running_loop_mgr) -> None:
+        """The notification handler must SPAWN the refresh, not await it:
+        the SDK awaits handlers inline in its receive loop, so an
+        in-handler request on the same session can never receive its
+        response — push-driven refreshes structurally never completed."""
+        mgr, loop, _ = running_loop_mgr
+        key = ("u0", "pool-srv")
+        refreshed: list[tuple[str, str]] = []
+
+        async def _fake_refresh(k: tuple[str, str]) -> tuple[list[str], list[str]]:
+            refreshed.append(k)
+            return [], []
+
+        mgr._refresh_pool_server_tools = _fake_refresh  # type: ignore[method-assign]
+        handler = mgr._make_pool_notification_handler(key)
+
+        async def _fire() -> bool:
+            note = mcp_types.ServerNotification(
+                mcp_types.ToolListChangedNotification(method="notifications/tools/list_changed")
+            )
+            await handler(note)
+            # The handler returned WITHOUT running the refresh inline —
+            # it must complete even though the refresh hasn't run yet.
+            return len(refreshed) == 0
+
+        returned_before_refresh = _run_on_loop(loop, _fire())
+        assert returned_before_refresh, "handler must not await the refresh inline"
+        _drain_background(mgr, loop)
+        assert refreshed == [key]
+        # Debounce stamp consumed at schedule time (storm dedupe).
+        assert key in mgr._last_pool_notification_refresh
 
     def test_lookup_grant_dead_requires_wired_infrastructure(self, running_loop_mgr) -> None:
         """kind='missing' is authoritative only when the stores that
@@ -739,16 +852,7 @@ class TestDispatchStateMachine:
 
         async def _seed() -> None:
             entry = await mgr._ensure_pool_entry(("user-1", "pool-srv"))
-            entry.tools = [
-                {
-                    "type": "function",
-                    "function": {
-                        "name": "mcp__pool-srv__do_thing",
-                        "description": "",
-                        "parameters": {"type": "object", "properties": {}},
-                    },
-                }
-            ]
+            entry.tools = _fake_pool_tools("pool-srv", "do_thing")
             mgr._rebuild_user_tool_map("user-1")
 
         _run_on_loop(loop, _seed())
@@ -785,8 +889,8 @@ class TestDispatchStateMachine:
         # the live session is notified — tools leave instead of dangling
         # behind a consent card for access the user no longer holds.
         # The drop is SCHEDULED (never awaited on the dispatch path, which
-        # may be parked behind a long same-key call) — flush the loop.
-        _run_on_loop(loop, asyncio.sleep(0.05))
+        # may be parked behind a long same-key call) — drain the tracked tasks.
+        _drain_background(mgr, loop)
         assert mgr._user_pool_entries[("user-1", "pool-srv")].tools is None
         assert mgr.is_mcp_tool("mcp__pool-srv__do_thing", user_id="user-1") is False
         assert fired[0] == 1
@@ -857,8 +961,8 @@ class TestDispatchStateMachine:
         payload = json.loads(str(exc_info.value))
         assert payload["error"]["code"] == "mcp_consent_required"
         # kind="refresh_failed" is likewise a DEAD grant → catalog drops
-        # (scheduled — flush the loop before asserting).
-        _run_on_loop(loop, asyncio.sleep(0.05))
+        # (scheduled — drain the tracked tasks before asserting).
+        _drain_background(mgr, loop)
         assert mgr._user_pool_entries[("user-1", "pool-srv")].tools is None
         assert fired[0] == 1
 
@@ -1443,16 +1547,7 @@ class TestOboPriming:
 
         async def _seed() -> None:
             entry = await mgr._ensure_pool_entry(key)
-            entry.tools = [
-                {
-                    "type": "function",
-                    "function": {
-                        "name": "mcp__pool-srv__t",
-                        "description": "",
-                        "parameters": {"type": "object", "properties": {}},
-                    },
-                }
-            ]
+            entry.tools = _fake_pool_tools("pool-srv", "t")
             mgr._rebuild_user_tool_map("user-1")
 
         _run_on_loop(loop, _seed())
@@ -1467,8 +1562,8 @@ class TestOboPriming:
         dead = AsyncMock(return_value=SimpleNamespace(kind="missing", token=None))
         with patch("turnstone.core.mcp_client.get_user_access_token_classified", new=dead):
             _run_on_loop(loop, mgr._prime_user_pools("user-1"))
-            # The drop is scheduled — flush the loop before asserting.
-            _run_on_loop(loop, asyncio.sleep(0.05))
+        # The drop is scheduled — drain the tracked tasks before asserting.
+        _drain_background(mgr, loop)
 
         entry = mgr._user_pool_entries[key]
         assert entry.tools is None
@@ -1512,6 +1607,54 @@ class TestOboPriming:
 
         obo_lookup.assert_not_awaited()
         assert warmed == []
+
+    def test_prime_drops_retained_obo_catalog_when_credential_gone(
+        self, running_loop_mgr, storage
+    ) -> None:
+        """The credential-presence gate must not starve dead-grant
+        convergence: a user whose captured credential is GONE (unlink /
+        deprovision) still has retained obo catalogs, and every
+        new-session prime must drop them — the gate skips exactly the
+        per-server lookup that would have."""
+        mgr, loop, _ = running_loop_mgr
+        cipher = make_mcp_token_cipher()
+        mgr.set_storage(storage)
+        app_state = _make_app_state(storage, cipher=cipher)
+        app_state.oidc_config = SimpleNamespace(issuer="https://idp.example.com")
+        mgr.set_app_state(app_state)
+        storage.create_mcp_server(
+            server_id="srv-obo",
+            name="obo-srv",
+            transport="streamable-http",
+            url="https://mcp.example.com/sse",
+            auth_type="oauth_obo",
+            oauth_audience="api://mcp-a",
+        )
+        mgr._obo_server_names = {"obo-srv"}
+        key = ("user-1", "obo-srv")
+
+        async def _seed() -> None:
+            entry = await mgr._ensure_pool_entry(key)
+            entry.tools = _fake_pool_tools("obo-srv", "t")
+            mgr._rebuild_user_tool_map("user-1")
+
+        _run_on_loop(loop, _seed())
+        fired = [0]
+
+        def _cb() -> None:
+            fired[0] += 1
+
+        mgr.add_listener(_cb, user_id="user-1")
+        assert mgr.is_mcp_tool("mcp__obo-srv__t", user_id="user-1") is True
+
+        # No credential row seeded — the gate fires.
+        _run_on_loop(loop, mgr._prime_user_pools("user-1"))
+        _drain_background(mgr, loop)
+
+        entry = mgr._user_pool_entries[key]
+        assert entry.tools is None
+        assert mgr.is_mcp_tool("mcp__obo-srv__t", user_id="user-1") is False
+        assert fired[0] == 1
 
 
 class TestPendingConsentClearGate:

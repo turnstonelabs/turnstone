@@ -2166,10 +2166,13 @@ async def handle_oidc_callback(request: Request, audience: str, cookie_name: str
                     mcp_client is not None
                     and hasattr(mcp_client, "prime_user_pools")
                     and hasattr(mcp_client, "has_live_session_listener")
-                    and mcp_client.has_live_session_listener(user["user_id"])
                 ):
+                    # The gate call sits INSIDE the try: nothing on this
+                    # best-effort path may fail the login (the credential
+                    # is already persisted; the JWT is not yet issued).
                     try:
-                        mcp_client.prime_user_pools(user["user_id"])
+                        if mcp_client.has_live_session_listener(user["user_id"]):
+                            mcp_client.prime_user_pools(user["user_id"])
                     except Exception:
                         log.debug(
                             "oidc.capture: post-capture pool prime scheduling failed user=%s",

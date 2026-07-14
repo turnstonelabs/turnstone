@@ -1724,20 +1724,18 @@ class ChatSession:
             # Single authoritative read, AFTER the registrations: a
             # catalog change firing earlier than this fans out to the
             # listeners just registered, so nothing can slip between
-            # read and register with its only notification unheard.
-            seq_before = self._mcp_tools_change_seq - 1
-            while self._mcp_tools_change_seq != seq_before:
-                # Re-read until stable: a listener callback firing
-                # between a read and its assignments would have its
-                # fresher merge clobbered by our staler snapshot (its
-                # only notification already consumed). NEVER call
-                # _on_mcp_tools_changed here — it dereferences tool-
-                # search state initialized later in construction; the
-                # downstream init consumes these converged lists.
-                seq_before = self._mcp_tools_change_seq
-                mcp_tools = self._mcp_client.get_tools(user_id=self._mcp_user_id)
-                self._tools = merge_mcp_tools(INTERACTIVE_TOOLS, mcp_tools)
-                self._task_tools = merge_mcp_tools(TASK_AGENT_TOOLS, mcp_tools)
+            # read and register with its only notification unheard. A
+            # change firing AFTER this read is converged by the seq
+            # re-check at the end of tool setup (once every
+            # _on_mcp_tools_changed dependency exists) — a callback
+            # running mid-construction may crash into not-yet-assigned
+            # attributes and be swallowed by the fan-out, losing its
+            # effect, and one that succeeds here would be clobbered by
+            # the tool-search construction below reading mixed state.
+            self._mcp_tools_seq_at_read = self._mcp_tools_change_seq
+            mcp_tools = self._mcp_client.get_tools(user_id=self._mcp_user_id)
+            self._tools = merge_mcp_tools(INTERACTIVE_TOOLS, mcp_tools)
+            self._task_tools = merge_mcp_tools(TASK_AGENT_TOOLS, mcp_tools)
             # Proactively warm this user's per-user OAuth (oauth_user) pools so
             # their tools are present without a manual reconnect (e.g. after a
             # reboot/upgrade, or right after consent). Fire-and-forget — the
@@ -1799,6 +1797,20 @@ class ChatSession:
                 max_results=tool_search_max_results,
                 reranker=self._bm25_reranker(),
             )
+        # Converge with any MCP catalog change that fired during
+        # construction: a listener callback landing between the
+        # authoritative read and here either crashed into
+        # not-yet-assigned attributes (swallowed by the fan-out) or was
+        # clobbered by the setup above. Every _on_mcp_tools_changed
+        # dependency now exists, so re-running the full callback is
+        # safe — it rebuilds the merged lists, rendered descriptions,
+        # and search index from the CURRENT maps.
+        if (
+            self._kind != WorkstreamKind.COORDINATOR
+            and self._mcp_client
+            and self._mcp_tools_change_seq != self._mcp_tools_seq_at_read
+        ):
+            self._on_mcp_tools_changed()
         # Skill: explicit name overrides is_default skills.  ``skill_arguments``
         # carries the spec's $ARGUMENTS payload — set at create/load time,
         # substituted into the skill body by ``_load_skills``.

@@ -1866,6 +1866,13 @@ class MCPClientManager:
                 )
                 return
             try:
+                # SPAWNED, never awaited: the SDK awaits notification
+                # handlers inline in its receive loop, so a handler that
+                # awaits a request on the SAME session deadlocks — the
+                # response can never be routed while the handler is
+                # parked, every in-flight call on the session stalls
+                # with it, and the refresh only ever exits via its
+                # timeout. The refresh runs as its own tracked task.
                 if isinstance(root, mcp_types.ToolListChangedNotification):
                     log.info(
                         "Received tools/list_changed from pool user=%s server=%s",
@@ -1873,7 +1880,12 @@ class MCPClientManager:
                         server_name,
                     )
                     self._last_pool_notification_refresh[key] = now
-                    await self._refresh_pool_server_tools(key)
+                    self._spawn_background(
+                        self._run_notification_refresh(
+                            key, "tools", self._refresh_pool_server_tools
+                        ),
+                        f"pool tools refresh for '{server_name}'",
+                    )
                 elif isinstance(root, mcp_types.ResourceListChangedNotification):
                     log.info(
                         "Received resources/list_changed from pool user=%s server=%s",
@@ -1881,7 +1893,12 @@ class MCPClientManager:
                         server_name,
                     )
                     self._last_pool_notification_refresh[key] = now
-                    await self._refresh_pool_server_resources(key)
+                    self._spawn_background(
+                        self._run_notification_refresh(
+                            key, "resources", self._refresh_pool_server_resources
+                        ),
+                        f"pool resources refresh for '{server_name}'",
+                    )
                 elif isinstance(root, mcp_types.PromptListChangedNotification):
                     log.info(
                         "Received prompts/list_changed from pool user=%s server=%s",
@@ -1889,23 +1906,54 @@ class MCPClientManager:
                         server_name,
                     )
                     self._last_pool_notification_refresh[key] = now
-                    await self._refresh_pool_server_prompts(key)
+                    self._spawn_background(
+                        self._run_notification_refresh(
+                            key, "prompts", self._refresh_pool_server_prompts
+                        ),
+                        f"pool prompts refresh for '{server_name}'",
+                    )
             except Exception as exc:
-                # Structured fields only — ``exc_info=True`` would
-                # serialize the chained ``httpx.Request`` whose headers
-                # carry ``Authorization: Bearer <token>``. Sentry /
-                # faulthandler-style integrations capture that frame
-                # and the bearer would land in error tracking.
-                # Mirrors the dispatch-path log scrubbing applied in
-                # the sec-1 round-1 fix.
+                # Scheduling failed (loop shutting down). Structured
+                # fields only — ``exc_info=True`` would serialize the
+                # chained ``httpx.Request`` whose headers carry
+                # ``Authorization: Bearer <token>``.
                 log.warning(
-                    "Pool refresh after notification failed user=%s server=%s exc=%s",
+                    "Pool refresh scheduling failed user=%s server=%s exc=%s",
                     user_id,
                     server_name,
                     type(exc).__name__,
                 )
 
         return _on_pool_notification
+
+    async def _run_notification_refresh(
+        self,
+        key: tuple[str, str],
+        kind: str,
+        refresh: Callable[[tuple[str, str]], Awaitable[tuple[list[str], list[str]]]],
+    ) -> None:
+        """Body of a spawned ``list_changed`` refresh — never on the receive loop.
+
+        A FAILED refresh returns the debounce stamp so the server's
+        next ``list_changed`` retries instead of being silently dropped
+        inside the debounce window with the catalog change never
+        landing.
+        """
+        user_id, server_name = key
+        try:
+            await refresh(key)
+        except Exception as exc:
+            self._last_pool_notification_refresh.pop(key, None)
+            # Structured fields only — ``exc_info=True`` would
+            # serialize the chained ``httpx.Request`` whose headers
+            # carry ``Authorization: Bearer <token>``.
+            log.warning(
+                "Pool %s refresh after notification failed user=%s server=%s exc=%s",
+                kind,
+                user_id,
+                server_name,
+                type(exc).__name__,
+            )
 
     async def _pool_transport_owner(
         self,
@@ -2696,6 +2744,16 @@ class MCPClientManager:
                 except Exception:
                     has_credential = True
             if not has_credential:
+                # The credential is GONE — fire the same dead-grant
+                # convergence the per-server lookup would have
+                # (kind="missing") for any retained obo catalogs, or
+                # ghosts survive every new-session prime: this gate
+                # skips exactly the lookup that would drop them.
+                for name in self._obo_server_names:
+                    obo_key = (user_id, name)
+                    obo_entry = self._user_pool_entries.get(obo_key)
+                    if obo_entry is not None and self._entry_has_catalog(obo_entry):
+                        self._schedule_dead_grant_drop(TokenLookupResult(kind="missing"), obo_key)
                 prime_names -= self._obo_server_names
         await asyncio.gather(*(_prime_one(s) for s in list(prime_names)))
 
@@ -3560,7 +3618,7 @@ class MCPClientManager:
         user_id, server_name = key
         old_names = {t["function"]["name"] for t in (entry.tools or [])}
         # ``asyncio.timeout`` mandatory (R6) — a wedged server must not
-        # hang the notification-handler task; siblings already comply.
+        # hang the spawned refresh task forever; siblings already comply.
         async with asyncio.timeout(self._CONNECT_TIMEOUT):
             result = await session.list_tools()
         if self._user_pool_entries.get(key) is not entry:
@@ -6443,9 +6501,8 @@ class MCPClientManager:
         lookup: TokenLookupResult = await self._pool_token_lookup(
             server_row, user_id, server_name, force_refresh=retry_count > 0
         )
-        lookup_error = _pool_lookup_error(lookup, server_name, server_row)
+        lookup_error = self._pool_lookup_failure(lookup, server_name, server_row, user_id)
         if lookup_error is not None:
-            self._schedule_dead_grant_drop(lookup, (user_id, server_name))
             return lookup_error
         access_token = lookup.token or ""
 
@@ -6590,9 +6647,8 @@ class MCPClientManager:
         lookup: TokenLookupResult = await self._pool_token_lookup(
             server_row, user_id, server_name, force_refresh=retry_count > 0
         )
-        lookup_error = _pool_lookup_error(lookup, server_name, server_row)
+        lookup_error = self._pool_lookup_failure(lookup, server_name, server_row, user_id)
         if lookup_error is not None:
-            self._schedule_dead_grant_drop(lookup, (user_id, server_name))
             return lookup_error
         access_token = lookup.token or ""
 
@@ -6715,9 +6771,8 @@ class MCPClientManager:
         lookup: TokenLookupResult = await self._pool_token_lookup(
             server_row, user_id, server_name, force_refresh=retry_count > 0
         )
-        lookup_error = _pool_lookup_error(lookup, server_name, server_row)
+        lookup_error = self._pool_lookup_failure(lookup, server_name, server_row, user_id)
         if lookup_error is not None:
-            self._schedule_dead_grant_drop(lookup, (user_id, server_name))
             return lookup_error
         access_token = lookup.token or ""
 
@@ -6909,6 +6964,27 @@ class MCPClientManager:
             return False
         return _pool_lookup_verdict(lookup) == "mcp_consent_required"
 
+    def _pool_lookup_failure(
+        self,
+        lookup: TokenLookupResult,
+        server_name: str,
+        server_row: dict[str, Any],
+        user_id: str,
+    ) -> str | None:
+        """Render a failed pool lookup AND pair it with its convergence drop.
+
+        The pairing is the contract (one helper, three dispatchers): a
+        dispatcher that rendered the error without scheduling the drop
+        would keep offering revoked tools behind a consent card — the
+        cross-node non-convergence #836 fixes, silently split by
+        dispatch surface. Returns ``None`` exactly when *lookup*
+        carries a usable bearer.
+        """
+        lookup_error = _pool_lookup_error(lookup, server_name, server_row)
+        if lookup_error is not None:
+            self._schedule_dead_grant_drop(lookup, (user_id, server_name))
+        return lookup_error
+
     def _schedule_dead_grant_drop(self, lookup: TokenLookupResult, key: tuple[str, str]) -> None:
         """Converge live sessions with a durably-gone grant (#836).
 
@@ -6930,24 +7006,42 @@ class MCPClientManager:
         if not self._lookup_grant_dead(lookup):
             return
         self._spawn_background(
-            self._drop_catalog_locked(key),
+            self._drop_catalog_locked(key, skip_if_connected=True),
             f"dead-grant catalog drop for '{key[1]}'",
         )
 
-    async def _drop_catalog_locked(self, key: tuple[str, str]) -> None:
+    async def _drop_catalog_locked(
+        self, key: tuple[str, str], *, skip_if_connected: bool = False
+    ) -> None:
         """Serialize a catalog drop against an in-flight connect.
 
         ``_evict_session_drop_catalog`` alone races
         ``_connect_one_pool``: a connect already past the token check
         publishes its discovery AFTER the drop, resurrecting a revoked
         server's catalog with no remaining path that ever clears it.
-        ``open_lock`` is held for the connect/reuse window only, so the
-        wait is bounded by connect+discovery. Runs on the mcp-loop.
+        ``open_lock`` is held across a same-key dispatch's ENTIRE SDK
+        call (the carrier serialization), so this wait can be a full
+        tool-call long — which is why every caller schedules it as a
+        tracked background task rather than awaiting it inline.
+
+        ``skip_if_connected`` is the dead-grant flavor's re-validation:
+        a dispatch-scheduled drop can be parked long enough for the
+        user to RE-CONSENT and the consent-completion prime to connect
+        and publish a fresh catalog — clearing that would strand the
+        just-restored tools (nothing re-primes until a new session). A
+        live session at drop time proves a connect succeeded after the
+        failed lookup that scheduled us, i.e. the grant is alive again:
+        connects always resolve their bearer through the classified
+        lookup first, so a session cannot exist without a grant that
+        was valid at its connect. The explicit-revocation path passes
+        False: it must clear even (especially) warm sessions.
         """
         entry = self._user_pool_entries.get(key)
         if entry is None:
             return
         async with entry.open_lock:
+            if skip_if_connected and entry.session is not None:
+                return
             self._evict_session_drop_catalog(key)
 
     async def _handle_auth_403(
