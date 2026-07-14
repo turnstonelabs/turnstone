@@ -1595,6 +1595,7 @@ class MCPClientManager:
         origin: str,
         label_prefix: str,
         label_target: str,
+        on_debounce_drop: Callable[[], None] | None = None,
     ) -> None:
         """Admission half of the ``*/list_changed`` protocol — ONE copy.
 
@@ -1620,6 +1621,20 @@ class MCPClientManager:
         notifying-but-slow server from accreting waiters that starve the
         lock's other users (reconnect drivers, dispatches, eviction).
 
+        *on_debounce_drop* recovers the ONE change the debounce genuinely
+        loses: a same-kind push landing in the window AFTER the previous
+        runner already completed (its marker cleared at lock-acquire, its
+        list finished) has no queued runner to observe it and, since MCP
+        servers announce a change once, would leave the catalog stale
+        indefinitely. Static passes an arm of the health-tick retry
+        (idempotent — a set — so a chatty server yields at most one retry
+        per tick, honouring the debounce's throttle while guaranteeing
+        eventual convergence). Pool passes ``None``: it has no health
+        tick, and its residual (a same-kind change debounced away
+        converges only on the entry's next reconnect or a later
+        cross-kind push) is the pre-existing #840 behaviour, unchanged
+        here.
+
         The refresh is SPAWNED, never awaited: the SDK awaits message
         handlers inline in its receive loop, so an in-handler request on
         the same session can never receive its response — only the
@@ -1640,6 +1655,12 @@ class MCPClientManager:
                 origin,
                 now - last,
             )
+            # A push queued behind a still-running runner (marker present)
+            # is already covered — that runner spawns a successor. Only a
+            # push with NO runner in flight is genuinely lost to the
+            # window; hand it to the recovery hook.
+            if on_debounce_drop is not None and marker not in pending:
+                on_debounce_drop()
             return
         if marker in pending:
             log.debug("Coalescing %s notification from %s (refresh queued)", kind, origin)
@@ -1818,6 +1839,7 @@ class MCPClientManager:
                 origin=f"'{name}'",
                 label_prefix="static",
                 label_target=name,
+                on_debounce_drop=lambda: self._arm_refresh_retry(name),
             )
 
         return _on_notification
@@ -4053,6 +4075,16 @@ class MCPClientManager:
         and outside the lock serialization — as an unbounded in-flight
         request on the shared session. On timeout expiry both tasks are
         cancelled together and the caller sees ``TimeoutError``.
+
+        The reap is BOUNDED by its own grace deadline, NOT left inside the
+        outer ``asyncio.timeout`` (which fires exactly once — after it has
+        fired, awaiting the cancelled children there is unbounded). The
+        pinned SDK (mcp>=1.27,<2) honours cancellation promptly, so this
+        is belt-and-braces against a future regression: a child that
+        ignores ``cancel()`` must not wedge this runner while it holds the
+        per-server connect lock — the #839 deadlock class. A child still
+        pending after the grace is logged and abandoned (a cancelled local
+        task, GC-reaped) rather than held onto.
         """
         async with asyncio.timeout(self._CONNECT_TIMEOUT):
             res_task = asyncio.create_task(session.list_resources())
@@ -4062,13 +4094,39 @@ class MCPClientManager:
             except BaseException:
                 # First failure (or our own cancellation, incl. the
                 # timeout's): cancel the pair — a done task ignores it —
-                # and REAP both so nothing survives detached and no
-                # exception goes unretrieved, then surface the original.
+                # and REAP within a bounded grace so nothing survives
+                # detached and no exception goes unretrieved, then surface
+                # the original.
                 for task in (res_task, tmpl_task):
                     task.cancel()
-                await asyncio.gather(res_task, tmpl_task, return_exceptions=True)
+                await self._reap_bounded((res_task, tmpl_task))
                 raise
             return res_result, tmpl_result
+
+    async def _reap_bounded(self, tasks: tuple[asyncio.Task[Any], ...]) -> None:
+        """Await already-cancelled *tasks* under a grace deadline.
+
+        Uses ``asyncio.shield`` so THIS await is immune to the caller's
+        own in-flight cancellation (an expired ``asyncio.timeout`` scope
+        has already delivered its single cancel), and ``asyncio.wait``
+        with a timeout so a child that refuses to honour ``cancel()``
+        cannot block indefinitely. Exceptions on done tasks are retrieved
+        (marking them handled); any straggler is logged and abandoned.
+        """
+        try:
+            done, pending = await asyncio.shield(
+                asyncio.wait(set(tasks), timeout=self._OWNER_CANCEL_GRACE_S)
+            )
+        except asyncio.CancelledError:
+            done, pending = {t for t in tasks if t.done()}, {t for t in tasks if not t.done()}
+        for task in done:
+            with contextlib.suppress(BaseException):
+                task.exception()
+        if pending:
+            log.warning(
+                "MCP resource-list reap: %d task(s) ignored cancellation; abandoning",
+                len(pending),
+            )
 
     async def _refresh_pool_server_resources(
         self, key: tuple[str, str]
@@ -4232,8 +4290,29 @@ class MCPClientManager:
             exc,
         )
         self._set_error(name, f"Refresh failed: {type(exc).__name__}: {exc}")
+        self._arm_refresh_retry(name)
+
+    def _arm_refresh_retry(self, name: str) -> None:
+        """Arm the health-tick refresh retry for *name* — the ONE gate copy.
+
+        Config-gated: a failure/skip/drop observed for a just-removed
+        server must not park a retry flag nothing will ever drain (the
+        tick iterates ``_server_configs`` only).
+        """
         if name in self._server_configs:
             self._static_refresh_retry.add(name)
+
+    def _spawn_full_refresh(self, name: str, label: str) -> None:
+        """Spawn a full logged catalog refresh; consume any pending retry.
+
+        The ONE copy of the discard-then-spawn idiom shared by the three
+        drivers that run a full pass (health-tick retry drain,
+        post-health-reconnect, post-dispatch-reconnect): the spawned pass
+        IS the refresh a pending health-tick retry wants, so clearing the
+        flag first prevents the next tick running a redundant second pass.
+        """
+        self._static_refresh_retry.discard(name)
+        self._spawn_background(self._refresh_server_logged(name), label)
 
     async def _refresh_server(self, name: str) -> tuple[list[str], list[str]] | None:
         """Re-fetch tools, resources, and prompts for one server.
@@ -4392,18 +4471,25 @@ class MCPClientManager:
         except (Exception, BaseExceptionGroup) as exc:
             self._record_refresh_failure(name, exc, context="Background catalog refresh")
         else:
-            if refreshed is None and name in self._server_configs:
-                self._static_refresh_retry.add(name)
+            if refreshed is None:
+                self._arm_refresh_retry(name)
 
     async def _refresh_all(
         self, server_name: str | None = None
-    ) -> dict[str, tuple[list[str], list[str]]]:
+    ) -> dict[str, tuple[list[str], list[str]] | None]:
         """Refresh tools, resources, and prompts for one or all servers.
 
         For disconnected servers (in config but not connected), attempts
-        reconnect.  Returns ``{server: (added, removed)}`` per server.
+        reconnect.  Returns ``{server: (added, removed)}`` per server —
+        or ``None`` for a server whose refresh was SKIPPED (another
+        operation held its lock, or it was removed/evicted mid-pass).
+        ``None`` is a distinct shape on purpose: rendering a skip as
+        ``([], [])`` told the operator "refreshed, no changes" for a
+        server that was never refreshed at all. Skips on live servers
+        also stamp a ``skipped`` ``_last_refresh`` row so the admin pill
+        tells the same story.
         """
-        results: dict[str, tuple[list[str], list[str]]] = {}
+        results: dict[str, tuple[list[str], list[str]] | None] = {}
         targets = [server_name] if server_name else list(self._server_configs.keys())
 
         for name in targets:
@@ -4417,12 +4503,16 @@ class MCPClientManager:
                         # starve every healthy server behind it (the same
                         # reason ``_refresh_server`` busy-skips). The
                         # holder finishes the job: a reconnect ends in
-                        # full rediscovery.
+                        # full rediscovery. No retry arm: the flag drains
+                        # only on live sessions, and a successful reconnect
+                        # already spawns its own full refresh.
                         log.info(
                             "Refresh pass for '%s' skipped: reconnect in flight",
                             name,
                         )
-                        results[name] = ([], [])
+                        if name in self._server_configs:
+                            self._last_refresh[name] = (time.time(), "skipped")
+                        results[name] = None
                         continue
                     # Attempt reconnect via the shared lazy primitive — it owns
                     # the per-name lock, live-session reuse, the in_flight
@@ -4437,8 +4527,9 @@ class MCPClientManager:
                             # Deliberate skip: removed concurrently, or a
                             # sibling call is still in flight on the old
                             # stack. Not a failure — the next refresh or
-                            # health tick retries.
-                            results[name] = ([], [])
+                            # health tick retries; report it as the skip
+                            # it is.
+                            results[name] = None
                             continue
                         post = self._static_servers.get(name)
                         new_names = (
@@ -4452,15 +4543,17 @@ class MCPClientManager:
                     # Skipped (lock busy) or superseded (removed /
                     # evicted) — a deliberate non-outcome: record neither
                     # success nor failure for whatever generation lives
-                    # now. BUT the operator asked for a refresh and a
-                    # busy-skip's lock holder may be a single-kind push
-                    # runner, not the full pass — arm the health-tick
-                    # retry so the request isn't silently dropped
-                    # (mirrors ``_refresh_server_logged``; config-gated,
-                    # so removed servers arm nothing).
+                    # now, and report None so the operator sees "skipped",
+                    # not a fake "no changes". BUT the operator asked for
+                    # a refresh and a busy-skip's lock holder may be a
+                    # single-kind push runner, not the full pass — arm the
+                    # health-tick retry so the request isn't silently
+                    # dropped (mirrors ``_refresh_server_logged``;
+                    # config-gated, so removed servers arm nothing).
                     if name in self._server_configs:
-                        self._static_refresh_retry.add(name)
-                    results[name] = ([], [])
+                        self._arm_refresh_retry(name)
+                        self._last_refresh[name] = (time.time(), "skipped")
+                    results[name] = None
                     continue
                 added, removed = refreshed
                 self._cb_record_success(name)
@@ -4509,10 +4602,16 @@ class MCPClientManager:
 
     def refresh_sync(
         self, server_name: str | None = None, timeout: int = 30
-    ) -> dict[str, tuple[list[str], list[str]]]:
+    ) -> dict[str, tuple[list[str], list[str]] | None]:
         """Refresh tools synchronously (blocks the calling thread).
 
-        Returns ``{server: (added_names, removed_names)}`` per server.
+        Returns ``{server: (added_names, removed_names)}`` per server, or
+        ``{server: None}`` when that server's refresh was SKIPPED (its
+        lock was held by a concurrent reconnect/refresh, or it was
+        removed mid-pass). Callers MUST distinguish ``None`` from
+        ``([], [])``: the latter is a refresh that ran and found no
+        changes; ``None`` is a refresh that never ran, deferred to the
+        health-tick retry.
         """
         assert self._loop is not None
         future = asyncio.run_coroutine_threadsafe(self._refresh_all(server_name), self._loop)
@@ -5390,59 +5489,90 @@ class MCPClientManager:
         if self._loop is not None:
 
             async def _remove() -> None:
+                # FORCE-drop the session before queueing (mirrors
+                # ``reconnect_sync``): parked push-refresh runners bail at
+                # their session gate instead of serializing up to one ≤30s
+                # list call per kind ahead of this removal — the noisy slow
+                # server most in need of removal was exactly the one whose
+                # runners could starve it past every caller budget.
+                # Timeout-safe: the config is still present at this point,
+                # so if the removal is then cancelled while parked, the
+                # health loop simply reconnects — recoverable, never
+                # half-removed.
+                pre = self._static_servers.get(name)
+                if pre is not None:
+                    self._drop_static_session_and_stamp(name, pre)
                 # Hold the per-name connect lock across the WHOLE removal —
                 # including the config pop. Popping the config before
                 # queueing (the old shape) meant a timed-out ``_remove``
-                # (cancelled while parked behind a slow reconnect or the
-                # push-refresh runners this lock now serializes) left a
-                # HALF-REMOVED server: config gone, but session + published
-                # catalogs alive with no driver able to reconnect or
-                # re-remove them. With every mutation under the lock, a
-                # removal cancelled while parked has touched NOTHING — the
-                # caller's False is honest and a retry works. The cost: a
-                # reconnect driver that wins the lock first can rebuild the
-                # session moments before removal — this teardown then
-                # closes it anyway.
+                # (cancelled while parked) left a HALF-REMOVED server:
+                # config gone, but session + published catalogs alive with
+                # no driver able to reconnect or re-remove them. With every
+                # mutation under the lock, a removal cancelled while parked
+                # has touched NOTHING (beyond the recoverable session drop
+                # above) — the caller's False is honest and a retry works.
+                # The cost: a reconnect driver that wins the lock first can
+                # rebuild the session moments before removal — this teardown
+                # then closes it anyway.
                 async with self._static_connect_lock_for(name):
                     self._server_configs.pop(name, None)
-                    # Close session + transport via the owner close protocol
-                    await self._teardown_static_session(name)
-                    # Clean up per-server state (on the event loop thread).
-                    # The push-state clear backs up the teardown call above:
-                    # ``_teardown_static_session`` early-returns (no pop) when
-                    # the state entry is already gone. ``markers=True`` keeps
-                    # a parked old-generation runner's marker from coalescing
-                    # AWAY a re-added server's first push — that runner bails
-                    # at its lock-identity check without refreshing, so
-                    # nothing would cover the dropped change.
-                    self._static_servers.pop(name, None)
-                    self._last_error.pop(name, None)
-                    self._clear_static_push_state(name, markers=True)
-                    self._cb_clear(name)
-                    # Clear health-loop backoff/ping state so a later re-add of
-                    # the same name doesn't inherit stale ``due`` deadlines.
-                    self._static_reconnect_attempt.pop(name, None)
-                    self._static_reconnect_next.pop(name, None)
-                    self._static_next_ping.pop(name, None)
-                    # Rebuild merged state (serialized with notification handlers)
-                    self._rebuild_tools()
-                    self._rebuild_resources()
-                    self._rebuild_prompts()
-                # Drop the now-orphaned per-name lock AFTER releasing it (the
-                # server is gone; a re-add re-creates it lazily).
-                self._static_connect_locks.pop(name, None)
+                    try:
+                        # Close session + transport via the owner close protocol
+                        await self._teardown_static_session(name)
+                    finally:
+                        # SYNC cleanup — all of it, no awaits: it must
+                        # complete even when the caller's timeout cancels us
+                        # inside the teardown awaits above, or a cancel
+                        # landing after the config pop would strand
+                        # published ghost catalogs with no config behind
+                        # them (the abandoned owner unwinds solo — the
+                        # close protocol tolerates that). A removal
+                        # cancelled HERE therefore still completes; the
+                        # caller's False is then stale, but a retry no-ops
+                        # and ``reconcile_sync``'s config post-condition
+                        # sees the truth.
+                        #
+                        # The push-state clear backs up the teardown call:
+                        # ``_teardown_static_session`` early-returns (no
+                        # pop) when the state entry is already gone.
+                        # ``markers=True`` keeps a parked old-generation
+                        # runner's marker from coalescing AWAY a re-added
+                        # server's first push — that runner bails at its
+                        # lock-identity check without refreshing, so
+                        # nothing would cover the dropped change.
+                        self._static_servers.pop(name, None)
+                        self._last_error.pop(name, None)
+                        self._clear_static_push_state(name, markers=True)
+                        self._cb_clear(name)
+                        # Clear health-loop backoff/ping state so a later
+                        # re-add of the same name doesn't inherit stale
+                        # ``due`` deadlines.
+                        self._static_reconnect_attempt.pop(name, None)
+                        self._static_reconnect_next.pop(name, None)
+                        self._static_next_ping.pop(name, None)
+                        # Rebuild merged state (serialized with notification
+                        # handlers on the loop thread).
+                        self._rebuild_tools()
+                        self._rebuild_resources()
+                        self._rebuild_prompts()
+                        # Retire the lock (a re-add re-creates it lazily);
+                        # parked waiters acquire the retired object and bail
+                        # at their identity checks.
+                        self._static_connect_locks.pop(name, None)
 
             future = asyncio.run_coroutine_threadsafe(_remove(), self._loop)
             try:
                 future.result(timeout=timeout)
             except concurrent.futures.TimeoutError:
-                # A slow reconnect (or the push-refresh runners that now
-                # share this lock) held it past our wait. CANCEL the pending
-                # ``_remove`` so it can't later pop a re-added entry (or its
-                # new lock) and corrupt state; report failure rather than a
-                # false "removed". Cancelled-while-parked has mutated
-                # NOTHING (every mutation, including the config pop, sits
-                # under the lock), so the removal is cleanly retryable.
+                # A slow reconnect held the lock past our wait (the session
+                # pre-drop already drained parked push runners). CANCEL the
+                # pending ``_remove`` so it can't later pop a re-added entry
+                # (or its new lock) and corrupt state; report failure rather
+                # than a false "removed". Cancelled while PARKED → nothing
+                # mutated (retry works); cancelled inside the teardown →
+                # the ``finally`` completes the removal anyway (a retry
+                # no-ops, and reconcile's config post-condition sees the
+                # truth either way).
                 future.cancel()
                 log.warning("MCP server '%s' removal timed out; cancelled (retryable)", name)
                 return False
@@ -5665,6 +5795,16 @@ class MCPClientManager:
         # Config-file servers (not in _db_managed) are left untouched.
         for name in list(self._db_managed - desired_names):
             self.remove_server_sync(name, timeout=timeout)
+            if name in self._server_configs:
+                # Removal timed out while parked (it mutates nothing in that
+                # case) — KEEP the name in ``_db_managed`` so the next
+                # reconcile pass retries. Discarding here made a DB-driven
+                # removal a silent, permanent no-op: the removal loop
+                # iterates ``_db_managed - desired``, so a discarded name
+                # can never be removed again while the health loop keeps
+                # the server alive off ``_server_configs``.
+                log.warning("reconcile_sync: removal of '%s' timed out; retrying next pass", name)
+                continue
             self._db_managed.discard(name)
             removed.append(name)
 
@@ -5685,6 +5825,19 @@ class MCPClientManager:
             if desired[name] != self._server_configs.get(name):
                 log.info("Config changed for MCP server '%s', reconnecting", name)
                 self.remove_server_sync(name, timeout=timeout)
+                if name in self._server_configs:
+                    # Removal timed out (nothing mutated) — defer the update
+                    # rather than layering the new config via add: a
+                    # subsequently timed-out add pops the config outright,
+                    # stranding the still-live OLD session as exactly the
+                    # half-removed ghost the locked removal exists to
+                    # prevent. The DB row is unchanged, so the next pass
+                    # sees the same drift and retries.
+                    log.warning(
+                        "reconcile_sync: config update for '%s' deferred (removal timed out)",
+                        name,
+                    )
+                    continue
                 result = self.add_server_sync(name, desired[name], timeout=timeout)
                 if result.get("connected"):
                     updated.append(name)
@@ -6128,11 +6281,7 @@ class MCPClientManager:
         state = self._static_servers.get(name)
         if state is not None and state.session is not None:
             if name in self._static_refresh_retry:
-                self._static_refresh_retry.discard(name)
-                self._spawn_background(
-                    self._refresh_server_logged(name),
-                    f"catalog refresh retry for '{name}'",
-                )
+                self._spawn_full_refresh(name, f"catalog refresh retry for '{name}'")
             return await self._static_ping_one(name, now)
         return await self._static_reconnect_one(name)
 
@@ -6210,15 +6359,7 @@ class MCPClientManager:
         self._static_reconnect_next.pop(name, None)
         next_ping = time.monotonic() + self._static_health_check_s
         self._static_next_ping[name] = next_ping
-        # The full pass spawned below IS the refresh a pending retry flag
-        # wants (a reconnect-branch failure arms the flag without a session
-        # drop to clear it) — discard it so the next tick doesn't run a
-        # redundant second pass.
-        self._static_refresh_retry.discard(name)
-        self._spawn_background(
-            self._refresh_server_logged(name),
-            f"catalog refresh after static health reconnect '{name}'",
-        )
+        self._spawn_full_refresh(name, f"catalog refresh after static health reconnect '{name}'")
         log.info("MCP static health: reconnected '%s'", name)
         return next_ping
 
@@ -6381,13 +6522,8 @@ class MCPClientManager:
         # scheduling itself.
         def _schedule_refresh() -> None:
             try:
-                # This full pass IS the refresh a pending retry flag wants —
-                # discard it so the next health tick doesn't run a redundant
-                # second pass (mirrors ``_static_reconnect_one``).
-                self._static_refresh_retry.discard(server_name)
-                self._spawn_background(
-                    self._refresh_server_logged(server_name),
-                    f"catalog refresh after reconnect for '{server_name}'",
+                self._spawn_full_refresh(
+                    server_name, f"catalog refresh after reconnect for '{server_name}'"
                 )
             except Exception:
                 log.warning(

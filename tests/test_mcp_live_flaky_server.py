@@ -19,8 +19,6 @@ from __future__ import annotations
 import asyncio
 import gc
 import signal
-import subprocess
-import sys
 import textwrap
 import time
 from typing import TYPE_CHECKING
@@ -28,10 +26,11 @@ from unittest.mock import patch
 
 import pytest
 
-from tests.conftest import _free_port, _wait_session_live, _wait_tcp_ready
+from tests.conftest import _free_port, _popen_mcp_server, _wait_session_live, _wait_tcp_ready
 from turnstone.core.mcp_client import MCPClientManager
 
 if TYPE_CHECKING:
+    import subprocess
     from pathlib import Path
 
 SERVER_SRC = textwrap.dedent(
@@ -108,11 +107,7 @@ class TestFlakyServerNoSpin:
         monkeypatch.setattr(MCPClientManager, "_STATIC_HEALTH_PING_TIMEOUT_S", 1.5)
 
         def _spawn_server(*, initial: bool = False) -> subprocess.Popen[bytes]:
-            proc = subprocess.Popen(
-                [sys.executable, str(script), str(port)],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-            )
+            proc = _popen_mcp_server(script, port)
             if not _wait_tcp_ready(port, 10.0):
                 proc.kill()
                 proc.wait(timeout=5)
