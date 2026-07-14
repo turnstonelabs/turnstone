@@ -28,102 +28,12 @@ log = structlog.get_logger(__name__)
 # Model capability table
 # ---------------------------------------------------------------------------
 
+# Table floor: gpt-5.4 (2026-07 pruning) — the o-series and pre-5.4 GPT-5
+# rows were dropped as unused in the field.  A legacy commercial id now
+# resolves to OPENAI_DEFAULT (generic caps: temperature sent, no declared
+# effort vocabulary); anyone still pinning one declares the contract on
+# the model definition's capabilities JSON or moves to a current model.
 OPENAI_CAPABILITIES: dict[str, ModelCapabilities] = {
-    # GPT-5 base — NO temperature support
-    "gpt-5": ModelCapabilities(
-        context_window=400000,
-        max_output_tokens=128000,
-        supports_temperature=False,
-        reasoning_effort_values=("minimal", "low", "medium", "high"),
-        default_reasoning_effort="medium",
-        supports_vision=True,
-        supports_pdf=True,
-        supports_reasoning_replay=True,
-    ),
-    "gpt-5-mini": ModelCapabilities(
-        context_window=400000,
-        max_output_tokens=128000,
-        supports_temperature=False,
-        reasoning_effort_values=("minimal", "low", "medium", "high"),
-        default_reasoning_effort="medium",
-        supports_vision=True,
-        supports_pdf=True,
-        supports_reasoning_replay=True,
-    ),
-    "gpt-5-nano": ModelCapabilities(
-        context_window=400000,
-        max_output_tokens=128000,
-        supports_temperature=False,
-        reasoning_effort_values=("minimal", "low", "medium", "high"),
-        default_reasoning_effort="medium",
-        supports_vision=True,
-        supports_pdf=True,
-        supports_reasoning_replay=True,
-    ),
-    # GPT-5 pro — high reasoning only, extended output
-    "gpt-5-pro": ModelCapabilities(
-        context_window=400000,
-        max_output_tokens=272000,
-        supports_temperature=False,
-        reasoning_effort_values=("high",),
-        default_reasoning_effort="high",
-        supports_vision=True,
-        supports_pdf=True,
-        supports_reasoning_replay=True,
-    ),
-    # GPT-5.1 — temperature OK when reasoning_effort=none (default)
-    "gpt-5.1": ModelCapabilities(
-        context_window=400000,
-        max_output_tokens=128000,
-        reasoning_effort_values=("none", "low", "medium", "high"),
-        default_reasoning_effort="none",
-        supports_vision=True,
-        supports_pdf=True,
-        supports_reasoning_replay=True,
-    ),
-    # GPT-5.1 codex-max — the model xhigh was introduced on; without this
-    # row it would prefix-match "gpt-5.1" (no xhigh) and the knob's xhigh
-    # would wrongly cap at high.  Responses-only, supports explicit none.
-    "gpt-5.1-codex-max": ModelCapabilities(
-        context_window=400000,
-        max_output_tokens=128000,
-        reasoning_effort_values=("none", "low", "medium", "high", "xhigh"),
-        default_reasoning_effort="medium",
-        supports_vision=True,
-        supports_pdf=True,
-        supports_reasoning_replay=True,
-    ),
-    # GPT-5.2 — adds xhigh
-    "gpt-5.2": ModelCapabilities(
-        context_window=400000,
-        max_output_tokens=128000,
-        reasoning_effort_values=("none", "low", "medium", "high", "xhigh"),
-        default_reasoning_effort="none",
-        supports_vision=True,
-        supports_pdf=True,
-        supports_reasoning_replay=True,
-    ),
-    # GPT-5.2 pro — always-reasoning variant
-    "gpt-5.2-pro": ModelCapabilities(
-        context_window=400000,
-        max_output_tokens=128000,
-        supports_temperature=False,
-        reasoning_effort_values=("medium", "high", "xhigh"),
-        default_reasoning_effort="medium",
-        supports_vision=True,
-        supports_pdf=True,
-        supports_reasoning_replay=True,
-    ),
-    # GPT-5.3 — same capabilities as 5.2 (matches gpt-5.3-chat-latest, codex)
-    "gpt-5.3": ModelCapabilities(
-        context_window=400000,
-        max_output_tokens=128000,
-        reasoning_effort_values=("none", "low", "medium", "high", "xhigh"),
-        default_reasoning_effort="none",
-        supports_vision=True,
-        supports_pdf=True,
-        supports_reasoning_replay=True,
-    ),
     # GPT-5.4 — 1M context window, native tool search
     "gpt-5.4": ModelCapabilities(
         context_window=1050000,
@@ -215,68 +125,6 @@ OPENAI_CAPABILITIES: dict[str, ModelCapabilities] = {
         supports_reasoning_replay=True,
         supports_verbosity=True,
         supports_pro_mode=True,
-    ),
-    # O-series reasoning models
-    "o1": ModelCapabilities(
-        context_window=200000,
-        max_output_tokens=100000,
-        supports_temperature=False,
-        reasoning_effort_values=("low", "medium", "high"),
-        default_reasoning_effort="medium",
-        supports_vision=True,
-        supports_pdf=True,
-        supports_reasoning_replay=True,
-    ),
-    "o1-mini": ModelCapabilities(
-        context_window=128000,
-        max_output_tokens=65536,
-        supports_temperature=False,
-        supports_vision=True,
-        supports_pdf=True,
-        supports_reasoning_replay=True,
-    ),
-    # low/medium/high on every o-series model EXCEPT o1-mini (Azure
-    # reasoning guide, 2026-06 revision) — without declared values the
-    # session knob was silently dropped for these models.
-    "o3": ModelCapabilities(
-        context_window=200000,
-        max_output_tokens=100000,
-        supports_temperature=False,
-        reasoning_effort_values=("low", "medium", "high"),
-        default_reasoning_effort="medium",
-        supports_vision=True,
-        supports_pdf=True,
-        supports_reasoning_replay=True,
-    ),
-    "o3-mini": ModelCapabilities(
-        context_window=200000,
-        max_output_tokens=100000,
-        supports_temperature=False,
-        reasoning_effort_values=("low", "medium", "high"),
-        default_reasoning_effort="medium",
-        supports_vision=True,
-        supports_pdf=True,
-        supports_reasoning_replay=True,
-    ),
-    "o3-pro": ModelCapabilities(
-        context_window=200000,
-        max_output_tokens=100000,
-        supports_temperature=False,
-        reasoning_effort_values=("low", "medium", "high"),
-        default_reasoning_effort="medium",
-        supports_vision=True,
-        supports_pdf=True,
-        supports_reasoning_replay=True,
-    ),
-    "o4-mini": ModelCapabilities(
-        context_window=200000,
-        max_output_tokens=100000,
-        supports_temperature=False,
-        reasoning_effort_values=("low", "medium", "high"),
-        default_reasoning_effort="medium",
-        supports_vision=True,
-        supports_pdf=True,
-        supports_reasoning_replay=True,
     ),
     # Search models — always search on every request, no reasoning_effort
     "gpt-5-search-api": ModelCapabilities(

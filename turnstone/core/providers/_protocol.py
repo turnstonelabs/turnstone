@@ -269,7 +269,7 @@ class ModelCapabilities:
     # user's effort setting always reaches the wire, and the serving
     # box is the authority on what it means.  Commercial rows leave
     # this False: there, an empty values list means the model has no
-    # effort control at all (o1-mini) and the param must be omitted.
+    # effort control at all (legacy o1-mini-era models) and the param must be omitted.
     effort_passthrough: bool = False
     supports_web_search: bool = False
     supports_tool_search: bool = False

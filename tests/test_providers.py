@@ -2484,58 +2484,51 @@ class TestOpenAIParameterGating:
         apply_temperature_and_effort(kwargs, caps, temperature=0.7, reasoning_effort="none")
         assert "reasoning_effort" not in kwargs
 
-    def test_gpt5_no_temperature_has_reasoning_effort(self) -> None:
-        """GPT-5 base: no temperature, reasoning_effort sent."""
-        caps = lookup_openai_capabilities("gpt-5")
+    def test_always_reasoning_row_no_temperature_effort_sent(self) -> None:
+        """Always-reasoning rows (gpt-5.4-pro): no temperature ever, the
+        knob's effort value reaches the wire."""
+        caps = lookup_openai_capabilities("gpt-5.4-pro")
         kwargs: dict[str, Any] = {}
         apply_temperature_and_effort(kwargs, caps, temperature=0.7, reasoning_effort="high")
         assert "temperature" not in kwargs
         assert kwargs["reasoning_effort"] == "high"
 
-    def test_gpt51_temperature_when_effort_none(self) -> None:
-        """GPT-5.1: temperature only when reasoning_effort='none'; the
+    def test_gpt54_temperature_when_effort_none(self) -> None:
+        """GPT-5.4: temperature only when reasoning_effort='none'; the
         declared "none" level is forwarded explicitly (knob = off)."""
-        caps = lookup_openai_capabilities("gpt-5.1")
+        caps = lookup_openai_capabilities("gpt-5.4")
         kwargs: dict[str, Any] = {}
         apply_temperature_and_effort(kwargs, caps, temperature=0.7, reasoning_effort="none")
         assert kwargs["temperature"] == 0.7
         assert kwargs["reasoning_effort"] == "none"
 
-    def test_gpt51_no_temperature_when_reasoning_active(self) -> None:
-        """GPT-5.1: no temperature when reasoning is active."""
-        caps = lookup_openai_capabilities("gpt-5.1")
+    def test_gpt54_no_temperature_when_reasoning_active(self) -> None:
+        """GPT-5.4: no temperature when reasoning is active."""
+        caps = lookup_openai_capabilities("gpt-5.4")
         kwargs: dict[str, Any] = {}
         apply_temperature_and_effort(kwargs, caps, temperature=0.7, reasoning_effort="high")
         assert "temperature" not in kwargs
         assert kwargs["reasoning_effort"] == "high"
 
-    def test_o_series_no_temperature_but_effort_forwarded(self) -> None:
-        """O-series: no temperature; low/medium/high ARE valid effort
-        values (all o-series except o1-mini) and the knob reaches them."""
-        caps = lookup_openai_capabilities("o3")
-        kwargs: dict[str, Any] = {}
-        apply_temperature_and_effort(kwargs, caps, temperature=0.7, reasoning_effort="medium")
-        assert "temperature" not in kwargs
-        assert kwargs["reasoning_effort"] == "medium"
-
-    def test_o1_mini_has_no_effort_control(self) -> None:
-        """o1-mini is the one o-series model without reasoning_effort."""
-        caps = lookup_openai_capabilities("o1-mini")
+    def test_no_effort_vocabulary_row_drops_the_knob(self) -> None:
+        """A commercial row with an EMPTY effort vocabulary (the search-api
+        model) drops the session knob — nothing valid to send."""
+        caps = lookup_openai_capabilities("gpt-5-search-api")
         kwargs: dict[str, Any] = {}
         apply_temperature_and_effort(kwargs, caps, temperature=0.7, reasoning_effort="medium")
         assert "reasoning_effort" not in kwargs
 
-    def test_gpt5_pro_unsupported_effort_falls_back(self) -> None:
-        """GPT-5 pro only supports 'high'; unsupported values fall back to default."""
-        caps = lookup_openai_capabilities("gpt-5-pro")
+    def test_pro_row_off_list_effort_snaps_onto_floor(self) -> None:
+        """gpt-5.4-pro declares medium/high/xhigh; an off-list low value
+        rounds UP onto the declared floor."""
+        caps = lookup_openai_capabilities("gpt-5.4-pro")
         kwargs: dict[str, Any] = {}
-        apply_temperature_and_effort(kwargs, caps, temperature=0.7, reasoning_effort="medium")
+        apply_temperature_and_effort(kwargs, caps, temperature=0.7, reasoning_effort="low")
         assert "temperature" not in kwargs
-        assert kwargs["reasoning_effort"] == "high"  # fell back to default
+        assert kwargs["reasoning_effort"] == "medium"
 
-    def test_gpt5_pro_supported_effort_passes_through(self) -> None:
-        """GPT-5 pro accepts 'high' directly."""
-        caps = lookup_openai_capabilities("gpt-5-pro")
+    def test_pro_row_supported_effort_passes_through(self) -> None:
+        caps = lookup_openai_capabilities("gpt-5.4-pro")
         kwargs: dict[str, Any] = {}
         apply_temperature_and_effort(kwargs, caps, temperature=0.7, reasoning_effort="high")
         assert kwargs["reasoning_effort"] == "high"
@@ -3999,7 +3992,7 @@ class TestVisionCapabilities:
         assert caps.supports_vision is False
 
     def test_openai_commercial_supports_vision(self) -> None:
-        for model in ("gpt-5", "gpt-5-mini", "gpt-5.4", "o3", "o4-mini"):
+        for model in ("gpt-5.4", "gpt-5.5", "gpt-5.6", "gpt-5.6-luna"):
             caps = lookup_openai_capabilities(model)
             assert caps.supports_vision is True, f"{model} should support vision"
 
