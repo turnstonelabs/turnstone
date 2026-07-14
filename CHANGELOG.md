@@ -160,6 +160,20 @@ Earlier stable lines (`stable/1.6`, `stable/1.5`) are frozen.
 
 ### Fixed
 
+- **Static MCP servers: a pushed catalog change no longer wedges the shared
+  session (#839).** The static-path `*/list_changed` handler awaited its
+  catalog refresh inline in the SDK's receive loop, but the refresh's own
+  request can only be answered by that (now parked) loop — the refresh never
+  completed, and every user's in-flight calls on the shared per-node session
+  stalled behind it, unbounded, until the health loop's ping timeout tore the
+  transport down (which was also the only way the changed catalog ever
+  landed). Push refreshes now run as spawned tasks — debounced, coalesced per
+  (server, kind), bounded by the connect timeout, and serialized on the
+  per-server connect lock — and the manual/periodic refresh publishes under
+  that same lock, so a slower publisher can no longer land a staler catalog
+  over a fresher one. Every teardown path now also clears the notification
+  debounce stamp, so a reconnected server's first push refreshes immediately.
+
 - **OpenAI Responses streaming: truncated and refused responses no longer
   vanish.** A response that hit `max_output_tokens` terminates the stream
   with `response.incomplete`, which the stream consumer did not handle —

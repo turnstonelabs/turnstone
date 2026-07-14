@@ -148,14 +148,15 @@ _MAX_PROMPTS_PER_SERVER = 1000
 # thundering herd of connects on every session start.
 _PRIME_MAX_CONCURRENCY = 4
 
-# One row per pool ``*/list_changed`` kind: notification type → kind label.
-# The pool notification handler drives all three catalog kinds through this
-# table (plus its kind → bound-method map, which stays mypy-checked attribute
-# access rather than a name-string table) so the debounce/coalesce/log/spawn
-# protocol exists exactly once — a protocol change cannot silently diverge
-# between kinds. Exact-type lookup is safe: the SDK's discriminated-union
-# parser instantiates these concrete classes, never subclasses.
-_POOL_LIST_CHANGED_KINDS: dict[type, str] = {
+# One row per ``*/list_changed`` kind: notification type → kind label.
+# The static AND pool notification handlers drive all three catalog kinds
+# through this table (plus their kind → bound-method maps, which stay
+# mypy-checked attribute access rather than name-string tables) so the
+# debounce/coalesce/log/spawn protocol exists exactly once per path — a
+# protocol change cannot silently diverge between kinds. Exact-type lookup
+# is safe: the SDK's discriminated-union parser instantiates these concrete
+# classes, never subclasses.
+_LIST_CHANGED_KINDS: dict[type, str] = {
     mcp_types.ToolListChangedNotification: "tools",
     mcp_types.ResourceListChangedNotification: "resources",
     mcp_types.PromptListChangedNotification: "prompts",
@@ -718,6 +719,14 @@ class MCPClientManager:
 
         # Notification debounce (per-server)
         self._last_notification_refresh: dict[str, float] = {}
+        # Coalescing markers for spawned static ``list_changed`` refreshes,
+        # keyed ``(server, kind)``: set at spawn, cleared the moment the
+        # runner acquires the per-name connect lock (before its list call).
+        # While set, further notifications for the server+kind are dropped —
+        # the parked runner's fresh list will observe their change — bounding
+        # the connect lock's waiter queue at ONE parked runner per
+        # server+kind. Mirrors ``_pool_refresh_pending``.
+        self._static_refresh_pending: set[tuple[str, str]] = set()
 
         # Last refresh outcome (Phase 9 — admin status indicator).  Per-
         # server tuple of ``(unix_ts, outcome)`` where outcome is one of
@@ -1323,6 +1332,21 @@ class MCPClientManager:
             )
         return disarmed
 
+    def _drop_static_session_and_stamp(self, name: str, state: StaticServerState) -> None:
+        """Null the session AND pop its notification debounce stamp (paired).
+
+        The static twin of :meth:`_drop_session_and_stamp` (pool). The
+        stamp must not outlive the transport: the keep-stamp-on-failure
+        design leans on every teardown popping it, so a reconnected
+        transport's first ``list_changed`` refreshes immediately instead
+        of being debounced against a pre-collapse stamp. An eviction site
+        that nulled the session directly would silently re-open that
+        stale-stamp hole. Safe when the session is already gone: both
+        halves are idempotent.
+        """
+        state.session = None
+        self._last_notification_refresh.pop(name, None)
+
     async def _teardown_static_session(self, name: str) -> None:
         """Tear down a static server's session/transport (the ONE canonical order).
 
@@ -1357,7 +1381,7 @@ class MCPClientManager:
         state = self._static_servers.get(name)
         if state is None:
             return
-        state.session = None
+        self._drop_static_session_and_stamp(name, state)
         owner = state.owner_task
         close_requested = state.close_requested
         state.owner_task = None
@@ -1526,10 +1550,16 @@ class MCPClientManager:
     def _make_static_notification_handler(self, name: str) -> Any:
         """Build the per-server notification handler for a static session.
 
-        Dispatches tool, resource, and prompt list-change notifications to the
-        appropriate refresh method (body unchanged from the pre-owner-task
-        closure in ``_connect_one_locked``; extracted because the session cm
-        is now entered by the transport owner).
+        The handler itself NEVER awaits a request on the session: the SDK
+        awaits message handlers inline in its receive loop, so an in-handler
+        request on the same session can never receive its response — the
+        response can only be routed by the receive loop that is parked
+        awaiting this handler, and while it is parked EVERY in-flight and
+        subsequent call on this shared per-node session stalls with it.
+        List-change refreshes are debounced, coalesced per (server, kind),
+        and SPAWNED as tracked tasks
+        (:meth:`_run_static_notification_refresh`), mirroring the pool
+        handler (:meth:`_make_pool_notification_handler`).
         """
 
         async def _on_notification(
@@ -1537,8 +1567,9 @@ class MCPClientManager:
         ) -> None:
             if not isinstance(msg, mcp_types.ServerNotification):
                 return
-            root = msg.root
-
+            kind = _LIST_CHANGED_KINDS.get(type(msg.root))
+            if kind is None:
+                return
             # Debounce: skip if we refreshed this server very recently
             now = time.monotonic()
             last = self._last_notification_refresh.get(name, 0.0)
@@ -1549,26 +1580,133 @@ class MCPClientManager:
                     now - last,
                 )
                 return
-
+            marker = (name, kind)
+            if marker in self._static_refresh_pending:
+                # A runner for this server+kind is queued but has not yet
+                # issued its list call — it will observe this change when
+                # it runs. Skipping bounds the connect lock's waiter queue
+                # at one parked runner per server+kind, so a notifying-
+                # but-slow server cannot accrete waiters that starve the
+                # reconnect drivers sharing that lock.
+                log.debug(
+                    "Coalescing static %s notification from '%s' (refresh queued)",
+                    kind,
+                    name,
+                )
+                return
             try:
-                if isinstance(root, mcp_types.ToolListChangedNotification):
-                    log.info("Received tools/list_changed from '%s'", name)
-                    self._last_notification_refresh[name] = now
-                    await self._refresh_server_tools(name)
-                elif isinstance(root, mcp_types.ResourceListChangedNotification):
-                    log.info("Received resources/list_changed from '%s'", name)
-                    self._last_notification_refresh[name] = now
-                    await self._refresh_server_resources(name)
-                elif isinstance(root, mcp_types.PromptListChangedNotification):
-                    log.info("Received prompts/list_changed from '%s'", name)
-                    self._last_notification_refresh[name] = now
-                    await self._refresh_server_prompts(name)
-                self._last_error.pop(name, None)
+                # SPAWNED, never awaited — see the factory docstring: an
+                # inline await here wedges the receive loop permanently.
+                # The refresh runs as its own tracked task.
+                #
+                # Bound at dispatch time (not a module-level name table)
+                # so instance-level overrides keep working and mypy
+                # checks the attribute references.
+                refreshers: dict[str, Callable[[str], Awaitable[Any]]] = {
+                    "tools": self._refresh_server_tools,
+                    "resources": self._refresh_server_resources,
+                    "prompts": self._refresh_server_prompts,
+                }
+                log.info("Received %s/list_changed from '%s'", kind, name)
+                self._last_notification_refresh[name] = now
+                self._static_refresh_pending.add(marker)
+                self._spawn_background(
+                    self._run_static_notification_refresh(name, kind, refreshers[kind]),
+                    f"static {kind} refresh for '{name}'",
+                )
             except Exception as exc:
-                log.warning("Refresh after notification failed for '%s'", name, exc_info=True)
-                self._set_error(name, f"Refresh failed: {exc}")
+                # Scheduling failed (loop shutting down) — release the
+                # coalesce marker or this server+kind never refreshes
+                # again. Structured fields only — ``exc_info=True`` would
+                # serialize the chained ``httpx.Request`` whose headers
+                # carry the configured bearer for ``auth_type=static``.
+                self._static_refresh_pending.discard(marker)
+                log.warning(
+                    "Static refresh scheduling failed server=%s exc=%s",
+                    name,
+                    type(exc).__name__,
+                )
 
         return _on_notification
+
+    async def _run_static_notification_refresh(
+        self,
+        name: str,
+        kind: str,
+        refresh: Callable[[str], Awaitable[Any]],
+    ) -> None:
+        """Body of a spawned static ``list_changed`` refresh — never on the receive loop.
+
+        The static-path port of :meth:`_run_notification_refresh` — see that
+        docstring for the full protocol rationale (serialize-then-list so the
+        last publish is always the freshest; coalesce marker cleared at
+        lock-ACQUIRE so a change the in-flight list missed spawns exactly one
+        successor; debounce stamp SURVIVES failure and is popped by every
+        teardown; ``finally`` discard gated on non-acquisition so it never
+        clobbers a successor's marker; bounded wedged-notifier residual).
+        The static primitives differ:
+
+        * Serialization is on the per-name CONNECT lock — the static path's
+          one writer lock, shared with ``_connect_one_locked``'s discovery
+          wiring, ``_refresh_server``, and the teardown protocol.
+        * The remove → re-add race is closed by LOCK IDENTITY (the pool uses
+          entry identity): ``remove_server_sync`` retires the lock object
+          after teardown, so a runner that parked on the OLD lock must not
+          touch state now owned by a NEW-lock holder.
+        * ``(Exception, BaseExceptionGroup)`` is caught type-name-only for
+          the same hygiene reason as the pool runner, but the credential at
+          stake is the CONFIGURED bearer: for ``auth_type=static`` servers
+          the chained ``httpx.Request`` headers carry it, and an escaping
+          exception would reach ``_spawn_background``'s ``exc_info`` log.
+        """
+        marker = (name, kind)
+        lock = self._static_connect_locks.get(name)
+        if lock is None:
+            # Removed (lock retired) between spawn and run — nothing to
+            # refresh; the marker is still ours to release. ``.get()``, not
+            # the get-or-create helper: minting a fresh lock here would
+            # resurrect an entry for a server that no longer exists.
+            self._static_refresh_pending.discard(marker)
+            return
+        acquired = False
+        try:
+            async with lock:
+                self._static_refresh_pending.discard(marker)
+                acquired = True
+                if self._static_connect_locks.get(name) is not lock:
+                    # Removed (and possibly re-added) while we were parked:
+                    # the notification belonged to the old transport, and a
+                    # re-add publishes its own discovery under the NEW lock.
+                    return
+                state = self._static_servers.get(name)
+                if state is None or state.session is None:
+                    # Torn down / evicted while we were parked. The
+                    # reconnect's rediscovery republishes, and every
+                    # teardown pops the debounce stamp, so the reconnected
+                    # transport's first notification refreshes immediately.
+                    return
+                await refresh(name)
+                self._last_error.pop(name, None)
+        except (Exception, BaseExceptionGroup) as exc:
+            # Structured fields only — ``exc_info`` would serialize the
+            # chained ``httpx.Request`` whose headers carry the configured
+            # bearer for ``auth_type=static`` servers.
+            log.warning(
+                "Static %s refresh after notification failed for '%s' exc=%s",
+                kind,
+                name,
+                type(exc).__name__,
+            )
+            self._set_error(name, f"Refresh failed: {type(exc).__name__}")
+        finally:
+            if not acquired:
+                # Cancelled (or failed) while PARKED — the marker still in
+                # the set is OURS; release it or this server+kind never
+                # refreshes again. After the at-acquire discard, a marker
+                # present at exit belongs to the SUCCESSOR spawned during
+                # our in-flight list — discarding it would let the handler
+                # mint runners past the one-parked-runner bound.
+                self._static_refresh_pending.discard(marker)
 
     async def _static_transport_owner(
         self,
@@ -1705,7 +1843,7 @@ class MCPClientManager:
         state.owner_task = None
         state.close_requested = None
         if state.session is not None:
-            state.session = None
+            self._drop_static_session_and_stamp(name, state)
             log.info("MCP server '%s' transport terminated; session evicted for reconnect", name)
 
     async def _connect_one_locked(self, name: str, cfg: dict[str, Any]) -> None:
@@ -1914,7 +2052,7 @@ class MCPClientManager:
         ) -> None:
             if not isinstance(msg, mcp_types.ServerNotification):
                 return
-            kind = _POOL_LIST_CHANGED_KINDS.get(type(msg.root))
+            kind = _LIST_CHANGED_KINDS.get(type(msg.root))
             if kind is None:
                 return
             now = time.monotonic()
@@ -3726,7 +3864,16 @@ class MCPClientManager:
 
         old_names = {t["function"]["name"] for t in state.tools}
 
-        result = await session.list_tools()
+        # ``asyncio.timeout`` mandatory — a wedged server must not hang a
+        # spawned refresh (and the connect lock it holds) forever; the pool
+        # sibling (:meth:`_refresh_pool_server_tools`) already complies.
+        async with asyncio.timeout(self._CONNECT_TIMEOUT):
+            result = await session.list_tools()
+        if self._static_servers.get(name) is not state:
+            # The state entry was replaced (remove + re-add) while
+            # list_tools was in flight — this result belongs to the old
+            # transport; publishing it would clobber the new discovery.
+            return [], []
         capped = _cap_server_tools(name, result.tools)
         server_tools = [_mcp_to_openai(name, tool) for tool in capped]
         new_names = {t["function"]["name"] for t in server_tools}
@@ -3970,31 +4117,45 @@ class MCPClientManager:
         / ``state.prompts`` are bounded to whichever sub-refresh
         succeeded — the documented trade-off vs leaving orphan tasks
         running after the error is observed.
+
+        Serialized on the per-name connect lock: every publisher of a
+        static per-server catalog — a connect's discovery wiring, a
+        spawned notification refresh
+        (:meth:`_run_static_notification_refresh`), and this
+        manual/periodic pass — writes under the same lock, so each list
+        call is issued only after the previous publisher finished and
+        the last publish is always the freshest. An unserialized pass
+        could land its older snapshot over a notification refresh's
+        newer one, with no convergence until the next change. No caller
+        holds the lock coming in: ``_refresh_all`` takes it per-branch
+        (never nested), and the two post-reconnect schedule sites spawn
+        this as its own task.
         """
-        results = await asyncio.gather(
-            self._refresh_server_tools(name),
-            self._refresh_server_resources(name),
-            self._refresh_server_prompts(name),
-            return_exceptions=True,
-        )
-        first_exc: BaseException | None = next(
-            (r for r in results if isinstance(r, BaseException)), None
-        )
-        if first_exc is not None:
-            self._last_refresh[name] = (
-                time.time(),
-                f"error:{type(first_exc).__name__}",
+        async with self._static_connect_lock_for(name):
+            results = await asyncio.gather(
+                self._refresh_server_tools(name),
+                self._refresh_server_resources(name),
+                self._refresh_server_prompts(name),
+                return_exceptions=True,
             )
-            raise first_exc
-        tool_diff = results[0]
-        # ``return_exceptions=True`` widens the static type; on the all-
-        # success path each entry is the awaited result.  We narrow the
-        # tool-diff entry to the documented ``(added, removed)`` shape.
-        assert isinstance(tool_diff, tuple)
-        added, removed = tool_diff
-        self._last_error.pop(name, None)
-        self._last_refresh[name] = (time.time(), "ok")
-        return added, removed
+            first_exc: BaseException | None = next(
+                (r for r in results if isinstance(r, BaseException)), None
+            )
+            if first_exc is not None:
+                self._last_refresh[name] = (
+                    time.time(),
+                    f"error:{type(first_exc).__name__}",
+                )
+                raise first_exc
+            tool_diff = results[0]
+            # ``return_exceptions=True`` widens the static type; on the all-
+            # success path each entry is the awaited result.  We narrow the
+            # tool-diff entry to the documented ``(added, removed)`` shape.
+            assert isinstance(tool_diff, tuple)
+            added, removed = tool_diff
+            self._last_error.pop(name, None)
+            self._last_refresh[name] = (time.time(), "ok")
+            return added, removed
 
     async def _refresh_all(
         self, server_name: str | None = None
@@ -4054,7 +4215,7 @@ class MCPClientManager:
                 if _is_dead_transport(exc):
                     dead_state = self._static_servers.get(name)
                     if dead_state is not None:
-                        dead_state.session = None
+                        self._drop_static_session_and_stamp(name, dead_state)
                 # Overwrite unconditionally with the freshest observed
                 # outcome.  Two cases produce the write:
                 # (1) Reconnect branch: ``_connect_one`` raised before
@@ -4164,8 +4325,22 @@ class MCPClientManager:
         # turn the second list_resource_templates() call into AttributeError.
         session = state.session
 
+        # ``asyncio.timeout`` mandatory — a wedged server must not hang a
+        # spawned refresh (and the connect lock it holds) forever.
+        async with asyncio.timeout(self._CONNECT_TIMEOUT):
+            # 1-RTT (gather) instead of 2 sequential RTTs — both calls
+            # share the same timeout budget and target disjoint catalogs
+            # (resources vs. templates), so ordering is irrelevant.
+            # Mirrors :meth:`_refresh_pool_server_resources`.
+            res_result, tmpl_result = await asyncio.gather(
+                session.list_resources(),
+                session.list_resource_templates(),
+            )
+        if self._static_servers.get(name) is not state:
+            # Entry replaced (remove + re-add) mid-flight — stale result.
+            return
+
         server_resources: list[dict[str, Any]] = []
-        res_result = await session.list_resources()
         for r in res_result.resources:
             server_resources.append(
                 {
@@ -4176,7 +4351,6 @@ class MCPClientManager:
                     "server": name,
                 }
             )
-        tmpl_result = await session.list_resource_templates()
         for t in tmpl_result.resourceTemplates:
             server_resources.append(
                 {
@@ -4222,8 +4396,15 @@ class MCPClientManager:
         # multi-await tomorrow; consistent capture-once idiom.
         session = state.session
 
+        # ``asyncio.timeout`` mandatory — a wedged server must not hang a
+        # spawned refresh (and the connect lock it holds) forever.
+        async with asyncio.timeout(self._CONNECT_TIMEOUT):
+            prompt_result = await session.list_prompts()
+        if self._static_servers.get(name) is not state:
+            # Entry replaced (remove + re-add) mid-flight — stale result.
+            return
+
         server_prompts: list[dict[str, Any]] = []
-        prompt_result = await session.list_prompts()
         for p in prompt_result.prompts:
             server_prompts.append(
                 {
@@ -4648,7 +4829,7 @@ class MCPClientManager:
             async def _close_all_owners() -> None:
                 owners: list[asyncio.Task[None]] = []
                 for srv_name, srv_state in list(self._static_servers.items()):
-                    srv_state.session = None
+                    self._drop_static_session_and_stamp(srv_name, srv_state)
                     owner = srv_state.owner_task
                     close_requested = srv_state.close_requested
                     srv_state.owner_task = None
@@ -4727,6 +4908,7 @@ class MCPClientManager:
         self._circuit_open_until.clear()
         self._circuit_trip_count.clear()
         self._last_notification_refresh.clear()
+        self._static_refresh_pending.clear()
         self._last_pool_notification_refresh.clear()
         self._pool_refresh_pending.clear()
         # Pool state already cleared above when the loop was alive; this
@@ -4872,7 +5054,7 @@ class MCPClientManager:
                         fail_state.tools = []
                         fail_state.resources = []
                         fail_state.prompts = []
-                        fail_state.session = None
+                        self._drop_static_session_and_stamp(name, fail_state)
                     self._rebuild_tools()
                     self._rebuild_resources()
                     self._rebuild_prompts()
@@ -5801,7 +5983,7 @@ class MCPClientManager:
             busy = evict is not None and evict.in_flight > 0
             if dead and evict is not None and not busy and evict.session is session:
                 self._cb_record_failure(name)
-                evict.session = None
+                self._drop_static_session_and_stamp(name, evict)
                 asap = time.monotonic()
                 self._static_reconnect_next[name] = asap  # reconnect asap
                 self._static_reconnect_attempt.pop(name, None)
@@ -5915,7 +6097,7 @@ class MCPClientManager:
         if dead:
             evict = self._static_servers.get(server_name)
             if evict is not None:
-                evict.session = None
+                self._drop_static_session_and_stamp(server_name, evict)
 
     async def _static_session_op(self, server_name: str, op: Coroutine[Any, Any, Any]) -> Any:
         """Await a static session op on the mcp-loop, pinned against eviction.
