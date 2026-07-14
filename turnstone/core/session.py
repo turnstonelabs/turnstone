@@ -70,6 +70,7 @@ from turnstone.core.lowering import (
     tool_args_preview,
     wire_valid_arguments,
 )
+from turnstone.core.mcp_client import try_prime_user_pools
 from turnstone.core.memory import (
     count_messages,
     count_structured_memories,
@@ -161,7 +162,7 @@ from turnstone.core.preview import (
     resolve_preview_kind,
     transcode_text,
 )
-from turnstone.core.providers import create_provider
+from turnstone.core.providers import accumulate_tool_call_delta, create_provider
 from turnstone.core.ratelimit import TokenBucket
 from turnstone.core.safety import is_command_blocked, sanitize_command
 from turnstone.core.settings_registry import DEFAULT_AUTO_COMPACT_PCT
@@ -1689,15 +1690,27 @@ class ChatSession:
         #     listeners register so tool/resource/prompt refreshes flow
         #     through to this session.
         #   * interactive (no mcp) — INTERACTIVE_TOOLS.
+        # Unconditional — every session kind carries the counter, so its
+        # existence never encodes "MCP was wired at construction" (a
+        # late-bound client or a directly-invoked callback must not
+        # AttributeError inside the listener fan-out, where per-callback
+        # exceptions are swallowed).
+        self._mcp_tools_change_seq = 0
+        # Construction-scoped (a local, NOT instance state): the seq
+        # value at the authoritative merged read, compared once at the
+        # end of tool setup. Only ``_mcp_tools_change_seq`` lives on.
+        mcp_tools_seq_at_read = 0
         if kind == WorkstreamKind.COORDINATOR:
             self._tools = list(COORDINATOR_TOOLS)
             self._task_tools = []
         elif self._mcp_client:
             # ``self._mcp_client`` (not the raw kwarg) so an MCP-off persona
             # falls through to the no-MCP branch below.
-            mcp_tools = self._mcp_client.get_tools(user_id=self._mcp_user_id)
-            self._tools = merge_mcp_tools(INTERACTIVE_TOOLS, mcp_tools)
-            self._task_tools = merge_mcp_tools(TASK_AGENT_TOOLS, mcp_tools)
+            # Constants first — the attributes must exist for a listener
+            # callback firing mid-construction; the ONE authoritative
+            # merged read runs after the registrations below.
+            self._tools = list(INTERACTIVE_TOOLS)
+            self._task_tools = list(TASK_AGENT_TOOLS)
             # Register for tool-change notifications from MCP servers.
             # ``user_id`` is the listener identity component — pool-only
             # changes for OTHER users must not fire this callback.
@@ -1713,21 +1726,28 @@ class ChatSession:
             # for OTHER users do not wake this session.
             self._mcp_prompt_cb = self._on_mcp_prompts_changed
             self._mcp_client.add_prompt_listener(self._mcp_prompt_cb, user_id=self._mcp_user_id)
+            # Single authoritative read, AFTER the registrations: a
+            # catalog change firing earlier than this fans out to the
+            # listeners just registered, so nothing can slip between
+            # read and register with its only notification unheard. A
+            # change firing AFTER this read is converged by the seq
+            # re-check at the end of tool setup (once every
+            # _on_mcp_tools_changed dependency exists) — a callback
+            # running mid-construction may crash into not-yet-assigned
+            # attributes and be swallowed by the fan-out, losing its
+            # effect, and one that succeeds here would be clobbered by
+            # the tool-search construction below reading mixed state.
+            mcp_tools_seq_at_read = self._mcp_tools_change_seq
+            mcp_tools = self._mcp_client.get_tools(user_id=self._mcp_user_id)
+            self._tools = merge_mcp_tools(INTERACTIVE_TOOLS, mcp_tools)
+            self._task_tools = merge_mcp_tools(TASK_AGENT_TOOLS, mcp_tools)
             # Proactively warm this user's per-user OAuth (oauth_user) pools so
             # their tools are present without a manual reconnect (e.g. after a
             # reboot/upgrade, or right after consent). Fire-and-forget — the
             # listeners registered just above deliver the catalog to this
             # session once each prime completes. No-op for users with no
             # consented oauth_user servers.
-            if self._mcp_user_id and hasattr(self._mcp_client, "prime_user_pools"):
-                try:
-                    self._mcp_client.prime_user_pools(self._mcp_user_id)
-                except Exception:
-                    log.debug(
-                        "mcp prime_user_pools scheduling failed user=%s",
-                        self._mcp_user_id,
-                        exc_info=True,
-                    )
+            try_prime_user_pools(self._mcp_client, self._mcp_user_id, context="session-start")
         else:
             self._tools = INTERACTIVE_TOOLS
             self._task_tools = TASK_AGENT_TOOLS
@@ -1774,6 +1794,20 @@ class ChatSession:
                 max_results=tool_search_max_results,
                 reranker=self._bm25_reranker(),
             )
+        # Converge with any MCP catalog change that fired during
+        # construction: a listener callback landing between the
+        # authoritative read and here either crashed into
+        # not-yet-assigned attributes (swallowed by the fan-out) or was
+        # clobbered by the setup above. Every _on_mcp_tools_changed
+        # dependency now exists, so re-running the full callback is
+        # safe — it rebuilds the merged lists, rendered descriptions,
+        # and search index from the CURRENT maps.
+        if (
+            self._kind != WorkstreamKind.COORDINATOR
+            and self._mcp_client
+            and self._mcp_tools_change_seq != mcp_tools_seq_at_read
+        ):
+            self._on_mcp_tools_changed()
         # Skill: explicit name overrides is_default skills.  ``skill_arguments``
         # carries the spec's $ARGUMENTS payload — set at create/load time,
         # substituted into the skill body by ``_load_skills``.
@@ -2466,6 +2500,12 @@ class ChatSession:
         # is fixed at COORDINATOR_TOOLS.  Ignore MCP server changes.
         if self._kind == WorkstreamKind.COORDINATOR:
             return
+        # Monotonic change marker: the constructor snapshots this around
+        # its authoritative post-registration read and re-runs this
+        # callback if it advanced — otherwise a notification landing
+        # between that read and its assignments is clobbered by the
+        # staler snapshot (its only notification already consumed).
+        self._mcp_tools_change_seq += 1
         # Pass the effective user_id (acting user on shared workstreams,
         # owner otherwise) so the merged tool list includes that user's
         # pool catalog. The static path is included by ``get_tools``
@@ -3017,7 +3057,21 @@ class ChatSession:
             return
 
         lines: list[str] = []
-        for srv, (added, removed) in sorted(results.items()):
+        for srv, diff in sorted(results.items()):
+            if diff is None:
+                # No catalog produced — the refresh either was SKIPPED
+                # (lock held by a concurrent reconnect/push refresh, or
+                # removed mid-pass) or FAILED. Disambiguate via the
+                # authoritative outcome so the operator is never told a
+                # stale/broken server is current. Both are distinct from
+                # "no changes".
+                outcome = self._mcp_client.last_refresh_outcome(srv) or ""
+                if outcome.startswith("error"):
+                    lines.append(f"  {srv}: {RED}refresh failed{RESET} ({dim(outcome)})")
+                else:
+                    lines.append(f"  {srv}: {dim('skipped (busy — retry scheduled)')}")
+                continue
+            added, removed = diff
             if added or removed:
                 summary: list[str] = []
                 if added:
@@ -5614,15 +5668,7 @@ class ChatSession:
                 mcp.remove_prompt_listener(self._mcp_prompt_cb, user_id=old_listener_uid)
                 mcp.add_prompt_listener(self._mcp_prompt_cb, user_id=new_listener_uid)
             self._mcp_listener_user_id = new_listener_uid
-        if new_listener_uid and hasattr(mcp, "prime_user_pools"):
-            try:
-                mcp.prime_user_pools(new_listener_uid)
-            except Exception:
-                log.debug(
-                    "mcp prime_user_pools scheduling failed user=%s",
-                    new_listener_uid,
-                    exc_info=True,
-                )
+        try_prime_user_pools(mcp, new_listener_uid, context="acting-user-change")
         # Rebuild the merged tool list and resource/prompt-dependent
         # state under the new identity NOW — the prime above completes
         # asynchronously and only notifies on catalog changes, while
@@ -6719,20 +6765,11 @@ class ChatSession:
                     if in_think:
                         in_think = False
                     for tcd in chunk.tool_call_deltas:
-                        idx = tcd.index
-                        if idx not in tool_calls_acc:
-                            tool_calls_acc[idx] = {
-                                "id": "",
-                                "type": "function",
-                                "function": {"name": "", "arguments": ""},
-                            }
-                        tc = tool_calls_acc[idx]
-                        if tcd.id:
-                            tc["id"] = tcd.id
-                        if tcd.name:
-                            tc["function"]["name"] = tcd.name
-                        if tcd.arguments_delta:
-                            tc["function"]["arguments"] += tcd.arguments_delta
+                        # THE tool-call merge rule, shared with drain_stream
+                        # and the Google raw-fidelity capture — the chat
+                        # loop and every drained lane assemble identical
+                        # calls from identical wire streams.
+                        accumulate_tool_call_delta(tool_calls_acc, tcd)
 
                 # Informational messages (e.g. server-side web search status)
                 if chunk.info_delta:
@@ -15134,11 +15171,19 @@ class ChatSession:
             # One plant call per attempt through ``model_turn`` — the seam
             # passes (sanitize, minted-id restore, Phase 5 reasoning attach)
             # and the native-lane re-ingest live there now, shared with every
-            # lane (#827).  Retry policy stays HERE: the sub-harness owns its
-            # backoff and salvage semantics, and ``model_turn`` is policy-free
-            # by contract.  Re-lowering per attempt is fine — the passes are
-            # deterministic and ``turns``/``wire_id_map`` are invariant across
-            # attempts (the retry path only sleeps and re-sends).
+            # lane (#827).  Retry policy at THIS layer stays here: the
+            # sub-harness owns its backoff and salvage semantics.
+            # ``model_turn`` itself re-issues only drain-time mid-stream
+            # deaths (2 attempts, its own short backoff — the request-level
+            # retry the SDK gave the retired non-streaming transport), so
+            # the two ladders stack multiplicatively on transient-shaped
+            # failures; both are short, and a deterministic failure (e.g. a
+            # server that never sends finish reasons) burns
+            # (_MAX_RETRIES+1) x (drain attempts) calls before the
+            # remediation error surfaces.  Re-lowering per attempt is fine —
+            # the passes are deterministic and ``turns``/``wire_id_map`` are
+            # invariant across attempts (the retry path only sleeps and
+            # re-sends).
             last_err: Exception | None = None
             for attempt in range(self._MAX_RETRIES + 1):
                 try:

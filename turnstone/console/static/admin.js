@@ -6341,7 +6341,6 @@ let _rerankCalFields = {};
 // known model keeps tracking future table updates instead of being pinned.
 const _MODEL_CAP_KEYS = [
   "supports_tools",
-  "supports_streaming",
   "supports_vision",
   "supports_pdf",
   "supports_web_search",
@@ -6356,7 +6355,6 @@ const _MODEL_CAP_KEYS = [
 ];
 const _MODEL_CAP_DEFAULTS = {
   supports_tools: true,
-  supports_streaming: true,
   supports_vision: false,
   supports_pdf: false,
   supports_web_search: false,

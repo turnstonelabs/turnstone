@@ -16,14 +16,13 @@ import threading
 import time
 import uuid
 from dataclasses import dataclass, field
-from functools import partial
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from turnstone.core.deadline import (
     DeadlineCancelledError,
     DeadlineExceededError,
-    run_with_deadline,
+    run_abortable_with_deadline,
 )
 from turnstone.core.log import get_logger
 from turnstone.core.model_turn import model_turn, resolve_capabilities, resolve_lane
@@ -32,6 +31,8 @@ from turnstone.core.trajectory import Turn
 if TYPE_CHECKING:
     from collections.abc import Callable
 
+    from turnstone.core.deadline import StreamAbortRef
+    from turnstone.core.model_turn import ModelTurnResult
     from turnstone.core.providers._protocol import LLMProvider, ModelCapabilities
 
 log = get_logger(__name__)
@@ -1392,18 +1393,30 @@ class IntentJudge:
                 # non-daemon thread that would block interpreter exit — the old
                 # single-slot ThreadPoolExecutor left a stuck worker that
                 # poisoned the pool, which is why the restart dance existed.
+                # The abort wiring (fresh ref per turn) closes the abandoned
+                # worker's HTTP stream so the read raises promptly.
                 # Temperature is deliberately NOT pinned (house rule): the
                 # lane inherits the judge model's configured temperature —
                 # many modern models misbehave below 1.0, so the model's own
                 # configuration beats a hard determinism pin.
-                result = run_with_deadline(
-                    partial(
-                        model_turn,
+                turn_tools = None if is_last_turn else tools
+
+                # Bound default: the call runs synchronously within this
+                # iteration; the binding makes the per-turn capture explicit
+                # (and satisfies B023 in the loop).
+                def _sample(
+                    ref: StreamAbortRef, _tools: list[dict[str, Any]] | None = turn_tools
+                ) -> ModelTurnResult:
+                    return model_turn(
                         lane,
                         judge_turns,
-                        tools=None if is_last_turn else tools,
+                        tools=_tools,
                         max_tokens=2048,
-                    ),
+                        cancel_ref=ref,
+                    )
+
+                result = run_abortable_with_deadline(
+                    _sample,
                     timeout=per_call_timeout,
                     cancel_event=cancel_event,
                     thread_name="judge-api",

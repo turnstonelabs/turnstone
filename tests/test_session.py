@@ -11,7 +11,13 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from tests._session_helpers import mock_completion_result
+from tests._session_helpers import (
+    FakeAnthropicBlock,
+    as_stream,
+    mock_completion_result,
+    scripted_anthropic_client,
+    scripted_chat_client,
+)
 from turnstone.core.session import _IMAGE_EXTENSIONS, _IMAGE_SIZE_CAP, ChatSession
 from turnstone.core.trajectory import (
     Turn,
@@ -1716,7 +1722,7 @@ class TestTitleRetry:
         # Mock provider to raise
         session._provider = MagicMock()
         session._provider.get_capabilities.return_value = ModelCapabilities()
-        session._provider.create_completion.side_effect = RuntimeError("API error")
+        session._provider.create_streaming.side_effect = RuntimeError("API error")
 
         session._generate_title()
 
@@ -1737,7 +1743,7 @@ class TestTitleRetry:
         result.content = "Test Title"
         session._provider = MagicMock()
         session._provider.get_capabilities.return_value = ModelCapabilities()
-        session._provider.create_completion.return_value = result
+        session._provider.create_streaming.return_value = as_stream(result)
 
         with patch("turnstone.core.session.update_workstream_title"):
             session._generate_title()
@@ -1765,7 +1771,7 @@ class TestTitleRetry:
         )
         session._provider = MagicMock()
         session._provider.get_capabilities.return_value = ModelCapabilities()
-        session._provider.create_completion.return_value = result
+        session._provider.create_streaming.return_value = as_stream(result)
 
         captured: dict[str, str] = {}
         with patch(
@@ -1778,7 +1784,7 @@ class TestTitleRetry:
         # Reasoning gets room to finish rather than a 200-token squeeze that
         # the think pass swallows whole (the empty-content regression); and the
         # title call forces no temperature — it defers to the session value.
-        _, kw = session._provider.create_completion.call_args
+        _, kw = session._provider.create_streaming.call_args
         assert kw["max_tokens"] == _TITLE_MAX_TOKENS
         assert kw["temperature"] == session.temperature
 
@@ -1796,7 +1802,7 @@ class TestTitleRetry:
         result.content = "<think>still reasoning, never closed before the cap"
         session._provider = MagicMock()
         session._provider.get_capabilities.return_value = ModelCapabilities()
-        session._provider.create_completion.return_value = result
+        session._provider.create_streaming.return_value = as_stream(result)
 
         with patch("turnstone.core.session.update_workstream_title") as upd:
             session._generate_title()
@@ -1826,7 +1832,7 @@ class TestTitleRetry:
             result.content = content
             session._provider = MagicMock()
             session._provider.get_capabilities.return_value = ModelCapabilities()
-            session._provider.create_completion.return_value = result
+            session._provider.create_streaming.return_value = as_stream(result)
 
             captured: dict[str, str] = {}
             with patch(
@@ -1849,7 +1855,7 @@ class TestTitleRetry:
         result.content = "Story " * 40  # 240 chars on one line
         session._provider = MagicMock()
         session._provider.get_capabilities.return_value = ModelCapabilities()
-        session._provider.create_completion.return_value = result
+        session._provider.create_streaming.return_value = as_stream(result)
 
         captured: dict[str, str] = {}
         with patch(
@@ -1876,14 +1882,14 @@ class TestTitleRetry:
         result.content = "Test Title"
         session._provider = MagicMock()
         session._provider.get_capabilities.return_value = ModelCapabilities()
-        session._provider.create_completion.return_value = result
+        session._provider.create_streaming.return_value = as_stream(result)
 
         # Simulate resume() changing ws_id while title generation is in flight
         def _change_ws_id(*args, **kwargs):
             session._ws_id = "different-ws-id"
-            return result
+            return as_stream(result)
 
-        session._provider.create_completion.side_effect = _change_ws_id
+        session._provider.create_streaming.side_effect = _change_ws_id
 
         with patch("turnstone.core.session.update_workstream_title") as mock_update:
             session._generate_title()
@@ -2054,34 +2060,20 @@ class TestAgentOutputGuard:
             session, "_evaluate_output", wraps=lambda cid, o, fn, **_kw: (o, None)
         ) as mock_eval:
             # Simulate _run_agent getting a tool call response then a text response
-            call_count = [0]
-
-            def fake_create(**kwargs):
-                call_count[0] += 1
-                resp = MagicMock()
-                if call_count[0] == 1:
-                    # First call: model returns a tool call
-                    choice = MagicMock()
-                    choice.finish_reason = "tool_calls"
-                    tc = MagicMock()
-                    tc.id = "call_1"
-                    tc.function.name = "read_file"
-                    tc.function.arguments = '{"path": "/tmp/test"}'
-                    choice.message.tool_calls = [tc]
-                    choice.message.content = None
-                    resp.choices = [choice]
-                    resp.usage = MagicMock(prompt_tokens=10, completion_tokens=5)
-                else:
-                    # Second call: model returns text (done)
-                    choice = MagicMock()
-                    choice.finish_reason = "stop"
-                    choice.message.tool_calls = None
-                    choice.message.content = "Done"
-                    resp.choices = [choice]
-                    resp.usage = MagicMock(prompt_tokens=10, completion_tokens=5)
-                return resp
-
-            session.client.chat.completions.create = fake_create
+            # Script: a tool-call turn, then text (done).
+            session.client.chat.completions.create = scripted_chat_client(
+                {
+                    "tool_calls": [
+                        {
+                            "id": "call_1",
+                            "name": "read_file",
+                            "arguments": '{"path": "/tmp/test"}',
+                        }
+                    ],
+                    "finish_reason": "tool_calls",
+                },
+                {"content": "Done"},
+            )
 
             # Mock tool preparation to return a simple output
             def fake_prepare(tc_dict, **kwargs):
@@ -2120,32 +2112,19 @@ class TestAgentOutputGuard:
         session._provider = OpenAIChatCompletionsProvider()
 
         with patch.object(session, "_evaluate_output") as mock_eval:
-            call_count = [0]
-
-            def fake_create(**kwargs):
-                call_count[0] += 1
-                resp = MagicMock()
-                if call_count[0] == 1:
-                    choice = MagicMock()
-                    choice.finish_reason = "tool_calls"
-                    tc = MagicMock()
-                    tc.id = "call_1"
-                    tc.function.name = "read_file"
-                    tc.function.arguments = '{"path": "/tmp/test"}'
-                    choice.message.tool_calls = [tc]
-                    choice.message.content = None
-                    resp.choices = [choice]
-                    resp.usage = MagicMock(prompt_tokens=10, completion_tokens=5)
-                else:
-                    choice = MagicMock()
-                    choice.finish_reason = "stop"
-                    choice.message.tool_calls = None
-                    choice.message.content = "Done"
-                    resp.choices = [choice]
-                    resp.usage = MagicMock(prompt_tokens=10, completion_tokens=5)
-                return resp
-
-            session.client.chat.completions.create = fake_create
+            session.client.chat.completions.create = scripted_chat_client(
+                {
+                    "tool_calls": [
+                        {
+                            "id": "call_1",
+                            "name": "read_file",
+                            "arguments": '{"path": "/tmp/test"}',
+                        }
+                    ],
+                    "finish_reason": "tool_calls",
+                },
+                {"content": "Done"},
+            )
 
             def fake_prepare(tc_dict, **kwargs):
                 return {
@@ -2183,18 +2162,7 @@ class TestAgentOutputGuard:
         with patch.object(
             session, "_evaluate_output", wraps=lambda cid, o, fn, **_kw: (o, None)
         ) as mock_eval:
-
-            def fake_create(**_kwargs):
-                resp = MagicMock()
-                choice = MagicMock()
-                choice.finish_reason = "stop"
-                choice.message.tool_calls = None
-                choice.message.content = synth
-                resp.choices = [choice]
-                resp.usage = MagicMock(prompt_tokens=10, completion_tokens=5)
-                return resp
-
-            session.client.chat.completions.create = fake_create
+            session.client.chat.completions.create = scripted_chat_client({"content": synth})
 
             result = session._run_agent(
                 [Turn.user("test")],
@@ -2222,18 +2190,9 @@ class TestAgentOutputGuard:
         with patch.object(
             session, "_evaluate_output", wraps=lambda cid, o, fn: (o, None)
         ) as mock_eval:
-
-            def fake_create(**_kwargs):
-                resp = MagicMock()
-                choice = MagicMock()
-                choice.finish_reason = "length"
-                choice.message.tool_calls = None
-                choice.message.content = partial
-                resp.choices = [choice]
-                resp.usage = MagicMock(prompt_tokens=10, completion_tokens=5)
-                return resp
-
-            session.client.chat.completions.create = fake_create
+            session.client.chat.completions.create = scripted_chat_client(
+                {"content": partial, "finish_reason": "length"}
+            )
             result = session._run_agent(
                 [Turn.user("test")],
                 tools=[{"type": "function", "function": {"name": "read_file"}}],
@@ -2348,33 +2307,20 @@ class TestAgentOutputGuard:
         session.agent_max_turns = 1  # one tool turn, then forced synthesis
 
         forced = "Forced synthesis after hitting the tool-turn ceiling."
-        call_count = [0]
 
         with patch.object(
             session, "_evaluate_output", wraps=lambda cid, o, fn, **_kw: (o, None)
         ) as mock_eval:
-
-            def fake_create(**_kwargs):
-                call_count[0] += 1
-                resp = MagicMock()
-                choice = MagicMock()
-                if call_count[0] == 1:
-                    # First call: tool call, eats the turn budget.
-                    choice.finish_reason = "tool_calls"
-                    tc = MagicMock()
-                    tc.id = "call_1"
-                    tc.function.name = "read_file"
-                    tc.function.arguments = '{"path": "/tmp/x"}'
-                    choice.message.tool_calls = [tc]
-                    choice.message.content = None
-                else:
-                    # Forced synthesis turn.
-                    choice.finish_reason = "stop"
-                    choice.message.tool_calls = None
-                    choice.message.content = forced
-                resp.choices = [choice]
-                resp.usage = MagicMock(prompt_tokens=10, completion_tokens=5)
-                return resp
+            # Script: a tool call eats the turn budget, then forced synthesis.
+            fake_create = scripted_chat_client(
+                {
+                    "tool_calls": [
+                        {"id": "call_1", "name": "read_file", "arguments": '{"path": "/tmp/x"}'}
+                    ],
+                    "finish_reason": "tool_calls",
+                },
+                {"content": forced},
+            )
 
             session.client.chat.completions.create = fake_create
 
@@ -2413,29 +2359,15 @@ class TestAgentChildRegistration:
         session._provider = OpenAIChatCompletionsProvider()
         session.ui.note_agent_child = MagicMock()
 
-        call_count = [0]
-
-        def fake_create(**_kwargs):
-            call_count[0] += 1
-            resp = MagicMock()
-            choice = MagicMock()
-            if call_count[0] == 1:
-                choice.finish_reason = "tool_calls"
-                tc = MagicMock()
-                tc.id = "call_1"
-                tc.function.name = "read_file"
-                tc.function.arguments = '{"path": "/tmp/x"}'
-                choice.message.tool_calls = [tc]
-                choice.message.content = None
-            else:
-                choice.finish_reason = "stop"
-                choice.message.tool_calls = None
-                choice.message.content = "done"
-            resp.choices = [choice]
-            resp.usage = MagicMock(prompt_tokens=10, completion_tokens=5)
-            return resp
-
-        session.client.chat.completions.create = fake_create
+        session.client.chat.completions.create = scripted_chat_client(
+            {
+                "tool_calls": [
+                    {"id": "call_1", "name": "read_file", "arguments": '{"path": "/tmp/x"}'}
+                ],
+                "finish_reason": "tool_calls",
+            },
+            {"content": "done"},
+        )
 
         def fake_prepare(tc_dict, **_kwargs):
             return {
@@ -2472,32 +2404,22 @@ class TestAgentChildRegistration:
         session._provider = OpenAIChatCompletionsProvider()
         session.ui.note_agent_child = MagicMock()
 
-        call_count = [0]
+        def _reused_call(path: str) -> dict:
+            # id reused verbatim across turns — the local-server shape.
+            return {
+                "tool_calls": [{"id": "call_0", "name": "read_file", "arguments": path}],
+                "finish_reason": "tool_calls",
+            }
 
-        def fake_create(**_kwargs):
-            call_count[0] += 1
-            resp = MagicMock()
-            choice = MagicMock()
-            if call_count[0] <= 2:
-                choice.finish_reason = "tool_calls"
-                tc = MagicMock()
-                tc.id = "call_0"  # reused verbatim across turns
-                tc.function.name = "read_file"
-                tc.function.arguments = f'{{"path": "/tmp/f{call_count[0]}"}}'
-                choice.message.tool_calls = [tc]
-                choice.message.content = None
-            else:
-                choice.finish_reason = "stop"
-                choice.message.tool_calls = None
-                choice.message.content = "done"
-            resp.choices = [choice]
-            resp.usage = MagicMock(prompt_tokens=10, completion_tokens=5)
-            return resp
-
-        session.client.chat.completions.create = fake_create
+        client_fn = scripted_chat_client(
+            _reused_call('{"path": "/tmp/f1"}'),
+            _reused_call('{"path": "/tmp/f2"}'),
+            {"content": "done"},
+        )
+        session.client.chat.completions.create = client_fn
 
         def fake_prepare(tc_dict, **_kwargs):
-            n = call_count[0]
+            n = len(client_fn.calls)
             return {
                 "call_id": tc_dict["id"],
                 "func_name": "read_file",
@@ -2531,31 +2453,16 @@ class TestAgentChildRegistration:
     @staticmethod
     def _reusing_provider(session, tool_turns: int = 1):
         """Fake create() reissuing id "call_0" for ``tool_turns`` turns, then
-        stopping — the local-server id-reuse shape.  Returns the counter."""
-        call_count = [0]
-
-        def fake_create(**_kwargs):
-            call_count[0] += 1
-            resp = MagicMock()
-            choice = MagicMock()
-            if call_count[0] <= tool_turns:
-                choice.finish_reason = "tool_calls"
-                tc = MagicMock()
-                tc.id = "call_0"
-                tc.function.name = "read_file"
-                tc.function.arguments = '{"path": "/tmp/x"}'
-                choice.message.tool_calls = [tc]
-                choice.message.content = None
-            else:
-                choice.finish_reason = "stop"
-                choice.message.tool_calls = None
-                choice.message.content = "done"
-            resp.choices = [choice]
-            resp.usage = MagicMock(prompt_tokens=10, completion_tokens=5)
-            return resp
-
-        session.client.chat.completions.create = fake_create
-        return call_count
+        stopping — the local-server id-reuse shape."""
+        reused = {
+            "tool_calls": [
+                {"id": "call_0", "name": "read_file", "arguments": '{"path": "/tmp/x"}'}
+            ],
+            "finish_reason": "tool_calls",
+        }
+        session.client.chat.completions.create = scripted_chat_client(
+            *([reused] * tool_turns), {"content": "done"}
+        )
 
     def test_parent_id_reuse_across_runs_mints_distinct_child_ids(self):
         # A local provider reuses "call_0" for the PARENT task_agent call too:
@@ -2617,33 +2524,22 @@ class TestAgentChildRegistration:
         session._provider = OpenAIChatCompletionsProvider()
         session.ui.note_agent_child = MagicMock()
 
-        seen_messages: list[list[dict]] = []
-        call_count = [0]
-
-        def fake_create(**kwargs):
-            seen_messages.append(kwargs.get("messages") or [])
-            call_count[0] += 1
-            resp = MagicMock()
-            choice = MagicMock()
-            if call_count[0] == 1:
-                choice.finish_reason = "tool_calls"
-                tc = MagicMock()
-                tc.id = "call_0"
-                tc.function.name = "read_file"
-                # Malformed: unterminated JSON with a non-"length" finish
-                # reason — the sanitize pass's reason to exist.
-                tc.function.arguments = '{"path": "/tmp/x"'
-                choice.message.tool_calls = [tc]
-                choice.message.content = None
-            else:
-                choice.finish_reason = "stop"
-                choice.message.tool_calls = None
-                choice.message.content = "done"
-            resp.choices = [choice]
-            resp.usage = MagicMock(prompt_tokens=10, completion_tokens=5)
-            return resp
-
-        session.client.chat.completions.create = fake_create
+        client_fn = scripted_chat_client(
+            {
+                "tool_calls": [
+                    {
+                        "id": "call_0",
+                        "name": "read_file",
+                        # Malformed: unterminated JSON with a non-"length"
+                        # finish reason — the sanitize pass's reason to exist.
+                        "arguments": '{"path": "/tmp/x"',
+                    }
+                ],
+                "finish_reason": "tool_calls",
+            },
+            {"content": "done"},
+        )
+        session.client.chat.completions.create = client_fn
 
         def fake_prepare(tc_dict, **_kwargs):
             return {
@@ -2669,7 +2565,7 @@ class TestAgentChildRegistration:
         # shape the provider-native tool_use block also holds, so a native
         # replay and a rebuild agree); arguments are legalized to a JSON
         # object.
-        replay = seen_messages[1]
+        replay = client_fn.calls[1].get("messages") or []
         wire_calls = [tc for m in replay if m.get("tool_calls") for tc in m["tool_calls"]]
         wire_results = [m for m in replay if m.get("role") == "tool"]
         assert wire_calls and wire_results
@@ -2688,45 +2584,26 @@ class TestAgentChildRegistration:
         # thinking-enabled tool_use turn without its thinking block).
         from turnstone.core.providers._anthropic import AnthropicProvider
 
-        class _Block:
-            def __init__(self, **d):
-                self._d = d
-                for k, v in d.items():
-                    setattr(self, k, v)
-
-            def model_dump(self, **_kw):
-                return dict(self._d)
-
         session = _make_session()
         session._provider = AnthropicProvider()
         session.ui.note_agent_child = MagicMock()
 
-        seen: list[dict] = []
-        call_count = [0]
-
-        def fake_stream(**kwargs):
-            seen.append(kwargs)
-            call_count[0] += 1
-            resp = MagicMock()
-            if call_count[0] == 1:
-                resp.content = [
-                    _Block(type="thinking", thinking="check the file first", signature="sig_v1"),
-                    _Block(type="text", text="reading"),
-                    _Block(type="tool_use", id="toolu_01AB", name="read_file", input={"path": "x"}),
-                ]
-                resp.stop_reason = "tool_use"
-            else:
-                resp.content = [_Block(type="text", text="done")]
-                resp.stop_reason = "end_turn"
-            resp.usage = None
-            mgr = MagicMock()
-            mgr.__enter__ = MagicMock(
-                return_value=MagicMock(get_final_message=MagicMock(return_value=resp))
-            )
-            mgr.__exit__ = MagicMock(return_value=False)
-            return mgr
-
-        session.client.messages.stream = fake_stream
+        client_fn = scripted_anthropic_client(
+            {
+                "blocks": [
+                    FakeAnthropicBlock(
+                        type="thinking", thinking="check the file first", signature="sig_v1"
+                    ),
+                    FakeAnthropicBlock(type="text", text="reading"),
+                    FakeAnthropicBlock(
+                        type="tool_use", id="toolu_01AB", name="read_file", input={"path": "x"}
+                    ),
+                ],
+                "stop_reason": "tool_use",
+            },
+            {"blocks": [FakeAnthropicBlock(type="text", text="done")]},
+        )
+        session.client.messages.stream = client_fn
 
         def fake_prepare(tc_dict, **_kwargs):
             return {
@@ -2756,7 +2633,7 @@ class TestAgentChildRegistration:
         # Internal key stays minted — the nesting registry saw the "::" id.
         assert session.ui.note_agent_child.call_args.args[0] == "task-1::r1s1::toolu_01AB"
         # Second request: the assistant wire turn IS the native lane.
-        replay = seen[1]["messages"]
+        replay = client_fn.calls[1]["messages"]
         assistant = next(
             m for m in replay if m["role"] == "assistant" and isinstance(m.get("content"), list)
         )
@@ -2785,45 +2662,24 @@ class TestAgentChildRegistration:
         # fallback (pinned in test_model_turn).
         from turnstone.core.providers._anthropic import AnthropicProvider
 
-        class _Block:
-            def __init__(self, **d):
-                self._d = d
-                for k, v in d.items():
-                    setattr(self, k, v)
-
-            def model_dump(self, **_kw):
-                return dict(self._d)
-
         session = _make_session()
         session._provider = AnthropicProvider()
         session.ui.note_agent_child = MagicMock()
 
-        seen: list[dict] = []
-        call_count = [0]
-
-        def fake_stream(**kwargs):
-            seen.append(kwargs)
-            call_count[0] += 1
-            resp = MagicMock()
-            if call_count[0] == 1:
-                resp.content = [
-                    _Block(type="thinking", thinking="hm", signature="sig_b"),
+        client_fn = scripted_anthropic_client(
+            {
+                "blocks": [
+                    FakeAnthropicBlock(type="thinking", thinking="hm", signature="sig_b"),
                     # Blank provider id — the back-fill case.
-                    _Block(type="tool_use", id="", name="read_file", input={"path": "x"}),
-                ]
-                resp.stop_reason = "tool_use"
-            else:
-                resp.content = [_Block(type="text", text="done")]
-                resp.stop_reason = "end_turn"
-            resp.usage = None
-            mgr = MagicMock()
-            mgr.__enter__ = MagicMock(
-                return_value=MagicMock(get_final_message=MagicMock(return_value=resp))
-            )
-            mgr.__exit__ = MagicMock(return_value=False)
-            return mgr
-
-        session.client.messages.stream = fake_stream
+                    FakeAnthropicBlock(
+                        type="tool_use", id="", name="read_file", input={"path": "x"}
+                    ),
+                ],
+                "stop_reason": "tool_use",
+            },
+            {"blocks": [FakeAnthropicBlock(type="text", text="done")]},
+        )
+        session.client.messages.stream = client_fn
 
         def fake_prepare(tc_dict, **_kwargs):
             return {
@@ -2863,7 +2719,7 @@ class TestAgentChildRegistration:
         # The replay request carries the native lane verbatim — thinking and
         # signature intact — with tool_use and tool_result agreeing on the
         # manufactured id: no blank id, no orphan, no lost reasoning.
-        replay = seen[1]["messages"]
+        replay = client_fn.calls[1]["messages"]
         assistant = next(
             m for m in replay if m["role"] == "assistant" and isinstance(m.get("content"), list)
         )
@@ -2902,33 +2758,19 @@ class TestAgentChildRegistration:
         )
         session.ui.note_agent_child = MagicMock()
 
-        call_count = [0]
-
-        def fake_create(**kwargs):
-            call_count[0] += 1
-            resp = MagicMock()
-            choice = MagicMock()
-            if call_count[0] == 1:
-                choice.finish_reason = "tool_calls"
-                tc = MagicMock()
-                tc.id = ""  # blank — the back-fill case
-                tc.function.name = "read_file"
-                tc.function.arguments = '{"path": "x"}'
-                choice.message.tool_calls = [tc]
-                choice.message.content = None
-                choice.message.reasoning = None
-                choice.message.reasoning_content = "work it out"
-            else:
-                choice.finish_reason = "stop"
-                choice.message.tool_calls = None
-                choice.message.content = "done"
-                choice.message.reasoning = None
-                choice.message.reasoning_content = None
-            resp.choices = [choice]
-            resp.usage = MagicMock(prompt_tokens=1, completion_tokens=1)
-            return resp
-
-        session.client.chat.completions.create = fake_create
+        session.client.chat.completions.create = scripted_chat_client(
+            {
+                "tool_calls": [
+                    # blank id — the back-fill case
+                    {"id": "", "name": "read_file", "arguments": '{"path": "x"}'}
+                ],
+                "finish_reason": "tool_calls",
+                "reasoning_content": "work it out",
+                "prompt_tokens": 1,
+                "completion_tokens": 1,
+            },
+            {"content": "done", "prompt_tokens": 1, "completion_tokens": 1},
+        )
 
         def fake_prepare(tc_dict, **_kwargs):
             return {
@@ -2980,35 +2822,15 @@ class TestAgentChildRegistration:
         )
         session.ui.note_agent_child = MagicMock()
 
-        seen_messages: list[list[dict]] = []
-        call_count = [0]
-
-        def fake_create(**kwargs):
-            seen_messages.append(kwargs.get("messages") or [])
-            call_count[0] += 1
-            resp = MagicMock()
-            choice = MagicMock()
-            if call_count[0] == 1:
-                choice.finish_reason = "tool_calls"
-                tc = MagicMock()
-                tc.id = "call_0"
-                tc.function.name = "read_file"
-                tc.function.arguments = '{"path": "x"}'
-                choice.message.tool_calls = [tc]
-                choice.message.content = None
-                choice.message.reasoning = None
-                choice.message.reasoning_content = "scan the repo first"
-            else:
-                choice.finish_reason = "stop"
-                choice.message.tool_calls = None
-                choice.message.content = "done"
-                choice.message.reasoning = None
-                choice.message.reasoning_content = None
-            resp.choices = [choice]
-            resp.usage = MagicMock(prompt_tokens=10, completion_tokens=5)
-            return resp
-
-        session.client.chat.completions.create = fake_create
+        client_fn = scripted_chat_client(
+            {
+                "tool_calls": [{"id": "call_0", "name": "read_file", "arguments": '{"path": "x"}'}],
+                "finish_reason": "tool_calls",
+                "reasoning_content": "scan the repo first",
+            },
+            {"content": "done"},
+        )
+        session.client.chat.completions.create = client_fn
 
         def fake_prepare(tc_dict, **_kwargs):
             return {
@@ -3042,7 +2864,7 @@ class TestAgentChildRegistration:
         # The replay request carries the vLLM ``reasoning`` field on the
         # assistant turn; the internal ``_provider_content`` key is stripped
         # by the provider's sanitize before the wire.
-        replay = seen_messages[1]
+        replay = client_fn.calls[1].get("messages") or []
         assistant_wire = next(m for m in replay if m.get("role") == "assistant")
         assert assistant_wire.get("reasoning") == "scan the repo first"
         assert "_provider_content" not in assistant_wire
@@ -3062,29 +2884,15 @@ class TestRunAgentDenialMessage:
         session = _make_session()
         session._provider = OpenAIChatCompletionsProvider()
 
-        call_count = [0]
-
-        def fake_create(**_kwargs):
-            call_count[0] += 1
-            resp = MagicMock()
-            choice = MagicMock()
-            if call_count[0] == 1:
-                choice.finish_reason = "tool_calls"
-                tc = MagicMock()
-                tc.id = "call_1"
-                tc.function.name = "notify"
-                tc.function.arguments = '{"message": "hi"}'
-                choice.message.tool_calls = [tc]
-                choice.message.content = None
-            else:
-                choice.finish_reason = "stop"
-                choice.message.tool_calls = None
-                choice.message.content = "done"
-            resp.choices = [choice]
-            resp.usage = MagicMock(prompt_tokens=10, completion_tokens=5)
-            return resp
-
-        session.client.chat.completions.create = fake_create
+        session.client.chat.completions.create = scripted_chat_client(
+            {
+                "tool_calls": [
+                    {"id": "call_1", "name": "notify", "arguments": '{"message": "hi"}'}
+                ],
+                "finish_reason": "tool_calls",
+            },
+            {"content": "done"},
+        )
         # approve_tools is the real two-phase gate: on denial it stamps a
         # specific denial_msg on the item AND returns the reason as its 2nd
         # value.  The sub-agent must honour both, not overwrite them.
@@ -3370,29 +3178,15 @@ class TestSubAgentErrorRecall:
 
         session = _make_session()
         session._provider = OpenAIChatCompletionsProvider()
-        calls = [0]
-
-        def fake_create(**_kwargs):
-            calls[0] += 1
-            resp = MagicMock()
-            choice = MagicMock()
-            if calls[0] == 1:
-                choice.finish_reason = "tool_calls"
-                tc = MagicMock()
-                tc.id = "call_1"
-                tc.function.name = "bash"
-                tc.function.arguments = '{"command":"false"}'
-                choice.message.tool_calls = [tc]
-                choice.message.content = None
-            else:
-                choice.finish_reason = "stop"
-                choice.message.tool_calls = None
-                choice.message.content = "done"
-            resp.choices = [choice]
-            resp.usage = MagicMock(prompt_tokens=10, completion_tokens=5)
-            return resp
-
-        session.client.chat.completions.create = fake_create
+        session.client.chat.completions.create = scripted_chat_client(
+            {
+                "tool_calls": [
+                    {"id": "call_1", "name": "bash", "arguments": '{"command":"false"}'}
+                ],
+                "finish_reason": "tool_calls",
+            },
+            {"content": "done"},
+        )
 
         def fake_prepare(tc_dict, **_kwargs):
             cid = tc_dict["id"]
@@ -7605,15 +7399,17 @@ def test_utility_completion_records_aux_usage():
     session = _make_session(ui=ui)
     session._provider = MagicMock()
     session._provider.get_capabilities.return_value = ModelCapabilities()
-    session._provider.create_completion.return_value = CompletionResult(
-        content="A Generated Title",
-        usage=UsageInfo(
-            prompt_tokens=120,
-            completion_tokens=8,
-            total_tokens=128,
-            cache_creation_tokens=4,
-            cache_read_tokens=16,
-        ),
+    session._provider.create_streaming.return_value = as_stream(
+        CompletionResult(
+            content="A Generated Title",
+            usage=UsageInfo(
+                prompt_tokens=120,
+                completion_tokens=8,
+                total_tokens=128,
+                cache_creation_tokens=4,
+                cache_read_tokens=16,
+            ),
+        )
     )
 
     session._utility_completion([Turn.user("hi")])
@@ -7639,14 +7435,14 @@ def test_utility_completion_defers_temperature_to_session():
     session.temperature = 0.42
     session._provider = MagicMock()
     session._provider.get_capabilities.return_value = ModelCapabilities()
-    session._provider.create_completion.return_value = CompletionResult(content="x")
+    session._provider.create_streaming.return_value = as_stream(CompletionResult(content="x"))
 
     session._utility_completion([Turn.user("hi")])
-    _, kw = session._provider.create_completion.call_args
+    _, kw = session._provider.create_streaming.call_args
     assert kw["temperature"] == 0.42  # deferred to the session/registry value
 
     session._utility_completion([Turn.user("hi")], temperature=0.9)
-    _, kw2 = session._provider.create_completion.call_args
+    _, kw2 = session._provider.create_streaming.call_args
     assert kw2["temperature"] == 0.9  # explicit override still honored
 
 

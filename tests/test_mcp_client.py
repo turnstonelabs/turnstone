@@ -7,15 +7,19 @@ import concurrent.futures
 import contextlib
 import inspect
 import json
+import threading
 import time
 from contextlib import AsyncExitStack, suppress
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import anyio
+import mcp.types as mcp_types
 import pytest
 
-from tests.conftest import _seed_static_state
+from tests.conftest import _drain_background, _run_on_loop, _seed_static_state
 from turnstone.core.mcp_client import (
+    _MAX_RESOURCES_PER_SERVER,
     MCPClientManager,
     _db_servers_to_config,
     _is_dead_transport,
@@ -1106,6 +1110,9 @@ class TestLastRefreshTracking:
             return_value=MagicMock(resourceTemplates=[])
         )
         mock_session.list_prompts = AsyncMock(return_value=MagicMock(prompts=[]))
+        # Config present: outcome writes are config-gated (a removed server
+        # must leave no stale row), so the tracked server must be configured.
+        mgr._server_configs[name] = {"type": "stdio", "command": "x"}
         _seed_static_state(
             mgr,
             name,
@@ -1133,16 +1140,22 @@ class TestLastRefreshTracking:
         asyncio.run(_run())
 
     def test_last_refresh_written_on_tool_refresh_failure(self) -> None:
-        """When ``_refresh_server_tools`` raises, the outcome reflects
-        the exception class and the exception still propagates."""
+        """When ``_refresh_server_tools`` raises, ``_refresh_server``
+        propagates the exception; the OUTCOME row is written by the
+        caller's ``_record_refresh_failure`` (one config-gated place),
+        which the spawned ``_refresh_server_logged`` wrapper routes
+        through."""
 
         async def _run() -> None:
             mgr = MCPClientManager({})
             mock_session = self._seed_minimal(mgr)
             mock_session.list_tools = AsyncMock(side_effect=RuntimeError("upstream down"))
 
+            # _refresh_server itself propagates (the caller records).
             with pytest.raises(RuntimeError, match="upstream down"):
                 await mgr._refresh_server("srv")
+            # The caller (here the logged wrapper) records the outcome.
+            await mgr._refresh_server_logged("srv")
 
             entry = mgr._last_refresh.get("srv")
             assert entry is not None
@@ -1167,15 +1180,16 @@ class TestLastRefreshTracking:
             mock_session.list_resources = AsyncMock(side_effect=ValueError("res boom"))
             mock_session.list_prompts = AsyncMock(side_effect=KeyError("prompts boom"))
 
+            # _refresh_server raises the first exception (positional gather
+            # order: resources arg #2 before prompts arg #3); the caller
+            # records that class as the outcome.
             with pytest.raises((ValueError, KeyError)):
                 await mgr._refresh_server("srv")
+            await mgr._refresh_server_logged("srv")
 
             entry = mgr._last_refresh.get("srv")
             assert entry is not None
             _, outcome = entry
-            # Either of the two failing tasks could be "first" in
-            # gather's results list ordering — the order is positional
-            # so resources (arg #2) comes before prompts (arg #3).
             assert outcome == "error:ValueError"
 
         asyncio.run(_run())
@@ -1494,6 +1508,36 @@ class TestSessionRefresh:
         session.handle_command("/mcp refresh")
         session.ui.on_error.assert_called_once()
         assert "MCP refresh failed" in session.ui.on_error.call_args[0][0]
+
+    def test_mcp_refresh_renders_skip_distinctly(self, tmp_db):
+        # A None result (busy-skip) with a "skipped" outcome must NOT render
+        # as "no changes" — the operator would think the server is current.
+        mock_mcp = MagicMock()
+        mock_mcp.get_tools.return_value = [_fake_openai_tool()]
+        mock_mcp.server_names = ["srv"]
+        mock_mcp.refresh_sync.return_value = {"srv": None}
+        mock_mcp.last_refresh_outcome.return_value = "skipped"
+        session = self._make_session(mcp_client=mock_mcp)
+
+        session.handle_command("/mcp refresh")
+        rendered = session.ui.on_info.call_args[0][0]
+        assert "skipped" in rendered
+        assert "no changes" not in rendered
+
+    def test_mcp_refresh_renders_failure_distinctly(self, tmp_db):
+        # A None result whose outcome is an error must render as a failure,
+        # NOT as "no changes" (the pre-#839 lie the None sentinel closes).
+        mock_mcp = MagicMock()
+        mock_mcp.get_tools.return_value = [_fake_openai_tool()]
+        mock_mcp.server_names = ["srv"]
+        mock_mcp.refresh_sync.return_value = {"srv": None}
+        mock_mcp.last_refresh_outcome.return_value = "error:ConnectionError"
+        session = self._make_session(mcp_client=mock_mcp)
+
+        session.handle_command("/mcp refresh")
+        rendered = session.ui.on_info.call_args[0][0]
+        assert "failed" in rendered
+        assert "no changes" not in rendered
 
 
 # ---------------------------------------------------------------------------
@@ -2589,12 +2633,17 @@ class TestCircuitBreaker:
             mock_session.list_prompts = AsyncMock(side_effect=dead)
             _seed_static_state(mgr, "test", session=mock_session)
 
-            await mgr._refresh_all("test")
+            results = await mgr._refresh_all("test")
 
             # Dead session evicted → next refresh tick / dispatch reconnects.
             assert mgr._static_servers["test"].session is None
             ts, outcome = mgr._last_refresh["test"]
             assert outcome == "error:ClosedResourceError"
+            # A FAILURE reports None, NOT ([], []) — rendering a failed
+            # refresh as "no changes" is the operator lie the sentinel
+            # closes; the outcome disambiguates None (error vs skipped).
+            assert results["test"] is None
+            assert mgr.last_refresh_outcome("test") == "error:ClosedResourceError"
 
         asyncio.run(_run())
 
@@ -2844,37 +2893,1191 @@ class TestSafeTransportStreams:
 
 
 # ---------------------------------------------------------------------------
-# Fix 4: Notification debounce
+# Notification debounce is covered BEHAVIORALLY (through the real handler) by
+# TestStaticNotificationRefresh — per-kind independence, coalescing, and the
+# debounce-drop retry arm. The old stamp-arithmetic TestNotificationDebounce
+# was deleted: it seeded a dict and asserted time math on the same dict,
+# exercising no product code path.
 # ---------------------------------------------------------------------------
 
 
-class TestNotificationDebounce:
-    """Verify notification-triggered refreshes are debounced."""
+# ---------------------------------------------------------------------------
+# Static-path list_changed refresh — spawned runner protocol (#839)
+# ---------------------------------------------------------------------------
 
-    def test_debounce_within_window(self):
-        mgr = MCPClientManager({})
-        mgr._last_notification_refresh["srv"] = time.monotonic()
-        # We can't easily call _on_notification (it's a closure), so test
-        # the debounce logic directly via the timestamp check
-        now = time.monotonic()
-        last = mgr._last_notification_refresh.get("srv", 0.0)
-        assert now - last < mgr._NOTIFICATION_DEBOUNCE
 
-    def test_debounce_passes_after_window(self):
-        mgr = MCPClientManager({})
-        # Set timestamp well in the past
-        mgr._last_notification_refresh["srv"] = time.monotonic() - 10
-        now = time.monotonic()
-        last = mgr._last_notification_refresh.get("srv", 0.0)
-        assert now - last >= mgr._NOTIFICATION_DEBOUNCE
+class TestStaticNotificationRefresh:
+    """The static ``*/list_changed`` protocol: spawn / serialize / coalesce.
 
-    def test_debounce_is_per_server(self):
+    Static twin of ``test_mcp_user_pool.py``'s notification-runner suite.
+    The SDK awaits message handlers inline in its receive loop, so a
+    handler that awaits a request on the SAME session self-deadlocks the
+    loop (#839) — and static sessions are shared per node, so every
+    user's in-flight calls on that server stall with it. The refresh must
+    be spawned, serialized on the per-name connect lock, coalesced per
+    (server, kind), and keep bearer-carrying exception chains out of the
+    logs on failure.
+    """
+
+    def test_list_changed_handler_spawns_refresh_off_receive_loop(self, running_loop_mgr) -> None:
+        """The notification handler must SPAWN the refresh, not await it:
+        an in-handler request on the same session can never receive its
+        response (only the parked receive loop could route it), so
+        push-driven static refreshes structurally never completed."""
+        mgr, loop, _thread = running_loop_mgr
+        refreshed: list[str] = []
+
+        async def _fake_refresh(name: str) -> tuple[list[str], list[str]]:
+            refreshed.append(name)
+            return [], []
+
+        mgr._refresh_server_tools = _fake_refresh  # type: ignore[method-assign]
+        handler = mgr._make_static_notification_handler("srv")
+
+        async def _fire() -> bool:
+            mgr._static_connect_lock_for("srv")
+            _seed_static_state(mgr, "srv", session=MagicMock())
+            note = mcp_types.ServerNotification(
+                mcp_types.ToolListChangedNotification(method="notifications/tools/list_changed")
+            )
+            await handler(note)
+            # The handler returned WITHOUT running the refresh inline —
+            # it must complete even though the refresh hasn't run yet.
+            return len(refreshed) == 0
+
+        returned_before_refresh = _run_on_loop(loop, _fire())
+        assert returned_before_refresh, "handler must not await the refresh inline"
+        _drain_background(mgr, loop)
+        assert refreshed == ["srv"]
+        # Debounce stamp consumed at schedule time (storm dedupe); the
+        # runner released its coalesce marker at lock acquire.
+        assert ("srv", "tools") in mgr._last_notification_refresh
+        assert not mgr._static_refresh_pending
+
+    def test_handler_ignores_non_list_changed_messages(self, running_loop_mgr) -> None:
+        """Non-ServerNotification messages (RequestResponder / Exception)
+        must schedule nothing — no stamp, no marker, no task."""
+        mgr, loop, _thread = running_loop_mgr
+        handler = mgr._make_static_notification_handler("srv")
+
+        async def _fire() -> int:
+            before = len(mgr._background_tasks)
+            await handler(MagicMock())
+            return len(mgr._background_tasks) - before
+
+        assert _run_on_loop(loop, _fire()) == 0
+        assert ("srv", "tools") not in mgr._last_notification_refresh
+        assert not mgr._static_refresh_pending
+
+    def test_notification_coalesces_when_refresh_already_queued(self, running_loop_mgr) -> None:
+        """While a runner is queued for a server+kind (coalesce marker
+        set), further notifications spawn NOTHING — the parked runner's
+        fresh list observes their change when it acquires the lock. This
+        bounds the connect lock's waiter queue at one parked runner per
+        server+kind: without it a notifying-but-slow server accretes
+        waiters (admitted 1/5s, drained 1/30s) that starve the reconnect
+        drivers sharing the lock, while ``_background_tasks`` grows
+        without bound."""
+        mgr, loop, _thread = running_loop_mgr
+        refreshed: list[str] = []
+
+        async def _fake_refresh(name: str) -> tuple[list[str], list[str]]:
+            refreshed.append(name)
+            return [], []
+
+        mgr._refresh_server_tools = _fake_refresh  # type: ignore[method-assign]
+        handler = mgr._make_static_notification_handler("srv")
+
+        async def _fire_twice() -> int:
+            lock = mgr._static_connect_lock_for("srv")
+            _seed_static_state(mgr, "srv", session=MagicMock())
+            await lock.acquire()  # park the first runner
+            note = mcp_types.ServerNotification(
+                mcp_types.ToolListChangedNotification(method="notifications/tools/list_changed")
+            )
+            before = len(mgr._background_tasks)
+            await handler(note)
+            # Age the stamp past the debounce window: the MARKER (not
+            # the stamp) must do the suppression for the second fire.
+            mgr._last_notification_refresh[("srv", "tools")] = time.monotonic() - 10.0
+            await handler(note)
+            spawned = len(mgr._background_tasks) - before
+            lock.release()
+            return spawned
+
+        spawned = _run_on_loop(loop, _fire_twice())
+        _drain_background(mgr, loop)
+        assert spawned == 1, "second notification must coalesce into the parked runner"
+        assert refreshed == ["srv"]
+        # The runner released its own marker at lock acquire.
+        assert not mgr._static_refresh_pending
+
+    def test_notification_refresh_failure_keeps_debounce_stamp(self, running_loop_mgr) -> None:
+        """A failed spawned refresh must KEEP the debounce stamp: popping
+        it re-arms the handler on every notification, so a fast-failing
+        server spawns unthrottled refresh tasks at its notification rate.
+        The bounded cost — a change announced in the remainder of the
+        failed window waits for the health tick's retry (armed by this
+        failure), the server's next ``list_changed``, or the next
+        reconnect — is the lesser failure (every teardown pops the
+        stamp, so a reconnect's first notification refreshes immediately).
+        The recorded operator error is ``type: message`` — never the
+        serialized exception chain, which can carry the configured
+        bearer for ``auth_type=static``."""
+        mgr, loop, _thread = running_loop_mgr
+
+        async def _seed() -> None:
+            mgr._static_connect_lock_for("srv")
+            _seed_static_state(mgr, "srv", session=MagicMock())
+
+        _run_on_loop(loop, _seed())
+        mgr._last_notification_refresh[("srv", "tools")] = 123.0
+
+        async def _boom(_name: str) -> tuple[list[str], list[str]]:
+            raise TimeoutError("slow server")
+
+        _run_on_loop(loop, mgr._run_static_notification_refresh("srv", "tools", _boom))
+        assert mgr._last_notification_refresh[("srv", "tools")] == 123.0
+        # type + message, never the serialized chain: the message text is
+        # diagnostic and header-free; exc_info's chained request carries
+        # the configured bearer.
+        assert mgr._last_error["srv"] == "Refresh failed: TimeoutError: slow server"
+        # The failure armed the health-tick retry — the only automatic
+        # driver left (no periodic pass; the server may never re-push).
+        assert "srv" in mgr._static_refresh_retry
+        mgr._static_refresh_retry.discard("srv")
+
+        async def _ok(_name: str) -> tuple[list[str], list[str]]:
+            return [], []
+
+        mgr._last_notification_refresh[("srv", "tools")] = 456.0
+        _run_on_loop(loop, mgr._run_static_notification_refresh("srv", "tools", _ok))
+        assert mgr._last_notification_refresh[("srv", "tools")] == 456.0
+        # A single-kind push SUCCESS does NOT clear the server error pill:
+        # it refreshed one kind, not the whole server, so it can't declare
+        # health (a different kind may still be broken). The prior failure's
+        # error stands until the full-pass retry clears it.
+        assert "srv" in mgr._last_error
+
+    def test_notification_refresh_catches_exception_group(self, running_loop_mgr) -> None:
+        """A wedged anyio transport surfaces session-op failures as
+        ``BaseExceptionGroup`` — which ``except Exception`` misses. An
+        escaping group reaches ``_spawn_background``'s failure log, whose
+        ``exc_info`` serializes the chained httpx request carrying the
+        CONFIGURED bearer for ``auth_type=static`` servers. The runner
+        must swallow the group (and keep the stamp) like any other
+        refresh failure. The member below is a BaseException so the group
+        does NOT collapse to ``ExceptionGroup`` (which ``Exception``
+        would catch) — the anyio stray-cancel shape."""
+        mgr, loop, _thread = running_loop_mgr
+
+        async def _seed() -> None:
+            mgr._static_connect_lock_for("srv")
+            _seed_static_state(mgr, "srv", session=MagicMock())
+
+        _run_on_loop(loop, _seed())
+        mgr._last_notification_refresh[("srv", "tools")] = 123.0
+
+        async def _wedge(_name: str) -> tuple[list[str], list[str]]:
+            raise BaseExceptionGroup("wedged transport", [asyncio.CancelledError()])
+
+        _run_on_loop(loop, mgr._run_static_notification_refresh("srv", "tools", _wedge))
+        assert mgr._last_notification_refresh[("srv", "tools")] == 123.0
+        assert mgr._last_error["srv"] == (
+            "Refresh failed: BaseExceptionGroup: wedged transport (1 sub-exception)"
+        )
+
+    def test_notification_refresh_serializes_on_connect_lock(self, running_loop_mgr) -> None:
+        """The runner must take the per-name connect lock before
+        refreshing: an unserialized refresh races an in-flight
+        ``_connect_one_locked``'s discovery wiring (which would overwrite
+        the refresh's newer catalog with its older snapshot) and sibling
+        same-server refreshes (the slower list call publishing the older
+        catalog last)."""
+        mgr, loop, _thread = running_loop_mgr
+        refreshed: list[str] = []
+
+        async def _rec(name: str) -> tuple[list[str], list[str]]:
+            refreshed.append(name)
+            return [], []
+
+        async def _scenario() -> bool:
+            lock = mgr._static_connect_lock_for("srv")
+            _seed_static_state(mgr, "srv", session=MagicMock())
+            await lock.acquire()
+            task = asyncio.ensure_future(mgr._run_static_notification_refresh("srv", "tools", _rec))
+            for _ in range(3):
+                await asyncio.sleep(0)
+            held_back = len(refreshed) == 0
+            lock.release()
+            await task
+            return held_back
+
+        held_back = _run_on_loop(loop, _scenario())
+        assert held_back, "refresh must wait for the connect lock"
+        assert refreshed == ["srv"]
+
+    def test_notification_refresh_discards_when_server_removed_while_waiting(
+        self, running_loop_mgr
+    ) -> None:
+        """``remove_server_sync`` retires the lock object after teardown;
+        a runner that parked on the OLD lock must not touch state now
+        owned by a NEW-lock holder (remove → re-add): the notification
+        belonged to the old transport and the re-add publishes its own
+        discovery under the new lock."""
+        mgr, loop, _thread = running_loop_mgr
+        refreshed: list[str] = []
+
+        async def _rec(name: str) -> tuple[list[str], list[str]]:
+            refreshed.append(name)
+            return [], []
+
+        async def _scenario() -> None:
+            old_lock = mgr._static_connect_lock_for("srv")
+            _seed_static_state(mgr, "srv", session=MagicMock())
+            await old_lock.acquire()
+            task = asyncio.ensure_future(mgr._run_static_notification_refresh("srv", "tools", _rec))
+            for _ in range(3):
+                await asyncio.sleep(0)
+            # Simulate remove → re-add while the runner is parked: the
+            # lock object is retired and a fresh one minted.
+            mgr._static_connect_locks.pop("srv", None)
+            mgr._static_connect_lock_for("srv")
+            old_lock.release()
+            await task
+
+        _run_on_loop(loop, _scenario())
+        assert refreshed == []
+
+    def test_notification_refresh_skips_when_session_evicted_while_parked(
+        self, running_loop_mgr
+    ) -> None:
+        """A session evicted while the runner was parked returns quietly:
+        the reconnect's rediscovery republishes, and every teardown pops
+        the debounce stamp, so the reconnected transport's first
+        notification refreshes immediately."""
+        mgr, loop, _thread = running_loop_mgr
+        refreshed: list[str] = []
+
+        async def _rec(name: str) -> tuple[list[str], list[str]]:
+            refreshed.append(name)
+            return [], []
+
+        async def _scenario() -> None:
+            lock = mgr._static_connect_lock_for("srv")
+            state = _seed_static_state(mgr, "srv", session=MagicMock())
+            await lock.acquire()
+            task = asyncio.ensure_future(mgr._run_static_notification_refresh("srv", "tools", _rec))
+            for _ in range(3):
+                await asyncio.sleep(0)
+            state.session = None  # evicted while parked
+            lock.release()
+            await task
+
+        _run_on_loop(loop, _scenario())
+        assert refreshed == []
+
+    def test_finally_does_not_clobber_successor_marker(self, running_loop_mgr) -> None:
+        """After the at-acquire discard, a marker present at the runner's
+        exit belongs to the SUCCESSOR spawned during its in-flight list
+        call — the finally must not discard it, or the handler mints
+        runners past the one-parked-runner bound."""
+        mgr, loop, _thread = running_loop_mgr
+        marker = ("srv", "tools")
+
+        async def _refresh_readding(_name: str) -> tuple[list[str], list[str]]:
+            # Our own marker was discarded at lock-acquire; a successor
+            # spawned mid-refresh re-adds the same (server, kind) marker.
+            assert marker not in mgr._static_refresh_pending
+            mgr._static_refresh_pending.add(marker)
+            return [], []
+
+        async def _scenario() -> None:
+            mgr._static_connect_lock_for("srv")
+            _seed_static_state(mgr, "srv", session=MagicMock())
+            mgr._static_refresh_pending.add(marker)  # our spawn's marker
+            await mgr._run_static_notification_refresh("srv", "tools", _refresh_readding)
+
+        _run_on_loop(loop, _scenario())
+        assert marker in mgr._static_refresh_pending, "successor's marker must survive our exit"
+        mgr._static_refresh_pending.discard(marker)
+
+    def test_cancel_while_parked_releases_marker(self, running_loop_mgr) -> None:
+        """A runner cancelled while PARKED on the connect lock never
+        reached the at-acquire discard — the finally must release its
+        marker, or the server+kind never refreshes again."""
+        mgr, loop, _thread = running_loop_mgr
+        marker = ("srv", "tools")
+
+        async def _rec(_name: str) -> tuple[list[str], list[str]]:
+            return [], []
+
+        async def _scenario() -> None:
+            lock = mgr._static_connect_lock_for("srv")
+            _seed_static_state(mgr, "srv", session=MagicMock())
+            await lock.acquire()
+            mgr._static_refresh_pending.add(marker)
+            task = asyncio.ensure_future(mgr._run_static_notification_refresh("srv", "tools", _rec))
+            for _ in range(3):
+                await asyncio.sleep(0)
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+            lock.release()
+
+        _run_on_loop(loop, _scenario())
+        assert marker not in mgr._static_refresh_pending
+
+    def test_runner_releases_marker_when_lock_already_retired(self, running_loop_mgr) -> None:
+        """Spawn → remove completes (lock retired) → runner starts: it
+        must release its marker and must NOT mint a fresh lock for the
+        removed server."""
+        mgr, loop, _thread = running_loop_mgr
+        marker = ("gone", "tools")
+        mgr._static_refresh_pending.add(marker)
+
+        async def _rec(_name: str) -> tuple[list[str], list[str]]:
+            raise AssertionError("must not refresh a removed server")
+
+        _run_on_loop(loop, mgr._run_static_notification_refresh("gone", "tools", _rec))
+        assert marker not in mgr._static_refresh_pending
+        assert "gone" not in mgr._static_connect_locks
+
+    def test_teardown_static_session_pops_debounce_stamp(self, running_loop_mgr) -> None:
+        """Every teardown path must pop the debounce stamp — the
+        keep-stamp-on-failure design leans on it: a reconnect's first
+        ``list_changed`` refreshes immediately, so a change announced in
+        a failed window converges at the next reconnect."""
+        mgr, loop, _thread = running_loop_mgr
+
+        async def _scenario() -> None:
+            _seed_static_state(mgr, "srv", session=MagicMock())
+            mgr._last_notification_refresh[("srv", "tools")] = 123.0
+            mgr._last_notification_refresh[("srv", "prompts")] = 123.0
+            await mgr._teardown_static_session("srv")
+
+        _run_on_loop(loop, _scenario())
+        assert ("srv", "tools") not in mgr._last_notification_refresh
+        assert ("srv", "prompts") not in mgr._last_notification_refresh
+
+    def test_owner_death_pops_debounce_stamp(self, running_loop_mgr) -> None:
+        """The unrequested-collapse path (owner done-callback) is a
+        teardown too: the stamp must not outlive the transport."""
+        mgr, loop, _thread = running_loop_mgr
+
+        async def _scenario() -> None:
+            state = _seed_static_state(mgr, "srv", session=MagicMock())
+
+            async def _noop() -> None:
+                pass
+
+            task = asyncio.ensure_future(_noop())
+            await task
+            state.owner_task = task
+            mgr._last_notification_refresh[("srv", "tools")] = 123.0
+            mgr._on_static_owner_death("srv", task)
+
+        _run_on_loop(loop, _scenario())
+        assert ("srv", "tools") not in mgr._last_notification_refresh
+
+    def test_dead_transport_eviction_pops_debounce_stamp(self) -> None:
+        """The dispatch-observed transport-failure eviction is a teardown
+        too — the stamp must not survive the session it throttled."""
         mgr = MCPClientManager({})
-        mgr._last_notification_refresh["srv_a"] = time.monotonic()
-        # srv_b has no timestamp — should pass debounce
-        now = time.monotonic()
-        last_b = mgr._last_notification_refresh.get("srv_b", 0.0)
-        assert now - last_b >= mgr._NOTIFICATION_DEBOUNCE
+        _seed_static_state(mgr, "srv", session=MagicMock())
+        mgr._last_notification_refresh[("srv", "tools")] = 123.0
+        mgr._record_and_evict_on_dead_transport("srv", anyio.ClosedResourceError())
+        assert mgr._static_servers["srv"].session is None
+        assert ("srv", "tools") not in mgr._last_notification_refresh
+
+    def test_refresh_server_tools_bounded_by_timeout(self) -> None:
+        """A wedged server's list call must not hang a spawned refresh
+        (and the connect lock it holds) forever — #839's unbounded
+        ``list_tools`` is what turned the receive-loop park into a
+        permanent wedge on main."""
+        mgr = MCPClientManager({})
+        mgr._CONNECT_TIMEOUT = 0.05  # instance override of the class constant
+
+        async def _hang() -> Any:
+            await asyncio.sleep(30)
+
+        session = MagicMock()
+        session.list_tools = _hang
+        _seed_static_state(mgr, "srv", session=session)
+
+        async def _run() -> None:
+            await mgr._refresh_server_tools("srv")
+
+        with pytest.raises(TimeoutError):
+            asyncio.run(_run())
+
+    def test_refresh_server_skips_when_session_evicted(self, running_loop_mgr) -> None:
+        """A spawned retry/post-reconnect pass racing an eviction must
+        SKIP (None), not run the gather into a RuntimeError that
+        manufactures a false operator error pill for a self-healing
+        condition — the reconnect's rediscovery owns convergence."""
+        mgr, loop, _thread = running_loop_mgr
+        refreshed: list[str] = []
+
+        async def _rec(_name: str) -> tuple[list[str], list[str]]:
+            refreshed.append("ran")
+            return [], []
+
+        mgr._refresh_server_tools = _rec  # type: ignore[method-assign]
+        mgr._refresh_server_resources = _rec  # type: ignore[method-assign]
+        mgr._refresh_server_prompts = _rec  # type: ignore[method-assign]
+
+        async def _scenario() -> Any:
+            mgr._static_connect_lock_for("srv")
+            _seed_static_state(mgr, "srv", session=None)  # evicted before the pass ran
+            return await mgr._refresh_server("srv")
+
+        result = _run_on_loop(loop, _scenario())
+        assert result is None
+        assert refreshed == []
+        assert "srv" not in mgr._last_refresh
+        assert "srv" not in mgr._last_error
+
+    def test_static_resources_refresh_caps_published_list(self) -> None:
+        """The static push path must cap resource publication like the
+        pool twin — a misbehaving server's push must not balloon the
+        shared node's merged catalogs."""
+        mgr = MCPClientManager({})
+
+        def _resource(i: int) -> MagicMock:
+            r = MagicMock()
+            r.uri = f"file:///r/{i}"
+            r.name = f"r{i}"
+            r.description = ""
+            r.mimeType = "text/plain"
+            return r
+
+        res_result = MagicMock()
+        res_result.resources = [_resource(i) for i in range(_MAX_RESOURCES_PER_SERVER + 50)]
+        tmpl_result = MagicMock()
+        tmpl_result.resourceTemplates = []
+        session = MagicMock()
+        session.list_resources = AsyncMock(return_value=res_result)
+        session.list_resource_templates = AsyncMock(return_value=tmpl_result)
+        _seed_static_state(mgr, "srv", session=session, supports_resources=True)
+
+        async def _run() -> None:
+            await mgr._refresh_server_resources("srv")
+
+        asyncio.run(_run())
+        assert len(mgr._static_servers["srv"].resources) == _MAX_RESOURCES_PER_SERVER
+
+    def test_different_kind_notification_not_debounced(self, running_loop_mgr) -> None:
+        """A tools push must not swallow a prompts push arriving inside
+        the same debounce window: refreshes are kind-scoped, so a
+        server-scoped stamp would drop the prompts notification outright
+        — no runner exists or is spawned for prompts, and the new prompt
+        never appears until the server pushes again (the same staleness
+        class #839 was opened to fix)."""
+        mgr, loop, _thread = running_loop_mgr
+        refreshed: list[str] = []
+
+        async def _rec_tools(_name: str) -> tuple[list[str], list[str]]:
+            refreshed.append("tools")
+            return [], []
+
+        async def _rec_prompts(_name: str) -> None:
+            refreshed.append("prompts")
+
+        mgr._refresh_server_tools = _rec_tools  # type: ignore[method-assign]
+        mgr._refresh_server_prompts = _rec_prompts  # type: ignore[method-assign]
+        handler = mgr._make_static_notification_handler("srv")
+
+        async def _fire_both() -> None:
+            mgr._static_connect_lock_for("srv")
+            _seed_static_state(mgr, "srv", session=MagicMock())
+            tools_note = mcp_types.ServerNotification(
+                mcp_types.ToolListChangedNotification(method="notifications/tools/list_changed")
+            )
+            prompts_note = mcp_types.ServerNotification(
+                mcp_types.PromptListChangedNotification(method="notifications/prompts/list_changed")
+            )
+            await handler(tools_note)
+            # Immediately inside the tools stamp's window.
+            await handler(prompts_note)
+
+        _run_on_loop(loop, _fire_both())
+        _drain_background(mgr, loop)
+        assert sorted(refreshed) == ["prompts", "tools"], (
+            "a same-window different-kind notification must spawn its own refresh"
+        )
+
+    def test_scheduling_failure_rolls_back_stamp_and_marker(self, running_loop_mgr) -> None:
+        """If _spawn_background raises (loop tearing down), BOTH the coalesce
+        marker and the debounce stamp we just wrote must be rolled back —
+        else a same-kind push landing in the window afterward is debounced
+        against a stamp for a refresh that never spawned, and (on the pool
+        path, no on_debounce_drop) never recovers."""
+        mgr, loop, _thread = running_loop_mgr
+        handler = mgr._make_static_notification_handler("srv")
+
+        def _boom(coro: Any, _label: str) -> None:
+            coro.close()  # avoid "coroutine was never awaited" — prod is loop-teardown
+            raise RuntimeError("loop closing")
+
+        async def _fire() -> None:
+            mgr._static_connect_lock_for("srv")
+            _seed_static_state(mgr, "srv", session=MagicMock())
+            note = mcp_types.ServerNotification(
+                mcp_types.ToolListChangedNotification(method="notifications/tools/list_changed")
+            )
+            with patch.object(mgr, "_spawn_background", side_effect=_boom):
+                await handler(note)  # must swallow the scheduling failure
+
+        _run_on_loop(loop, _fire())
+        assert ("srv", "tools") not in mgr._last_notification_refresh, "stamp must roll back"
+        assert ("srv", "tools") not in mgr._static_refresh_pending, "marker must roll back"
+
+    def test_first_notification_not_debounced_near_boot(self, running_loop_mgr) -> None:
+        """The FIRST (server, kind) notification must never be debounced —
+        even when ``time.monotonic()`` is < the debounce window (a node
+        whose process started < 5s after boot). An absent stamp (None), not
+        a 0.0 default, means 'never refreshed → always admit'."""
+        mgr, loop, _thread = running_loop_mgr
+        refreshed: list[str] = []
+
+        async def _rec(name: str) -> tuple[list[str], list[str]]:
+            refreshed.append(name)
+            return [], []
+
+        mgr._refresh_server_tools = _rec  # type: ignore[method-assign]
+        handler = mgr._make_static_notification_handler("srv")
+
+        async def _fire() -> None:
+            mgr._static_connect_lock_for("srv")
+            _seed_static_state(mgr, "srv", session=MagicMock())
+            note = mcp_types.ServerNotification(
+                mcp_types.ToolListChangedNotification(method="notifications/tools/list_changed")
+            )
+            # monotonic() < _NOTIFICATION_DEBOUNCE: a 0.0-default compare
+            # would debounce this first push; the None sentinel admits it.
+            with patch("turnstone.core.mcp_client.time.monotonic", return_value=2.0):
+                await handler(note)
+
+        _run_on_loop(loop, _fire())
+        _drain_background(mgr, loop)
+        assert refreshed == ["srv"], "the first notification must not be debounced near boot"
+
+    def test_same_kind_debounce_drop_arms_retry(self, running_loop_mgr) -> None:
+        """A SAME-kind push landing in the debounce window AFTER the
+        previous runner completed (no runner queued) is genuinely lost to
+        the window — MCP servers announce a change once. It must arm the
+        health-tick retry so the change still converges; otherwise the
+        catalog stays stale for every user until an unrelated push or a
+        reconnect."""
+        mgr, loop, _thread = running_loop_mgr
+
+        async def _rec(_name: str) -> tuple[list[str], list[str]]:
+            return [], []
+
+        mgr._refresh_server_tools = _rec  # type: ignore[method-assign]
+        mgr._server_configs["srv"] = {"type": "http", "url": "http://x/mcp"}
+        handler = mgr._make_static_notification_handler("srv")
+
+        async def _fire_then_redrive() -> int:
+            mgr._static_connect_lock_for("srv")
+            _seed_static_state(mgr, "srv", session=MagicMock())
+            note = mcp_types.ServerNotification(
+                mcp_types.ToolListChangedNotification(method="notifications/tools/list_changed")
+            )
+            await handler(note)  # admitted, runner spawns
+            return len(mgr._background_tasks)
+
+        _run_on_loop(loop, _fire_then_redrive())
+        _drain_background(mgr, loop)  # first runner completes, clears marker
+        # Second same-kind push, still inside the 5s window, NO runner queued.
+        mgr._static_refresh_retry.discard("srv")
+
+        async def _fire_again() -> int:
+            note = mcp_types.ServerNotification(
+                mcp_types.ToolListChangedNotification(method="notifications/tools/list_changed")
+            )
+            before = len(mgr._background_tasks)
+            await handler(note)
+            return len(mgr._background_tasks) - before
+
+        spawned = _run_on_loop(loop, _fire_again())
+        assert spawned == 0, "debounce must still suppress the spawn (throttle intact)"
+        assert "srv" in mgr._static_refresh_retry, "but the lost change must arm the retry"
+
+    def test_debounce_drop_behind_running_runner_does_not_arm(self, running_loop_mgr) -> None:
+        """A same-kind push arriving while a runner is STILL queued (marker
+        present) is already covered — that runner spawns a successor — so
+        the debounce drop must NOT arm the retry (no lost change to
+        recover). Guards against the arm firing on every chatty push."""
+        mgr, loop, _thread = running_loop_mgr
+        mgr._server_configs["srv"] = {"type": "http", "url": "http://x/mcp"}
+        handler = mgr._make_static_notification_handler("srv")
+
+        async def _fire_with_marker_present() -> None:
+            mgr._static_connect_lock_for("srv")
+            _seed_static_state(mgr, "srv", session=MagicMock())
+            # Stamp fresh (inside window) AND a runner marker present.
+            mgr._last_notification_refresh[("srv", "tools")] = time.monotonic()
+            mgr._static_refresh_pending.add(("srv", "tools"))
+            note = mcp_types.ServerNotification(
+                mcp_types.ToolListChangedNotification(method="notifications/tools/list_changed")
+            )
+            await handler(note)
+
+        _run_on_loop(loop, _fire_with_marker_present())
+        assert "srv" not in mgr._static_refresh_retry, (
+            "a push covered by a queued runner must not arm a redundant retry"
+        )
+
+    def test_refresh_server_superseded_by_remove_returns_none(self, running_loop_mgr) -> None:
+        """A ``_refresh_server`` pass whose server was removed before it
+        ran must publish nothing and write NO status: the removal
+        cleaned the status maps, and running the list calls would
+        resurrect ``_last_refresh`` / ``_last_error`` rows for a server
+        that no longer exists (or stamp a false ``ok`` over a re-added
+        generation this pass never refreshed)."""
+        mgr, loop, _thread = running_loop_mgr
+        refreshed: list[str] = []
+
+        async def _rec(_name: str) -> tuple[list[str], list[str]]:
+            refreshed.append("ran")
+            return [], []
+
+        mgr._refresh_server_tools = _rec  # type: ignore[method-assign]
+        mgr._refresh_server_resources = _rec  # type: ignore[method-assign]
+        mgr._refresh_server_prompts = _rec  # type: ignore[method-assign]
+
+        async def _scenario() -> Any:
+            mgr._static_connect_lock_for("srv")
+            _seed_static_state(mgr, "srv", session=MagicMock())
+            # Remove completed before the pass ran: state gone, lock free.
+            mgr._static_servers.pop("srv")
+            return await mgr._refresh_server("srv")
+
+        result = _run_on_loop(loop, _scenario())
+        assert result is None
+        assert refreshed == []
+        assert "srv" not in mgr._last_refresh, "superseded pass must not write a status row"
+        assert "srv" not in mgr._last_error
+
+    def test_refresh_server_skips_when_lock_busy(self, running_loop_mgr) -> None:
+        """A manual/periodic-style pass must NOT park on a held connect
+        lock: the holder is itself a catalog publisher whose publish
+        supersedes the pass, and parking would burn ``refresh_sync``'s
+        whole 30s budget on one busy server (a reconnect attempt holds
+        the lock up to 45s), failing the pass for every healthy server
+        queued behind it. Skip → ``None``, no publish, no status row."""
+        mgr, loop, _thread = running_loop_mgr
+        refreshed: list[str] = []
+
+        async def _rec(_name: str) -> tuple[list[str], list[str]]:
+            refreshed.append("ran")
+            return [], []
+
+        mgr._refresh_server_tools = _rec  # type: ignore[method-assign]
+        mgr._refresh_server_resources = _rec  # type: ignore[method-assign]
+        mgr._refresh_server_prompts = _rec  # type: ignore[method-assign]
+
+        async def _scenario() -> Any:
+            lock = mgr._static_connect_lock_for("srv")
+            _seed_static_state(mgr, "srv", session=MagicMock())
+            await lock.acquire()
+            try:
+                # Returns IMMEDIATELY (no parking) even though the lock
+                # is held — a parked pass would deadlock this scenario.
+                return await mgr._refresh_server("srv")
+            finally:
+                lock.release()
+
+        result = _run_on_loop(loop, _scenario())
+        assert result is None
+        assert refreshed == []
+        assert "srv" not in mgr._last_refresh
+        assert "srv" not in mgr._last_error
+
+    def test_refresh_server_logged_swallows_failure(self, running_loop_mgr) -> None:
+        """The spawned post-reconnect pass has no caller to observe a
+        re-raise; an escaping exception would reach ``_spawn_background``'s
+        ``exc_info`` failure log, which serializes the bearer-carrying
+        request chain for ``auth_type=static`` servers. The wrapper must
+        swallow, record the pill, leave the error row written by
+        ``_refresh_server`` — and ARM the health-tick retry, the only
+        automatic driver that can converge the catalog afterwards."""
+        mgr, loop, _thread = running_loop_mgr
+
+        async def _boom(_name: str) -> tuple[list[str], list[str]]:
+            raise TimeoutError("slow server")
+
+        mgr._refresh_server_tools = _boom  # type: ignore[method-assign]
+        mgr._refresh_server_resources = _boom  # type: ignore[method-assign]
+        mgr._refresh_server_prompts = _boom  # type: ignore[method-assign]
+
+        async def _scenario() -> None:
+            mgr._static_connect_lock_for("srv")
+            _seed_static_state(mgr, "srv", session=MagicMock())
+            await mgr._refresh_server_logged("srv")  # must not raise
+
+        _run_on_loop(loop, _scenario())
+        assert mgr._last_refresh["srv"][1] == "error:TimeoutError"
+        assert mgr._last_error["srv"] == "Refresh failed: TimeoutError: slow server"
+        assert "srv" in mgr._static_refresh_retry
+
+    def test_refresh_server_logged_rearms_retry_on_busy_skip(self, running_loop_mgr) -> None:
+        """A skipped pass (connect lock busy) must RE-ARM the health-tick
+        retry: the lock holder may be a single-kind notification refresh,
+        not the full pass the retry wanted, so a skip is not convergence."""
+        mgr, loop, _thread = running_loop_mgr
+
+        async def _scenario() -> None:
+            lock = mgr._static_connect_lock_for("srv")
+            _seed_static_state(mgr, "srv", session=MagicMock())
+            await lock.acquire()
+            try:
+                await mgr._refresh_server_logged("srv")
+            finally:
+                lock.release()
+
+        _run_on_loop(loop, _scenario())
+        assert "srv" in mgr._static_refresh_retry
+
+    def test_health_tick_drains_refresh_retry(self, running_loop_mgr) -> None:
+        """An armed retry flag + a live session → the health pass spawns
+        one full lock-serialized refresh and clears the flag (a failure
+        inside that refresh re-arms it for the next tick)."""
+        mgr, loop, _thread = running_loop_mgr
+        refreshed: list[str] = []
+
+        async def _rec(name: str) -> tuple[list[str], list[str]]:
+            refreshed.append(name)
+            return [], []
+
+        mgr._refresh_server_tools = _rec  # type: ignore[method-assign]
+        mgr._refresh_server_resources = _rec  # type: ignore[method-assign]
+        mgr._refresh_server_prompts = _rec  # type: ignore[method-assign]
+
+        async def _scenario() -> None:
+            mgr._static_connect_lock_for("srv")
+            session = MagicMock()
+            session.send_ping = AsyncMock()
+            _seed_static_state(mgr, "srv", session=session)
+            mgr._static_refresh_retry.add("srv")
+            await mgr._static_health_one("srv", time.monotonic())
+
+        _run_on_loop(loop, _scenario())
+        _drain_background(mgr, loop)
+        assert refreshed == ["srv", "srv", "srv"], "retry must run the FULL three-kind pass"
+        assert "srv" not in mgr._static_refresh_retry
+
+    def test_push_refresh_failure_writes_outcome(self, running_loop_mgr) -> None:
+        """A push-driven refresh failure must update last_refresh_outcome
+        (not just the error pill) — the pill and outcome are ONE source of
+        truth, so a green 'ok' outcome persisting under a red error row is
+        a contradictory signal."""
+        mgr, loop, _thread = running_loop_mgr
+        mgr._server_configs["srv"] = {"type": "http", "url": "http://x/mcp"}
+        mgr._last_refresh["srv"] = (1.0, "ok")  # stale prior success
+
+        async def _boom(_name: str) -> tuple[list[str], list[str]]:
+            raise TimeoutError("slow")
+
+        async def _scenario() -> None:
+            mgr._static_connect_lock_for("srv")
+            _seed_static_state(mgr, "srv", session=MagicMock())
+            await mgr._run_static_notification_refresh("srv", "tools", _boom)
+
+        _run_on_loop(loop, _scenario())
+        assert mgr.last_refresh_outcome("srv") == "error:TimeoutError"
+
+    def test_push_refresh_success_does_not_declare_server_healthy(self, running_loop_mgr) -> None:
+        """A single-kind push SUCCESS must NOT clear the server error pill
+        or stamp 'ok': ``_last_error`` / ``_last_refresh`` are server-scoped
+        but the push refreshed only ONE kind, so a tools-still-broken server
+        must not go green because its prompts push succeeded. The full-pass
+        health-tick retry (armed by the tools failure) is the authority on
+        'ok'."""
+        mgr, loop, _thread = running_loop_mgr
+        mgr._server_configs["srv"] = {"type": "http", "url": "http://x/mcp"}
+        mgr._last_refresh["srv"] = (1.0, "error:TimeoutError")
+        mgr._last_error["srv"] = "Refresh failed: TimeoutError"  # tools broken
+
+        async def _ok(_name: str) -> tuple[list[str], list[str]]:
+            return [], []  # prompts push succeeds
+
+        async def _scenario() -> None:
+            mgr._static_connect_lock_for("srv")
+            _seed_static_state(mgr, "srv", session=MagicMock())
+            await mgr._run_static_notification_refresh("srv", "prompts", _ok)
+
+        _run_on_loop(loop, _scenario())
+        # The tools error stands — the prompts success did not paint the
+        # whole server healthy.
+        assert mgr.last_refresh_outcome("srv") == "error:TimeoutError"
+        assert "srv" in mgr._last_error
+
+    def test_remove_server_pops_last_refresh_outcome(self) -> None:
+        """Removal must drop the outcome row — a stale row would make
+        last_refresh_outcome report a departed server's last result, and a
+        re-add before its first refresh would read it."""
+        mgr = MCPClientManager({})  # no loop → direct-mutation branch
+        _seed_static_state(mgr, "srv", session=None)
+        mgr._server_configs["srv"] = {"type": "http", "url": "http://x/mcp"}
+        mgr._last_refresh["srv"] = (1.0, "ok")
+        mgr.remove_server_sync("srv")
+        assert mgr.last_refresh_outcome("srv") is None
+
+    def test_refresh_failure_for_removed_server_leaves_no_stale_row(self) -> None:
+        """A failure observed for a just-removed server must NOT stamp a
+        stale error outcome (removal doesn't resurrect the row): the write
+        is config-gated."""
+        mgr = MCPClientManager({})
+        # NOT configured (removed).
+        mgr._record_refresh_failure("gone", RuntimeError("x"), context="Refresh")
+        assert mgr.last_refresh_outcome("gone") is None
+        assert "gone" not in mgr._static_refresh_retry
+
+    def test_session_drop_clears_refresh_retry(self, running_loop_mgr) -> None:
+        """Every session drop clears the retry flag — the reconnect's
+        full rediscovery supersedes the pending retry. But the refresh
+        OUTCOME persists across a drop (only REMOVAL clears it): a
+        transient reconnect must not erase the last-known status."""
+        mgr, loop, _thread = running_loop_mgr
+
+        async def _scenario() -> None:
+            state = _seed_static_state(mgr, "srv", session=MagicMock())
+            mgr._static_refresh_retry.add("srv")
+            mgr._last_refresh["srv"] = (1.0, "ok")
+            mgr._drop_static_session_and_stamp("srv", state)
+
+        _run_on_loop(loop, _scenario())
+        assert "srv" not in mgr._static_refresh_retry
+        assert mgr.last_refresh_outcome("srv") == "ok", "outcome persists across a session drop"
+
+    def test_refresh_all_arms_retry_on_busy_skip(self, running_loop_mgr) -> None:
+        """An operator-requested pass that busy-skips a server must report
+        None (distinct from a real ``([], [])`` no-change) AND arm the
+        health-tick retry: the lock holder may be a single-kind push
+        runner, not the full pass the operator asked for. A ``None`` +
+        ``skipped`` status is what keeps the operator from being told a
+        stale server is current."""
+        mgr, loop, _thread = running_loop_mgr
+
+        async def _scenario() -> dict[str, tuple[list[str], list[str]] | None]:
+            lock = mgr._static_connect_lock_for("srv")
+            _seed_static_state(mgr, "srv", session=MagicMock())
+            await lock.acquire()
+            try:
+                return await mgr._refresh_all("srv")
+            finally:
+                lock.release()
+
+        results = _run_on_loop(loop, _scenario())
+        assert results == {"srv": None}, "a busy-skip must be None, not a fake no-change"
+        assert "srv" in mgr._static_refresh_retry
+        assert mgr._last_refresh["srv"][1] == "skipped"
+
+    def test_refresh_all_disconnected_reconnect_deferral_stamps_skipped(
+        self, running_loop_mgr
+    ) -> None:
+        """A disconnected server whose reconnect DEFERS (``_ensure_static_connected``
+        returns None: sibling call in flight on the old stack) must stamp
+        ``skipped``, not leave a STALE prior ``ok`` — else the endpoint /
+        pill report a never-run refresh as current. Lock NOT held here (an
+        in_flight defer, not a busy lock), so it reaches the reconnect
+        branch."""
+        mgr, loop, _thread = running_loop_mgr
+        mgr._server_configs["srv"] = {"type": "http", "url": "http://x/mcp"}
+        mgr._last_refresh["srv"] = (1.0, "ok")  # stale prior success
+
+        async def _defer(_name: str, _cfg: dict[str, Any], **_kw: Any) -> Any:
+            return None  # reconnect deferred
+
+        mgr._ensure_static_connected = _defer  # type: ignore[method-assign]
+
+        async def _scenario() -> dict[str, tuple[list[str], list[str]] | None]:
+            _seed_static_state(mgr, "srv", session=None)  # disconnected
+            return await mgr._refresh_all("srv")
+
+        results = _run_on_loop(loop, _scenario())
+        assert results == {"srv": None}
+        assert mgr.last_refresh_outcome("srv") == "skipped", "stale 'ok' must be overwritten"
+
+    def test_refresh_all_reports_server_removed_mid_pass(self, running_loop_mgr) -> None:
+        """A server removed from config between the session check and the
+        cfg lookup must still appear in the result dict (as None), not be
+        silently omitted — an operator refreshing that one server got a
+        bare 'refresh complete' with no line at all."""
+        mgr, loop, _thread = running_loop_mgr
+
+        async def _scenario() -> dict[str, tuple[list[str], list[str]] | None]:
+            # Target present at the top (state exists, disconnected) but
+            # NO config → the cfg lookup finds nothing (removed mid-pass).
+            _seed_static_state(mgr, "srv", session=None)
+            return await mgr._refresh_all("srv")
+
+        results = _run_on_loop(loop, _scenario())
+        assert "srv" in results, "a removed-mid-pass server must not vanish from results"
+        assert results["srv"] is None
+
+    def test_refresh_all_skips_disconnected_server_with_reconnect_in_flight(
+        self, running_loop_mgr
+    ) -> None:
+        """The DISCONNECTED branch must busy-skip too: a reconnect
+        attempt holds the per-name lock for up to 45s, and parking there
+        burned the whole 30s ``refresh_sync`` budget on one server,
+        starving every healthy server behind it. The in-flight reconnect
+        finishes the job (full rediscovery); the pass reports the skip
+        as None with a ``skipped`` pill."""
+        mgr, loop, _thread = running_loop_mgr
+        ensure_calls: list[str] = []
+
+        async def _ensure(name: str, _cfg: dict[str, Any], **_kw: Any) -> Any:
+            ensure_calls.append(name)
+            return MagicMock()
+
+        mgr._ensure_static_connected = _ensure  # type: ignore[method-assign]
+        mgr._server_configs["srv"] = {"type": "http", "url": "http://x/mcp"}
+
+        async def _scenario() -> dict[str, tuple[list[str], list[str]] | None]:
+            lock = mgr._static_connect_lock_for("srv")
+            _seed_static_state(mgr, "srv", session=None)  # disconnected
+            await lock.acquire()  # a reconnect driver holds the lock
+            try:
+                return await mgr._refresh_all("srv")
+            finally:
+                lock.release()
+
+        results = _run_on_loop(loop, _scenario())
+        assert results == {"srv": None}
+        assert ensure_calls == [], "the pass must not park inside _ensure_static_connected"
+        assert mgr._last_refresh["srv"][1] == "skipped"
+
+    def test_remove_server_timeout_leaves_retryable_state(self, running_loop_mgr) -> None:
+        """A removal cancelled while PARKED behind a lock holder must
+        leave RETRYABLE state — config still present (pre-fix it popped
+        the config up front, so a timeout stranded a live session and its
+        published catalog with no config behind them). The FORCE session
+        pre-drop is recoverable precisely because the config survives: the
+        health loop reconnects it. The config pop and all cleanup now sit
+        under the lock, so a re-remove works."""
+        mgr, loop, _thread = running_loop_mgr
+        mgr._server_configs["srv"] = {"type": "http", "url": "http://x/mcp"}
+
+        async def _hold() -> None:
+            lock = mgr._static_connect_lock_for("srv")
+            _seed_static_state(mgr, "srv", session=MagicMock())
+            await lock.acquire()
+
+        _run_on_loop(loop, _hold())
+        assert mgr.remove_server_sync("srv", timeout=0.3) is False
+        # Config survives (the pop is under the lock the timeout never
+        # reached), so the health loop can reconnect and a retry works —
+        # no config-gone ghost. The session pre-drop is the one recoverable
+        # mutation.
+        assert "srv" in mgr._server_configs
+
+        async def _release() -> None:
+            mgr._static_connect_locks["srv"].release()
+
+        _run_on_loop(loop, _release())
+        # The retry completes the removal. Its bool return is ``was_connected``
+        # (connected AND removed) — False here because the first attempt's
+        # FORCE pre-drop already disconnected the session; the EFFECT is what
+        # matters, and every trace of the server is now gone.
+        mgr.remove_server_sync("srv", timeout=5)
+        assert "srv" not in mgr._server_configs
+        assert "srv" not in mgr._static_servers
+        assert "srv" not in mgr._static_connect_locks
+
+    def test_remove_cancel_mid_teardown_completes_cleanup(self, running_loop_mgr) -> None:
+        """If the caller timeout cancels _remove AFTER the config pop,
+        while it is awaiting inside _teardown_static_session, the SYNC
+        cleanup in the finally must still run — else config-gone +
+        published ghost catalogs strand with no driver to reach them.
+        We drive the exact interleave: teardown blocks, the caller times
+        out and cancels mid-await, and we assert full cleanup ran."""
+        mgr, loop, _thread = running_loop_mgr
+        mgr._server_configs["srv"] = {"type": "http", "url": "http://x/mcp"}
+        _seed_static_state(
+            mgr, "srv", session=MagicMock(), tools=[_fake_openai_tool("mcp__srv__t")]
+        )
+        mgr._rebuild_tools()
+
+        release = threading.Event()
+
+        async def _blocking_teardown(_name: str) -> None:
+            # Simulate a teardown that blocks past the caller budget, then
+            # gets cancelled at this await.
+            await asyncio.get_running_loop().run_in_executor(None, release.wait)
+
+        mgr._teardown_static_session = _blocking_teardown  # type: ignore[method-assign]
+
+        # Short caller timeout: cancels _remove while it's parked in the
+        # blocking teardown (config already popped).
+        result = mgr.remove_server_sync("srv", timeout=0.4)
+        release.set()  # let the executor wait return so the loop drains
+        assert result is False
+        # The finally completed the removal despite the mid-teardown cancel:
+        # no ghost catalog, no orphaned state.
+        deadline = time.time() + 5
+        while "srv" in mgr._static_servers and time.time() < deadline:
+            time.sleep(0.02)
+        assert "srv" not in mgr._static_servers, "finally must complete cleanup on cancel"
+        assert "srv" not in mgr._server_configs
+        assert "mcp__srv__t" not in mgr._tool_map, "ghost tool must not survive"
+
+    def test_reconcile_keeps_managed_when_removal_times_out(self, running_loop_mgr) -> None:
+        """reconcile_sync must NOT discard a name from _db_managed when
+        remove_server_sync times out (returns False having mutated
+        nothing): discarding it made a DB-driven removal a permanent
+        no-op — the removal loop iterates ``_db_managed - desired``, so a
+        discarded name can never be retried while the health loop keeps
+        the server alive off ``_server_configs``."""
+        mgr, _loop, _thread = running_loop_mgr
+        mgr._db_managed = {"gone"}
+        mgr._server_configs["gone"] = {"type": "http", "url": "http://x/mcp"}
+
+        # remove_server_sync reports timeout (False) WITHOUT clearing config
+        # — the mutated-nothing path.
+        def _timeout_remove(name: str, timeout: float = 30) -> bool:
+            return False
+
+        mgr.remove_server_sync = _timeout_remove  # type: ignore[method-assign]
+        # DB now has NO servers, so 'gone' is in the removal set.
+        storage = MagicMock()
+        storage.list_mcp_servers.return_value = []
+        mgr.reconcile_sync(storage)
+        # Name RETAINED for the next reconcile to retry (config still present,
+        # so the False means "timed out", not "removed").
+        assert "gone" in mgr._db_managed, "a timed-out removal must be retried, not abandoned"
+
+    def test_reconnect_sync_drops_session_before_queueing(self, running_loop_mgr) -> None:
+        """Force-reconnect drops the session up front so parked
+        push-refresh runners bail at their session check instead of
+        serializing their 30s list calls ahead of the operator's
+        recovery action."""
+        mgr, loop, _thread = running_loop_mgr
+        mgr._server_configs["srv"] = {"type": "http", "url": "http://x/mcp"}
+        session_at_connect: list[Any] = []
+
+        async def _fake_connect(name: str, _cfg: dict[str, Any]) -> None:
+            session_at_connect.append(mgr._static_servers[name].session)
+            _seed_static_state(mgr, name, session=MagicMock())
+
+        async def _seed() -> None:
+            mgr._static_connect_lock_for("srv")
+            _seed_static_state(mgr, "srv", session=MagicMock())
+
+        _run_on_loop(loop, _seed())
+        with patch.object(mgr, "_connect_one_locked", side_effect=_fake_connect):
+            result = mgr.reconnect_sync("srv", timeout=5)
+        assert result["connected"] is True
+        assert session_at_connect == [None], "session must be dropped before the rebuild"
+
+    def test_resources_refresh_fails_fast_and_reaps_sibling(self) -> None:
+        """A fast real error must surface as ITSELF — not be masked
+        behind a hung sibling's eventual 30s ``TimeoutError`` — and the
+        surviving sibling must be CANCELLED and REAPED inside the scope,
+        never left running detached (outside the timeout scope and the
+        lock serialization) on the shared session."""
+        mgr = MCPClientManager({})
+        sibling_events: list[str] = []
+
+        async def _hanging_resources() -> Any:
+            try:
+                await asyncio.sleep(30)  # would mask the real error as TimeoutError
+            except asyncio.CancelledError:
+                sibling_events.append("cancelled")
+                raise
+            sibling_events.append("completed")
+
+        async def _fast_fail_templates() -> Any:
+            raise RuntimeError("method not found")
+
+        session = MagicMock()
+        session.list_resources = _hanging_resources
+        session.list_resource_templates = _fast_fail_templates
+        _seed_static_state(mgr, "srv", session=session, supports_resources=True)
+
+        async def _run() -> None:
+            await mgr._refresh_server_resources("srv")
+
+        start = time.monotonic()
+        with pytest.raises(RuntimeError, match="method not found"):
+            asyncio.run(_run())
+        assert time.monotonic() - start < 5, "real error must surface fast, not at timeout"
+        assert sibling_events == ["cancelled"], (
+            "the hung sibling must be cancelled and reaped inside the scope"
+        )
+
+    def test_reap_bounded_reraises_external_cancel(self) -> None:
+        """An EXTERNAL cancel delivered during the reap window must be
+        HONOURED (re-raised), not swallowed — else a shutdown/cancel of
+        the refresh runner is silently dropped and the frame completes via
+        its original error path instead."""
+        mgr = MCPClientManager({})
+
+        async def _run() -> None:
+            async def _quick() -> None:
+                return None
+
+            t1 = asyncio.ensure_future(_quick())
+            t2 = asyncio.ensure_future(_quick())
+            await asyncio.gather(t1, t2)  # both done before the reap
+            # asyncio.wait raising CancelledError models an external cancel
+            # landing on the reap await.
+            with (
+                patch("asyncio.wait", side_effect=asyncio.CancelledError()),
+                pytest.raises(asyncio.CancelledError),
+            ):
+                await mgr._reap_bounded((t1, t2))
+
+        asyncio.run(_run())
+
+    def test_remove_server_clears_markers_and_stamps(self) -> None:
+        """``remove_server_sync`` must clear the server's coalesce
+        markers: a parked old-generation runner's marker would otherwise
+        coalesce AWAY a re-added server's first push, and that runner
+        bails at its lock-identity check without refreshing — the pushed
+        change would be silently dropped."""
+        mgr = MCPClientManager({})  # no loop → direct-mutation branch
+        _seed_static_state(mgr, "srv", session=None)
+        mgr._server_configs["srv"] = {"type": "http", "url": "http://x/mcp"}
+        mgr._static_refresh_pending.add(("srv", "tools"))
+        mgr._static_refresh_pending.add(("srv", "prompts"))
+        mgr._last_notification_refresh[("srv", "tools")] = 123.0
+        mgr.remove_server_sync("srv")
+        assert not mgr._static_refresh_pending
+        assert ("srv", "tools") not in mgr._last_notification_refresh
+
+    def test_refresh_server_runs_and_publishes_when_lock_free(self, running_loop_mgr) -> None:
+        """The happy path: lock free → the pass acquires it, runs all
+        three kind refreshes under it, and records the ``ok`` row.
+        (Serialization against a BUSY lock is the skip test above — the
+        pass never runs concurrently with another publisher.)"""
+        mgr, loop, _thread = running_loop_mgr
+        refreshed: list[str] = []
+
+        async def _rec_tools(name: str) -> tuple[list[str], list[str]]:
+            refreshed.append(name)
+            return [], []
+
+        async def _rec_none(_name: str) -> None:
+            return None
+
+        mgr._refresh_server_tools = _rec_tools  # type: ignore[method-assign]
+        mgr._refresh_server_resources = _rec_none  # type: ignore[method-assign]
+        mgr._refresh_server_prompts = _rec_none  # type: ignore[method-assign]
+
+        async def _scenario() -> Any:
+            mgr._static_connect_lock_for("srv")
+            _seed_static_state(mgr, "srv", session=MagicMock())
+            return await mgr._refresh_server("srv")
+
+        result = _run_on_loop(loop, _scenario())
+        assert result == ([], [])
+        assert refreshed == ["srv"]
+        assert mgr._last_refresh["srv"][1] == "ok"
 
 
 # ---------------------------------------------------------------------------
@@ -2940,7 +4143,7 @@ class TestReconnectSync:
             await asyncio.sleep(0)
             return ev, task
 
-        ev, old_owner = _run_hl(loop, _make_owner())
+        ev, old_owner = _run_on_loop(loop, _make_owner())
 
         async def _pre_close(name: str) -> None:
             order.append("pre_close")
@@ -3102,10 +4305,12 @@ class TestCBAutoReconnectRefresh:
         assert session is new_session
 
     def test_auto_reconnect_retrieves_and_logs_refresh_failure(self, running_loop_mgr):
-        """A refresh failure must be RETRIEVED and logged by the task's
-        done-callback — not abandoned for asyncio to report as "Task exception
-        was never retrieved" at GC time (which lands on whatever stream pytest
-        has attached by then: the closed-file CI spew)."""
+        """A refresh failure must be logged INSIDE ``_refresh_server_logged``
+        (type + message, no ``exc_info``) — not by the done-callback, whose
+        ``exc_info`` log serializes the chained ``httpx.Request`` carrying the
+        configured bearer for ``auth_type=static`` servers, and not abandoned
+        for asyncio to report as "Task exception was never retrieved" at GC
+        time (the closed-file CI spew)."""
         import threading as _threading
 
         mgr, _loop, _thread = running_loop_mgr
@@ -3135,7 +4340,9 @@ class TestCBAutoReconnectRefresh:
             warn_calls = []
             while not warn_calls and time.time() < deadline:
                 warn_calls = [
-                    c for c in mock_log.warning.call_args_list if "MCP background" in str(c.args[0])
+                    c
+                    for c in mock_log.warning.call_args_list
+                    if "Background catalog refresh" in str(c.args)
                 ]
                 time.sleep(0.02)
             # The tracked task must also fully drain (emptiness now implies
@@ -3144,19 +4351,22 @@ class TestCBAutoReconnectRefresh:
             while mgr._background_tasks and time.time() < deadline:
                 time.sleep(0.02)
             assert not mgr._background_tasks, "background refresh task never drained"
+            # The done-callback's exc_info channel must have stayed silent:
+            # the wrapper swallowed the failure before it could escape.
+            assert not [
+                c for c in mock_log.warning.call_args_list if "MCP background" in str(c.args[0])
+            ], "failure escaped to _spawn_background's exc_info log (bearer-leak channel)"
         assert session is new_session
         assert warn_calls, (
-            "the refresh failure must be logged by the done-callback, not left "
-            "for GC-time reporting"
+            "the refresh failure must be logged by _refresh_server_logged, not "
+            "left for GC-time reporting"
         )
-        exc = warn_calls[0].kwargs.get("exc_info")
-        assert isinstance(exc, RuntimeError)
-        assert "catalog fetch broke" in str(exc)
-
-
-def _run_hl(loop: asyncio.AbstractEventLoop, coro: Any) -> Any:
-    """Submit *coro* to the running fixture loop and wait (5s)."""
-    return asyncio.run_coroutine_threadsafe(coro, loop).result(timeout=5)
+        # type + message as structured args (via _record_refresh_failure:
+        # fmt, context, name, type-name, message); exc_info must NOT be
+        # passed.
+        assert warn_calls[0].kwargs.get("exc_info") is None
+        assert warn_calls[0].args[3] == "RuntimeError"
+        assert "catalog fetch broke" in str(warn_calls[0].args[4])
 
 
 class TestStaticHealthLoop:
@@ -3211,7 +4421,7 @@ class TestStaticHealthLoop:
             patch.object(mgr, "_connect_one_locked", side_effect=_fake_connect),
             patch.object(mgr, "_refresh_server", new=AsyncMock()),
         ):
-            _run_hl(loop, mgr._static_reconnect_one("down"))
+            _run_on_loop(loop, mgr._static_reconnect_one("down"))
 
         assert mgr._static_servers["down"].session is not None
         assert "down" not in mgr._static_reconnect_attempt  # health backoff reset
@@ -3232,7 +4442,7 @@ class TestStaticHealthLoop:
         with patch.object(mgr, "_connect_one_locked", side_effect=_boom):
             for expected in range(1, 7):
                 mgr._static_reconnect_next.pop("down", None)  # force it due
-                due = _run_hl(loop, mgr._static_reconnect_one("down"))
+                due = _run_on_loop(loop, mgr._static_reconnect_one("down"))
                 assert mgr._static_reconnect_attempt["down"] == expected  # no cap
                 assert due > time.monotonic() - 1  # next attempt scheduled
 
@@ -3260,7 +4470,7 @@ class TestStaticHealthLoop:
             patch.object(mgr, "_connect_one_locked", new=AsyncMock()) as cm,
             patch.object(mgr, "_refresh_server", new=AsyncMock()),
         ):
-            due = _run_hl(loop, _scenario())
+            due = _run_on_loop(loop, _scenario())
         cm.assert_not_awaited()  # reused the holder's session; no second connect
         assert mgr._static_servers["down"].session is sess  # never torn down
         assert due > time.monotonic() - 1  # success cadence scheduled
@@ -3283,7 +4493,7 @@ class TestStaticHealthLoop:
             with patch.object(mgr, "_connect_one_locked", side_effect=_inner):
                 await asyncio.gather(mgr._connect_one("x", {}), mgr._connect_one("x", {}))
 
-        _run_hl(loop, _two())
+        _run_on_loop(loop, _two())
         assert max_active == 1  # serialized, never overlapping
 
     # -- liveness ping (layer 2 — the idle-dead detection) -------------------
@@ -3293,7 +4503,7 @@ class TestStaticHealthLoop:
         sess = MagicMock()
         sess.send_ping = AsyncMock()
         _seed_static_state(mgr, "up", session=sess)
-        due = _run_hl(loop, mgr._static_ping_one("up", time.monotonic()))
+        due = _run_on_loop(loop, mgr._static_ping_one("up", time.monotonic()))
         sess.send_ping.assert_awaited_once()
         assert mgr._static_servers["up"].session is sess  # kept
         assert due > time.monotonic()  # next ping scheduled
@@ -3307,7 +4517,7 @@ class TestStaticHealthLoop:
         sess.send_ping = AsyncMock(side_effect=ConnectionResetError("peer gone"))
         _seed_static_state(mgr, "up", session=sess)
         now = time.monotonic()
-        _run_hl(loop, mgr._static_ping_one("up", now))
+        _run_on_loop(loop, mgr._static_ping_one("up", now))
         assert mgr._static_servers["up"].session is None  # evicted
         # "Reconnect asap": the (fresh-clock) deadline is already due.
         assert now <= mgr._static_reconnect_next["up"] <= time.monotonic()
@@ -3328,7 +4538,7 @@ class TestStaticHealthLoop:
         sess.send_ping = _hang
         _seed_static_state(mgr, "up", session=sess)
         now = time.monotonic()
-        due = _run_hl(loop, mgr._static_ping_one("up", now))
+        due = _run_on_loop(loop, mgr._static_ping_one("up", now))
         assert mgr._static_servers["up"].session is sess  # kept — timeout != dead
         assert "up" not in mgr._consecutive_failures  # breaker NOT tripped
         assert due > now  # next ping rescheduled, not "reconnect asap"
@@ -3347,7 +4557,7 @@ class TestStaticHealthLoop:
         )
         _seed_static_state(mgr, "up", session=sess)
         now = time.monotonic()
-        due = _run_hl(loop, mgr._static_ping_one("up", now))
+        due = _run_on_loop(loop, mgr._static_ping_one("up", now))
         assert mgr._static_servers["up"].session is sess  # kept — protocol != dead
         assert "up" not in mgr._consecutive_failures  # breaker untouched
         assert due > now  # rescheduled, not "reconnect asap"
@@ -3363,7 +4573,7 @@ class TestStaticHealthLoop:
         sess.send_ping = AsyncMock(side_effect=httpx.PoolTimeout("pool saturated"))
         _seed_static_state(mgr, "up", session=sess)
         now = time.monotonic()
-        due = _run_hl(loop, mgr._static_ping_one("up", now))
+        due = _run_on_loop(loop, mgr._static_ping_one("up", now))
         assert mgr._static_servers["up"].session is sess  # kept — pool != dead
         assert "up" not in mgr._consecutive_failures
         assert due > now
@@ -3378,7 +4588,7 @@ class TestStaticHealthLoop:
         state = _seed_static_state(mgr, "up", session=sess)
         state.in_flight = 1  # a call_tool is in flight
         now = time.monotonic()
-        due = _run_hl(loop, mgr._static_ping_one("up", now))
+        due = _run_on_loop(loop, mgr._static_ping_one("up", now))
         sess.send_ping.assert_not_awaited()  # skipped entirely
         assert mgr._static_servers["up"].session is sess  # not evicted
         assert "up" not in mgr._consecutive_failures
@@ -3400,7 +4610,7 @@ class TestStaticHealthLoop:
         stale = MagicMock()  # S1
         stale.send_ping = _die_after_swap
         _seed_static_state(mgr, "up", session=stale)
-        _run_hl(loop, mgr._static_ping_one("up", time.monotonic()))
+        _run_on_loop(loop, mgr._static_ping_one("up", time.monotonic()))
         # S1's failure handler must NOT have nulled the freshly-installed S2.
         assert mgr._static_servers["up"].session is fresh
 
@@ -3415,7 +4625,7 @@ class TestStaticHealthLoop:
             seen.append(state.in_flight)  # observed WHILE in flight
             return "ok"
 
-        assert _run_hl(loop, mgr._static_session_op("srv", _op())) == "ok"
+        assert _run_on_loop(loop, mgr._static_session_op("srv", _op())) == "ok"
         assert seen == [1]  # bumped for the duration of the op
         assert state.in_flight == 0  # decremented in finally
 
@@ -3427,7 +4637,7 @@ class TestStaticHealthLoop:
             raise RuntimeError("dead transport")
 
         with pytest.raises(RuntimeError, match="dead transport"):
-            _run_hl(loop, mgr._static_session_op("srv", _boom()))
+            _run_on_loop(loop, mgr._static_session_op("srv", _boom()))
         assert state.in_flight == 0  # finally ran even on failure
 
     def test_ping_skips_while_session_op_in_flight(self, running_loop_mgr) -> None:
@@ -3455,7 +4665,7 @@ class TestStaticHealthLoop:
             assert await op_task == "done"
             assert mgr._static_servers["up"].in_flight == 0  # decremented
 
-        _run_hl(loop, _scenario())
+        _run_on_loop(loop, _scenario())
         sess.send_ping.assert_not_awaited()
 
     # -- loop robustness (bounded / concurrent / fresh clock) ---------------
@@ -3475,7 +4685,7 @@ class TestStaticHealthLoop:
 
         # Patch the LOCKED body so the real ``_connect_one`` still takes the lock.
         with patch.object(mgr, "_connect_one_locked", side_effect=_wedge_locked):
-            due = _run_hl(loop, mgr._static_reconnect_one("wedge"))
+            due = _run_on_loop(loop, mgr._static_reconnect_one("wedge"))
         assert mgr._static_reconnect_attempt["wedge"] == 1  # failed attempt
         assert not mgr._static_connect_lock_for("wedge").locked()  # lock released
         assert due > time.monotonic() - 1  # backoff scheduled
@@ -3514,7 +4724,7 @@ class TestStaticHealthLoop:
                 with suppress(BaseException):
                     await tick
 
-        _run_hl(loop, _scenario())
+        _run_on_loop(loop, _scenario())
 
     def test_health_tick_sleep_uses_fresh_clock(self, running_loop_mgr) -> None:
         """The returned sleep is computed against a FRESH clock, so a tick whose
@@ -3528,7 +4738,7 @@ class TestStaticHealthLoop:
             return time.monotonic() + 1.0  # due in ~1s from now
 
         with patch.object(mgr, "_static_reconnect_one", side_effect=_slow_reconnect):
-            sleep_s = _run_hl(loop, mgr._static_health_tick())
+            sleep_s = _run_on_loop(loop, mgr._static_health_tick())
         # The reconnect returns "due ~1s from post-sleep clock", and the tick
         # subtracts its own fresh after-clock — the result should be near 1.0.
         assert 0.7 <= sleep_s <= 1.3
@@ -3542,7 +4752,7 @@ class TestStaticHealthLoop:
             patch.object(mgr, "_static_reconnect_one", new=AsyncMock()) as recon,
             patch.object(mgr, "_static_ping_one", new=AsyncMock()) as ping,
         ):
-            sleep_s = _run_hl(loop, mgr._static_health_tick())
+            sleep_s = _run_on_loop(loop, mgr._static_health_tick())
         recon.assert_not_awaited()  # never even attempted
         ping.assert_not_awaited()
         assert sleep_s == mgr._static_health_check_s  # nothing due → full cadence
@@ -3691,35 +4901,35 @@ class TestStaticHealthLoop:
             patch.object(mgr, "_static_ping_one", new=AsyncMock(return_value=now)) as ping,
             patch.object(mgr, "_static_reconnect_one", new=AsyncMock(return_value=now)) as recon,
         ):
-            _run_hl(loop, mgr._static_health_tick())
+            _run_on_loop(loop, mgr._static_health_tick())
         for call in ping.await_args_list + recon.await_args_list:
             assert call.args[0] != "pool"  # oauth_user pools are managed separately
 
     def test_connect_all_starts_health_task_and_disable_gates_it(self, running_loop_mgr) -> None:
         mgr, loop, _ = running_loop_mgr
         mgr._server_configs = {}
-        _run_hl(loop, mgr._connect_all())
+        _run_on_loop(loop, mgr._connect_all())
         assert mgr._static_health_task is not None  # started
 
         mgr2 = MCPClientManager({})
         mgr2._loop = loop
         mgr2._server_configs = {}
         mgr2._static_health_check_s = 0  # disabled
-        _run_hl(loop, mgr2._connect_all())
+        _run_on_loop(loop, mgr2._connect_all())
         assert mgr2._static_health_task is None  # not started
 
     def test_health_loop_cancel_returns_cleanly(self, running_loop_mgr) -> None:
         mgr, loop, _ = running_loop_mgr
         mgr._server_configs = {}  # nothing to do → parks in the sleep
 
-        task = _run_hl(loop, _spawn_task(mgr._static_health_loop()))
+        task = _run_on_loop(loop, _spawn_task(mgr._static_health_loop()))
 
         async def _cancel() -> None:
             task.cancel()
             with suppress(BaseException):
                 await task
 
-        _run_hl(loop, _cancel())
+        _run_on_loop(loop, _cancel())
         assert task.cancelled() or task.done()
 
     # -- unified reconnect coordination (round 3) ----------------------------
@@ -3734,7 +4944,7 @@ class TestStaticHealthLoop:
         state.in_flight = 1  # a call_tool still draining on the evicted stack
         before = time.monotonic()
         with patch.object(mgr, "_connect_one_locked", new=AsyncMock()) as cm:
-            due = _run_hl(loop, mgr._static_reconnect_one("down"))
+            due = _run_on_loop(loop, mgr._static_reconnect_one("down"))
         cm.assert_not_awaited()  # no teardown-under-dispatch
         assert before < due <= time.monotonic() + 1.5  # ~1s recheck, not backoff
         assert "down" not in mgr._static_reconnect_attempt  # not a failed attempt
@@ -3754,7 +4964,7 @@ class TestStaticHealthLoop:
 
         with patch.object(mgr, "_connect_one_locked", side_effect=_boom):
             before = time.monotonic()
-            due = _run_hl(loop, mgr._static_reconnect_one("down"))
+            due = _run_on_loop(loop, mgr._static_reconnect_one("down"))
         assert due >= before  # future-dated, not tick-start-relative
         assert mgr._static_reconnect_next["down"] == due
 
@@ -3768,7 +4978,7 @@ class TestStaticHealthLoop:
         _seed_static_state(mgr, "up", session=sess)
         stale_now = time.monotonic() - 45.0
         before = time.monotonic()
-        due = _run_hl(loop, mgr._static_ping_one("up", stale_now))
+        due = _run_on_loop(loop, mgr._static_ping_one("up", stale_now))
         assert due >= before + mgr._static_health_check_s - 1.0
         assert mgr._static_next_ping["up"] == due
 
@@ -3784,7 +4994,7 @@ class TestStaticHealthLoop:
             raise asyncio.CancelledError
 
         with patch.object(mgr, "_static_reconnect_one", side_effect=_stray):
-            sleep_s = _run_hl(loop, mgr._static_health_tick())
+            sleep_s = _run_on_loop(loop, mgr._static_health_tick())
         # Returned a sleep instead of re-raising; the server was rescheduled
         # on the normal cadence.
         assert 0.5 <= sleep_s <= mgr._static_health_check_s + 1.0
@@ -3811,7 +5021,7 @@ class TestStaticHealthLoop:
             return 3600.0  # park until the genuine cancel below
 
         with patch.object(mgr, "_static_health_tick", side_effect=_tick):
-            task = _run_hl(loop, _spawn_task(mgr._static_health_loop()))
+            task = _run_on_loop(loop, _spawn_task(mgr._static_health_loop()))
             assert survived.wait(timeout=5), "loop died on a stray per-server cancel"
             assert not task.done()
 
@@ -3820,7 +5030,7 @@ class TestStaticHealthLoop:
                 with suppress(BaseException):
                     await task
 
-            _run_hl(loop, _cancel())
+            _run_on_loop(loop, _cancel())
         assert task.done()
 
     def test_dispatch_reconnect_lock_contention_records_no_breaker_failure(
@@ -3955,7 +5165,7 @@ class TestEnsureStaticConnected:
             )
 
         with patch.object(mgr, "_connect_one_locked", side_effect=_connect):
-            sessions = _run_hl(loop, _storm())
+            sessions = _run_on_loop(loop, _storm())
         assert connects == 1  # queued callers reused, not rebuilt
         assert all(s is sess for s in sessions)
 
@@ -3964,7 +5174,9 @@ class TestEnsureStaticConnected:
         sess = MagicMock()
         _seed_static_state(mgr, "srv", session=sess)
         with patch.object(mgr, "_connect_one_locked", new=AsyncMock()) as cm:
-            out = _run_hl(loop, mgr._ensure_static_connected("srv", mgr._server_configs["srv"]))
+            out = _run_on_loop(
+                loop, mgr._ensure_static_connected("srv", mgr._server_configs["srv"])
+            )
         assert out is sess
         cm.assert_not_awaited()
 
@@ -3975,7 +5187,7 @@ class TestEnsureStaticConnected:
         cfg = {"type": "stdio", "command": "echo"}  # caller's stale snapshot
         assert "gone" not in mgr._server_configs
         with patch.object(mgr, "_connect_one_locked", new=AsyncMock()) as cm:
-            out = _run_hl(loop, mgr._ensure_static_connected("gone", cfg))
+            out = _run_on_loop(loop, mgr._ensure_static_connected("gone", cfg))
         assert out is None
         cm.assert_not_awaited()
         assert "gone" not in mgr._static_servers  # nothing rebuilt
@@ -3993,11 +5205,11 @@ class TestEnsureStaticConnected:
 
         cfg = mgr._server_configs["srv"]
         with patch.object(mgr, "_connect_one_locked", side_effect=_connect) as cm:
-            out = _run_hl(loop, mgr._ensure_static_connected("srv", cfg))
+            out = _run_on_loop(loop, mgr._ensure_static_connected("srv", cfg))
             assert out is None
             assert cm.await_count == 0  # no teardown-under-dispatch
             state.in_flight = 0  # the sibling call finished
-            out2 = _run_hl(loop, mgr._ensure_static_connected("srv", cfg))
+            out2 = _run_on_loop(loop, mgr._ensure_static_connected("srv", cfg))
         assert out2 is sess
         assert cm.await_count == 1
 
@@ -4014,7 +5226,7 @@ class TestEnsureStaticConnected:
             _seed_static_state(mgr, name, session=sess)
 
         with patch.object(mgr, "_connect_one_locked", side_effect=_connect) as cm:
-            out = _run_hl(
+            out = _run_on_loop(
                 loop,
                 mgr._ensure_static_connected(
                     "srv", mgr._server_configs["srv"], defer_if_busy=False
@@ -4043,7 +5255,7 @@ class TestEnsureStaticConnected:
             # as concurrent.futures.CancelledError at the .result() boundary.
             pytest.raises((asyncio.CancelledError, concurrent.futures.CancelledError)),
         ):
-            _run_hl(loop, mgr._ensure_static_connected("srv", mgr._server_configs["srv"]))
+            _run_on_loop(loop, mgr._ensure_static_connected("srv", mgr._server_configs["srv"]))
         assert mgr._static_servers["srv"].session is None  # partial session dropped
         assert "srv" not in mgr._consecutive_failures  # CancelledError is NOT a server failure
 
@@ -4068,7 +5280,7 @@ class TestEnsureStaticConnected:
             patch.object(mgr, "_connect_one_locked", side_effect=_boom),
             pytest.raises(ConnectionError),
         ):
-            _run_hl(loop, mgr._ensure_static_connected("srv", mgr._server_configs["srv"]))
+            _run_on_loop(loop, mgr._ensure_static_connected("srv", mgr._server_configs["srv"]))
         assert mgr._consecutive_failures.get("srv") == 1
 
     def test_success_clears_only_open_circuit_deadline(self, running_loop_mgr) -> None:
@@ -4086,7 +5298,9 @@ class TestEnsureStaticConnected:
             _seed_static_state(mgr, name, session=sess)
 
         with patch.object(mgr, "_connect_one_locked", side_effect=_connect):
-            out = _run_hl(loop, mgr._ensure_static_connected("srv", mgr._server_configs["srv"]))
+            out = _run_on_loop(
+                loop, mgr._ensure_static_connected("srv", mgr._server_configs["srv"])
+            )
         assert out is sess
         assert "srv" not in mgr._circuit_open_until  # dispatch flows again
         assert mgr._consecutive_failures.get("srv", 0) >= 3  # count kept
@@ -4168,7 +5382,7 @@ class TestTeardownStaticSession:
             await asyncio.sleep(0)  # let the owner park
             return ev, task
 
-        ev, owner = _run_hl(loop, _make_owner())
+        ev, owner = _run_on_loop(loop, _make_owner())
 
         async def _pre_close(name: str) -> None:
             order.append("pre_close")
@@ -4180,7 +5394,7 @@ class TestTeardownStaticSession:
 
         _seed_static_state(mgr, "srv", session=MagicMock(), owner_task=owner, close_requested=ev)
         with patch.object(mgr, "_pre_close_streams", side_effect=_pre_close):
-            _run_hl(loop, mgr._teardown_static_session("srv"))
+            _run_on_loop(loop, mgr._teardown_static_session("srv"))
         assert order == ["pre_close", "owner_exit"]
         state = mgr._static_servers["srv"]
         assert state.session is None
@@ -4211,18 +5425,18 @@ class TestTeardownStaticSession:
             task.cancel = _counting_cancel  # type: ignore[method-assign]
             return task
 
-        owner = _run_hl(loop, _make_owner())
+        owner = _run_on_loop(loop, _make_owner())
         _seed_static_state(
             mgr, "srv", session=MagicMock(), owner_task=owner, close_requested=asyncio.Event()
         )
-        _run_hl(loop, mgr._teardown_static_session("srv"))
+        _run_on_loop(loop, mgr._teardown_static_session("srv"))
         assert owner.cancelled()
         assert len(cancel_calls) == 1  # one cancel, never a second
         assert mgr._static_servers["srv"].owner_task is None
 
     def test_teardown_missing_server_is_noop(self, running_loop_mgr) -> None:
         mgr, loop, _ = running_loop_mgr
-        _run_hl(loop, mgr._teardown_static_session("nope"))  # must not raise
+        _run_on_loop(loop, mgr._teardown_static_session("nope"))  # must not raise
 
 
 async def _spawn_task(coro: Any) -> asyncio.Task[Any]:

@@ -21,12 +21,17 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
-    from collections.abc import Iterator
+    from collections.abc import Callable, Iterator
 
 from turnstone.core.lowering import legalize_tool_call_entry
 from turnstone.core.providers._openai_chat import OpenAIChatCompletionsProvider
 from turnstone.core.providers._openai_common import sanitize_messages
-from turnstone.core.providers._protocol import ModelCapabilities, StreamChunk
+from turnstone.core.providers._protocol import (
+    ModelCapabilities,
+    StreamChunk,
+    ToolCallDelta,
+    accumulate_tool_call_delta,
+)
 
 # Default endpoint used when no base_url is configured.
 GOOGLE_DEFAULT_BASE_URL = "https://generativelanguage.googleapis.com/v1beta/openai/"
@@ -63,9 +68,12 @@ _GOOGLE_DEFAULT = ModelCapabilities(
 class GoogleProvider(OpenAIChatCompletionsProvider):
     """Provider for Google models using the OpenAI-compatible endpoint.
 
-    Overrides message preparation and tool-call extraction to preserve
-    Gemini-specific fields (``thought_signature``) through the round-trip
-    via the ``provider_blocks`` / ``_provider_content`` fidelity lane.
+    Overrides message preparation (``_prepare_messages`` reconstructs the
+    raw tool calls from ``_provider_content``) and registers an
+    ``on_tool_call_delta`` capture with the base stream iterator to
+    preserve Gemini-specific fields (``thought_signature``) through the
+    round-trip via the ``provider_blocks`` / ``_provider_content``
+    fidelity lane.
     """
 
     @property
@@ -127,69 +135,55 @@ class GoogleProvider(OpenAIChatCompletionsProvider):
             cleaned.append(msg)
         return sanitize_messages(cleaned)
 
-    # -- tool-call extraction (non-streaming fidelity) -------------------------
-
-    def _extract_tool_calls(
-        self, sdk_tool_calls: list[Any]
-    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
-        """Capture raw tool-call dicts alongside the normalised ones.
-
-        ``model_dump()`` includes ``thought_signature`` and any other
-        provider-specific fields.  The raw dicts are returned as
-        ``provider_blocks`` so the session stores them in
-        ``_provider_content`` for round-trip fidelity.
-        """
-        tool_calls, _ = super()._extract_tool_calls(sdk_tool_calls)
-        # model_dump() on the Pydantic SDK objects captures thought_signature
-        # and any other provider-specific fields alongside the standard ones.
-        provider_blocks = [tc.model_dump(exclude_none=True) for tc in sdk_tool_calls]
-        return tool_calls, provider_blocks
-
     # -- streaming -----------------------------------------------------------
 
-    def _iter_stream(self, stream: Any) -> Iterator[StreamChunk]:
-        """Wrap the base stream to capture raw tool-call metadata.
+    def _iter_stream(
+        self,
+        stream: Any,
+        *,
+        finish_reason_optional: bool = False,
+        on_tool_call_delta: Callable[[ToolCallDelta, Any], None] | None = None,
+    ) -> Iterator[StreamChunk]:
+        """Wrap the base iterator to capture raw tool-call metadata.
 
-        Taps the raw SDK stream to accumulate provider-specific fields
-        (e.g. ``thought_signature``) from each tool-call delta, then
-        delegates all chunk processing to the base class.  The accumulated
-        raw tool-call dicts are emitted as ``provider_blocks`` on the
-        final chunk so the session stores them as ``_provider_content``.
+        Registers an ``on_tool_call_delta`` capture with the base
+        iterator to accumulate provider-specific fields (e.g.
+        ``thought_signature``) from each raw SDK tool-call delta, then
+        delegates all chunk processing to the base class.  The
+        accumulated raw tool-call dicts are emitted as
+        ``provider_blocks`` on the final chunk so the session stores
+        them as ``_provider_content``.
+
+        The capture receives the SAME slot the base's
+        :class:`ToolCallSlotter` assigned to the normalized
+        ``tool_calls`` mirror — one slotter drives both lanes, so call
+        identity cannot desync between them (a desync — one fused raw
+        dict vs two mirror calls on an index-degenerate stream — would
+        fail ``_prepare_messages``' length gate and silently drop
+        ``thought_signature`` from the replay).
         """
         raw_tool_calls: dict[int, dict[str, Any]] = {}
 
-        def _tap(raw_stream: Any) -> Any:
-            """Pass-through iterator that captures tool-call extras."""
-            for chunk in raw_stream:
-                if chunk.choices:
-                    delta = chunk.choices[0].delta
-                    if delta.tool_calls:
-                        for tc_delta in delta.tool_calls:
-                            idx = tc_delta.index
-                            if idx not in raw_tool_calls:
-                                raw_tool_calls[idx] = {
-                                    "id": "",
-                                    "type": "function",
-                                    "function": {"name": "", "arguments": ""},
-                                }
-                            raw_tc = raw_tool_calls[idx]
-                            if tc_delta.id:
-                                raw_tc["id"] = tc_delta.id
-                            if tc_delta.function:
-                                if tc_delta.function.name:
-                                    raw_tc["function"]["name"] = tc_delta.function.name
-                                if tc_delta.function.arguments:
-                                    raw_tc["function"]["arguments"] += tc_delta.function.arguments
-                            # Capture provider-specific extras (e.g. thought_signature)
-                            extras = getattr(tc_delta, "__pydantic_extra__", None)
-                            if extras:
-                                for k, v in extras.items():
-                                    if k not in ("index", "id", "type", "function"):
-                                        raw_tc.setdefault(k, v)
-                yield chunk
+        def _capture(tcd: ToolCallDelta, raw_delta: Any) -> None:
+            # The normalized delta carries the base's slot AND its
+            # id/name/arguments extraction verbatim — the raw lane
+            # accumulates the exact bytes the mirror sees.
+            raw_tc = accumulate_tool_call_delta(raw_tool_calls, tcd)
+            # Capture provider-specific extras (e.g. thought_signature)
+            extras = getattr(raw_delta, "__pydantic_extra__", None)
+            if extras:
+                for k, v in extras.items():
+                    if k not in ("index", "id", "type", "function"):
+                        raw_tc.setdefault(k, v)
+            if on_tool_call_delta is not None:
+                on_tool_call_delta(tcd, raw_delta)
 
         # Delegate all chunk processing to the base class
-        for sc in super()._iter_stream(_tap(stream)):
+        for sc in super()._iter_stream(
+            stream,
+            finish_reason_optional=finish_reason_optional,
+            on_tool_call_delta=_capture,
+        ):
             # Attach provider_blocks on the finish-reason chunk
             if sc.finish_reason and raw_tool_calls:
                 sc.provider_blocks = [raw_tool_calls[i] for i in sorted(raw_tool_calls)]

@@ -19,9 +19,6 @@ from __future__ import annotations
 import asyncio
 import gc
 import signal
-import socket
-import subprocess
-import sys
 import textwrap
 import time
 from typing import TYPE_CHECKING
@@ -29,9 +26,11 @@ from unittest.mock import patch
 
 import pytest
 
+from tests.conftest import _free_port, _popen_mcp_server, _wait_session_live, _wait_tcp_ready
 from turnstone.core.mcp_client import MCPClientManager
 
 if TYPE_CHECKING:
+    import subprocess
     from pathlib import Path
 
 SERVER_SRC = textwrap.dedent(
@@ -55,33 +54,6 @@ SERVER_SRC = textwrap.dedent(
         mcp.run(transport="streamable-http")
     '''
 ).lstrip()
-
-
-def _free_port() -> int:
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        s.bind(("127.0.0.1", 0))
-        return int(s.getsockname()[1])
-
-
-def _wait_tcp_ready(port: int, timeout: float) -> bool:
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        try:
-            with socket.create_connection(("127.0.0.1", port), timeout=0.3):
-                return True
-        except OSError:
-            time.sleep(0.05)
-    return False
-
-
-def _wait_session_live(mgr: MCPClientManager, name: str, timeout: float) -> bool:
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        state = mgr._static_servers.get(name)
-        if state is not None and state.session is not None:
-            return True
-        time.sleep(0.05)
-    return False
 
 
 async def _armed_scope_count() -> int:
@@ -135,11 +107,7 @@ class TestFlakyServerNoSpin:
         monkeypatch.setattr(MCPClientManager, "_STATIC_HEALTH_PING_TIMEOUT_S", 1.5)
 
         def _spawn_server(*, initial: bool = False) -> subprocess.Popen[bytes]:
-            proc = subprocess.Popen(
-                [sys.executable, str(script), str(port)],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-            )
+            proc = _popen_mcp_server(script, port)
             if not _wait_tcp_ready(port, 10.0):
                 proc.kill()
                 proc.wait(timeout=5)

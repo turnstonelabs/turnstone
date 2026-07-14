@@ -148,6 +148,60 @@ _MAX_PROMPTS_PER_SERVER = 1000
 # thundering herd of connects on every session start.
 _PRIME_MAX_CONCURRENCY = 4
 
+# One row per ``*/list_changed`` kind: notification type → kind label.
+# The static AND pool notification handlers drive all three catalog kinds
+# through this table (plus their kind → bound-method maps, which stay
+# mypy-checked attribute access rather than name-string tables) so the
+# debounce/coalesce/log/spawn protocol exists exactly once per path — a
+# protocol change cannot silently diverge between kinds. Exact-type lookup
+# is safe: the SDK's discriminated-union parser instantiates these concrete
+# classes, never subclasses.
+_LIST_CHANGED_KINDS: dict[type, str] = {
+    mcp_types.ToolListChangedNotification: "tools",
+    mcp_types.ResourceListChangedNotification: "resources",
+    mcp_types.PromptListChangedNotification: "prompts",
+}
+
+
+def try_prime_user_pools(
+    mcp_client: Any,
+    user_id: str | None,
+    *,
+    require_live_listener: bool = False,
+    context: str = "prime",
+) -> None:
+    """Best-effort per-user pool prime: schedule and swallow, never raise.
+
+    The ONE copy of the fire-and-forget prime idiom shared by the
+    session-construction, acting-user-change, and OIDC capture-success
+    call sites — three hand-synced copies had already drifted.
+    ``mcp_client`` is duck-typed (session and auth tests stub it): a
+    client without the prime surface, or a falsy ``user_id``, is a
+    silent no-op, matching the guards this replaces. Failures never
+    propagate — a prime is an optimisation, and neither login nor
+    session construction may fail on it. ``require_live_listener``
+    gates on an open session to heal (the OIDC capture site: priming on
+    every routine SSO re-login would warm transports and mint tokens
+    for users with nothing open, at deployment scale).
+    """
+    if not user_id or not hasattr(mcp_client, "prime_user_pools"):
+        return
+    try:
+        if require_live_listener and not (
+            hasattr(mcp_client, "has_live_session_listener")
+            and mcp_client.has_live_session_listener(user_id)
+        ):
+            return
+        mcp_client.prime_user_pools(user_id)
+    except Exception:
+        log.debug(
+            "MCP pool prime scheduling failed (%s) user=%s",
+            context,
+            user_id,
+            exc_info=True,
+        )
+
+
 # How long a node trusts its own pending-consent DELETE before re-running it on
 # the next dispatch success. Bounds two things at once: the hot-path SQL rate
 # (at most one DELETE per (user, server) per window) and the staleness of a
@@ -565,6 +619,20 @@ class PoolEntryState:
     supports_resource_list_changed: bool = False
     supports_prompt_list_changed: bool = False
 
+    def drop_session(self) -> None:
+        """Drop the cached session AND its paired plaintext bearer copy.
+
+        The ONE way to null ``session``: ``bound_token`` is read only
+        under a live session (stale-rebind detection) and overwritten
+        at reconnect, so it is dead the moment the session goes — and
+        an entry may cool indefinitely after any drop, which must not
+        retain a plaintext credential for the life of the user's
+        sessions. A site that nulled ``session`` directly would
+        silently re-open that hole.
+        """
+        self.session = None
+        self.bound_token = None
+
 
 # ---------------------------------------------------------------------------
 # Client manager
@@ -649,8 +717,29 @@ class MCPClientManager:
         self._circuit_open_until: dict[str, float] = {}  # monotonic timestamp
         self._circuit_trip_count: dict[str, int] = {}  # backoff exponent
 
-        # Notification debounce (per-server)
-        self._last_notification_refresh: dict[str, float] = {}
+        # Notification debounce, keyed ``(server, kind)`` — kind-scoped to
+        # match the kind-scoped refreshes: a server-scoped stamp would drop
+        # a different-kind notification inside the window outright, with no
+        # parked runner to observe the change.
+        self._last_notification_refresh: dict[tuple[str, str], float] = {}
+        # Coalescing markers for spawned static ``list_changed`` refreshes,
+        # keyed ``(server, kind)``: set at spawn, cleared the moment the
+        # runner acquires the per-name connect lock (before its list call).
+        # While set, further notifications for the server+kind are dropped —
+        # the parked runner's fresh list will observe their change — bounding
+        # the connect lock's waiter queue at ONE parked runner per
+        # server+kind. Mirrors ``_pool_refresh_pending``.
+        self._static_refresh_pending: set[tuple[str, str]] = set()
+        # Servers whose last static-path refresh FAILED (or was skipped as
+        # lock-busy) while their transport stayed up. There is NO periodic
+        # refresh pass — push + manual + post-reconnect are the only
+        # drivers — so without this a catalog whose one ``list_changed``
+        # push failed on a transient blip stays stale for every user on
+        # the node until an operator intervenes. The health tick drains
+        # this set: one bounded, lock-serialized full refresh per tick
+        # until a pass completes. Cleared by every session drop / removal
+        # (the reconnect's rediscovery supersedes the retry).
+        self._static_refresh_retry: set[str] = set()
 
         # Last refresh outcome (Phase 9 — admin status indicator).  Per-
         # server tuple of ``(unix_ts, outcome)`` where outcome is one of
@@ -696,8 +785,8 @@ class MCPClientManager:
         # this via a single dict-get (atomic under GIL) so sync-thread
         # callers (ChatSession) never iterate ``_user_pool_entries``
         # concurrently with the mcp-loop's mutations of the same dict
-        # (insert in ``_ensure_pool_entry`` / pop in
-        # ``_close_pool_entry_if_idle`` / ``_evict_session``).
+        # (insert in ``_ensure_pool_entry`` / the SOLE pop in
+        # ``_close_pool_entry_if_idle``'s full-drop path).
         self._user_tools: dict[str, list[dict[str, Any]]] = {}
 
         # Per-user resource catalog. Mirrors ``_user_tool_map`` /
@@ -720,11 +809,21 @@ class MCPClientManager:
         self._user_prompt_map: dict[str, dict[str, tuple[str, str]]] = {}
         self._user_prompts: dict[str, list[dict[str, Any]]] = {}
 
-        # Notification debounce for pool sessions, keyed ``(user_id, server)``.
-        # Mirrors ``_last_notification_refresh`` (static) but per-pool-key
-        # so a noisy server in one user's pool doesn't suppress a refresh
-        # in another user's pool of the same server.
-        self._last_pool_notification_refresh: dict[tuple[str, str], float] = {}
+        # Notification debounce for pool sessions, keyed
+        # ``((user_id, server), kind)``. Mirrors ``_last_notification_refresh``
+        # (static) but per-pool-key so a noisy server in one user's pool
+        # doesn't suppress a refresh in another user's pool of the same
+        # server — and kind-scoped for the same reason as the static stamp:
+        # refreshes are kind-scoped, so a key-scoped stamp would drop a
+        # different-kind notification inside the window outright.
+        self._last_pool_notification_refresh: dict[tuple[tuple[str, str], str], float] = {}
+        # Coalescing markers for spawned ``list_changed`` refreshes, keyed
+        # ``((user_id, server), kind)``: set at spawn, cleared the moment
+        # the runner acquires ``open_lock`` (before its list call). While
+        # set, further notifications for the key+kind are dropped — the
+        # parked runner's fresh list will observe their change — bounding
+        # the lock's waiter queue at ONE parked runner per key+kind.
+        self._pool_refresh_pending: set[tuple[tuple[str, str], str]] = set()
 
         # Pool tuning (read at construction; falls back to defaults).
         mcp_cfg = load_config("mcp")
@@ -1249,6 +1348,49 @@ class MCPClientManager:
             )
         return disarmed
 
+    def _clear_static_push_state(self, name: str, *, markers: bool) -> None:
+        """Clear per-server push-refresh bookkeeping — the ONE keyspace walk.
+
+        Covers the per-(server, kind) debounce stamps, the health-tick
+        refresh-retry flag, and (``markers=True``) the coalesce markers.
+        ``markers=False`` for session drops: a parked runner still owns
+        its marker and releases it itself (at-acquire or via its gated
+        ``finally``), and clobbering it would let the handler mint a
+        duplicate runner. ``markers=True`` for REMOVAL: retired-lock
+        runners bail at the identity check WITHOUT touching the set, so
+        a stale marker left behind would coalesce away a re-added
+        server's first push with no runner covering it.
+        """
+        self._static_refresh_retry.discard(name)
+        if markers:
+            # REMOVAL (markers=True): the server is gone, so its refresh
+            # OUTCOME must go too — a stale ``_last_refresh`` row would make
+            # ``last_refresh_outcome`` report the departed server's last
+            # result (and a re-add before its first refresh would read it).
+            # NOT on a session drop (markers=False): the outcome legitimately
+            # persists across a reconnect.
+            self._last_refresh.pop(name, None)
+        for kind in _LIST_CHANGED_KINDS.values():
+            self._last_notification_refresh.pop((name, kind), None)
+            if markers:
+                self._static_refresh_pending.discard((name, kind))
+
+    def _drop_static_session_and_stamp(self, name: str, state: StaticServerState) -> None:
+        """Null the session AND its push bookkeeping (stamps + retry flag).
+
+        The static twin of :meth:`_drop_session_and_stamp` (pool). The
+        stamp must not outlive the transport: the keep-stamp-on-failure
+        design leans on every teardown popping it, so a reconnected
+        transport's first ``list_changed`` refreshes immediately instead
+        of being debounced against a pre-collapse stamp — and the
+        reconnect's full rediscovery supersedes any pending refresh
+        retry. An eviction site that nulled the session directly would
+        silently re-open that stale-stamp hole. Safe when the session is
+        already gone: all parts are idempotent.
+        """
+        state.session = None
+        self._clear_static_push_state(name, markers=False)
+
     async def _teardown_static_session(self, name: str) -> None:
         """Tear down a static server's session/transport (the ONE canonical order).
 
@@ -1283,7 +1425,7 @@ class MCPClientManager:
         state = self._static_servers.get(name)
         if state is None:
             return
-        state.session = None
+        self._drop_static_session_and_stamp(name, state)
         owner = state.owner_task
         close_requested = state.close_requested
         state.owner_task = None
@@ -1449,52 +1591,364 @@ class MCPClientManager:
             self._circuit_open_until.pop(name, None)
             return state.session
 
+    def _admit_list_changed(
+        self,
+        msg: Any,
+        key: Any,
+        *,
+        stamps: dict[Any, float],
+        pending: set[Any],
+        refreshers: dict[str, Callable[[Any], Awaitable[Any]]],
+        runner: Callable[[Any, str, Callable[[Any], Awaitable[Any]]], Coroutine[Any, Any, None]],
+        origin: str,
+        label_prefix: str,
+        label_target: str,
+        on_debounce_drop: Callable[[], None] | None = None,
+    ) -> None:
+        """Admission half of the ``*/list_changed`` protocol — ONE copy.
+
+        Shared by the static and pool notification handlers (issue #842 —
+        the twin copies had already needed the same two corrections
+        applied twice). Every parameter is a plain value or bound method
+        from the calling path: *key* is opaque (``name`` for static,
+        ``(user_id, server)`` for pool), *stamps*/*pending* are the
+        path's debounce and coalesce structures, *runner* is the path's
+        :meth:`_run_list_changed_refresh` binding, and *origin* /
+        *label_prefix* / *label_target* only feed log lines and the
+        spawn label.
+
+        The flow: kind lookup → per-(key, kind) debounce → coalesce
+        check → stamp + marker + SPAWN. Debounce is kind-scoped because
+        refreshes are kind-scoped — a key-scoped stamp would drop a
+        different-kind notification landing inside the window (a tools
+        push swallowing the prompts push 100ms behind it) with no parked
+        runner to observe it. The coalesce check bounds the
+        serialization lock's waiter queue at one parked runner per
+        key+kind: a queued runner has not issued its list call yet, so
+        it will observe this change when it runs, and skipping keeps a
+        notifying-but-slow server from accreting waiters that starve the
+        lock's other users (reconnect drivers, dispatches, eviction).
+
+        *on_debounce_drop* recovers the ONE change the debounce genuinely
+        loses: a same-kind push landing in the window AFTER the previous
+        runner already completed (its marker cleared at lock-acquire, its
+        list finished) has no queued runner to observe it and, since MCP
+        servers announce a change once, would leave the catalog stale
+        indefinitely. Static passes an arm of the health-tick retry
+        (idempotent — a set — so a chatty server yields at most one retry
+        per tick, honouring the debounce's throttle while guaranteeing
+        eventual convergence). Pool passes ``None``: it has no health
+        tick, and its residual (a same-kind change debounced away
+        converges only on the entry's next reconnect or a later
+        cross-kind push) is the pre-existing #840 behaviour, unchanged
+        here.
+
+        The refresh is SPAWNED, never awaited: the SDK awaits message
+        handlers inline in its receive loop, so an in-handler request on
+        the same session can never receive its response — only the
+        parked receive loop could route it (#839).
+        """
+        if not isinstance(msg, mcp_types.ServerNotification):
+            return
+        kind = _LIST_CHANGED_KINDS.get(type(msg.root))
+        if kind is None:
+            return
+        marker = (key, kind)
+        now = time.monotonic()
+        last = stamps.get(marker)
+        # ``None`` sentinel, not a ``0.0`` default: the FIRST notification
+        # for a (key, kind) must never be debounced. ``time.monotonic()``
+        # counts from boot, so on a node whose process started < DEBOUNCE
+        # seconds after boot, ``now - 0.0 < DEBOUNCE`` would debounce the
+        # very first push — dropped with no recovery on the pool path
+        # (``on_debounce_drop=None``). An absent stamp = never refreshed =
+        # always admit.
+        if last is not None and now - last < self._NOTIFICATION_DEBOUNCE:
+            log.debug(
+                "Debouncing %s notification from %s (%.1fs since last refresh)",
+                kind,
+                origin,
+                now - last,
+            )
+            # A push queued behind a still-running runner (marker present)
+            # is already covered — that runner spawns a successor. Only a
+            # push with NO runner in flight is genuinely lost to the
+            # window; hand it to the recovery hook.
+            if on_debounce_drop is not None and marker not in pending:
+                on_debounce_drop()
+            return
+        if marker in pending:
+            log.debug("Coalescing %s notification from %s (refresh queued)", kind, origin)
+            return
+        try:
+            log.info("Received %s/list_changed from %s", kind, origin)
+            stamps[marker] = now
+            pending.add(marker)
+            self._spawn_background(
+                runner(key, kind, refreshers[kind]),
+                f"{label_prefix} {kind} refresh for '{label_target}'",
+            )
+        except Exception as exc:
+            # Scheduling failed (loop shutting down) — release BOTH the
+            # coalesce marker and the debounce stamp we just wrote, or a
+            # same-kind push landing inside the window afterward is
+            # debounced against a stamp for a refresh that never spawned
+            # (the pool path has no on_debounce_drop recovery). Structured
+            # fields only — ``exc_info=True`` would serialize the chained
+            # ``httpx.Request`` whose headers carry the bearer (configured
+            # for auth_type=static, minted for pool).
+            pending.discard(marker)
+            stamps.pop(marker, None)
+            log.warning(
+                "list_changed refresh scheduling failed for %s exc=%s",
+                origin,
+                type(exc).__name__,
+            )
+
+    async def _run_list_changed_refresh(
+        self,
+        key: Any,
+        kind: str,
+        refresh: Callable[[Any], Awaitable[Any]],
+        *,
+        pending: set[Any],
+        lock: asyncio.Lock | None,
+        still_current: Callable[[], bool],
+        live_session: Callable[[], bool],
+        marker_owned_when_stale: bool,
+        record: Callable[[BaseException | None], None],
+    ) -> None:
+        """Runner half of the ``*/list_changed`` protocol — ONE copy.
+
+        Body of a spawned refresh, never on the receive loop. Shared by
+        the static and pool bindings (:meth:`_run_static_notification_refresh`
+        / :meth:`_run_notification_refresh`), which supply plain values
+        and small closures: the path's *pending* set, the resolved
+        serialization *lock* (``None`` when the target was removed
+        between spawn and run — resolved WITHOUT get-or-create so a dead
+        target stays dead), a *still_current* generation check (lock
+        identity for static, entry identity for pool), a *live_session*
+        gate, and a *record* outcome hook.
+
+        Serializes on *lock* before refreshing: an unserialized refresh
+        races two writers — an in-flight connect, whose final wiring
+        block would overwrite the refresh's newer catalog with its older
+        discovery snapshot, and a sibling refresh for the same key,
+        where the slower list call can publish the older catalog last.
+        Under the lock each refresh issues its list call only after the
+        previous publisher finished, so the last publish is always the
+        freshest.
+
+        The coalesce marker (set by the handler at spawn) is cleared the
+        moment the lock is ACQUIRED and the generation is confirmed,
+        before the list call: a notification landing during the
+        in-flight list may announce a change that list already missed,
+        so it must spawn exactly one successor — which parks behind this
+        lock. Together with the handler's marker check this bounds the
+        waiter queue at one parked runner per key+kind. The ``finally``
+        discard covers cancellation while parked and is GATED on
+        non-acquisition: after the at-acquire discard (or the
+        superseded-path settlement), a marker present at exit belongs to
+        the SUCCESSOR spawned during our list call, and clobbering it
+        would re-open the unbounded FIFO the marker exists to prevent.
+
+        On the SUPERSEDED path (generation changed while parked — the
+        notification belonged to the old transport, and the replacement
+        publishes its own discovery under ITS lock/entry), marker
+        ownership differs by binding — *marker_owned_when_stale*:
+
+        * ``True`` (pool): nothing else clears pool markers, and while
+          OUR marker is set the handler coalesces every new spawn — a
+          marker present here is necessarily ours, and keeping it would
+          coalesce this key+kind forever.
+        * ``False`` (static): ``remove_server_sync`` discarded OUR
+          marker with the retired lock; a marker present NOW belongs to
+          the re-added generation's parked runner, and discarding it
+          would let the handler mint duplicates past the
+          one-parked-runner bound.
+
+        A session evicted while we were parked returns quietly: the
+        reconnect's rediscovery republishes, and every teardown path
+        pops the debounce stamp, so the reconnected transport's first
+        notification refreshes immediately. The debounce stamp (set at
+        schedule time) deliberately SURVIVES a failed refresh: popping
+        it re-armed the handler on every notification, so a fast-failing
+        server spawned refresh tasks at its notification rate; recovery
+        is the binding's concern (static arms the health-tick retry via
+        its *record* hook).
+
+        ``BaseExceptionGroup`` is caught alongside ``Exception``: a
+        wedged anyio transport surfaces session-op failures as groups,
+        and a group escaping this frame would reach
+        ``_spawn_background``'s failure log, whose ``exc_info``
+        serializes the chained bearer-carrying ``httpx.Request``.
+        """
+        marker = (key, kind)
+        if lock is None:
+            # Removed/replaced between spawn and run — nothing to
+            # refresh; the marker is still ours to release.
+            pending.discard(marker)
+            return
+        acquired = False
+        try:
+            async with lock:
+                if not still_current():
+                    if marker_owned_when_stale:
+                        pending.discard(marker)
+                    acquired = True  # marker settled — finally must not touch it
+                    return
+                pending.discard(marker)
+                acquired = True
+                if not live_session():
+                    return
+                await refresh(key)
+                record(None)
+        except (Exception, BaseExceptionGroup) as exc:
+            record(exc)
+        finally:
+            if not acquired:
+                # Cancelled (or failed) while PARKED — the marker still in
+                # the set is OURS; release it or this key+kind never
+                # refreshes again (see the docstring's ownership rules).
+                pending.discard(marker)
+
     def _make_static_notification_handler(self, name: str) -> Any:
         """Build the per-server notification handler for a static session.
 
-        Dispatches tool, resource, and prompt list-change notifications to the
-        appropriate refresh method (body unchanged from the pre-owner-task
-        closure in ``_connect_one_locked``; extracted because the session cm
-        is now entered by the transport owner).
+        The handler itself NEVER awaits a request on the session: the SDK
+        awaits message handlers inline in its receive loop, so an in-handler
+        request on the same session can never receive its response — the
+        response can only be routed by the receive loop that is parked
+        awaiting this handler, and while it is parked EVERY in-flight and
+        subsequent call on this shared per-node session stalls with it.
+        List-change refreshes are debounced per (server, kind), coalesced
+        per (server, kind), and SPAWNED as tracked tasks
+        (:meth:`_run_static_notification_refresh`), mirroring the pool
+        handler (:meth:`_make_pool_notification_handler`).
+
+        Deliberate change from the pre-#839 handler: the error pill
+        (``_last_error``) is no longer cleared on ANY incoming
+        notification — only a COMPLETED refresh clears it, because a
+        notification's arrival proves nothing about whether the previous
+        refresh failure resolved. A transient push-refresh failure shows
+        in the pill until the health tick's refresh RETRY completes
+        (:meth:`_static_health_one` — there is NO periodic refresh pass;
+        push, manual, post-reconnect, and that retry are the only
+        drivers), where the old handler cleared it, dishonestly, on the
+        next notification of any kind.
         """
+
+        # Built ONCE per handler (not per message): the SDK invokes the
+        # handler for every server->client message, and rebuilding the
+        # 3-entry dict + closure on each — before the isinstance/debounce/
+        # coalesce early-returns even run — was pure per-message garbage on
+        # the receive path. Bound off ``self`` here (not a module table) so
+        # instance-level overrides set before handler construction still
+        # apply and mypy checks the attribute references; nothing overrides
+        # a refresher AFTER the handler exists.
+        refreshers: dict[str, Callable[[str], Awaitable[Any]]] = {
+            "tools": self._refresh_server_tools,
+            "resources": self._refresh_server_resources,
+            "prompts": self._refresh_server_prompts,
+        }
+
+        def _on_debounce_drop() -> None:
+            self._arm_refresh_retry(name)
 
         async def _on_notification(
             msg: Any,  # RequestResponder | ServerNotification | Exception
         ) -> None:
-            if not isinstance(msg, mcp_types.ServerNotification):
-                return
-            root = msg.root
-
-            # Debounce: skip if we refreshed this server very recently
-            now = time.monotonic()
-            last = self._last_notification_refresh.get(name, 0.0)
-            if now - last < self._NOTIFICATION_DEBOUNCE:
-                log.debug(
-                    "Debouncing notification from '%s' (%.1fs since last refresh)",
-                    name,
-                    now - last,
-                )
-                return
-
-            try:
-                if isinstance(root, mcp_types.ToolListChangedNotification):
-                    log.info("Received tools/list_changed from '%s'", name)
-                    self._last_notification_refresh[name] = now
-                    await self._refresh_server_tools(name)
-                elif isinstance(root, mcp_types.ResourceListChangedNotification):
-                    log.info("Received resources/list_changed from '%s'", name)
-                    self._last_notification_refresh[name] = now
-                    await self._refresh_server_resources(name)
-                elif isinstance(root, mcp_types.PromptListChangedNotification):
-                    log.info("Received prompts/list_changed from '%s'", name)
-                    self._last_notification_refresh[name] = now
-                    await self._refresh_server_prompts(name)
-                self._last_error.pop(name, None)
-            except Exception as exc:
-                log.warning("Refresh after notification failed for '%s'", name, exc_info=True)
-                self._set_error(name, f"Refresh failed: {exc}")
+            self._admit_list_changed(
+                msg,
+                name,
+                stamps=self._last_notification_refresh,
+                pending=self._static_refresh_pending,
+                refreshers=refreshers,
+                runner=self._run_static_notification_refresh,
+                origin=f"'{name}'",
+                label_prefix="static",
+                label_target=name,
+                on_debounce_drop=_on_debounce_drop,
+            )
 
         return _on_notification
+
+    async def _run_static_notification_refresh(
+        self,
+        name: str,
+        kind: str,
+        refresh: Callable[[str], Awaitable[Any]],
+    ) -> None:
+        """Static binding of :meth:`_run_list_changed_refresh` — the protocol
+        (serialize → at-acquire discard → generation check → session gate →
+        refresh → gated ``finally``) lives there; only the bindings differ:
+
+        * Serialization is the per-name CONNECT lock — the static path's
+          one writer lock, shared with ``_connect_one_locked``'s discovery
+          wiring, ``_refresh_server``, and the teardown protocol — resolved
+          via ``.get()`` (never the get-or-create helper: minting would
+          resurrect a lock for a removed server) and generation-checked by
+          LOCK identity: ``remove_server_sync`` retires the lock object
+          after teardown.
+        * ``marker_owned_when_stale=False``: ``remove_server_sync`` clears
+          static markers with the retired lock, so on the superseded path
+          a marker present in the set belongs to the re-added generation's
+          parked runner (the pool binding deliberately differs).
+        * Failures route through :meth:`_record_refresh_failure` — the
+          redacted ``type: message`` log + error pill + health-tick retry
+          arm; the credential at stake is the CONFIGURED bearer carried in
+          the chained ``httpx.Request`` for ``auth_type=static`` servers.
+          Success clears the operator error pill.
+
+        Bounded contention residual, accepted: this runner (and the
+        lock-serialized :meth:`_refresh_server`) holds the connect lock
+        for up to one list timeout (``_CONNECT_TIMEOUT``), and a
+        dispatch-driven reconnect queues behind it — but a reconnect only
+        runs after the session was EVICTED, and every parked runner bails
+        instantly on the session gate once that happens, so the added
+        wait is at most the single in-flight list call. A caller timeout
+        expiring on that wait is deliberately not a breaker record (see
+        :meth:`_cb_auto_reconnect`); the next dispatch retries.
+        """
+        lock = self._static_connect_locks.get(name)
+
+        def _still_current() -> bool:
+            return self._static_connect_locks.get(name) is lock
+
+        def _live_session() -> bool:
+            state = self._static_servers.get(name)
+            return state is not None and state.session is not None
+
+        def _record(exc: BaseException | None) -> None:
+            if exc is None:
+                # A single-kind push SUCCESS does NOT declare the whole
+                # server healthy: ``_last_error`` / ``_last_refresh`` are
+                # server-scoped, but this refreshed only ONE kind. Stamping
+                # "ok" / clearing the pill here would paint a green,
+                # 200-OK server whose OTHER kind's catalog is still broken
+                # (a tools push failing while a prompts push succeeds). So
+                # a push success leaves the server-level outcome untouched
+                # — only the FULL pass (``_refresh_server`` ->
+                # ``_record_refresh_success``) is the authority on "ok",
+                # and a prior failure's armed health-tick retry runs that
+                # pass to converge. A push FAILURE still records (a known
+                # broken kind IS a broken server).
+                return
+            self._record_refresh_failure(
+                name, exc, context=f"Static {kind} refresh after notification"
+            )
+
+        await self._run_list_changed_refresh(
+            name,
+            kind,
+            refresh,
+            pending=self._static_refresh_pending,
+            lock=lock,
+            still_current=_still_current,
+            live_session=_live_session,
+            marker_owned_when_stale=False,
+            record=_record,
+        )
 
     async def _static_transport_owner(
         self,
@@ -1631,7 +2085,7 @@ class MCPClientManager:
         state.owner_task = None
         state.close_requested = None
         if state.session is not None:
-            state.session = None
+            self._drop_static_session_and_stamp(name, state)
             log.info("MCP server '%s' transport terminated; session evicted for reconnect", name)
 
     async def _connect_one_locked(self, name: str, cfg: dict[str, Any]) -> None:
@@ -1739,7 +2193,10 @@ class MCPClientManager:
         if resources_cap is not None:
             server_resources: list[dict[str, Any]] = []
             res_result = await self._await_owner_discovery(owner, session.list_resources())
-            for r in res_result.resources:
+            # Capped like the tools list above (and like the pool twins): a
+            # misbehaving server must not balloon the shared node's merged
+            # catalogs.
+            for r in _cap_server_resources(name, res_result.resources):
                 server_resources.append(
                     {
                         "uri": str(r.uri),
@@ -1754,7 +2211,7 @@ class MCPClientManager:
             tmpl_result = await self._await_owner_discovery(
                 owner, session.list_resource_templates()
             )
-            for t in tmpl_result.resourceTemplates:
+            for t in _cap_server_resource_templates(name, tmpl_result.resourceTemplates):
                 server_resources.append(
                     {
                         "uri": str(t.uriTemplate),
@@ -1774,7 +2231,7 @@ class MCPClientManager:
         if prompts_cap is not None:
             server_prompts: list[dict[str, Any]] = []
             prompt_result = await self._await_owner_discovery(owner, session.list_prompts())
-            for p in prompt_result.prompts:
+            for p in _cap_server_prompts(name, prompt_result.prompts):
                 server_prompts.append(
                     {
                         "name": f"mcp__{name}__{p.name}",
@@ -1835,63 +2292,97 @@ class MCPClientManager:
         """
         user_id, server_name = key
 
+        # Built ONCE per handler (not per message) — see the static twin
+        # (:meth:`_make_static_notification_handler`) for why: the SDK calls
+        # the handler on every server->client message, and rebuilding this
+        # dict each time was per-message garbage on the receive path. Bound
+        # off ``self`` here so instance overrides set before construction
+        # apply and mypy checks the references.
+        refreshers: dict[
+            str, Callable[[tuple[str, str]], Awaitable[tuple[list[str], list[str]]]]
+        ] = {
+            "tools": self._refresh_pool_server_tools,
+            "resources": self._refresh_pool_server_resources,
+            "prompts": self._refresh_pool_server_prompts,
+        }
+
         async def _on_pool_notification(
             msg: Any,  # RequestResponder | ServerNotification | Exception
         ) -> None:
-            if not isinstance(msg, mcp_types.ServerNotification):
-                return
-            root = msg.root
-            now = time.monotonic()
-            last = self._last_pool_notification_refresh.get(key, 0.0)
-            if now - last < self._NOTIFICATION_DEBOUNCE:
-                log.debug(
-                    "Debouncing pool notification user=%s server=%s (%.1fs since last refresh)",
-                    user_id,
-                    server_name,
-                    now - last,
-                )
-                return
-            try:
-                if isinstance(root, mcp_types.ToolListChangedNotification):
-                    log.info(
-                        "Received tools/list_changed from pool user=%s server=%s",
-                        user_id,
-                        server_name,
-                    )
-                    self._last_pool_notification_refresh[key] = now
-                    await self._refresh_pool_server_tools(key)
-                elif isinstance(root, mcp_types.ResourceListChangedNotification):
-                    log.info(
-                        "Received resources/list_changed from pool user=%s server=%s",
-                        user_id,
-                        server_name,
-                    )
-                    self._last_pool_notification_refresh[key] = now
-                    await self._refresh_pool_server_resources(key)
-                elif isinstance(root, mcp_types.PromptListChangedNotification):
-                    log.info(
-                        "Received prompts/list_changed from pool user=%s server=%s",
-                        user_id,
-                        server_name,
-                    )
-                    self._last_pool_notification_refresh[key] = now
-                    await self._refresh_pool_server_prompts(key)
-            except Exception as exc:
-                # Structured fields only — ``exc_info=True`` would
-                # serialize the chained ``httpx.Request`` whose headers
-                # carry ``Authorization: Bearer <token>``. Sentry /
-                # faulthandler-style integrations capture that frame
-                # and the bearer would land in error tracking.
-                # Mirrors the dispatch-path log scrubbing applied in
-                # the sec-1 round-1 fix.
+            self._admit_list_changed(
+                msg,
+                key,
+                stamps=self._last_pool_notification_refresh,
+                pending=self._pool_refresh_pending,
+                refreshers=refreshers,
+                runner=self._run_notification_refresh,
+                origin=f"pool user={user_id} server={server_name}",
+                label_prefix="pool",
+                label_target=server_name,
+            )
+
+        return _on_pool_notification
+
+    async def _run_notification_refresh(
+        self,
+        key: tuple[str, str],
+        kind: str,
+        refresh: Callable[[tuple[str, str]], Awaitable[tuple[list[str], list[str]]]],
+    ) -> None:
+        """Pool binding of :meth:`_run_list_changed_refresh` — the protocol
+        (serialize → at-acquire discard → generation check → session gate →
+        refresh → gated ``finally``) lives there; only the bindings differ:
+
+        * Serialization is the entry's ``open_lock``; the generation check
+          is ENTRY identity — an entry replaced (full drop + re-create)
+          while we parked published its own discovery, and this runner
+          holds a lock the new entry does not share.
+        * ``marker_owned_when_stale=True``: nothing else clears pool
+          markers, so on the superseded path the marker is still this
+          runner's own to release.
+        * Failures log type-name only (the pool path's converged shape;
+          no operator pill here) — the chained ``httpx.Request`` carries
+          ``Authorization: Bearer <token>``, so ``exc_info`` never runs.
+
+        Bounded residual, accepted: a server that keeps notifying while
+        every list call hangs to ``_CONNECT_TIMEOUT`` keeps THIS entry's
+        ``open_lock`` near-continuously occupied (one active + one parked
+        runner), deferring idle eviction of the entry (the eviction pass
+        skips a contested lock). The churn ends at the first real
+        dispatch (whose transport failure evicts the session, after which
+        parked runners bail on the session gate), at server recovery, or
+        when the notifications stop; other entries are unaffected.
+        """
+        user_id, server_name = key
+        entry = self._user_pool_entries.get(key)
+
+        def _still_current() -> bool:
+            return self._user_pool_entries.get(key) is entry
+
+        def _live_session() -> bool:
+            return entry is not None and entry.session is not None
+
+        def _record(exc: BaseException | None) -> None:
+            if exc is not None:
                 log.warning(
-                    "Pool refresh after notification failed user=%s server=%s exc=%s",
+                    "Pool %s refresh after notification failed user=%s server=%s exc=%s",
+                    kind,
                     user_id,
                     server_name,
                     type(exc).__name__,
                 )
 
-        return _on_pool_notification
+        await self._run_list_changed_refresh(
+            key,
+            kind,
+            refresh,
+            pending=self._pool_refresh_pending,
+            lock=entry.open_lock if entry is not None else None,
+            still_current=_still_current,
+            live_session=_live_session,
+            marker_owned_when_stale=True,
+            record=_record,
+        )
 
     async def _pool_transport_owner(
         self,
@@ -2025,7 +2516,7 @@ class MCPClientManager:
         entry = self._user_pool_entries.get(key)
         if entry is None:
             return
-        entry.session = None
+        self._drop_session_and_stamp(key, entry)
         owner = entry.owner_task
         close_requested = entry.close_requested
         entry.owner_task = None
@@ -2075,8 +2566,9 @@ class MCPClientManager:
             return
         entry.owner_task = None
         entry.close_requested = None
-        if entry.session is not None:
-            entry.session = None
+        had_session = entry.session is not None
+        self._drop_session_and_stamp(key, entry)
+        if had_session:
             user_id, server_name = key
             log.info(
                 "MCP pool transport terminated user=%s server=%s; session evicted for reconnect",
@@ -2300,7 +2792,12 @@ class MCPClientManager:
             raise
 
         capped_tools = _cap_server_tools(server_name, tools_result.tools)
-        entry.tools = [_mcp_to_openai(server_name, tool) for tool in capped_tools]
+        # STAGED — published to the entry only in the final wiring block
+        # below, together with resources/prompts: a mid-discovery
+        # failure tears the transport down and must leave the entry's
+        # (retained) catalog exactly as it was, never half-updated with
+        # the per-user maps still holding the old view.
+        server_tools = [_mcp_to_openai(server_name, tool) for tool in capped_tools]
 
         # Phase 7b — discover resources (capability-gated). Same anyio /
         # ``asyncio.timeout`` invariant as the tool discovery above (R1).
@@ -2397,6 +2894,7 @@ class MCPClientManager:
                     }
                 )
 
+        entry.tools = server_tools
         entry.resources = server_resources if resources_cap is not None else None
         entry.prompts = server_prompts if prompts_cap is not None else None
 
@@ -2415,16 +2913,9 @@ class MCPClientManager:
 
         # Loop-only mutation; sync-thread readers observe the new
         # catalog atomically via per-user dict-gets on ``_user_tools`` /
-        # ``_user_resources`` / ``_user_prompts``.
-        self._rebuild_user_tool_map(user_id)
-        self._rebuild_user_resource_map(user_id)
-        self._rebuild_user_prompt_map(user_id)
-        # Wake user-keyed AND admin (None) listeners; per-user fan-out
-        # ensures another user's session never observes this user's
-        # catalog change.
-        self._notify_user_tool_listeners(user_id)
-        self._notify_user_resource_listeners(user_id)
-        self._notify_user_prompt_listeners(user_id)
+        # ``_user_resources`` / ``_user_prompts``. Per-user fan-out
+        # ensures another user's session never observes this change.
+        self._rebuild_and_notify_user_catalogs(user_id)
         return entry
 
     # -- pool priming ---------------------------------------------------------
@@ -2576,6 +3067,10 @@ class MCPClientManager:
             entry = self._user_pool_entries.get(key)
             if entry is not None and entry.session is not None:
                 return  # already connected — nothing to do
+            # Pre-lookup observation for the dead-grant drop below: at
+            # this point the session is None; one connected during the
+            # lookup's awaits must read as re-consent evidence.
+            observed_session = self._observed_pool_session(user_id, server_name)
             if key in self._priming_keys:
                 return  # a concurrent prime for this (user, server) is in flight
             # Claim synchronously before any await — the mcp-loop is single-
@@ -2630,6 +3125,14 @@ class MCPClientManager:
                                 revoke_ambiguous_escalation=False,
                             )
                         if lookup.kind != "token" or not lookup.token:
+                            # Priming is also a convergence point (#836):
+                            # a NEW session's prime discovering the grant
+                            # is durably gone must drop the retained
+                            # catalog other live sessions still serve —
+                            # e.g. a disconnect made on another node.
+                            self._schedule_dead_grant_drop(
+                                lookup, key, observed_session=observed_session
+                            )
                             return  # not consented / no credential / refresh failed — lazy paths handle it
                         if server_row is None:
                             server_row = await asyncio.to_thread(
@@ -2664,6 +3167,13 @@ class MCPClientManager:
             # kind="missing". The oauth_user branch keeps its own deferred-row
             # optimisation. On any read hiccup, fail open and let the
             # per-server mint path classify it.
+            # Pre-read observation for the dead-grant drops below: a
+            # session connected DURING the credential read (a re-login
+            # capture prime racing this one) must read as re-consent
+            # evidence at drop time, not as the pre-observation session.
+            observed_obo = {
+                name: self._observed_pool_session(user_id, name) for name in self._obo_server_names
+            }
             issuer = str(getattr(getattr(self._app_state, "oidc_config", None), "issuer", "") or "")
             has_credential = False
             if issuer:
@@ -2677,6 +3187,25 @@ class MCPClientManager:
                 except Exception:
                     has_credential = True
             if not has_credential:
+                # The credential is GONE — fire the same dead-grant
+                # convergence the per-server lookup would have
+                # (kind="missing") for any retained obo entries, or
+                # ghosts survive every new-session prime: this gate
+                # skips exactly the lookup that would drop them (the
+                # schedule-side guard skips entries with nothing to
+                # converge).
+                # Contract: the synthesized kind="missing" mirrors
+                # get_obo_access_token_classified's durably-absent-
+                # credential verdict (its missing-credential return
+                # notes this back-reference); if that classification
+                # ever splits — say a transient sub-case — update this
+                # synthesis with it.
+                for name in self._obo_server_names:
+                    self._schedule_dead_grant_drop(
+                        TokenLookupResult(kind="missing"),
+                        (user_id, name),
+                        observed_session=observed_obo.get(name),
+                    )
                 prime_names -= self._obo_server_names
         await asyncio.gather(*(_prime_one(s) for s in list(prime_names)))
 
@@ -2951,8 +3480,12 @@ class MCPClientManager:
         Note: the loop wakes on a fixed tick rather than a condition
         variable. Event-driven evictions would be more efficient on
         large idle pools but add complexity (tracking per-entry
-        deadlines + a wakeup ``asyncio.Event``); at the design cap of
-        200 entries the unconditional 30 s wake is negligible.
+        deadlines + a wakeup ``asyncio.Event``). Warm entries are
+        bounded by the LRU cap (default 200); cooled catalog-only
+        entries are bounded by live-session users × registered pool
+        servers, and each tick's work over them is a per-entry set
+        lookup against a once-per-tick listener snapshot — negligible
+        either way.
         """
         while True:
             try:
@@ -2965,54 +3498,219 @@ class MCPClientManager:
                 # — a transport-layer group must not kill the loop.
                 log.warning("MCP pool eviction iteration failed", exc_info=True)
 
+    def has_live_session_listener(self, user_id: str) -> bool:
+        """True when *user_id* has a registered user-scoped tool listener.
+
+        A live listener means a live ChatSession whose merged tool list
+        is derived from this user's pool catalog. The ONE liveness
+        predicate: the eviction passes use it to decide cool-vs-drop
+        (#836), and outside callers (the OIDC capture-site prime) use
+        it to fan out work only for users who actually have an open
+        session to heal — priming on every routine SSO re-login would
+        warm transports and mint tokens for users with nothing open, at
+        deployment scale. Admin (``None``) listeners don't count: they
+        track catalog state for operator tooling, not a user's
+        model-visible tool list.
+        """
+        with self._listeners_lock:
+            return any(uid == user_id for uid, _cb in self._listeners)
+
+    def _live_listener_uids(self) -> set[str]:
+        """Snapshot the user ids with a live tool listener (one lock take).
+
+        The TTL pass checks retention for every idle entry every tick;
+        a per-entry ``has_live_session_listener`` scan would be
+        O(entries × listeners) under ``_listeners_lock`` on the
+        mcp-loop. Snapshot staleness is bounded by one tick and benign:
+        a listener added after the snapshot re-primes at session start
+        anyway, and one removed after it is caught next tick.
+        """
+        with self._listeners_lock:
+            return {uid for uid, _cb in self._listeners if uid}
+
+    @staticmethod
+    def _entry_has_catalog(entry: PoolEntryState) -> bool:
+        """True when the entry carries a discovered catalog worth retaining.
+
+        Never-connected stubs (``_ensure_pool_entry`` allocated, connect
+        failed before discovery) and revoke-cleared entries
+        (:meth:`_evict_session_drop_catalog`) carry none — retaining
+        those serves nobody, so the eviction passes full-drop them even
+        when the user has a live session.
+        """
+        return entry.tools is not None or entry.resources is not None or entry.prompts is not None
+
+    @staticmethod
+    def _entry_is_warm(entry: PoolEntryState) -> bool:
+        """True when the entry holds connection resources.
+
+        Warm = an open session OR a live owner task (an owner parked
+        after ``_evict_session`` still holds the transport until the
+        close protocol runs). Cooled catalog-only entries hold neither.
+        This is THE definition the LRU cap bounds; every warm check in
+        the eviction passes must go through it.
+        """
+        return entry.session is not None or entry.owner_task is not None
+
+    def _warm_pool_count(self) -> int:
+        """Live count of entries holding connection resources (:meth:`_entry_is_warm`)."""
+        return sum(1 for e in self._user_pool_entries.values() if self._entry_is_warm(e))
+
+    def _retain_cooled(
+        self,
+        key: tuple[str, str],
+        entry: PoolEntryState,
+        live_uids: set[str] | None = None,
+    ) -> bool:
+        """Retention policy: keep this entry cooled for a live session?
+
+        True iff ALL of:
+        - the entry carries a discovered catalog (stubs and
+          revoke-cleared entries retain nothing);
+        - the server still exists as a pool server in the in-memory
+          registries (:meth:`_is_pool_server`, rebuilt wholesale by
+          every reconcile). Without this, an admin delete / disable /
+          rename / auth-flip left an IMMORTAL cooled entry serving
+          ghost tools to live sessions — pre-#836-fix those aged out
+          with the idle TTL; with the registry check they full-drop
+          within one eviction tick, faster than before;
+        - the user has a live session (a registered user-scoped tool
+          listener). ``live_uids`` is the per-tick snapshot; ``None``
+          consults the registry directly (authoritative, single key).
+
+        Single copy of the policy — the TTL pass's already-cooled skip
+        and :meth:`_close_pool_entry_if_idle`'s cool-vs-drop decision
+        must never diverge.
+
+        Accepted residual: the two pool-name registries are replaced by
+        ``reconcile_sync`` on a server thread as two adjacent stores, so
+        a same-tick read here can theoretically observe a flip
+        mid-swap (in neither set) and full-drop a cooled entry. The
+        window is one bytecode boundary, and the same reconcile's
+        flip re-prime restores the catalog seconds later — an atomic
+        single-source registry is not worth the churn for that.
+        """
+        user_id, server_name = key
+        if not self._entry_has_catalog(entry):
+            return False
+        if not self._is_pool_server(server_name):
+            return False
+        if live_uids is not None:
+            return user_id in live_uids
+        return self.has_live_session_listener(user_id)
+
+    def _rebuild_and_notify_user_catalogs(self, user_id: str) -> None:
+        """Rebuild all three per-user catalog maps, then fan out to all
+        three listener classes (user-keyed + admin ``None``).
+
+        MUST run on the mcp-loop. Rebuild-before-notify is the
+        invariant (listeners re-read the maps), and tools / resources /
+        prompts move together — the Phase 7 round-2 "bug-pair" was
+        exactly a tools-only cleanup missing its resource/prompt half.
+        Shared by connect wiring, the full-drop eviction path, and the
+        revocation drop.
+        """
+        self._rebuild_user_tool_map(user_id)
+        self._rebuild_user_resource_map(user_id)
+        self._rebuild_user_prompt_map(user_id)
+        self._notify_user_tool_listeners(user_id)
+        self._notify_user_resource_listeners(user_id)
+        self._notify_user_prompt_listeners(user_id)
+
     async def _evict_idle_pool_entries(self) -> None:
         """Evict pool entries past the idle TTL or above the LRU cap.
 
         Skips any key whose ``open_lock`` is currently held or whose
         ``in_flight`` counter is non-zero — eviction never blocks on a
         contested lock or an active dispatch; the next tick retries.
+
+        Both passes close TRANSPORTS. Whether the ENTRY (and with it the
+        user's catalog contribution) survives is decided per user in
+        :meth:`_close_pool_entry_if_idle`: a user with a live session
+        keeps a cooled catalog-only entry so their model-visible tool
+        list never silently shrinks (#836); a user without one gets the
+        full drop. The LRU cap therefore bounds WARM entries — the
+        connection resources (transport, httpx client, owner task) are
+        what the cap exists to limit. Cooled entries hold none of
+        those; they are bounded by live-session users × pool servers
+        and reaped by the TTL pass within a tick of their user's last
+        listener going away.
         """
         if not self._user_pool_entries:
             return
         now = time.monotonic()
         ttl = self._user_pool_idle_ttl_s
+        live_uids = self._live_listener_uids()
 
         # First pass: TTL-based eviction. Run closes in parallel so a tick
         # that needs to evict many entries doesn't block on serial teardowns.
         ttl_targets: list[tuple[str, str]] = []
         for key, entry in list(self._user_pool_entries.items()):
             last = self._user_pool_last_used.get(key, entry.last_used)
-            if (now - last) >= ttl:
-                ttl_targets.append(key)
+            if (now - last) < ttl:
+                continue
+            if not self._entry_is_warm(entry) and self._retain_cooled(key, entry, live_uids):
+                # Already cooled — nothing to close. Retained for the
+                # live session's tool list; once the user's last
+                # listener goes away OR the server leaves the pool
+                # registries, this stops matching and the entry takes
+                # the full-drop path below.
+                continue
+            ttl_targets.append(key)
         if ttl_targets:
             await asyncio.gather(
                 *(self._close_pool_entry_if_idle(k) for k in ttl_targets),
                 return_exceptions=True,
             )
 
-        # Second pass: LRU cap. Iterate the canonical entry map (not the
-        # last_used view) so brand-new entries that were created via
-        # ``_ensure_pool_entry`` but haven't dispatched yet are still
-        # eviction-eligible.
-        if len(self._user_pool_entries) <= self._user_pool_lru_max:
+        # Second pass: LRU cap over warm entries. Iterate the canonical
+        # entry map (not the last_used view) so brand-new entries that
+        # were created via ``_ensure_pool_entry`` but haven't dispatched
+        # yet are still eviction-eligible.
+        warm = [
+            (key, entry)
+            for key, entry in self._user_pool_entries.items()
+            if self._entry_is_warm(entry)
+        ]
+        if len(warm) <= self._user_pool_lru_max:
             return
         ordered = sorted(
-            self._user_pool_entries.items(),
+            warm,
             key=lambda kv: self._user_pool_last_used.get(kv[0], kv[1].last_used),
         )
-        # Compute the eviction batch up front; we re-check the cap after
-        # each close (in-flight skips can leave us still over).
+        # Re-check the LIVE warm count each iteration — concurrent
+        # tasks change the warm set during this pass's awaits
+        # (revocation evictions, owner deaths, new connects), and a
+        # snapshot delta would keep closing healthy transports below
+        # the cap or stop above it. O(entries) per close is fine at
+        # cap scale; cooled entries are excluded from the count.
         for key, _entry in ordered:
-            if len(self._user_pool_entries) <= self._user_pool_lru_max:
+            if self._warm_pool_count() <= self._user_pool_lru_max:
                 break
             await self._close_pool_entry_if_idle(key)
 
     async def _close_pool_entry_if_idle(self, key: tuple[str, str]) -> None:
-        """Close ``key`` iff its open_lock is uncontested AND in_flight==0.
+        """Close ``key``'s transport iff its open_lock is uncontested AND in_flight==0.
 
         Best-effort: a contested lock or an active dispatch causes the
         function to return without mutation; the next eviction tick
         retries.
+
+        What happens to the ENTRY is :meth:`_retain_cooled` — ONE
+        policy shared with the TTL pass's already-cooled skip:
+
+        - retained → the entry is COOLED: transport torn down, catalog
+          kept, no rebuild, no listener fan-out. The user's merged tool
+          list is untouched and the next dispatch or prime reconnects —
+          the evict-session-keep-entry shape of
+          ``_on_pool_owner_death``. Dropping the catalog here instead
+          silently removed the server's tools from live sessions with
+          no re-prime path (#836).
+        - otherwise → full drop: entry popped, per-user catalogs
+          rebuilt, listeners notified. Covers departed users (no live
+          listener), catalog-less stubs, and servers that left the pool
+          registries (deleted / disabled / renamed / auth-flipped) —
+          whose ghost tools must leave live sessions within a tick.
         """
         entry = self._user_pool_entries.get(key)
         if entry is None:
@@ -3043,22 +3741,27 @@ class MCPClientManager:
             if entry.in_flight > 0:
                 return
             await self._teardown_pool_entry(key)
+            user_id, _server_name = key
+            if self._retain_cooled(key, entry):
+                # Cooled: entry + catalog stay, so the live session's
+                # tool list and ``is_mcp_tool`` are untouched. Nothing
+                # changed catalog-wise → no rebuild, no fan-out. The
+                # entry's ``open_lock`` must survive with it (an
+                # in-flight dispatcher's next acquire needs the same
+                # lock object), so skip the ``evicted`` cleanup too.
+                return
+            had_catalog = self._entry_has_catalog(entry)
             self._user_pool_entries.pop(key, None)
             self._user_pool_last_used.pop(key, None)
-            # Mirror ``_evict_session``'s catalog cleanup: dropping the
-            # entry without rebuilding the per-user catalogs would leave
-            # ``is_mcp_tool`` / per-user resource & prompt maps returning
-            # stale entries whose backing pool is gone, and ChatSession's
-            # tool / resource / prompt lists would never rebuild because
-            # no listener fires.
-            self._last_pool_notification_refresh.pop(key, None)
-            user_id, _server_name = key
-            self._rebuild_user_tool_map(user_id)
-            self._rebuild_user_resource_map(user_id)
-            self._rebuild_user_prompt_map(user_id)
-            self._notify_user_tool_listeners(user_id)
-            self._notify_user_resource_listeners(user_id)
-            self._notify_user_prompt_listeners(user_id)
+            if had_catalog:
+                # Dropping the entry without rebuilding the per-user
+                # catalogs would leave ``is_mcp_tool`` / per-user
+                # resource & prompt maps returning stale entries whose
+                # backing pool is gone for good (departed user, or a
+                # server no longer in the pool registries). A
+                # catalog-less stub contributed nothing — skip the
+                # zero-delta fan-out.
+                self._rebuild_and_notify_user_catalogs(user_id)
             evicted = True
         finally:
             lock.release()
@@ -3303,7 +4006,16 @@ class MCPClientManager:
             self._user_prompts.pop(user_id, None)
 
     async def _refresh_server_tools(self, name: str) -> tuple[list[str], list[str]]:
-        """Re-fetch tools for one server.  Returns ``(added, removed)`` names."""
+        """Re-fetch tools for one server.  Returns ``(added, removed)`` names.
+
+        MUST run with the per-name connect lock HELD (`_refresh_server` and
+        :meth:`_run_static_notification_refresh` acquire it): the lock is
+        what serializes this publish against connect discovery wiring,
+        sibling refreshes, AND remove/re-add — state replacement cannot
+        happen mid-flight while the lock is held, which is why there is no
+        post-await staleness recheck here (unlike the pool twins, whose
+        entry lifecycle has lock-free replacement paths).
+        """
         state = self._static_servers.get(name)
         if state is None or state.session is None:
             raise RuntimeError(f"MCP server '{name}' is not connected")
@@ -3314,7 +4026,11 @@ class MCPClientManager:
 
         old_names = {t["function"]["name"] for t in state.tools}
 
-        result = await session.list_tools()
+        # ``asyncio.timeout`` mandatory — a wedged server must not hang a
+        # spawned refresh (and the connect lock it holds) forever; the pool
+        # sibling (:meth:`_refresh_pool_server_tools`) already complies.
+        async with asyncio.timeout(self._CONNECT_TIMEOUT):
+            result = await session.list_tools()
         capped = _cap_server_tools(name, result.tools)
         server_tools = [_mcp_to_openai(name, tool) for tool in capped]
         new_names = {t["function"]["name"] for t in server_tools}
@@ -3342,10 +4058,11 @@ class MCPClientManager:
         listener fan-out. Static-path catalogs are NEVER touched, so
         invariant 1 (static path byte-identical) is preserved.
 
-        MUST run on the mcp-loop. Caller does not need to hold
-        ``open_lock`` — ``_refresh_pool_server_tools`` is invoked from
-        the pool session's notification handler, which already runs in
-        the SDK's receive task on the loop.
+        MUST run on the mcp-loop, with the entry's ``open_lock`` HELD
+        (:meth:`_run_notification_refresh` acquires it): an unlocked
+        refresh races a connect's discovery wiring and sibling
+        refreshes, either of which can publish an older catalog over
+        this one — see the runner's ordering rationale.
         """
         entry = self._user_pool_entries.get(key)
         if entry is None or entry.session is None:
@@ -3357,7 +4074,16 @@ class MCPClientManager:
         session = entry.session
         user_id, server_name = key
         old_names = {t["function"]["name"] for t in (entry.tools or [])}
-        result = await session.list_tools()
+        # ``asyncio.timeout`` mandatory — a wedged server must not hang
+        # the spawned refresh task (and the ``open_lock`` it holds)
+        # forever; the resource/prompt siblings already comply.
+        async with asyncio.timeout(self._CONNECT_TIMEOUT):
+            result = await session.list_tools()
+        if self._user_pool_entries.get(key) is not entry:
+            # The entry was replaced (full drop + re-create) while
+            # list_tools was in flight — this result belongs to the
+            # old entry; publishing it would clobber the new one.
+            return [], []
         capped = _cap_server_tools(server_name, result.tools)
         server_tools = [_mcp_to_openai(server_name, tool) for tool in capped]
         new_names = {t["function"]["name"] for t in server_tools}
@@ -3378,6 +4104,86 @@ class MCPClientManager:
             )
         return added, removed
 
+    async def _list_resource_pair(self, session: Any) -> tuple[Any, Any]:
+        """``list_resources`` + ``list_resource_templates`` in one bounded RTT.
+
+        The ONE copy of the paired-list protocol for both refresh twins
+        (:meth:`_refresh_server_resources` /
+        :meth:`_refresh_pool_server_resources`). Both calls share the
+        timeout budget and target disjoint catalogs (resources vs.
+        templates), so ordering is irrelevant.
+
+        Fail-FAST on the first real error — a fast, meaningful failure
+        (an auth or method rejection) must surface as ITSELF, not be
+        masked behind a hung sibling's eventual ``TimeoutError`` — but
+        with the surviving sibling CANCELLED and REAPED inside this
+        scope before the error re-raises: bare fail-fast ``gather``
+        leaves the survivor running detached — outside the timeout scope
+        and outside the lock serialization — as an unbounded in-flight
+        request on the shared session. On timeout expiry both tasks are
+        cancelled together and the caller sees ``TimeoutError``.
+
+        The reap is BOUNDED by its own grace deadline, NOT left inside the
+        outer ``asyncio.timeout`` (which fires exactly once — after it has
+        fired, awaiting the cancelled children there is unbounded). The
+        pinned SDK (mcp>=1.27,<2) honours cancellation promptly, so this
+        is belt-and-braces against a future regression: a child that
+        ignores ``cancel()`` must not wedge this runner while it holds the
+        per-server connect lock — the #839 deadlock class. A child still
+        pending after the grace is logged and abandoned (a cancelled local
+        task, GC-reaped) rather than held onto.
+        """
+        async with asyncio.timeout(self._CONNECT_TIMEOUT):
+            res_task = asyncio.create_task(session.list_resources())
+            tmpl_task = asyncio.create_task(session.list_resource_templates())
+            try:
+                res_result, tmpl_result = await asyncio.gather(res_task, tmpl_task)
+            except BaseException:
+                # First failure (or our own cancellation, incl. the
+                # timeout's): cancel the pair — a done task ignores it —
+                # and REAP within a bounded grace so nothing survives
+                # detached and no exception goes unretrieved, then surface
+                # the original.
+                for task in (res_task, tmpl_task):
+                    task.cancel()
+                await self._reap_bounded((res_task, tmpl_task))
+                raise
+            return res_result, tmpl_result
+
+    async def _reap_bounded(self, tasks: tuple[asyncio.Task[Any], ...]) -> None:
+        """Await already-cancelled *tasks* under a grace deadline.
+
+        ``asyncio.wait`` with a timeout so a child that refuses to honour
+        ``cancel()`` cannot block indefinitely — the expired outer
+        ``asyncio.timeout`` fires only once, so this await would otherwise
+        be unbounded on a wedged child. Exceptions on done tasks are
+        retrieved (marking them handled); a straggler is logged and
+        abandoned (a cancelled local task the loop will GC).
+
+        An EXTERNAL ``CancelledError`` (shutdown, an operator cancel of
+        the refresh runner) is honoured, NOT swallowed: it is re-raised
+        after a best-effort retrieval of any already-done task's
+        exception, so a shutdown signal delivered during the reap window
+        is not dropped on the floor.
+        """
+        try:
+            _done, pending = await asyncio.wait(set(tasks), timeout=self._OWNER_CANCEL_GRACE_S)
+        except asyncio.CancelledError:
+            for task in tasks:
+                if task.done():
+                    with contextlib.suppress(BaseException):
+                        task.exception()
+            raise
+        for task in tasks:
+            if task.done():
+                with contextlib.suppress(BaseException):
+                    task.exception()
+        if pending:
+            log.warning(
+                "MCP resource-list reap: %d task(s) ignored cancellation; abandoning",
+                len(pending),
+            )
+
     async def _refresh_pool_server_resources(
         self, key: tuple[str, str]
     ) -> tuple[list[str], list[str]]:
@@ -3386,11 +4192,14 @@ class MCPClientManager:
         Mirror of :meth:`_refresh_pool_server_tools` for the resource
         path (RFC §3.2). Skips when ``supports_resources`` is False so
         a server that no longer advertises resources doesn't trigger
-        a list call. ``asyncio.timeout`` is mandatory — see R6.
+        a list call. ``asyncio.timeout`` is mandatory — a wedged server
+        must not hang the refresh (and the lock it holds) forever.
 
-        MUST run on the mcp-loop. Caller does not need to hold
-        ``open_lock``; this is invoked from the pool notification
-        handler running on the SDK's receive task.
+        MUST run on the mcp-loop, with the entry's ``open_lock`` HELD
+        (:meth:`_run_notification_refresh` acquires it): an unlocked
+        refresh races a connect's discovery wiring and sibling
+        refreshes, either of which can publish an older catalog over
+        this one — see the runner's ordering rationale.
         """
         entry = self._user_pool_entries.get(key)
         if entry is None or entry.session is None or not entry.supports_resources:
@@ -3399,14 +4208,10 @@ class MCPClientManager:
         user_id, server_name = key
         old_uris = {r["uri"] for r in (entry.resources or []) if not r.get("template")}
 
-        async with asyncio.timeout(self._CONNECT_TIMEOUT):
-            # 1-RTT (gather) instead of 2 sequential RTTs — both calls
-            # share the same timeout budget and target disjoint catalogs
-            # (resources vs. templates), so ordering is irrelevant.
-            res_result, tmpl_result = await asyncio.gather(
-                session.list_resources(),
-                session.list_resource_templates(),
-            )
+        res_result, tmpl_result = await self._list_resource_pair(session)
+        if self._user_pool_entries.get(key) is not entry:
+            # Entry replaced mid-flight — stale result, discard.
+            return [], []
 
         server_resources: list[dict[str, Any]] = []
         for r in _cap_server_resources(server_name, res_result.resources):
@@ -3458,11 +4263,14 @@ class MCPClientManager:
         Mirror of :meth:`_refresh_pool_server_tools` for the prompt
         path (RFC §3.3). Skips when ``supports_prompts`` is False so a
         server that no longer advertises prompts doesn't trigger a list
-        call. ``asyncio.timeout`` is mandatory — see R6.
+        call. ``asyncio.timeout`` is mandatory — a wedged server must
+        not hang the refresh (and the lock it holds) forever.
 
-        MUST run on the mcp-loop. Caller does not need to hold
-        ``open_lock``; this is invoked from the pool notification
-        handler running on the SDK's receive task.
+        MUST run on the mcp-loop, with the entry's ``open_lock`` HELD
+        (:meth:`_run_notification_refresh` acquires it): an unlocked
+        refresh races a connect's discovery wiring and sibling
+        refreshes, either of which can publish an older catalog over
+        this one — see the runner's ordering rationale.
         """
         entry = self._user_pool_entries.get(key)
         if entry is None or entry.session is None or not entry.supports_prompts:
@@ -3473,6 +4281,9 @@ class MCPClientManager:
 
         async with asyncio.timeout(self._CONNECT_TIMEOUT):
             prompt_result = await session.list_prompts()
+        if self._user_pool_entries.get(key) is not entry:
+            # Entry replaced mid-flight — stale result, discard.
+            return [], []
 
         server_prompts: list[dict[str, Any]] = []
         for p in _cap_server_prompts(server_name, prompt_result.prompts):
@@ -3510,11 +4321,123 @@ class MCPClientManager:
             )
         return added, removed
 
-    async def _refresh_server(self, name: str) -> tuple[list[str], list[str]]:
+    def _record_refresh_failure(self, name: str, exc: BaseException, *, context: str) -> None:
+        """Record a static-path refresh failure — the ONE redaction policy copy.
+
+        ``type: str(exc)`` and NEVER ``exc_info``: the message text (server
+        error / URL) is diagnostic and header-free, while the serialized
+        exception CHAIN carries the chained ``httpx.Request`` whose headers
+        hold the configured bearer for ``auth_type=static`` servers. Every
+        static refresh-failure path routes through here so a drive-by
+        "improve logging" edit cannot silently reintroduce the leak at one
+        hand-synced copy.
+
+        Also stamps the ``error:<Class>`` outcome and arms the health-tick
+        refresh retry — the ONE place a static refresh FAILURE is recorded,
+        so the push path (which used to touch only ``_last_error``) and the
+        full-pass path agree on ``last_refresh_outcome``. Both the outcome
+        stamp and the retry arm are config-gated: a failure observed for a
+        just-removed server must not leave a stale ``error:`` row (removal
+        does not resurrect the outcome) or park a retry nothing will drain.
+        """
+        log.warning(
+            "%s failed for MCP server '%s' exc=%s: %s",
+            context,
+            name,
+            type(exc).__name__,
+            exc,
+        )
+        self._set_error(name, f"Refresh failed: {type(exc).__name__}: {exc}")
+        if name in self._server_configs:
+            self._last_refresh[name] = (time.time(), f"error:{type(exc).__name__}")
+        self._arm_refresh_retry(name)
+
+    def _record_refresh_success(self, name: str) -> None:
+        """Record a static-path refresh SUCCESS — the outcome twin of
+        :meth:`_record_refresh_failure`.
+
+        Clears the error pill and stamps the ``ok`` outcome, config-gated
+        so a success observed for a just-removed server leaves no stale
+        row. Called only by a FULL refresh pass (``_refresh_server`` and
+        the reconnect-then-refresh branch): a full pass has fetched every
+        kind, so it can legitimately declare the whole server healthy.
+        The push-driven single-kind refresh deliberately does NOT call
+        this on success — refreshing one kind cannot clear a server-scoped
+        error that may belong to another kind (see the ``_record`` closure
+        in :meth:`_run_static_notification_refresh`).
+        """
+        self._last_error.pop(name, None)
+        if name in self._server_configs:
+            self._last_refresh[name] = (time.time(), "ok")
+
+    def _record_refresh_skipped(self, name: str) -> None:
+        """Stamp the ``skipped`` outcome — the third outcome helper.
+
+        Config-gated like its ``success`` / ``failure`` siblings so the
+        three ``skipped`` sites in :meth:`_refresh_all` share ONE gate and
+        cannot drift (the drift class #842's shared helpers exist to
+        prevent). Does NOT touch the error pill: a skip is a non-event,
+        not a resolution — a prior failure's pill and armed retry stand.
+        """
+        if name in self._server_configs:
+            self._last_refresh[name] = (time.time(), "skipped")
+
+    def last_refresh_outcome(self, name: str) -> str | None:
+        """Authoritative last-refresh outcome for static server *name*.
+
+        One of ``"ok"``, ``"skipped"``, ``"error:<Class>"``, or ``None``
+        (no refresh since start). The single source of truth every
+        operator surface renders from — the ``refresh_sync`` diff tuple
+        says only WHAT changed, not whether the pass ran, was skipped, or
+        failed. Static-only (reads ``_last_refresh`` directly); no
+        oauth_user status routing.
+        """
+        row = self._last_refresh.get(name)
+        return row[1] if row is not None else None
+
+    def _arm_refresh_retry(self, name: str) -> None:
+        """Arm the health-tick refresh retry for *name* — the ONE gate copy.
+
+        Config-gated: a failure/skip/drop observed for a just-removed
+        server must not park a retry flag nothing will ever drain (the
+        tick iterates ``_server_configs`` only).
+        """
+        if name in self._server_configs:
+            self._static_refresh_retry.add(name)
+
+    def _spawn_full_refresh(self, name: str, label: str) -> None:
+        """Spawn a full logged catalog refresh; consume any pending retry.
+
+        The ONE copy of the discard-then-spawn idiom shared by the three
+        drivers that run a full pass (health-tick retry drain,
+        post-health-reconnect, post-dispatch-reconnect): the spawned pass
+        IS the refresh a pending health-tick retry wants, so clearing the
+        flag first prevents the next tick running a redundant second pass.
+        """
+        self._static_refresh_retry.discard(name)
+        self._spawn_background(self._refresh_server_logged(name), label)
+
+    async def _refresh_server(self, name: str) -> tuple[list[str], list[str]] | None:
         """Re-fetch tools, resources, and prompts for one server.
 
         Returns ``(added_tools, removed_tools)`` names (tool diff only,
-        for backward compatibility with ``/mcp refresh`` output).
+        for backward compatibility with ``/mcp refresh`` output), or
+        ``None`` when the pass deliberately did nothing — publish
+        nothing, write no status row — because another driver owns the
+        outcome:
+
+        * lock BUSY: the holder (connect wiring, a push runner, a
+          sibling pass) publishes a fresher catalog than this pass
+          would; callers that need convergence arm the health-tick
+          retry (``_refresh_server_logged``, ``_refresh_all``).
+        * SUPERSEDED: removed (or removed + re-added) — the removal
+          cleaned the status maps and a re-add's discovery owns the new
+          generation; writing here would resurrect rows for a
+          nonexistent server or stamp a false ``ok``.
+        * session EVICTED: the reconnect's full rediscovery owns
+          convergence; running the gather would only manufacture a
+          false 'not connected' error pill for a self-healing
+          condition.
 
         Writes the ``_last_refresh`` entry on every call so the Phase 9
         admin status pill reflects every refresh path — manual
@@ -3536,47 +4459,172 @@ class MCPClientManager:
         / ``state.prompts`` are bounded to whichever sub-refresh
         succeeded — the documented trade-off vs leaving orphan tasks
         running after the error is observed.
+
+        Serialized on the per-name connect lock: every publisher of a
+        static per-server catalog — a connect's discovery wiring, a
+        spawned notification refresh
+        (:meth:`_run_static_notification_refresh`), and this
+        manual/retry pass — writes under the same lock, so each list
+        call is issued only after the previous publisher finished and
+        the last publish is always the freshest. An unserialized pass
+        could land its older snapshot over a notification refresh's
+        newer one, with no convergence until the next change. No caller
+        holds the lock coming in: ``_refresh_all`` takes it per-branch
+        (never nested), and the spawn sites (post-reconnect, health-tick
+        retry) go through :meth:`_refresh_server_logged` — the raise
+        below must never reach ``_spawn_background``'s ``exc_info``
+        failure log.
+
+        The post-acquire recheck closes the remove → re-add race the
+        same way :meth:`_ensure_static_connected` does — by LOCK
+        IDENTITY: ``remove_server_sync`` retires the lock object after
+        teardown, so a pass that parked on the OLD lock must not run
+        its list calls concurrently with a re-add publishing under the
+        NEW lock (two unserialized publishers — the exact race this
+        lock exists to close). The get-or-create acquire mirrors
+        ``_ensure_static_connected``; a mint for a just-removed name is
+        bounded (a re-add reuses it, shutdown clears it) and the
+        recheck below keeps it inert.
         """
-        results = await asyncio.gather(
-            self._refresh_server_tools(name),
-            self._refresh_server_resources(name),
-            self._refresh_server_prompts(name),
-            return_exceptions=True,
-        )
-        first_exc: BaseException | None = next(
-            (r for r in results if isinstance(r, BaseException)), None
-        )
-        if first_exc is not None:
-            self._last_refresh[name] = (
-                time.time(),
-                f"error:{type(first_exc).__name__}",
+        lock = self._static_connect_lock_for(name)
+        if lock.locked():
+            # Contended: the holder IS a catalog publisher — a connect's
+            # discovery wiring, a spawned notification refresh, or a
+            # sibling pass — whose publish supersedes this one. Parking
+            # here would burn the operator's whole ``refresh_sync``
+            # budget (default 30s) on ONE busy server (a reconnect
+            # attempt holds this lock for up to 45s) and fail the pass
+            # for every healthy server queued behind it, where the
+            # pre-serialization code never waited at all. The one-tick
+            # check→acquire race window below is accepted: the sync
+            # boundary cancels a parked pass at its own budget, and
+            # ``_refresh_server_logged`` re-arms the health-tick retry
+            # on a skip.
+            log.info(
+                "Refresh pass for '%s' skipped: connect lock busy "
+                "(the holder's publish supersedes this pass)",
+                name,
             )
-            raise first_exc
-        tool_diff = results[0]
-        # ``return_exceptions=True`` widens the static type; on the all-
-        # success path each entry is the awaited result.  We narrow the
-        # tool-diff entry to the documented ``(added, removed)`` shape.
-        assert isinstance(tool_diff, tuple)
-        added, removed = tool_diff
-        self._last_error.pop(name, None)
-        self._last_refresh[name] = (time.time(), "ok")
-        return added, removed
+            return None
+        async with lock:
+            state = self._static_servers.get(name)
+            if (
+                self._static_connect_locks.get(name) is not lock
+                or state is None
+                or state.session is None
+            ):
+                # Superseded: removed (state gone), removed + re-added
+                # (lock retired — the new generation publishes its own
+                # discovery under the NEW lock), or the session was
+                # EVICTED before this pass ran — the reconnect's full
+                # rediscovery owns convergence then, and running the
+                # gather would just manufacture a false operator-facing
+                # 'not connected' error row for a self-healing condition.
+                # With the busy-skip above the first two arms are
+                # belt-and-braces (the lock was won through the one-tick
+                # check→acquire race); the session arm is load-bearing
+                # for spawned retry/post-reconnect passes racing an
+                # eviction.
+                return None
+            results = await asyncio.gather(
+                self._refresh_server_tools(name),
+                self._refresh_server_resources(name),
+                self._refresh_server_prompts(name),
+                return_exceptions=True,
+            )
+            first_exc: BaseException | None = next(
+                (r for r in results if isinstance(r, BaseException)), None
+            )
+            if first_exc is not None:
+                # The outcome row is written by the caller's
+                # ``_record_refresh_failure`` (every caller — ``_refresh_all``
+                # and ``_refresh_server_logged`` — routes the raise through
+                # it), config-gated in one place; writing here too would be
+                # an ungated duplicate.
+                raise first_exc
+            tool_diff = results[0]
+            # ``return_exceptions=True`` widens the static type; on the all-
+            # success path each entry is the awaited result.  We narrow the
+            # tool-diff entry to the documented ``(added, removed)`` shape.
+            assert isinstance(tool_diff, tuple)
+            added, removed = tool_diff
+            self._record_refresh_success(name)
+            return added, removed
+
+    async def _refresh_server_logged(self, name: str) -> None:
+        """:meth:`_refresh_server` for ``_spawn_background`` schedule sites.
+
+        The spawned pass has no caller to observe the re-raise, so an
+        escaping exception would land in ``_spawn_background``'s
+        done-callback, whose ``exc_info`` log serializes the chained
+        ``httpx.Request`` — headers carrying the configured bearer for
+        ``auth_type=static`` servers. Failures route through
+        :meth:`_record_refresh_failure` (redacted log + pill + retry
+        arm); ``_refresh_server`` already wrote the ``_last_refresh``
+        error row before re-raising, so no outcome is lost — only the
+        leak.
+
+        A ``None`` (skipped: lock busy / superseded) RE-ARMS the
+        health-tick retry when the server still exists: the lock holder
+        may be a single-kind notification refresh, not the full pass a
+        retry wanted, so a skip must not count as convergence.
+        """
+        try:
+            refreshed = await self._refresh_server(name)
+        except (Exception, BaseExceptionGroup) as exc:
+            self._record_refresh_failure(name, exc, context="Background catalog refresh")
+        else:
+            if refreshed is None:
+                self._arm_refresh_retry(name)
 
     async def _refresh_all(
         self, server_name: str | None = None
-    ) -> dict[str, tuple[list[str], list[str]]]:
+    ) -> dict[str, tuple[list[str], list[str]] | None]:
         """Refresh tools, resources, and prompts for one or all servers.
 
         For disconnected servers (in config but not connected), attempts
-        reconnect.  Returns ``{server: (added, removed)}`` per server.
+        reconnect. Per-server value:
+
+        * ``(added, removed)`` — the refresh RAN to completion; the tuple
+          is the tool diff (``([], [])`` = ran, no changes). Outcome
+          ``ok``.
+        * ``None`` — the refresh produced NO catalog, either SKIPPED
+          (another operation held the lock, or removed/evicted mid-pass;
+          outcome ``skipped``) or FAILED (it ran and errored; outcome
+          ``error:<Class>``). Consumers disambiguate via the
+          ``last_refresh_outcome`` status field.
+
+        ``None`` is a distinct shape on purpose: rendering either a skip
+        or a failure as ``([], [])`` told the operator "refreshed, no
+        changes" for a server that was never refreshed / whose refresh
+        failed. The ``_last_refresh`` status row carries the authoritative
+        outcome for every operator surface (CLI, HTTP endpoint, admin
+        pill) so they render consistently off ONE source of truth.
         """
-        results: dict[str, tuple[list[str], list[str]]] = {}
+        results: dict[str, tuple[list[str], list[str]] | None] = {}
         targets = [server_name] if server_name else list(self._server_configs.keys())
 
         for name in targets:
             try:
                 state = self._static_servers.get(name)
                 if state is None or state.session is None:
+                    if self._static_connect_lock_for(name).locked():
+                        # A reconnect (health loop / dispatch) or refresh
+                        # already holds the lock — parking here would burn
+                        # the pass's 30s budget on this one server and
+                        # starve every healthy server behind it (the same
+                        # reason ``_refresh_server`` busy-skips). The
+                        # holder finishes the job: a reconnect ends in
+                        # full rediscovery. No retry arm: the flag drains
+                        # only on live sessions, and a successful reconnect
+                        # already spawns its own full refresh.
+                        log.info(
+                            "Refresh pass for '%s' skipped: reconnect in flight",
+                            name,
+                        )
+                        self._record_refresh_skipped(name)
+                        results[name] = None
+                        continue
                     # Attempt reconnect via the shared lazy primitive — it owns
                     # the per-name lock, live-session reuse, the in_flight
                     # deferral, and the breaker (so no separate
@@ -3590,51 +4638,81 @@ class MCPClientManager:
                             # Deliberate skip: removed concurrently, or a
                             # sibling call is still in flight on the old
                             # stack. Not a failure — the next refresh or
-                            # health tick retries.
-                            results[name] = ([], [])
+                            # health tick retries. Stamp ``skipped`` (like
+                            # every other skip branch) so the endpoint /
+                            # pill don't read a STALE prior ``ok`` and
+                            # report a never-run refresh as current.
+                            self._record_refresh_skipped(name)
+                            results[name] = None
                             continue
                         post = self._static_servers.get(name)
                         new_names = (
                             [t["function"]["name"] for t in post.tools] if post is not None else []
                         )
                         results[name] = (new_names, [])
-                        self._last_refresh[name] = (time.time(), "ok")
+                        self._record_refresh_success(name)
+                    else:
+                        # Removed from config between the top-of-loop
+                        # session check and this cfg lookup. Report the
+                        # skip explicitly — falling through to ``continue``
+                        # left ``results[name]`` UNSET, omitting the server
+                        # from the returned dict, so an operator refreshing
+                        # that one server saw a bare "refresh complete" with
+                        # no line at all. Drop any stale outcome row too, so
+                        # ``last_refresh_outcome`` doesn't report the gone
+                        # server's prior ``ok`` (deterministic even if the
+                        # concurrent removal hasn't popped it yet).
+                        self._last_refresh.pop(name, None)
+                        results[name] = None
                     continue
-                added, removed = await self._refresh_server(name)
+                refreshed = await self._refresh_server(name)
+                if refreshed is None:
+                    # Skipped (lock busy) or superseded (removed /
+                    # evicted) — a deliberate non-outcome: record neither
+                    # success nor failure for whatever generation lives
+                    # now, and report None so the operator sees "skipped",
+                    # not a fake "no changes". BUT the operator asked for
+                    # a refresh and a busy-skip's lock holder may be a
+                    # single-kind push runner, not the full pass — arm the
+                    # health-tick retry so the request isn't silently
+                    # dropped (mirrors ``_refresh_server_logged``;
+                    # config-gated, so removed servers arm nothing).
+                    self._arm_refresh_retry(name)
+                    self._record_refresh_skipped(name)
+                    results[name] = None
+                    continue
+                added, removed = refreshed
                 self._cb_record_success(name)
                 results[name] = (added, removed)
             except (Exception, BaseExceptionGroup) as exc:
                 # BaseExceptionGroup: a transport task-group failure from the
                 # reconnect/refresh must stay isolated to this server, not
-                # abort the whole refresh pass.
-                log.warning("Refresh failed for MCP server '%s'", name, exc_info=True)
-                self._set_error(name, f"Refresh failed: {exc}")
-                results[name] = ([], [])
+                # abort the whole refresh pass. Redaction + retry-arm live
+                # in the shared helper.
+                # ``_record_refresh_failure`` stamps the (config-gated)
+                # ``error:<Class>`` outcome and the pill in one place — see
+                # the eviction note below for why the write must not be
+                # duplicated (ungated) here.
+                self._record_refresh_failure(name, exc, context="Refresh")
+                # None, NOT ``([], [])``: a failure produced no catalog, and
+                # ``([], [])`` is reserved for "ran, no changes" — rendering
+                # a failure as "no changes" is the operator lie the sentinel
+                # exists to prevent. Consumers disambiguate None (skipped vs
+                # failed) via ``last_refresh_outcome``, which
+                # ``_record_refresh_failure`` set above.
+                results[name] = None
                 # A dead transport leaves a non-None but unusable session, so
                 # the reconnect branch at the top of this loop (gated on
-                # ``session is None``) would never fire and we would re-probe
-                # the corpse on every tick forever — the exact failure that
+                # ``session is None``) would never fire and every later pass
+                # would re-probe the corpse forever — the exact failure that
                 # required a full process restart to clear. Evicting the
-                # session here makes the NEXT refresh tick reconnect, turning
-                # this periodic refresh into a self-healing liveness probe.
+                # session here hands recovery to the health loop (and makes
+                # the next manual pass reconnect), turning any refresh pass
+                # into a self-healing liveness probe.
                 if _is_dead_transport(exc):
                     dead_state = self._static_servers.get(name)
                     if dead_state is not None:
-                        dead_state.session = None
-                # Overwrite unconditionally with the freshest observed
-                # outcome.  Two cases produce the write:
-                # (1) Reconnect branch: ``_connect_one`` raised before
-                #     ``_refresh_server`` could write — no prior entry
-                #     from this iteration exists yet, so the write is
-                #     the only fresh signal.
-                # (2) ``_refresh_server`` branch: it already wrote a
-                #     fresh ``error:<ClassName>`` before re-raising, so
-                #     the outer overwrite is a no-op for the value.
-                # Using ``setdefault`` here would preserve a stale prior
-                # ``"ok"`` from the previous successful refresh when the
-                # current attempt fails — the admin pill would show
-                # "ok" for a broken server.
-                self._last_refresh[name] = (time.time(), f"error:{type(exc).__name__}")
+                        self._drop_static_session_and_stamp(name, dead_state)
 
         # Final sync to clean up templates from servers that are no longer connected
         try:
@@ -3646,10 +4724,16 @@ class MCPClientManager:
 
     def refresh_sync(
         self, server_name: str | None = None, timeout: int = 30
-    ) -> dict[str, tuple[list[str], list[str]]]:
+    ) -> dict[str, tuple[list[str], list[str]] | None]:
         """Refresh tools synchronously (blocks the calling thread).
 
-        Returns ``{server: (added_names, removed_names)}`` per server.
+        Returns ``{server: (added_names, removed_names)}`` for a refresh
+        that RAN (``([], [])`` = no changes), or ``{server: None}`` when
+        it produced no catalog — SKIPPED (lock held by a concurrent
+        reconnect/refresh, or removed mid-pass) or FAILED. Callers MUST
+        NOT render ``None`` as "no changes"; consult
+        :meth:`last_refresh_outcome` (or the status ``last_refresh_outcome``
+        field) to distinguish ``skipped`` from ``error:<Class>``.
         """
         assert self._loop is not None
         future = asyncio.run_coroutine_threadsafe(self._refresh_all(server_name), self._loop)
@@ -3719,7 +4803,12 @@ class MCPClientManager:
         self._notify_resource_listeners()
 
     async def _refresh_server_resources(self, name: str) -> None:
-        """Re-fetch resources for one server."""
+        """Re-fetch resources for one server.
+
+        MUST run with the per-name connect lock HELD — see
+        :meth:`_refresh_server_tools` for the serialization contract (and
+        why no post-await staleness recheck is needed).
+        """
         state = self._static_servers.get(name)
         if state is None or not state.supports_resources:
             return
@@ -3730,9 +4819,12 @@ class MCPClientManager:
         # turn the second list_resource_templates() call into AttributeError.
         session = state.session
 
+        res_result, tmpl_result = await self._list_resource_pair(session)
+
         server_resources: list[dict[str, Any]] = []
-        res_result = await session.list_resources()
-        for r in res_result.resources:
+        # Capped like the pool twin — a misbehaving server's push must not
+        # balloon the shared node's merged catalogs.
+        for r in _cap_server_resources(name, res_result.resources):
             server_resources.append(
                 {
                     "uri": str(r.uri),
@@ -3742,8 +4834,7 @@ class MCPClientManager:
                     "server": name,
                 }
             )
-        tmpl_result = await session.list_resource_templates()
-        for t in tmpl_result.resourceTemplates:
+        for t in _cap_server_resource_templates(name, tmpl_result.resourceTemplates):
             server_resources.append(
                 {
                     "uri": str(t.uriTemplate),
@@ -3777,7 +4868,12 @@ class MCPClientManager:
         self._notify_prompt_listeners()
 
     async def _refresh_server_prompts(self, name: str) -> None:
-        """Re-fetch prompts for one server."""
+        """Re-fetch prompts for one server.
+
+        MUST run with the per-name connect lock HELD — see
+        :meth:`_refresh_server_tools` for the serialization contract (and
+        why no post-await staleness recheck is needed).
+        """
         state = self._static_servers.get(name)
         if state is None or not state.supports_prompts:
             return
@@ -3788,9 +4884,14 @@ class MCPClientManager:
         # multi-await tomorrow; consistent capture-once idiom.
         session = state.session
 
+        # ``asyncio.timeout`` mandatory — a wedged server must not hang a
+        # spawned refresh (and the connect lock it holds) forever.
+        async with asyncio.timeout(self._CONNECT_TIMEOUT):
+            prompt_result = await session.list_prompts()
+
         server_prompts: list[dict[str, Any]] = []
-        prompt_result = await session.list_prompts()
-        for p in prompt_result.prompts:
+        # Capped like the pool twin — see _refresh_server_resources.
+        for p in _cap_server_prompts(name, prompt_result.prompts):
             server_prompts.append(
                 {
                     "name": f"mcp__{name}__{p.name}",
@@ -4167,7 +5268,7 @@ class MCPClientManager:
                     entry = self._user_pool_entries.get(key)
                     if entry is None:
                         continue
-                    entry.session = None
+                    entry.drop_session()
                     owner = entry.owner_task
                     close_requested = entry.close_requested
                     entry.owner_task = None
@@ -4214,7 +5315,7 @@ class MCPClientManager:
             async def _close_all_owners() -> None:
                 owners: list[asyncio.Task[None]] = []
                 for srv_name, srv_state in list(self._static_servers.items()):
-                    srv_state.session = None
+                    self._drop_static_session_and_stamp(srv_name, srv_state)
                     owner = srv_state.owner_task
                     close_requested = srv_state.close_requested
                     srv_state.owner_task = None
@@ -4293,6 +5394,10 @@ class MCPClientManager:
         self._circuit_open_until.clear()
         self._circuit_trip_count.clear()
         self._last_notification_refresh.clear()
+        self._static_refresh_pending.clear()
+        self._static_refresh_retry.clear()
+        self._last_pool_notification_refresh.clear()
+        self._pool_refresh_pending.clear()
         # Pool state already cleared above when the loop was alive; this
         # makes shutdown idempotent if the loop exited before pool state
         # could be wound down (e.g., manager constructed but never started).
@@ -4403,6 +5508,19 @@ class MCPClientManager:
 
         async def _reconnect() -> None:
             self._cb_clear(name)
+            # FORCE semantics: drop the session BEFORE queueing on the lock
+            # (lock-free, same as the dispatch eviction sites). Push-refresh
+            # runners now share this lock, and parked ones bail instantly at
+            # their session check once it is None — without this, a noisy
+            # slow server could serialize up to one 30s list call per kind
+            # ahead of the operator's recovery action and spuriously expire
+            # the 55s caller budget. Residual: ONE mid-list holder can still
+            # precede us by up to ``_CONNECT_TIMEOUT``; a timed-out
+            # reconnect is honest and retryable (this drop already emptied
+            # the queue for the retry).
+            pre_state = self._static_servers.get(name)
+            if pre_state is not None:
+                self._drop_static_session_and_stamp(name, pre_state)
             # Hold the per-name connect lock across the FORCE rebuild so an
             # autonomous health-loop / dispatch reconnect can never interleave
             # its own teardown/rebuild on the shared ``StaticServerState``
@@ -4436,7 +5554,7 @@ class MCPClientManager:
                         fail_state.tools = []
                         fail_state.resources = []
                         fail_state.prompts = []
-                        fail_state.session = None
+                        self._drop_static_session_and_stamp(name, fail_state)
                     self._rebuild_tools()
                     self._rebuild_resources()
                     self._rebuild_prompts()
@@ -4490,57 +5608,105 @@ class MCPClientManager:
         existing = self._static_servers.get(name)
         was_connected = existing is not None and existing.session is not None
 
-        # Remove from config to prevent reconnection
-        self._server_configs.pop(name, None)
-
         if self._loop is not None:
 
             async def _remove() -> None:
-                # Hold the per-name connect lock across teardown so an autonomous
-                # health-loop reconnect can't interleave (config was already
-                # popped above, so no NEW reconnect will start; this serializes
-                # against one already in flight).
+                # FORCE-drop the session before queueing (mirrors
+                # ``reconnect_sync``): parked push-refresh runners bail at
+                # their session gate instead of serializing up to one ≤30s
+                # list call per kind ahead of this removal — the noisy slow
+                # server most in need of removal was exactly the one whose
+                # runners could starve it past every caller budget.
+                # Timeout-safe: the config is still present at this point,
+                # so if the removal is then cancelled while parked, the
+                # health loop simply reconnects — recoverable, never
+                # half-removed.
+                pre = self._static_servers.get(name)
+                if pre is not None:
+                    self._drop_static_session_and_stamp(name, pre)
+                # Hold the per-name connect lock across the WHOLE removal —
+                # including the config pop. Popping the config before
+                # queueing (the old shape) meant a timed-out ``_remove``
+                # (cancelled while parked) left a HALF-REMOVED server:
+                # config gone, but session + published catalogs alive with
+                # no driver able to reconnect or re-remove them. With every
+                # mutation under the lock, a removal cancelled while parked
+                # has touched NOTHING (beyond the recoverable session drop
+                # above) — the caller's False is honest and a retry works.
+                # The cost: a reconnect driver that wins the lock first can
+                # rebuild the session moments before removal — this teardown
+                # then closes it anyway.
                 async with self._static_connect_lock_for(name):
-                    # Close session + transport via the owner close protocol
-                    await self._teardown_static_session(name)
-                    # Clean up per-server state (on the event loop thread)
-                    self._static_servers.pop(name, None)
-                    self._last_error.pop(name, None)
-                    self._last_notification_refresh.pop(name, None)
-                    self._cb_clear(name)
-                    # Clear health-loop backoff/ping state so a later re-add of
-                    # the same name doesn't inherit stale ``due`` deadlines.
-                    self._static_reconnect_attempt.pop(name, None)
-                    self._static_reconnect_next.pop(name, None)
-                    self._static_next_ping.pop(name, None)
-                    # Rebuild merged state (serialized with notification handlers)
-                    self._rebuild_tools()
-                    self._rebuild_resources()
-                    self._rebuild_prompts()
-                # Drop the now-orphaned per-name lock AFTER releasing it (the
-                # server is gone; a re-add re-creates it lazily).
-                self._static_connect_locks.pop(name, None)
+                    self._server_configs.pop(name, None)
+                    try:
+                        # Close session + transport via the owner close protocol
+                        await self._teardown_static_session(name)
+                    finally:
+                        # SYNC cleanup — all of it, no awaits: it must
+                        # complete even when the caller's timeout cancels us
+                        # inside the teardown awaits above, or a cancel
+                        # landing after the config pop would strand
+                        # published ghost catalogs with no config behind
+                        # them (the abandoned owner unwinds solo — the
+                        # close protocol tolerates that). A removal
+                        # cancelled HERE therefore still completes; the
+                        # caller's False is then stale, but a retry no-ops
+                        # and ``reconcile_sync``'s config post-condition
+                        # sees the truth.
+                        #
+                        # The push-state clear backs up the teardown call:
+                        # ``_teardown_static_session`` early-returns (no
+                        # pop) when the state entry is already gone.
+                        # ``markers=True`` keeps a parked old-generation
+                        # runner's marker from coalescing AWAY a re-added
+                        # server's first push — that runner bails at its
+                        # lock-identity check without refreshing, so
+                        # nothing would cover the dropped change.
+                        self._static_servers.pop(name, None)
+                        self._last_error.pop(name, None)
+                        self._clear_static_push_state(name, markers=True)
+                        self._cb_clear(name)
+                        # Clear health-loop backoff/ping state so a later
+                        # re-add of the same name doesn't inherit stale
+                        # ``due`` deadlines.
+                        self._static_reconnect_attempt.pop(name, None)
+                        self._static_reconnect_next.pop(name, None)
+                        self._static_next_ping.pop(name, None)
+                        # Rebuild merged state (serialized with notification
+                        # handlers on the loop thread).
+                        self._rebuild_tools()
+                        self._rebuild_resources()
+                        self._rebuild_prompts()
+                        # Retire the lock (a re-add re-creates it lazily);
+                        # parked waiters acquire the retired object and bail
+                        # at their identity checks.
+                        self._static_connect_locks.pop(name, None)
 
             future = asyncio.run_coroutine_threadsafe(_remove(), self._loop)
             try:
                 future.result(timeout=timeout)
             except concurrent.futures.TimeoutError:
-                # A slow reconnect held the per-name lock past our wait. CANCEL
-                # the pending ``_remove`` so it can't later pop a re-added entry
-                # (or its new lock) and corrupt state; report failure rather than
-                # a false "removed" (the default timeout exceeds the reconnect
-                # bound, so this is an edge — a caller passing a short timeout).
+                # A slow reconnect held the lock past our wait (the session
+                # pre-drop already drained parked push runners). CANCEL the
+                # pending ``_remove`` so it can't later pop a re-added entry
+                # (or its new lock) and corrupt state; report failure rather
+                # than a false "removed". Cancelled while PARKED → nothing
+                # mutated (retry works); cancelled inside the teardown →
+                # the ``finally`` completes the removal anyway (a retry
+                # no-ops, and reconcile's config post-condition sees the
+                # truth either way).
                 future.cancel()
-                log.warning("MCP server '%s' removal timed out; cancelled", name)
+                log.warning("MCP server '%s' removal timed out; cancelled (retryable)", name)
                 return False
             except Exception:
                 log.warning("Error removing MCP server '%s'", name, exc_info=True)
                 return False
         else:
             # No event loop (tests / pre-start) — mutate directly
+            self._server_configs.pop(name, None)
             self._static_servers.pop(name, None)
             self._last_error.pop(name, None)
-            self._last_notification_refresh.pop(name, None)
+            self._clear_static_push_state(name, markers=True)
             self._cb_clear(name)
             self._rebuild_tools()
             self._rebuild_resources()
@@ -4635,18 +5801,22 @@ class MCPClientManager:
         # and the eviction loop snapshot the same way.
         entries = list(self._user_pool_entries.items())
         if aggregate:
-            warm = [e for (uid, sname), e in entries if sname == name and e.session is not None]
+            scoped = [e for (uid, sname), e in entries if sname == name]
         elif user_id:
-            warm = [
-                e
-                for (uid, sname), e in entries
-                if sname == name and uid == user_id and e.session is not None
-            ]
+            scoped = [e for (uid, sname), e in entries if sname == name and uid == user_id]
         else:
-            warm = []
+            scoped = []
+        warm = [e for e in scoped if e.session is not None]
+        # Cooled entries (transport idled out, catalog retained for the
+        # user's live sessions, #836) still SERVE their tools — a
+        # warm-only view told the user "0 tools" for a catalog their
+        # own chat was actively offered. ``connected`` stays
+        # transport-truthful; the catalog counts must not.
+        idle = [e for e in scoped if e.session is None and self._entry_has_catalog(e)]
         # rep is the first warm entry (insertion order): the requester's own pool
-        # when scoped, or a representative catalog for the aggregate operator view.
-        rep = warm[0] if warm else None
+        # when scoped, or a representative catalog for the aggregate operator
+        # view — falling back to a cooled catalog when nothing is warm.
+        rep = warm[0] if warm else (idle[0] if idle else None)
         cb_deadline = self._circuit_open_until.get(name)
         cb_open = cb_deadline is not None and time.monotonic() < cb_deadline
         last_refresh = self._last_refresh.get(name)
@@ -4663,6 +5833,7 @@ class MCPClientManager:
             "consecutive_failures": self._consecutive_failures.get(name, 0),
             "auth_type": self.server_auth_type(name) or "oauth_user",
             "user_pools": len(warm),
+            "user_pools_idle": len(idle),
             "last_refresh_at": last_refresh[0] if last_refresh is not None else None,
             "last_refresh_outcome": last_refresh[1] if last_refresh is not None else None,
         }
@@ -4719,12 +5890,14 @@ class MCPClientManager:
         # just read — feeds :meth:`server_auth_type` so callers (e.g.
         # ``web_search.resolve_web_search_client``) avoid a per-turn SQL
         # roundtrip.
-        self._oauth_user_server_names = {
-            row["name"] for row in rows if row.get("auth_type") == "oauth_user"
-        }
-        self._obo_server_names = {
-            row["name"] for row in rows if row.get("auth_type") == "oauth_obo"
-        }
+        # Build both sets BEFORE storing so the two attribute stores are
+        # adjacent: cross-thread readers (the eviction tick's
+        # _retain_cooled) see at most a single-bytecode tear window on a
+        # flip instead of a full row iteration between the swaps.
+        new_oauth_user_names = {row["name"] for row in rows if row.get("auth_type") == "oauth_user"}
+        new_obo_names = {row["name"] for row in rows if row.get("auth_type") == "oauth_obo"}
+        self._oauth_user_server_names = new_oauth_user_names
+        self._obo_server_names = new_obo_names
         new_pool_auth = {n: "oauth_user" for n in self._oauth_user_server_names}
         new_pool_auth.update(dict.fromkeys(self._obo_server_names, "oauth_obo"))
         # Pool servers newly registered OR migrated between pool auth types
@@ -4744,6 +5917,16 @@ class MCPClientManager:
         # Config-file servers (not in _db_managed) are left untouched.
         for name in list(self._db_managed - desired_names):
             self.remove_server_sync(name, timeout=timeout)
+            if name in self._server_configs:
+                # Removal timed out while parked (it mutates nothing in that
+                # case) — KEEP the name in ``_db_managed`` so the next
+                # reconcile pass retries. Discarding here made a DB-driven
+                # removal a silent, permanent no-op: the removal loop
+                # iterates ``_db_managed - desired``, so a discarded name
+                # can never be removed again while the health loop keeps
+                # the server alive off ``_server_configs``.
+                log.warning("reconcile_sync: removal of '%s' timed out; retrying next pass", name)
+                continue
             self._db_managed.discard(name)
             removed.append(name)
 
@@ -4764,6 +5947,19 @@ class MCPClientManager:
             if desired[name] != self._server_configs.get(name):
                 log.info("Config changed for MCP server '%s', reconnecting", name)
                 self.remove_server_sync(name, timeout=timeout)
+                if name in self._server_configs:
+                    # Removal timed out (nothing mutated) — defer the update
+                    # rather than layering the new config via add: a
+                    # subsequently timed-out add pops the config outright,
+                    # stranding the still-live OLD session as exactly the
+                    # half-removed ghost the locked removal exists to
+                    # prevent. The DB row is unchanged, so the next pass
+                    # sees the same drift and retries.
+                    log.warning(
+                        "reconcile_sync: config update for '%s' deferred (removal timed out)",
+                        name,
+                    )
+                    continue
                 result = self.add_server_sync(name, desired[name], timeout=timeout)
                 if result.get("connected"):
                     updated.append(name)
@@ -4817,8 +6013,7 @@ class MCPClientManager:
         follow-up if IdP rate-limiting is ever observed under a large active-user
         count.
         """
-        with self._listeners_lock:
-            user_ids = {uid for uid, _cb in self._listeners if uid}
+        user_ids = self._live_listener_uids()
         for user_id in user_ids:
             try:
                 self.prime_user_pools(user_id)
@@ -5194,9 +6389,21 @@ class MCPClientManager:
 
     async def _static_health_one(self, name: str, now: float) -> float:
         """Ping a connected server or reconnect a disconnected one; return its
-        next-due monotonic deadline. Runs concurrently per server in the tick."""
+        next-due monotonic deadline. Runs concurrently per server in the tick.
+
+        Also the refresh-RETRY driver: a push-driven (or manual) refresh
+        that failed while the transport stayed up has no other automatic
+        recovery — there is no periodic refresh pass, and the server may
+        never push that ``list_changed`` again — so the catalog would
+        stay stale for every user on the node until an operator
+        intervened. One bounded, lock-serialized full pass is spawned
+        per tick while the flag stays armed (a failure or busy-skip
+        re-arms it; success, session drop, or removal clears it).
+        """
         state = self._static_servers.get(name)
         if state is not None and state.session is not None:
+            if name in self._static_refresh_retry:
+                self._spawn_full_refresh(name, f"catalog refresh retry for '{name}'")
             return await self._static_ping_one(name, now)
         return await self._static_reconnect_one(name)
 
@@ -5274,10 +6481,7 @@ class MCPClientManager:
         self._static_reconnect_next.pop(name, None)
         next_ping = time.monotonic() + self._static_health_check_s
         self._static_next_ping[name] = next_ping
-        self._spawn_background(
-            self._refresh_server(name),
-            f"catalog refresh after static health reconnect '{name}'",
-        )
+        self._spawn_full_refresh(name, f"catalog refresh after static health reconnect '{name}'")
         log.info("MCP static health: reconnected '%s'", name)
         return next_ping
 
@@ -5359,7 +6563,7 @@ class MCPClientManager:
             busy = evict is not None and evict.in_flight > 0
             if dead and evict is not None and not busy and evict.session is session:
                 self._cb_record_failure(name)
-                evict.session = None
+                self._drop_static_session_and_stamp(name, evict)
                 asap = time.monotonic()
                 self._static_reconnect_next[name] = asap  # reconnect asap
                 self._static_reconnect_attempt.pop(name, None)
@@ -5434,13 +6638,14 @@ class MCPClientManager:
         # Schedule catalog refresh on the loop without blocking the caller.
         # The reconnected session is valid for the imminent dispatch; catalog
         # drift will be reconciled on the loop in the background.  The task is
-        # tracked: a refresh FAILURE is logged by the done-callback — this
-        # except only covers the scheduling itself.
+        # tracked; a refresh FAILURE is logged inside ``_refresh_server_logged``
+        # (type + message, never the done-callback's ``exc_info`` — the chain
+        # carries the configured bearer) — this except only covers the
+        # scheduling itself.
         def _schedule_refresh() -> None:
             try:
-                self._spawn_background(
-                    self._refresh_server(server_name),
-                    f"catalog refresh after reconnect for '{server_name}'",
+                self._spawn_full_refresh(
+                    server_name, f"catalog refresh after reconnect for '{server_name}'"
                 )
             except Exception:
                 log.warning(
@@ -5473,7 +6678,7 @@ class MCPClientManager:
         if dead:
             evict = self._static_servers.get(server_name)
             if evict is not None:
-                evict.session = None
+                self._drop_static_session_and_stamp(server_name, evict)
 
     async def _static_session_op(self, server_name: str, op: Coroutine[Any, Any, Any]) -> Any:
         """Await a static session op on the mcp-loop, pinned against eviction.
@@ -6217,10 +7422,9 @@ class MCPClientManager:
         # this retry; the local cached token is the one the AS just
         # rejected, so reading it back without ``force_refresh=True``
         # would re-attempt with the same (rejected) bearer.
-        lookup: TokenLookupResult = await self._pool_token_lookup(
+        lookup, lookup_error = await self._pool_lookup_checked(
             server_row, user_id, server_name, force_refresh=retry_count > 0
         )
-        lookup_error = _pool_lookup_error(lookup, server_name, server_row)
         if lookup_error is not None:
             return lookup_error
         access_token = lookup.token or ""
@@ -6301,6 +7505,9 @@ class MCPClientManager:
                     user_id,
                     type(exc).__name__,
                 )
+                # No catalog drop: refresh SUCCEEDED, so this 401 is
+                # RS-side (JWKS lag / audience / skew), not a dead
+                # grant — see _evict_session's docstring.
                 return _structured_error(
                     code="mcp_consent_required",
                     server=server_name,
@@ -6360,10 +7567,9 @@ class MCPClientManager:
         if self._app_state is None:
             raise RuntimeError("Pool dispatch requires set_app_state() to have been called")
 
-        lookup: TokenLookupResult = await self._pool_token_lookup(
+        lookup, lookup_error = await self._pool_lookup_checked(
             server_row, user_id, server_name, force_refresh=retry_count > 0
         )
-        lookup_error = _pool_lookup_error(lookup, server_name, server_row)
         if lookup_error is not None:
             return lookup_error
         access_token = lookup.token or ""
@@ -6415,6 +7621,9 @@ class MCPClientManager:
                     user_id,
                     type(exc).__name__,
                 )
+                # No catalog drop: refresh SUCCEEDED, so this 401 is
+                # RS-side (JWKS lag / audience / skew), not a dead
+                # grant — see _evict_session's docstring.
                 return _structured_error(
                     code="mcp_consent_required",
                     server=server_name,
@@ -6481,10 +7690,9 @@ class MCPClientManager:
         if self._app_state is None:
             raise RuntimeError("Pool dispatch requires set_app_state() to have been called")
 
-        lookup: TokenLookupResult = await self._pool_token_lookup(
+        lookup, lookup_error = await self._pool_lookup_checked(
             server_row, user_id, server_name, force_refresh=retry_count > 0
         )
-        lookup_error = _pool_lookup_error(lookup, server_name, server_row)
         if lookup_error is not None:
             return lookup_error
         access_token = lookup.token or ""
@@ -6536,6 +7744,9 @@ class MCPClientManager:
                     user_id,
                     type(exc).__name__,
                 )
+                # No catalog drop: refresh SUCCEEDED, so this 401 is
+                # RS-side (JWKS lag / audience / skew), not a dead
+                # grant — see _evict_session's docstring.
                 return _structured_error(
                     code="mcp_consent_required",
                     server=server_name,
@@ -6572,8 +7783,25 @@ class MCPClientManager:
         self._cb_record_success(server_name)
         return _decode_prompt_result(sdk_result)
 
+    def _drop_session_and_stamp(self, key: tuple[str, str], entry: PoolEntryState) -> None:
+        """Drop the entry's session AND its notification debounce stamp.
+
+        The structural pairing for every teardown path (the same
+        rationale as ``PoolEntryState.drop_session``): the stamp must
+        not outlive the transport, so a reconnect's first
+        ``list_changed`` refreshes immediately — a path that nulled the
+        session without the pop silently re-opens the stale-stamp hole
+        where a post-reconnect change is debounced against a
+        pre-collapse stamp. Safe on an already-session-less entry
+        (owner death after an eviction): ``drop_session`` is idempotent
+        and the pop is a no-op.
+        """
+        entry.drop_session()
+        for kind in _LIST_CHANGED_KINDS.values():
+            self._last_pool_notification_refresh.pop((key, kind), None)
+
     def _evict_session(self, key: tuple[str, str]) -> None:
-        """Drop the cached session AND catalog on a pool entry.
+        """Drop the cached session on a pool entry; KEEP the catalog.
 
         Owner/streams left for reconnect. Auth/transport branches both call
         this — the next connect's ``_connect_one_pool`` tears down the stale
@@ -6584,39 +7812,277 @@ class MCPClientManager:
         following reconnect is reaped by idle eviction, which drives the same
         protocol.
 
-        Catalog cleanup (Phase 7 / 7b): clearing ``entry.tools`` /
-        ``entry.resources`` / ``entry.prompts`` here ensures an
-        evicted-then-not-yet-reconnected entry contributes no stale
-        entries to ``_user_tool_map`` / ``_user_resource_map`` /
-        ``_user_prompt_map``. Without this, ``is_mcp_tool`` /
-        ``is_mcp_prompt`` / pool resource resolution could return True
-        for names whose backing pool is gone, then the resolver would
-        dispatch into a session-less entry and the next call would
-        surface as a generic transport error instead of a clean
-        reconnect path.
+        The catalog (``entry.tools`` / ``resources`` / ``prompts``) is
+        deliberately RETAINED — the evict-session-keep-entry shape of
+        ``_on_pool_owner_death`` (#836). Clearing it here removed the
+        server's tools from the user's live sessions on the first failed
+        dispatch (a transport blip, a 403, a double-401): the per-user
+        maps rebuilt empty, the session-side ``is_mcp_tool`` gate
+        closed, and with no re-prime path for a live session the tools
+        never came back — which also made the breaker's half-open
+        recovery and the consent / step-up cards unreachable (the model
+        could no longer emit the name they need to fire). A session-less
+        entry stays fully dispatchable: tool-name resolution never reads
+        the catalog (``_resolve_pool_target`` is name + server-row
+        based) and ``_dispatch_pool_with_entry`` connect-or-reuses,
+        re-running discovery — post-reconnect drift self-corrects and
+        the catalog-refresh notification fans out then.
         """
         evict = self._user_pool_entries.get(key)
         if evict is not None:
-            evict.session = None
-            evict.tools = None
-            evict.resources = None
-            evict.prompts = None
-            # Prune the debounce stamp in lockstep with the entry — the
-            # dict grows otherwise (slow leak) across (user, server)
-            # churn. Mirrors the cleanup in ``_close_pool_entry_if_idle``.
-            self._last_pool_notification_refresh.pop(key, None)
-            user_id, _server_name = key
-            self._rebuild_user_tool_map(user_id)
-            self._rebuild_user_resource_map(user_id)
-            self._rebuild_user_prompt_map(user_id)
-            # Wake the user's session so its merged tool / resource /
-            # prompt lists shrink back to static-only until the next
-            # connect populates the entry. Admin (None) listeners also
-            # fire — operator tooling tracking pool catalog state
-            # observes the drop.
-            self._notify_user_tool_listeners(user_id)
-            self._notify_user_resource_listeners(user_id)
-            self._notify_user_prompt_listeners(user_id)
+            self._drop_session_and_stamp(key, evict)
+
+    def _evict_session_drop_catalog(self, key: tuple[str, str]) -> None:
+        """Drop the cached session AND the entry's catalog contribution.
+
+        The dead-grant flavor of :meth:`_evict_session`, used when the
+        user's grant for this server is GONE — explicit disconnect
+        (:meth:`evict_user_session`) or a dispatch that failed with the
+        token-missing / grant-rejected class — so their live sessions
+        SHOULD see the tools leave rather than keep offering a card for
+        access that no longer exists (#836 cross-node convergence).
+        Clearing the catalog also makes the eviction passes treat the
+        entry as a droppable stub (``_entry_has_catalog`` is False), so
+        it doesn't linger cooled behind a live listener.
+
+        Session-drop prologue is delegated to :meth:`_evict_session` —
+        owner/streams left for reconnect teardown exactly as there (the
+        one-cancel close protocol). Callers that can race an in-flight
+        connect must serialize via :meth:`_drop_catalog_locked` so a
+        completing discovery can't republish the cleared catalog.
+
+        ACCEPTED RESIDUAL (deliberate, after a rev-generation protocol
+        proved buggier than the race it closed): a publisher already
+        suspended across this drop — a ``list_changed`` refresh in
+        flight, or a connect whose token was read pre-revocation and
+        queued on ``open_lock`` ahead of us — can republish the catalog
+        after the drop. The ghost is bounded and self-healing: any use
+        of it fails the token lookup and re-schedules this drop
+        (:meth:`_schedule_dead_grant_drop`, from dispatch AND priming),
+        and a reconnected stale bearer dies at access-token expiry —
+        the same bound every warm session already rides at revocation
+        time.
+        """
+        self._evict_session(key)
+        evict = self._user_pool_entries.get(key)
+        if evict is None:
+            return
+        if not self._entry_has_catalog(evict):
+            # Already catalog-less (repeat drop from a racing dispatch,
+            # or a never-discovered stub) — nothing to clear, and a
+            # zero-delta fan-out would wake every session of the user
+            # to rebuild an unchanged list.
+            return
+        evict.tools = None
+        evict.resources = None
+        evict.prompts = None
+        # Wake the user's sessions so their merged tool / resource /
+        # prompt lists shrink now, not at the next turn boundary.
+        self._rebuild_and_notify_user_catalogs(key[0])
+
+    def _lookup_grant_dead(self, lookup: TokenLookupResult) -> bool:
+        """Does this failed lookup prove the grant is GONE?
+
+        Derived from :func:`_pool_lookup_verdict` — the classification
+        has ONE source, so the consent card the user sees and the
+        catalog-drop convergence can never disagree by kind. True only
+        when the infrastructure that could know is actually wired: the
+        obo lookup returns kind="missing" for an unconfigured token
+        store / storage too, and dropping a catalog on a boot-ordering
+        window would strand live sessions until a fresh prime.
+        Transient refresh failures and decrypt failures keep the
+        catalog: access still exists.
+        """
+        if getattr(self._app_state, "mcp_token_store", None) is None:
+            return False
+        if self._storage is None:
+            return False
+        return _pool_lookup_verdict(lookup) == "mcp_consent_required"
+
+    def _observed_pool_session(self, user_id: str, server_name: str) -> Any:
+        """Snapshot the entry's session for a dead-grant observation.
+
+        MUST be called BEFORE the classified lookup's first await (the
+        callers' contract with :meth:`_schedule_dead_grant_drop`): a
+        snapshot taken after those awaits can capture a session the
+        consent-completion prime connected mid-lookup, and the drop
+        would then evict the just-restored catalog it was designed to
+        spare — the session has to predate the failure to count as the
+        pre-observation transport.
+        """
+        entry = self._user_pool_entries.get((user_id, server_name))
+        return entry.session if entry is not None else None
+
+    async def _pool_lookup_checked(
+        self,
+        server_row: dict[str, Any],
+        user_id: str,
+        server_name: str,
+        *,
+        force_refresh: bool,
+    ) -> tuple[TokenLookupResult, str | None]:
+        """Classified pool lookup with its convergence pairing, ordering-safe.
+
+        The ONE copy of the dispatch-side lookup protocol (three
+        dispatchers): the dead-grant observation is taken synchronously
+        BEFORE the lookup's first await — a session the
+        consent-completion prime connects DURING the lookup must read
+        as re-consent evidence at drop time, not as pre-observation —
+        and the failed-lookup render is paired with its convergence
+        drop via :meth:`_pool_lookup_failure`. Structuring the ordering
+        here makes it un-violable per dispatch site. Returns
+        ``(lookup, error)``; ``error`` is ``None`` exactly when the
+        lookup carries a usable bearer.
+        """
+        observed_session = self._observed_pool_session(user_id, server_name)
+        lookup = await self._pool_token_lookup(
+            server_row, user_id, server_name, force_refresh=force_refresh
+        )
+        return lookup, self._pool_lookup_failure(
+            lookup, server_name, server_row, user_id, observed_session=observed_session
+        )
+
+    def _pool_lookup_failure(
+        self,
+        lookup: TokenLookupResult,
+        server_name: str,
+        server_row: dict[str, Any],
+        user_id: str,
+        *,
+        observed_session: Any,
+    ) -> str | None:
+        """Render a failed pool lookup AND pair it with its convergence drop.
+
+        The pairing is the contract (one helper, three dispatchers): a
+        dispatcher that rendered the error without scheduling the drop
+        would keep offering revoked tools behind a consent card — the
+        cross-node non-convergence #836 fixes, silently split by
+        dispatch surface. Returns ``None`` exactly when *lookup*
+        carries a usable bearer. ``observed_session`` is the caller's
+        PRE-lookup snapshot (:meth:`_observed_pool_session`).
+        """
+        lookup_error = _pool_lookup_error(lookup, server_name, server_row)
+        if lookup_error is not None:
+            self._schedule_dead_grant_drop(
+                lookup, (user_id, server_name), observed_session=observed_session
+            )
+        return lookup_error
+
+    def _schedule_dead_grant_drop(
+        self,
+        lookup: TokenLookupResult,
+        key: tuple[str, str],
+        *,
+        observed_session: Any,
+    ) -> None:
+        """Converge live sessions with a durably-gone grant (#836).
+
+        Called on the mcp-loop wherever a classified lookup fails — the
+        three dispatchers, session-start priming, and the obo
+        credential gate. When :meth:`_lookup_grant_dead` confirms the
+        grant is gone (revoked, disconnected, or unlinked — not an
+        infrastructure blip), the (user, server) catalog is dropped so
+        the tools leave the user's live sessions instead of dangling
+        behind a consent card for access that no longer exists.
+        Re-consent restores them via the consent-completion prime; obo
+        re-login via the capture prime.
+
+        SCHEDULED, never awaited: the locked drop can park behind a
+        same-key dispatch holding ``open_lock`` across its entire SDK
+        call — awaiting here stalled token-side errors past the sync
+        timeout and charged the breaker they are documented to bypass.
+        ``_spawn_background`` tracks the task so shutdown cancels it.
+
+        ``observed_session`` is REQUIRED and must be snapshotted by the
+        caller BEFORE the classified lookup's first await
+        (:meth:`_observed_pool_session`): a warm session that already
+        existed at observation time predates the revocation and must be
+        evicted (the #836 warm case — dispatches short-circuit on the
+        failed lookup without ever touching the session, so no 401 path
+        would converge it), while only a session that CHANGED after the
+        observation proves a later successful connect. Snapshotting
+        here, after the lookup returned, would capture a session the
+        consent-completion prime connected mid-lookup and evict the
+        just-restored catalog.
+
+        Skips when there is provably nothing to converge — no entry, or
+        a session-less entry with no catalog. At scale every
+        unconsented server classifies as a dead grant on every prime;
+        spawning a tracked no-op task per (user, unconsented server)
+        for that is pure mcp-loop overhead. A catalog appearing AFTER
+        this check implies a successful connect, i.e. a lookup that
+        succeeded after this one failed.
+        """
+        if not self._lookup_grant_dead(lookup):
+            return
+        entry = self._user_pool_entries.get(key)
+        if entry is None or (entry.session is None and not self._entry_has_catalog(entry)):
+            return
+        self._spawn_background(
+            self._drop_catalog_locked(
+                key, skip_if_connected=True, observed_session=observed_session
+            ),
+            f"dead-grant catalog drop for '{key[1]}'",
+        )
+
+    async def _drop_catalog_locked(
+        self,
+        key: tuple[str, str],
+        *,
+        skip_if_connected: bool = False,
+        observed_session: Any = None,
+    ) -> None:
+        """Serialize a catalog drop against an in-flight connect.
+
+        ``_evict_session_drop_catalog`` alone races
+        ``_connect_one_pool``: a connect already past the token check
+        publishes its discovery AFTER the drop, resurrecting a revoked
+        server's catalog with no remaining path that ever clears it.
+        ``open_lock`` is held across a same-key dispatch's ENTIRE SDK
+        call (the carrier serialization), so this wait can be a full
+        tool-call long — which is why every caller schedules it as a
+        tracked background task rather than awaiting it inline.
+
+        ``skip_if_connected`` is the dead-grant flavor's re-validation:
+        a dispatch-scheduled drop can be parked long enough for the
+        user to RE-CONSENT and the consent-completion prime to connect
+        and publish a fresh catalog — clearing that would strand the
+        just-restored tools (nothing re-primes until a new session).
+        Re-consent evidence is a session DIFFERENT from
+        ``observed_session`` — the one snapshotted when the dead grant
+        was discovered (``_schedule_dead_grant_drop``): connects
+        resolve their bearer through the classified lookup first, so a
+        session created after the failed lookup implies a grant that
+        was valid again at its connect. The session that was ALREADY
+        live at observation time predates the revocation and is
+        evicted along with the catalog — a warm transport is exactly
+        how the #836 warm case dangles, since failed lookups
+        short-circuit dispatch before any 401 could evict it. Callers
+        without an observation leave ``observed_session=None``, which
+        treats any live session as re-consent evidence (the cold
+        case). The explicit-revocation path passes
+        ``skip_if_connected=False``: it must clear even (especially)
+        warm sessions.
+
+        Bounded residual, accepted: if the entry is fully dropped,
+        re-created, connected, and COOLED between the observation and
+        this drop running, the stale drop clears that fresh cooled
+        catalog — it self-heals at next use (the grant is alive, so
+        dispatch/prime reconnects and republishes), and the window
+        requires a full connect-and-cool cycle inside task-scheduling
+        latency.
+        """
+        entry = self._user_pool_entries.get(key)
+        if entry is None:
+            return
+        async with entry.open_lock:
+            if (
+                skip_if_connected
+                and entry.session is not None
+                and entry.session is not observed_session
+            ):
+                return
+            self._evict_session_drop_catalog(key)
 
     async def _handle_auth_403(
         self,
@@ -7073,25 +8539,39 @@ class MCPClientManager:
         return _decode_prompt_result(result)
 
     def evict_user_session(self, user_id: str, server_name: str) -> None:
-        """Drop the cached pool session for ``(user_id, server_name)``.
+        """Drop the cached pool session AND catalog for ``(user_id, server_name)``.
 
-        Sync entry point for callers (e.g. the OAuth revoke handler)
-        that mutate token state from outside the mcp-loop and need the
-        next dispatch to reconnect with fresh credentials. Idempotent —
+        Sync entry point for the OAuth revoke handler: the user
+        explicitly disconnected the server, so the session is dropped
+        and — unlike the dispatch-failure eviction (#836) — the user's
+        catalog view of the server is removed and their live sessions
+        notified (:meth:`_evict_session_drop_catalog`). Idempotent —
         a missing key is a silent no-op. Fire-and-forget: schedules
-        :meth:`_evict_session` on the mcp-loop and returns immediately
-        without waiting for the future. Best-effort: a closed loop or
-        scheduling failure logs at info level; never raises.
+        onto the mcp-loop and returns immediately without waiting for
+        the future. Best-effort: a closed loop or scheduling failure
+        logs at info level; never raises.
         """
         if self._loop is None:
             return
         key = (user_id, server_name)
 
-        async def _do_evict() -> None:
-            self._evict_session(key)
+        async def _spawn_tracked() -> None:
+            # ``_spawn_background`` is loop-thread-only — hop first.
+            # Tracking matters: the locked drop can park behind a
+            # same-key dispatch's long SDK call, and an untracked task
+            # still pending at shutdown is abandoned with "Task was
+            # destroyed but it is pending!" noise; tracked tasks are
+            # cancelled by shutdown().
+            self._spawn_background(
+                self._drop_catalog_locked(key),
+                f"revocation catalog drop for '{server_name}'",
+            )
 
         try:
-            asyncio.run_coroutine_threadsafe(_do_evict(), self._loop)
+            # Locked: an in-flight connect completing its discovery
+            # after an unserialized drop would republish (resurrect)
+            # the revoked catalog with nothing left to clear it.
+            asyncio.run_coroutine_threadsafe(_spawn_tracked(), self._loop)
         except RuntimeError as exc:
             log.info(
                 "mcp_pool.evict_user_session_failed server=%s user=%s error=%s",
@@ -7396,19 +8876,20 @@ def _pool_lookup_error(
 ) -> str | None:
     """Map a failed pool token lookup to its structured error; ``None`` on success.
 
-    Single copy of the lookup-kind → structured-error mapping shared by the
-    tool / resource / prompt dispatchers — previously three hand-synced
+    Single copy of the lookup-kind → structured-error RENDERING shared by
+    the tool / resource / prompt dispatchers — previously three hand-synced
     copies that every auth-model change had to edit in lockstep. Returns
-    ``None`` exactly when *lookup* carries a non-empty bearer.
+    ``None`` exactly when *lookup* carries a non-empty bearer. The
+    CLASSIFICATION lives in :func:`_pool_lookup_verdict`; this function
+    only chooses per-kind detail copy for the code it returns.
     """
-    if lookup.kind == "missing":
-        return _structured_error(
-            code="mcp_consent_required",
-            server=server_name,
-            detail=_consent_missing_detail(server_row),
-            consent_url=_build_consent_url(server_row),
-        )
-    if lookup.kind == "decrypt_failure":
+    # Literal ``code=`` strings in each branch (not ``code=verdict``) so the
+    # consent-url sibling audit (tests/test_mcp_consent_url_sibling_audit.py)
+    # keeps seeing these sites — a variable code is invisible to its scan.
+    verdict = _pool_lookup_verdict(lookup)
+    if verdict is None:
+        return None
+    if verdict == "mcp_token_undecryptable_key_unknown":
         return _structured_error(
             code="mcp_token_undecryptable_key_unknown",
             server=server_name,
@@ -7417,7 +8898,7 @@ def _pool_lookup_error(
                 "Operator action required."
             ),
         )
-    if lookup.kind == "refresh_failed_transient":
+    if verdict == "mcp_refresh_unavailable":
         # Transient refresh failure (AS/network blip) — the token was kept;
         # a retry may succeed once the AS recovers. Retryable, NOT re-consent.
         return _structured_error(
@@ -7425,27 +8906,52 @@ def _pool_lookup_error(
             server=server_name,
             detail="Token refresh temporarily failed; please retry.",
         )
+    # verdict == "mcp_consent_required": pick the detail by kind.
     if lookup.kind == "refresh_failed":
         # The ``mcp_server.oauth.token_revoked`` audit was already emitted by
         # the classified lookup when it deleted the row; no second audit here.
-        return _structured_error(
-            code="mcp_consent_required",
-            server=server_name,
-            detail=_pool_error_detail(server_row, "refresh_failed"),
-            consent_url=_build_consent_url(server_row),
-        )
+        detail = _pool_error_detail(server_row, "refresh_failed")
+    else:
+        # kind == "missing", or the barely-reachable empty-token fallback —
+        # auth-model-aware so an obo row never shows per-server-consent copy
+        # + a null consent_url.
+        detail = _consent_missing_detail(server_row)
+    return _structured_error(
+        code="mcp_consent_required",
+        server=server_name,
+        detail=detail,
+        consent_url=_build_consent_url(server_row),
+    )
+
+
+_PoolLookupVerdict = Literal[
+    "mcp_consent_required",
+    "mcp_token_undecryptable_key_unknown",
+    "mcp_refresh_unavailable",
+]
+
+
+def _pool_lookup_verdict(lookup: TokenLookupResult) -> _PoolLookupVerdict | None:
+    """Classify a pool token lookup outcome as a structured-error code.
+
+    THE single classification of failed lookups: ``_pool_lookup_error``
+    renders it, and ``MCPClientManager._lookup_grant_dead`` derives the
+    catalog-drop decision from it (``mcp_consent_required`` == the grant
+    is gone) — so the card the user sees and the convergence behavior
+    can never disagree by kind. Returns ``None`` exactly when *lookup*
+    carries a non-empty bearer.
+    """
+    if lookup.kind == "missing":
+        return "mcp_consent_required"
+    if lookup.kind == "decrypt_failure":
+        return "mcp_token_undecryptable_key_unknown"
+    if lookup.kind == "refresh_failed_transient":
+        return "mcp_refresh_unavailable"
+    if lookup.kind == "refresh_failed":
+        return "mcp_consent_required"
     # kind == "token"
     if not (lookup.token or ""):
-        # A classified lookup returns kind=="token" only with a real token, so
-        # this empty-token fallback is barely reachable — but keep it
-        # auth-model-aware like the sibling ``missing`` branch above, so an obo
-        # row never shows per-server-consent copy + a null consent_url.
-        return _structured_error(
-            code="mcp_consent_required",
-            server=server_name,
-            detail=_consent_missing_detail(server_row),
-            consent_url=_build_consent_url(server_row),
-        )
+        return "mcp_consent_required"
     return None
 
 

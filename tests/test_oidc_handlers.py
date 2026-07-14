@@ -8,6 +8,7 @@ on the HTTP handler logic, request/response wiring, and storage side-effects.
 from __future__ import annotations
 
 import urllib.parse
+from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any
 from unittest.mock import AsyncMock, patch
 
@@ -831,6 +832,102 @@ class TestOIDCCallbackCapture:
         plain = store.get_oidc_credential("test-admin", cfg.issuer)
         assert plain is not None
         assert plain["refresh_token"] == "rt-1"
+
+    @patch("turnstone.core.auth.provision_oidc_user")
+    @patch("turnstone.core.auth.validate_id_token")
+    @patch("turnstone.core.auth.exchange_code", new_callable=AsyncMock)
+    def test_capture_success_primes_user_pools(
+        self,
+        mock_exchange: AsyncMock,
+        mock_validate: Any,
+        mock_provision: Any,
+        storage: SQLiteBackend,
+        oidc_config: OIDCConfig,
+    ) -> None:
+        """Re-login is the OBO restore moment (#836): a successful
+        credential capture for a user with a LIVE session schedules a
+        pool prime so a previously dropped obo catalog returns to their
+        open workstreams — obo has no consent flow, so nothing else
+        re-primes them after re-login."""
+        client, store, cfg = self._capture_client(storage, oidc_config)
+        primed: list[str] = []
+        client.app.state.mcp_client = SimpleNamespace(  # type: ignore[attr-defined]
+            prime_user_pools=primed.append,
+            has_live_session_listener=lambda _uid: True,
+        )
+        resp = self._login(
+            client,
+            storage,
+            mock_exchange,
+            mock_validate,
+            mock_provision,
+            tokens={"id_token": "fake.jwt.token", "access_token": "at", "refresh_token": "rt-1"},
+        )
+        assert resp.status_code == 302
+        assert primed == ["test-admin"]
+
+    @patch("turnstone.core.auth.provision_oidc_user")
+    @patch("turnstone.core.auth.validate_id_token")
+    @patch("turnstone.core.auth.exchange_code", new_callable=AsyncMock)
+    def test_no_capture_no_prime(
+        self,
+        mock_exchange: AsyncMock,
+        mock_validate: Any,
+        mock_provision: Any,
+        storage: SQLiteBackend,
+        oidc_config: OIDCConfig,
+    ) -> None:
+        """No refresh token in the response → no capture → no prime
+        (the prime is gated on a persisted credential, not on login)."""
+        client, store, cfg = self._capture_client(storage, oidc_config)
+        primed: list[str] = []
+        client.app.state.mcp_client = SimpleNamespace(  # type: ignore[attr-defined]
+            prime_user_pools=primed.append,
+            has_live_session_listener=lambda _uid: True,
+        )
+        resp = self._login(
+            client,
+            storage,
+            mock_exchange,
+            mock_validate,
+            mock_provision,
+            tokens={"id_token": "fake.jwt.token", "access_token": "at"},
+        )
+        assert resp.status_code == 302
+        assert primed == []
+
+    @patch("turnstone.core.auth.provision_oidc_user")
+    @patch("turnstone.core.auth.validate_id_token")
+    @patch("turnstone.core.auth.exchange_code", new_callable=AsyncMock)
+    def test_capture_without_live_session_does_not_prime(
+        self,
+        mock_exchange: AsyncMock,
+        mock_validate: Any,
+        mock_provision: Any,
+        storage: SQLiteBackend,
+        oidc_config: OIDCConfig,
+    ) -> None:
+        """Routine SSO re-login with nothing open must not fan out pool
+        warms — the prime exists to heal LIVE sessions only."""
+        client, store, cfg = self._capture_client(storage, oidc_config)
+        primed: list[str] = []
+        client.app.state.mcp_client = SimpleNamespace(  # type: ignore[attr-defined]
+            prime_user_pools=primed.append,
+            has_live_session_listener=lambda _uid: False,
+        )
+        resp = self._login(
+            client,
+            storage,
+            mock_exchange,
+            mock_validate,
+            mock_provision,
+            tokens={"id_token": "fake.jwt.token", "access_token": "at", "refresh_token": "rt-1"},
+        )
+        assert resp.status_code == 302
+        # Credential captured, but no live session → no prime.
+        assert store is not None
+        assert store.get_oidc_credential("test-admin", cfg.issuer) is not None
+        assert primed == []
 
     @patch("turnstone.core.auth.provision_oidc_user")
     @patch("turnstone.core.auth.validate_id_token")

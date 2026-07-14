@@ -25,6 +25,7 @@ from unittest.mock import MagicMock
 import httpx
 import pytest
 
+from tests.conftest import _run_on_loop
 from turnstone.core.mcp_client import (
     MCPClientManager,
     PoolEntryState,
@@ -62,11 +63,6 @@ def running_loop_mgr() -> Any:
             asyncio.run_coroutine_threadsafe(_drain(mgr), loop).result(timeout=2)
         loop.call_soon_threadsafe(loop.stop)
         thread.join(timeout=2)
-
-
-def _run_on_loop(loop: asyncio.AbstractEventLoop, coro: Any, timeout: float = 10) -> Any:
-    fut = asyncio.run_coroutine_threadsafe(coro, loop)
-    return fut.result(timeout=timeout)
 
 
 def _build_mock_transport_factory(
@@ -430,17 +426,76 @@ def test_pool_tool_visibility_user_isolation(
     assert mgr.is_mcp_tool("mcp__pool-srv__shared_tool", user_id="user-3") is False
 
 
-def test_eviction_drops_catalog_and_fires_listener(
+def test_evict_session_keeps_catalog_and_fires_no_listener(
     running_loop_mgr: Any, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """``_evict_session`` clears ``entry.tools``, rebuilds the user's
-    map (drops the now-empty entry), and fires user + admin listeners.
+    """``_evict_session`` (dispatch-failure eviction: 401 / 403 /
+    transport blip) drops ONLY the session — the catalog and per-user
+    maps stay, no listener fires, and ``is_mcp_tool`` keeps resolving
+    the name (#836).
 
-    Verified by reverting the catalog-cleanup block in ``_evict_session``
-    (drop the ``evict.tools = None`` / ``_rebuild_user_tool_map`` /
-    ``_notify_user_tool_listeners`` calls): the test fails because the
+    Clearing the catalog here silently removed the server's tools from
+    the user's live sessions on the first failed dispatch: the maps
+    rebuilt empty, the session-side ``is_mcp_tool`` gate closed, and
+    with no re-prime path the tools never came back — which also made
+    the breaker's half-open recovery and the consent / step-up cards
+    unreachable.
+
+    Verified by restoring the old catalog-cleanup block in
+    ``_evict_session`` (``evict.tools = None`` + rebuild + notify):
+    this test fails because the listener fires AND ``is_mcp_tool``
+    flips to False.
+    """
+    mgr, loop, _ = running_loop_mgr
+    handler = _make_jsonrpc_handler(
+        list_tools_response=_list_tools_payload([_tool_spec("do_thing")]),
+    )
+    _build_mock_transport_factory(mgr, monkeypatch, handler)
+    _patch_tcp_probe(mgr, monkeypatch)
+
+    _connect_pool(mgr, loop, user_id="user-1", server_name="pool-srv")
+    assert mgr.is_mcp_tool("mcp__pool-srv__do_thing", user_id="user-1") is True
+
+    user_calls = [0]
+    admin_calls = [0]
+
+    def _user_cb() -> None:
+        user_calls[0] += 1
+
+    def _admin_cb() -> None:
+        admin_calls[0] += 1
+
+    mgr.add_listener(_user_cb, user_id="user-1")
+    mgr.add_listener(_admin_cb)  # admin / None
+
+    mgr._evict_session(("user-1", "pool-srv"))
+
+    # Session dropped; catalog RETAINED; dead bearer copy cleared.
+    entry = mgr._user_pool_entries[("user-1", "pool-srv")]
+    assert entry.session is None
+    assert entry.bound_token is None
+    assert entry.tools is not None
+    # User map intact — the live session's merged tool list is untouched.
+    assert "user-1" in mgr._user_tool_map
+    assert mgr.is_mcp_tool("mcp__pool-srv__do_thing", user_id="user-1") is True
+    # Nothing changed catalog-wise → NO fan-out.
+    assert user_calls[0] == 0, f"user-keyed listener fired {user_calls[0]} times; expected 0"
+    assert admin_calls[0] == 0, f"admin listener fired {admin_calls[0]} times; expected 0"
+
+
+def test_evict_user_session_drops_catalog_and_fires_listener(
+    running_loop_mgr: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``_evict_session_drop_catalog`` (the explicit-revocation flavor
+    behind ``evict_user_session``) clears ``entry.tools``, rebuilds the
+    user's map (drops the now-empty entry), and fires user + admin
+    listeners — the user asked for the disconnect, so their live
+    sessions SHOULD see the tools leave.
+
+    Verified by reverting the catalog-cleanup block in
+    ``_evict_session_drop_catalog``: the test fails because the
     listener never fires AND ``is_mcp_tool`` keeps returning True for
-    the now-evicted tool.
+    the now-revoked tool.
     """
     mgr, loop, _ = running_loop_mgr
     handler = _make_jsonrpc_handler(
@@ -453,7 +508,7 @@ def test_eviction_drops_catalog_and_fires_listener(
     assert mgr.is_mcp_tool("mcp__pool-srv__do_thing", user_id="user-1") is True
 
     # Register one user-keyed and one admin (None) listener; both
-    # MUST fire on this user's eviction.
+    # MUST fire on this user's revocation.
     user_calls = [0]
     admin_calls = [0]
     other_calls = [0]
@@ -471,7 +526,7 @@ def test_eviction_drops_catalog_and_fires_listener(
     mgr.add_listener(_admin_cb)  # admin / None
     mgr.add_listener(_other_cb, user_id="user-2")
 
-    mgr._evict_session(("user-1", "pool-srv"))
+    mgr._evict_session_drop_catalog(("user-1", "pool-srv"))
 
     # Catalog cleared.
     entry = mgr._user_pool_entries[("user-1", "pool-srv")]
@@ -479,7 +534,7 @@ def test_eviction_drops_catalog_and_fires_listener(
     assert entry.tools is None
     # User map dropped (no remaining pool entries for this user).
     assert "user-1" not in mgr._user_tool_map
-    # is_mcp_tool no longer surfaces the evicted name.
+    # is_mcp_tool no longer surfaces the revoked name.
     assert mgr.is_mcp_tool("mcp__pool-srv__do_thing", user_id="user-1") is False
     # Listener fan-out: matching user + admin fire, OTHER user does not.
     assert user_calls[0] == 1, f"user-keyed listener fired {user_calls[0]} times; expected 1"
@@ -490,22 +545,19 @@ def test_eviction_drops_catalog_and_fires_listener(
     )
 
 
-def test_close_pool_entry_if_idle_clears_catalog_and_fires_listener(
+def test_close_pool_entry_if_idle_cools_entry_for_live_session_user(
     running_loop_mgr: Any, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """LRU/TTL eviction (``_close_pool_entry_if_idle``) mirrors
-    ``_evict_session``'s catalog-cleanup contract: drops the entry,
-    prunes the notification-debounce dict, rebuilds the user's tool
-    map, and fires user + admin listeners.
+    """TTL/LRU eviction COOLS the entry when the user has a live
+    session (a registered user-scoped tool listener): the transport is
+    torn down but the entry, its catalog, the per-user maps, and the
+    entry's ``open_lock`` all survive, and NO listener fires — the live
+    session's model-visible tool list must not shrink because the user
+    went 10 minutes without an MCP dispatch (#836).
 
-    Phase 7 round-2 review hardening (round2-1): the bug-2 fix added
-    the catalog-cleanup block to this method but no integration test
-    drove it — exactly the failure mode flagged in
-    ``feedback_tests_through_boundaries.md``. Negative test: drop the
-    ``_rebuild_user_tool_map`` / ``_notify_user_tool_listeners`` calls
-    from ``_close_pool_entry_if_idle``'s post-pop block; this test
-    fails because ``is_mcp_tool`` keeps returning ``True`` for the
-    evicted name AND no listener fires.
+    Negative test: restore the unconditional pop + rebuild + notify in
+    ``_close_pool_entry_if_idle``: this test fails because the entry
+    vanishes, ``is_mcp_tool`` flips to False, and the listener fires.
     """
     mgr, loop, _ = running_loop_mgr
     handler = _make_jsonrpc_handler(
@@ -516,15 +568,15 @@ def test_close_pool_entry_if_idle_clears_catalog_and_fires_listener(
 
     _connect_pool(mgr, loop, user_id="user-1", server_name="pool-srv")
     key = ("user-1", "pool-srv")
+    # Retention also requires the server to still exist as a pool server.
+    mgr._oauth_user_server_names = {"pool-srv"}
     assert mgr.is_mcp_tool("mcp__pool-srv__do_thing", user_id="user-1") is True
-    # Sanity: in_flight must be 0 for the eviction path to proceed.
     assert mgr._user_pool_entries[key].in_flight == 0
-    # Seed the debounce dict so the perf-1 prune is observable.
-    mgr._last_pool_notification_refresh[key] = 0.0
+    # Seed the debounce dict so the prune-on-close is observable.
+    mgr._last_pool_notification_refresh[(key, "tools")] = 0.0
 
     user_calls = [0]
     admin_calls = [0]
-    other_calls = [0]
 
     def _user_cb() -> None:
         user_calls[0] += 1
@@ -532,32 +584,103 @@ def test_close_pool_entry_if_idle_clears_catalog_and_fires_listener(
     def _admin_cb() -> None:
         admin_calls[0] += 1
 
+    # The user-scoped tool listener is the liveness signal (#836).
+    mgr.add_listener(_user_cb, user_id="user-1")
+    mgr.add_listener(_admin_cb)  # admin / None
+
+    _run_on_loop(loop, mgr._close_pool_entry_if_idle(key))
+
+    # Entry cooled, not dropped: transport gone, catalog intact, dead
+    # bearer copy cleared with the transport.
+    entry = mgr._user_pool_entries.get(key)
+    assert entry is not None, "cooled entry must survive TTL eviction"
+    assert entry.session is None
+    assert entry.owner_task is None
+    assert entry.bound_token is None
+    assert entry.tools is not None
+    # The lock object must survive with the entry — an in-flight
+    # dispatcher's next acquire needs the same lock.
+    assert key in mgr._user_pool_locks
+    # Debounce stamp pruned with the transport.
+    assert (key, "tools") not in mgr._last_pool_notification_refresh
+    # Per-user catalog view untouched.
+    assert "user-1" in mgr._user_tool_map
+    assert "user-1" in mgr._user_tools
+    assert mgr.is_mcp_tool("mcp__pool-srv__do_thing", user_id="user-1") is True
+    # Nothing changed catalog-wise → NO fan-out (a fan-out here would
+    # make every live session rebuild its tool list every idle TTL).
+    assert user_calls[0] == 0, f"user-keyed listener fired {user_calls[0]} times; expected 0"
+    assert admin_calls[0] == 0, f"admin listener fired {admin_calls[0]} times; expected 0"
+
+    # A second close on the already-cooled entry is a no-op — no drop,
+    # no fan-out (the eviction loop additionally skips cooled entries
+    # before even getting here).
+    _run_on_loop(loop, mgr._close_pool_entry_if_idle(key))
+    assert key in mgr._user_pool_entries
+    assert user_calls[0] == 0 and admin_calls[0] == 0
+
+
+def test_close_pool_entry_if_idle_drops_entry_without_live_listener(
+    running_loop_mgr: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """TTL/LRU eviction FULLY drops the entry when the user has no live
+    session: entry popped, notification-debounce dict pruned, per-user
+    maps rebuilt, and the (admin-only) fan-out fires — departed users'
+    entries must not outlive their sessions.
+
+    Phase 7 round-2 review hardening (round2-1) heritage: the
+    catalog-cleanup block needs an integration test driving it — the
+    failure mode flagged in ``feedback_tests_through_boundaries.md``.
+    Negative test: drop the ``_rebuild_user_tool_map`` /
+    ``_notify_user_tool_listeners`` calls from the post-pop block; this
+    test fails because ``is_mcp_tool`` keeps returning ``True`` for the
+    evicted name AND the admin listener never fires.
+    """
+    mgr, loop, _ = running_loop_mgr
+    handler = _make_jsonrpc_handler(
+        list_tools_response=_list_tools_payload([_tool_spec("do_thing")]),
+    )
+    _build_mock_transport_factory(mgr, monkeypatch, handler)
+    _patch_tcp_probe(mgr, monkeypatch)
+
+    _connect_pool(mgr, loop, user_id="user-1", server_name="pool-srv")
+    key = ("user-1", "pool-srv")
+    # Registry seeded so the DROP below is attributable to the missing
+    # listener alone, not to registry-liveness.
+    mgr._oauth_user_server_names = {"pool-srv"}
+    assert mgr.is_mcp_tool("mcp__pool-srv__do_thing", user_id="user-1") is True
+    assert mgr._user_pool_entries[key].in_flight == 0
+    # Seed the debounce dict so the perf-1 prune is observable.
+    mgr._last_pool_notification_refresh[(key, "tools")] = 0.0
+
+    admin_calls = [0]
+    other_calls = [0]
+
+    def _admin_cb() -> None:
+        admin_calls[0] += 1
+
     def _other_cb() -> None:
         other_calls[0] += 1
 
-    mgr.add_listener(_user_cb, user_id="user-1")
+    # NO user-1 tool listener — user-1 has no live session. The admin
+    # (None) and unrelated-user listeners don't count as liveness.
     mgr.add_listener(_admin_cb)  # admin / None
     mgr.add_listener(_other_cb, user_id="user-2")
 
-    # Drive the LRU/TTL eviction path directly. ``open_lock`` is
-    # uncontested (no concurrent dispatch) and ``in_flight`` is 0,
-    # so the close proceeds without retry.
     _run_on_loop(loop, mgr._close_pool_entry_if_idle(key))
 
-    # Entry fully removed (LRU eviction pops the dict — unlike
-    # ``_evict_session`` which keeps the entry as a ``session=None``
-    # phantom for the next dispatch to re-connect).
+    # Entry fully removed.
     assert key not in mgr._user_pool_entries
     assert key not in mgr._user_pool_last_used
     assert key not in mgr._user_pool_locks
     # perf-1 prune: debounce dict no longer carries the key.
-    assert key not in mgr._last_pool_notification_refresh
+    assert (key, "tools") not in mgr._last_pool_notification_refresh
     # Catalog cleanup ran in BOTH dicts (bug-1 sibling + bug-2 cleanup).
     assert "user-1" not in mgr._user_tool_map
     assert "user-1" not in mgr._user_tools
     assert mgr.is_mcp_tool("mcp__pool-srv__do_thing", user_id="user-1") is False
-    # Listener fan-out: matching user + admin fire, OTHER user does not.
-    assert user_calls[0] == 1, f"user-keyed listener fired {user_calls[0]} times; expected 1"
+    # Admin fan-out fires (operator tooling observes the drop); the
+    # unrelated user's listener does not.
     assert admin_calls[0] == 1, f"admin listener fired {admin_calls[0]} times; expected 1"
     assert other_calls[0] == 0, (
         f"unrelated user-2 listener fired {other_calls[0]} times; expected 0 — "
@@ -565,18 +688,25 @@ def test_close_pool_entry_if_idle_clears_catalog_and_fires_listener(
     )
 
 
-def test_reconnect_after_eviction_repopulates_catalog(
+def test_reconnect_after_eviction_corrects_catalog_drift(
     running_loop_mgr: Any, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """After eviction, the next ``_connect_one_pool`` re-populates the
-    catalog from the SDK by construction — no extra glue required.
+    """The retained catalog self-corrects at reconnect: the next
+    ``_connect_one_pool`` re-runs discovery and REPLACES the stale
+    snapshot — no extra glue required (#836).
+
+    Between eviction and reconnect the OLD names stay visible (that is
+    the point of retention — the model can still emit them, and the
+    dispatch that follows performs this reconnect); a name the server
+    dropped in the meantime dies at the server as a per-call error
+    while the refreshed catalog fans out.
 
     Verified by reverting the discovery block in ``_connect_one_pool``:
-    the reconnected entry's ``tools`` stays ``None`` and the user map
-    never re-emerges.
+    the reconnected entry keeps serving the stale ``tool_a`` and
+    ``tool_b`` never appears.
     """
     mgr, loop, _ = running_loop_mgr
-    # Sequence: first connect sees [tool_a]; eviction clears; second
+    # Sequence: first connect sees [tool_a]; the session dies; second
     # connect (after backend rotates) sees [tool_b].
     handler = _make_jsonrpc_handler(
         list_tools_seq=[
@@ -591,7 +721,9 @@ def test_reconnect_after_eviction_repopulates_catalog(
     assert mgr.is_mcp_tool("mcp__pool-srv__tool_a", user_id="user-1") is True
 
     mgr._evict_session(("user-1", "pool-srv"))
-    assert mgr.is_mcp_tool("mcp__pool-srv__tool_a", user_id="user-1") is False
+    # Retention: the stale snapshot keeps serving the live session
+    # until the reconnect refreshes it.
+    assert mgr.is_mcp_tool("mcp__pool-srv__tool_a", user_id="user-1") is True
 
     _connect_pool(mgr, loop, user_id="user-1", server_name="pool-srv")
     # Reconnect picked up the rotated catalog.
@@ -1555,17 +1687,14 @@ def test_refresh_pool_server_prompts_skips_when_capability_unset(
 # ---------------------------------------------------------------------------
 
 
-def test_eviction_clears_resource_and_prompt_catalogs_and_fires_listeners(
+def test_evict_session_keeps_resource_and_prompt_catalogs(
     running_loop_mgr: Any, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """``_evict_session`` clears ``entry.resources`` and ``entry.prompts``,
-    rebuilds both per-user maps (drops the now-empty entries), and
-    fires the matching user-keyed + admin listeners for ALL three
-    catalogs (tools, resources, prompts).
-
-    Negative-test: drop the resource/prompt cleanup additions in
-    ``_evict_session``: this test fails because the user-resource map
-    keeps the evicted URIs and no resource listener fires.
+    """``_evict_session`` retains ``entry.resources`` / ``entry.prompts``
+    and their per-user maps, firing NO listeners — symmetric with the
+    tool-catalog retention (#836). The revocation flavor
+    (``_evict_session_drop_catalog``) is what clears and notifies; see
+    the sibling test below.
     """
     mgr, loop, _ = running_loop_mgr
     handler = _make_jsonrpc_handler(
@@ -1606,13 +1735,79 @@ def test_eviction_clears_resource_and_prompt_catalogs_and_fires_listeners(
 
     entry = mgr._user_pool_entries[("user-1", "pool-srv")]
     assert entry.session is None
+    # All three catalogs retained.
+    assert entry.tools is not None
+    assert entry.resources is not None
+    assert entry.prompts is not None
+    # Per-user maps keep the entries.
+    assert "res://r/1" in (mgr._user_resource_map.get("user-1") or {})
+    assert "mcp__pool-srv__p1" in (mgr._user_prompt_map.get("user-1") or {})
+    # Nothing changed catalog-wise → NO fan-out for anyone.
+    assert res_calls[0] == 0
+    assert prompt_calls[0] == 0
+    assert other_res_calls[0] == 0, "unrelated user-2 resource listener fired — RFC §3.3 violation"
+    assert other_prompt_calls[0] == 0, "unrelated user-2 prompt listener fired — RFC §3.3 violation"
+
+
+def test_evict_user_session_clears_resource_and_prompt_catalogs(
+    running_loop_mgr: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``_evict_session_drop_catalog`` (explicit revocation) clears
+    ``entry.resources`` / ``entry.prompts``, rebuilds both per-user
+    maps (drops the now-empty entries), and fires the matching
+    user-keyed listeners for resources and prompts.
+
+    Negative-test: drop the resource/prompt cleanup in
+    ``_evict_session_drop_catalog``: this test fails because the
+    user-resource map keeps the revoked URIs and no resource listener
+    fires.
+    """
+    mgr, loop, _ = running_loop_mgr
+    handler = _make_jsonrpc_handler(
+        init_response=_init_response_with_caps(resources=True, prompts=True),
+        list_resources_response=_list_resources_payload([_resource_spec("res://r/1")]),
+        list_prompts_response=_list_prompts_payload([_prompt_spec("p1")]),
+    )
+    _build_mock_transport_factory(mgr, monkeypatch, handler)
+    _patch_tcp_probe(mgr, monkeypatch)
+
+    _connect_pool(mgr, loop, user_id="user-1", server_name="pool-srv")
+    assert "res://r/1" in (mgr._user_resource_map.get("user-1") or {})
+    assert "mcp__pool-srv__p1" in (mgr._user_prompt_map.get("user-1") or {})
+
+    res_calls = [0]
+    prompt_calls = [0]
+    other_res_calls = [0]
+    other_prompt_calls = [0]
+
+    def _user_res_cb() -> None:
+        res_calls[0] += 1
+
+    def _user_prompt_cb() -> None:
+        prompt_calls[0] += 1
+
+    def _other_res_cb() -> None:
+        other_res_calls[0] += 1
+
+    def _other_prompt_cb() -> None:
+        other_prompt_calls[0] += 1
+
+    mgr.add_resource_listener(_user_res_cb, user_id="user-1")
+    mgr.add_resource_listener(_other_res_cb, user_id="user-2")
+    mgr.add_prompt_listener(_user_prompt_cb, user_id="user-1")
+    mgr.add_prompt_listener(_other_prompt_cb, user_id="user-2")
+
+    mgr._evict_session_drop_catalog(("user-1", "pool-srv"))
+
+    entry = mgr._user_pool_entries[("user-1", "pool-srv")]
+    assert entry.session is None
     assert entry.tools is None
     assert entry.resources is None
     assert entry.prompts is None
-    # Per-user maps drop the evicted entries.
+    # Per-user maps drop the revoked entries.
     assert "user-1" not in mgr._user_resource_map
     assert "user-1" not in mgr._user_prompt_map
-    # Listeners fire for the evicted user but not for the unrelated user.
+    # Listeners fire for the revoked user but not for the unrelated user.
     assert res_calls[0] == 1
     assert prompt_calls[0] == 1
     assert other_res_calls[0] == 0, "unrelated user-2 resource listener fired — RFC §3.3 violation"
@@ -1623,8 +1818,13 @@ def test_close_pool_entry_if_idle_clears_resource_and_prompt_catalogs(
     running_loop_mgr: Any, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """LRU/TTL eviction (``_close_pool_entry_if_idle``) symmetric
-    cleanup for resources & prompts. Bug-pair to the tools-only
-    cleanup added in Phase 7 round-2."""
+    cleanup for resources & prompts on the FULL-DROP path. Bug-pair to
+    the tools-only cleanup added in Phase 7 round-2.
+
+    Deliberately registers NO user-1 TOOL listener: the user-scoped
+    tool listener is the liveness signal (#836) — resource/prompt
+    listeners alone do not mark a user live (every real ChatSession
+    registers the tool listener), so this drives the full drop."""
     mgr, loop, _ = running_loop_mgr
     handler = _make_jsonrpc_handler(
         init_response=_init_response_with_caps(resources=True, prompts=True),
@@ -1661,12 +1861,63 @@ def test_close_pool_entry_if_idle_clears_resource_and_prompt_catalogs(
     assert prompt_calls[0] == 1
 
 
+def test_close_pool_entry_if_idle_cooling_keeps_resources_and_prompts(
+    running_loop_mgr: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The cooled path retains resources & prompts symmetrically with
+    tools: a user-1 TOOL listener (the liveness signal, #836) makes
+    TTL/LRU eviction keep the entry, both per-user maps, and fire no
+    resource/prompt listener."""
+    mgr, loop, _ = running_loop_mgr
+    handler = _make_jsonrpc_handler(
+        init_response=_init_response_with_caps(resources=True, prompts=True),
+        list_resources_response=_list_resources_payload([_resource_spec("res://r/1")]),
+        list_prompts_response=_list_prompts_payload([_prompt_spec("p1")]),
+    )
+    _build_mock_transport_factory(mgr, monkeypatch, handler)
+    _patch_tcp_probe(mgr, monkeypatch)
+
+    _connect_pool(mgr, loop, user_id="user-1", server_name="pool-srv")
+    key = ("user-1", "pool-srv")
+    mgr._oauth_user_server_names = {"pool-srv"}
+
+    res_calls = [0]
+    prompt_calls = [0]
+
+    def _res_cb() -> None:
+        res_calls[0] += 1
+
+    def _prompt_cb() -> None:
+        prompt_calls[0] += 1
+
+    # The TOOL listener marks user-1 live; the resource/prompt
+    # listeners observe (non-)fan-out.
+    mgr.add_listener(lambda: None, user_id="user-1")
+    mgr.add_resource_listener(_res_cb, user_id="user-1")
+    mgr.add_prompt_listener(_prompt_cb, user_id="user-1")
+
+    _run_on_loop(loop, mgr._close_pool_entry_if_idle(key))
+
+    # Entry cooled: transport gone, catalogs and maps intact.
+    entry = mgr._user_pool_entries.get(key)
+    assert entry is not None
+    assert entry.session is None
+    assert entry.resources is not None
+    assert entry.prompts is not None
+    assert "res://r/1" in (mgr._user_resource_map.get("user-1") or {})
+    assert "mcp__pool-srv__p1" in (mgr._user_prompt_map.get("user-1") or {})
+    # No fan-out — nothing changed catalog-wise.
+    assert res_calls[0] == 0
+    assert prompt_calls[0] == 0
+
+
 def test_reconnect_after_eviction_repopulates_resource_and_prompt_catalogs(
     running_loop_mgr: Any, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """After eviction, the next ``_connect_one_pool`` re-populates the
-    resource and prompt catalogs from the SDK. Bug-class: an extra
-    glue layer would only repopulate tools."""
+    """After a session eviction the next ``_connect_one_pool`` REPLACES
+    the retained resource and prompt catalogs from the SDK — drift
+    self-corrects for all three catalogs, not just tools (#836).
+    Bug-class: an extra glue layer would only repopulate tools."""
     mgr, loop, _ = running_loop_mgr
     handler = _make_jsonrpc_handler(
         init_response=_init_response_with_caps(resources=True, prompts=True),
@@ -1687,8 +1938,9 @@ def test_reconnect_after_eviction_repopulates_resource_and_prompt_catalogs(
     assert "mcp__pool-srv__p_a" in (mgr._user_prompt_map.get("user-1") or {})
 
     mgr._evict_session(("user-1", "pool-srv"))
-    assert "user-1" not in mgr._user_resource_map
-    assert "user-1" not in mgr._user_prompt_map
+    # Retention: the stale snapshots keep serving until reconnect.
+    assert "res://a" in (mgr._user_resource_map.get("user-1") or {})
+    assert "mcp__pool-srv__p_a" in (mgr._user_prompt_map.get("user-1") or {})
 
     _connect_pool(mgr, loop, user_id="user-1", server_name="pool-srv")
     # New catalogs reflect the rotated payload.

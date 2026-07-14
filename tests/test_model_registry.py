@@ -8,6 +8,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+from tests._session_helpers import scripted_chat_client
 from turnstone.core.model_registry import (
     ModelConfig,
     ModelRegistry,
@@ -1299,18 +1300,8 @@ class TestSessionAgentModel:
         )
         session = _make_session(registry=reg, model_alias="main")
 
-        # Mock the API to capture what model was used
-        captured_model = None
-        mock_response = MagicMock()
-        mock_response.choices = [MagicMock()]
-        mock_response.choices[0].message.content = "done"
-        mock_response.choices[0].message.tool_calls = None
-        mock_response.choices[0].finish_reason = "stop"
-
-        def fake_create(**kwargs: Any) -> Any:
-            nonlocal captured_model
-            captured_model = kwargs.get("model")
-            return mock_response
+        # Scripted client records kwargs; read the model off its calls.
+        fake_create = scripted_chat_client({"content": "done"})
 
         # Get the agent client from the registry and patch it
         agent_client = reg.get_client("agent")
@@ -1321,21 +1312,21 @@ class TestSessionAgentModel:
             Turn.user("Do something."),
         ]
         session._run_agent(agent_msgs)
-        assert captured_model == "agent-model"
+        assert fake_create.calls[-1].get("model") == "agent-model"
 
     @staticmethod
     def _capture_on(client: Any) -> dict[str, Any]:
-        """Patch *client* (registry-resolved or session.client) to capture kwargs."""
+        """Patch *client* (registry-resolved or session.client) to capture kwargs.
+
+        Rides the shared scripted client; the returned dict mirrors the
+        LAST call's kwargs (existing reader contract).
+        """
         captured: dict[str, Any] = {}
-        mock_response = MagicMock()
-        mock_response.choices = [MagicMock()]
-        mock_response.choices[0].message.content = "done"
-        mock_response.choices[0].message.tool_calls = None
-        mock_response.choices[0].finish_reason = "stop"
+        scripted = scripted_chat_client({"content": "done"})
 
         def fake_create(**kwargs: Any) -> Any:
             captured.update(kwargs)
-            return mock_response
+            return scripted(**kwargs)
 
         client.chat.completions.create = fake_create
         return captured

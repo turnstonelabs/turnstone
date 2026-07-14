@@ -36,6 +36,7 @@ if TYPE_CHECKING:
     from turnstone.core.oidc import OIDCConfig
 
 from turnstone.core.log import get_logger
+from turnstone.core.mcp_client import try_prime_user_pools
 from turnstone.core.oidc import (
     OIDC_STATE_TTL_SECONDS,
     OIDCError,
@@ -2152,6 +2153,23 @@ async def handle_oidc_callback(request: Request, audience: str, cookie_name: str
                 )
             except Exception:
                 log.exception("oidc.capture: failed to persist credential")
+            else:
+                # Re-login is the OBO restore moment (#836): a dropped
+                # obo catalog (credential unlinked / mint rejected) has
+                # no consent flow to heal through, so warm this user's
+                # pools now — live sessions pick the tools back up via
+                # their listeners. Gated on a LIVE session: routine SSO
+                # re-logins by users with nothing open must not fan out
+                # mints and transport connects at deployment scale.
+                # Fire-and-forget; a failure changes nothing about login
+                # (the credential is already persisted; the JWT is not
+                # yet issued) — the helper owns the swallow.
+                try_prime_user_pools(
+                    getattr(request.app.state, "mcp_client", None),
+                    user["user_id"],
+                    require_live_listener=True,
+                    context="oidc-capture",
+                )
 
     # Load permissions and issue Turnstone JWT
     perms = await asyncio.to_thread(_load_user_permissions, storage, user["user_id"])

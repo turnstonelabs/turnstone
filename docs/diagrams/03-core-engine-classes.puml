@@ -66,8 +66,7 @@ class "NullUI" as NullUI {
 interface "LLMProvider" as LLMProvider <<Protocol>> {
     + provider_name: str {property}
     + get_capabilities(model) → ModelCapabilities
-    + create_streaming(client, model, messages, ..., replay_reasoning_to_model) → Iterator[StreamChunk]
-    + create_completion(client, model, messages, ..., replay_reasoning_to_model) → CompletionResult
+    + create_streaming(client, model, messages, ..., cancel_ref, replay_reasoning_to_model) → Iterator[StreamChunk]
     + convert_tools(tools) → list[dict]
     + extract_reasoning_text(provider_blocks) → str
     + retryable_error_names: frozenset[str] {property}
@@ -177,7 +176,7 @@ class "HeadlessSession" as HeadlessSession {
     + send_headless(input, max_turns, ...)
     - _override_system_prompt(content)
     --
-    eval.py: non-streaming,
+    eval.py: drained single-shot turns,
     records all tool calls
 }
 

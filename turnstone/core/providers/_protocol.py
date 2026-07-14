@@ -7,7 +7,7 @@ knowing provider-specific details.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 
 if TYPE_CHECKING:
@@ -67,6 +67,215 @@ class CompletionResult:
     reasoning: str = ""
 
 
+class IncompleteStreamError(RuntimeError):
+    """The stream ended without any terminal/finish signal.
+
+    Every adapter emits a finish reason on a healthy stream (Chat
+    Completions' final choice chunk, Anthropic's ``message_delta`` stop
+    reason, Responses' terminal event); a stream that exhausts without
+    one is a generation that died mid-response behind a proxy/ASGI layer
+    that closed the body cleanly.  Typed and listed in every provider's
+    ``retryable_error_names`` so callers re-run it like the wire errors
+    it stands in for — restoring the retired non-streaming transport's
+    complete-or-error contract for single-shot lanes (the interactive
+    loop keeps showing partial output live; this gate is drain-only).
+    """
+
+
+def merge_usage(acc: UsageInfo | None, new: UsageInfo) -> UsageInfo:
+    """Merge one stream-chunk usage report into an accumulator, per-field max.
+
+    Anthropic splits a request's usage across events (``message_start``
+    carries prompt tokens with completion 0; ``message_delta`` carries
+    completion tokens and may omit prompt tokens), so neither first-wins
+    nor last-wins sees both — the max-merge does.  ``total_tokens`` is
+    recomputed from the merged parts.  Returns a fresh ``UsageInfo`` and
+    never mutates ``new`` (the provider's object).
+
+    ``ChatSession``'s inline chunk consumer implements the same rule over
+    its dict-shaped accumulator; it adopts this helper when the main loop
+    moves onto ``model_turn`` (#832).
+    """
+    if acc is None:
+        return replace(new)
+    prompt = max(acc.prompt_tokens, new.prompt_tokens)
+    completion = max(acc.completion_tokens, new.completion_tokens)
+    return UsageInfo(
+        prompt_tokens=prompt,
+        completion_tokens=completion,
+        total_tokens=prompt + completion,
+        cache_creation_tokens=max(acc.cache_creation_tokens, new.cache_creation_tokens),
+        cache_read_tokens=max(acc.cache_read_tokens, new.cache_read_tokens),
+    )
+
+
+def finish_shim_due(
+    *, finish_reason_optional: bool, finish_seen: bool, delivered_output: bool
+) -> bool:
+    """THE gate for the lax-server finish shim, shared by every adapter.
+
+    A stream that ended cleanly without any terminal signal is shimmed to
+    ``"stop"`` only when ALL of: the operator declared
+    ``finish_reason_optional`` on the model (this server never sends
+    terminal signals), no finish was seen (the shim never overrides a
+    real signal), and output was DELIVERED — content, reasoning, or tool
+    calls; ``info_delta``/usage do not count (status pings are not a
+    generation).  Dead/empty streams keep failing the drain's
+    complete-or-error gate even when the flag is armed.  One predicate so
+    the same capability flag cannot acquire different completion
+    semantics per provider family.
+    """
+    return finish_reason_optional and not finish_seen and delivered_output
+
+
+def accumulate_tool_call_delta(
+    acc: dict[int, dict[str, Any]], tcd: ToolCallDelta
+) -> dict[str, Any]:
+    """Fold one ``ToolCallDelta`` into a per-index tool-call accumulator.
+
+    THE tool-call merge rule, in one place: ``id``/``name`` are whole
+    values (last truthy wins — servers may re-send them on every
+    fragment), ``arguments_delta`` concatenates.  Returns the (possibly
+    fresh) accumulator entry so callers can hang provider extras off it.
+
+    Serves :func:`drain_stream`, ``GoogleProvider``'s raw-fidelity
+    capture, and ``ChatSession``'s inline chunk consumer — every
+    accumulator in the tree, so the chat loop and the drained lanes
+    cannot assemble different calls from the same wire stream.
+    """
+    tc = acc.setdefault(
+        tcd.index,
+        {"id": "", "type": "function", "function": {"name": "", "arguments": ""}},
+    )
+    if tcd.id:
+        tc["id"] = tcd.id
+    if tcd.name:
+        tc["function"]["name"] = tcd.name
+    if tcd.arguments_delta:
+        tc["function"]["arguments"] += tcd.arguments_delta
+    return tc
+
+
+def drain_stream(chunks: Iterator[StreamChunk]) -> CompletionResult:
+    """Drain a ``create_streaming`` iterator into a ``CompletionResult``.
+
+    The ONE non-streaming transport: single-shot callers (``model_turn``)
+    sample through the provider's streaming entry and accumulate here, so
+    the streaming and non-streaming lanes cannot drift apart per adapter.
+    Accumulation mirrors the main loop's chunk consumer (``ChatSession``),
+    plus the complete-or-error gate the interactive loop doesn't need:
+
+    - A stream that exhausts with NO finish reason raises
+      :class:`IncompleteStreamError` (retryable) — every adapter emits one
+      on a healthy stream (a server that genuinely never sends a terminal
+      signal needs ``finish_reason_optional`` declared in its model
+      capabilities; the adapter then shims ``"stop"`` once output
+      arrived), so its absence means the generation died mid-response.  Partial text must
+      never be handed to a caller that stores it as a complete result (a
+      compaction summary, a title).  A transport blip AFTER the finish
+      reason keeps the completed result and forfeits only trailing
+      metadata.
+    - ``usage`` merges via :func:`merge_usage` — Anthropic splits prompt
+      and completion tokens across separate events.
+    - Tool calls accumulate by ``ToolCallDelta.index`` via
+      :func:`accumulate_tool_call_delta`.  Adapters own index sanity —
+      the chat iterator remaps index-degenerate wire deltas onto
+      distinct slots before they reach any accumulator (this one or the
+      chat loop's).
+    - ``provider_blocks`` replaces on each non-empty emission — every
+      adapter attaches its full block list exactly once, on or after the
+      terminal chunk.
+    - ``info_delta`` before the finish reason is transient status (server-
+      side search pings) that the non-streaming lane never surfaced —
+      dropped.  ``info_delta`` after the finish reason is the citations
+      footer (``format_citations("", annotations).strip()``); folding it
+      back as ``content + "\\n\\n" + info`` byte-matches the non-streaming
+      lane's ``format_citations(content, annotations)`` append.
+
+    Raises whatever the underlying stream raises — retry/deadline/fallback
+    policy stays with the caller, exactly as with the old non-streaming
+    transport — EXCEPT httpx transport failures: streaming moves the body
+    read out of the SDK's ``APIConnectionError``-wrapped request into raw
+    iteration, so a mid-body connection drop or read timeout surfaces as a
+    bare ``httpx.TransportError`` no retry predicate recognizes.  Those
+    are re-raised (chained) as :class:`IncompleteStreamError`, restoring
+    the wire-blip retryability the non-streaming transport had.
+    """
+    import httpx  # noqa: PLC0415 — heavyweight; deferred off the type-module import path
+
+    content_parts: list[str] = []
+    reasoning_parts: list[str] = []
+    trailing_info_parts: list[str] = []
+    tool_calls_acc: dict[int, dict[str, Any]] = {}
+    usage: UsageInfo | None = None
+    finish_reason: str | None = None
+    provider_blocks: list[dict[str, Any]] = []
+
+    iterator = iter(chunks)
+    while True:
+        try:
+            sc = next(iterator)
+        except StopIteration:
+            break
+        except httpx.TransportError as exc:
+            if finish_reason is not None:
+                # The generation already completed (finish reason in hand);
+                # the blip only cost trailing metadata — a usage-only chunk
+                # or the citation footer.  Keep the complete result rather
+                # than discarding it for a retry that re-pays the tokens —
+                # but say so: on the chat lane the usage chunk trails the
+                # finish reason, so this result may report usage=None and
+                # the call's spend goes missing from usage accounting.
+                import structlog  # noqa: PLC0415 — deferred with httpx off the type-module path
+
+                structlog.get_logger(__name__).warning(
+                    "drain_stream.post_finish_blip",
+                    error_type=type(exc).__name__,
+                    usage_captured=usage is not None,
+                )
+                break
+            raise IncompleteStreamError(
+                f"stream transport failed mid-response ({type(exc).__name__}: {exc})"
+            ) from exc
+        if sc.content_delta:
+            content_parts.append(sc.content_delta)
+        if sc.reasoning_delta:
+            reasoning_parts.append(sc.reasoning_delta)
+        for tcd in sc.tool_call_deltas:
+            accumulate_tool_call_delta(tool_calls_acc, tcd)
+        if sc.usage is not None:
+            usage = merge_usage(usage, sc.usage)
+        if sc.finish_reason:
+            finish_reason = sc.finish_reason
+        if sc.provider_blocks:
+            provider_blocks = sc.provider_blocks
+        # Pre-finish info is transient status — intentionally dropped;
+        # only the trailing (post-finish) citations footer folds back.
+        if sc.info_delta and finish_reason is not None:
+            trailing_info_parts.append(sc.info_delta)
+
+    if finish_reason is None:
+        raise IncompleteStreamError(
+            "stream ended without a finish reason — generation died mid-response "
+            "(a server that never sends finish reasons needs finish_reason_optional "
+            "declared in its model capabilities)"
+        )
+
+    content = "".join(content_parts)
+    for info in trailing_info_parts:
+        content += "\n\n" + info
+
+    tool_calls = [tool_calls_acc[i] for i in sorted(tool_calls_acc)]
+    return CompletionResult(
+        content=content,
+        tool_calls=tool_calls or None,
+        finish_reason=finish_reason,
+        usage=usage,
+        provider_blocks=provider_blocks,
+        reasoning="".join(reasoning_parts),
+    )
+
+
 @dataclass(frozen=True)
 class ModelCapabilities:
     """Describes what a specific model supports — used by providers to
@@ -76,7 +285,6 @@ class ModelCapabilities:
     context_window: int = 200000
     max_output_tokens: int = 64000
     supports_temperature: bool = True
-    supports_streaming: bool = True
     supports_tools: bool = True
     token_param: str = "max_completion_tokens"
     thinking_mode: str = "none"  # "none" | "manual" | "adaptive"
@@ -112,7 +320,7 @@ class ModelCapabilities:
     # user's effort setting always reaches the wire, and the serving
     # box is the authority on what it means.  Commercial rows leave
     # this False: there, an empty values list means the model has no
-    # effort control at all (o1-mini) and the param must be omitted.
+    # effort control at all (legacy o1-mini-era models) and the param must be omitted.
     effort_passthrough: bool = False
     supports_web_search: bool = False
     supports_tool_search: bool = False
@@ -179,6 +387,22 @@ class ModelCapabilities:
     # "" = omit (standard reasoning).  There is no gpt-5.6-pro model.
     supports_pro_mode: bool = False
     reasoning_mode: str = ""
+    # Lax-server tolerance (operator-declared, model-definition
+    # capabilities JSON): this server never sends a terminal signal, so a
+    # stream that ends CLEANLY after delivering output (content, reasoning,
+    # or tool calls) is a completed generation — the adapter shims a
+    # ``"stop"`` finish and :func:`drain_stream`'s complete-or-error gate
+    # passes.  Leave False (the default) for every server that reliably
+    # terminates its streams: there, a clean signal-less end IS a
+    # died-mid-generation stream (worker crashed behind a clean-closing
+    # proxy/ASGI layer) and blessing it would store partial text as a
+    # complete result.  SSE has no body framing, so the two cases are one
+    # wire shape — this flag is the operator asserting which server class
+    # they run.  Honored on every drained lane: Chat Completions (no
+    # ``finish_reason`` ever arrived), Anthropic (no ``message_delta``
+    # stop_reason AND no ``message_stop``), Responses (no terminal
+    # ``response.completed``/``response.incomplete`` event).
+    finish_reason_optional: bool = False
 
 
 # The session effort knob is ORDINAL — snapping must respect this order.
@@ -457,12 +681,22 @@ class LLMProvider(Protocol):
         first chunk.  The caller can then close it from another thread to
         abort a blocked HTTP read immediately.
 
+        This is the ONLY transport — single-shot callers drain it through
+        :func:`drain_stream` instead of a separate non-streaming entry
+        (retired on #831), so per-adapter request shaping cannot drift
+        between the two consumption styles.
+
+        ``temperature=None`` (the default) means the field is OMITTED from
+        the wire request and the server's own default applies — it must
+        never be replaced by a Python-level constant (house rule: code
+        never pins a temperature; ``model_turn`` resolves the operator's
+        ladder and passes ``None`` when nothing is configured).
+
         ``replay_reasoning_to_model`` defaults to ``True`` here (and on
-        every concrete provider's ``create_streaming`` /
-        ``create_completion``) for back-compat with direct callers that
-        haven't been updated to thread the resolver — eval scripts,
-        ad-hoc tests, third-party harnesses.  This is INTENTIONALLY
-        the opposite of the operator-side default
+        every concrete provider's ``create_streaming``) for back-compat
+        with direct callers that haven't been updated to thread the
+        resolver — eval scripts, ad-hoc tests, third-party harnesses.
+        This is INTENTIONALLY the opposite of the operator-side default
         (``ModelConfig.replay_reasoning_to_model = False``,
         ``model_definitions`` server_default ``0``); the resolver in
         ``ChatSession`` reads the operator value and passes it
@@ -471,40 +705,6 @@ class LLMProvider(Protocol):
         ``OpenAIResponsesProvider._convert_messages``) default ``False``
         because they're called BY the public entry points — once the
         resolver-driven value lands, it's already explicit.
-        """
-        ...
-
-    def create_completion(
-        self,
-        *,
-        client: Any,
-        model: str,
-        messages: list[dict[str, Any]],
-        tools: list[dict[str, Any]] | None = None,
-        max_tokens: int = 4096,
-        temperature: float | None = None,
-        reasoning_effort: str | None = None,
-        extra_params: dict[str, Any] | None = None,
-        deferred_names: frozenset[str] | None = None,
-        capabilities: ModelCapabilities | None = None,
-        replay_reasoning_to_model: bool = True,
-        extra_headers: dict[str, str] | None = None,
-        resolve_attachments: Callable[[list[str]], dict[str, Any]] | None = None,
-    ) -> CompletionResult:
-        """Create a non-streaming request, returning a normalized result.
-
-        ``temperature=None`` (the default) means the field is OMITTED from
-        the wire request and the server's own default applies — it must
-        never be replaced by a Python-level constant (house rule: code
-        never pins a temperature; ``model_turn`` resolves the operator's
-        ladder and passes ``None`` when nothing is configured).
-
-        ``replay_reasoning_to_model`` mirrors the per-model
-        ``model_definitions`` operator flag.  Anthropic uses it to
-        gate the verbatim ``_provider_content`` replay (Phase 2);
-        other providers accept the kwarg for Protocol conformance and
-        ignore it (chat-template ``<think>`` content isn't part of
-        their wire-side replay path).
         """
         ...
 

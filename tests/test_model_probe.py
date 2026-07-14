@@ -60,11 +60,11 @@ class TestProbeModelEndpoint:
 
     @patch("turnstone.core.providers.create_client")
     def test_target_found(self, mock_cc: MagicMock) -> None:
-        m1 = _mock_model("gpt-5")
+        m1 = _mock_model("gpt-5.4")
         mock_cc.return_value = _mock_client(m1)
 
         result = probe_model_endpoint(
-            "openai", "http://localhost:8000/v1", "key", target_model="gpt-5"
+            "openai", "http://localhost:8000/v1", "key", target_model="gpt-5.4"
         )
         assert result["model_found"] is True
 
@@ -74,7 +74,7 @@ class TestProbeModelEndpoint:
         mock_cc.return_value = _mock_client(m1)
 
         result = probe_model_endpoint(
-            "openai", "http://localhost:8000/v1", "key", target_model="gpt-5"
+            "openai", "http://localhost:8000/v1", "key", target_model="gpt-5.4"
         )
         assert result["model_found"] is False
         assert result["available_models"] == ["model-a"]
@@ -98,7 +98,7 @@ class TestProbeModelEndpoint:
 
     @patch("turnstone.core.providers.create_client")
     def test_server_type_openai(self, mock_cc: MagicMock) -> None:
-        m = _mock_model("gpt-5")
+        m = _mock_model("gpt-5.4")
         mock_cc.return_value = _mock_client(m)
 
         result = probe_model_endpoint("openai", "https://api.openai.com/v1", "sk-test")
@@ -203,13 +203,13 @@ class TestProbeModelEndpoint:
     @patch("turnstone.core.providers.create_client")
     def test_context_window_openai_static_table(self, mock_cc: MagicMock) -> None:
         """When base_url is api.openai.com and model is known, use static table."""
-        m = _mock_model("gpt-5")
+        m = _mock_model("gpt-5.4")
         mock_cc.return_value = _mock_client(m)
 
         result = probe_model_endpoint(
-            "openai", "https://api.openai.com/v1", "sk-test", target_model="gpt-5"
+            "openai", "https://api.openai.com/v1", "sk-test", target_model="gpt-5.4"
         )
-        assert result["context_window"] == 400000
+        assert result["context_window"] == 1050000
 
 
 # ---------------------------------------------------------------------------
@@ -219,10 +219,11 @@ class TestProbeModelEndpoint:
 
 class TestLookupModelCapabilities:
     def test_known_openai_model(self) -> None:
-        caps = lookup_model_capabilities("openai", "gpt-5")
+        caps = lookup_model_capabilities("openai", "gpt-5.4")
         assert caps is not None
-        assert caps["context_window"] == 400000
-        assert caps["supports_temperature"] is False
+        assert caps["context_window"] == 1050000
+        # 5.4 accepts temperature (applied only when effort="none")
+        assert caps["supports_temperature"] is True
 
     def test_known_anthropic_model(self) -> None:
         caps = lookup_model_capabilities("anthropic", "claude-opus-4-6")
@@ -235,13 +236,13 @@ class TestLookupModelCapabilities:
         assert caps is None
 
     def test_tuples_converted_to_lists(self) -> None:
-        caps = lookup_model_capabilities("openai", "gpt-5")
+        caps = lookup_model_capabilities("openai", "gpt-5.4")
         assert caps is not None
         for val in caps.values():
             assert not isinstance(val, tuple), f"Found tuple: {val}"
 
     def test_reasoning_effort_values_are_list(self) -> None:
-        caps = lookup_model_capabilities("openai", "gpt-5")
+        caps = lookup_model_capabilities("openai", "gpt-5.4")
         assert caps is not None
         assert isinstance(caps["reasoning_effort_values"], list)
         assert "medium" in caps["reasoning_effort_values"]
@@ -252,7 +253,7 @@ class TestLookupModelCapabilities:
 
     def test_invalid_provider_raises(self) -> None:
         with pytest.raises(ValueError, match="Unknown provider"):
-            lookup_model_capabilities("bad-provider", "gpt-5")
+            lookup_model_capabilities("bad-provider", "gpt-5.4")
 
 
 # ---------------------------------------------------------------------------
@@ -263,7 +264,7 @@ class TestLookupModelCapabilities:
 class TestListKnownModels:
     def test_openai_models(self) -> None:
         models = list_known_models("openai")
-        assert "gpt-5" in models
+        assert "gpt-5.4" in models
         assert isinstance(models, list)
         assert models == sorted(models)
 

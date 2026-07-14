@@ -64,3 +64,75 @@ def test_cancel_returns_promptly() -> None:
     assert time.monotonic() - start < 1.0
     stragglers = [t for t in threading.enumerate() if t.name == "dl-cancel" and not t.daemon]
     assert stragglers == [], f"non-daemon worker survived: {stragglers}"
+
+
+def test_on_abandon_fires_on_timeout_and_cancel_but_not_success() -> None:
+    calls: list[str] = []
+
+    with pytest.raises(DeadlineExceededError):
+        run_with_deadline(
+            lambda: time.sleep(2.0),
+            timeout=0.1,
+            poll=0.05,
+            thread_name="dl-abandon-t",
+            on_abandon=lambda: calls.append("timeout"),
+        )
+    assert calls == ["timeout"]
+
+    cancel = threading.Event()
+    cancel.set()
+    with pytest.raises(DeadlineCancelledError):
+        run_with_deadline(
+            lambda: time.sleep(2.0),
+            timeout=10.0,
+            cancel_event=cancel,
+            poll=0.05,
+            thread_name="dl-abandon-c",
+            on_abandon=lambda: calls.append("cancel"),
+        )
+    assert calls == ["timeout", "cancel"]
+
+    result = run_with_deadline(lambda: 7, timeout=1.0, on_abandon=lambda: calls.append("no"))
+    assert result == 7
+    assert calls == ["timeout", "cancel"]
+
+
+def test_on_abandon_errors_do_not_mask_the_deadline_error() -> None:
+    def _boom() -> None:
+        raise RuntimeError("abort hook broke")
+
+    with pytest.raises(DeadlineExceededError):
+        run_with_deadline(
+            lambda: time.sleep(2.0),
+            timeout=0.1,
+            poll=0.05,
+            thread_name="dl-abandon-e",
+            on_abandon=_boom,
+        )
+
+
+class TestStreamAbortRef:
+    def test_abort_closes_captured_stream(self) -> None:
+        from unittest.mock import MagicMock
+
+        from turnstone.core.deadline import StreamAbortRef
+
+        ref = StreamAbortRef()
+        stream = MagicMock()
+        ref.append(stream)
+        stream.close.assert_not_called()
+        ref.abort()
+        stream.close.assert_called_once()
+
+    def test_late_arriving_stream_closes_on_append(self) -> None:
+        # The arrival race: abort fires while the worker is still inside the
+        # SDK connect — the handle must close the moment it is captured.
+        from unittest.mock import MagicMock
+
+        from turnstone.core.deadline import StreamAbortRef
+
+        ref = StreamAbortRef()
+        ref.abort()
+        stream = MagicMock()
+        ref.append(stream)
+        stream.close.assert_called_once()

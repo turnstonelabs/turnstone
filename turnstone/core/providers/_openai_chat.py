@@ -23,11 +23,11 @@ from turnstone.core.providers._openai_common import (
     sanitize_messages,
 )
 from turnstone.core.providers._protocol import (
-    CompletionResult,
     ModelCapabilities,
     StreamChunk,
     ToolCallDelta,
     _join_reasoning_with_cap,
+    finish_shim_due,
     merge_reasoning_template_kwargs,
 )
 from turnstone.core.trajectory import materialize_attachments
@@ -56,6 +56,149 @@ def _reasoning_text(obj: Any) -> str:
 log = structlog.get_logger(__name__)
 
 
+class _ArgsScanner:
+    """Incremental JSON-completeness state over streamed argument fragments.
+
+    Tracks bracket depth and string state character-by-character so the
+    slotter can ask, at any fragment boundary, whether the arguments
+    accumulated so far form a syntactically CLOSED value.  Arguments are
+    JSON objects per the tool-call spec, so depth-tracking suffices; a
+    server streaming non-JSON arguments never reads complete, which
+    degrades the slotter to plain per-index accumulation (the pre-slotter
+    behavior) for that slot.
+    """
+
+    __slots__ = ("depth", "escaped", "in_string", "saw_token")
+
+    def __init__(self) -> None:
+        self.depth = 0
+        self.in_string = False
+        self.escaped = False
+        self.saw_token = False
+
+    def feed(self, fragment: str) -> None:
+        for ch in fragment:
+            if self.in_string:
+                if self.escaped:
+                    self.escaped = False
+                elif ch == "\\":
+                    self.escaped = True
+                elif ch == '"':
+                    self.in_string = False
+                continue
+            if ch in " \t\r\n":
+                continue
+            self.saw_token = True
+            if ch == '"':
+                self.in_string = True
+            elif ch in "{[":
+                self.depth += 1
+            elif ch in "}]":
+                self.depth -= 1
+
+    @property
+    def complete(self) -> bool:
+        return self.saw_token and self.depth <= 0 and not self.in_string
+
+
+class ToolCallSlotter:
+    """Wire-index → logical-slot assignment for streamed tool-call deltas.
+
+    One slotter (the base iterator's) drives both the normalized
+    ``tool_calls`` mirror and ``GoogleProvider``'s raw fidelity capture
+    (via the ``on_tool_call_delta`` hook), so the two lanes assign call
+    identity identically by construction.  Index-degenerate compat
+    servers (historical vLLM/llama.cpp builds) emit every parallel call
+    at index 0; ids, names, and argument JSON completeness decide where
+    one call ends and the next begins:
+
+    - A delta whose id CONTRADICTS the slot's id is a new call; a delta
+      whose id MATCHES is the same call, however many times the server
+      repeats the name header per fragment.  Ids are authoritative both
+      ways — and a slot whose id is KNOWN never splits on an id-less
+      delta at all: on an id-disciplined server new calls arrive with
+      ids, so an id-less fragment (the call's first name announcement,
+      an argument fragment, a redundant header) is always a
+      continuation.  All heuristics below apply only to fully id-less
+      slots.
+    - A delta with NO name is always an arguments continuation.
+    - A name arriving for a slot that has NO name yet is the call's
+      FIRST announcement (e.g. the slot was opened by an args-only
+      delta), never a new call.
+    - A delta announcing a DIFFERENT name than the slot's is a new call
+      (two functions cannot be one call).
+    - A re-announcement of the SAME name splits only when the slot's
+      accumulated arguments are syntactically complete JSON AND the
+      delta itself carries arguments (the next parallel call arriving
+      with its payload).  Mid-JSON, or as a bare trailing delta after
+      complete arguments, the name is a redundant per-fragment header /
+      footer and the delta merges.  With NO arguments accumulated yet:
+      a re-announce that carries arguments merges (name-first emission,
+      the arguments are starting now); a bare re-announce splits (the
+      id-less whole-delta shape — two zero-argument parallel calls).
+
+    Residual ambiguity, resolved toward the shapes observed in the wild:
+    a same-name re-announce on an empty slot that carries arguments is
+    read as one call (not a zero-arg call followed by an arg-ful twin),
+    and a bare same-name re-announce after complete arguments is read
+    as a redundant footer (not a second zero-arg call of the same
+    function).  Only ids disambiguate those; servers that omit them
+    choose the bet.
+    """
+
+    def __init__(self) -> None:
+        self._slot_for_index: dict[int, int] = {}
+        self._slot_ids: dict[int, str] = {}
+        self._slot_names: dict[int, str] = {}
+        self._slot_args: dict[int, _ArgsScanner] = {}
+        self._next_slot = 0
+
+    def slot_for(self, wire_index: int, tc_id: str, name: str, args: str) -> int:
+        slot = self._slot_for_index.get(wire_index)
+        if slot is None or self._is_new_call(slot, tc_id, name, args):
+            slot = self._next_slot
+            self._next_slot += 1
+            self._slot_for_index[wire_index] = slot
+        if tc_id:
+            self._slot_ids[slot] = tc_id
+        if name:
+            self._slot_names[slot] = name
+        # JSON-completeness state is consulted only for fully id-less
+        # slots (``_is_new_call`` short-circuits on a known id), so id'd
+        # slots — the dominant case — skip the per-character scan.
+        if args and slot not in self._slot_ids:
+            self._slot_args.setdefault(slot, _ArgsScanner()).feed(args)
+        return slot
+
+    def _is_new_call(self, slot: int, tc_id: str, name: str, args: str) -> bool:
+        slot_id = self._slot_ids.get(slot, "")
+        if tc_id:
+            return bool(slot_id) and tc_id != slot_id
+        if slot_id:
+            # Id-disciplined slot: new calls on this server arrive with
+            # ids (the id-conflict rule above), so an id-less delta —
+            # the call's first name fragment, an argument fragment, a
+            # redundant header — is always a continuation.
+            return False
+        if not name:
+            return False
+        slot_name = self._slot_names.get(slot, "")
+        if not slot_name:
+            # First name announcement for a slot opened by an args-only
+            # delta — naming the call, not starting a new one.
+            return False
+        if name != slot_name:
+            return True
+        scanner = self._slot_args.get(slot)
+        if scanner is not None:
+            # Complete arguments end the call — but only a re-announce
+            # that itself CARRIES arguments starts the next one; a bare
+            # same-name delta after complete arguments is a redundant
+            # footer.
+            return scanner.complete and bool(args)
+        return not args
+
+
 class OpenAIChatCompletionsProvider:
     """Provider for local OpenAI-compatible servers (vLLM, llama.cpp, SGLang).
 
@@ -82,32 +225,6 @@ class OpenAIChatCompletionsProvider:
         sending.  The base implementation just calls ``sanitize_messages``.
         """
         return sanitize_messages(messages)
-
-    # -- tool-call extraction -------------------------------------------------
-
-    def _extract_tool_calls(
-        self, sdk_tool_calls: list[Any]
-    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
-        """Extract normalised tool-call dicts from SDK objects.
-
-        Returns ``(tool_calls, provider_blocks)``.  The base implementation
-        returns an empty ``provider_blocks`` list.  Subclasses (e.g.
-        ``GoogleProvider``) override this to capture provider-specific
-        fields (like ``thought_signature``) in ``provider_blocks`` for
-        round-trip fidelity.
-        """
-        tool_calls = [
-            {
-                "id": tc.id,
-                "type": "function",
-                "function": {
-                    "name": tc.function.name,
-                    "arguments": tc.function.arguments,
-                },
-            }
-            for tc in sdk_tool_calls
-        ]
-        return tool_calls, []
 
     # -- web search ----------------------------------------------------------
 
@@ -165,7 +282,7 @@ class OpenAIChatCompletionsProvider:
 
     # Phase 2 of the reasoning-persistence feature plumbs an optional
     # ``replay_reasoning_to_model`` kwarg through every provider's
-    # ``create_streaming`` / ``create_completion``.  OpenAI Chat (and
+    # ``create_streaming``.  OpenAI Chat (and
     # the local-model server flavours that route through this adapter)
     # have no first-class reasoning shape on the wire, so the kwarg is
     # accepted for Protocol conformance and ignored here.
@@ -219,16 +336,39 @@ class OpenAIChatCompletionsProvider:
         stream = client.chat.completions.create(**kwargs)
         if cancel_ref is not None:
             cancel_ref.append(stream)
-        return self._iter_stream(stream)
+        return self._iter_stream(stream, finish_reason_optional=caps.finish_reason_optional)
 
-    def _iter_stream(self, stream: Any) -> Iterator[StreamChunk]:
-        """Convert OpenAI Chat Completions stream chunks to StreamChunks."""
+    def _iter_stream(
+        self,
+        stream: Any,
+        *,
+        finish_reason_optional: bool = False,
+        on_tool_call_delta: Callable[[ToolCallDelta, Any], None] | None = None,
+    ) -> Iterator[StreamChunk]:
+        """Convert OpenAI Chat Completions stream chunks to StreamChunks.
+
+        *finish_reason_optional* is the model capability of the same name:
+        it arms the lax-server finish shim at the end of this generator.
+
+        *on_tool_call_delta* is called with ``(normalized, raw_sdk_delta)``
+        for every tool-call delta — the normalized ``ToolCallDelta``
+        carries the slot the base's slotter assigned AND the base's
+        id/name/arguments extraction, so a subclass capturing provider
+        extras (``GoogleProvider``'s ``thought_signature``) accumulates
+        the exact bytes the ``tool_calls`` mirror sees and cannot desync
+        from it on either axis.
+        """
         first = True
         annotations: list[Any] = []
         content_len = 0
+        reasoning_len = 0
         tool_call_count = 0
         last_finish_reason: str | None = None
         completion_tokens: int | None = None
+        # Remap wire indexes onto logical slots (see ToolCallSlotter) so
+        # downstream accumulators (drain_stream, the chat loop) can key by
+        # index safely even on index-degenerate compat servers.
+        slotter = ToolCallSlotter()
         for chunk in stream:
             sc = StreamChunk()
 
@@ -254,6 +394,7 @@ class OpenAIChatCompletionsProvider:
             rc = _reasoning_text(delta)
             if rc:
                 sc.reasoning_delta = rc
+                reasoning_len += len(rc)
 
             # Content
             if delta.content:
@@ -263,14 +404,20 @@ class OpenAIChatCompletionsProvider:
             # Tool calls
             if delta.tool_calls:
                 for tc_delta in delta.tool_calls:
-                    tcd = ToolCallDelta(index=tc_delta.index)
-                    if tc_delta.id:
-                        tcd.id = tc_delta.id
-                    if tc_delta.function:
-                        if tc_delta.function.name:
-                            tcd.name = tc_delta.function.name
-                        if tc_delta.function.arguments:
-                            tcd.arguments_delta = tc_delta.function.arguments
+                    tc_id = tc_delta.id or ""
+                    fn = tc_delta.function
+                    name = (fn.name if fn else None) or ""
+                    args = (fn.arguments if fn else None) or ""
+                    slot = slotter.slot_for(tc_delta.index, tc_id, name, args)
+                    tcd = ToolCallDelta(index=slot)
+                    if tc_id:
+                        tcd.id = tc_id
+                    if name:
+                        tcd.name = name
+                    if args:
+                        tcd.arguments_delta = args
+                    if on_tool_call_delta is not None:
+                        on_tool_call_delta(tcd, tc_delta)
                     sc.tool_call_deltas.append(tcd)
                     tool_call_count += 1
 
@@ -287,11 +434,38 @@ class OpenAIChatCompletionsProvider:
             if has_content or sc.finish_reason or sc.usage:
                 yield sc
 
+        # Finish-reason-less lax-server tolerance (the deleted non-streaming
+        # path's `finish_reason or "stop"` default), armed ONLY by the
+        # operator-declared ``finish_reason_optional`` capability: on a
+        # server that never sends finish reasons, a stream that ended
+        # CLEANLY — the SDK ends iteration on [DONE]; an abrupt connection
+        # death raises httpx.TransportError out of this generator — after
+        # delivering output is a completed generation.  Everywhere else a
+        # clean finish-less end is indistinguishable from a generation
+        # that died behind a clean-closing proxy/ASGI layer, so the shim
+        # stays DISARMED and the drain's complete-or-error gate raises
+        # (retryable) instead of blessing possibly-truncated text.
+        # Reasoning counts as delivered output — a thinking model that
+        # spent its budget before emitting content is still a completed
+        # generation (the retired non-streaming path returned it with
+        # empty content).  Emit the finish BEFORE the citation footer so
+        # the drain folds the footer as trailing info.  A clean-exhaustion
+        # stream with NO output still yields nothing, so dead/empty
+        # streams keep failing the gate even when the shim is armed.
+        if finish_shim_due(
+            finish_reason_optional=finish_reason_optional,
+            finish_seen=last_finish_reason is not None,
+            delivered_output=bool(content_len or reasoning_len or tool_call_count),
+        ):
+            last_finish_reason = "stop"
+            yield StreamChunk(finish_reason="stop")
+
         log.debug(
             "openai.chat.response",
             stream=True,
             finish_reason=last_finish_reason,
             content_length=content_len,
+            reasoning_length=reasoning_len,
             tool_call_deltas=tool_call_count,
             completion_tokens=completion_tokens,
         )
@@ -301,94 +475,6 @@ class OpenAIChatCompletionsProvider:
             citation_text = format_citations("", annotations).strip()
             if citation_text:
                 yield StreamChunk(info_delta=citation_text)
-
-    # -- non-streaming -------------------------------------------------------
-
-    def create_completion(
-        self,
-        *,
-        client: Any,
-        model: str,
-        messages: list[dict[str, Any]],
-        tools: list[dict[str, Any]] | None = None,
-        max_tokens: int = 4096,
-        temperature: float | None = None,
-        reasoning_effort: str | None = None,
-        extra_params: dict[str, Any] | None = None,
-        deferred_names: frozenset[str] | None = None,
-        capabilities: ModelCapabilities | None = None,
-        # See create_streaming above for the Phase 2 reasoning-persistence rationale.
-        replay_reasoning_to_model: bool = True,
-        extra_headers: dict[str, str] | None = None,
-        resolve_attachments: Callable[[list[str]], dict[str, Any]] | None = None,
-    ) -> CompletionResult:
-        messages = materialize_attachments(messages, resolve_attachments)
-        caps = capabilities or self.get_capabilities(model)
-        messages = self._prepare_messages(messages)
-        kwargs: dict[str, Any] = {
-            "model": model,
-            "messages": messages,
-            caps.token_param: max_tokens,
-            "stream": False,
-        }
-        apply_temperature_and_effort(kwargs, caps, temperature, reasoning_effort)
-        tools = self._apply_web_search(kwargs, caps, tools)
-        tools = apply_tool_search(caps, tools, deferred_names)
-        if tools:
-            kwargs["tools"] = tools
-        extra_body = self._finalize_extra_body(extra_params, caps, reasoning_effort)
-        if extra_body:
-            kwargs["extra_body"] = extra_body
-        if extra_headers:
-            kwargs["extra_headers"] = extra_headers
-
-        log.debug(
-            "openai.chat.request",
-            model=model,
-            stream=False,
-            max_tokens=max_tokens,
-            message_count=len(messages),
-            tool_count=len(tools) if tools else 0,
-        )
-        response = client.chat.completions.create(**kwargs)
-        choice = response.choices[0]
-        msg = choice.message
-
-        tool_calls = None
-        provider_blocks: list[dict[str, Any]] = []
-        if msg.tool_calls:
-            tool_calls, provider_blocks = self._extract_tool_calls(msg.tool_calls)
-
-        # Extract url_citation annotations from web search models
-        content = msg.content or ""
-        annotations = getattr(msg, "annotations", None)
-        if annotations:
-            content = format_citations(content, annotations)
-
-        # Non-canonical reasoning text (vLLM ``--reasoning-parser``, llama.cpp
-        # ``reasoning_format``) — the shared extractor also serves the
-        # streaming delta path, so the two lanes cannot drift.
-        reasoning = _reasoning_text(msg)
-
-        usage = extract_usage(getattr(response, "usage", None))
-
-        result = CompletionResult(
-            content=content,
-            tool_calls=tool_calls,
-            finish_reason=choice.finish_reason or "stop",
-            usage=usage,
-            provider_blocks=provider_blocks,
-            reasoning=reasoning,
-        )
-        log.debug(
-            "openai.chat.response",
-            stream=False,
-            finish_reason=result.finish_reason,
-            content_length=len(content),
-            tool_call_count=len(tool_calls) if tool_calls else 0,
-            completion_tokens=usage.completion_tokens if usage else None,
-        )
-        return result
 
     # -- tool conversion -----------------------------------------------------
 

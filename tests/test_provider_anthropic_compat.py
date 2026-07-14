@@ -332,20 +332,19 @@ class TestCompatReasoningControl:
             "chat_template_kwargs": {"enable_thinking": True, "reasoning_effort": "high"}
         }
 
-    def test_create_completion_same_injection(self) -> None:
-        """The non-streaming path shares _build_thinking_and_kwargs."""
+    def test_create_streaming_same_injection(self) -> None:
+        """The public streaming entry shares _build_thinking_and_kwargs."""
         client = MagicMock()
-        final = MagicMock(content=[], stop_reason="end_turn")
-        stream = MagicMock()
-        stream.get_final_message.return_value = final
-        client.messages.stream.return_value.__enter__.return_value = stream
+        client.messages.stream.return_value.__enter__.return_value = iter([])
         with patch("turnstone.core.providers._anthropic._ensure_anthropic"):
-            self.provider.create_completion(
-                client=client,
-                model="qwen3.6-27b",
-                messages=[{"role": "user", "content": "hi"}],
-                reasoning_effort="none",
-                capabilities=self._MANUAL_CAPS,
+            list(
+                self.provider.create_streaming(
+                    client=client,
+                    model="qwen3.6-27b",
+                    messages=[{"role": "user", "content": "hi"}],
+                    reasoning_effort="none",
+                    capabilities=self._MANUAL_CAPS,
+                )
             )
         kwargs = client.messages.stream.call_args[1]
         assert kwargs["extra_body"] == {"chat_template_kwargs": {"enable_thinking": False}}

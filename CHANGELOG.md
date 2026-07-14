@@ -18,6 +18,49 @@ Earlier stable lines (`stable/1.6`, `stable/1.5`) are frozen.
 
 ### Added
 
+- **One provider transport: every model call now streams (#831).**
+  The per-adapter non-streaming entry (`create_completion`) is retired;
+  single-shot lanes — judges, titles, compaction, web-fetch extraction,
+  perception, eval, optimizer — sample through the same streaming entry
+  the chat loop uses and accumulate via one shared drain, so request
+  shaping can no longer drift between the two consumption styles. Two
+  operator-visible consequences: long single-shot generations (a thinking
+  model composing a title, a slow local judge) no longer sit in a single
+  blocking read that can hit client read-timeouts — the same reason the
+  Anthropic adapter already streamed internally — and judge timeouts now
+  *abort* the underlying HTTP read instead of abandoning a worker thread
+  on a dead call. Because every call now streams, an alias pointed at a
+  model or org that cannot stream (OpenAI's verified-org streaming
+  entitlement, a gateway api-version predating `stream_options` — e.g.
+  older Azure OpenAI deployments) fails at request time where 1.7's
+  non-streaming single-shot call succeeded; remediation is on the
+  serving side (verify the org, bump the api-version/gateway) — there is
+  deliberately no per-model non-streaming fallback left to configure. These lanes are also complete-or-error now: a stream
+  that ends without any finish signal is treated as a generation that
+  died mid-response and retried, instead of storing the partial text as
+  a clean result (previously a half-generated compaction summary could
+  silently replace real history). Caveats: these lanes now carry the
+  same `stream_options: {include_usage: true}` the chat loop always
+  sent — OpenAI-compatible servers old enough to *ignore* it stop
+  producing usage rows on these lanes, and servers strict enough to
+  *reject* unknown fields (pre-2024 llama.cpp/proxy builds) will 400 —
+  such a server already couldn't serve turnstone's chat loop, but a
+  judge/utility alias pointed at one worked on 1.7 and needs to move to
+  a current server. Transient mid-stream deaths (connection drop, proxy
+  hiccup) are re-issued in place up to twice with exponential backoff —
+  the retry the SDK's request loop used to provide these lanes
+  invisibly. Each lane accepts its own terminal marker (Anthropic
+  `message_stop`, Responses terminal events); a lax server/gateway that
+  never sends any terminal signal needs
+  `{"finish_reason_optional": true}` in the model definition's
+  capabilities JSON, which restores 1.7's tolerance (clean end-of-stream
+  after output = completion) for that model on every lane — without it
+  such streams fail as died-mid-generation, because SSE gives no way to
+  tell the two apart and the default favors catching truncation. The
+  unread `supports_streaming` capability flag (and its admin tile) is
+  gone; the o-series models it described are dropped from the capability
+  table entirely (see Removed).
+
 - **One turn interface for every model call: `core/model_turn.py` (#827).**
   Judges (intent + output guard), perception, title generation, compaction,
   web-fetch extraction, the eval harness, the optimizer's meta lanes, and
@@ -99,7 +142,88 @@ Earlier stable lines (`stable/1.6`, `stable/1.5`) are frozen.
     inherit semantics the next time you change the model or a sampling
     knob in that workstream. New workstreams inherit from the start.
 
+### Removed
+
+- **O-series and pre-5.4 GPT-5 rows dropped from the OpenAI capability
+  table.** `o1`, `o1-mini`, `o3`, `o3-mini`, `o3-pro`, `o4-mini`,
+  `gpt-5`, `gpt-5-mini`, `gpt-5-nano`, `gpt-5-pro`, `gpt-5.1`,
+  `gpt-5.1-codex-max`, `gpt-5.2`, `gpt-5.2-pro`, and `gpt-5.3` no longer
+  have built-in capability rows — OpenAI has retired these model ids
+  from the API, so the rows described contracts no request can reach
+  anymore. The table floor is now `gpt-5.4`; the search-api and
+  audio/STT/TTS rows are unchanged. An alias still pinning a retired id
+  fails at OpenAI itself; any other unlisted commercial id resolves to
+  the generic commercial defaults (temperature sent, no declared
+  reasoning-effort vocabulary, 200K window) — declare the contract on
+  the model definition's capabilities JSON if you run one, or move to a
+  current model.
+
 ### Fixed
+
+- **Static MCP servers: a pushed catalog change no longer wedges the shared
+  session (#839).** The static-path `*/list_changed` handler awaited its
+  catalog refresh inline in the SDK's receive loop, but the refresh's own
+  request can only be answered by that (now parked) loop — the refresh never
+  completed, and every user's in-flight calls on the shared per-node session
+  stalled behind it, unbounded, until the health loop's ping timeout tore the
+  transport down (which was also the only way the changed catalog ever
+  landed). Push refreshes now run as spawned tasks — debounced, coalesced per
+  (server, kind), bounded by the connect timeout, and serialized on the
+  per-server connect lock — and the manual and post-reconnect refreshes
+  publish under that same lock, so a slower publisher can no longer land a
+  staler catalog over a fresher one. Every teardown path now also clears the
+  notification debounce stamp, so a reconnected server's first push refreshes
+  immediately. Push-refresh debouncing is now per (server, kind) on BOTH the
+  static and per-user pool paths — a tools push no longer swallows a prompts
+  push arriving in the same 5-second window. A change genuinely lost to the
+  debounce window (a same-kind push landing after the prior refresh finished,
+  which the server will never re-announce) is recovered by an automatic
+  health-tick retry rather than staying invisible until an unrelated push or
+  a reconnect. The resource-refresh fan-out on both paths no longer orphans
+  its sibling list call when one of the pair fails fast — the real error
+  surfaces immediately (not masked as a 30-second timeout) and the surviving
+  sibling is cancelled and reaped, under a bounded grace, inside the scope. A
+  push refresh that fails while the connection stays up is likewise retried on
+  the next health-loop tick until one completes — previously a single
+  transient blip left the shared catalog stale for every user on the node
+  until an operator intervened. An operator `/mcp refresh` no longer parks
+  behind a busy per-server connect lock (a slow reconnect attempt could eat
+  the whole 30-second refresh budget and fail the pass for every healthy
+  server behind it) — the busy server is skipped on both the connected and
+  disconnected branches, reported distinctly as "skipped" rather than as a
+  false "no changes", the skip arms the automatic retry, and a
+  force-reconnect drops the session up front so queued push refreshes can't
+  starve it. Static-path resource and prompt catalogs are now size-capped
+  like the pool path's (and like static tools) at discovery and on every
+  refresh, so a misbehaving server's push can't balloon the node's merged
+  catalogs. Deleting or reconfiguring a server can no longer leave it
+  half-removed: the config removal and all cleanup are serialized under the
+  connect lock (a cancelled removal completes its cleanup rather than
+  stranding a live session and published catalog with the config already
+  gone), and `reconcile_sync` retries a removal that timed out instead of
+  marking it done — previously a DB-driven delete of a busy server could be a
+  silent, permanent no-op until process restart. A refresh outcome now
+  threads consistently to every operator surface off one source of truth
+  (the per-server `last_refresh_outcome`): a busy-skip and a genuine failure
+  are each reported distinctly from a real "no changes" — `/mcp refresh`
+  prints "skipped" or "failed" rather than a false "no changes", and the
+  node-internal refresh endpoint returns `202 skipped` instead of a
+  misleading `200 ok` for a refresh that never ran. A single-kind push
+  refresh no longer paints the whole server healthy: because the
+  error/outcome state is server-scoped, a successful tools push while the
+  prompts catalog is still broken (or vice versa) no longer clears the
+  failure — only a full refresh pass declares "ok".
+
+- **OpenAI Responses streaming: truncated and refused responses no longer
+  vanish.** A response that hit `max_output_tokens` terminates the stream
+  with `response.incomplete`, which the stream consumer did not handle —
+  the turn was mislabeled `finish_reason: stop` and its final usage and
+  collected output items were dropped. Refusal parts had no streaming
+  handler at all, so a refusal rendered as empty content instead of the
+  `[Refused: …]` text the non-streaming path produced. Both now match:
+  truncation maps to `length` with usage/items intact, refusals render
+  in content. Applies to the chat loop and every drained single-shot
+  lane (#831).
 
 - **task_agent: sub-tool ids no longer alias across a local model's reused
   ids.** A local model that reissues per-response sequential tool-call ids

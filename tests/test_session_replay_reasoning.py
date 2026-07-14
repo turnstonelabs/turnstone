@@ -2,8 +2,8 @@
 
 Phase 2 of optional reasoning persistence reads the per-model
 ``ModelConfig.replay_reasoning_to_model`` flag at the wire-build call
-site and threads it through ``provider.create_streaming`` /
-``provider.create_completion``.  These tests pin:
+site and threads it through ``provider.create_streaming`` (the one
+transport post-#831).  These tests pin:
 
 1. The resolver helper (``ChatSession._resolve_replay_reasoning_to_model``)
    walks the registry correctly and falls back to ``False`` (the
@@ -26,8 +26,8 @@ from types import SimpleNamespace
 from typing import Any
 from unittest.mock import MagicMock, patch
 
+from tests._session_helpers import as_stream, mock_completion_result
 from tests._session_helpers import make_session as _make_session
-from tests._session_helpers import mock_completion_result
 from turnstone.core.trajectory import Turn
 
 
@@ -626,12 +626,12 @@ class TestUtilityCompletionPassesFlag:
         session._model_alias = "claude-opus-4-7"
         captured: dict[str, Any] = {}
 
-        def capture_completion(**kwargs: Any) -> Any:
+        def capture_streaming(**kwargs: Any) -> Any:
             captured.update(kwargs)
-            return mock_completion_result("title")
+            return as_stream(mock_completion_result("title"))
 
         mock_provider = MagicMock()
-        mock_provider.create_completion = capture_completion
+        mock_provider.create_streaming = capture_streaming
         session._provider = mock_provider
         caps = ModelCapabilities(max_output_tokens=0, supports_reasoning_replay=True)
         # No _provider_extra_params patch: _utility_completion resolves

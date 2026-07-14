@@ -4,6 +4,9 @@ import asyncio
 import contextlib
 import logging
 import os
+import socket
+import subprocess
+import sys
 import threading
 import time
 from typing import TYPE_CHECKING, Any
@@ -214,6 +217,98 @@ def _seed_static_state(mgr: MCPClientManager, name: str, **overrides: Any) -> St
     for k, v in overrides.items():
         setattr(state, k, v)
     return state
+
+
+def _run_on_loop(loop: asyncio.AbstractEventLoop, coro: Any, timeout: float = 10) -> Any:
+    """Submit *coro* to *loop*, wait for the result.
+
+    The ONE copy shared by the MCP test files — four hand-synced copies
+    had already drifted on the timeout (5s hardcoded vs a 10s default).
+    The timeout is an upper bound on waiting, not a behavior assertion,
+    so the most generous variant won the merge.
+    """
+    fut = asyncio.run_coroutine_threadsafe(coro, loop)
+    return fut.result(timeout=timeout)
+
+
+def _drain_background(mgr: MCPClientManager, loop: asyncio.AbstractEventLoop) -> None:
+    """Deterministically await ``mgr``'s tracked background tasks.
+
+    Replaces fixed sleeps for synchronizing with scheduled dead-grant
+    drops / spawned refreshes: exact, and immune to slow-runner flake.
+    """
+
+    async def _drain() -> None:
+        tasks = [t for t in list(mgr._background_tasks) if not t.done()]
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+
+    _run_on_loop(loop, _drain())
+
+
+def _poll_until(predicate: Callable[[], bool], timeout: float, interval: float = 0.05) -> bool:
+    """Poll *predicate* until true or *timeout* elapses — the ONE wait loop.
+
+    Shared by the live MCP smoke tests' condition helpers so the
+    deadline/poll pattern doesn't accrete per-file hand-synced copies.
+    """
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if predicate():
+            return True
+        time.sleep(interval)
+    return False
+
+
+def _free_port() -> int:
+    """Grab an ephemeral localhost port for a live-server subprocess.
+
+    Shared by the live MCP smoke tests (flaky-server, push-refresh) so
+    the socket-probe helpers stay in one place instead of drifting per
+    file.
+    """
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind(("127.0.0.1", 0))
+        return int(s.getsockname()[1])
+
+
+def _tcp_accepts(port: int) -> bool:
+    try:
+        with socket.create_connection(("127.0.0.1", port), timeout=0.3):
+            return True
+    except OSError:
+        return False
+
+
+def _wait_tcp_ready(port: int, timeout: float) -> bool:
+    """Poll until something accepts TCP on 127.0.0.1:*port* (live tests)."""
+    return _poll_until(lambda: _tcp_accepts(port), timeout)
+
+
+def _wait_session_live(mgr: MCPClientManager, name: str, timeout: float) -> bool:
+    """Poll until static server *name* has a live session (live tests)."""
+
+    def _live() -> bool:
+        state = mgr._static_servers.get(name)
+        return state is not None and state.session is not None
+
+    return _poll_until(_live, timeout)
+
+
+def _popen_mcp_server(script_path: Any, port: int) -> subprocess.Popen[bytes]:
+    """Start a FastMCP live-server subprocess, streams to DEVNULL.
+
+    The shared spawn primitive for the live MCP smoke tests
+    (flaky-server flap loop, push-refresh) — the readiness wait and the
+    skip-vs-raise-on-failure policy legitimately differ per test and
+    stay at the call sites. ``sys.executable`` runs the same interpreter,
+    so a server-side import gap surfaces as a failed TCP wait, not here.
+    """
+    return subprocess.Popen(
+        [sys.executable, str(script_path), str(port)],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
 
 
 def make_oidc_test_config(**overrides: Any) -> OIDCConfig:

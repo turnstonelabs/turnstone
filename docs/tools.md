@@ -779,13 +779,20 @@ MCP tool lists stay up-to-date without restart through two mechanisms:
 1. **Push notifications** -- MCP servers that declare `tools.listChanged: true` in
    their capabilities send `notifications/tools/list_changed` when their tool list
    changes. `MCPClientManager` registers a `message_handler` on each `ClientSession`
-   that triggers an immediate refresh for that server.
+   that triggers an immediate refresh for that server (debounced per server and
+   notification kind, and run off the receive loop). A refresh that fails while
+   the connection stays up is retried automatically on the next health-loop tick
+   until one completes.
 
 2. **Manual** -- `/mcp refresh` re-fetches tools from all servers immediately.
    `/mcp refresh <server>` targets a single server. If a server has disconnected,
    manual refresh attempts reconnection. The console admin panel exposes the
    same controls (refresh / reconnect buttons per server) for cluster-wide
    fan-out.
+
+Reconnects (health-loop, dispatch-driven, or operator-forced) always end in a
+full catalog rediscovery, so a server that changed its tools while disconnected
+comes back current.
 
 When tools change, `MCPClientManager` rebuilds its merged tool list using copy-on-write
 (new list/dict objects assigned atomically) and notifies all active `ChatSession`
@@ -857,13 +864,16 @@ catalog.
 
 ### Refresh
 
-Resource lists stay current through the same three-tier mechanism as tool lists:
+Resource lists stay current through the same mechanisms as tool lists:
 
 1. **Push** -- Servers declaring `resources.listChanged: true` send
-   `notifications/resources/list_changed`, triggering an immediate refresh.
-2. **Periodic** -- Servers without push are polled on the configured refresh
-   interval (default 4 hours, same timer as tools).
-3. **Manual** -- `/mcp refresh` re-fetches resources alongside tools.
+   `notifications/resources/list_changed`, triggering an immediate refresh
+   (with the same failed-refresh retry on the health-loop tick).
+2. **Manual** -- `/mcp refresh` re-fetches resources alongside tools.
+
+Servers without push support are refreshed whenever they reconnect (every
+reconnect ends in full rediscovery) or when an operator refreshes manually;
+there is no periodic polling.
 
 ---
 

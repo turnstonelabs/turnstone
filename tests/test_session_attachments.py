@@ -6,7 +6,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from tests._session_helpers import mock_completion_result
+from tests._session_helpers import as_stream, mock_completion_result
 from turnstone.core import perception
 from turnstone.core.attachments import Attachment
 from turnstone.core.memory import (
@@ -561,7 +561,7 @@ class TestPerceptionFallback:
         """Wire a stub perception backend onto the session; return the provider mock."""
         perception._clear_perception_cache_for_test()
         prov = MagicMock()
-        prov.create_completion.return_value = mock_completion_result(content)
+        prov.create_streaming.return_value = as_stream(mock_completion_result(content))
         s._config_store = MagicMock()
         s._config_store.get = lambda k, *a: "omni" if k == "perception.model_alias" else ""
         s._registry = MagicMock()
@@ -581,7 +581,7 @@ class TestPerceptionFallback:
         assert part["type"] == "text"
         assert "DESCRIPTION" in part["text"]
         assert "image attachment 'i.png'" in part["text"]
-        prov.create_completion.assert_called_once()
+        prov.create_streaming.assert_called_once()
 
     def test_image_falls_through_to_native_without_perception(self, tmp_db, mock_openai_client):
         # No perception configured (registry/config_store None) → native image_url:
@@ -606,10 +606,10 @@ class TestPerceptionFallback:
         # the perception model was handed the rasterized pages, not the raw
         # PDF: the wire carries the prompt + a by-reference placeholder, and
         # the threaded resolver materializes the page parts at the translator.
-        sent = prov.create_completion.call_args.kwargs["messages"][0]["content"]
+        sent = prov.create_streaming.call_args.kwargs["messages"][0]["content"]
         assert sent[0]["type"] == "text"
         assert sent[1]["attachment_id"] == "perception-input"
-        resolver = prov.create_completion.call_args.kwargs["resolve_attachments"]
+        resolver = prov.create_streaming.call_args.kwargs["resolve_attachments"]
         pages = resolver(["perception-input"])["perception-input"]
         assert [p["type"] for p in pages] == ["image_url", "image_url"]
 
@@ -634,7 +634,7 @@ class TestPerceptionFallback:
         )
         assert part["type"] == "text"
         assert "no transcription backend" in part["text"]
-        prov.create_completion.assert_not_called()
+        prov.create_streaming.assert_not_called()
 
 
 class TestResolveAttachmentsCapsThreading:

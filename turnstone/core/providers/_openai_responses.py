@@ -8,7 +8,7 @@ of the Chat Completions endpoint.
 from __future__ import annotations
 
 import json
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, NoReturn
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterator
@@ -31,16 +31,66 @@ from turnstone.core.providers._openai_common import (
     sanitize_messages,
 )
 from turnstone.core.providers._protocol import (
-    CompletionResult,
     ModelCapabilities,
     StreamChunk,
     ToolCallDelta,
     _join_reasoning_with_cap,
+    finish_shim_due,
     resolve_reasoning_effort,
 )
 from turnstone.core.trajectory import materialize_attachments
 
 log = structlog.get_logger(__name__)
+
+
+# response.failed error codes that indicate a transient server-side
+# condition — the only ones worth retrying (the API's other codes are
+# deterministic request rejections).
+_TRANSIENT_FAILURE_CODES = frozenset({"server_error", "rate_limit_exceeded"})
+
+
+def _format_refusal(text: str) -> str:
+    """Render a refusal part as visible content — ONE format for both the
+    streamed ``response.refusal.done`` event and the terminal-payload
+    harvest, so drained text cannot differ by which path carried it."""
+    return f"[Refused: {text}]"
+
+
+def _extend_message_annotations(item: Any, annotations: list[Any]) -> None:
+    """Collect url_citation annotations off a message output item's text
+    parts — ONE walk shared by the ``output_item.done`` handler and the
+    terminal-payload rebuild so the two cannot drift (``content`` may be
+    ``None`` on partial items)."""
+    if getattr(item, "type", "") != "message":
+        return
+    for content_part in getattr(item, "content", None) or []:
+        part_anns = getattr(content_part, "annotations", None)
+        if part_anns:
+            annotations.extend(part_anns)
+
+
+def _raise_responses_failure(error_code: str, error_msg: str) -> NoReturn:
+    """One classification ladder for BOTH in-band failure shapes (`error`
+    events and ``response.failed``) — a one-sided edit would make the same
+    API failure retryable through one event type and fatal through the
+    other."""
+    if error_code in _TRANSIENT_FAILURE_CODES:
+        raise ResponsesStreamFailedError(f"Responses API error ({error_code}): {error_msg}")
+    raise RuntimeError(f"Responses API error ({error_code or 'unknown'}): {error_msg}")
+
+
+class ResponsesStreamFailedError(RuntimeError):
+    """A TRANSIENT in-band ``response.failed`` terminal event.
+
+    Raised only for ``_TRANSIENT_FAILURE_CODES`` (server error, rate
+    limit) — and listed in the provider's ``retryable_error_names`` — so
+    retry loops treat those like the wire-level errors they stand in
+    for.  Deterministic in-band failures (invalid prompt, image fetch,
+    policy) raise plain ``RuntimeError`` and stop retry loops on attempt
+    zero, exactly as the retired non-streaming lane's HTTP errors did.
+    Callers that give up keep their degrade paths (judges fall back to
+    the heuristic tier).
+    """
 
 
 def convert_content_parts(parts: list[Any]) -> list[dict[str, Any]]:
@@ -501,6 +551,7 @@ class OpenAIResponsesProvider:
         messages = materialize_attachments(messages, resolve_attachments)
         if extra_params:
             log.debug("openai.responses: extra_params ignored (not supported by Responses API)")
+        caps = capabilities or self.get_capabilities(model)
         kwargs = self._build_kwargs(
             model,
             messages,
@@ -509,7 +560,7 @@ class OpenAIResponsesProvider:
             temperature,
             reasoning_effort,
             deferred_names,
-            capabilities=capabilities,
+            capabilities=caps,
             replay_reasoning_to_model=replay_reasoning_to_model,
         )
         kwargs["stream"] = True
@@ -528,17 +579,35 @@ class OpenAIResponsesProvider:
         stream = client.responses.create(**kwargs)
         if cancel_ref is not None:
             cancel_ref.append(stream)
-        return self._iter_stream(stream)
+        return self._iter_stream(stream, finish_reason_optional=caps.finish_reason_optional)
 
-    def _iter_stream(self, stream: Any) -> Iterator[StreamChunk]:
-        """Convert Responses API stream events to StreamChunks."""
+    def _iter_stream(
+        self, stream: Any, *, finish_reason_optional: bool = False
+    ) -> Iterator[StreamChunk]:
+        """Convert Responses API stream events to StreamChunks.
+
+        *finish_reason_optional* is the model capability of the same name:
+        a lax Responses-compatible server that ends the stream without any
+        terminal event (``response.completed`` / ``response.incomplete``)
+        gets the end-of-generator shim below — the retired non-streaming
+        path needed no terminal event either.
+        """
         first = True
         content_len = 0
+        reasoning_len = 0
         tool_call_count = 0
         last_finish: str | None = None
         completion_tokens: int | None = None
-        # Track tool call indices by call_id for consistent ToolCallDelta.index
+        # Track tool call indices by item_id for consistent ToolCallDelta.index.
+        # ``next_tool_idx`` mints slots (NOT len(dict): duplicate/empty item
+        # ids overwrite their mapping and would collide later slots);
+        # ``last_tool_idx`` routes argument deltas whose item_id was never
+        # announced — a lax server's deltas belong to the call most recently
+        # opened, not hardwired slot 0.
         tool_call_indices: dict[str, int] = {}
+        next_tool_idx = 0
+        last_tool_idx = 0
+        orphan_args_seen = False
         # Collect output items for provider_blocks
         provider_blocks: list[dict[str, Any]] = []
         # Collect annotations across text parts
@@ -567,10 +636,26 @@ class OpenAIResponsesProvider:
                 delta_text = getattr(event, "delta", "")
                 if delta_text:
                     sc = StreamChunk(reasoning_delta=delta_text)
+                    reasoning_len += len(delta_text)
                     if first:
                         sc.is_first = True
                         first = False
                     yield sc
+                continue
+
+            # -- refusal parts --
+            # Emitted whole on the ``done`` event (not per-delta), matching
+            # how the Responses API's non-streaming shape carries refusals
+            # (one whole content part) — handling the deltas too would
+            # double-emit.
+            if event_type == "response.refusal.done":
+                refusal_text = getattr(event, "refusal", "")
+                sc = StreamChunk(content_delta=_format_refusal(refusal_text))
+                content_len += len(sc.content_delta)
+                if first:
+                    sc.is_first = True
+                    first = False
+                yield sc
                 continue
 
             # -- new tool call (function_call output item added) --
@@ -580,7 +665,9 @@ class OpenAIResponsesProvider:
                     call_id = getattr(item, "call_id", "")
                     item_id = getattr(item, "id", "")
                     name = getattr(item, "name", "")
-                    idx = len(tool_call_indices)
+                    idx = next_tool_idx
+                    next_tool_idx += 1
+                    last_tool_idx = idx
                     # Index by item_id — argument deltas reference this, not call_id
                     tool_call_indices[item_id] = idx
                     sc = StreamChunk(
@@ -598,7 +685,14 @@ class OpenAIResponsesProvider:
                 item_id = getattr(event, "item_id", "")
                 delta_args = getattr(event, "delta", "")
                 if delta_args:
-                    idx = tool_call_indices.get(item_id, 0)
+                    if item_id not in tool_call_indices:
+                        # Orphan deltas ARE a streamed tool-call signal:
+                        # without this flag the terminal harvest (gated on
+                        # "no tool calls streamed") re-emits the same call
+                        # onto the same slot and the arguments JSON
+                        # duplicates.
+                        orphan_args_seen = True
+                    idx = tool_call_indices.get(item_id, last_tool_idx)
                     yield StreamChunk(
                         tool_call_deltas=[ToolCallDelta(index=idx, arguments_delta=delta_args)]
                     )
@@ -619,44 +713,173 @@ class OpenAIResponsesProvider:
                     item_dict = item.model_dump() if hasattr(item, "model_dump") else {}
                     if item_dict:
                         provider_blocks.append(item_dict)
-                    # Collect annotations from completed text parts
-                    if getattr(item, "type", "") == "message":
-                        for content_part in getattr(item, "content", []):
-                            part_anns = getattr(content_part, "annotations", None)
-                            if part_anns:
-                                annotations.extend(part_anns)
+                    _extend_message_annotations(item, annotations)
                 continue
 
-            # -- response completed --
-            if event_type == "response.completed":
+            # -- terminal response event --
+            # ``response.incomplete`` is the real terminal event for a
+            # max-output-tokens truncation (status "incomplete"); handling
+            # only ``response.completed`` dropped the truncated run's
+            # finish reason, final usage, AND collected provider_blocks.
+            if event_type in ("response.completed", "response.incomplete"):
                 response = getattr(event, "response", None)
-                if response:
-                    status = getattr(response, "status", "completed")
-                    last_finish = "stop" if status == "completed" else "length"
-                    usage = extract_usage(getattr(response, "usage", None))
-                    if usage:
-                        completion_tokens = usage.completion_tokens
-                    sc = StreamChunk(
-                        finish_reason=last_finish,
-                        usage=usage,
-                    )
-                    if provider_blocks:
-                        sc.provider_blocks = provider_blocks
-                    yield sc
+                # A terminal event without a usable status — payload absent
+                # entirely (lax compat server) OR a slim payload omitting
+                # the field — is still a terminal signal: the event type
+                # itself says whether the run completed.  Only usage (and
+                # the rebuild below) genuinely needs the payload.
+                status = (getattr(response, "status", "") if response is not None else "") or ""
+                if not status:
+                    status = "completed" if event_type == "response.completed" else "incomplete"
+                last_finish = "stop" if status == "completed" else "length"
+                usage = extract_usage(getattr(response, "usage", None)) if response else None
+                if usage:
+                    completion_tokens = usage.completion_tokens
+                # Prefer the terminal response's own output items over the
+                # incrementally collected ones — but only when the two can
+                # DISAGREE: on truncation (an item still being generated
+                # never receives its ``output_item.done`` event, and
+                # storing a reasoning item without its required following
+                # item makes the next turn's replay a 400) or when the
+                # collected count differs from the terminal output (a lax
+                # server dropped ``.done`` events).  On the happy path the
+                # ``.done`` items ARE the terminal items, so the rebuild is
+                # skipped — it would re-serialize every output item and
+                # double every already-collected annotation once per turn.
+                # A rebuild replaces BOTH lanes: blocks from the terminal
+                # output, annotations from a fresh walk of it (annotations
+                # have no other source than these item walks).
+                out_items = (getattr(response, "output", None) or []) if response else []
+                if status != "completed" or len(out_items) != len(provider_blocks):
+                    final_items = [
+                        item.model_dump() for item in out_items if hasattr(item, "model_dump")
+                    ]
+                    if final_items:
+                        provider_blocks = final_items
+                        annotations = []
+                        for item in out_items:
+                            _extend_message_annotations(item, annotations)
+                # Under-streaming gateway parity: the retired non-streaming
+                # path read content and tool calls off this same terminal
+                # payload, so output that exists ONLY in the final blocks —
+                # a buffering proxy that never fired output_text.delta /
+                # output_item.added events — must be emitted here or the
+                # drained result is a clean-looking empty success.  Gated
+                # on NOTHING of that kind having streamed: the normal
+                # event flow already emitted these, and a partially
+                # under-streaming server (some deltas, fuller terminal) is
+                # indistinguishable from a complete stream without diffing.
+                if content_len == 0:
+                    parts_text: list[str] = []
+                    for block in provider_blocks:
+                        if not (isinstance(block, dict) and block.get("type") == "message"):
+                            continue
+                        for part in block.get("content") or []:
+                            if not isinstance(part, dict):
+                                continue
+                            if part.get("type") == "output_text" and part.get("text"):
+                                parts_text.append(part["text"])
+                            elif part.get("type") == "refusal" and part.get("refusal"):
+                                parts_text.append(_format_refusal(part["refusal"]))
+                    harvested = "".join(parts_text)
+                    if harvested:
+                        content_len = len(harvested)
+                        hc = StreamChunk(content_delta=harvested)
+                        if first:
+                            hc.is_first = True
+                            first = False
+                        yield hc
+                if tool_call_count == 0 and not orphan_args_seen:
+                    for block in provider_blocks:
+                        if not (isinstance(block, dict) and block.get("type") == "function_call"):
+                            continue
+                        idx = next_tool_idx
+                        next_tool_idx += 1
+                        tool_call_count += 1
+                        tc_chunk = StreamChunk(
+                            tool_call_deltas=[
+                                ToolCallDelta(
+                                    index=idx,
+                                    id=block.get("call_id", "") or "",
+                                    name=block.get("name", "") or "",
+                                    arguments_delta=block.get("arguments", "") or "",
+                                )
+                            ]
+                        )
+                        if first:
+                            tc_chunk.is_first = True
+                            first = False
+                        yield tc_chunk
+                sc = StreamChunk(
+                    finish_reason=last_finish,
+                    usage=usage,
+                )
+                if provider_blocks:
+                    sc.provider_blocks = provider_blocks
+                yield sc
                 continue
 
-            # -- error --
-            if event_type == "response.failed":
-                response = getattr(event, "response", None)
-                error = getattr(response, "error", None) if response else None
-                error_msg = getattr(error, "message", "Unknown error") if error else "Unknown error"
-                raise RuntimeError(f"Responses API error: {error_msg}")
+            # -- in-band failure events --
+            # ``error`` (ResponseErrorEvent): the SDK YIELDS these rather
+            # than raising, and no response.failed necessarily follows —
+            # without this branch the stream exhausts finish-less and the
+            # real API message is lost behind a misleading
+            # IncompleteStreamError.  ``response.failed`` carries the same
+            # failure nested in its response payload.  ONE tail for both
+            # shapes (only the code/message extraction differs), so the
+            # same server failure can never become retryable through one
+            # event type and fatal through the other: BEFORE a terminal
+            # event the failure raises; AFTER one the generation is
+            # complete and in hand — a trailing failure frame is teardown
+            # noise (the in-band twin of the post-finish transport-blip
+            # tolerance ``drain_stream`` grants), logged and dropped.
+            if event_type in ("error", "response.failed"):
+                if event_type == "error":
+                    code = getattr(event, "code", "") or ""
+                    message = getattr(event, "message", "") or ""
+                else:
+                    response = getattr(event, "response", None)
+                    error = getattr(response, "error", None) if response else None
+                    code = (getattr(error, "code", "") if error else "") or ""
+                    message = (getattr(error, "message", "") if error else "") or ""
+                if last_finish is not None:
+                    log.warning("openai.responses.post_terminal_error", code=code, message=message)
+                    break
+                _raise_responses_failure(code, message or "Unknown error")
+
+        # Terminal-event-less lax-server tolerance, armed ONLY by the
+        # operator-declared ``finish_reason_optional`` capability: a
+        # stream that ended cleanly after delivering output but never sent
+        # ``response.completed``/``response.incomplete`` is a completed
+        # generation on such a server (the retired non-streaming path
+        # needed no terminal event).  The ``.done``-collected blocks ride
+        # the shimmed finish chunk, exactly as they would the terminal
+        # handler's.  Everywhere else the drain's complete-or-error gate
+        # raises — a missing terminal on an event-disciplined server means
+        # the generation died mid-response.
+        # Orphan argument deltas count as delivered output exactly as they
+        # count as a streamed tool-call signal for the terminal harvest —
+        # a lax server that never announces items must not read as an
+        # empty (failed) stream when its tool output actually arrived.
+        if finish_shim_due(
+            finish_reason_optional=finish_reason_optional,
+            finish_seen=last_finish is not None,
+            delivered_output=bool(
+                content_len or reasoning_len or tool_call_count or orphan_args_seen
+            ),
+        ):
+            last_finish = "stop"
+            sc = StreamChunk(finish_reason="stop")
+            if provider_blocks:
+                sc.provider_blocks = provider_blocks
+            yield sc
 
         log.debug(
             "openai.responses.response",
             stream=True,
             finish_reason=last_finish,
             content_length=content_len,
+            reasoning_length=reasoning_len,
             tool_call_count=tool_call_count,
             completion_tokens=completion_tokens,
         )
@@ -666,118 +889,6 @@ class OpenAIResponsesProvider:
             citation_text = format_citations("", annotations).strip()
             if citation_text:
                 yield StreamChunk(info_delta=citation_text)
-
-    # -- non-streaming -------------------------------------------------------
-
-    def create_completion(
-        self,
-        *,
-        client: Any,
-        model: str,
-        messages: list[dict[str, Any]],
-        tools: list[dict[str, Any]] | None = None,
-        max_tokens: int = 4096,
-        temperature: float | None = None,
-        reasoning_effort: str | None = None,
-        extra_params: dict[str, Any] | None = None,
-        deferred_names: frozenset[str] | None = None,
-        capabilities: ModelCapabilities | None = None,
-        # See create_streaming above for the Phase 3 reasoning-persistence rationale.
-        replay_reasoning_to_model: bool = True,
-        extra_headers: dict[str, str] | None = None,
-        resolve_attachments: Callable[[list[str]], dict[str, Any]] | None = None,
-    ) -> CompletionResult:
-        messages = materialize_attachments(messages, resolve_attachments)
-        if extra_params:
-            log.debug("openai.responses: extra_params ignored (not supported by Responses API)")
-        kwargs = self._build_kwargs(
-            model,
-            messages,
-            tools,
-            max_tokens,
-            temperature,
-            reasoning_effort,
-            deferred_names,
-            capabilities=capabilities,
-            replay_reasoning_to_model=replay_reasoning_to_model,
-        )
-        if extra_headers:
-            kwargs["extra_headers"] = extra_headers
-
-        log.debug(
-            "openai.responses.request",
-            model=model,
-            stream=False,
-            max_tokens=max_tokens,
-            input_items=len(kwargs.get("input", [])),
-            tool_count=len(kwargs.get("tools", [])),
-        )
-
-        response = client.responses.create(**kwargs)
-        return self._parse_response(response)
-
-    def _parse_response(self, response: Any) -> CompletionResult:
-        """Convert a Responses API ``Response`` object to ``CompletionResult``."""
-        content_parts: list[str] = []
-        tool_calls: list[dict[str, Any]] = []
-        provider_blocks: list[dict[str, Any]] = []
-        all_annotations: list[Any] = []
-
-        for item in getattr(response, "output", []):
-            item_type = getattr(item, "type", "")
-
-            if item_type == "message":
-                for content_part in getattr(item, "content", []):
-                    part_type = getattr(content_part, "type", "")
-                    if part_type == "output_text":
-                        content_parts.append(getattr(content_part, "text", ""))
-                        anns = getattr(content_part, "annotations", None)
-                        if anns:
-                            all_annotations.extend(anns)
-                    elif part_type == "refusal":
-                        content_parts.append(f"[Refused: {getattr(content_part, 'refusal', '')}]")
-
-            elif item_type == "function_call":
-                tool_calls.append(
-                    {
-                        "id": getattr(item, "call_id", ""),
-                        "type": "function",
-                        "function": {
-                            "name": getattr(item, "name", ""),
-                            "arguments": getattr(item, "arguments", ""),
-                        },
-                    }
-                )
-
-            # Capture all output items for provider_blocks (multi-turn)
-            item_dict = item.model_dump() if hasattr(item, "model_dump") else {}
-            if item_dict:
-                provider_blocks.append(item_dict)
-
-        content = "".join(content_parts)
-        if all_annotations:
-            content = format_citations(content, all_annotations)
-
-        status = getattr(response, "status", "completed")
-        finish_reason = "stop" if status == "completed" else "length"
-        usage = extract_usage(getattr(response, "usage", None))
-
-        result = CompletionResult(
-            content=content,
-            tool_calls=tool_calls if tool_calls else None,
-            finish_reason=finish_reason,
-            usage=usage,
-            provider_blocks=provider_blocks,
-        )
-        log.debug(
-            "openai.responses.response",
-            stream=False,
-            finish_reason=finish_reason,
-            content_length=len(content),
-            tool_call_count=len(tool_calls),
-            completion_tokens=usage.completion_tokens if usage else None,
-        )
-        return result
 
     # -- tool conversion (public interface) ----------------------------------
 
@@ -789,9 +900,15 @@ class OpenAIResponsesProvider:
 
     # -- retryable errors ----------------------------------------------------
 
+    # Computed once at class creation — the retry predicate consults this
+    # per error, and a per-access union allocates a fresh frozenset each time.
+    _RETRYABLE_WITH_STREAM_FAILURES: frozenset[str] = RETRYABLE_ERROR_NAMES | {
+        "ResponsesStreamFailedError"
+    }
+
     @property
     def retryable_error_names(self) -> frozenset[str]:
-        return RETRYABLE_ERROR_NAMES
+        return self._RETRYABLE_WITH_STREAM_FAILURES
 
     # -- reasoning extraction ------------------------------------------------
 

@@ -6,7 +6,7 @@ from typing import TYPE_CHECKING, Any
 
 import pytest
 
-from tests._session_helpers import mock_completion_result
+from tests._session_helpers import as_stream, mock_completion_result
 from turnstone.core import perception
 
 if TYPE_CHECKING:
@@ -36,7 +36,7 @@ class _StubProvider:
 
         return ModelCapabilities()
 
-    def create_completion(
+    def create_streaming(
         self,
         *,
         client: Any,
@@ -53,7 +53,7 @@ class _StubProvider:
         # Shared field inventory: when model_turn's re-ingest reads a new
         # CompletionResult field, mock_completion_result is the ONE
         # definition to extend and this suite moves with it.
-        return mock_completion_result(self._content)
+        return as_stream(mock_completion_result(self._content))
 
 
 @pytest.fixture(autouse=True)

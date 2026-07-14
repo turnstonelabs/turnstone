@@ -3469,8 +3469,21 @@ def internal_mcp_refresh_one(request: Request) -> JSONResponse:
         return JSONResponse({"status": "error", "error": "refresh failed"}, status_code=500)
 
     # _refresh_all swallows per-server errors into _last_error rather than
-    # raising, so a 200-OK from refresh_sync isn't enough — re-check status
-    # and surface 500 if the refresh actually failed for this server.
+    # raising, so a 200-OK from refresh_sync isn't enough — re-check the
+    # authoritative outcome. A refresh can (a) run and fail → 500, (b) be
+    # SKIPPED because the server's connect lock was busy (a reconnect / a
+    # push refresh already running) → 202 with status "skipped", the
+    # health-tick retry will run it, or (c) run cleanly → 200 ok. Reporting
+    # a skip as 200 "ok" told the caller the catalog is current when
+    # nothing ran. The outcome is read from the manager directly — the
+    # public status projection whitelists ``last_refresh_outcome`` out (it
+    # encodes the error class, which read-scope deliberately coarsens to
+    # ``has_error``), so it cannot be recovered from the stripped dict.
+    #
+    # Error is checked BEFORE the skip: a live error pill (a server in a
+    # genuine failure state whose refresh was skipped because its lock was
+    # busy) MUST surface as 500 — reporting a benign 202 for an erroring
+    # server would let a status-code-keyed caller treat it as healthy.
     status = _public_server_status(mcp_mgr, name)
     if status.get("error"):
         log.warning(
@@ -3480,6 +3493,8 @@ def internal_mcp_refresh_one(request: Request) -> JSONResponse:
             {"status": "error", "error": "refresh failed", "server": status},
             status_code=500,
         )
+    if mcp_mgr.last_refresh_outcome(name) == "skipped":
+        return JSONResponse({"status": "skipped", "server": status}, status_code=202)
     return JSONResponse({"status": "ok", "server": status})
 
 
