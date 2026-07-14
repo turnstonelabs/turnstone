@@ -4358,10 +4358,13 @@ class MCPClientManager:
 
         Clears the error pill and stamps the ``ok`` outcome, config-gated
         so a success observed for a just-removed server leaves no stale
-        row. Used by every static success path (the full pass and the
-        push-driven single-kind refresh) so ``last_refresh_outcome`` — the
-        single source of truth for the CLI / endpoint / admin pill — is
-        updated after a push refresh too, not just a full pass.
+        row. Called only by a FULL refresh pass (``_refresh_server`` and
+        the reconnect-then-refresh branch): a full pass has fetched every
+        kind, so it can legitimately declare the whole server healthy.
+        The push-driven single-kind refresh deliberately does NOT call
+        this on success — refreshing one kind cannot clear a server-scoped
+        error that may belong to another kind (see the ``_record`` closure
+        in :meth:`_run_static_notification_refresh`).
         """
         self._last_error.pop(name, None)
         if name in self._server_configs:
