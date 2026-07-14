@@ -2015,7 +2015,11 @@ class MCPClientManager:
         handler's marker check this bounds the waiter queue at one
         parked runner per key+kind: a same-key dispatch waits at most
         two refresh timeouts, not an unbounded runner FIFO. The
-        ``finally`` discard covers cancellation while parked.
+        ``finally`` discard covers cancellation while parked and is
+        GATED on non-acquisition: after the at-acquire discard, a
+        marker present at exit belongs to the successor spawned during
+        our list call, and clobbering it would re-open the unbounded
+        FIFO the marker exists to prevent.
 
         The same-entry recheck under the lock discards a refresh whose
         entry was replaced (full drop + re-create) while it waited —
@@ -2057,9 +2061,11 @@ class MCPClientManager:
         if entry is None:
             self._pool_refresh_pending.discard(marker)
             return
+        acquired = False
         try:
             async with entry.open_lock:
                 self._pool_refresh_pending.discard(marker)
+                acquired = True
                 if self._user_pool_entries.get(key) is not entry:
                     return
                 if entry.session is None:
@@ -2077,7 +2083,15 @@ class MCPClientManager:
                 type(exc).__name__,
             )
         finally:
-            self._pool_refresh_pending.discard(marker)
+            if not acquired:
+                # Cancelled (or failed) while PARKED — the marker still
+                # in the set is OURS; release it or the key+kind never
+                # refreshes again. After the at-acquire discard, a
+                # marker present at exit belongs to the SUCCESSOR
+                # spawned during our in-flight list — discarding it
+                # would let the handler mint runners past the
+                # one-parked-runner bound.
+                self._pool_refresh_pending.discard(marker)
 
     async def _pool_transport_owner(
         self,
@@ -2211,10 +2225,7 @@ class MCPClientManager:
         entry = self._user_pool_entries.get(key)
         if entry is None:
             return
-        entry.drop_session()
-        # The debounce stamp must not outlive the transport: a
-        # reconnect's first ``list_changed`` refreshes immediately.
-        self._last_pool_notification_refresh.pop(key, None)
+        self._drop_session_and_stamp(key, entry)
         owner = entry.owner_task
         close_requested = entry.close_requested
         entry.owner_task = None
@@ -2264,11 +2275,9 @@ class MCPClientManager:
             return
         entry.owner_task = None
         entry.close_requested = None
-        # The debounce stamp must not outlive the transport: the
-        # reconnect's first ``list_changed`` refreshes immediately.
-        self._last_pool_notification_refresh.pop(key, None)
-        if entry.session is not None:
-            entry.drop_session()
+        had_session = entry.session is not None
+        self._drop_session_and_stamp(key, entry)
+        if had_session:
             user_id, server_name = key
             log.info(
                 "MCP pool transport terminated user=%s server=%s; session evicted for reconnect",
@@ -4718,6 +4727,8 @@ class MCPClientManager:
         self._circuit_open_until.clear()
         self._circuit_trip_count.clear()
         self._last_notification_refresh.clear()
+        self._last_pool_notification_refresh.clear()
+        self._pool_refresh_pending.clear()
         # Pool state already cleared above when the loop was alive; this
         # makes shutdown idempotent if the loop exited before pool state
         # could be wound down (e.g., manager constructed but never started).
@@ -6648,15 +6659,8 @@ class MCPClientManager:
         # this retry; the local cached token is the one the AS just
         # rejected, so reading it back without ``force_refresh=True``
         # would re-attempt with the same (rejected) bearer.
-        # Observe the session BEFORE the lookup's awaits: a session the
-        # consent-completion prime connects DURING the lookup must read
-        # as re-consent evidence at drop time, not as pre-observation.
-        observed_session = self._observed_pool_session(user_id, server_name)
-        lookup: TokenLookupResult = await self._pool_token_lookup(
+        lookup, lookup_error = await self._pool_lookup_checked(
             server_row, user_id, server_name, force_refresh=retry_count > 0
-        )
-        lookup_error = self._pool_lookup_failure(
-            lookup, server_name, server_row, user_id, observed_session=observed_session
         )
         if lookup_error is not None:
             return lookup_error
@@ -6800,15 +6804,8 @@ class MCPClientManager:
         if self._app_state is None:
             raise RuntimeError("Pool dispatch requires set_app_state() to have been called")
 
-        # Observe the session BEFORE the lookup's awaits: a session the
-        # consent-completion prime connects DURING the lookup must read
-        # as re-consent evidence at drop time, not as pre-observation.
-        observed_session = self._observed_pool_session(user_id, server_name)
-        lookup: TokenLookupResult = await self._pool_token_lookup(
+        lookup, lookup_error = await self._pool_lookup_checked(
             server_row, user_id, server_name, force_refresh=retry_count > 0
-        )
-        lookup_error = self._pool_lookup_failure(
-            lookup, server_name, server_row, user_id, observed_session=observed_session
         )
         if lookup_error is not None:
             return lookup_error
@@ -6930,15 +6927,8 @@ class MCPClientManager:
         if self._app_state is None:
             raise RuntimeError("Pool dispatch requires set_app_state() to have been called")
 
-        # Observe the session BEFORE the lookup's awaits: a session the
-        # consent-completion prime connects DURING the lookup must read
-        # as re-consent evidence at drop time, not as pre-observation.
-        observed_session = self._observed_pool_session(user_id, server_name)
-        lookup: TokenLookupResult = await self._pool_token_lookup(
+        lookup, lookup_error = await self._pool_lookup_checked(
             server_row, user_id, server_name, force_refresh=retry_count > 0
-        )
-        lookup_error = self._pool_lookup_failure(
-            lookup, server_name, server_row, user_id, observed_session=observed_session
         )
         if lookup_error is not None:
             return lookup_error
@@ -7030,6 +7020,22 @@ class MCPClientManager:
         self._cb_record_success(server_name)
         return _decode_prompt_result(sdk_result)
 
+    def _drop_session_and_stamp(self, key: tuple[str, str], entry: PoolEntryState) -> None:
+        """Drop the entry's session AND its notification debounce stamp.
+
+        The structural pairing for every teardown path (the same
+        rationale as ``PoolEntryState.drop_session``): the stamp must
+        not outlive the transport, so a reconnect's first
+        ``list_changed`` refreshes immediately — a path that nulled the
+        session without the pop silently re-opens the stale-stamp hole
+        where a post-reconnect change is debounced against a
+        pre-collapse stamp. Safe on an already-session-less entry
+        (owner death after an eviction): ``drop_session`` is idempotent
+        and the pop is a no-op.
+        """
+        entry.drop_session()
+        self._last_pool_notification_refresh.pop(key, None)
+
     def _evict_session(self, key: tuple[str, str]) -> None:
         """Drop the cached session on a pool entry; KEEP the catalog.
 
@@ -7060,10 +7066,7 @@ class MCPClientManager:
         """
         evict = self._user_pool_entries.get(key)
         if evict is not None:
-            evict.drop_session()
-            # Prune the push-notification debounce stamp so a
-            # reconnect's first ``list_changed`` refreshes immediately.
-            self._last_pool_notification_refresh.pop(key, None)
+            self._drop_session_and_stamp(key, evict)
 
     def _evict_session_drop_catalog(self, key: tuple[str, str]) -> None:
         """Drop the cached session AND the entry's catalog contribution.
@@ -7145,6 +7148,35 @@ class MCPClientManager:
         """
         entry = self._user_pool_entries.get((user_id, server_name))
         return entry.session if entry is not None else None
+
+    async def _pool_lookup_checked(
+        self,
+        server_row: dict[str, Any],
+        user_id: str,
+        server_name: str,
+        *,
+        force_refresh: bool,
+    ) -> tuple[TokenLookupResult, str | None]:
+        """Classified pool lookup with its convergence pairing, ordering-safe.
+
+        The ONE copy of the dispatch-side lookup protocol (three
+        dispatchers): the dead-grant observation is taken synchronously
+        BEFORE the lookup's first await — a session the
+        consent-completion prime connects DURING the lookup must read
+        as re-consent evidence at drop time, not as pre-observation —
+        and the failed-lookup render is paired with its convergence
+        drop via :meth:`_pool_lookup_failure`. Structuring the ordering
+        here makes it un-violable per dispatch site. Returns
+        ``(lookup, error)``; ``error`` is ``None`` exactly when the
+        lookup carries a usable bearer.
+        """
+        observed_session = self._observed_pool_session(user_id, server_name)
+        lookup = await self._pool_token_lookup(
+            server_row, user_id, server_name, force_refresh=force_refresh
+        )
+        return lookup, self._pool_lookup_failure(
+            lookup, server_name, server_row, user_id, observed_session=observed_session
+        )
 
     def _pool_lookup_failure(
         self,
