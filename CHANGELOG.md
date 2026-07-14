@@ -173,6 +173,14 @@ Earlier stable lines (`stable/1.6`, `stable/1.5`) are frozen.
   that same lock, so a slower publisher can no longer land a staler catalog
   over a fresher one. Every teardown path now also clears the notification
   debounce stamp, so a reconnected server's first push refreshes immediately.
+  Push-refresh debouncing is now per (server, kind) on BOTH the static and
+  per-user pool paths — a tools push no longer swallows a prompts push
+  arriving in the same 5-second window (previously the second push was
+  dropped outright, and the change stayed invisible until the server pushed
+  that kind again). The resource-refresh fan-out on both paths also no
+  longer orphans its sibling list call when one of the pair fails fast —
+  both calls now complete inside the timeout scope before the failure is
+  re-raised.
 
 - **OpenAI Responses streaming: truncated and refused responses no longer
   vanish.** A response that hit `max_output_tokens` terminates the stream

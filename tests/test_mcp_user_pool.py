@@ -26,7 +26,12 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import mcp.types as mcp_types
 import pytest
 
-from tests.conftest import make_mcp_token_cipher, stop_loop_thread
+from tests.conftest import (
+    _drain_background,
+    _run_on_loop,
+    make_mcp_token_cipher,
+    stop_loop_thread,
+)
 from turnstone.core.mcp_client import MCPClientManager, PoolEntryState
 from turnstone.core.mcp_crypto import MCPTokenStore
 from turnstone.core.storage._sqlite import SQLiteBackend
@@ -146,12 +151,6 @@ def running_loop_mgr():
         stop_loop_thread(loop, thread)
 
 
-def _run_on_loop(loop: asyncio.AbstractEventLoop, coro: Any) -> Any:
-    """Submit *coro* to *loop*, wait for the result with a 5s timeout."""
-    fut = asyncio.run_coroutine_threadsafe(coro, loop)
-    return fut.result(timeout=5)
-
-
 def _fake_pool_tools(server_name: str, tool_name: str) -> list[dict[str, Any]]:
     """One OpenAI-format tool entry, shaped as the pool catalog seeds expect.
 
@@ -169,21 +168,6 @@ def _fake_pool_tools(server_name: str, tool_name: str) -> list[dict[str, Any]]:
             },
         }
     ]
-
-
-def _drain_background(mgr: MCPClientManager, loop: asyncio.AbstractEventLoop) -> None:
-    """Deterministically await the manager's tracked background tasks.
-
-    Replaces fixed sleeps for synchronizing with scheduled dead-grant
-    drops / spawned refreshes: exact, and immune to slow-runner flake.
-    """
-
-    async def _drain() -> None:
-        tasks = [t for t in list(mgr._background_tasks) if not t.done()]
-        if tasks:
-            await asyncio.gather(*tasks, return_exceptions=True)
-
-    _run_on_loop(loop, _drain())
 
 
 # ---------------------------------------------------------------------------
@@ -713,20 +697,20 @@ class TestEviction:
             entry.session = MagicMock()  # runner refreshes only live sessions
 
         _run_on_loop(loop, _seed())
-        mgr._last_pool_notification_refresh[key] = 123.0
+        mgr._last_pool_notification_refresh[(key, "tools")] = 123.0
 
         async def _boom(_key: tuple[str, str]) -> tuple[list[str], list[str]]:
             raise TimeoutError("slow server")
 
         _run_on_loop(loop, mgr._run_notification_refresh(key, "tools", _boom))
-        assert mgr._last_pool_notification_refresh[key] == 123.0
+        assert mgr._last_pool_notification_refresh[(key, "tools")] == 123.0
 
         async def _ok(_key: tuple[str, str]) -> tuple[list[str], list[str]]:
             return [], []
 
-        mgr._last_pool_notification_refresh[key] = 456.0
+        mgr._last_pool_notification_refresh[(key, "tools")] = 456.0
         _run_on_loop(loop, mgr._run_notification_refresh(key, "tools", _ok))
-        assert mgr._last_pool_notification_refresh[key] == 456.0
+        assert mgr._last_pool_notification_refresh[(key, "tools")] == 456.0
 
     def test_notification_refresh_catches_exception_group(self, running_loop_mgr) -> None:
         """A wedged anyio transport surfaces session-op failures as
@@ -746,13 +730,13 @@ class TestEviction:
             entry.session = MagicMock()  # runner refreshes only live sessions
 
         _run_on_loop(loop, _seed())
-        mgr._last_pool_notification_refresh[key] = 123.0
+        mgr._last_pool_notification_refresh[(key, "tools")] = 123.0
 
         async def _wedge(_key: tuple[str, str]) -> tuple[list[str], list[str]]:
             raise BaseExceptionGroup("wedged transport", [asyncio.CancelledError()])
 
         _run_on_loop(loop, mgr._run_notification_refresh(key, "tools", _wedge))
-        assert mgr._last_pool_notification_refresh[key] == 123.0
+        assert mgr._last_pool_notification_refresh[(key, "tools")] == 123.0
 
     def test_notification_refresh_serializes_on_open_lock(self, running_loop_mgr) -> None:
         """The runner must take ``open_lock`` before refreshing: an
@@ -845,7 +829,7 @@ class TestEviction:
             await handler(note)
             # Age the stamp past the debounce window: the MARKER (not
             # the stamp) must do the suppression for the second fire.
-            mgr._last_pool_notification_refresh[key] = time.monotonic() - 10.0
+            mgr._last_pool_notification_refresh[(key, "tools")] = time.monotonic() - 10.0
             await handler(note)
             spawned = len(mgr._background_tasks) - before
             entry.open_lock.release()
@@ -926,9 +910,9 @@ class TestEviction:
             entry.session = MagicMock()
 
         _run_on_loop(loop, _seed())
-        mgr._last_pool_notification_refresh[key] = 123.0
+        mgr._last_pool_notification_refresh[(key, "tools")] = 123.0
         _run_on_loop(loop, mgr._teardown_pool_entry(key))
-        assert key not in mgr._last_pool_notification_refresh
+        assert (key, "tools") not in mgr._last_pool_notification_refresh
 
     def test_owner_death_pops_debounce_stamp(self, running_loop_mgr) -> None:
         """The unrequested-collapse path (owner done-callback) is a
@@ -946,11 +930,11 @@ class TestEviction:
             task = asyncio.ensure_future(_noop())
             await task
             entry.owner_task = task
-            mgr._last_pool_notification_refresh[key] = 123.0
+            mgr._last_pool_notification_refresh[(key, "tools")] = 123.0
             mgr._on_pool_owner_death(key, task)
 
         _run_on_loop(loop, _scenario())
-        assert key not in mgr._last_pool_notification_refresh
+        assert (key, "tools") not in mgr._last_pool_notification_refresh
 
     def test_list_changed_handler_spawns_refresh_off_receive_loop(self, running_loop_mgr) -> None:
         """The notification handler must SPAWN the refresh, not await it:
@@ -987,7 +971,7 @@ class TestEviction:
         _drain_background(mgr, loop)
         assert refreshed == [key]
         # Debounce stamp consumed at schedule time (storm dedupe).
-        assert key in mgr._last_pool_notification_refresh
+        assert (key, "tools") in mgr._last_pool_notification_refresh
 
     def test_lookup_grant_dead_requires_wired_infrastructure(self, running_loop_mgr) -> None:
         """kind='missing' is authoritative only when the stores that

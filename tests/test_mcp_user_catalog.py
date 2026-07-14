@@ -25,6 +25,7 @@ from unittest.mock import MagicMock
 import httpx
 import pytest
 
+from tests.conftest import _run_on_loop
 from turnstone.core.mcp_client import (
     MCPClientManager,
     PoolEntryState,
@@ -62,11 +63,6 @@ def running_loop_mgr() -> Any:
             asyncio.run_coroutine_threadsafe(_drain(mgr), loop).result(timeout=2)
         loop.call_soon_threadsafe(loop.stop)
         thread.join(timeout=2)
-
-
-def _run_on_loop(loop: asyncio.AbstractEventLoop, coro: Any, timeout: float = 10) -> Any:
-    fut = asyncio.run_coroutine_threadsafe(coro, loop)
-    return fut.result(timeout=timeout)
 
 
 def _build_mock_transport_factory(
@@ -577,7 +573,7 @@ def test_close_pool_entry_if_idle_cools_entry_for_live_session_user(
     assert mgr.is_mcp_tool("mcp__pool-srv__do_thing", user_id="user-1") is True
     assert mgr._user_pool_entries[key].in_flight == 0
     # Seed the debounce dict so the prune-on-close is observable.
-    mgr._last_pool_notification_refresh[key] = 0.0
+    mgr._last_pool_notification_refresh[(key, "tools")] = 0.0
 
     user_calls = [0]
     admin_calls = [0]
@@ -606,7 +602,7 @@ def test_close_pool_entry_if_idle_cools_entry_for_live_session_user(
     # dispatcher's next acquire needs the same lock.
     assert key in mgr._user_pool_locks
     # Debounce stamp pruned with the transport.
-    assert key not in mgr._last_pool_notification_refresh
+    assert (key, "tools") not in mgr._last_pool_notification_refresh
     # Per-user catalog view untouched.
     assert "user-1" in mgr._user_tool_map
     assert "user-1" in mgr._user_tools
@@ -655,7 +651,7 @@ def test_close_pool_entry_if_idle_drops_entry_without_live_listener(
     assert mgr.is_mcp_tool("mcp__pool-srv__do_thing", user_id="user-1") is True
     assert mgr._user_pool_entries[key].in_flight == 0
     # Seed the debounce dict so the perf-1 prune is observable.
-    mgr._last_pool_notification_refresh[key] = 0.0
+    mgr._last_pool_notification_refresh[(key, "tools")] = 0.0
 
     admin_calls = [0]
     other_calls = [0]
@@ -678,7 +674,7 @@ def test_close_pool_entry_if_idle_drops_entry_without_live_listener(
     assert key not in mgr._user_pool_last_used
     assert key not in mgr._user_pool_locks
     # perf-1 prune: debounce dict no longer carries the key.
-    assert key not in mgr._last_pool_notification_refresh
+    assert (key, "tools") not in mgr._last_pool_notification_refresh
     # Catalog cleanup ran in BOTH dicts (bug-1 sibling + bug-2 cleanup).
     assert "user-1" not in mgr._user_tool_map
     assert "user-1" not in mgr._user_tools

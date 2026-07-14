@@ -216,6 +216,33 @@ def _seed_static_state(mgr: MCPClientManager, name: str, **overrides: Any) -> St
     return state
 
 
+def _run_on_loop(loop: asyncio.AbstractEventLoop, coro: Any, timeout: float = 10) -> Any:
+    """Submit *coro* to *loop*, wait for the result.
+
+    The ONE copy shared by the MCP test files — four hand-synced copies
+    had already drifted on the timeout (5s hardcoded vs a 10s default).
+    The timeout is an upper bound on waiting, not a behavior assertion,
+    so the most generous variant won the merge.
+    """
+    fut = asyncio.run_coroutine_threadsafe(coro, loop)
+    return fut.result(timeout=timeout)
+
+
+def _drain_background(mgr: MCPClientManager, loop: asyncio.AbstractEventLoop) -> None:
+    """Deterministically await ``mgr``'s tracked background tasks.
+
+    Replaces fixed sleeps for synchronizing with scheduled dead-grant
+    drops / spawned refreshes: exact, and immune to slow-runner flake.
+    """
+
+    async def _drain() -> None:
+        tasks = [t for t in list(mgr._background_tasks) if not t.done()]
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+
+    _run_on_loop(loop, _drain())
+
+
 def make_oidc_test_config(**overrides: Any) -> OIDCConfig:
     """Build a test ``OIDCConfig`` with sensible defaults.
 

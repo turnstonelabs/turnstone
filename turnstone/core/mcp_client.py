@@ -717,8 +717,11 @@ class MCPClientManager:
         self._circuit_open_until: dict[str, float] = {}  # monotonic timestamp
         self._circuit_trip_count: dict[str, int] = {}  # backoff exponent
 
-        # Notification debounce (per-server)
-        self._last_notification_refresh: dict[str, float] = {}
+        # Notification debounce, keyed ``(server, kind)`` — kind-scoped to
+        # match the kind-scoped refreshes: a server-scoped stamp would drop
+        # a different-kind notification inside the window outright, with no
+        # parked runner to observe the change.
+        self._last_notification_refresh: dict[tuple[str, str], float] = {}
         # Coalescing markers for spawned static ``list_changed`` refreshes,
         # keyed ``(server, kind)``: set at spawn, cleared the moment the
         # runner acquires the per-name connect lock (before its list call).
@@ -796,11 +799,14 @@ class MCPClientManager:
         self._user_prompt_map: dict[str, dict[str, tuple[str, str]]] = {}
         self._user_prompts: dict[str, list[dict[str, Any]]] = {}
 
-        # Notification debounce for pool sessions, keyed ``(user_id, server)``.
-        # Mirrors ``_last_notification_refresh`` (static) but per-pool-key
-        # so a noisy server in one user's pool doesn't suppress a refresh
-        # in another user's pool of the same server.
-        self._last_pool_notification_refresh: dict[tuple[str, str], float] = {}
+        # Notification debounce for pool sessions, keyed
+        # ``((user_id, server), kind)``. Mirrors ``_last_notification_refresh``
+        # (static) but per-pool-key so a noisy server in one user's pool
+        # doesn't suppress a refresh in another user's pool of the same
+        # server — and kind-scoped for the same reason as the static stamp:
+        # refreshes are kind-scoped, so a key-scoped stamp would drop a
+        # different-kind notification inside the window outright.
+        self._last_pool_notification_refresh: dict[tuple[tuple[str, str], str], float] = {}
         # Coalescing markers for spawned ``list_changed`` refreshes, keyed
         # ``((user_id, server), kind)``: set at spawn, cleared the moment
         # the runner acquires ``open_lock`` (before its list call). While
@@ -1345,7 +1351,8 @@ class MCPClientManager:
         halves are idempotent.
         """
         state.session = None
-        self._last_notification_refresh.pop(name, None)
+        for kind in _LIST_CHANGED_KINDS.values():
+            self._last_notification_refresh.pop((name, kind), None)
 
     async def _teardown_static_session(self, name: str) -> None:
         """Tear down a static server's session/transport (the ONE canonical order).
@@ -1556,10 +1563,19 @@ class MCPClientManager:
         response can only be routed by the receive loop that is parked
         awaiting this handler, and while it is parked EVERY in-flight and
         subsequent call on this shared per-node session stalls with it.
-        List-change refreshes are debounced, coalesced per (server, kind),
-        and SPAWNED as tracked tasks
+        List-change refreshes are debounced per (server, kind), coalesced
+        per (server, kind), and SPAWNED as tracked tasks
         (:meth:`_run_static_notification_refresh`), mirroring the pool
         handler (:meth:`_make_pool_notification_handler`).
+
+        Deliberate change from the pre-#839 handler: the error pill
+        (``_last_error``) is no longer cleared on ANY incoming
+        notification — only a COMPLETED refresh (push, periodic, or
+        reconnect-driven) clears it, because a notification's arrival
+        proves nothing about whether the previous refresh failure
+        resolved. A transient push-refresh failure can therefore show in
+        the pill until the next refresh attempt (worst case: the periodic
+        pass), where the old handler cleared it on the next notification.
         """
 
         async def _on_notification(
@@ -1570,17 +1586,22 @@ class MCPClientManager:
             kind = _LIST_CHANGED_KINDS.get(type(msg.root))
             if kind is None:
                 return
-            # Debounce: skip if we refreshed this server very recently
+            marker = (name, kind)
+            # Debounce per (server, kind): refreshes are kind-scoped, so a
+            # server-scoped stamp would DROP a different-kind notification
+            # landing inside the window (tools push swallowing the prompts
+            # push 100ms behind it) with no parked runner to observe it —
+            # nothing would refresh prompts until the server pushed again.
             now = time.monotonic()
-            last = self._last_notification_refresh.get(name, 0.0)
+            last = self._last_notification_refresh.get(marker, 0.0)
             if now - last < self._NOTIFICATION_DEBOUNCE:
                 log.debug(
-                    "Debouncing notification from '%s' (%.1fs since last refresh)",
+                    "Debouncing %s notification from '%s' (%.1fs since last refresh)",
+                    kind,
                     name,
                     now - last,
                 )
                 return
-            marker = (name, kind)
             if marker in self._static_refresh_pending:
                 # A runner for this server+kind is queued but has not yet
                 # issued its list call — it will observe this change when
@@ -1608,7 +1629,7 @@ class MCPClientManager:
                     "prompts": self._refresh_server_prompts,
                 }
                 log.info("Received %s/list_changed from '%s'", kind, name)
-                self._last_notification_refresh[name] = now
+                self._last_notification_refresh[marker] = now
                 self._static_refresh_pending.add(marker)
                 self._spawn_background(
                     self._run_static_notification_refresh(name, kind, refreshers[kind]),
@@ -1653,11 +1674,26 @@ class MCPClientManager:
           entry identity): ``remove_server_sync`` retires the lock object
           after teardown, so a runner that parked on the OLD lock must not
           touch state now owned by a NEW-lock holder.
-        * ``(Exception, BaseExceptionGroup)`` is caught type-name-only for
-          the same hygiene reason as the pool runner, but the credential at
-          stake is the CONFIGURED bearer: for ``auth_type=static`` servers
-          the chained ``httpx.Request`` headers carry it, and an escaping
+        * ``(Exception, BaseExceptionGroup)`` is caught for the same
+          hygiene reason as the pool runner, but the credential at stake
+          is the CONFIGURED bearer: for ``auth_type=static`` servers the
+          chained ``httpx.Request`` headers carry it, and an escaping
           exception would reach ``_spawn_background``'s ``exc_info`` log.
+          The log line and error pill carry ``type: str(exc)`` — the
+          message text (server error / URL) is diagnostic and header-free;
+          it is ``exc_info``'s serialized request CHAIN that leaks, so
+          that is the only thing withheld.
+
+        Bounded contention residual, accepted: this runner (and the
+        lock-serialized :meth:`_refresh_server`) holds the connect lock
+        for up to one list timeout (``_CONNECT_TIMEOUT``), and a
+        dispatch-driven reconnect queues behind it — but a reconnect only
+        runs after the session was EVICTED, and every parked runner bails
+        instantly on the session check below once that happens, so the
+        added wait is at most the single in-flight list call. A caller
+        timeout expiring on that wait is deliberately not a breaker
+        record (see :meth:`_cb_auto_reconnect`); the next dispatch
+        retries.
         """
         marker = (name, kind)
         lock = self._static_connect_locks.get(name)
@@ -1688,16 +1724,19 @@ class MCPClientManager:
                 await refresh(name)
                 self._last_error.pop(name, None)
         except (Exception, BaseExceptionGroup) as exc:
-            # Structured fields only — ``exc_info`` would serialize the
-            # chained ``httpx.Request`` whose headers carry the configured
-            # bearer for ``auth_type=static`` servers.
+            # ``type: str(exc)``, never ``exc_info`` — the message text is
+            # diagnostic and header-free; it is the serialized exception
+            # CHAIN (chained ``httpx.Request`` whose headers carry the
+            # configured bearer for ``auth_type=static``) that must never
+            # reach the log.
             log.warning(
-                "Static %s refresh after notification failed for '%s' exc=%s",
+                "Static %s refresh after notification failed for '%s' exc=%s: %s",
                 kind,
                 name,
                 type(exc).__name__,
+                exc,
             )
-            self._set_error(name, f"Refresh failed: {type(exc).__name__}")
+            self._set_error(name, f"Refresh failed: {type(exc).__name__}: {exc}")
         finally:
             if not acquired:
                 # Cancelled (or failed) while PARKED — the marker still in
@@ -2055,17 +2094,21 @@ class MCPClientManager:
             kind = _LIST_CHANGED_KINDS.get(type(msg.root))
             if kind is None:
                 return
+            marker = (key, kind)
+            # Debounce per (key, kind) — see the static handler's rationale:
+            # refreshes are kind-scoped, so a key-scoped stamp would drop a
+            # different-kind notification inside the window outright.
             now = time.monotonic()
-            last = self._last_pool_notification_refresh.get(key, 0.0)
+            last = self._last_pool_notification_refresh.get(marker, 0.0)
             if now - last < self._NOTIFICATION_DEBOUNCE:
                 log.debug(
-                    "Debouncing pool notification user=%s server=%s (%.1fs since last refresh)",
+                    "Debouncing pool %s notification user=%s server=%s (%.1fs since last refresh)",
+                    kind,
                     user_id,
                     server_name,
                     now - last,
                 )
                 return
-            marker = (key, kind)
             if marker in self._pool_refresh_pending:
                 # A runner for this key+kind is queued but has not yet
                 # issued its list call — it will observe this change
@@ -2106,7 +2149,7 @@ class MCPClientManager:
                     user_id,
                     server_name,
                 )
-                self._last_pool_notification_refresh[key] = now
+                self._last_pool_notification_refresh[marker] = now
                 self._pool_refresh_pending.add(marker)
                 self._spawn_background(
                     self._run_notification_refresh(key, kind, refreshers[kind]),
@@ -3975,10 +4018,26 @@ class MCPClientManager:
             # 1-RTT (gather) instead of 2 sequential RTTs — both calls
             # share the same timeout budget and target disjoint catalogs
             # (resources vs. templates), so ordering is irrelevant.
-            res_result, tmpl_result = await asyncio.gather(
+            # ``return_exceptions=True`` so a fast failure on one call
+            # cannot orphan the sibling: fail-fast gather leaves the
+            # survivor running DETACHED — outside this timeout scope and
+            # outside the lock serialization — as an unbounded in-flight
+            # request on the shared session. Both awaitables complete
+            # here (the timeout cancels them together on expiry), then
+            # the first failure is re-raised.
+            pool_res_pair: tuple[Any, Any] = await asyncio.gather(
                 session.list_resources(),
                 session.list_resource_templates(),
+                return_exceptions=True,
             )
+            res_result, tmpl_result = pool_res_pair
+        pool_res_exc: BaseException | None = next(
+            (r for r in (res_result, tmpl_result) if isinstance(r, BaseException)), None
+        )
+        if pool_res_exc is not None:
+            raise pool_res_exc
+        assert not isinstance(res_result, BaseException)
+        assert not isinstance(tmpl_result, BaseException)
         if self._user_pool_entries.get(key) is not entry:
             # Entry replaced mid-flight — stale result, discard.
             return [], []
@@ -4091,11 +4150,19 @@ class MCPClientManager:
             )
         return added, removed
 
-    async def _refresh_server(self, name: str) -> tuple[list[str], list[str]]:
+    async def _refresh_server(self, name: str) -> tuple[list[str], list[str]] | None:
         """Re-fetch tools, resources, and prompts for one server.
 
         Returns ``(added_tools, removed_tools)`` names (tool diff only,
-        for backward compatibility with ``/mcp refresh`` output).
+        for backward compatibility with ``/mcp refresh`` output), or
+        ``None`` when the pass was SUPERSEDED — the server was removed
+        (or removed and re-added) while this pass waited on the lock, so
+        its mandate is gone and it must publish nothing and write no
+        status: the removal cleaned the status maps, and a re-add's
+        connect discovery owns the new generation's status. Writing
+        anything here would either resurrect rows for a nonexistent
+        server or stamp a false ``ok`` over a generation this pass never
+        actually refreshed.
 
         Writes the ``_last_refresh`` entry on every call so the Phase 9
         admin status pill reflects every refresh path — manual
@@ -4129,9 +4196,31 @@ class MCPClientManager:
         newer one, with no convergence until the next change. No caller
         holds the lock coming in: ``_refresh_all`` takes it per-branch
         (never nested), and the two post-reconnect schedule sites spawn
-        this as its own task.
+        this as its own task (through
+        :meth:`_refresh_server_logged` — the raise below must never
+        reach ``_spawn_background``'s ``exc_info`` failure log).
+
+        The post-acquire recheck closes the remove → re-add race the
+        same way :meth:`_ensure_static_connected` does — by LOCK
+        IDENTITY: ``remove_server_sync`` retires the lock object after
+        teardown, so a pass that parked on the OLD lock must not run
+        its list calls concurrently with a re-add publishing under the
+        NEW lock (two unserialized publishers — the exact race this
+        lock exists to close). The get-or-create acquire mirrors
+        ``_ensure_static_connected``; a mint for a just-removed name is
+        bounded (a re-add reuses it, shutdown clears it) and the
+        recheck below keeps it inert.
         """
-        async with self._static_connect_lock_for(name):
+        lock = self._static_connect_lock_for(name)
+        async with lock:
+            if (
+                self._static_connect_locks.get(name) is not lock
+                or self._static_servers.get(name) is None
+            ):
+                # Superseded while parked: removed (state gone), or
+                # removed + re-added (lock retired — the new generation
+                # publishes its own discovery under the NEW lock).
+                return None
             results = await asyncio.gather(
                 self._refresh_server_tools(name),
                 self._refresh_server_resources(name),
@@ -4156,6 +4245,29 @@ class MCPClientManager:
             self._last_error.pop(name, None)
             self._last_refresh[name] = (time.time(), "ok")
             return added, removed
+
+    async def _refresh_server_logged(self, name: str) -> None:
+        """:meth:`_refresh_server` for ``_spawn_background`` schedule sites.
+
+        The spawned pass has no caller to observe the re-raise, so an
+        escaping exception would land in ``_spawn_background``'s
+        done-callback, whose ``exc_info`` log serializes the chained
+        ``httpx.Request`` — headers carrying the configured bearer for
+        ``auth_type=static`` servers. Swallow here with the same
+        ``type: str(exc)`` shape as :meth:`_refresh_all`'s except;
+        ``_refresh_server`` already wrote the ``_last_refresh`` error
+        row before re-raising, so no outcome is lost — only the leak.
+        """
+        try:
+            await self._refresh_server(name)
+        except (Exception, BaseExceptionGroup) as exc:
+            log.warning(
+                "Post-reconnect catalog refresh failed for '%s' exc=%s: %s",
+                name,
+                type(exc).__name__,
+                exc,
+            )
+            self._set_error(name, f"Refresh failed: {type(exc).__name__}: {exc}")
 
     async def _refresh_all(
         self, server_name: str | None = None
@@ -4195,15 +4307,34 @@ class MCPClientManager:
                         results[name] = (new_names, [])
                         self._last_refresh[name] = (time.time(), "ok")
                     continue
-                added, removed = await self._refresh_server(name)
+                refreshed = await self._refresh_server(name)
+                if refreshed is None:
+                    # Superseded (removed / removed+re-added while parked
+                    # on the lock) — a deliberate skip, not an outcome:
+                    # nothing was refreshed, so record neither success
+                    # nor failure for whatever generation lives now.
+                    results[name] = ([], [])
+                    continue
+                added, removed = refreshed
                 self._cb_record_success(name)
                 results[name] = (added, removed)
             except (Exception, BaseExceptionGroup) as exc:
                 # BaseExceptionGroup: a transport task-group failure from the
                 # reconnect/refresh must stay isolated to this server, not
                 # abort the whole refresh pass.
-                log.warning("Refresh failed for MCP server '%s'", name, exc_info=True)
-                self._set_error(name, f"Refresh failed: {exc}")
+                #
+                # ``type: str(exc)``, never ``exc_info`` — the serialized
+                # exception CHAIN carries the chained ``httpx.Request``
+                # whose headers hold the configured bearer for
+                # ``auth_type=static`` servers; the message text is
+                # diagnostic and header-free.
+                log.warning(
+                    "Refresh failed for MCP server '%s' exc=%s: %s",
+                    name,
+                    type(exc).__name__,
+                    exc,
+                )
+                self._set_error(name, f"Refresh failed: {type(exc).__name__}: {exc}")
                 results[name] = ([], [])
                 # A dead transport leaves a non-None but unusable session, so
                 # the reconnect branch at the top of this loop (gated on
@@ -4331,11 +4462,23 @@ class MCPClientManager:
             # 1-RTT (gather) instead of 2 sequential RTTs — both calls
             # share the same timeout budget and target disjoint catalogs
             # (resources vs. templates), so ordering is irrelevant.
-            # Mirrors :meth:`_refresh_pool_server_resources`.
-            res_result, tmpl_result = await asyncio.gather(
+            # ``return_exceptions=True`` so a fast failure on one call
+            # cannot orphan the sibling as a detached, unbounded request
+            # on the shared session — see
+            # :meth:`_refresh_pool_server_resources`.
+            static_res_pair: tuple[Any, Any] = await asyncio.gather(
                 session.list_resources(),
                 session.list_resource_templates(),
+                return_exceptions=True,
             )
+            res_result, tmpl_result = static_res_pair
+        static_res_exc: BaseException | None = next(
+            (r for r in (res_result, tmpl_result) if isinstance(r, BaseException)), None
+        )
+        if static_res_exc is not None:
+            raise static_res_exc
+        assert not isinstance(res_result, BaseException)
+        assert not isinstance(tmpl_result, BaseException)
         if self._static_servers.get(name) is not state:
             # Entry replaced (remove + re-add) mid-flight — stale result.
             return
@@ -5121,10 +5264,19 @@ class MCPClientManager:
                 async with self._static_connect_lock_for(name):
                     # Close session + transport via the owner close protocol
                     await self._teardown_static_session(name)
-                    # Clean up per-server state (on the event loop thread)
+                    # Clean up per-server state (on the event loop thread).
+                    # The direct stamp pops back up the teardown call above:
+                    # ``_teardown_static_session`` early-returns (no pop) when
+                    # the state entry is already gone. The marker discards
+                    # keep a parked old-generation runner's marker from
+                    # coalescing AWAY a re-added server's first push — that
+                    # runner bails at its lock-identity check without
+                    # refreshing, so nothing would cover the dropped change.
                     self._static_servers.pop(name, None)
                     self._last_error.pop(name, None)
-                    self._last_notification_refresh.pop(name, None)
+                    for kind in _LIST_CHANGED_KINDS.values():
+                        self._last_notification_refresh.pop((name, kind), None)
+                        self._static_refresh_pending.discard((name, kind))
                     self._cb_clear(name)
                     # Clear health-loop backoff/ping state so a later re-add of
                     # the same name doesn't inherit stale ``due`` deadlines.
@@ -5158,7 +5310,9 @@ class MCPClientManager:
             # No event loop (tests / pre-start) — mutate directly
             self._static_servers.pop(name, None)
             self._last_error.pop(name, None)
-            self._last_notification_refresh.pop(name, None)
+            for kind in _LIST_CHANGED_KINDS.values():
+                self._last_notification_refresh.pop((name, kind), None)
+                self._static_refresh_pending.discard((name, kind))
             self._cb_clear(name)
             self._rebuild_tools()
             self._rebuild_resources()
@@ -5899,7 +6053,7 @@ class MCPClientManager:
         next_ping = time.monotonic() + self._static_health_check_s
         self._static_next_ping[name] = next_ping
         self._spawn_background(
-            self._refresh_server(name),
+            self._refresh_server_logged(name),
             f"catalog refresh after static health reconnect '{name}'",
         )
         log.info("MCP static health: reconnected '%s'", name)
@@ -6058,12 +6212,14 @@ class MCPClientManager:
         # Schedule catalog refresh on the loop without blocking the caller.
         # The reconnected session is valid for the imminent dispatch; catalog
         # drift will be reconciled on the loop in the background.  The task is
-        # tracked: a refresh FAILURE is logged by the done-callback — this
-        # except only covers the scheduling itself.
+        # tracked; a refresh FAILURE is logged inside ``_refresh_server_logged``
+        # (type + message, never the done-callback's ``exc_info`` — the chain
+        # carries the configured bearer) — this except only covers the
+        # scheduling itself.
         def _schedule_refresh() -> None:
             try:
                 self._spawn_background(
-                    self._refresh_server(server_name),
+                    self._refresh_server_logged(server_name),
                     f"catalog refresh after reconnect for '{server_name}'",
                 )
             except Exception:
@@ -7216,7 +7372,8 @@ class MCPClientManager:
         and the pop is a no-op.
         """
         entry.drop_session()
-        self._last_pool_notification_refresh.pop(key, None)
+        for kind in _LIST_CHANGED_KINDS.values():
+            self._last_pool_notification_refresh.pop((key, kind), None)
 
     def _evict_session(self, key: tuple[str, str]) -> None:
         """Drop the cached session on a pool entry; KEEP the catalog.

@@ -30,7 +30,6 @@ Self-contained (spawns its own server; no LLM backend, no network beyond
 
 from __future__ import annotations
 
-import signal
 import socket
 import subprocess
 import sys
@@ -186,5 +185,5 @@ class TestPushRefreshNoDeadlock:
             if mgr is not None:
                 mgr.shutdown()
             if proc is not None:
-                proc.send_signal(signal.SIGKILL)
+                proc.kill()
                 proc.wait(timeout=5)
