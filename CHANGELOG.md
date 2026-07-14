@@ -188,9 +188,17 @@ Earlier stable lines (`stable/1.6`, `stable/1.5`) are frozen.
   change never announces it again. And an operator `/mcp refresh` no longer
   parks behind a busy per-server connect lock (a slow reconnect attempt
   could eat the whole 30-second refresh budget and fail the pass for every
-  healthy server behind it) — the busy server is skipped, since whatever
-  holds the lock publishes a fresher catalog than the skipped pass would
-  have.
+  healthy server behind it) — the busy server is skipped on both the
+  connected and disconnected branches, the skip arms the automatic retry so
+  the operator's request isn't silently dropped, and a force-reconnect
+  drops the session up front so queued push refreshes can't starve it.
+  Static-path resource and prompt catalogs are now size-capped like the
+  pool path's (and like static tools) at discovery and on every refresh,
+  so a misbehaving server's push can't balloon the node's merged catalogs.
+  Deleting a server can no longer leave it half-removed: a removal that
+  times out behind a busy connect lock now mutates nothing and is cleanly
+  retryable (previously the config was popped up front, stranding a live
+  session and its published catalog with no driver able to reach them).
 
 - **OpenAI Responses streaming: truncated and refused responses no longer
   vanish.** A response that hit `max_output_tokens` terminates the stream

@@ -244,6 +244,20 @@ def _drain_background(mgr: MCPClientManager, loop: asyncio.AbstractEventLoop) ->
     _run_on_loop(loop, _drain())
 
 
+def _poll_until(predicate: Callable[[], bool], timeout: float, interval: float = 0.05) -> bool:
+    """Poll *predicate* until true or *timeout* elapses — the ONE wait loop.
+
+    Shared by the live MCP smoke tests' condition helpers so the
+    deadline/poll pattern doesn't accrete per-file hand-synced copies.
+    """
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if predicate():
+            return True
+        time.sleep(interval)
+    return False
+
+
 def _free_port() -> int:
     """Grab an ephemeral localhost port for a live-server subprocess.
 
@@ -256,27 +270,27 @@ def _free_port() -> int:
         return int(s.getsockname()[1])
 
 
+def _tcp_accepts(port: int) -> bool:
+    try:
+        with socket.create_connection(("127.0.0.1", port), timeout=0.3):
+            return True
+    except OSError:
+        return False
+
+
 def _wait_tcp_ready(port: int, timeout: float) -> bool:
     """Poll until something accepts TCP on 127.0.0.1:*port* (live tests)."""
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        try:
-            with socket.create_connection(("127.0.0.1", port), timeout=0.3):
-                return True
-        except OSError:
-            time.sleep(0.05)
-    return False
+    return _poll_until(lambda: _tcp_accepts(port), timeout)
 
 
 def _wait_session_live(mgr: MCPClientManager, name: str, timeout: float) -> bool:
     """Poll until static server *name* has a live session (live tests)."""
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
+
+    def _live() -> bool:
         state = mgr._static_servers.get(name)
-        if state is not None and state.session is not None:
-            return True
-        time.sleep(0.05)
-    return False
+        return state is not None and state.session is not None
+
+    return _poll_until(_live, timeout)
 
 
 def make_oidc_test_config(**overrides: Any) -> OIDCConfig:

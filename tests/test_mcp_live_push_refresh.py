@@ -33,13 +33,12 @@ from __future__ import annotations
 import subprocess
 import sys
 import textwrap
-import time
 from typing import TYPE_CHECKING
 from unittest.mock import patch
 
 import pytest
 
-from tests.conftest import _free_port, _wait_session_live, _wait_tcp_ready
+from tests.conftest import _free_port, _poll_until, _wait_session_live, _wait_tcp_ready
 from turnstone.core.mcp_client import MCPClientManager
 
 if TYPE_CHECKING:
@@ -83,13 +82,12 @@ SERVER_SRC = textwrap.dedent(
 
 def _wait_tool_visible(mgr: MCPClientManager, server: str, tool: str, timeout: float) -> bool:
     """Poll the per-server catalog for *tool* — the push refresh landing."""
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
+
+    def _visible() -> bool:
         state = mgr._static_servers.get(server)
-        if state is not None and any(t["function"]["name"] == tool for t in state.tools):
-            return True
-        time.sleep(0.05)
-    return False
+        return state is not None and any(t["function"]["name"] == tool for t in state.tools)
+
+    return _poll_until(_visible, timeout)
 
 
 class TestPushRefreshNoDeadlock:
