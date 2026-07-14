@@ -36,6 +36,7 @@ if TYPE_CHECKING:
     from turnstone.core.oidc import OIDCConfig
 
 from turnstone.core.log import get_logger
+from turnstone.core.mcp_client import try_prime_user_pools
 from turnstone.core.oidc import (
     OIDC_STATE_TTL_SECONDS,
     OIDCError,
@@ -2160,25 +2161,15 @@ async def handle_oidc_callback(request: Request, audience: str, cookie_name: str
                 # their listeners. Gated on a LIVE session: routine SSO
                 # re-logins by users with nothing open must not fan out
                 # mints and transport connects at deployment scale.
-                # Fire-and-forget; a failure changes nothing about login.
-                mcp_client = getattr(request.app.state, "mcp_client", None)
-                if (
-                    mcp_client is not None
-                    and hasattr(mcp_client, "prime_user_pools")
-                    and hasattr(mcp_client, "has_live_session_listener")
-                ):
-                    # The gate call sits INSIDE the try: nothing on this
-                    # best-effort path may fail the login (the credential
-                    # is already persisted; the JWT is not yet issued).
-                    try:
-                        if mcp_client.has_live_session_listener(user["user_id"]):
-                            mcp_client.prime_user_pools(user["user_id"])
-                    except Exception:
-                        log.debug(
-                            "oidc.capture: post-capture pool prime scheduling failed user=%s",
-                            user["user_id"],
-                            exc_info=True,
-                        )
+                # Fire-and-forget; a failure changes nothing about login
+                # (the credential is already persisted; the JWT is not
+                # yet issued) — the helper owns the swallow.
+                try_prime_user_pools(
+                    getattr(request.app.state, "mcp_client", None),
+                    user["user_id"],
+                    require_live_listener=True,
+                    context="oidc-capture",
+                )
 
     # Load permissions and issue Turnstone JWT
     perms = await asyncio.to_thread(_load_user_permissions, storage, user["user_id"])

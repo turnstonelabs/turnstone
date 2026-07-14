@@ -70,6 +70,7 @@ from turnstone.core.lowering import (
     tool_args_preview,
     wire_valid_arguments,
 )
+from turnstone.core.mcp_client import try_prime_user_pools
 from turnstone.core.memory import (
     count_messages,
     count_structured_memories,
@@ -1689,6 +1690,10 @@ class ChatSession:
         #     listeners register so tool/resource/prompt refreshes flow
         #     through to this session.
         #   * interactive (no mcp) — INTERACTIVE_TOOLS.
+        # Construction-scoped (a local, NOT instance state): the seq
+        # value at the authoritative merged read, compared once at the
+        # end of tool setup. Only ``_mcp_tools_change_seq`` lives on.
+        mcp_tools_seq_at_read = 0
         if kind == WorkstreamKind.COORDINATOR:
             self._tools = list(COORDINATOR_TOOLS)
             self._task_tools = []
@@ -1727,7 +1732,7 @@ class ChatSession:
             # attributes and be swallowed by the fan-out, losing its
             # effect, and one that succeeds here would be clobbered by
             # the tool-search construction below reading mixed state.
-            self._mcp_tools_seq_at_read = self._mcp_tools_change_seq
+            mcp_tools_seq_at_read = self._mcp_tools_change_seq
             mcp_tools = self._mcp_client.get_tools(user_id=self._mcp_user_id)
             self._tools = merge_mcp_tools(INTERACTIVE_TOOLS, mcp_tools)
             self._task_tools = merge_mcp_tools(TASK_AGENT_TOOLS, mcp_tools)
@@ -1737,15 +1742,7 @@ class ChatSession:
             # listeners registered just above deliver the catalog to this
             # session once each prime completes. No-op for users with no
             # consented oauth_user servers.
-            if self._mcp_user_id and hasattr(self._mcp_client, "prime_user_pools"):
-                try:
-                    self._mcp_client.prime_user_pools(self._mcp_user_id)
-                except Exception:
-                    log.debug(
-                        "mcp prime_user_pools scheduling failed user=%s",
-                        self._mcp_user_id,
-                        exc_info=True,
-                    )
+            try_prime_user_pools(self._mcp_client, self._mcp_user_id, context="session-start")
         else:
             self._tools = INTERACTIVE_TOOLS
             self._task_tools = TASK_AGENT_TOOLS
@@ -1803,7 +1800,7 @@ class ChatSession:
         if (
             self._kind != WorkstreamKind.COORDINATOR
             and self._mcp_client
-            and self._mcp_tools_change_seq != self._mcp_tools_seq_at_read
+            and self._mcp_tools_change_seq != mcp_tools_seq_at_read
         ):
             self._on_mcp_tools_changed()
         # Skill: explicit name overrides is_default skills.  ``skill_arguments``
@@ -5652,15 +5649,7 @@ class ChatSession:
                 mcp.remove_prompt_listener(self._mcp_prompt_cb, user_id=old_listener_uid)
                 mcp.add_prompt_listener(self._mcp_prompt_cb, user_id=new_listener_uid)
             self._mcp_listener_user_id = new_listener_uid
-        if new_listener_uid and hasattr(mcp, "prime_user_pools"):
-            try:
-                mcp.prime_user_pools(new_listener_uid)
-            except Exception:
-                log.debug(
-                    "mcp prime_user_pools scheduling failed user=%s",
-                    new_listener_uid,
-                    exc_info=True,
-                )
+        try_prime_user_pools(mcp, new_listener_uid, context="acting-user-change")
         # Rebuild the merged tool list and resource/prompt-dependent
         # state under the new identity NOW — the prime above completes
         # asynchronously and only notifies on catalog changes, while
