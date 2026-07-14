@@ -169,36 +169,40 @@ Earlier stable lines (`stable/1.6`, `stable/1.5`) are frozen.
   transport down (which was also the only way the changed catalog ever
   landed). Push refreshes now run as spawned tasks — debounced, coalesced per
   (server, kind), bounded by the connect timeout, and serialized on the
-  per-server connect lock — and the manual/periodic refresh publishes under
-  that same lock, so a slower publisher can no longer land a staler catalog
-  over a fresher one. Every teardown path now also clears the notification
-  debounce stamp, so a reconnected server's first push refreshes immediately.
-  Push-refresh debouncing is now per (server, kind) on BOTH the static and
-  per-user pool paths — a tools push no longer swallows a prompts push
-  arriving in the same 5-second window (previously the second push was
-  dropped outright, and the change stayed invisible until the server pushed
-  that kind again). The resource-refresh fan-out on both paths no longer
-  orphans its sibling list call when one of the pair fails fast — the real
-  error surfaces immediately (not masked as a 30-second timeout) and the
-  surviving sibling is cancelled inside the timeout scope. A push refresh
-  that fails while the connection stays up is now retried automatically on
+  per-server connect lock — and the manual and post-reconnect refreshes
+  publish under that same lock, so a slower publisher can no longer land a
+  staler catalog over a fresher one. Every teardown path now also clears the
+  notification debounce stamp, so a reconnected server's first push refreshes
+  immediately. Push-refresh debouncing is now per (server, kind) on BOTH the
+  static and per-user pool paths — a tools push no longer swallows a prompts
+  push arriving in the same 5-second window. A change genuinely lost to the
+  debounce window (a same-kind push landing after the prior refresh finished,
+  which the server will never re-announce) is recovered by an automatic
+  health-tick retry rather than staying invisible until an unrelated push or
+  a reconnect. The resource-refresh fan-out on both paths no longer orphans
+  its sibling list call when one of the pair fails fast — the real error
+  surfaces immediately (not masked as a 30-second timeout) and the surviving
+  sibling is cancelled and reaped, under a bounded grace, inside the scope. A
+  push refresh that fails while the connection stays up is likewise retried on
   the next health-loop tick until one completes — previously a single
   transient blip left the shared catalog stale for every user on the node
-  until an operator intervened, since a server that already announced its
-  change never announces it again. And an operator `/mcp refresh` no longer
-  parks behind a busy per-server connect lock (a slow reconnect attempt
-  could eat the whole 30-second refresh budget and fail the pass for every
-  healthy server behind it) — the busy server is skipped on both the
-  connected and disconnected branches, the skip arms the automatic retry so
-  the operator's request isn't silently dropped, and a force-reconnect
-  drops the session up front so queued push refreshes can't starve it.
-  Static-path resource and prompt catalogs are now size-capped like the
-  pool path's (and like static tools) at discovery and on every refresh,
-  so a misbehaving server's push can't balloon the node's merged catalogs.
-  Deleting a server can no longer leave it half-removed: a removal that
-  times out behind a busy connect lock now mutates nothing and is cleanly
-  retryable (previously the config was popped up front, stranding a live
-  session and its published catalog with no driver able to reach them).
+  until an operator intervened. An operator `/mcp refresh` no longer parks
+  behind a busy per-server connect lock (a slow reconnect attempt could eat
+  the whole 30-second refresh budget and fail the pass for every healthy
+  server behind it) — the busy server is skipped on both the connected and
+  disconnected branches, reported distinctly as "skipped" rather than as a
+  false "no changes", the skip arms the automatic retry, and a
+  force-reconnect drops the session up front so queued push refreshes can't
+  starve it. Static-path resource and prompt catalogs are now size-capped
+  like the pool path's (and like static tools) at discovery and on every
+  refresh, so a misbehaving server's push can't balloon the node's merged
+  catalogs. Deleting or reconfiguring a server can no longer leave it
+  half-removed: the config removal and all cleanup are serialized under the
+  connect lock (a cancelled removal completes its cleanup rather than
+  stranding a live session and published catalog with the config already
+  gone), and `reconcile_sync` retries a removal that timed out instead of
+  marking it done — previously a DB-driven delete of a busy server could be a
+  silent, permanent no-op until process restart.
 
 - **OpenAI Responses streaming: truncated and refused responses no longer
   vanish.** A response that hit `max_output_tokens` terminates the stream

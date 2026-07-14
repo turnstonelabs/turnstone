@@ -5,6 +5,8 @@ import contextlib
 import logging
 import os
 import socket
+import subprocess
+import sys
 import threading
 import time
 from typing import TYPE_CHECKING, Any
@@ -291,6 +293,22 @@ def _wait_session_live(mgr: MCPClientManager, name: str, timeout: float) -> bool
         return state is not None and state.session is not None
 
     return _poll_until(_live, timeout)
+
+
+def _popen_mcp_server(script_path: Any, port: int) -> subprocess.Popen[bytes]:
+    """Start a FastMCP live-server subprocess, streams to DEVNULL.
+
+    The shared spawn primitive for the live MCP smoke tests
+    (flaky-server flap loop, push-refresh) — the readiness wait and the
+    skip-vs-raise-on-failure policy legitimately differ per test and
+    stay at the call sites. ``sys.executable`` runs the same interpreter,
+    so a server-side import gap surfaces as a failed TCP wait, not here.
+    """
+    return subprocess.Popen(
+        [sys.executable, str(script_path), str(port)],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
 
 
 def make_oidc_test_config(**overrides: Any) -> OIDCConfig:

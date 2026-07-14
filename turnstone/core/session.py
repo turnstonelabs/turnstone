@@ -3057,7 +3057,16 @@ class ChatSession:
             return
 
         lines: list[str] = []
-        for srv, (added, removed) in sorted(results.items()):
+        for srv, diff in sorted(results.items()):
+            if diff is None:
+                # Skipped, NOT refreshed: another operation held the
+                # server's lock (a reconnect / a push refresh), or it was
+                # removed mid-pass. Reported distinctly from "no changes"
+                # so the operator isn't told a stale server is current;
+                # the health-tick retry runs the real refresh shortly.
+                lines.append(f"  {srv}: {dim('skipped (busy — retry scheduled)')}")
+                continue
+            added, removed = diff
             if added or removed:
                 summary: list[str] = []
                 if added:
