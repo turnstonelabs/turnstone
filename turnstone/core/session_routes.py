@@ -2539,6 +2539,44 @@ def make_create_handler(
             if err_validate is not None:
                 return err_validate
 
+        # --- Require-project deployment gate (server.require_project) -----
+        # Optional policy: when a deployment flips ``server.require_project``
+        # on, every INTERACTIVE chat must be filed under a project. The gate
+        # lives here in the shared factory rather than the console-only
+        # ``create_workstream`` route because interactive workstreams are
+        # created on the WORKER via
+        # ``make_create_handler(interactive_endpoint_config)`` — that is where
+        # the overwhelming majority of workstream creation happens. Scoped to
+        # the interactive kind so coordinator workstreams (operator/automation
+        # orchestration) are never forced to carry a project. It runs AFTER
+        # ``create_validate_request``, so ``body["project_id"]`` already
+        # reflects a child's parent-inherited project — legitimate branches
+        # are not false-blocked. Exemptions fail OPEN to "allowed": a resume
+        # keeps its existing project; ``service`` scope covers cluster
+        # machinery / scheduled automation; ``admin.coordinator`` covers
+        # coordinator spawns. Off by default (registry default False), so this
+        # is inert until an admin sets the flag.
+        if cfg.list_kind == "interactive":
+            _cfg_store = getattr(request.app.state, "config_store", None)
+            if _cfg_store is not None and _cfg_store.get("server.require_project"):
+                _proj_raw = body.get("project_id")
+                _proj = _proj_raw.strip() if isinstance(_proj_raw, str) else ""
+                _resume_raw = body.get("resume_ws")
+                _resuming = isinstance(_resume_raw, str) and _resume_raw.strip() != ""
+                _exempt = auth is not None and (
+                    auth.has_scope("service") or auth.has_permission("admin.coordinator")
+                )
+                if not _proj and not _resuming and not _exempt:
+                    return JSONResponse(
+                        {
+                            "error": (
+                                "This deployment requires every chat to be "
+                                "assigned to a project."
+                            )
+                        },
+                        status_code=400,
+                    )
+
         # --- Skill resolution --------------------------------------------
         # Both kinds resolve a body ``skill`` field through
         # ``get_skill_by_name`` to the skill_data dict + the next
