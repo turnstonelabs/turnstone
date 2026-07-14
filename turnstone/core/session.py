@@ -1690,6 +1690,12 @@ class ChatSession:
         #     listeners register so tool/resource/prompt refreshes flow
         #     through to this session.
         #   * interactive (no mcp) — INTERACTIVE_TOOLS.
+        # Unconditional — every session kind carries the counter, so its
+        # existence never encodes "MCP was wired at construction" (a
+        # late-bound client or a directly-invoked callback must not
+        # AttributeError inside the listener fan-out, where per-callback
+        # exceptions are swallowed).
+        self._mcp_tools_change_seq = 0
         # Construction-scoped (a local, NOT instance state): the seq
         # value at the authoritative merged read, compared once at the
         # end of tool setup. Only ``_mcp_tools_change_seq`` lives on.
@@ -1705,7 +1711,6 @@ class ChatSession:
             # merged read runs after the registrations below.
             self._tools = list(INTERACTIVE_TOOLS)
             self._task_tools = list(TASK_AGENT_TOOLS)
-            self._mcp_tools_change_seq = 0
             # Register for tool-change notifications from MCP servers.
             # ``user_id`` is the listener identity component — pool-only
             # changes for OTHER users must not fire this callback.

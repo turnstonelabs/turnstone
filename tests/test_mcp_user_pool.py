@@ -855,8 +855,63 @@ class TestEviction:
         _drain_background(mgr, loop)
         assert spawned == 1, "second notification must coalesce into the parked runner"
         assert refreshed == [key]
-        # The runner released its marker (at lock acquire + finally).
+        # The runner released its own marker at lock acquire.
         assert not mgr._pool_refresh_pending
+
+    def test_finally_does_not_clobber_successor_marker(self, running_loop_mgr) -> None:
+        """After the at-acquire discard, a marker present at the
+        runner's exit belongs to the SUCCESSOR spawned during its
+        in-flight list call — the finally must not discard it, or the
+        handler mints runners past the one-parked-runner bound (one
+        extra 30s list call serialized ahead of the user's dispatch per
+        debounce window)."""
+        mgr, loop, _ = running_loop_mgr
+        key = ("u0", "pool-srv")
+        marker = (key, "tools")
+
+        async def _refresh_readding(_k: tuple[str, str]) -> tuple[list[str], list[str]]:
+            # Our own marker was discarded at lock-acquire; a successor
+            # spawned mid-refresh re-adds the same (key, kind) marker.
+            assert marker not in mgr._pool_refresh_pending
+            mgr._pool_refresh_pending.add(marker)
+            return [], []
+
+        async def _scenario() -> None:
+            entry = await mgr._ensure_pool_entry(key)
+            entry.session = MagicMock()
+            mgr._pool_refresh_pending.add(marker)  # our spawn's marker
+            await mgr._run_notification_refresh(key, "tools", _refresh_readding)
+
+        _run_on_loop(loop, _scenario())
+        assert marker in mgr._pool_refresh_pending, "successor's marker must survive our exit"
+        mgr._pool_refresh_pending.discard(marker)
+
+    def test_cancel_while_parked_releases_marker(self, running_loop_mgr) -> None:
+        """A runner cancelled while PARKED on open_lock never reached
+        the at-acquire discard — the finally must release its marker,
+        or the key+kind never refreshes again."""
+        mgr, loop, _ = running_loop_mgr
+        key = ("u0", "pool-srv")
+        marker = (key, "tools")
+
+        async def _rec(_k: tuple[str, str]) -> tuple[list[str], list[str]]:
+            return [], []
+
+        async def _scenario() -> None:
+            entry = await mgr._ensure_pool_entry(key)
+            entry.session = MagicMock()
+            await entry.open_lock.acquire()
+            mgr._pool_refresh_pending.add(marker)
+            task = asyncio.ensure_future(mgr._run_notification_refresh(key, "tools", _rec))
+            for _ in range(3):
+                await asyncio.sleep(0)
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+            entry.open_lock.release()
+
+        _run_on_loop(loop, _scenario())
+        assert marker not in mgr._pool_refresh_pending
 
     def test_teardown_pool_entry_pops_debounce_stamp(self, running_loop_mgr) -> None:
         """Every teardown path must pop the debounce stamp — the
