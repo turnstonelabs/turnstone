@@ -5790,6 +5790,25 @@ class TestResponsesDrainedStream:
         assert len(result.tool_calls) == 1
         assert result.tool_calls[0]["function"]["arguments"] == '{"x": 1}'
 
+    def test_orphan_only_tool_stream_completes_with_declared_tolerance(self) -> None:
+        # Orphan argument deltas must count as delivered output for the
+        # finish shim exactly as they count as a streamed signal for the
+        # terminal harvest: a lax server that never announces items AND
+        # never sends a terminal event still delivered its tool call —
+        # with the tolerance declared, that is a completion, not an
+        # IncompleteStreamError.
+        events = [
+            SimpleNamespace(
+                type="response.function_call_arguments.delta",
+                item_id="never_announced",
+                delta='{"x": 1}',
+            ),
+        ]
+        result = self._drain(events, capabilities=ModelCapabilities(finish_reason_optional=True))
+        assert result.finish_reason == "stop"
+        assert result.tool_calls is not None
+        assert result.tool_calls[0]["function"]["arguments"] == '{"x": 1}'
+
     def test_duplicate_item_ids_keep_distinct_slots(self) -> None:
         # Slot numbering must survive duplicate/empty item ids: len(dict)
         # numbering collided the third call onto the second's slot once an

@@ -92,7 +92,8 @@ def test_on_abandon_fires_on_timeout_and_cancel_but_not_success() -> None:
         )
     assert calls == ["timeout", "cancel"]
 
-    assert run_with_deadline(lambda: 7, timeout=1.0, on_abandon=lambda: calls.append("no")) == 7
+    result = run_with_deadline(lambda: 7, timeout=1.0, on_abandon=lambda: calls.append("no"))
+    assert result == 7
     assert calls == ["timeout", "cancel"]
 
 

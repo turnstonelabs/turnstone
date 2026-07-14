@@ -202,7 +202,7 @@ def scripted_anthropic_client(*scripts: Any) -> _ScriptedClient:
     """A scripted ``client.messages.stream`` — dict scripts are
     :func:`fake_anthropic_stream` kwargs (``blocks`` plus optional
     ``stop_reason``/``usage``)."""
-    return _ScriptedClient(scripts, lambda **kw: fake_anthropic_stream(**kw))
+    return _ScriptedClient(scripts, fake_anthropic_stream)
 
 
 class FakeAnthropicBlock:

@@ -857,10 +857,16 @@ class OpenAIResponsesProvider:
         # handler's.  Everywhere else the drain's complete-or-error gate
         # raises — a missing terminal on an event-disciplined server means
         # the generation died mid-response.
+        # Orphan argument deltas count as delivered output exactly as they
+        # count as a streamed tool-call signal for the terminal harvest —
+        # a lax server that never announces items must not read as an
+        # empty (failed) stream when its tool output actually arrived.
         if finish_shim_due(
             finish_reason_optional=finish_reason_optional,
             finish_seen=last_finish is not None,
-            delivered_output=bool(content_len or reasoning_len or tool_call_count),
+            delivered_output=bool(
+                content_len or reasoning_len or tool_call_count or orphan_args_seen
+            ),
         ):
             last_finish = "stop"
             sc = StreamChunk(finish_reason="stop")

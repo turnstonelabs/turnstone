@@ -14,6 +14,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
+import turnstone.core.model_turn as model_turn_mod
 from tests._session_helpers import as_stream
 from turnstone.core.model_turn import (
     ModelLane,
@@ -138,8 +139,6 @@ def test_model_turn_retry_backs_off_between_attempts(monkeypatch: pytest.MonkeyP
     # Instant re-issues are guaranteed to re-hit a still-active rate
     # limit/overload — the loop paces like the SDK request retry it
     # replaces: 0.5s base, doubling, ±50% jitter.
-    import turnstone.core.model_turn as model_turn_mod
-
     sleeps: list[float] = []
     monkeypatch.setattr(model_turn_mod, "time", SimpleNamespace(sleep=sleeps.append))
     provider = _FlakyProvider(
@@ -175,7 +174,6 @@ def test_model_turn_abort_during_backoff_suppresses_reissue(
     # The deadline can abandon the worker while it sleeps between
     # attempts — the wake-up must die with the original failure, not
     # issue one more full request from an abandoned thread.
-    import turnstone.core.model_turn as model_turn_mod
     from turnstone.core.deadline import StreamAbortRef
 
     ref = StreamAbortRef()
