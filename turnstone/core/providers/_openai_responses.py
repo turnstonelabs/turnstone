@@ -35,6 +35,7 @@ from turnstone.core.providers._protocol import (
     StreamChunk,
     ToolCallDelta,
     _join_reasoning_with_cap,
+    finish_shim_due,
     resolve_reasoning_effort,
 )
 from turnstone.core.trajectory import materialize_attachments
@@ -46,6 +47,13 @@ log = structlog.get_logger(__name__)
 # condition — the only ones worth retrying (the API's other codes are
 # deterministic request rejections).
 _TRANSIENT_FAILURE_CODES = frozenset({"server_error", "rate_limit_exceeded"})
+
+
+def _format_refusal(text: str) -> str:
+    """Render a refusal part as visible content — ONE format for both the
+    streamed ``response.refusal.done`` event and the terminal-payload
+    harvest, so drained text cannot differ by which path carried it."""
+    return f"[Refused: {text}]"
 
 
 def _extend_message_annotations(item: Any, annotations: list[Any]) -> None:
@@ -599,6 +607,7 @@ class OpenAIResponsesProvider:
         tool_call_indices: dict[str, int] = {}
         next_tool_idx = 0
         last_tool_idx = 0
+        orphan_args_seen = False
         # Collect output items for provider_blocks
         provider_blocks: list[dict[str, Any]] = []
         # Collect annotations across text parts
@@ -641,7 +650,7 @@ class OpenAIResponsesProvider:
             # double-emit.
             if event_type == "response.refusal.done":
                 refusal_text = getattr(event, "refusal", "")
-                sc = StreamChunk(content_delta=f"[Refused: {refusal_text}]")
+                sc = StreamChunk(content_delta=_format_refusal(refusal_text))
                 content_len += len(sc.content_delta)
                 if first:
                     sc.is_first = True
@@ -676,6 +685,13 @@ class OpenAIResponsesProvider:
                 item_id = getattr(event, "item_id", "")
                 delta_args = getattr(event, "delta", "")
                 if delta_args:
+                    if item_id not in tool_call_indices:
+                        # Orphan deltas ARE a streamed tool-call signal:
+                        # without this flag the terminal harvest (gated on
+                        # "no tool calls streamed") re-emits the same call
+                        # onto the same slot and the arguments JSON
+                        # duplicates.
+                        orphan_args_seen = True
                     idx = tool_call_indices.get(item_id, last_tool_idx)
                     yield StreamChunk(
                         tool_call_deltas=[ToolCallDelta(index=idx, arguments_delta=delta_args)]
@@ -764,7 +780,7 @@ class OpenAIResponsesProvider:
                             if part.get("type") == "output_text" and part.get("text"):
                                 parts_text.append(part["text"])
                             elif part.get("type") == "refusal" and part.get("refusal"):
-                                parts_text.append(f"[Refused: {part['refusal']}]")
+                                parts_text.append(_format_refusal(part["refusal"]))
                     harvested = "".join(parts_text)
                     if harvested:
                         content_len = len(harvested)
@@ -773,7 +789,7 @@ class OpenAIResponsesProvider:
                             hc.is_first = True
                             first = False
                         yield hc
-                if tool_call_count == 0:
+                if tool_call_count == 0 and not orphan_args_seen:
                     for block in provider_blocks:
                         if not (isinstance(block, dict) and block.get("type") == "function_call"):
                             continue
@@ -803,43 +819,33 @@ class OpenAIResponsesProvider:
                 yield sc
                 continue
 
-            # -- in-band error event (ResponseErrorEvent) --
-            # The SDK YIELDS `error` SSE events rather than raising, and no
-            # response.failed necessarily follows — without this branch the
-            # stream exhausts finish-less and the real API message is lost
-            # behind a misleading IncompleteStreamError.  AFTER a terminal
-            # event the generation is complete and in hand: a trailing
-            # error frame is teardown noise, and raising would discard the
-            # finished result (the in-band twin of the post-finish
-            # transport-blip tolerance ``drain_stream`` grants).
-            if event_type == "error":
+            # -- in-band failure events --
+            # ``error`` (ResponseErrorEvent): the SDK YIELDS these rather
+            # than raising, and no response.failed necessarily follows —
+            # without this branch the stream exhausts finish-less and the
+            # real API message is lost behind a misleading
+            # IncompleteStreamError.  ``response.failed`` carries the same
+            # failure nested in its response payload.  ONE tail for both
+            # shapes (only the code/message extraction differs), so the
+            # same server failure can never become retryable through one
+            # event type and fatal through the other: BEFORE a terminal
+            # event the failure raises; AFTER one the generation is
+            # complete and in hand — a trailing failure frame is teardown
+            # noise (the in-band twin of the post-finish transport-blip
+            # tolerance ``drain_stream`` grants), logged and dropped.
+            if event_type in ("error", "response.failed"):
+                if event_type == "error":
+                    code = getattr(event, "code", "") or ""
+                    message = getattr(event, "message", "") or ""
+                else:
+                    response = getattr(event, "response", None)
+                    error = getattr(response, "error", None) if response else None
+                    code = (getattr(error, "code", "") if error else "") or ""
+                    message = (getattr(error, "message", "") if error else "") or ""
                 if last_finish is not None:
-                    log.warning(
-                        "openai.responses.post_terminal_error",
-                        code=getattr(event, "code", "") or "",
-                        message=getattr(event, "message", "") or "",
-                    )
+                    log.warning("openai.responses.post_terminal_error", code=code, message=message)
                     break
-                _raise_responses_failure(
-                    getattr(event, "code", "") or "",
-                    getattr(event, "message", "Unknown error") or "Unknown error",
-                )
-
-            # -- error --
-            if event_type == "response.failed":
-                response = getattr(event, "response", None)
-                error = getattr(response, "error", None) if response else None
-                if last_finish is not None:
-                    log.warning(
-                        "openai.responses.post_terminal_error",
-                        code=(getattr(error, "code", "") if error else "") or "",
-                        message=(getattr(error, "message", "") if error else "") or "",
-                    )
-                    break
-                _raise_responses_failure(
-                    (getattr(error, "code", "") if error else "") or "",
-                    (getattr(error, "message", "") if error else "") or "Unknown error",
-                )
+                _raise_responses_failure(code, message or "Unknown error")
 
         # Terminal-event-less lax-server tolerance, armed ONLY by the
         # operator-declared ``finish_reason_optional`` capability: a
@@ -851,10 +857,10 @@ class OpenAIResponsesProvider:
         # handler's.  Everywhere else the drain's complete-or-error gate
         # raises — a missing terminal on an event-disciplined server means
         # the generation died mid-response.
-        if (
-            finish_reason_optional
-            and last_finish is None
-            and (content_len or reasoning_len or tool_call_count)
+        if finish_shim_due(
+            finish_reason_optional=finish_reason_optional,
+            finish_seen=last_finish is not None,
+            delivered_output=bool(content_len or reasoning_len or tool_call_count),
         ):
             last_finish = "stop"
             sc = StreamChunk(finish_reason="stop")

@@ -29,7 +29,13 @@ Earlier stable lines (`stable/1.6`, `stable/1.5`) are frozen.
   blocking read that can hit client read-timeouts — the same reason the
   Anthropic adapter already streamed internally — and judge timeouts now
   *abort* the underlying HTTP read instead of abandoning a worker thread
-  on a dead call. These lanes are also complete-or-error now: a stream
+  on a dead call. Because every call now streams, an alias pointed at a
+  model or org that cannot stream (OpenAI's verified-org streaming
+  entitlement, a gateway api-version predating `stream_options` — e.g.
+  older Azure OpenAI deployments) fails at request time where 1.7's
+  non-streaming single-shot call succeeded; remediation is on the
+  serving side (verify the org, bump the api-version/gateway) — there is
+  deliberately no per-model non-streaming fallback left to configure. These lanes are also complete-or-error now: a stream
   that ends without any finish signal is treated as a generation that
   died mid-response and retried, instead of storing the partial text as
   a clean result (previously a half-generated compaction summary could
@@ -142,13 +148,14 @@ Earlier stable lines (`stable/1.6`, `stable/1.5`) are frozen.
   table.** `o1`, `o1-mini`, `o3`, `o3-mini`, `o3-pro`, `o4-mini`,
   `gpt-5`, `gpt-5-mini`, `gpt-5-nano`, `gpt-5-pro`, `gpt-5.1`,
   `gpt-5.1-codex-max`, `gpt-5.2`, `gpt-5.2-pro`, and `gpt-5.3` no longer
-  have built-in capability rows — these models are effectively unused in
-  the field. The table floor is now `gpt-5.4`; the search-api and
-  audio/STT/TTS rows are unchanged. An alias still pinning one of the
-  removed ids resolves to the generic commercial defaults (temperature
-  sent, no declared reasoning-effort vocabulary, 200K window), which
-  those models may reject — declare the contract on the model
-  definition's capabilities JSON if you must stay on one, or move to a
+  have built-in capability rows — OpenAI has retired these model ids
+  from the API, so the rows described contracts no request can reach
+  anymore. The table floor is now `gpt-5.4`; the search-api and
+  audio/STT/TTS rows are unchanged. An alias still pinning a retired id
+  fails at OpenAI itself; any other unlisted commercial id resolves to
+  the generic commercial defaults (temperature sent, no declared
+  reasoning-effort vocabulary, 200K window) — declare the contract on
+  the model definition's capabilities JSON if you run one, or move to a
   current model.
 
 ### Fixed

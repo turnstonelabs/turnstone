@@ -5760,6 +5760,36 @@ class TestResponsesDrainedStream:
         assert by_name["beta"] == '{"x": 1}'
         assert by_name["alpha"] == ""
 
+    def test_orphan_deltas_do_not_collide_with_terminal_harvest(self) -> None:
+        # Reproduced round-9 regression: argument deltas streamed without
+        # any output_item.added announcement accumulate at slot 0, and the
+        # terminal harvest (gated on "no tool calls streamed") re-emitted
+        # the same call onto the same slot — concatenating the arguments
+        # into '{"x": 1}{"x": 1}'.  Orphan deltas ARE a streamed tool-call
+        # signal, so the harvest must stand down.
+        terminal_item = SimpleNamespace(type="function_call")
+        terminal_item.model_dump = lambda **_kw: {  # type: ignore[method-assign]
+            "type": "function_call",
+            "call_id": "call_1",
+            "name": "do_thing",
+            "arguments": '{"x": 1}',
+        }
+        events = [
+            SimpleNamespace(
+                type="response.function_call_arguments.delta",
+                item_id="never_announced",
+                delta='{"x": 1}',
+            ),
+            SimpleNamespace(
+                type="response.completed",
+                response=SimpleNamespace(status="completed", usage=None, output=[terminal_item]),
+            ),
+        ]
+        result = self._drain(events)
+        assert result.tool_calls is not None
+        assert len(result.tool_calls) == 1
+        assert result.tool_calls[0]["function"]["arguments"] == '{"x": 1}'
+
     def test_duplicate_item_ids_keep_distinct_slots(self) -> None:
         # Slot numbering must survive duplicate/empty item ids: len(dict)
         # numbering collided the third call onto the second's slot once an

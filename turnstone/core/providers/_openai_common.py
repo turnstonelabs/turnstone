@@ -29,10 +29,14 @@ log = structlog.get_logger(__name__)
 # ---------------------------------------------------------------------------
 
 # Table floor: gpt-5.4 (2026-07 pruning) — the o-series and pre-5.4 GPT-5
-# rows were dropped as unused in the field.  A legacy commercial id now
-# resolves to OPENAI_DEFAULT (generic caps: temperature sent, no declared
-# effort vocabulary); anyone still pinning one declares the contract on
-# the model definition's capabilities JSON or moves to a current model.
+# rows were dropped because OpenAI has RETIRED those model ids from the
+# API (they are no longer served, not merely unpopular), so no live
+# deployment can be calling them and the rows described unreachable
+# contracts.  A request for a retired id fails at OpenAI regardless of
+# what this table says.  Any OTHER unlisted commercial id resolves to
+# OPENAI_DEFAULT (generic caps: temperature sent, no declared effort
+# vocabulary); an operator pinning one declares the contract on the
+# model definition's capabilities JSON or moves to a current model.
 OPENAI_CAPABILITIES: dict[str, ModelCapabilities] = {
     # GPT-5.4 — 1M context window, native tool search
     "gpt-5.4": ModelCapabilities(

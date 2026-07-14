@@ -176,7 +176,7 @@ class "HeadlessSession" as HeadlessSession {
     + send_headless(input, max_turns, ...)
     - _override_system_prompt(content)
     --
-    eval.py: non-streaming,
+    eval.py: drained single-shot turns,
     records all tool calls
 }
 

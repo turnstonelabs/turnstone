@@ -109,6 +109,25 @@ def merge_usage(acc: UsageInfo | None, new: UsageInfo) -> UsageInfo:
     )
 
 
+def finish_shim_due(
+    *, finish_reason_optional: bool, finish_seen: bool, delivered_output: bool
+) -> bool:
+    """THE gate for the lax-server finish shim, shared by every adapter.
+
+    A stream that ended cleanly without any terminal signal is shimmed to
+    ``"stop"`` only when ALL of: the operator declared
+    ``finish_reason_optional`` on the model (this server never sends
+    terminal signals), no finish was seen (the shim never overrides a
+    real signal), and output was DELIVERED — content, reasoning, or tool
+    calls; ``info_delta``/usage do not count (status pings are not a
+    generation).  Dead/empty streams keep failing the drain's
+    complete-or-error gate even when the flag is armed.  One predicate so
+    the same capability flag cannot acquire different completion
+    semantics per provider family.
+    """
+    return finish_reason_optional and not finish_seen and delivered_output
+
+
 def accumulate_tool_call_delta(
     acc: dict[int, dict[str, Any]], tcd: ToolCallDelta
 ) -> dict[str, Any]:

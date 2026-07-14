@@ -20,6 +20,7 @@ from turnstone.core.providers._protocol import (
     UsageInfo,
     _join_reasoning_with_cap,
     _lookup_capabilities,
+    finish_shim_due,
     merge_reasoning_template_kwargs,
     snap_reasoning_effort,
 )
@@ -969,6 +970,14 @@ class AnthropicProvider:
                 # every drained lane return a clean-looking empty result
                 # where the retired non-streaming path (SDK
                 # get_final_message accumulation) returned the content.
+                # Residual bet, documented: a HYBRID gateway that sends a
+                # populated start AND re-streams the same content as
+                # deltas would double-count.  No known server does this
+                # (it would double on the SDK's own accumulators too), and
+                # the two attested classes — real API (empty starts),
+                # whole-block gateways (no deltas) — are both handled;
+                # disambiguating would mean buffering every start block
+                # until its first delta or block_stop.
                 if block.type == "text":
                     # Separate consecutive text blocks the way the Messages
                     # API's non-streaming shape reads when joined — without
@@ -1163,7 +1172,11 @@ class AnthropicProvider:
         # else the drain's complete-or-error gate raises, because a
         # missing message_stop on a signal-disciplined server means the
         # generation died mid-response.
-        if finish_reason_optional and not emitted_finish and delivered_output:
+        if finish_shim_due(
+            finish_reason_optional=finish_reason_optional,
+            finish_seen=emitted_finish,
+            delivered_output=delivered_output,
+        ):
             sc = StreamChunk(finish_reason="stop")
             _attach_terminal_blocks(sc)
             yield sc

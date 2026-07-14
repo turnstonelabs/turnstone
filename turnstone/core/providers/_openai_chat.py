@@ -27,6 +27,7 @@ from turnstone.core.providers._protocol import (
     StreamChunk,
     ToolCallDelta,
     _join_reasoning_with_cap,
+    finish_shim_due,
     merge_reasoning_template_kwargs,
 )
 from turnstone.core.trajectory import materialize_attachments
@@ -451,10 +452,10 @@ class OpenAIChatCompletionsProvider:
         # the drain folds the footer as trailing info.  A clean-exhaustion
         # stream with NO output still yields nothing, so dead/empty
         # streams keep failing the gate even when the shim is armed.
-        if (
-            finish_reason_optional
-            and last_finish_reason is None
-            and (content_len or reasoning_len or tool_call_count)
+        if finish_shim_due(
+            finish_reason_optional=finish_reason_optional,
+            finish_seen=last_finish_reason is not None,
+            delivered_output=bool(content_len or reasoning_len or tool_call_count),
         ):
             last_finish_reason = "stop"
             yield StreamChunk(finish_reason="stop")

@@ -662,7 +662,7 @@ display). Automatic prompt caching is enabled via top-level `cache_control:
 cacheable block and advances it as conversations grow (90% input cost
 reduction on cache hits, 1.25x write on first turn). Cache metrics
 (`cache_creation_input_tokens`, `cache_read_input_tokens`) are extracted from
-both streaming and non-streaming responses. The `anthropic` SDK is a core
+the stream's usage events. The `anthropic` SDK is a core
 dependency — the Anthropic provider is first-class alongside OpenAI.
 
 **GoogleProvider** (`_google.py`): extends `OpenAIChatCompletionsProvider` for
@@ -1149,20 +1149,30 @@ Named (aliased) workstreams are never age-pruned. Configure with
 
 ### API Retry
 
-`ChatSession._create_stream_with_retry()` (streaming path) and the agent
-`_api_call()` (non-streaming) both use the same retry pattern:
+Every model call streams (#831); retry lives at two stacked layers:
 
-- **Retries**: 4 total attempts (1 initial + 3 retries, `_MAX_RETRIES = 3`)
-- **Backoff**: exponential, base 1 second (`delay = 1s * 2^attempt`)
-- **Retryable errors**: `RateLimitError`, `APITimeoutError`,
-  `APIConnectionError`, `InternalServerError`, `ServiceUnavailableError`,
-  `APIError` (matched by class name to avoid importing backend-specific
-  exception hierarchies)
-- On retry: `ui.on_info()` notification
-- On final failure: exception propagates
-
-`_compact_messages()` also wraps its non-streaming API call in the same
-retry loop.
+- **Caller ladders** — `ChatSession._create_stream_with_retry()` (chat
+  loop) and the agent `_api_call()` (drained via `model_turn`) use the
+  same pattern: 4 total attempts (1 initial + 3 retries,
+  `_MAX_RETRIES = 3`), exponential backoff base 1 second
+  (`delay = 1s * 2^attempt`), `ui.on_info()` on retry, exception
+  propagates on final failure. `_compact_messages()` wraps its drained
+  call in the same loop.
+- **`model_turn`'s drain ladder** — inside every single-shot call,
+  mid-stream deaths (errors raised while draining, e.g.
+  `IncompleteStreamError`) are re-issued up to 2 more times with a
+  0.5s-base exponential backoff (±50% jitter); request-time failures
+  keep the SDK's own retry policy. The two ladders stack
+  multiplicatively on transient-shaped failures.
+- **Retryable errors** are matched by class name against each
+  provider's `retryable_error_names` (avoids importing
+  backend-specific exception hierarchies): `RateLimitError`,
+  `APITimeoutError`, `APIConnectionError`, `InternalServerError`,
+  `ServiceUnavailableError`, `APIError`, plus the drained-transport
+  errors `IncompleteStreamError` (stream ended with no terminal
+  signal — for servers that never send one, declare
+  `finish_reason_optional` in the model's capabilities JSON) and
+  `ResponsesStreamFailedError` (transient in-band Responses failure).
 
 ### Finish Reason Handling
 
@@ -1175,7 +1185,7 @@ retry loop.
   blocked.
 
 Agent sub-sessions (`_run_agent()`) check `finish_reason` on each
-non-streaming response and stop the agent early on `"length"` or
+drained turn and stop the agent early on `"length"` or
 `"content_filter"`.
 
 `_compact_messages()` checks `finish_reason` on the compaction response and
