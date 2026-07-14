@@ -103,10 +103,11 @@ class _FlakyProvider:
         return _iter()
 
 
-def test_model_turn_retries_transient_mid_stream_death() -> None:
+def test_model_turn_retries_transient_mid_stream_death(monkeypatch: pytest.MonkeyPatch) -> None:
     # The retired non-streaming transport read the whole body inside the
     # SDK's retried request, so single-shot lanes never saw a mid-body wire
     # blip — the drain-scoped loop is that retry's new home.
+    monkeypatch.setattr("turnstone.core.model_turn._DRAIN_RETRY_BASE_DELAY", 0.0)
     provider = _FlakyProvider(
         [
             IncompleteStreamError("stream died mid-response"),
@@ -121,7 +122,8 @@ def test_model_turn_retries_transient_mid_stream_death() -> None:
     assert len(provider.calls) == 2
 
 
-def test_model_turn_gives_up_after_retry_budget() -> None:
+def test_model_turn_gives_up_after_retry_budget(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("turnstone.core.model_turn._DRAIN_RETRY_BASE_DELAY", 0.0)
     provider = _FlakyProvider([IncompleteStreamError(f"death {i}") for i in range(5)])
     lane = ModelLane(provider=provider, client=object(), model="m")
 
@@ -130,6 +132,31 @@ def test_model_turn_gives_up_after_retry_budget() -> None:
 
     # One initial issue + _DRAIN_RETRIES re-issues, then it propagates.
     assert len(provider.calls) == 3
+
+
+def test_model_turn_retry_backs_off_between_attempts(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Instant re-issues are guaranteed to re-hit a still-active rate
+    # limit/overload — the loop paces like the SDK request retry it
+    # replaces: 0.5s base, doubling, ±50% jitter.
+    import turnstone.core.model_turn as model_turn_mod
+
+    sleeps: list[float] = []
+    monkeypatch.setattr(model_turn_mod, "time", SimpleNamespace(sleep=sleeps.append))
+    provider = _FlakyProvider(
+        [
+            IncompleteStreamError("death 1"),
+            IncompleteStreamError("death 2"),
+            CompletionResult(content="ok"),
+        ]
+    )
+    lane = ModelLane(provider=provider, client=object(), model="m")
+
+    result = model_turn(lane, [Turn.user("x")])
+
+    assert result.content == "ok"
+    assert len(sleeps) == 2
+    assert 0.25 <= sleeps[0] <= 0.75  # 0.5 * jitter[0.5, 1.5)
+    assert 0.5 <= sleeps[1] <= 1.5  # 1.0 * jitter[0.5, 1.5)
 
 
 def test_model_turn_does_not_retry_unrecognized_errors() -> None:

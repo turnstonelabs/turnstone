@@ -148,10 +148,10 @@ def drain_stream(chunks: Iterator[StreamChunk]) -> CompletionResult:
 
     - A stream that exhausts with NO finish reason raises
       :class:`IncompleteStreamError` (retryable) — every adapter emits one
-      on a healthy stream (a server that genuinely never sends one needs
-      ``finish_reason_optional`` declared in its model capabilities; the
-      chat iterator then shims ``"stop"`` once output arrived), so its
-      absence means the generation died mid-response.  Partial text must
+      on a healthy stream (a server that genuinely never sends a terminal
+      signal needs ``finish_reason_optional`` declared in its model
+      capabilities; the adapter then shims ``"stop"`` once output
+      arrived), so its absence means the generation died mid-response.  Partial text must
       never be handed to a caller that stores it as a complete result (a
       compaction summary, a title).  A transport blip AFTER the finish
       reason keeps the completed result and forfeits only trailing
@@ -358,18 +358,21 @@ class ModelCapabilities:
     # "" = omit (standard reasoning).  There is no gpt-5.6-pro model.
     supports_pro_mode: bool = False
     reasoning_mode: str = ""
-    # Chat-lane lax-server tolerance (operator-declared, model-definition
-    # capabilities JSON): this server never sends ``finish_reason``, so a
+    # Lax-server tolerance (operator-declared, model-definition
+    # capabilities JSON): this server never sends a terminal signal, so a
     # stream that ends CLEANLY after delivering output (content, reasoning,
-    # or tool calls) is a completed generation — the chat iterator shims
-    # ``finish_reason="stop"`` and :func:`drain_stream`'s complete-or-error
-    # gate passes.  Leave False (the default) for every server that
-    # reliably sends finish reasons: there, a clean finish-less end IS a
+    # or tool calls) is a completed generation — the adapter shims a
+    # ``"stop"`` finish and :func:`drain_stream`'s complete-or-error gate
+    # passes.  Leave False (the default) for every server that reliably
+    # terminates its streams: there, a clean signal-less end IS a
     # died-mid-generation stream (worker crashed behind a clean-closing
     # proxy/ASGI layer) and blessing it would store partial text as a
     # complete result.  SSE has no body framing, so the two cases are one
     # wire shape — this flag is the operator asserting which server class
-    # they run.  Honored by the Chat Completions lane only.
+    # they run.  Honored on every drained lane: Chat Completions (no
+    # ``finish_reason`` ever arrived), Anthropic (no ``message_delta``
+    # stop_reason AND no ``message_stop``), Responses (no terminal
+    # ``response.completed``/``response.incomplete`` event).
     finish_reason_optional: bool = False
 
 

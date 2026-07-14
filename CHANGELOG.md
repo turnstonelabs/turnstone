@@ -41,18 +41,19 @@ Earlier stable lines (`stable/1.6`, `stable/1.5`) are frozen.
   such a server already couldn't serve turnstone's chat loop, but a
   judge/utility alias pointed at one worked on 1.7 and needs to move to
   a current server. Transient mid-stream deaths (connection drop, proxy
-  hiccup) are re-issued in place up to twice — the retry the SDK's
-  request loop used to provide these lanes invisibly. Each lane accepts
-  its own terminal marker (Anthropic `message_stop`, Responses terminal
-  events); on the Chat Completions lane a server that never sends
-  `finish_reason` at all needs `{"finish_reason_optional": true}` in the
-  model definition's capabilities JSON, which restores 1.7's tolerance
-  (clean end-of-stream after output = completion) for that model —
-  without it such streams fail as died-mid-generation, because SSE gives
-  no way to tell the two apart and the default favors catching
-  truncation. The unread `supports_streaming` capability flag (and its
-  admin tile) is gone; the o-series models it described are dropped from
-  the capability table entirely (see Removed).
+  hiccup) are re-issued in place up to twice with exponential backoff —
+  the retry the SDK's request loop used to provide these lanes
+  invisibly. Each lane accepts its own terminal marker (Anthropic
+  `message_stop`, Responses terminal events); a lax server/gateway that
+  never sends any terminal signal needs
+  `{"finish_reason_optional": true}` in the model definition's
+  capabilities JSON, which restores 1.7's tolerance (clean end-of-stream
+  after output = completion) for that model on every lane — without it
+  such streams fail as died-mid-generation, because SSE gives no way to
+  tell the two apart and the default favors catching truncation. The
+  unread `supports_streaming` capability flag (and its admin tile) is
+  gone; the o-series models it described are dropped from the capability
+  table entirely (see Removed).
 
 - **One turn interface for every model call: `core/model_turn.py` (#827).**
   Judges (intent + output guard), perception, title generation, compaction,

@@ -222,7 +222,7 @@ class FakeAnthropicBlock:
 def fake_anthropic_stream(
     blocks: list[Any],
     *,
-    stop_reason: str = "end_turn",
+    stop_reason: str | None = "end_turn",
     usage: Any = None,
 ) -> Any:
     """Fake Anthropic SDK stream context manager for tests that drive the
@@ -240,6 +240,10 @@ def fake_anthropic_stream(
     ``stop_reason`` (+ optional usage object).  Without the stripping, the
     provider's raw-block accumulator would double every text/thinking
     field (start capture + delta append).
+
+    ``stop_reason=None`` omits the closing ``message_delta`` entirely —
+    the terminal-signal-less lax-gateway shape ``finish_reason_optional``
+    exists for (content arrives, then the stream just ends).
     """
     events: list[Any] = []
     for idx, block in enumerate(blocks):
@@ -295,11 +299,12 @@ def fake_anthropic_stream(
                 )
             )
         events.append(SimpleNamespace(type="content_block_stop", index=idx))
-    events.append(
-        SimpleNamespace(
-            type="message_delta", usage=usage, delta=SimpleNamespace(stop_reason=stop_reason)
+    if stop_reason is not None or usage is not None:
+        events.append(
+            SimpleNamespace(
+                type="message_delta", usage=usage, delta=SimpleNamespace(stop_reason=stop_reason)
+            )
         )
-    )
 
     mgr = MagicMock()
     mgr.__enter__ = MagicMock(return_value=events)

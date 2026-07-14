@@ -31,6 +31,8 @@ Contract, held deliberately narrow:
 
 from __future__ import annotations
 
+import random
+import time
 import uuid
 from dataclasses import dataclass, fields, replace
 from typing import TYPE_CHECKING, Any
@@ -65,6 +67,13 @@ log = get_logger(__name__)
 # retry (openai/anthropic default ``max_retries=2``) that covered the
 # whole body read on the retired non-streaming transport.
 _DRAIN_RETRIES = 2
+# Base for the exponential inter-attempt delay (0.5s → 1s, ±50% jitter) —
+# the SDK retry's pacing, minus Retry-After (an in-band stream failure
+# carries no header to honor).  An instant re-issue is guaranteed to
+# re-hit a still-active rate limit or overload, and at fleet scale
+# synchronized re-issues amplify the very condition being retried
+# through.  Module-level so tests can zero it.
+_DRAIN_RETRY_BASE_DELAY = 0.5
 
 # Block types that carry model reasoning natively.  Anthropic emits
 # ``thinking``/``redacted_thinking`` blocks, OpenAI Responses emits
@@ -750,12 +759,16 @@ def model_turn(
                 or type(exc).__name__ not in lane.provider.retryable_error_names
             ):
                 raise
+            delay = _DRAIN_RETRY_BASE_DELAY * (2 ** (attempt - 1)) * (0.5 + random.random())
             log.warning(
                 "model_turn.drain_retry",
                 error_type=type(exc).__name__,
                 attempt=attempt,
                 model=lane.model,
+                retry_in=round(delay, 2),
             )
+            if delay > 0:
+                time.sleep(delay)
 
     raw_calls: list[dict[str, Any]] = list(result.tool_calls or [])
     # Record blanks BEFORE the uuid back-fill: a back-filled id exists only

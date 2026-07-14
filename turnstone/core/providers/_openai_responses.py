@@ -570,17 +570,35 @@ class OpenAIResponsesProvider:
         stream = client.responses.create(**kwargs)
         if cancel_ref is not None:
             cancel_ref.append(stream)
-        return self._iter_stream(stream)
+        caps = capabilities or self.get_capabilities(model)
+        return self._iter_stream(stream, finish_reason_optional=caps.finish_reason_optional)
 
-    def _iter_stream(self, stream: Any) -> Iterator[StreamChunk]:
-        """Convert Responses API stream events to StreamChunks."""
+    def _iter_stream(
+        self, stream: Any, *, finish_reason_optional: bool = False
+    ) -> Iterator[StreamChunk]:
+        """Convert Responses API stream events to StreamChunks.
+
+        *finish_reason_optional* is the model capability of the same name:
+        a lax Responses-compatible server that ends the stream without any
+        terminal event (``response.completed`` / ``response.incomplete``)
+        gets the end-of-generator shim below — the retired non-streaming
+        path needed no terminal event either.
+        """
         first = True
         content_len = 0
+        reasoning_len = 0
         tool_call_count = 0
         last_finish: str | None = None
         completion_tokens: int | None = None
-        # Track tool call indices by call_id for consistent ToolCallDelta.index
+        # Track tool call indices by item_id for consistent ToolCallDelta.index.
+        # ``next_tool_idx`` mints slots (NOT len(dict): duplicate/empty item
+        # ids overwrite their mapping and would collide later slots);
+        # ``last_tool_idx`` routes argument deltas whose item_id was never
+        # announced — a lax server's deltas belong to the call most recently
+        # opened, not hardwired slot 0.
         tool_call_indices: dict[str, int] = {}
+        next_tool_idx = 0
+        last_tool_idx = 0
         # Collect output items for provider_blocks
         provider_blocks: list[dict[str, Any]] = []
         # Collect annotations across text parts
@@ -609,6 +627,7 @@ class OpenAIResponsesProvider:
                 delta_text = getattr(event, "delta", "")
                 if delta_text:
                     sc = StreamChunk(reasoning_delta=delta_text)
+                    reasoning_len += len(delta_text)
                     if first:
                         sc.is_first = True
                         first = False
@@ -637,7 +656,9 @@ class OpenAIResponsesProvider:
                     call_id = getattr(item, "call_id", "")
                     item_id = getattr(item, "id", "")
                     name = getattr(item, "name", "")
-                    idx = len(tool_call_indices)
+                    idx = next_tool_idx
+                    next_tool_idx += 1
+                    last_tool_idx = idx
                     # Index by item_id — argument deltas reference this, not call_id
                     tool_call_indices[item_id] = idx
                     sc = StreamChunk(
@@ -655,7 +676,7 @@ class OpenAIResponsesProvider:
                 item_id = getattr(event, "item_id", "")
                 delta_args = getattr(event, "delta", "")
                 if delta_args:
-                    idx = tool_call_indices.get(item_id, 0)
+                    idx = tool_call_indices.get(item_id, last_tool_idx)
                     yield StreamChunk(
                         tool_call_deltas=[ToolCallDelta(index=idx, arguments_delta=delta_args)]
                     )
@@ -736,8 +757,19 @@ class OpenAIResponsesProvider:
             # The SDK YIELDS `error` SSE events rather than raising, and no
             # response.failed necessarily follows — without this branch the
             # stream exhausts finish-less and the real API message is lost
-            # behind a misleading IncompleteStreamError.
+            # behind a misleading IncompleteStreamError.  AFTER a terminal
+            # event the generation is complete and in hand: a trailing
+            # error frame is teardown noise, and raising would discard the
+            # finished result (the in-band twin of the post-finish
+            # transport-blip tolerance ``drain_stream`` grants).
             if event_type == "error":
+                if last_finish is not None:
+                    log.warning(
+                        "openai.responses.post_terminal_error",
+                        code=getattr(event, "code", "") or "",
+                        message=getattr(event, "message", "") or "",
+                    )
+                    break
                 _raise_responses_failure(
                     getattr(event, "code", "") or "",
                     getattr(event, "message", "Unknown error") or "Unknown error",
@@ -747,16 +779,45 @@ class OpenAIResponsesProvider:
             if event_type == "response.failed":
                 response = getattr(event, "response", None)
                 error = getattr(response, "error", None) if response else None
+                if last_finish is not None:
+                    log.warning(
+                        "openai.responses.post_terminal_error",
+                        code=(getattr(error, "code", "") if error else "") or "",
+                        message=(getattr(error, "message", "") if error else "") or "",
+                    )
+                    break
                 _raise_responses_failure(
                     (getattr(error, "code", "") if error else "") or "",
                     (getattr(error, "message", "") if error else "") or "Unknown error",
                 )
+
+        # Terminal-event-less lax-server tolerance, armed ONLY by the
+        # operator-declared ``finish_reason_optional`` capability: a
+        # stream that ended cleanly after delivering output but never sent
+        # ``response.completed``/``response.incomplete`` is a completed
+        # generation on such a server (the retired non-streaming path
+        # needed no terminal event).  The ``.done``-collected blocks ride
+        # the shimmed finish chunk, exactly as they would the terminal
+        # handler's.  Everywhere else the drain's complete-or-error gate
+        # raises — a missing terminal on an event-disciplined server means
+        # the generation died mid-response.
+        if (
+            finish_reason_optional
+            and last_finish is None
+            and (content_len or reasoning_len or tool_call_count)
+        ):
+            last_finish = "stop"
+            sc = StreamChunk(finish_reason="stop")
+            if provider_blocks:
+                sc.provider_blocks = provider_blocks
+            yield sc
 
         log.debug(
             "openai.responses.response",
             stream=True,
             finish_reason=last_finish,
             content_length=content_len,
+            reasoning_length=reasoning_len,
             tool_call_count=tool_call_count,
             completion_tokens=completion_tokens,
         )

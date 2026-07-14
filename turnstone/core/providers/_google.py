@@ -68,9 +68,12 @@ _GOOGLE_DEFAULT = ModelCapabilities(
 class GoogleProvider(OpenAIChatCompletionsProvider):
     """Provider for Google models using the OpenAI-compatible endpoint.
 
-    Overrides message preparation and tool-call extraction to preserve
-    Gemini-specific fields (``thought_signature``) through the round-trip
-    via the ``provider_blocks`` / ``_provider_content`` fidelity lane.
+    Overrides message preparation (``_prepare_messages`` reconstructs the
+    raw tool calls from ``_provider_content``) and registers an
+    ``on_tool_call_delta`` capture with the base stream iterator to
+    preserve Gemini-specific fields (``thought_signature``) through the
+    round-trip via the ``provider_blocks`` / ``_provider_content``
+    fidelity lane.
     """
 
     @property
@@ -139,7 +142,7 @@ class GoogleProvider(OpenAIChatCompletionsProvider):
         stream: Any,
         *,
         finish_reason_optional: bool = False,
-        on_tool_call_delta: Callable[[int, Any], None] | None = None,
+        on_tool_call_delta: Callable[[ToolCallDelta, Any], None] | None = None,
     ) -> Iterator[StreamChunk]:
         """Wrap the base iterator to capture raw tool-call metadata.
 
@@ -161,25 +164,19 @@ class GoogleProvider(OpenAIChatCompletionsProvider):
         """
         raw_tool_calls: dict[int, dict[str, Any]] = {}
 
-        def _capture(slot: int, tc_delta: Any) -> None:
-            fn = tc_delta.function
-            raw_tc = accumulate_tool_call_delta(
-                raw_tool_calls,
-                ToolCallDelta(
-                    index=slot,
-                    id=tc_delta.id or "",
-                    name=(fn.name if fn else None) or "",
-                    arguments_delta=(fn.arguments if fn else None) or "",
-                ),
-            )
+        def _capture(tcd: ToolCallDelta, raw_delta: Any) -> None:
+            # The normalized delta carries the base's slot AND its
+            # id/name/arguments extraction verbatim — the raw lane
+            # accumulates the exact bytes the mirror sees.
+            raw_tc = accumulate_tool_call_delta(raw_tool_calls, tcd)
             # Capture provider-specific extras (e.g. thought_signature)
-            extras = getattr(tc_delta, "__pydantic_extra__", None)
+            extras = getattr(raw_delta, "__pydantic_extra__", None)
             if extras:
                 for k, v in extras.items():
                     if k not in ("index", "id", "type", "function"):
                         raw_tc.setdefault(k, v)
             if on_tool_call_delta is not None:
-                on_tool_call_delta(slot, tc_delta)
+                on_tool_call_delta(tcd, raw_delta)
 
         # Delegate all chunk processing to the base class
         for sc in super()._iter_stream(

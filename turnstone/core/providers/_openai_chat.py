@@ -114,25 +114,35 @@ class ToolCallSlotter:
     - A delta whose id CONTRADICTS the slot's id is a new call; a delta
       whose id MATCHES is the same call, however many times the server
       repeats the name header per fragment.  Ids are authoritative both
-      ways.
-    - An id-less delta with NO name is always an arguments continuation.
-    - An id-less delta announcing a DIFFERENT name than the slot's is a
-      new call (two functions cannot be one call).
-    - An id-less re-announcement of the SAME name splits only when the
-      slot's accumulated arguments are syntactically complete JSON (the
-      previous call is over — this starts the next parallel call).
-      Mid-JSON, the name is a redundant per-fragment header and the
-      delta merges.  With NO arguments accumulated yet: a re-announce
-      that itself carries arguments merges (name-first emission, the
-      arguments are starting now); a bare re-announce splits (the
+      ways — and a slot whose id is KNOWN never splits on an id-less
+      delta at all: on an id-disciplined server new calls arrive with
+      ids, so an id-less fragment (the call's first name announcement,
+      an argument fragment, a redundant header) is always a
+      continuation.  All heuristics below apply only to fully id-less
+      slots.
+    - A delta with NO name is always an arguments continuation.
+    - A name arriving for a slot that has NO name yet is the call's
+      FIRST announcement (e.g. the slot was opened by an args-only
+      delta), never a new call.
+    - A delta announcing a DIFFERENT name than the slot's is a new call
+      (two functions cannot be one call).
+    - A re-announcement of the SAME name splits only when the slot's
+      accumulated arguments are syntactically complete JSON AND the
+      delta itself carries arguments (the next parallel call arriving
+      with its payload).  Mid-JSON, or as a bare trailing delta after
+      complete arguments, the name is a redundant per-fragment header /
+      footer and the delta merges.  With NO arguments accumulated yet:
+      a re-announce that carries arguments merges (name-first emission,
+      the arguments are starting now); a bare re-announce splits (the
       id-less whole-delta shape — two zero-argument parallel calls).
 
     Residual ambiguity, resolved toward the shapes observed in the wild:
     a same-name re-announce on an empty slot that carries arguments is
     read as one call (not a zero-arg call followed by an arg-ful twin),
-    and a trailing bare same-name re-announce after complete arguments
-    is read as a second zero-arg call (not a redundant footer).  Only
-    ids disambiguate those; servers that omit them choose the bet.
+    and a bare same-name re-announce after complete arguments is read
+    as a redundant footer (not a second zero-arg call of the same
+    function).  Only ids disambiguate those; servers that omit them
+    choose the bet.
     """
 
     def __init__(self) -> None:
@@ -152,7 +162,10 @@ class ToolCallSlotter:
             self._slot_ids[slot] = tc_id
         if name:
             self._slot_names[slot] = name
-        if args:
+        # JSON-completeness state is consulted only for fully id-less
+        # slots (``_is_new_call`` short-circuits on a known id), so id'd
+        # slots — the dominant case — skip the per-character scan.
+        if args and slot not in self._slot_ids:
             self._slot_args.setdefault(slot, _ArgsScanner()).feed(args)
         return slot
 
@@ -160,14 +173,28 @@ class ToolCallSlotter:
         slot_id = self._slot_ids.get(slot, "")
         if tc_id:
             return bool(slot_id) and tc_id != slot_id
+        if slot_id:
+            # Id-disciplined slot: new calls on this server arrive with
+            # ids (the id-conflict rule above), so an id-less delta —
+            # the call's first name fragment, an argument fragment, a
+            # redundant header — is always a continuation.
+            return False
         if not name:
             return False
         slot_name = self._slot_names.get(slot, "")
-        if slot_name and name != slot_name:
+        if not slot_name:
+            # First name announcement for a slot opened by an args-only
+            # delta — naming the call, not starting a new one.
+            return False
+        if name != slot_name:
             return True
         scanner = self._slot_args.get(slot)
         if scanner is not None:
-            return scanner.complete
+            # Complete arguments end the call — but only a re-announce
+            # that itself CARRIES arguments starts the next one; a bare
+            # same-name delta after complete arguments is a redundant
+            # footer.
+            return scanner.complete and bool(args)
         return not args
 
 
@@ -315,18 +342,20 @@ class OpenAIChatCompletionsProvider:
         stream: Any,
         *,
         finish_reason_optional: bool = False,
-        on_tool_call_delta: Callable[[int, Any], None] | None = None,
+        on_tool_call_delta: Callable[[ToolCallDelta, Any], None] | None = None,
     ) -> Iterator[StreamChunk]:
         """Convert OpenAI Chat Completions stream chunks to StreamChunks.
 
         *finish_reason_optional* is the model capability of the same name:
         it arms the lax-server finish shim at the end of this generator.
 
-        *on_tool_call_delta* is called with ``(slot, raw_sdk_delta)`` for
-        every tool-call delta, AFTER slot assignment — the seam a subclass
-        uses to capture provider extras (``GoogleProvider``'s
-        ``thought_signature``) keyed by the SAME slot the normalized
-        mirror uses, so the raw and mirror lanes cannot desync.
+        *on_tool_call_delta* is called with ``(normalized, raw_sdk_delta)``
+        for every tool-call delta — the normalized ``ToolCallDelta``
+        carries the slot the base's slotter assigned AND the base's
+        id/name/arguments extraction, so a subclass capturing provider
+        extras (``GoogleProvider``'s ``thought_signature``) accumulates
+        the exact bytes the ``tool_calls`` mirror sees and cannot desync
+        from it on either axis.
         """
         first = True
         annotations: list[Any] = []
@@ -379,8 +408,6 @@ class OpenAIChatCompletionsProvider:
                     name = (fn.name if fn else None) or ""
                     args = (fn.arguments if fn else None) or ""
                     slot = slotter.slot_for(tc_delta.index, tc_id, name, args)
-                    if on_tool_call_delta is not None:
-                        on_tool_call_delta(slot, tc_delta)
                     tcd = ToolCallDelta(index=slot)
                     if tc_id:
                         tcd.id = tc_id
@@ -388,6 +415,8 @@ class OpenAIChatCompletionsProvider:
                         tcd.name = name
                     if args:
                         tcd.arguments_delta = args
+                    if on_tool_call_delta is not None:
+                        on_tool_call_delta(tcd, tc_delta)
                     sc.tool_call_deltas.append(tcd)
                     tool_call_count += 1
 

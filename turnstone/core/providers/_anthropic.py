@@ -903,20 +903,35 @@ class AnthropicProvider:
             raise
         if cancel_ref is not None:
             cancel_ref.append(stream)
-        return self._iter_with_cleanup(stream, manager)
+        return self._iter_with_cleanup(
+            stream, manager, finish_reason_optional=caps.finish_reason_optional
+        )
 
-    def _iter_with_cleanup(self, stream: Any, manager: Any) -> Iterator[StreamChunk]:
+    def _iter_with_cleanup(
+        self, stream: Any, manager: Any, *, finish_reason_optional: bool = False
+    ) -> Iterator[StreamChunk]:
         """Iterate the Anthropic stream, ensuring the context manager exits."""
         try:
-            yield from self._iter_anthropic_stream(stream)
+            yield from self._iter_anthropic_stream(
+                stream, finish_reason_optional=finish_reason_optional
+            )
         except BaseException:
             manager.__exit__(*sys.exc_info())
             raise
         else:
             manager.__exit__(None, None, None)
 
-    def _iter_anthropic_stream(self, stream: Any) -> Iterator[StreamChunk]:
-        """Convert Anthropic streaming events to normalized StreamChunks."""
+    def _iter_anthropic_stream(
+        self, stream: Any, *, finish_reason_optional: bool = False
+    ) -> Iterator[StreamChunk]:
+        """Convert Anthropic streaming events to normalized StreamChunks.
+
+        *finish_reason_optional* is the model capability of the same name:
+        a lax anthropic-compatible gateway that ends the stream without
+        EITHER terminal signal (no ``message_delta`` stop_reason, no
+        ``message_stop``) gets the end-of-generator shim below — the
+        retired non-streaming path's absent-stop_reason tolerance.
+        """
         first = True
         # Map content block index → tool call index for our accumulator
         tool_block_to_index: dict[int, int] = {}
@@ -927,6 +942,7 @@ class AnthropicProvider:
         raw_blocks: dict[int, dict[str, Any]] = {}
         saw_text_block = False
         emitted_finish = False
+        delivered_output = False
 
         for event in stream:
             sc = StreamChunk()
@@ -1079,6 +1095,7 @@ class AnthropicProvider:
                 # whose content actually arrived intact.
                 if not emitted_finish:
                     sc.finish_reason = "stop"
+                    emitted_finish = True
                     if raw_blocks:
                         sc.provider_blocks = [raw_blocks[i] for i in sorted(raw_blocks)]
 
@@ -1098,29 +1115,51 @@ class AnthropicProvider:
                     )
 
             has_content = sc.content_delta or sc.reasoning_delta or sc.tool_call_deltas
-            if has_content and first:
-                sc.is_first = True
-                first = False
+            if has_content:
+                delivered_output = True
+                if first:
+                    sc.is_first = True
+                    first = False
 
             if has_content or sc.finish_reason or sc.usage or sc.info_delta:
                 yield sc
 
+        # Terminal-signal-less lax-gateway tolerance, armed ONLY by the
+        # operator-declared ``finish_reason_optional`` capability: a
+        # stream that ended cleanly after delivering output but carried
+        # NEITHER terminal signal (no message_delta stop_reason, no
+        # message_stop — an anthropic-compatible proxy shape; the real
+        # API always sends both) is a completed generation.  Everywhere
+        # else the drain's complete-or-error gate raises, because a
+        # missing message_stop on a signal-disciplined server means the
+        # generation died mid-response.
+        if finish_reason_optional and not emitted_finish and delivered_output:
+            sc = StreamChunk(finish_reason="stop")
+            if raw_blocks:
+                sc.provider_blocks = [raw_blocks[i] for i in sorted(raw_blocks)]
+            yield sc
+
     # -- retryable errors ----------------------------------------------------
+
+    # Computed once at class creation — the retry predicate consults this
+    # per error, and a per-access literal allocates a fresh frozenset each
+    # time.
+    _RETRYABLE_ERROR_NAMES: frozenset[str] = frozenset(
+        {
+            "RateLimitError",
+            "APITimeoutError",
+            "APIConnectionError",
+            "InternalServerError",
+            "APIError",
+            "OverloadedError",
+            # Transport-level: drained stream ended without a stop reason.
+            "IncompleteStreamError",
+        }
+    )
 
     @property
     def retryable_error_names(self) -> frozenset[str]:
-        return frozenset(
-            {
-                "RateLimitError",
-                "APITimeoutError",
-                "APIConnectionError",
-                "InternalServerError",
-                "APIError",
-                "OverloadedError",
-                # Transport-level: drained stream ended without a stop reason.
-                "IncompleteStreamError",
-            }
-        )
+        return self._RETRYABLE_ERROR_NAMES
 
     # -- reasoning extraction ------------------------------------------------
 

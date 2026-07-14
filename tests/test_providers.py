@@ -967,6 +967,49 @@ class TestOpenAIProvider:
         assert [tc["function"]["name"] for tc in result.tool_calls] == ["refresh_state", "read"]
         assert result.tool_calls[1]["function"]["arguments"] == '{"p": "x"}'
 
+    def test_id_first_fragmented_call_stays_one_call(self) -> None:
+        # id → name → args across three fragments (the later two id-less):
+        # a slot with a KNOWN id never splits on id-less continuations —
+        # the call's first name fragment is not a re-announcement (round-7
+        # regression: it split into an unnamed id-bearing call plus a
+        # nameless-id twin).
+        result = self._drain_chunks(
+            [
+                _openai_stream_chunk(tool_calls=[_openai_tool_call_delta(index=0, tc_id="call_1")]),
+                _openai_stream_chunk(
+                    tool_calls=[_openai_tool_call_delta(index=0, name="get_weather")]
+                ),
+                _openai_stream_chunk(
+                    tool_calls=[_openai_tool_call_delta(index=0, arguments='{"city": "x"}')]
+                ),
+                _openai_stream_chunk(finish_reason="tool_calls"),
+            ]
+        )
+        assert len(result.tool_calls) == 1
+        assert result.tool_calls[0]["id"] == "call_1"
+        assert result.tool_calls[0]["function"]["name"] == "get_weather"
+        assert result.tool_calls[0]["function"]["arguments"] == '{"city": "x"}'
+
+    def test_idless_bare_name_footer_after_complete_args_merges(self) -> None:
+        # A bare same-name delta after the argument JSON closed is a
+        # redundant footer, not a second zero-argument call — splitting
+        # would run the side-effecting tool twice.
+        result = self._drain_chunks(
+            [
+                _openai_stream_chunk(
+                    tool_calls=[
+                        _openai_tool_call_delta(index=0, name="write_file", arguments='{"x": 1}')
+                    ]
+                ),
+                _openai_stream_chunk(
+                    tool_calls=[_openai_tool_call_delta(index=0, name="write_file")]
+                ),
+                _openai_stream_chunk(finish_reason="tool_calls"),
+            ]
+        )
+        assert len(result.tool_calls) == 1
+        assert result.tool_calls[0]["function"]["arguments"] == '{"x": 1}'
+
     def test_idless_name_first_then_args_with_repeated_name_merges(self) -> None:
         # Name announced first (no arguments), then arguments arrive
         # carrying the SAME name again: one call whose arguments are
@@ -1328,6 +1371,51 @@ class TestAnthropicProvider:
         assert result.content == "Hello world"
         assert result.tool_calls is None
         assert result.finish_reason == "stop"
+
+    @patch("turnstone.core.providers._anthropic._ensure_anthropic")
+    def test_terminal_signal_less_stream_raises_by_default(self, mock_ensure: MagicMock) -> None:
+        # No message_delta stop_reason and no message_stop: on a
+        # signal-disciplined server (the real API always sends both) this
+        # is a generation that died mid-response — the drain refuses to
+        # bless possibly-truncated content.
+        from turnstone.core.providers import IncompleteStreamError
+
+        client = MagicMock()
+        client.messages.stream.return_value = fake_anthropic_stream(
+            [SimpleNamespace(type="text", text="full answer")], stop_reason=None
+        )
+        with pytest.raises(IncompleteStreamError):
+            drain_stream(
+                self.provider.create_streaming(
+                    client=client,
+                    model="claude-sonnet-4-20250514",
+                    messages=[{"role": "user", "content": "hi"}],
+                )
+            )
+
+    @patch("turnstone.core.providers._anthropic._ensure_anthropic")
+    def test_terminal_signal_less_stream_completes_with_declared_tolerance(
+        self, mock_ensure: MagicMock
+    ) -> None:
+        # ``finish_reason_optional`` (operator-declared: this gateway never
+        # sends terminal signals) restores the retired non-streaming
+        # path's absent-stop_reason tolerance — the raw blocks ride the
+        # shimmed finish chunk.
+        client = MagicMock()
+        client.messages.stream.return_value = fake_anthropic_stream(
+            [SimpleNamespace(type="text", text="full answer")], stop_reason=None
+        )
+        result = drain_stream(
+            self.provider.create_streaming(
+                client=client,
+                model="claude-sonnet-4-20250514",
+                messages=[{"role": "user", "content": "hi"}],
+                capabilities=ModelCapabilities(finish_reason_optional=True),
+            )
+        )
+        assert result.content == "full answer"
+        assert result.finish_reason == "stop"
+        assert result.provider_blocks
 
     @patch("turnstone.core.providers._anthropic._ensure_anthropic")
     def test_drained_stream_with_tool_use(self, mock_ensure: MagicMock) -> None:
@@ -5472,12 +5560,15 @@ class TestResponsesDrainedStream:
         )
         return events
 
-    def _drain(self, events: list[Any]):
+    def _drain(self, events: list[Any], capabilities: ModelCapabilities | None = None):
         client = MagicMock()
         client.responses.create.return_value = events
         return drain_stream(
             self.provider.create_streaming(
-                client=client, model="gpt-5.1", messages=[{"role": "user", "content": "hi"}]
+                client=client,
+                model="gpt-5.1",
+                messages=[{"role": "user", "content": "hi"}],
+                capabilities=capabilities,
             )
         )
 
@@ -5511,6 +5602,115 @@ class TestResponsesDrainedStream:
         assert result.finish_reason == "length"
         assert result.usage is not None
         assert result.provider_blocks
+
+    def test_terminal_event_less_stream_raises_by_default(self) -> None:
+        # No response.completed/incomplete ever arrived: on an
+        # event-disciplined server this is a generation that died
+        # mid-response — the drain refuses to bless possibly-truncated
+        # content.
+        from turnstone.core.providers import IncompleteStreamError
+
+        events = self._make_events(text="Hello")[:-1]  # drop the terminal event
+        with pytest.raises(IncompleteStreamError):
+            self._drain(events)
+
+    def test_terminal_event_less_stream_completes_with_declared_tolerance(self) -> None:
+        # ``finish_reason_optional`` (operator-declared: this server never
+        # sends terminal events) completes the clean output-bearing end —
+        # the .done-collected blocks ride the shimmed finish chunk.
+        events = self._make_events(text="Hello")[:-1]
+        result = self._drain(events, capabilities=ModelCapabilities(finish_reason_optional=True))
+        assert result.content == "Hello"
+        assert result.finish_reason == "stop"
+        assert result.provider_blocks
+
+    def test_post_terminal_error_event_keeps_completed_result(self) -> None:
+        # A trailing in-band error frame after response.completed is
+        # teardown noise — raising would discard a generation already in
+        # hand (the in-band twin of drain_stream's post-finish
+        # transport-blip tolerance).
+        events = self._make_events(text="Hello")
+        events.append(SimpleNamespace(type="error", code="server_error", message="boom"))
+        result = self._drain(events)
+        assert result.content == "Hello"
+        assert result.finish_reason == "stop"
+
+    def test_post_terminal_failed_event_keeps_completed_result(self) -> None:
+        events = self._make_events(text="Hello")
+        events.append(
+            SimpleNamespace(
+                type="response.failed",
+                response=SimpleNamespace(
+                    error=SimpleNamespace(code="server_error", message="boom")
+                ),
+            )
+        )
+        result = self._drain(events)
+        assert result.content == "Hello"
+        assert result.finish_reason == "stop"
+
+    def test_orphan_argument_deltas_route_to_last_announced_call(self) -> None:
+        # A lax server whose argument deltas reference an item_id that was
+        # never announced: they belong to the call most recently opened,
+        # not hardwired slot 0.
+        item_a = SimpleNamespace(type="function_call", call_id="call_a", id="item_a", name="alpha")
+        item_a.model_dump = lambda **_kw: {  # type: ignore[method-assign]
+            "type": "function_call",
+            "call_id": "call_a",
+            "name": "alpha",
+        }
+        item_b = SimpleNamespace(type="function_call", call_id="call_b", id="item_b", name="beta")
+        item_b.model_dump = lambda **_kw: {  # type: ignore[method-assign]
+            "type": "function_call",
+            "call_id": "call_b",
+            "name": "beta",
+        }
+        events = [
+            SimpleNamespace(type="response.output_item.added", item=item_a),
+            SimpleNamespace(type="response.output_item.added", item=item_b),
+            SimpleNamespace(
+                type="response.function_call_arguments.delta",
+                item_id="bogus",
+                delta='{"x": 1}',
+            ),
+            SimpleNamespace(
+                type="response.completed",
+                response=SimpleNamespace(status="completed", usage=None),
+            ),
+        ]
+        result = self._drain(events)
+        assert result.tool_calls is not None
+        by_name = {tc["function"]["name"]: tc["function"]["arguments"] for tc in result.tool_calls}
+        assert by_name["beta"] == '{"x": 1}'
+        assert by_name["alpha"] == ""
+
+    def test_duplicate_item_ids_keep_distinct_slots(self) -> None:
+        # Slot numbering must survive duplicate/empty item ids: len(dict)
+        # numbering collided the third call onto the second's slot once an
+        # overwrite kept the dict size flat.
+        def _item(call_id: str, item_id: str, name: str) -> SimpleNamespace:
+            item = SimpleNamespace(type="function_call", call_id=call_id, id=item_id, name=name)
+            item.model_dump = lambda **_kw: {  # type: ignore[method-assign]
+                "type": "function_call",
+                "call_id": call_id,
+                "name": name,
+            }
+            return item
+
+        events = [
+            SimpleNamespace(type="response.output_item.added", item=_item("call_a", "", "alpha")),
+            SimpleNamespace(type="response.output_item.added", item=_item("call_b", "", "beta")),
+            SimpleNamespace(
+                type="response.output_item.added", item=_item("call_c", "item_c", "gamma")
+            ),
+            SimpleNamespace(
+                type="response.completed",
+                response=SimpleNamespace(status="completed", usage=None),
+            ),
+        ]
+        result = self._drain(events)
+        assert result.tool_calls is not None
+        assert [tc["function"]["name"] for tc in result.tool_calls] == ["alpha", "beta", "gamma"]
 
     def test_completed_terminal_keeps_done_items_without_rebuild(self) -> None:
         # Happy path: every item got its ``output_item.done`` and the
