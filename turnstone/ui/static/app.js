@@ -526,9 +526,15 @@ function _populateProjectSelect(sel) {
   if (!sel || !window.TurnstoneProjects) return;
   _ensureStandaloneProjectCreator(sel);
   const previous = sel.value;
+  // When the deployment requires a project (server.require_project), drop the
+  // "No project" placeholder so a chat can't be launched unassigned.  The create
+  // endpoint rejects it with 400 regardless — this just avoids the dead option.
+  const requireProject =
+    typeof window.TurnstoneProjects.requireProject === "function" &&
+    window.TurnstoneProjects.requireProject();
   const placeholder = sel.options.length ? sel.options[0] : null;
   sel.replaceChildren();
-  if (placeholder) sel.appendChild(placeholder);
+  if (placeholder && !requireProject) sel.appendChild(placeholder);
   window.TurnstoneProjects.projectChoices().forEach(function (c) {
     const opt = document.createElement("option");
     opt.value = c.value;
@@ -540,6 +546,15 @@ function _populateProjectSelect(sel) {
   newOpt.textContent = "+ New project…";
   sel.appendChild(newOpt);
   if (previous && previous !== _PROJECT_NEW) sel.value = previous;
+  // With the placeholder gone, ensure a real project is selected (not the
+  // "+ New project…" sentinel) so submit carries a project_id.  If the user is
+  // in no project, the value stays empty and the server gate explains why.
+  if (requireProject && (!sel.value || sel.value === _PROJECT_NEW)) {
+    const firstReal = Array.prototype.find.call(sel.options, function (o) {
+      return o.value && o.value !== _PROJECT_NEW;
+    });
+    sel.value = firstReal ? firstReal.value : "";
+  }
 }
 
 function submitNewWs() {
