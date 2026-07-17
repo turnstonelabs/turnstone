@@ -4786,6 +4786,43 @@ class ChatSession:
         self._has_persisted_error = True
         self._emit_state("error")
 
+    def ensure_error_recorded(self, exc: BaseException) -> None:
+        """Idempotently route a fatal exception through :meth:`_record_fatal_error`.
+
+        FRESH-SESSION USE ONLY.  The sole caller is the initial-message worker
+        ``_run_initial`` (server.py), which runs on a factory-fresh session's
+        FIRST send.  The idempotency guard is ``_has_persisted_error``, which is
+        **session-lifetime** — cleared only by an ``idle``/``running`` state
+        emission, NOT per turn — so it distinguishes "send already recorded THIS
+        turn's error" from "not yet recorded" only when no prior turn could have
+        left it set.  On a **reused** session (a ``/retry``, main ``/send``, the
+        coordinator send, a wake) a pre-try raise after a prior errored turn
+        finds the flag stale-True and this no-ops — silently swallowing the fresh
+        error and surfacing the stale ``last_error``.  Those closures therefore
+        must NOT route through here until the per-turn error-recorded signal of
+        #865 lands; see ``_run`` for the deliberate non-use.
+
+        Two cases on the fresh-session path, one primitive:
+
+        * ``send`` already recorded this turn's fatal error in-line — the common
+          backend-boundary path, where its ``except`` arm ran
+          ``_record_fatal_error`` (setting ``_has_persisted_error``) before
+          re-raising.  Then this is a **no-op**: no second ``state=error``
+          emission, avoiding the duplicate ``state_change`` SSE / ``set_state``.
+        * the exception escaped ``send`` BEFORE its ``try`` — a pre-try failure
+          (model-registry refresh, user-turn append, system-message recompose)
+          that bypasses ``_record_fatal_error``.  Then this **records it now**,
+          so ``state==error ⇒ meaningful last_error`` holds on that path too.
+
+        Sanitizing lives inside ``_record_fatal_error``, so a worker closure must
+        route raw exceptions here rather than emitting ``str(exc)`` to a UI sink
+        itself: a credential-bearing ``base_url`` in the exception text would
+        otherwise cross the confidentiality floor into a dashboard SSE.
+        """
+        if self._has_persisted_error:
+            return
+        self._record_fatal_error(exc)
+
     def _format_backend_error(self, exc: BaseException) -> str | None:
         """Return an enriched message for known backend boundary errors.
 
@@ -4808,10 +4845,22 @@ class ChatSession:
         base URL are redacted before display / persist.
         """
         # Backend identity shared by every branch — model label + raw tail.
-        # Hoisted so the context-overflow branch and the class-name branches use
-        # one derivation.  self.model/_model_alias are plain __init__ attributes
+        # The model references models by ALIAS everywhere it acts (list_nodes
+        # advertises aliases, spawn takes an alias as model=), so lead with the
+        # alias here too: a coordinator reading this error can correlate the
+        # failed model with those surfaces without a lookup and route around it
+        # (respawn on another node/alias) instead of burning reasoning tokens
+        # reconciling the alias against a backend id it never sees elsewhere.
+        # The backend id (what the server was actually asked for) rides as a
+        # labeled annotation for the operator, collapsing to one token when the
+        # two coincide.  self.model/_model_alias are plain __init__ attributes
         # (always set), so reading them here can't raise on the fatal path.
-        model_label = self.model or self._model_alias or "?"
+        alias = self._model_alias or ""
+        backend_id = self.model or ""
+        if alias and backend_id and alias != backend_id:
+            model_label = f"{alias} (id={backend_id})"
+        else:
+            model_label = alias or backend_id or "?"
         raw_msg = str(exc).strip()
         raw_tail = f" raw={raw_msg!r}" if raw_msg else ""
 

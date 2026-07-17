@@ -9,6 +9,7 @@ Exercises:
 
 from __future__ import annotations
 
+import contextlib
 import json
 import queue
 import threading
@@ -16,6 +17,8 @@ import time
 
 import pytest
 from starlette.testclient import TestClient
+
+from tests._helpers import wait_until
 
 # Magic-byte-valid 1x1 PNG (matches the fixture in test_server_attachments_endpoints.py)
 PNG_1x1 = (
@@ -223,6 +226,29 @@ class _FakeSession:
         self._cancel_event = threading.Event()
         self.notify_targets = ""
         self._notify_on_complete = "[]"
+        # Wired by the app_client session factory so the faithful
+        # _record_fatal_error model below can emit through the real UI.
+        self.ui = None
+        self._has_persisted_error = False
+
+    def _record_fatal_error(self, exc):
+        """Faithful model of ChatSession._record_fatal_error: sanitize, emit
+        on_error, persist last_error, set the flag, emit state=error."""
+        from turnstone.core.memory import persist_last_error, sanitize_error_text
+
+        safe = sanitize_error_text(f"{type(exc).__name__}: {exc}")
+        if self.ui is not None:
+            self.ui.on_error(safe)
+        persist_last_error(self.ws_id, safe)
+        self._has_persisted_error = True
+        if self.ui is not None:
+            self.ui.on_state_change("error")
+
+    def ensure_error_recorded(self, exc):
+        """Mirror ChatSession.ensure_error_recorded: idempotent on the flag."""
+        if self._has_persisted_error:
+            return
+        self._record_fatal_error(exc)
 
     def send(self, text, attachments=None, send_id=None):
         with self._lock:
@@ -270,6 +296,10 @@ class _FakeSession:
 
 
 class _FakeUI:
+    # Set by the app_client fixture; mirrors WebUI._workstream_mgr so
+    # on_state_change routes to the real manager the coordinator polls.
+    _workstream_mgr = None
+
     def __init__(self, ws_id="", user_id=""):
         self.ws_id = ws_id
         self._user_id = user_id
@@ -286,6 +316,14 @@ class _FakeUI:
 
     def on_state_change(self, state):
         self.events.append({"type": "state_change", "state": state})
+        # Mirror WebUI.on_state_change's real routing so tests assert the
+        # state the coordinator polls (via the manager), not just the label.
+        mgr = type(self)._workstream_mgr
+        if mgr is not None:
+            from turnstone.core.workstream import WorkstreamState
+
+            with contextlib.suppress(ValueError):
+                mgr.set_state(self.ws_id, WorkstreamState(state))
 
     def on_error(self, msg):
         self.events.append({"type": "error", "message": msg})
@@ -316,6 +354,9 @@ def app_client(tmp_path, monkeypatch):
         # ui instance so the FakeSession's consume step uses the right scope.
         user_id = getattr(ui, "_user_id", "")
         s = _FakeSession(ws_id=ws_id, user_id=user_id)
+        # Hand the fake its UI so the faithful _record_fatal_error model can
+        # emit on_error/on_state_change exactly as the real ChatSession does.
+        s.ui = ui
         fake_sessions.append(s)
         return s
 
@@ -332,6 +373,9 @@ def app_client(tmp_path, monkeypatch):
     mgr = SessionManager(
         adapter, storage=get_storage(), max_active=10, node_id="node-test", event_emitter=adapter
     )
+    # Route _FakeUI.on_state_change through this manager's set_state (mirrors
+    # WebUI._workstream_mgr) so a test can read the coordinator-visible state.
+    monkeypatch.setattr(_FakeUI, "_workstream_mgr", mgr, raising=False)
 
     app = create_app(
         workstreams=mgr,
@@ -637,3 +681,98 @@ class TestCreateJsonStillWorks:
             # dead-by-construction ``enqueue`` branch is still wired (loudly).
             assert callable(kwargs["run"])
             assert callable(kwargs["enqueue"])
+
+
+# ---------------------------------------------------------------------------
+# Initial-message worker failure state
+# ---------------------------------------------------------------------------
+
+
+def _post_init(client, name):
+    """Create a workstream with an initial message and return the response."""
+    body = {"name": name, "initial_message": "go"}
+    return client.post("/v1/api/workstreams/new", json=body, headers=_auth("userA"))
+
+
+class TestInitialWorkerFailureState:
+    """The initial-message worker classifies its first-turn exit the way the
+    send/retry closure does, asserted — once the worker has FULLY finished —
+    against the coordinator-visible manager state (what wait_for_workstream
+    polls), the persisted last_error, and the emitted events, NOT a default
+    label:
+
+    * backend failure → state=error carrying a readable last_error, recorded
+      EXACTLY once (proving ensure_error_recorded's no-op on the common leg);
+    * cancel-to-idle (send self-handles) → no error recorded.
+
+    (The completion-notification honesty surface is deferred to #865.)
+    """
+
+    @pytest.mark.parametrize("pretry", [False, True], ids=["common-backend", "pre-try"])
+    def test_backend_error_settles_error_with_detail(self, app_client, monkeypatch, pretry):
+        from turnstone.core.memory import load_last_error
+        from turnstone.core.workstream import WorkstreamState
+
+        client, sessions, _gq = app_client
+
+        def _boom(self, *_a, **_k):
+            exc = RuntimeError("cannot reach openai-compatible at http://x:8000/v1")
+            # common-backend: send records the fatal error in-line (its own
+            # except arm) before re-raising → _has_persisted_error set → the
+            # closure's ensure_error_recorded is a no-op.  pre-try: send raises
+            # BEFORE it would reach _record_fatal_error, so the closure's
+            # ensure_error_recorded is the ONLY recorder — the finding-[1] path.
+            if not pretry:
+                self._record_fatal_error(exc)
+            raise exc
+
+        monkeypatch.setattr(_FakeSession, "send", _boom)
+        resp = _post_init(client, "dead-backend")
+        assert resp.status_code == 200, resp.text
+        ws_id = resp.json()["ws_id"]
+        mgr = client.app.state.workstreams
+
+        # Wait for the init worker to FULLY finish (_worker_running clears in the
+        # runner's finally) — not for a state, which a fresh ws already holds and
+        # which would race the double-emit count below.
+        wait_until(lambda: (w := mgr.get(ws_id)) is not None and not w._worker_running)
+
+        # Coordinator-visible state (what wait_for_workstream polls) is ERROR,
+        # and the failure DETAIL is readable — on the pre-try leg the proof that
+        # ensure_error_recorded closed [1].
+        assert mgr.get(ws_id).state is WorkstreamState.ERROR
+        assert load_last_error(ws_id)
+        # Recorded EXACTLY once.  On the common-backend leg this is the proof
+        # that ensure_error_recorded no-oped on send's in-line record — a lost
+        # _has_persisted_error guard would emit state=error + on_error twice.
+        events = sessions[0].ui.events
+        assert len([e for e in events if e.get("state") == "error"]) == 1, events
+        assert len([e for e in events if e.get("type") == "error"]) == 1, events
+
+    def test_cancel_settles_idle_no_error(self, app_client, monkeypatch):
+        client, sessions, _gq = app_client
+
+        def _cancel_to_idle(self, *_a, **_k):
+            # Model send's OWN in-turn cancel handling: it emits idle and returns
+            # normally (session.py:6474), never re-raising — the reachable
+            # cancel→idle contract, not the unreachable except-GenerationCancelled
+            # arm.
+            if self.ui is not None:
+                self.ui.on_state_change("idle")
+
+        monkeypatch.setattr(_FakeSession, "send", _cancel_to_idle)
+        resp = _post_init(client, "stopped")
+        assert resp.status_code == 200, resp.text
+        ws_id = resp.json()["ws_id"]
+        mgr = client.app.state.workstreams
+
+        # Positive barrier: wait for the worker to finish, not for a state — a
+        # fresh ws already defaults to IDLE, so a state==IDLE gate would pass
+        # before the worker runs and the assertions below would be vacuous.
+        wait_until(lambda: (w := mgr.get(ws_id)) is not None and not w._worker_running)
+        # A clean return records NO error — neither an error state_change nor an
+        # on_error event ({"type": "error"}, no "state" key).
+        events = sessions[0].ui.events
+        assert events, "init worker never emitted"
+        assert all(e.get("state") != "error" for e in events)
+        assert all(e.get("type") != "error" for e in events)

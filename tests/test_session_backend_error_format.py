@@ -142,6 +142,32 @@ def test_not_found_points_at_model_name_mismatch():
     assert "/v1/models" in msg  # operator hint
 
 
+# ---------------------------------------------------------------------------
+# Model label — lead with the alias the model references, annotate the id
+# ---------------------------------------------------------------------------
+
+
+def test_error_leads_with_alias_and_annotates_backend_id():
+    """When the display alias differs from the backend model id, the enriched
+    error leads with the ALIAS (the identifier the model references everywhere —
+    list_nodes, spawn) and annotates the backend id for the operator, so a
+    coordinator correlates the failure with those surfaces without a lookup."""
+    msg = _format(
+        _stub(model="deepseek-v4-flash", model_alias="DeepSeek-V4-Flash"),
+        APIConnectionError("cannot reach"),
+    )
+    assert msg is not None
+    assert "model=DeepSeek-V4-Flash (id=deepseek-v4-flash)" in msg
+
+
+def test_error_model_label_collapses_when_alias_equals_id():
+    """No redundant (id=...) annotation when the alias and backend id coincide."""
+    msg = _format(_stub(model="flatspark", model_alias="flatspark"), APIConnectionError("x"))
+    assert msg is not None
+    assert "model=flatspark" in msg
+    assert "(id=" not in msg
+
+
 @pytest.mark.parametrize("exc_cls", [AuthenticationError, PermissionDeniedError])
 def test_auth_message_mentions_api_key(exc_cls):
     msg = _format(_stub(), exc_cls("invalid api key"))

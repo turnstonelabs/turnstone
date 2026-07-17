@@ -723,6 +723,15 @@ def _interactive_dispatch_retry(ws: Workstream, user_msg: str) -> None:
                 ui.on_stream_end()
                 ui.on_state_change("idle")
         except Exception as exc:
+            # Deliberately NOT routed through session.ensure_error_recorded: on a
+            # REUSED session a pre-try raise after a prior errored turn finds
+            # _has_persisted_error stale-True (it is session-lifetime — cleared
+            # only by _emit_state idle/running, not per-turn), so the recorder
+            # would no-op and swallow the fresh error.  The raw-exc UI leak, the
+            # double state emit, and the pre-try no-persist (the coordinator can
+            # then read a STALE last_error on a reused-session retry) are known,
+            # match the /send and coord-send sibling closures, and are tracked in
+            # #865's per-turn error-signal redesign.
             if ws.worker_thread is me:
                 ui.on_error(f"Error: {exc}")
                 ui.on_stream_end()
@@ -2504,16 +2513,44 @@ async def _interactive_create_post_install(
                     attachments=resolved_atts or None,
                     send_id=send_id if resolved_atts else None,
                 )
-            except (Exception, GenerationCancelled):
-                # Abandoned-worker guard (sibling of _run_cmd/_run_compact/
-                # the send closures): a force-cancelled init that unwedges
-                # late must not stamp idle over — or emit stream_end into —
-                # a successor turn.
+            except GenerationCancelled:
+                # Defense-in-depth, effectively unreachable on the init path:
+                # send self-handles an in-turn cancel and self-emits idle
+                # (session.py:6474), and an orphaned/superseded cancel returns
+                # WITHOUT re-raising — so this arm carries no direct unit test,
+                # its non-triggering being send's own contract.  Kept for
+                # symmetry with the _run/_run_cmd/_run_compact siblings and to
+                # settle a stray GenerationCancelled to idle rather than leak it.
                 if ws.worker_thread is me and isinstance(ws.ui, WebUI):
                     ws.ui.on_stream_end()
                     ws.ui.on_state_change("idle")
+            except Exception as exc:
+                # A failed first turn settles to state=error, NOT idle.  The old
+                # combined arm stamped idle unconditionally, clobbering the
+                # error row send had just written, so the coord's wait/inspect
+                # (which reads last_error only for state=="error") saw an empty
+                # "successful" turn ("no recent assistant output") and the real
+                # failure stayed invisible until a manual nudge re-ran it.
+                # ensure_error_recorded is a no-op when send already recorded
+                # the error in-line (no double state emit) and the recorder when
+                # a pre-try exception bypassed send's handler (so state=error
+                # always carries a last_error).  Owner-guarded like every
+                # sibling closure: a late-unwedging abandoned init must not stamp
+                # over a successor.
+                #
+                # Settling to error (not idle) is deliberately terminal for
+                # automated wakes: a watch/schedule nudge enqueued during a
+                # failed init is not re-delivered at worker exit
+                # (wake_workstream_if_pending is idle-gated) — a failed first
+                # turn is a non-ready terminal, not the idle ready-set that
+                # timer/watch wakes recur to; explicit user/coordinator action
+                # reactivates it.  A self-healing wake-from-error would be a
+                # separate wake-gate change, out of scope here.
+                if ws.worker_thread is me and isinstance(ws.ui, WebUI):
+                    ws.ui.on_stream_end()
+                    session.ensure_error_recorded(exc)
             finally:
-                # Deliberately NOT owner-gated, unlike the except arm above
+                # Deliberately NOT owner-gated, unlike the except arms above
                 # and the _run_cmd/_run_compact follow-ups: those mutate
                 # live slot/UI state a successor now owns, while the notify
                 # is workstream-scoped — an outward signal that this
@@ -2524,7 +2561,10 @@ async def _interactive_create_post_install(
                 # gate to prevent — gating it turned force-cancel into
                 # permanent notification loss for scheduled/unattended
                 # workstreams (the empty-content fallback covers the
-                # error/cancel exits, as it always did).
+                # error/cancel exits, as it always did).  Outcome-honesty —
+                # a failed or force-cancelled init still notifies the
+                # empty-content "(Task completed)" fallback, not "Failed:" —
+                # is deferred to #865.
                 try:
                     last_content = _extract_last_assistant_content(session)
                     _fire_notify_targets(ws, last_content)
