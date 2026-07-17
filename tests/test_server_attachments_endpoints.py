@@ -105,6 +105,28 @@ def _auth(user: str) -> dict[str, str]:
     return {"Authorization": f"Bearer {_make_jwt(user)}"}
 
 
+def _harden_ws_mock(ws) -> None:
+    """Neutralize every truthy-Mock trap the /send dispatch path reads.
+
+    A bare ``MagicMock()`` auto-creates truthy attributes and callables,
+    which the route misreads: a truthy ``_closed`` makes ``send()``
+    refuse; truthy ``_pending_sends``/``_pending_drain`` (and a truthy
+    ``send_barrier_active()`` result — the route consults the barrier as
+    a METHOD) defer every send behind a phantom order barrier.  Every
+    NEW Workstream field the dispatch path reads gets added HERE, once —
+    not appended to each fixture (missing one copy made that fixture's
+    sends defer/hang with an error pointing nowhere near the cause).
+    Deliberately does NOT set ``_worker_running``: fixtures choose that
+    per scenario (one even relies on the truthy auto-Mock to force the
+    queue path).
+    """
+    ws._closed = False
+    ws._pending_sends = []
+    ws._pending_drain = None
+    ws.send_barrier_active = lambda: False
+    ws._lock = threading.RLock()
+
+
 # ---------------------------------------------------------------------------
 # Upload
 # ---------------------------------------------------------------------------
@@ -503,17 +525,7 @@ class TestSendMessageAttachments:
         ws.session = session
         ws.worker_thread = None
         ws._worker_running = False
-        ws._closed = False  # a bare Mock attr is truthy → send() would refuse
-        # Same truthy-Mock trap as _closed: the /send order barrier reads
-        # both — a bare Mock attr would defer every send behind a phantom
-        # pending list.
-        ws._pending_sends = []
-        ws._pending_drain = None
-        # The /send route consults the order barrier as a METHOD — a bare
-        # Mock attr would be a truthy callable result and defer every send
-        # behind a phantom barrier (same class as the fields above).
-        ws.send_barrier_active = lambda: False
-        ws._lock = threading.RLock()
+        _harden_ws_mock(ws)
         mgr.get.return_value = ws
         return captured, session
 
@@ -711,16 +723,7 @@ class TestQueuedSendWithAttachments:
         ws.session = session
         ws.worker_thread = worker
         ws._worker_running = True
-        ws._closed = False  # a bare Mock attr is truthy → send() would refuse
-        # Same truthy-Mock trap: the /send order barrier reads both — a
-        # bare Mock attr would defer every send behind a phantom list.
-        ws._pending_sends = []
-        ws._pending_drain = None
-        # The /send route consults the order barrier as a METHOD — a bare
-        # Mock attr would be a truthy callable result and defer every send
-        # behind a phantom barrier (same class as the fields above).
-        ws.send_barrier_active = lambda: False
-        ws._lock = threading.RLock()
+        _harden_ws_mock(ws)
         mgr.get.return_value = ws
         return captured
 
@@ -783,16 +786,9 @@ class TestBusyWorkerAttachments:
         ws.ui = ui
         ws.session = session
         ws.worker_thread = worker
-        ws._closed = False  # a bare Mock attr is truthy → send() would refuse
-        # Same truthy-Mock trap: the /send order barrier reads both — a
-        # bare Mock attr would defer every send behind a phantom list.
-        ws._pending_sends = []
-        ws._pending_drain = None
-        # The /send route consults the order barrier as a METHOD — a bare
-        # Mock attr would be a truthy callable result and defer every send
-        # behind a phantom barrier (same class as the fields above).
-        ws.send_barrier_active = lambda: False
-        ws._lock = threading.RLock()
+        # No explicit _worker_running: the truthy auto-Mock forces the
+        # queue path (deliberate — see _harden_ws_mock's exclusion note).
+        _harden_ws_mock(ws)
         mgr.get.return_value = ws
         return ws, session
 

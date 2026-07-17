@@ -4563,7 +4563,7 @@ def create_app(
         magic-mocked ``ws.user_id``."""
         return _require_ws_access(request, ws_id)
 
-    def _interactive_spawn_metrics(_request: Request | None, ui: Any) -> None:
+    def _interactive_spawn_metrics(ui: Any) -> None:
         """Per-conversation metrics fired once per send that spawns a
         fresh worker. Coord wires its own
         :func:`turnstone.console.server._coord_spawn_metrics` (the

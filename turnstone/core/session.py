@@ -204,7 +204,11 @@ from turnstone.core.trajectory import (
 )
 from turnstone.core.watch import WATCH_REMINDER_OPTIONAL_KEYS
 from turnstone.core.web import check_ssrf, fetch_with_ssrf_guard, strip_html
-from turnstone.core.workstream import PENDING_SENDS_MAX, WorkstreamKind
+from turnstone.core.workstream import (
+    INTERJECTION_CAP_CHARS,
+    PENDING_SENDS_MAX,
+    WorkstreamKind,
+)
 from turnstone.prompts import (
     INTERACTIVE_CONSENT_CLIENT_TYPES,
     ClientType,
@@ -9130,9 +9134,11 @@ class ChatSession:
             )
 
         cleaned, priority = parse_priority(text)
-        # Cap individual message length to prevent context bloat
-        if len(cleaned) > 2000:
-            cleaned = cleaned[:2000] + "..."
+        # Cap individual message length to prevent context bloat (the
+        # shared bound — the /send defer-fidelity check refuses fold-ins
+        # that could hit this truncation).
+        if len(cleaned) > INTERJECTION_CAP_CHARS:
+            cleaned = cleaned[:INTERJECTION_CAP_CHARS] + "..."
         # Full UUID hex (128 bits) rather than a truncated prefix — this id is
         # the ``send_id`` tracking token threaded through the turn, so the wide
         # space keeps the birthday bound comfortable.

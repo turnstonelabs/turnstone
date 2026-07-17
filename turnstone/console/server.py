@@ -3895,7 +3895,7 @@ def _audit_coordinator_create(
     )
 
 
-def _coord_spawn_metrics(_request: Request | None, ui: Any) -> None:
+def _coord_spawn_metrics(ui: Any) -> None:
     """Per-spawn counter writes for coord — mirrors interactive's pattern.
 
     Wired onto :attr:`SessionEndpointConfig.spawn_metrics`. Increments

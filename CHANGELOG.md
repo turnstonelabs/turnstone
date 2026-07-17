@@ -128,6 +128,15 @@ Earlier stable lines (`stable/1.6`, `stable/1.5`) are frozen.
 
 ### Changed
 
+- **Breaking (1.8): compaction feedback moved from `info` events to the
+  typed `compaction` SSE event.** Pre-1.8 SSE/SDK clients that ignore
+  unknown event types no longer see compaction lines (they are
+  deliberately not dual-emitted — dual emission would double-render on
+  every current client). Consume the `compaction` lifecycle event (see
+  the API reference and the `CompactionEvent` SDK type); embedders
+  driving `ChatSession` through a duck-typed `SessionUI` are unaffected
+  (the classic `on_info` lines are restored for them — see Fixed).
+
 - **Sampling knobs (temperature, reasoning effort) now ride one assignment
   scheme: per-model alias value → operator-stored global setting → the
   model definition's declared default (effort only) → field omitted.**
@@ -216,8 +225,11 @@ Earlier stable lines (`stable/1.6`, `stable/1.5`) are frozen.
   honored rather than silently eaten; and Stop now aborts the in-flight
   summary HTTP call itself (the compaction lane registers its stream in
   the same abort seam the main loop uses), so cancelling a compaction is
-  immediate instead of waiting out a model call. Messages sent while any
-  slash command holds the worker slot are **deferred**: answered
+  immediate instead of waiting out a model call.
+
+- **Sends during a command window are deferred, ordered, bounded, and
+  honestly rendered — never silently truncated or lost.** Messages sent
+  while any slash command holds the worker slot are **deferred**: answered
   `{"status": "queued", "msg_id"}` immediately and dispatched as ordinary
   full-fidelity sends (attachments and sender identity included) when the
   command finishes — never routed through the mid-turn interjection
@@ -254,7 +266,12 @@ Earlier stable lines (`stable/1.6`, `stable/1.5`) are frozen.
   chip instead of a sent-looking bubble, releases the composer (a
   deferred send has no running worker to wait on), and cleans up fully
   when the send is refused or the chip retracted instead of stranding
-  the pane in Stop mode.
+  the pane in Stop mode. Dismissing a queued bubble — interjection or
+  deferred — is a server-confirmed `DELETE`, and retracting a deferred
+  send that carried attachments tells the user they were discarded
+  instead of silently expiring them.
+
+- **Slash commands hold the worker slot with a loud contract.**
   A `/compact` raced against an in-flight turn is refused with an
   explicit busy response. Every other slash command runs through the same
   worker slot too — mutual exclusion against sends, a running compaction,
@@ -269,7 +286,10 @@ Earlier stable lines (`stable/1.6`, `stable/1.5`) are frozen.
   a proxied pane, which now surfaces it instead of silence; the
   `/command` response contract — `ok` / `running`, with busy refusals
   answering a loud HTTP 409 rather than a silent 200 — is now documented
-  in the API reference and the OpenAPI spec). Manual compaction
+  in the API reference and the OpenAPI spec).
+
+- **Compaction status stays truthful across every UI surface.** Manual
+  compaction
   success also refreshes the status line/context pill immediately (parity
   with auto-compaction), compaction failures keep feeding the typed
   `error` event and the node error counter (while a CLI Ctrl-C reports as
@@ -282,10 +302,9 @@ Earlier stable lines (`stable/1.6`, `stable/1.5`) are frozen.
   retry backoff on the session (stream retries, task agents, notify
   delivery, compaction) now aborts immediately on Stop via one shared
   cancel-aware helper instead of sleeping out its exponential delay.
-  Dismissing a queued bubble — interjection or deferred — is a
-  server-confirmed `DELETE`, and retracting a deferred send that carried
-  attachments tells the user they were discarded instead of silently
-  expiring them. A compaction failure reports
+
+- **Compaction failures report exactly once, to the right owner.** A
+  compaction failure reports
   exactly once (auto-compaction errors defer to the turn's fatal handler
   instead of doubling the red row and the error metric), failed-end
   notice suppression is computed once by the emitter (a `notice` bool on
@@ -299,13 +318,13 @@ Earlier stable lines (`stable/1.6`, `stable/1.5`) are frozen.
   the other post-command pane refreshes and error notices remain
   owner-guarded, so a force-cancelled wedged command that unwedges late
   can't wipe panes or inject stray notices into a successor turn.
-  Embedders driving `ChatSession` with a pre-1.8 duck-typed `SessionUI`
+
+- **Pre-1.8 embedder UIs keep their compaction lines.** Embedders
+  driving `ChatSession` with a pre-1.8 duck-typed `SessionUI`
   (no `on_compaction` hook) get the classic `on_info` compaction lines
   back — threshold notice, `part k/N`, retry waits, token delta +
-  summary box — instead of silent history swaps. **Breaking (1.8):**
-  compaction feedback moved from `info` events to the typed `compaction`
-  SSE event; pre-1.8 SSE/SDK clients that ignore unknown event types no
-  longer see compaction lines (they are deliberately not dual-emitted).
+  summary box — instead of silent history swaps. (See the breaking
+  event-contract note under **Changed** for SSE/SDK clients.)
 
 - **Static MCP servers: a pushed catalog change no longer wedges the shared
   session (#839).** The static-path `*/list_changed` handler awaited its

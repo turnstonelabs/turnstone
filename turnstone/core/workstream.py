@@ -119,6 +119,15 @@ BULK_CLOSE_STATE_VALUES: frozenset[str] = frozenset(
 # turn, so acceptance must be bounded.
 PENDING_SENDS_MAX = 10
 
+# The interjection queue's per-message character cap, shared by its TWO
+# consumers so they cannot drift: ``ChatSession.queue_message`` truncates
+# the cleaned text at this bound, and the /send defer-fidelity check
+# refuses the interjection fold-in for any deferred entry whose text
+# could hit it (routing the entry to a full-fidelity fresh spawn
+# instead).  A drift between those sites is exactly the silent-truncation
+# bug the defer contract exists to prevent.
+INTERJECTION_CAP_CHARS = 2000
+
 
 @dataclass
 class _PendingSend:

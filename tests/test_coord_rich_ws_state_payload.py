@@ -476,7 +476,7 @@ def test_coord_spawn_metrics_increments_messages_and_resets_tool_count() -> None
     ui = ConsoleCoordinatorUI(ws_id="coord-ws", user_id="u1")
     ui._ws_messages = 5
     ui._ws_turn_tool_calls = 3
-    _coord_spawn_metrics(MagicMock(), ui)
+    _coord_spawn_metrics(ui)
     assert ui._ws_messages == 6
     assert ui._ws_turn_tool_calls == 0
 
@@ -489,7 +489,7 @@ def test_coord_spawn_metrics_tolerates_ui_without_counters() -> None:
     class _StubUI:
         pass
 
-    _coord_spawn_metrics(MagicMock(), _StubUI())  # must not raise
+    _coord_spawn_metrics(_StubUI())  # must not raise
 
 
 # ---------------------------------------------------------------------------

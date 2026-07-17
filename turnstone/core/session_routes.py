@@ -40,7 +40,11 @@ from starlette.routing import Route
 
 from turnstone.core.log import get_logger
 from turnstone.core.session_ui_base import AutoApproveReason
-from turnstone.core.workstream import PENDING_SENDS_MAX, _PendingSend
+from turnstone.core.workstream import (
+    INTERJECTION_CAP_CHARS,
+    PENDING_SENDS_MAX,
+    _PendingSend,
+)
 
 if TYPE_CHECKING:
     import threading
@@ -104,12 +108,12 @@ AttachmentOwnerResolver = Callable[
     ["Request", str, "SessionManager"],
     tuple[str, "JSONResponse | None"],
 ]
-# (request, ui) — kind's spawn-time bookkeeping. Interactive bumps
+# (ui) — kind's spawn-time bookkeeping. Interactive bumps
 # ``_metrics.record_message_sent`` + per-UI message counters; coord
-# has no analog and wires ``None``.  The request is ``None`` when the
-# pending-send drain dispatches a deferred entry (no live request
-# exists by then) — both installed impls ignore the argument.
-SpawnMetricsHook = Callable[["Request | None", Any], None]
+# wires its per-UI-counter analog.  Deliberately request-free: the
+# pending-send drain dispatches deferred entries with no live request,
+# and no impl ever needed one.
+SpawnMetricsHook = Callable[[Any], None]
 
 
 class CancelForensics(Protocol):
@@ -346,7 +350,7 @@ class SessionEndpointConfig:
     - ``spawn_metrics``: optional bookkeeping hook fired once per
       ``send`` that spawns a fresh worker (queue-reuse path skips it).
       Interactive wires its WebUI per-conversation counters; coord
-      wires ``None``.
+      wires its per-UI-counter analog.
     - ``emit_message_queued``: when ``True`` and the dispatcher takes
       the live-worker enqueue path, the lifted body emits a
       ``message_queued`` event onto the workstream's listener queue
@@ -4015,7 +4019,6 @@ def _make_dispatch_attempt(
     ordered_taken: list[str],
     send_id: str,
     acting_uid: str,
-    request: Request | None,
     defer_fidelity: bool = False,
 ) -> Callable[[ChatSession], tuple[bool, dict[str, Any]]]:
     """Build one atomic queue-or-spawn attempt bound to ONE session capture.
@@ -4036,17 +4039,15 @@ def _make_dispatch_attempt(
 
     ``defer_fidelity=True`` marks a deferred entry's attempt: it was
     answered "queued" under the full-fidelity defer contract, so the
-    interjection fallback — which truncates at ``queue_message``'s
-    2000-char cap and cannot carry attachments — is refused for
+    interjection fallback — which truncates at ``queue_message``'s cap
+    (``workstream.INTERJECTION_CAP_CHARS``) and cannot carry
+    attachments — is refused for
     oversized or attachment-bearing entries (the drain waits for the
     slot and retries into the fresh-spawn arm instead).  The refusal
     happens inside the enqueue callback, under the same ``ws._lock``
     acquisition as the queue-vs-spawn decision, so a turn claiming the
     slot between the drain's poll and this dispatch can never route the
     entry into truncation.
-
-    ``request`` is ``None`` for drain-side attempts; the spawn-metrics
-    hook tolerates it (both installed impls ignore the argument).
     """
     import threading
 
@@ -4070,7 +4071,14 @@ def _make_dispatch_attempt(
             if ws.worker_kind == "command":
                 queue_outcome["rejected"] = "command_window"
                 return
-            if defer_fidelity and (resolved_atts or len(message) > 2000):
+            # Measures the RAW message while queue_message caps the
+            # post-!!!-strip CLEANED text — deliberate: parse_priority
+            # only strips, so raw >= cleaned and the raw measure can
+            # only ever OVER-refuse (a borderline fold-in costs one
+            # full-fidelity fresh spawn, never a truncation); measuring
+            # cleaned here would run parse_priority twice per dispatch
+            # for zero safety gain.
+            if defer_fidelity and (resolved_atts or len(message) > INTERJECTION_CAP_CHARS):
                 queue_outcome["rejected"] = "defer_full_fidelity"
                 return
             try:
@@ -4141,7 +4149,7 @@ def _make_dispatch_attempt(
             # Fresh spawn — the kind's per-turn metrics fire exactly once,
             # from the shared attempt so the drain's dispatches count too.
             try:
-                cfg.spawn_metrics(request, ui)
+                cfg.spawn_metrics(ui)
             except Exception:
                 log.debug(
                     "ws.send.spawn_metrics_failed ws=%s",
@@ -4384,8 +4392,8 @@ def make_send_handler(cfg: SessionEndpointConfig) -> Handler:
       ``True`` post-P1.5; the flag exists so a kind that hasn't
       lit up its UI surface yet can defer.
     - ``spawn_metrics``: when set, fires once on the spawn path with
-      ``(request, ui)``. Interactive wires its WebUI per-conversation
-      counters here; coord wires ``None``.
+      ``(ui)``. Interactive wires its WebUI per-conversation counters
+      here; coord wires its per-UI-counter analog.
     - ``emit_message_queued``: when ``True``, the queue-reuse path
       pushes a ``message_queued`` event onto the listener queue.
 
@@ -4523,8 +4531,9 @@ def make_send_handler(cfg: SessionEndpointConfig) -> Handler:
 
         # Defer-and-drain.  While a slash-command worker holds the slot (a
         # manual /compact can hold it for MINUTES), a send must not take
-        # the interjection-queue path — its 2000-char cap and cross-user
-        # guard are mid-TURN semantics, and a queued message would cross a
+        # the interjection-queue path — its INTERJECTION_CAP_CHARS cap and
+        # cross-user guard are mid-TURN semantics, and a queued message
+        # would cross a
         # /resume//new identity swap into the wrong workstream.  Instead
         # of parking THIS request until the window closes (which encoded
         # "client disconnected" as "message retracted" — deterministic
@@ -4608,7 +4617,6 @@ def make_send_handler(cfg: SessionEndpointConfig) -> Handler:
                         ordered_taken=ordered_taken,
                         send_id=pending_msg_id,
                         acting_uid=acting_uid,
-                        request=None,
                         defer_fidelity=True,
                     ),
                 )
@@ -4705,7 +4713,6 @@ def make_send_handler(cfg: SessionEndpointConfig) -> Handler:
             ordered_taken=ordered_taken,
             send_id=send_id,
             acting_uid=acting_uid,
-            request=request,
         )
         session_now = ws.session
         if session_now is None:

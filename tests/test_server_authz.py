@@ -12,7 +12,6 @@ from __future__ import annotations
 import json
 import queue
 import threading
-import time
 from typing import Any
 from unittest.mock import MagicMock
 
@@ -20,6 +19,7 @@ import pytest
 from starlette.testclient import TestClient
 
 from tests._helpers import wait_until
+from turnstone.core.workstream import INTERJECTION_CAP_CHARS
 
 _TEST_JWT_SECRET = "test-jwt-secret-minimum-32-chars!"
 
@@ -274,7 +274,8 @@ class _FakeSession:
         self.queue_calls.append(text)
         if self.queue_raises is not None:
             raise self.queue_raises
-        cleaned = text[:2000] + "..." if len(text) > 2000 else text
+        cap = INTERJECTION_CAP_CHARS
+        cleaned = text[:cap] + "..." if len(text) > cap else text
         return cleaned, "notice", queue_msg_id or "m1"
 
     def dequeue_message(self, msg_id: str) -> bool:
@@ -1338,9 +1339,9 @@ class TestCompactCommandDispatch:
         IMMEDIATELY (no parked POST — a 30s-bounded caller like the
         coordinator client or console proxy must never lose a message to
         a multi-minute window) and then runs as an ordinary full-fidelity
-        send — never the interjection queue, whose 2000-char cap silently
-        truncated pasted logs/code and whose cross-user guard locked
-        second participants out for the whole compaction."""
+        send — never the interjection queue, whose INTERJECTION_CAP_CHARS
+        cap silently truncated pasted logs/code and whose cross-user guard
+        locked second participants out for the whole compaction."""
         client, mgr = app_client
         ws_id = self._create_ws(client)
         ws = mgr.get(ws_id)
@@ -1531,11 +1532,7 @@ class TestCompactCommandDispatch:
         runner = threading.Thread(target=_cmd, daemon=True)
         runner.start()
         # Wait until the command worker actually holds the slot.
-        for _ in range(100):
-            if ws._worker_running:
-                break
-            time.sleep(0.02)
-        assert ws._worker_running
+        wait_until(lambda: ws._worker_running, timeout=8.0)
         assert ws.worker_kind == "command"
         r = client.post(
             f"/v1/api/workstreams/{ws_id}/send",
@@ -1591,11 +1588,7 @@ class TestCompactCommandDispatch:
 
         runner = threading.Thread(target=_cmd, daemon=True)
         runner.start()
-        for _ in range(100):
-            if ws._worker_running:
-                break
-            time.sleep(0.02)
-        assert ws._worker_running
+        wait_until(lambda: ws._worker_running, timeout=8.0)
         worker = ws.worker_thread
         # The cancel handler's force path shape: abandon the worker.
         with ws._lock:
