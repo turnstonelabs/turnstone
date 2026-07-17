@@ -13,6 +13,8 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
+import pytest
+
 _ROOT = Path(__file__).resolve().parent.parent
 _INTERACTIVE = _ROOT / "turnstone/shared_static/interactive.js"
 _COMPOSER = _ROOT / "turnstone/shared_static/composer.js"
@@ -738,6 +740,12 @@ def test_deferred_send_settle_protocol_pins() -> None:
     assert composer_queue.count("ctx.optimisticEl.remove()") >= 2, (
         "both the retro-convert and queue_full arms must clear the optimistic bubble"
     )
+    # The missed-edge settle: a non-deferred chip binding onto an
+    # already-idle pane missed its only sweep — the post-bind promote
+    # (keyed on POST-bind chip state, honoring the aria-busy
+    # dismiss-in-flight discipline) is what settles it.
+    assert "!ctx.paneIsBusy()" in composer_queue
+    assert 'queuedEl.hasAttribute("aria-busy")' in composer_queue
     # Both panes route their parsed /send response through the helper and
     # consume the pane-tier settle event; the busy stamp is centralized in
     # each pane's setBusy (source defaults to "server" — only the send
@@ -745,12 +753,91 @@ def test_deferred_send_settle_protocol_pins() -> None:
     for name, src in (("interactive.js", interactive), ("coordinator.js", coordinator)):
         assert "settleSendResponse(" in src, f"{name}: settle matrix must be the shared helper"
         assert "busyIsOptimistic" in src, name
+        assert "paneIsBusy" in src, f"{name}: the missed-edge settle needs the live flag"
         assert 'setBusy(true, "optimistic")' in src, f"{name}: optimistic flip must stamp"
         assert "parsePriority(" in src, f"{name}: shared !!! parse"
         assert 'case "message_dispatched"' in src, f"{name}: settle event not consumed"
         assert "settleDeferred(" in src, name
-    # /command's degraded statuses are all surfaced: busy, running (the
-    # backstop answer), and error (503 — the worker never spawned; silence
-    # here reads as success).
+    # /command's degraded outcomes are ALL surfaced: busy, running (the
+    # backstop answer), error (503 — the worker never spawned), the
+    # status-less non-2xx arm (404 / proxy 502), and the transport catch —
+    # silence at any of them reads as success.
     assert 'body.status === "running"' in interactive
     assert 'body.status === "error"' in interactive
+    assert "Command failed (HTTP " in interactive
+    assert '"Command failed: " + err.message' in interactive
+
+
+def test_settle_send_response_missed_edge_behavior(tmp_path) -> None:
+    """Execute the shared settle helper under node and pin the
+    missed-edge matrix behaviorally (not just textually): a non-deferred
+    chip binding onto an idle pane promotes; a busy pane, a deferred
+    chip, and a dismiss-in-flight chip do not."""
+    import shutil
+    import subprocess
+
+    if shutil.which("node") is None:
+        pytest.skip("node binary not available on PATH")
+    helper = _ROOT / "turnstone/shared_static/composer_queue.js"
+    script = tmp_path / "settle_harness.mjs"
+    script.write_text(
+        f'const {{ settleSendResponse }} = await import("file://{helper}");\n'
+        + """
+function makeEl(over) {
+  const el = {
+    isConnected: true,
+    classList: { contains: (c) => c === "msg-queued" },
+    dataset: {},
+    hasAttribute: () => false,
+  };
+  return Object.assign(el, over || {});
+}
+function run(queuedEl, paneBusy, data) {
+  const calls = [];
+  const queue = {
+    bind: (el, id, opts) => {
+      calls.push("bind");
+      // Mirror the real bind: stamp the deferred flag from opts.
+      if (opts && opts.deferred) el.dataset.deferred = "1";
+    },
+    promote: () => calls.push("promote"),
+    remove: () => calls.push("remove"),
+    addQueuedMessage: () => makeEl(),
+  };
+  settleSendResponse(queue, data, {
+    queuedEl,
+    optimisticEl: null,
+    isBusy: true,
+    displayText: "t",
+    priority: "notice",
+    setBusy: () => {},
+    busyIsOptimistic: () => false,
+    paneIsBusy: () => paneBusy,
+    renderError: () => {},
+    consumeAttachments: () => {},
+  });
+  return calls;
+}
+const queued = { status: "queued", msg_id: "m1" };
+let c = run(makeEl(), false, queued);
+if (!(c.includes("bind") && c.includes("promote")))
+  throw new Error("missed-edge chip must promote: " + c);
+c = run(makeEl(), true, queued);
+if (c.includes("promote")) throw new Error("busy pane must not promote: " + c);
+c = run(makeEl(), false, { status: "queued", msg_id: "m1", deferred: true });
+if (c.includes("promote"))
+  throw new Error("deferred chip is message_dispatched's: " + c);
+c = run(makeEl({ hasAttribute: (a) => a === "aria-busy" }), false, queued);
+if (c.includes("promote"))
+  throw new Error("dismiss-in-flight chip must be left to its DELETE verdict: " + c);
+console.log("settle matrix OK");
+""",
+        encoding="utf-8",
+    )
+    proc = subprocess.run(
+        ["node", str(script)],
+        capture_output=True,
+        text=True,
+        timeout=15,
+    )
+    assert proc.returncode == 0, f"settle harness failed:\n{proc.stderr}\n{proc.stdout}"

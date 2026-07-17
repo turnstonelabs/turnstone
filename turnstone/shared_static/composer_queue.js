@@ -1,7 +1,7 @@
 /* composer_queue.js — shared optimistic-queue UI for the chat composer.
  *
  * Used by both:
- *   - turnstone/ui/static/app.js (interactive Pane)
+ *   - turnstone/shared_static/interactive.js (interactive Pane)
  *   - turnstone/console/static/coordinator/coordinator.js (coord IIFE)
  *
  * What this owns:
@@ -444,8 +444,11 @@ export function createQueueController(opts) {
       // Unbound chips (no msg_id — the POST round-trip is still in
       // flight): a quick command window can close inside the round-trip,
       // firing this edge before bind() could stamp the deferred flag.
-      // Every response arm (bind/promote/remove/catch) settles unbound
-      // chips, so the sweep never needs them.
+      // Every response arm settles unbound chips — including the edge
+      // this sweep just consumed without them: settleSendResponse's
+      // post-bind missed-edge promote catches a non-deferred chip whose
+      // busy→idle edge passed mid-round-trip — so the sweep never needs
+      // them.
       if (!el.dataset.msgId) return;
       _promote(el);
     });
@@ -518,6 +521,8 @@ export function parsePriority(text) {
 //   busyIsOptimistic(): true iff the pane's CURRENT busy came from this
 //                 send flow's optimistic flip and no server state event
 //                 has since asserted it (see the panes' busySource stamp)
+//   paneIsBusy(): the pane's LIVE busy flag (not the send-time snapshot)
+//                 — drives the missed-edge settle below
 //   renderError(msg): pane error row
 //   consumeAttachments(attached_ids, dropped_ids): composer chip sync
 //
@@ -528,7 +533,9 @@ export function parsePriority(text) {
 //     delivered). For deferred sends the optimistic busy flip is then a
 //     lie — no worker exists for this send — so busy clears under the
 //     busyIsOptimistic guard, AFTER bind() so the false-edge idle sweep
-//     sees dataset.deferred and skips the new chip.
+//     sees dataset.deferred and skips the new chip. A non-deferred chip
+//     binding onto an ALREADY-idle pane missed its only sweep — the
+//     post-bind settle promotes it (see the inline contract).
 //   queue_full — the send was NEVER accepted (interjection cap, deferred-
 //     list saturation, or drain-spawn failure): remove the optimistic
 //     bubble too — leaving it renders loss as delivery — and restore busy
@@ -551,11 +558,39 @@ export function settleSendResponse(queue, data, ctx) {
         attachedCount: (data.attached_ids || []).length,
       });
       if (data.deferred && ctx.busyIsOptimistic()) ctx.setBusy(false);
+      // Missed-edge settle: if the busy→idle edge already passed during
+      // the POST round-trip, this chip's only sweep skipped it (unbound
+      // then) and — for non-deferred sends — no message_dispatched will
+      // ever fire, so without this the pane keeps a retractable "queued"
+      // bubble for a delivered message forever.  Keyed on the POST-BIND
+      // chip state, not the wire flag: bind's pre-bind-settle
+      // reconciliation may have just cleared a raced folded settle's
+      // deferred flag, and that chip needs the same catch-up.  Skips
+      // dismiss-in-flight chips (aria-busy — _confirmDequeue's verdict
+      // settles those, the sweep's own discipline) and still-deferred
+      // chips (message_dispatched owns them).  Carries the same bet the
+      // old edge-promote made: idle can precede the final flush; a
+      // DELETE racing delivery resolves via the not_found → "already
+      // sent" arm as ever.
+      if (
+        queuedEl.isConnected &&
+        queuedEl.classList.contains("msg-queued") &&
+        !queuedEl.dataset.deferred &&
+        !queuedEl.hasAttribute("aria-busy") &&
+        !ctx.paneIsBusy()
+      ) {
+        queue.promote(queuedEl);
+      }
     } else {
       // Non-deferred queuedEl-absent: the client thought it was idle but
       // a live worker interjection-queued the message (SSE state_change
-      // race). A worker provably exists, so its idle edge will arrive —
-      // keep the historical busy flip.
+      // race) — keep the historical busy flip.  KNOWN residual (the
+      // missed-edge sibling of the chip arm above): if that worker
+      // exited during the POST round-trip, no further state event
+      // arrives and this flip strands an idle pane busy until the next
+      // real activity; pre-branch behavior, preserved verbatim —
+      // ctx.paneIsBusy() is the instrument if a future round promotes
+      // this from residual to fix.
       ctx.setBusy(true);
     }
     ctx.consumeAttachments(data.attached_ids, data.dropped_attachment_ids);
@@ -603,8 +638,3 @@ export function settleSendResponse(queue, data, ctx) {
   if (ctx.queuedEl) queue.promote(ctx.queuedEl);
   ctx.consumeAttachments(data.attached_ids, data.dropped_attachment_ids);
 }
-
-// --- Legacy window bridge ---------------------------------------------------
-// Still-classic consumers reach this as a global at event/boot time (after
-// this deferred module evaluated).  New module code imports instead.
-window.createQueueController = createQueueController;

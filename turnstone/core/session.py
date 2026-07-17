@@ -204,7 +204,7 @@ from turnstone.core.trajectory import (
 )
 from turnstone.core.watch import WATCH_REMINDER_OPTIONAL_KEYS
 from turnstone.core.web import check_ssrf, fetch_with_ssrf_guard, strip_html
-from turnstone.core.workstream import WorkstreamKind
+from turnstone.core.workstream import PENDING_SENDS_MAX, WorkstreamKind
 from turnstone.prompts import (
     INTERACTIVE_CONSENT_CLIENT_TYPES,
     ClientType,
@@ -1370,7 +1370,11 @@ def _tool_turn_meta(
 
 
 class ChatSession:
-    _QUEUE_MAX = 10
+    # The mid-turn interjection queue's cap — an ALIAS of the shared
+    # per-workstream backpressure bound (see workstream.PENDING_SENDS_MAX):
+    # the deferred-send list refuses at the same size, so busy-window and
+    # command-window sends can never silently diverge on saturation.
+    _QUEUE_MAX = PENDING_SENDS_MAX
 
     def __init__(
         self,
@@ -5409,14 +5413,23 @@ class ChatSession:
         told to break a stale compaction activity latch here — otherwise a
         force-abandoned compaction's latch suppresses the whole successor
         turn's pill writes, re-broadcasting "Compacting context…" through
-        a live turn.  getattr-guarded like ``on_aux_usage``: minimal UI
-        stubs predate the hook and must not crash a claim.
+        a live turn.  getattr-guarded like ``on_aux_usage`` (minimal UI
+        stubs predate the hook) AND call-guarded: this emission sits on
+        send()'s PRE-turn path — before the user turn is appended, before
+        ``_record_fatal_error``'s coverage — so a raising override
+        (``_broadcast_activity`` is a documented override seam) must
+        degrade to a lost latch-break, never to a silently dropped user
+        message.  Same policy as ``_compaction_event``'s dispatch tail;
+        the claim-state writes above stay infallible either way.
         """
         self._generation += 1
         self._cancel_event = threading.Event()
         release = getattr(self.ui, "on_generation_claimed", None)
         if release is not None:
-            release(self._generation)
+            try:
+                release(self._generation)
+            except Exception:
+                log.debug("ui.on_generation_claimed raised; claim proceeds", exc_info=True)
         return self._generation
 
     def _consume_cancel(self, my_generation: int) -> bool:

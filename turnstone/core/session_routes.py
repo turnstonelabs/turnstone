@@ -40,7 +40,7 @@ from starlette.routing import Route
 
 from turnstone.core.log import get_logger
 from turnstone.core.session_ui_base import AutoApproveReason
-from turnstone.core.workstream import _PendingSend
+from turnstone.core.workstream import PENDING_SENDS_MAX, _PendingSend
 
 if TYPE_CHECKING:
     import threading
@@ -3954,20 +3954,15 @@ def make_detail_handler(cfg: SessionEndpointConfig) -> Handler:
 # Deferred sends (command windows / order barrier)
 # ---------------------------------------------------------------------------
 
-# The dataclass and the order-barrier predicate live with the Workstream
-# fields they annotate (turnstone.core.workstream): _PendingSend carries
-# the "drain not alive ⇒ nothing claimed" invariant (imported at module
-# top), and Workstream.send_barrier_active() is the ONE definition of
-# the two-term barrier every dispatch surface consults.
-
-# Saturation bound for ws._pending_sends — restores the backpressure
-# contract the interjection queue (ChatSession._QUEUE_MAX, same value)
-# enforced for every busy-window send before the defer seam replaced it.
-# Each accepted entry pins its full message text plus materialized
-# attachment bytes for the length of a command window and then costs one
-# unattended turn, so acceptance must be bounded; callers get the
-# standard retryable ``queue_full``.
-_PENDING_SENDS_MAX = 10
+# The dataclass, the order-barrier predicate, and the saturation bound
+# all live with the Workstream fields they annotate
+# (turnstone.core.workstream, imported at module top): _PendingSend
+# carries the "drain not alive ⇒ nothing claimed" invariant,
+# Workstream.send_barrier_active() is the ONE definition of the two-term
+# barrier every dispatch surface consults, and PENDING_SENDS_MAX is the
+# shared backpressure bound ChatSession._QUEUE_MAX aliases — one
+# constant, structurally incapable of diverging between the interjection
+# queue and the deferred list.
 
 
 def _make_drain_thread(ws: Workstream) -> threading.Thread:
@@ -4220,10 +4215,18 @@ def _drain_pending_sends(ws: Workstream) -> None:
     dispatch, it's a cheap no-op re-check after the last turn's own exit
     backstop.
     """
+    # Function-local imports (file style): ``threading`` is NEEDED here —
+    # the module-top import is TYPE_CHECKING-only, and the except arm's
+    # identity guard below would otherwise NameError at runtime inside
+    # the last-resort handler (masking the original exception and leaving
+    # the slot permanently held — the exact wedge the handler prevents);
+    # mypy can't catch that because the type-only import satisfies it.
+    import threading
     import time
 
     from turnstone.core.idle_nudge_watcher import wake_workstream_if_pending
 
+    clean_exit = False
     try:
         while True:
             with ws._lock:
@@ -4242,7 +4245,8 @@ def _drain_pending_sends(ws: Workstream) -> None:
                     return
                 if not pending:
                     ws._pending_drain = None
-                    break  # clean exit — wake backstop below, outside the lock
+                    clean_exit = True
+                    break  # clean exit — wake backstop AFTER the try block
                 entry = pending[0]
             if ws._worker_running and ws.worker_kind == "command":
                 # The park, relocated server-side: the poll cadence
@@ -4322,7 +4326,6 @@ def _drain_pending_sends(ws: Workstream) -> None:
             # Dispatched: fresh spawn (empty outcome) or interjection
             # fallback (msg_id preserved) — this entry is done.  The
             # settle event (message_dispatched) fired inside the attempt.
-        wake_workstream_if_pending(ws, trigger="drain-exit")
     except Exception:
         # Never die holding the single-flight slot — a wedged drain would
         # strand every future deferred send for this workstream.  With the
@@ -4334,7 +4337,32 @@ def _drain_pending_sends(ws: Workstream) -> None:
         # the single spawn site is what makes single-flight structural).
         log.exception("ws.send.pending_drain_failed ws=%s", ws.id[:8] if ws.id else "")
         with ws._lock:
-            ws._pending_drain = None
+            # Identity-guarded, like every sibling exit seam: on paths
+            # that already RELEASED the slot before raising, an
+            # unconditional clear here would null a SUCCESSOR drain's
+            # live registration (two drains servicing one list — FIFO
+            # inversion, and the barrier reads inactive while the
+            # survivor holds a claimed entry).  The guard makes any
+            # future post-release statement inside the try safe by
+            # construction.
+            if ws._pending_drain is threading.current_thread():
+                ws._pending_drain = None
+        return
+    # Clean-exit wake backstop — AFTER the try/except, deliberately: this
+    # runs once the drain has already retired its slot, so a raise out of
+    # the wake (session_worker.send re-raises Thread.start failures) must
+    # not reach the last-resort handler above and mutate state this
+    # thread no longer owns.  Own guard, mirroring _retry_pending_wake's
+    # discipline around the same gate.  Not run on the closed arm (the
+    # workstream is torn down) nor after the except (entries remain, the
+    # barrier still holds — the gate would just yield).
+    if clean_exit:
+        try:
+            wake_workstream_if_pending(ws, trigger="drain-exit")
+        except Exception:
+            log.warning(
+                "ws.send.drain_exit_wake_failed ws=%s", ws.id[:8] if ws.id else "", exc_info=True
+            )
 
 
 def make_send_handler(cfg: SessionEndpointConfig) -> Handler:
@@ -4386,7 +4414,7 @@ def make_send_handler(cfg: SessionEndpointConfig) -> Handler:
       "dropped_attachment_ids"}`` — the send was refused with
       retry-shortly semantics: the live worker's interjection queue is
       at capacity, the deferred-send list hit its saturation bound
-      (``_PENDING_SENDS_MAX`` — the same backpressure contract), or the
+      (``PENDING_SENDS_MAX`` — the shared backpressure bound), or the
       drain thread could not be started under resource exhaustion (the
       entry is rolled back, never phantom-parked). Reservations
       released; caller should retry. The ``attached_ids`` list is
@@ -4546,15 +4574,14 @@ def make_send_handler(cfg: SessionEndpointConfig) -> Handler:
                     # answer for a workstream whose next resolution 404s
                     # would promise a dispatch that can never happen.
                     return JSONResponse({"error": cfg.not_found_label}, status_code=404)
-                if len(ws._pending_sends) >= _PENDING_SENDS_MAX:
-                    # Saturation backpressure — restores the contract the
-                    # interjection queue enforced for every busy-window
-                    # send before the defer seam replaced it
-                    # (ChatSession._QUEUE_MAX, session.py): without a
-                    # bound, each acked entry pins its message text plus
-                    # materialized attachment bytes for a whole command
-                    # window and then costs one unattended turn — an
-                    # automated caller could OOM the node with 200s.
+                if len(ws._pending_sends) >= PENDING_SENDS_MAX:
+                    # Saturation backpressure — the SHARED bound
+                    # (workstream.PENDING_SENDS_MAX, which the
+                    # interjection queue's _QUEUE_MAX aliases): without
+                    # a bound, each acked entry pins its message text
+                    # plus materialized attachment bytes for a whole
+                    # command window and then costs one unattended turn
+                    # — an automated caller could OOM the node with 200s.
                     # len() deliberately counts retract-marked husks
                     # awaiting the drain's loop-top purge (DELETE only
                     # marks): a live-only count would let park/retract
@@ -4697,19 +4724,11 @@ def make_send_handler(cfg: SessionEndpointConfig) -> Handler:
                 # resolution 404s.  Mirror the resolution miss instead.
                 return JSONResponse({"error": cfg.not_found_label}, status_code=404)
             # queue.Full or session-disappeared race — surface as
-            # queue_full so clients retry rather than 500 (the same shape
-            # _defer_send answers for its saturation cap and drain-spawn
-            # failure). ``attached_ids``
+            # queue_full so clients retry rather than 500.  ``attached_ids``
             # is always empty on this path (the dispatch never took
             # ownership); the empty arrays preserve the response-shape
             # guarantee so SDK consumers don't branch on status.
-            return JSONResponse(
-                {
-                    "status": "queue_full",
-                    "attached_ids": [],
-                    "dropped_attachment_ids": list(requested_ids),
-                }
-            )
+            return _queue_full_response()
 
         if queue_outcome.get("rejected") == "attachments_busy":
             # Attachments can't ride a queued user turn (see

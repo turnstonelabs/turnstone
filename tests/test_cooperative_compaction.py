@@ -2170,6 +2170,34 @@ class TestPreHookUICompat:
         )
 
 
+class TestClaimGenerationHookGuard:
+    """_claim_generation's on_generation_claimed emission sits on send()'s
+    PRE-turn path — before the user turn is appended, before
+    _record_fatal_error's coverage — so a raising override must degrade
+    to a lost latch-break, never to a silently dropped user message."""
+
+    def test_raising_claim_hook_does_not_abort_the_claim(self, session):
+        calls: list[int] = []
+
+        def _boom(gen: int) -> None:
+            calls.append(gen)
+            raise RuntimeError("broadcast backend down")
+
+        session.ui = SimpleNamespace(
+            on_thinking_start=lambda: None,
+            on_thinking_stop=lambda: None,
+            on_error=lambda _m: None,
+            on_generation_claimed=_boom,
+        )
+        before = session._generation
+        claimed = session._claim_generation()
+        assert claimed == before + 1  # claim-state writes stayed infallible
+        assert session._generation == claimed
+        assert calls == [claimed]  # the hook WAS attempted, then contained
+        # And again — every claim survives, not just the first.
+        assert session._claim_generation() == claimed + 1
+
+
 class TestCompactionNoticeStamp:
     """_compaction_event is the single display-policy site: failed ends
     carry ``notice`` — renderers show the message iff it is true, instead

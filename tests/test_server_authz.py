@@ -2176,11 +2176,11 @@ class TestCompactCommandDispatch:
         assert [s[0] for s in ws.session.sends] == ["first"]
 
     def test_deferred_send_list_saturation_returns_queue_full(self, app_client):
-        """The deferred list is bounded (_PENDING_SENDS_MAX = 10, mirroring
-        the interjection queue's cap): the 11th pending send answers
-        queue_full instead of silently pinning message + attachment bytes
-        per entry for a whole command window and then costing one
-        unattended turn each."""
+        """The deferred list is bounded (workstream.PENDING_SENDS_MAX — the
+        shared constant ChatSession._QUEUE_MAX aliases): the 11th pending
+        send answers queue_full instead of silently pinning message +
+        attachment bytes per entry for a whole command window and then
+        costing one unattended turn each."""
         client, mgr = app_client
         ws_id = self._create_ws(client)
         ws = mgr.get(ws_id)
@@ -2291,6 +2291,146 @@ class TestCompactCommandDispatch:
         assert resp.status_code == 503
         assert resp.json()["status"] == "error"
         assert ws.session.commands == []  # the command never ran
+
+    def test_drain_exit_wake_raise_is_contained(self, app_client, monkeypatch, caplog):
+        """A raising drain-exit wake (session_worker.send re-raises
+        Thread.start failures) must stay inside the wake's own guard —
+        it runs AFTER the drain retired its slot, so reaching the
+        last-resort handler would clear a slot this thread no longer
+        owns (a successor drain's live registration)."""
+        import logging
+
+        from turnstone.core import idle_nudge_watcher
+
+        def _raising_gate(ws, *, trigger="unspecified"):
+            if trigger == "drain-exit":
+                raise RuntimeError("can't start new thread")
+            return False
+
+        monkeypatch.setattr(idle_nudge_watcher, "wake_workstream_if_pending", _raising_gate)
+        client, mgr = app_client
+        ws_id = self._create_ws(client)
+        ws = mgr.get(ws_id)
+        assert ws is not None
+        gate = threading.Event()
+        ws.session.compact_gate = gate
+        client.post(
+            "/v1/api/command",
+            json={"command": "/compact", "ws_id": ws_id},
+            headers=_auth("user-1"),
+        )
+        client.post(
+            f"/v1/api/workstreams/{ws_id}/send",
+            json={"message": "dispatch me"},
+            headers=_auth("user-1"),
+        )
+        with caplog.at_level(logging.WARNING, logger="turnstone.core.session_routes"):
+            gate.set()
+            wait_until(lambda: ws.session.sends, timeout=8.0)
+            wait_until(lambda: self._drain_idle(ws), timeout=8.0)
+            wait_until(
+                lambda: any("drain_exit_wake_failed" in r.message for r in caplog.records),
+                timeout=8.0,
+            )
+        # The raise was contained by the wake's own guard — never the
+        # last-resort handler (whose log would be a false failure for a
+        # drain that exited cleanly).
+        assert not any("pending_drain_failed" in r.message for r in caplog.records)
+        # The seam stays fully serviceable: another defer cycle works.
+        gate2 = threading.Event()
+        ws.session.compact_gate = gate2
+        client.post(
+            "/v1/api/command",
+            json={"command": "/compact", "ws_id": ws_id},
+            headers=_auth("user-1"),
+        )
+        client.post(
+            f"/v1/api/workstreams/{ws_id}/send",
+            json={"message": "and me"},
+            headers=_auth("user-1"),
+        )
+        gate2.set()
+        wait_until(lambda: len(ws.session.sends) == 2, timeout=8.0)
+        wait_until(lambda: self._drain_idle(ws), timeout=8.0)
+
+    def test_closed_drain_exit_runs_no_wake(self, app_client, monkeypatch):
+        """The drain-exit wake backstop belongs to the CLEAN exit only: a
+        closed workstream is torn down, and firing the gate there would
+        be work on a corpse.  (The clean-exit case is pinned by
+        test_drain_exit_re_arms_wake_gate_after_pure_retraction.)"""
+        from turnstone.core import idle_nudge_watcher
+
+        triggers: list[str] = []
+        monkeypatch.setattr(
+            idle_nudge_watcher,
+            "wake_workstream_if_pending",
+            lambda ws, *, trigger="unspecified": (triggers.append(trigger), False)[1],
+        )
+        client, mgr = app_client
+        ws_id = self._create_ws(client)
+        ws = mgr.get(ws_id)
+        assert ws is not None
+        gate = threading.Event()
+        ws.session.compact_gate = gate
+        client.post(
+            "/v1/api/command",
+            json={"command": "/compact", "ws_id": ws_id},
+            headers=_auth("user-1"),
+        )
+        client.post(
+            f"/v1/api/workstreams/{ws_id}/send",
+            json={"message": "dies with the ws"},
+            headers=_auth("user-1"),
+        )
+        with ws._lock:
+            ws._closed = True  # tombstone, as SessionManager.close sets it
+        gate.set()
+        wait_until(lambda: self._drain_idle(ws), timeout=8.0)
+        assert "drain-exit" not in triggers
+        assert ws.session.sends == []
+
+    def test_drain_last_resort_clear_is_identity_guarded(self, app_client, monkeypatch, caplog):
+        """Drive the drain's OUTER except (loop machinery failing — here
+        the closed-arm log call) and prove the last-resort slot-clear
+        executes its identity guard: the slot is this drain's own, so it
+        clears; a successor's registration would be left alone (the
+        guard compares thread identity, the sibling exit-seam pattern)."""
+        import logging
+
+        from turnstone.core import session_routes
+
+        client, mgr = app_client
+        ws_id = self._create_ws(client)
+        ws = mgr.get(ws_id)
+        assert ws is not None
+        gate = threading.Event()
+        ws.session.compact_gate = gate
+        client.post(
+            "/v1/api/command",
+            json={"command": "/compact", "ws_id": ws_id},
+            headers=_auth("user-1"),
+        )
+        client.post(
+            f"/v1/api/workstreams/{ws_id}/send",
+            json={"message": "stranded by the crash"},
+            headers=_auth("user-1"),
+        )
+
+        def _broken_warning(*_a, **_kw):
+            raise RuntimeError("log backend down")
+
+        monkeypatch.setattr(session_routes.log, "warning", _broken_warning)
+        with ws._lock:
+            ws._closed = True  # closed arm with a pending entry → log.warning
+        with caplog.at_level(logging.ERROR, logger="turnstone.core.session_routes"):
+            gate.set()
+            wait_until(
+                lambda: any("pending_drain_failed" in r.message for r in caplog.records),
+                timeout=8.0,
+            )
+        # The identity-guarded clear ran for the drain's OWN slot.
+        wait_until(lambda: ws._pending_drain is None, timeout=8.0)
+        assert ws.session.sends == []
 
     def test_exit_command_emits_ended_info_and_never_answers(self, app_client):
         """should_exit commands shut the session down — the worker emits
