@@ -2068,7 +2068,7 @@ function createCoordinatorPane(root, wsId, opts) {
         // queue_full, attachments_busy, cross_user, unknown-ok) lives in
         // the shared helper — ONE settle matrix for both panes; see
         // settleSendResponse's contract for the arm semantics.
-        settleSendResponse(queue, data || {}, {
+        settleSendResponse(queue, data, {
           queuedEl,
           optimisticEl,
           isBusy,
