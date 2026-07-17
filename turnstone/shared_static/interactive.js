@@ -3736,12 +3736,16 @@ class Pane {
         body: JSON.stringify({ command: text, ws_id: this.wsId }),
       })
         .then((r) =>
+          // Thread {ok, status} alongside the parsed body — the loud
+          // arms below ride NON-2xx codes (busy = 409, error = 503), so
+          // an /send-style throw-on-!ok pre-gate would wrongly reroute
+          // them into the transport catch.
           r.json().then(
-            (b) => b || {},
-            () => ({}),
+            (b) => ({ ok: r.ok, status: r.status, body: b || {} }),
+            () => ({ ok: r.ok, status: r.status, body: {} }),
           ),
         )
-        .then((body) => {
+        .then(({ ok, status, body }) => {
           // /compact dispatched onto an already-busy worker reports
           // {status: "busy"} — surface it (the optimistic busy guard
           // above can lose that race).
@@ -3764,9 +3768,21 @@ class Pane {
             this.addErrorMessage(
               body.error || "Command failed to start — retry shortly.",
             );
+          } else if (!ok) {
+            // Status-less non-2xx (404 unknown workstream, proxy 502
+            // HTML): the same silence-reads-as-success rule as the arms
+            // above. Rendered directly — not thrown into the catch,
+            // which would double-prefix the message.
+            this.addErrorMessage(
+              body.error || "Command failed (HTTP " + status + ")",
+            );
           }
         })
-        .catch(() => {});
+        .catch((err) => {
+          // Transport failure (network drop, abort): the command-echo
+          // chip is already rendered — say the command did not run.
+          this.addErrorMessage("Command failed: " + err.message);
+        });
       // Echo as a command chip, not addUserMessage — a slash command is
       // control-plane input, not a conversational user turn.
       this.addCommandEcho(text);
@@ -3878,6 +3894,7 @@ class Pane {
           priority,
           setBusy: (b) => this.setBusy(b),
           busyIsOptimistic: () => this.busy && this.busySource === "optimistic",
+          paneIsBusy: () => this.busy,
           renderError: (msg) => this.addErrorMessage(msg),
           consumeAttachments: (attached, droppedIds) =>
             this.attachments.consume(attached, droppedIds),

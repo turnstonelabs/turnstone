@@ -108,6 +108,17 @@ BULK_CLOSE_STATE_VALUES: frozenset[str] = frozenset(
 # Deferred sends
 # ---------------------------------------------------------------------------
 
+# Per-workstream backpressure bound shared by BOTH message-acceptance
+# surfaces: the deferred-send list below refuses appends at this size
+# (the 11th answers the retryable ``queue_full``), and
+# ``ChatSession._QUEUE_MAX`` aliases it for the mid-turn interjection
+# queue — one constant, so busy-window and command-window sends can
+# never silently diverge on saturation behavior.  Each accepted deferred
+# entry pins its full message text plus materialized attachment bytes
+# for the length of a command window and then costs one unattended
+# turn, so acceptance must be bounded.
+PENDING_SENDS_MAX = 10
+
 
 @dataclass
 class _PendingSend:

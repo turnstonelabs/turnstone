@@ -2076,6 +2076,7 @@ function createCoordinatorPane(root, wsId, opts) {
           priority,
           setBusy: (b) => setBusy(b),
           busyIsOptimistic: () => busy && busySource === "optimistic",
+          paneIsBusy: () => busy,
           renderError: (msg) => appendText("error", msg, { label: "error" }),
           consumeAttachments: (attached, droppedIds) =>
             attachments.consume(attached, droppedIds),
