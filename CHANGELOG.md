@@ -199,14 +199,22 @@ Earlier stable lines (`stable/1.6`, `stable/1.5`) are frozen.
   summary HTTP call itself (the compaction lane registers its stream in
   the same abort seam the main loop uses), so cancelling a compaction is
   immediate instead of waiting out a model call. Messages sent while any
-  slash command holds the worker slot **park** and then run as ordinary
-  full-fidelity sends when the command finishes — they are never routed
-  through the mid-turn interjection queue, whose semantics are
-  turn-shaped: previously a send during a manual `/compact` was silently
-  truncated to 2,000 characters, a second participant in a shared
-  workstream was locked out with a misleading "another participant's
-  turn" 409 for the whole compaction, and a message queued across a
-  `/resume`/`/new` could be answered into the post-swap workstream.
+  slash command holds the worker slot are **deferred**: answered
+  `{"status": "queued", "msg_id"}` immediately and dispatched as ordinary
+  full-fidelity sends (attachments and sender identity included) when the
+  command finishes — never routed through the mid-turn interjection
+  queue, whose semantics are turn-shaped: previously a send during a
+  manual `/compact` was silently truncated to 2,000 characters, a second
+  participant in a shared workstream was locked out with a misleading
+  "another participant's turn" 409 for the whole compaction, and a
+  message queued across a `/resume`/`/new` could be answered into the
+  post-swap workstream. Because the response is immediate,
+  timeout-bounded callers — the coordinator's `send_message`, the console
+  proxy, SDKs, anything behind a stock reverse proxy — can no longer lose
+  a message to a multi-minute command window; the deferred send is
+  retractable until dispatch via the same `DELETE .../send` used for
+  queued interjections (node-local, in-memory — the API reference
+  documents the at-most-once durability contract).
   A `/compact` raced against an in-flight turn is refused with an
   explicit busy response. Every other slash command runs through the same
   worker slot too — mutual exclusion against sends, a running compaction,
@@ -230,17 +238,31 @@ Earlier stable lines (`stable/1.6`, `stable/1.5`) are frozen.
   compaction (a new turn's generation claim breaks a stale latch). Every
   retry backoff on the session (stream retries, task agents, notify
   delivery, compaction) now aborts immediately on Stop via one shared
-  cancel-aware helper instead of sleeping out its exponential delay. The
-  web composer bounds a parked send at 10 minutes while a compaction card
-  is visible (15 s wedged-node default otherwise, shared by both panes),
-  and dismissing a queued bubble aborts the in-flight POST so a dismissed
-  message can't dispatch minutes later. A compaction failure reports
+  cancel-aware helper instead of sleeping out its exponential delay.
+  Dismissing a queued bubble — interjection or deferred — is a
+  server-confirmed `DELETE`, and retracting a deferred send that carried
+  attachments tells the user they were discarded instead of silently
+  expiring them. A compaction failure reports
   exactly once (auto-compaction errors defer to the turn's fatal handler
-  instead of doubling the red row and the error metric), and a manual
-  `/compact` failure no longer crashes the CLI REPL. Post-command pane
-  refreshes and error notices are owner-guarded, so a force-cancelled
-  wedged command that unwedges late can't wipe panes or inject stray
-  notices into a successor turn.
+  instead of doubling the red row and the error metric), failed-end
+  notice suppression is computed once by the emitter (a `notice` bool on
+  the end event — in the SDKs — replaces hand-synced client policy), and
+  a manual `/compact` failure no longer crashes the CLI REPL. `/compact`
+  on a workstream showing the `error` badge restores the badge on exit
+  instead of stamping `idle` over it (the compaction neither retried nor
+  resolved the failed turn). A force-cancelled initial send that
+  completes late still delivers its scheduled-run completion
+  notification (the only completion signal unattended workstreams have);
+  the other post-command pane refreshes and error notices remain
+  owner-guarded, so a force-cancelled wedged command that unwedges late
+  can't wipe panes or inject stray notices into a successor turn.
+  Embedders driving `ChatSession` with a pre-1.8 duck-typed `SessionUI`
+  (no `on_compaction` hook) get the classic `on_info` compaction lines
+  back — threshold notice, `part k/N`, retry waits, token delta +
+  summary box — instead of silent history swaps. **Breaking (1.8):**
+  compaction feedback moved from `info` events to the typed `compaction`
+  SSE event; pre-1.8 SSE/SDK clients that ignore unknown event types no
+  longer see compaction lines (they are deliberately not dual-emitted).
 
 - **Static MCP servers: a pushed catalog change no longer wedges the shared
   session (#839).** The static-path `*/list_changed` handler awaited its

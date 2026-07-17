@@ -378,7 +378,7 @@ class CoordinatorAdapter:
                 # at this workstream from the interactive UI) holds the
                 # raced slot: the interjection queue is turn-shaped and must
                 # stay unreachable during command windows — same rule as the
-                # /send route's park.  Fail the dispatch (returns False, the
+                # /send route's defer.  Fail the dispatch (returns False, the
                 # caller's retryable-backpressure surface) rather than queue
                 # a message that would be capped and could cross a /resume
                 # identity swap.

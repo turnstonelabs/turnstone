@@ -113,24 +113,29 @@ def send(
     ``ws.worker_kind`` in the same lock acquisition as the
     ``(worker_thread, _worker_running)`` pair.  This is the ONLY site
     that sets ``_worker_running=True``, so the classification cannot be
-    bypassed by a new dispatch caller.  The /send route parks while a
+    bypassed by a new dispatch caller.  The /send route DEFERS while a
     command holds the slot instead of taking the interjection-queue
-    path (whose length cap / cross-user guard are turn semantics); an
-    ``enqueue`` callback that can fire during a command window (the
-    coordinator adapter's, the init race's) must refuse rather than
-    queue — see the command-window refusals at those closures.
+    path (whose length cap / cross-user guard are turn semantics): its
+    enqueue closure reports the window and the route registers the send
+    on ``ws._pending_sends`` for the drain task to dispatch when the
+    window closes.  An ``enqueue`` callback that can fire during a
+    command window (the coordinator adapter's, the init race's) must
+    refuse rather than queue — see the command-window refusals at those
+    closures.
 
-    The refusal is DELIBERATELY not centralized here despite the three
+    The refusal is DELIBERATELY not centralized here despite the
     hand-written guards: each surface needs a different refusal channel
-    (the /send route signals "re-park" via its ``queue_outcome`` flag;
-    the coordinator adapter and the init race raise ``queue.Full`` into
-    their existing backpressure statuses), and a central refusal inside
-    this function can only return ``False`` — indistinguishable from
-    queue-full/closed for the route's re-park decision and mislabeled by
-    the init path's status derivation.  Making it distinguishable means
-    a tri-state contract change across every dispatch caller, which is
-    more surface than three four-line guards.  If you add a NEW enqueue
-    closure that can queue turn work, copy the guard.
+    (the /send route's closure signals "command window" via its
+    ``queue_outcome`` flag — the defer trigger; the coordinator adapter
+    and the init race raise ``queue.Full`` into their existing
+    backpressure statuses), and a central refusal inside this function
+    can only return ``False`` — indistinguishable from queue-full/closed
+    exactly where the route must distinguish "defer this" from "drop
+    this".  Making it distinguishable means a tri-state contract change
+    across every dispatch caller — more surface than the guards it
+    replaces.  (A check inside this function's locked section would be
+    race-free; the cost is the contract change, not atomicity.)  If you
+    add a NEW enqueue closure that can queue turn work, copy the guard.
 
     Returns:
         ``True`` on successful enqueue (existing worker accepted) or

@@ -103,8 +103,10 @@ AttachmentOwnerResolver = Callable[
 ]
 # (request, ui) — kind's spawn-time bookkeeping. Interactive bumps
 # ``_metrics.record_message_sent`` + per-UI message counters; coord
-# has no analog and wires ``None``.
-SpawnMetricsHook = Callable[["Request", Any], None]
+# has no analog and wires ``None``.  The request is ``None`` when the
+# pending-send drain dispatches a deferred entry (no live request
+# exists by then) — both installed impls ignore the argument.
+SpawnMetricsHook = Callable[["Request | None", Any], None]
 
 
 class CancelForensics(Protocol):
@@ -1369,13 +1371,16 @@ def make_cancel_handler(
                 #
                 # Documented bet — force-cancelling a wedged QUICK command
                 # (worker_kind == "command", e.g. /resume stuck in storage
-                # I/O): clearing the flag releases any parked /send, whose
-                # fresh worker can then run while the abandoned command
-                # thread finishes its in-place mutation — quick commands
-                # have no generation checkpoints to retire them (compact_now
-                # does).  Same blast radius as force-abandoning a send
-                # worker mid-tool; accepted because force-cancel is the
-                # operator escape hatch for an already-wedged session, not a
+                # I/O): clearing the flag releases the pending-send
+                # drain's park (_drain_pending_sends polls the same
+                # (_worker_running, worker_kind) pair the parked /send
+                # used to), so a deferred message's fresh worker can then
+                # run while the abandoned command thread finishes its
+                # in-place mutation — quick commands have no generation
+                # checkpoints to retire them (compact_now does).  Same
+                # blast radius as force-abandoning a send worker
+                # mid-tool; accepted because force-cancel is the operator
+                # escape hatch for an already-wedged session, not a
                 # routine path.  Revisit if commands ever gain generation
                 # discipline.
                 with ws._lock:
@@ -3942,6 +3947,313 @@ def make_detail_handler(cfg: SessionEndpointConfig) -> Handler:
     return detail
 
 
+# ---------------------------------------------------------------------------
+# Deferred sends (command windows)
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class _PendingSend:
+    """One send deferred during a command window.
+
+    A /send that lands while a slash-command worker holds the slot
+    (``ws.worker_kind == "command"`` — a manual /compact can hold it for
+    minutes) is answered ``{"status": "queued", "msg_id": ...}``
+    immediately and registered here; :func:`_drain_pending_sends`
+    dispatches it full-fidelity when the window closes.  This replaces
+    the parked-POST design, which encoded "client disconnected" as
+    "message retracted" — true only for the web composers' ✕-abort;
+    every bounded caller (the coordinator client and the console proxy
+    at timeout=30, SDKs, curl) times out instead, and its message was
+    deliberately dropped for the whole window.
+
+    ``attempt`` is the prebuilt one-session-capture dispatch closure
+    (:func:`_make_dispatch_attempt` with ``defer_fidelity=True``), so
+    the drain stays endpoint-agnostic — everything kind-specific
+    (attachments, spawn metrics, UI hooks) was captured at defer time.
+    ``retracted`` is flipped under ``ws._lock`` by the DELETE dequeue
+    fall-through; the drain never dispatches a retracted entry.
+
+    Durability contract (documented in the API reference): node-local
+    and in-memory, the interjection queue's lifetime — entries die with
+    the workstream or the process, so "queued" is at-most-once intake,
+    not durable acceptance.
+    """
+
+    msg_id: str
+    priority: str
+    attempt: Callable[[ChatSession], tuple[bool, dict[str, Any]]]
+    retracted: bool = False
+
+
+def _emit_send_ui(ws: Workstream, ui: Any, hook_name: str, *args: Any) -> None:
+    """Best-effort UI hook dispatch for send-worker closures.
+
+    Each call is wrapped in try/except so a failure in one hook (e.g.
+    listener-queue full → on_error raises) doesn't suppress the others.
+    Mirrors the pre-P1.5 coord_adapter.send per-hook defense.
+    """
+    if ui is None:
+        return
+    method = getattr(ui, hook_name, None)
+    if method is None:
+        return
+    try:
+        method(*args)
+    except Exception:
+        log.debug(
+            "ws.send.ui_hook_failed ws=%s hook=%s",
+            ws.id[:8] if ws.id else "",
+            hook_name,
+            exc_info=True,
+        )
+
+
+def _make_dispatch_attempt(
+    ws: Workstream,
+    cfg: SessionEndpointConfig,
+    ui: Any,
+    *,
+    message: str,
+    resolved_atts: list[Any],
+    ordered_taken: list[str],
+    send_id: str,
+    acting_uid: str,
+    request: Request | None,
+    defer_fidelity: bool = False,
+) -> Callable[[ChatSession], tuple[bool, dict[str, Any]]]:
+    """Build one atomic queue-or-spawn attempt bound to ONE session capture.
+
+    The single dispatch implementation shared by the /send route's
+    immediate path and :func:`_drain_pending_sends` — session re-capture
+    across /resume//new identity swaps, the cross-user and attachment
+    queue guards, ``send_id`` threading (the queue path reuses it as
+    ``queue_msg_id`` so the client's DELETE targets one id either way),
+    and the spawn-path metrics all live here, once.  Callers re-capture
+    ``ws.session`` before every attempt and pass it in: closures bound
+    to a pre-swap capture would send the user's message into the wrong
+    workstream's transcript.
+
+    ``queue_outcome`` (second element of the return) is written only
+    when the dispatcher takes the live-worker reuse path; empty after a
+    fresh-spawn dispatch.
+
+    ``defer_fidelity=True`` marks a deferred entry's attempt: it was
+    answered "queued" under the full-fidelity defer contract, so the
+    interjection fallback — which truncates at ``queue_message``'s
+    2000-char cap and cannot carry attachments — is refused for
+    oversized or attachment-bearing entries (the drain waits for the
+    slot and retries into the fresh-spawn arm instead).  The refusal
+    happens inside the enqueue callback, under the same ``ws._lock``
+    acquisition as the queue-vs-spawn decision, so a turn claiming the
+    slot between the drain's poll and this dispatch can never route the
+    entry into truncation.
+
+    ``request`` is ``None`` for drain-side attempts; the spawn-metrics
+    hook tolerates it (both installed impls ignore the argument).
+    """
+    import threading
+
+    from turnstone.core import session_worker
+    from turnstone.core.session import (
+        AttachmentsNotQueueableError,
+        CrossUserInterjectionError,
+        GenerationCancelled,
+    )
+
+    def attempt(session: ChatSession) -> tuple[bool, dict[str, Any]]:
+        queue_outcome: dict[str, Any] = {}
+
+        def _enqueue() -> None:
+            # Runs under ``ws._lock`` (session_worker.send calls it inside
+            # the same acquisition that reads _worker_running), so this
+            # worker_kind read cannot race the spawn write.  A command
+            # window must NEVER reach queue_message — its cap and
+            # cross-user guard are turn semantics — so report it and let
+            # the route defer (or the drain re-park).
+            if ws.worker_kind == "command":
+                queue_outcome["rejected"] = "command_window"
+                return
+            if defer_fidelity and (resolved_atts or len(message) > 2000):
+                queue_outcome["rejected"] = "defer_full_fidelity"
+                return
+            try:
+                cleaned, priority, msg_id = session.queue_message(
+                    message,
+                    attachment_ids=list(ordered_taken),
+                    queue_msg_id=send_id or None,
+                    interjector_user_id=acting_uid,
+                )
+            except AttachmentsNotQueueableError:
+                queue_outcome["rejected"] = "attachments_busy"
+                return
+            except CrossUserInterjectionError:
+                # A different authenticated participant tried to interject
+                # into someone else's in-flight turn; folding it in would
+                # borrow the initiator's credentials and misattribute the
+                # message.  Reject so they resend as a fresh turn once the
+                # worker idles (the drain instead waits and re-attempts).
+                queue_outcome["rejected"] = "cross_user_interjection"
+                return
+            queue_outcome["cleaned"] = cleaned
+            queue_outcome["priority"] = priority
+            queue_outcome["msg_id"] = msg_id
+
+        def _run() -> None:
+            me = threading.current_thread()
+            try:
+                kwargs: dict[str, Any] = {}
+                if resolved_atts:
+                    kwargs["attachments"] = resolved_atts
+                if send_id:
+                    kwargs["send_id"] = send_id
+                # Fresh turn: rebind per-user MCP credentials to the
+                # authenticated sender. Bound here (not via a send()
+                # kwarg) so per-kind session stubs with explicit send
+                # signatures keep working; getattr-guarded for the same
+                # reason. The queue path above never rebinds.
+                bind = getattr(session, "bind_acting_user", None)
+                if acting_uid and callable(bind):
+                    bind(acting_uid)
+                session.send(message, **kwargs)
+            except GenerationCancelled:
+                # Safety net — send() normally handles this internally.
+                # If this thread was force-abandoned, ws.worker_thread
+                # was set to None — don't emit spurious events.
+                if ws.worker_thread is me:
+                    _emit_send_ui(ws, ui, "on_stream_end")
+                    _emit_send_ui(ws, ui, "on_state_change", "idle")
+            except Exception:
+                # Undrained staged uploads aren't locked (the buffer is a
+                # peek, not a reservation) — they expire on the buffer TTL
+                # — so the only cleanup owed here is the UI streaming
+                # hook: ``session.send()`` already fired ``on_error``
+                # (with sanitized text), persisted ``last_error``, and
+                # emitted ``state='error'`` via
+                # :meth:`ChatSession._record_fatal_error` before
+                # re-raising.
+                if ws.worker_thread is me:
+                    _emit_send_ui(ws, ui, "on_stream_end")
+
+        ok = session_worker.send(
+            ws,
+            enqueue=_enqueue,
+            run=_run,
+            thread_name=f"send-worker-{ws.id[:8]}",
+        )
+        if ok and not queue_outcome and cfg.spawn_metrics is not None:
+            # Fresh spawn — the kind's per-turn metrics fire exactly once,
+            # from the shared attempt so the drain's dispatches count too.
+            try:
+                cfg.spawn_metrics(request, ui)
+            except Exception:
+                log.debug(
+                    "ws.send.spawn_metrics_failed ws=%s",
+                    ws.id[:8] if ws.id else "",
+                    exc_info=True,
+                )
+        return ok, queue_outcome
+
+    return attempt
+
+
+def _drain_pending_sends(ws: Workstream) -> None:
+    """Dispatch a workstream's deferred sends once its command window closes.
+
+    Per-workstream single-flight (``ws._pending_drain``), started by the
+    /send route when it defers an entry and run on a small daemon thread
+    (the dispatch machinery is synchronous and thread-shaped like every
+    other worker here, and a thread's lifetime is independent of any
+    event loop's — the request loop owes this drain nothing once the
+    route has answered).  It owns the waiting the parked POST used to do
+    — but server-side, so a client timeout or abort can no longer become
+    message loss.  Entries dispatch in arrival order via their prebuilt
+    attempt closures, re-capturing ``ws.session`` per attempt (a /resume
+    or /new that swapped the session mid-window routes the message into
+    the post-swap session, exactly as the park did).
+
+    Terminal outcomes per entry: dispatched (fresh spawn — or, for a
+    queue-shaped entry, the interjection fallback into a live turn,
+    msg_id preserved so the client's DELETE still targets it),
+    retracted (dismissed before dispatch), or dropped because the
+    workstream closed.  There is deliberately no give-up bound: an entry
+    acknowledged "queued" is never silently dropped while the workstream
+    lives — rejections wait for the slot to free and retry into the
+    fresh-spawn arm.
+
+    Claim discipline: an entry is popped under ``ws._lock`` immediately
+    before its dispatch attempt and re-inserted on rejection, so the
+    DELETE fall-through (which marks only in-list entries) can never
+    "remove" a message whose dispatch already left the station — a
+    claimed entry answers ``not_found`` ("already sent"), which its
+    eventual dispatch makes true.
+    """
+    import time
+
+    try:
+        while True:
+            with ws._lock:
+                pending = ws._pending_sends
+                while pending and pending[0].retracted:
+                    pending.pop(0)
+                if ws._closed:
+                    if pending:
+                        log.warning(
+                            "ws.send.pending_dropped_on_close ws=%s count=%d",
+                            ws.id[:8],
+                            len(pending),
+                        )
+                        pending.clear()
+                    ws._pending_drain = None
+                    return
+                if not pending:
+                    ws._pending_drain = None
+                    return
+                entry = pending[0]
+            if ws._worker_running and ws.worker_kind == "command":
+                # The park, relocated server-side: the poll cadence
+                # matches the old request-handler loop's.
+                time.sleep(0.25)
+                continue
+            session_now = ws.session
+            if session_now is None:
+                # Mid-swap / partial-construction gap; the loop-top close
+                # check terminates this if it's a close in progress.
+                time.sleep(0.25)
+                continue
+            with ws._lock:
+                if not ws._pending_sends or ws._pending_sends[0] is not entry:
+                    continue  # list reshaped under us — re-evaluate
+                if entry.retracted:
+                    ws._pending_sends.pop(0)
+                    continue
+                ws._pending_sends.pop(0)  # claim
+            ok, outcome = entry.attempt(session_now)
+            if not ok or outcome.get("rejected") in (
+                "command_window",
+                "defer_full_fidelity",
+                "attachments_busy",
+                "cross_user_interjection",
+            ):
+                # Window re-claimed between the poll and the dispatch, a
+                # live turn holds the slot against a full-fidelity entry,
+                # the interjection queue is saturated
+                # (session_worker.send → False on queue.Full), or the ws
+                # closed (resolved at the loop top).  Unclaim and wait.
+                with ws._lock:
+                    ws._pending_sends.insert(0, entry)
+                time.sleep(0.25)
+                continue
+            # Dispatched: fresh spawn (empty outcome) or interjection
+            # fallback (msg_id preserved) — this entry is done.
+    except Exception:
+        # Never die holding the single-flight slot — a wedged drain would
+        # strand every future deferred send for this workstream.
+        log.exception("ws.send.pending_drain_failed ws=%s", ws.id[:8] if ws.id else "")
+        with ws._lock:
+            ws._pending_drain = None
+
+
 def make_send_handler(cfg: SessionEndpointConfig) -> Handler:
     """Lifted body for ``POST {prefix}/{ws_id}/send`` — message dispatch.
 
@@ -3977,8 +4289,13 @@ def make_send_handler(cfg: SessionEndpointConfig) -> Handler:
       requested attachments that landed (may be a strict subset on
       reservation race losses).
     - 200 ``{"status": "queued", "priority", "msg_id", "attached_ids",
-      "dropped_attachment_ids"}`` — reused live worker; queued for
-      injection at the next tool-result seam.
+      "dropped_attachment_ids"}`` — reused live worker (queued for
+      injection at the next tool-result seam), OR deferred during a
+      slash-command window (registered on ``ws._pending_sends`` and
+      dispatched full-fidelity by :func:`_drain_pending_sends` when the
+      window closes — see :class:`_PendingSend` for the durability
+      contract).  ``DELETE {prefix}/{ws_id}/send`` with the ``msg_id``
+      retracts either kind before dispatch.
     - 200 ``{"status": "queue_full", "attached_ids",
       "dropped_attachment_ids"}`` — live worker's queue at
       capacity; reservations released. Caller should retry. The
@@ -3991,12 +4308,7 @@ def make_send_handler(cfg: SessionEndpointConfig) -> Handler:
     import threading
     import uuid
 
-    from turnstone.core import session_worker
-    from turnstone.core.session import (
-        AttachmentsNotQueueableError,
-        CrossUserInterjectionError,
-        GenerationCancelled,
-    )
+    from turnstone.core.tool_advisory import parse_priority
     from turnstone.core.web_helpers import auth_user_id, read_json_or_400
 
     async def send(request: Request) -> Response:
@@ -4093,162 +4405,94 @@ def make_send_handler(cfg: SessionEndpointConfig) -> Handler:
         if ws.session is None:
             return JSONResponse({"error": "No session"}, status_code=500)
 
-        def _dispatch_once(session: ChatSession) -> tuple[bool, dict[str, Any]]:
-            """One atomic queue-or-spawn attempt bound to ONE session capture.
-
-            The park loop below re-captures ``ws.session`` before every
-            attempt — a /resume or /new that ran while we parked swaps the
-            session's workstream identity in place, and closures bound to
-            the pre-swap capture would send the user's message into the
-            wrong workstream's transcript.  Binding happens here, in one
-            place, per attempt.  ``queue_outcome`` is written only when the
-            dispatcher takes the live-worker reuse path; empty after a
-            fresh-spawn dispatch.
-            """
-            queue_outcome: dict[str, Any] = {}
-
-            def _enqueue() -> None:
-                # Runs under ``ws._lock`` (session_worker.send calls it
-                # inside the same acquisition that reads _worker_running),
-                # so this worker_kind read cannot race the spawn write.  A
-                # command window must NEVER reach queue_message — its cap
-                # and cross-user guard are turn semantics — so refuse and
-                # let the route loop back to the park.
-                if ws.worker_kind == "command":
-                    queue_outcome["rejected"] = "command_window"
-                    return
-                try:
-                    cleaned, priority, msg_id = session.queue_message(
-                        message,
-                        attachment_ids=list(ordered_taken),
-                        queue_msg_id=send_id or None,
-                        interjector_user_id=acting_uid,
-                    )
-                except AttachmentsNotQueueableError:
-                    queue_outcome["rejected"] = "attachments_busy"
-                    return
-                except CrossUserInterjectionError:
-                    # A different authenticated participant tried to interject into
-                    # someone else's in-flight turn; folding it in would borrow the
-                    # initiator's credentials and misattribute the message. Reject
-                    # so they resend as a fresh turn once the worker idles.
-                    queue_outcome["rejected"] = "cross_user_interjection"
-                    return
-                queue_outcome["cleaned"] = cleaned
-                queue_outcome["priority"] = priority
-                queue_outcome["msg_id"] = msg_id
-
-            def _run() -> None:
-                me = threading.current_thread()
-                try:
-                    kwargs: dict[str, Any] = {}
-                    if resolved_atts:
-                        kwargs["attachments"] = resolved_atts
-                    if send_id:
-                        kwargs["send_id"] = send_id
-                    # Fresh turn: rebind per-user MCP credentials to the
-                    # authenticated sender. Bound here (not via a send()
-                    # kwarg) so per-kind session stubs with explicit send
-                    # signatures keep working; getattr-guarded for the same
-                    # reason. The queue path above never rebinds.
-                    bind = getattr(session, "bind_acting_user", None)
-                    if acting_uid and callable(bind):
-                        bind(acting_uid)
-                    session.send(message, **kwargs)
-                except GenerationCancelled:
-                    # Safety net — send() normally handles this internally.
-                    # If this thread was force-abandoned, ws.worker_thread
-                    # was set to None — don't emit spurious events.
-                    if ws.worker_thread is me:
-                        _emit_ui("on_stream_end")
-                        _emit_ui("on_state_change", "idle")
-                except Exception:
-                    # Undrained staged uploads aren't locked (the buffer is a peek,
-                    # not a reservation) — they expire on the buffer TTL — so the
-                    # only cleanup owed here is the UI streaming hook.
-                    if ws.worker_thread is me:
-                        # ``session.send()`` already fired ``on_error``
-                        # (with sanitized text), persisted ``last_error``,
-                        # and emitted ``state='error'`` via
-                        # :meth:`ChatSession._record_fatal_error` before
-                        # re-raising.  The route handler only needs the
-                        # streaming-cleanup hook the worker contract owes
-                        # the UI listeners.
-                        _emit_ui("on_stream_end")
-
-            ok = session_worker.send(
-                ws,
-                enqueue=_enqueue,
-                run=_run,
-                thread_name=f"send-worker-{ws.id[:8]}",
-            )
-            return ok, queue_outcome
-
-        def _emit_ui(hook_name: str, *args: Any) -> None:
-            """Best-effort UI hook dispatch.
-
-            Each call is wrapped in try/except so a failure in one
-            hook (e.g. listener-queue full → on_error raises) doesn't
-            suppress the others. Mirrors the pre-P1.5
-            coord_adapter.send per-hook defense.  Defined after
-            ``_dispatch_once`` but resolved late (when a worker runs) —
-            every dispatch happens strictly below this line.
-            """
-            if ui is None:
-                return
-            method = getattr(ui, hook_name, None)
-            if method is None:
-                return
-            try:
-                method(*args)
-            except Exception:
-                log.debug(
-                    "ws.send.ui_hook_failed ws=%s hook=%s",
-                    ws.id[:8] if ws.id else "",
-                    hook_name,
-                    exc_info=True,
-                )
-
-        # Park-then-dispatch.  While a slash-command worker holds the slot
-        # (a manual /compact can hold it for MINUTES), a send must not take
+        # Defer-and-drain.  While a slash-command worker holds the slot (a
+        # manual /compact can hold it for MINUTES), a send must not take
         # the interjection-queue path — its 2000-char cap and cross-user
         # guard are mid-TURN semantics, and a queued message would cross a
-        # /resume//new identity swap into the wrong workstream.  Parking
-        # reproduces the pre-worker-dispatch observable behavior (the
-        # request waited out the then-blocked event loop, then ran as a
-        # normal full-fidelity send under the sender's own identity) with
-        # the loop free: SSE keeps streaming the compaction progress card
-        # while we wait.  The inner park is deliberately unbounded — the
-        # composer bounds its POST at ~15s and aborts, and we poll
-        # ``is_disconnected`` because starlette does NOT cancel a running
-        # handler on client disconnect: dispatching after the client gave
-        # up would surprise the user with a duplicate turn when they
-        # resend.  The outer bound only caps command-window FLAPPING
-        # (back-to-back commands re-claiming the slot between our park
-        # exit and dispatch).
-        ok = False
-        queue_outcome: dict[str, Any] = {}
-        for _ in range(20):
-            while ws._worker_running and ws.worker_kind == "command":
-                if await request.is_disconnected():
-                    # Client abandoned the send mid-park; the response is
-                    # discarded — the status is for the access log only.
-                    return JSONResponse({"status": "abandoned"})
-                await asyncio.sleep(0.25)
-            session_now = ws.session
-            if session_now is None:
-                return JSONResponse({"error": "No session"}, status_code=500)
-            ok, queue_outcome = _dispatch_once(session_now)
-            if queue_outcome.get("rejected") != "command_window":
-                break
-        else:
-            # 20 consecutive command-window collisions — surface the same
-            # retryable backpressure shape as a saturated queue.
+        # /resume//new identity swap into the wrong workstream.  Instead
+        # of parking THIS request until the window closes (which encoded
+        # "client disconnected" as "message retracted" — deterministic
+        # message loss for every bounded caller: the coordinator client
+        # and console proxy time out at 30s, and the web composers' long
+        # abort bound raced the compaction card), the send is answered
+        # "queued" immediately and registered on ``ws._pending_sends``;
+        # the per-workstream drain task dispatches it full-fidelity when
+        # the window closes.  Dismissal is the same DELETE /send
+        # {msg_id} the interjection queue uses — server-confirmed, no
+        # POST-abort side channel.
+        attempt = _make_dispatch_attempt(
+            ws,
+            cfg,
+            ui,
+            message=message,
+            resolved_atts=resolved_atts,
+            ordered_taken=ordered_taken,
+            send_id=send_id,
+            acting_uid=acting_uid,
+            request=request,
+        )
+        session_now = ws.session
+        if session_now is None:
+            return JSONResponse({"error": "No session"}, status_code=500)
+        ok, queue_outcome = attempt(session_now)
+        if queue_outcome.get("rejected") == "command_window":
+            # ``send_id`` is minted only when attachments are enabled —
+            # the deferred entry needs a truthy id regardless: it is the
+            # client's dismiss/bind handle and the drain's
+            # queue_msg_id/send_id thread.
+            pending_msg_id = send_id or uuid.uuid4().hex
+            cleaned_display, pending_priority = parse_priority(message)
+            entry = _PendingSend(
+                msg_id=pending_msg_id,
+                priority=pending_priority,
+                attempt=_make_dispatch_attempt(
+                    ws,
+                    cfg,
+                    ui,
+                    message=message,
+                    resolved_atts=resolved_atts,
+                    ordered_taken=ordered_taken,
+                    send_id=pending_msg_id,
+                    acting_uid=acting_uid,
+                    request=None,
+                    defer_fidelity=True,
+                ),
+            )
+            with ws._lock:
+                if ws._closed:
+                    # Mirror the dispatch-refusal 404 below: a "queued"
+                    # answer for a workstream whose next resolution 404s
+                    # would promise a dispatch that can never happen.
+                    return JSONResponse({"error": cfg.not_found_label}, status_code=404)
+                ws._pending_sends.append(entry)
+                drain = ws._pending_drain
+                if drain is None or not drain.is_alive():
+                    t = threading.Thread(
+                        target=_drain_pending_sends,
+                        args=(ws,),
+                        name=f"pending-drain-{ws.id[:8]}",
+                        daemon=True,
+                    )
+                    ws._pending_drain = t
+                    t.start()
+            if cfg.emit_message_queued and hasattr(ui, "_enqueue"):
+                ui._enqueue(
+                    {
+                        "type": "message_queued",
+                        "message": cleaned_display,
+                        "priority": pending_priority,
+                        "msg_id": pending_msg_id,
+                    }
+                )
             return JSONResponse(
                 {
-                    "status": "queue_full",
-                    "attached_ids": [],
-                    "dropped_attachment_ids": list(requested_ids),
+                    "status": "queued",
+                    "priority": pending_priority,
+                    "msg_id": pending_msg_id,
+                    "attached_ids": list(ordered_taken),
+                    "dropped_attachment_ids": [
+                        aid for aid in requested_ids if aid not in taken_set
+                    ],
                 }
             )
         if not ok:
@@ -4324,16 +4568,9 @@ def make_send_handler(cfg: SessionEndpointConfig) -> Handler:
                 }
             )
 
-        # Spawned a fresh worker — kind's metrics fire once per turn.
-        if cfg.spawn_metrics is not None:
-            try:
-                cfg.spawn_metrics(request, ui)
-            except Exception:
-                log.debug(
-                    "ws.send.spawn_metrics_failed ws=%s",
-                    ws_id[:8] if ws_id else "",
-                    exc_info=True,
-                )
+        # Spawned a fresh worker — the kind's per-turn metrics fired inside
+        # the shared attempt (see _make_dispatch_attempt), where the drain
+        # task's dispatches fire them too.
         return JSONResponse(
             {
                 "status": "ok",
@@ -4633,12 +4870,17 @@ def make_attachment_handlers(cfg: SessionEndpointConfig) -> AttachmentHandlers:
 def make_dequeue_handler(cfg: SessionEndpointConfig) -> Handler:
     """Lifted body for ``DELETE {prefix}/{ws_id}/send`` — cancel a queued message.
 
-    Removes a previously-queued message identified by ``msg_id`` from
-    the workstream's pending queue. Returns ``status: removed`` when
-    the queue had the entry and ``status: not_found`` otherwise.
-    Queued messages don't carry attachments (see
-    :class:`AttachmentsNotQueueableError`), so there's no reservation
-    side-effect to undo here.
+    Removes a previously-queued message identified by ``msg_id`` —
+    first from the session's interjection queue, then (fall-through)
+    from the workstream's deferred-send list (``ws._pending_sends``,
+    sends answered "queued" during a command window).  Returns
+    ``status: removed`` when either held the entry and
+    ``status: not_found`` otherwise.  Interjection-queued messages
+    don't carry attachments (see :class:`AttachmentsNotQueueableError`)
+    and a deferred entry's resolved attachments die with it (the staged
+    bytes were peeked, not reserved — they expire on the buffer TTL),
+    so there's no reservation side-effect to undo here; the client
+    surfaces the discarded-attachments consequence to the user.
     """
     from turnstone.core.web_helpers import read_json_or_400
 
@@ -4677,6 +4919,21 @@ def make_dequeue_handler(cfg: SessionEndpointConfig) -> Handler:
         if ws.session is None:
             return JSONResponse({"error": "No session"}, status_code=400)
         removed = ws.session.dequeue_message(msg_id)
+        if not removed:
+            # Fall through to the deferred-send list: a send answered
+            # "queued" during a command window lives on the workstream
+            # (see _PendingSend), not in the session's interjection
+            # queue.  Marked under the same lock the drain claims under,
+            # so a retracted entry can never dispatch; an entry the
+            # drain already claimed is gone from the list and correctly
+            # answers not_found ("already sent" — its dispatch is in
+            # flight).
+            with ws._lock:
+                for entry in ws._pending_sends:
+                    if entry.msg_id == msg_id and not entry.retracted:
+                        entry.retracted = True
+                        removed = True
+                        break
         return JSONResponse({"status": "removed" if removed else "not_found"})
 
     return dequeue

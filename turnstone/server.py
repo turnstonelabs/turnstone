@@ -1737,11 +1737,13 @@ async def command(request: Request) -> JSONResponse:
             One envelope for both command branches: the unknown-workstream
             404 and the busy refusal differ only in the retry hint.  The
             worker slot is claimed with ``worker_kind="command"`` — the
-            /send route PARKS (never queues) while that kind holds the
+            /send route DEFERS (never queues) while that kind holds the
             slot, so the mid-turn interjection queue and its turn-shaped
             semantics (length cap, cross-user guard) are unreachable for
-            the whole command window; messages sent mid-command dispatch
-            as ordinary full-fidelity sends when the window closes.
+            the whole command window; messages sent mid-command are
+            answered ``queued`` immediately and dispatched as ordinary
+            full-fidelity sends by the pending-send drain when the window
+            closes.
             """
             dispatched = session_worker.send(
                 ws,
@@ -1790,6 +1792,15 @@ async def command(request: Request) -> JSONResponse:
 
             def _run_compact() -> None:
                 me = threading.current_thread()
+                # Snapshot for the exit restore: with the slot free to
+                # claim, only IDLE or ERROR are reachable here (the live
+                # states imply a held slot and _dispatch_command refuses
+                # busy).  ERROR is the user-investigatable badge (same
+                # carve-out the orphan reaper honors) and /compact neither
+                # retries nor resolves the failed turn — the old inline
+                # /compact never touched ws.state — so the badge must
+                # survive the window; everything else exits to idle.
+                prev_state = ws.state
                 try:
                     cmd_ui.on_state_change("thinking")
                     session.compact_now()
@@ -1805,7 +1816,7 @@ async def command(request: Request) -> JSONResponse:
                     if ws.worker_thread is me:
                         try:
                             # Backstop only: sends during the command window
-                            # PARK in the /send route (they cannot reach the
+                            # DEFER in the /send route (they cannot reach the
                             # interjection queue — see _dispatch_command), so
                             # anything found here predates the window (a
                             # message stranded by a dying send worker's
@@ -1815,7 +1826,9 @@ async def command(request: Request) -> JSONResponse:
                                 log.warning("ws.compact.stranded_queue_flushed ws=%s", ws.id[:8])
                         except Exception:
                             log.exception("ws.compact.exit_seam_failed ws=%s", ws.id[:8])
-                        cmd_ui.on_state_change("idle")
+                        cmd_ui.on_state_change(
+                            "error" if prev_state is WorkstreamState.ERROR else "idle"
+                        )
 
             refusal = _dispatch_command(
                 _run_compact, f"compact-worker-{ws.id[:8]}", "run /compact again"
@@ -1875,11 +1888,12 @@ async def command(request: Request) -> JSONResponse:
                 # Unblock the endpoint response.  Suppress the loop-closed
                 # RuntimeError (process shutdown mid-command): nobody is
                 # waiting anymore.  No queue drain here: sends during the
-                # command window PARK in the /send route (the interjection
+                # command window DEFER in the /send route (the interjection
                 # queue is unreachable while worker_kind == "command"), so
-                # they dispatch as ordinary sends when this worker exits —
-                # the stranded-message backstop lives on the /compact seam,
-                # the only command window long enough to matter.
+                # the pending-send drain dispatches them as ordinary sends
+                # when this worker exits — the stranded-message backstop
+                # lives on the /compact seam, the only command window long
+                # enough to matter.
                 with contextlib.suppress(RuntimeError):
                     loop.call_soon_threadsafe(done.set)
 
@@ -2458,15 +2472,23 @@ async def _interactive_create_post_install(
                     ws.ui.on_stream_end()
                     ws.ui.on_state_change("idle")
             finally:
-                # Owner only — an abandoned init's late notify would
-                # duplicate the successor's.  (Guard, not early-return: a
-                # return in a finally silences in-flight exceptions.)
-                if ws.worker_thread is me:
-                    try:
-                        last_content = _extract_last_assistant_content(session)
-                        _fire_notify_targets(ws, last_content)
-                    except Exception:
-                        log.warning("notify_completion.hook_error", ws_id=ws.id, exc_info=True)
+                # Deliberately NOT owner-gated, unlike the except arm above
+                # and the _run_cmd/_run_compact follow-ups: those mutate
+                # live slot/UI state a successor now owns, while the notify
+                # is workstream-scoped — an outward signal that this
+                # workstream's initial turn ran to completion and its
+                # answer is in the transcript.  _fire_notify_targets has
+                # exactly ONE call site (here); successor turns never
+                # notify, so there is no successor duplicate for an owner
+                # gate to prevent — gating it turned force-cancel into
+                # permanent notification loss for scheduled/unattended
+                # workstreams (the empty-content fallback covers the
+                # error/cancel exits, as it always did).
+                try:
+                    last_content = _extract_last_assistant_content(session)
+                    _fire_notify_targets(ws, last_content)
+                except Exception:
+                    log.warning("notify_completion.hook_error", ws_id=ws.id, exc_info=True)
 
         init_enqueued = False
 
@@ -2492,7 +2514,7 @@ async def _interactive_create_post_install(
                 # raced slot: the interjection queue is turn-shaped (length
                 # cap, and the text would cross a /resume identity swap) and
                 # must stay unreachable during command windows — same rule
-                # as the /send route's park.  queue.Full is the existing
+                # as the /send route's defer.  queue.Full is the existing
                 # backpressure surface: the create reports the first message
                 # as undelivered (``queue_full``) and the client retries.
                 raise queue.Full()
@@ -4497,7 +4519,7 @@ def create_app(
         magic-mocked ``ws.user_id``."""
         return _require_ws_access(request, ws_id)
 
-    def _interactive_spawn_metrics(_request: Request, ui: Any) -> None:
+    def _interactive_spawn_metrics(_request: Request | None, ui: Any) -> None:
         """Per-conversation metrics fired once per send that spawns a
         fresh worker. Coord wires its own
         :func:`turnstone.console.server._coord_spawn_metrics` (the

@@ -265,6 +265,16 @@ export function createQueueController(opts) {
         var status = data && data.status;
         if (status === "removed") {
           el.remove();
+          // A deferred send (command-window defer) can carry attachments;
+          // retracting it discards them — the chips were consumed when the
+          // send was accepted and a retract does not re-stage the bytes.
+          // Say so instead of letting the files silently expire.
+          if (el._deferredAttachments > 0 && onNotice)
+            onNotice(
+              "Message removed. Its " +
+                el._deferredAttachments +
+                " attachment(s) were discarded — re-attach them to send again.",
+            );
           // `removed` is the only verdict that mutated server-side queue
           // state, so it's the only one worth re-syncing composer state for.
           if (onAfterDequeue) onAfterDequeue();
@@ -297,11 +307,6 @@ export function createQueueController(opts) {
     if (el.getAttribute("aria-busy") === "true") return;
     el.dataset.dismissAttempted = "1";
     _setDismissing(el, true);
-    // A send whose POST is still in flight (parked server-side during a
-    // command window — possibly for minutes) attaches an abort hook: the ×
-    // must kill the request itself, or the dismissed message dispatches
-    // anyway when the window closes.  Post-response the hook is a no-op.
-    if (typeof el._sendAbort === "function") el._sendAbort();
     var msgId = el.dataset.msgId;
     if (!msgId) {
       // Pre-bind: bind() confirms once the server returns the msg_id (it

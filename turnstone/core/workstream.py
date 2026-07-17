@@ -13,7 +13,7 @@ import threading
 import time
 import uuid
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     from turnstone.core.session import ChatSession, SessionUI
@@ -146,11 +146,24 @@ class Workstream:
     # sets ``worker_thread``/``_worker_running``, so readers gating on
     # the running flag see a coherent triple.  A stale value after the
     # worker exits is harmless — every reader conjoins
-    # ``_worker_running``.  The /send route parks (never queues) while
+    # ``_worker_running``.  The /send route defers (never queues) while
     # this reads "command": the mid-turn interjection queue is
     # turn-shaped (length cap, cross-user guard) and must be
-    # unreachable during command windows.
+    # unreachable during command windows — deferred entries live on
+    # ``_pending_sends`` below.
     worker_kind: str = field(default="", repr=False)
+    # Sends deferred during a command window (full-fidelity pending
+    # entries — see ``session_routes._PendingSend``), dispatched in
+    # arrival order by the per-workstream drain task when the window
+    # closes.  Appends, retract-marks and claims all happen under
+    # ``_lock``.  Node-local and in-memory: entries die with the
+    # workstream or the process (the interjection queue's lifetime) —
+    # the /send contract documents the at-most-once consequence.
+    _pending_sends: list[Any] = field(default_factory=list, repr=False)
+    # Single-flight guard for the drain (a daemon ``threading.Thread``
+    # while one is live).  Written under ``_lock``; the drain clears it
+    # before exiting so a later deferred send starts a fresh one.
+    _pending_drain: Any = field(default=None, repr=False)
     # True once ``SessionManager.commit_create`` (or the non-deferred
     # path through ``SessionManager.create``) has fired the lifecycle
     # ``emit_created`` event for this workstream. Used by

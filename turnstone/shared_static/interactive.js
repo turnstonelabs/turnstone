@@ -26,7 +26,6 @@ import {
   buildCompactionCard,
   applyCompactionEvent,
   resetCompactionHolder,
-  sendAbortMs,
   buildSystemNudgeMarker,
   buildConvBatchShell,
   buildConvRow,
@@ -269,6 +268,12 @@ class Pane {
     // (conversation.applyCompactionEvent); `card` is the in-progress card
     // between start and end, nulled wherever the transcript DOM is wiped.
     this._compaction = { card: null, cid: null };
+    // Rendered-event-id dedup for system turns and compaction markers
+    // (/history repaint vs live/replayed event — whichever renders first
+    // wins).  replayHistory assigns a FRESH Set on every transcript wipe
+    // so pre-wipe ids can't suppress re-painted rows; this is the
+    // first-load init.
+    this._renderedSystemEventIds = new Set();
     this._retryHolderEl = null;
     this._toolRowIndex = new Map();
     this._streamElIndex = new Map();
@@ -560,9 +565,6 @@ class Pane {
     // repaint or live/replayed event renders first wins.  reason="error"
     // ends render through the paired `error` event (red row), not here.
     this.removeEmptyState();
-    if (!this._renderedSystemEventIds) {
-      this._renderedSystemEventIds = new Set();
-    }
     applyCompactionEvent(this._compaction, evt, {
       container: this.messagesEl,
       renderedIds: this._renderedSystemEventIds,
@@ -1918,11 +1920,7 @@ class Pane {
         // the resume-cursor fix this shouldn't recur, but the guard keeps the
         // /history+replay seam idempotent for system turns regardless.
         const sysEid = evt._event_id != null ? String(evt._event_id) : null;
-        if (
-          sysEid &&
-          this._renderedSystemEventIds &&
-          this._renderedSystemEventIds.has(sysEid)
-        ) {
+        if (sysEid && this._renderedSystemEventIds.has(sysEid)) {
           break;
         }
         this.addSystemContext(
@@ -1930,11 +1928,7 @@ class Pane {
           evt.source || "",
           evt.meta || null,
         );
-        if (sysEid) {
-          if (!this._renderedSystemEventIds)
-            this._renderedSystemEventIds = new Set();
-          this._renderedSystemEventIds.add(sysEid);
-        }
+        if (sysEid) this._renderedSystemEventIds.add(sysEid);
         break;
       }
 
@@ -3769,17 +3763,12 @@ class Pane {
     let sendTimer = null;
     if (sendCtrl) {
       sendInit.signal = sendCtrl.signal;
-      // Long bound while a compaction card is live (the send is parked
-      // server-side for the command window); wedged-node default
-      // otherwise — see sendAbortMs.
-      sendTimer = setTimeout(
-        () => sendCtrl.abort(),
-        sendAbortMs(this._compaction),
-      );
-      // An × on the queued bubble BEFORE the response arrives (pre-bind)
-      // must also kill the parked POST — otherwise the dismissed message
-      // dispatches anyway when the command window closes, minutes later.
-      if (queuedEl) queuedEl._sendAbort = () => sendCtrl.abort();
+      // Flat wedged-node bound: every /send answers within RTT now —
+      // dispatched, queued, or deferred-with-msg_id during a command
+      // window (the server parks nothing against this POST), so a
+      // response slower than this means a wedged node, not a long
+      // command.  Dismissal is bind() → DELETE, never a POST abort.
+      sendTimer = setTimeout(() => sendCtrl.abort(), 15000);
     }
     let sendReq = authFetch(
       this._base +
@@ -3836,8 +3825,15 @@ class Pane {
           // optimistic user bubble is already in the log and the server
           // still delivers the message on worker drain — accept the
           // small UX gap (no in-UI dismiss for THIS message).
-          if (queuedEl) this.queue.bind(queuedEl, data.msg_id);
-          else this.setBusy(true);
+          if (queuedEl) {
+            // A deferred send (command-window defer) can carry
+            // attachments — stash the count BEFORE bind (a pre-bind ✕
+            // confirms inside bind) so the dismiss path can tell the
+            // user the attachments were discarded: the chips are
+            // consumed below and a retract does not re-stage them.
+            queuedEl._deferredAttachments = (data.attached_ids || []).length;
+            this.queue.bind(queuedEl, data.msg_id);
+          } else this.setBusy(true);
           this.attachments.consume(
             data.attached_ids,
             data.dropped_attachment_ids,

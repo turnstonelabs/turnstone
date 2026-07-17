@@ -176,6 +176,12 @@ export interface CompactionEvent {
    * those (an OK end's result still stands; the history swap happened).
    */
   superseded?: boolean;
+  /**
+   * Failed ends only: the emitter-computed display verdict — show
+   * `message` only when true, instead of re-deriving suppression from
+   * reason/trigger/superseded client-side.
+   */
+  notice?: boolean;
   /** Present on start and on every end (ok or failed). */
   trigger?: "manual" | "auto";
   where?: string;

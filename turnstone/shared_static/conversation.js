@@ -246,11 +246,7 @@ export function applyCompactionEvent(holder, evt, hooks) {
     return;
   }
   if (evt.phase === "end") {
-    if (owns && holder.card) {
-      holder.card.remove();
-      holder.card = null;
-      holder.cid = null;
-    }
+    if (owns) resetCompactionHolder(holder);
     if (evt.ok) {
       // The persisted marker row is stamped with THIS event's id, so
       // whichever of /history repaint or live/replayed event renders
@@ -269,46 +265,25 @@ export function applyCompactionEvent(holder, evt, hooks) {
         ),
       );
       if (eid) hooks.renderedIds.add(eid);
-    } else if (
-      owns &&
-      !evt.superseded &&
-      evt.reason !== "error" &&
-      !(evt.reason === "cancelled" && evt.trigger === "auto")
-    ) {
+    } else if (owns && evt.notice) {
       // cancelled / not_enough_messages / irreducible / empty_summary —
-      // informational, not an error state.  Three suppressions: a stale
-      // end's notice would narrate a dead compaction underneath a live
-      // one; a superseded end (a force-abandoned compaction retiring
-      // late, flagged by the backend) is one nobody is waiting on — its
-      // notice mid-turn reads as the LIVE work being cancelled; and an
-      // auto-compaction's cancel is just part of cancelling the
-      // surrounding turn — the send loop emits its own "[Generation
-      // cancelled]" info line, so a second line here stacked two notices
-      // for one Stop click.  (A superseded OK end above still renders
-      // its result card — the history swap really happened.)
-      // HAND-SYNCED SIBLING: cli.py TerminalUI.on_compaction implements
-      // this same three-clause policy for the terminal — change both or
-      // they drift (two runtimes, no shared code path).
+      // informational, not an error state.  Whether the message is shown
+      // is the emitter's call: the backend stamps `notice` on failed ends
+      // (suppressing error-reason / superseded / cancelled-auto ends —
+      // see ChatSession._compaction_event, the single policy site), so
+      // this arm stays mechanical.  `owns` is the one pane-local clause
+      // the emitter cannot compute — card ownership via compaction_id vs
+      // holder.cid — and it guards a reachable divergence: a /resume
+      // swaps sessions and restarts generation counters, so an abandoned
+      // old-session end can arrive superseded=false against the new
+      // session's live card.  An end without the field (replayed from an
+      // older node) stays silent — these notices are informational.
+      // (A superseded OK end above still renders its result card — the
+      // history swap really happened.)
       hooks.onNotice(evt.message || "Compaction skipped.");
     }
     hooks.scroll(true);
   }
-}
-
-// Send-POST abort bound for a pane, selected off its compaction holder.
-// Sends during a slash-command window PARK server-side and dispatch when
-// the window closes — a manual /compact legitimately runs for minutes, so
-// while ITS progress card is live the composer must not abort the parked
-// POST at the wedged-node default (~15s) and silently drop the message.
-// The card is the one cross-tab signal that a long window is in progress
-// (SSE-driven via applyCompactionEvent); with no card the short default
-// stands — a WEDGED quick command past 15s should fail loudly, not hang
-// the composer for 10 minutes.  Deployment note: reverse proxies bound
-// the effective park at their own read timeout (documented in the API
-// reference).  Shared by the interactive composer and the coordinator
-// viewer so the policy can't drift between panes.
-export function sendAbortMs(holder) {
-  return holder && holder.card ? 600000 : 15000;
 }
 
 // Retire a pane's in-progress compaction card (if any) and clear the

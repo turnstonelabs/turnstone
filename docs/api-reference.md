@@ -482,13 +482,16 @@ carries `before_tokens`/`after_tokens` and the produced `summary`;
 `"cancelled"` / `"error"`) and a human-readable `message` — for
 `reason: "error"` the same message is also emitted as a paired typed
 `error` event (that is the renderable error surface; the end event is
-card-teardown). Every end (ok or failed) carries `trigger`, and every
-event carries `compaction_id` — an opaque integer correlating the
-start/progress/end of one compaction run (a client that force-stopped one
-compaction can use it to ignore stragglers from the abandoned run). End
-events also carry `superseded`: `true` marks a force-abandoned compaction
-retiring after a successor generation took over — skip failure notices for
-those (an OK end's result card still stands: the history swap happened).
+card-teardown). Failed ends also carry `notice`: the emitter-computed
+display verdict — show `message` only when it is `true` (the server
+suppresses error-reason, superseded, and cancelled-auto notices once,
+centrally, so clients don't re-derive that policy). Every end (ok or
+failed) carries `trigger`, and every event carries `compaction_id` — an
+opaque integer correlating the start/progress/end of one compaction run (a
+client that force-stopped one compaction can use it to ignore stragglers
+from the abandoned run). End events also carry `superseded`: `true` marks
+a force-abandoned compaction retiring after a successor generation took
+over (an OK end's result card still stands: the history swap happened).
 Superseded start/progress events are never emitted.
 Exactly one `start` and one `end` are emitted per attempt,
 so clients can key an in-progress affordance (progress bar) on the pair. A
@@ -875,19 +878,25 @@ synchronous:
   endpoint executed commands unconditionally mid-turn; the 409 makes the
   refusal loud for callers that only check the HTTP status.)
 
-While a command holds the slot, `POST .../send` requests **park** server-side
-and dispatch as ordinary full-fidelity sends when the command's window closes
-— they are never routed through the mid-turn interjection queue (no length
-cap, no cross-user rejection). A client that aborts a parked send before the
-window closes abandons it: the message is not dispatched. Clients must
-therefore bound parked sends generously: the bundled web composer uses a
-10-minute abort while a compaction progress card is visible (its usual bound
-is ~15 s, sized for wedged-node detection), and dismissing a queued bubble
-aborts the in-flight POST so a dismissed message can't dispatch later.
-Deployment note: a reverse proxy's read timeout bounds the effective park —
-behind a stock 60 s proxy, sends parked longer than that fail at the proxy
-(the park sees the disconnect and abandons; nothing is dispatched — resend
-after the command completes, or raise the proxy read timeout).
+While a command holds the slot, `POST .../send` requests are **deferred**:
+the server answers `{"status": "queued", "msg_id": ...}` immediately and
+dispatches the message as an ordinary full-fidelity send (attachments and
+sender identity included) when the command's window closes — it is never
+routed through the mid-turn interjection queue (no length cap, no cross-user
+rejection). The response arrives within normal round-trip time, so
+timeout-bounded clients (SDKs, proxies, the coordinator) need no special
+handling. To retract a deferred send before it dispatches, issue the same
+`DELETE .../send` with its `msg_id` used for queued interjections —
+`{"status": "removed"}` confirms it will not dispatch; `"not_found"` means
+it already dispatched (or is dispatching). Retracting a deferred send
+discards any attachments it carried; re-attach to send them again.
+
+Durability: deferred sends are **node-local and in-memory** (the same
+lifetime as the interjection queue). `"queued"` is at-most-once intake, not
+durable acceptance — if the workstream is closed or the node restarts before
+the window ends, the message is dropped. Anything that must survive a
+restart should be re-sent after confirming dispatch (the turn appears on the
+SSE stream / in `/history`).
 
 **Request body:**
 

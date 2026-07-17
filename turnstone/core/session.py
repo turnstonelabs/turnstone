@@ -7799,16 +7799,52 @@ class ChatSession:
         not drive the activity-pill restore or animate a successor's card.
         ``my_generation`` is 0 on direct test invocations — falsy, so such
         events are never marked superseded (matching ``_check_cancelled``).
+
+        Failed ends additionally carry ``notice`` — the single display-
+        policy site: renderers show the failure message only when it is
+        true, instead of each re-deriving suppression from reason/trigger/
+        superseded (the cross-runtime drift trap the old hand-synced
+        cli.py/conversation.js clauses documented).  Error-reason ends are
+        suppressed because :meth:`_compaction_bailed` already fired the one
+        red ``on_error`` row; cancelled-auto ends because the surrounding
+        send prints its own "[Generation cancelled]"; superseded ends
+        because nobody is waiting on a force-abandoned compaction and its
+        notice mid-turn reads as the LIVE work being cancelled.
         """
         stale = bool(my_generation and my_generation != self._generation)
+        event: dict[str, Any] = {"compaction_id": my_generation, "superseded": stale, **payload}
+        if payload.get("phase") == "end" and not payload.get("ok"):
+            event["notice"] = (
+                not stale
+                and payload.get("reason") != "error"
+                and not (payload.get("reason") == "cancelled" and payload.get("trigger") == "auto")
+            )
         # getattr-guarded like on_generation_claimed/on_aux_usage: a
-        # duck-typed SessionUI predating the hook gets no compaction events
-        # rather than an AttributeError that wedges every long session at
-        # its first auto-compaction.
+        # duck-typed SessionUI predating the hook must not hit an
+        # AttributeError that wedges every long session at its first
+        # auto-compaction.
         emit = getattr(self.ui, "on_compaction", None)
         if emit is None:
+            # Pre-hook UIs get the classic info lines back (an
+            # auto-compaction must never swap history with zero
+            # announcement — the pre-1.8 lines reached every UI
+            # unconditionally).  Invoked for superseded events too: a
+            # superseded OK end announces a swap that really committed,
+            # and failed-end staleness is already encoded in ``notice``.
+            # ``on_info`` is getattr-guarded like the hook itself — the
+            # never-crash property is the floor; a UI with neither hook
+            # keeps compacting silently.  Deliberately NOT dual-emitted
+            # for hook-aware UIs or SSE: pre-1.8 SSE/SDK clients that
+            # ignore unknown `compaction` events lose these lines — a
+            # documented 1.8 breaking change (CHANGELOG); dual emission
+            # would double-render on every current client.
+            info = getattr(self.ui, "on_info", None)
+            if info is not None:
+                from turnstone.core.compaction_render import render_compaction_event_as_info
+
+                render_compaction_event_as_info(event, info)
             return None
-        result = emit({"compaction_id": my_generation, "superseded": stale, **payload})
+        result = emit(event)
         # Duck-typed hooks aren't bound to the protocol's return type; the
         # marker-stamp consumer needs int-or-None, nothing else.
         return result if isinstance(result, int) else None
@@ -9043,9 +9079,10 @@ class ChatSession:
         queue from BEFORE their window (a dying send worker's closing race)
         — the /compact worker's exit seam is the caller.  Messages sent
         DURING a command window never reach this queue: the /send route
-        parks them while ``worker_kind == "command"`` and dispatches them
-        as ordinary sends afterwards.  Must only be called by the thread
-        that owns the worker slot — it mutates ``self.messages``.
+        defers them (``ws._pending_sends``) while ``worker_kind ==
+        "command"`` and the drain task dispatches them as ordinary sends
+        afterwards.  Must only be called by the thread that owns the
+        worker slot — it mutates ``self.messages``.
         """
         return self._flush_queued_messages()
 
@@ -17338,9 +17375,10 @@ class ChatSession:
 
             # Flush any stranded queued text BEFORE the identity swap so it
             # is persisted into the workstream it was ADDRESSED to.  Sends
-            # during the command window itself park in the /send route and
-            # never queue; this covers only a message stranded by a dying
-            # send worker's closing race before this command started.
+            # during the command window itself defer in the /send route
+            # (ws._pending_sends) and never queue; this covers only a
+            # message stranded by a dying send worker's closing race
+            # before this command started.
             self._flush_queued_messages()
             self.messages.clear()
             self._read_files.clear()

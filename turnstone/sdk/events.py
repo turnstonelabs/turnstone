@@ -314,13 +314,17 @@ class CompactionEvent(ServerEvent):
     events additionally carry ``superseded``: True marks a force-abandoned
     compaction retiring after a successor generation took over — clients
     should skip failure notices for those (an OK end's result still
-    stands; the history swap happened).
+    stands; the history swap happened).  Failed ends carry ``notice``:
+    the emitter-computed display verdict — show ``message`` only when it
+    is True, instead of re-deriving suppression from
+    reason/trigger/superseded client-side.
     """
 
     type: str = "compaction"
     phase: str = ""
     compaction_id: int = 0
     superseded: bool = False
+    notice: bool = False
     trigger: str = ""
     where: str = ""
     pct: int | None = None

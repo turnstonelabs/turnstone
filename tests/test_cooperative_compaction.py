@@ -1891,7 +1891,9 @@ class TestPreHookUICompat:
         """A duck-typed SessionUI predating the compaction hook gets no
         lifecycle events but must not crash — an unguarded emit would
         AttributeError inside send()'s auto-compaction and permanently
-        wedge every long session on such a UI."""
+        wedge every long session on such a UI.  (This one has no on_info
+        either — the fallback below is getattr-guarded the same way, so
+        the never-crash floor holds even for a hookless minimal UI.)"""
         _seed_two_messages(session)
         session.ui = SimpleNamespace(
             on_thinking_start=lambda: None,
@@ -1901,6 +1903,193 @@ class TestPreHookUICompat:
         summary = SimpleNamespace(content="dense", finish_reason="stop")
         with patch.object(session, "_utility_completion", return_value=summary):
             assert session._compact_messages() is True
+
+    def _duck_ui_with_info(self):
+        infos: list[str] = []
+        ui = SimpleNamespace(
+            on_thinking_start=lambda: None,
+            on_thinking_stop=lambda: None,
+            on_error=lambda _m: None,
+            on_info=infos.append,
+        )
+        return ui, infos
+
+    def test_pre_hook_ui_gets_classic_info_lines(self, session):
+        """A duck-typed UI WITH on_info but WITHOUT on_compaction gets the
+        pre-1.8 lines back through the shared renderer — an auto-compaction
+        must never swap history with zero announcement for embedders that
+        predate the hook (the old lines reached them unconditionally)."""
+        session.ui, infos = self._duck_ui_with_info()
+        session._compaction_event(
+            0, {"phase": "start", "trigger": "auto", "where": "mid-turn", "pct": 80}
+        )
+        session._compaction_event(0, {"phase": "progress", "part": 1, "total": 2, "depth": 0})
+        session._compaction_event(
+            0,
+            {
+                "phase": "end",
+                "ok": True,
+                "trigger": "auto",
+                "before_tokens": 900,
+                "after_tokens": 100,
+                "summary": "dense",
+            },
+        )
+        assert any("Auto-compacting mid-turn" in m and "80%" in m for m in infos)
+        assert any("compacting part 1/2" in m for m in infos)
+        assert any("compacted: ~900 -> ~100 tokens" in m for m in infos)
+        assert any("dense" in m for m in infos)
+
+    def test_pre_hook_fallback_consumes_notice_not_policy(self, session):
+        """Failed-end display rides the emitter's ``notice`` stamp: a
+        manual cancelled end prints its message; an error-reason end (the
+        red row already came through on_error) and a cancelled AUTO end
+        stay silent — the fallback never re-derives the policy."""
+        session.ui, infos = self._duck_ui_with_info()
+        session._compaction_event(
+            0,
+            {
+                "phase": "end",
+                "ok": False,
+                "reason": "cancelled",
+                "message": "Compaction cancelled.",
+                "trigger": "manual",
+            },
+        )
+        assert infos == ["Compaction cancelled."]
+        infos.clear()
+        session._compaction_event(
+            0,
+            {
+                "phase": "end",
+                "ok": False,
+                "reason": "error",
+                "message": "boom",
+                "trigger": "manual",
+            },
+        )
+        session._compaction_event(
+            0,
+            {
+                "phase": "end",
+                "ok": False,
+                "reason": "cancelled",
+                "message": "Compaction cancelled.",
+                "trigger": "auto",
+            },
+        )
+        assert infos == []
+
+    def test_superseded_ok_end_still_renders_via_fallback(self, session):
+        """A superseded OK end announces a history swap that REALLY
+        committed — suppressing it re-creates the silent-swap failure for
+        duck-typed embedders (the web reducer renders the result card for
+        superseded OK ends for the same reason).  A superseded FAILED end
+        stays silent via the notice stamp."""
+        session.ui, infos = self._duck_ui_with_info()
+        session._generation = 7  # the emitting generation 3 is stale
+        session._compaction_event(
+            3,
+            {
+                "phase": "end",
+                "ok": True,
+                "trigger": "manual",
+                "before_tokens": 500,
+                "after_tokens": 50,
+                "summary": "kept",
+            },
+        )
+        assert any("compacted: ~500 -> ~50 tokens" in m for m in infos)
+        infos.clear()
+        session._compaction_event(
+            3,
+            {
+                "phase": "end",
+                "ok": False,
+                "reason": "cancelled",
+                "message": "Compaction cancelled.",
+                "trigger": "manual",
+            },
+        )
+        assert infos == []
+
+
+class TestCompactionNoticeStamp:
+    """_compaction_event is the single display-policy site: failed ends
+    carry ``notice`` — renderers show the message iff it is true, instead
+    of each re-deriving suppression from reason/trigger/superseded (the
+    cross-runtime drift trap the old hand-synced cli.py/conversation.js
+    clauses documented)."""
+
+    def _emit(self, session, payload, my_generation=0):
+        seen: dict = {}
+        with patch.object(session.ui, "on_compaction", side_effect=lambda p: seen.update(p)):
+            session._compaction_event(my_generation, payload)
+        return seen
+
+    def test_manual_cancelled_end_notice_true(self, session):
+        seen = self._emit(
+            session,
+            {
+                "phase": "end",
+                "ok": False,
+                "reason": "cancelled",
+                "message": "x",
+                "trigger": "manual",
+            },
+        )
+        assert seen["notice"] is True
+
+    def test_error_reason_end_notice_false(self, session):
+        """reason=error already fired the one red on_error row — the end
+        event is card-teardown, never a second line."""
+        seen = self._emit(
+            session,
+            {
+                "phase": "end",
+                "ok": False,
+                "reason": "error",
+                "message": "boom",
+                "trigger": "manual",
+            },
+        )
+        assert seen["notice"] is False
+
+    def test_cancelled_auto_end_notice_false(self, session):
+        """A cancelled AUTO compaction is part of cancelling the turn —
+        the send loop prints its own '[Generation cancelled]'."""
+        seen = self._emit(
+            session,
+            {"phase": "end", "ok": False, "reason": "cancelled", "message": "x", "trigger": "auto"},
+        )
+        assert seen["notice"] is False
+
+    def test_stale_generation_end_notice_false(self, session):
+        """A superseded end is one nobody is waiting on — its notice
+        mid-turn reads as the LIVE work being cancelled."""
+        session._generation = 9
+        seen = self._emit(
+            session,
+            {
+                "phase": "end",
+                "ok": False,
+                "reason": "cancelled",
+                "message": "x",
+                "trigger": "manual",
+            },
+            my_generation=4,
+        )
+        assert seen["superseded"] is True
+        assert seen["notice"] is False
+
+    def test_ok_end_and_start_carry_no_notice(self, session):
+        seen = self._emit(
+            session,
+            {"phase": "end", "ok": True, "trigger": "manual", "summary": "s"},
+        )
+        assert "notice" not in seen
+        seen = self._emit(session, {"phase": "start", "trigger": "manual"})
+        assert "notice" not in seen
 
 
 class TestPreSwapQueueFlush:

@@ -638,33 +638,39 @@ def test_connectsse_defers_open_when_tab_hidden() -> None:
     assert head.index('addEventListener("visibilitychange"') < head.index("if (document.hidden) {")
 
 
-def test_send_abort_bound_is_compaction_aware() -> None:
-    """The send POST's abort bound must be selected via the shared
-    ``sendAbortMs`` helper in BOTH panes: sends during a slash-command
-    window park server-side (a manual /compact legitimately runs for
-    minutes), so a hard-coded ~15s abort silently dropped any send made
-    >15s into a long compaction.  The compaction card is the long-bound
-    signal; the wedged-node default stays otherwise."""
+def test_send_post_abort_machinery_is_gone() -> None:
+    """The parked-POST era's client abort machinery must stay deleted in
+    BOTH panes: sends during a command window are answered "queued"
+    immediately (server-side defer-and-drain), so there is no long-lived
+    POST for a compaction-aware bound (``sendAbortMs``) to protect, and
+    dismissal is bind() → server-confirmed DELETE — never a POST abort
+    (``_sendAbort``), which fired on the interjection path too and
+    dispatched "dismissed" messages anyway.  Reintroducing either hook
+    means re-parking the POST; that design deterministically dropped
+    messages from every timeout-bounded caller (coordinator client and
+    console proxy at 30s, SDKs, stock proxies)."""
     interactive = _INTERACTIVE.read_text(encoding="utf-8")
-    assert "sendAbortMs(this._compaction)" in interactive, (
-        "interactive sendMessage must select its abort bound off the compaction holder"
-    )
     coordinator = (_ROOT / "turnstone/console/static/coordinator/coordinator.js").read_text(
         encoding="utf-8"
     )
-    assert "sendAbortMs(compactionHolder)" in coordinator, (
-        "coordinator coordSend must share the same abort-bound policy"
-    )
     conversation = (_ROOT / "turnstone/shared_static/conversation.js").read_text(encoding="utf-8")
-    assert "export function sendAbortMs" in conversation
-    assert "600000 : 15000" in conversation.replace("\n", " "), (
-        "long bound while a compaction card is live; 15s wedged-node default otherwise"
-    )
-    # The queued bubble's pre-response x must abort the in-flight (possibly
-    # parked) POST — otherwise a dismissed message dispatches anyway when
-    # the command window closes.
-    assert "queuedEl._sendAbort = () => sendCtrl.abort()" in interactive
     composer_queue = (_ROOT / "turnstone/shared_static/composer_queue.js").read_text(
         encoding="utf-8"
     )
-    assert "el._sendAbort()" in composer_queue
+    for name, src in (
+        ("interactive.js", interactive),
+        ("coordinator.js", coordinator),
+        ("conversation.js", conversation),
+        ("composer_queue.js", composer_queue),
+    ):
+        assert "sendAbortMs" not in src, f"{name}: the compaction-aware abort bound is dead"
+        assert "_sendAbort" not in src, f"{name}: dismiss must be bind() → DELETE, not a POST abort"
+    # The flat wedged-node bound stands in both panes: every /send answers
+    # within RTT now (dispatched / queued / deferred-with-msg_id).
+    assert "sendCtrl.abort(), 15000" in interactive
+    assert "sendCtrl.abort(), 15000" in coordinator
+    # Retracting a deferred send discards its attachments — both panes
+    # stash the count and composer_queue surfaces the consequence.
+    assert "_deferredAttachments" in interactive
+    assert "_deferredAttachments" in coordinator
+    assert "_deferredAttachments" in composer_queue

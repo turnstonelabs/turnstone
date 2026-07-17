@@ -31,7 +31,6 @@ import {
   buildCompactionCard,
   applyCompactionEvent,
   resetCompactionHolder,
-  sendAbortMs,
   buildSystemNudgeMarker,
   maxSeverityItem,
   buildConvBatchShell,
@@ -1997,10 +1996,11 @@ function createCoordinatorPane(root, wsId, opts) {
     let sendTimer = null;
     if (sendCtrl) {
       sendInit.signal = sendCtrl.signal;
-      // Same policy as the interactive composer: long bound while this
-      // pane's compaction card is live (the send parks server-side for
-      // the command window), wedged-node default otherwise.
-      sendTimer = setTimeout(() => sendCtrl.abort(), sendAbortMs(compactionHolder));
+      // Same policy as the interactive composer: flat wedged-node bound —
+      // every /send answers within RTT now (dispatched, queued, or
+      // deferred-with-msg_id during a command window; the server parks
+      // nothing against this POST).  Dismissal is bind() → DELETE.
+      sendTimer = setTimeout(() => sendCtrl.abort(), 15000);
     }
     let sendReq = authFetch(
       "/v1/api/workstreams/" + encodeURIComponent(wsId) + "/send",
@@ -2053,8 +2053,14 @@ function createCoordinatorPane(root, wsId, opts) {
           // flag so any subsequent send takes the queue path correctly,
           // and accept the small UX gap (no in-UI dismiss for THIS
           // message). The server still delivers it on worker drain.
-          if (queuedEl) queue.bind(queuedEl, data.msg_id);
-          else setBusy(true);
+          if (queuedEl) {
+            // Deferred sends (command-window defer) can carry attachments —
+            // stash the count BEFORE bind (a pre-bind ✕ confirms inside
+            // bind) so the dismiss path can surface the
+            // discarded-attachments consequence.
+            queuedEl._deferredAttachments = (data.attached_ids || []).length;
+            queue.bind(queuedEl, data.msg_id);
+          } else setBusy(true);
           attachments.consume(data.attached_ids, data.dropped_attachment_ids);
         } else if (data && data.status === "busy") {
           if (queuedEl) queue.remove(queuedEl);
