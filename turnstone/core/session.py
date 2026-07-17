@@ -16929,7 +16929,7 @@ class ChatSession:
                 self.set_skill(None)
                 self._append_system_turn(
                     "skill_hint",
-                    f"Operator changed the active skill from {previous_skill} to defaults.",
+                    f"Operator set the active skill from {previous_skill} to defaults.",
                 )
                 self.ui.on_info("Skill cleared; using defaults.")
             else:
@@ -16938,7 +16938,7 @@ class ChatSession:
                     self.set_skill(tpl["name"])
                     self._append_system_turn(
                         "skill_hint",
-                        f"Operator changed the active skill from {previous_skill} to {tpl['name']}.",
+                        f"Operator set the active skill from {previous_skill} to {tpl['name']}.",
                     )
                     self.ui.on_info(f"Skill set: {tpl['name']}")
                 else:

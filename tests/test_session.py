@@ -248,7 +248,7 @@ class TestSkillCommand:
         assert marker["role"] == "system"
         assert marker["_source"] == "skill_hint"
         assert marker["content"] == (
-            f"Operator changed the active skill from alpha to {expected_target}."
+            f"Operator set the active skill from alpha to {expected_target}."
         )
         save_message.assert_called_once()
 
