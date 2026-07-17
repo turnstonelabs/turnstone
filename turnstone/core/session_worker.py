@@ -145,6 +145,12 @@ def send(
         caller surfaces 429) or any other exception (logged). Falling
         through to spawn a second worker on a full queue would corrupt
         ChatSession state.
+
+    Raises:
+        Whatever ``Thread.start()`` raised when the spawn itself fails
+        (thread exhaustion, ``MemoryError``) — the slot claim is rolled
+        back first, so the workstream stays dispatchable once resources
+        recover instead of wedging behind a flag no thread will clear.
     """
     name = thread_name or f"session-worker-{ws.id[:8]}"
 
@@ -233,5 +239,27 @@ def send(
     # ``t.start()`` may run user code (worker body) before returning;
     # keep it outside the lock to avoid pinning ``ws._lock`` for the
     # full thread-creation cost.
-    t.start()
+    try:
+        t.start()
+    except Exception:
+        # Thread creation failed (RuntimeError under thread exhaustion,
+        # MemoryError): the slot was claimed under the lock above, but the
+        # flag's normal clearer is ``_runner``'s finally — on a thread
+        # that will never run.  Without this release, ``_worker_running``
+        # stays True forever on a workstream that LOOKS idle (the worker
+        # never fired a state change), every future dispatch takes the
+        # reuse path into a queue with no consumer, and only an operator
+        # force-cancel unwedges it.  Identity-guarded like ``_runner``'s
+        # clear: a concurrent force-cancel may already have cleared or
+        # replaced the slot, and this must not clobber a live successor.
+        # Re-raise rather than return False: callers' crash paths (the
+        # deferred-send drain's per-iteration handler with its backoff)
+        # are shaped for exceptions, and a False here would masquerade as
+        # queue-full backpressure.
+        with ws._lock:
+            if ws.worker_thread is t:
+                ws.worker_thread = None
+                ws._worker_running = False
+        log.exception("session_worker.spawn_failed ws=%s — slot released", ws.id[:8])
+        raise
     return True

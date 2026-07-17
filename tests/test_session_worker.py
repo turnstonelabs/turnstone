@@ -146,6 +146,45 @@ def test_enqueue_unexpected_exception_returns_false_logged() -> None:
     assert ws._worker_running is True
 
 
+def test_spawn_failure_releases_slot_and_reraises(monkeypatch) -> None:
+    """``Thread.start`` raising (thread exhaustion, MemoryError) must not
+    wedge the slot: the claim ``(worker_thread, _worker_running)`` taken
+    under the lock is rolled back and the exception propagates.  Without
+    the rollback the flag's only clearer is a finally on a thread that
+    never started — the workstream looks idle forever (no state change
+    ever fired) while every dispatch takes the reuse path into a queue
+    no worker will drain, until an operator force-cancel."""
+    import pytest
+
+    session = _SendSession()
+    ws = _make_ws(session)
+
+    class _ExhaustedThread(threading.Thread):
+        def start(self) -> None:
+            raise RuntimeError("can't start new thread")
+
+    class _ThreadNS:
+        # Shim only what session_worker.send touches; patching the real
+        # threading module's Thread attribute would break every other
+        # test's spawns.
+        Thread = _ExhaustedThread
+        current_thread = staticmethod(threading.current_thread)
+
+    monkeypatch.setattr(session_worker, "threading", _ThreadNS)
+    with pytest.raises(RuntimeError, match="can't start new thread"):
+        _send_message(ws, session, "doomed")
+    assert ws._worker_running is False
+    assert ws.worker_thread is None
+    assert session.send_calls == []
+
+    # The slot is genuinely reusable once resources recover.
+    monkeypatch.setattr(session_worker, "threading", threading)
+    assert _send_message(ws, session, "recovered") is True
+    ws.worker_thread.join(timeout=2.0)
+    assert session.send_calls == ["recovered"]
+    assert ws._worker_running is False
+
+
 def test_closed_workstream_refused_no_spawn() -> None:
     """Authoritative closed-check: ``close()`` sets ``_closed`` under
     ``ws._lock``, so a wake (or send) racing it must be refused HERE —

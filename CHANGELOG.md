@@ -175,6 +175,16 @@ Earlier stable lines (`stable/1.6`, `stable/1.5`) are frozen.
 
 ### Fixed
 
+- **A failed worker-thread spawn no longer wedges the workstream.** If
+  `Thread.start()` itself raised (thread exhaustion, out-of-memory), the
+  dispatcher had already claimed the worker slot but the flag's only
+  clearer lived in the never-started thread — the workstream looked idle
+  forever while every subsequent message queued behind a worker that
+  didn't exist, until an operator force-cancel. The claim is now rolled
+  back under the lock and the error propagates, so the workstream is
+  dispatchable again as soon as resources recover. Affected every
+  dispatch path (sends, wakes, retries, deferred-send drain, init).
+
 - **Manual `/compact` from the web UI: no phantom user turn, no frozen
   server, cancellable.** A slash command typed into the web composer no
   longer renders as a user chat bubble (it echoes as a distinct command
