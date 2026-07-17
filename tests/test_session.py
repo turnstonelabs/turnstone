@@ -213,6 +213,46 @@ def _run_exec_search(session, capture_return):
     return output
 
 
+class TestSkillCommand:
+    @pytest.mark.parametrize(
+        ("command", "skill", "expected_name", "expected_target"),
+        [
+            ("/skill beta", {"name": "beta"}, "beta", "beta"),
+            ("/skill clear", None, None, "defaults"),
+        ],
+    )
+    def test_operator_change_is_recorded_in_trajectory(
+        self, command, skill, expected_name, expected_target
+    ):
+        session = ChatSession.__new__(ChatSession)
+        session._skill_name = "alpha"
+        session.messages = [turn_from_dict({"role": "user", "content": "prior work"})]
+        session._msg_tokens = [2]
+        session._chars_per_token = 4.0
+        session._ws_id = "test-workstream"
+        session.ui = MagicMock()
+        session.ui.on_system_turn.return_value = None
+        session._ui_event_id = MagicMock(return_value=None)
+        session.set_skill = MagicMock(
+            side_effect=lambda name: setattr(session, "_skill_name", name)
+        )
+
+        with (
+            patch("turnstone.core.session.get_skill_by_name", return_value=skill),
+            patch("turnstone.core.session.save_message") as save_message,
+        ):
+            session.handle_command(command)
+
+        session.set_skill.assert_called_once_with(expected_name)
+        marker = turn_to_dict(session.messages[-1])
+        assert marker["role"] == "system"
+        assert marker["_source"] == "skill_hint"
+        assert marker["content"] == (
+            f"Operator changed the active skill from alpha to {expected_target}."
+        )
+        save_message.assert_called_once()
+
+
 class TestChatSessionConstruction:
     def test_system_messages_created(self, tmp_db):
         session = _make_session()

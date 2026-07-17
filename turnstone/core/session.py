@@ -16919,6 +16919,7 @@ class ChatSession:
                 self.ui.on_info("Instructions updated.")
 
         elif cmd == "/skill":
+            previous_skill = self._skill_name or "defaults"
             if not arg:
                 if self._skill_name:
                     self.ui.on_info(f"Active skill: {self._skill_name}")
@@ -16926,11 +16927,19 @@ class ChatSession:
                     self.ui.on_info("Using defaults. Usage: /skill <name> or /skill clear")
             elif arg.strip().lower() == "clear":
                 self.set_skill(None)
+                self._append_system_turn(
+                    "skill_hint",
+                    f"Operator changed the active skill from {previous_skill} to defaults.",
+                )
                 self.ui.on_info("Skill cleared; using defaults.")
             else:
                 tpl = get_skill_by_name(arg.strip())
                 if tpl:
                     self.set_skill(tpl["name"])
+                    self._append_system_turn(
+                        "skill_hint",
+                        f"Operator changed the active skill from {previous_skill} to {tpl['name']}.",
+                    )
                     self.ui.on_info(f"Skill set: {tpl['name']}")
                 else:
                     self.ui.on_error(f"Skill not found: {arg.strip()}")
