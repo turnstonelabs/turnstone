@@ -168,3 +168,17 @@ def test_unbounded_render_inputs_are_capped() -> None:
     assert "more preview lines not shown" in body
     assert "RAW_CAP" in body
     assert "truncated for display" in body
+
+
+def test_retry_note_validates_backoff_before_rendering() -> None:
+    """retry_in is a server-emitted backoff coerced with Number(); like the
+    part/total pair just below it, it must be finiteness-validated (and
+    non-negative) so a malformed value can't render "retrying in NaNs".  The
+    error text is kept regardless — it is the load-bearing half of the note."""
+    body = _body()
+    assert "Number.isFinite(secs) && secs >= 0" in body, (
+        "retry_in must be validated (finite, non-negative) before its seconds render"
+    )
+    assert "Math.round(Number(evt.retry_in))" not in body, (
+        "retry_in must not be Math.round(Number(...))'d without a finiteness guard"
+    )

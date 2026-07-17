@@ -169,12 +169,16 @@ export function updateCompactionProgress(el, evt) {
     return;
   }
   if (evt.retry_in != null) {
+    // retry_in is a server-emitted backoff (seconds) coerced with Number();
+    // validate it the way part/total below are, so a malformed value can't
+    // render "retrying in NaNs".  The error text is the load-bearing half —
+    // keep it whether or not the duration parses.
+    const secs = Number(evt.retry_in);
+    const err = String(evt.error || "error");
     note.textContent =
-      "retrying in " +
-      Math.round(Number(evt.retry_in)) +
-      "s (" +
-      String(evt.error || "error") +
-      ")…";
+      Number.isFinite(secs) && secs >= 0
+        ? "retrying in " + Math.round(secs) + "s (" + err + ")…"
+        : "retrying (" + err + ")…";
     return;
   }
   const part = Number(evt.part);
