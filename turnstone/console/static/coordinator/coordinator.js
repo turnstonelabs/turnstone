@@ -1956,15 +1956,18 @@ function createCoordinatorPane(root, wsId, opts) {
     const snap = attachments.snapshot();
 
     let queuedEl = null;
+    let optimisticEl = null;
+    // Server re-parses the !!! prefix to set queue priority — the
+    // optimistic bubble strips it for display. Parsed outside the busy
+    // branch: the queued+deferred response arm needs it too (an idle
+    // pane's send can defer behind a command window / pending list).
+    let displayText = trimmed;
+    let priority = "notice";
+    if (trimmed.startsWith("!!!")) {
+      displayText = trimmed.slice(3).trimStart();
+      priority = "important";
+    }
     if (busy) {
-      // Server re-parses the !!! prefix to set queue priority — the
-      // optimistic bubble strips it for display.
-      let displayText = trimmed;
-      let priority = "notice";
-      if (trimmed.startsWith("!!!")) {
-        displayText = trimmed.slice(3).trimStart();
-        priority = "important";
-      }
       queuedEl = queue.addQueuedMessage(displayText, priority);
     } else {
       setBusy(true);
@@ -1972,9 +1975,13 @@ function createCoordinatorPane(root, wsId, opts) {
       // for every stable chip the composer holds; pass it through so
       // the optimistic user bubble shows the same pill cluster the
       // history-replay path renders below.
-      appendUserMessageWithAttachments(trimmed, snap.attachments, {
-        label: "you",
-      });
+      optimisticEl = appendUserMessageWithAttachments(
+        trimmed,
+        snap.attachments,
+        {
+          label: "you",
+        },
+      );
     }
     composer.clear();
 
@@ -2045,21 +2052,24 @@ function createCoordinatorPane(root, wsId, opts) {
       })
       .then((data) => {
         if (data && data.status === "queued" && data.msg_id) {
-          // Race: server returned queued but the client thought it was
-          // idle (SSE state_change hadn't arrived yet on initial load /
-          // reconnect). The optimistic user bubble is already in the
-          // log; we can't bind msg_id to a queued bubble retroactively
-          // without flipping the visual state mid-stream. Flip the busy
-          // flag so any subsequent send takes the queue path correctly,
-          // and accept the small UX gap (no in-UI dismiss for THIS
-          // message). The server still delivers it on worker drain.
+          // queuedEl-present: bind() handles the known races. queuedEl-
+          // absent + deferred: the pane thought it was idle but the send
+          // parked on the server's deferred list (command window / order
+          // barrier) — a plain sent bubble would present a parked,
+          // still-retractable, restart-droppable message as delivered, so
+          // replace the optimistic bubble with a real queued chip.
+          // queuedEl-absent + undeferred: plain interjection into a live
+          // turn the client hadn't seen yet (SSE state_change race); keep
+          // the historical small-UX-gap behavior (busy flip only).
+          if (!queuedEl && data.deferred) {
+            if (optimisticEl && optimisticEl.isConnected) optimisticEl.remove();
+            queuedEl = queue.addQueuedMessage(displayText, priority);
+          }
           if (queuedEl) {
-            // Deferred sends (command-window defer) can carry attachments —
-            // stash the count BEFORE bind (a pre-bind ✕ confirms inside
-            // bind) so the dismiss path can surface the
-            // discarded-attachments consequence.
-            queuedEl._deferredAttachments = (data.attached_ids || []).length;
-            queue.bind(queuedEl, data.msg_id);
+            queue.bind(queuedEl, data.msg_id, {
+              deferred: !!data.deferred,
+              attachedCount: (data.attached_ids || []).length,
+            });
           } else setBusy(true);
           attachments.consume(data.attached_ids, data.dropped_attachment_ids);
         } else if (data && data.status === "busy") {
@@ -3040,6 +3050,14 @@ function createCoordinatorPane(root, wsId, opts) {
         // already showed it; nothing to render here. (Earlier this
         // surfaced an extra info row, which doubled up with the
         // queued bubble once the composer started rendering one.)
+        break;
+      case "message_dispatched":
+        // A deferred send left the parked list: fresh spawn (promote the
+        // chip — the ×'s window is over) or interjection fold-in
+        // (folded: true — only the deferred flag clears; the chip resumes
+        // the normal queued lifecycle). No-op when this tab holds no
+        // matching chip.
+        queue.settleDeferred(ev.msg_id, !!ev.folded);
         break;
       case "busy_error":
         // Worker is still alive after a cancel attempt; re-arm the

@@ -640,6 +640,9 @@ class Pane {
     this._addUserMsgActions(el, text);
     this.messagesEl.appendChild(el);
     this.scrollToBottom(true);
+    // Returned so the send flow can retro-convert the optimistic bubble
+    // into a queued chip when the server answers queued+deferred.
+    return el;
   }
 
   // --- Approval-cycle bookkeeping -----------------------------------------
@@ -1942,6 +1945,15 @@ class Pane {
       case "message_queued":
         // Confirmation from server that a queued message was accepted.
         // The UI already showed the message optimistically in addQueuedMessage.
+        break;
+
+      case "message_dispatched":
+        // A deferred send left the parked list: fresh spawn (promote the
+        // chip — the ×'s window is over) or interjection fold-in
+        // (folded: true — only the deferred flag clears; the chip resumes
+        // the normal queued lifecycle). No-op when this tab holds no
+        // matching chip.
+        this.queue.settleDeferred(evt.msg_id, !!evt.folded);
         break;
 
       case "busy_error":
@@ -3715,6 +3727,14 @@ class Pane {
             this.addInfoMessage(
               body.error || "Session is busy — try again shortly.",
             );
+          } else if (body.status === "running") {
+            // The command outlived the endpoint's 25s completion backstop
+            // (kept under the console proxy's 30s bound precisely so this
+            // answer can traverse a proxied pane). The worker is still
+            // going; its output and pane refreshes arrive over SSE.
+            this.addInfoMessage(
+              "Command is still running — results will appear here when it finishes.",
+            );
           }
         })
         .catch(() => {});
@@ -3727,22 +3747,26 @@ class Pane {
 
     const isBusy = this.busy;
     let queuedEl = null;
+    let optimisticEl = null;
     const snap = this.attachments.snapshot();
 
+    // Server re-parses the !!! prefix to set queue priority — the
+    // optimistic bubble strips it for display. Parsed outside the busy
+    // branch: the queued+deferred response arm needs it too (an idle
+    // pane's send can defer behind a command window / pending list).
+    let displayText = text;
+    let priority = "notice";
+    if (text.startsWith("!!!")) {
+      displayText = text.slice(3).trimStart();
+      priority = "important";
+    }
+
     if (isBusy) {
-      // Server re-parses the !!! prefix to set queue priority — the
-      // optimistic bubble strips it for display.
-      let displayText = text;
-      let priority = "notice";
-      if (text.startsWith("!!!")) {
-        displayText = text.slice(3).trimStart();
-        priority = "important";
-      }
       this.removeEmptyState();
       queuedEl = this.queue.addQueuedMessage(displayText, priority);
     } else {
       this.setBusy(true);
-      this.addUserMessage(text, snap.attachments);
+      optimisticEl = this.addUserMessage(text, snap.attachments);
     }
     this.composer.clear();
 
@@ -3819,20 +3843,23 @@ class Pane {
         if (data.status === "queued" && data.msg_id) {
           // queuedEl-present path: bind() handles the three known races
           // (pre-bind dismiss, promote sweep raced ahead, normal accept).
-          // queuedEl-absent path: client thought it was idle but the
-          // server saw a live worker (SSE state_change hadn't arrived
-          // yet). Flip busy so subsequent sends queue correctly; the
-          // optimistic user bubble is already in the log and the server
-          // still delivers the message on worker drain — accept the
-          // small UX gap (no in-UI dismiss for THIS message).
+          // queuedEl-absent + deferred: the pane thought it was idle but
+          // the send parked on the server's deferred list (command window
+          // / order barrier) — a plain sent bubble would present a parked,
+          // still-retractable, restart-droppable message as delivered, so
+          // replace the optimistic bubble with a real queued chip carrying
+          // the dismiss affordance. queuedEl-absent + undeferred: plain
+          // interjection into a live turn the client hadn't seen yet;
+          // keep the historical small-UX-gap behavior (busy flip only).
+          if (!queuedEl && data.deferred) {
+            if (optimisticEl && optimisticEl.isConnected) optimisticEl.remove();
+            queuedEl = this.queue.addQueuedMessage(displayText, priority);
+          }
           if (queuedEl) {
-            // A deferred send (command-window defer) can carry
-            // attachments — stash the count BEFORE bind (a pre-bind ✕
-            // confirms inside bind) so the dismiss path can tell the
-            // user the attachments were discarded: the chips are
-            // consumed below and a retract does not re-stage them.
-            queuedEl._deferredAttachments = (data.attached_ids || []).length;
-            this.queue.bind(queuedEl, data.msg_id);
+            this.queue.bind(queuedEl, data.msg_id, {
+              deferred: !!data.deferred,
+              attachedCount: (data.attached_ids || []).length,
+            });
           } else this.setBusy(true);
           this.attachments.consume(
             data.attached_ids,

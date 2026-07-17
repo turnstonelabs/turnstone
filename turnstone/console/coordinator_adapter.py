@@ -391,6 +391,25 @@ class CoordinatorAdapter:
                 interjector_user_id=acting_user_id,
             )
 
+        # Order-barrier yield, mirroring the /send route's pre-check: once
+        # deferred sends are pending (or a claimed entry's dispatch is in
+        # flight — the drain-alive term), a spawn here would overtake
+        # messages already acknowledged "queued".  Refuse via the return
+        # value — the adapter's documented backpressure surface, which the
+        # sole call site reports as queue_full/undelivered — NEVER by
+        # raising queue.Full from the body: only enqueue closures may (the
+        # dispatcher catches it there); a body-raise would escape into the
+        # create handler as a crash.  Unreachable today (that caller
+        # dispatches on a freshly created workstream, which cannot have
+        # pending sends); the guard exists for future dispatch callers.
+        drain_t = ws._pending_drain
+        if ws._pending_sends or (drain_t is not None and drain_t.is_alive()):
+            log.warning(
+                "coord_adapter.send_refused_pending_sends ws=%s count=%d",
+                ws.id[:8],
+                len(ws._pending_sends),
+            )
+            return False
         return session_worker.send(
             ws,
             enqueue=_enqueue,

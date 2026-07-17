@@ -2013,6 +2013,91 @@ class TestPreHookUICompat:
         )
         assert infos == []
 
+    def test_explicit_protocol_subclass_inherits_classic_lines(self, session):
+        """An explicit ``class MyUI(SessionUI)`` never lands in the getattr
+        fallback — it INHERITS the protocol member as a real method — so
+        the protocol default body itself must be the pre-1.8 rendering.
+        With a bare ``...`` stub, exactly these embedders (the ones the
+        fallback was built for) silently swallowed every lifecycle event."""
+        from turnstone.core.session import SessionUI
+
+        infos: list[str] = []
+
+        class _ExplicitUI(SessionUI):
+            def on_info(self, message: str) -> None:
+                infos.append(message)
+
+        session.ui = _ExplicitUI()
+        result = session._compaction_event(
+            0,
+            {
+                "phase": "end",
+                "ok": True,
+                "trigger": "auto",
+                "before_tokens": 900,
+                "after_tokens": 100,
+                "summary": "dense",
+            },
+        )
+        assert result is None  # inherited default returns None, not a stub echo
+        # Rendered exactly once — via the inherited default, with no second
+        # pass through the duck-type fallback (emit is not None here).
+        assert sum("compacted: ~900 -> ~100 tokens" in m for m in infos) == 1
+        assert any("dense" in m for m in infos)
+
+    def test_explicit_subclass_override_suppresses_default_lines(self, session):
+        """A subclass that implements the hook owns the rendering: no
+        classic info lines from the default body, and its return value
+        reaches the marker stamp."""
+        from turnstone.core.session import SessionUI
+
+        infos: list[str] = []
+        seen: list[dict] = []
+
+        class _HookedUI(SessionUI):
+            def on_info(self, message: str) -> None:
+                infos.append(message)
+
+            def on_compaction(self, payload: dict) -> int | None:
+                seen.append(payload)
+                return 42
+
+        session.ui = _HookedUI()
+        result = session._compaction_event(
+            0, {"phase": "end", "ok": True, "trigger": "auto", "summary": "s"}
+        )
+        assert result == 42
+        assert len(seen) == 1
+        assert infos == []
+
+    def test_duck_hook_bool_return_never_reaches_marker_stamp(self, session):
+        """A duck-typed on_compaction returning ``True`` (bool ⊂ int) must
+        coerce to ``None`` — a boolean stamped into the persisted marker's
+        event_id fails the PG INSERT after the history swap committed and
+        mis-keys the SQLite dedupe (same guard as parse_checkpoint_watermark,
+        via _coerce_event_id)."""
+        session.ui = SimpleNamespace(
+            on_thinking_start=lambda: None,
+            on_thinking_stop=lambda: None,
+            on_error=lambda _m: None,
+            on_compaction=lambda _payload: True,
+        )
+        result = session._compaction_event(
+            0, {"phase": "end", "ok": True, "trigger": "auto", "summary": "s"}
+        )
+        assert result is None
+
+    def test_coerce_event_id_rejects_bools(self):
+        """The shared coercion helper: ints pass, bools and non-ints don't."""
+        from turnstone.core.session import _coerce_event_id
+
+        assert _coerce_event_id(46) == 46
+        assert _coerce_event_id(0) == 0
+        assert _coerce_event_id(True) is None
+        assert _coerce_event_id(False) is None
+        assert _coerce_event_id(None) is None
+        assert _coerce_event_id("46") is None
+
 
 class TestCompactionNoticeStamp:
     """_compaction_event is the single display-policy site: failed ends

@@ -1150,6 +1150,21 @@ def _is_ctx_overflow(exc: BaseException) -> bool:
     )
 
 
+def _coerce_event_id(value: Any) -> int | None:
+    """Narrow a duck-typed hook return / attribute to a usable event id.
+
+    ``bool`` is an ``int`` subclass, so a bare ``isinstance(value, int)``
+    lets a hook returning ``True`` stamp a boolean into a persisted
+    ``event_id`` — PostgreSQL then fails the INSERT after the state it
+    annotates already committed, and SQLite stores ``1`` and mis-keys
+    the /history-vs-replay dedupe.  Same guard as
+    ``parse_checkpoint_watermark`` (storage/_utils.py); every consumer
+    of a duck-typed event-id source must route through here rather than
+    re-deriving the isinstance chain per site.
+    """
+    return value if isinstance(value, int) and not isinstance(value, bool) else None
+
+
 class SessionUI(Protocol):
     def on_turn_start(self) -> None: ...
     def on_turn_committed(self) -> None: ...
@@ -1187,8 +1202,22 @@ class SessionUI(Protocol):
         assigns one (see :meth:`on_system_turn`) so the persisted
         compaction marker row can be stamped with the matching resume
         cursor; ``None`` for UIs without an event stream.
+
+        The default body IS the pre-1.8 compat rendering — the classic
+        ``on_info`` lines via the shared renderer.  It must not be a bare
+        ``...`` stub: a Protocol member's body is inherited as a REAL
+        method by explicit subclasses, so a pre-1.8 ``class MyUI(SessionUI)``
+        that never implemented this hook would satisfy the getattr probe
+        in ``_compaction_event`` with a silent no-op and defeat the very
+        fallback built for it — every lifecycle event swallowed, history
+        swapping with zero announcement.  Event-stream UIs override and
+        return the assigned id; a subclass implementing neither hook
+        no-ops through ``on_info``'s own stub (the never-crash floor).
         """
-        ...
+        from turnstone.core.compaction_render import render_compaction_event_as_info
+
+        render_compaction_event_as_info(payload, self.on_info)
+        return None
 
     def on_state_change(self, state: str) -> None: ...
     def on_rename(self, name: str) -> None: ...
@@ -3178,7 +3207,7 @@ class ChatSession:
         available" (the synthetic-snapshot floor).
         """
         eid = getattr(self.ui, "_event_id", None)
-        return eid if isinstance(eid, int) else None
+        return _coerce_event_id(eid)
 
     def _tool_def_chars(self) -> int:
         """Total serialized char size of the active tool definitions (resent on
@@ -5701,7 +5730,9 @@ class ChatSession:
         # event was delivered to double anyway).
         emitted_event_id: int | None = None
         try:
-            emitted_event_id = self.ui.on_system_turn(content, source, meta or None)
+            emitted_event_id = _coerce_event_id(
+                self.ui.on_system_turn(content, source, meta or None)
+            )
         except Exception:
             log.warning("ui.on_system_turn failed; system turn still appended", exc_info=True)
         save_message(
@@ -5709,7 +5740,7 @@ class ChatSession:
             "system",
             content,
             source=source,
-            event_id=emitted_event_id if isinstance(emitted_event_id, int) else self._ui_event_id(),
+            event_id=emitted_event_id if emitted_event_id is not None else self._ui_event_id(),
             meta=meta_json,
         )
 
@@ -7822,7 +7853,13 @@ class ChatSession:
         # getattr-guarded like on_generation_claimed/on_aux_usage: a
         # duck-typed SessionUI predating the hook must not hit an
         # AttributeError that wedges every long session at its first
-        # auto-compaction.
+        # auto-compaction.  This probe only catches DUCK-typed UIs — an
+        # explicit ``class MyUI(SessionUI)`` inherits the protocol
+        # member as a real method and never lands in the None arm, which
+        # is why the protocol default body renders the same classic
+        # lines itself (see SessionUI.on_compaction): both compat routes
+        # converge on render_compaction_event_as_info, policy
+        # single-sited.
         emit = getattr(self.ui, "on_compaction", None)
         if emit is None:
             # Pre-hook UIs get the classic info lines back (an
@@ -7846,8 +7883,9 @@ class ChatSession:
             return None
         result = emit(event)
         # Duck-typed hooks aren't bound to the protocol's return type; the
-        # marker-stamp consumer needs int-or-None, nothing else.
-        return result if isinstance(result, int) else None
+        # marker-stamp consumer needs int-or-None, nothing else (and a
+        # hook returning True must not stamp a bool — see _coerce_event_id).
+        return _coerce_event_id(result)
 
     def _compaction_bailed(
         self,
@@ -9086,15 +9124,6 @@ class ChatSession:
         """
         return self._flush_queued_messages()
 
-    @staticmethod
-    def _combine_queued_items(items: list[tuple[str, str]]) -> str:
-        """Render drained queue items to one text block ([IMPORTANT] framing)."""
-        from turnstone.core.tool_advisory import PRIORITY_IMPORTANT
-
-        return "\n\n".join(
-            f"[IMPORTANT] {msg}" if pri == PRIORITY_IMPORTANT else msg for msg, pri in items
-        )
-
     def compact_now(self) -> bool:
         """Manual compaction with send()'s full generation discipline.
 
@@ -9165,10 +9194,14 @@ class ChatSession:
         Returns ``True`` when any user row was appended (prefix or
         items), ``False`` when both were empty.
         """
+        from turnstone.core.tool_advisory import PRIORITY_IMPORTANT
+
         with self._queued_lock:
             items = list(self._queued_messages.values())
             self._queued_messages.clear()
-        queued_text = self._combine_queued_items(items)
+        queued_text = "\n\n".join(
+            f"[IMPORTANT] {msg}" if pri == PRIORITY_IMPORTANT else msg for msg, pri in items
+        )
         if not queued_text and not prefix:
             return False
 

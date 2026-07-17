@@ -698,6 +698,14 @@ def _interactive_dispatch_retry(ws: Workstream, user_msg: str) -> None:
     the pre-lift inline behaviour). The shared dispatcher owns the
     ``_worker_running`` lifecycle, so the ``run`` closure needs no
     ``finally`` flag-clear of its own.
+
+    Deliberately NOT gated on the /send order barrier
+    (``ws._pending_sends``): a retry is an explicit user action that
+    rewinds a COMPLETED turn — dispatching it ahead of deferred sends is
+    an accepted overtake (the user just asked for exactly that turn to
+    run again), not the silent send-vs-send inversion the barrier exists
+    to prevent.  Deferred entries dispatch after it, order among
+    themselves preserved.
     """
     from turnstone.core import session_worker
 
@@ -1787,7 +1795,7 @@ async def command(request: Request) -> JSONResponse:
             # Fire-and-forget: the response returns as soon as the worker is
             # dispatched and NO completion bound applies — a large context
             # can legitimately compact for many minutes; progress streams
-            # over SSE and Stop cancels it.  (The 60s wait below is for the
+            # over SSE and Stop cancels it.  (The 25s wait below is for the
             # quick commands only.)
 
             def _run_compact() -> None:
@@ -1852,9 +1860,9 @@ async def command(request: Request) -> JSONResponse:
             try:
                 should_exit = session.handle_command(cmd)
                 # Post-command follow-ups run HERE, on the worker, not
-                # after the endpoint's done-wait: past the 60s backstop the
+                # after the endpoint's done-wait: past the 25s backstop the
                 # endpoint has already answered {"status": "running"}, and
-                # follow-ups parked there were silently skipped — a >60s
+                # follow-ups parked there were silently skipped — a slow
                 # /resume left every pane rendering the pre-resume
                 # transcript against a session whose history had changed,
                 # and the workstream list kept the stale name.
@@ -1907,9 +1915,15 @@ async def command(request: Request) -> JSONResponse:
         # the worker itself, so a late completion still refreshes the
         # panes.  Loop-native wait (call_soon_threadsafe from the worker's
         # finally): a thread parked in Event.wait via to_thread would hold
-        # a shared default-executor slot for up to 60s per wedged command.
+        # a shared default-executor slot for the whole wait per wedged
+        # command.  25s: strictly under the console proxy's 30s client
+        # timeout (console/server.py proxy_client) so the degraded
+        # ``running`` answer can actually traverse a proxied pane — at 60s
+        # the proxy aborted first, the pane's dispatch swallowed the 5xx,
+        # and the user saw nothing at all (the same bounded-caller
+        # reasoning that redesigned /send's command-window path).
         try:
-            async with asyncio.timeout(60):
+            async with asyncio.timeout(25):
                 await done.wait()
         except TimeoutError:
             return JSONResponse({"status": "running"})
@@ -2537,6 +2551,9 @@ async def _interactive_create_post_install(
         # creation) unless a caller-supplied ws_id is raced — hence
         # ``_enqueue_init`` preserves the message and leaves the staged
         # attachments recoverable instead of assuming the branch is dead.
+        # No /send order-barrier pre-check for the same by-construction
+        # reason: a freshly created workstream cannot have deferred sends
+        # pending (``ws._pending_sends`` only ever grows via that route).
         init_ok = session_worker.send(
             ws,
             enqueue=_enqueue_init,

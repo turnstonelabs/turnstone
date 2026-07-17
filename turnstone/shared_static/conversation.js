@@ -265,6 +265,7 @@ export function applyCompactionEvent(holder, evt, hooks) {
         ),
       );
       if (eid) hooks.renderedIds.add(eid);
+      hooks.scroll(true);
     } else if (owns && evt.notice) {
       // cancelled / not_enough_messages / irreducible / empty_summary —
       // informational, not an error state.  Whether the message is shown
@@ -281,8 +282,12 @@ export function applyCompactionEvent(holder, evt, hooks) {
       // (A superseded OK end above still renders its result card — the
       // history swap really happened.)
       hooks.onNotice(evt.message || "Compaction skipped.");
+      hooks.scroll(true);
     }
-    hooks.scroll(true);
+    // No follow-scroll on the remaining paths: a non-owning failed end
+    // renders nothing (scrolling would yank the view with zero visual
+    // change — the round-7 finding), and an owning teardown only REMOVES
+    // the progress card, which needs no scroll chase.
   }
 }
 

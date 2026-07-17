@@ -214,7 +214,18 @@ Earlier stable lines (`stable/1.6`, `stable/1.5`) are frozen.
   a message to a multi-minute command window; the deferred send is
   retractable until dispatch via the same `DELETE .../send` used for
   queued interjections (node-local, in-memory — the API reference
-  documents the at-most-once durability contract).
+  documents the at-most-once durability contract). Deferred responses
+  carry `"deferred": true`, the pending list is the **order authority**
+  (a fresh send — or a coordinator dispatch, or a queued-nudge wake —
+  lines up behind acknowledged entries instead of overtaking them, and
+  the wake gate re-arms at the drain's exit even when everything pending
+  was retracted), a dispatch crash re-queues the entry instead of eating
+  an acknowledged message, and each dispatch emits a pane-tier
+  `message_dispatched` event (`folded: true` for interjection fold-ins)
+  so queued-bubble UI keeps its retract affordance exactly until the
+  message truly leaves — including when the send was accepted by a pane
+  that believed the workstream idle, which now renders a real queued
+  chip instead of a sent-looking bubble.
   A `/compact` raced against an in-flight turn is refused with an
   explicit busy response. Every other slash command runs through the same
   worker slot too — mutual exclusion against sends, a running compaction,
@@ -223,10 +234,13 @@ Earlier stable lines (`stable/1.6`, `stable/1.5`) are frozen.
   (without parking an executor thread per request); the post-command pane
   refreshes (`clear_ui` after `/clear`/`/new`/`/resume`, the
   workstream-name sync) ride the worker itself, so a command that
-  outlives the endpoint's 60s response backstop still refreshes every
-  pane on completion (the `/command` response contract — `ok` / `running`,
-  with busy refusals answering a loud HTTP 409 rather than a silent 200 —
-  is now documented in the API reference and the OpenAPI spec). Manual compaction
+  outlives the endpoint's 25s response backstop still refreshes every
+  pane on completion (the backstop sits under the console proxy's 30s
+  client timeout so the degraded `running` answer can actually traverse
+  a proxied pane, which now surfaces it instead of silence; the
+  `/command` response contract — `ok` / `running`, with busy refusals
+  answering a loud HTTP 409 rather than a silent 200 — is now documented
+  in the API reference and the OpenAPI spec). Manual compaction
   success also refreshes the status line/context pill immediately (parity
   with auto-compaction), compaction failures keep feeding the typed
   `error` event and the node error counter (while a CLI Ctrl-C reports as

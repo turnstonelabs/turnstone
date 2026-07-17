@@ -39,8 +39,28 @@ class DequeueRequest(BaseModel):
 
 class SendResponse(BaseModel):
     status: str = Field(
-        description="'ok', 'busy', 'queued', or 'queue_full'",
-        examples=["ok", "busy", "queued", "queue_full"],
+        description=(
+            "'ok' (fresh turn dispatched), 'queued' (folded into the live "
+            "turn's interjection queue, or — when `deferred` is true — "
+            "parked for dispatch after the current command window), "
+            "'queue_full', 'attachments_busy' (attachments can't ride a "
+            "queued turn; retry when idle), or 'cross_user_interjection' "
+            "(another participant's turn is in flight; carried on the 409 "
+            "body)."
+        ),
+        examples=["ok", "queued", "queue_full", "attachments_busy", "cross_user_interjection"],
+    )
+    deferred: bool = Field(
+        default=False,
+        description=(
+            "Set on `queued` responses: the message is parked on the "
+            "workstream's deferred-send list (a slash-command window holds "
+            "the worker slot, or earlier deferred sends are still pending) "
+            "and dispatches as an ordinary full-fidelity send afterwards — "
+            "it is NOT in a live turn's interjection queue. `DELETE .../send` "
+            "retracts it until dispatch. Node-local and in-memory: a node "
+            "restart before dispatch drops it (at-most-once intake)."
+        ),
     )
     attached_ids: list[str] = Field(
         default_factory=list,

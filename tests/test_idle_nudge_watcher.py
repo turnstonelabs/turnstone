@@ -39,6 +39,10 @@ class _FakeWorkstream:
         self._worker_running = False
         self._closed = False
         self.worker_thread: Any = None
+        # Deferred /send entries — the wake gate yields while any are
+        # pending (order barrier); empty is the default every other test
+        # assumes.
+        self._pending_sends: list[Any] = []
 
 
 class _FakeManager:
@@ -193,6 +197,25 @@ class TestWakeWorkstreamIfPending:
         with patch("turnstone.core.session_worker.send") as mock_send:
             assert wake_workstream_if_pending(ws) is False
             assert mock_send.call_count == 0
+
+    def test_yields_to_pending_deferred_sends(self, fake_mgr_and_ws):
+        """Deferred /send entries hold the order barrier: a wake worker
+        claiming the slot would push messages already acknowledged
+        "queued" behind its whole turn, so the gate yields.  Re-armed
+        structurally — every deferred turn's exit re-runs the gate, and
+        the drain's clean exit (trigger="drain-exit") covers a list that
+        emptied by pure retraction and never ran a turn."""
+        _mgr, ws = fake_mgr_and_ws
+        ws.session._nudge_queue.enqueue("watch_triggered", "output", "any")
+        ws._pending_sends.append(object())
+        with patch("turnstone.core.session_worker.send", return_value=True) as mock_send:
+            assert wake_workstream_if_pending(ws, trigger="worker-exit") is False
+            assert mock_send.call_count == 0
+        # Barrier cleared (the drain retired) — the same call dispatches.
+        ws._pending_sends.clear()
+        with patch("turnstone.core.session_worker.send", return_value=True) as mock_send:
+            assert wake_workstream_if_pending(ws, trigger="drain-exit") is True
+            assert mock_send.call_count == 1
 
     def test_skips_closed_ws(self, fake_mgr_and_ws):
         """A workstream mid-``close()`` must not get a wake spawned on

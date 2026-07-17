@@ -788,32 +788,37 @@ Sends a user message to a workstream. Spawns a daemon worker thread that calls
 **Request body:**
 
 ```json
-{"message": "Explain how the server works"}
+{"message": "Explain how the server works", "attachment_ids": ["a1"]}
 ```
 
-| Field     | Type   | Required | Description             |
-|-----------|--------|----------|-------------------------|
-| `message` | string | yes      | The user's message text |
+| Field            | Type       | Required | Description                                          |
+|------------------|------------|----------|------------------------------------------------------|
+| `message`        | string     | yes      | The user's message text                              |
+| `attachment_ids` | string[]   | no       | Staged uploads to attach (omit = auto-consume; `[]` = none) |
 
-**Response (success):**
+**Response.** Every 200 body carries `attached_ids` and
+`dropped_attachment_ids` (empty lists when no attachments are involved):
 
-```json
-{"status": "ok"}
-```
-
-**Response (busy):** Returned if the workstream's worker thread is still alive
-from a previous request. Also pushes a `busy_error` event to the SSE stream.
-
-```json
-{"status": "busy"}
-```
+- `{"status": "ok", ...}` — a fresh turn was dispatched.
+- `{"status": "queued", "priority", "msg_id", ...}` — folded into the live
+  turn's interjection queue; delivered at the next tool-result seam.
+  `DELETE .../send` with the `msg_id` retracts it before delivery.
+- `{"status": "queued", "deferred": true, ...}` — parked on the deferred-send
+  list (a command window holds the slot, or earlier deferred sends are
+  pending) and dispatched as its own full-fidelity send afterwards; see the
+  defer contract under `POST /v1/api/command`.
+- `{"status": "queue_full", ...}` — the live worker's queue is at capacity;
+  retry shortly.
+- `{"status": "attachments_busy", ...}` — attachments can't ride a queued
+  turn; the staged uploads survive for a retry once the worker idles.
 
 **Error responses:**
 
-| Status | Body                               | Condition              |
-|--------|------------------------------------|------------------------|
-| 400    | `{"error": "Empty message"}`       | Message is empty       |
-| 404    | `{"error": "Unknown workstream"}`  | `ws_id` not found      |
+| Status | Body                                            | Condition                              |
+|--------|-------------------------------------------------|----------------------------------------|
+| 400    | `{"error": "message is required"}`              | Message is empty                       |
+| 404    | `{"error": "Unknown workstream"}`               | `ws_id` not found (or closed mid-send) |
+| 409    | `{"status": "cross_user_interjection", ...}`    | Another participant's turn is in flight |
 
 ---
 
@@ -863,9 +868,11 @@ synchronous:
 
 - **Quick commands** (everything except `/compact`): the endpoint waits for
   completion, so `{"status": "ok"}` means the command ran. A command still
-  running after 60 s answers `{"status": "running"}` — the worker keeps
+  running after 25 s answers `{"status": "running"}` — the worker keeps
   going, its output reaches the pane via SSE, and the post-command pane
-  refreshes below still fire when it completes.
+  refreshes below still fire when it completes. (The bound sits under
+  common 30 s client/proxy timeouts — the console proxy's included — so
+  the degraded answer actually reaches bounded callers.)
 - **`/compact`**: dispatched fire-and-forget — `{"status": "ok"}` means the
   compaction *started*. A large context can legitimately compact for many
   minutes; progress streams as `compaction` SSE events (see the event
@@ -878,18 +885,25 @@ synchronous:
   endpoint executed commands unconditionally mid-turn; the 409 makes the
   refusal loud for callers that only check the HTTP status.)
 
-While a command holds the slot, `POST .../send` requests are **deferred**:
-the server answers `{"status": "queued", "msg_id": ...}` immediately and
-dispatches the message as an ordinary full-fidelity send (attachments and
-sender identity included) when the command's window closes — it is never
-routed through the mid-turn interjection queue (no length cap, no cross-user
+While a command holds the slot — and afterwards, while earlier deferred
+sends are still waiting (the pending list is the order authority: a fresh
+send never overtakes a message already acknowledged) — `POST .../send`
+requests are **deferred**: the server answers `{"status": "queued",
+"deferred": true, "msg_id": ...}` immediately and dispatches the message
+as an ordinary full-fidelity send (attachments and sender identity
+included) in arrival order once the slot frees — it is never routed
+through the mid-turn interjection queue (no length cap, no cross-user
 rejection). The response arrives within normal round-trip time, so
 timeout-bounded clients (SDKs, proxies, the coordinator) need no special
 handling. To retract a deferred send before it dispatches, issue the same
 `DELETE .../send` with its `msg_id` used for queued interjections —
 `{"status": "removed"}` confirms it will not dispatch; `"not_found"` means
 it already dispatched (or is dispatching). Retracting a deferred send
-discards any attachments it carried; re-attach to send them again.
+discards any attachments it carried; re-attach to send them again. When a
+deferred send dispatches, panes receive a `message_dispatched` event
+(`msg_id`, plus `folded: true` when it folded into a live turn's
+interjection queue rather than spawning its own turn) so queued-message
+UI can settle the right way.
 
 Durability: deferred sends are **node-local and in-memory** (the same
 lifetime as the interjection queue). `"queued"` is at-most-once intake, not
@@ -909,10 +923,10 @@ SSE stream / in `/history`).
 | `command` | string | yes      | The slash command (e.g. `/clear`)  |
 | `ws_id`   | string | yes      | Target workstream ID               |
 
-If the command is `/clear` or `/new`, the server pushes a `clear_ui` SSE event
-to instruct the client to reset its message display. If the command is
-`/resume`, the server pushes `clear_ui` followed by a `history` event
-containing the resumed session's messages. These follow-ups are emitted by the
+If the command is `/clear`, `/new`, or `/resume`, the server pushes a
+`clear_ui` SSE event to instruct the client to reset its message display and
+re-fetch the transcript via `GET .../history` (there is no SSE event that
+carries the messages themselves). These follow-ups are emitted by the
 command worker itself, so they fire even when the endpoint already answered
 `{"status": "running"}`.
 

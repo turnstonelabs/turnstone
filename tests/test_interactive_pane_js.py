@@ -669,8 +669,60 @@ def test_send_post_abort_machinery_is_gone() -> None:
     # within RTT now (dispatched / queued / deferred-with-msg_id).
     assert "sendCtrl.abort(), 15000" in interactive
     assert "sendCtrl.abort(), 15000" in coordinator
-    # Retracting a deferred send discards its attachments — both panes
-    # stash the count and composer_queue surfaces the consequence.
-    assert "_deferredAttachments" in interactive
-    assert "_deferredAttachments" in coordinator
-    assert "_deferredAttachments" in composer_queue
+    # The deferred-attachment count rides bind()'s documented options seam
+    # (controller dataset) — the per-pane element expando is dead.
+    for name, src in (
+        ("interactive.js", interactive),
+        ("coordinator.js", coordinator),
+        ("composer_queue.js", composer_queue),
+    ):
+        assert "_deferredAttachments" not in src, (
+            f"{name}: deferred state must ride bind(el, msgId, opts), not an expando"
+        )
+
+
+def test_deferred_send_settle_protocol_pins() -> None:
+    """The deferred-chip settle protocol (round 7, C4): a deferred send's
+    queued chip keeps its retraction affordance exactly until the message
+    truly leaves the parked list.  Pins the controller's contract and both
+    panes' wiring — losing any of these silently re-promotes parked
+    messages to "sent" while the server still honors DELETE (loss
+    disguised as delivery on a node restart)."""
+    interactive = _INTERACTIVE.read_text(encoding="utf-8")
+    coordinator = (_ROOT / "turnstone/console/static/coordinator/coordinator.js").read_text(
+        encoding="utf-8"
+    )
+    composer_queue = (_ROOT / "turnstone/shared_static/composer_queue.js").read_text(
+        encoding="utf-8"
+    )
+    # Controller: bind() stores the options on its own dataset state...
+    assert "function bind(el, msgId, opts)" in composer_queue
+    assert 'el.dataset.deferred = "1"' in composer_queue
+    assert "el.dataset.attachedCount = String(opts.attachedCount)" in composer_queue
+    # ...the idle sweep skips deferred AND unbound chips (the "idle ⇒
+    # drained" invariant is untrue for both)...
+    assert "if (el.dataset.deferred) return;" in composer_queue
+    assert "if (!el.dataset.msgId) return;" in composer_queue
+    # ...and settleDeferred branches on the fold-in arm: clear the flag
+    # only (DELETE still genuinely removes a folded message until the seam
+    # drains), promote only on the fresh-spawn arm.
+    assert "function settleDeferred(msgId, folded)" in composer_queue
+    assert "delete target.dataset.deferred;" in composer_queue
+    assert "settleDeferred: settleDeferred" in composer_queue
+    # A barrier-deferred entry can dispatch within milliseconds of its ack,
+    # so the SSE settle can beat the POST response's bind(): the controller
+    # parks chip-absent settles and bind() reconciles them — without this a
+    # raced chip stays flagged deferred and the idle sweep skips it forever.
+    assert "_preBindSettles" in composer_queue
+    assert "_preBindSettles.has(msgId)" in composer_queue
+    # Both panes pass the response through the options seam and consume the
+    # pane-tier settle event.
+    for name, src in (("interactive.js", interactive), ("coordinator.js", coordinator)):
+        assert "deferred: !!data.deferred" in src, f"{name}: bind must carry the deferred flag"
+        assert "attachedCount: (data.attached_ids || []).length" in src, name
+        assert 'case "message_dispatched"' in src, f"{name}: settle event not consumed"
+        assert "settleDeferred(" in src, name
+        # queuedEl-absent + deferred: the idle-thinking pane must render a
+        # real queued chip (retro-convert), not leave a sent-looking bubble
+        # for a parked, still-retractable message.
+        assert "!queuedEl && data.deferred" in src, f"{name}: idle-pane defer must chip"

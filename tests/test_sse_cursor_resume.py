@@ -236,6 +236,27 @@ def test_append_system_turn_stamps_row_with_its_sse_event_id(
     assert ui._event_buffer[-1][1]["type"] == "system_turn"
 
 
+def test_system_turn_bool_hook_return_falls_back_to_counter(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A duck-typed ``on_system_turn`` returning ``True`` (bool ⊂ int) must
+    never stamp a boolean into the persisted row: PostgreSQL fails the
+    INSERT after the turn already appended, SQLite stores ``1`` and
+    mis-keys the /history-vs-replay dedupe.  ``_coerce_event_id`` rejects
+    bools at the shared chokepoint and the stamp falls back to the
+    ring-buffer counter (same guard class as ``parse_checkpoint_watermark``)."""
+    session = make_session()
+    captured: dict[str, Any] = {}
+    monkeypatch.setattr(
+        "turnstone.core.session.save_message",
+        lambda *a, **k: captured.update(event_id=k.get("event_id")),
+    )
+    session.ui.on_system_turn = lambda *_a, **_k: True
+    session._append_system_turn("start", "ground yourself")
+    assert not isinstance(captured["event_id"], bool)
+    assert captured["event_id"] == session._ui_event_id()
+
+
 # ---------------------------------------------------------------------------
 # Storage: event_id round-trip, get_max_event_id, _event_id reseed
 # ---------------------------------------------------------------------------

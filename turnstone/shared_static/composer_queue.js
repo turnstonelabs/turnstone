@@ -57,20 +57,40 @@
  * Returned controller surface:
  *   addQueuedMessage(text, priority) -> el
  *       priority: "important" | anything-else (treated as "notice")
- *   bind(el, msgId)
+ *   bind(el, msgId, opts)
  *       Server returned status:queued + msg_id. Stamps msgId so the × can
  *       dequeue; if the user already clicked × (pre-bind) runs the
  *       confirming delete now; if the idle sweep already promoted the
  *       bubble (already delivered), leaves it untouched.
+ *       opts (optional): { deferred, attachedCount } from the send
+ *       response — deferred chips are skipped by the idle sweep (they
+ *       settle via settleDeferred instead), and attachedCount feeds the
+ *       discarded-attachments notice on a confirmed retract. This is the
+ *       ONLY channel for both facts; consumers must not stash expandos
+ *       on the element.
  *   promote(el)
  *       Settle an optimistic bubble as a normal sent message — used by the
  *       consumer when the send response wasn't "queued" (e.g. an "ok"
  *       stale-busy race) so a pre-bind × can't strand the card.
  *   remove(el)
  *       Drop the bubble (busy / queue_full / connection-error path).
+ *   settleDeferred(msgId, folded)
+ *       Consume a `message_dispatched` pane event: the deferred send left
+ *       the parked list. folded=false → fresh turn spawned; promote (the
+ *       ×'s window is over — a late DELETE resolves via not_found).
+ *       folded=true → interjection fold-in; clear ONLY the deferred flag
+ *       so the chip resumes the normal queued lifecycle (DELETE still
+ *       genuinely removes it until the seam drains; the idle sweep
+ *       promotes it at the turn edge). No-op when no live chip carries
+ *       msgId (other tabs, replays) or a dismiss is in flight.
  *   onIdleEdge()
  *       Caller invokes once per busy → idle transition. Promotes every
  *       not-in-flight queued bubble and then fires the onIdle hook.
+ *       Skips deferred chips ("idle ⇒ drained" is untrue for them — they
+ *       dispatch when the server-side drain runs, possibly minutes later)
+ *       and unbound chips (POST round-trip still in flight — a quick
+ *       command window can close inside it; the response arms settle
+ *       every unbound chip, so the sweep never needs to).
  */
 export function createQueueController(opts) {
   if (!opts || !opts.messagesEl)
@@ -98,6 +118,14 @@ export function createQueueController(opts) {
   // Live queued bubbles — the idle sweep iterates this instead of querying
   // the whole messages container (see onIdleEdge).
   var _liveQueued = new Set();
+  // Settles that arrived before bind() could stamp the chip: the order
+  // barrier lets a deferred entry dispatch within milliseconds of its ack,
+  // so the SSE message_dispatched can beat the POST response's .then —
+  // without this, the chip would stay flagged deferred and the idle sweep
+  // would skip it forever. bind() reconciles and deletes; capped small
+  // because chip-absent settles (other tabs, replays) also land here and
+  // never get consumed.
+  var _preBindSettles = new Map(); // msgId -> folded
   // Upper bound on the dequeue DELETE so a wedged proxied node (the exact
   // case this flow targets) can't leave a card stuck "dismissing" forever.
   var DELETE_TIMEOUT_MS = 15000;
@@ -268,11 +296,13 @@ export function createQueueController(opts) {
           // A deferred send (command-window defer) can carry attachments;
           // retracting it discards them — the chips were consumed when the
           // send was accepted and a retract does not re-stage the bytes.
-          // Say so instead of letting the files silently expire.
-          if (el._deferredAttachments > 0 && onNotice)
+          // Say so instead of letting the files silently expire. The count
+          // rides bind()'s opts (dataset), never an element expando.
+          var nAtt = parseInt(el.dataset.attachedCount || "0", 10);
+          if (nAtt > 0 && onNotice)
             onNotice(
               "Message removed. Its " +
-                el._deferredAttachments +
+                nAtt +
                 " attachment(s) were discarded — re-attach them to send again.",
             );
           // `removed` is the only verdict that mutated server-side queue
@@ -317,16 +347,34 @@ export function createQueueController(opts) {
   }
 
   // Server returned status:queued + msg_id.
-  function bind(el, msgId) {
+  function bind(el, msgId, opts) {
     if (!el || !msgId) return;
     // Idle sweep already promoted the bubble (worker drained mid-POST): the
-    // message is on its way, so leave it as a sent bubble. We deliberately do
-    // NOT delete here — idle can be emitted before the worker actually drains,
-    // so a delete could cancel a still-queued message; and a dismissed card
-    // never reaches this branch (onIdleEdge skips aria-busy cards), so doing
-    // nothing is the safe action.
+    // message is on its way, so leave it as a sent bubble. Dead-but-harmless
+    // since the sweep skips unbound chips; kept as the safe action for any
+    // promote path we didn't enumerate. We deliberately do NOT delete here —
+    // a delete could cancel a still-queued message; and a dismissed card
+    // never reaches this branch (onIdleEdge skips aria-busy cards).
     if (!el.classList.contains("msg-queued")) return;
     el.dataset.msgId = msgId;
+    if (opts && opts.deferred) el.dataset.deferred = "1";
+    if (opts && opts.attachedCount > 0)
+      el.dataset.attachedCount = String(opts.attachedCount);
+    // A settle raced ahead of this bind (see _preBindSettles): apply it
+    // now. Fresh-spawn settle → the dispatch already happened, promote
+    // (fires "already sent" if the × was clicked — the dispatch won);
+    // fold-in settle → clear the flag, the chip is a normal queued
+    // interjection from here.
+    if (el.dataset.deferred && _preBindSettles.has(msgId)) {
+      var racedFolded = _preBindSettles.get(msgId);
+      _preBindSettles.delete(msgId);
+      if (racedFolded) {
+        delete el.dataset.deferred;
+      } else {
+        _promote(el);
+        return;
+      }
+    }
     // User clicked × before the id arrived → confirm the delete now
     // (removes only on a confirmed `removed`; promotes on not_found).
     if (el.dataset.dismissAttempted) _confirmDequeue(el, msgId);
@@ -348,6 +396,8 @@ export function createQueueController(opts) {
     var attempted = el.dataset.dismissAttempted;
     el.classList.remove("msg-queued", "msg-queued-important");
     delete el.dataset.msgId;
+    delete el.dataset.deferred;
+    delete el.dataset.attachedCount;
     delete el.dataset.dismissAttempted;
     el.removeAttribute("role");
     el.removeAttribute("aria-label");
@@ -378,9 +428,47 @@ export function createQueueController(opts) {
         return;
       }
       if (el.hasAttribute("aria-busy")) return; // mid-dequeue — let it settle
+      // Deferred sends outlive the busy→idle edge: they dispatch when the
+      // server-side drain runs (message_dispatched → settleDeferred), and
+      // promoting here would strip the × while DELETE still genuinely
+      // retracts — presenting a parked message as sent, which on a node
+      // restart before dispatch becomes loss disguised as delivery.
+      if (el.dataset.deferred) return;
+      // Unbound chips (no msg_id — the POST round-trip is still in
+      // flight): a quick command window can close inside the round-trip,
+      // firing this edge before bind() could stamp the deferred flag.
+      // Every response arm (bind/promote/remove/catch) settles unbound
+      // chips, so the sweep never needs them.
+      if (!el.dataset.msgId) return;
       _promote(el);
     });
     if (onIdle) onIdle();
+  }
+
+  // Consume a `message_dispatched {msg_id, folded}` pane event — see the
+  // header contract. Promote on a fresh spawn; on a fold-in clear only the
+  // deferred flag so the chip re-enters the normal interjection lifecycle.
+  function settleDeferred(msgId, folded) {
+    if (!msgId) return;
+    var target = null;
+    _liveQueued.forEach(function (el) {
+      if (el.isConnected && el.dataset.msgId === msgId) target = el;
+    });
+    if (!target) {
+      // No bound chip yet: either another tab's message (never consumed —
+      // hence the cap) or this tab's bind() is still in the POST
+      // round-trip; park the settle for bind() to reconcile.
+      _preBindSettles.set(msgId, !!folded);
+      if (_preBindSettles.size > 8)
+        _preBindSettles.delete(_preBindSettles.keys().next().value);
+      return;
+    }
+    if (target.hasAttribute("aria-busy")) return; // dismiss in flight — let it settle
+    if (folded) {
+      delete target.dataset.deferred;
+      return;
+    }
+    _promote(target);
   }
 
   return {
@@ -388,6 +476,7 @@ export function createQueueController(opts) {
     bind: bind,
     promote: _promote,
     remove: remove,
+    settleDeferred: settleDeferred,
     onIdleEdge: onIdleEdge,
   };
 }

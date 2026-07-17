@@ -504,6 +504,11 @@ class TestSendMessageAttachments:
         ws.worker_thread = None
         ws._worker_running = False
         ws._closed = False  # a bare Mock attr is truthy → send() would refuse
+        # Same truthy-Mock trap as _closed: the /send order barrier reads
+        # both — a bare Mock attr would defer every send behind a phantom
+        # pending list.
+        ws._pending_sends = []
+        ws._pending_drain = None
         ws._lock = threading.RLock()
         mgr.get.return_value = ws
         return captured, session
@@ -703,6 +708,10 @@ class TestQueuedSendWithAttachments:
         ws.worker_thread = worker
         ws._worker_running = True
         ws._closed = False  # a bare Mock attr is truthy → send() would refuse
+        # Same truthy-Mock trap: the /send order barrier reads both — a
+        # bare Mock attr would defer every send behind a phantom list.
+        ws._pending_sends = []
+        ws._pending_drain = None
         ws._lock = threading.RLock()
         mgr.get.return_value = ws
         return captured
@@ -767,6 +776,10 @@ class TestBusyWorkerAttachments:
         ws.session = session
         ws.worker_thread = worker
         ws._closed = False  # a bare Mock attr is truthy → send() would refuse
+        # Same truthy-Mock trap: the /send order barrier reads both — a
+        # bare Mock attr would defer every send behind a phantom list.
+        ws._pending_sends = []
+        ws._pending_drain = None
         ws._lock = threading.RLock()
         mgr.get.return_value = ws
         return ws, session
